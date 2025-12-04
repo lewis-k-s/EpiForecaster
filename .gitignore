@@ -30,6 +30,8 @@ checkpoints/
 data/*.csv
 data/*.parquet
 data/*.h5
+data/*.zarr
+data/processed/
 outputs/
 logs/
 
@@ -55,6 +57,7 @@ venv.bak/
 # OS
 .DS_Store
 Thumbs.db
+*.zarr
 
 # UV
 .uv/
