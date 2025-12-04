@@ -1,21 +1,24 @@
 """
 Data loading and preprocessing modules for epidemiological forecasting.
+
+This module provides the canonical data structures and preprocessing pipeline
+for epidemiological forecasting. The main components are:
+
+- EpiDataset: PyTorch Dataset interface for loading preprocessed Zarr datasets
+- EpiBatch: Universal batch representation for all model variants
+- DatasetStorage: Zarr-based storage for canonical datasets
+- OfflinePreprocessingPipeline: Configuration-driven preprocessing pipeline
 """
 
-from .feature_extractor import GeometricFeatureExtractor, example_custom_features
-from .mobility_loader import MobilityDataLoader, example_preprocessing_hooks
-from .region_data import (
-    RegionDataProcessor,
-    SpatialAdjacencyBuilder,
-    create_region_data_processor,
-)
+from .dataset_storage import DatasetStorage
+from .epi_batch import EpiBatch
+from .epi_dataset import EpiDataset
+from .preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
 
 __all__ = [
-    "MobilityDataLoader",
-    "example_preprocessing_hooks",
-    "GeometricFeatureExtractor",
-    "example_custom_features",
-    "RegionDataProcessor",
-    "SpatialAdjacencyBuilder",
-    "create_region_data_processor",
+    "EpiBatch",
+    "EpiDataset",
+    "DatasetStorage",
+    "OfflinePreprocessingPipeline",
+    "PreprocessingConfig",
 ]

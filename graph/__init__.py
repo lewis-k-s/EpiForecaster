@@ -8,14 +8,10 @@ from .edge_processor import (
 )
 from .node_encoder import (
     InductiveNodeEncoder,
-    TemporalNodeEncoder,
-    create_node_encoder,
 )
 
 __all__ = [
     "InductiveNodeEncoder",
-    "TemporalNodeEncoder",
-    "create_node_encoder",
     "EdgeAttributeEmbedder",
     "EdgeFeatureProcessor",
 ]

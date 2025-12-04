@@ -1,9 +1,16 @@
 """
-Training modules for region embedding and forecasting models.
+Training modules for epidemiological forecasting models.
+
+This module provides the unified training infrastructure for all model variants
+in the EpiForecaster pipeline.
 """
 
-from .data_manager import DataManager
-from .region_pretraining import RegionPretrainer, create_region_pretrainer
-from .timeseries_trainer import TimeSeriesTrainer
+from .epiforecaster_trainer import EpiForecasterTrainerConfig, EpiForecasterTrainer
+from .region_embedder_trainer import RegionTrainerConfig, RegionEmbedderTrainer
 
-__all__ = ["RegionPretrainer", "create_region_pretrainer", "DataManager", "TimeSeriesTrainer"]
+__all__ = [
+    "EpiForecasterTrainer",
+    "EpiForecasterTrainerConfig",
+    "RegionTrainerConfig",
+    "RegionEmbedderTrainer",
+]
