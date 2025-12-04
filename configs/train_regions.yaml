@@ -1,0 +1,54 @@
+# Example configuration for Region2Vec-style region embedding training.
+
+data:
+  zarr_path: "/Volumes/HUBSSD/code/EpiForecaster/outputs/region_graph/region_graph.zarr"
+  normalize_features: true
+
+encoder:
+  hidden_dim: 128
+  embedding_dim: 64
+  num_layers: 2
+  dropout: 0.2
+  aggregation: "mean"
+  residual: true
+  normalize: true
+
+training:
+  epochs: 200
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  device: "auto"
+  log_every: 10
+  gradient_clip: 1.0
+  seed: 42
+  checkpoint_every: 0
+
+sampling:
+  positive_pairs: 8192
+  negative_pairs: 8192
+  hop_pairs: 4096
+  min_flow_threshold: 5.0
+  hop_threshold: 2
+  max_hops: 5
+
+loss:
+  loss_type: "community"        # or "spatial" when flows are unavailable
+  spatial_weight: 1.0
+  autocorr_weight: 0.5
+  ratio_weight: 1.0
+  hop_weight: 0.3
+  temperature: 0.1
+  margin: 1.0
+
+output:
+  output_dir: "outputs/region_embeddings"
+  embedding_filename: "region_embeddings.pt"
+  metrics_filename: "region_training_metrics.json"
+  cluster_labels_filename: "region_clusters.json"
+  save_numpy: true
+
+clustering:
+  enabled: true
+  num_clusters: 14
+  linkage: "ward"
+  compute_connectivity: true

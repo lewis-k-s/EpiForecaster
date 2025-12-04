@@ -1,0 +1,61 @@
+# Cases-only preprocessing configuration for Catalan COVID-19 epidemiological data
+# Base model configuration: cases only (no wastewater, no mobility)
+
+# Data source paths - cases only
+data_dir: "data/files"
+cases_file: "data/files/flowmaps_cat_municipio_cases.csv"
+wastewater_file: null  # Skip wastewater for cases-only model
+population_file: "data/files/fl_population_por_municipis.csv"
+mobility_path: null     # Skip mobility for cases-only model
+region_metadata_file: null
+
+# Temporal processing parameters - maximum coverage
+start_date: "2020-03-01" # Early pandemic period
+end_date: "2022-07-26" # Latest case data available
+forecast_horizon: 7
+sequence_length: 14
+
+# Feature processing options - cases only focus
+cases_normalization: "log1p"
+mobility_normalization: "log1p"
+min_flow_threshold: 10
+
+# Column mapping for custom CSV structure (actual CSV column -> expected column)
+cases_column_mapping:
+  evstart: "date"          # Map evstart column to expected date column
+  "d.cases": "cases"       # Map d.cases column to expected cases column
+  c.cumun: "region_id"     # Map c.cumun column to expected region_id column
+
+# Alignment and validation options
+alignment_strategy: "interpolate"
+target_dataset: "cases"
+crop_datasets: true
+validate_alignment: true
+generate_alignment_report: true
+
+# Output configuration
+output_path: "data/processed"
+dataset_name: "cases_only_v1"
+compression: "blosc"
+
+# Processing configuration
+num_workers: 4
+chunk_size: 1000
+memory_limit_gb: 8.0
+
+# Graph construction options - minimal for cases-only model
+graph_options:
+  edge_strategy: "knn"
+  k_neighbors: 8
+  distance_threshold: 50.0 # 50km radius for regional connectivity
+  include_self_loops: false
+
+# Validation and quality control options
+validation_options:
+  max_missing_percentage: 0.15
+  min_data_coverage: 0.75
+  outlier_detection: true
+  outlier_threshold: 3.0
+  temporal_consistency_check: true
+  spatial_consistency_check: true
+  generate_plots: true
