@@ -3,7 +3,6 @@ Mobility flow edge feature processing for epidemiological graphs.
 """
 
 import logging
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -220,14 +219,14 @@ class MobilityFlowProcessor:
     def _create_edge_features(self, flow_data: torch.Tensor) -> torch.Tensor:
         """Create edge features from processed mobility flows."""
         # For now, we'll aggregate temporal dimension and create basic features
-        T, O, D = flow_data.shape
+        T, n_origins, n_destinations = flow_data.shape
 
         # Create edge list from non-zero flows
         edges = []
         edge_features = []
 
-        for o in range(O):
-            for d in range(D):
+        for o in range(n_origins):
+            for d in range(n_destinations):
                 if o != d:  # Skip self-loops
                     # Time series of flows for this edge
                     flow_series = flow_data[:, o, d]
@@ -366,8 +365,8 @@ class EdgeFeatureProcessor:
     def process_all_features(
         self,
         flow_data: torch.Tensor,
-        geographic_data: Optional[pd.DataFrame] = None,
-        temporal_data: Optional[pd.DataFrame] = None,
+        geographic_data: pd.DataFrame | None = None,
+        temporal_data: pd.DataFrame | None = None,
     ) -> torch.Tensor:
         """
         Process all types of edge features.

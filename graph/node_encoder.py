@@ -3,7 +3,8 @@ Inductive node feature encoding for epidemiological graphs.
 """
 
 import logging
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -27,7 +28,7 @@ class InductiveNodeEncoder(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int = 128,
-        output_dim: Optional[int] = None,
+        output_dim: int | None = None,
         num_layers: int = 2,
         aggregation: str = "mean",
         dropout: float = 0.5,
@@ -142,7 +143,7 @@ class InductiveNodeEncoder(nn.Module):
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
-        batch_size: Optional[int] = None,
+        batch_size: int | None = None,
     ) -> torch.Tensor:
         """
         Encode node features using neighbor sampling for large graphs.
@@ -183,169 +184,3 @@ class InductiveNodeEncoder(nn.Module):
             embeddings.append(sub_embeddings)
 
         return torch.cat(embeddings, dim=0)
-
-
-class TemporalNodeEncoder(nn.Module):
-    """
-    Temporal node encoder that captures both spatial and temporal patterns.
-
-    Combines spatial graph encoding with temporal sequence modeling for
-    time-evolving epidemiological graphs.
-    """
-
-    def __init__(
-        self,
-        spatial_encoder: nn.Module,
-        temporal_hidden_dim: int = 64,
-        sequence_length: int = 7,
-        temporal_layers: int = 1,
-        bidirectional: bool = False,
-    ):
-        """
-        Initialize temporal node encoder.
-
-        Args:
-            spatial_encoder: Spatial node encoder (InductiveNodeEncoder)
-            temporal_hidden_dim: Hidden dimension for temporal modeling
-            sequence_length: Length of temporal sequences
-            temporal_layers: Number of LSTM layers
-            bidirectional: Whether to use bidirectional LSTM
-        """
-        super().__init__()
-
-        self.spatial_encoder = spatial_encoder
-        self.temporal_hidden_dim = temporal_hidden_dim
-        self.sequence_length = sequence_length
-
-        # Determine spatial output dimension
-        if hasattr(spatial_encoder, "output_dim"):
-            spatial_dim = spatial_encoder.output_dim
-        else:
-            spatial_dim = spatial_encoder.hidden_dim
-
-        # Temporal sequence encoder
-        self.temporal_lstm = nn.LSTM(
-            input_size=spatial_dim,
-            hidden_size=temporal_hidden_dim,
-            num_layers=temporal_layers,
-            batch_first=True,
-            bidirectional=bidirectional,
-            dropout=0.1 if temporal_layers > 1 else 0.0,
-        )
-
-        # Output dimension
-        lstm_output_dim = temporal_hidden_dim * (2 if bidirectional else 1)
-        self.output_projection = nn.Linear(lstm_output_dim, spatial_dim)
-
-    def forward(
-        self, graph_sequence: list[HeteroData], node_type: str = "region"
-    ) -> torch.Tensor:
-        """
-        Encode temporal sequence of graphs.
-
-        Args:
-            graph_sequence: List of HeteroData graphs in temporal order
-            node_type: Node type to encode (for heterogeneous graphs)
-
-        Returns:
-            Temporal node embeddings
-        """
-        # Encode each graph spatially
-        spatial_embeddings = []
-
-        for graph in graph_sequence:
-            spatial_emb = self.spatial_encoder(graph.x, graph.edge_index)
-
-            if spatial_emb is not None:
-                spatial_embeddings.append(spatial_emb)
-
-        if len(spatial_embeddings) == 0:
-            raise ValueError(f"No embeddings found for node type: {node_type}")
-
-        # Stack spatial embeddings into temporal sequence
-        # Shape: [num_nodes, sequence_length, spatial_dim]
-        temporal_sequence = torch.stack(spatial_embeddings, dim=1)
-
-        # Apply temporal LSTM
-        lstm_output, (hidden, cell) = self.temporal_lstm(temporal_sequence)
-
-        # Use last output or mean of sequence
-        temporal_embeddings = lstm_output[:, -1, :]  # Last time step
-
-        # Project back to spatial dimension
-        output_embeddings = self.output_projection(temporal_embeddings)
-
-        return output_embeddings
-
-
-def create_node_encoder(
-    config: dict[str, Any],
-    input_dims: dict[str, int],
-) -> nn.Module:
-    """
-    Factory function to create appropriate node encoder based on configuration.
-
-    Args:
-        config: Configuration dictionary
-        input_dims: Input dimensions (single int)
-
-    Returns:
-        Configured node encoder
-    """
-    encoder_type = config.get("encoder_type", "inductive")
-
-    if encoder_type == "inductive":
-        # Homogeneous inductive encoder
-        if isinstance(input_dims, dict):
-            input_dim = input_dims.get("region", 64)  # Default for region nodes
-        else:
-            input_dim = input_dims
-
-        return InductiveNodeEncoder(
-            input_dim=input_dim,
-            hidden_dim=config.get("hidden_dim", 128),
-            output_dim=config.get("output_dim"),
-            num_layers=config.get("num_layers", 2),
-            aggregation=config.get("aggregation", "mean"),
-            dropout=config.get("dropout", 0.5),
-            activation=config.get("activation", "relu"),
-            normalize=config.get("normalize", True),
-            residual=config.get("residual", False),
-        )
-
-    elif encoder_type == "temporal":
-        # Temporal encoder (requires base spatial encoder)
-        base_config = config.get("spatial_encoder", {})
-        base_encoder = create_node_encoder(base_config, input_dims)
-
-        return TemporalNodeEncoder(
-            spatial_encoder=base_encoder,
-            temporal_hidden_dim=config.get("temporal_hidden_dim", 64),
-            sequence_length=config.get("sequence_length", 7),
-            temporal_layers=config.get("temporal_layers", 1),
-            bidirectional=config.get("bidirectional", False),
-        )
-
-    else:
-        raise ValueError(f"Unknown encoder type: {encoder_type}")
-
-
-if __name__ == "__main__":
-    # Example usage and testing
-
-    # Test inductive encoder
-    input_dim = 64
-    encoder = InductiveNodeEncoder(
-        input_dim=input_dim, hidden_dim=128, num_layers=2, aggregation="mean"
-    )
-
-    # Create dummy data
-    num_nodes = 100
-    x = torch.randn(num_nodes, input_dim)
-    edge_index = torch.randint(0, num_nodes, (2, 200))
-
-    # Test encoding
-    embeddings = encoder(x, edge_index)
-    print(f"Inductive encoder output shape: {embeddings.shape}")
-
-    print("Node encoders initialized successfully")
