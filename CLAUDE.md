@@ -1,1 +1,1 @@
-Use @./AGENTS.md for project context
+@AGENTS.md
