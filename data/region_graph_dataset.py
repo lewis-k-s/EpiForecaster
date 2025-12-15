@@ -1,21 +1,16 @@
+import json
 from pathlib import Path
 from typing import Any
 
-import json
-
 import torch
-from torch.utils.data import Dataset
-
 import zarr
-import numpy as np
+from torch.utils.data import Dataset
 
 
 class RegionGraphDataset(Dataset):
     """Dataset for region graph data stored in zarr format.
 
-    This dataset provides access to region features, adjacency, flows, and IDs
-    for training region embeddings. It follows the same patterns as EpiDataset
-    and GraphEgoDataset in the codebase.
+    This dataset provides access to region features, adjacency, flows, and IDs for training region embeddings.
     """
 
     def __init__(

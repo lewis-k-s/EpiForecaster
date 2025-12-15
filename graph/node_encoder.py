@@ -2,20 +2,36 @@
 Inductive node feature encoding for epidemiological graphs.
 """
 
+from __future__ import annotations
+
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import HeteroData
 from torch_geometric.nn import GATConv, SAGEConv
 
 logger = logging.getLogger(__name__)
 
 
-class InductiveNodeEncoder(nn.Module):
+class RegionEncoderArtifact(TypedDict, total=False):
+    """Serialized payload emitted by :class:`RegionEmbedderTrainer`.
+
+    The trainer stores both the frozen encoder weights and the already-computed
+    embeddings so downstream components can either reuse the tensor directly or
+    regenerate embeddings for new graphs.
+    """
+
+    embeddings: torch.Tensor
+    region_ids: list[str]
+    config: dict[str, Any]
+    encoder_state_dict: dict[str, torch.Tensor]
+    feature_dim: int
+
+
+class Region2Vec(nn.Module):
     """
     Inductive node encoder that learns to aggregate features from local neighborhoods
     rather than learning fixed embeddings for specific nodes.
@@ -184,3 +200,78 @@ class InductiveNodeEncoder(nn.Module):
             embeddings.append(sub_embeddings)
 
         return torch.cat(embeddings, dim=0)
+
+    # ------------------------------------------------------------------
+    # Serialization helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_weights(
+        cls,
+        checkpoint_path: str | Path,
+        *,
+        map_location: str | torch.device | None = "cpu",
+    ) -> tuple[Region2Vec, RegionEncoderArtifact]:
+        """
+        Restore a pretrained encoder from a Region2Vec artifact.
+
+        Returns the instantiated encoder (set to eval mode) and the raw artifact
+        dictionary so callers can access the stored embeddings/region_ids.
+        """
+
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Region encoder checkpoint not found: {checkpoint_path}"
+            )
+
+        artifact = torch.load(checkpoint_path, map_location=map_location or "cpu")
+        if not isinstance(artifact, dict):
+            raise ValueError(
+                "Region encoder checkpoint must contain a dictionary payload. "
+                f"Got type={type(artifact)!r}"
+            )
+        region_artifact: RegionEncoderArtifact = cast(RegionEncoderArtifact, artifact)
+
+        feature_dim = region_artifact.get("feature_dim")
+        if feature_dim is None:
+            raise ValueError(
+                "Region encoder artifact missing 'feature_dim'; unable to rebuild encoder."
+            )
+
+        encoder_cfg = (region_artifact.get("config") or {}).get("encoder", {})
+        embedding_dim = encoder_cfg.get("embedding_dim")
+        if embedding_dim is None:
+            embedding_dim = encoder_cfg.get("hidden_dim", 128)
+
+        encoder = cls(
+            input_dim=int(feature_dim),
+            hidden_dim=int(encoder_cfg.get("hidden_dim", 128)),
+            output_dim=int(embedding_dim),
+            num_layers=int(encoder_cfg.get("num_layers", 2)),
+            aggregation=str(encoder_cfg.get("aggregation", "mean")),
+            dropout=float(encoder_cfg.get("dropout", 0.5)),
+            activation=str(encoder_cfg.get("activation", "relu")),
+            normalize=bool(encoder_cfg.get("normalize", True)),
+            residual=bool(encoder_cfg.get("residual", False)),
+        )
+
+        state_dict = region_artifact.get("encoder_state_dict")
+        if state_dict is None:
+            raise ValueError(
+                "Region encoder artifact missing 'encoder_state_dict'; cannot load weights."
+            )
+        encoder.load_state_dict(state_dict)
+        encoder.eval()
+        return encoder, region_artifact
+
+
+def load_pretrained_region_encoder(
+    checkpoint_path: str | Path, map_location: str | torch.device | None = "cpu"
+) -> tuple[Region2Vec, RegionEncoderArtifact]:
+    """
+    Backwards-compatible helper used by tests/legacy code.
+    """
+
+    return Region2Vec.from_weights(
+        checkpoint_path=checkpoint_path, map_location=map_location
+    )

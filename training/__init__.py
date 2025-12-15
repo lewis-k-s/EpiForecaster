@@ -5,12 +5,12 @@ This module provides the unified training infrastructure for all model variants
 in the EpiForecaster pipeline.
 """
 
-from .epiforecaster_trainer import EpiForecasterTrainerConfig, EpiForecasterTrainer
-from .region_embedder_trainer import RegionTrainerConfig, RegionEmbedderTrainer
+from .epiforecaster_trainer import EpiForecasterConfig, EpiForecasterTrainer
+from .region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
 
 __all__ = [
     "EpiForecasterTrainer",
-    "EpiForecasterTrainerConfig",
+    "EpiForecasterConfig",
+    "Region2VecTrainer",
     "RegionTrainerConfig",
-    "RegionEmbedderTrainer",
 ]

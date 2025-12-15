@@ -22,6 +22,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import GATConv, GCNConv
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,79 @@ class MobilityGNNLayer(nn.Module):
         return edge_index, edge_attr
 
 
+class MobilityPyGEncoder(nn.Module):
+    """
+    Lightweight PyG-based encoder that can switch between GCN and GAT.
+
+    This expects PyG-style sparse graphs (edge_index/edge_weight) and produces
+    per-node embeddings of dimension ``out_dim``.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        depth: int = 2,
+        module_type: str = "gcn",
+        dropout: float = 0.1,
+        heads: int = 1,
+    ):
+        super().__init__()
+
+        self.module_type = module_type
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+        if module_type == "gcn":
+            self.conv1: nn.Module = GCNConv(in_dim, hidden_dim, add_self_loops=True)
+            self.conv2: nn.Module = GCNConv(hidden_dim, out_dim, add_self_loops=True)
+        elif module_type == "gat":
+            # Use concat=False so output dims match hidden_dim / out_dim.
+            self.conv1 = GATConv(
+                in_dim,
+                hidden_dim,
+                heads=heads,
+                concat=False,
+                add_self_loops=True,
+                dropout=dropout,
+            )
+            self.conv2 = GATConv(
+                hidden_dim,
+                out_dim,
+                heads=heads,
+                concat=False,
+                add_self_loops=True,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(f"Unsupported module_type for mobility GNN: {module_type}")
+
+        # Log initialization
+        logger.info(
+            f"Initialized MobilityPyGEncoder: {in_dim}->{hidden_dim}->{out_dim}, "
+            f"module_type={module_type}, layers={depth}, heads={heads}"
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: Node features [num_nodes, in_dim]
+            edge_index: Graph connectivity [2, num_edges]
+            edge_weight: Optional edge weights aligned to edge_index
+        """
+        h = self.conv1(x, edge_index, edge_weight)
+        h = self.activation(h)
+        h = self.dropout(h)
+        h = self.conv2(h, edge_index, edge_weight)
+        return h
+
+
 class MobilityGNN(nn.Module):
     """
     Mobility-based Graph Neural Network for per-time-step processing.
@@ -340,7 +414,6 @@ class MobilityGNN(nn.Module):
         self,
         node_features_t: torch.Tensor,
         mobility_matrix_t: torch.Tensor,
-        region_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of MobilityGNN for a single time step.
@@ -350,26 +423,15 @@ class MobilityGNN(nn.Module):
                 Should contain cases, biomarkers, and optionally region embeddings
             mobility_matrix_t: Mobility flows at time t [num_nodes, num_nodes]
                 mobility_matrix_t[j, i] = flow from origin j to destination i
-            region_embeddings: Optional static region embeddings [num_nodes, embed_dim]
-                If provided, will be concatenated to node_features_t
 
         Returns:
             Mobility-enhanced node embeddings [num_nodes, out_dim]
         """
-        # Add static region embeddings if provided
-        if region_embeddings is not None:
-            # Concatenate region embeddings to node features
-            node_features_t = torch.cat([node_features_t, region_embeddings], dim=1)
-
         # Validate input dimensions
         expected_in_dim = self.in_dim
-        if region_embeddings is not None:
-            expected_in_dim -= region_embeddings.size(1)
-
         if node_features_t.size(1) != expected_in_dim:
             raise ValueError(
                 f"Expected input dim {expected_in_dim}, got {node_features_t.size(1)}. "
-                f"If using region_embeddings, they should be concatenated to node_features_t."
             )
 
         # Apply GNN layers
@@ -391,7 +453,6 @@ class MobilityGNN(nn.Module):
         self,
         node_features_batch: torch.Tensor,  # [batch_size, num_nodes, in_dim]
         mobility_matrices_batch: torch.Tensor,  # [batch_size, num_nodes, num_nodes]
-        region_embeddings: torch.Tensor | None = None,  # [num_nodes, embed_dim]
     ) -> torch.Tensor:
         """
         Forward pass for batch processing of multiple time steps/samples.
@@ -410,99 +471,7 @@ class MobilityGNN(nn.Module):
         outputs = []
 
         for b in range(batch_size):
-            output_b = self.forward(
-                node_features_batch[b],
-                mobility_matrices_batch[b],
-                region_embeddings,
-            )
+            output_b = self.forward(node_features_batch[b], mobility_matrices_batch[b])
             outputs.append(output_b)
 
         return torch.stack(outputs, dim=0)
-
-    def get_output_dimension(self) -> int:
-        """Get the output dimension of the MobilityGNN."""
-        return self.out_dim
-
-
-def create_mobility_gnn(
-    in_dim: int,
-    hidden_dim: int = 64,
-    out_dim: int = 64,
-    num_layers: int = 2,
-    aggregator_type: str = "mean",
-    dropout: float = 0.1,
-    **kwargs,
-) -> MobilityGNN:
-    """
-    Factory function to create MobilityGNN with common configurations.
-
-    Args:
-        in_dim: Input feature dimension
-        hidden_dim: Hidden layer dimension
-        out_dim: Output embedding dimension
-        num_layers: Number of GNN layers
-        aggregator_type: Type of neighborhood aggregation
-        dropout: Dropout probability
-        **kwargs: Additional arguments for MobilityGNN
-
-    Returns:
-        Configured MobilityGNN instance
-    """
-    return MobilityGNN(
-        in_dim=in_dim,
-        hidden_dim=hidden_dim,
-        out_dim=out_dim,
-        num_layers=num_layers,
-        aggregator_type=aggregator_type,
-        dropout=dropout,
-        **kwargs,
-    )
-
-
-if __name__ == "__main__":
-    # Example usage and testing
-    torch.manual_seed(42)
-
-    # Configuration
-    num_nodes = 10
-    in_dim = 5  # cases + biomarkers
-    hidden_dim = 16
-    out_dim = 8
-    batch_size = 3
-
-    # Create test data
-    node_features = torch.randn(batch_size, num_nodes, in_dim).abs()  # Positive values
-    mobility_matrices = torch.abs(torch.randn(batch_size, num_nodes, num_nodes)) * 100
-
-    # Remove self-loops
-    for b in range(batch_size):
-        mobility_matrices[b].fill_diagonal_(0)
-
-    # Create MobilityGNN
-    mobility_gnn = create_mobility_gnn(
-        in_dim=in_dim,
-        hidden_dim=hidden_dim,
-        out_dim=out_dim,
-        num_layers=2,
-        aggregator_type="mean",
-    )
-
-    # Test forward pass
-    print(f"Input node features shape: {node_features.shape}")
-    print(f"Input mobility matrices shape: {mobility_matrices.shape}")
-
-    # Process batch
-    output_embeddings = mobility_gnn.forward_batch(node_features, mobility_matrices)
-
-    print(f"Output embeddings shape: {output_embeddings.shape}")
-    print(f"Output dimension: {mobility_gnn.get_output_dimension()}")
-
-    # Test with region embeddings
-    region_embeddings = torch.randn(num_nodes, 4)
-    output_with_regions = mobility_gnn.forward_batch(
-        node_features, mobility_matrices, region_embeddings
-    )
-
-    print(f"Output with region embeddings shape: {output_with_regions.shape}")
-
-    print("MobilityGNN test completed successfully!")

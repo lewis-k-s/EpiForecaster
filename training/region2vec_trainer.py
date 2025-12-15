@@ -15,7 +15,7 @@ from scipy import sparse
 from sklearn.cluster import AgglomerativeClustering
 from torch import nn
 
-from graph.node_encoder import InductiveNodeEncoder
+from graph.node_encoder import Region2Vec
 from models.region_losses import (
     CommunityOrientedLoss,
     SpatialContiguityPrior,
@@ -54,7 +54,7 @@ class RegionDataConfig:
     normalize_features: bool = True
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], base_dir: Path) -> "RegionDataConfig":
+    def from_dict(cls, raw: dict[str, Any], base_dir: Path) -> RegionDataConfig:
         """Instantiate from ``data`` dictionary while resolving relative paths."""
 
         zarr_path_str = raw.get("zarr_path")
@@ -80,7 +80,7 @@ class EncoderConfig:
     normalize: bool = True
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None) -> "EncoderConfig":
+    def from_dict(cls, raw: dict[str, Any] | None) -> EncoderConfig:
         raw = raw or {}
         defaults = cls()
         values = {
@@ -103,7 +103,7 @@ class TrainingConfig:
     checkpoint_every: int = 0
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None) -> "TrainingConfig":
+    def from_dict(cls, raw: dict[str, Any] | None) -> TrainingConfig:
         raw = raw or {}
         defaults = cls()
         values = {
@@ -124,7 +124,7 @@ class SamplingConfig:
     max_hops: int = 5
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None) -> "SamplingConfig":
+    def from_dict(cls, raw: dict[str, Any] | None) -> SamplingConfig:
         raw = raw or {}
         defaults = cls()
         values = {
@@ -146,7 +146,7 @@ class LossConfig:
     margin: float = 1.0
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None) -> "LossConfig":
+    def from_dict(cls, raw: dict[str, Any] | None) -> LossConfig:
         raw = raw or {}
         defaults = cls()
         values = {
@@ -166,7 +166,7 @@ class OutputConfig:
     save_numpy: bool = True
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> "OutputConfig":
+    def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> OutputConfig:
         raw = raw or {}
         output_dir = _resolve_path(base_dir, raw.get("output_dir", cls.output_dir))
         return cls(
@@ -190,7 +190,7 @@ class ClusteringConfig:
     compute_connectivity: bool = True
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any] | None) -> "ClusteringConfig":
+    def from_dict(cls, raw: dict[str, Any] | None) -> ClusteringConfig:
         raw = raw or {}
         defaults = cls()
         values = {
@@ -213,7 +213,7 @@ class RegionTrainerConfig:
     config_path: Path | None = None
 
     @classmethod
-    def from_file(cls, config_path: str | Path) -> "RegionTrainerConfig":
+    def from_file(cls, config_path: str | Path) -> RegionTrainerConfig:
         path = Path(config_path)
         with open(path) as f:
             raw = yaml.safe_load(f)
@@ -222,7 +222,7 @@ class RegionTrainerConfig:
     @classmethod
     def from_dict(
         cls, raw: dict[str, Any], base_dir: Path, config_path: Path | None = None
-    ) -> "RegionTrainerConfig":
+    ) -> RegionTrainerConfig:
         data_cfg = RegionDataConfig.from_dict(raw.get("data", {}), base_dir)
         encoder_cfg = EncoderConfig.from_dict(raw.get("encoder"))
         training_cfg = TrainingConfig.from_dict(raw.get("training"))
@@ -240,25 +240,6 @@ class RegionTrainerConfig:
             clustering=clustering_cfg,
             config_path=config_path,
         )
-
-    def apply_cli_overrides(
-        self,
-        *,
-        epochs: int | None = None,
-        device: str | None = None,
-        output_dir: Path | None = None,
-        disable_clustering: bool = False,
-    ) -> None:
-        """Apply ad-hoc CLI overrides without mutating the backing YAML."""
-
-        if epochs is not None:
-            self.training.epochs = epochs
-        if device is not None:
-            self.training.device = device
-        if output_dir is not None:
-            self.output.output_dir = output_dir
-        if disable_clustering:
-            self.clustering.enabled = False
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize config back to primitive types for logging or dumps."""
@@ -394,7 +375,7 @@ class PairSampler:
 # ---------------------------------------------------------------------------
 
 
-class RegionEmbedderTrainer:
+class Region2VecTrainer:
     def __init__(self, config: RegionTrainerConfig) -> None:
         self.config = config
         self.device = self._select_device(config.training.device)
@@ -440,7 +421,7 @@ class RegionEmbedderTrainer:
         if len(self.region_ids) != self.num_nodes:
             raise ValueError("Number of region IDs does not match number of regions.")
 
-        self.encoder = InductiveNodeEncoder(
+        self.encoder = Region2Vec(
             input_dim=self.feature_dim,
             hidden_dim=self.config.encoder.hidden_dim,
             output_dim=self.config.encoder.embedding_dim,
@@ -573,7 +554,7 @@ class RegionEmbedderTrainer:
     def _compute_primary_loss(
         self, embeddings: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        if isinstance(self.primary_loss, (CommunityOrientedLoss, SpatialOnlyLoss)):
+        if isinstance(self.primary_loss, CommunityOrientedLoss | SpatialOnlyLoss):
             flow = (
                 self.flow_matrix
                 if self.flow_matrix is not None
@@ -716,10 +697,7 @@ class RegionEmbedderTrainer:
         cluster_path = None
         if clusters is not None:
             cluster_path = output_dir / self.config.output.cluster_labels_filename
-            cluster_payload = {
-                rid: label
-                for rid, label in zip(self.region_ids, clusters, strict=False)
-            }
+            cluster_payload = dict(zip(self.region_ids, clusters, strict=False))
             cluster_path.write_text(json.dumps(cluster_payload, indent=2))
 
         return {

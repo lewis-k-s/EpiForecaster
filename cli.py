@@ -8,36 +8,45 @@ This module provides a streamlined command-line interface with only two main com
 This replaces the complex variant-specific CLI with configuration-driven training.
 """
 
+import logging
 import traceback
 from datetime import datetime
 from pathlib import Path
 
 import click
 
-from data.ego_graph_dataset import create_ego_graph_dataset
 from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
-from data.region_graph_preprocessor import (
+from data.preprocess.region_graph_preprocessor import (
     RegionGraphPreprocessConfig,
     RegionGraphPreprocessor,
 )
 from training.epiforecaster_trainer import (
+    EpiForecasterConfig,
     EpiForecasterTrainer,
-    EpiForecasterTrainerConfig,
 )
-from training.region_embedder_trainer import RegionEmbedderTrainer, RegionTrainerConfig
+from training.region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
 
 VALID_DEVICES = ["auto", "cpu", "cuda", "mps"]
 
 
 @click.group()
 @click.version_option()
-def cli():
+@click.option(
+    "--debug/--no-debug",
+    default=False,
+    help="Enable debug logging (includes model forward-pass debug logs).",
+)
+def cli(debug: bool):
     """Graph Neural Network for Epidemiological Forecasting.
 
     A streamlined toolkit for preprocessing data and training graph neural networks
     for epidemiological forecasting using canonical datasets.
     """
-    pass
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
 
 @cli.group("preprocess")
@@ -235,14 +244,8 @@ def train_regions(
     """Train the Region2Vec-style region embedder via configuration."""
     try:
         region_config = RegionTrainerConfig.from_file(config)
-        region_config.apply_cli_overrides(
-            epochs=epochs,
-            device=device,
-            output_dir=output_dir,
-            disable_clustering=no_cluster,
-        )
 
-        trainer = RegionEmbedderTrainer(region_config)
+        trainer = Region2VecTrainer(region_config)
 
         if verbose or dry_run:
             summary = trainer.describe()
@@ -281,16 +284,24 @@ def train_regions(
 @train_group.command("epiforecaster")
 @click.option("--config", required=True, help="Path to training configuration file")
 @click.option("--verbose", is_flag=True, help="Enable verbose logging")
-def train_epiforecaster(config: str, verbose: bool):
+@click.option(
+    "--progress/--no-progress",
+    default=True,
+    show_default=True,
+    help="Show tqdm progress bars during training",
+)
+def train_epiforecaster(config: str, verbose: bool, progress: bool):
     """Train the EpiForecaster model."""
-    _run_forecaster_training(config, verbose)
+    _run_forecaster_training(config, verbose, progress)
 
 
-def _run_forecaster_training(config: str, verbose: bool) -> None:
+def _run_forecaster_training(config: str, verbose: bool, progress: bool) -> None:
     """Execute the original unified forecaster training workflow."""
     try:
-        trainer_config = EpiForecasterTrainerConfig.from_file(config)
+        trainer_config = EpiForecasterConfig.from_file(config)
         # Dataset path should be read from the config file
+
+        trainer_config.training.use_tqdm = progress
 
         if verbose:
             print(f"Loading training configuration from: {config}")
@@ -314,7 +325,7 @@ def _run_forecaster_training(config: str, verbose: bool) -> None:
         print(
             f"Trainable parameters: {results['model_info']['trainable_parameters']:,}"
         )
-        print(f"Training logs saved to: {trainer.config.log_dir}")
+        print(f"Training logs saved to: {trainer.config.output.log_dir}")
         print(f"{'=' * 60}")
 
     except Exception as exc:  # pragma: no cover - CLI handles presentation

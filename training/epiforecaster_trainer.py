@@ -8,23 +8,32 @@ model while maintaining the flexibility to support various data configurations.
 The trainer works with the EpiForecaster model.
 """
 
+import math
 import platform
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
-from einops import rearrange
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.profiler import (
+    ProfilerActivity,
+    profile,
+    schedule,
+    tensorboard_trace_handler,
+)
+from tqdm.auto import tqdm
 
-from data.ego_graph_dataset import GraphEgoDataset
-from data.epi_batch import EpiBatch
-from data.epi_dataset import EpiDataset
-from models.configs import EpiForecasterTrainerConfig
+from data.epi_dataset import EpiDataset, EpiDatasetItem
+from data.preprocess.config import REGION_COORD
+from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
+
+from torch_geometric.data import Batch
 
 
 class EpiForecasterTrainer:
@@ -32,19 +41,14 @@ class EpiForecasterTrainer:
     Single trainer handling all variants via configuration.
 
     Key features:
-    - Works with any model variant through configuration
-    - Supports mixed precision training
-    - Implements standard training loop with validation
+    - Works with any model variant through EpiForecasterConfig
     - Handles checkpointing and experiment tracking
     - Provides comprehensive metrics and logging
 
-    The trainer is designed to be model-agnostic, with variant-specific
-    behavior controlled through configuration rather than separate code paths.
+    The trainer is designed to be model-agnostic, with variant-specific behavior controlled through model configuration.
     """
 
-    def __init__(
-        self, config: EpiForecasterTrainerConfig
-    ):
+    def __init__(self, config: EpiForecasterConfig):
         """
         Initialize the unified trainer.
 
@@ -54,15 +58,66 @@ class EpiForecasterTrainer:
         """
         self.config = config
         self.device = self._setup_device()
-        self.base_dataset: EpiDataset | None = None
+        self.use_tqdm = getattr(self.config.training, "use_tqdm", True)
 
-        self.dataset = self._load_dataset()
+        train_nodes, val_nodes, test_nodes = self._split_dataset()
+        train_nodes = list(train_nodes)
+        val_nodes = list(val_nodes)
+        test_nodes = list(test_nodes)
+
+        region2vec_path = (
+            Path(self.config.data.region2vec_path)
+            if self.config.model.type.regions
+            else None
+        )
+
+        self.train_dataset = EpiDataset(
+            aligned_data_path=Path(self.config.data.dataset_path),
+            region2vec_path=region2vec_path,
+            config=self.config,
+            target_nodes=train_nodes,
+            context_nodes=train_nodes,
+        )
+
+        self.val_dataset = EpiDataset(
+            aligned_data_path=Path(self.config.data.dataset_path),
+            region2vec_path=region2vec_path,
+            config=self.config,
+            target_nodes=val_nodes,
+            context_nodes=train_nodes + val_nodes,
+        )
+
+        self.test_dataset = EpiDataset(
+            aligned_data_path=Path(self.config.data.dataset_path),
+            region2vec_path=region2vec_path,
+            config=self.config,
+            target_nodes=test_nodes,
+            context_nodes=train_nodes + val_nodes,
+        )
+
+        # Optional static region embeddings from dataset
+        self.region_embeddings = None
+        if hasattr(self.train_dataset, "region_embeddings"):
+            self.region_embeddings = self.train_dataset.region_embeddings.to(
+                self.device
+            )
+        elif self.config.model.type.regions:
+            raise ValueError(
+                "Region embeddings requested by config but region2vec_path was not provided."
+            )
 
         # Create model based on configuration
         self.model = EpiForecaster(
-            config.model.type,
-            **config.model.params,
-            # **config.model.ego_graph_params.as_dict(),
+            variant_type=self.config.model.type,
+            cases_dim=self.config.model.cases_dim,
+            biomarkers_dim=self.config.model.biomarkers_dim,
+            region_embedding_dim=self.config.model.region_embedding_dim,
+            mobility_embedding_dim=self.config.model.mobility_embedding_dim,
+            gnn_depth=self.config.model.gnn_depth,
+            sequence_length=self.config.model.history_length,
+            forecast_horizon=self.config.model.forecast_horizon,
+            device=self.device,
+            gnn_module=self.config.model.gnn_module,
         )
 
         self.model.to(self.device)
@@ -73,28 +128,63 @@ class EpiForecasterTrainer:
         self.criterion = self._create_criterion()
 
         # Setup data loaders
-        self.train_loader, self.val_loader = self._create_data_loaders()
+        self.train_loader, self.val_loader, self.test_loader = (
+            self._create_data_loaders()
+        )
 
         # Setup logging and checkpointing
         self.setup_logging()
 
         # Training state
         self.current_epoch = 0
+        self.global_step = 0
         self.best_val_loss = float("inf")
         self.patience_counter = 0
         self.training_history = {
             "train_loss": [],
             "val_loss": [],
+            "val_mae": [],
+            "val_rmse": [],
+            "val_smape": [],
+            "val_r2": [],
             "learning_rate": [],
             "epoch_times": [],
         }
 
-        print("UnifiedTrainer initialized:")
+        print("EpiForecasterTrainer initialized:")
         print(f"  Model: {config.model.type}")
         print(f"  Dataset: {config.data.dataset_path}")
         print(f"  Device: {self.device}")
         print(f"  Epochs: {config.training.epochs}")
         print(f"  Batch size: {config.training.batch_size}")
+
+    def _split_dataset(self) -> tuple[list[int], list[int], list[int]]:
+        """
+        Split the dataset into train, val, and test sets.
+        We use node holdouts for splitting so that we can evaluate the ability of the model to generalize to new regions.
+        """
+        train_split = (
+            1 - self.config.training.val_split - self.config.training.test_split
+        )
+
+        aligned_dataset = EpiDataset.load_canonical_dataset(
+            Path(self.config.data.dataset_path)
+        )
+        N = aligned_dataset[REGION_COORD].size
+        all_nodes = np.arange(N)
+        rng = np.random.default_rng(42)
+        rng.shuffle(all_nodes)
+        n_train = int(len(all_nodes) * train_split)
+        n_val = int(len(all_nodes) * self.config.training.val_split)
+        train_nodes = all_nodes[:n_train]
+        val_nodes = all_nodes[n_train : n_train + n_val]
+        test_nodes = all_nodes[n_train + n_val :]
+
+        assert len(train_nodes) + len(val_nodes) + len(test_nodes) == len(all_nodes), (
+            "Dataset split is not correct"
+        )
+
+        return list(train_nodes), list(val_nodes), list(test_nodes)
 
     def _setup_device(self) -> torch.device:
         """Setup computation device with MPS support and validation."""
@@ -127,29 +217,6 @@ class EpiForecasterTrainer:
 
         return device
 
-    def _load_dataset(self) -> GraphEgoDataset:
-        """Load dataset as GraphEgoDataset for ego-graph processing."""
-        ego_params = self.config.model.ego_graph_params
-        model_params = self.config.model.params
-        sequence_length = model_params.get("sequence_length", ego_params.history_length)
-
-        # Create EpiDataset first
-        self.base_dataset = EpiDataset(
-            zarr_path=Path(self.config.data.dataset_path),
-            variant_config=self.config.model.type,
-            batch_size=1,
-            shuffle_timepoints=False,
-            sequence_length=sequence_length,
-        )
-
-        # Ego-graph view is now enabled by default in EpiDataset
-        # Get the GraphEgoDataset
-        ego_graph_datasets = self.base_dataset.get_ego_graph_dataset()
-
-        # For now, use the same dataset for train and val
-        # TODO: Implement proper train/val split
-        return ego_graph_datasets["train"]
-
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on configuration."""
         return torch.optim.Adam(
@@ -158,7 +225,7 @@ class EpiForecasterTrainer:
             weight_decay=self.config.training.weight_decay,
         )
 
-    def _create_scheduler(self) -> torch.optim.lr_scheduler._LRScheduler | None:
+    def _create_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler | None:
         """Create learning rate scheduler."""
         if self.config.training.scheduler_type == "cosine":
             return torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -179,19 +246,8 @@ class EpiForecasterTrainer:
         """Create loss criterion."""
         return nn.MSELoss()
 
-    def _create_data_loaders(self) -> tuple[DataLoader, DataLoader]:
+    def _create_data_loaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
         """Create training and validation data loaders with device-aware optimizations."""
-        # Split dataset
-        total_size = len(self.dataset)
-        val_size = int(total_size * self.config.training.validation_split)
-        train_size = total_size - val_size
-
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            self.dataset,
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(42),  # For reproducibility
-        )
-
         # Device-aware hardware optimizations
         pin_memory = self.config.training.pin_memory and self.device.type == "cuda"
 
@@ -200,146 +256,73 @@ class EpiForecasterTrainer:
             0 if platform.system() == "Darwin" else self.config.training.num_workers
         )
 
-        if isinstance(self.dataset, GraphEgoDataset):
-            from data.ego_graph_dataset import ego_graph_collate_fn
+        train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=self.config.training.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=self._collate_fn,
+        )
 
-            def device_aware_collate_fn(batch):
-                return ego_graph_collate_fn(batch, device=self.device)
+        val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=self.config.training.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=self._collate_fn,
+        )
 
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=self.config.training.batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=device_aware_collate_fn,
-            )
+        test_loader = DataLoader(
+            self.test_dataset,
+            batch_size=self.config.training.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=self._collate_fn,
+        )
+        return train_loader, val_loader, test_loader
 
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.config.training.batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=device_aware_collate_fn,
-            )
-        else:
-            if self.config.training.batch_size != 1:
-                print(
-                    "Warning: canonical datasets currently enforce batch_size=1; overriding trainer setting."
-                )
+    def _collate_fn(self, batch: list[EpiDatasetItem]) -> dict[str, Any]:
+        "Custom collate for per-node samples with PyG mobility graphs."
 
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=1,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=self._collate_fn,
-            )
+        B = len(batch)
+        case_node = torch.stack([item["case_node"] for item in batch], dim=0)
+        bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
+        targets = torch.stack([item["target"] for item in batch], dim=0)
+        target_nodes = torch.tensor(
+            [item["target_node"] for item in batch], dtype=torch.long
+        )
 
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=1,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=self._collate_fn,
-            )
+        # Flatten mobility graphs and annotate batch_id/time_id for batching
+        graph_list = []
+        for b, item in enumerate(batch):
+            for t, g in enumerate(item["mob"]):
+                g.batch_id = torch.tensor([b], dtype=torch.long)
+                g.time_id = torch.tensor([t], dtype=torch.long)
+                graph_list.append(g)
 
-        return train_loader, val_loader
+        mob_batch = Batch.from_data_list(graph_list)
+        T = len(batch[0]["mob"]) if B > 0 else 0
+        # store B and T on the batch for downstream reshaping
+        mob_batch.B = torch.tensor([B], dtype=torch.long)
+        mob_batch.T = torch.tensor([T], dtype=torch.long)
 
-    def _collate_fn(self, batch: list[EpiBatch]) -> dict[str, torch.Tensor]:
-        """Custom collate function for single-region EpiBatch objects."""
-        if len(batch) == 1:
-            # Single item case - add batch dimension to single region data
-            batch_data = batch[0]
+        static_covariates = batch[0]["static_covariates"]
+        static_covariates = {k: v.to(self.device) for k, v in static_covariates.items()}
 
-            # The EpiBatch now contains single region data:
-            # - node_features: [sequence_length, feature_dim]
-            # - target_sequences: [forecast_horizon]
-            # - time_index: [sequence_length]
-
-            return {
-                "node_features": batch_data.node_features.unsqueeze(0).to(self.device),  # [1, seq_len, feat_dim]
-                "edge_index": batch_data.edge_index.to(self.device),  # No batch dim for edge_index
-                "edge_attr": batch_data.edge_attr.unsqueeze(0).to(self.device)
-                if batch_data.edge_attr is not None
-                else None,
-                "target_sequences": batch_data.target_sequences.unsqueeze(0).to(self.device),  # [1, horizon]
-                "region_embeddings": batch_data.region_embeddings.to(self.device)
-                if batch_data.region_embeddings is not None
-                else None,
-                "edar_features": batch_data.edar_features.unsqueeze(0).to(self.device)
-                if batch_data.edar_features is not None
-                else None,
-                "edar_attention_mask": batch_data.edar_attention_mask.to(self.device)
-                if batch_data.edar_attention_mask is not None
-                else None,
-                "batch_size": 1,
-                "sequence_length": batch_data.sequence_length,
-            }
-        else:
-            # Multiple regions in a batch - stack them
-            node_features = torch.stack([b.node_features for b in batch])  # [batch, seq_len, feat_dim]
-            target_sequences = torch.stack([b.target_sequences for b in batch])  # [batch, horizon]
-
-            # Use edge_index from first batch (same graph for all regions)
-            edge_index = batch[0].edge_index
-
-            # Handle optional tensors
-            edge_attr = None
-            if batch[0].edge_attr is not None:
-                edge_attr = torch.stack([b.edge_attr for b in batch])
-
-            region_embeddings = None
-            if batch[0].region_embeddings is not None:
-                region_embeddings = torch.cat([b.region_embeddings for b in batch], dim=0)  # [batch, embed_dim]
-
-            edar_features = None
-            if batch[0].edar_features is not None:
-                edar_features = torch.stack([b.edar_features for b in batch])
-
-            edar_attention_mask = None
-            if batch[0].edar_attention_mask is not None:
-                edar_attention_mask = torch.cat([b.edar_attention_mask for b in batch], dim=0)  # [batch, num_edars]
-
-            return {
-                "node_features": node_features.to(self.device),
-                "edge_index": edge_index.to(self.device),
-                "edge_attr": edge_attr.to(self.device) if edge_attr is not None else None,
-                "target_sequences": target_sequences.to(self.device),
-                "region_embeddings": region_embeddings.to(self.device) if region_embeddings is not None else None,
-                "edar_features": edar_features.to(self.device) if edar_features is not None else None,
-                "edar_attention_mask": edar_attention_mask.to(self.device) if edar_attention_mask is not None else None,
-                "batch_size": len(batch),
-                "sequence_length": batch[0].sequence_length,
-            }
-
-    def _transfer_batch_to_device(self, batch_data: dict[str, Any]) -> dict[str, Any]:
-        """
-        Transfer all tensors in batch to target device.
-
-        Args:
-            batch_data: Dictionary containing batch data with potentially mixed device tensors
-
-        Returns:
-            Dictionary with all tensors transferred to target device
-        """
-        transferred = {}
-        for key, value in batch_data.items():
-            if isinstance(value, torch.Tensor):
-                transferred[key] = value.to(self.device, non_blocking=True)
-            elif isinstance(value, list):
-                transferred[key] = [
-                    item.to(self.device, non_blocking=True)
-                    if isinstance(item, torch.Tensor)
-                    else item
-                    for item in value
-                ]
-            else:
-                transferred[key] = value
-        return transferred
+        return {
+            "CaseNode": case_node,  # (B, L, C)
+            "BioNode": bio_node,  # (B, L, B)
+            "MobBatch": mob_batch,  # Batched PyG graphs
+            "B": B,
+            "T": T,
+            "Target": targets,  # (B, H)
+            "TargetNode": target_nodes,  # (B,)
+            "StaticCovariates": static_covariates,
+            "NodeLabels": [item["node_label"] for item in batch],
+        }
 
     def setup_logging(self):
         """Setup logging and experiment tracking."""
@@ -365,14 +348,40 @@ class EpiForecasterTrainer:
             "batch_size": self.config.training.batch_size,
             "epochs": self.config.training.epochs,
             "use_region_embeddings": self.config.model.type.regions,
-            "use_edar_data": self.config.model.type.biomarkers,
-            "use_mobility_data": self.config.model.type.mobility,
-            **self.config.model.params,
+            "use_biomarkers": self.config.model.type.biomarkers,
+            "use_mobility": self.config.model.type.mobility,
+            "history_length": self.config.model.history_length,
+            "forecast_horizon": self.config.model.forecast_horizon,
+            "cases_dim": self.config.model.cases_dim,
+            "biomarkers_dim": self.config.model.biomarkers_dim,
+            "mobility_embedding_dim": self.config.model.mobility_embedding_dim,
+            "region_embedding_dim": self.config.model.region_embedding_dim,
         }
-        hyperparams["ego_graph_params"] = self.config.model.ego_graph_params.as_dict()
 
         for key, value in hyperparams.items():
             self.writer.add_text(f"hyperparams/{key}", str(value), 0)
+
+    def _setup_profiler(self):
+        activities = [ProfilerActivity.CPU]
+        if self.device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+
+        profile_log_dir = Path(self.config.training.profiler.log_dir)
+        profile_log_dir.mkdir(parents=True, exist_ok=True)
+
+        return profile(
+            activities=activities,
+            schedule=schedule(
+                wait=self.config.training.profiler.wait_steps,
+                warmup=self.config.training.profiler.warmup_steps,
+                active=self.config.training.profiler.active_steps,
+                repeat=self.config.training.profiler.repeat,
+            ),
+            on_trace_ready=tensorboard_trace_handler(str(profile_log_dir)),
+            record_shapes=True,
+            profile_memory=self.config.training.profiler.record_memory,
+            with_stack=self.config.training.profiler.with_stack,
+        )
 
     def run(self) -> dict[str, Any]:
         """Execute training loop."""
@@ -380,9 +389,9 @@ class EpiForecasterTrainer:
         print(f"STARTING TRAINING: {self.config.output.experiment_name}")
         print(f"{'=' * 60}")
         print(f"Model: {self.config.model.type}")
-        print(f"Dataset: {self.base_dataset.metadata.get('dataset_name', 'Unknown')} (ego-graph enabled)")
-        if hasattr(self.dataset, 'indices'):
-            print(f"  Samples: {len(self.dataset)} ego-graph items")
+        print(f"Dataset: {self.config.data.dataset_path} (ego-graph per-node)")
+        print(f"  Train samples: {len(self.train_dataset)}")
+        print(f"  Val samples:   {len(self.val_dataset)}")
         print(f"Device: {self.device}")
         print()
 
@@ -395,7 +404,9 @@ class EpiForecasterTrainer:
             train_loss = self._train_epoch()
 
             # Validation phase
-            val_loss = self._validate_epoch()
+            val_loss, val_metrics = self._evaluate_split(
+                split_name="Val", loader=self.val_loader, epoch=epoch
+            )
 
             # Learning rate scheduling
             if self.scheduler:
@@ -405,13 +416,17 @@ class EpiForecasterTrainer:
             epoch_time = time.time() - epoch_start_time
             self.training_history["train_loss"].append(train_loss)
             self.training_history["val_loss"].append(val_loss)
+            self.training_history["val_mae"].append(val_metrics["mae"])
+            self.training_history["val_rmse"].append(val_metrics["rmse"])
+            self.training_history["val_smape"].append(val_metrics["smape"])
+            self.training_history["val_r2"].append(val_metrics["r2"])
             self.training_history["learning_rate"].append(
                 self.optimizer.param_groups[0]["lr"]
             )
             self.training_history["epoch_times"].append(epoch_time)
 
             # Logging
-            self._log_epoch(epoch, train_loss, val_loss, epoch_time)
+            self._log_epoch(epoch, train_loss, val_loss, val_metrics, epoch_time)
 
             # Checkpointing
             if (
@@ -449,6 +464,22 @@ class EpiForecasterTrainer:
         if self.config.output.save_checkpoints:
             self._save_checkpoint(self.current_epoch, self.best_val_loss, is_final=True)
 
+        # Test phase
+        test_start_time = time.time()
+        test_loss, test_metrics = self.test_epoch()
+        test_time = time.time() - test_start_time
+        print(f"{'=' * 60}")
+        print("TESTING COMPLETED")
+        print(
+            f"Test loss: {test_loss:.6f} | "
+            f"MAE: {test_metrics['mae']:.6f} | "
+            f"RMSE: {test_metrics['rmse']:.6f} | "
+            f"sMAPE: {test_metrics['smape']:.6f} | "
+            f"R2: {test_metrics['r2']:.6f} | "
+            f"Time: {test_time:.2f}s"
+        )
+        print(f"{'=' * 60}")
+
         # Close tensorboard writer
         self.writer.close()
 
@@ -459,99 +490,236 @@ class EpiForecasterTrainer:
         self.model.train()
         total_loss = 0.0
         num_batches = len(self.train_loader)
+        counted_batches = 0
 
-        for batch_idx, batch_data in enumerate(self.train_loader):
+        train_iter = self.train_loader
+        if self.use_tqdm:
+            train_iter = tqdm(
+                self.train_loader,
+                desc=f"Train {self.current_epoch + 1}/{self.config.training.epochs}",
+                leave=False,
+                total=num_batches,
+            )
+
+        profiler = None
+        if self.config.training.profiler.enabled:
+            profiler = self._setup_profiler()
+            profiler.__enter__()
+
+        fetch_start_time = time.time()
+        for batch_idx, batch_data in enumerate(train_iter):
+            # print(f"Start train iteration {batch_idx + 1}/{num_batches}")
             self.optimizer.zero_grad()
 
-            predictions = self._forward_epiforecaster(batch_data)
-            loss = self.criterion(predictions, batch_data["target_sequences"])
+            data_time_s = time.time() - fetch_start_time
+            batch_start_time = time.time()
+            predictions = self.model.forward(
+                cases_hist=batch_data["CaseNode"].to(self.device),
+                biomarkers_hist=batch_data["BioNode"].to(self.device),
+                mob_graphs=batch_data["MobBatch"],
+                target_nodes=batch_data["TargetNode"].to(self.device),
+                region_embeddings=self.region_embeddings
+                if self.region_embeddings is not None
+                else None,
+                node_static_covariates=batch_data["StaticCovariates"],
+            )
+
+            loss = self.criterion(predictions, batch_data["Target"].to(self.device))
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.training.gradient_clip_value
             )
             self.optimizer.step()
 
             total_loss += loss.item()
+            counted_batches += 1
+
+            batch_time_s = time.time() - batch_start_time
+            fetch_start_time = time.time()
+            lr = self.optimizer.param_groups[0]["lr"]
 
             # Progress logging
-            if batch_idx % max(1, num_batches // 10) == 0:
-                print(f"  Batch {batch_idx}/{num_batches}: Loss = {loss.item():.6f}")
+            if self.use_tqdm:
+                bsz = int(batch_data["CaseNode"].shape[0])
+                samples_per_s = (
+                    (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
+                )
+                train_iter.set_postfix(
+                    loss=loss.item(),
+                    lr=f"{lr:.2e}",
+                    grad=f"{float(grad_norm):.3f}",
+                    sps=f"{samples_per_s:7.1f}",
+                )
+                
+            # Tensorboard: per-iteration metrics
+            self.writer.add_scalar("Loss/Train_step", loss.item(), self.global_step)
+            self.writer.add_scalar("Learning_Rate/step", lr, self.global_step)
+            self.writer.add_scalar("GradNorm/step", float(grad_norm), self.global_step)
+            self.writer.add_scalar("Time/Batch_s", batch_time_s, self.global_step)
+            self.writer.add_scalar("Time/DataLoad_s", data_time_s, self.global_step)
+            self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
 
-        return total_loss / num_batches
+            if profiler:
+                profiler.step()
+                if (
+                    self.config.training.profiler.profile_batches is not None
+                    and (batch_idx + 1)
+                    >= self.config.training.profiler.profile_batches
+                ):
+                    break
 
-    def _validate_epoch(self) -> float:
-        """Validate for one epoch."""
+            self.global_step += 1
+
+            # print(f"End train iteration {batch_idx + 1}/{num_batches}")
+
+        if profiler:
+            profiler.__exit__(None, None, None)
+
+        effective_batches = max(1, counted_batches)
+        return total_loss / effective_batches
+
+    def _evaluate_split(
+        self, split_name: str, loader: DataLoader, epoch: int | None = None
+    ) -> tuple[float, dict[str, Any]]:
+        """Shared evaluation for validation and test splits with extra metrics."""
         self.model.eval()
-        total_loss = 0.0
-        num_batches = len(self.val_loader)
 
+        total_loss = 0.0
+        mae_sum = 0.0
+        mse_sum = 0.0
+        smape_sum = 0.0
+        target_sum = 0.0
+        target_sq_sum = 0.0
+        total_count = 0
+
+        horizon = self.config.model.forecast_horizon
+        per_h_mae_sum = torch.zeros(horizon)
+        per_h_mse_sum = torch.zeros(horizon)
+
+        num_batches = len(loader)
+        iterator = loader
+
+        epsilon = 1e-6
         with torch.no_grad():
-            for batch_data in self.val_loader:
-                predictions = self._forward_epiforecaster(batch_data)
-                loss = self.criterion(predictions, batch_data["target_sequences"])
+            for batch_data in iterator:
+                targets = batch_data["Target"].to(self.device)
+                predictions = self.model.forward(
+                    cases_hist=batch_data["CaseNode"].to(self.device),
+                    biomarkers_hist=batch_data["BioNode"].to(self.device),
+                    mob_graphs=batch_data["MobBatch"],
+                    target_nodes=batch_data["TargetNode"].to(self.device),
+                    region_embeddings=self.region_embeddings.to(self.device)
+                    if self.region_embeddings is not None
+                    else None,
+                    node_static_covariates=batch_data["StaticCovariates"],
+                )
+
+                loss = self.criterion(predictions, targets)
                 total_loss += loss.item()
 
-        return total_loss / num_batches
+                diff = predictions - targets
+                abs_diff = diff.abs()
+                mae_sum += abs_diff.sum().item()
+                mse_sum += (diff**2).sum().item()
+                smape_sum += (
+                    (2 * abs_diff / (predictions.abs() + targets.abs() + epsilon))
+                    .sum()
+                    .item()
+                )
+                total_count += diff.numel()
+                target_sum += targets.sum().item()
+                target_sq_sum += (targets**2).sum().item()
 
-    def _forward_epiforecaster_ego_graph(
-        self, batch_data: dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Forward pass for EpiForecaster with ego-graph batches."""
+                per_h_mae_sum += abs_diff.sum(dim=0).detach().cpu()
+                per_h_mse_sum += (diff**2).sum(dim=0).detach().cpu()
 
-        # Ego-graph batches come directly from GraphEgoDataset
-        # Use the model's forward_ego_graph method
-        predictions = self.model.forward_ego_graph(batch_data)
+        mean_loss = total_loss / max(1, num_batches)
+        mean_mae = mae_sum / max(1, total_count)
+        mean_rmse = math.sqrt(mse_sum / max(1, total_count)) if total_count else 0.0
+        mean_smape = smape_sum / max(1, total_count)
 
-        return predictions
+        target_mean = target_sum / max(1, total_count)
+        ss_tot = target_sq_sum - total_count * (target_mean**2)
+        ss_res = mse_sum
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
-    def _validate_batch_shapes(self, batch_data: dict[str, torch.Tensor]):
-        """Validate tensor shapes and add assertions for debugging."""
-        batch_size = batch_data.get("batch_size", 1)
-
-        # Log tensor shapes for debugging
-        if hasattr(self, "_debug_shapes") and self._debug_shapes:
-            print("Batch data shapes:")
-            for key, tensor in batch_data.items():
-                if tensor is not None and isinstance(tensor, torch.Tensor):
-                    print(f"  {key}: {tensor.shape}")
-
-        # Basic shape validations
-        assert batch_data["target_sequences"].dim() == 2, (
-            f"target_sequences should be 2D, got {batch_data['target_sequences'].shape}"
+        per_h_count = total_count / max(1, horizon)
+        per_h_mae = (per_h_mae_sum / max(1, per_h_count)).tolist()
+        per_h_rmse = (
+            (per_h_mse_sum / max(1, per_h_count)).sqrt().tolist() if per_h_count else []
         )
 
-        expected_batch_size = batch_data["target_sequences"].size(0)
-        assert batch_data["target_sequences"].size(0) == expected_batch_size, (
-            f"Batch size mismatch in target_sequences: expected {batch_size}, got {batch_data['target_sequences'].size(0)}"
+        metrics = {
+            "mae": mean_mae,
+            "rmse": mean_rmse,
+            "smape": mean_smape,
+            "r2": r2,
+            "mae_per_h": per_h_mae,
+            "rmse_per_h": per_h_rmse,
+        }
+
+        return mean_loss, metrics
+
+    def test_epoch(self) -> tuple[float, dict[str, Any]]:
+        """Public test evaluation entrypoint."""
+        test_loss, test_metrics = self._evaluate_split(
+            "Test", self.test_loader, self.current_epoch
         )
-
-    def _forward_epiforecaster(
-        self, batch_data: dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """Forward pass for EpiForecaster with ego-graph batches."""
-
-        # Always use ego-graph processing
-        return self._forward_epiforecaster_ego_graph(batch_data)
+        self._log_split("Test", test_loss, test_metrics, self.current_epoch)
+        return test_loss, test_metrics
 
     def _log_epoch(
-        self, epoch: int, train_loss: float, val_loss: float, epoch_time: float
+        self,
+        epoch: int,
+        train_loss: float,
+        val_loss: float,
+        val_metrics: dict[str, Any],
+        epoch_time: float,
     ):
-        """Log epoch results."""
+        """Log epoch results with validation metrics."""
         print(
             f"Epoch {epoch + 1:3d}/{self.config.training.epochs}: "
             f"Train Loss = {train_loss:.6f}, "
             f"Val Loss = {val_loss:.6f}, "
+            f"Val MAE = {val_metrics['mae']:.6f}, "
+            f"Val RMSE = {val_metrics['rmse']:.6f}, "
+            f"Val sMAPE = {val_metrics['smape']:.6f}, "
             f"Time = {epoch_time:.2f}s, "
             f"LR = {self.optimizer.param_groups[0]['lr']:.2e}"
         )
+        assert not math.isnan(train_loss), "Train loss is NaN"
+        assert not math.isnan(val_loss), "Validation loss is NaN"
 
         # Tensorboard logging
         self.writer.add_scalar("Loss/Train", train_loss, epoch)
         self.writer.add_scalar("Loss/Validation", val_loss, epoch)
+        self._log_split("Val", val_loss, val_metrics, epoch)
         self.writer.add_scalar(
             "Learning_Rate", self.optimizer.param_groups[0]["lr"], epoch
         )
         self.writer.add_scalar("Time/Epoch", epoch_time, epoch)
+
+    def _log_split(
+        self,
+        split_name: str,
+        loss: float,
+        metrics: dict[str, Any],
+        epoch: int | None = None,
+    ):
+        """Log metrics for a specific split."""
+        if epoch is None:
+            return
+        prefix = split_name.capitalize()
+        self.writer.add_scalar(f"Loss/{prefix}", loss, epoch)
+        self.writer.add_scalar(f"Metrics/{prefix}/MAE", metrics["mae"], epoch)
+        self.writer.add_scalar(f"Metrics/{prefix}/RMSE", metrics["rmse"], epoch)
+        self.writer.add_scalar(f"Metrics/{prefix}/sMAPE", metrics["smape"], epoch)
+        self.writer.add_scalar(f"Metrics/{prefix}/R2", metrics["r2"], epoch)
+        for idx, (mae_h, rmse_h) in enumerate(
+            zip(metrics["mae_per_h"], metrics["rmse_per_h"], strict=False)
+        ):
+            self.writer.add_scalar(f"Metrics/{prefix}/MAE_h{idx + 1}", mae_h, epoch)
+            self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
 
     def _save_checkpoint(
         self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False
@@ -590,7 +758,6 @@ class EpiForecasterTrainer:
                     p.numel() for p in self.model.parameters() if p.requires_grad
                 ),
             },
-            "dataset_info": self.dataset.get_dataset_info(),
             "training_history": self.training_history,
             "best_val_loss": self.best_val_loss,
             "total_epochs": self.current_epoch + 1,
