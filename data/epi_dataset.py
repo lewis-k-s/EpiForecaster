@@ -1,371 +1,251 @@
-"""
-Dataset interface for loading and configuring canonical EpiBatch objects.
-
-This module provides the EpiDataset class which serves as the primary interface
-for loading preprocessed datasets and applying variant-specific configurations.
-It handles lazy loading, batching, and variant masking to support different
-model configurations from a single canonical dataset.
-"""
-
-from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 import numpy as np
 import torch
+import xarray as xr
 from torch.utils.data import Dataset
+from torch_geometric.data import Data
 
-from models.configs import ModelVariant
+from graph.node_encoder import Region2Vec
+from models.configs import EpiForecasterConfig
 
-from .dataset_storage import DatasetStorage
-from .ego_graph_dataset import GraphEgoDataset
-from .epi_batch import EpiBatch
+from .preprocess.config import REGION_COORD, TEMPORAL_COORD
+
+StaticCovariates = dict[str, torch.Tensor]
+
+
+class EpiDatasetItem(TypedDict):
+    node_label: str
+    target_node: int
+    case_node: torch.Tensor
+    bio_node: torch.Tensor
+    target: torch.Tensor
+    mob: list[Data]
+    static_covariates: StaticCovariates
 
 
 class EpiDataset(Dataset):
     """
-    Canonical dataset that loads and configures EpiBatch objects.
+    Dataset loader for preprocessed epidemiological datasets.
 
-    This class provides a PyTorch Dataset interface for loading preprocessed
-    epidemiological data stored in Zarr format. It supports variant-specific
-    configuration through masking of optional features like region embeddings
-    and EDAR wastewater data.
-
+    This class loads preprocessed epidemiological data stored in Zarr format
+    and converts it to GraphEgoDataset for ego-graph processing.
     Args:
         zarr_path: Path to the Zarr dataset
-        variant_config: Configuration for masking features (e.g., which
-            data streams to use for a specific model variant)
-        batch_size: Number of timepoints per batch (default: 1)
-        shuffle_timepoints: Whether to shuffle temporal order (default: False)
-        sequence_length: Length of input sequences (default: 1)
-        forecast_horizon: Override forecast horizon from dataset (optional)
-        ego_graph_params: Parameters forwarded to the ego-graph dataset factory
+        config: EpiForecasterTrainerConfig configuration
     """
 
     def __init__(
         self,
-        zarr_path: Path,
-        variant_config: ModelVariant,
-        batch_size: int = 1,
-        shuffle_timepoints: bool = False,
-        sequence_length: int = 1,
-        forecast_horizon: int | None = None,
+        aligned_data_path: Path,
+        region2vec_path: Path | None,
+        config: EpiForecasterConfig,
+        target_nodes: list[int],
+        context_nodes: list[int],
     ):
-        self.zarr_path = Path(zarr_path)
-        self.variant_config = variant_config or {}
-        self.batch_size = batch_size
-        self.shuffle_timepoints = shuffle_timepoints
-        self.sequence_length = sequence_length
-        # Enable ego-graph view by default since trainer uses forward_ego_graph
-        self.enable_ego_graph_view = True
-        self._ego_graph_dataset: GraphEgoDataset | None = None
-        self._ego_graph_signature: tuple[Any, ...] | None = None
+        self.aligned_data_path = Path(aligned_data_path)
+        self.config = config
 
         # Load dataset
-        self.dataset_info = DatasetStorage.load_dataset(self.zarr_path)
-        self.metadata = self.dataset_info["metadata"]
-        self.arrays = self.dataset_info["arrays"]
+        self.dataset: xr.Dataset = xr.open_zarr(self.aligned_data_path)
+        self.num_nodes = self.dataset[REGION_COORD].size
 
-        self._validate_dataset_compatibility()
+        if region2vec_path:
+            # use pre-trained region2vec embeddings and lookup by labeled regions
+            # TODO: actually run forward pass region2vec in EpiForecaster
+            _, art = Region2Vec.from_weights(region2vec_path)
+
+            # Filter region embeddings using numpy instead of xarray to avoid requiring a named dimension
+            # for the embedding size (since xarray expects all dims to be named).
+            region_ids = list(art["region_ids"])
+            selected_ids = list(self.dataset[REGION_COORD].values)
+            region_id_index = {rid: i for i, rid in enumerate(region_ids)}
+            indices = [
+                region_id_index[rid] for rid in selected_ids if rid in region_id_index
+            ]
+            region_embeddings = art["embeddings"][indices]
+
+            assert region_embeddings.shape == (
+                self.num_nodes,
+                self.config.model.region_embedding_dim,
+            ), "Static embeddings shape mismatch"
+
+            self.region_embeddings = torch.as_tensor(
+                region_embeddings, dtype=torch.float32
+            )
+
+        self.target_nodes = target_nodes
+        self.context_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+        self.context_mask[target_nodes] = True
+        self.context_mask[context_nodes] = True
 
         # Set dimensions
-        self.num_timepoints = self.metadata["num_timepoints"]
-        self.num_nodes = self.metadata["num_nodes"]
-        self.num_edges = self.metadata["num_edges"]
-        self.feature_dim = self.metadata["feature_dim"]
-        self.forecast_horizon = forecast_horizon or self.metadata["forecast_horizon"]
+        self.time_dim_size = config.model.history_length + config.model.forecast_horizon
 
-        # Create timepoint indices
-        self.timepoint_indices = np.arange(self.num_timepoints)
-        if self.shuffle_timepoints:
-            np.random.shuffle(self.timepoint_indices)
-
-        # Pre-calculate batch indices
-        self._create_batch_indices()
-
-        print(f"Loaded dataset: {self.metadata['dataset_name']}")
-        print(f"  - {self.num_timepoints} timepoints")
-        print(f"  - {self.num_nodes} nodes, {self.num_edges} edges")
-        print(f"  - Feature dimension: {self.feature_dim}")
-        print(f"  - Forecast horizon: {self.forecast_horizon}")
-        print(f"  - Variant config: {self.variant_config}")
-        if self.enable_ego_graph_view:
-            # Lazily initialize so we fail fast if parameters are invalid
-            self.get_ego_graph_dataset()
-
-    def _validate_dataset_compatibility(self):
-        """Validate that dataset is compatible with current configuration."""
-        # Check required arrays exist
-        required_arrays = [
-            "node_features",
-            "edge_index",
-            "target_sequences",
-            "time_index",
-        ]
-        for array_name in required_arrays:
-            if array_name not in self.arrays:
-                raise ValueError(f"Dataset missing required array: {array_name}")
-
-        # Validate array shapes
-        expected_shapes = {
-            "node_features": (
-                self.metadata["num_timepoints"],
-                self.metadata["num_nodes"],
-                self.metadata["feature_dim"],
-            ),
-            "edge_index": (2, self.metadata["num_edges"]),
-            "target_sequences": (
-                self.metadata["num_timepoints"],
-                self.metadata["num_nodes"],
-                self.metadata["forecast_horizon"],
-            ),
-            "time_index": (self.metadata["num_timepoints"],),
-        }
-
-        for array_name, expected_shape in expected_shapes.items():
-            actual_shape = self.arrays[array_name].shape
-            if actual_shape != expected_shape:
-                raise ValueError(
-                    f"Dataset {array_name} shape mismatch: "
-                    f"{actual_shape} != {expected_shape}"
-                )
-
-    def _create_batch_indices(self):
-        """Create indices for batching timepoints."""
-        if self.batch_size == 1:
-            # Single timepoint batches
-            self.batch_indices = [[i] for i in range(self.num_timepoints)]
-        else:
-            # Multi-timepoint batches
-            num_batches = self.num_timepoints // self.batch_size
-            self.batch_indices = [
-                list(range(i * self.batch_size, (i + 1) * self.batch_size))
-                for i in range(num_batches)
-            ]
-
-            # Handle remaining timepoints
-            remaining = self.num_timepoints % self.batch_size
-            if remaining > 0:
-                self.batch_indices.append(
-                    list(range(num_batches * self.batch_size, self.num_timepoints))
-                )
-
-        # Shuffle batch order if requested
-        if self.shuffle_timepoints:
-            np.random.shuffle(self.batch_indices)
+        self.node_static_covariates = self.static_covariates()
 
     def __len__(self) -> int:
-        """Return number of region-timepoint combinations."""
-        return self.num_timepoints * self.num_nodes
+        """Number of samples in the dataset.
 
-    def __getitem__(self, idx: int) -> EpiBatch:
+        One sample corresponds to a (window, node) pair. We retain the
+        non-overlapping stride of `history_length` and multiply by the number
+        of nodes to expose a per-node item API.
         """
-        Load data for a single region with sequence history.
+        L = self.config.model.history_length
+        H = self.config.model.forecast_horizon
+        T = len(self.dataset[TEMPORAL_COORD].values)
+        if T < L + H:
+            return 0
+        total_windows = ((T - (L + H)) // L) + 1
+        return total_windows * len(self.target_nodes)
 
-        Args:
-            idx: Index representing (timepoint_idx * num_nodes + region_idx)
+    def __getitem__(self, idx: int) -> EpiDatasetItem:
+        """Return a single target node over one time window.
 
-        Returns:
-            EpiBatch for one region with:
-            - node_features: [sequence_length, feature_dim]
-            - target_sequences: [forecast_horizon]
-            - time_index: [sequence_length]
+        Each item is keyed by (window_idx, target_node). The mobility slice is
+        converted to a PyG ego-graph per time step containing the target node
+        and its incoming neighbors.
         """
-        # Convert idx to timepoint and region indices
-        timepoint_idx = idx // self.num_nodes
-        region_idx = idx % self.num_nodes
 
-        # Validate indices
-        if timepoint_idx >= self.num_timepoints:
-            raise IndexError(f"Timepoint index {timepoint_idx} out of range")
-        if region_idx >= self.num_nodes:
-            raise IndexError(f"Region index {region_idx} out of range")
+        N = len(self.target_nodes)
+        L = self.config.model.history_length
+        H = self.config.model.forecast_horizon
+        BDim = self.config.model.biomarkers_dim
+        CDim = self.config.model.cases_dim
 
-        # Load static data (same for all timepoints)
-        edge_index = torch.from_numpy(self.arrays["edge_index"][:])
+        window_idx, local_idx = divmod(idx, N)
+        target_idx = self.target_nodes[local_idx]
 
-        # Load sequence data for this region
-        if timepoint_idx >= self.sequence_length:
-            # Have enough history for full sequence
-            seq_start = timepoint_idx - self.sequence_length + 1
-            node_features = torch.from_numpy(
-                self.arrays["node_features"][seq_start:timepoint_idx+1, region_idx, :]
-            )  # [sequence_length, feature_dim]
-        else:
-            # Handle early timepoints with zero padding
-            padding_size = self.sequence_length - timepoint_idx - 1
-            padding = torch.zeros(padding_size, self.feature_dim)
-            available_data = torch.from_numpy(
-                self.arrays["node_features"][:timepoint_idx+1, region_idx, :]
+        node_label = self.dataset[REGION_COORD].values[target_idx]
+
+        range_start = window_idx * L
+        range_end = range_start + L
+        forecast_targets = range_end + H
+        T = len(self.dataset[TEMPORAL_COORD].values)
+        if forecast_targets > T:
+            raise IndexError("Requested window exceeds available time steps")
+
+        history = self.dataset.isel({TEMPORAL_COORD: slice(range_start, range_end)})
+        future = self.dataset.isel({TEMPORAL_COORD: slice(range_end, forecast_targets)})
+
+        mobility_history = torch.from_numpy(history.mobility.values).to(torch.float32)
+
+        cases_np = history.cases.values
+        if cases_np.ndim == 2:
+            cases_np = cases_np[..., None]
+        cases_np = np.nan_to_num(cases_np, nan=0.0)
+        case_history = torch.from_numpy(cases_np).to(torch.float32)
+
+        bio_np = history.edar_biomarker.values
+        if bio_np.ndim == 2:
+            bio_np = bio_np[..., None]
+        bio_np = np.nan_to_num(bio_np, nan=0.0)
+        biomarker_history = torch.from_numpy(bio_np).to(torch.float32)
+
+        target_np = future.cases.isel({REGION_COORD: target_idx}).values
+        targets = torch.from_numpy(target_np).to(torch.float32).squeeze(-1)
+
+        assert mobility_history.shape == (L, self.num_nodes, self.num_nodes), (
+            "Mob history shape mismatch"
+        )
+        assert case_history.shape == (L, self.num_nodes, CDim), (
+            "Case history shape mismatch"
+        )
+        assert biomarker_history.shape == (L, self.num_nodes, BDim), (
+            "Biomarker history shape mismatch"
+        )
+        assert targets.shape == (H,), "Targets shape mismatch"
+
+        mob_graphs: list[Data] = []
+        for t in range(L):
+            mob_graphs.append(
+                self._mobility_ego_to_pyg(
+                    mobility_history[t],
+                    case_history[t],
+                    biomarker_history[t],
+                    target_idx,
+                    time_id=t,
+                )
             )
-            node_features = torch.cat([padding, available_data], dim=0)
-
-        # Target sequences for this region: [forecast_horizon]
-        target_sequences = torch.from_numpy(
-            self.arrays["target_sequences"][timepoint_idx, region_idx, :]
-        )  # [forecast_horizon]
-
-        # Time indices for the sequence: [sequence_length]
-        time_index = torch.arange(
-            timepoint_idx - self.sequence_length + 1,
-            timepoint_idx + 1,
-            dtype=torch.long
-        )
-        time_index = torch.clamp(time_index, 0, self.num_timepoints - 1)
-
-        # Get timestamp for primary timepoint
-        timestamp_np = self.arrays["time_index"][timepoint_idx]
-        timestamp = datetime.fromtimestamp(
-            timestamp_np.astype("datetime64[s]").astype(int)
-        )
-
-        # Load optional data for this region and timepoint
-        edge_attr = None
-        if "edge_attr" in self.arrays and self.variant_config.mobility:
-            # Use the current timepoint's edge features
-            edge_attr = torch.from_numpy(
-                self.arrays["edge_attr"][timepoint_idx, :, :]
-            )  # [num_edges, edge_dim]
-
-        region_embeddings = None
-        if "region_embeddings" in self.arrays and self.variant_config.regions:
-            # Get embedding for this specific region
-            region_embeddings = torch.from_numpy(
-                self.arrays["region_embeddings"][region_idx:region_idx+1, :]
-            )  # [1, embed_dim]
-
-        edar_features = None
-        edar_attention_mask = None
-        if "edar_features" in self.arrays and self.variant_config.biomarkers:
-            # Use the current timepoint's EDAR features
-            edar_features = torch.from_numpy(
-                self.arrays["edar_features"][timepoint_idx]
-            ).mean(dim=0)  # [edar_dim] - average across EDARs
-            edar_attention_mask = torch.from_numpy(
-                self.arrays["edar_attention_mask"][region_idx:region_idx+1, :]
-            )  # [1, num_edars]
-
-        # Create EpiBatch with num_nodes=1 for single region
-        batch = EpiBatch(
-            batch_id=f"{self.metadata['dataset_name']}_region{region_idx}_t{timepoint_idx}",
-            timestamp=timestamp,
-            num_nodes=1,  # Single region
-            node_features=node_features,  # [sequence_length, feature_dim]
-            edge_index=edge_index,  # Full graph structure
-            edge_attr=edge_attr,
-            time_index=time_index,  # [sequence_length]
-            sequence_length=self.sequence_length,
-            target_sequences=target_sequences,  # [forecast_horizon]
-            region_embeddings=region_embeddings,  # [1, embed_dim] or None
-            edar_features=edar_features,  # [edar_dim] or None
-            edar_attention_mask=edar_attention_mask,  # [1, num_edars] or None
-            metadata={
-                "dataset_name": self.metadata["dataset_name"],
-                "variant_config": asdict(self.variant_config),
-                "preprocessing_config": self.metadata.get("preprocessing_config", {}),
-                "timepoint_idx": timepoint_idx,
-                "region_idx": region_idx,
-            },
-        )
-
-        return batch
-
-    def get_time_range(self) -> tuple[datetime, datetime]:
-        """Get the time range of the dataset."""
-        time_array = self.arrays["time_index"][:]
-        start_time = datetime.fromtimestamp(
-            time_array[0].astype("datetime64[s]").astype(int)
-        )
-        end_time = datetime.fromtimestamp(
-            time_array[-1].astype("datetime64[s]").astype(int)
-        )
-        return start_time, end_time
-
-    def summary(self) -> dict[str, Any]:
-        """Get summary of dataset information."""
-        start_time, end_time = self.get_time_range()
 
         return {
-            "dataset_name": self.metadata["dataset_name"],
-            "path": str(self.zarr_path),
-            "num_timepoints": self.num_timepoints,
-            "num_nodes": self.num_nodes,
-            "num_edges": self.num_edges,
-            "feature_dim": self.feature_dim,
-            "forecast_horizon": self.forecast_horizon,
-            "num_batches": len(self),
-            "batch_size": self.batch_size,
-            "time_range": {
-                "start": start_time.isoformat(),
-                "end": end_time.isoformat(),
-                "duration_days": (end_time - start_time).days,
-            },
-            "variant_config": self.variant_config.as_dict(),
-            "ego_graph_view_enabled": self.enable_ego_graph_view,
-            "ego_graph_initialized": self._ego_graph_dataset is not None,
-            "ego_graph_params": self._normalize_ego_graph_params(),
-            "available_features": {
-                "edge_attr": "edge_attr" in self.arrays,
-                "region_embeddings": "region_embeddings" in self.arrays,
-                "edar_data": "edar_features" in self.arrays,
-            },
-            "created_at": self.metadata.get("created_at"),
-            "schema_version": self.metadata.get("schema_version"),
+            "node_label": node_label,
+            "target_node": target_idx,
+            "case_node": case_history[:, target_idx, :],
+            "bio_node": biomarker_history[:, target_idx, :],
+            "target": targets,
+            "mob": mob_graphs,
+            "static_covariates": self.node_static_covariates,
         }
 
-    def get_ego_graph_dataset(self) -> dict[str, GraphEgoDataset]:
-        """Create and return GraphEgoDataset from the loaded data."""
-        if self._ego_graph_dataset is None:
-            # Extract data for GraphEgoDataset
-            # GraphEgoDataset expects: cases [num_nodes, num_timesteps]
-            # Our data is: node_features [num_timesteps, num_nodes, feature_dim]
-            cases = torch.from_numpy(self.arrays["node_features"][:, :, 0]).T  # Transpose to [num_nodes, num_timesteps]
+    def static_covariates(self) -> StaticCovariates:
+        "Returns static covariates for the dataset. (num_nodes, num_features)"
+        population_cov = self.dataset.population
+        population_tensor = torch.from_numpy(population_cov.to_numpy()).to(
+            torch.float32
+        )
+        assert population_tensor.shape == (self.num_nodes,), (
+            f"Static covariates shape mismatch: expected ({self.num_nodes},), got {population_tensor.shape}"
+        )
 
-            # Handle biomarkers (remaining features)
-            if self.feature_dim > 1:
-                biomarkers = torch.from_numpy(self.arrays["node_features"][:, :, 1:]).transpose(0, 1)  # [num_nodes, num_timesteps, biomarker_dim]
-            else:
-                # Create dummy biomarkers if not available
-                biomarkers = torch.zeros(self.num_nodes, self.num_timepoints, 1)
+        return {
+            "Pop": population_tensor,
+        }
 
-            # Handle mobility data
-            mobility = []
-            if "edge_attr" in self.arrays and self.arrays["edge_attr"].shape[0] > 0:
-                # Convert edge_attr to mobility matrices
-                for t in range(self.num_timepoints):
-                    mobility.append(torch.from_numpy(self.arrays["edge_attr"][t]))
-            else:
-                # Create identity mobility if not available
-                for t in range(self.num_timepoints):
-                    mobility.append(torch.eye(self.num_nodes))
+    def _mobility_ego_to_pyg(
+        self,
+        mob_t: torch.Tensor,
+        case_t: torch.Tensor,
+        bio_t: torch.Tensor,
+        dst_idx: int,
+        time_id: int | None = None,
+    ) -> Data:
+        """Convert a dense mobility slice into a PyG ego-graph for one target node.
 
-            # Create GraphEgoDataset
-            self._ego_graph_dataset = GraphEgoDataset(
-                cases=cases,
-                biomarkers=biomarkers,
-                mobility=mobility,
-                L=self.sequence_length,
-                H=self.forecast_horizon,
-                min_flow_threshold=10.0,
-                max_neighbors=20,
-                include_target_in_graph=True,
-            )
+        Nodes include the target and all origins with non-zero incoming flow. Edges
+        are directed origin -> target and store the raw flow weight.
+        """
+        if self.context_mask is not None:
+            mob_t = mob_t.clone()
+            mob_t[~self.context_mask, dst_idx] = 0
 
-        return {"train": self._ego_graph_dataset, "val": self._ego_graph_dataset}
+        inflow = mob_t[:, dst_idx]
+        origins = inflow.nonzero(as_tuple=False).flatten()
 
-    def get_dataset_info(self) -> dict[str, Any]:
-        """Compatibility helper mirroring GraphEgoDataset API."""
-        info = self.summary()
-        if self._ego_graph_dataset is not None:
-            info["ego_graph_dataset"] = self._ego_graph_dataset.get_dataset_info()
-        return info
+        node_ids = torch.cat(
+            [origins, torch.tensor([dst_idx], dtype=torch.long)], dim=0
+        )
+        id_map = {int(n): i for i, n in enumerate(node_ids)}
+
+        if origins.numel() == 0:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_weight = torch.empty((0,), dtype=mob_t.dtype)
+        else:
+            edge_index = torch.tensor(
+                [[id_map[int(o)], id_map[dst_idx]] for o in origins],
+                dtype=torch.long,
+            ).t()
+            edge_weight = inflow[origins]
+
+        x = torch.cat([case_t[node_ids], bio_t[node_ids]], dim=-1)
+
+        g = Data(x=x, edge_index=edge_index, edge_weight=edge_weight)
+        g.num_nodes = node_ids.numel()
+        g.target_node = torch.tensor([id_map[dst_idx]], dtype=torch.long)
+        if time_id is not None:
+            g.time_id = torch.tensor([time_id], dtype=torch.long)
+        return g
 
     def __repr__(self) -> str:
         """String representation of the dataset."""
         return (
-            f"EpiDataset(name='{self.metadata['dataset_name']}', "
-            f"timepoints={self.num_timepoints}, "
-            f"nodes={self.num_nodes}, "
-            f"batches={len(self)})"
+            f"EpiDataset(source={self.aligned_data_path}, "
+            f"seq_len={self.time_dim_size}, "
+            f"nodes={self.num_nodes})"
         )
+
+    @classmethod
+    def load_canonical_dataset(cls, aligned_data_path: Path) -> xr.Dataset:
+        "Load the canonical dataset from the aligned data path."
+        return xr.open_zarr(aligned_data_path)

@@ -212,8 +212,8 @@ class ForecasterHead(nn.Module):
 
         # Log initialization
         logger.info(
-            f"Initialized ForecasterHead: {in_dim}->{d_model}, "
-            f"layers={num_layers}, heads={n_heads}, horizon={horizon}"
+            f"Initialized ForecasterHead: {in_dim}->{d_model}->{horizon}, "
+            f"layers={num_layers}, heads={n_heads}"
         )
 
     def forward(

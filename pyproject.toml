@@ -48,6 +48,10 @@ dependencies = [
   "ipykernel>=7.0.1",
   "folium>=0.20.0",
   "mapclassify>=2.10.0",
+  "bottleneck>=1.6.0",
+  "pyarrow>=22.0.0",
+  "fastparquet>=2024.11.0",
+  "torch-tb-profiler>=0.4.3",
 ]
 
 # Note: torch-scatter and torch-sparse are installed separately using:

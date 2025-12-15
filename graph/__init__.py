@@ -7,11 +7,11 @@ from .edge_processor import (
     EdgeFeatureProcessor,
 )
 from .node_encoder import (
-    InductiveNodeEncoder,
+    Region2Vec,
 )
 
 __all__ = [
-    "InductiveNodeEncoder",
+    "Region2Vec",
     "EdgeAttributeEmbedder",
     "EdgeFeatureProcessor",
 ]
