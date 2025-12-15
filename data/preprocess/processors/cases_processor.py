@@ -2,8 +2,8 @@
 Processor for COVID-19 case data from CSV files.
 
 This module handles the conversion of COVID-19 case data from CSV format into
-canonical tensor formats. It processes temporal case counts, applies normalization,
-handles missing values, and creates target sequences for forecasting models.
+canonical xarray formats. It processes temporal case counts, applies normalization,
+and handles missing values. The output is a simple (time, region) time series.
 """
 
 from typing import Any
@@ -11,24 +11,24 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import xarray as xr
 
-from ..config import PreprocessingConfig
+from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 
 
 class CasesProcessor:
     """
-    Converts COVID-19 case CSV data to aligned tensors.
+    Converts COVID-19 case CSV data to xarray Dataset.
 
     This processor handles:
     - Loading and parsing case data from CSV files
-    - Temporal alignment to specified date ranges
+    - Temporal cropping to specified date ranges
     - Normalization (log1p, standard, minmax)
     - Missing value handling and interpolation
-    - Creation of target sequences for forecasting
     - Municipality/region mapping and validation
 
-    The output includes case tensors aligned with other data sources
-    and properly formatted for input to the EpiBatch creation process.
+    Output is a simple (time, region) time series. The model data loader
+    handles horizon and history windowing decisions.
     """
 
     def __init__(self, config: PreprocessingConfig):
@@ -41,123 +41,167 @@ class CasesProcessor:
         self.config = config
         self.validation_options = config.validation_options
 
-    def process(
-        self, cases_file: str, region_mapping: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """
-        Process COVID-19 case data into canonical tensors.
-
-        Args:
-            cases_file: Path to CSV file with case data
-            region_mapping: Optional mapping from regions to municipality IDs
-
-        Returns:
-            Dictionary containing processed case data:
-            - cases_tensor: [time, num_regions] tensor with case counts
-            - target_sequences: [time, num_regions, forecast_horizon] tensor
-            - region_metadata: Dictionary with region information
-            - metadata: Processing metadata and statistics
-        """
-        print(f"Processing case data from {cases_file}")
-
-        # Load case data
-        cases_df = self._load_cases_data(cases_file)
-
-        # Process region mapping
-        region_info = self._process_region_mapping(cases_df, region_mapping)
-
-        # Create temporal tensor
-        cases_tensor = self._create_cases_tensor(cases_df, region_info)
-
-        # Handle missing values
-        cases_tensor = self._handle_missing_values(cases_tensor)
-
-        # Apply normalization
-        cases_tensor = self._normalize_cases(
-            cases_tensor, self.config.cases_normalization
+    def _load_cases_data(self, cases_file: str) -> pd.DataFrame:
+        """Load and validate case data from CSV."""
+        cases_df = pd.read_csv(
+            cases_file,
+            usecols=["id", "evend", "d.cases"],
+            dtype={"id": str, "evend": str, "d.cases": int},
+        )
+        cases_df = cases_df.rename(
+            columns={"id": REGION_COORD, "evend": "date", "d.cases": "cases"}
         )
 
-        # Create target sequences for forecasting
-        target_sequences = self._create_target_sequences(cases_tensor)
-
-        # Validate data quality
-        self._validate_cases_data(cases_tensor, target_sequences)
-
-        # Create metadata
-        metadata = {
-            "num_timepoints": cases_tensor.shape[0],
-            "num_regions": cases_tensor.shape[1],
-            "forecast_horizon": self.config.forecast_horizon,
-            "normalization": self.config.cases_normalization,
-            "date_range": {
-                "start": self.config.start_date.isoformat(),
-                "end": self.config.end_date.isoformat(),
-            },
-            "data_stats": self._compute_case_statistics(cases_tensor),
-            "quality_metrics": self._compute_quality_metrics(cases_tensor),
-        }
-
-        return {
-            "cases_tensor": cases_tensor,
-            "target_sequences": target_sequences,
-            "region_metadata": region_info,
-            "metadata": metadata,
-        }
-
-    def _load_cases_data(self, cases_file: str) -> pd.DataFrame:
-        """
-        Load and validate case data from CSV.
-
-        Args:
-            cases_file: Path to CSV file
-
-        Returns:
-            DataFrame with case data
-        """
-        cases_df = pd.read_csv(cases_file)
-
-        # Apply column mapping if provided
-        if self.config.cases_column_mapping:
-            cases_df = cases_df.rename(columns=self.config.cases_column_mapping)
-
-        # Validate required columns
-        required_columns = ["date", "region_id", "cases"]
-        missing_columns = [
-            col for col in required_columns if col not in cases_df.columns
-        ]
-        if missing_columns:
-            raise ValueError(
-                f"Missing required columns in cases file: {missing_columns}"
-            )
+        assert not cases_df.empty, "No data found in cases file"
+        assert {"date", REGION_COORD, "cases"} == set(cases_df.columns), (
+            "Cases columns mismatch"
+        )
 
         # Convert date column and handle timezone information
         cases_df["date"] = pd.to_datetime(cases_df["date"]).dt.tz_localize(None)
 
-        # Validate data types
-        cases_df["cases"] = pd.to_numeric(cases_df["cases"], errors="coerce")
-        cases_df["region_id"] = pd.to_numeric(cases_df["region_id"], errors="coerce")
-
         # Remove invalid rows
-        cases_df = cases_df.dropna(subset=["date", "region_id", "cases"])
-        cases_df = cases_df[cases_df["cases"] >= 0]  # Remove negative cases
+        cases_df = cases_df.dropna(subset=["date", REGION_COORD, "cases"])
+
+        if (cases_df["cases"] < 0).any():
+            print("Warning: Negative cases found in cases file")
+
+        cases_df = cases_df[cases_df["cases"] >= 0]
 
         return cases_df
 
-    def _process_region_mapping(
-        self, cases_df: pd.DataFrame, region_mapping: dict[str, Any] | None
-    ) -> dict[str, Any]:
+    def process(self, cases_file: str) -> xr.Dataset:
         """
-        Process and validate region mapping.
+        Process COVID-19 case data into canonical xarray Dataset.
 
         Args:
-            cases_df: DataFrame with case data
-            region_mapping: Optional region mapping information
+            cases_file: Path to CSV file with case data
 
         Returns:
-            Dictionary with region information
+            xarray Dataset containing:
+            - cases: xarray DataArray with cases (time, region)
         """
-        # Get unique regions from data
-        unique_regions = sorted(cases_df["region_id"].unique())
+        print(f"Processing case data from {cases_file}")
+
+        # Load and prepare DataFrame
+        cases_df = self._load_cases_data(cases_file)
+
+        # Crop to config date range
+        cases_df = cases_df[
+            (cases_df["date"] >= self.config.start_date)
+            & (cases_df["date"] <= self.config.end_date)
+        ]
+        assert not cases_df.empty, "No data found in temporal range"
+
+        # Pivot to wide format: date as index, region_id as columns. Assume unique but sum if not
+        cases_pivot = cases_df.pivot_table(
+            index="date", columns=REGION_COORD, values="cases", aggfunc="sum"
+        )
+
+        # Reindex to complete date range to ensure all dates are present
+        date_range = pd.date_range(
+            start=self.config.start_date, end=self.config.end_date, freq="D"
+        )
+        cases_pivot = cases_pivot.reindex(date_range)
+
+        # Rename columns and index to match coordinate names
+        cases_pivot.columns.name = REGION_COORD
+        cases_pivot.index.name = TEMPORAL_COORD
+
+        # Convert to xarray DataArray with proper coordinates
+        # DataFrame index becomes temporal dimension, columns become region dimension
+        cases_ds = xr.DataArray(
+            cases_pivot.values,
+            dims=[TEMPORAL_COORD, REGION_COORD],
+            coords={
+                TEMPORAL_COORD: cases_pivot.index,
+                REGION_COORD: cases_pivot.columns,
+            },
+        )
+        cases_ds = cases_ds.to_dataset(name="cases")
+
+        # Handle missing values
+        cases_ds = self._interpolate_cases(cases_ds)
+
+        # Apply normalization
+        cases_ds = self._normalize(cases_ds, self.config.cases_normalization)
+
+        # Validate data quality
+        self._validate_cases_data_xr(cases_ds)
+
+        # Create region metadata
+        print(cases_ds)
+        # region_info = self._create_region_info(cases_ds, region_mapping)
+
+        return cases_ds
+
+    def _interpolate_cases(self, cases_ds: xr.Dataset) -> xr.Dataset:
+        """Handle missing values in case data using xarray operations."""
+        # Check temporal coverage for each region
+        temporal_coverage = (~cases_ds["cases"].isnull()).mean(dim=TEMPORAL_COORD)
+        min_coverage = self.validation_options.get("min_data_coverage", 0.8)
+
+        # Identify regions with insufficient coverage
+        low_coverage_regions = temporal_coverage < min_coverage
+        if low_coverage_regions.any():
+            num_low = int(low_coverage_regions.sum())
+            print(
+                f"Warning: {num_low} regions have < {min_coverage * 100}% data coverage"
+            )
+
+        # Interpolate missing values: forward fill then backward fill
+        # TODO: interpolate better
+        cases_filled = (
+            cases_ds["cases"].ffill(dim=TEMPORAL_COORD).bfill(dim=TEMPORAL_COORD)
+        )
+
+        # For remaining NaN values (at beginning/end), use small value
+        cases_filled = cases_filled.fillna(1e-6)
+        cases_filled = cases_filled.to_dataset(name="cases")
+
+        return cases_filled
+
+    def _normalize(self, cases_da: xr.DataArray, normalization: str) -> xr.DataArray:
+        """Apply normalization to case data."""
+        if normalization == "none":
+            return cases_da
+        elif normalization == "log1p":
+            return xr.apply_ufunc(np.log1p, cases_da + 1e-6)
+        elif normalization == "standard":
+            mean = cases_da.mean()
+            std = cases_da.std()
+            return (cases_da - mean) / (std + 1e-8)
+        elif normalization == "minmax":
+            min_val = cases_da.min()
+            max_val = cases_da.max()
+            return (cases_da - min_val) / (max_val - min_val + 1e-8)
+        else:
+            raise ValueError(f"Unknown normalization method: {normalization}")
+
+    def _validate_cases_data_xr(self, cases_xr: xr.Dataset):
+        """Validate processed case data quality."""
+        cases_da = cases_xr.cases
+
+        # Check for NaN values
+        if cases_da.isnull().any():
+            raise ValueError("NaN values found in processed case data")
+
+        # Check for negative values (should not exist after normalization)
+        if (cases_da < 0).any():
+            print("Warning: Negative values found in case data")
+
+        # Check temporal consistency
+        self._check_temporal_consistency_xr(cases_da)
+
+        # Check for outliers
+        if self.validation_options.get("outlier_detection", True):
+            self._detect_outliers_xr(cases_da)
+
+    def _create_region_info(
+        self, cases_xr: xr.Dataset, region_mapping: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Create region information from xarray Dataset."""
+        unique_regions = cases_xr[REGION_COORD].values.tolist()
         num_regions = len(unique_regions)
 
         # Create region ID to index mapping
@@ -176,191 +220,17 @@ class CasesProcessor:
                     f"Warning: {len(unmapped_regions)} regions not found in mapping: {unmapped_regions}"
                 )
 
-        region_info = {
+        return {
             "unique_regions": unique_regions,
             "num_regions": num_regions,
             "region_id_to_index": region_id_to_index,
             "region_mapping": region_mapping,
         }
 
-        return region_info
-
-    def _create_cases_tensor(
-        self, cases_df: pd.DataFrame, region_info: dict[str, Any]
-    ) -> torch.Tensor:
-        """
-        Create temporal tensor from case data.
-
-        Args:
-            cases_df: DataFrame with case data
-            region_info: Region mapping information
-
-        Returns:
-            [time, num_regions] tensor with case counts
-        """
-        # Create date range
-        date_range = pd.date_range(
-            start=self.config.start_date, end=self.config.end_date, freq="D"
-        )
-
-        num_timepoints = len(date_range)
-        num_regions = region_info["num_regions"]
-        region_id_to_index = region_info["region_id_to_index"]
-
-        # Initialize tensor
-        cases_tensor = torch.zeros(num_timepoints, num_regions)
-
-        # Fill tensor with case data
-        for _, row in cases_df.iterrows():
-            date = row["date"]
-            region_id = int(row["region_id"])
-            cases = float(row["cases"])
-
-            # Check if date is in our range
-            if self.config.start_date <= date <= self.config.end_date:
-                date_idx = (date - self.config.start_date).days
-                if date_idx < num_timepoints and region_id in region_id_to_index:
-                    region_idx = region_id_to_index[region_id]
-                    cases_tensor[date_idx, region_idx] = cases
-
-        return cases_tensor
-
-    def _handle_missing_values(self, cases_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Handle missing values in case data.
-
-        Args:
-            cases_tensor: [time, num_regions] tensor with case counts
-
-        Returns:
-            Tensor with missing values handled
-        """
-        # Replace zeros with NaN for missing value detection
-        cases_nan = cases_tensor.clone()
-        cases_nan[cases_nan == 0] = float("nan")
-
-        # Check temporal coverage for each region
-        temporal_coverage = (~torch.isnan(cases_nan)).float().mean(dim=0)
-        min_coverage = self.validation_options.get("min_data_coverage", 0.8)
-
-        # Identify regions with insufficient coverage
-        low_coverage_regions = temporal_coverage < min_coverage
-        if low_coverage_regions.any():
-            print(
-                f"Warning: {low_coverage_regions.sum().item()} regions have < {min_coverage * 100}% data coverage"
-            )
-
-        # Interpolate missing values
-        cases_processed = self._interpolate_missing_values(cases_tensor)
-
-        return cases_processed
-
-    def _interpolate_missing_values(self, cases_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Interpolate missing values using configured strategy.
-
-        Args:
-            cases_tensor: Tensor with potential missing values
-
-        Returns:
-            Tensor with interpolated values
-        """
-        # Convert to numpy for interpolation
-        cases_np = cases_tensor.numpy()
-
-        # Forward fill then backward fill
-        cases_df = pd.DataFrame(cases_np)
-        cases_filled = cases_df.fillna(method="ffill").fillna(method="bfill")
-
-        # For remaining NaN values (at beginning/end), use small value
-        cases_filled = cases_filled.fillna(1e-6)
-
-        return torch.from_numpy(cases_filled.values).float()
-
-    def _normalize_cases(
-        self, cases_tensor: torch.Tensor, normalization: str
-    ) -> torch.Tensor:
-        """
-        Apply normalization to case data.
-
-        Args:
-            cases_tensor: Input case tensor
-            normalization: Normalization method
-
-        Returns:
-            Normalized case tensor
-        """
-        if normalization == "none":
-            return cases_tensor
-        elif normalization == "log1p":
-            # Add small epsilon to handle zeros
-            return torch.log1p(cases_tensor + 1e-6)
-        elif normalization == "standard":
-            mean = cases_tensor.mean()
-            std = cases_tensor.std()
-            return (cases_tensor - mean) / (std + 1e-8)
-        elif normalization == "minmax":
-            min_val = cases_tensor.min()
-            max_val = cases_tensor.max()
-            return (cases_tensor - min_val) / (max_val - min_val + 1e-8)
-        else:
-            raise ValueError(f"Unknown normalization method: {normalization}")
-
-    def _create_target_sequences(self, cases_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Create target sequences for forecasting.
-
-        Args:
-            cases_tensor: [time, num_regions] tensor with normalized cases
-
-        Returns:
-            [time, num_regions, forecast_horizon] tensor with target sequences
-        """
-        num_timepoints, num_regions = cases_tensor.shape
-        forecast_horizon = self.config.forecast_horizon
-
-        # Initialize target tensor
-        target_sequences = torch.zeros(num_timepoints, num_regions, forecast_horizon)
-
-        # Create target sequences by shifting the case tensor
-        for h in range(forecast_horizon):
-            if h < num_timepoints:
-                target_sequences[: num_timepoints - h, :, h] = cases_tensor[h:]
-
-        return target_sequences
-
-    def _validate_cases_data(
-        self, cases_tensor: torch.Tensor, target_sequences: torch.Tensor
-    ):
-        """
-        Validate processed case data quality.
-
-        Args:
-            cases_tensor: Processed case tensor
-            target_sequences: Target sequence tensor
-        """
-        # Check for NaN values
-        if torch.isnan(cases_tensor).any():
-            raise ValueError("NaN values found in processed case tensor")
-
-        if torch.isnan(target_sequences).any():
-            raise ValueError("NaN values found in target sequences")
-
-        # Check for negative values (should not exist after normalization)
-        if (cases_tensor < 0).any():
-            print("Warning: Negative values found in case tensor")
-
-        # Check temporal consistency
-        self._check_temporal_consistency(cases_tensor)
-
-        # Check for outliers
-        if self.validation_options.get("outlier_detection", True):
-            self._detect_outliers(cases_tensor)
-
-    def _check_temporal_consistency(self, cases_tensor: torch.Tensor):
+    def _check_temporal_consistency_xr(self, cases_da: xr.DataArray):
         """Check for temporal consistency in case data."""
         # Compute day-to-day changes
-        case_changes = torch.diff(cases_tensor, dim=0)
+        case_changes = cases_da.diff(dim=TEMPORAL_COORD)
 
         # Check for extreme changes (potential data errors)
         extreme_threshold = self.validation_options.get("outlier_threshold", 3.0)
@@ -368,29 +238,29 @@ class CasesProcessor:
         std_change = case_changes.std()
 
         extreme_changes = (
-            torch.abs(case_changes - mean_change) > extreme_threshold * std_change
+            xr.ufuncs.abs(case_changes - mean_change) > extreme_threshold * std_change
         )
 
         if extreme_changes.any():
-            num_extreme = extreme_changes.sum().item()
-            total_changes = extreme_changes.numel()
+            num_extreme = int(extreme_changes.sum())
+            total_changes = extreme_changes.size
             print(
                 f"Warning: {num_extreme}/{total_changes} extreme temporal changes detected"
             )
 
-    def _detect_outliers(self, cases_tensor: torch.Tensor):
+    def _detect_outliers_xr(self, cases_da: xr.DataArray):
         """Detect outliers in case data using z-score method."""
-        mean_cases = cases_tensor.mean()
-        std_cases = cases_tensor.std()
+        mean_cases = cases_da.mean()
+        std_cases = cases_da.std()
 
-        z_scores = torch.abs((cases_tensor - mean_cases) / (std_cases + 1e-8))
+        z_scores = xr.ufuncs.abs((cases_da - mean_cases) / (std_cases + 1e-8))
         outlier_threshold = self.validation_options.get("outlier_threshold", 3.0)
 
         outliers = z_scores > outlier_threshold
 
         if outliers.any():
-            num_outliers = outliers.sum().item()
-            total_values = outliers.numel()
+            num_outliers = int(outliers.sum())
+            total_values = outliers.size
             print(
                 f"Warning: {num_outliers}/{total_values} outliers detected (z-score > {outlier_threshold})"
             )
