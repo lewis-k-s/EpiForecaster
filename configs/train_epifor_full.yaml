@@ -1,0 +1,39 @@
+data:
+  dataset_path: data/processed/full_v1.zarr
+  region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
+model:
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    biomarkers_dim: 1
+    cases_dim: 1
+    mobility_embedding_dim: 16
+    region_embedding_dim: 64
+    gnn_module: "gcn"
+    #-- seq sizes --#
+    history_length: 14
+    forecast_horizon: 7
+    #-- graph params --#
+    max_neighbors: 20
+    gnn_depth: 2
+output:
+  experiment_name: epiforecaster_base_experiment
+  log_dir: outputs/training
+training:
+  device: "cpu"
+  batch_size: 20
+  early_stopping_patience: 5
+  epochs: 1
+  learning_rate: 0.001
+  weight_decay: 1.0e-05
+  num_workers: 0
+  val_split: 0.2
+  test_split: 0.1
+  profiler:
+    enabled: false
+    profile_batches: 10
+    log_dir: outputs/profiler
+

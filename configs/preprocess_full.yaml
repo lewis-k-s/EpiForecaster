@@ -4,14 +4,14 @@
 # Data source paths - cases only
 data_dir: "data/files"
 cases_file: "data/files/flowmaps_cat_municipio_cases.csv"
-wastewater_file: null  # Skip wastewater for cases-only model
+wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
+region_metadata_file: "data/files/edar_muni_edges.nc"
 population_file: "data/files/fl_population_por_municipis.csv"
-mobility_path: null     # Skip mobility for cases-only model
-region_metadata_file: null
+mobility_path: "data/files/mobility.zarr"
 
 # Temporal processing parameters - maximum coverage
-start_date: "2020-03-01" # Early pandemic period
-end_date: "2022-07-26" # Latest case data available
+start_date: "2020-03-01" # Earliest case data available
+end_date: "2021-05-09" # Latest mobility data available
 forecast_horizon: 7
 sequence_length: 14
 
@@ -19,12 +19,6 @@ sequence_length: 14
 cases_normalization: "log1p"
 mobility_normalization: "log1p"
 min_flow_threshold: 10
-
-# Column mapping for custom CSV structure (actual CSV column -> expected column)
-cases_column_mapping:
-  evstart: "date"          # Map evstart column to expected date column
-  "d.cases": "cases"       # Map d.cases column to expected cases column
-  c.cumun: "region_id"     # Map c.cumun column to expected region_id column
 
 # Alignment and validation options
 alignment_strategy: "interpolate"
@@ -35,12 +29,13 @@ generate_alignment_report: true
 
 # Output configuration
 output_path: "data/processed"
-dataset_name: "cases_only_v1"
+dataset_name: "full_v1"
 compression: "blosc"
 
 # Processing configuration
 num_workers: 4
-chunk_size: 1000
+# time dim chunk size
+chunk_size: 14
 memory_limit_gb: 8.0
 
 # Graph construction options - minimal for cases-only model

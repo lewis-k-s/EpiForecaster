@@ -13,6 +13,9 @@ from typing import Any
 
 import yaml
 
+REGION_COORD = "region_id"
+TEMPORAL_COORD = "date"
+
 
 @dataclass
 class PreprocessingConfig:
@@ -27,9 +30,9 @@ class PreprocessingConfig:
         data_dir: Base directory for raw data files
         mobility_path: Path to NetCDF mobility data
         cases_file: Path to COVID case data CSV
-        wastewater_file: Optional path to wastewater biomarker data
-        population_file: Optional path to population data for normalization
-        region_metadata_file: Optional path to regional metadata
+        wastewater_file: Path to wastewater biomarker data
+        population_file: Path to population data for normalization
+        region_metadata_file: Path to regional metadata
 
         start_date: Start date for temporal processing
         end_date: End date for temporal processing
@@ -62,29 +65,19 @@ class PreprocessingConfig:
     # Required fields (no defaults)
     data_dir: str
     cases_file: str
+    mobility_path: str
+    wastewater_file: str
+    population_file: str
+    region_metadata_file: str
     start_date: datetime
     end_date: datetime
     output_path: str
     dataset_name: str
 
-    # Optional data sources
-    mobility_path: str | None = None
-
-    # Optional fields with defaults
-    # Data source paths
-    wastewater_file: str | None = None
-    population_file: str | None = None
-    region_metadata_file: str | None = None
-
     # Feature processing options
     mobility_normalization: str = "log1p"  # "log1p", "standard", "minmax", "none"
     cases_normalization: str = "log1p"  # "log1p", "standard", "minmax", "none"
     min_flow_threshold: int = 10
-
-    # Column mapping for CSV files with custom column names
-    cases_column_mapping: dict[str, str] | None = (
-        None  # Maps expected columns to actual CSV columns
-    )
 
     # Temporal processing parameters
     forecast_horizon: int = 7

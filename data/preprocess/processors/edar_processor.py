@@ -4,18 +4,17 @@ Processor for EDAR wastewater biomarker data.
 This module handles the conversion of wastewater biomarker data from EDAR
 (Environmental DNA Analysis and Recovery) systems into canonical tensor formats.
 It processes variant selection, flow calculations, temporal alignment, and
-creates attention masks for the bipartite graph between municipalities and
-EDAR plants.
+creates temporal tensors for downstream aggregation to target regions.
 """
 
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
+import xarray as xr
 
-from ..config import PreprocessingConfig
+from ..config import REGION_COORD, PreprocessingConfig
 
 
 class EDARProcessor:
@@ -28,10 +27,10 @@ class EDARProcessor:
     - Duplicate removal and temporal aggregation
     - Flow calculation and normalization
     - Resampling to daily frequency
-    - Creation of municipality-EDAR bipartite graph connectivity
+    - Creation of temporal tensors for EDAR site features
 
-    The output includes EDAR features, attention masks for graph connectivity,
-    and metadata for integration with other data sources.
+    The output includes EDAR features and metadata for integration with other
+    data sources. Biomarker data is aggregated to target regions in _process_edar_mapping.
     """
 
     def __init__(self, config: PreprocessingConfig):
@@ -44,30 +43,24 @@ class EDARProcessor:
         self.config = config
         self.validation_options = config.validation_options
 
-    def process(
-        self, wastewater_file: str, edar_mapping: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def process(self, wastewater_file: str, region_metadata_file: str) -> xr.Dataset:
         """
-        Process EDAR wastewater biomarker data into canonical tensors.
+        Process EDAR wastewater biomarker data into canonical xarray Dataset.
 
         Args:
             wastewater_file: Path to CSV/Excel file with wastewater data
             edar_mapping: Optional mapping from EDAR plants to municipalities
 
         Returns:
-            Dictionary containing processed EDAR data:
-            - edar_features: [time, num_edar_sites, feature_dim] tensor
-            - edar_attention_mask: [num_municipalities, num_edar_sites] tensor
-            - edar_metadata: Dictionary with site information
-            - metadata: Processing metadata and statistics
+            xarray Dataset containing:
+            - edar_features: [time, edar_sites, variants]
+            - biomarkers: [time, regions, 1] (optional)
+            - attrs: Processing metadata and statistics
         """
         print(f"Processing EDAR wastewater data from {wastewater_file}")
 
         # Load wastewater data
         wastewater_df = self._load_wastewater_data(wastewater_file)
-
-        # Process EDAR mapping
-        mapping_info = self._process_edar_mapping(wastewater_df, edar_mapping)
 
         # Select best variant for each site
         selected_data = self._select_variants(wastewater_df)
@@ -81,212 +74,120 @@ class EDARProcessor:
         # Resample to daily frequency
         daily_data = self._resample_to_daily(flow_data)
 
-        # Create temporal tensors
-        edar_features = self._create_edar_tensors(daily_data, mapping_info)
+        daily_data_xr = daily_data.set_index(["date", "edar_id"])[
+            "total_covid_flow"
+        ].to_xarray()
+        emap = xr.open_dataarray(region_metadata_file)
+        emap = emap.rename({"home": REGION_COORD})
 
-        # Create attention mask for bipartite graph
-        edar_attention_mask = self._create_attention_mask(mapping_info)
+        print(
+            f"Transforming EDAR data to regions using contribution matrix from {region_metadata_file}"
+        )
+        result = xr.dot(daily_data_xr, emap, dims="edar_id")
 
-        # Validate data quality
-        self._validate_edar_data(edar_features, edar_attention_mask)
+        result.name = "edar_biomarker"
 
-        # Create metadata
-        metadata = {
-            "num_timepoints": edar_features.shape[0],
-            "num_edar_sites": edar_features.shape[1],
-            "feature_dim": edar_features.shape[2],
-            "date_range": {
-                "start": self.config.start_date.isoformat(),
-                "end": self.config.end_date.isoformat(),
-            },
-            "variants_used": list(selected_data["variant"].unique()),
-            "data_stats": self._compute_edar_statistics(edar_features),
-            "quality_metrics": self._compute_quality_metrics(edar_features),
-        }
-
-        return {
-            "edar_features": edar_features,
-            "edar_attention_mask": edar_attention_mask,
-            "edar_metadata": mapping_info,
-            "metadata": metadata,
-        }
+        return result
 
     def _load_wastewater_data(self, wastewater_file: str) -> pd.DataFrame:
-        """
-        Load and validate wastewater data.
+        df = pd.read_csv(
+            wastewater_file,
+            usecols=[
+                "id mostra",
+                "Cabal últimes 24h(m3)",
+                "IP4(CG/L)",
+                "N1(CG/L)",
+                "N2(CG/L)",
+            ],
+            dtype={
+                "id mostra": str,
+                "depuradora": str,
+                "Cabal últimes 24h(m3)": float,
+                "IP4(CG/L)": float,
+                "N1(CG/L)": float,
+                "N2(CG/L)": float,
+            },
+        )
 
-        Args:
-            wastewater_file: Path to wastewater data file
+        df = df.rename(
+            columns={
+                "id mostra": "date",
+                "Cabal últimes 24h(m3)": "flow_rate",
+                "IP4(CG/L)": "IP4",
+                "N1(CG/L)": "N1",
+                "N2(CG/L)": "N2",
+            }
+        )
 
-        Returns:
-            DataFrame with wastewater data
-        """
-        file_path = Path(wastewater_file)
+        # Parse date from 'id mostra' (format: XXXX-YYYY-MM-DD)
+        dates = df["date"].astype(str).str.extract(r"(\d{4}-\d{2}-\d{2})")[0]
+        edar_codes = df["date"].astype(str).str.extract(r"^(\w+)-\d{4}-\d{2}-\d{2}$")[0]
+        df["date"] = pd.to_datetime(dates)
+        df["edar_id"] = edar_codes
 
-        # Determine file format
-        if file_path.suffix.lower() == ".csv":
-            df = pd.read_csv(wastewater_file)
-        elif file_path.suffix.lower() in [".xlsx", ".xls"]:
-            df = pd.read_excel(wastewater_file)
-        else:
-            raise ValueError(f"Unsupported file format: {file_path.suffix}")
+        time_mask = df["date"].isin(
+            pd.date_range(
+                start=self.config.start_date, end=self.config.end_date, freq="D"
+            )
+        )
+        df = df[time_mask]
 
-        # Validate required columns
-        required_columns = ["date", "edar_id", "variant", "viral_load", "flow_rate"]
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            raise ValueError(f"Missing required columns: {missing_columns}")
+        df = df.melt(
+            id_vars=["date", "edar_id", "flow_rate"],
+            value_vars=["N2", "IP4", "N1"],
+            var_name="variant",
+            value_name="viral_load",
+        )
 
-        # Convert date column
-        df["date"] = pd.to_datetime(df["date"])
-
-        # Clean and validate data
-        df = self._clean_wastewater_data(df)
-
-        return df
-
-    def _clean_wastewater_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Clean and validate wastewater data.
-
-        Args:
-            df: Raw wastewater DataFrame
-
-        Returns:
-            Cleaned DataFrame
-        """
-        # Convert numeric columns
-        numeric_columns = ["viral_load", "flow_rate"]
-        for col in numeric_columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # Remove invalid rows
         df = df.dropna(subset=["date", "edar_id", "variant", "viral_load", "flow_rate"])
 
         # Remove negative values
         df = df[(df["viral_load"] >= 0) & (df["flow_rate"] >= 0)]
 
-        # Filter by flow rate threshold
-        min_flow = self.config.min_flow_threshold
-        df = df[df["flow_rate"] >= min_flow]
-
         return df
-
-    def _process_edar_mapping(
-        self, wastewater_df: pd.DataFrame, edar_mapping: dict[str, Any] | None
-    ) -> dict[str, Any]:
-        """
-        Process EDAR to municipality mapping.
-
-        Args:
-            wastewater_df: DataFrame with wastewater data
-            edar_mapping: Optional mapping dictionary
-
-        Returns:
-            Dictionary with mapping information
-        """
-        # Get unique EDAR sites from data
-        unique_edar_sites = sorted(wastewater_df["edar_id"].unique())
-        num_edar_sites = len(unique_edar_sites)
-
-        # Create EDAR site to index mapping
-        edar_id_to_index = {
-            edar_id: idx for idx, edar_id in enumerate(unique_edar_sites)
-        }
-
-        # Create default attention mask (all-to-all connectivity)
-        num_municipalities = 100  # Default, should be updated from actual data
-        attention_mask = torch.ones(num_municipalities, num_edar_sites)
-
-        # Apply custom mapping if provided
-        if edar_mapping is not None:
-            attention_mask = self._apply_custom_mapping(
-                edar_mapping, unique_edar_sites, edar_id_to_index
-            )
-
-        mapping_info = {
-            "unique_edar_sites": unique_edar_sites,
-            "num_edar_sites": num_edar_sites,
-            "edar_id_to_index": edar_id_to_index,
-            "attention_mask": attention_mask,
-            "custom_mapping": edar_mapping is not None,
-        }
-
-        return mapping_info
-
-    def _apply_custom_mapping(
-        self,
-        edar_mapping: dict[str, Any],
-        unique_edar_sites: list[int],
-        edar_id_to_index: dict[int, int],
-    ) -> torch.Tensor:
-        """
-        Apply custom EDAR to municipality mapping.
-
-        Args:
-            edar_mapping: Mapping from EDAR sites to municipalities
-            unique_edar_sites: List of EDAR site IDs
-            edar_id_to_index: EDAR ID to index mapping
-
-        Returns:
-            Attention mask tensor
-        """
-        # Determine number of municipalities from mapping
-        all_municipalities = set()
-        for _site_id, municipalities in edar_mapping.items():
-            all_municipalities.update(municipalities)
-
-        num_municipalities = max(all_municipalities) + 1
-        num_edar_sites = len(unique_edar_sites)
-
-        # Create attention mask
-        attention_mask = torch.zeros(num_municipalities, num_edar_sites)
-
-        for site_id, municipalities in edar_mapping.items():
-            if site_id in edar_id_to_index:
-                site_idx = edar_id_to_index[site_id]
-                for mun_id in municipalities:
-                    attention_mask[mun_id, site_idx] = 1.0
-
-        return attention_mask
 
     def _select_variants(self, wastewater_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Select best variant for each EDAR site based on data quality.
+        Select top 2 most prevalent variants for each EDAR site.
 
         Args:
             wastewater_df: DataFrame with all variants
 
         Returns:
-            DataFrame with selected variants
+            DataFrame with top 2 variants per site
         """
-        # Prioritize variants in order of preference
-        variant_preference = ["N2", "IP4", "N1", "E", "S"]
+        assert not wastewater_df.empty, "No wastewater data to select variants from"
 
-        selected_rows = []
+        # Count non-null viral_load entries per (edar_id, variant)
+        # Filter valid entries first
+        valid_entries = wastewater_df[wastewater_df["viral_load"].notna()]
 
-        for edar_id in wastewater_df["edar_id"].unique():
-            site_data = wastewater_df[wastewater_df["edar_id"] == edar_id]
+        if valid_entries.empty:
+            raise ValueError("No valid entries to select variants from")
 
-            # Try variants in order of preference
-            for variant in variant_preference:
-                variant_data = site_data[site_data["variant"] == variant]
+        # Group and count
+        variant_counts = (
+            valid_entries.groupby(["edar_id", "variant"])
+            .size()
+            .reset_index(name="count")
+        )
 
-                if len(variant_data) > 0:
-                    # Check data quality
-                    data_completeness = 1.0 - variant_data[
-                        "viral_load"
-                    ].isna().sum() / len(variant_data)
+        # Rank variants by count within each edar_id
+        variant_counts["rank"] = variant_counts.groupby("edar_id")["count"].rank(
+            method="first", ascending=False
+        )
 
-                    if data_completeness >= 0.5:  # At least 50% complete
-                        selected_rows.append(variant_data)
-                        break
-            else:
-                # If no preferred variant found, use the one with most data
-                best_variant = site_data.groupby("variant").size().idxmax()
-                selected_rows.append(site_data[site_data["variant"] == best_variant])
+        # Select top 2 variants
+        top_variants = variant_counts[variant_counts["rank"] <= 2][
+            ["edar_id", "variant"]
+        ]
 
-        return pd.concat(selected_rows, ignore_index=True)
+        # Filter original dataframe to keep only selected variants
+        selected_df = wastewater_df.merge(
+            top_variants, on=["edar_id", "variant"], how="inner"
+        )
+
+        return selected_df
 
     def _remove_duplicates_and_aggregate(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -307,7 +208,7 @@ class EDARProcessor:
         # Aggregate multiple measurements on same day for same site
         agg_functions = {
             "viral_load": "mean",
-            "flow_rate": "sum",  # Sum flow rates for multiple measurements
+            "flow_rate": "mean",
         }
 
         aggregated = (
@@ -332,142 +233,21 @@ class EDARProcessor:
         # Calculate total COVID flow (viral_load * flow_rate)
         df["total_covid_flow"] = df["viral_load"] * df["flow_rate"]
 
+        df = df.groupby(["edar_id", "date"])["total_covid_flow"].sum().reset_index()
+
         return df
 
     def _resample_to_daily(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Resample data to daily frequency.
-
-        Args:
-            df: DataFrame with potentially irregular timestamps
-
-        Returns:
-            DataFrame resampled to daily frequency
-        """
-        # Set date as index
-        df = df.set_index("date")
-
-        # Group by EDAR site and resample
-        daily_data = []
-
-        for edar_id in df["edar_id"].unique():
-            site_data = df[df["edar_id"] == edar_id]
-
-            # Resample to daily frequency with linear interpolation
-            resampled = site_data.resample("D").mean()
-
-            # Forward fill missing values
-            resampled = resampled.fillna(method="ffill").fillna(method="bfill")
-
-            # Keep EDAR ID
-            resampled["edar_id"] = edar_id
-            daily_data.append(resampled.reset_index())
-
-        if daily_data:
-            return pd.concat(daily_data, ignore_index=True)
-        else:
-            return pd.DataFrame()
-
-    def _create_edar_tensors(
-        self, daily_data: pd.DataFrame, mapping_info: dict[str, Any]
-    ) -> torch.Tensor:
-        """
-        Create temporal tensors from daily EDAR data.
-
-        Args:
-            daily_data: Daily resampled data
-            mapping_info: EDAR mapping information
-
-        Returns:
-            [time, num_edar_sites, feature_dim] tensor
-        """
-        # Create date range
-        date_range = pd.date_range(
-            start=self.config.start_date, end=self.config.end_date, freq="D"
+        df = (
+            df.pivot(index="date", columns="edar_id", values="total_covid_flow")
+            .resample("D")
+            .sum()
         )
-
-        num_timepoints = len(date_range)
-        num_edar_sites = mapping_info["num_edar_sites"]
-        edar_id_to_index = mapping_info["edar_id_to_index"]
-
-        # Feature columns to include
-        feature_columns = [
-            "viral_load",
-            "flow_rate",
-            "viral_concentration",
-            "total_covid_flow",
-        ]
-        feature_dim = len(feature_columns)
-
-        # Initialize tensor
-        edar_features = torch.zeros(num_timepoints, num_edar_sites, feature_dim)
-
-        # Fill tensor with data
-        for _, row in daily_data.iterrows():
-            date = row["date"]
-            edar_id = int(row["edar_id"])
-
-            # Check if date is in our range
-            if self.config.start_date <= date <= self.config.end_date:
-                date_idx = (date - self.config.start_date).days
-                if date_idx < num_timepoints and edar_id in edar_id_to_index:
-                    site_idx = edar_id_to_index[edar_id]
-
-                    for feat_idx, col in enumerate(feature_columns):
-                        if col in row and not pd.isna(row[col]):
-                            edar_features[date_idx, site_idx, feat_idx] = float(
-                                row[col]
-                            )
-
-        # Apply log1p normalization to viral-related features
-        viral_features = [0, 2, 3]  # viral_load, viral_concentration, total_covid_flow
-        for feat_idx in viral_features:
-            edar_features[:, :, feat_idx] = torch.log1p(
-                torch.clamp(edar_features[:, :, feat_idx], min=0)
-            )
-
-        return edar_features
-
-    def _create_attention_mask(self, mapping_info: dict[str, Any]) -> torch.Tensor:
-        """
-        Create attention mask for municipality-EDAR connectivity.
-
-        Args:
-            mapping_info: EDAR mapping information
-
-        Returns:
-            [num_municipalities, num_edar_sites] attention mask
-        """
-        return mapping_info["attention_mask"]
-
-    def _validate_edar_data(
-        self, edar_features: torch.Tensor, edar_attention_mask: torch.Tensor
-    ):
-        """
-        Validate processed EDAR data quality.
-
-        Args:
-            edar_features: Processed EDAR features tensor
-            edar_attention_mask: Attention mask tensor
-        """
-        # Check for NaN values
-        if torch.isnan(edar_features).any():
-            raise ValueError("NaN values found in processed EDAR features")
-
-        if torch.isnan(edar_attention_mask).any():
-            raise ValueError("NaN values found in attention mask")
-
-        # Check attention mask values
-        if not torch.all((edar_attention_mask >= 0) & (edar_attention_mask <= 1)):
-            raise ValueError("Attention mask contains values outside [0, 1] range")
-
-        # Check for sites with no connectivity
-        site_connectivity = edar_attention_mask.sum(dim=0)
-        zero_connectivity_sites = (site_connectivity == 0).sum().item()
-        if zero_connectivity_sites > 0:
-            print(
-                f"Warning: {zero_connectivity_sites} EDAR sites have no connectivity to municipalities"
-            )
+        # Unpivot the date index to a column and edar_id index to a column
+        df = df.reset_index().melt(
+            id_vars="date", var_name="edar_id", value_name="total_covid_flow"
+        )
+        return df
 
     def _compute_edar_statistics(self, edar_features: torch.Tensor) -> dict[str, float]:
         """Compute statistics for EDAR data."""
@@ -504,3 +284,30 @@ class EDARProcessor:
                 np.sum(np.array(temporal_coverage) > 0.9)
             ),
         }
+
+    def transform_to_regions(
+        self,
+        single_covid: pd.DataFrame,
+        edar_muni_mapping: xr.DataArray,
+    ) -> dict[str, Any]:
+        """
+        Transform wastewater data to region features using EDAR to municipality mapping.
+        """
+        print(single_covid.info())
+        print(edar_muni_mapping)
+
+        assert set(single_covid.edar_id) == set(edar_muni_mapping.edar_id.values), (
+            "EDAR IDs in single_covid and edar_muni_mapping do not match"
+        )
+
+        edar_features = (
+            single_covid.groupby(["date", "edar_id"])["total_covid_flow"]
+            .sum()
+            .to_xarray()
+        )
+        print(edar_features)
+
+        result = xr.dot(edar_features, edar_muni_mapping, dims="edar_id")
+        print(result)
+
+        return result
