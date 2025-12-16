@@ -191,7 +191,9 @@ class EpiForecaster(nn.Module):
 
         return forecasts
 
-    def _process_mobility_sequence_pyg(self, mob_batch: Batch, B: int, T: int) -> torch.Tensor:
+    def _process_mobility_sequence_pyg(
+        self, mob_batch: Batch, B: int, T: int
+    ) -> torch.Tensor:
         """Process mobility graphs (batched) with MobilityGNN."""
 
         if not self.variant_type.mobility or self.mobility_gnn is None:
@@ -223,9 +225,7 @@ class EpiForecaster(nn.Module):
             target_indices.append(start + tgt_local)
 
         target_embeddings = node_emb[target_indices]
-        mobility_embeddings = target_embeddings.view(
-            B, T, self.mobility_embedding_dim
-        )
+        mobility_embeddings = target_embeddings.view(B, T, self.mobility_embedding_dim)
 
         return mobility_embeddings
 
@@ -237,4 +237,3 @@ class EpiForecaster(nn.Module):
             f"device={self.device}, "
             f"variant_type={self.variant_type})"
         )
-        

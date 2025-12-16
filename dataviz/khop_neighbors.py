@@ -6,7 +6,6 @@ graph data to understand the receptive field of spatial aggregation for minibatc
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,7 +39,7 @@ except ImportError:
 class KHopNeighborAnalyzer:
     """Analyzes k-hop neighborhoods in mobility graphs."""
 
-    def __init__(self, edge_index: torch.Tensor, num_nodes: Optional[int] = None):
+    def __init__(self, edge_index: torch.Tensor, num_nodes: int | None = None):
         """
         Initialize the analyzer with a graph structure.
 
@@ -105,7 +104,7 @@ class KHopNeighborAnalyzer:
         return subset, sub_edge_index
 
     def analyze_receptive_field(
-        self, max_k: int = 5, sample_nodes: Optional[list[int]] = None
+        self, max_k: int = 5, sample_nodes: list[int] | None = None
     ) -> pd.DataFrame:
         """
         Analyze receptive field growth with increasing k.
@@ -194,8 +193,8 @@ class KHopVisualizer:
         self,
         node_idx: int,
         k: int,
-        node_labels: Optional[dict] = None,
-        edge_weights: Optional[torch.Tensor] = None,
+        node_labels: dict | None = None,
+        edge_weights: torch.Tensor | None = None,
         figsize: tuple[int, int] = (12, 8),
     ) -> plt.Figure:
         """
@@ -256,7 +255,7 @@ class KHopVisualizer:
                     distance = nx.shortest_path_length(G, node_idx, node)
                     node_colors.append(plt.cm.viridis(distance / k))
                     node_sizes.append(300 - distance * 50)
-                except:
+                except Exception:
                     node_colors.append("gray")
                     node_sizes.append(200)
 
@@ -435,7 +434,7 @@ class KHopVisualizer:
         ax.grid(True, alpha=0.3, axis="y")
 
         # Add text annotations
-        for k, size in zip(k_values, recommended_batch_sizes):
+        for k, size in zip(k_values, recommended_batch_sizes, strict=False):
             ax.text(k, size + 0.5, str(size), ha="center", va="bottom")
 
         # Plot 2: Memory estimate (simplified)
@@ -537,7 +536,7 @@ class KHopVisualizer:
         return fig
 
     def create_interactive_khop_viz(
-        self, node_idx: int, max_k: int = 3, node_labels: Optional[dict] = None
+        self, node_idx: int, max_k: int = 3, node_labels: dict | None = None
     ) -> go.Figure:
         """
         Create interactive visualization of k-hop neighborhoods using Plotly.
@@ -625,7 +624,7 @@ class KHopVisualizer:
                         distance = nx.shortest_path_length(G, node_idx, node)
                         node_colors.append(colors[min(distance, len(colors) - 1)])
                         node_text.append(f"{label}<br>Distance: {distance}")
-                    except:
+                    except Exception:
                         node_colors.append("gray")
                         node_text.append(f"{label}<br>Distance: N/A")
 
@@ -798,7 +797,7 @@ def load_mobility_graph_from_nc(filepath: str) -> tuple[torch.Tensor, dict]:
         if "ds" in locals():
             try:
                 ds.close()
-            except:
+            except Exception:
                 pass
         raise RuntimeError(
             f"Failed to load mobility graph from {filepath}: {str(e)}"

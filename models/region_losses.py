@@ -5,8 +5,8 @@ Implements community-oriented contrastive loss with spatial contiguity priors
 for unsupervised geography-aware pretraining.
 """
 
-from collections import deque
 import logging
+from collections import deque
 
 import esda
 import numpy as np
