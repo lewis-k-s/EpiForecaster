@@ -228,7 +228,15 @@ class EpiDataset(Dataset):
             ).t()
             edge_weight = inflow[origins]
 
-        x = torch.cat([case_t[node_ids], bio_t[node_ids]], dim=-1)
+        #TODO: find a better way to do this. the feature concatenation logic is scattered
+        # through the model.
+        feat = []
+        if self.config.model.type.cases:
+            feat.append(case_t[node_ids])
+        if self.config.model.type.biomarkers:
+            feat.append(bio_t[node_ids])
+
+        x = torch.cat(feat, dim=-1)
 
         g = Data(x=x, edge_index=edge_index, edge_weight=edge_weight)
         g.num_nodes = node_ids.numel()
