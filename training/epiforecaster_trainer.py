@@ -722,38 +722,6 @@ class EpiForecasterTrainer:
             self.writer.add_scalar(f"Metrics/{prefix}/MAE_h{idx + 1}", mae_h, epoch)
             self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
 
-    def _log_batch(
-        self,
-        loss: float,
-        lr: float,
-        grad_norm: float,
-        batch_time_s: float,
-        data_time_s: float,
-    ):
-        self.writer.add_scalar("Loss/Train_step", loss, self.global_step)
-        self.writer.add_scalar("Learning_Rate/step", lr, self.global_step)
-        self.writer.add_scalar("GradNorm/step", grad_norm, self.global_step)
-        self.writer.add_scalar("Time/Batch_s", batch_time_s, self.global_step)
-        self.writer.add_scalar("Time/DataLoad_s", data_time_s, self.global_step)
-        self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
-
-    def _finalize_tqdm(
-        self,
-        loader_iterator: Iterator,
-        loss,
-        lr,
-        grad_norm,
-        n_samples: int,
-        batch_time_s: float,
-    ):
-        samples_per_s = (n_samples / batch_time_s) if batch_time_s > 0 else float("inf")
-        loader_iterator.set_postfix(
-            loss=loss.item(),
-            lr=f"{lr:.2e}",
-            grad=f"{float(grad_norm):.3f}",
-            sps=f"{samples_per_s:7.1f}",
-        )
-
     def _save_checkpoint(
         self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False
     ):
