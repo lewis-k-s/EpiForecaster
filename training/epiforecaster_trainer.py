@@ -11,6 +11,7 @@ The trainer works with the EpiForecaster model.
 import math
 import platform
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,22 +19,21 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torch.profiler import (
     ProfilerActivity,
     profile,
     schedule,
     tensorboard_trace_handler,
 )
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torch_geometric.data import Batch
 from tqdm.auto import tqdm
 
 from data.epi_dataset import EpiDataset, EpiDatasetItem
 from data.preprocess.config import REGION_COORD
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
-
-from torch_geometric.data import Batch
 
 
 class EpiForecasterTrainer:
@@ -361,6 +361,35 @@ class EpiForecasterTrainer:
         for key, value in hyperparams.items():
             self.writer.add_text(f"hyperparams/{key}", str(value), 0)
 
+        # Enable TensorBoard Projector by logging embeddings (if available)
+        self._log_projector_embeddings()
+
+    def _log_projector_embeddings(self):
+        """
+        Export embeddings to TensorBoard Projector.
+
+        TensorBoard's projector tab expects either a checkpoint or an
+        embedding summary (tensors + metadata). When we only write scalar
+        summaries, the projector UI shows "No checkpoint was found". By
+        proactively writing embeddings here, the projector can render
+        without TensorFlow checkpoints.
+        """
+        if self.region_embeddings is None:
+            return
+
+        # Use region labels from the dataset for metadata so points are readable
+        region_labels = [
+            str(label) for label in self.train_dataset.dataset[REGION_COORD].values
+        ]
+
+        # The projector expects CPU tensors; ensure a detached copy
+        self.writer.add_embedding(
+            mat=self.region_embeddings.detach().cpu(),
+            metadata=region_labels,
+            tag="region_embeddings/static",
+            global_step=0,
+        )
+
     def _setup_profiler(self):
         activities = [ProfilerActivity.CPU]
         if self.device.type == "cuda":
@@ -397,36 +426,19 @@ class EpiForecasterTrainer:
 
         # Training loop
         for epoch in range(self.current_epoch, self.config.training.epochs):
-            epoch_start_time = time.time()
             self.current_epoch = epoch
 
-            # Training phase
-            train_loss = self._train_epoch()
+            _train_loss = self._train_epoch()
 
             # Validation phase
-            val_loss, val_metrics = self._evaluate_split(
-                split_name="Val", loader=self.val_loader, epoch=epoch
+            val_loss, val_metrics = self._evaluate_split(self.val_loader)
+            self._log_epoch(
+                split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
 
             # Learning rate scheduling
             if self.scheduler:
                 self.scheduler.step()
-
-            # Record metrics
-            epoch_time = time.time() - epoch_start_time
-            self.training_history["train_loss"].append(train_loss)
-            self.training_history["val_loss"].append(val_loss)
-            self.training_history["val_mae"].append(val_metrics["mae"])
-            self.training_history["val_rmse"].append(val_metrics["rmse"])
-            self.training_history["val_smape"].append(val_metrics["smape"])
-            self.training_history["val_r2"].append(val_metrics["r2"])
-            self.training_history["learning_rate"].append(
-                self.optimizer.param_groups[0]["lr"]
-            )
-            self.training_history["epoch_times"].append(epoch_time)
-
-            # Logging
-            self._log_epoch(epoch, train_loss, val_loss, val_metrics, epoch_time)
 
             # Checkpointing
             if (
@@ -550,7 +562,7 @@ class EpiForecasterTrainer:
                     grad=f"{float(grad_norm):.3f}",
                     sps=f"{samples_per_s:7.1f}",
                 )
-                
+
             # Tensorboard: per-iteration metrics
             self.writer.add_scalar("Loss/Train_step", loss.item(), self.global_step)
             self.writer.add_scalar("Learning_Rate/step", lr, self.global_step)
@@ -563,8 +575,7 @@ class EpiForecasterTrainer:
                 profiler.step()
                 if (
                     self.config.training.profiler.profile_batches is not None
-                    and (batch_idx + 1)
-                    >= self.config.training.profiler.profile_batches
+                    and (batch_idx + 1) >= self.config.training.profiler.profile_batches
                 ):
                     break
 
@@ -578,9 +589,7 @@ class EpiForecasterTrainer:
         effective_batches = max(1, counted_batches)
         return total_loss / effective_batches
 
-    def _evaluate_split(
-        self, split_name: str, loader: DataLoader, epoch: int | None = None
-    ) -> tuple[float, dict[str, Any]]:
+    def _evaluate_split(self, loader: DataLoader) -> tuple[float, dict[str, Any]]:
         """Shared evaluation for validation and test splits with extra metrics."""
         self.model.eval()
 
@@ -597,11 +606,20 @@ class EpiForecasterTrainer:
         per_h_mse_sum = torch.zeros(horizon)
 
         num_batches = len(loader)
-        iterator = loader
+        eval_iter = loader
+        if self.use_tqdm:
+            eval_iter = tqdm(
+                loader,
+                desc=f"Eval {self.current_epoch + 1}/{self.config.training.epochs}",
+                leave=False,
+                total=num_batches,
+            )
 
         epsilon = 1e-6
         with torch.no_grad():
-            for batch_data in iterator:
+            for batch_idx, batch_data in enumerate(eval_iter):
+                batch_start_time = time.time()
+
                 targets = batch_data["Target"].to(self.device)
                 predictions = self.model.forward(
                     cases_hist=batch_data["CaseNode"].to(self.device),
@@ -633,6 +651,17 @@ class EpiForecasterTrainer:
                 per_h_mae_sum += abs_diff.sum(dim=0).detach().cpu()
                 per_h_mse_sum += (diff**2).sum(dim=0).detach().cpu()
 
+                if self.use_tqdm:
+                    bsz = int(batch_data["CaseNode"].shape[0])
+                    batch_time_s = time.time() - batch_start_time
+                    samples_per_s = (
+                        (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
+                    )
+                    eval_iter.set_postfix(
+                        n=f"{batch_idx + 1}/{num_batches}",
+                        sps=samples_per_s,
+                    )
+
         mean_loss = total_loss / max(1, num_batches)
         mean_mae = mae_sum / max(1, total_count)
         mean_rmse = math.sqrt(mse_sum / max(1, total_count)) if total_count else 0.0
@@ -662,44 +691,16 @@ class EpiForecasterTrainer:
 
     def test_epoch(self) -> tuple[float, dict[str, Any]]:
         """Public test evaluation entrypoint."""
-        test_loss, test_metrics = self._evaluate_split(
-            "Test", self.test_loader, self.current_epoch
+        test_loss, test_metrics = self._evaluate_split(self.test_loader)
+        self._log_epoch(
+            split_name="Test",
+            loss=test_loss,
+            metrics=test_metrics,
+            epoch=self.current_epoch,
         )
-        self._log_split("Test", test_loss, test_metrics, self.current_epoch)
         return test_loss, test_metrics
 
     def _log_epoch(
-        self,
-        epoch: int,
-        train_loss: float,
-        val_loss: float,
-        val_metrics: dict[str, Any],
-        epoch_time: float,
-    ):
-        """Log epoch results with validation metrics."""
-        print(
-            f"Epoch {epoch + 1:3d}/{self.config.training.epochs}: "
-            f"Train Loss = {train_loss:.6f}, "
-            f"Val Loss = {val_loss:.6f}, "
-            f"Val MAE = {val_metrics['mae']:.6f}, "
-            f"Val RMSE = {val_metrics['rmse']:.6f}, "
-            f"Val sMAPE = {val_metrics['smape']:.6f}, "
-            f"Time = {epoch_time:.2f}s, "
-            f"LR = {self.optimizer.param_groups[0]['lr']:.2e}"
-        )
-        assert not math.isnan(train_loss), "Train loss is NaN"
-        assert not math.isnan(val_loss), "Validation loss is NaN"
-
-        # Tensorboard logging
-        self.writer.add_scalar("Loss/Train", train_loss, epoch)
-        self.writer.add_scalar("Loss/Validation", val_loss, epoch)
-        self._log_split("Val", val_loss, val_metrics, epoch)
-        self.writer.add_scalar(
-            "Learning_Rate", self.optimizer.param_groups[0]["lr"], epoch
-        )
-        self.writer.add_scalar("Time/Epoch", epoch_time, epoch)
-
-    def _log_split(
         self,
         split_name: str,
         loss: float,
@@ -720,6 +721,38 @@ class EpiForecasterTrainer:
         ):
             self.writer.add_scalar(f"Metrics/{prefix}/MAE_h{idx + 1}", mae_h, epoch)
             self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
+
+    def _log_batch(
+        self,
+        loss: float,
+        lr: float,
+        grad_norm: float,
+        batch_time_s: float,
+        data_time_s: float,
+    ):
+        self.writer.add_scalar("Loss/Train_step", loss, self.global_step)
+        self.writer.add_scalar("Learning_Rate/step", lr, self.global_step)
+        self.writer.add_scalar("GradNorm/step", grad_norm, self.global_step)
+        self.writer.add_scalar("Time/Batch_s", batch_time_s, self.global_step)
+        self.writer.add_scalar("Time/DataLoad_s", data_time_s, self.global_step)
+        self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
+
+    def _finalize_tqdm(
+        self,
+        loader_iterator: Iterator,
+        loss,
+        lr,
+        grad_norm,
+        n_samples: int,
+        batch_time_s: float,
+    ):
+        samples_per_s = (n_samples / batch_time_s) if batch_time_s > 0 else float("inf")
+        loader_iterator.set_postfix(
+            loss=loss.item(),
+            lr=f"{lr:.2e}",
+            grad=f"{float(grad_norm):.3f}",
+            sps=f"{samples_per_s:7.1f}",
+        )
 
     def _save_checkpoint(
         self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False
