@@ -185,8 +185,9 @@ def preprocess_epiforecaster(config: str, verbose: bool):
         print(f"Dataset name: {preprocess_config.dataset_name}")
         print("You can now train models using:")
         print(
-            f"  epiforecaster train --dataset {output_path} --config <training_config>"
+            "  uv run python -m cli train epiforecaster --config <training_config>"
         )
+        print(f"  (Make sure your training config contains: data.dataset_path: {output_path})")
         print(f"{'=' * 60}")
 
     except Exception as exc:
