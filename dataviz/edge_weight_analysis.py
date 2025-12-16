@@ -9,7 +9,6 @@ meaningful neighborhood weights.
 import logging
 import sys
 from pathlib import Path
-from typing import Dict
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -38,7 +37,7 @@ class EdgeWeightAnalyzer:
         self.lockdown_periods = LOCKDOWNS
         self._self_edge_cache = {}  # Cache self-edge mappings per dataset
 
-    def load_all_data(self) -> Dict[str, xr.Dataset]:
+    def load_all_data(self) -> dict[str, xr.Dataset]:
         """Load all monthly OD data files."""
         datasets = {}
         nc_files = sorted(self.data_dir.glob("*.nc"))
@@ -153,7 +152,7 @@ class EdgeWeightAnalyzer:
 
     def compute_basic_statistics(
         self,
-        datasets: Dict[str, xr.Dataset],
+        datasets: dict[str, xr.Dataset],
         exclude_self_edges: bool = True,
         normalize_by_days: bool = True,
     ) -> pd.DataFrame:
@@ -312,7 +311,7 @@ class EdgeWeightAnalyzer:
 
         return "no_emergency"
 
-    def analyze_lockdown_impact(self, stats_df: pd.DataFrame) -> Dict:
+    def analyze_lockdown_impact(self, stats_df: pd.DataFrame) -> dict:
         """Analyze the impact of lockdowns on mobility patterns."""
         # Add multiple classification methods
         stats_df["lockdown_period"] = stats_df["month"].apply(
@@ -427,7 +426,7 @@ class EdgeWeightAnalyzer:
 
         return impact_analysis
 
-    def analyze_lockdown_decay(self, datasets: Dict[str, xr.Dataset]) -> Dict:
+    def analyze_lockdown_decay(self, datasets: dict[str, xr.Dataset]) -> dict:
         """Analyze the decaying effectiveness of lockdowns over time."""
         decay_analysis = {}
 
@@ -589,7 +588,7 @@ class EdgeWeightAnalyzer:
 
         return decay_analysis
 
-    def analyze_intra_lockdown_patterns(self, decay_analysis: Dict) -> Dict:
+    def analyze_intra_lockdown_patterns(self, decay_analysis: dict) -> dict:
         """Analyze patterns within each lockdown period (early, middle, late phases)."""
         intra_patterns = {}
 
@@ -666,7 +665,7 @@ class EdgeWeightAnalyzer:
 
         return intra_patterns
 
-    def create_visualizations(self, datasets: Dict[str, xr.Dataset], output_dir: Path):
+    def create_visualizations(self, datasets: dict[str, xr.Dataset], output_dir: Path):
         """Create comprehensive visualizations of edge weight distributions."""
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -835,7 +834,7 @@ class EdgeWeightAnalyzer:
         logger.info(f"Visualizations saved to {output_dir}")
 
     def create_lockdown_visualizations(
-        self, stats_df: pd.DataFrame, impact_analysis: Dict, output_dir: Path
+        self, stats_df: pd.DataFrame, impact_analysis: dict, output_dir: Path
     ):
         """Create visualizations specifically focused on lockdown impact analysis."""
         # 4. Lockdown impact analysis
@@ -923,7 +922,7 @@ class EdgeWeightAnalyzer:
             patch_artist=True,
             labels=[p.replace("_", " ").title() for p in available_periods],
         )
-        for patch, period in zip(bp["boxes"], available_periods):
+        for patch, period in zip(bp["boxes"], available_periods, strict=False):
             patch.set_facecolor(period_colors[period])
             patch.set_alpha(0.7)
         axes[1, 0].set_ylabel("Mean Edge Weight")
@@ -1022,7 +1021,7 @@ class EdgeWeightAnalyzer:
         logger.info(f"Lockdown visualizations saved to {output_dir}")
 
     def create_decay_visualizations(
-        self, decay_analysis: Dict, intra_patterns: Dict, output_dir: Path
+        self, decay_analysis: dict, intra_patterns: dict, output_dir: Path
     ):
         """Create visualizations for lockdown effectiveness decay analysis."""
         if not decay_analysis:
@@ -1093,7 +1092,7 @@ class EdgeWeightAnalyzer:
                     xytext=(adapt_week + 1, adapt_effect - 5),
                     fontsize=9,
                     ha="left",
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1),
+                    arrowprops={"arrowstyle": "->", "color": color, "lw": 1},
                 )
 
         ax1.axhline(y=0, color="black", linestyle="--", alpha=0.3, label="Baseline")
@@ -1132,7 +1131,7 @@ class EdgeWeightAnalyzer:
             ax2.set_xticklabels(lockdown_labels)
 
             # Add value labels on bars
-            for bar, rate in zip(bars, decay_rates):
+            for bar, rate in zip(bars, decay_rates, strict=False):
                 height = bar.get_height()
                 ax2.text(
                     bar.get_x() + bar.get_width() / 2.0,
@@ -1242,7 +1241,7 @@ class EdgeWeightAnalyzer:
                     )
 
                     # Add value labels
-                    for bar, value in zip(bars, fatigue_data[:, i]):
+                    for bar, value in zip(bars, fatigue_data[:, i], strict=False):
                         ax4.text(
                             bar.get_x() + bar.get_width() / 2.0,
                             value,
@@ -1317,7 +1316,7 @@ class EdgeWeightAnalyzer:
 
             for metric_name, val1, val2 in metrics:
                 if val1 is not None and val2 is not None:
-                    if isinstance(val1, (int, float)):
+                    if isinstance(val1, int | float):
                         diff = val2 - val1
                         if (
                             "days" in metric_name
@@ -1410,10 +1409,10 @@ class EdgeWeightAnalyzer:
     def generate_report(
         self,
         stats_df: pd.DataFrame,
-        impact_analysis: Dict,
+        impact_analysis: dict,
         output_file: Path,
-        decay_analysis: Dict = None,
-        intra_patterns: Dict = None,
+        decay_analysis: dict = None,
+        intra_patterns: dict = None,
     ):
         """Generate a comprehensive markdown report including lockdown impact and decay analysis."""
         report = []
