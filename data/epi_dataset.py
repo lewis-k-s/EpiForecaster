@@ -22,7 +22,7 @@ class EpiDatasetItem(TypedDict):
     bio_node: torch.Tensor
     target: torch.Tensor
     mob: list[Data]
-    static_covariates: StaticCovariates
+    population: torch.Tensor
 
 
 class EpiDataset(Dataset):
@@ -51,6 +51,7 @@ class EpiDataset(Dataset):
         self.dataset: xr.Dataset = xr.open_zarr(self.aligned_data_path)
         self.num_nodes = self.dataset[REGION_COORD].size
 
+        self.region_embeddings = None
         if region2vec_path:
             # use pre-trained region2vec embeddings and lookup by labeled regions
             # TODO: actually run forward pass region2vec in EpiForecaster
@@ -160,7 +161,7 @@ class EpiDataset(Dataset):
         mob_graphs: list[Data] = []
         for t in range(L):
             mob_graphs.append(
-                self._mobility_ego_to_pyg(
+                self._dense_graph_to_ego_pyg(
                     mobility_history[t],
                     case_history[t],
                     biomarker_history[t],
@@ -169,6 +170,8 @@ class EpiDataset(Dataset):
                 )
             )
 
+        population = self.node_static_covariates["Pop"][target_idx]
+
         return {
             "node_label": node_label,
             "target_node": target_idx,
@@ -176,7 +179,7 @@ class EpiDataset(Dataset):
             "bio_node": biomarker_history[:, target_idx, :],
             "target": targets,
             "mob": mob_graphs,
-            "static_covariates": self.node_static_covariates,
+            "population": population,
         }
 
     def static_covariates(self) -> StaticCovariates:
@@ -193,7 +196,7 @@ class EpiDataset(Dataset):
             "Pop": population_tensor,
         }
 
-    def _mobility_ego_to_pyg(
+    def _dense_graph_to_ego_pyg(
         self,
         mob_t: torch.Tensor,
         case_t: torch.Tensor,
