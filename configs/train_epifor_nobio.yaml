@@ -29,11 +29,10 @@ training:
   epochs: 5
   learning_rate: 0.001
   weight_decay: 1.0e-05
-  num_workers: 0
+  num_workers: 5
   val_split: 0.2
   test_split: 0.1
   profiler:
     enabled: false
     profile_batches: 10
-    log_dir: outputs/profiler
-
+    log_dir: auto

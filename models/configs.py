@@ -16,8 +16,12 @@ class ProfilerConfig:
     warmup_steps: int = 1
     active_steps: int = 3
     repeat: int = 1
+    # Optional cap on the number of *training* batches to profile at the start of
+    # each epoch. When reached, the profiler is shut off and training continues.
     profile_batches: int | None = None
-    log_dir: str = "outputs/profiler"
+    # Where to write profiler traces. Use "auto" to place traces inside the
+    # TensorBoard run directory so they appear alongside scalars for that run.
+    log_dir: str = "auto"
     record_memory: bool = True
     with_stack: bool = False
 
@@ -59,6 +63,10 @@ class ModelConfig:
     max_neighbors: int
     gnn_depth: int = 2
 
+    # -- static/temporal covariates --#
+    use_population: bool = True
+    population_dim: int = 1
+
     # -- module choices --#
     gnn_module: str = ""
     forecaster_head: str = "transformer"
@@ -75,6 +83,9 @@ class ModelConfig:
                 raise ValueError("Mobility is enabled but GNN module is not specified")
             if self.gnn_module not in GNN_TYPES:
                 raise ValueError(f"Invalid GNN module: {self.gnn_module}")
+
+        if self.use_population and self.population_dim <= 0:
+            raise ValueError("population_dim must be positive when use_population is True")
 
         assert self.forecaster_head in FORECASTER_HEAD_TYPES, (
             f"Invalid forecaster head: {self.forecaster_head}"

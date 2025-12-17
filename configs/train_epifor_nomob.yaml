@@ -6,7 +6,7 @@ model:
     cases: true
     regions: true
     biomarkers: true
-    mobility: true
+    mobility: false
   params:
     biomarkers_dim: 1
     cases_dim: 1
@@ -33,6 +33,6 @@ training:
   val_split: 0.2
   test_split: 0.1
   profiler:
-    enabled: true
+    enabled: false
     profile_batches: 10
     log_dir: auto

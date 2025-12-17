@@ -31,6 +31,8 @@ class EpiForecaster(nn.Module):
         gnn_depth: int = 2,
         sequence_length: int = 14,
         forecast_horizon: int = 7,
+        use_population: bool = True,
+        population_dim: int = 1,
         device: torch.device | None = None,
         gnn_module: str = "gcn",
     ):
@@ -45,6 +47,8 @@ class EpiForecaster(nn.Module):
             gnn_module: GNN backbone for mobility graphs ('gcn' or 'gat')
             sequence_length: Length of historical context window
             forecast_horizon: Number of future time steps to forecast
+            use_population: Whether to include static population feature
+            population_dim: Dimension of the population feature (default 1)
             device: Device for tensor operations
         """
         super().__init__()
@@ -56,6 +60,8 @@ class EpiForecaster(nn.Module):
         self.mobility_embedding_dim = mobility_embedding_dim
         self.sequence_length = sequence_length
         self.forecast_horizon = forecast_horizon
+        self.use_population = use_population
+        self.population_dim = population_dim
         self.device = device or torch.device("cpu")
         self.gnn_module = gnn_module
 
@@ -74,6 +80,8 @@ class EpiForecaster(nn.Module):
             self.forecaster_input_dim += mobility_embedding_dim
         if self.variant_type.regions:
             self.forecaster_input_dim += region_embedding_dim
+        if self.use_population:
+            self.forecaster_input_dim += population_dim
 
         if self.variant_type.mobility:
             assert self.temporal_node_dim > 0, (
@@ -126,7 +134,8 @@ class EpiForecaster(nn.Module):
         mob_graphs: Sequence[Sequence[Data]] | None,
         target_nodes: torch.Tensor,
         region_embeddings: torch.Tensor | None = None,
-        node_static_covariates: dict[str, torch.Tensor] | None = None,
+        population: torch.Tensor | None = None,
+        temporal_covariates: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of three-layer EpiForecaster.
@@ -137,7 +146,8 @@ class EpiForecaster(nn.Module):
             mob_graphs: Per-batch list of per-time-step PyG graphs
             target_nodes: Indices of target nodes in the global region list [batch_size]
             region_embeddings: Optional static region embeddings [num_regions, region_embedding_dim]
-            node_static_covariates: Optional static covariates dictionary (unused here)
+            population: Optional per-node population [batch_size]
+            temporal_covariates: Optional generic temporal covariates [batch_size, seq_len, k]
 
         Returns:
             Forecasts [batch_size, forecast_horizon] for future time steps
@@ -166,10 +176,8 @@ class EpiForecaster(nn.Module):
             assert mob_graphs is not None, "Mobility graphs required but not provided."
             if not isinstance(mob_graphs, Batch):
                 raise TypeError("Expected mob_graphs to be a PyG Batch after collate.")
-            if not hasattr(mob_graphs, "B") or not hasattr(mob_graphs, "T"):
-                raise ValueError("Mobility batch missing B or T metadata.")
             mobility_embeddings = self._process_mobility_sequence_pyg(
-                mob_graphs, int(mob_graphs.B.item()), int(mob_graphs.T.item())
+                mob_graphs, B, T
             )
             features.append(mobility_embeddings)
 
@@ -180,6 +188,16 @@ class EpiForecaster(nn.Module):
             region_emb_batch = region_embeddings[target_nodes]  # (B, region_dim)
             region_emb_seq = region_emb_batch.unsqueeze(1).expand(-1, T, -1)
             features.append(region_emb_seq)
+
+        if self.use_population:
+            assert population is not None, (
+                "Population feature enabled but not provided."
+            )
+            pop_seq = population.view(B, 1, -1).expand(-1, T, -1)
+            features.append(pop_seq)
+
+        if temporal_covariates is not None:
+            features.append(temporal_covariates)
 
         x_seq = torch.cat(features, dim=-1)
 
@@ -215,14 +233,24 @@ class EpiForecaster(nn.Module):
             getattr(mob_batch, "edge_weight", None),
         )
 
-        # Gather target embeddings via ptr offsets (start index per graph)
+        # Gather target embeddings via ptr offsets (start index per graph).
+        # IMPORTANT: keep this fully tensorized to avoid `.item()` on CUDA tensors
+        # which forces device synchronization and DtoH copies.
         ptr = mob_batch.ptr  # shape (num_graphs + 1,)
-        target_indices = []
         num_graphs = ptr.numel() - 1
-        for i in range(num_graphs):
-            start = ptr[i].item()
-            tgt_local = int(mob_batch.target_node[i].item())
-            target_indices.append(start + tgt_local)
+        expected_graphs = B * T
+        if num_graphs != expected_graphs:
+            raise ValueError(
+                f"Mobility batch has {num_graphs} graphs, expected B*T={expected_graphs} "
+                f"(B={B}, T={T})."
+            )
+
+        if hasattr(mob_batch, "target_index"):
+            target_indices = mob_batch.target_index.reshape(-1).to(ptr.device)
+        else:
+            start = ptr[:-1]
+            tgt_local = mob_batch.target_node.reshape(-1).to(start.device)
+            target_indices = start + tgt_local
 
         target_embeddings = node_emb[target_indices]
         mobility_embeddings = target_embeddings.view(B, T, self.mobility_embedding_dim)

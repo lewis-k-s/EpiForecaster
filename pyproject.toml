@@ -52,6 +52,7 @@ dependencies = [
   "pyarrow>=22.0.0",
   "fastparquet>=2024.11.0",
   "torch-tb-profiler>=0.4.3",
+  "tensorboard-plugin-profile>=2.21.3",
 ]
 
 # Note: torch-scatter and torch-sparse are installed separately using:
