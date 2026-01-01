@@ -216,7 +216,6 @@ class MobilityGNNLayer(nn.Module):
             edge_index: [2, num_edges] tensor of edge connections
             edge_attr: [num_edges, 1] tensor of edge weights
         """
-        num_nodes = mobility_matrix.size(0)
 
         # Find edges with flow above threshold
         edge_mask = mobility_matrix > threshold

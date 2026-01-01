@@ -7,7 +7,7 @@ from torch_geometric.data import Batch, Data
 
 from .configs import ModelVariant
 from .forecaster_head import ForecasterHead
-from .mobility_gnn import MobilityGNN, MobilityPyGEncoder
+from .mobility_gnn import MobilityPyGEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class EpiForecaster(nn.Module):
     def __init__(
         self,
         variant_type: ModelVariant,
-        cases_dim: int = 1,
+        temporal_input_dim: int = 1,
         biomarkers_dim: int = 1,
         region_embedding_dim: int = 64,
         mobility_embedding_dim: int = 64,
@@ -40,7 +40,7 @@ class EpiForecaster(nn.Module):
         Initialize EpiForecaster with three-layer architecture.
 
         Args:
-            cases_dim: Dimension of case features (usually 1)
+            temporal_input_dim: Dimension of temporal input features (cases)
             biomarkers_dim: Dimension of biomarker features
             region_embedding_dim: Dimension of static region embeddings
             mobility_embedding_dim: Dimension of mobility embeddings
@@ -54,7 +54,7 @@ class EpiForecaster(nn.Module):
         super().__init__()
 
         self.variant_type = variant_type
-        self.cases_dim = cases_dim
+        self.temporal_input_dim = temporal_input_dim
         self.biomarkers_dim = biomarkers_dim
         self.region_embedding_dim = region_embedding_dim
         self.mobility_embedding_dim = mobility_embedding_dim
@@ -67,13 +67,13 @@ class EpiForecaster(nn.Module):
 
         self.temporal_node_dim = 0
         if self.variant_type.cases:
-            self.temporal_node_dim += cases_dim
+            self.temporal_node_dim += temporal_input_dim
         if self.variant_type.biomarkers:
             self.temporal_node_dim += biomarkers_dim
 
         self.forecaster_input_dim = 0
         if self.variant_type.cases:
-            self.forecaster_input_dim += cases_dim
+            self.forecaster_input_dim += temporal_input_dim
         if self.variant_type.biomarkers:
             self.forecaster_input_dim += biomarkers_dim
         if self.variant_type.mobility:
@@ -97,15 +97,16 @@ class EpiForecaster(nn.Module):
                     depth=gnn_depth,
                 )
             else:
-                # Fallback to legacy dense MobilityGNN (kept for backward compatibility)
-                self.mobility_gnn = MobilityGNN(
-                    in_dim=self.temporal_node_dim,
-                    hidden_dim=16,
-                    out_dim=self.mobility_embedding_dim,
-                    num_layers=gnn_depth,
-                    aggregator_type="mean",
-                    dropout=0.1,
-                )
+                raise ValueError(f"Unsupported GNN module: {gnn_module}")
+                # # Fallback to legacy dense MobilityGNN (kept for backward compatibility)
+                # self.mobility_gnn = MobilityGNN(
+                #     in_dim=self.temporal_node_dim,
+                #     hidden_dim=16,
+                #     out_dim=self.mobility_embedding_dim,
+                #     num_layers=gnn_depth,
+                #     aggregator_type="mean",
+                #     dropout=0.1,
+                # )
         else:
             self.mobility_gnn = None
 
@@ -176,9 +177,7 @@ class EpiForecaster(nn.Module):
             assert mob_graphs is not None, "Mobility graphs required but not provided."
             if not isinstance(mob_graphs, Batch):
                 raise TypeError("Expected mob_graphs to be a PyG Batch after collate.")
-            mobility_embeddings = self._process_mobility_sequence_pyg(
-                mob_graphs, B, T
-            )
+            mobility_embeddings = self._process_mobility_sequence_pyg(mob_graphs, B, T)
             features.append(mobility_embeddings)
 
         if self.variant_type.regions:
@@ -246,7 +245,7 @@ class EpiForecaster(nn.Module):
             )
 
         if hasattr(mob_batch, "target_index"):
-            target_indices = mob_batch.target_index.reshape(-1).to(ptr.device)
+            target_indices = mob_batch.target_index.reshape(-1)
         else:
             start = ptr[:-1]
             tgt_local = mob_batch.target_node.reshape(-1).to(start.device)
