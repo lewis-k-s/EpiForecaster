@@ -1,17 +1,15 @@
 data:
-  # Use valid_targets mask from dataset to filter target nodes
-  use_valid_targets: true
   dataset_path: data/processed/full_v2.zarr
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
+  use_valid_targets: true
   mobility_threshold: 10
-  window_stride: 1
   missing_permit: 0
+  window_stride: 1
   #-- smoothing --#
   smoothing:
-    enabled: true
+    enabled: false
     window: 5
     smoothing_type: rolling_mean
-  #-- log transformation --#
   log_scale: true
 model:
   type:
@@ -22,7 +20,7 @@ model:
   params:
     biomarkers_dim: 4
     cases_dim: 1
-    mobility_embedding_dim: 16
+    mobility_embedding_dim: 32
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
@@ -32,23 +30,22 @@ model:
     max_neighbors: 20
     gnn_depth: 2
 output:
-  experiment_name: local_full
+  experiment_name: mn5_epiforecaster_full
   log_dir: outputs/training
 training:
-  device: "cpu"
-  batch_size: 20
+  device: "cuda"
+  batch_size: 256
   early_stopping_patience: 5
   nan_loss_patience: 5
-  max_batches: 20
-  epochs: 5
+  epochs: 10
   learning_rate: 0.001
   weight_decay: 1.0e-05
-  num_workers: 4
-  val_split: 0.2
+  num_workers: 5
+  val_split: 0.1
   test_split: 0.1
   profiler:
     enabled: true
-    profile_batches: 10
+    profile_batches: 20
     log_dir: auto
   plot_forecasts: true
   num_forecast_samples: 3

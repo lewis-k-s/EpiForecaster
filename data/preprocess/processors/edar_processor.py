@@ -15,6 +15,7 @@ import torch
 import xarray as xr
 
 from ..config import REGION_COORD, PreprocessingConfig
+from .quality_checks import DataQualityThresholds, validate_notna_and_std
 
 
 class EDARProcessor:
@@ -43,19 +44,17 @@ class EDARProcessor:
         self.config = config
         self.validation_options = config.validation_options
 
-    def process(self, wastewater_file: str, region_metadata_file: str) -> xr.Dataset:
+    def process(self, wastewater_file: str, region_metadata_file: str) -> xr.DataArray:
         """
-        Process EDAR wastewater biomarker data into canonical xarray Dataset.
+        Process EDAR wastewater biomarker data into a canonical xarray DataArray.
 
         Args:
             wastewater_file: Path to CSV/Excel file with wastewater data
             edar_mapping: Optional mapping from EDAR plants to municipalities
 
         Returns:
-            xarray Dataset containing:
-            - edar_features: [time, edar_sites, variants]
-            - biomarkers: [time, regions, 1] (optional)
-            - attrs: Processing metadata and statistics
+            Biomarker time series aggregated to regions, as an xarray DataArray
+            with dims `[date, region_id]`.
         """
         print(f"Processing EDAR wastewater data from {wastewater_file}")
 
@@ -78,14 +77,64 @@ class EDARProcessor:
             "total_covid_flow"
         ].to_xarray()
         emap = xr.open_dataarray(region_metadata_file)
+        # EDAR contribution matrices are typically stored sparsely with NaNs where
+        # there is no contribution. `xr.dot` does not skip NaNs, so we must treat
+        # missing contributions as zeros.
+        emap = emap.fillna(0)
         emap = emap.rename({"home": REGION_COORD})
 
         print(
             f"Transforming EDAR data to regions using contribution matrix from {region_metadata_file}"
         )
-        result = xr.dot(daily_data_xr, emap, dims="edar_id")
+        if "edar_id" not in daily_data_xr.dims:
+            raise ValueError(
+                "Expected 'edar_id' dimension in processed wastewater data, "
+                f"got dims={tuple(daily_data_xr.dims)!r}"
+            )
+        if "edar_id" not in emap.dims:
+            raise ValueError(
+                "Expected 'edar_id' dimension in EDAR contribution matrix, "
+                f"got dims={tuple(emap.dims)!r}"
+            )
+
+        # Align IDs before dot product. A common silent failure mode is that
+        # `xr.dot` aligns on labels and produces all-NaNs when there is no overlap.
+        daily_data_xr = daily_data_xr.assign_coords(
+            edar_id=daily_data_xr["edar_id"].astype(str)
+        )
+        emap = emap.assign_coords(edar_id=emap["edar_id"].astype(str))
+
+        wastewater_ids = set(daily_data_xr["edar_id"].values.tolist())
+        mapping_ids = set(emap["edar_id"].values.tolist())
+        overlap = sorted(wastewater_ids.intersection(mapping_ids))
+        if not overlap:
+            wastewater_sample = sorted(wastewater_ids)[:10]
+            mapping_sample = sorted(mapping_ids)[:10]
+            raise ValueError(
+                "No overlapping 'edar_id' labels between wastewater data and "
+                "EDAR contribution matrix. This would produce an all-NaN biomarker.\n"
+                f"- wastewater edar_id sample: {wastewater_sample}\n"
+                f"- mapping edar_id sample: {mapping_sample}\n"
+                "Fix by normalizing IDs (leading zeros, prefixes) or updating the "
+                "contribution matrix to match the raw wastewater data."
+            )
+
+        daily_data_xr_aligned, emap_aligned = xr.align(
+            daily_data_xr, emap, join="inner"
+        )
+        result = xr.dot(daily_data_xr_aligned, emap_aligned, dims="edar_id")
 
         result.name = "edar_biomarker"
+
+        thresholds = DataQualityThresholds(
+            min_notna_fraction=float(
+                self.validation_options.get("min_notna_fraction", 0.99)
+            ),
+            min_std_epsilon=float(
+                self.validation_options.get("min_std_epsilon", 1e-12)
+            ),
+        )
+        validate_notna_and_std(result, name="edar_biomarker", thresholds=thresholds)
 
         return result
 

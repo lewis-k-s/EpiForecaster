@@ -10,6 +10,6 @@ __author__ = "Lewis Knox"
 __description__ = "Graph Neural Network for Mobility-Based Epidemiological Forecasting"
 
 # Make main modules easily accessible
-from . import data, graph, models
+from . import data, graph, models, plotting
 
-__all__ = ["data", "graph", "models"]
+__all__ = ["data", "graph", "models", "plotting"]

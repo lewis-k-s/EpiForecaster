@@ -14,6 +14,7 @@ import numpy as np
 import xarray as xr
 
 from ..config import TEMPORAL_COORD, PreprocessingConfig
+from .quality_checks import DataQualityThresholds, validate_notna_and_std
 
 
 class MobilityProcessor:
@@ -98,6 +99,18 @@ class MobilityProcessor:
             raise ValueError(f"Mobility path must be a Zarr directory: {mobility_path}")
 
         mobility_data = self._open_dataset(str(mobility_path))
+
+        thresholds = DataQualityThresholds(
+            min_notna_fraction=float(
+                self.config.validation_options.get("min_notna_fraction", 0.99)
+            ),
+            min_std_epsilon=float(
+                self.config.validation_options.get("min_std_epsilon", 1e-12)
+            ),
+        )
+        validate_notna_and_std(
+            mobility_data, name="mobility", var="mobility", thresholds=thresholds
+        )
 
         # stats = self._compute_statistics(od_matrix, time_coords)
 

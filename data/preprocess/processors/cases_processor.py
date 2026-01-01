@@ -2,8 +2,9 @@
 Processor for COVID-19 case data from CSV files.
 
 This module handles the conversion of COVID-19 case data from CSV format into
-canonical xarray formats. It processes temporal case counts, applies normalization,
-and handles missing values. The output is a simple (time, region) time series.
+canonical xarray formats. It processes temporal case counts and preserves missing
+values for downstream, window-scoped processing. The output is a simple
+(time, region) time series.
 """
 
 from typing import Any
@@ -23,8 +24,7 @@ class CasesProcessor:
     This processor handles:
     - Loading and parsing case data from CSV files
     - Temporal cropping to specified date ranges
-    - Normalization (log1p, standard, minmax)
-    - Missing value handling and interpolation
+    - Missing value tracking (preserves NaNs)
     - Municipality/region mapping and validation
 
     Output is a simple (time, region) time series. The model data loader
@@ -59,6 +59,9 @@ class CasesProcessor:
 
         # Convert date column and handle timezone information
         cases_df["date"] = pd.to_datetime(cases_df["date"]).dt.tz_localize(None)
+        # `evend` represents the end-of-day timestamp; strip the time component to align
+        # to the daily date_range used downstream.
+        cases_df["date"] = cases_df["date"].dt.floor("D")
 
         # Remove invalid rows
         cases_df = cases_df.dropna(subset=["date", REGION_COORD, "cases"])
@@ -120,71 +123,36 @@ class CasesProcessor:
         )
         cases_ds = cases_ds.to_dataset(name="cases")
 
-        # Handle missing values
-        cases_ds = self._interpolate_cases(cases_ds)
-
-        # Apply normalization
-        cases_ds = self._normalize(cases_ds, self.config.cases_normalization)
+        # Preserve missing values for downstream, window-scoped processing.
 
         # Validate data quality
         self._validate_cases_data_xr(cases_ds)
-
         # Create region metadata
         print(cases_ds)
         # region_info = self._create_region_info(cases_ds, region_mapping)
 
         return cases_ds
 
-    def _interpolate_cases(self, cases_ds: xr.Dataset) -> xr.Dataset:
-        """Handle missing values in case data using xarray operations."""
-        # Check temporal coverage for each region
-        temporal_coverage = (~cases_ds["cases"].isnull()).mean(dim=TEMPORAL_COORD)
-        min_coverage = self.validation_options.get("min_data_coverage", 0.8)
-
-        # Identify regions with insufficient coverage
-        low_coverage_regions = temporal_coverage < min_coverage
-        if low_coverage_regions.any():
-            num_low = int(low_coverage_regions.sum())
-            print(
-                f"Warning: {num_low} regions have < {min_coverage * 100}% data coverage"
-            )
-
-        # Interpolate missing values: forward fill then backward fill
-        # TODO: interpolate better
-        cases_filled = (
-            cases_ds["cases"].ffill(dim=TEMPORAL_COORD).bfill(dim=TEMPORAL_COORD)
-        )
-
-        # For remaining NaN values (at beginning/end), use small value
-        cases_filled = cases_filled.fillna(1e-6)
-        cases_filled = cases_filled.to_dataset(name="cases")
-
-        return cases_filled
-
-    def _normalize(self, cases_da: xr.DataArray, normalization: str) -> xr.DataArray:
-        """Apply normalization to case data."""
-        if normalization == "none":
-            return cases_da
-        elif normalization == "log1p":
-            return xr.apply_ufunc(np.log1p, cases_da + 1e-6)
-        elif normalization == "standard":
-            mean = cases_da.mean()
-            std = cases_da.std()
-            return (cases_da - mean) / (std + 1e-8)
-        elif normalization == "minmax":
-            min_val = cases_da.min()
-            max_val = cases_da.max()
-            return (cases_da - min_val) / (max_val - min_val + 1e-8)
-        else:
-            raise ValueError(f"Unknown normalization method: {normalization}")
-
     def _validate_cases_data_xr(self, cases_xr: xr.Dataset):
         """Validate processed case data quality."""
-        cases_da = cases_xr.cases
+        if "cases_normalized" in cases_xr:
+            cases_da = cases_xr.cases_normalized
+        elif "cases" in cases_xr:
+            cases_da = cases_xr.cases
+        else:
+            raise ValueError("No cases variable found for validation")
 
-        # Check for NaN values
-        if cases_da.isnull().any():
-            raise ValueError("NaN values found in processed case data")
+        # Missing data is expected; ensure we still have some observations.
+        notna_count = int(cases_da.notnull().sum())
+        if notna_count == 0:
+            raise ValueError("All values are NaN in processed case data")
+        notna_fraction = float(cases_da.notnull().mean())
+        min_coverage = self.validation_options.get("min_data_coverage", 0.8)
+        if notna_fraction < min_coverage:
+            print(
+                f"Warning: cases notna fraction {notna_fraction:.3f} below "
+                f"min_data_coverage {min_coverage:.3f}"
+            )
 
         # Check for negative values (should not exist after normalization)
         if (cases_da < 0).any():
