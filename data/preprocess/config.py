@@ -83,6 +83,11 @@ class PreprocessingConfig:
     forecast_horizon: int = 7
     sequence_length: int = 1
 
+    # Region filtering
+    min_density_threshold: float = (
+        0.5  # Minimum data density (non-NaN fraction) for a region to be valid
+    )
+
     # Output configuration
     compression: str = "blosc"
     chunk_sizes: dict[str, list[int]] | None = None
