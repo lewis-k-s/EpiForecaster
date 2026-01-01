@@ -9,6 +9,7 @@ This module provides the canonical data structures and preprocessing pipelines. 
 - RegionGraphDataset: PyTorch Dataset interface for loading preprocessed region graph Zarr datasets
 """
 
+from .cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig
 from .epi_dataset import EpiDataset
 from .preprocess import (
     OfflinePreprocessingPipeline,
@@ -17,6 +18,8 @@ from .preprocess import (
 )
 
 __all__ = [
+    "CasesPreprocessor",
+    "CasesPreprocessorConfig",
     "EpiDataset",
     "OfflinePreprocessingPipeline",
     "PreprocessingConfig",

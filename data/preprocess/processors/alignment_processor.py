@@ -2,7 +2,6 @@ import logging
 
 import numpy as np
 import pandas as pd
-import torch
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
@@ -17,7 +16,7 @@ class AlignmentProcessor:
     This processor aligns different data sources to common temporal and spatial
     dimensions using configurable strategies. It supports:
 
-    - Temporal alignment (interpolation, nearest neighbor, spline)
+    - Temporal alignment (reindexing/cropping without interpolation)
     - Spatial alignment (region matching, coordinate mapping)
     - Validation of alignment quality
     - Generation of comprehensive alignment reports
@@ -93,8 +92,8 @@ class AlignmentProcessor:
         assert not edar_data[TEMPORAL_COORD].values[-1] == target_dates.values[-1], (
             "UNEXPECTED: EDAR end date has already been expanded to target dates"
         )
-        print("Expanding EDAR dates to target dates")
-        edar_aligned = edar_data.reindex({TEMPORAL_COORD: target_dates}, fill_value=0)
+        print("Expanding EDAR dates to target dates (preserving NaNs)")
+        edar_aligned = edar_data.reindex({TEMPORAL_COORD: target_dates})
 
         # STEP 2: Spatial alignment - identify common regions
         # All datasets should use REGION_COORD for spatial dimension
@@ -125,7 +124,7 @@ class AlignmentProcessor:
             origin=common_regions, destination=common_regions
         )
         population_final = population_data.sel({REGION_COORD: common_regions})
-        edar_final = edar_aligned.reindex({REGION_COORD: common_regions}, fill_value=0)
+        edar_final = edar_aligned.reindex({REGION_COORD: common_regions})
 
         # Generate report
         _report = {
@@ -143,28 +142,3 @@ class AlignmentProcessor:
         print(aligned_dataset)
         print("-" * 50)
         return aligned_dataset
-
-    def _normalize_features(
-        self, features: torch.Tensor | np.ndarray, normalization: str
-    ) -> torch.Tensor:
-        """
-        Apply normalization to features.
-        """
-        # Convert numpy array to torch tensor if needed
-        if isinstance(features, np.ndarray):
-            features = torch.from_numpy(features).float()
-
-        if normalization == "none":
-            return features
-        elif normalization == "log1p":
-            return torch.log1p(torch.clamp(features, min=0))
-        elif normalization == "standard":
-            mean = features.mean()
-            std = features.std()
-            return (features - mean) / (std + 1e-8)
-        elif normalization == "minmax":
-            min_val = features.min()
-            max_val = features.max()
-            return (features - min_val) / (max_val - min_val + 1e-8)
-        else:
-            raise ValueError(f"Unknown normalization method: {normalization}")

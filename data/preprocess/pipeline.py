@@ -1,15 +1,16 @@
 """
 Main offline preprocessing pipeline for EpiForecaster.
 
-This module orchestrates the complete preprocessing workflow, from raw data
+This module orchestrates complete preprocessing workflow, from raw data
 loading to canonical dataset creation. It coordinates individual processors,
-handles validation, and provides comprehensive reporting throughout the
+handles validation, and provides comprehensive reporting throughout
 process.
 """
 
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -96,6 +97,10 @@ class OfflinePreprocessingPipeline:
                 }
             )
 
+            # Compute valid_targets mask based on data density
+            valid_targets_mask = self._compute_valid_targets_mask(alignment_result)
+            alignment_result["valid_targets"] = valid_targets_mask
+
             # # Store alignment report in pipeline state
             # self.pipeline_state["alignment_report"] = alignment_report
 
@@ -176,11 +181,45 @@ class OfflinePreprocessingPipeline:
         # Load population data with proper dtypes to preserve leading zeros
         df = pd.read_csv(
             population_file,
-            usecols=["id", "d.population"],  # type: ignore
+            usecols=["id", "d.population"],  # type: ignore[arg-type]
             dtype={"id": str, "d.population": int},
         )
         df = df.rename(columns={"id": REGION_COORD, "d.population": "population"})
         return df.set_index(REGION_COORD)["population"].to_xarray()
+
+    def _compute_valid_targets_mask(self, aligned_dataset: xr.Dataset) -> xr.DataArray:
+        """Compute boolean mask for regions that meet minimum density threshold.
+
+        Args:
+            aligned_dataset: Aligned dataset with cases data
+
+        Returns:
+            DataArray of shape (num_regions,) with boolean values
+        """
+        print("Computing valid_targets mask...")
+
+        cases_da = aligned_dataset.cases
+        density_threshold = self.config.min_density_threshold
+
+        # Compute data density per region (fraction of non-NaN values)
+        missing_mask = cases_da.isnull().values
+        density = 1 - (missing_mask.sum(axis=0) / missing_mask.shape[0])
+
+        # Create boolean mask
+        valid_mask = density >= density_threshold
+
+        print(
+            f"  Regions with density >= {density_threshold}: {valid_mask.sum()}/{valid_mask.size}"
+        )
+        print(f"  Average density: {density.mean():.3f}")
+
+        valid_targets_da = xr.DataArray(
+            valid_mask.astype(np.int32),
+            dims=[REGION_COORD],
+            coords={REGION_COORD: cases_da[REGION_COORD].values},
+        )
+
+        return valid_targets_da
 
     def _save_aligned_dataset(self, aligned_dataset: xr.Dataset) -> Path:
         """Save aligned dataset to processed dir."""
@@ -189,7 +228,8 @@ class OfflinePreprocessingPipeline:
             self.config.dataset_name + ".zarr"
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
-        aligned_dataset.to_zarr(aligned_dataset_path)
+        # allow overwrite mode w
+        aligned_dataset.to_zarr(aligned_dataset_path, mode="w")
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
 

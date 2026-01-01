@@ -20,6 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # PyTorch
 *.pth
@@ -61,3 +64,8 @@ Thumbs.db
 
 # UV
 .uv/
+.uv-cache/
+.cache/uv/
+
+# agents
+.claude/
