@@ -1,18 +1,31 @@
+import logging
 from pathlib import Path
 from typing import TypedDict
 
 import numpy as np
+import pandas as pd
 import torch
 import xarray as xr
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 from torch_geometric.data import Data
 
 from graph.node_encoder import Region2Vec
 from models.configs import EpiForecasterConfig
 
+from .biomarker_preprocessor import BiomarkerPreprocessor
+from .cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig
 from .preprocess.config import REGION_COORD, TEMPORAL_COORD
 
+logger = logging.getLogger(__name__)
+
 StaticCovariates = dict[str, torch.Tensor]
+
+
+def _ensure_3d(arr: np.ndarray) -> np.ndarray:
+    """Ensure array is 3D (time, region, feature), adding trailing dim if needed."""
+    if arr.ndim == 2:
+        return arr[..., None]
+    return arr
 
 
 class EpiDatasetItem(TypedDict):
@@ -21,6 +34,7 @@ class EpiDatasetItem(TypedDict):
     case_node: torch.Tensor
     bio_node: torch.Tensor
     target: torch.Tensor
+    target_scale: torch.Tensor
     mob: list[Data]
     population: torch.Tensor
 
@@ -38,29 +52,95 @@ class EpiDataset(Dataset):
 
     def __init__(
         self,
-        aligned_data_path: Path,
-        region2vec_path: Path | None,
         config: EpiForecasterConfig,
         target_nodes: list[int],
         context_nodes: list[int],
+        biomarker_preprocessor: BiomarkerPreprocessor | None = None,
+        cases_preprocessor: CasesPreprocessor | None = None,
     ):
-        self.aligned_data_path = Path(aligned_data_path)
+        self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
 
         # Load dataset
-        self.dataset: xr.Dataset = xr.open_zarr(self.aligned_data_path)
-        self.num_nodes = self.dataset[REGION_COORD].size
+        self._dataset = xr.open_zarr(self.aligned_data_path)
+        self.num_nodes = self._dataset[REGION_COORD].size
+        self.biomarker_available_mask = self._compute_biomarker_available_mask()
+
+        # Setup cases preprocessor
+        if cases_preprocessor is None:
+            cp_config = CasesPreprocessorConfig(
+                history_length=config.model.history_length,
+                log_scale=config.data.log_scale,
+                scale_epsilon=1e-6,
+                per_100k=True,
+            )
+            self.cases_preprocessor = CasesPreprocessor(cp_config)
+        else:
+            self.cases_preprocessor = cases_preprocessor
+
+        # Precompute cases
+        (
+            self.precomputed_cases,
+            self.rolling_mean,
+            self.rolling_std,
+        ) = self.cases_preprocessor.preprocess_dataset(self._dataset)
+
+        # Setup biomarker preprocessor
+        if biomarker_preprocessor is None:
+            self.biomarker_preprocessor = BiomarkerPreprocessor()
+
+            # Log biomarker availability in train split
+            available_mask_np = self.biomarker_available_mask.cpu().numpy().flatten()
+            train_nodes_with_bio = [
+                n for n in target_nodes if available_mask_np[n] == 1.0
+            ]
+            logger.info(
+                f"Train split: {len(train_nodes_with_bio)}/{len(target_nodes)} "
+                f"nodes have biomarker data"
+            )
+
+            if len(train_nodes_with_bio) == 0:
+                if self.config.model.type.biomarkers:
+                    raise ValueError(
+                        "Biomarkers enabled in config but no train nodes have biomarker data. "
+                        "Disable biomarkers or use a different train split."
+                    )
+                logger.warning(
+                    "No train nodes have biomarker data, using zero encoding"
+                )
+
+            # Convert indices to region IDs for fit_scaler
+            all_region_ids = self._dataset[REGION_COORD].values
+            train_region_ids = [all_region_ids[n] for n in train_nodes_with_bio]
+
+            # Only fit scaler on train nodes that have biomarkers
+            self.biomarker_preprocessor.fit_scaler(self._dataset, train_region_ids)
+        else:
+            self.biomarker_preprocessor = biomarker_preprocessor
+
+        # Precompute biomarkers for the entire dataset
+        # This returns a (TotalTime, NumNodes, 3) tensor
+        if "edar_biomarker" in self._dataset:
+            self.precomputed_biomarkers = torch.from_numpy(
+                self.biomarker_preprocessor.preprocess_dataset(self._dataset)
+            ).to(torch.float32)
+        else:
+            T_total = len(self._dataset[TEMPORAL_COORD])
+            # 3 channels: value=0, mask=0, age=1
+            dummy = torch.zeros((T_total, self.num_nodes, 3), dtype=torch.float32)
+            dummy[:, :, 2] = 1.0
+            self.precomputed_biomarkers = dummy
 
         self.region_embeddings = None
-        if region2vec_path:
+        if config.data.region2vec_path:
             # use pre-trained region2vec embeddings and lookup by labeled regions
             # TODO: actually run forward pass region2vec in EpiForecaster
-            _, art = Region2Vec.from_weights(region2vec_path)
+            _, art = Region2Vec.from_weights(config.data.region2vec_path)
 
             # Filter region embeddings using numpy instead of xarray to avoid requiring a named dimension
             # for the embedding size (since xarray expects all dims to be named).
             region_ids = list(art["region_ids"])
-            selected_ids = list(self.dataset[REGION_COORD].values)
+            selected_ids = list(self._dataset[REGION_COORD].values)
             region_id_index = {rid: i for i, rid in enumerate(region_ids)}
             indices = [
                 region_id_index[rid] for rid in selected_ids if rid in region_id_index
@@ -77,84 +157,168 @@ class EpiDataset(Dataset):
             )
 
         self.target_nodes = target_nodes
+        self._target_node_to_local_idx = {n: i for i, n in enumerate(target_nodes)}
         self.context_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
         self.context_mask[target_nodes] = True
         self.context_mask[context_nodes] = True
 
         # Set dimensions
         self.time_dim_size = config.model.history_length + config.model.forecast_horizon
+        self.window_stride = int(config.data.window_stride)
+        self.missing_permit = int(config.data.missing_permit)
+        self.window_starts = self._compute_window_starts()
+        self._valid_window_starts_by_node = self._compute_valid_window_starts()
+        self.window_starts = self._collect_valid_window_starts()
+        self._index_map, self._index_lookup = self._build_index_map()
 
         self.node_static_covariates = self.static_covariates()
+        self.scale_epsilon = 1e-6
+
+        # Close dataset and clear reference to avoid pickling issues
+        self._dataset.close()
+        self._dataset = None
+
+    @property
+    def dataset(self) -> xr.Dataset:
+        if self._dataset is not None:
+            return self._dataset
+
+        ds = xr.open_zarr(self.aligned_data_path)
+        if get_worker_info() is not None:
+            self._dataset = ds
+        return ds
+
+    def num_windows(self) -> int:
+        """Number of window start positions valid for at least one target node."""
+        return len(self.window_starts)
+
+    @property
+    def cases_output_dim(self) -> int:
+        """Temporal input dimension (single feature, always 1)."""
+        return 1
+
+    @property
+    def biomarkers_output_dim(self) -> int:
+        """Biomarkers dim - 4 channels (value, mask, age, has_data)."""
+        return 4
+
+    def index_for_target_node_window(self, *, target_node: int, window_idx: int) -> int:
+        """Map a (window_idx, target_node) pair to a dataset index.
+
+        window_idx indexes into the stride-based window starts (see ``num_windows``)
+        and is filtered by missingness per target node.
+        """
+        if window_idx < 0 or window_idx >= len(self.window_starts):
+            raise IndexError("Requested window exceeds available time windows")
+
+        window_start = self.window_starts[window_idx]
+        idx = self._index_lookup.get((target_node, window_start))
+        if idx is None:
+            raise KeyError(
+                "Requested window is not valid for the specified target node"
+            )
+        return idx
 
     def __len__(self) -> int:
         """Number of samples in the dataset.
 
-        One sample corresponds to a (window, node) pair. We retain the
-        non-overlapping stride of `history_length` and multiply by the number
-        of nodes to expose a per-node item API.
+        One sample corresponds to a (window, node) pair. Windows are generated
+        with the configured stride and filtered by missingness permit.
         """
-        L = self.config.model.history_length
-        H = self.config.model.forecast_horizon
-        T = len(self.dataset[TEMPORAL_COORD].values)
-        if T < L + H:
-            return 0
-        total_windows = ((T - (L + H)) // L) + 1
-        return total_windows * len(self.target_nodes)
+        return len(self._index_map)
 
     def __getitem__(self, idx: int) -> EpiDatasetItem:
         """Return a single target node over one time window.
 
-        Each item is keyed by (window_idx, target_node). The mobility slice is
+        Each item is keyed by (target_node, window_start). The mobility slice is
         converted to a PyG ego-graph per time step containing the target node
         and its incoming neighbors.
         """
 
-        N = len(self.target_nodes)
         L = self.config.model.history_length
         H = self.config.model.forecast_horizon
-        BDim = self.config.model.biomarkers_dim
-        CDim = self.config.model.cases_dim
 
-        window_idx, local_idx = divmod(idx, N)
-        target_idx = self.target_nodes[local_idx]
+        try:
+            target_idx, range_start = self._index_map[idx]
+        except IndexError as exc:
+            raise IndexError("Sample index out of range") from exc
 
         node_label = self.dataset[REGION_COORD].values[target_idx]
 
-        range_start = window_idx * L
         range_end = range_start + L
         forecast_targets = range_end + H
         T = len(self.dataset[TEMPORAL_COORD].values)
         if forecast_targets > T:
             raise IndexError("Requested window exceeds available time steps")
 
-        history = self.dataset.isel({TEMPORAL_COORD: slice(range_start, range_end)})
-        future = self.dataset.isel({TEMPORAL_COORD: slice(range_end, forecast_targets)})
+        # Optimization: Only slice mobility from dataset (disk/zarr), not everything
+        mobility_da = self.dataset.mobility.isel(
+            {TEMPORAL_COORD: slice(range_start, range_end)}
+        )
+        mobility_np = mobility_da.values
+        mobility_history = torch.from_numpy(mobility_np).to(torch.float32)
 
-        mobility_history = torch.from_numpy(history.mobility.values).to(torch.float32)
+        # Cases Processing (using precomputed tensors)
+        # 1. Get stats at the end of history window (t + L - 1)
+        stat_idx = range_end - 1
+        mean = self.rolling_mean[stat_idx]  # (N, 1)
+        std = self.rolling_std[stat_idx]  # (N, 1)
 
-        cases_np = history.cases.values
-        if cases_np.ndim == 2:
-            cases_np = cases_np[..., None]
-        cases_np = np.nan_to_num(cases_np, nan=0.0)
-        case_history = torch.from_numpy(cases_np).to(torch.float32)
+        # 2. Slice precomputed cases (L+H, N, 1)
+        cases_window = self.precomputed_cases[
+            range_start:forecast_targets
+        ]  # (L+H, N, 1)
 
-        bio_np = history.edar_biomarker.values
-        if bio_np.ndim == 2:
-            bio_np = bio_np[..., None]
-        bio_np = np.nan_to_num(bio_np, nan=0.0)
-        biomarker_history = torch.from_numpy(bio_np).to(torch.float32)
+        # 3. Normalize
+        norm_window = (cases_window - mean) / std
+        norm_window = torch.nan_to_num(norm_window, nan=0.0)
 
-        target_np = future.cases.isel({REGION_COORD: target_idx}).values
-        targets = torch.from_numpy(target_np).to(torch.float32).squeeze(-1)
+        # Split into history and future
+        case_history = norm_window[:L]  # (L, N, 1)
+        future_cases = norm_window[L:]  # (H, N, 1)
+
+        mobility_threshold = float(self.config.data.mobility_threshold)
+        neigh_mask = mobility_np[:, :, target_idx] >= mobility_threshold
+        if self.context_mask is not None:
+            context_mask_np = self.context_mask.cpu().numpy()
+            neigh_mask = neigh_mask & context_mask_np[None, :]
+            neigh_mask[:, target_idx] = True
+
+        # Apply mask to case_history
+        neigh_mask_t = torch.from_numpy(neigh_mask).to(torch.float32).unsqueeze(-1)
+        case_history = case_history * neigh_mask_t
+
+        # Encode all regions in context using 4-channel biomarker encoding
+        # Optimized: Use precomputed biomarkers + broadcasted availability mask
+
+        # 1. Get precomputed bio history (value, mask, age) -> (L, N, 3)
+        # Note: self.precomputed_biomarkers is a CPU tensor
+        bio_slice = self.precomputed_biomarkers[range_start:range_end]
+
+        # 2. Get availability mask -> (N,)
+        if self.biomarker_available_mask is not None:
+            # We assume dim 0 matches nodes. If available_mask is (N, 1), take col 0.
+            has_data = self.biomarker_available_mask[:, 0]
+        else:
+            has_data = torch.zeros(self.num_nodes, dtype=torch.float32)
+
+        # 3. Broadcast to (L, N, 1)
+        has_data_3d = has_data.view(1, self.num_nodes, 1).expand(L, -1, -1)
+
+        # 4. Concatenate -> (L, N, 4)
+        biomarker_history = torch.cat([bio_slice, has_data_3d], dim=-1)
+
+        target_np = future_cases[:, target_idx, :]
+        targets = target_np.squeeze(-1)
 
         assert mobility_history.shape == (L, self.num_nodes, self.num_nodes), (
             "Mob history shape mismatch"
         )
-        assert case_history.shape == (L, self.num_nodes, CDim), (
+        assert case_history.shape == (L, self.num_nodes, 1), (
             "Case history shape mismatch"
         )
-        assert biomarker_history.shape == (L, self.num_nodes, BDim), (
-            "Biomarker history shape mismatch"
+        assert biomarker_history.shape == (L, self.num_nodes, 4), (
+            "Biomarker history shape mismatch - expected (T, N, 4)"
         )
         assert targets.shape == (H,), "Targets shape mismatch"
 
@@ -178,6 +342,7 @@ class EpiDataset(Dataset):
             "case_node": case_history[:, target_idx, :],
             "bio_node": biomarker_history[:, target_idx, :],
             "target": targets,
+            "target_scale": std[target_idx].squeeze(-1),
             "mob": mob_graphs,
             "population": population,
         }
@@ -195,6 +360,115 @@ class EpiDataset(Dataset):
         return {
             "Pop": population_tensor,
         }
+
+    def _compute_window_starts(self) -> list[int]:
+        """Compute window start indices given history, horizon, and stride."""
+        L = self.config.model.history_length
+        H = self.config.model.forecast_horizon
+        T = len(self.dataset[TEMPORAL_COORD].values)
+        seg = L + H
+        if T < seg:
+            return []
+        return list(range(0, T - seg + 1, self.window_stride))
+
+    def _compute_biomarker_available_mask(self) -> torch.Tensor | None:
+        """Return a (num_nodes, biomarkers_output_dim) availability mask for biomarkers.
+
+        The mask is tiled to cover both raw and change features.
+        """
+        if "edar_biomarker" not in self.dataset:
+            return None
+        biomarker_da = self.dataset["edar_biomarker"]
+        values = _ensure_3d(biomarker_da.values)
+        if values.ndim != 3:
+            raise ValueError(
+                f"Expected biomarker array with 2 or 3 dims, got shape {values.shape}"
+            )
+        available = np.isfinite(values).any(axis=0)
+        available = available.astype(np.float32)
+        if available.shape[0] != self.num_nodes:
+            raise ValueError(
+                "Biomarker availability mask does not match number of nodes."
+            )
+        return torch.from_numpy(available).to(torch.float32)
+
+    def _compute_valid_window_starts(self) -> dict[int, list[int]]:
+        """Compute valid window starts per target node using missingness permit.
+
+        History windows may include up to ``missing_permit`` missing values, but
+        forecast targets must be fully observed (no NaNs).
+        """
+        if not self.window_starts:
+            return {target_idx: [] for target_idx in self.target_nodes}
+
+        other_dims = [
+            d
+            for d in self.dataset.cases.dims
+            if d not in (TEMPORAL_COORD, REGION_COORD)
+        ]
+        cases_da = self.dataset.cases.transpose(
+            TEMPORAL_COORD, REGION_COORD, *other_dims
+        )
+        cases_np = _ensure_3d(cases_da.values)
+        if cases_np.ndim != 3:
+            raise ValueError(
+                f"Expected cases array with 2 or 3 dims, got shape {cases_np.shape}"
+            )
+
+        valid = np.isfinite(cases_np).all(axis=2)
+        valid_int = valid.astype(np.int32)
+
+        L = self.config.model.history_length
+        H = self.config.model.forecast_horizon
+
+        cumsum = np.concatenate(
+            [
+                np.zeros((1, self.num_nodes), dtype=np.int32),
+                np.cumsum(valid_int, axis=0),
+            ],
+            axis=0,
+        )
+
+        history_counts = cumsum[L:] - cumsum[:-L]
+        target_counts = cumsum[L + H :] - cumsum[L:-H]
+
+        starts = np.asarray(self.window_starts, dtype=np.int64)
+        history_counts = history_counts[starts]
+        target_counts = target_counts[starts]
+
+        history_threshold = max(0, L - self.missing_permit)
+        history_ok = history_counts >= history_threshold
+        target_ok = target_counts >= H
+        valid_mask = history_ok & target_ok
+
+        starts_by_node: dict[int, list[int]] = {}
+        for target_idx in self.target_nodes:
+            mask = valid_mask[:, target_idx]
+            starts_by_node[target_idx] = [
+                int(s) for s, ok in zip(starts, mask, strict=False) if ok
+            ]
+
+        return starts_by_node
+
+    def _collect_valid_window_starts(self) -> list[int]:
+        """Return sorted window starts that are valid for at least one target node."""
+        unique_starts: set[int] = set()
+        for starts in self._valid_window_starts_by_node.values():
+            unique_starts.update(starts)
+        return sorted(unique_starts)
+
+    def _build_index_map(
+        self,
+    ) -> tuple[list[tuple[int, int]], dict[tuple[int, int], int]]:
+        """Build index mappings for fast (node, window_start) lookup."""
+        index_map: list[tuple[int, int]] = []
+        index_lookup: dict[tuple[int, int], int] = {}
+        for target_idx in self.target_nodes:
+            for start in self._valid_window_starts_by_node.get(target_idx, []):
+                idx = len(index_map)
+                index_map.append((target_idx, start))
+                index_lookup[(target_idx, start)] = idx
+        return index_map, index_lookup
 
     def _dense_graph_to_ego_pyg(
         self,
@@ -231,7 +505,7 @@ class EpiDataset(Dataset):
             ).t()
             edge_weight = inflow[origins]
 
-        #TODO: find a better way to do this. the feature concatenation logic is scattered
+        # TODO: find a better way to do this. the feature concatenation logic is scattered
         # through the model.
         feat = []
         if self.config.model.type.cases:
@@ -255,6 +529,37 @@ class EpiDataset(Dataset):
             f"seq_len={self.time_dim_size}, "
             f"nodes={self.num_nodes})"
         )
+
+    def missingness_features(self, data: xr.DataArray) -> torch.Tensor:
+        """Return a missingness indicator tensor for a (time, region[, feature]) array."""
+        if not isinstance(data, xr.DataArray):
+            raise TypeError("missingness_features expects an xarray DataArray")
+        mask = _ensure_3d(data.isnull().values)
+        return torch.from_numpy(mask).to(torch.float32)
+
+    def calendar_features(
+        self, time_index: pd.DatetimeIndex | None = None
+    ) -> torch.Tensor:
+        """Return simple calendar covariates for each timestamp.
+
+        Features: day-of-week one-hot (7), month one-hot (12), day-of-year sin/cos (2).
+        Shape: (time, 21).
+        """
+        if time_index is None:
+            time_index = pd.DatetimeIndex(self.dataset[TEMPORAL_COORD].values)
+
+        dow = time_index.dayofweek.to_numpy()
+        months = time_index.month.to_numpy()
+        doy = time_index.dayofyear.to_numpy()
+
+        dow_oh = np.eye(7, dtype=np.float32)[dow]
+        month_oh = np.eye(12, dtype=np.float32)[months - 1]
+        doy_angle = 2 * np.pi * (doy / 365.25)
+        doy_sin = np.sin(doy_angle).astype(np.float32)[:, None]
+        doy_cos = np.cos(doy_angle).astype(np.float32)[:, None]
+
+        features = np.concatenate([dow_oh, month_oh, doy_sin, doy_cos], axis=1)
+        return torch.from_numpy(features).to(torch.float32)
 
     @classmethod
     def load_canonical_dataset(cls, aligned_data_path: Path) -> xr.Dataset:
