@@ -8,6 +8,25 @@ FORECASTER_HEAD_TYPES = ["transformer"]
 
 
 @dataclass
+class SmoothingConfig:
+    """Temporal smoothing configuration for case data."""
+
+    enabled: bool = False
+    window: int = 5
+    smoothing_type: str = "none"
+
+    def __post_init__(self) -> None:
+        valid_types = {"none", "rolling_mean", "rolling_sum"}
+        if self.smoothing_type not in valid_types:
+            raise ValueError(
+                f"Invalid smoothing_type: {self.smoothing_type}. "
+                f"Valid options: {sorted(valid_types)}"
+            )
+        if self.window <= 0:
+            raise ValueError("smoothing.window must be positive")
+
+
+@dataclass
 class ProfilerConfig:
     """Lightweight toggle for torch.profiler sampling during training."""
 
@@ -36,12 +55,34 @@ class ModelVariant:
 
 @dataclass
 class DataConfig:
-    """Dataset configuration loaded from the ``data`` YAML block."""
+    """Dataset configuration loaded from ``data`` YAML block."""
 
     dataset_path: str = ""
     regions_data_path: str = ""
-    # .pt file containing the region2vec encoder model weights
+    # .pt file containing region2vec encoder model weights
     region2vec_path: str = ""
+    # Minimum incoming mobility flow to include a node in the neighborhood mask.
+    mobility_threshold: float = 0.0
+    # Use valid_targets mask from dataset to filter target nodes
+    use_valid_targets: bool = False
+    # Sliding window stride for training samples
+    window_stride: int = 1
+    # Maximum allowed missing values in a history window
+    missing_permit: int = 0
+    # Temporal smoothing configuration for case data
+    smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
+    # Log transformation for cases and biomarkers
+    log_scale: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.smoothing, dict):
+            self.smoothing = SmoothingConfig(**self.smoothing)
+
+        if self.window_stride <= 0:
+            raise ValueError("window_stride must be positive")
+
+        if self.missing_permit < 0:
+            raise ValueError("missing_permit must be non-negative")
 
 
 @dataclass
@@ -85,7 +126,9 @@ class ModelConfig:
                 raise ValueError(f"Invalid GNN module: {self.gnn_module}")
 
         if self.use_population and self.population_dim <= 0:
-            raise ValueError("population_dim must be positive when use_population is True")
+            raise ValueError(
+                "population_dim must be positive when use_population is True"
+            )
 
         assert self.forecaster_head in FORECASTER_HEAD_TYPES, (
             f"Invalid forecaster head: {self.forecaster_head}"
@@ -94,15 +137,19 @@ class ModelConfig:
 
 @dataclass
 class TrainingParams:
-    """Trainer hyper-parameters from the ``training`` YAML block."""
+    """Trainer hyper-parameters from ``training`` YAML block."""
 
     epochs: int = 100
     batch_size: int = 32
-    learning_rate: float = 0.001
-    weight_decay: float = 1e-5
+    max_batches: int | None = None
+    learning_rate: float = 1.0e-3
+    weight_decay: float = 1.0e-5
+    model_id: str = ""
+    resume: bool = False
     scheduler_type: str = "cosine"
     gradient_clip_value: float = 1.0
     early_stopping_patience: int = 10
+    nan_loss_patience: int | None = None
     val_split: float = 0.2
     test_split: float = 0.1
     device: str = "auto"
@@ -110,8 +157,18 @@ class TrainingParams:
     pin_memory: bool = True
     eval_frequency: int = 5
     eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
-    use_tqdm: bool = True
+    # forecast plotting during validation/test evaluation
+    plot_forecasts: bool = True
+    num_forecast_samples: int = (
+        3  # Number of samples per category (best, worst, random)
+    )
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+
+    def __post_init__(self) -> None:
+        if self.resume and not self.model_id:
+            raise ValueError(
+                "model_id must be provided when resume is True. If you are not resuming, leave model_id empty."
+            )
 
 
 @dataclass
