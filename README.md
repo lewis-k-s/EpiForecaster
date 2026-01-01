@@ -5,6 +5,52 @@ A PyTorch Geometric implementation for epidemiological forecasting which combine
 For information on the forecaster model design see EPIFORECASTER.md
 For information on the region embedding model design see REGION2VEC.md
 
+## Model Architecture
+
+The `EpiForecaster` assembly in `models/epiforecaster.py` orchestrates three cooperating modules: the inductive region embedder defined in `graph/node_encoder.py`, the per-time-step mobility GNN in `models/mobility_gnn.py`, and the Transformer forecasting head in `models/forecaster_head.py`. The diagram below shows how static, mobility, and temporal signals move through the complete model.
+
+```mermaid
+flowchart TD
+    subgraph Inputs
+        cases[["covid case incidence
+        (T,N,1)"]]
+        biomarkers[["biomarkers
+        (T,N,F_bio)"]]
+        mobility[["mobility
+        (T,N,N,1)"]]
+        regions[["region geometries, spatial metadata
+        (N,F_regions)"]]
+    end
+
+    subgraph Region2Vec
+        regionEmbedder["Region Embedder
+        (graph/node_encoder.py)"]
+    end
+
+    subgraph TimeStepProcessing
+        featureBuilder["Local feature builder
+        (models/epiforecaster.py)"]
+        mobilityGNN["Mobility GNN
+        (models/mobility_gnn.py)"]
+    end
+
+    subgraph TemporalHead
+        transformerHead["Transformer Forecaster Head
+        (models/forecaster_head.py)"]
+    end
+
+    cases --> featureBuilder
+    biomarkers --> featureBuilder
+    regions --> regionEmbedder --> featureBuilder
+    featureBuilder --> mobilityGNN
+    mobility --> mobilityGNN
+    regionEmbedder --> mobilityGNN
+    mobilityGNN --> transformerHead
+    featureBuilder --> transformerHead
+    transformerHead --> forecasts[["- H-step forecasts
+    - Outbreak classification"]]
+```
+
 ## Installation
 
 ```bash
@@ -22,13 +68,6 @@ The installation provides access to the `epiforecaster` command-line interface:
 - After `pip install -e .`: Use `epiforecaster` directly
 - With `uv`: Use `uv run python -m cli` (recommended for development)
 
-### Key Dependencies
-
-- **PyTorch Ecosystem**: `torch>=2.0.0`, `torch-geometric>=2.3.0`
-- **NetCDF Processing**: `xarray>=2024.7.0`, `netcdf4>=1.7.2`, `h5netcdf>=1.6.4`
-- **Scientific Computing**: `numpy>=1.24.0`, `pandas>=2.0.0`, `dask>=2024.8.0`
-- **Geospatial**: `geopandas>=0.13.0`, `shapely>=2.0.0`
-
 ## Usage
 
 EpiForecaster follows a two-step workflow: data preprocessing followed by model training. All operations are managed through the `epiforecaster` CLI with YAML configuration files.
@@ -36,16 +75,8 @@ EpiForecaster follows a two-step workflow: data preprocessing followed by model 
 ### Quick Start
 
 ```bash
-# 1. Copy and modify a preprocessing configuration
-cp configs/preprocess_example.yaml preprocess_config.yaml
-
-# 2. Run data preprocessing (explicit subcommand required)
 uv run python -m cli preprocess epiforecaster --config preprocess_config.yaml
 
-# 3. Copy and modify a training configuration for the full model
-cp configs/epiforecaster_full.yaml train_config.yaml
-
-# 4. Train the model (dataset path is read from config)
 uv run python -m cli train epiforecaster --config train_config.yaml
 ```
 

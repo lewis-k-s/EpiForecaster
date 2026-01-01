@@ -21,11 +21,11 @@ For detailed information on the region embedding model design see REGION2VEC.md
 # Install dependencies
 uv sync
 
-# Code quality and testing
-uv run ruff check         # linting
-uv run ruff format        # formatting
-uv run mypy .            # type checking
-uv run pytest           # run tests
+# Dev loop (run these often)
+uv run ruff check .        # linting (required)
+uv run pytest tests/       # tests (required)
+uv run ruff format .       # formatting
+uv run mypy .              # type checking (best-effort; excludes dataviz/plotting)
 
 # CLI usage
 .venv/bin/python -m cli --help  # access CLI commands
@@ -34,7 +34,7 @@ uv run pytest           # run tests
 
 ## Coding Style & Naming Conventions
 
-- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with mypy (py39 target).
+- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with mypy.
 - Indentation: 4 spaces; no tabs. Imports sorted (Ruff isort rules).
 - Naming: modules `snake_case.py`, classes `PascalCase`, functions/vars `snake_case`, constants `UPPER_SNAKE_CASE`.
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.
@@ -46,7 +46,7 @@ uv run pytest           # run tests
 - Framework: pytest. Place tests under `tests/` as `test_*.py`.
 - Cover new/changed logic with focused unit tests; avoid network/IO in unit tests.
 - Use fixtures for sample data; keep tests deterministic (seed RNGs).
-- Quick examples: `uv run pytest -k graph`, `uv run pytest -q`.
+- Quick examples: `uv run pytest -k graph tests/`, `uv run pytest -q tests/`.
 
 ## Configuration-Driven Development
 
@@ -70,7 +70,7 @@ The canonical data pipeline follows: raw data → preprocessing → Zarr dataset
 
 - Commits: imperative mood, scoped, and small (e.g., `graph: add OD edge builder`). Reference issues when applicable.
 - PRs must include: concise description, rationale, screenshots of plots (if any) saved to `outputs/`, and notes on breaking changes.
-- CI gates locally: ensure `uv run ruff check` and `uv run pytest` pass before requesting review.
+- CI gates locally: ensure `uv run ruff check .` and `uv run pytest tests/` pass before requesting review.
 
 ## Agent-Specific Instructions
 
