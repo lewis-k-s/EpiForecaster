@@ -9,6 +9,7 @@ This replaces the complex variant-specific CLI with configuration-driven trainin
 """
 
 import logging
+import math
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from training.epiforecaster_trainer import (
     EpiForecasterTrainer,
 )
 from training.region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
+from utils.logging import setup_logging
 
 VALID_DEVICES = ["auto", "cpu", "cuda", "mps"]
 
@@ -43,10 +45,7 @@ def cli(debug: bool):
     for epidemiological forecasting using canonical datasets.
     """
     level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    setup_logging(level=level)
 
 
 @cli.group("preprocess")
@@ -161,34 +160,36 @@ def preprocess_regions(
 @click.option(
     "--config", required=True, help="Path to preprocessing configuration file"
 )
-@click.option("--verbose", is_flag=True, help="Enable verbose logging")
-def preprocess_epiforecaster(config: str, verbose: bool):
+def preprocess_epiforecaster(config: str):
     """Run the standard EpiForecaster preprocessing pipeline."""
     try:
         preprocess_config = PreprocessingConfig.from_file(config)
 
-        if verbose:
-            print(f"Loading configuration from: {config}")
-            print("Configuration summary:")
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loading configuration from: {config}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Configuration summary:")
             summary = preprocess_config.summary()
             for section, info in summary.items():
-                print(f"  {section}: {info}")
-            print()
+                logger.debug(f"  {section}: {info}")
 
         pipeline = OfflinePreprocessingPipeline(preprocess_config)
         output_path = pipeline.run()
 
-        print(f"\n{'=' * 60}")
-        print("✅ PREPROCESSING COMPLETED SUCCESSFULLY")
-        print(f"{'=' * 60}")
-        print(f"Dataset saved to: {output_path}")
-        print(f"Dataset name: {preprocess_config.dataset_name}")
-        print("You can now train models using:")
-        print(
+        logger = logging.getLogger(__name__)
+        logger.info(f"\n{'=' * 60}")
+        logger.info("✅ PREPROCESSING COMPLETED SUCCESSFULLY")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"Dataset saved to: {output_path}")
+        logger.info(f"Dataset name: {preprocess_config.dataset_name}")
+        logger.info("You can now train models using:")
+        logger.info(
             "  uv run python -m cli train epiforecaster --config <training_config>"
         )
-        print(f"  (Make sure your training config contains: data.dataset_path: {output_path})")
-        print(f"{'=' * 60}")
+        logger.debug(
+            f"  (Make sure your training config contains: data.dataset_path: {output_path})"
+        )
+        logger.info(f"{'=' * 60}")
 
     except Exception as exc:
         click.echo(f"❌ Preprocessing failed: {exc}", err=True)
@@ -200,6 +201,139 @@ def preprocess_epiforecaster(config: str, verbose: bool):
 def train_group():
     """Train forecasting models or specialized submodules."""
     pass
+
+
+@cli.group("eval")
+def eval_group():
+    """Evaluate trained checkpoints and generate plots."""
+    pass
+
+
+@eval_group.command("epiforecaster")
+@click.option(
+    "--checkpoint",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Path to a saved `.pt` checkpoint (e.g., best_model.pt).",
+)
+@click.option(
+    "--split",
+    type=click.Choice(["val", "test"], case_sensitive=False),
+    default="val",
+    show_default=True,
+    help="Which split to evaluate for top-k node selection.",
+)
+@click.option(
+    "--topk",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Number of best (lowest MAE) target nodes to visualize.",
+)
+@click.option(
+    "--window",
+    type=click.Choice(["last"], case_sensitive=False),
+    default="last",
+    show_default=True,
+    help="Which window to plot for each selected node.",
+)
+@click.option(
+    "--device",
+    type=click.Choice(VALID_DEVICES),
+    default="auto",
+    show_default=True,
+    help="Device to use for evaluation.",
+)
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional output image path (e.g., outputs/plots/topk_val.png).",
+)
+@click.option(
+    "--quiet",
+    is_flag=True,
+    help="Suppress evaluation progress logs.",
+)
+@click.option(
+    "--log-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional TensorBoard log dir for eval metrics.",
+)
+def eval_epiforecaster(
+    checkpoint: Path,
+    split: str,
+    topk: int,
+    window: str,
+    device: str,
+    output: Path | None,
+    quiet: bool,
+    log_dir: Path | None,
+):
+    """Evaluate an EpiForecaster checkpoint and plot top-k forecasts."""
+    try:
+        from evaluation.epiforecaster_eval import evaluate_checkpoint_topk_forecasts
+
+        resolved_log_dir = _resolve_eval_log_dir(checkpoint, log_dir)
+        result = evaluate_checkpoint_topk_forecasts(
+            checkpoint_path=checkpoint,
+            split=split,
+            k=topk,
+            device=device,
+            window=window,
+            output_path=output,
+            log_dir=resolved_log_dir,
+        )
+
+        topk_nodes = result["topk_nodes"]
+        click.echo(
+            f"Top-{len(topk_nodes)} target nodes (by MAE on {split}): {topk_nodes}"
+        )
+        loss = result.get("eval_loss", float("nan"))
+        metrics = result.get("eval_metrics", {})
+        summary = _format_eval_summary(loss, metrics)
+        click.echo(f"\nEval summary ({split}):\n{summary}")
+        if resolved_log_dir is not None:
+            click.echo(f"Eval metrics logged to: {resolved_log_dir}")
+        if output is not None:
+            click.echo(f"Saved plot to: {output}")
+    except Exception as exc:  # pragma: no cover - Click will handle reporting
+        click.echo(f"❌ Evaluation failed: {exc}", err=True)
+        click.echo(traceback.format_exc(), err=True)
+        raise click.ClickException(str(exc)) from exc
+
+
+def _resolve_eval_log_dir(checkpoint: Path, log_dir: Path | None) -> Path | None:
+    if log_dir is not None:
+        return log_dir
+
+    parts = checkpoint.parts
+    if "checkpoints" in parts:
+        idx = parts.index("checkpoints")
+        if idx > 0:
+            return Path(*parts[:idx])
+    return None
+
+
+def _format_eval_summary(loss: float, metrics: dict) -> str:
+    def _fmt(value: float) -> str:
+        if value is None or not math.isfinite(value):
+            return "n/a"
+        return f"{value:.6f}"
+
+    rows = [
+        ("Loss", _fmt(loss)),
+        ("MAE", _fmt(metrics.get("mae"))),
+        ("RMSE", _fmt(metrics.get("rmse"))),
+        ("sMAPE", _fmt(metrics.get("smape"))),
+        ("R2", _fmt(metrics.get("r2"))),
+    ]
+    lines = ["Metric  Value"]
+    lines.append("------  ------")
+    for name, value in rows:
+        lines.append(f"{name:<6}  {value}")
+    return "\n".join(lines)
 
 
 @train_group.command("regions")
@@ -232,7 +366,6 @@ def train_group():
     is_flag=True,
     help="Load configuration and initialize the trainer without running optimization",
 )
-@click.option("--verbose", is_flag=True, help="Print detailed setup information")
 def train_regions(
     config: str,
     epochs: int | None,
@@ -240,7 +373,6 @@ def train_regions(
     output_dir: Path | None,
     no_cluster: bool,
     dry_run: bool,
-    verbose: bool,
 ):
     """Train the Region2Vec-style region embedder via configuration."""
     try:
@@ -248,33 +380,32 @@ def train_regions(
 
         trainer = Region2VecTrainer(region_config)
 
-        if verbose or dry_run:
-            summary = trainer.describe()
-            click.echo("Region embedder configuration:")
-            for key, value in summary.items():
-                click.echo(f"  - {key}: {value}")
-
+        logger = logging.getLogger(__name__)
         if dry_run:
+            summary = trainer.describe()
+            logger.info("Region embedder configuration:")
+            for key, value in summary.items():
+                logger.info(f"  - {key}: {value}")
             click.echo("Dry run complete. No training executed.")
             return
 
         results = trainer.run()
-        click.echo(f"\n{'=' * 60}")
-        click.echo("✅ REGION EMBEDDING TRAINING COMPLETED")
-        click.echo(f"{'=' * 60}")
-        click.echo(f"Best loss: {results['best_loss']:.6f}")
-        click.echo(f"Epochs run: {results['epochs']}")
+        logger.info(f"\n{'=' * 60}")
+        logger.info("✅ REGION EMBEDDING TRAINING COMPLETED")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"Best loss: {results['best_loss']:.6f}")
+        logger.info(f"Epochs run: {results['epochs']}")
         artifacts = results.get("artifacts", {})
         embedding_path = artifacts.get("embedding_path")
         metrics_path = artifacts.get("metrics_path")
         cluster_path = artifacts.get("cluster_labels_path")
         if embedding_path:
-            click.echo(f"Embeddings saved to: {embedding_path}")
+            logger.info(f"Embeddings saved to: {embedding_path}")
         if metrics_path:
-            click.echo(f"Metrics written to: {metrics_path}")
+            logger.info(f"Metrics written to: {metrics_path}")
         if cluster_path:
-            click.echo(f"Cluster labels saved to: {cluster_path}")
-        click.echo(f"{'=' * 60}")
+            logger.info(f"Cluster labels saved to: {cluster_path}")
+        logger.info(f"{'=' * 60}")
 
     except Exception as exc:  # pragma: no cover - Click will handle reporting
         click.echo(f"❌ Region training failed: {exc}", err=True)
@@ -284,50 +415,69 @@ def train_regions(
 
 @train_group.command("epiforecaster")
 @click.option("--config", required=True, help="Path to training configuration file")
-@click.option("--verbose", is_flag=True, help="Enable verbose logging")
+@click.option("--model-id", default="", help="Model id for logging/checkpoints")
+@click.option("--resume", is_flag=True, help="Resume training from a saved checkpoint")
 @click.option(
-    "--progress/--no-progress",
-    default=True,
-    show_default=True,
-    help="Show tqdm progress bars during training",
+    "--max-batches",
+    type=int,
+    default=None,
+    help="Maximum number of batches to run (for smoke testing)",
 )
-def train_epiforecaster(config: str, verbose: bool, progress: bool):
-    """Train the EpiForecaster model."""
-    _run_forecaster_training(config, verbose, progress)
+def train_epiforecaster(
+    config: str, model_id: str, resume: bool, max_batches: int | None
+):
+    """Train EpiForecaster model."""
+    _run_forecaster_training(config, model_id, resume, max_batches)
 
 
-def _run_forecaster_training(config: str, verbose: bool, progress: bool) -> None:
+def _run_forecaster_training(
+    config: str, model_id: str, resume: bool, max_batches: int | None
+) -> None:
     """Execute the original unified forecaster training workflow."""
     try:
         trainer_config = EpiForecasterConfig.from_file(config)
         # Dataset path should be read from the config file
+        if model_id:
+            trainer_config.training.model_id = model_id
+        trainer_config.training.resume = resume
 
-        trainer_config.training.use_tqdm = progress
+        # Override max_batches if specified
+        if max_batches is not None:
+            trainer_config.training.max_batches = max_batches
 
-        if verbose:
-            print(f"Loading training configuration from: {config}")
-            print(f"Training model: {trainer_config.model.type}")
-            print(f"Using dataset: {trainer_config.data.dataset_path}")
-            print("Configuration:")
-            print(f"  - Epochs: {trainer_config.training.epochs}")
-            print(f"  - Batch size: {trainer_config.training.batch_size}")
-            print(f"  - Learning rate: {trainer_config.training.learning_rate}")
-            print()
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loading training configuration from: {config}")
+        logger.debug(f"Training model: {trainer_config.model.type}")
+        logger.debug(f"Using dataset: {trainer_config.data.dataset_path}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Configuration:")
+            logger.debug(f"  - Epochs: {trainer_config.training.epochs}")
+            logger.debug(f"  - Batch size: {trainer_config.training.batch_size}")
+            logger.debug(f"  - Learning rate: {trainer_config.training.learning_rate}")
+            if trainer_config.training.model_id:
+                logger.debug(f"  - Model ID: {trainer_config.training.model_id}")
+            if trainer_config.training.resume:
+                logger.debug("  - Resume: enabled")
 
         trainer = EpiForecasterTrainer(trainer_config)
         results = trainer.run()
 
-        print(f"\n{'=' * 60}")
-        print("✅ TRAINING COMPLETED SUCCESSFULLY")
-        print(f"{'=' * 60}")
-        print(f"Best validation loss: {results['best_val_loss']:.6f}")
-        print(f"Total epochs trained: {results['total_epochs']}")
-        print(f"Model parameters: {results['model_info']['parameters']:,}")
-        print(
+        logger.info(f"\n{'=' * 60}")
+        logger.info("✅ TRAINING COMPLETED SUCCESSFULLY")
+        logger.info(f"{'=' * 60}")
+        logger.info(f"Best validation loss: {results['best_val_loss']:.6f}")
+        logger.info(f"Total epochs trained: {results['total_epochs']}")
+        logger.info(f"Model parameters: {results['model_info']['parameters']:,}")
+        logger.info(
             f"Trainable parameters: {results['model_info']['trainable_parameters']:,}"
         )
-        print(f"Training logs saved to: {trainer.config.output.log_dir}")
-        print(f"{'=' * 60}")
+        log_dir = (
+            Path(trainer.config.output.log_dir)
+            / trainer.config.output.experiment_name
+            / trainer.model_id
+        )
+        logger.info(f"Training logs saved to: {log_dir}")
+        logger.info(f"{'=' * 60}")
 
     except Exception as exc:  # pragma: no cover - CLI handles presentation
         click.echo(f"❌ Training failed: {exc}", err=True)
@@ -353,49 +503,51 @@ def dataset_info(dataset: str, validate: bool):
         # Load dataset index
         from data.dataset_storage import DatasetStorage
 
+        logger = logging.getLogger(__name__)
+
         if validate:
-            print(f"Validating dataset: {dataset}")
+            logger.info(f"Validating dataset: {dataset}")
             validation_result = DatasetStorage.validate_dataset(dataset_path)
 
             if validation_result["valid"]:
-                print("✅ Dataset validation passed")
+                logger.info("✅ Dataset validation passed")
             else:
-                print("❌ Dataset validation failed:")
+                logger.warning("❌ Dataset validation failed:")
                 for issue in validation_result["issues"]:
-                    print(f"  - {issue}")
+                    logger.warning(f"  - {issue}")
 
         # Get dataset metadata
         dataset_info = DatasetStorage.load_dataset(dataset_path)
         metadata = dataset_info["metadata"]
 
-        print(f"\n{'=' * 50}")
-        print("DATASET INFORMATION")
-        print(f"{'=' * 50}")
-        print(f"Name: {metadata['dataset_name']}")
-        print(f"Created: {metadata['created_at']}")
-        print(f"Schema version: {metadata['schema_version']}")
+        logger.info(f"\n{'=' * 50}")
+        logger.info("DATASET INFORMATION")
+        logger.info(f"{'=' * 50}")
+        logger.info(f"Name: {metadata['dataset_name']}")
+        logger.info(f"Created: {metadata['created_at']}")
+        logger.info(f"Schema version: {metadata['schema_version']}")
 
-        print("\n📊 DIMENSIONS:")
-        print(f"  Timepoints: {metadata['num_timepoints']}")
-        print(f"  Nodes: {metadata['num_nodes']}")
-        print(f"  Edges: {metadata['num_edges']}")
-        print(f"  Feature dimension: {metadata['feature_dim']}")
-        print(f"  Forecast horizon: {metadata['forecast_horizon']}")
+        logger.info("\n📊 DIMENSIONS:")
+        logger.info(f"  Timepoints: {metadata['num_timepoints']}")
+        logger.info(f"  Nodes: {metadata['num_nodes']}")
+        logger.info(f"  Edges: {metadata['num_edges']}")
+        logger.info(f"  Feature dimension: {metadata['feature_dim']}")
+        logger.info(f"  Forecast horizon: {metadata['forecast_horizon']}")
 
-        print("\n📁 AVAILABLE FEATURES:")
-        print("  Node features: ✅")
-        print(f"  Edge attributes: {'✅' if metadata['has_edge_attr'] else '❌'}")
-        print(
+        logger.info("\n📁 AVAILABLE FEATURES:")
+        logger.info("  Node features: ✅")
+        logger.info(f"  Edge attributes: {'✅' if metadata['has_edge_attr'] else '❌'}")
+        logger.info(
             f"  Region embeddings: {'✅' if metadata['has_region_embeddings'] else '❌'}"
         )
-        print(f"  EDAR data: {'✅' if metadata['has_edar_data'] else '❌'}")
+        logger.info(f"  EDAR data: {'✅' if metadata['has_edar_data'] else '❌'}")
 
         if "time_range" in metadata:
-            print("\n📅 TEMPORAL RANGE:")
-            print(f"  Start: {metadata['time_range']['start']}")
-            print(f"  End: {metadata['time_range']['end']}")
+            logger.info("\n📅 TEMPORAL RANGE:")
+            logger.info(f"  Start: {metadata['time_range']['start']}")
+            logger.info(f"  End: {metadata['time_range']['end']}")
 
-        print(f"{'=' * 50}")
+        logger.info(f"{'=' * 50}")
 
     except Exception as e:
         click.echo(f"❌ Failed to get dataset info: {str(e)}", err=True)
@@ -419,24 +571,25 @@ def list_datasets(data_dir: str):
             click.echo(f"❌ Data directory not found: {data_dir}", err=True)
             return
 
-        print(f"Scanning for datasets in: {data_dir}")
+        logger = logging.getLogger(__name__)
+        logger.info(f"Scanning for datasets in: {data_dir}")
         dataset_index = DatasetStorage.create_dataset_index(data_dir_path)
 
         if not dataset_index:
-            print("No datasets found.")
+            logger.info("No datasets found.")
             return
 
-        print(f"\n{'=' * 60}")
-        print(f"AVAILABLE DATASETS ({len(dataset_index)} found)")
-        print(f"{'=' * 60}")
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"AVAILABLE DATASETS ({len(dataset_index)} found)")
+        logger.info(f"{'=' * 60}")
 
         for name, info in dataset_index.items():
-            print(f"\n📦 {name}")
-            print(f"  Path: {info['path']}")
-            print(f"  Timepoints: {info['num_timepoints']}")
-            print(f"  Nodes: {info['num_nodes']}")
-            print(f"  Forecast horizon: {info['forecast_horizon']}")
-            print(f"  Created: {info['created_at']}")
+            logger.info(f"\n📦 {name}")
+            logger.info(f"  Path: {info['path']}")
+            logger.info(f"  Timepoints: {info['num_timepoints']}")
+            logger.info(f"  Nodes: {info['num_nodes']}")
+            logger.info(f"  Forecast horizon: {info['forecast_horizon']}")
+            logger.info(f"  Created: {info['created_at']}")
 
             features = []
             if info["has_edge_attr"]:
@@ -447,9 +600,9 @@ def list_datasets(data_dir: str):
                 features.append("EDAR")
 
             if features:
-                print(f"  Features: {', '.join(features)}")
+                logger.info(f"  Features: {', '.join(features)}")
 
-        print(f"{'=' * 60}")
+        logger.info(f"{'=' * 60}")
 
     except Exception as e:
         click.echo(f"❌ Failed to list datasets: {str(e)}", err=True)
