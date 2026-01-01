@@ -124,15 +124,18 @@ class EpiForecasterTrainer:
 
         self.model.to(self.device)
 
-        # Setup training components
-        self.optimizer = self._create_optimizer()
-        self.scheduler = self._create_scheduler()
-        self.criterion = self._create_criterion()
-
         # Setup data loaders
         self.train_loader, self.val_loader, self.test_loader = (
             self._create_data_loaders()
         )
+
+        # Setup training components (optimizer, scheduler, criterion)
+        self.optimizer = self._create_optimizer()
+
+        # Calculate total steps for scheduler if needed
+        total_steps = self.config.training.epochs * len(self.train_loader)
+        self.scheduler = self._create_scheduler(total_steps=total_steps)
+        self.criterion = self._create_criterion()
 
         # Setup logging and checkpointing
         self.setup_logging()
@@ -269,13 +272,17 @@ class EpiForecasterTrainer:
             weight_decay=self.config.training.weight_decay,
         )
 
-    def _create_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler | None:
+    def _create_scheduler(
+        self, total_steps: int
+    ) -> torch.optim.lr_scheduler.LRScheduler | None:
         """Create learning rate scheduler."""
         if self.config.training.scheduler_type == "cosine":
+            # T_max is set to total_steps for a smooth curve across all epochs
             return torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=self.config.training.epochs
+                self.optimizer, T_max=total_steps
             )
         elif self.config.training.scheduler_type == "step":
+            # StepLR remains per-epoch based for simplicity
             return torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=self.config.training.epochs // 3, gamma=0.1
             )
@@ -350,6 +357,7 @@ class EpiForecasterTrainer:
         bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
         targets = torch.stack([item["target"] for item in batch], dim=0)
         target_scales = torch.stack([item["target_scale"] for item in batch], dim=0)
+        target_mean = torch.stack([item["target_mean"] for item in batch], dim=0)
         target_nodes = torch.tensor(
             [item["target_node"] for item in batch], dtype=torch.long
         )
@@ -367,7 +375,9 @@ class EpiForecasterTrainer:
         # This enables fully-vectorized target gathering in the model without CUDA `.item()` syncs.
         if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
             # Use dict assignment to ensure it's in the store and moves with .to(device)
-            mob_batch["target_index"] = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(-1)
+            mob_batch["target_index"] = mob_batch.ptr[
+                :-1
+            ] + mob_batch.target_node.reshape(-1)
 
         return {
             "CaseNode": case_node,  # (B, L, C)
@@ -378,6 +388,7 @@ class EpiForecasterTrainer:
             "T": T,
             "Target": targets,  # (B, H)
             "TargetScale": target_scales,  # (B, C)
+            "TargetMean": target_mean,  # (B, 1)
             "TargetNode": target_nodes,  # (B,)
             "NodeLabels": [item["node_label"] for item in batch],
         }
@@ -616,9 +627,7 @@ class EpiForecasterTrainer:
             # Check max_batches limit
             if self.config.training.max_batches is not None:
                 if self.current_epoch == 0:
-                    self._status(
-                        "max_batches=1: Running only 1 batch as smoke test"
-                    )
+                    self._status("max_batches=1: Running only 1 batch as smoke test")
                 else:
                     break
 
@@ -635,8 +644,8 @@ class EpiForecasterTrainer:
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
 
-            # Learning rate scheduling
-            if self.scheduler:
+            # Learning rate scheduling (if per-epoch)
+            if self.scheduler and self.config.training.scheduler_type == "step":
                 self.scheduler.step()
 
             # Checkpointing
@@ -753,6 +762,7 @@ class EpiForecasterTrainer:
                     if self.region_embeddings is not None
                     else None,
                     population=batch_data["Population"].to(self.device),
+                    target_mean=batch_data["TargetMean"].to(self.device),
                 )
 
                 loss = self.criterion(predictions, batch_data["Target"].to(self.device))
@@ -789,6 +799,10 @@ class EpiForecasterTrainer:
                     self.model.parameters(), self.config.training.gradient_clip_value
                 )
                 self.optimizer.step()
+
+                # Per-step scheduler update (e.g., for CosineAnnealingLR)
+                if self.scheduler and self.config.training.scheduler_type == "cosine":
+                    self.scheduler.step()
 
                 total_loss += loss.item()
                 counted_batches += 1
@@ -1069,45 +1083,52 @@ class EpiForecasterTrainer:
 
     def _log_gradient_norms(self, step: int):
         """Calculates and logs the gradient norms for model components."""
+        frequency = self.config.training.grad_norm_log_frequency
+        if frequency <= 0 or (step % frequency != 0 and step != 0):
+            return
+
         if not any(p.requires_grad for p in self.model.parameters()):
             return
 
-        comp_norms = {"mobility_gnn": 0.0, "forecaster_head": 0.0, "other": 0.0}
-        total_norm = 0.0
+        # Vectorized calculation on GPU to avoid CPU-GPU sync bottleneck
+        gnn_sq_sum = torch.tensor(0.0, device=self.device)
+        head_sq_sum = torch.tensor(0.0, device=self.device)
+        other_sq_sum = torch.tensor(0.0, device=self.device)
 
         for name, param in self.model.named_parameters():
             if param.grad is not None and param.requires_grad:
-                param_norm = param.grad.data.norm(2).item()
-                total_norm += param_norm**2
-
+                grad_sq_sum = param.grad.detach().pow(2).sum()
                 if "mobility_gnn" in name:
-                    comp_norms["mobility_gnn"] += param_norm**2
+                    gnn_sq_sum += grad_sq_sum
                 elif "forecaster_head" in name:
-                    comp_norms["forecaster_head"] += param_norm**2
+                    head_sq_sum += grad_sq_sum
                 else:
-                    comp_norms["other"] += param_norm**2
+                    other_sq_sum += grad_sq_sum
 
-        total_norm = total_norm**0.5
-        for k in comp_norms:
-            comp_norms[k] = comp_norms[k] ** 0.5
+        # Single synchronization for all group results
+        group_sq_sums = torch.stack([gnn_sq_sum, head_sq_sum, other_sq_sum])
+        total_sq_sum = group_sq_sums.sum()
+
+        # Move all squared sums to CPU at once
+        all_metrics = torch.cat([group_sq_sums, total_sq_sum.unsqueeze(0)])
+        all_norms = all_metrics.sqrt().cpu().numpy()
+
+        gnn_norm, head_norm, other_norm, total_norm = all_norms
 
         # Log to TensorBoard
         self.writer.add_scalar("GradNorm/Total_PreClip", total_norm, step)
-        self.writer.add_scalar("GradNorm/MobilityGNN", comp_norms["mobility_gnn"], step)
-        self.writer.add_scalar(
-            "GradNorm/ForecasterHead", comp_norms["forecaster_head"], step
-        )
-        self.writer.add_scalar("GradNorm/Other", comp_norms["other"], step)
+        self.writer.add_scalar("GradNorm/MobilityGNN", gnn_norm, step)
+        self.writer.add_scalar("GradNorm/ForecasterHead", head_norm, step)
+        self.writer.add_scalar("GradNorm/Other", other_norm, step)
 
-        # Log to console/file (less frequently)
-        if (step == 0) or (step % 10 == 0):
-            self._status(
-                f"Grad norms @ step {step}: Total={total_norm:.4f} | "
-                f"GNN={comp_norms['mobility_gnn']:.4f} | "
-                f"Head={comp_norms['forecaster_head']:.4f} | "
-                f"Other={comp_norms['other']:.4f}",
-                logging.DEBUG,
-            )
+        # Log to console/file
+        self._status(
+            f"Grad norms @ step {step}: Total={total_norm:.4f} | "
+            f"GNN={gnn_norm:.4f} | "
+            f"Head={head_norm:.4f} | "
+            f"Other={other_norm:.4f}",
+            logging.DEBUG,
+        )
 
     def _log_epoch(
         self,
