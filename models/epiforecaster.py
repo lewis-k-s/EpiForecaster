@@ -83,6 +83,9 @@ class EpiForecaster(nn.Module):
         if self.use_population:
             self.forecaster_input_dim += population_dim
 
+        # We always include target_mean as a feature now
+        self.forecaster_input_dim += 1
+
         if self.variant_type.mobility:
             assert self.temporal_node_dim > 0, (
                 "Mobility GNN requires temporal node features (cases/biomarkers)."
@@ -137,6 +140,7 @@ class EpiForecaster(nn.Module):
         region_embeddings: torch.Tensor | None = None,
         population: torch.Tensor | None = None,
         temporal_covariates: torch.Tensor | None = None,
+        target_mean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of three-layer EpiForecaster.
@@ -149,6 +153,7 @@ class EpiForecaster(nn.Module):
             region_embeddings: Optional static region embeddings [num_regions, region_embedding_dim]
             population: Optional per-node population [batch_size]
             temporal_covariates: Optional generic temporal covariates [batch_size, seq_len, k]
+            target_mean: Optional mean of targets for unscaling hints [batch_size]
 
         Returns:
             Forecasts [batch_size, forecast_horizon] for future time steps
@@ -197,6 +202,16 @@ class EpiForecaster(nn.Module):
 
         if temporal_covariates is not None:
             features.append(temporal_covariates)
+
+        if target_mean is not None:
+            # Expand (B,) -> (B, T, 1)
+            target_mean_seq = target_mean.view(B, 1, 1).expand(-1, T, -1)
+            features.append(target_mean_seq)
+        else:
+            # Should practically always be provided, but handle fallback or error?
+            # For now, let's assume if it is missing we might have issues if dimensionality expects it.
+            # But since we incremented dimensionality in init, we MUST provide it.
+            raise ValueError("target_mean is required")
 
         x_seq = torch.cat(features, dim=-1)
 

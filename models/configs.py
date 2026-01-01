@@ -162,6 +162,7 @@ class TrainingParams:
     num_forecast_samples: int = (
         3  # Number of samples per category (best, worst, random)
     )
+    grad_norm_log_frequency: int = 50
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
 
     def __post_init__(self) -> None:
