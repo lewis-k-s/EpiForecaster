@@ -32,9 +32,12 @@ class EpiDatasetItem(TypedDict):
     node_label: str
     target_node: int
     case_node: torch.Tensor
+    case_mean: torch.Tensor
+    case_std: torch.Tensor
     bio_node: torch.Tensor
     target: torch.Tensor
     target_scale: torch.Tensor
+    target_mean: torch.Tensor
     mob: list[Data]
     population: torch.Tensor
 
@@ -334,15 +337,37 @@ class EpiDataset(Dataset):
                 )
             )
 
+        # Slice history for mean and std
+        # mean/std are (TotalTime, N) -> need to slice [range_start:range_end] and select target_idx
+        # rolling_mean/std are numpy arrays (T, N, 1) or (T, N)
+        # Check dim of rolling_mean
+
+        # Original code used rolling_mean[stat_idx] which is one time step.
+        # Now we want the sequence.
+
+        # Ensure rolling stats are dense and correct shape (L, 1)
+        mean_seq = self.rolling_mean[
+            range_start:range_end, target_idx
+        ].float()  # (L, 1)
+        std_seq = self.rolling_std[range_start:range_end, target_idx].float()  # (L, 1)
+
+        if mean_seq.ndim == 1:
+            mean_seq = mean_seq.unsqueeze(-1)
+        if std_seq.ndim == 1:
+            std_seq = std_seq.unsqueeze(-1)
+
         population = self.node_static_covariates["Pop"][target_idx]
 
         return {
             "node_label": node_label,
             "target_node": target_idx,
-            "case_node": case_history[:, target_idx, :],
+            "case_node": case_history[:, target_idx, :],  # Already normalized
+            "case_mean": mean_seq,
+            "case_std": std_seq,
             "bio_node": biomarker_history[:, target_idx, :],
             "target": targets,
             "target_scale": std[target_idx].squeeze(-1),
+            "target_mean": mean[target_idx].squeeze(-1),
             "mob": mob_graphs,
             "population": population,
         }

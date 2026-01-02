@@ -74,6 +74,9 @@ class EpiForecaster(nn.Module):
         self.forecaster_input_dim = 0
         if self.variant_type.cases:
             self.forecaster_input_dim += temporal_input_dim
+            # We add mean and std as features
+            self.forecaster_input_dim += 1
+            self.forecaster_input_dim += 1
         if self.variant_type.biomarkers:
             self.forecaster_input_dim += biomarkers_dim
         if self.variant_type.mobility:
@@ -82,9 +85,6 @@ class EpiForecaster(nn.Module):
             self.forecaster_input_dim += region_embedding_dim
         if self.use_population:
             self.forecaster_input_dim += population_dim
-
-        # We always include target_mean as a feature now
-        self.forecaster_input_dim += 1
 
         if self.variant_type.mobility:
             assert self.temporal_node_dim > 0, (
@@ -133,39 +133,41 @@ class EpiForecaster(nn.Module):
 
     def forward(
         self,
-        cases_hist: torch.Tensor,
+        cases_norm: torch.Tensor,
+        cases_mean: torch.Tensor,
+        cases_std: torch.Tensor,
         biomarkers_hist: torch.Tensor,
         mob_graphs: Sequence[Sequence[Data]] | None,
         target_nodes: torch.Tensor,
         region_embeddings: torch.Tensor | None = None,
         population: torch.Tensor | None = None,
         temporal_covariates: torch.Tensor | None = None,
-        target_mean: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of three-layer EpiForecaster.
 
         Args:
-            cases_hist: Historical case counts [batch_size, seq_len, cases_dim]
+            cases_norm: Normalized case counts [batch_size, seq_len, cases_dim]
+            cases_mean: Rolling mean of cases [batch_size, seq_len, 1]
+            cases_std: Rolling std of cases [batch_size, seq_len, 1]
             biomarkers_hist: Historical biomarker measurements [batch_size, seq_len, biomarkers_dim]
             mob_graphs: Per-batch list of per-time-step PyG graphs
             target_nodes: Indices of target nodes in the global region list [batch_size]
             region_embeddings: Optional static region embeddings [num_regions, region_embedding_dim]
             population: Optional per-node population [batch_size]
             temporal_covariates: Optional generic temporal covariates [batch_size, seq_len, k]
-            target_mean: Optional mean of targets for unscaling hints [batch_size]
 
         Returns:
             Forecasts [batch_size, forecast_horizon] for future time steps
         """
-        B, T, _ = cases_hist.shape
+        B, T, _ = cases_norm.shape
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "EpiForecaster.forward: B=%d T=%d cases=%s biomarkers=%s mobility=%s regions=%s",
                 B,
                 T,
-                tuple(cases_hist.shape),
+                tuple(cases_norm.shape),
                 tuple(biomarkers_hist.shape),
                 self.variant_type.mobility,
                 self.variant_type.regions,
@@ -174,7 +176,9 @@ class EpiForecaster(nn.Module):
         features: list[torch.Tensor] = []
 
         if self.variant_type.cases:
-            features.append(cases_hist)
+            features.append(cases_norm)
+            features.append(cases_mean)
+            features.append(cases_std)
         if self.variant_type.biomarkers:
             features.append(biomarkers_hist)
 
@@ -202,16 +206,6 @@ class EpiForecaster(nn.Module):
 
         if temporal_covariates is not None:
             features.append(temporal_covariates)
-
-        if target_mean is not None:
-            # Expand (B,) -> (B, T, 1)
-            target_mean_seq = target_mean.view(B, 1, 1).expand(-1, T, -1)
-            features.append(target_mean_seq)
-        else:
-            # Should practically always be provided, but handle fallback or error?
-            # For now, let's assume if it is missing we might have issues if dimensionality expects it.
-            # But since we incremented dimensionality in init, we MUST provide it.
-            raise ValueError("target_mean is required")
 
         x_seq = torch.cat(features, dim=-1)
 

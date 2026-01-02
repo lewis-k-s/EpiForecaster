@@ -326,12 +326,12 @@ class EpiForecasterTrainer:
             "dataset": self.val_dataset,
             "batch_size": self.config.training.batch_size,
             "shuffle": False,
-            "num_workers": num_workers,
+            # avoid oom in validation step due to holding 2x num_workers in memory
+            "num_workers": 0,
+            "persistent_workers": False,
             "pin_memory": pin_memory,
             "collate_fn": self._collate_fn,
         }
-        if persistent_workers:
-            val_loader_kwargs["persistent_workers"] = True
         val_loader = DataLoader(**val_loader_kwargs)
 
         test_loader_kwargs = {
@@ -355,6 +355,8 @@ class EpiForecasterTrainer:
         B = len(batch)
         case_node = torch.stack([item["case_node"] for item in batch], dim=0)
         bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
+        case_mean = torch.stack([item["case_mean"] for item in batch], dim=0)
+        case_std = torch.stack([item["case_std"] for item in batch], dim=0)
         targets = torch.stack([item["target"] for item in batch], dim=0)
         target_scales = torch.stack([item["target_scale"] for item in batch], dim=0)
         target_mean = torch.stack([item["target_mean"] for item in batch], dim=0)
@@ -381,6 +383,8 @@ class EpiForecasterTrainer:
 
         return {
             "CaseNode": case_node,  # (B, L, C)
+            "CaseMean": case_mean,  # (B, L, 1)
+            "CaseStd": case_std,  # (B, L, 1)
             "BioNode": bio_node,  # (B, L, B)
             "MobBatch": mob_batch,  # Batched PyG graphs
             "Population": population,  # (B,)
@@ -754,7 +758,9 @@ class EpiForecasterTrainer:
                 data_time_s = time.time() - fetch_start_time
                 batch_start_time = time.time()
                 predictions = self.model.forward(
-                    cases_hist=batch_data["CaseNode"].to(self.device),
+                    cases_norm=batch_data["CaseNode"].to(self.device),
+                    cases_mean=batch_data["CaseMean"].to(self.device),
+                    cases_std=batch_data["CaseStd"].to(self.device),
                     biomarkers_hist=batch_data["BioNode"].to(self.device),
                     mob_graphs=batch_data["MobBatch"],
                     target_nodes=batch_data["TargetNode"].to(self.device),
@@ -762,7 +768,6 @@ class EpiForecasterTrainer:
                     if self.region_embeddings is not None
                     else None,
                     population=batch_data["Population"].to(self.device),
-                    target_mean=batch_data["TargetMean"].to(self.device),
                 )
 
                 loss = self.criterion(predictions, batch_data["Target"].to(self.device))
