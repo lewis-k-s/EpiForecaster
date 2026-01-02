@@ -14,7 +14,11 @@ def collate_epidataset_batch(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     B = len(batch)
     case_node = torch.stack([item["case_node"] for item in batch], dim=0)
     bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
+    case_mean = torch.stack([item["case_mean"] for item in batch], dim=0)
+    case_std = torch.stack([item["case_std"] for item in batch], dim=0)
     targets = torch.stack([item["target"] for item in batch], dim=0)
+    target_scales = torch.stack([item["target_scale"] for item in batch], dim=0)
+    target_mean = torch.stack([item["target_mean"] for item in batch], dim=0)
     target_nodes = torch.tensor(
         [item["target_node"] for item in batch], dtype=torch.long
     )
@@ -40,12 +44,16 @@ def collate_epidataset_batch(batch: list[EpiDatasetItem]) -> dict[str, Any]:
 
     return {
         "CaseNode": case_node,  # (B, L, C)
+        "CaseMean": case_mean,  # (B, L, 1)
+        "CaseStd": case_std,  # (B, L, 1)
         "BioNode": bio_node,  # (B, L, B)
         "MobBatch": mob_batch,  # Batched PyG graphs
         "Population": population,  # (B,)
         "B": B,
         "T": T,
         "Target": targets,  # (B, H)
+        "TargetScale": target_scales,
+        "TargetMean": target_mean,
         "TargetNode": target_nodes,  # (B,)
         "NodeLabels": [item["node_label"] for item in batch],
     }

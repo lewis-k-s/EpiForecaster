@@ -476,12 +476,13 @@ def _forward_batch(
     target_mean = batch_data["TargetMean"].to(device)
     target_scale = batch_data["TargetScale"].to(device)
     predictions = model.forward(
-        cases_hist=batch_data["CaseNode"].to(device),
+        cases_norm=batch_data["CaseNode"].to(device),
+        cases_mean=batch_data["CaseMean"].to(device),
+        cases_std=batch_data["CaseStd"].to(device),
         biomarkers_hist=batch_data["BioNode"].to(device),
         mob_graphs=batch_data["MobBatch"],
         target_nodes=batch_data["TargetNode"].to(device),
         region_embeddings=region_embeddings,
         population=batch_data["Population"].to(device),
-        target_mean=target_mean,
     )
     return predictions, targets, target_mean, target_scale
