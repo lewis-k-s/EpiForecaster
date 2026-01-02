@@ -711,7 +711,7 @@ class EdgeWeightAnalyzer:
         ]  # First 6 months
         box_labels = sorted(monthly_data.keys())[:6]
 
-        bp = axes[1, 0].boxplot(box_data, labels=box_labels, patch_artist=True)
+        axes[1, 0].boxplot(box_data, labels=box_labels, patch_artist=True)
         axes[1, 0].set_ylabel("Edge Weight (person-hours)")
         axes[1, 0].set_title("Monthly Distributions (Linear)")
         axes[1, 0].set_yscale("log")
@@ -965,14 +965,14 @@ class EdgeWeightAnalyzer:
             x_pos = np.arange(len(periods))
             width = 0.35
 
-            bars1 = axes[1, 1].bar(
+            axes[1, 1].bar(
                 x_pos - width / 2,
                 mean_changes,
                 width,
                 label="Mean Weight Change (%)",
                 alpha=0.7,
             )
-            bars2 = axes[1, 1].bar(
+            axes[1, 1].bar(
                 x_pos + width / 2,
                 sparsity_changes,
                 width,

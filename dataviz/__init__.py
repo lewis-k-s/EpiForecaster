@@ -7,6 +7,7 @@ in mobility graphs to optimize minibatch sizes for GraphSAGE training.
 Main components:
 - KHopNeighborAnalyzer: Analyze receptive fields and neighborhood growth
 - KHopVisualizer: Create visualizations of k-hop subgraphs
+- neighborhood_global_regression: Compare neighborhood vs global trends
 
 Example usage:
     from dataviz.khop_neighbors import KHopNeighborAnalyzer, load_mobility_graph_from_nc
