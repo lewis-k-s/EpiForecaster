@@ -16,6 +16,8 @@ import xarray as xr
 import zarr
 from libpysal import weights
 
+from utils.logging import suppress_zarr_warnings
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MOBILITY_WINDOW_DAYS = 30
@@ -184,6 +186,7 @@ class RegionGraphPreprocessor:
     def _compute_average_mobility_flows(
         self, region_ids: list[str]
     ) -> np.ndarray | None:
+        suppress_zarr_warnings()
         mobility_path = self.config.mobility_zarr_path
         if mobility_path is None:
             return None
@@ -337,6 +340,7 @@ class RegionGraphPreprocessor:
         flows: np.ndarray,
         region_ids: list[str],
     ) -> Path:
+        suppress_zarr_warnings()
         output_path = self.config.output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():

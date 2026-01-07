@@ -6,6 +6,8 @@ import torch
 import zarr
 from torch.utils.data import Dataset
 
+from utils.logging import suppress_zarr_warnings
+
 
 class RegionGraphDataset(Dataset):
     """Dataset for region graph data stored in zarr format.
@@ -16,6 +18,7 @@ class RegionGraphDataset(Dataset):
     def __init__(
         self, zarr_path: Path, normalize_features: bool = True, device: str = "auto"
     ):
+        suppress_zarr_warnings()
         self.zarr_path = zarr_path
         self.normalize_features = normalize_features
         self.device = torch.device(

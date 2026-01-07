@@ -13,8 +13,12 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
-from ..config import TEMPORAL_COORD, PreprocessingConfig
-from .quality_checks import DataQualityThresholds, validate_notna_and_std
+from utils.logging import suppress_zarr_warnings
+
+suppress_zarr_warnings()
+
+from ..config import TEMPORAL_COORD, PreprocessingConfig  # noqa: E402
+from .quality_checks import DataQualityThresholds, validate_notna_and_std  # noqa: E402
 
 
 class MobilityProcessor:
