@@ -12,9 +12,13 @@ from torch_geometric.data import Data
 from graph.node_encoder import Region2Vec
 from models.configs import EpiForecasterConfig
 
-from .biomarker_preprocessor import BiomarkerPreprocessor
-from .cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig
-from .preprocess.config import REGION_COORD, TEMPORAL_COORD
+from utils.logging import suppress_zarr_warnings
+
+suppress_zarr_warnings()
+
+from .biomarker_preprocessor import BiomarkerPreprocessor  # noqa: E402
+from .cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig  # noqa: E402
+from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

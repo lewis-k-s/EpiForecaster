@@ -70,7 +70,7 @@ def _create_spatial_weights_from_edge_index(
     if total_nodes == 0:
         raise ValueError("edge_index is empty; cannot build spatial weights")
 
-    neighbors = {i: [] for i in range(total_nodes)}
+    neighbors: dict[int, list[int]] = {i: [] for i in range(total_nodes)}
     for src, dst in zip(row, col, strict=False):
         src_i, dst_i = int(src), int(dst)
         if src_i == dst_i:
@@ -357,7 +357,7 @@ class SpatialAutocorrelationLoss(nn.Module):
         """
         try:
             embeddings_np = embeddings.detach().cpu().numpy()
-            n_nodes, embed_dim = embeddings_np.shape
+            _n_nodes, embed_dim = embeddings_np.shape
 
             moran_losses = []
 
@@ -395,7 +395,7 @@ class SpatialAutocorrelationLoss(nn.Module):
         """
         try:
             embeddings_np = embeddings.detach().cpu().numpy()
-            n_nodes, embed_dim = embeddings_np.shape
+            _n_nodes, embed_dim = embeddings_np.shape
 
             lisa_losses = []
 
@@ -440,7 +440,7 @@ class SpatialAutocorrelationLoss(nn.Module):
         """
         try:
             embeddings_np = embeddings.detach().cpu().numpy()
-            n_nodes, embed_dim = embeddings_np.shape
+            _n_nodes, embed_dim = embeddings_np.shape
 
             smoothness_losses = []
 
