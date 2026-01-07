@@ -29,12 +29,17 @@ class EpiForecaster(nn.Module):
         region_embedding_dim: int = 64,
         mobility_embedding_dim: int = 64,
         gnn_depth: int = 2,
+        gnn_hidden_dim: int = 32,
         sequence_length: int = 14,
         forecast_horizon: int = 7,
         use_population: bool = True,
         population_dim: int = 1,
         device: torch.device | None = None,
         gnn_module: str = "gcn",
+        head_d_model: int = 96,
+        head_n_heads: int = 2,
+        head_num_layers: int = 2,
+        head_dropout: float = 0.1,
     ):
         """
         Initialize EpiForecaster with three-layer architecture.
@@ -50,6 +55,11 @@ class EpiForecaster(nn.Module):
             use_population: Whether to include static population feature
             population_dim: Dimension of the population feature (default 1)
             device: Device for tensor operations
+            gnn_hidden_dim: Hidden dimension for GNN
+            head_d_model: Transformer d_model
+            head_n_heads: Transformer heads
+            head_num_layers: Transformer layers
+            head_dropout: Transformer dropout
         """
         super().__init__()
 
@@ -93,7 +103,7 @@ class EpiForecaster(nn.Module):
             if gnn_module in {"gcn", "gat"}:
                 self.mobility_gnn = MobilityPyGEncoder(
                     in_dim=self.temporal_node_dim,
-                    hidden_dim=16,
+                    hidden_dim=gnn_hidden_dim,
                     out_dim=self.mobility_embedding_dim,
                     module_type=gnn_module,
                     dropout=0.1,
@@ -115,11 +125,11 @@ class EpiForecaster(nn.Module):
 
         self.forecaster_head = ForecasterHead(
             in_dim=self.forecaster_input_dim,
-            d_model=96,
-            n_heads=2,
-            num_layers=2,
+            d_model=head_d_model,
+            n_heads=head_n_heads,
+            num_layers=head_num_layers,
             horizon=forecast_horizon,
-            dropout=0.1,
+            dropout=head_dropout,
             device=device,
         )
 

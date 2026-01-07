@@ -209,26 +209,210 @@ def eval_group():
     pass
 
 
+@cli.group("plot")
+def plot_group():
+    """Generate forecast plots from evaluation results."""
+    pass
+
+
 @eval_group.command("epiforecaster")
+@click.option(
+    "--experiment",
+    type=str,
+    default=None,
+    help="Experiment name (e.g., 'local_full'). Used to auto-resolve paths.",
+)
+@click.option(
+    "--run",
+    type=str,
+    default=None,
+    help="Run ID (e.g., 'run_1767364191170741000'). Used with --experiment.",
+)
 @click.option(
     "--checkpoint",
     type=click.Path(path_type=Path),
-    required=True,
-    help="Path to a saved `.pt` checkpoint (e.g., best_model.pt).",
+    default=None,
+    help="Path to checkpoint. Optional if --experiment and --run are provided.",
 )
 @click.option(
     "--split",
     type=click.Choice(["val", "test"], case_sensitive=False),
     default="val",
     show_default=True,
-    help="Which split to evaluate for top-k node selection.",
+    help="Which split to evaluate.",
 )
 @click.option(
-    "--topk",
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional output image path.",
+)
+@click.option(
+    "--output-csv",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional CSV output path for node-level metrics (node_id, mae, num_samples).",
+)
+@click.option(
+    "--log-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional TensorBoard log dir for eval metrics.",
+)
+@click.option(
+    "--override",
+    multiple=True,
+    help="Override config values using dotted keys (e.g., training.val_workers=4).",
+)
+def eval_epiforecaster(
+    experiment: str | None,
+    run: str | None,
+    checkpoint: Path | None,
+    split: str,
+    output: Path | None,
+    output_csv: Path | None,
+    log_dir: Path | None,
+    override: tuple[str, ...],
+):
+    """Evaluate an EpiForecaster checkpoint and generate quartile-based forecast plots.
+
+    Use --override to customize evaluation settings like workers, device, or sampling:
+
+    \b
+    --override training.val_workers=4      # Use 4 workers for eval dataloader
+    --override training.device=cpu          # Use CPU instead of GPU
+    --override training.num_forecast_samples=6  # Sample 6 nodes per quartile
+    """
+    try:
+        # Resolve paths from experiment/run if provided
+        if experiment and run:
+            from utils.run_discovery import (
+                resolve_checkpoint_path,
+                get_eval_output_dir,
+                list_available_runs,
+            )
+
+            if checkpoint is None:
+                try:
+                    checkpoint = resolve_checkpoint_path(
+                        experiment_name=experiment,
+                        run_id=run,
+                    )
+                except FileNotFoundError as e:
+                    click.echo(f"❌ Checkpoint not found: {e}", err=True)
+                    click.echo(f"\n{list_available_runs(experiment_name=experiment)}", err=True)
+                    raise click.ClickException("Cannot resolve checkpoint path")
+
+            # Auto-resolve output paths to eval directory
+            eval_dir = get_eval_output_dir(experiment_name=experiment, run_id=run)
+            if output is None:
+                output = eval_dir / f"{split}_forecasts.png"
+            if output_csv is None:
+                output_csv = eval_dir / f"{split}_node_metrics.csv"
+
+            click.echo("Resolved output paths:")
+            click.echo(f"  Checkpoint: {checkpoint}")
+            click.echo(f"  Plot: {output}")
+            click.echo(f"  CSV: {output_csv}")
+        elif checkpoint is None:
+            raise click.ClickException(
+                "Must provide either --checkpoint or both --experiment and --run"
+            )
+
+        # Suppress zarr logging spam
+        logging.getLogger("zarr").setLevel(logging.WARNING)
+        logging.getLogger("numcodecs").setLevel(logging.WARNING)
+
+        from evaluation.epiforecaster_eval import (
+            eval_checkpoint,
+            select_nodes_by_loss,
+            generate_forecast_plots,
+        )
+
+        # Step 1: Evaluate (with config overrides if provided)
+        eval_result = eval_checkpoint(
+            checkpoint_path=checkpoint,
+            split=split,
+            log_dir=log_dir,
+            overrides=list(override) if override else None,
+            output_csv_path=output_csv,
+        )
+
+        # Get samples_per_group from config (default 3)
+        samples_per_group = eval_result["config"].training.num_forecast_samples
+
+        # Step 2: Select nodes (quartile strategy)
+        node_groups = select_nodes_by_loss(
+            node_mae=eval_result["node_mae"],
+            strategy="quartile",
+            samples_per_group=samples_per_group,
+        )
+
+        # Step 3: Generate plots (use "last" window by default)
+        plot_result = generate_forecast_plots(
+            model=eval_result["model"],
+            loader=eval_result["loader"],
+            node_groups=node_groups,
+            window="last",
+            output_path=output,
+            log_dir=log_dir,
+        )
+
+        # Step 4: Show results
+        total_nodes = len(plot_result["selected_nodes"])
+        click.echo(f"Selected {total_nodes} nodes from quartiles:")
+        for group_name, nodes in plot_result["node_groups"].items():
+            click.echo(f"  {group_name}: {len(nodes)} nodes")
+
+        # Show eval metrics
+        loss = eval_result["eval_loss"]
+        metrics = eval_result["eval_metrics"]
+        summary = _format_eval_summary(loss, metrics)
+        click.echo(f"\nEval summary ({split}):\n{summary}")
+
+        if log_dir is not None:
+            click.echo(f"Eval metrics logged to: {log_dir}")
+        if output is not None:
+            click.echo(f"Saved plot to: {output}")
+        if output_csv is not None:
+            click.echo(f"Saved node metrics to: {output_csv}")
+    except Exception as exc:
+        click.echo(f"❌ Evaluation failed: {exc}", err=True)
+        click.echo(traceback.format_exc(), err=True)
+        raise click.ClickException(str(exc)) from exc
+
+
+@plot_group.command("forecasts")
+@click.option(
+    "--experiment",
+    type=str,
+    default=None,
+    help="Experiment name. Used with --run to auto-resolve paths.",
+)
+@click.option(
+    "--run",
+    type=str,
+    default=None,
+    help="Run ID. Used with --experiment to auto-resolve checkpoint and CSV.",
+)
+@click.option(
+    "--csv",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to evaluation CSV. Optional if --experiment and --run are provided.",
+)
+@click.option(
+    "--checkpoint",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Path to model checkpoint. Optional if --experiment and --run are provided.",
+)
+@click.option(
+    "--samples-per-quartile",
     type=int,
-    default=5,
+    default=2,
     show_default=True,
-    help="Number of best (lowest MAE) target nodes to visualize.",
+    help="Number of nodes to sample from each MAE quartile for plotting.",
 )
 @click.option(
     "--window",
@@ -242,78 +426,105 @@ def eval_group():
     type=click.Choice(VALID_DEVICES),
     default="auto",
     show_default=True,
-    help="Device to use for evaluation.",
+    help="Device to use for inference.",
 )
 @click.option(
     "--output",
     type=click.Path(path_type=Path),
     default=None,
-    help="Optional output image path (e.g., outputs/plots/topk_val.png).",
+    help="Optional output image path.",
 )
-@click.option(
-    "--quiet",
-    is_flag=True,
-    help="Suppress evaluation progress logs.",
-)
-@click.option(
-    "--log-dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Optional TensorBoard log dir for eval metrics.",
-)
-def eval_epiforecaster(
-    checkpoint: Path,
-    split: str,
-    topk: int,
+def plot_forecasts(
+    experiment: str | None,
+    run: str | None,
+    csv: Path | None,
+    checkpoint: Path | None,
+    samples_per_quartile: int,
     window: str,
     device: str,
     output: Path | None,
-    quiet: bool,
-    log_dir: Path | None,
 ):
-    """Evaluate an EpiForecaster checkpoint and plot top-k forecasts."""
+    """Generate forecast plots from evaluation CSV using quartile sampling."""
     try:
-        from evaluation.epiforecaster_eval import evaluate_checkpoint_topk_forecasts
+        # Resolve paths from experiment/run if provided
+        if experiment and run:
+            from utils.run_discovery import (
+                get_eval_output_dir,
+                resolve_checkpoint_path,
+                resolve_node_metrics_csv_path,
+                list_available_runs,
+            )
 
-        resolved_log_dir = _resolve_eval_log_dir(checkpoint, log_dir)
-        result = evaluate_checkpoint_topk_forecasts(
+            if checkpoint is None:
+                try:
+                    checkpoint = resolve_checkpoint_path(
+                        experiment_name=experiment,
+                        run_id=run,
+                    )
+                except FileNotFoundError as e:
+                    click.echo(f"❌ Checkpoint not found: {e}", err=True)
+                    click.echo(f"\n{list_available_runs(experiment_name=experiment)}", err=True)
+                    raise click.ClickException("Cannot resolve checkpoint path")
+
+            # Resolve the per-node metrics CSV (written by eval_checkpoint)
+            if csv is None:
+                try:
+                    csv = resolve_node_metrics_csv_path(
+                        experiment_name=experiment,
+                        run_id=run,
+                        split="val",
+                    )
+                except FileNotFoundError as e:
+                    click.echo(
+                        f"Note: The per-node CSV (val_node_metrics.csv) may not exist yet. "
+                        f"Run 'eval epiforecaster --experiment {experiment} --run {run}' first.",
+                        err=True,
+                    )
+                    click.echo(f"❌ Evaluation CSV not found: {e}", err=True)
+                    click.echo(f"\n{list_available_runs(experiment_name=experiment)}", err=True)
+                    raise click.ClickException("Cannot resolve CSV path")
+
+            click.echo("Resolved paths:")
+            click.echo(f"  Checkpoint: {checkpoint}")
+            click.echo(f"  CSV: {csv}")
+            if output is None:
+                eval_dir = get_eval_output_dir(experiment_name=experiment, run_id=run)
+                output = eval_dir / "val_forecasts.png"
+                click.echo(f"  Output: {output}")
+
+        # Validate required paths
+        if csv is None:
+            raise click.ClickException("Must provide --csv or both --experiment and --run")
+        if checkpoint is None:
+            raise click.ClickException("Must provide --checkpoint or both --experiment and --run")
+
+        # Suppress zarr logging spam
+        logging.getLogger("zarr").setLevel(logging.WARNING)
+        logging.getLogger("numcodecs").setLevel(logging.WARNING)
+
+        from evaluation.epiforecaster_eval import plot_forecasts_from_csv
+
+        click.echo(f"Loading evaluation CSV: {csv}")
+        result = plot_forecasts_from_csv(
+            csv_path=csv,
             checkpoint_path=checkpoint,
-            split=split,
-            k=topk,
-            device=device,
+            samples_per_quartile=samples_per_quartile,
             window=window,
+            device=device,
             output_path=output,
-            log_dir=resolved_log_dir,
         )
 
-        topk_nodes = result["topk_nodes"]
-        click.echo(
-            f"Top-{len(topk_nodes)} target nodes (by MAE on {split}): {topk_nodes}"
-        )
-        loss = result.get("eval_loss", float("nan"))
-        metrics = result.get("eval_metrics", {})
-        summary = _format_eval_summary(loss, metrics)
-        click.echo(f"\nEval summary ({split}):\n{summary}")
-        if resolved_log_dir is not None:
-            click.echo(f"Eval metrics logged to: {resolved_log_dir}")
+        selected_nodes = result["selected_nodes"]
+        quartile_groups = result["quartile_groups"]
+        click.echo(f"Sampled {len(selected_nodes)} nodes from quartiles:")
+        for quartile_name, nodes in quartile_groups.items():
+            click.echo(f"  {quartile_name}: {nodes}")
         if output is not None:
-            click.echo(f"Saved plot to: {output}")
+            click.echo(f"Saved figure to: {output}")
     except Exception as exc:  # pragma: no cover - Click will handle reporting
-        click.echo(f"❌ Evaluation failed: {exc}", err=True)
+        click.echo(f"❌ Plot generation failed: {exc}", err=True)
         click.echo(traceback.format_exc(), err=True)
         raise click.ClickException(str(exc)) from exc
-
-
-def _resolve_eval_log_dir(checkpoint: Path, log_dir: Path | None) -> Path | None:
-    if log_dir is not None:
-        return log_dir
-
-    parts = checkpoint.parts
-    if "checkpoints" in parts:
-        idx = parts.index("checkpoints")
-        if idx > 0:
-            return Path(*parts[:idx])
-    return None
 
 
 def _format_eval_summary(loss: float, metrics: dict) -> str:
@@ -423,27 +634,43 @@ def train_regions(
     default=None,
     help="Maximum number of batches to run (for smoke testing)",
 )
+@click.option(
+    "--override",
+    multiple=True,
+    help="Override config values using dotted keys (e.g., training.learning_rate=0.001)",
+)
 def train_epiforecaster(
-    config: str, model_id: str, resume: bool, max_batches: int | None
+    config: str,
+    model_id: str,
+    resume: bool,
+    max_batches: int | None,
+    override: tuple[str, ...],
 ):
     """Train EpiForecaster model."""
-    _run_forecaster_training(config, model_id, resume, max_batches)
+    _run_forecaster_training(config, model_id, resume, max_batches, override)
 
 
 def _run_forecaster_training(
-    config: str, model_id: str, resume: bool, max_batches: int | None
+    config: str,
+    model_id: str,
+    resume: bool,
+    max_batches: int | None,
+    overrides: tuple[str, ...] = (),
 ) -> None:
     """Execute the original unified forecaster training workflow."""
     try:
-        trainer_config = EpiForecasterConfig.from_file(config)
-        # Dataset path should be read from the config file
-        if model_id:
-            trainer_config.training.model_id = model_id
-        trainer_config.training.resume = resume
+        override_list = list(overrides)
 
-        # Override max_batches if specified
+        if model_id:
+            override_list.append(f"training.model_id={model_id}")
+        if resume:
+            override_list.append("training.resume=true")
         if max_batches is not None:
-            trainer_config.training.max_batches = max_batches
+            override_list.append(f"training.max_batches={max_batches}")
+
+        trainer_config = EpiForecasterConfig.load(
+            config, overrides=override_list if override_list else None
+        )
 
         logger = logging.getLogger(__name__)
         logger.info(f"Loading training configuration from: {config}")

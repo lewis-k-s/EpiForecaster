@@ -236,8 +236,7 @@ class MobilityPyGEncoder(nn.Module):
     """
     Lightweight PyG-based encoder that can switch between GCN and GAT.
 
-    This expects PyG-style sparse graphs (edge_index/edge_weight) and produces
-    per-node embeddings of dimension ``out_dim``.
+    Supports variable depth, residual connections, and normalization.
     """
 
     def __init__(
@@ -253,38 +252,59 @@ class MobilityPyGEncoder(nn.Module):
         super().__init__()
 
         self.module_type = module_type
-        self.dropout = nn.Dropout(dropout)
+        self.depth = depth
+        self.dropout_val = dropout
         self.activation = nn.ReLU()
 
-        if module_type == "gcn":
-            self.conv1: nn.Module = GCNConv(in_dim, hidden_dim, add_self_loops=True)
-            self.conv2: nn.Module = GCNConv(hidden_dim, out_dim, add_self_loops=True)
-        elif module_type == "gat":
-            # Use concat=False so output dims match hidden_dim / out_dim.
-            self.conv1 = GATConv(
-                in_dim,
-                hidden_dim,
-                heads=heads,
-                concat=False,
-                add_self_loops=True,
-                dropout=dropout,
-            )
-            self.conv2 = GATConv(
-                hidden_dim,
-                out_dim,
-                heads=heads,
-                concat=False,
-                add_self_loops=True,
-                dropout=dropout,
-            )
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.skips = nn.ModuleList()
+
+        if depth == 1:
+            self.layers.append(self._make_layer(in_dim, out_dim, heads, module_type))
         else:
-            raise ValueError(f"Unsupported module_type for mobility GNN: {module_type}")
+            # Input layer
+            self.layers.append(self._make_layer(in_dim, hidden_dim, heads, module_type))
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+            if in_dim != hidden_dim:
+                self.skips.append(nn.Linear(in_dim, hidden_dim))
+            else:
+                self.skips.append(nn.Identity())
+
+            # Hidden layers
+            for _ in range(depth - 2):
+                self.layers.append(
+                    self._make_layer(hidden_dim, hidden_dim, heads, module_type)
+                )
+                self.norms.append(nn.LayerNorm(hidden_dim))
+                self.skips.append(nn.Identity())
+
+            # Output layer
+            self.layers.append(
+                self._make_layer(hidden_dim, out_dim, heads, module_type)
+            )
 
         # Log initialization
         logger.info(
             f"Initialized MobilityPyGEncoder: {in_dim}->{hidden_dim}->{out_dim}, "
             f"module_type={module_type}, layers={depth}, heads={heads}"
         )
+
+    def _make_layer(self, in_c, out_c, heads, module_type):
+        if module_type == "gcn":
+            return GCNConv(in_c, out_c, add_self_loops=True)
+        elif module_type == "gat":
+            return GATConv(
+                in_c,
+                out_c,
+                heads=heads,
+                concat=False,
+                add_self_loops=True,
+                dropout=self.dropout_val,
+            )
+        else:
+            raise ValueError(f"Unsupported module_type: {module_type}")
 
     def forward(
         self,
@@ -298,10 +318,26 @@ class MobilityPyGEncoder(nn.Module):
             edge_index: Graph connectivity [2, num_edges]
             edge_weight: Optional edge weights aligned to edge_index
         """
-        h = self.conv1(x, edge_index, edge_weight)
-        h = self.activation(h)
-        h = self.dropout(h)
-        h = self.conv2(h, edge_index, edge_weight)
+        h = x
+
+        for i, layer in enumerate(self.layers):
+            h_in = h
+
+            # Message Passing
+            h = layer(h, edge_index, edge_weight)
+
+            # Activation and Norm (skip for last layer if desired, but here we apply uniform block structure for hidden)
+            # Logic: If it's not the last layer, apply activation & norm & dropout
+            if i < len(self.layers) - 1:
+                h = self.norms[i](h)
+                h = self.activation(h)
+                h = F.dropout(h, p=self.dropout_val, training=self.training)
+
+                # Residual connection
+                if i < len(self.skips):
+                    skip = self.skips[i](h_in)
+                    h = h + skip
+
         return h
 
 
@@ -464,7 +500,7 @@ class MobilityGNN(nn.Module):
         Returns:
             Batch of mobility-enhanced embeddings [batch_size, num_nodes, out_dim]
         """
-        batch_size, num_nodes, _ = node_features_batch.shape
+        batch_size, _num_nodes, _ = node_features_batch.shape
 
         # Process each batch element (can be optimized with proper batching)
         outputs = []
