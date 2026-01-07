@@ -7,6 +7,7 @@ or any entry point to ensure consistent logging behavior across all modules.
 
 import logging
 import sys
+import warnings
 from typing import Literal
 
 
@@ -43,4 +44,22 @@ def setup_logging(
         format=format_str,
         stream=sys.stdout,
         force=False,
+    )
+
+
+def suppress_zarr_warnings() -> None:
+    """
+    Suppress zarr warnings about numcodecs not being in v3 specification.
+
+    Call this at module import time in any file that uses zarr to silence
+    warnings about numcodecs codec compatibility.
+
+    Example:
+        >>> import zarr
+        >>> from utils.logging import suppress_zarr_warnings
+        >>> suppress_zarr_warnings()
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message=".*Numcodecs codecs are not in the Zarr version 3 specification.*",
     )

@@ -6,12 +6,10 @@ data:
   mobility_threshold: 10
   window_stride: 1
   missing_permit: 0
-  #-- smoothing --#
   smoothing:
     enabled: true
     window: 5
     smoothing_type: rolling_mean
-  #-- log transformation --#
   log_scale: true
 model:
   type:
@@ -36,18 +34,19 @@ output:
   log_dir: outputs/training
 training:
   device: "cpu"
-  batch_size: 20
+  batch_size: 32
   early_stopping_patience: 5
   nan_loss_patience: 5
   max_batches: 20
-  epochs: 5
+  epochs: 2
   learning_rate: 0.001
   weight_decay: 1.0e-05
   num_workers: 4
+  val_workers: 2
   val_split: 0.2
   test_split: 0.1
   profiler:
-    enabled: true
+    enabled: false
     profile_batches: 10
     log_dir: auto
   plot_forecasts: true

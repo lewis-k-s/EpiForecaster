@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from omegaconf import MISSING, DictConfig, OmegaConf
 
 GNN_TYPES = ["gcn", "gat"]
 FORECASTER_HEAD_TYPES = ["transformer"]
@@ -75,8 +76,8 @@ class DataConfig:
     log_scale: bool = False
 
     def __post_init__(self) -> None:
-        if isinstance(self.smoothing, dict):
-            self.smoothing = SmoothingConfig(**self.smoothing)
+        if isinstance(self.smoothing, (dict, DictConfig)):
+            self.smoothing = SmoothingConfig(**self.smoothing)  # type: ignore[arg-type]
 
         if self.window_stride <= 0:
             raise ValueError("window_stride must be positive")
@@ -103,6 +104,7 @@ class ModelConfig:
     # -- graph params --#
     max_neighbors: int
     gnn_depth: int = 2
+    gnn_hidden_dim: int = 32
 
     # -- static/temporal covariates --#
     use_population: bool = True
@@ -111,13 +113,19 @@ class ModelConfig:
     # -- module choices --#
     gnn_module: str = ""
     forecaster_head: str = "transformer"
+    
+    # -- forecaster head params --#
+    head_d_model: int = 128
+    head_n_heads: int = 4
+    head_num_layers: int = 3
+    head_dropout: float = 0.1
 
     # pretrained region2vec encoder model weights
     region2vec_path: str = ""
 
     def __post_init__(self) -> None:
-        assert isinstance(self.type, dict), "type must be a dictionary"
-        self.type = ModelVariant(**self.type)
+        if isinstance(self.type, (dict, DictConfig)):
+            self.type = ModelVariant(**self.type)  # type: ignore[arg-type]
 
         if self.type.mobility:
             if not self.gnn_module:
@@ -154,6 +162,7 @@ class TrainingParams:
     test_split: float = 0.1
     device: str = "auto"
     num_workers: int = 4
+    val_workers: int = 0
     pin_memory: bool = True
     eval_frequency: int = 5
     eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
@@ -200,41 +209,120 @@ class EpiForecasterConfig:
     simple while we retain a typed, well-documented configuration surface.
     """
 
-    model: ModelConfig = field(default_factory=ModelConfig)
-    data: DataConfig = field(default_factory=DataConfig)
-    training: TrainingParams = field(default_factory=TrainingParams)
-    output: OutputConfig = field(default_factory=OutputConfig)
+    model: ModelConfig = MISSING
+    data: DataConfig = MISSING
+    training: TrainingParams = MISSING
+    output: OutputConfig = MISSING
 
     @classmethod
     def from_file(cls, config_path: str) -> "EpiForecasterConfig":
         """Load configuration from YAML file located at ``config_path``."""
+        return cls.load(config_path)
 
+    @classmethod
+    def apply_overrides(
+        cls, config: "EpiForecasterConfig", overrides: list[str]
+    ) -> "EpiForecasterConfig":
+        """Apply dotted-key overrides to an existing configuration object.
+
+        Args:
+            config: Existing EpiForecasterConfig instance (e.g., loaded from checkpoint).
+            overrides: List of dotted-key overrides like ``["training.learning_rate=0.001"]``.
+
+        Returns:
+            EpiForecasterConfig instance with overrides applied.
+        """
+        from omegaconf import OmegaConf
+
+        # Convert to dict, apply overrides with OmegaConf, then reconstruct
+        config_dict = config.to_dict()
+        config_cfg = OmegaConf.create(config_dict)
+        override_cfg = OmegaConf.from_dotlist(overrides)
+        merged_cfg = OmegaConf.merge(config_cfg, override_cfg)
+
+        # Use OmegaConf.to_container to get a proper dict with nested objects converted
+        merged_dict = OmegaConf.to_container(merged_cfg)
+        assert merged_dict is not None and isinstance(merged_dict, dict)
+
+        # Recreate nested config objects and replace top-level config
+        return cls(
+            model=ModelConfig(**merged_dict["model"]),
+            data=DataConfig(**merged_dict["data"]),
+            training=TrainingParams(**merged_dict["training"]),
+            output=OutputConfig(**merged_dict["output"]),
+        )
+
+    @classmethod
+    def load(
+        cls,
+        config_path: str | Path,
+        *,
+        overrides: list[str] | None = None,
+        strict: bool = True,
+    ) -> "EpiForecasterConfig":
+        """Load configuration from YAML file with optional dotted-key overrides.
+
+        Args:
+            config_path: Path to YAML configuration file.
+            overrides: List of dotted-key overrides like ``["training.learning_rate=0.001"]``.
+            strict: If True, reject unknown keys in the configuration (raises StructuredConfigError).
+
+        Returns:
+            EpiForecasterConfig instance with all validation from ``__post_init__`` applied.
+
+        Example:
+            >>> cfg = EpiForecasterConfig.load(
+            ...     "configs/train_epifor_full.yaml",
+            ...     overrides=["training.learning_rate=0.001", "data.smoothing.window=7"],
+            ...     strict=True,
+            ... )
+        """
         config_path = Path(config_path)
         if not config_path.exists():
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-        with open(config_path) as f:
-            config_dict = yaml.safe_load(f)
+        raw = yaml.safe_load(config_path.read_text())
+        if raw is None:
+            raise ValueError(f"Configuration file is empty: {config_path}")
 
-        data_cfg = DataConfig(**config_dict.get("data", {}))
-
-        # Handle nested model config structure (params may be nested)
-        model_dict = config_dict.get("model", {}).copy()
+        model_dict = (raw.get("model", {}) or {}).copy()
         if "params" in model_dict:
             params = model_dict.pop("params")
-            model_dict.update(params)
+            if params:
+                model_dict.update(params)
 
-        model_cfg = ModelConfig(**model_dict)
-        training_dict = config_dict.get("training", {}).copy()
-        profiler_dict = training_dict.pop("profiler", {})
-        training_cfg = TrainingParams(
-            **training_dict, profiler=ProfilerConfig(**profiler_dict)
-        )
-        output_cfg = OutputConfig(**config_dict.get("output", {}))
+        cfg_dict = {
+            "model": model_dict,
+            "data": raw.get("data", {}) or {},
+            "training": raw.get("training", {}) or {},
+            "output": raw.get("output", {}) or {},
+        }
 
-        return cls(
-            model=model_cfg,
-            data=data_cfg,
-            training=training_cfg,
-            output=output_cfg,
-        )
+        schema = OmegaConf.structured(cls)
+        file_cfg = OmegaConf.create(cfg_dict)
+        merged = OmegaConf.merge(schema, file_cfg)
+
+        if overrides:
+            override_cfg = OmegaConf.from_dotlist(overrides)
+            merged = OmegaConf.merge(merged, override_cfg)
+
+        if strict:
+            OmegaConf.set_struct(merged, True)
+
+        cfg: EpiForecasterConfig = OmegaConf.to_object(merged)  # type: ignore[assignment]
+
+        return cfg
+
+    def to_dict(self) -> dict:
+        """Serialize configuration to a plain dictionary for YAML export."""
+        from dataclasses import fields
+
+        result = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if value is not None:
+                if hasattr(value, "to_dict"):
+                    result[f.name] = value.to_dict()
+                else:
+                    result[f.name] = value
+        return result

@@ -231,7 +231,7 @@ class ForecasterHead(nn.Module):
         Returns:
             Forecasts [batch_size, horizon] for future time steps
         """
-        batch_size, seq_len, _ = x_seq.shape
+        _batch_size, seq_len, _ = x_seq.shape
 
         # Input projection to model dimension
         x = self.input_projection(x_seq)  # [batch_size, seq_len, d_model]
@@ -367,7 +367,7 @@ class MultiHorizonForecaster(nn.Module):
 
         # Multiple output heads for different horizons
         self.output_heads = nn.ModuleDict()
-        for horizon in horizons:
+        for horizon in self.horizons:
             self.output_heads[str(horizon)] = nn.Linear(d_model, horizon)
 
     def forward(self, x_seq: torch.Tensor) -> dict[int, torch.Tensor]:
