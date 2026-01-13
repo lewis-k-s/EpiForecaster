@@ -74,6 +74,10 @@ class DataConfig:
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     # Log transformation for cases and biomarkers
     log_scale: bool = False
+    # Mobility preprocessing configuration
+    mobility_log_scale: bool = True
+    mobility_clip_range: tuple[float, float] = (-8.0, 8.0)
+    mobility_scale_epsilon: float = 1e-6
 
     def __post_init__(self) -> None:
         if isinstance(self.smoothing, (dict, DictConfig)):
@@ -84,6 +88,12 @@ class DataConfig:
 
         if self.missing_permit < 0:
             raise ValueError("missing_permit must be non-negative")
+
+        if len(self.mobility_clip_range) != 2:
+            raise ValueError("mobility_clip_range must be a tuple of (min, max)")
+
+        if self.mobility_scale_epsilon <= 0:
+            raise ValueError("mobility_scale_epsilon must be positive")
 
 
 @dataclass
@@ -113,7 +123,7 @@ class ModelConfig:
     # -- module choices --#
     gnn_module: str = ""
     forecaster_head: str = "transformer"
-    
+
     # -- forecaster head params --#
     head_d_model: int = 128
     head_n_heads: int = 4
@@ -163,6 +173,7 @@ class TrainingParams:
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 0
+    prefetch_factor: int | None = None
     pin_memory: bool = True
     eval_frequency: int = 5
     eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
@@ -171,7 +182,10 @@ class TrainingParams:
     num_forecast_samples: int = (
         3  # Number of samples per category (best, worst, random)
     )
-    grad_norm_log_frequency: int = 50
+    grad_norm_log_frequency: int = 100
+    progress_log_frequency: int = (
+        10  # Log progress every N steps to reduce CPU-GPU sync
+    )
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
 
     def __post_init__(self) -> None:
