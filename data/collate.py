@@ -25,12 +25,17 @@ def collate_epidataset_batch(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     population = torch.stack([item["population"] for item in batch], dim=0)
 
     # Flatten mobility graphs and annotate batch_id/time_id for batching
-    graph_list = []
+    # Pre-allocate list to avoid dynamic resizing
+    B, T = len(batch), len(batch[0]["mob"]) if batch else 0
+    graph_list = [None] * (B * T)
+    idx = 0
     for b, item in enumerate(batch):
         for t, g in enumerate(item["mob"]):
-            g.batch_id = torch.tensor([b], dtype=torch.long)
-            g.time_id = torch.tensor([t], dtype=torch.long)
-            graph_list.append(g)
+            # Use scalar assignment instead of tensor creation for performance
+            g.batch_id = b
+            g.time_id = t
+            graph_list[idx] = g
+            idx += 1
 
     mob_batch = Batch.from_data_list(graph_list)
     T = len(batch[0]["mob"]) if B > 0 else 0

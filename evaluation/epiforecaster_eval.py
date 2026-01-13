@@ -371,7 +371,7 @@ def topk_target_nodes_by_mae(
                 for sample_mae, target_node in zip(
                     per_sample_mae, target_nodes, strict=False
                 ):
-                    node_id = int(target_node.item())
+                    node_id = int(target_node)
                     if node_id not in node_mae_sum:
                         node_mae_sum[node_id] = torch.tensor(0.0, device=device)
                     node_mae_sum[node_id] += sample_mae.detach()
@@ -597,7 +597,7 @@ def evaluate_loader(
                 for sample_mae, target_node in zip(
                     per_sample_mae, target_nodes, strict=False
                 ):
-                    node_id = int(target_node.item())
+                    node_id = int(target_node)
                     if node_id not in node_mae_sum:
                         node_mae_sum[node_id] = torch.tensor(0.0, device=device)
                     node_mae_sum[node_id] += sample_mae.detach()

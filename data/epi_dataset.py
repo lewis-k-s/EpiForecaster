@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import Dataset
 from torch_geometric.data import Data
 
 from graph.node_encoder import Region2Vec
@@ -18,6 +18,10 @@ suppress_zarr_warnings()
 
 from .biomarker_preprocessor import BiomarkerPreprocessor  # noqa: E402
 from .cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig  # noqa: E402
+from .mobility_preprocessor import (  # noqa: E402
+    MobilityPreprocessor,
+    MobilityPreprocessorConfig,
+)
 from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,7 @@ class EpiDataset(Dataset):
         context_nodes: list[int],
         biomarker_preprocessor: BiomarkerPreprocessor | None = None,
         cases_preprocessor: CasesPreprocessor | None = None,
+        mobility_preprocessor: MobilityPreprocessor | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
@@ -91,6 +96,45 @@ class EpiDataset(Dataset):
             self.rolling_mean,
             self.rolling_std,
         ) = self.cases_preprocessor.preprocess_dataset(self._dataset)
+
+        # Setup mobility preprocessor
+        if mobility_preprocessor is None:
+            mp_config = MobilityPreprocessorConfig(
+                log_scale=config.data.mobility_log_scale,
+                clip_range=config.data.mobility_clip_range,
+                scale_epsilon=config.data.mobility_scale_epsilon,
+            )
+            self.mobility_preprocessor = MobilityPreprocessor(mp_config)
+
+            # Fit scaler on train nodes only
+            all_region_ids = self._dataset[REGION_COORD].values
+            train_region_ids = [all_region_ids[n] for n in target_nodes]
+            self.mobility_preprocessor.fit_scaler(self._dataset, train_region_ids)
+        else:
+            self.mobility_preprocessor = mobility_preprocessor
+
+        # Always preload mobility data into memory (RAM) to avoid Zarr chunking I/O overhead.
+        mobility_da = self._dataset.mobility
+        # Ensure proper dimension ordering: Time, Origin, Destination
+        mobility_da = self.mobility_preprocessor._ensure_time_first(mobility_da)
+
+        # Load all values into memory
+        mobility_np = mobility_da.values
+
+        # Apply preprocessing/scaling once
+        mobility_np = self.mobility_preprocessor.transform_values(mobility_np)
+
+        # Convert to torch tensor
+        self.preloaded_mobility = torch.from_numpy(mobility_np).to(torch.float32)
+
+        # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
+        mobility_threshold = float(config.data.mobility_threshold)
+        self.mobility_mask = self.preloaded_mobility >= mobility_threshold
+
+        logger.info(
+            f"Mobility preloaded: {self.preloaded_mobility.shape}, "
+            f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
+        )
 
         # Setup biomarker preprocessor
         if biomarker_preprocessor is None:
@@ -190,10 +234,17 @@ class EpiDataset(Dataset):
         if self._dataset is not None:
             return self._dataset
 
+        # Always cache the dataset handle
         ds = xr.open_zarr(self.aligned_data_path)
-        if get_worker_info() is not None:
-            self._dataset = ds
+        self._dataset = ds
         return ds
+
+    def __getstate__(self):
+        """Allow pickling by clearing the dataset handle."""
+        state = self.__dict__.copy()
+        state["_dataset"] = None
+        # preloaded_mobility is a tensor, so it picks fine.
+        return state
 
     def num_windows(self) -> int:
         """Number of window start positions valid for at least one target node."""
@@ -258,12 +309,11 @@ class EpiDataset(Dataset):
         if forecast_targets > T:
             raise IndexError("Requested window exceeds available time steps")
 
-        # Optimization: Only slice mobility from dataset (disk/zarr), not everything
-        mobility_da = self.dataset.mobility.isel(
-            {TEMPORAL_COORD: slice(range_start, range_end)}
-        )
-        mobility_np = mobility_da.values
-        mobility_history = torch.from_numpy(mobility_np).to(torch.float32)
+        # Optimization: Only slice mobility from RAM tensor, never from disk/zarr
+        # preloaded_mobility is (TotalTime, Origin, Destination)
+        # We want [range_start:range_end, :, target_idx]
+        mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
+        neigh_mask = self.mobility_mask[range_start:range_end, :, target_idx]
 
         # Cases Processing (using precomputed tensors)
         # 1. Get stats at the end of history window (t + L - 1)
@@ -284,15 +334,14 @@ class EpiDataset(Dataset):
         case_history = norm_window[:L]  # (L, N, 1)
         future_cases = norm_window[L:]  # (H, N, 1)
 
-        mobility_threshold = float(self.config.data.mobility_threshold)
-        neigh_mask = mobility_np[:, :, target_idx] >= mobility_threshold
         if self.context_mask is not None:
-            context_mask_np = self.context_mask.cpu().numpy()
-            neigh_mask = neigh_mask & context_mask_np[None, :]
+            # self.context_mask is a tensor
+            neigh_mask = neigh_mask & self.context_mask[None, :]
+            # Force target node to be included
             neigh_mask[:, target_idx] = True
 
         # Apply mask to case_history
-        neigh_mask_t = torch.from_numpy(neigh_mask).to(torch.float32).unsqueeze(-1)
+        neigh_mask_t = neigh_mask.to(torch.float32).unsqueeze(-1)
         case_history = case_history * neigh_mask_t
 
         # Encode all regions in context using 4-channel biomarker encoding
@@ -318,8 +367,8 @@ class EpiDataset(Dataset):
         target_np = future_cases[:, target_idx, :]
         targets = target_np.squeeze(-1)
 
-        assert mobility_history.shape == (L, self.num_nodes, self.num_nodes), (
-            "Mob history shape mismatch"
+        assert mobility_history.shape == (L, self.num_nodes), (
+            f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
         )
         assert case_history.shape == (L, self.num_nodes, 1), (
             "Case history shape mismatch"
@@ -501,7 +550,7 @@ class EpiDataset(Dataset):
 
     def _dense_graph_to_ego_pyg(
         self,
-        mob_t: torch.Tensor,
+        inflow_t: torch.Tensor,
         case_t: torch.Tensor,
         bio_t: torch.Tensor,
         dst_idx: int,
@@ -511,28 +560,56 @@ class EpiDataset(Dataset):
 
         Nodes include the target and all origins with non-zero incoming flow. Edges
         are directed origin -> target and store the raw flow weight.
+
+        Vectorized Logic:
+            We construct node_ids as [neighbor_1, ..., neighbor_k, target].
+            We then blindly create edges 0 -> k, 1 -> k, etc.
+            If a self-loop exists (neighbor_i == target), we generate an edge i -> k.
+            Since x[i] and x[k] are identical feature vectors (derived from the same region),
+            the Message Passing Neural Network (MPNN) receives the exact same information
+            as a k -> k self-loop.
+
+        Args:
+            inflow_t: Vector (N,) of inflow values to dst_idx
+            case_t: Vector (N, C) of case features
+            bio_t: Vector (N, B) of biomarker features
+            dst_idx: Index of the target node
+            time_id: Optional time step index
         """
         if self.context_mask is not None:
-            mob_t = mob_t.clone()
-            mob_t[~self.context_mask, dst_idx] = 0
+            inflow_t = inflow_t.clone()
+            inflow_t[~self.context_mask] = 0
 
-        inflow = mob_t[:, dst_idx]
-        origins = inflow.nonzero(as_tuple=False).flatten()
+        # Now inflow_t is already the inflow vector (N,)
+        origins = inflow_t.nonzero(as_tuple=False).flatten()
 
-        node_ids = torch.cat(
-            [origins, torch.tensor([dst_idx], dtype=torch.long)], dim=0
-        )
-        id_map = {int(n): i for i, n in enumerate(node_ids)}
+        # Limit to max_neighbors by selecting top-k by inflow
+        max_neighbors = self.config.model.max_neighbors
+        if origins.numel() > max_neighbors:
+            # Get top-k neighbors by inflow value
+            top_values = inflow_t[origins]
+            top_k_indices = torch.topk(top_values, k=max_neighbors).indices
+            origins = origins[top_k_indices]
 
-        if origins.numel() == 0:
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weight = torch.empty((0,), dtype=mob_t.dtype)
+        # Construct node_ids: [neighbor_1, ..., neighbor_k, target_node]
+        # Note: 'origins' might contain dst_idx if self-loop exists.
+        # We append dst_idx at the end regardless, effectively treating it as a
+        # distinct node in the graph structure if it also appears in origins.
+        # This simplifies edge construction to "all nodes in list -> last node".
+        target_node_tensor = torch.tensor([dst_idx], dtype=torch.long)
+        node_ids = torch.cat([origins, target_node_tensor], dim=0)
+
+        num_neighbors = origins.numel()
+        # Edge index: all neighbor indices (0 to num_neighbors-1) -> target index (num_neighbors)
+        # Shape (2, num_edges)
+        if num_neighbors > 0:
+            sources = torch.arange(num_neighbors, dtype=torch.long)
+            targets = torch.full((num_neighbors,), num_neighbors, dtype=torch.long)
+            edge_index = torch.stack([sources, targets], dim=0)
+            edge_weight = inflow_t[origins]
         else:
-            edge_index = torch.tensor(
-                [[id_map[int(o)], id_map[dst_idx]] for o in origins],
-                dtype=torch.long,
-            ).t()
-            edge_weight = inflow[origins]
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_weight = torch.empty((0,), dtype=inflow_t.dtype)
 
         # TODO: find a better way to do this. the feature concatenation logic is scattered
         # through the model.
@@ -546,7 +623,8 @@ class EpiDataset(Dataset):
 
         g = Data(x=x, edge_index=edge_index, edge_weight=edge_weight)
         g.num_nodes = node_ids.numel()
-        g.target_node = torch.tensor([id_map[dst_idx]], dtype=torch.long)
+        # The target node is always the last one in our construction
+        g.target_node = torch.tensor([num_neighbors], dtype=torch.long)
         if time_id is not None:
             g.time_id = torch.tensor([time_id], dtype=torch.long)
         return g
