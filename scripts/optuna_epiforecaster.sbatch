@@ -2,8 +2,8 @@
 #SBATCH --job-name=epi-hpo
 #SBATCH --account=bsc08
 #SBATCH --qos=acc_bscls
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=80
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=20
 #SBATCH --time=04:00:00 # remember to update the timeout_secs below if you change this
 #SBATCH --array=0-3 # saturate the node with parallel tasks on each GPU
 #SBATCH --output=slurm-%x-%A_%a.out # stdout/stderr log per array task
@@ -27,7 +27,7 @@ MAX_BATCHES="${MAX_BATCHES:-}"
 SEED="${SEED:-}"
 # Worker timeout in seconds (defaults to SLURM time limit minus buffer).
 # Format HH:MM:SS is converted to seconds.
-TIMEOUT_SECS="${TIMEOUT_SECS:-14200}"  # 4 hours - buffer
+TIMEOUT_SECS="${TIMEOUT_SECS:-14200}" # 4 hours - buffer
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 
