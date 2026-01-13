@@ -73,23 +73,27 @@ class EpiForecasterTrainer:
             target_nodes=train_nodes,
             context_nodes=train_nodes,
             biomarker_preprocessor=None,
+            mobility_preprocessor=None,
         )
 
-        # Reuse train dataset's fitted preprocessor for val/test
-        fitted_preprocessor = self.train_dataset.biomarker_preprocessor
+        # Reuse train dataset's fitted preprocessors for val/test
+        fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
+        fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
 
         self.val_dataset = EpiDataset(
             config=self.config,
             target_nodes=val_nodes,
             context_nodes=train_nodes + val_nodes,
-            biomarker_preprocessor=fitted_preprocessor,
+            biomarker_preprocessor=fitted_bio_preprocessor,
+            mobility_preprocessor=fitted_mobility_preprocessor,
         )
 
         self.test_dataset = EpiDataset(
             config=self.config,
             target_nodes=test_nodes,
             context_nodes=train_nodes + val_nodes,
-            biomarker_preprocessor=fitted_preprocessor,
+            biomarker_preprocessor=fitted_bio_preprocessor,
+            mobility_preprocessor=fitted_mobility_preprocessor,
         )
 
         # Optional static region embeddings from dataset
@@ -183,7 +187,9 @@ class EpiForecasterTrainer:
         self._status(f"  Batch size: {config.training.batch_size}")
         # Check max_batches limit
         if self.config.training.max_batches is not None:
-            self._status(f"max_batches={self.config.training.max_batches}: Limited to 1 epoch")
+            self._status(
+                f"max_batches={self.config.training.max_batches}: Limited to 1 epoch"
+            )
         else:
             self._status(f"  Epochs: {config.training.epochs}")
             self._status(f"  {len(self.train_loader)} batches per epoch")
@@ -318,6 +324,16 @@ class EpiForecasterTrainer:
 
     def _create_data_loaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
         """Create training and validation data loaders with device-aware optimizations."""
+        # Set multiprocessing context to avoid CUDA fork deadlocks
+        # 'spawn' is required when using CUDA with num_workers > 0
+        all_num_workers_zero = (
+            self.config.training.num_workers == 0
+            and self.config.training.val_workers == 0
+        )
+        mp_context = (
+            "spawn" if self.device.type == "cuda" and not all_num_workers_zero else None
+        )
+
         # Device-aware hardware optimizations
         pin_memory = self.config.training.pin_memory and self.device.type == "cuda"
 
@@ -343,9 +359,14 @@ class EpiForecasterTrainer:
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "collate_fn": self._collate_fn,
+            "multiprocessing_context": mp_context,
         }
         if persistent_workers:
             train_loader_kwargs["persistent_workers"] = True
+        if self.config.training.prefetch_factor is not None:
+            train_loader_kwargs["prefetch_factor"] = (
+                self.config.training.prefetch_factor
+            )
         train_loader = DataLoader(**train_loader_kwargs)
 
         val_persistent_workers = val_num_workers > 0
@@ -357,9 +378,12 @@ class EpiForecasterTrainer:
             "persistent_workers": val_persistent_workers,
             "pin_memory": pin_memory,
             "collate_fn": self._collate_fn,
+            "multiprocessing_context": mp_context,
         }
         if val_persistent_workers:
             val_loader_kwargs["persistent_workers"] = True
+        if self.config.training.prefetch_factor is not None:
+            val_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
         val_loader = DataLoader(**val_loader_kwargs)
 
         test_loader_kwargs = {
@@ -369,9 +393,12 @@ class EpiForecasterTrainer:
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "collate_fn": self._collate_fn,
+            "multiprocessing_context": mp_context,
         }
         if persistent_workers:
             test_loader_kwargs["persistent_workers"] = True
+        if self.config.training.prefetch_factor is not None:
+            test_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
         test_loader = DataLoader(**test_loader_kwargs)
         return train_loader, val_loader, test_loader
 
@@ -424,6 +451,42 @@ class EpiForecasterTrainer:
             "TargetNode": target_nodes,  # (B,)
             "NodeLabels": [item["node_label"] for item in batch],
         }
+
+    @staticmethod
+    def _forward_batch(
+        *,
+        model: torch.nn.Module,
+        batch_data: dict[str, Any],
+        device: torch.device,
+        region_embeddings: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unified forward pass with non-blocking device transfers.
+
+        Returns:
+            Tuple of (predictions, targets, target_mean, target_scale)
+        """
+        # Non-blocking transfer for all PyTorch tensors
+        batch = {
+            k: v.to(device, non_blocking=True)
+            for k, v in batch_data.items()
+            if isinstance(v, torch.Tensor)
+        }
+
+        # PyG Batch handles its own device transfer
+        mob_batch = batch_data["MobBatch"].to(device)
+
+        predictions = model.forward(
+            cases_norm=batch["CaseNode"],
+            cases_mean=batch["CaseMean"],
+            cases_std=batch["CaseStd"],
+            biomarkers_hist=batch["BioNode"],
+            mob_graphs=mob_batch,
+            target_nodes=batch["TargetNode"],
+            region_embeddings=region_embeddings,
+            population=batch["Population"],
+        )
+
+        return predictions, batch["Target"], batch["TargetMean"], batch["TargetScale"]
 
     def setup_logging(self):
         """Setup logging and experiment tracking."""
@@ -654,7 +717,9 @@ class EpiForecasterTrainer:
         # self._log_model_graph()
 
         _prev_val_loss = float("inf")
-        epochs_todo = 1 if self.config.training.max_batches else self.config.training.epochs
+        epochs_todo = (
+            1 if self.config.training.max_batches else self.config.training.epochs
+        )
         for epoch in range(self.current_epoch, epochs_todo):
             self.current_epoch = epoch
 
@@ -784,24 +849,18 @@ class EpiForecasterTrainer:
 
                 data_time_s = time.time() - fetch_start_time
                 batch_start_time = time.time()
-                predictions = self.model.forward(
-                    cases_norm=batch_data["CaseNode"].to(self.device),
-                    cases_mean=batch_data["CaseMean"].to(self.device),
-                    cases_std=batch_data["CaseStd"].to(self.device),
-                    biomarkers_hist=batch_data["BioNode"].to(self.device),
-                    mob_graphs=batch_data["MobBatch"],
-                    target_nodes=batch_data["TargetNode"].to(self.device),
-                    region_embeddings=self.region_embeddings
-                    if self.region_embeddings is not None
-                    else None,
-                    population=batch_data["Population"].to(self.device),
+                predictions, targets, target_mean, target_scale = self._forward_batch(
+                    model=self.model,
+                    batch_data=batch_data,
+                    device=self.device,
+                    region_embeddings=self.region_embeddings,
                 )
 
                 loss = self.criterion(
                     predictions,
-                    batch_data["Target"].to(self.device),
-                    batch_data["TargetMean"].to(self.device),
-                    batch_data["TargetScale"].to(self.device),
+                    targets,
+                    target_mean,
+                    target_scale,
                 )
                 # import torch as tf
                 # loss = tf.tensor(float("nan"))
@@ -841,7 +900,7 @@ class EpiForecasterTrainer:
                 if self.scheduler and self.config.training.scheduler_type == "cosine":
                     self.scheduler.step()
 
-                total_loss += loss.item()
+                total_loss += loss.detach()
                 counted_batches += 1
 
                 batch_time_s = time.time() - batch_start_time
@@ -852,13 +911,19 @@ class EpiForecasterTrainer:
                 samples_per_s = (
                     (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
                 )
-                # Progress logging
-                self._status(
-                    f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss.item():.6f} | Lr: {lr:.2e} | Grad: {float(grad_norm):.3f} | SPS: {samples_per_s:7.1f}",
+                # Progress logging - only sync to CPU periodically to reduce overhead
+                log_frequency = getattr(
+                    self.config.training, "progress_log_frequency", 1
                 )
-
-                # Tensorboard: per-iteration metrics
-                self.writer.add_scalar("Loss/Train_step", loss.item(), self.global_step)
+                log_this_step = self.global_step % log_frequency == 0
+                if log_this_step:
+                    loss_value = loss.item()
+                    self._status(
+                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.6f} | Lr: {lr:.2e} | Grad: {float(grad_norm):.3f} | SPS: {samples_per_s:7.1f}",
+                    )
+                    self.writer.add_scalar(
+                        "Loss/Train_step", loss_value, self.global_step
+                    )
                 self.writer.add_scalar("Learning_Rate/step", lr, self.global_step)
                 self.writer.add_scalar(
                     "GradNorm/Clipped_Total", float(grad_norm), self.global_step
@@ -892,7 +957,7 @@ class EpiForecasterTrainer:
                     profiler_complete_announced = True
 
         effective_batches = max(1, counted_batches)
-        return total_loss / effective_batches
+        return (total_loss / effective_batches).item()
 
     def _generate_forecast_plots(self, loader: DataLoader, split: str):
         """Generate and save forecast plots using quartile strategy."""
@@ -1013,7 +1078,7 @@ class EpiForecasterTrainer:
 
     def _persist_run_config(self, run_dir: Path) -> None:
         """Copy the input configuration to the run directory.
-        Note that the config is saved in the model snapshots eg. best_model.pt 
+        Note that the config is saved in the model snapshots eg. best_model.pt
         So this is purely a convenience method for easier readability
         """
         config_dict = self.config.to_dict()
@@ -1102,7 +1167,10 @@ class EpiForecasterTrainer:
                     if hasattr(loader, "_workers"):
                         workers = loader._workers
                         if workers:
-                            self._status(f"Cleaning up {name} loader ({len(workers)} workers)...", logging.DEBUG)
+                            self._status(
+                                f"Cleaning up {name} loader ({len(workers)} workers)...",
+                                logging.DEBUG,
+                            )
                             # Terminate workers explicitly
                             for worker in workers:
                                 if worker.is_alive():
@@ -1110,7 +1178,9 @@ class EpiForecasterTrainer:
                     # Clear the loader reference
                     setattr(self, f"{name}_loader", None)
                 except Exception as e:
-                    self._status(f"Error cleaning up {name} loader: {e}", logging.WARNING)
+                    self._status(
+                        f"Error cleaning up {name} loader: {e}", logging.WARNING
+                    )
 
     def get_training_results(self) -> dict[str, Any]:
         """Return training results summary dictionary."""
