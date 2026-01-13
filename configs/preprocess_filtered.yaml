@@ -16,8 +16,6 @@ forecast_horizon: 7
 sequence_length: 14
 
 # Feature processing options
-cases_normalization: "log1p"
-mobility_normalization: "log1p"
 min_flow_threshold: 10
 
 # Region filtering

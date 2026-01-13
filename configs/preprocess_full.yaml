@@ -15,9 +15,7 @@ end_date: "2021-05-09" # Latest mobility data available
 forecast_horizon: 7
 sequence_length: 14
 
-# Feature processing options - cases only focus
-cases_normalization: "log1p"
-mobility_normalization: "log1p"
+# Feature processing options
 min_flow_threshold: 10
 
 # Alignment and validation options

@@ -39,8 +39,6 @@ class PreprocessingConfig:
         forecast_horizon: Number of days to forecast into the future
         sequence_length: Length of input sequences for models
 
-        mobility_normalization: Normalization method for mobility data
-        cases_normalization: Normalization method for case data
         min_flow_threshold: Minimum flow threshold for wastewater data
 
         alignment_strategy: Strategy for aligning multiple datasets
@@ -75,8 +73,6 @@ class PreprocessingConfig:
     dataset_name: str
 
     # Feature processing options
-    mobility_normalization: str = "log1p"  # "log1p", "standard", "minmax", "none"
-    cases_normalization: str = "log1p"  # "log1p", "standard", "minmax", "none"
     min_flow_threshold: int = 10
 
     # Temporal processing parameters
@@ -180,19 +176,6 @@ class PreprocessingConfig:
 
     def _validate_processing_options(self):
         """Validate processing options."""
-        valid_normalizations = ["log1p", "standard", "minmax", "none"]
-        if self.mobility_normalization not in valid_normalizations:
-            raise ValueError(
-                f"Invalid mobility_normalization: {self.mobility_normalization}. "
-                f"Valid options: {valid_normalizations}"
-            )
-
-        if self.cases_normalization not in valid_normalizations:
-            raise ValueError(
-                f"Invalid cases_normalization: {self.cases_normalization}. "
-                f"Valid options: {valid_normalizations}"
-            )
-
         valid_alignments = ["interpolate", "nearest", "spline"]
         if self.alignment_strategy not in valid_alignments:
             raise ValueError(
@@ -298,8 +281,6 @@ class PreprocessingConfig:
             "processing_parameters": {
                 "forecast_horizon": self.forecast_horizon,
                 "sequence_length": self.sequence_length,
-                "mobility_normalization": self.mobility_normalization,
-                "cases_normalization": self.cases_normalization,
             },
             "alignment": {
                 "strategy": self.alignment_strategy,
