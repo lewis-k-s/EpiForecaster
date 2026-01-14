@@ -138,7 +138,7 @@ def generate_input_plots(
             logger.info("  - Creating cases window figure...")
             fig_cases = make_cases_window_figure(samples, history_length)
             if fig_cases is not None:
-                cases_path = output_dir / "cases_window.png"
+                cases_path = output_dir / "input_series.png"
                 fig_cases.savefig(cases_path, dpi=150, bbox_inches="tight")
                 logger.info(f"    Saved: {cases_path}")
 
