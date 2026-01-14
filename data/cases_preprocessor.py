@@ -30,7 +30,9 @@ class CasesPreprocessor:
             dataset: xarray Dataset containing 'cases' and optionally 'population'.
 
         Returns:
-            processed_cases: (T, N, 1) Tensor of scaled, log-transformed (if set) cases.
+            processed_cases: (T, N, 2) Tensor with [value, mask] channels.
+                Channel 0: scaled, log-transformed (if set) cases (NaN preserved).
+                Channel 1: mask (1.0 if finite, 0.0 if NaN).
             rolling_mean: (T, N, 1) Tensor of rolling means (right-aligned).
             rolling_std: (T, N, 1) Tensor of rolling stds (right-aligned).
         """
@@ -107,9 +109,17 @@ class CasesPreprocessor:
         # Let's keep NaNs in `values` for now, so we can see where data is missing.
         # But we must ensure `rolling_mean` and `rolling_std` are dense (no NaNs).
 
-        # 5. Convert to Tensor and add feature dim (T, N, 1)
-        values_t = torch.from_numpy(values).float().unsqueeze(-1)
+        # 5. Compute mask channel (1.0 if finite, 0.0 if NaN)
+        mask = np.isfinite(values).astype(np.float32)
+
+        # 6. Convert to Tensor and stack channels
+        values_t = torch.from_numpy(values).float()  # (T, N)
+        mask_t = torch.from_numpy(mask).float()  # (T, N)
+
+        # Stack to (T, N, 2): channel 0 = value, channel 1 = mask
+        cases_2ch = torch.stack([values_t, mask_t], dim=-1)
+
         mean_t = torch.from_numpy(rolling_mean).float().unsqueeze(-1)
         std_t = torch.from_numpy(rolling_std).float().unsqueeze(-1)
 
-        return values_t, mean_t, std_t
+        return cases_2ch, mean_t, std_t
