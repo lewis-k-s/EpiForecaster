@@ -70,14 +70,15 @@ def collect_case_window_samples(
         }
 
         if include_biomarkers_locf:
-            biomarkers_locf = item.get("bio_node_locf")
-            if isinstance(biomarkers_locf, torch.Tensor):
-                if biomarkers_locf.ndim != 3:
-                    raise ValueError("Expected `bio_node_locf` with shape (L, B, 3).")
+            biomarkers = item.get("bio_node")
+            if isinstance(biomarkers, torch.Tensor):
+                # bio_node has shape (L, 4) with channels: [value, mask, age, has_data]
+                if biomarkers.ndim != 2 or biomarkers.shape[1] != 4:
+                    raise ValueError("Expected `bio_node` with shape (L, 4).")
                 # Extract channels: [value, mask, age]
-                value_channel = biomarkers_locf[:, :, 0]
-                mask_channel = biomarkers_locf[:, :, 1]
-                age_channel = biomarkers_locf[:, :, 2]
+                value_channel = biomarkers[:, 0]
+                mask_channel = biomarkers[:, 1]
+                age_channel = biomarkers[:, 2]
                 sample["biomarkers_locf"] = {
                     "value": value_channel.detach().cpu().numpy().astype(np.float32),
                     "mask": mask_channel.detach().cpu().numpy().astype(np.float32),
@@ -87,12 +88,11 @@ def collect_case_window_samples(
         if include_biomarkers:
             biomarkers = item.get("bio_node")
             if isinstance(biomarkers, torch.Tensor):
-                if biomarkers.ndim != 2:
-                    raise ValueError("Expected `bio_node` with shape (L, B).")
-                if biomarker_feature_idx is None:
-                    biomarker_series = biomarkers.mean(dim=-1)
-                else:
-                    biomarker_series = biomarkers[:, biomarker_feature_idx]
+                # bio_node has shape (L, 4) with channels: [value, mask, age, has_data]
+                if biomarkers.ndim != 2 or biomarkers.shape[1] != 4:
+                    raise ValueError("Expected `bio_node` with shape (L, 4).")
+                # Use the value channel (index 0) for biomarker visualization
+                biomarker_series = biomarkers[:, 0]
                 sample["biomarkers"] = (
                     biomarker_series.detach().cpu().numpy().astype(np.float32)
                 )
@@ -100,16 +100,25 @@ def collect_case_window_samples(
         if include_mobility:
             mob_graphs = item.get("mob")
             if isinstance(mob_graphs, list):
-                incoming = []
+                means = []
+                stds = []
+                counts = []
                 for g in mob_graphs:
                     edge_weight = getattr(g, "edge_weight", None)
                     if edge_weight is None:
                         edge_weight = getattr(g, "edge_attr", None)
                     if edge_weight is None:
-                        incoming.append(0.0)
+                        means.append(0.0)
+                        stds.append(0.0)
+                        counts.append(0)
                     else:
-                        incoming.append(float(edge_weight.detach().sum().cpu().item()))
-                sample["mobility_incoming"] = np.asarray(incoming, dtype=np.float32)
+                        weights = edge_weight.detach().cpu()
+                        means.append(weights.mean().item())
+                        stds.append(weights.std().item())
+                        counts.append(len(weights))
+                sample["mobility_mean"] = np.asarray(means, dtype=np.float32)
+                sample["mobility_std"] = np.asarray(stds, dtype=np.float32)
+                sample["mobility_count"] = np.asarray(counts, dtype=np.int32)
 
         samples.append(sample)
 
@@ -150,7 +159,8 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         total_len = series.shape[0]
 
         biomarker_series = sample.get("biomarkers")
-        mobility_series = sample.get("mobility_incoming")
+        mobility_mean = sample.get("mobility_mean")
+        mobility_std = sample.get("mobility_std")
 
         plot_series: dict[str, np.ndarray] = {"Cases": series}
 
@@ -163,12 +173,18 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
             biomarker_aligned[:hist_len] = biomarker_series[:hist_len]
             plot_series["Biomarkers"] = biomarker_aligned
 
-        if mobility_series is not None:
-            mobility_series = np.asarray(mobility_series, dtype=np.float32).reshape(-1)
-            mobility_aligned = np.full(total_len, np.nan, dtype=np.float32)
-            hist_len = min(history_length, mobility_series.shape[0])
-            mobility_aligned[:hist_len] = mobility_series[:hist_len]
-            plot_series["Incoming mobility"] = mobility_aligned
+        mobility_mean_aligned = None
+        mobility_std_aligned = None
+        mobility_vmin, mobility_vmax = 0.0, 1.0
+        if mobility_mean is not None:
+            mobility_mean = np.asarray(mobility_mean, dtype=np.float32).reshape(-1)
+            mobility_std = np.asarray(mobility_std, dtype=np.float32).reshape(-1)
+            mobility_mean_aligned = np.full(total_len, np.nan, dtype=np.float32)
+            mobility_std_aligned = np.full(total_len, np.nan, dtype=np.float32)
+            hist_len = min(history_length, mobility_mean.shape[0])
+            mobility_mean_aligned[:hist_len] = mobility_mean[:hist_len]
+            mobility_std_aligned[:hist_len] = mobility_std[:hist_len]
+            plot_series["Incoming mobility"] = mobility_mean_aligned
 
         # Normalize all series to 0-1 for comparability
         for label, values in plot_series.items():
@@ -177,8 +193,13 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                 vmin, vmax = valid.min(), valid.max()
                 if vmax > vmin:
                     plot_series[label] = (values - vmin) / (vmax - vmin)
+                    # Store vmin, vmax for mobility std normalization
+                    if label == "Incoming mobility":
+                        mobility_vmin, mobility_vmax = vmin, vmax
                 else:
                     plot_series[label] = values - vmin
+                    if label == "Incoming mobility":
+                        mobility_vmin, mobility_vmax = vmin, vmin
 
         t = np.arange(total_len)
 
@@ -197,16 +218,31 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                 alpha=0.8,
             )
 
-        # Plot mobility with IQR band
-        if mobility_series is not None and "Incoming mobility" in plot_series:
-            mobility_mean = plot_series["Incoming mobility"]
+        # Plot mobility with std dev band
+        if mobility_mean_aligned is not None and "Incoming mobility" in plot_series:
+            mobility_mean_norm = plot_series["Incoming mobility"]
+            # Normalize std by the same scale used for mean
+            if mobility_vmax > mobility_vmin:
+                mobility_std_norm = mobility_std_aligned / (mobility_vmax - mobility_vmin)
+            else:
+                mobility_std_norm = mobility_std_aligned
+
             ax.plot(
                 t,
-                mobility_mean,
+                mobility_mean_norm,
                 label="Incoming mobility (mean)",
                 color=colors["Incoming mobility"],
                 linewidth=1.5,
                 alpha=0.9,
+            )
+            # Plot shaded std dev band
+            ax.fill_between(
+                t,
+                mobility_mean_norm - mobility_std_norm,
+                mobility_mean_norm + mobility_std_norm,
+                color=colors["Incoming mobility"],
+                alpha=0.25,
+                label="±1 std",
             )
 
         # Draw history/horizon separator
@@ -428,7 +464,6 @@ def compute_locf_age_stats(
 
     # Create bins
     bin_edges = np.linspace(0, age_max_days, n_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 
     counts, _ = np.histogram(all_ages, bins=bin_edges)
 
@@ -547,7 +582,6 @@ def plot_biomarker_age_heatmap(
     import seaborn as sns
 
     from data.biomarker_preprocessor import BiomarkerPreprocessor
-    from data.preprocess.config import REGION_COORD
 
     # Convert to dataset format expected by preprocessor
     if biomarker_da.name is None:
