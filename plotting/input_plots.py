@@ -91,10 +91,14 @@ def collect_case_window_samples(
                 # bio_node has shape (L, 4) with channels: [value, mask, age, has_data]
                 if biomarkers.ndim != 2 or biomarkers.shape[1] != 4:
                     raise ValueError("Expected `bio_node` with shape (L, 4).")
-                # Use the value channel (index 0) for biomarker visualization
-                biomarker_series = biomarkers[:, 0]
+                # Extract channels: [value, age]
+                value_channel = biomarkers[:, 0]
+                age_channel = biomarkers[:, 2]
                 sample["biomarkers"] = (
-                    biomarker_series.detach().cpu().numpy().astype(np.float32)
+                    value_channel.detach().cpu().numpy().astype(np.float32)
+                )
+                sample["biomarkers_age"] = (
+                    age_channel.detach().cpu().numpy().astype(np.float32)
                 )
 
         if include_mobility:
@@ -155,36 +159,61 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
     }
 
     for ax, sample in zip(axes, samples, strict=False):
+        # Series already includes history + horizon
         series = np.asarray(sample["series"], dtype=np.float32).reshape(-1)
         total_len = series.shape[0]
+        horizon_length = total_len - history_length
 
         biomarker_series = sample.get("biomarkers")
+        biomarker_age = sample.get("biomarkers_age")
         mobility_mean = sample.get("mobility_mean")
         mobility_std = sample.get("mobility_std")
 
         plot_series: dict[str, np.ndarray] = {"Cases": series}
 
+        # Extract and pad biomarkers for plotting (history only)
+        biomarker_padded = None
+        biomarker_age_padded = None
         if biomarker_series is not None:
             biomarker_series = np.asarray(biomarker_series, dtype=np.float32).reshape(
                 -1
             )
-            biomarker_aligned = np.full(total_len, np.nan, dtype=np.float32)
-            hist_len = min(history_length, biomarker_series.shape[0])
-            biomarker_aligned[:hist_len] = biomarker_series[:hist_len]
-            plot_series["Biomarkers"] = biomarker_aligned
+            assert biomarker_series.shape[0] == history_length, (
+                f"Biomarker length {biomarker_series.shape[0]} != history_length {history_length}"
+            )
+            # Pad with NaNs for horizon portion
+            biomarker_padded = np.concatenate(
+                [biomarker_series, np.full(horizon_length, np.nan)]
+            )
+            plot_series["Biomarkers"] = biomarker_padded
 
-        mobility_mean_aligned = None
-        mobility_std_aligned = None
+            # Extract and pad age channel
+            if biomarker_age is not None:
+                biomarker_age = np.asarray(biomarker_age, dtype=np.float32).reshape(-1)
+                assert biomarker_age.shape[0] == history_length
+                biomarker_age_padded = np.concatenate(
+                    [biomarker_age, np.full(horizon_length, np.nan)]
+                )
+
+        # Extract and pad mobility for plotting (history only)
+        mobility_mean_padded = None
+        mobility_std_padded = None
         mobility_vmin, mobility_vmax = 0.0, 1.0
         if mobility_mean is not None:
             mobility_mean = np.asarray(mobility_mean, dtype=np.float32).reshape(-1)
             mobility_std = np.asarray(mobility_std, dtype=np.float32).reshape(-1)
-            mobility_mean_aligned = np.full(total_len, np.nan, dtype=np.float32)
-            mobility_std_aligned = np.full(total_len, np.nan, dtype=np.float32)
-            hist_len = min(history_length, mobility_mean.shape[0])
-            mobility_mean_aligned[:hist_len] = mobility_mean[:hist_len]
-            mobility_std_aligned[:hist_len] = mobility_std[:hist_len]
-            plot_series["Incoming mobility"] = mobility_mean_aligned
+            assert mobility_mean.shape[0] == history_length, (
+                f"Mobility length {mobility_mean.shape[0]} != history_length {history_length}"
+            )
+            assert mobility_std.shape[0] == history_length
+            # Pad with NaNs for horizon portion
+            mobility_mean_padded = np.concatenate(
+                [mobility_mean, np.full(horizon_length, np.nan)]
+            )
+            mobility_std_padded = np.concatenate(
+                [mobility_std, np.full(horizon_length, np.nan)]
+            )
+            plot_series["Incoming mobility"] = mobility_mean_padded
 
         # Normalize all series to 0-1 for comparability
         for label, values in plot_series.items():
@@ -204,28 +233,55 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         t = np.arange(total_len)
 
         # Plot cases
-        ax.plot(t, plot_series["Cases"], label="Cases", color=colors["Cases"], linewidth=1.5)
+        ax.plot(
+            t, plot_series["Cases"], label="Cases", color=colors["Cases"], linewidth=1.5
+        )
 
-        # Plot biomarkers
-        if biomarker_series is not None and "Biomarkers" in plot_series:
-            biomarker_aligned = plot_series["Biomarkers"]
+        # Plot biomarkers (simple line, age shown in ribbon below)
+        if biomarker_padded is not None and "Biomarkers" in plot_series:
+            biomarker_norm = plot_series["Biomarkers"]
             ax.plot(
                 t,
-                biomarker_aligned,
+                biomarker_norm,
                 label="Biomarkers",
                 color=colors["Biomarkers"],
                 linewidth=1.5,
                 alpha=0.8,
             )
 
+            # Add age ribbon at bottom of plot (just above x-axis)
+            if biomarker_age_padded is not None:
+                # Get valid (non-NaN) age values - history only
+                valid_mask = ~np.isnan(biomarker_age_padded)
+                valid_t = t[valid_mask]
+                valid_age = biomarker_age_padded[valid_mask]
+
+                if len(valid_t) > 0:
+                    # Draw ribbon for each timestep with color based on age
+                    # ymin/ymax are in axes coordinates (0-1), so 0-0.05 is bottom 5%
+                    for ti, age in zip(valid_t, valid_age):
+                        # Use RdYlGn colormap: green=fresh (age=0), red=stale (age=1)
+                        color = plt.cm.RdYlGn_r(min(age, 1.0))
+                        ax.axvspan(
+                            ti - 0.5,
+                            ti + 0.5,
+                            ymin=0,
+                            ymax=0.05,
+                            color=color,
+                            alpha=0.7,
+                            zorder=-1,
+                        )
+
         # Plot mobility with std dev band
-        if mobility_mean_aligned is not None and "Incoming mobility" in plot_series:
+        if mobility_mean_padded is not None and "Incoming mobility" in plot_series:
             mobility_mean_norm = plot_series["Incoming mobility"]
             # Normalize std by the same scale used for mean
             if mobility_vmax > mobility_vmin:
-                mobility_std_norm = mobility_std_aligned / (mobility_vmax - mobility_vmin)
+                mobility_std_norm = mobility_std_padded / (
+                    mobility_vmax - mobility_vmin
+                )
             else:
-                mobility_std_norm = mobility_std_aligned
+                mobility_std_norm = mobility_std_padded
 
             ax.plot(
                 t,
@@ -257,9 +313,10 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         ax.set_title(title, fontsize=10, fontweight="semibold")
 
         ax.set_ylabel("Scaled value", fontsize=9)
-        legend = ax.get_legend()
-        if legend is not None and ax is not axes[0]:
-            legend.remove()
+
+    # Add figure-level legend (shared across all subplots)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper right", bbox_to_anchor=(0.98, 0.98))
 
     axes[-1].set_xlabel("Time index (history → horizon)")
     fig.tight_layout()
@@ -363,6 +420,7 @@ def _import_seaborn():
     """Import seaborn optionally, returning None if not available."""
     try:
         import seaborn as sns
+
         return sns
     except ImportError:
         return None
@@ -417,15 +475,19 @@ def compute_biomarker_sparsity_stats(
         else:
             mean_staleness_days = np.nan
 
-        rows.append({
-            "node_id": sample.get("node_id", ""),
-            "node_label": sample.get("node_label", ""),
-            "measurements_count": n_measurements,
-            "total_timesteps": total_timesteps,
-            "sparsity_pct": round(sparsity_pct, 2),
-            "max_consecutive_missing": max_consecutive_missing,
-            "mean_staleness_days": round(mean_staleness_days, 1) if not np.isnan(mean_staleness_days) else None,
-        })
+        rows.append(
+            {
+                "node_id": sample.get("node_id", ""),
+                "node_label": sample.get("node_label", ""),
+                "measurements_count": n_measurements,
+                "total_timesteps": total_timesteps,
+                "sparsity_pct": round(sparsity_pct, 2),
+                "max_consecutive_missing": max_consecutive_missing,
+                "mean_staleness_days": round(mean_staleness_days, 1)
+                if not np.isnan(mean_staleness_days)
+                else None,
+            }
+        )
 
     if not rows:
         return pd.DataFrame()
@@ -470,11 +532,13 @@ def compute_locf_age_stats(
     rows = []
     for i, count in enumerate(counts):
         bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
-        rows.append({
-            "age_bin_days": bin_label,
-            "count": int(count),
-            "pct": round(100 * count / total, 2),
-        })
+        rows.append(
+            {
+                "age_bin_days": bin_label,
+                "count": int(count),
+                "pct": round(100 * count / total, 2),
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -620,10 +684,16 @@ def plot_biomarker_age_heatmap(
 
     # Draw history/horizon separator if provided
     if history_length is not None:
-        ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5, linewidth=2)
+        ax.axvline(
+            history_length - 0.5, color="black", linestyle="--", alpha=0.5, linewidth=2
+        )
 
     n_regions = age_filtered.shape[0]
-    ax.set_title(f"Biomarker LOCF Age/Staleness ({n_regions} regions with data)", fontsize=10, fontweight="semibold")
+    ax.set_title(
+        f"Biomarker LOCF Age/Staleness ({n_regions} regions with data)",
+        fontsize=10,
+        fontweight="semibold",
+    )
     ax.set_xlabel("Time index")
 
 
@@ -666,14 +736,16 @@ def compute_biomarker_sparsity_stats_all(
             else:
                 current = 0
 
-        rows.append({
-            "node_id": int(region_id),
-            "node_label": str(region_id),
-            "measurements_count": n_measurements,
-            "total_timesteps": total_timesteps,
-            "sparsity_pct": round(sparsity_pct, 2),
-            "max_consecutive_missing": max_consecutive_missing,
-        })
+        rows.append(
+            {
+                "node_id": int(region_id),
+                "node_label": str(region_id),
+                "measurements_count": n_measurements,
+                "total_timesteps": total_timesteps,
+                "sparsity_pct": round(sparsity_pct, 2),
+                "max_consecutive_missing": max_consecutive_missing,
+            }
+        )
 
     if not rows:
         return pd.DataFrame()
@@ -742,18 +814,18 @@ def compute_locf_age_stats_from_biomarker_da(
     rows = []
     for i, count in enumerate(counts):
         bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
-        rows.append({
-            "age_bin_days": bin_label,
-            "count": int(count),
-            "pct": round(100 * count / total, 2),
-        })
+        rows.append(
+            {
+                "age_bin_days": bin_label,
+                "count": int(count),
+                "pct": round(100 * count / total, 2),
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
-def export_biomarker_sparsity_tables(
-    biomarker_da, output_dir: Path
-) -> dict[str, Path]:
+def export_biomarker_sparsity_tables(biomarker_da, output_dir: Path) -> dict[str, Path]:
     """Export biomarker sparsity statistics for ALL regions to CSV files.
 
     Args:
@@ -814,10 +886,18 @@ def make_biomarker_sparsity_figure_all(
     ax2 = fig.add_subplot(gs[1, 0])
     sparsity_df = compute_biomarker_sparsity_stats_all(biomarker_da)
     if not sparsity_df.empty:
-        ax2.hist(sparsity_df["sparsity_pct"], bins=20, color="steelblue", edgecolor="black", alpha=0.7)
+        ax2.hist(
+            sparsity_df["sparsity_pct"],
+            bins=20,
+            color="steelblue",
+            edgecolor="black",
+            alpha=0.7,
+        )
         ax2.set_xlabel("Sparsity (%)")
         ax2.set_ylabel("Number of regions")
-        ax2.set_title("Sparsity Distribution (all regions)", fontsize=10, fontweight="semibold")
+        ax2.set_title(
+            "Sparsity Distribution (all regions)", fontsize=10, fontweight="semibold"
+        )
         ax2.axvline(
             sparsity_df["sparsity_pct"].median(),
             color="red",
@@ -832,10 +912,20 @@ def make_biomarker_sparsity_figure_all(
     ax3 = fig.add_subplot(gs[1, 1])
     age_df = compute_locf_age_stats_from_biomarker_da(biomarker_da)
     if not age_df.empty:
-        ax3.bar(age_df["age_bin_days"], age_df["count"], color="coral", edgecolor="black", alpha=0.7)
+        ax3.bar(
+            age_df["age_bin_days"],
+            age_df["count"],
+            color="coral",
+            edgecolor="black",
+            alpha=0.7,
+        )
         ax3.set_xlabel("Age (days)")
         ax3.set_ylabel("Count")
-        ax3.set_title("LOCF Value Age Distribution (all regions)", fontsize=10, fontweight="semibold")
+        ax3.set_title(
+            "LOCF Value Age Distribution (all regions)",
+            fontsize=10,
+            fontweight="semibold",
+        )
         ax3.tick_params(axis="x", rotation=45)
     else:
         ax3.text(0.5, 0.5, "No age data", ha="center", va="center")
