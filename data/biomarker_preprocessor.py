@@ -46,7 +46,8 @@ class BiomarkerPreprocessor:
 
         all_values = biomarker_da.isel(region_id=train_mask).values
 
-        finite_values = all_values[np.isfinite(all_values)]
+        # Exclude zeros (below detection limit) from scaler fitting
+        finite_values = all_values[np.isfinite(all_values) & (all_values > 0)]
 
         if len(finite_values) == 0:
             raise ValueError("No finite biomarker values in train nodes")
@@ -90,12 +91,14 @@ class BiomarkerPreprocessor:
         T, N = values.shape
 
         # --- Mask Channel ---
-        # 1.0 if measured (finite), 0.0 otherwise
-        mask_channel = np.isfinite(values).astype(np.float32)
+        # 1.0 if measured (finite and positive), 0.0 otherwise
+        # Zeros are below detection limit and treated as non-measurements
+        mask_channel = (np.isfinite(values) & (values > 0)).astype(np.float32)
 
         # --- Value Channel (LOCF + Log + Scale) ---
-        # Use pandas ffill for efficient LOCF along time axis
-        df = pd.DataFrame(values)
+        # Convert zeros/negatives to NaN for LOCF (they mean "not measured")
+        values_for_locf = np.where(values > 0, values, np.nan)
+        df = pd.DataFrame(values_for_locf)
         # ffill propagates last valid observation forward
         # fillna(0) handles leading NaNs (before first measurement)
         filled_values = df.ffill().fillna(0.0).values

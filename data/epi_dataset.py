@@ -321,18 +321,25 @@ class EpiDataset(Dataset):
         mean = self.rolling_mean[stat_idx]  # (N, 1)
         std = self.rolling_std[stat_idx]  # (N, 1)
 
-        # 2. Slice precomputed cases (L+H, N, 1)
+        # 2. Slice precomputed cases (L+H, N, 2) - channel 0: value, channel 1: mask
         cases_window = self.precomputed_cases[
             range_start:forecast_targets
-        ]  # (L+H, N, 1)
+        ]  # (L+H, N, 2)
 
-        # 3. Normalize
-        norm_window = (cases_window - mean) / std
-        norm_window = torch.nan_to_num(norm_window, nan=0.0)
+        # 3. Normalize only the value channel (channel 0)
+        # Mask channel (channel 1) is already binary and doesn't need normalization
+        value_channel = cases_window[..., 0:1]  # (L+H, N, 1)
+        mask_channel = cases_window[..., 1:2]  # (L+H, N, 1)
+
+        norm_value = (value_channel - mean) / std
+        norm_value = torch.nan_to_num(norm_value, nan=0.0)
+
+        # Recombine normalized value with original mask
+        norm_window = torch.cat([norm_value, mask_channel], dim=-1)  # (L+H, N, 2)
 
         # Split into history and future
-        case_history = norm_window[:L]  # (L, N, 1)
-        future_cases = norm_window[L:]  # (H, N, 1)
+        case_history = norm_window[:L]  # (L, N, 2)
+        future_cases = norm_window[L:]  # (H, N, 2)
 
         if self.context_mask is not None:
             # self.context_mask is a tensor
@@ -340,7 +347,7 @@ class EpiDataset(Dataset):
             # Force target node to be included
             neigh_mask[:, target_idx] = True
 
-        # Apply mask to case_history
+        # Apply mask to case_history (both channels)
         neigh_mask_t = neigh_mask.to(torch.float32).unsqueeze(-1)
         case_history = case_history * neigh_mask_t
 
@@ -364,14 +371,14 @@ class EpiDataset(Dataset):
         # 4. Concatenate -> (L, N, 4)
         biomarker_history = torch.cat([bio_slice, has_data_3d], dim=-1)
 
-        target_np = future_cases[:, target_idx, :]
+        target_np = future_cases[:, target_idx, 0]  # Only value channel for targets
         targets = target_np.squeeze(-1)
 
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
         )
-        assert case_history.shape == (L, self.num_nodes, 1), (
-            "Case history shape mismatch"
+        assert case_history.shape == (L, self.num_nodes, 2), (
+            f"Case history shape mismatch: expected ({L}, {self.num_nodes}, 2), got {case_history.shape}"
         )
         assert biomarker_history.shape == (L, self.num_nodes, 4), (
             "Biomarker history shape mismatch - expected (T, N, 4)"
