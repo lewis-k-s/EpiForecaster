@@ -102,8 +102,6 @@ class ModelConfig:
 
     type: ModelVariant
 
-    biomarkers_dim: int
-    cases_dim: int
     mobility_embedding_dim: int
     region_embedding_dim: int
 
@@ -113,6 +111,10 @@ class ModelConfig:
 
     # -- graph params --#
     max_neighbors: int
+
+    # -- dimensionality --#
+    biomarkers_dim: int = 4
+    cases_dim: int = 2
     gnn_depth: int = 2
     gnn_hidden_dim: int = 32
 

@@ -225,6 +225,21 @@ class EpiDataset(Dataset):
         self.node_static_covariates = self.static_covariates()
         self.scale_epsilon = 1e-6
 
+        # Validate config dims match dataset expectations
+        expected_cases_dim = self.cases_output_dim  # 2
+        expected_bio_dim = self.biomarkers_output_dim  # 4
+
+        if self.config.model.cases_dim != expected_cases_dim:
+            logger.warning(
+                f"Config cases_dim={self.config.model.cases_dim} != "
+                f"expected {expected_cases_dim} (value + mask channels)"
+            )
+        if self.config.model.biomarkers_dim != expected_bio_dim:
+            logger.warning(
+                f"Config biomarkers_dim={self.config.model.biomarkers_dim} != "
+                f"expected {expected_bio_dim} (value + mask + age + has_data)"
+            )
+
         # Close dataset and clear reference to avoid pickling issues
         self._dataset.close()
         self._dataset = None
@@ -252,8 +267,8 @@ class EpiDataset(Dataset):
 
     @property
     def cases_output_dim(self) -> int:
-        """Temporal input dimension (single feature, always 1)."""
-        return 1
+        """Temporal input dimension (value, mask)."""
+        return 2
 
     @property
     def biomarkers_output_dim(self) -> int:
@@ -315,27 +330,14 @@ class EpiDataset(Dataset):
         mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
         neigh_mask = self.mobility_mask[range_start:range_end, :, target_idx]
 
-        # Cases Processing (using precomputed tensors)
-        # 1. Get stats at the end of history window (t + L - 1)
-        stat_idx = range_end - 1
-        mean = self.rolling_mean[stat_idx]  # (N, 1)
-        std = self.rolling_std[stat_idx]  # (N, 1)
-
-        # 2. Slice precomputed cases (L+H, N, 2) - channel 0: value, channel 1: mask
-        cases_window = self.precomputed_cases[
-            range_start:forecast_targets
-        ]  # (L+H, N, 2)
-
-        # 3. Normalize only the value channel (channel 0)
-        # Mask channel (channel 1) is already binary and doesn't need normalization
-        value_channel = cases_window[..., 0:1]  # (L+H, N, 1)
-        mask_channel = cases_window[..., 1:2]  # (L+H, N, 1)
-
-        norm_value = (value_channel - mean) / std
-        norm_value = torch.nan_to_num(norm_value, nan=0.0)
-
-        # Recombine normalized value with original mask
-        norm_window = torch.cat([norm_value, mask_channel], dim=-1)  # (L+H, N, 2)
+        # Cases Processing (delegate window normalization to the preprocessor)
+        norm_window, mean_anchor, std_anchor = (
+            self.cases_preprocessor.make_normalized_window(
+                range_start=range_start,
+                history_length=L,
+                forecast_horizon=H,
+            )
+        )
 
         # Split into history and future
         case_history = norm_window[:L]  # (L, N, 2)
@@ -426,8 +428,8 @@ class EpiDataset(Dataset):
             "case_std": std_seq,
             "bio_node": biomarker_history[:, target_idx, :],
             "target": targets,
-            "target_scale": std[target_idx].squeeze(-1),
-            "target_mean": mean[target_idx].squeeze(-1),
+            "target_scale": std_anchor[target_idx].squeeze(-1),
+            "target_mean": mean_anchor[target_idx].squeeze(-1),
             "mob": mob_graphs,
             "population": population,
         }
