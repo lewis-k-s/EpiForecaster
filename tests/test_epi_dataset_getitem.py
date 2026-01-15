@@ -1,0 +1,125 @@
+import numpy as np
+import pandas as pd
+import torch
+import xarray as xr
+
+
+from data.epi_dataset import EpiDataset
+from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
+
+
+def _make_config(dataset_path: str, log_scale: bool = False) -> EpiForecasterConfig:
+    # Minimal config
+    model = ModelConfig(
+        type={"cases": True, "regions": False, "biomarkers": True, "mobility": False},
+        # Note: cases_dim and biomarkers_dim now have defaults (2 and 4)
+        # that match the dataset output dimensions
+        mobility_embedding_dim=1,
+        region_embedding_dim=1,
+        history_length=3,
+        forecast_horizon=2,
+        max_neighbors=1,
+        gnn_depth=1,
+        population_dim=1,
+    )
+    data_cfg = DataConfig(
+        dataset_path=str(dataset_path),
+        mobility_threshold=0.0,
+        missing_permit=0,
+        log_scale=log_scale,
+    )
+    return EpiForecasterConfig(model=model, data=data_cfg)
+
+
+def test_getitem_values(tmp_path):
+    zarr_path = tmp_path / "tiny.zarr"
+
+    dates = pd.date_range("2020-01-01", periods=10, freq="D")
+    regions = np.array([0, 1], dtype=np.int64)
+
+    # Constant cases for easy verification
+    # Node 0: 100 cases per day. Pop 1000. -> 10,000 per 100k. Log1p(10000) ~ 9.21
+    # Node 1: 0 cases. Pop 1000. -> 0. Log1p(0) = 0.
+
+    # Use 3D cases to test squeeze
+    cases = np.zeros((10, 2, 1), dtype=np.float32)
+    cases[:, 0, 0] = 100.0
+
+    # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
+    biomarkers = np.zeros((10, 2), dtype=np.float32)
+    biomarkers[:, 0] = 1.0  # Node 0 has non-zero biomarkers
+
+    # Mobility: full connectivity
+    mobility = np.ones((10, 2, 2), dtype=np.float32)
+
+    population = np.array([1000.0, 1000.0], dtype=np.float32)
+
+    ds = xr.Dataset(
+        data_vars={
+            "cases": ((TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "edar_biomarker": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
+            "mobility": ((TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
+            "population": ((REGION_COORD,), population),
+        },
+        coords={
+            TEMPORAL_COORD: dates,
+            REGION_COORD: regions,
+            "region_id_to": regions,
+        },
+    )
+    ds.to_zarr(zarr_path, mode="w")
+
+    config = _make_config(str(zarr_path), log_scale=True)
+    dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+
+    # Check item 0 (window start 0)
+    # History: 0, 1, 2. Future: 3, 4.
+
+    item = dataset[0]  # Should be node 0 (based on sorted node iteration usually)
+
+    # Check node label to be sure
+    # EpiDataset sorts target_nodes?
+    # __init__: self.target_nodes = target_nodes (list)
+    # _build_index_map: iterates self.target_nodes.
+
+    if item["node_label"] == 0:
+        # Node 0: constant cases.
+        # Mean should be approx log1p(10000). Std should be epsilon.
+        # Normalized values should be approx 0.
+        cases_hist = item["case_node"]  # (L, 2) - value, mask
+
+        # Channel 0 (value) should be 0 (normalized constant)
+        assert torch.allclose(
+            cases_hist[..., 0], torch.zeros_like(cases_hist[..., 0]), atol=1e-3
+        )
+        # Channel 1 (mask) should be 1 (finite data)
+        assert torch.allclose(
+            cases_hist[..., 1], torch.ones_like(cases_hist[..., 1]), atol=1e-3
+        )
+
+        # Check target scale
+        # Should be epsilon
+        assert item["target_scale"].item() < 1e-4
+
+        # Check target mean
+        # Should be approx log1p(10000) ~ 9.21
+        assert abs(item["target_mean"].item() - 9.21) < 0.1
+
+        # Check case mean/std sequences
+        assert item["case_mean"].shape == (3, 1)  # history_length
+        assert abs(item["case_mean"][-1].item() - 9.21) < 0.1
+        assert item["case_std"].shape == (3, 1)
+        assert item["case_std"][-1].item() < 1e-4
+
+    elif item["node_label"] == 1:
+        # Node 1: 0 cases.
+        cases_hist = item["case_node"]
+        # Channel 0 (value) should be 0
+        assert torch.allclose(
+            cases_hist[..., 0], torch.zeros_like(cases_hist[..., 0]), atol=1e-3
+        )
+        # Channel 1 (mask) should be 1
+        assert torch.allclose(
+            cases_hist[..., 1], torch.ones_like(cases_hist[..., 1]), atol=1e-3
+        )
