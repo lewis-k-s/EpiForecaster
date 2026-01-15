@@ -8,8 +8,6 @@ model:
     biomarkers: false
     mobility: true
   params:
-    biomarkers_dim: 1
-    cases_dim: 1
     mobility_embedding_dim: 16
     region_embedding_dim: 64
     gnn_module: "gcn"
