@@ -3,6 +3,8 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
+
+# type: ignore[import-not-found] (PyTorch Geometric has incomplete type stubs)
 from torch_geometric.data import Batch, Data
 
 from .configs import ModelVariant
@@ -237,24 +239,25 @@ class EpiForecaster(nn.Module):
                 "Mobility processing requested but MobilityGNN is not enabled."
             )
 
-        if mob_batch.x.size(-1) != self.temporal_node_dim:
-            raise ValueError(
-                f"Mobility graph feature dim {mob_batch.x.size(-1)} "
+        # type: ignore[attr-defined] (PyTorch Geometric Batch class missing type stubs)
+        if mob_batch.x.size(-1) != self.temporal_node_dim:  # type: ignore[attr-defined]
+            raise ValueError(  # type: ignore[attr-defined]
+                f"Mobility graph feature dim {mob_batch.x.size(-1)} "  # type: ignore[attr-defined]
                 f"!= expected {self.temporal_node_dim}"
             )
 
-        mob_batch = mob_batch.to(self.device)
+        mob_batch = mob_batch.to(self.device)  # type: ignore[attr-defined]
 
         node_emb = self.mobility_gnn(
-            mob_batch.x,
-            mob_batch.edge_index,
+            mob_batch.x,  # type: ignore[attr-defined]
+            mob_batch.edge_index,  # type: ignore[attr-defined]
             getattr(mob_batch, "edge_weight", None),
         )
 
         # Gather target embeddings via ptr offsets (start index per graph).
         # IMPORTANT: keep this fully tensorized to avoid `.item()` on CUDA tensors
         # which forces device synchronization and DtoH copies.
-        ptr = mob_batch.ptr  # shape (num_graphs + 1,)
+        ptr = mob_batch.ptr  # type: ignore[attr-defined]
         num_graphs = ptr.numel() - 1
         expected_graphs = B * T
         if num_graphs != expected_graphs:
@@ -264,10 +267,10 @@ class EpiForecaster(nn.Module):
             )
 
         if hasattr(mob_batch, "target_index"):
-            target_indices = mob_batch.target_index.reshape(-1)
+            target_indices = mob_batch.target_index.reshape(-1)  # type: ignore[attr-defined]
         else:
             start = ptr[:-1]
-            tgt_local = mob_batch.target_node.reshape(-1).to(start.device)
+            tgt_local = mob_batch.target_node.reshape(-1).to(start.device)  # type: ignore[attr-defined]
             target_indices = start + tgt_local
 
         target_embeddings = node_emb[target_indices]
