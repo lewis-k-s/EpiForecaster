@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch  # type: ignore[import-not-found]
 
 from data.epi_dataset import EpiDatasetItem
 
@@ -34,18 +34,18 @@ def collate_epidataset_batch(batch: list[EpiDatasetItem]) -> dict[str, Any]:
             # Use scalar assignment instead of tensor creation for performance
             g.batch_id = b
             g.time_id = t
-            graph_list[idx] = g
+            graph_list[idx] = g  # type: ignore[list-item]
             idx += 1
 
-    mob_batch = Batch.from_data_list(graph_list)
+    mob_batch = Batch.from_data_list(graph_list)  # type: ignore[arg-type]
     T = len(batch[0]["mob"]) if B > 0 else 0
     # store B and T on the batch for downstream reshaping
-    mob_batch.B = torch.tensor([B], dtype=torch.long)
-    mob_batch.T = torch.tensor([T], dtype=torch.long)
+    mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
+    mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
     # Precompute a global target node index per ego-graph in the batched `x`.
     # This enables fully-vectorized target gathering in the model without CUDA `.item()` syncs.
     if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
-        mob_batch.target_index = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(-1)
+        mob_batch.target_index = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(-1)  # type: ignore[attr-defined]
 
     return {
         "CaseNode": case_node,  # (B, L, C)
