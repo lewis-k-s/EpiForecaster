@@ -127,7 +127,8 @@ class SpatialContiguityPrior:
         if (
             self.cache_distances
             and self._cached_distances is not None
-            and torch.equal(edge_index, self._cached_edge_index)
+            and self._cached_edge_index is not None
+            and torch.equal(edge_index, self._cached_edge_index)  # type: ignore[arg-type]
             and (num_nodes is None or num_nodes == self._cached_num_nodes)
         ):
             return self._cached_distances
@@ -288,8 +289,8 @@ class FlowWeightedContrastiveLoss(nn.Module):
         neg_loss = torch.relu(neg_similarities - self.margin)
 
         # Combine losses
-        total_pos_loss = pos_loss.sum() if pos_loss.numel() > 0 else 0.0
-        total_neg_loss = neg_loss.sum() if neg_loss.numel() > 0 else 0.0
+        total_pos_loss = pos_loss.sum() if pos_loss.numel() > 0 else torch.tensor(0.0)
+        total_neg_loss = neg_loss.sum() if neg_loss.numel() > 0 else torch.tensor(0.0)
 
         total_loss = total_pos_loss + total_neg_loss
 
@@ -741,8 +742,8 @@ class SpatialOnlyLoss(nn.Module):
             "total_loss": total_loss,
             "contrastive_loss": contrastive_loss,
             "spatial_penalty": autocorr_loss,
-            "num_positive_pairs": positive_pairs.size(1),
-            "num_negative_pairs": negative_pairs.size(1),
+            "num_positive_pairs": torch.tensor(positive_pairs.size(1)),
+            "num_negative_pairs": torch.tensor(negative_pairs.size(1)),
         }
 
 
