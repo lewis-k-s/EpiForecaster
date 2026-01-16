@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import bottleneck as bn
 import numpy as np
+import pandas as pd
 import torch
 import xarray as xr
 
@@ -12,6 +13,7 @@ class CasesPreprocessorConfig:
     log_scale: bool = False
     scale_epsilon: float = 1e-6
     per_100k: bool = True
+    age_max: int = 14  # Max days for LOCF age channel
 
 
 class CasesPreprocessor:
@@ -26,7 +28,7 @@ class CasesPreprocessor:
 
     def __init__(self, config: CasesPreprocessorConfig):
         self.config = config
-        self.processed_cases: torch.Tensor | None = None  # (T, N, 2) [value, mask]
+        self.processed_cases: torch.Tensor | None = None  # (T, N, 3) [value, mask, age]
         self.rolling_mean: torch.Tensor | None = None  # (T, N, 1)
         self.rolling_std: torch.Tensor | None = None  # (T, N, 1)
 
@@ -36,9 +38,10 @@ class CasesPreprocessor:
         """Precompute cases + rolling stats over full dataset.
 
         Returns:
-            processed_cases: (T, N, 2) tensor with [value, mask] channels.
+            processed_cases: (T, N, 3) tensor with [value, mask, age] channels.
                 Channel 0: scaled/log-transformed (if configured) case values (NaN preserved).
                 Channel 1: mask (1.0 if finite, 0.0 if NaN).
+                Channel 2: LOCF age normalized to [0, 1] (days since last observation / age_max).
             rolling_mean: (T, N, 1) rolling mean tensor (right-aligned, NaN-aware).
             rolling_std: (T, N, 1) rolling std tensor (right-aligned, NaN-aware, >= scale_epsilon).
         """
@@ -68,20 +71,53 @@ class CasesPreprocessor:
         rolling_std = np.nan_to_num(rolling_std, nan=0.0)
         rolling_std = np.maximum(rolling_std, float(self.config.scale_epsilon))
 
+        # Mask channel: 1.0 if finite, 0.0 otherwise
         mask = np.isfinite(values).astype(np.float32)
 
+        # --- Age Channel (LOCF) ---
+        # Calculate days since last observation, normalized to [0, 1]
+        T, N = values.shape
+        age_channel = np.full_like(values, self.config.age_max, dtype=np.float32)
+
+        # Vectorized age calculation
+        # 1. Create time indices [0, 1, ..., T-1] broadcasted to (T, N)
+        # 2. Where mask is 1, keep the index. Where mask is 0, set to NaN.
+        # 3. Forward fill to propagate "last seen time".
+        # 4. Age = current_time - last_seen_time.
+        time_indices = np.arange(T)[:, None]  # (T, 1)
+        last_seen_indices = np.where(mask > 0, time_indices, np.nan)
+
+        last_seen_df = pd.DataFrame(last_seen_indices)
+        last_seen_filled = last_seen_df.ffill().values  # Propagate last seen index
+
+        # Calculate diff. For leading NaNs (no previous measurement), age remains max_age
+        valid_history_mask = ~np.isnan(last_seen_filled)
+
+        current_age = np.zeros_like(age_channel)
+        current_age[valid_history_mask] = (
+            time_indices * np.ones((1, N)) - last_seen_filled
+        )[valid_history_mask]
+
+        # Clip to age_max and normalize to [0, 1]
+        final_age = np.where(
+            valid_history_mask, np.minimum(current_age, self.config.age_max), self.config.age_max
+        )
+        age_channel = (final_age / self.config.age_max).astype(np.float32)
+
+        # Stack channels: (T, N, 3) -> [value, mask, age]
         values_t = torch.from_numpy(values).to(torch.float32)
         mask_t = torch.from_numpy(mask).to(torch.float32)
-        cases_2ch = torch.stack([values_t, mask_t], dim=-1)
+        age_t = torch.from_numpy(age_channel).to(torch.float32)
+        cases_3ch = torch.stack([values_t, mask_t, age_t], dim=-1)
 
         mean_t = torch.from_numpy(rolling_mean).to(torch.float32).unsqueeze(-1)
         std_t = torch.from_numpy(rolling_std).to(torch.float32).unsqueeze(-1)
 
-        self.processed_cases = cases_2ch
+        self.processed_cases = cases_3ch
         self.rolling_mean = mean_t
         self.rolling_std = std_t
 
-        return cases_2ch, mean_t, std_t
+        return cases_3ch, mean_t, std_t
 
     def _require_fitted(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if (
@@ -98,12 +134,13 @@ class CasesPreprocessor:
     def _normalize_window(
         *, cases_window: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
     ) -> torch.Tensor:
-        """Normalize value channel of a (L+H, N, 2) window; preserve mask channel."""
+        """Normalize value channel of a (L+H, N, 3) window; preserve mask and age channels."""
         value_channel = cases_window[..., 0:1]
         mask_channel = cases_window[..., 1:2]
+        age_channel = cases_window[..., 2:3]
         norm_value = (value_channel - mean) / std
         norm_value = torch.nan_to_num(norm_value, nan=0.0)
-        return torch.cat([norm_value, mask_channel], dim=-1)
+        return torch.cat([norm_value, mask_channel, age_channel], dim=-1)
 
     def make_normalized_window(
         self, *, range_start: int, history_length: int, forecast_horizon: int
@@ -115,7 +152,7 @@ class CasesPreprocessor:
         `unscale_forecasts`.
 
         Returns:
-            norm_window: (L+H, N, 2) tensor with [norm_value, mask]
+            norm_window: (L+H, N, 3) tensor with [norm_value, mask, age]
             mean_anchor: (N, 1) rolling mean at stat_idx
             std_anchor: (N, 1) rolling std at stat_idx
         """
