@@ -39,6 +39,7 @@ def _ensure_3d(arr: np.ndarray) -> np.ndarray:
 class EpiDatasetItem(TypedDict):
     node_label: str
     target_node: int
+    window_start: int
     case_node: torch.Tensor
     case_mean: torch.Tensor
     case_std: torch.Tensor
@@ -76,7 +77,15 @@ class EpiDataset(Dataset):
         # Load dataset
         self._dataset = xr.open_zarr(self.aligned_data_path)
         self.num_nodes = self._dataset[REGION_COORD].size
-        self.biomarker_available_mask = self._compute_biomarker_available_mask()
+
+        # Load biomarker data start offset if available
+        if "biomarker_data_start" in self._dataset:
+            self.biomarker_data_start = torch.from_numpy(
+                self._dataset["biomarker_data_start"].values
+            ).to(torch.long)
+        else:
+            # Fallback: all regions have data starting at index 0
+            self.biomarker_data_start = torch.zeros(self.num_nodes, dtype=torch.long)
 
         # Setup cases preprocessor
         if cases_preprocessor is None:
@@ -141,9 +150,9 @@ class EpiDataset(Dataset):
             self.biomarker_preprocessor = BiomarkerPreprocessor()
 
             # Log biomarker availability in train split
-            available_mask_np = self.biomarker_available_mask.cpu().numpy().flatten()
+            # Regions with biomarker data have biomarker_data_start >= 0
             train_nodes_with_bio = [
-                n for n in target_nodes if available_mask_np[n] == 1.0
+                n for n in target_nodes if self.biomarker_data_start[n] >= 0
             ]
             logger.info(
                 f"Train split: {len(train_nodes_with_bio)}/{len(target_nodes)} "
@@ -190,13 +199,16 @@ class EpiDataset(Dataset):
 
             # Filter region embeddings using numpy instead of xarray to avoid requiring a named dimension
             # for the embedding size (since xarray expects all dims to be named).
-            region_ids = list(art["region_ids"])
+            region_ids = list(art.get("region_ids", []))  # type: ignore[typeddict-item]
             selected_ids = list(self._dataset[REGION_COORD].values)
             region_id_index = {rid: i for i, rid in enumerate(region_ids)}
             indices = [
                 region_id_index[rid] for rid in selected_ids if rid in region_id_index
             ]
-            region_embeddings = art["embeddings"][indices]
+            embeddings = art.get("embeddings")  # type: ignore[typeddict-item]
+            if embeddings is None:
+                raise ValueError("Region embeddings not found in artifact")
+            region_embeddings = embeddings[indices]
 
             assert region_embeddings.shape == (
                 self.num_nodes,
@@ -226,13 +238,13 @@ class EpiDataset(Dataset):
         self.scale_epsilon = 1e-6
 
         # Validate config dims match dataset expectations
-        expected_cases_dim = self.cases_output_dim  # 2
+        expected_cases_dim = self.cases_output_dim  # 3
         expected_bio_dim = self.biomarkers_output_dim  # 4
 
         if self.config.model.cases_dim != expected_cases_dim:
             logger.warning(
                 f"Config cases_dim={self.config.model.cases_dim} != "
-                f"expected {expected_cases_dim} (value + mask channels)"
+                f"expected {expected_cases_dim} (value + mask + age channels)"
             )
         if self.config.model.biomarkers_dim != expected_bio_dim:
             logger.warning(
@@ -267,13 +279,25 @@ class EpiDataset(Dataset):
 
     @property
     def cases_output_dim(self) -> int:
-        """Temporal input dimension (value, mask)."""
-        return 2
+        """Temporal input dimension (value, mask, age)."""
+        return 3
 
     @property
     def biomarkers_output_dim(self) -> int:
         """Biomarkers dim - 4 channels (value, mask, age, has_data)."""
         return 4
+
+    @property
+    def biomarker_available_mask(self) -> torch.Tensor:
+        """Compatibility property for plotting functions.
+
+        Returns a (N, 4) tensor indicating region-level availability based on
+        biomarker_data_start. Regions with data start >= 0 have data (1.0),
+        regions with sentinel -1 don't have data (0.0).
+        """
+        # Create (N, 4) tensor with 1.0 for regions with data, 0.0 otherwise
+        has_data = (self.biomarker_data_start >= 0).to(torch.float32)
+        return has_data.unsqueeze(-1).expand(-1, 4)
 
     def index_for_target_node_window(self, *, target_node: int, window_idx: int) -> int:
         """Map a (window_idx, target_node) pair to a dataset index.
@@ -354,18 +378,19 @@ class EpiDataset(Dataset):
         case_history = case_history * neigh_mask_t
 
         # Encode all regions in context using 4-channel biomarker encoding
-        # Optimized: Use precomputed biomarkers + broadcasted availability mask
+        # Optimized: Use precomputed biomarkers + dynamic has_data based on data start offset
 
         # 1. Get precomputed bio history (value, mask, age) -> (L, N, 3)
         # Note: self.precomputed_biomarkers is a CPU tensor
         bio_slice = self.precomputed_biomarkers[range_start:range_end]
 
-        # 2. Get availability mask -> (N,)
-        if self.biomarker_available_mask is not None:
-            # We assume dim 0 matches nodes. If available_mask is (N, 1), take col 0.
-            has_data = self.biomarker_available_mask[:, 0]
-        else:
-            has_data = torch.zeros(self.num_nodes, dtype=torch.float32)
+        # 2. Get availability mask based on data start offset -> (N,)
+        # has_data = 1.0 if current time >= region's data start, else 0.0
+        # Use -1 sentinel for regions with no data
+        range_end_idx = range_end - 1  # Last index of history window
+        has_data = (range_end_idx >= self.biomarker_data_start).to(torch.float32)
+        # Regions with sentinel -1 never have data
+        has_data[self.biomarker_data_start < 0] = 0.0
 
         # 3. Broadcast to (L, N, 1)
         has_data_3d = has_data.view(1, self.num_nodes, 1).expand(L, -1, -1)
@@ -379,8 +404,8 @@ class EpiDataset(Dataset):
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
         )
-        assert case_history.shape == (L, self.num_nodes, 2), (
-            f"Case history shape mismatch: expected ({L}, {self.num_nodes}, 2), got {case_history.shape}"
+        assert case_history.shape == (L, self.num_nodes, 3), (
+            f"Case history shape mismatch: expected ({L}, {self.num_nodes}, 3), got {case_history.shape}"
         )
         assert biomarker_history.shape == (L, self.num_nodes, 4), (
             "Biomarker history shape mismatch - expected (T, N, 4)"
@@ -423,6 +448,7 @@ class EpiDataset(Dataset):
         return {
             "node_label": node_label,
             "target_node": target_idx,
+            "window_start": range_start,
             "case_node": case_history[:, target_idx, :],  # Already normalized
             "case_mean": mean_seq,
             "case_std": std_seq,
@@ -457,27 +483,6 @@ class EpiDataset(Dataset):
         if T < seg:
             return []
         return list(range(0, T - seg + 1, self.window_stride))
-
-    def _compute_biomarker_available_mask(self) -> torch.Tensor | None:
-        """Return a (num_nodes, biomarkers_output_dim) availability mask for biomarkers.
-
-        The mask is tiled to cover both raw and change features.
-        """
-        if "edar_biomarker" not in self.dataset:
-            return None
-        biomarker_da = self.dataset["edar_biomarker"]
-        values = _ensure_3d(biomarker_da.values)
-        if values.ndim != 3:
-            raise ValueError(
-                f"Expected biomarker array with 2 or 3 dims, got shape {values.shape}"
-            )
-        available = np.isfinite(values).any(axis=0)
-        available = available.astype(np.float32)
-        if available.shape[0] != self.num_nodes:
-            raise ValueError(
-                "Biomarker availability mask does not match number of nodes."
-            )
-        return torch.from_numpy(available).to(torch.float32)
 
     def _compute_valid_window_starts(self) -> dict[int, list[int]]:
         """Compute valid window starts per target node using missingness permit.
@@ -550,11 +555,24 @@ class EpiDataset(Dataset):
         """Build index mappings for fast (node, window_start) lookup."""
         index_map: list[tuple[int, int]] = []
         index_lookup: dict[tuple[int, int], int] = {}
-        for target_idx in self.target_nodes:
-            for start in self._valid_window_starts_by_node.get(target_idx, []):
-                idx = len(index_map)
-                index_map.append((target_idx, start))
-                index_lookup[(target_idx, start)] = idx
+        sample_ordering = self.config.data.sample_ordering
+
+        if sample_ordering == "time":
+            starts_to_nodes = {start: [] for start in self.window_starts}
+            for target_idx in self.target_nodes:
+                for start in self._valid_window_starts_by_node.get(target_idx, []):
+                    starts_to_nodes[start].append(target_idx)
+            for start in self.window_starts:
+                for target_idx in starts_to_nodes[start]:
+                    idx = len(index_map)
+                    index_map.append((target_idx, start))
+                    index_lookup[(target_idx, start)] = idx
+        else:
+            for target_idx in self.target_nodes:
+                for start in self._valid_window_starts_by_node.get(target_idx, []):
+                    idx = len(index_map)
+                    index_map.append((target_idx, start))
+                    index_lookup[(target_idx, start)] = idx
         return index_map, index_lookup
 
     def _dense_graph_to_ego_pyg(
@@ -664,9 +682,10 @@ class EpiDataset(Dataset):
         if time_index is None:
             time_index = pd.DatetimeIndex(self.dataset[TEMPORAL_COORD].values)
 
-        dow = time_index.dayofweek.to_numpy()
-        months = time_index.month.to_numpy()
-        doy = time_index.dayofyear.to_numpy()
+        # type: ignore[attr-defined] (pandas type stubs incomplete for DatetimeIndex)
+        dow = time_index.day_of_week.to_numpy()  # type: ignore[attr-defined]
+        months = time_index.month.to_numpy()  # type: ignore[attr-defined]
+        doy = time_index.dayofyear.to_numpy()  # type: ignore[attr-defined]
 
         dow_oh = np.eye(7, dtype=np.float32)[dow]
         month_oh = np.eye(12, dtype=np.float32)[months - 1]

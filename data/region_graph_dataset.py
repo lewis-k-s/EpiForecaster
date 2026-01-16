@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+# type: ignore[import-not-found] (zarr has incomplete type stubs)
 import zarr
 from torch.utils.data import Dataset
 
@@ -42,13 +43,13 @@ class RegionGraphDataset(Dataset):
         self.flow_source = self.metadata.get("flow_source")
 
         # Store array references for lazy loading
-        self._features = self.root["features"] if "features" in self.root else None
-        self._edge_index = (
-            self.root["edge_index"] if "edge_index" in self.root else None
+        self._features = self.root["features"] if "features" in self.root else None  # type: ignore[index]
+        self._edge_index = (  # type: ignore[index]
+            self.root["edge_index"] if "edge_index" in self.root else None  # type: ignore[index]
         )
-        self._flows = self.root["flows"] if "flows" in self.root else None
-        self._region_ids = (
-            self.root["region_ids"] if "region_ids" in self.root else None
+        self._flows = self.root["flows"] if "flows" in self.root else None  # type: ignore[index]
+        self._region_ids = (  # type: ignore[index]
+            self.root["region_ids"] if "region_ids" in self.root else None  # type: ignore[index]
         )
 
         # Validate required arrays exist
@@ -58,17 +59,18 @@ class RegionGraphDataset(Dataset):
             raise ValueError("'edge_index' not found in zarr file")
 
         # Store dataset info
-        self.num_regions = self._features.shape[0]
-        self.feature_dim = self._features.shape[1]
+        # type: ignore[attr-defined] (zarr array shape attribute)
+        self.num_regions = self._features.shape[0]  # type: ignore[attr-defined]
+        self.feature_dim = self._features.shape[1]  # type: ignore[attr-defined]
 
         # Precompute normalization stats if needed
         if self.normalize_features:
-            features_array = self._features[:]
+            features_array = self._features[:]  # type: ignore[index]
             self.feature_mean = torch.from_numpy(
-                features_array.mean(axis=0, keepdims=True)
+                features_array.mean(axis=0, keepdims=True)  # type: ignore[attr-defined]
             )
             self.feature_std = torch.from_numpy(
-                features_array.std(axis=0, keepdims=True)
+                features_array.std(axis=0, keepdims=True)  # type: ignore[attr-defined]
             )
 
     def __len__(self) -> int:

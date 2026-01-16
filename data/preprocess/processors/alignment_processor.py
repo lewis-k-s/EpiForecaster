@@ -126,6 +126,33 @@ class AlignmentProcessor:
         population_final = population_data.sel({REGION_COORD: common_regions})
         edar_final = edar_aligned.reindex({REGION_COORD: common_regions})
 
+        # Compute biomarker data start offset for each region
+        # For each region, find the first time index where biomarker data > 0
+        # Use -1 for regions with no biomarker data
+        print("Computing biomarker data start offset per region...")
+        biomarker_data_start = xr.DataArray(
+            np.full(len(common_regions), -1, dtype=np.int32),
+            dims=[REGION_COORD],
+            coords={REGION_COORD: common_regions},
+            name="biomarker_data_start",
+        )
+
+        for i, region in enumerate(common_regions):
+            region_data = edar_final.sel({REGION_COORD: region})
+            # Find first index where value > 0 (finite and positive)
+            has_data = (region_data.values > 0) & np.isfinite(region_data.values)
+            if has_data.any():
+                first_idx = int(np.argmax(has_data))
+                biomarker_data_start[i] = first_idx
+
+        print(
+            f"  Regions with biomarker data: {(biomarker_data_start.values >= 0).sum()}/{len(common_regions)}"
+        )
+        if (biomarker_data_start.values >= 0).sum() > 0:
+            valid_starts = biomarker_data_start.values[biomarker_data_start.values >= 0]
+            print(f"  First data start index: {valid_starts.min()}")
+            print(f"  Last data start index: {valid_starts.max()}")
+
         # Generate report
         _report = {
             "common_regions": len(common_regions),
@@ -134,7 +161,14 @@ class AlignmentProcessor:
         # TODO: write report?
 
         aligned_dataset = xr.merge(
-            [cases_final, mobility_final, population_final, edar_final], join="exact"
+            [
+                cases_final,
+                mobility_final,
+                population_final,
+                edar_final,
+                biomarker_data_start,
+            ],
+            join="exact",
         )
         print("-" * 50)
         print("Aligned Dataset")
