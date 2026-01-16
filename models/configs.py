@@ -70,6 +70,8 @@ class DataConfig:
     window_stride: int = 1
     # Maximum allowed missing values in a history window
     missing_permit: int = 0
+    # Dataset sample ordering: "node" (node-major) or "time" (time-major)
+    sample_ordering: str = "node"
     # Temporal smoothing configuration for case data
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     # Log transformation for cases and biomarkers
@@ -95,6 +97,12 @@ class DataConfig:
         if self.mobility_scale_epsilon <= 0:
             raise ValueError("mobility_scale_epsilon must be positive")
 
+        valid_orderings = {"node", "time"}
+        if self.sample_ordering not in valid_orderings:
+            raise ValueError(
+                f"sample_ordering must be one of: {sorted(valid_orderings)}"
+            )
+
 
 @dataclass
 class ModelConfig:
@@ -114,7 +122,7 @@ class ModelConfig:
 
     # -- dimensionality --#
     biomarkers_dim: int = 4
-    cases_dim: int = 2
+    cases_dim: int = 3  # (value, mask, age) - LOCF age channel added
     gnn_depth: int = 2
     gnn_hidden_dim: int = 32
 
