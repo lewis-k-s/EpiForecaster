@@ -71,6 +71,7 @@ class PositionalEncoding(nn.Module):
 
         pe = pe.unsqueeze(0).transpose(0, 1)  # [max_len, 1, d_model]
         self.register_buffer("pe", pe)
+        self.pe: torch.Tensor  # Type annotation for type checking
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
