@@ -162,7 +162,7 @@ def plot_windowed_sparsity_scatter(
     region_ids: np.ndarray,
     dates: pd.DatetimeIndex,
     output_dir: Path,
-    top_n_regions: int = 20,
+    top_n_regions: int = 100,
 ) -> None:
     """Create scatter plot of sparsity over time windows for high-sparsity regions.
 
@@ -197,7 +197,6 @@ def plot_windowed_sparsity_scatter(
     ax.set_ylabel("Sparsity (%)")
     ax.set_title(f"Sparsity Over Time (Top {top_n_regions} Highest-Sparsity Regions)")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), fontsize=8)
 
     plt.tight_layout()
     output_path = output_dir / "windowed_sparsity_scatter.png"
@@ -440,11 +439,6 @@ def main() -> None:
         default=20,
         help="Number of top sparsity regions to highlight in plots",
     )
-    parser.add_argument(
-        "--show",
-        action="store_true",
-        help="Show plots interactively",
-    )
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -525,7 +519,7 @@ def main() -> None:
         np.array(regions),
         dates,
         output_dir,
-        top_n_regions=args.top_regions,
+        # top_n_regions=args.top_regions,
     )
 
     plot_sparsity_distribution(sparsity_series, consecutive_series, output_dir)
@@ -551,9 +545,6 @@ def main() -> None:
         output_dir,
         top_n=args.top_regions,
     )
-
-    if args.show:
-        plt.show()
 
 
 if __name__ == "__main__":

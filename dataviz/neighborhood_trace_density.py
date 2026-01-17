@@ -13,6 +13,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import xarray as xr
 
@@ -101,16 +102,13 @@ def compute_valid_window_mask(
     )
 
     history_counts = cumsum[history_length:] - cumsum[:-history_length]
-    target_counts = cumsum[history_length + horizon :] - cumsum[history_length:-horizon]
 
     starts = np.arange(0, T - seg + 1, window_stride, dtype=np.int64)
     history_counts = history_counts[starts]
-    target_counts = target_counts[starts]
 
     history_threshold = max(0, history_length - missing_permit)
     history_ok = history_counts >= history_threshold
-    target_ok = target_counts >= horizon
-    valid_mask = history_ok & target_ok
+    valid_mask = history_ok
 
     return starts, valid_mask
 
@@ -197,6 +195,76 @@ def plot_density_traces(
     plt.close(fig)
 
 
+def compute_neighbor_sparsity(
+    mobility: np.ndarray,
+    starts: np.ndarray,
+    valid_mask: np.ndarray,
+    history_length: int,
+    mobility_threshold: float,
+    neighbor_timestep: str,
+    include_self: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute neighbor sparsity summaries for valid windows.
+
+    Returns:
+        mean_neighbor_counts: Mean neighbor count per node across valid windows
+        zero_neighbor_fraction: Fraction of valid windows with zero neighbors per node
+    """
+    if neighbor_timestep not in {"start", "end"}:
+        raise ValueError("neighbor_timestep must be 'start' or 'end'")
+
+    if mobility.ndim != 3:
+        raise ValueError(
+            f"Expected mobility (time, origin, dest), got {mobility.shape}"
+        )
+
+    offset = 0 if neighbor_timestep == "start" else max(0, history_length - 1)
+    times = starts + offset
+    time_mask = times < mobility.shape[0]
+    times = times[time_mask]
+    valid_mask = valid_mask[time_mask]
+
+    num_windows = len(times)
+    num_nodes = mobility.shape[1]
+    neighbor_counts = np.full((num_windows, num_nodes), np.nan, dtype=np.float32)
+
+    for i, t in enumerate(times):
+        inflow = mobility[t]
+        neighbors = inflow >= mobility_threshold
+        if not include_self:
+            np.fill_diagonal(neighbors, False)
+        neighbor_counts[i] = neighbors.sum(axis=0)
+
+    neighbor_counts = np.where(valid_mask, neighbor_counts, np.nan)
+    mean_counts = np.nanmean(neighbor_counts, axis=0)
+    zero_frac = np.nanmean(neighbor_counts == 0, axis=0)
+    return mean_counts, zero_frac
+
+
+def plot_neighbor_sparsity(
+    mean_counts: pd.Series,
+    zero_fraction: pd.Series,
+    output_dir: Path,
+    title_suffix: str,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+    sns.histplot(mean_counts.dropna(), bins=60, ax=axes[0])
+    axes[0].set_title(f"Mean neighbor count per node{title_suffix}")
+    axes[0].set_xlabel("Mean neighbor count")
+    axes[0].set_ylabel("Nodes")
+
+    sns.histplot(zero_fraction.dropna(), bins=60, ax=axes[1])
+    axes[1].set_title(f"Zero-neighbor window fraction per node{title_suffix}")
+    axes[1].set_xlabel("Fraction of valid windows")
+    axes[1].set_ylabel("Nodes")
+
+    output_path = output_dir / "neighborhood_sparsity_hist.png"
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    logger.info("Saved neighbor sparsity histogram to %s", output_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Plot neighborhood trace density across window starts."
@@ -268,8 +336,8 @@ def main() -> None:
 
     history_len = int(config.model.history_length)
     horizon = int(config.model.forecast_horizon)
-    window_stride = int(config.model.window_stride)
-    missing_permit = int(config.model.missing_permit)
+    window_stride = int(config.data.window_stride)
+    missing_permit = int(config.data.missing_permit)
     window_len = history_len + horizon
 
     starts, valid_mask = compute_valid_window_mask(
@@ -296,6 +364,10 @@ def main() -> None:
         if args.mobility_threshold is not None
         else float(config.data.mobility_threshold)
     )
+
+    # Save original starts and valid_mask before filtering for density computation
+    starts_orig = starts.copy()
+    valid_mask_orig = valid_mask.copy()
 
     offset = 0 if args.neighbor_timestep == "start" else max(0, history_len - 1)
     times = starts + offset
@@ -350,6 +422,21 @@ def main() -> None:
     )
 
     logger.info("Saved plot to %s", output_path)
+
+    # Compute and plot neighbor sparsity histograms
+    mean_neighbors, zero_fraction = compute_neighbor_sparsity(
+        mobility,
+        starts_orig,
+        valid_mask_orig,
+        history_length=history_len,
+        mobility_threshold=mobility_threshold,
+        neighbor_timestep=args.neighbor_timestep,
+        include_self=args.include_self,
+    )
+    region_ids = dataset[REGION_COORD].values
+    mean_series = pd.Series(mean_neighbors, index=region_ids)
+    zero_series = pd.Series(zero_fraction, index=region_ids)
+    plot_neighbor_sparsity(mean_series, zero_series, output_dir, "")
 
 
 if __name__ == "__main__":
