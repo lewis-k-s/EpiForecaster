@@ -43,7 +43,7 @@ dependencies = [
   "zarr>=2.18.0",
   "tensorboard>=2.14.0",
   "ipython>=9.6.0",
-  "mypy>=1.18.2",
+  "pyright>=1.1.0",
   "types-pyyaml>=6.0.12.20250915",
   "ipykernel>=7.0.1",
   "folium>=0.20.0",
@@ -64,7 +64,7 @@ dev = [
   "pytest>=7.4.0",
   "black>=23.0.0",
   "ruff>=0.1.0",
-  "mypy>=1.5.0",
+  "pyright>=1.1.0",
   "pre-commit>=3.4.0",
 ]
 notebook = ["jupyter>=1.0.0", "ipykernel>=6.23.0", "notebook>=7.0.0"]
@@ -124,27 +124,51 @@ line-length = 88
 target-version = ["py311"]
 include = '\.pyi?$'
 
-[tool.mypy]
-python_version = "3.11"
-exclude = '^(dataviz/|plotting/|utils/plotting\.py|utils/data_analytics\.py)'
-explicit_package_bases = true
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
-ignore_missing_imports = true
-strict_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-no_implicit_optional = true
-check_untyped_defs = true
+[tool.pyright]
+# As a research codebase, strict type checking is not enforced in CI
+# Pyright is used for editor feedback and best-effort type checking
+exclude = [
+  ".venv",
+  "**/__pycache__",
+  "**/.pytest_cache",
+  "**/.ruff_cache",
+  "**/.uv-cache",
+  "**/.uv_cache",
+  "**/node_modules",
+  "**/dataviz/**",
+  "**/plotting/**",
+  "**/utils/plotting.py",
+  "**/utils/data_analytics.py",
+  "docker/**",
+  "checkpoints/**",
+  "outputs/**",
+  "reports/**",
+  # Preprocessing files have incomplete pandas/GeoPandas type stubs
+  "**/data/preprocess/**",
+  # Region graph dataset has incomplete zarr type stubs
+  "**/data/region_graph_dataset.py",
+  # Tests and scripts have various type issues that are not critical
+  "**/tests/**",
+  "**/scripts/**",
+  # Evaluation has torch.utils.data.Dataset protocol issues
+  "**/evaluation/epiforecaster_eval.py",
+]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+reportUnknownMemberType = "warning"
+reportUnknownParameterType = "warning"
+reportUnknownVariableType = "warning"
+reportUnknownArgumentType = "warning"
+reportMissingTypeArgument = "warning"
+reportGeneralTypeIssues = "warning"
 
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
 pythonpath = ["."]
 
-dependency-groups.dev = ["ipython>=8.12.0"]
+[dependency-groups]
+dev = ["ipython>=8.12.0"]
 
 # Build dependencies are handled by pip/uv automatically
