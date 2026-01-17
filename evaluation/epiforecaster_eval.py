@@ -499,7 +499,7 @@ def evaluate_checkpoint_topk_forecasts(
 
 
 def _format_eval_summary(loss: float, metrics: dict[str, Any]) -> str:
-    def _fmt(value: float) -> str:
+    def _fmt(value: float | None) -> str:
         if value is None or not math.isfinite(value):
             return "n/a"
         return f"{value:.6f}"
