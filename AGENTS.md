@@ -25,7 +25,7 @@ uv sync
 uv run ruff check .        # linting (required)
 uv run pytest tests/       # tests (required)
 uv run ruff format .       # formatting
-uv run mypy .              # type checking (best-effort; excludes dataviz/plotting)
+uv run pyright .           # type checking (best-effort; excludes dataviz/plotting)
 
 # CLI usage
 .venv/bin/python -m cli --help  # access CLI commands
@@ -34,7 +34,7 @@ uv run mypy .              # type checking (best-effort; excludes dataviz/plotti
 
 ## Coding Style & Naming Conventions
 
-- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with mypy.
+- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
 - Indentation: 4 spaces; no tabs. Imports sorted (Ruff isort rules).
 - Naming: modules `snake_case.py`, classes `PascalCase`, functions/vars `snake_case`, constants `UPPER_SNAKE_CASE`.
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.
