@@ -47,7 +47,9 @@ class MobilityProcessor:
     def _open_dataset(self, mobility_path: str) -> xr.Dataset:
         print("Opening OD dataset...")
         # Open zarr with chunking on temporal dimension
-        ds = xr.open_zarr(str(mobility_path), chunks={"date": self.config.chunk_size})
+        ds = xr.open_zarr(  # type: ignore[arg-type]
+            str(mobility_path), chunks={"date": self.config.chunk_size}
+        )
         ds = ds.rename({"target": "destination"})
 
         assert (ds["origin"].values == ds["destination"].values).all(), (
@@ -97,12 +99,12 @@ class MobilityProcessor:
         """
         print(f"Processing mobility data from {mobility_path}")
 
-        mobility_path = Path(mobility_path)
+        mobility_dir = Path(mobility_path)  # type: ignore[assignment]
 
-        if not mobility_path.is_dir():
-            raise ValueError(f"Mobility path must be a Zarr directory: {mobility_path}")
+        if not mobility_dir.is_dir():
+            raise ValueError(f"Mobility path must be a Zarr directory: {mobility_dir}")
 
-        mobility_data = self._open_dataset(str(mobility_path))
+        mobility_data = self._open_dataset(str(mobility_dir))
 
         thresholds = DataQualityThresholds(
             min_notna_fraction=float(
@@ -131,7 +133,7 @@ class MobilityProcessor:
     ) -> dict[str, Any]:
         """Compute dataset statistics for metadata."""
 
-        stats = {
+        stats: dict[str, Any] = {
             "total_flows": float(np.sum(od_matrix)),
             "mean_flow": float(np.mean(od_matrix)),
             "std_flow": float(np.std(od_matrix)),
@@ -140,7 +142,7 @@ class MobilityProcessor:
         }
 
         if time_coords is not None and len(time_coords) > 0:
-            stats["time_range"] = {
+            stats["time_range"] = {  # type: ignore[assignment]
                 "start": str(time_coords[0]),
                 "end": str(time_coords[-1]),
             }

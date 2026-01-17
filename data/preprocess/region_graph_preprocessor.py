@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# type: ignore[import-not-found] (GeoPandas and libpysal have incomplete type stubs)
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import xarray as xr
 import zarr
-from libpysal import weights
+from libpysal import weights  # type: ignore[import-not-found]
 
 from utils.logging import suppress_zarr_warnings
 

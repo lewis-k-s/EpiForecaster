@@ -141,7 +141,7 @@ class EDARProcessor:
     def _load_wastewater_data(self, wastewater_file: str) -> pd.DataFrame:
         df = pd.read_csv(
             wastewater_file,
-            usecols=[
+            usecols=[  # type: ignore[arg-type]
                 "id mostra",
                 "Cabal últimes 24h(m3)",
                 "IP4(CG/L)",
@@ -218,7 +218,7 @@ class EDARProcessor:
         variant_counts = (
             valid_entries.groupby(["edar_id", "variant"])
             .size()
-            .reset_index(name="count")
+            .reset_index(name="count")  # type: ignore[call-arg]
         )
 
         # Rank variants by count within each edar_id
@@ -232,7 +232,7 @@ class EDARProcessor:
         ]
 
         # Filter original dataframe to keep only selected variants
-        selected_df = wastewater_df.merge(
+        selected_df = wastewater_df.merge(  # type: ignore[arg-type]
             top_variants, on=["edar_id", "variant"], how="inner"
         )
 

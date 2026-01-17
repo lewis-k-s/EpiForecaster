@@ -45,7 +45,7 @@ class CasesProcessor:
         """Load and validate case data from CSV."""
         cases_df = pd.read_csv(
             cases_file,
-            usecols=["id", "evend", "d.cases"],
+            usecols=["id", "evend", "d.cases"],  # type: ignore[arg-type]
             dtype={"id": str, "evend": str, "d.cases": int},
         )
         cases_df = cases_df.rename(
