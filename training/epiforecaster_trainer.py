@@ -26,7 +26,7 @@ from torch.profiler import (
 )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch_geometric.data import Batch
+from torch_geometric.data import Batch  # type: ignore[import-not-found]
 
 from data.epi_dataset import EpiDataset, EpiDatasetItem
 from data.preprocess.config import REGION_COORD
@@ -418,23 +418,24 @@ class EpiForecasterTrainer:
         target_nodes = torch.tensor(
             [item["target_node"] for item in batch], dtype=torch.long
         )
+        window_starts = torch.tensor(
+            [item["window_start"] for item in batch], dtype=torch.long
+        )
         population = torch.stack([item["population"] for item in batch], dim=0)
 
         # Flatten mobility graphs efficiently
         graph_list = list(itertools.chain.from_iterable(item["mob"] for item in batch))
 
-        mob_batch = Batch.from_data_list(graph_list)
+        mob_batch = Batch.from_data_list(graph_list)  # type: ignore[arg-type]
         T = len(batch[0]["mob"]) if B > 0 else 0
         # store B and T on the batch for downstream reshaping
-        mob_batch.B = torch.tensor([B], dtype=torch.long)
-        mob_batch.T = torch.tensor([T], dtype=torch.long)
+        mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
+        mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
         # Precompute a global target node index per ego-graph in the batched `x`.
         # This enables fully-vectorized target gathering in the model without CUDA `.item()` syncs.
         if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
             # Use dict assignment to ensure it's in the store and moves with .to(device)
-            mob_batch["target_index"] = mob_batch.ptr[
-                :-1
-            ] + mob_batch.target_node.reshape(-1)
+            mob_batch["target_index"] = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(-1)  # type: ignore[index]
 
         return {
             "CaseNode": case_node,  # (B, L, C)
@@ -449,6 +450,7 @@ class EpiForecasterTrainer:
             "TargetScale": target_scales,  # (B, C)
             "TargetMean": target_mean,  # (B, 1)
             "TargetNode": target_nodes,  # (B,)
+            "WindowStart": window_starts,  # (B,)
             "NodeLabels": [item["node_label"] for item in batch],
         }
 
@@ -928,6 +930,12 @@ class EpiForecasterTrainer:
                 self.writer.add_scalar(
                     "GradNorm/Clipped_Total", float(grad_norm), self.global_step
                 )
+                window_start_mean = float(
+                    batch_data["WindowStart"].float().mean().item()
+                )
+                self.writer.add_scalar(
+                    "Time/WindowStart", window_start_mean, self.global_step
+                )
                 self.writer.add_scalar("Time/Batch_s", batch_time_s, self.global_step)
                 self.writer.add_scalar("Time/DataLoad_s", data_time_s, self.global_step)
                 self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
@@ -957,7 +965,8 @@ class EpiForecasterTrainer:
                     profiler_complete_announced = True
 
         effective_batches = max(1, counted_batches)
-        return (total_loss / effective_batches).item()
+        result = total_loss / effective_batches
+        return result.item() if isinstance(result, torch.Tensor) else float(result)
 
     def _generate_forecast_plots(self, loader: DataLoader, split: str):
         """Generate and save forecast plots using quartile strategy."""
@@ -1001,7 +1010,7 @@ class EpiForecasterTrainer:
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=self.model,
             loader=loader,
-            criterion=self.criterion,
+            criterion=self.criterion,  # type: ignore[arg-type]
             horizon=self.config.model.forecast_horizon,
             device=self.device,
             region_embeddings=self.region_embeddings,
@@ -1165,7 +1174,7 @@ class EpiForecasterTrainer:
                 try:
                     # Store reference to workers before cleanup
                     if hasattr(loader, "_workers"):
-                        workers = loader._workers
+                        workers = loader._workers  # type: ignore[attr-defined]
                         if workers:
                             self._status(
                                 f"Cleaning up {name} loader ({len(workers)} workers)...",
