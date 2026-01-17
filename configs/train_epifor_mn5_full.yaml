@@ -1,5 +1,5 @@
 data:
-  dataset_path: data/processed/full_v2.zarr
+  dataset_path: data/processed/full_v1.zarr
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
