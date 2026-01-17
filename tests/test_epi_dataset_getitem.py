@@ -9,7 +9,11 @@ from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 
 
-def _make_config(dataset_path: str, log_scale: bool = False) -> EpiForecasterConfig:
+def _make_config(
+    dataset_path: str,
+    log_scale: bool = False,
+    sample_ordering: str = "node",
+) -> EpiForecasterConfig:
     # Minimal config
     model = ModelConfig(
         type={"cases": True, "regions": False, "biomarkers": True, "mobility": False},
@@ -28,30 +32,25 @@ def _make_config(dataset_path: str, log_scale: bool = False) -> EpiForecasterCon
         mobility_threshold=0.0,
         missing_permit=0,
         log_scale=log_scale,
+        sample_ordering=sample_ordering,
     )
     return EpiForecasterConfig(model=model, data=data_cfg)
 
 
-def test_getitem_values(tmp_path):
-    zarr_path = tmp_path / "tiny.zarr"
-
-    dates = pd.date_range("2020-01-01", periods=10, freq="D")
+def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
+    dates = pd.date_range("2020-01-01", periods=periods, freq="D")
     regions = np.array([0, 1], dtype=np.int64)
 
-    # Constant cases for easy verification
-    # Node 0: 100 cases per day. Pop 1000. -> 10,000 per 100k. Log1p(10000) ~ 9.21
-    # Node 1: 0 cases. Pop 1000. -> 0. Log1p(0) = 0.
-
     # Use 3D cases to test squeeze
-    cases = np.zeros((10, 2, 1), dtype=np.float32)
+    cases = np.zeros((periods, 2, 1), dtype=np.float32)
     cases[:, 0, 0] = 100.0
 
     # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
-    biomarkers = np.zeros((10, 2), dtype=np.float32)
+    biomarkers = np.zeros((periods, 2), dtype=np.float32)
     biomarkers[:, 0] = 1.0  # Node 0 has non-zero biomarkers
 
     # Mobility: full connectivity
-    mobility = np.ones((10, 2, 2), dtype=np.float32)
+    mobility = np.ones((periods, 2, 2), dtype=np.float32)
 
     population = np.array([1000.0, 1000.0], dtype=np.float32)
 
@@ -69,6 +68,15 @@ def test_getitem_values(tmp_path):
         },
     )
     ds.to_zarr(zarr_path, mode="w")
+
+
+def test_getitem_values(tmp_path):
+    zarr_path = tmp_path / "tiny.zarr"
+    _write_tiny_dataset(str(zarr_path))
+
+    # Constant cases for easy verification
+    # Node 0: 100 cases per day. Pop 1000. -> 10,000 per 100k. Log1p(10000) ~ 9.21
+    # Node 1: 0 cases. Pop 1000. -> 0. Log1p(0) = 0.
 
     config = _make_config(str(zarr_path), log_scale=True)
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
@@ -123,3 +131,34 @@ def test_getitem_values(tmp_path):
         assert torch.allclose(
             cases_hist[..., 1], torch.ones_like(cases_hist[..., 1]), atol=1e-3
         )
+
+
+def test_index_ordering_time_major(tmp_path):
+    zarr_path = tmp_path / "ordering.zarr"
+    _write_tiny_dataset(str(zarr_path), periods=8)
+
+    node_config = _make_config(str(zarr_path), sample_ordering="node")
+    node_dataset = EpiDataset(
+        config=node_config, target_nodes=[0, 1], context_nodes=[0, 1]
+    )
+
+    time_config = _make_config(str(zarr_path), sample_ordering="time")
+    time_dataset = EpiDataset(
+        config=time_config, target_nodes=[0, 1], context_nodes=[0, 1]
+    )
+
+    assert node_dataset._index_map[:4] == [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+    ]
+    assert time_dataset._index_map[:4] == [
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (1, 1),
+    ]
+
+    assert node_dataset[1]["window_start"] == 1
+    assert time_dataset[1]["window_start"] == 0

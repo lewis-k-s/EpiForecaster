@@ -31,8 +31,8 @@ def test_cases_preprocessor_basic():
 
     p_cases, p_mean, p_std = processor.preprocess_dataset(ds)
 
-    # p_cases now has 2 channels: [value, mask]
-    assert p_cases.shape == (10, 2, 2)
+    # p_cases has 3 channels: [value, mask, age]
+    assert p_cases.shape == (10, 2, 3)
     assert p_mean.shape == (10, 2, 1)
     assert p_std.shape == (10, 2, 1)
 
