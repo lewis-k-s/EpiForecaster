@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import xarray as xr
 from torch.utils.data import DataLoader
 
 
@@ -55,6 +56,9 @@ def collect_case_window_samples(
             raise ValueError("Expected `case_node` with shape (L, C).")
 
         history = case_hist[:, cases_feature_idx]
+        # Extract cases age channel (index 2) for ribbon visualization
+        cases_age = case_hist[:, 2].detach().cpu().numpy().astype(np.float32)
+
         if targets.ndim == 1:
             future = targets
         elif targets.ndim == 2:
@@ -66,7 +70,9 @@ def collect_case_window_samples(
         sample: dict[str, Any] = {
             "node_id": int(item["target_node"]),
             "node_label": str(item.get("node_label", "")),
+            "window_start": int(item.get("window_start", -1)),
             "series": np.asarray(window, dtype=np.float32),
+            "cases_age": cases_age,  # History-only cases age for ribbon
         }
 
         if include_biomarkers_locf:
@@ -164,6 +170,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         total_len = series.shape[0]
         horizon_length = total_len - history_length
 
+        cases_age = sample.get("cases_age")
         biomarker_series = sample.get("biomarkers")
         biomarker_age = sample.get("biomarkers_age")
         mobility_mean = sample.get("mobility_mean")
@@ -232,6 +239,45 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
 
         t = np.arange(total_len)
 
+        # Add cases age ribbon at top of plot (just below top edge)
+        if cases_age is not None:
+            # cases_age is history-only, pad with NaNs for horizon
+            cases_age_padded = np.concatenate(
+                [cases_age, np.full(horizon_length, np.nan)]
+            )
+            valid_mask = ~np.isnan(cases_age_padded)
+            valid_t = t[valid_mask]
+            valid_age = cases_age_padded[valid_mask]
+
+            if len(valid_t) > 0:
+                # Draw ribbon for each timestep with color based on age
+                # ymin/ymax are in axes coordinates (0-1), so 0.95-1.0 is top 5%
+                for ti, age in zip(valid_t, valid_age):
+                    # Use RdYlGn colormap: green=fresh (age=0), red=stale (age=1)
+                    color = plt.cm.RdYlGn_r(min(age, 1.0))
+                    ax.axvspan(
+                        ti - 0.5,
+                        ti + 0.5,
+                        ymin=0.95,
+                        ymax=1.0,
+                        color=color,
+                        alpha=0.7,
+                        zorder=-1,
+                    )
+
+                # Add label to the right of the ribbon, aligned with history/horizon line
+                ax.text(
+                    history_length - 0.5,
+                    0.975,  # Center of the ribbon (ymin=0.95, ymax=1.0)
+                    " cases age",
+                    transform=ax.get_xaxis_transform(),
+                    ha="left",
+                    va="center",
+                    fontsize=7,
+                    fontweight="semibold",
+                    color="#333333",
+                )
+
         # Plot cases
         ax.plot(
             t, plot_series["Cases"], label="Cases", color=colors["Cases"], linewidth=1.5
@@ -272,6 +318,19 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                             zorder=-1,
                         )
 
+                    # Add label to the right of the ribbon, aligned with history/horizon line
+                    ax.text(
+                        history_length - 0.5,
+                        0.025,  # Center of the ribbon (ymin=0, ymax=0.05)
+                        " biomarker age",
+                        transform=ax.get_xaxis_transform(),
+                        ha="left",
+                        va="center",
+                        fontsize=7,
+                        fontweight="semibold",
+                        color="#333333",
+                    )
+
         # Plot mobility with std dev band
         if mobility_mean_padded is not None and "Incoming mobility" in plot_series:
             mobility_mean_norm = plot_series["Incoming mobility"]
@@ -307,9 +366,12 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         # Title
         node_label = sample.get("node_label", "")
         node_id = sample.get("node_id", None)
+        window_start = sample.get("window_start", None)
         title = f"{node_label}".strip()
         if node_id is not None:
             title = f"{title} (id={node_id})" if title else f"id={node_id}"
+        if window_start is not None and window_start >= 0:
+            title = f"{title} | window_start={window_start}"
         ax.set_title(title, fontsize=10, fontweight="semibold")
 
         ax.set_ylabel("Scaled value", fontsize=9)
@@ -401,9 +463,12 @@ def make_biomarker_locf_figure(
         # Title
         node_label = sample.get("node_label", "")
         node_id = sample.get("node_id", None)
+        window_start = sample.get("window_start", None)
         title = f"{node_label}".strip()
         if node_id is not None:
             title = f"{title} (id={node_id})" if title else f"id={node_id}"
+        if window_start is not None and window_start >= 0:
+            title = f"{title} | window_start={window_start}"
         ax.set_title(title, fontsize=10, fontweight="semibold")
 
         ax.set_ylabel("Biomarker value (scaled)", fontsize=9)
@@ -923,6 +988,647 @@ def make_biomarker_sparsity_figure_all(
         ax3.set_ylabel("Count")
         ax3.set_title(
             "LOCF Value Age Distribution (all regions)",
+            fontsize=10,
+            fontweight="semibold",
+        )
+        ax3.tick_params(axis="x", rotation=45)
+    else:
+        ax3.text(0.5, 0.5, "No age data", ha="center", va="center")
+
+    return fig
+
+
+# =============================================================================
+# Cases LOCF Sparsity Analysis (All Regions)
+# =============================================================================
+
+
+def compute_cases_locf_age_from_dataset(
+    cases_da: xr.DataArray, age_max: int = 14
+) -> np.ndarray:
+    """Calculate LOCF age for cases DataArray.
+
+    Args:
+        cases_da: (time, region) cases DataArray
+        age_max: Maximum age in days for LOCF
+
+    Returns:
+        Age channel (time, region) normalized to [0, 1]
+    """
+    # Get values
+    values = cases_da.values  # (T, N)
+    T, N = values.shape
+
+    # Mask: 1.0 if finite, 0.0 otherwise
+    mask = np.isfinite(values).astype(np.float32)
+
+    # Vectorized age calculation (same as biomarker preprocessor)
+    age_channel = np.full_like(values, age_max, dtype=np.float32)
+
+    time_indices = np.arange(T)[:, None]  # (T, 1)
+    last_seen_indices = np.where(mask > 0, time_indices, np.nan)
+
+    last_seen_df = pd.DataFrame(last_seen_indices)
+    last_seen_filled = last_seen_df.ffill().values
+
+    valid_history_mask = ~np.isnan(last_seen_filled)
+
+    current_age = np.zeros_like(age_channel)
+    current_age[valid_history_mask] = (
+        time_indices * np.ones((1, N)) - last_seen_filled
+    )[valid_history_mask]
+
+    final_age = np.where(valid_history_mask, np.minimum(current_age, age_max), age_max)
+
+    return (final_age / age_max).astype(np.float32)
+
+
+def plot_cases_age_heatmap(
+    ax,
+    cases_da: xr.DataArray,
+    history_length: int | None = None,
+    age_max: int = 14,
+) -> None:
+    """Plot cases LOCF age (staleness) heatmap across ALL regions.
+
+    Since LOCF means every region that has ever had a measurement
+    will have a value for all timesteps, the meaningful visualization is
+    the AGE channel (days since last observation), not binary missingness.
+
+    Args:
+        ax: Matplotlib axes to plot on
+        cases_da: (time, region) cases DataArray
+        history_length: Optional history/horizon separator position
+        age_max: Maximum age in days for LOCF (for normalization)
+    """
+    import seaborn as sns
+
+    age_channel = compute_cases_locf_age_from_dataset(cases_da, age_max)
+
+    # Filter to regions with any finite values in original data
+    has_data = np.isfinite(cases_da.values).any(axis=0)
+    age_filtered = age_channel[:, has_data].T  # (regions, time)
+
+    # Plot heatmap with regions as rows, time as columns
+    sns.heatmap(
+        age_filtered,
+        cbar_kws={"label": f"Age (days, max={age_max})"},
+        cmap="Reds",
+        vmin=0,
+        vmax=1,
+        xticklabels=30,
+        yticklabels=False,
+        ax=ax,
+    )
+
+    # Draw history/horizon separator if provided
+    if history_length is not None:
+        ax.axvline(
+            history_length - 0.5, color="black", linestyle="--", alpha=0.5, linewidth=2
+        )
+
+    n_regions = age_filtered.shape[0]
+    ax.set_title(
+        f"Cases LOCF Age/Staleness ({n_regions} regions with data)",
+        fontsize=10,
+        fontweight="semibold",
+    )
+    ax.set_xlabel("Time index")
+
+
+def compute_cases_sparsity_stats_all(
+    cases_da: xr.DataArray,
+) -> pd.DataFrame:
+    """Compute sparsity statistics for ALL cases regions.
+
+    Args:
+        cases_da: (time, region) cases DataArray
+
+    Returns:
+        DataFrame with one row per region that has case data
+    """
+    from data.preprocess.config import REGION_COORD
+
+    # Filter to regions with any data
+    has_data = np.isfinite(cases_da.values).any(axis=0)
+
+    rows = []
+    for region_idx, region_id in enumerate(cases_da[REGION_COORD].values):
+        if not has_data[region_idx]:
+            continue
+
+        series = cases_da.isel({REGION_COORD: region_idx}).values
+
+        # Compute sparsity
+        n_measurements = int(np.sum(np.isfinite(series)))
+        total_timesteps = len(series)
+        sparsity_pct = 100 * (1 - n_measurements / total_timesteps)
+
+        # Compute max consecutive missing
+        missing_mask = np.isnan(series)
+        max_consecutive_missing = 0
+        current = 0
+        for val in missing_mask:
+            if val:
+                current += 1
+                max_consecutive_missing = max(max_consecutive_missing, current)
+            else:
+                current = 0
+
+        rows.append(
+            {
+                "node_id": int(region_id),
+                "node_label": str(region_id),
+                "measurements_count": n_measurements,
+                "total_timesteps": total_timesteps,
+                "sparsity_pct": round(sparsity_pct, 2),
+                "max_consecutive_missing": max_consecutive_missing,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+def compute_cases_locf_age_stats(
+    cases_da: xr.DataArray,
+    age_max: int = 14,
+    n_bins: int = 10,
+) -> pd.DataFrame:
+    """Compute LOCF age distribution from cases data.
+
+    Args:
+        cases_da: (time, region) cases DataArray
+        age_max: Maximum age in days for LOCF
+        n_bins: Number of bins for age distribution
+
+    Returns:
+        DataFrame with age bin distribution
+    """
+    age_channel = compute_cases_locf_age_from_dataset(cases_da, age_max)
+
+    # Collect all age values where there's data (mask > 0)
+    all_ages = []
+    for region_idx in range(age_channel.shape[1]):
+        region_ages = age_channel[:, region_idx]
+        all_ages.extend(region_ages)
+
+    all_ages = np.array(all_ages)
+    # Unnormalize to days
+    age_days = all_ages * age_max
+
+    # Filter out any NaN
+    age_days = age_days[~np.isnan(age_days)]
+
+    if len(age_days) == 0:
+        return pd.DataFrame(columns=["age_bin_days", "count", "pct"])
+
+    total = len(age_days)
+
+    # Create bins
+    bin_edges = np.linspace(0, age_max, n_bins + 1)
+
+    counts, _ = np.histogram(age_days, bins=bin_edges)
+
+    rows = []
+    for i, count in enumerate(counts):
+        bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
+        rows.append(
+            {
+                "age_bin_days": bin_label,
+                "count": int(count),
+                "pct": round(100 * count / total, 2),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def make_cases_sparsity_figure_all(
+    cases_da: xr.DataArray,
+    history_length: int | None = None,
+    age_max: int = 14,
+):
+    """Create multi-panel cases sparsity figure using ALL regions.
+
+    This version uses LOCF age (staleness) for the heatmap since with LOCF
+    imputation, every region that has ever had a measurement will have a value
+    for all timesteps. The age channel shows how stale each value is.
+
+    Args:
+        cases_da: Raw cases DataArray (time, region)
+        history_length: Optional history/horizon separator position
+        age_max: Maximum age in days for LOCF
+
+    Returns a matplotlib Figure suitable for saving.
+    """
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25)
+
+    # Panel 1: LOCF age heatmap (ALL regions)
+    ax1 = fig.add_subplot(gs[0, :])
+    plot_cases_age_heatmap(ax1, cases_da, history_length, age_max)
+
+    # Panel 2: Sparsity distribution (ALL regions)
+    ax2 = fig.add_subplot(gs[1, 0])
+    sparsity_df = compute_cases_sparsity_stats_all(cases_da)
+    if not sparsity_df.empty:
+        ax2.hist(
+            sparsity_df["sparsity_pct"],
+            bins=20,
+            color="steelblue",
+            edgecolor="black",
+            alpha=0.7,
+        )
+        ax2.set_xlabel("Sparsity (%)")
+        ax2.set_ylabel("Number of regions")
+        ax2.set_title(
+            "Sparsity Distribution (all regions)", fontsize=10, fontweight="semibold"
+        )
+        ax2.axvline(
+            sparsity_df["sparsity_pct"].median(),
+            color="red",
+            linestyle="--",
+            label=f"Median: {sparsity_df['sparsity_pct'].median():.1f}%",
+        )
+        ax2.legend(fontsize=8)
+    else:
+        ax2.text(0.5, 0.5, "No sparsity data", ha="center", va="center")
+
+    # Panel 3: Age distribution (ALL regions)
+    ax3 = fig.add_subplot(gs[1, 1])
+    age_df = compute_cases_locf_age_stats(cases_da, age_max)
+    if not age_df.empty:
+        ax3.bar(
+            age_df["age_bin_days"],
+            age_df["count"],
+            color="coral",
+            edgecolor="black",
+            alpha=0.7,
+        )
+        ax3.set_xlabel("Age (days)")
+        ax3.set_ylabel("Count")
+        ax3.set_title(
+            "LOCF Value Age Distribution (all regions)",
+            fontsize=10,
+            fontweight="semibold",
+        )
+        ax3.tick_params(axis="x", rotation=45)
+    else:
+        ax3.text(0.5, 0.5, "No age data", ha="center", va="center")
+
+    return fig
+
+
+def export_cases_sparsity_tables(
+    cases_da: xr.DataArray, output_dir: Path, age_max: int = 14
+) -> dict[str, Path]:
+    """Export cases sparsity statistics for ALL regions to CSV files.
+
+    Args:
+        cases_da: (time, region) cases DataArray
+        output_dir: Directory to save CSV files
+        age_max: Maximum age in days for LOCF
+
+    Returns:
+        Dict mapping table name to output file path
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    exported = {}
+
+    # 1. Cases sparsity stats (all regions)
+    sparsity_df = compute_cases_sparsity_stats_all(cases_da)
+    if not sparsity_df.empty:
+        path = output_dir / "cases_sparsity.csv"
+        sparsity_df.to_csv(path, index=False)
+        exported["sparsity"] = path
+
+    # 2. Age distribution (all regions)
+    age_df = compute_cases_locf_age_stats(cases_da, age_max)
+    if not age_df.empty:
+        path = output_dir / "cases_age_dist.csv"
+        age_df.to_csv(path, index=False)
+        exported["age_dist"] = path
+
+    return exported
+
+
+# =============================================================================
+# Biomarker Sparsity Analysis from Precomputed Data (Model-Visible Metrics)
+# =============================================================================
+
+
+def compute_biomarker_sparsity_stats_from_precomputed(
+    precomputed_biomarkers: torch.Tensor,
+    biomarker_available_mask: torch.Tensor,
+    region_ids: np.ndarray,
+    age_max: int = 14,
+) -> tuple[pd.DataFrame, str]:
+    """Compute per-region biomarker sparsity from precomputed tensor.
+
+    This function uses the model-visible data (mask channel) to compute
+    sparsity statistics. Only regions with biomarker data (has_data > 0)
+    are included in the sparsity analysis.
+
+    Args:
+        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
+        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        region_ids: Array of region IDs
+        age_max: Maximum age in days (for reference, sparsity uses mask only)
+
+    Returns:
+        Tuple of (DataFrame, context_string):
+        - DataFrame with columns: node_id, node_label, measurements_count,
+            total_timesteps, sparsity_pct, max_consecutive_missing
+        - Context string: "n of N regions have biomarker data"
+    """
+    T, N, C = precomputed_biomarkers.shape
+
+    # Extract mask channel (index 1) - indicates fresh measurements
+    mask_channel = precomputed_biomarkers[:, :, 1].cpu().numpy()  # (T, N)
+
+    # Filter to regions with biomarker data
+    has_data = biomarker_available_mask[:, 0].cpu().numpy() > 0.5
+    n_with_data = int(has_data.sum())
+    n_total = len(region_ids)
+
+    rows = []
+    for region_idx, region_id in enumerate(region_ids):
+        # Skip regions without biomarker data
+        if not has_data[region_idx]:
+            continue
+
+        mask = mask_channel[:, region_idx]
+        n_measurements = int((mask == 1.0).sum())
+        sparsity_pct = 100 * (1 - n_measurements / T)
+
+        # Compute max consecutive missing (where mask == 0)
+        max_consecutive_missing = 0
+        current = 0
+        for val in mask:
+            if val < 0.5:  # mask == 0 means LOCF, not fresh measurement
+                current += 1
+                max_consecutive_missing = max(max_consecutive_missing, current)
+            else:
+                current = 0
+
+        rows.append(
+            {
+                "node_id": int(region_id),
+                "node_label": str(region_id),
+                "measurements_count": n_measurements,
+                "total_timesteps": T,
+                "sparsity_pct": round(sparsity_pct, 2),
+                "max_consecutive_missing": max_consecutive_missing,
+            }
+        )
+
+    context = f"{n_with_data} of {n_total} regions have biomarker data"
+
+    if not rows:
+        return pd.DataFrame(), context
+
+    return pd.DataFrame(rows), context
+
+
+def compute_biomarker_age_dist_from_precomputed(
+    precomputed_biomarkers: torch.Tensor,
+    age_max: int = 14,
+    n_bins: int = 10,
+) -> pd.DataFrame:
+    """Compute LOCF age distribution from precomputed biomarker tensor.
+
+    Args:
+        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
+        age_max: Maximum age in days for unnormalization
+        n_bins: Number of bins for age distribution
+
+    Returns:
+        DataFrame with columns: age_bin_days, count, pct
+    """
+    # Extract age channel (index 2) and unnormalize to days
+    age_channel = precomputed_biomarkers[:, :, 2].cpu().numpy()  # (T, N)
+    age_days = age_channel * age_max
+
+    # Collect all age values
+    all_ages = age_days.flatten()
+    all_ages = all_ages[~np.isnan(all_ages)]
+
+    if len(all_ages) == 0:
+        return pd.DataFrame(columns=["age_bin_days", "count", "pct"])
+
+    total = len(all_ages)
+
+    # Create bins
+    bin_edges = np.linspace(0, age_max, n_bins + 1)
+
+    counts, _ = np.histogram(all_ages, bins=bin_edges)
+
+    rows = []
+    for i, count in enumerate(counts):
+        bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
+        rows.append(
+            {
+                "age_bin_days": bin_label,
+                "count": int(count),
+                "pct": round(100 * count / total, 2),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def plot_biomarker_age_heatmap_from_precomputed(
+    ax,
+    precomputed_biomarkers: torch.Tensor,
+    biomarker_available_mask: torch.Tensor,
+    history_length: int | None = None,
+    age_max: int = 14,
+) -> None:
+    """Plot biomarker LOCF age (staleness) heatmap from precomputed data.
+
+    Args:
+        ax: Matplotlib axes to plot on
+        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
+        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        history_length: Optional history/horizon separator position
+        age_max: Maximum age in days (for normalization label only)
+    """
+    import seaborn as sns
+
+    # Extract age channel (index 2) - already normalized to [0, 1]
+    age_channel = precomputed_biomarkers[:, :, 2].cpu().numpy()  # (T, N)
+
+    # Filter to regions with biomarker availability (has_data > 0)
+    has_data = biomarker_available_mask[:, 0].cpu().numpy() > 0.5
+    age_filtered = age_channel[:, has_data].T  # (regions, time)
+
+    # Plot heatmap with regions as rows, time as columns
+    sns.heatmap(
+        age_filtered,
+        cbar_kws={"label": f"Age (normalized 0-1, max={age_max} days)"},
+        cmap="Reds",
+        vmin=0,
+        vmax=1,
+        xticklabels=30,
+        yticklabels=False,
+        ax=ax,
+    )
+
+    # Draw history/horizon separator if provided
+    if history_length is not None:
+        ax.axvline(
+            history_length - 0.5, color="black", linestyle="--", alpha=0.5, linewidth=2
+        )
+
+    n_regions = age_filtered.shape[0]
+    ax.set_title(
+        f"Biomarker LOCF Age/Staleness ({n_regions} regions with data)",
+        fontsize=10,
+        fontweight="semibold",
+    )
+    ax.set_xlabel("Time index")
+
+
+def export_biomarker_sparsity_tables_from_precomputed(
+    precomputed_biomarkers: torch.Tensor,
+    biomarker_available_mask: torch.Tensor,
+    region_ids: np.ndarray,
+    output_dir: Path,
+    age_max: int = 14,
+) -> tuple[dict[str, Path], str]:
+    """Export biomarker sparsity statistics from precomputed data to CSV files.
+
+    Args:
+        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
+        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        region_ids: Array of region IDs
+        output_dir: Directory to save CSV files
+        age_max: Maximum age in days
+
+    Returns:
+        Tuple of (exported_files_dict, context_string):
+        - Dict mapping table name to output file path
+        - Context string: "n of N regions have biomarker data"
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    exported = {}
+
+    # 1. Biomarker sparsity stats (regions with data only)
+    sparsity_df, context = compute_biomarker_sparsity_stats_from_precomputed(
+        precomputed_biomarkers,
+        biomarker_available_mask,
+        region_ids,
+        age_max,
+    )
+    if not sparsity_df.empty:
+        path = output_dir / "biomarker_sparsity.csv"
+        sparsity_df.to_csv(path, index=False)
+        exported["sparsity"] = path
+
+    # 2. Age distribution (all regions)
+    age_df = compute_biomarker_age_dist_from_precomputed(
+        precomputed_biomarkers, age_max
+    )
+    if not age_df.empty:
+        path = output_dir / "biomarker_age_dist.csv"
+        age_df.to_csv(path, index=False)
+        exported["age_dist"] = path
+
+    return exported, context
+
+
+def make_biomarker_sparsity_figure_all_from_precomputed(
+    precomputed_biomarkers: torch.Tensor,
+    biomarker_available_mask: torch.Tensor,
+    region_ids: np.ndarray,
+    history_length: int | None = None,
+    age_max: int = 14,
+):
+    """Create multi-panel biomarker sparsity figure using precomputed data.
+
+    This version uses the model-visible data (mask and age channels from
+    precomputed biomarkers) to show regional variation in measurement patterns.
+
+    Args:
+        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
+        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        region_ids: Array of region IDs
+        history_length: Optional history/horizon separator position
+        age_max: Maximum age in days
+
+    Returns a matplotlib Figure suitable for saving.
+    """
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25)
+
+    # Panel 1: LOCF age heatmap (all regions with data)
+    ax1 = fig.add_subplot(gs[0, :])
+    plot_biomarker_age_heatmap_from_precomputed(
+        ax1, precomputed_biomarkers, biomarker_available_mask, history_length, age_max
+    )
+
+    # Panel 2: Sparsity distribution (regions with data only)
+    ax2 = fig.add_subplot(gs[1, 0])
+    sparsity_df, context = compute_biomarker_sparsity_stats_from_precomputed(
+        precomputed_biomarkers,
+        biomarker_available_mask,
+        region_ids,
+        age_max,
+    )
+    if not sparsity_df.empty:
+        ax2.hist(
+            sparsity_df["sparsity_pct"],
+            bins=20,
+            color="steelblue",
+            edgecolor="black",
+            alpha=0.7,
+        )
+        ax2.set_xlim(0, 100)
+        ax2.set_xlabel("Sparsity (%)")
+        ax2.set_ylabel("Number of regions")
+        ax2.set_title(
+            f"Sparsity Distribution ({context})",
+            fontsize=10,
+            fontweight="semibold",
+        )
+        ax2.axvline(
+            sparsity_df["sparsity_pct"].median(),
+            color="red",
+            linestyle="--",
+            label=f"Median: {sparsity_df['sparsity_pct'].median():.1f}%",
+        )
+        ax2.legend(fontsize=8)
+    else:
+        ax2.text(0.5, 0.5, "No sparsity data", ha="center", va="center")
+
+    # Panel 3: Age distribution (all regions)
+    ax3 = fig.add_subplot(gs[1, 1])
+    age_df = compute_biomarker_age_dist_from_precomputed(
+        precomputed_biomarkers, age_max
+    )
+    if not age_df.empty:
+        ax3.bar(
+            age_df["age_bin_days"],
+            age_df["count"],
+            color="coral",
+            edgecolor="black",
+            alpha=0.7,
+        )
+        ax3.set_xlabel("Age (days)")
+        ax3.set_ylabel("Count")
+        ax3.set_title(
+            "LOCF Value Age Distribution (model-visible)",
             fontsize=10,
             fontweight="semibold",
         )
