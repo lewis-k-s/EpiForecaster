@@ -528,7 +528,7 @@ def plot_forecasts(
 
 
 def _format_eval_summary(loss: float, metrics: dict) -> str:
-    def _fmt(value: float) -> str:
+    def _fmt(value: float | None) -> str:
         if value is None or not math.isfinite(value):
             return "n/a"
         return f"{value:.6f}"
@@ -714,8 +714,7 @@ def _run_forecaster_training(
 
 @cli.command("info")
 @click.option("--dataset", help="Path to preprocessed dataset (.zarr file)")
-@click.option("--validate", is_flag=True, help="Validate dataset integrity")
-def dataset_info(dataset: str, validate: bool):
+def dataset_info(dataset: str):
     """Display information about preprocessed datasets."""
     try:
         if not dataset:
@@ -727,52 +726,23 @@ def dataset_info(dataset: str, validate: bool):
             click.echo(f"❌ Dataset not found: {dataset}", err=True)
             return
 
-        # Load dataset index
-        from data.dataset_storage import DatasetStorage
-
         logger = logging.getLogger(__name__)
 
-        if validate:
-            logger.info(f"Validating dataset: {dataset}")
-            validation_result = DatasetStorage.validate_dataset(dataset_path)
+        # Open the zarr dataset and read basic metadata
+        import zarr
 
-            if validation_result["valid"]:
-                logger.info("✅ Dataset validation passed")
-            else:
-                logger.warning("❌ Dataset validation failed:")
-                for issue in validation_result["issues"]:
-                    logger.warning(f"  - {issue}")
-
-        # Get dataset metadata
-        dataset_info = DatasetStorage.load_dataset(dataset_path)
-        metadata = dataset_info["metadata"]
+        z = zarr.open(dataset_path, mode="r")
 
         logger.info(f"\n{'=' * 50}")
         logger.info("DATASET INFORMATION")
         logger.info(f"{'=' * 50}")
-        logger.info(f"Name: {metadata['dataset_name']}")
-        logger.info(f"Created: {metadata['created_at']}")
-        logger.info(f"Schema version: {metadata['schema_version']}")
+        logger.info(f"Path: {dataset_path}")
 
-        logger.info("\n📊 DIMENSIONS:")
-        logger.info(f"  Timepoints: {metadata['num_timepoints']}")
-        logger.info(f"  Nodes: {metadata['num_nodes']}")
-        logger.info(f"  Edges: {metadata['num_edges']}")
-        logger.info(f"  Feature dimension: {metadata['feature_dim']}")
-        logger.info(f"  Forecast horizon: {metadata['forecast_horizon']}")
-
-        logger.info("\n📁 AVAILABLE FEATURES:")
-        logger.info("  Node features: ✅")
-        logger.info(f"  Edge attributes: {'✅' if metadata['has_edge_attr'] else '❌'}")
-        logger.info(
-            f"  Region embeddings: {'✅' if metadata['has_region_embeddings'] else '❌'}"
-        )
-        logger.info(f"  EDAR data: {'✅' if metadata['has_edar_data'] else '❌'}")
-
-        if "time_range" in metadata:
-            logger.info("\n📅 TEMPORAL RANGE:")
-            logger.info(f"  Start: {metadata['time_range']['start']}")
-            logger.info(f"  End: {metadata['time_range']['end']}")
+        # Print arrays info
+        if hasattr(z, "arrays"):
+            logger.info("\n📊 ARRAYS:")
+            for name, arr in z.arrays():  # type: ignore[attr-defined]
+                logger.info(f"  {name}: {arr.shape}")
 
         logger.info(f"{'=' * 50}")
 
@@ -791,8 +761,6 @@ def dataset_info(dataset: str, validate: bool):
 def list_datasets(data_dir: str):
     """List all available preprocessed datasets."""
     try:
-        from data.dataset_storage import DatasetStorage
-
         data_dir_path = Path(data_dir)
         if not data_dir_path.exists():
             click.echo(f"❌ Data directory not found: {data_dir}", err=True)
@@ -800,34 +768,23 @@ def list_datasets(data_dir: str):
 
         logger = logging.getLogger(__name__)
         logger.info(f"Scanning for datasets in: {data_dir}")
-        dataset_index = DatasetStorage.create_dataset_index(data_dir_path)
 
-        if not dataset_index:
+        # Find all .zarr files/directories
+        zarr_files = list(data_dir_path.glob("*.zarr")) + [
+            p for p in data_dir_path.iterdir() if p.is_dir() and (p / ".zarray").exists()
+        ]
+
+        if not zarr_files:
             logger.info("No datasets found.")
             return
 
         logger.info(f"\n{'=' * 60}")
-        logger.info(f"AVAILABLE DATASETS ({len(dataset_index)} found)")
+        logger.info(f"AVAILABLE DATASETS ({len(zarr_files)} found)")
         logger.info(f"{'=' * 60}")
 
-        for name, info in dataset_index.items():
-            logger.info(f"\n📦 {name}")
-            logger.info(f"  Path: {info['path']}")
-            logger.info(f"  Timepoints: {info['num_timepoints']}")
-            logger.info(f"  Nodes: {info['num_nodes']}")
-            logger.info(f"  Forecast horizon: {info['forecast_horizon']}")
-            logger.info(f"  Created: {info['created_at']}")
-
-            features = []
-            if info["has_edge_attr"]:
-                features.append("mobility")
-            if info["has_region_embeddings"]:
-                features.append("embeddings")
-            if info["has_edar_data"]:
-                features.append("EDAR")
-
-            if features:
-                logger.info(f"  Features: {', '.join(features)}")
+        for zarr_path in zarr_files:
+            logger.info(f"\n📦 {zarr_path.name}")
+            logger.info(f"  Path: {zarr_path}")
 
         logger.info(f"{'=' * 60}")
 
