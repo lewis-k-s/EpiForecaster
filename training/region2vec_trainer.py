@@ -61,6 +61,8 @@ class RegionDataConfig:
         if not zarr_path_str:
             raise ValueError("Region training config requires zarr_path under `data`.")
         zarr_path = _resolve_path(base_dir, zarr_path_str)
+        if zarr_path is None:
+            raise ValueError(f"Could not resolve zarr_path: {zarr_path_str}")
         return cls(
             zarr_path=zarr_path,
             normalize_features=raw.get("normalize_features", True),
@@ -389,7 +391,7 @@ class Region2VecTrainer:
         self.dataset = RegionGraphDataset(
             zarr_path=config.data.zarr_path,
             normalize_features=config.data.normalize_features,
-            device=self.device,
+            device=str(self.device),  # type: ignore[arg-type]
         )
 
         # Load required data
