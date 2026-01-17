@@ -1,11 +1,12 @@
 data:
   # Use valid_targets mask from dataset to filter target nodes
   use_valid_targets: true
-  dataset_path: data/processed/full_v2.zarr
+  dataset_path: data/processed/full_v1.zarr
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
   mobility_threshold: 10
   window_stride: 1
-  missing_permit: 0
+  missing_permit: 2
+  sample_ordering: "time"
   smoothing:
     enabled: true
     window: 5
