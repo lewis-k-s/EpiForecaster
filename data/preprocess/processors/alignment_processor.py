@@ -46,7 +46,7 @@ class AlignmentProcessor:
         self,
         cases_data: xr.DataArray,
         mobility_data: xr.Dataset,
-        edar_data: xr.DataArray,
+        edar_data: xr.Dataset,
         population_data: xr.DataArray,
     ) -> xr.Dataset:
         """
@@ -55,7 +55,7 @@ class AlignmentProcessor:
         Args:
             cases_data: Processed cases dataset
             mobility_data: Processed mobility dataset (OD matrix)
-            edar_data: Processed EDAR dataset
+            edar_data: Processed EDAR dataset (per-variant variables)
             population_data: Processed population dataset
 
         Returns:
@@ -126,6 +126,16 @@ class AlignmentProcessor:
         population_final = population_data.sel({REGION_COORD: common_regions})
         edar_final = edar_aligned.reindex({REGION_COORD: common_regions})
 
+        # Fill mask/censor/age channels with proper defaults for regions without EDAR data
+        # Mask: 0.0 (no measurement), Censor: 0.0 (not censored), Age: 1.0 (max age)
+        for var_name in edar_final.data_vars:
+            if var_name.endswith("_mask"):
+                edar_final[var_name] = edar_final[var_name].fillna(0.0)
+            elif var_name.endswith("_censor"):
+                edar_final[var_name] = edar_final[var_name].fillna(0.0)
+            elif var_name.endswith("_age"):
+                edar_final[var_name] = edar_final[var_name].fillna(1.0)
+
         # Compute biomarker data start offset for each region
         # For each region, find the first time index where biomarker data > 0
         # Use -1 for regions with no biomarker data
@@ -140,9 +150,16 @@ class AlignmentProcessor:
         for i, region in enumerate(common_regions):
             region_data = edar_final.sel({REGION_COORD: region})
             # Find first index where value > 0 (finite and positive)
-            has_data = (region_data.values > 0) & np.isfinite(region_data.values)
-            if has_data.any():
-                first_idx = int(np.argmax(has_data))
+            if isinstance(region_data, xr.Dataset):
+                data = region_data.to_array().values
+                has_data = (data > 0) & np.isfinite(data)
+                has_data_any = np.any(has_data, axis=0)
+            else:
+                has_data_any = (region_data.values > 0) & np.isfinite(
+                    region_data.values
+                )
+            if has_data_any.any():
+                first_idx = int(np.argmax(has_data_any))
                 biomarker_data_start[i] = first_idx
 
         print(

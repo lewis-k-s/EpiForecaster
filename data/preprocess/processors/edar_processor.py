@@ -7,15 +7,97 @@ It processes variant selection, flow calculations, temporal alignment, and
 creates temporal tensors for downstream aggregation to target regions.
 """
 
+import warnings
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
+from scipy.stats import norm
+from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, PreprocessingConfig
 from .quality_checks import DataQualityThresholds, validate_notna_and_std
+
+
+class _TobitKalman:
+    def __init__(
+        self,
+        *,
+        process_var: float,
+        measurement_var: float,
+        censor_inflation: float = 4.0,
+    ) -> None:
+        self.process_var = float(process_var)
+        self.measurement_var = float(measurement_var)
+        self.censor_inflation = float(censor_inflation)
+        self.state = 0.0
+        self.state_var = 1.0
+        self.initialized = False
+
+    def _initialize(self, first_log_value: float) -> None:
+        self.state = float(first_log_value)
+        self.state_var = float(self.measurement_var)
+        self.initialized = True
+
+    def filter_series(
+        self, values: np.ndarray, limits: np.ndarray
+    ) -> tuple[list[float], list[int]]:
+        filtered: list[float] = []
+        flags: list[int] = []
+
+        finite_mask = np.isfinite(values) & (values > 0)
+        if finite_mask.any():
+            first_value = float(np.log(values[finite_mask][0]))
+            self._initialize(first_value)
+
+        for value, limit in zip(values, limits, strict=False):
+            # Predict
+            pred_state = self.state
+            pred_var = self.state_var + self.process_var
+            pred_sigma = float(np.sqrt(pred_var + self.measurement_var))
+
+            limit_valid = np.isfinite(limit) and limit > 0
+
+            if not np.isfinite(value):
+                # Missing observation
+                z_eff = pred_state
+                r_eff = 1e9
+                flag = 2
+            elif limit_valid and value <= limit:
+                if not self.initialized:
+                    self._initialize(float(np.log(limit) - 0.5))
+                    pred_state = self.state
+                    pred_var = self.state_var + self.process_var
+                    pred_sigma = float(np.sqrt(pred_var + self.measurement_var))
+
+                log_limit = float(np.log(limit + 1e-9))
+                alpha = (log_limit - pred_state) / pred_sigma
+                pdf = float(norm.pdf(alpha))
+                cdf = float(norm.cdf(alpha))
+                cdf = max(cdf, 1e-9)
+                z_eff = pred_state - pred_sigma * (pdf / cdf)
+                r_eff = self.measurement_var * self.censor_inflation
+                flag = 1
+            else:
+                log_value = float(np.log(value + 1e-9))
+                if not self.initialized:
+                    self._initialize(log_value)
+                    pred_state = self.state
+                z_eff = log_value
+                r_eff = self.measurement_var
+                flag = 0
+
+            s = pred_var + r_eff
+            k_gain = pred_var / s
+            self.state = pred_state + k_gain * (z_eff - pred_state)
+            self.state_var = (1 - k_gain) * pred_var
+
+            filtered.append(float(self.state))
+            flags.append(flag)
+
+        return filtered, flags
 
 
 class EDARProcessor:
@@ -44,17 +126,215 @@ class EDARProcessor:
         self.config = config
         self.validation_options = config.validation_options
 
-    def process(self, wastewater_file: str, region_metadata_file: str) -> xr.DataArray:
+    def _fit_kalman_params(self, series: pd.Series) -> tuple[float, float]:
+        series = series.where(series > 0)
+        series_log = pd.Series(np.log(series), index=series.index)
+        if series_log.dropna().empty:
+            raise ValueError("No finite observations to fit Kalman params")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = UnobservedComponents(series_log, level="local level")
+            result = model.fit(disp=False)
+
+        params = dict(zip(result.param_names, result.params, strict=False))
+        process_var = float(params.get("sigma2.level", 0.0))
+        measurement_var = float(params.get("sigma2.irregular", 0.0))
+
+        process_var = max(process_var, 1e-6)
+        measurement_var = max(measurement_var, 1e-6)
+        return process_var, measurement_var
+
+    def _apply_tobit_kalman(self, daily_data: pd.DataFrame) -> pd.DataFrame:
+        if daily_data.empty:
+            return daily_data
+
+        if "limit_flow" not in daily_data.columns:
+            return daily_data
+
+        if not np.isfinite(daily_data["limit_flow"]).any():
+            return daily_data
+
+        censor_inflation = float(self.validation_options.get("censor_inflation", 4.0))
+        fallback_process = float(self.validation_options.get("process_var", 0.05))
+        fallback_measure = float(self.validation_options.get("measurement_var", 0.5))
+
+        filtered_frames: list[pd.DataFrame] = []
+        for (edar_id, variant), group in daily_data.groupby(["edar_id", "variant"]):
+            series = group.set_index("date").sort_index().asfreq("D")
+            values = series["total_covid_flow"].to_numpy()
+            limits = (
+                series["limit_flow"].ffill().bfill().to_numpy()
+                if "limit_flow" in series
+                else np.full_like(values, np.nan)
+            )
+
+            fit_series = pd.Series(values, index=series.index)
+            censored_mask = np.isfinite(limits) & (values <= limits)
+            fit_series = fit_series.mask(censored_mask)
+
+            try:
+                process_var, measurement_var = self._fit_kalman_params(fit_series)
+            except ValueError:
+                process_var = fallback_process
+                measurement_var = fallback_measure
+
+            filter_model = _TobitKalman(
+                process_var=process_var,
+                measurement_var=measurement_var,
+                censor_inflation=censor_inflation,
+            )
+            filtered_log, flags = filter_model.filter_series(values, limits)
+
+            series["total_covid_flow"] = np.exp(filtered_log)
+            series["censor_flag"] = flags
+            series["process_var"] = process_var
+            series["measurement_var"] = measurement_var
+            series["edar_id"] = edar_id
+            series["variant"] = variant
+            filtered_frames.append(series.reset_index())
+
+        return pd.concat(filtered_frames, ignore_index=True)
+
+    def _aggregate_censor_flags(
+        self,
+        censor_xr: xr.DataArray,
+        emap: xr.DataArray,
+    ) -> xr.DataArray:
+        """Aggregate censor flags from EDAR sites to regions.
+
+        Uses max-severity aggregation: missing (2) > censored (1) > uncensored (0).
+        Where multiple EDAR sites contribute to a region, takes the maximum flag value.
+
+        Args:
+            censor_xr: Censor flags with dimensions (date, edar_id, variant)
+            emap: EDAR contribution matrix (edar_id, region_id)
+
+        Returns:
+            Censor flags aggregated to regions with dimensions (date, region_id, variant)
         """
-        Process EDAR wastewater biomarker data into a canonical xarray DataArray.
+        # Align and take max over EDAR sites contributing to each region
+        censor_xr_aligned, emap_aligned = xr.align(censor_xr, emap, join="inner")
+
+        # For each region, take the max censor flag among contributing EDAR sites
+        # We use a weighted max where emap weights determine contribution
+        result = xr.DataArray(
+            coords={
+                "date": censor_xr_aligned["date"].values,
+                REGION_COORD: emap_aligned[REGION_COORD].values,
+                "variant": censor_xr_aligned["variant"].values,
+            },
+            dims=["date", REGION_COORD, "variant"],
+        )
+
+        for variant in censor_xr_aligned["variant"].values:
+            variant_censor = censor_xr_aligned.sel(variant=variant)
+            # Fill NaN with 0 (uncensored) for sites without data
+            variant_censor_filled = variant_censor.fillna(0)
+
+            # Max-severity aggregation: for each region, take max of contributing sites
+            # We compute this by iterating over regions and taking max where emap > 0
+            for region in emap_aligned[REGION_COORD].values:
+                # Find EDAR sites that contribute to this region
+                contributing_sites = emap_aligned.sel({REGION_COORD: region}) > 0
+
+                # Take max censor flag among contributing sites
+                region_censor = variant_censor_filled.where(contributing_sites).max(
+                    dim="edar_id"
+                )
+                result.loc[{"variant": variant, REGION_COORD: region}] = region_censor.values
+
+        return result
+
+    def _compute_age_channel(
+        self,
+        values: xr.DataArray,
+        max_age: int = 14,
+    ) -> xr.DataArray:
+        """Compute age channel (days since last measurement).
+
+        Age is normalized to [0, 1] with max_age days as the maximum.
+        Leading NaNs (before first measurement) get age = 1.0.
+
+        Args:
+            values: DataArray with shape (date, region_id) or (date, region_id, variant)
+            max_age: Maximum age in days for normalization
+
+        Returns:
+            DataArray with normalized age values [0, 1]
+        """
+        # Handle both 2D and 3D inputs
+        has_variant = "variant" in values.dims
+        if has_variant:
+            results = []
+            for variant in values["variant"].values:
+                variant_values = values.sel(variant=variant)
+                results.append(self._compute_age_channel_2d(variant_values, max_age))
+            return xr.concat(results, dim=values["variant"])
+        else:
+            return self._compute_age_channel_2d(values, max_age)
+
+    def _compute_age_channel_2d(
+        self,
+        values: xr.DataArray,
+        max_age: int,
+    ) -> xr.DataArray:
+        """Compute age channel for 2D DataArray.
+
+        Args:
+            values: DataArray with shape (date, region_id)
+            max_age: Maximum age in days for normalization
+
+        Returns:
+            DataArray with normalized age values [0, 1]
+        """
+        T = len(values["date"])
+        N = len(values[REGION_COORD])
+
+        # Mask: 1.0 if measured (finite and positive), 0.0 otherwise
+        mask = xr.where(values.notnull() & (values > 0), 1.0, 0.0)
+
+        # Initialize age channel with max_age
+        age_data = np.full((T, N), max_age, dtype=np.float32)
+
+        # Convert to numpy for vectorized computation
+        mask_np = mask.values
+        time_indices = np.arange(T)[:, None]  # (T, 1)
+
+        # Find last measurement time for each region
+        last_seen_indices = np.where(mask_np > 0, time_indices, np.nan)
+        last_seen_filled = pd.DataFrame(last_seen_indices).ffill().values
+
+        # Calculate age = current_time - last_seen_time
+        valid_history_mask = ~np.isnan(last_seen_filled)
+        current_age = np.zeros_like(age_data)
+        current_age[valid_history_mask] = (
+            time_indices * np.ones((1, N)) - last_seen_filled
+        )[valid_history_mask]
+
+        # Clip to max_age and normalize
+        final_age = np.where(
+            valid_history_mask, np.minimum(current_age, max_age), max_age
+        )
+        age_normalized = final_age / max_age
+
+        return xr.DataArray(
+            age_normalized,
+            coords={"date": values["date"].values, REGION_COORD: values[REGION_COORD].values},
+            dims=["date", REGION_COORD],
+        )
+
+    def process(self, wastewater_file: str, region_metadata_file: str) -> xr.Dataset:
+        """
+        Process EDAR wastewater biomarker data into a canonical xarray Dataset.
 
         Args:
             wastewater_file: Path to CSV/Excel file with wastewater data
             edar_mapping: Optional mapping from EDAR plants to municipalities
 
         Returns:
-            Biomarker time series aggregated to regions, as an xarray DataArray
-            with dims `[date, region_id]`.
+            Biomarker time series aggregated to regions, as an xarray Dataset
+            with per-variant variables shaped `[date, region_id]`.
         """
         print(f"Processing EDAR wastewater data from {wastewater_file}")
 
@@ -72,10 +352,20 @@ class EDARProcessor:
 
         # Resample to daily frequency
         daily_data = self._resample_to_daily(flow_data)
+        daily_data = self._apply_tobit_kalman(daily_data)
 
-        daily_data_xr = daily_data.set_index(["date", "edar_id"])[
+        # Convert to xarray - include both flow values and censor flags
+        daily_data_xr_flow = daily_data.set_index(["date", "edar_id", "variant"])[
             "total_covid_flow"
         ].to_xarray()
+        # Handle missing censor_flag column (when no LD data available)
+        if "censor_flag" in daily_data.columns:
+            daily_data_xr_censor = daily_data.set_index(["date", "edar_id", "variant"])[
+                "censor_flag"
+            ].to_xarray()
+        else:
+            # Create default censor flags (all uncensored = 0)
+            daily_data_xr_censor = daily_data_xr_flow * 0
         emap = xr.open_dataarray(region_metadata_file)
         # EDAR contribution matrices are typically stored sparsely with NaNs where
         # there is no contribution. `xr.dot` does not skip NaNs, so we must treat
@@ -86,10 +376,10 @@ class EDARProcessor:
         print(
             f"Transforming EDAR data to regions using contribution matrix from {region_metadata_file}"
         )
-        if "edar_id" not in daily_data_xr.dims:
+        if "edar_id" not in daily_data_xr_flow.dims:
             raise ValueError(
                 "Expected 'edar_id' dimension in processed wastewater data, "
-                f"got dims={tuple(daily_data_xr.dims)!r}"
+                f"got dims={tuple(daily_data_xr_flow.dims)!r}"
             )
         if "edar_id" not in emap.dims:
             raise ValueError(
@@ -99,12 +389,15 @@ class EDARProcessor:
 
         # Align IDs before dot product. A common silent failure mode is that
         # `xr.dot` aligns on labels and produces all-NaNs when there is no overlap.
-        daily_data_xr = daily_data_xr.assign_coords(
-            edar_id=daily_data_xr["edar_id"].astype(str)
+        daily_data_xr_flow = daily_data_xr_flow.assign_coords(
+            edar_id=daily_data_xr_flow["edar_id"].astype(str)
+        )
+        daily_data_xr_censor = daily_data_xr_censor.assign_coords(
+            edar_id=daily_data_xr_censor["edar_id"].astype(str)
         )
         emap = emap.assign_coords(edar_id=emap["edar_id"].astype(str))
 
-        wastewater_ids = set(daily_data_xr["edar_id"].values.tolist())
+        wastewater_ids = set(daily_data_xr_flow["edar_id"].values.tolist())
         mapping_ids = set(emap["edar_id"].values.tolist())
         overlap = sorted(wastewater_ids.intersection(mapping_ids))
         if not overlap:
@@ -119,12 +412,35 @@ class EDARProcessor:
                 "contribution matrix to match the raw wastewater data."
             )
 
-        daily_data_xr_aligned, emap_aligned = xr.align(
-            daily_data_xr, emap, join="inner"
+        # Align both flow and censor data with emap
+        daily_data_xr_flow_aligned, emap_aligned = xr.align(
+            daily_data_xr_flow, emap, join="inner"
         )
-        result = xr.dot(daily_data_xr_aligned, emap_aligned, dims="edar_id")
+        daily_data_xr_censor_aligned, _ = xr.align(
+            daily_data_xr_censor, emap, join="inner"
+        )
 
-        result.name = "edar_biomarker"
+        # xr.dot propagates NaN values, causing all-NaN output even when only
+        # some EDAR sites have missing data. We need a masked dot product that
+        # only sums valid contributions per region, then normalizes by the
+        # number of contributing sites.
+        # Note: This is before Kalman imputation; NaN values represent truly
+        # missing measurements that shouldn't contribute zero flow.
+        mask = daily_data_xr_flow_aligned.notnull()
+        masked_data = daily_data_xr_flow_aligned.fillna(0)
+        weighted_sum = xr.dot(masked_data, emap_aligned, dim="edar_id")
+        contribution_count = xr.dot(
+            mask.astype(float),
+            emap_aligned.astype(bool).astype(float),
+            dim="edar_id",
+        )
+        # Normalize by contribution count (avoid division by zero)
+        result = weighted_sum / contribution_count.where(contribution_count > 0, 1)
+
+        # Aggregate censor flags to regions using max-severity
+        censor_aggregated = self._aggregate_censor_flags(
+            daily_data_xr_censor_aligned, emap_aligned
+        )
 
         thresholds = DataQualityThresholds(
             min_notna_fraction=float(
@@ -134,20 +450,50 @@ class EDARProcessor:
                 self.validation_options.get("min_std_epsilon", 1e-12)
             ),
         )
-        validate_notna_and_std(result, name="edar_biomarker", thresholds=thresholds)
 
-        return result
+        biomarkers: dict[str, xr.DataArray] = {}
+        for variant in result["variant"].values.tolist():
+            variant_da = result.sel(variant=variant).drop_vars("variant")
+            variant_name = f"edar_biomarker_{variant}"
+            variant_da.name = variant_name
+            validate_notna_and_std(variant_da, name=variant_name, thresholds=thresholds)
+            biomarkers[variant_name] = variant_da
+
+            # Mask channel: 1.0 if measured, 0.0 otherwise
+            # Fill NaN with 0.0 (no measurement) to prevent NaN propagation
+            mask = xr.where(variant_da.notnull() & (variant_da > 0), 1.0, 0.0).fillna(0.0)
+            biomarkers[f"{variant_name}_mask"] = mask
+
+            # Censor flag channel: 0=uncensored, 1=censored, 2=missing
+            # Fill NaN with 0.0 (uncensored) for regions without EDAR data
+            censor_variant = censor_aggregated.sel(variant=variant).drop_vars("variant").fillna(0.0)
+            biomarkers[f"{variant_name}_censor"] = censor_variant
+
+            # Age channel: normalized days since last measurement
+            # Fill NaN with 1.0 (max age) for regions without data
+            age = self._compute_age_channel(variant_da).fillna(1.0)
+            biomarkers[f"{variant_name}_age"] = age
+
+        return xr.Dataset(biomarkers)
 
     def _load_wastewater_data(self, wastewater_file: str) -> pd.DataFrame:
+        header = pd.read_csv(wastewater_file, nrows=0)
+        available_columns = set(header.columns)
+        usecols = [
+            "id mostra",
+            "Cabal últimes 24h(m3)",
+            "IP4(CG/L)",
+            "N1(CG/L)",
+            "N2(CG/L)",
+        ]
+        if "LD(CG/L)" in available_columns:
+            usecols.append("LD(CG/L)")
+        if "depuradora" in available_columns:
+            usecols.append("depuradora")
+
         df = pd.read_csv(
             wastewater_file,
-            usecols=[  # type: ignore[arg-type]
-                "id mostra",
-                "Cabal últimes 24h(m3)",
-                "IP4(CG/L)",
-                "N1(CG/L)",
-                "N2(CG/L)",
-            ],
+            usecols=usecols,  # type: ignore[arg-type]
             dtype={
                 "id mostra": str,
                 "depuradora": str,
@@ -155,6 +501,7 @@ class EDARProcessor:
                 "IP4(CG/L)": float,
                 "N1(CG/L)": float,
                 "N2(CG/L)": float,
+                "LD(CG/L)": float,
             },
         )
 
@@ -165,6 +512,7 @@ class EDARProcessor:
                 "IP4(CG/L)": "IP4",
                 "N1(CG/L)": "N1",
                 "N2(CG/L)": "N2",
+                "LD(CG/L)": "detection_limit",
             }
         )
 
@@ -181,8 +529,12 @@ class EDARProcessor:
         )
         df = df[time_mask]
 
+        id_vars = ["date", "edar_id", "flow_rate"]
+        if "detection_limit" in df.columns:
+            id_vars.append("detection_limit")
+
         df = df.melt(
-            id_vars=["date", "edar_id", "flow_rate"],
+            id_vars=id_vars,
             value_vars=["N2", "IP4", "N1"],
             var_name="variant",
             value_name="viral_load",
@@ -259,6 +611,8 @@ class EDARProcessor:
             "viral_load": "mean",
             "flow_rate": "mean",
         }
+        if "detection_limit" in df.columns:
+            agg_functions["detection_limit"] = "max"
 
         aggregated = (
             df.groupby(["edar_id", "date", "variant"]).agg(agg_functions).reset_index()
@@ -279,22 +633,39 @@ class EDARProcessor:
         # Calculate viral concentration (viral load per unit flow)
         df["viral_concentration"] = df["viral_load"] / (df["flow_rate"] + 1e-8)
 
-        # Calculate total COVID flow (viral_load * flow_rate)
-        df["total_covid_flow"] = df["viral_load"] * df["flow_rate"]
+        flow_mode = self.config.wastewater_flow_mode
+        if flow_mode not in {"total_flow", "concentration"}:
+            raise ValueError(
+                "Unsupported wastewater_flow_mode. Expected 'total_flow' or "
+                f"'concentration', got {flow_mode!r}."
+            )
 
-        df = df.groupby(["edar_id", "date"])["total_covid_flow"].sum().reset_index()
+        if flow_mode == "total_flow":
+            # Calculate total COVID flow (viral_load * flow_rate)
+            df["total_covid_flow"] = df["viral_load"] * df["flow_rate"]
+            if "detection_limit" in df.columns:
+                df["limit_flow"] = df["detection_limit"] * df["flow_rate"]
+        else:
+            # Use concentration directly without flow weighting
+            df["total_covid_flow"] = df["viral_load"]
+            if "detection_limit" in df.columns:
+                df["limit_flow"] = df["detection_limit"]
+
+        agg_columns = {"total_covid_flow": "sum"}
+        if "limit_flow" in df.columns:
+            agg_columns["limit_flow"] = "sum"
+
+        df = df.groupby(["edar_id", "date", "variant"]).agg(agg_columns).reset_index()
 
         return df
 
     def _resample_to_daily(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.set_index("date")
         df = (
-            df.pivot(index="date", columns="edar_id", values="total_covid_flow")
+            df.groupby(["edar_id", "variant"])
             .resample("D")
-            .sum()
-        )
-        # Unpivot the date index to a column and edar_id index to a column
-        df = df.reset_index().melt(
-            id_vars="date", var_name="edar_id", value_name="total_covid_flow"
+            .sum(numeric_only=True)
+            .reset_index()
         )
         return df
 
