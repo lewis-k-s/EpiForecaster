@@ -1,5 +1,11 @@
 import pandas as pd
 
+# Wastewater Biomarker Gene Targets
+# SARS-CoV-2 RNA targets measured in wastewater surveillance
+EDAR_BIOMARKER_VARIANTS = ["N1", "N2", "IP4"]
+EDAR_BIOMARKER_PREFIX = "edar_biomarker_"
+EDAR_BIOMARKER_CHANNEL_SUFFIXES = ("_mask", "_age", "_censor")
+
 # Spanish COVID-19 Lockdown and Restriction Timeline
 # Based on official government announcements and Wikipedia timeline
 

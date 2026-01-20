@@ -3,6 +3,12 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
+from constants import (
+    EDAR_BIOMARKER_CHANNEL_SUFFIXES,
+    EDAR_BIOMARKER_PREFIX,
+    EDAR_BIOMARKER_VARIANTS,
+)
+
 
 @dataclass
 class BiomarkerScalerParams:
@@ -39,13 +45,18 @@ class BiomarkerPreprocessor:
         self.scaler_params: BiomarkerScalerParams | None = None
 
     def _get_variant_names(self, dataset: xr.Dataset) -> list[str]:
+        """Get biomarker variant names present in the dataset.
+
+        Looks for edar_biomarker_{variant} variables where variant is one of
+        EDAR_BIOMARKER_VARIANTS (N1, N2, IP4), excluding channel suffixes.
+        """
+        expected_names = [f"{EDAR_BIOMARKER_PREFIX}{v}" for v in EDAR_BIOMARKER_VARIANTS]
         variant_names = [
             str(name)
             for name in dataset.data_vars
-            if str(name).startswith("edar_biomarker_")
-            and not str(name).endswith(("_mask", "_age", "_censor"))
+            if str(name) in expected_names
         ]
-        return sorted(variant_names) if variant_names else []
+        return sorted(variant_names, key=lambda x: EDAR_BIOMARKER_VARIANTS.index(x.replace(EDAR_BIOMARKER_PREFIX, "")))
 
     def fit_scaler(
         self, dataset: xr.Dataset, train_nodes: list[str] | list[int]

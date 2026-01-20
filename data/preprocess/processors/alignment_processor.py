@@ -4,6 +4,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from constants import (
+    EDAR_BIOMARKER_CHANNEL_SUFFIXES,
+    EDAR_BIOMARKER_PREFIX,
+    EDAR_BIOMARKER_VARIANTS,
+)
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 
 logger = logging.getLogger(__name__)
@@ -149,8 +154,9 @@ class AlignmentProcessor:
 
         # Get only true biomarker variables (exclude mask/censor/age channels)
         biomarker_vars = [
-            v for v in edar_final.data_vars
-            if v.startswith("edar_biomarker_") and not v.endswith(("_mask", "_age", "_censor"))
+            f"{EDAR_BIOMARKER_PREFIX}{v}"
+            for v in EDAR_BIOMARKER_VARIANTS
+            if f"{EDAR_BIOMARKER_PREFIX}{v}" in edar_final.data_vars
         ]
 
         for i, region in enumerate(common_regions):

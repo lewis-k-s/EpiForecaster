@@ -12,6 +12,11 @@ from torch_geometric.data import Data
 from graph.node_encoder import Region2Vec
 from models.configs import EpiForecasterConfig
 
+from constants import (
+    EDAR_BIOMARKER_CHANNEL_SUFFIXES,
+    EDAR_BIOMARKER_PREFIX,
+    EDAR_BIOMARKER_VARIANTS,
+)
 from utils.logging import suppress_zarr_warnings
 
 suppress_zarr_warnings()
@@ -268,19 +273,18 @@ class EpiDataset(Dataset):
         self._dataset = None
 
     def _get_biomarker_variants(self) -> list[str]:
-        # Get base biomarker names, excluding mask/age/censor channels
-        suffixes = ("_mask", "_age", "_censor")
+        """Get biomarker variant names present in the dataset.
+
+        Looks for edar_biomarker_{variant} variables where variant is one of
+        EDAR_BIOMARKER_VARIANTS (N1, N2, IP4), excluding channel suffixes.
+        """
+        expected_names = [f"{EDAR_BIOMARKER_PREFIX}{v}" for v in EDAR_BIOMARKER_VARIANTS]
         variant_names = [
             str(name)
             for name in self.dataset.data_vars
-            if str(name).startswith("edar_biomarker_")
-            and not str(name).endswith(suffixes)
+            if str(name) in expected_names
         ]
-        if variant_names:
-            return sorted(variant_names)
-        if "edar_biomarker" in self.dataset:
-            return ["edar_biomarker"]
-        return []
+        return sorted(variant_names, key=lambda x: EDAR_BIOMARKER_VARIANTS.index(x.replace(EDAR_BIOMARKER_PREFIX, "")))
 
     @property
     def dataset(self) -> xr.Dataset:
