@@ -147,17 +147,20 @@ class AlignmentProcessor:
             name="biomarker_data_start",
         )
 
+        # Get only true biomarker variables (exclude mask/censor/age channels)
+        biomarker_vars = [
+            v for v in edar_final.data_vars
+            if v.startswith("edar_biomarker_") and not v.endswith(("_mask", "_age", "_censor"))
+        ]
+
         for i, region in enumerate(common_regions):
-            region_data = edar_final.sel({REGION_COORD: region})
-            # Find first index where value > 0 (finite and positive)
-            if isinstance(region_data, xr.Dataset):
-                data = region_data.to_array().values
-                has_data = (data > 0) & np.isfinite(data)
-                has_data_any = np.any(has_data, axis=0)
-            else:
-                has_data_any = (region_data.values > 0) & np.isfinite(
-                    region_data.values
-                )
+            # Select only biomarker value variables for this region
+            region_biomarkers = edar_final[biomarker_vars].sel({REGION_COORD: region})
+            # Stack to (n_variants, T) array
+            data = region_biomarkers.to_array().values
+            has_data = (data > 0) & np.isfinite(data)
+            has_data_any = np.any(has_data, axis=0)  # (T,) - True if any variant has data
+
             if has_data_any.any():
                 first_idx = int(np.argmax(has_data_any))
                 biomarker_data_start[i] = first_idx

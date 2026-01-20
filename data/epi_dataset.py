@@ -87,6 +87,8 @@ class EpiDataset(Dataset):
             # Fallback: all regions have data starting at index 0
             self.biomarker_data_start = torch.zeros(self.num_nodes, dtype=torch.long)
 
+        self.biomarker_variants = self._get_biomarker_variants()
+
         # Setup cases preprocessor
         if cases_preprocessor is None:
             cp_config = CasesPreprocessorConfig(
@@ -169,26 +171,31 @@ class EpiDataset(Dataset):
                     "No train nodes have biomarker data, using zero encoding"
                 )
 
-            # Convert indices to region IDs for fit_scaler
-            all_region_ids = self._dataset[REGION_COORD].values
-            train_region_ids = [all_region_ids[n] for n in train_nodes_with_bio]
+            if self.biomarker_variants:
+                # Convert indices to region IDs for fit_scaler
+                all_region_ids = self._dataset[REGION_COORD].values
+                train_region_ids = [all_region_ids[n] for n in train_nodes_with_bio]
 
-            # Only fit scaler on train nodes that have biomarkers
-            self.biomarker_preprocessor.fit_scaler(self._dataset, train_region_ids)
+                # Only fit scaler on train nodes that have biomarkers
+                self.biomarker_preprocessor.fit_scaler(self._dataset, train_region_ids)
         else:
             self.biomarker_preprocessor = biomarker_preprocessor
 
         # Precompute biomarkers for the entire dataset
-        # This returns a (TotalTime, NumNodes, 3) tensor
-        if "edar_biomarker" in self._dataset:
+        # This returns a (TotalTime, NumNodes, 3 * variants) tensor
+        if self.biomarker_variants:
             self.precomputed_biomarkers = torch.from_numpy(
                 self.biomarker_preprocessor.preprocess_dataset(self._dataset)
             ).to(torch.float32)
         else:
             T_total = len(self._dataset[TEMPORAL_COORD])
-            # 3 channels: value=0, mask=0, age=1
-            dummy = torch.zeros((T_total, self.num_nodes, 3), dtype=torch.float32)
-            dummy[:, :, 2] = 1.0
+            channel_count = max(1, len(self.biomarker_variants)) * 3
+            # channels: value=0, mask=0, age=1
+            dummy = torch.zeros(
+                (T_total, self.num_nodes, channel_count), dtype=torch.float32
+            )
+            for idx in range(2, channel_count, 3):
+                dummy[:, :, idx] = 1.0
             self.precomputed_biomarkers = dummy
 
         self.region_embeddings = None
@@ -239,22 +246,41 @@ class EpiDataset(Dataset):
 
         # Validate config dims match dataset expectations
         expected_cases_dim = self.cases_output_dim  # 3
-        expected_bio_dim = self.biomarkers_output_dim  # 4
+        expected_bio_dim = self.biomarkers_output_dim
 
         if self.config.model.cases_dim != expected_cases_dim:
-            logger.warning(
-                f"Config cases_dim={self.config.model.cases_dim} != "
-                f"expected {expected_cases_dim} (value + mask + age channels)"
+            logger.info(
+                "Updating cases_dim from %d to %d based on dataset",
+                self.config.model.cases_dim,
+                expected_cases_dim,
             )
+            self.config.model.cases_dim = expected_cases_dim
         if self.config.model.biomarkers_dim != expected_bio_dim:
-            logger.warning(
-                f"Config biomarkers_dim={self.config.model.biomarkers_dim} != "
-                f"expected {expected_bio_dim} (value + mask + age + has_data)"
+            logger.info(
+                "Updating biomarkers_dim from %d to %d based on dataset",
+                self.config.model.biomarkers_dim,
+                expected_bio_dim,
             )
+            self.config.model.biomarkers_dim = expected_bio_dim
 
         # Close dataset and clear reference to avoid pickling issues
         self._dataset.close()
         self._dataset = None
+
+    def _get_biomarker_variants(self) -> list[str]:
+        # Get base biomarker names, excluding mask/age/censor channels
+        suffixes = ("_mask", "_age", "_censor")
+        variant_names = [
+            str(name)
+            for name in self.dataset.data_vars
+            if str(name).startswith("edar_biomarker_")
+            and not str(name).endswith(suffixes)
+        ]
+        if variant_names:
+            return sorted(variant_names)
+        if "edar_biomarker" in self.dataset:
+            return ["edar_biomarker"]
+        return []
 
     @property
     def dataset(self) -> xr.Dataset:
@@ -284,20 +310,25 @@ class EpiDataset(Dataset):
 
     @property
     def biomarkers_output_dim(self) -> int:
-        """Biomarkers dim - 4 channels (value, mask, age, has_data)."""
-        return 4
+        """Biomarkers dim (value/mask/censor/age per variant from preprocessor + has_data).
+
+        Note: The preprocessor outputs 4 channels per variant. The has_data channel
+        is added dynamically in __getitem__ based on biomarker_data_start.
+        """
+        variant_count = max(1, len(self.biomarker_variants))
+        return variant_count * 4 + 1
 
     @property
     def biomarker_available_mask(self) -> torch.Tensor:
         """Compatibility property for plotting functions.
 
-        Returns a (N, 4) tensor indicating region-level availability based on
+        Returns a (N, B) tensor indicating region-level availability based on
         biomarker_data_start. Regions with data start >= 0 have data (1.0),
         regions with sentinel -1 don't have data (0.0).
         """
-        # Create (N, 4) tensor with 1.0 for regions with data, 0.0 otherwise
+        # Create (N, B) tensor with 1.0 for regions with data, 0.0 otherwise
         has_data = (self.biomarker_data_start >= 0).to(torch.float32)
-        return has_data.unsqueeze(-1).expand(-1, 4)
+        return has_data.unsqueeze(-1).expand(-1, self.biomarkers_output_dim)
 
     def index_for_target_node_window(self, *, target_node: int, window_idx: int) -> int:
         """Map a (window_idx, target_node) pair to a dataset index.
@@ -377,10 +408,10 @@ class EpiDataset(Dataset):
         neigh_mask_t = neigh_mask.to(torch.float32).unsqueeze(-1)
         case_history = case_history * neigh_mask_t
 
-        # Encode all regions in context using 4-channel biomarker encoding
+        # Encode all regions in context using biomarker encoding
         # Optimized: Use precomputed biomarkers + dynamic has_data based on data start offset
 
-        # 1. Get precomputed bio history (value, mask, age) -> (L, N, 3)
+        # 1. Get precomputed bio history (value, mask, age per variant)
         # Note: self.precomputed_biomarkers is a CPU tensor
         bio_slice = self.precomputed_biomarkers[range_start:range_end]
 
@@ -407,8 +438,9 @@ class EpiDataset(Dataset):
         assert case_history.shape == (L, self.num_nodes, 3), (
             f"Case history shape mismatch: expected ({L}, {self.num_nodes}, 3), got {case_history.shape}"
         )
-        assert biomarker_history.shape == (L, self.num_nodes, 4), (
-            "Biomarker history shape mismatch - expected (T, N, 4)"
+        expected_bio_dim = self.biomarkers_output_dim
+        assert biomarker_history.shape == (L, self.num_nodes, expected_bio_dim), (
+            "Biomarker history shape mismatch - expected (T, N, B)"
         )
         assert targets.shape == (H,), "Targets shape mismatch"
 

@@ -31,7 +31,7 @@ class OfflinePreprocessingPipeline:
     1. Loading raw data from various sources (NetCDF, Zarr, CSV)
     2. Processing each data type with specialized processors
     3. Multi-dataset temporal and spatial alignment
-    7. Saving the aligned dataset to Zarr format
+    4. Saving the aligned dataset to Zarr format
 
     The pipeline is designed for one-time execution per dataset configuration,
     producing persistent canonical datasets for efficient training.
@@ -100,6 +100,13 @@ class OfflinePreprocessingPipeline:
             # Compute valid_targets mask based on data density
             valid_targets_mask = self._compute_valid_targets_mask(alignment_result)
             alignment_result["valid_targets"] = valid_targets_mask
+
+            # Add wastewater source availability per region
+            edar_region_mask = self._compute_edar_region_mask(
+                self.config.region_metadata_file,
+                alignment_result[REGION_COORD].values,
+            )
+            alignment_result["edar_has_source"] = edar_region_mask
 
             # # Store alignment report in pipeline state
             # self.pipeline_state["alignment_report"] = alignment_report
@@ -220,6 +227,24 @@ class OfflinePreprocessingPipeline:
         )
 
         return valid_targets_da
+
+    def _compute_edar_region_mask(
+        self, region_metadata_file: str, region_ids: np.ndarray
+    ) -> xr.DataArray:
+        """Compute mask for regions with EDAR contributions."""
+        print("Computing edar_has_source mask...")
+        emap = xr.open_dataarray(region_metadata_file)
+        emap = emap.fillna(0).rename({"home": REGION_COORD})
+        emap = emap.assign_coords(
+            edar_id=emap["edar_id"].astype(str),
+            **{REGION_COORD: emap[REGION_COORD].astype(str)},
+        )
+        emap = emap.reindex({REGION_COORD: region_ids}, fill_value=0)
+        has_source = (emap > 0).any("edar_id").astype(np.int32)
+        has_source.name = "edar_has_source"
+
+        print(f"  Regions with EDAR source: {int(has_source.sum())}/{has_source.size}")
+        return has_source
 
     def _save_aligned_dataset(self, aligned_dataset: xr.Dataset) -> Path:
         """Save aligned dataset to processed dir."""

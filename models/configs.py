@@ -122,7 +122,7 @@ class ModelConfig:
 
     # -- dimensionality --#
     biomarkers_dim: int = 4
-    cases_dim: int = 3  # (value, mask, age) - LOCF age channel added
+    cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
     gnn_depth: int = 2
     gnn_hidden_dim: int = 32
 
