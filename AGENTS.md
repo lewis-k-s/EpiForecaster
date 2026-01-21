@@ -62,9 +62,9 @@ This project uses YAML configuration files for reproducible experiments:
 
 The canonical data pipeline follows: raw data → preprocessing → Zarr datasets → training
 
-- Use `uv run main preprocess (regions|epiforecaster)` to convert raw data to canonical format
+- Use `uv run preprocess (regions|epiforecaster)` to convert raw data to canonical format
 - Manage datasets with `epiforecaster list-datasets` and `epiforecaster info`
-- Use `uv run main train (regions|epiforecaster)` to train on the prepared dataset.
+- Use `uv run train (regions|epiforecaster)` to train on the prepared dataset.
 
 ## Commit & Pull Request Guidelines
 

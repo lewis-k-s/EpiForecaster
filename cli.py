@@ -48,13 +48,24 @@ def cli(debug: bool):
     setup_logging(level=level)
 
 
-@cli.group("preprocess")
-def preprocess_group():
-    """Run preprocessing pipelines for datasets or region graphs."""
-    pass
+@click.group()
+@click.version_option()
+@click.option(
+    "--debug/--no-debug",
+    default=False,
+    help="Enable debug logging (includes model forward-pass debug logs).",
+)
+def preprocess_cli(debug: bool):
+    """Run preprocessing pipelines for datasets or region graphs.
+
+    Direct usage: uv run preprocess <command>
+    Via main:     uv run main preprocess <command>
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    setup_logging(level=level)
 
 
-@preprocess_group.command("regions")
+@preprocess_cli.command("regions")
 @click.option(
     "--geojson",
     type=click.Path(path_type=Path),
@@ -156,7 +167,7 @@ def preprocess_regions(
         raise click.ClickException(str(exc)) from exc
 
 
-@preprocess_group.command("epiforecaster")
+@preprocess_cli.command("epiforecaster")
 @click.option(
     "--config", required=True, help="Path to preprocessing configuration file"
 )
@@ -197,10 +208,26 @@ def preprocess_epiforecaster(config: str):
         raise click.ClickException(str(exc)) from exc
 
 
-@cli.group("train")
-def train_group():
-    """Train forecasting models or specialized submodules."""
-    pass
+@click.group()
+@click.version_option()
+@click.option(
+    "--debug/--no-debug",
+    default=False,
+    help="Enable debug logging (includes model forward-pass debug logs).",
+)
+def train_cli(debug: bool):
+    """Train forecasting models or specialized submodules.
+
+    Direct usage: uv run train <command>
+    Via main:     uv run main train <command>
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    setup_logging(level=level)
+
+
+# Backward compatibility: add preprocess and train as subgroups of main
+cli.add_command(preprocess_cli, name="preprocess")
+cli.add_command(train_cli, name="train")
 
 
 @cli.group("eval")
@@ -300,7 +327,9 @@ def eval_epiforecaster(
                     )
                 except FileNotFoundError as e:
                     click.echo(f"❌ Checkpoint not found: {e}", err=True)
-                    click.echo(f"\n{list_available_runs(experiment_name=experiment)}", err=True)
+                    click.echo(
+                        f"\n{list_available_runs(experiment_name=experiment)}", err=True
+                    )
                     raise click.ClickException("Cannot resolve checkpoint path")
 
             # Auto-resolve output paths to eval directory
@@ -463,7 +492,9 @@ def plot_forecasts(
                     )
                 except FileNotFoundError as e:
                     click.echo(f"❌ Checkpoint not found: {e}", err=True)
-                    click.echo(f"\n{list_available_runs(experiment_name=experiment)}", err=True)
+                    click.echo(
+                        f"\n{list_available_runs(experiment_name=experiment)}", err=True
+                    )
                     raise click.ClickException("Cannot resolve checkpoint path")
 
             # Resolve the per-node metrics CSV (written by eval_checkpoint)
@@ -481,7 +512,9 @@ def plot_forecasts(
                         err=True,
                     )
                     click.echo(f"❌ Evaluation CSV not found: {e}", err=True)
-                    click.echo(f"\n{list_available_runs(experiment_name=experiment)}", err=True)
+                    click.echo(
+                        f"\n{list_available_runs(experiment_name=experiment)}", err=True
+                    )
                     raise click.ClickException("Cannot resolve CSV path")
 
             click.echo("Resolved paths:")
@@ -494,9 +527,13 @@ def plot_forecasts(
 
         # Validate required paths
         if csv is None:
-            raise click.ClickException("Must provide --csv or both --experiment and --run")
+            raise click.ClickException(
+                "Must provide --csv or both --experiment and --run"
+            )
         if checkpoint is None:
-            raise click.ClickException("Must provide --checkpoint or both --experiment and --run")
+            raise click.ClickException(
+                "Must provide --checkpoint or both --experiment and --run"
+            )
 
         # Suppress zarr logging spam
         logging.getLogger("zarr").setLevel(logging.WARNING)
@@ -547,7 +584,7 @@ def _format_eval_summary(loss: float, metrics: dict) -> str:
     return "\n".join(lines)
 
 
-@train_group.command("regions")
+@train_cli.command("regions")
 @click.option("--config", required=True, help="Path to region training configuration")
 @click.option(
     "--epochs",
@@ -624,7 +661,7 @@ def train_regions(
         raise click.ClickException(str(exc)) from exc
 
 
-@train_group.command("epiforecaster")
+@train_cli.command("epiforecaster")
 @click.option("--config", required=True, help="Path to training configuration file")
 @click.option("--model-id", default="", help="Model id for logging/checkpoints")
 @click.option("--resume", is_flag=True, help="Resume training from a saved checkpoint")
@@ -771,7 +808,9 @@ def list_datasets(data_dir: str):
 
         # Find all .zarr files/directories
         zarr_files = list(data_dir_path.glob("*.zarr")) + [
-            p for p in data_dir_path.iterdir() if p.is_dir() and (p / ".zarray").exists()
+            p
+            for p in data_dir_path.iterdir()
+            if p.is_dir() and (p / ".zarray").exists()
         ]
 
         if not zarr_files:
