@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import NamedTuple
+
+import click
 
 logger = logging.getLogger(__name__)
 
@@ -233,3 +236,87 @@ def list_available_runs(
         lines.append(f"  {run.run_id}  (has: {flags_str})")
 
     return "\n".join(lines)
+
+
+def extract_run_from_checkpoint_path(
+    checkpoint_path: Path,
+    outputs_root: Path = DEFAULT_OUTPUTS_ROOT,
+) -> tuple[str, str] | None:
+    """Extract experiment name and run ID from a checkpoint path.
+
+    Supports both patterns:
+    - outputs_root/training/{experiment}/{run_id}/checkpoints/best_model.pt
+    - outputs_root/optuna/{experiment}/{run_id}/checkpoints/best_model.pt
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        outputs_root: Root outputs directory (default: outputs/)
+
+    Returns:
+        (experiment_name, run_id) tuple if path matches expected pattern,
+        None if path doesn't match or run_id doesn't match expected patterns.
+    """
+    # Convert both to absolute paths for consistent matching
+    # Use absolute() instead of resolve() to handle relative paths correctly
+    # (resolve() follows symlinks which can cause path mismatches in tests)
+    if checkpoint_path.is_absolute():
+        checkpoint_path = checkpoint_path
+    else:
+        checkpoint_path = Path.cwd() / checkpoint_path
+
+    if outputs_root.is_absolute():
+        outputs_root = outputs_root
+    else:
+        outputs_root = Path.cwd() / outputs_root
+
+    # Check if path contains outputs_root/training/ or outputs_root/optuna/
+    checkpoint_str = str(checkpoint_path)
+    outputs_str = str(outputs_root)
+
+    # Pattern 1: outputs_root/training/{experiment}/{run_id}/checkpoints/best_model.pt
+    # Pattern 2: outputs_root/optuna/{experiment}/{run_id}/checkpoints/best_model.pt
+    training_pattern = rf"{re.escape(outputs_str)}/(training|optuna)/([^/]+)/([^/]+)/checkpoints/"
+    match = re.search(training_pattern, checkpoint_str)
+
+    if not match:
+        return None
+
+    run_id = match.group(3)
+    experiment_name = match.group(2)
+
+    # Validate run_id matches expected patterns:
+    # - run_* (standard training runs)
+    # - *trial*_* (optuna trials, e.g., local_trial29_1768952246597587000)
+    # The pattern matches:
+    #   1. run_* at the start
+    #   2. Anything containing "trial" followed by at least one underscore-separated part
+    #     (e.g., trial1_123, local_trial29_1768952246597587000)
+    run_id_pattern = r"^(run_|.*trial.+_.+)"
+    if not re.match(run_id_pattern, run_id):
+        return None
+
+    return experiment_name, run_id
+
+
+def prompt_to_save_eval(experiment: str, run: str, default: bool = True) -> bool:
+    """Prompt user whether to save eval results to outputs/eval/{experiment}/{run}/.
+
+    Args:
+        experiment: Experiment name
+        run: Run ID
+        default: Default value (True means Enter confirms Y)
+
+    Returns:
+        True if user wants to save, False otherwise (including on abort/interrupt)
+    """
+    eval_dir = DEFAULT_OUTPUTS_ROOT / "eval" / experiment / run
+    prompt_text = (
+        f"Save eval results to {eval_dir}/? [Y/n] "
+        if default
+        else f"Save eval results to {eval_dir}/? [y/N] "
+    )
+    try:
+        return click.confirm(prompt_text, default=default)
+    except click.exceptions.Abort:
+        # User pressed Ctrl+C or similar - treat as "no"
+        return False

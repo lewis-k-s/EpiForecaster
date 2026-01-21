@@ -343,6 +343,44 @@ def eval_epiforecaster(
             click.echo(f"  Checkpoint: {checkpoint}")
             click.echo(f"  Plot: {output}")
             click.echo(f"  CSV: {output_csv}")
+        elif checkpoint is not None and experiment is None and run is None:
+            # User provided --checkpoint but not --experiment/--run
+            from utils.run_discovery import (
+                extract_run_from_checkpoint_path,
+                prompt_to_save_eval,
+                get_eval_output_dir,
+            )
+
+            extracted = extract_run_from_checkpoint_path(checkpoint)
+
+            if extracted is not None:
+                extracted_experiment, extracted_run = extracted
+                click.echo(
+                    f"Detected: experiment={extracted_experiment}, run={extracted_run}"
+                )
+                should_save = prompt_to_save_eval(
+                    extracted_experiment, extracted_run, default=True
+                )
+
+                if should_save:
+                    eval_dir = get_eval_output_dir(
+                        experiment_name=extracted_experiment, run_id=extracted_run
+                    )
+                    if output is None:
+                        output = eval_dir / f"{split}_forecasts.png"
+                    if output_csv is None:
+                        output_csv = eval_dir / f"{split}_node_metrics.csv"
+                else:
+                    click.echo("Skipping persistence. Use --output to specify save location.")
+            else:
+                # Could not extract - default to current directory
+                click.echo(
+                    "Could not auto-detect experiment/run from checkpoint path."
+                )
+                if output is None:
+                    output = Path(f"{split}_forecasts.png")
+                if output_csv is None:
+                    output_csv = Path(f"{split}_node_metrics.csv")
         elif checkpoint is None:
             raise click.ClickException(
                 "Must provide either --checkpoint or both --experiment and --run"

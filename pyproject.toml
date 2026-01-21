@@ -86,7 +86,7 @@ requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["cli"]
+py-modules = ["cli", "constants"]
 
 [tool.setuptools.packages.find]
 include = [
