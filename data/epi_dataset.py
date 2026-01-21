@@ -194,12 +194,14 @@ class EpiDataset(Dataset):
             ).to(torch.float32)
         else:
             T_total = len(self._dataset[TEMPORAL_COORD])
-            channel_count = max(1, len(self.biomarker_variants)) * 3
-            # channels: value=0, mask=0, age=1
+            # 4 channels per variant: value, mask, censor, age
+            channel_count = max(1, len(self.biomarker_variants)) * 4
+            # channels: value=0, mask=0, censor=0, age=1
             dummy = torch.zeros(
                 (T_total, self.num_nodes, channel_count), dtype=torch.float32
             )
-            for idx in range(2, channel_count, 3):
+            # For 4-channel layout [value, mask, censor, age], age is at indices 3, 7, 11, ...
+            for idx in range(3, channel_count, 4):
                 dummy[:, :, idx] = 1.0
             self.precomputed_biomarkers = dummy
 
