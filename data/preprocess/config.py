@@ -39,7 +39,8 @@ class PreprocessingConfig:
         forecast_horizon: Number of days to forecast into the future
         sequence_length: Length of input sequences for models
 
-        min_flow_threshold: Minimum flow threshold for wastewater data
+        min_flow_threshold: Minimum flow threshold for mobility pairs (i,j)
+        wastewater_flow_mode: "total_flow" or "concentration" for EDAR
 
         alignment_strategy: Strategy for aligning multiple datasets
         target_dataset: Which dataset to align others to
@@ -74,6 +75,7 @@ class PreprocessingConfig:
 
     # Feature processing options
     min_flow_threshold: int = 10
+    wastewater_flow_mode: str = "total_flow"  # "total_flow" or "concentration"
 
     # Temporal processing parameters
     forecast_horizon: int = 7
@@ -251,7 +253,7 @@ class PreprocessingConfig:
         config_dict["end_date"] = self.end_date.isoformat()
 
         with open(config_path, "w") as f:
-            yaml.dump(config_dict, f, default_flow_style=False, indent=2)
+            yaml.safe_dump(config_dict, f, default_flow_style=False, indent=2)
 
     def get_dataset_filename(self) -> str:
         """Generate standardized filename for the processed dataset."""
