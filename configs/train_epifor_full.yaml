@@ -1,7 +1,7 @@
 data:
   # Use valid_targets mask from dataset to filter target nodes
   use_valid_targets: true
-  dataset_path: data/processed/full_v1.zarr
+  dataset_path: data/processed/new_interp.zarr
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
   mobility_threshold: 10
   window_stride: 1
@@ -36,8 +36,8 @@ training:
   batch_size: 32
   early_stopping_patience: 5
   nan_loss_patience: 5
-  max_batches: 20
-  epochs: 2
+  # max_batches: 20
+  epochs: 5
   learning_rate: 0.001
   weight_decay: 1.0e-05
   num_workers: 4

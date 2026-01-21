@@ -17,6 +17,7 @@ sequence_length: 14
 
 # Feature processing options
 min_flow_threshold: 10
+wastewater_flow_mode: "concentration"
 
 # Alignment and validation options
 alignment_strategy: "interpolate"
@@ -27,7 +28,7 @@ generate_alignment_report: true
 
 # Output configuration
 output_path: "data/processed"
-dataset_name: "full_v1"
+dataset_name: "new_interp"
 compression: "blosc"
 
 # Processing configuration
@@ -52,3 +53,4 @@ validation_options:
   temporal_consistency_check: true
   spatial_consistency_check: true
   generate_plots: true
+

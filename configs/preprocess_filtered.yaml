@@ -17,6 +17,7 @@ sequence_length: 14
 
 # Feature processing options
 min_flow_threshold: 10
+wastewater_flow_mode: "concentration"
 
 # Region filtering
 min_density_threshold: 0.5  # Regions must have >= 50% non-missing data
