@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import yaml
@@ -121,7 +121,8 @@ class ModelConfig:
     max_neighbors: int
 
     # -- dimensionality --#
-    biomarkers_dim: int = 4
+    # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
+    biomarkers_dim: int = 13
     cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
     gnn_depth: int = 2
     gnn_hidden_dim: int = 32
@@ -339,14 +340,4 @@ class EpiForecasterConfig:
 
     def to_dict(self) -> dict:
         """Serialize configuration to a plain dictionary for YAML export."""
-        from dataclasses import fields
-
-        result = {}
-        for f in fields(self):
-            value = getattr(self, f.name)
-            if value is not None:
-                if hasattr(value, "to_dict"):
-                    result[f.name] = value.to_dict()
-                else:
-                    result[f.name] = value
-        return result
+        return asdict(self)

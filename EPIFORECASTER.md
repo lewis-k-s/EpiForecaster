@@ -27,12 +27,10 @@ We consider a discrete time index:
 * Forecasting horizon: $H$ (number of future time steps to predict)
 * Historical context length: $L$ (number of past time steps used as input)
 
-For each **region** $i \in \{1, \dots, N\}$ in the **case layer** C, we have:
+For each **region** $i \in \{1, \dots, N\}$, we have:
 
 * Case incidence series $y_{i,t}$ (e.g., cases per 100k population)
-* Biomarker series $b_{i,t,f}$ for biomarkers $f \in \{1, \dots, F\}$
-
-Wastewater biomarker measurements originate at catchment areas (layer W) and are mapped to case regions (layer C) via a static contribution matrix.
+* Biomarker series $b_{i,t}$ with 13 channels (3 gene targets × 4 channels + 1 has_data)
 
 The forecasting objective is, for each region $i$:
 
@@ -53,15 +51,12 @@ The model learns parameters $\theta$ that minimize a forecasting loss between $\
   * Number of patches: $N$
   * Represent, for example, municipalities or districts.
 
-* **Wastewater catchment areas (layer W)**
-
-  * Number of patches: $M$
-  * Each catchment serves one or more case regions.
-
 * **Biomarkers**
 
-  * Number of biomarkers: $F$
-  * Examples: pathogen-specific RNA concentrations, surrogate markers, etc.
+  * Number of gene targets: 3 (N1, N2, IP4)
+  * Each target encoded as 4 channels: value, mask, censor, age
+  * Total biomarker dimension: 3 × 4 + 1 (has_data) = 13
+  * All channels are region-level (aggregation from catchments occurs during preprocessing)
 
 * **Mobility**
 
@@ -80,9 +75,10 @@ We denote batches where useful, but core dimensions are below.
   * Cases at region level:
 
     * `cases` ($\in \mathbb{R}^{N \times T}$)
-  * Biomarkers at catchment level (raw):
+  * Biomarkers at region level:
 
-    * `biomarkers_raw` ($\in \mathbb{R}^{M \times T \times F}$)
+    * `biomarkers` ($\in \mathbb{R}^{N \times T \times 13}$)
+    * 13 = 3 variants × 4 channels (value, mask, censor, age) + 1 has_data channel
 
 * **Mobility** (origin–destination):
 
@@ -96,28 +92,22 @@ We denote batches where useful, but core dimensions are below.
     * Demographic, geographic, infrastructure, etc.
   * Static adjacency / graph for regions C (e.g., contiguity or distance-based).
 
-* **Dimension mapper (catchment → regions)**:
+### 3.3 Biomarker Channel Encoding
 
-  * `relation` ($\in \mathbb{R}^{M \times N}$)
+Each gene target (N1, N2, IP4) is encoded as 4 channels:
 
-    * `relation[m, n]` is the contribution ratio from catchment $m$ to region $n$.
+1. **Value**: $\log(1 + x)$ transformed, robust-scaled, clipped to [-8, 8]
+2. **Mask**: 1.0 if measured on current day, 0.0 otherwise
+3. **Censor**: 1.0 if censored at limit of detection (from Kalman filter), 0.0 otherwise
+4. **Age**: Days since last measurement, normalized to [0, 1] (max 14 days)
 
-### 3.3 Wastewater Aggregation to Regions
+Additionally, a **has_data** channel (1 per time step) indicates whether the region has
+any biomarker data available at that time (based on `biomarker_data_start` offset).
 
-To aggregate catchment-level biomarkers to region-level:
+Total dimension: 3 variants × 4 channels + 1 has_data = 13
 
-* Let $R \in \mathbb{R}^{M \times N}$ be the normalized contribution matrix.
-* Raw biomarker data: $B^{\text{raw}}_{m,t,f}$.
-
-Then for region-level biomarkers:
-
-$$
-\text{biomarkers}_{n,t,f} = \sum_{m=1}^M R_{mn} \cdot B^{\text{raw}}_{m,t,f}.
-$$
-
-Resulting tensor:
-
-* `biomarkers` ($\in \mathbb{R}^{N \times T \times F}$)
+Note: All channels are computed during preprocessing. The model receives the final
+region-level encoded tensor with shape $(N, T, 13)$.
 
 ### 3.4 Windowing for Forecasting
 
@@ -131,7 +121,7 @@ Given `cases` and region-level `biomarkers`, we construct samples defined by:
 For each region $i$:
 
 * Case history: $y_{i, t_0-L+1:t_0}$
-* Biomarker history: $b_{i, t_0-L+1:t_0, 1:F}$
+* Biomarker history: $b_{i, t_0-L+1:t_0}$ (13 channels per time step)
 * Mobility history: $M_{t_0-L+1:t_0}$, used by MobilityGNN.
 
 Preprocessing steps:
@@ -239,13 +229,15 @@ In practice, this is implemented via edge lists (e.g., `edge_index_t`, `edge_wei
 At time $t$:
 
 * Case counts: $y_{i,t}$ for all regions $i$
-* Optional: current biomarkers $b_{i,t,1:F}$
+* Optional: current biomarkers $b_{i,t}$ with 13 channels:
+  * 3 gene targets (N1, N2, IP4) × 4 channels (value, mask, censor, age)
+  * + 1 has_data channel indicating biomarker availability
 * Origin–destination mobility matrix: $M_t \in \mathbb{R}^{N \times N}$ where $M_{t, j i}$ is flow from origin $j$ to destination $i$
 
 We construct node features for MobilityGNN:
 
 $$
-x_{i,t}^{\text{mob}} = \text{concat}\big( y_{i,t},\; b_{i,t,1:F},\; z_i^{\text{static?}} \big)
+x_{i,t}^{\text{mob}} = \text{concat}\big( y_{i,t},\; b_{i,t},\; z_i^{\text{static?}} \big)
 $$
 
 (The inclusion of biomarkers and region embeddings into `x^{mob}` is configurable; minimally, it must include $y_{i,t}$.)
@@ -314,15 +306,17 @@ where $L_{\text{gnn}}$ is the number of GNN layers.
 For each region $i$ and reference time $t_0$, we consider the sequence of length $L$:
 
 * Case history: $y_{i, t_0-L+1:t_0}$
-* Biomarker history: $b_{i, t_0-L+1:t_0, 1:F}$
+* Biomarker history: $b_{i, t_0-L+1:t_0}$ (13 channels per time step)
 * Mobility embeddings: $m_{i, t_0-L+1:t_0}$
 * Static region embedding: $z_i$
 
 At each time step $\tau \in [t_0-L+1, t_0]$ we build a feature vector:
 
 $$
-\text{local}_{i,\tau} = \text{concat}\big( y_{i,\tau},\; b_{i,\tau,1:F} \big)
+\text{local}_{i,\tau} = \text{concat}\big( y_{i,\tau},\; b_{i,\tau} \big)
 $$
+
+Where $b_{i,\tau} \in \mathbb{R}^{13}$ represents the 13 biomarker channels.
 
 $$
 x_{i,\tau}^{\text{forecaster}} = \text{concat}\big( \text{local}_{i,\tau},\; m_{i,\tau},\; z_i \big)
