@@ -49,6 +49,11 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
     biomarkers = np.zeros((periods, 2), dtype=np.float32)
     biomarkers[:, 0] = 1.0  # Node 0 has non-zero biomarkers
 
+    # Required mask, censor, and age channels for biomarkers
+    biomarker_mask = np.ones((periods, 2), dtype=np.float32)
+    biomarker_censor = np.zeros((periods, 2), dtype=np.float32)
+    biomarker_age = np.zeros((periods, 2), dtype=np.float32)
+
     # Mobility: full connectivity
     mobility = np.ones((periods, 2, 2), dtype=np.float32)
 
@@ -57,7 +62,10 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
     ds = xr.Dataset(
         data_vars={
             "cases": ((TEMPORAL_COORD, REGION_COORD, "feature"), cases),
-            "edar_biomarker": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
+            "edar_biomarker_N1": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
+            "edar_biomarker_N1_mask": ((TEMPORAL_COORD, REGION_COORD), biomarker_mask),
+            "edar_biomarker_N1_censor": ((TEMPORAL_COORD, REGION_COORD), biomarker_censor),
+            "edar_biomarker_N1_age": ((TEMPORAL_COORD, REGION_COORD), biomarker_age),
             "mobility": ((TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
             "population": ((REGION_COORD,), population),
         },

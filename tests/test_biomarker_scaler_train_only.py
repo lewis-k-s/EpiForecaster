@@ -8,9 +8,9 @@ def test_scaler_fitted_on_train_only():
     """Verify scalers are computed using only train nodes."""
     dataset = xr.Dataset(
         {
-            "edar_biomarker": xr.DataArray(
+            "edar_biomarker_N1": xr.DataArray(
                 np.array([[1.0, 2.0], [np.nan, 10.0], [5.0, np.nan]]),
-                dims=["time", "region_id"],
+                dims=["date", "region_id"],
             )
         }
     )
@@ -22,16 +22,19 @@ def test_scaler_fitted_on_train_only():
 
     expected_values = np.log1p(np.array([1.0, 5.0]))
     expected_center = np.median(expected_values)
-    assert np.isclose(preprocessor.scaler_params.center, expected_center)
+    assert preprocessor.scaler_params is not None
+    assert np.isclose(
+        preprocessor.scaler_params.center["edar_biomarker_N1"], expected_center
+    )
 
 
 def test_scaler_reused_for_val_test():
     """Verify same scaler params are used for val/test."""
     dataset = xr.Dataset(
         {
-            "edar_biomarker": xr.DataArray(
+            "edar_biomarker_N1": xr.DataArray(
                 np.array([[1.0, 2.0], [np.nan, 10.0]]),
-                dims=["time", "region_id"],
+                dims=["date", "region_id"],
             )
         }
     )
@@ -40,9 +43,11 @@ def test_scaler_reused_for_val_test():
     preprocessor.fit_scaler(dataset, [0])
 
     train_params = preprocessor.scaler_params
+    assert train_params is not None
 
     preprocessor.set_scaler_params(train_params)
 
+    assert preprocessor.scaler_params is not None
     assert preprocessor.scaler_params.center == train_params.center
     assert preprocessor.scaler_params.scale == train_params.scale
 
@@ -51,9 +56,9 @@ def test_near_constant_biomarker():
     """Verify scale=1.0 when IQR≈0."""
     dataset = xr.Dataset(
         {
-            "edar_biomarker": xr.DataArray(
+            "edar_biomarker_N1": xr.DataArray(
                 np.array([[1.0], [1.0], [1.0]]),
-                dims=["time", "region_id"],
+                dims=["date", "region_id"],
             )
         }
     )
@@ -61,16 +66,17 @@ def test_near_constant_biomarker():
     preprocessor = BiomarkerPreprocessor()
     preprocessor.fit_scaler(dataset, [0])
 
-    assert preprocessor.scaler_params.scale == 1.0
+    assert preprocessor.scaler_params is not None
+    assert preprocessor.scaler_params.scale["edar_biomarker_N1"] == 1.0
 
 
 def test_scaler_no_finite_values_error():
     """Verify error raised when no finite values in train nodes."""
     dataset = xr.Dataset(
         {
-            "edar_biomarker": xr.DataArray(
+            "edar_biomarker_N1": xr.DataArray(
                 np.array([[np.nan], [np.nan]]),
-                dims=["time", "region_id"],
+                dims=["date", "region_id"],
             )
         }
     )
@@ -85,9 +91,9 @@ def test_scaler_log_transform():
     """Verify scaler is computed on log1p transformed values, excluding zeros."""
     dataset = xr.Dataset(
         {
-            "edar_biomarker": xr.DataArray(
+            "edar_biomarker_N1": xr.DataArray(
                 np.array([[1.0, 0.0]]),
-                dims=["time", "region_id"],
+                dims=["date", "region_id"],
             )
         }
     )
@@ -101,5 +107,10 @@ def test_scaler_log_transform():
     # Single value -> IQR = 0, so scale = 1.0
     expected_scale = 1.0
 
-    assert np.isclose(preprocessor.scaler_params.center, expected_center)
-    assert np.isclose(preprocessor.scaler_params.scale, expected_scale)
+    assert preprocessor.scaler_params is not None
+    assert np.isclose(
+        preprocessor.scaler_params.center["edar_biomarker_N1"], expected_center
+    )
+    assert np.isclose(
+        preprocessor.scaler_params.scale["edar_biomarker_N1"], expected_scale
+    )
