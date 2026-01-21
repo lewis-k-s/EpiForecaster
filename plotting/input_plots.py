@@ -11,6 +11,69 @@ import xarray as xr
 from torch.utils.data import DataLoader
 
 
+def _split_biomarker_channels(
+    biomarkers: torch.Tensor,
+    variant_names: list[str] | None,
+) -> dict[str, dict[str, np.ndarray]]:
+    if biomarkers.ndim != 2:
+        raise ValueError("Expected `bio_node` with shape (L, B).")
+
+    total_channels = biomarkers.shape[1]
+    if total_channels % 4 != 0:
+        raise ValueError(
+            "Expected biomarker channels in 4-channel blocks [value, mask, censor, age]."
+        )
+
+    variant_count = total_channels // 4
+    if variant_count <= 0:
+        raise ValueError("Unexpected biomarker channel layout.")
+
+    if not variant_names or len(variant_names) != variant_count:
+        variant_names = [f"variant_{i + 1}" for i in range(variant_count)]
+
+    output: dict[str, dict[str, np.ndarray]] = {}
+    for idx, name in enumerate(variant_names):
+        base = idx * 4
+        output[name] = {
+            "value": biomarkers[:, base].detach().cpu().numpy().astype(np.float32),
+            "mask": biomarkers[:, base + 1].detach().cpu().numpy().astype(np.float32),
+            "censor": biomarkers[:, base + 2].detach().cpu().numpy().astype(np.float32),
+            "age": biomarkers[:, base + 3].detach().cpu().numpy().astype(np.float32),
+        }
+
+    return output
+
+
+def _split_precomputed_variants(
+    precomputed_biomarkers: torch.Tensor,
+    variant_names: list[str] | None,
+) -> dict[str, dict[str, np.ndarray]]:
+    if precomputed_biomarkers.ndim != 3:
+        raise ValueError("Expected precomputed biomarkers with shape (T, N, B).")
+
+    total_channels = precomputed_biomarkers.shape[2]
+    if total_channels % 4 != 0:
+        raise ValueError(
+            "Expected biomarker channels in 4-channel blocks [value, mask, censor, age]."
+        )
+
+    variant_count = total_channels // 4
+    if not variant_names or len(variant_names) != variant_count:
+        variant_names = [f"variant_{i + 1}" for i in range(variant_count)]
+
+    output: dict[str, dict[str, np.ndarray]] = {}
+    for idx, name in enumerate(variant_names):
+        base = idx * 4
+        output[name] = {
+            "value": precomputed_biomarkers[:, :, base].cpu().numpy(),
+            "mask": precomputed_biomarkers[:, :, base + 1].cpu().numpy(),
+            "censor": precomputed_biomarkers[:, :, base + 2].cpu().numpy(),
+            "age": precomputed_biomarkers[:, :, base + 3].cpu().numpy(),
+        }
+
+    return output
+
+
 def collect_case_window_samples(
     loader: DataLoader,
     n: int = 5,
@@ -18,7 +81,6 @@ def collect_case_window_samples(
     biomarker_feature_idx: int | None = 0,
     include_biomarkers: bool = True,
     include_mobility: bool = True,
-    include_biomarkers_locf: bool = False,
     shuffle: bool = False,
     seed: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -39,6 +101,8 @@ def collect_case_window_samples(
         indices = rng.sample(range(len(dataset)), k=k)
     else:
         indices = list(range(k))
+
+    variant_names = getattr(dataset, "biomarker_variants", None)
 
     for idx in indices:
         item = dataset[idx]
@@ -75,37 +139,27 @@ def collect_case_window_samples(
             "cases_age": cases_age,  # History-only cases age for ribbon
         }
 
-        if include_biomarkers_locf:
-            biomarkers = item.get("bio_node")
-            if isinstance(biomarkers, torch.Tensor):
-                # bio_node has shape (L, 4) with channels: [value, mask, age, has_data]
-                if biomarkers.ndim != 2 or biomarkers.shape[1] != 4:
-                    raise ValueError("Expected `bio_node` with shape (L, 4).")
-                # Extract channels: [value, mask, age]
-                value_channel = biomarkers[:, 0]
-                mask_channel = biomarkers[:, 1]
-                age_channel = biomarkers[:, 2]
-                sample["biomarkers_locf"] = {
-                    "value": value_channel.detach().cpu().numpy().astype(np.float32),
-                    "mask": mask_channel.detach().cpu().numpy().astype(np.float32),
-                    "age": age_channel.detach().cpu().numpy().astype(np.float32),
-                }
-
         if include_biomarkers:
             biomarkers = item.get("bio_node")
             if isinstance(biomarkers, torch.Tensor):
-                # bio_node has shape (L, 4) with channels: [value, mask, age, has_data]
-                if biomarkers.ndim != 2 or biomarkers.shape[1] != 4:
-                    raise ValueError("Expected `bio_node` with shape (L, 4).")
-                # Extract channels: [value, age]
-                value_channel = biomarkers[:, 0]
-                age_channel = biomarkers[:, 2]
-                sample["biomarkers"] = (
-                    value_channel.detach().cpu().numpy().astype(np.float32)
+                # Exclude the last channel (has_data) which is not part of variant blocks
+                # Shape: (L, 13) -> (L, 12) where 12 = 3 variants * 4 channels
+                biomarkers_for_splitting = biomarkers[:, :-1]
+                biomarker_channels = _split_biomarker_channels(
+                    biomarkers_for_splitting, variant_names
                 )
-                sample["biomarkers_age"] = (
-                    age_channel.detach().cpu().numpy().astype(np.float32)
-                )
+                sample["biomarkers"] = {
+                    name: channels["value"]
+                    for name, channels in biomarker_channels.items()
+                }
+                sample["biomarkers_age"] = {
+                    name: channels["age"]
+                    for name, channels in biomarker_channels.items()
+                }
+                sample["biomarkers_censor"] = {
+                    name: channels["censor"]
+                    for name, channels in biomarker_channels.items()
+                }
 
         if include_mobility:
             mob_graphs = item.get("mob")
@@ -171,36 +225,38 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         horizon_length = total_len - history_length
 
         cases_age = sample.get("cases_age")
-        biomarker_series = sample.get("biomarkers")
-        biomarker_age = sample.get("biomarkers_age")
+        biomarker_series = sample.get("biomarkers") or {}
+        biomarker_age = sample.get("biomarkers_age") or {}
+        biomarker_censor = sample.get("biomarkers_censor") or {}
         mobility_mean = sample.get("mobility_mean")
         mobility_std = sample.get("mobility_std")
 
         plot_series: dict[str, np.ndarray] = {"Cases": series}
 
         # Extract and pad biomarkers for plotting (history only)
-        biomarker_padded = None
-        biomarker_age_padded = None
-        if biomarker_series is not None:
-            biomarker_series = np.asarray(biomarker_series, dtype=np.float32).reshape(
-                -1
-            )
-            assert biomarker_series.shape[0] == history_length, (
-                f"Biomarker length {biomarker_series.shape[0]} != history_length {history_length}"
-            )
-            # Pad with NaNs for horizon portion
-            biomarker_padded = np.concatenate(
-                [biomarker_series, np.full(horizon_length, np.nan)]
-            )
-            plot_series["Biomarkers"] = biomarker_padded
-
-            # Extract and pad age channel
-            if biomarker_age is not None:
-                biomarker_age = np.asarray(biomarker_age, dtype=np.float32).reshape(-1)
-                assert biomarker_age.shape[0] == history_length
-                biomarker_age_padded = np.concatenate(
-                    [biomarker_age, np.full(horizon_length, np.nan)]
+        biomarker_padded: dict[str, np.ndarray] = {}
+        biomarker_age_padded: dict[str, np.ndarray] = {}
+        if biomarker_series:
+            for name, series_values in biomarker_series.items():
+                series_values = np.asarray(series_values, dtype=np.float32).reshape(-1)
+                assert series_values.shape[0] == history_length, (
+                    f"Biomarker length {series_values.shape[0]} != history_length {history_length}"
                 )
+                padded = np.concatenate(
+                    [series_values, np.full(horizon_length, np.nan)]
+                )
+                # Use shorthand label: N1, N2, IP4
+                label = str(name).replace("edar_biomarker_", "")
+                biomarker_padded[label] = padded
+                plot_series[label] = padded
+
+                age_values = biomarker_age.get(name)
+                if age_values is not None:
+                    age_values = np.asarray(age_values, dtype=np.float32).reshape(-1)
+                    assert age_values.shape[0] == history_length
+                    biomarker_age_padded[label] = np.concatenate(
+                        [age_values, np.full(horizon_length, np.nan)]
+                    )
 
         # Extract and pad mobility for plotting (history only)
         mobility_mean_padded = None
@@ -254,7 +310,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                 # ymin/ymax are in axes coordinates (0-1), so 0.95-1.0 is top 5%
                 for ti, age in zip(valid_t, valid_age):
                     # Use RdYlGn colormap: green=fresh (age=0), red=stale (age=1)
-                    color = plt.cm.RdYlGn_r(min(age, 1.0))
+                    color = plt.get_cmap("RdYlGn_r")(min(age, 1.0))
                     ax.axvspan(
                         ti - 0.5,
                         ti + 0.5,
@@ -283,31 +339,33 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
             t, plot_series["Cases"], label="Cases", color=colors["Cases"], linewidth=1.5
         )
 
-        # Plot biomarkers (simple line, age shown in ribbon below)
-        if biomarker_padded is not None and "Biomarkers" in plot_series:
-            biomarker_norm = plot_series["Biomarkers"]
-            ax.plot(
-                t,
-                biomarker_norm,
-                label="Biomarkers",
-                color=colors["Biomarkers"],
-                linewidth=1.5,
-                alpha=0.8,
-            )
+        # Plot biomarkers (per-variant lines)
+        if biomarker_padded:
+            palette = sns.color_palette("tab10", n_colors=len(biomarker_padded))
+            biomarker_colors = dict(zip(biomarker_padded.keys(), palette, strict=False))
+            for label, series_values in biomarker_padded.items():
+                biomarker_norm = plot_series[label]
+                ax.plot(
+                    t,
+                    biomarker_norm,
+                    label=label,
+                    color=biomarker_colors[label],
+                    linewidth=1.5,
+                    alpha=0.85,
+                )
 
             # Add age ribbon at bottom of plot (just above x-axis)
-            if biomarker_age_padded is not None:
-                # Get valid (non-NaN) age values - history only
-                valid_mask = ~np.isnan(biomarker_age_padded)
+            if biomarker_age_padded:
+                stacked = np.vstack(list(biomarker_age_padded.values()))
+                combined_age = np.nanmin(stacked, axis=0)
+                valid_mask = ~np.isnan(combined_age)
                 valid_t = t[valid_mask]
-                valid_age = biomarker_age_padded[valid_mask]
+                valid_age = combined_age[valid_mask]
 
                 if len(valid_t) > 0:
-                    # Draw ribbon for each timestep with color based on age
-                    # ymin/ymax are in axes coordinates (0-1), so 0-0.05 is bottom 5%
+                    cmap = plt.get_cmap("RdYlGn_r")
                     for ti, age in zip(valid_t, valid_age):
-                        # Use RdYlGn colormap: green=fresh (age=0), red=stale (age=1)
-                        color = plt.cm.RdYlGn_r(min(age, 1.0))
+                        color = cmap(min(age, 1.0))
                         ax.axvspan(
                             ti - 0.5,
                             ti + 0.5,
@@ -318,11 +376,49 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                             zorder=-1,
                         )
 
-                    # Add label to the right of the ribbon, aligned with history/horizon line
                     ax.text(
                         history_length - 0.5,
-                        0.025,  # Center of the ribbon (ymin=0, ymax=0.05)
-                        " biomarker age",
+                        0.025,
+                        " biomarker age (min)",
+                        transform=ax.get_xaxis_transform(),
+                        ha="left",
+                        va="center",
+                        fontsize=7,
+                        fontweight="semibold",
+                        color="#333333",
+                    )
+
+            # Add censor ribbon just above age ribbon (ymin=0.05, ymax=0.10)
+            if biomarker_censor:
+                for variant, flags in biomarker_censor.items():
+                    flags_padded = np.concatenate(
+                        [flags, np.full(horizon_length, np.nan)]
+                    )
+                    valid_mask = ~np.isnan(flags_padded)
+                    valid_t = t[valid_mask]
+                    valid_flags = flags_padded[valid_mask]
+
+                    if len(valid_t) > 0:
+                        # Use purple colormap for censor ribbon (distinct from age ribbon)
+                        cmap = plt.get_cmap("Purples")
+                        for ti, flag in zip(valid_t, valid_flags):
+                            if flag == 1.0:
+                                # censored=1, so darker purple
+                                ax.axvspan(
+                                    ti - 0.5,
+                                    ti + 0.5,
+                                    ymin=0.05,
+                                    ymax=0.10,
+                                    color=cmap(0.8),
+                                    alpha=0.7,
+                                    zorder=-1,
+                                )
+
+                if biomarker_censor:
+                    ax.text(
+                        history_length - 0.5,
+                        0.075,
+                        " LD censored",
                         transform=ax.get_xaxis_transform(),
                         ha="left",
                         va="center",
@@ -385,102 +481,6 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
     return fig
 
 
-def make_biomarker_locf_figure(
-    samples: list[dict[str, Any]],
-    history_length: int,
-    age_visualization: str = "ribbon",
-):
-    """
-    Build a figure to visualize LOCF biomarker data with age indicators.
-
-    The age_visualization parameter controls how measurement staleness is shown:
-    - "ribbon": Semi-transparent gray ribbon showing staleness (darker = older)
-    - "scatter": Scatter points colored by age
-
-    Returns a matplotlib Figure suitable for saving or TensorBoard logging.
-    """
-    if not samples:
-        return None
-
-    import matplotlib.pyplot as plt
-
-    sns = _import_seaborn()
-    if sns is None:
-        return None
-
-    sns.set_theme(style="whitegrid")
-    n = len(samples)
-    fig, axes = plt.subplots(
-        nrows=n, ncols=1, figsize=(12, max(2.5 * n, 3.0)), sharex=True
-    )
-    if n == 1:
-        axes = [axes]
-
-    for ax, sample in zip(axes, samples, strict=False):
-        locf_data = sample.get("biomarkers_locf")
-        if locf_data is None:
-            ax.text(0.5, 0.5, "No LOCF data", ha="center", va="center")
-            continue
-
-        values = locf_data["value"]
-        mask = locf_data["mask"]
-        age = locf_data["age"]
-
-        total_len = values.shape[0]
-        t = np.arange(total_len)
-
-        # Plot the LOCF values
-        ax.plot(t, values, color="steelblue", linewidth=1.5, label="LOCF value")
-
-        # Add age visualization
-        if age_visualization == "ribbon":
-            # Semi-transparent ribbon: darker = more stale
-            for i in range(total_len):
-                alpha = min(age[i], 1.0) * 0.7
-                ax.axvspan(i - 0.4, i + 0.4, color="gray", alpha=alpha, zorder=-1)
-
-            # Add a vertical line at history/horizon boundary
-            ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
-
-        elif age_visualization == "scatter":
-            # Scatter points colored by age
-            measured = mask > 0.5
-            if np.any(measured):
-                scatter = ax.scatter(
-                    t[measured],
-                    values[measured],
-                    c=age[measured],
-                    cmap="YlOrRd",
-                    s=30,
-                    edgecolors="black",
-                    linewidths=0.5,
-                    zorder=5,
-                    label="Fresh measurement",
-                )
-                cbar = plt.colorbar(scatter, ax=ax)
-                cbar.set_label("Age (days)")
-
-        # Title
-        node_label = sample.get("node_label", "")
-        node_id = sample.get("node_id", None)
-        window_start = sample.get("window_start", None)
-        title = f"{node_label}".strip()
-        if node_id is not None:
-            title = f"{title} (id={node_id})" if title else f"id={node_id}"
-        if window_start is not None and window_start >= 0:
-            title = f"{title} | window_start={window_start}"
-        ax.set_title(title, fontsize=10, fontweight="semibold")
-
-        ax.set_ylabel("Biomarker value (scaled)", fontsize=9)
-        legend = ax.get_legend()
-        if legend is not None and ax is not axes[0]:
-            legend.remove()
-
-    axes[-1].set_xlabel("Time index (history → horizon)")
-    fig.tight_layout()
-    return fig
-
-
 def _import_seaborn():
     """Import seaborn optionally, returning None if not available."""
     try:
@@ -506,53 +506,53 @@ def compute_biomarker_sparsity_stats(
         age_max_days: Maximum age in days (for unnormalizing age channel)
 
     Returns:
-        DataFrame with columns: node_id, node_label, measurements_count,
+        DataFrame with columns: node_id, node_label, variant, measurements_count,
             sparsity_pct, max_consecutive_missing, mean_staleness_days
     """
     rows = []
 
     for sample in samples:
-        locf_data = sample.get("biomarkers_locf")
-        if locf_data is None:
+        locf_data = sample.get("biomarkers_locf") or {}
+        if not locf_data:
             continue
 
-        mask = locf_data["mask"]
-        age = locf_data["age"]
+        for variant, channels in locf_data.items():
+            mask = channels["mask"]
+            age = channels["age"]
 
-        n_measurements = int(np.sum(mask))
-        total_timesteps = len(mask)
-        sparsity_pct = 100 * (1 - n_measurements / total_timesteps)
+            n_measurements = int(np.sum(mask))
+            total_timesteps = len(mask)
+            sparsity_pct = 100 * (1 - n_measurements / total_timesteps)
 
-        # Compute max consecutive missing
-        max_consecutive_missing = 0
-        current = 0
-        for val in mask:
-            if val < 0.5:
-                current += 1
-                max_consecutive_missing = max(max_consecutive_missing, current)
+            max_consecutive_missing = 0
+            current = 0
+            for val in mask:
+                if val < 0.5:
+                    current += 1
+                    max_consecutive_missing = max(max_consecutive_missing, current)
+                else:
+                    current = 0
+
+            valid_age = age[mask > 0.5]
+            if len(valid_age) > 0:
+                mean_staleness_days = float(np.mean(valid_age) * age_max_days)
             else:
-                current = 0
+                mean_staleness_days = np.nan
 
-        # Compute mean staleness (only for non-mask positions)
-        valid_age = age[mask > 0.5]
-        if len(valid_age) > 0:
-            mean_staleness_days = float(np.mean(valid_age) * age_max_days)
-        else:
-            mean_staleness_days = np.nan
-
-        rows.append(
-            {
-                "node_id": sample.get("node_id", ""),
-                "node_label": sample.get("node_label", ""),
-                "measurements_count": n_measurements,
-                "total_timesteps": total_timesteps,
-                "sparsity_pct": round(sparsity_pct, 2),
-                "max_consecutive_missing": max_consecutive_missing,
-                "mean_staleness_days": round(mean_staleness_days, 1)
-                if not np.isnan(mean_staleness_days)
-                else None,
-            }
-        )
+            rows.append(
+                {
+                    "node_id": sample.get("node_id", ""),
+                    "node_label": sample.get("node_label", ""),
+                    "variant": variant,
+                    "measurements_count": n_measurements,
+                    "total_timesteps": total_timesteps,
+                    "sparsity_pct": round(sparsity_pct, 2),
+                    "max_consecutive_missing": max_consecutive_missing,
+                    "mean_staleness_days": round(mean_staleness_days, 1)
+                    if not np.isnan(mean_staleness_days)
+                    else None,
+                }
+            )
 
     if not rows:
         return pd.DataFrame()
@@ -571,39 +571,36 @@ def compute_locf_age_stats(
         n_bins: Number of bins for age distribution
 
     Returns:
-        DataFrame with columns: age_bin, count, pct
+        DataFrame with columns: variant, age_bin_days, count, pct
     """
-    all_ages = []
+    rows = []
 
     for sample in samples:
-        locf_data = sample.get("biomarkers_locf")
-        if locf_data is not None:
-            age = locf_data["age"]
-            # Unnormalize to days
+        locf_data = sample.get("biomarkers_locf") or {}
+        for variant, channels in locf_data.items():
+            age = channels["age"]
             age_days = age * age_max_days
-            all_ages.extend(age_days[~np.isnan(age_days)])
+            age_days = age_days[~np.isnan(age_days)]
+            if len(age_days) == 0:
+                continue
 
-    if not all_ages:
-        return pd.DataFrame(columns=["age_bin_days", "count", "pct"])
+            total = len(age_days)
+            bin_edges = np.linspace(0, age_max_days, n_bins + 1)
+            counts, _ = np.histogram(age_days, bins=bin_edges)
 
-    all_ages = np.array(all_ages)
-    total = len(all_ages)
+            for i, count in enumerate(counts):
+                bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
+                rows.append(
+                    {
+                        "variant": variant,
+                        "age_bin_days": bin_label,
+                        "count": int(count),
+                        "pct": round(100 * count / total, 2),
+                    }
+                )
 
-    # Create bins
-    bin_edges = np.linspace(0, age_max_days, n_bins + 1)
-
-    counts, _ = np.histogram(all_ages, bins=bin_edges)
-
-    rows = []
-    for i, count in enumerate(counts):
-        bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
-        rows.append(
-            {
-                "age_bin_days": bin_label,
-                "count": int(count),
-                "pct": round(100 * count / total, 2),
-            }
-        )
+    if not rows:
+        return pd.DataFrame(columns=["variant", "age_bin_days", "count", "pct"])
 
     return pd.DataFrame(rows)
 
@@ -644,9 +641,11 @@ def export_summary_tables(
             row["case_max"] = round(float(np.max(series)), 2)
 
         # Biomarker stats
-        locf_data = sample.get("biomarkers_locf")
-        if locf_data is not None:
-            values = locf_data["value"]
+        locf_data = sample.get("biomarkers_locf") or {}
+        if locf_data:
+            values = np.concatenate(
+                [channels["value"].reshape(-1) for channels in locf_data.values()]
+            )
             row["biomarker_mean"] = round(float(np.mean(values)), 2)
             row["biomarker_std"] = round(float(np.std(values)), 2)
         else:
@@ -710,21 +709,26 @@ def plot_biomarker_age_heatmap(
     """
     import seaborn as sns
 
-    from data.biomarker_preprocessor import BiomarkerPreprocessor
+    from data.biomarker_preprocessor import (
+        BiomarkerPreprocessor,
+        BiomarkerScalerParams,
+    )
 
     # Convert to dataset format expected by preprocessor
     if biomarker_da.name is None:
-        biomarker_ds = biomarker_da.to_dataset(name="edar_biomarker")
+        biomarker_name = "edar_biomarker_N1"
+        biomarker_ds = biomarker_da.to_dataset(name=biomarker_name)
     else:
+        biomarker_name = str(biomarker_da.name)
         biomarker_ds = biomarker_da.to_dataset()
 
     # Create preprocessor and process to get age channel
     preprocessor = BiomarkerPreprocessor(age_max=age_max_days)
-    preprocessor.scaler_params = type(
-        "obj",
-        (object,),
-        {"center": 0.0, "scale": 1.0, "is_fitted": True},
-    )()
+    preprocessor.scaler_params = BiomarkerScalerParams(
+        center={biomarker_name: 0.0},
+        scale={biomarker_name: 1.0},
+        is_fitted=True,
+    )
 
     processed = preprocessor.preprocess_dataset(biomarker_ds)
     # Shape: (time, regions, 3) -> [value, mask, age]
@@ -833,21 +837,26 @@ def compute_locf_age_stats_from_biomarker_da(
     Returns:
         DataFrame with age bin distribution
     """
-    from data.biomarker_preprocessor import BiomarkerPreprocessor
+    from data.biomarker_preprocessor import (
+        BiomarkerPreprocessor,
+        BiomarkerScalerParams,
+    )
 
     # Convert to dataset format expected by preprocessor
     if biomarker_da.name is None:
-        biomarker_ds = biomarker_da.to_dataset(name="edar_biomarker")
+        biomarker_name = "edar_biomarker_N1"
+        biomarker_ds = biomarker_da.to_dataset(name=biomarker_name)
     else:
+        biomarker_name = str(biomarker_da.name)
         biomarker_ds = biomarker_da.to_dataset()
 
     # Create preprocessor and process to get age channel
     preprocessor = BiomarkerPreprocessor(age_max=age_max_days)
-    preprocessor.scaler_params = type(
-        "obj",
-        (object,),
-        {"center": 0.0, "scale": 1.0, "is_fitted": True},
-    )()
+    preprocessor.scaler_params = BiomarkerScalerParams(
+        center={biomarker_name: 0.0},
+        scale={biomarker_name: 1.0},
+        is_fitted=True,
+    )
 
     processed = preprocessor.preprocess_dataset(biomarker_ds)
     # Shape: (time, regions, 3) -> [value, mask, age]
@@ -1329,6 +1338,7 @@ def compute_biomarker_sparsity_stats_from_precomputed(
     biomarker_available_mask: torch.Tensor,
     region_ids: np.ndarray,
     age_max: int = 14,
+    variant_names: list[str] | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """Compute per-region biomarker sparsity from precomputed tensor.
 
@@ -1337,57 +1347,79 @@ def compute_biomarker_sparsity_stats_from_precomputed(
     are included in the sparsity analysis.
 
     Args:
-        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
-        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        precomputed_biomarkers: (T, N,4 * V) tensor with [value, mask, censor, age] blocks
+        biomarker_available_mask: (N, B) tensor indicating region-level availability
         region_ids: Array of region IDs
         age_max: Maximum age in days (for reference, sparsity uses mask only)
+        variant_names: Optional list of biomarker variant names
 
     Returns:
         Tuple of (DataFrame, context_string):
-        - DataFrame with columns: node_id, node_label, measurements_count,
-            total_timesteps, sparsity_pct, max_consecutive_missing
+        - DataFrame with columns: node_id, node_label, variant, measurements_count,
+            total_timesteps, sparsity_pct, max_consecutive_missing,
+            censored_count, censored_pct
         - Context string: "n of N regions have biomarker data"
     """
-    T, N, C = precomputed_biomarkers.shape
-
-    # Extract mask channel (index 1) - indicates fresh measurements
-    mask_channel = precomputed_biomarkers[:, :, 1].cpu().numpy()  # (T, N)
+    T, N, _ = precomputed_biomarkers.shape
 
     # Filter to regions with biomarker data
     has_data = biomarker_available_mask[:, 0].cpu().numpy() > 0.5
     n_with_data = int(has_data.sum())
     n_total = len(region_ids)
 
+    variants = _split_precomputed_variants(precomputed_biomarkers, variant_names)
+
     rows = []
-    for region_idx, region_id in enumerate(region_ids):
-        # Skip regions without biomarker data
-        if not has_data[region_idx]:
-            continue
+    for variant, channels in variants.items():
+        mask_channel = channels["mask"]
+        censor_channel = channels["censor"]
 
-        mask = mask_channel[:, region_idx]
-        n_measurements = int((mask == 1.0).sum())
-        sparsity_pct = 100 * (1 - n_measurements / T)
+        for region_idx, region_id in enumerate(region_ids):
+            if not has_data[region_idx]:
+                continue
 
-        # Compute max consecutive missing (where mask == 0)
-        max_consecutive_missing = 0
-        current = 0
-        for val in mask:
-            if val < 0.5:  # mask == 0 means LOCF, not fresh measurement
-                current += 1
-                max_consecutive_missing = max(max_consecutive_missing, current)
-            else:
-                current = 0
+            mask = mask_channel[:, region_idx]
+            n_measurements = int((mask == 1.0).sum())
+            sparsity_pct = 100 * (1 - n_measurements / T)
 
-        rows.append(
-            {
+            max_consecutive_missing = 0
+            current = 0
+            for val in mask:
+                if val < 0.5:
+                    current += 1
+                    max_consecutive_missing = max(max_consecutive_missing, current)
+                else:
+                    current = 0
+
+            # Compute censored count from precomputed censor channel
+            # Assert censor data is valid for regions with biomarker data
+            censor = censor_channel[:, region_idx]
+            if np.any(mask == 1.0) and np.all(np.isnan(censor[mask == 1.0])):
+                raise ValueError(
+                    f"Censor data is all NaN for region {region_id}, variant {variant} "
+                    "with non-zero mask values. This indicates missing required data."
+                )
+
+            measured_mask = mask == 1.0
+            censored_mask = measured_mask & (censor == 1.0)
+            censored_count = int(censored_mask.sum())
+            n_valid_measured = int(measured_mask.sum())
+
+            row = {
                 "node_id": int(region_id),
                 "node_label": str(region_id),
+                "variant": variant,
                 "measurements_count": n_measurements,
                 "total_timesteps": T,
                 "sparsity_pct": round(sparsity_pct, 2),
                 "max_consecutive_missing": max_consecutive_missing,
+                "censored_count": censored_count,
+                "censored_pct": round(100 * (censored_count / n_valid_measured), 2)
+                if n_valid_measured > 0
+                else None,
             }
-        )
+
+            rows.append(row)
 
     context = f"{n_with_data} of {n_total} regions have biomarker data"
 
@@ -1401,45 +1433,48 @@ def compute_biomarker_age_dist_from_precomputed(
     precomputed_biomarkers: torch.Tensor,
     age_max: int = 14,
     n_bins: int = 10,
+    variant_names: list[str] | None = None,
 ) -> pd.DataFrame:
     """Compute LOCF age distribution from precomputed biomarker tensor.
 
     Args:
-        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
+        precomputed_biomarkers: (T, N, 3 * V) tensor with [value, mask, age] blocks
         age_max: Maximum age in days for unnormalization
         n_bins: Number of bins for age distribution
+        variant_names: Optional list of biomarker variant names
 
     Returns:
-        DataFrame with columns: age_bin_days, count, pct
+        DataFrame with columns: variant, age_bin_days, count, pct
     """
-    # Extract age channel (index 2) and unnormalize to days
-    age_channel = precomputed_biomarkers[:, :, 2].cpu().numpy()  # (T, N)
-    age_days = age_channel * age_max
-
-    # Collect all age values
-    all_ages = age_days.flatten()
-    all_ages = all_ages[~np.isnan(all_ages)]
-
-    if len(all_ages) == 0:
-        return pd.DataFrame(columns=["age_bin_days", "count", "pct"])
-
-    total = len(all_ages)
-
-    # Create bins
-    bin_edges = np.linspace(0, age_max, n_bins + 1)
-
-    counts, _ = np.histogram(all_ages, bins=bin_edges)
-
+    variants = _split_precomputed_variants(precomputed_biomarkers, variant_names)
     rows = []
-    for i, count in enumerate(counts):
-        bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
-        rows.append(
-            {
-                "age_bin_days": bin_label,
-                "count": int(count),
-                "pct": round(100 * count / total, 2),
-            }
-        )
+
+    for variant, channels in variants.items():
+        age_channel = channels["age"]
+        age_days = age_channel * age_max
+        all_ages = age_days.flatten()
+        all_ages = all_ages[~np.isnan(all_ages)]
+
+        if len(all_ages) == 0:
+            continue
+
+        total = len(all_ages)
+        bin_edges = np.linspace(0, age_max, n_bins + 1)
+        counts, _ = np.histogram(all_ages, bins=bin_edges)
+
+        for i, count in enumerate(counts):
+            bin_label = f"{int(bin_edges[i])}-{int(bin_edges[i + 1])}"
+            rows.append(
+                {
+                    "variant": variant,
+                    "age_bin_days": bin_label,
+                    "count": int(count),
+                    "pct": round(100 * count / total, 2),
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["variant", "age_bin_days", "count", "pct"])
 
     return pd.DataFrame(rows)
 
@@ -1450,20 +1485,23 @@ def plot_biomarker_age_heatmap_from_precomputed(
     biomarker_available_mask: torch.Tensor,
     history_length: int | None = None,
     age_max: int = 14,
+    variant_names: list[str] | None = None,
 ) -> None:
     """Plot biomarker LOCF age (staleness) heatmap from precomputed data.
 
     Args:
         ax: Matplotlib axes to plot on
-        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
-        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        precomputed_biomarkers: (T, N, 3 * V) tensor with [value, mask, age] blocks
+        biomarker_available_mask: (N, B) tensor indicating region-level availability
         history_length: Optional history/horizon separator position
         age_max: Maximum age in days (for normalization label only)
+        variant_names: Optional list of biomarker variant names
     """
     import seaborn as sns
 
-    # Extract age channel (index 2) - already normalized to [0, 1]
-    age_channel = precomputed_biomarkers[:, :, 2].cpu().numpy()  # (T, N)
+    variants = _split_precomputed_variants(precomputed_biomarkers, variant_names)
+    age_stack = np.stack([channels["age"] for channels in variants.values()], axis=0)
+    age_channel = np.nanmin(age_stack, axis=0)
 
     # Filter to regions with biomarker availability (has_data > 0)
     has_data = biomarker_available_mask[:, 0].cpu().numpy() > 0.5
@@ -1502,41 +1540,40 @@ def export_biomarker_sparsity_tables_from_precomputed(
     region_ids: np.ndarray,
     output_dir: Path,
     age_max: int = 14,
+    variant_names: list[str] | None = None,
 ) -> tuple[dict[str, Path], str]:
     """Export biomarker sparsity statistics from precomputed data to CSV files.
 
     Args:
-        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
-        biomarker_available_mask: (N, 4) tensor indicating region-level availability
+        precomputed_biomarkers: (T, N,4 * V) tensor with [value, mask, censor, age] blocks
+        biomarker_available_mask: (N, B) tensor indicating region-level availability
         region_ids: Array of region IDs
         output_dir: Directory to save CSV files
         age_max: Maximum age in days
+        variant_names: Optional list of biomarker variant names
 
     Returns:
-        Tuple of (exported_files_dict, context_string):
-        - Dict mapping table name to output file path
-        - Context string: "n of N regions have biomarker data"
+        Tuple of (exported_files_dict, context_string)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     exported = {}
 
-    # 1. Biomarker sparsity stats (regions with data only)
     sparsity_df, context = compute_biomarker_sparsity_stats_from_precomputed(
         precomputed_biomarkers,
         biomarker_available_mask,
         region_ids,
         age_max,
+        variant_names,
     )
     if not sparsity_df.empty:
         path = output_dir / "biomarker_sparsity.csv"
         sparsity_df.to_csv(path, index=False)
         exported["sparsity"] = path
 
-    # 2. Age distribution (all regions)
     age_df = compute_biomarker_age_dist_from_precomputed(
-        precomputed_biomarkers, age_max
+        precomputed_biomarkers, age_max, variant_names=variant_names
     )
     if not age_df.empty:
         path = output_dir / "biomarker_age_dist.csv"
@@ -1552,39 +1589,31 @@ def make_biomarker_sparsity_figure_all_from_precomputed(
     region_ids: np.ndarray,
     history_length: int | None = None,
     age_max: int = 14,
+    variant_names: list[str] | None = None,
 ):
-    """Create multi-panel biomarker sparsity figure using precomputed data.
-
-    This version uses the model-visible data (mask and age channels from
-    precomputed biomarkers) to show regional variation in measurement patterns.
-
-    Args:
-        precomputed_biomarkers: (T, N, 3) tensor with [value, mask, age] channels
-        biomarker_available_mask: (N, 4) tensor indicating region-level availability
-        region_ids: Array of region IDs
-        history_length: Optional history/horizon separator position
-        age_max: Maximum age in days
-
-    Returns a matplotlib Figure suitable for saving.
-    """
+    """Create multi-panel biomarker sparsity figure using precomputed data."""
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(14, 8))
     gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25)
 
-    # Panel 1: LOCF age heatmap (all regions with data)
     ax1 = fig.add_subplot(gs[0, :])
     plot_biomarker_age_heatmap_from_precomputed(
-        ax1, precomputed_biomarkers, biomarker_available_mask, history_length, age_max
+        ax1,
+        precomputed_biomarkers,
+        biomarker_available_mask,
+        history_length,
+        age_max,
+        variant_names=variant_names,
     )
 
-    # Panel 2: Sparsity distribution (regions with data only)
     ax2 = fig.add_subplot(gs[1, 0])
     sparsity_df, context = compute_biomarker_sparsity_stats_from_precomputed(
         precomputed_biomarkers,
         biomarker_available_mask,
         region_ids,
         age_max,
+        variant_names,
     )
     if not sparsity_df.empty:
         ax2.hist(
@@ -1612,28 +1641,75 @@ def make_biomarker_sparsity_figure_all_from_precomputed(
     else:
         ax2.text(0.5, 0.5, "No sparsity data", ha="center", va="center")
 
-    # Panel 3: Age distribution (all regions)
     ax3 = fig.add_subplot(gs[1, 1])
-    age_df = compute_biomarker_age_dist_from_precomputed(
-        precomputed_biomarkers, age_max
-    )
-    if not age_df.empty:
-        ax3.bar(
-            age_df["age_bin_days"],
-            age_df["count"],
-            color="coral",
-            edgecolor="black",
-            alpha=0.7,
-        )
-        ax3.set_xlabel("Age (days)")
-        ax3.set_ylabel("Count")
-        ax3.set_title(
-            "LOCF Value Age Distribution (model-visible)",
-            fontsize=10,
-            fontweight="semibold",
-        )
-        ax3.tick_params(axis="x", rotation=45)
+    if not sparsity_df.empty and "censored_pct" in sparsity_df.columns:
+        # Plot censored percentage distribution
+        censored_data = sparsity_df.dropna(subset=["censored_pct"])
+        if not censored_data.empty:
+            if "variant" in censored_data.columns:
+                sns = _import_seaborn()
+                if sns is not None:
+                    sns.boxplot(
+                        data=censored_data,
+                        x="variant",
+                        y="censored_pct",
+                        ax=ax3,
+                        color="lightcoral",
+                    )
+                ax3.set_ylim(0, 100)
+                ax3.set_ylabel("Censored (%)")
+                ax3.set_title(
+                    "LD Censoring Distribution (by variant)",
+                    fontsize=10,
+                    fontweight="semibold",
+                )
+                ax3.tick_params(axis="x", rotation=45)
+            else:
+                ax3.hist(
+                    censored_data["censored_pct"],
+                    bins=20,
+                    color="lightcoral",
+                    edgecolor="black",
+                    alpha=0.7,
+                )
+                ax3.set_xlabel("Censored (%)")
+                ax3.set_ylabel("Number of regions")
+                ax3.set_title(
+                    "LD Censoring Distribution",
+                    fontsize=10,
+                    fontweight="semibold",
+                )
     else:
-        ax3.text(0.5, 0.5, "No age data", ha="center", va="center")
+        # Fallback to age distribution if no censor data
+        age_df = compute_biomarker_age_dist_from_precomputed(
+            precomputed_biomarkers, age_max, variant_names=variant_names
+        )
+        if not age_df.empty:
+            if "variant" in age_df.columns:
+                sns = _import_seaborn()
+                if sns is not None:
+                    sns.barplot(
+                        data=age_df,
+                        x="age_bin_days",
+                        y="count",
+                        hue="variant",
+                        ax=ax3,
+                    )
+            else:
+                ax3.bar(
+                    age_df["age_bin_days"],
+                    age_df["count"],
+                    color="coral",
+                    edgecolor="black",
+                    alpha=0.7,
+                )
+            ax3.set_xlabel("Age (days)")
+            ax3.set_ylabel("Count")
+            ax3.set_title(
+                "LOCF Value Age Distribution (all regions)",
+                fontsize=10,
+                fontweight="semibold",
+            )
+            ax3.tick_params(axis="x", rotation=45)
 
     return fig

@@ -16,19 +16,18 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader
 
+from data.preprocess.config import REGION_COORD
 from models.configs import EpiForecasterConfig
 from plotting.input_plots import (
     collect_case_window_samples,
     export_biomarker_sparsity_tables_from_precomputed,
     export_cases_sparsity_tables,
     export_summary_tables,
-    make_biomarker_locf_figure,
     make_biomarker_sparsity_figure_all_from_precomputed,
     make_cases_sparsity_figure_all,
     make_cases_window_figure,
 )
 from utils.logging import setup_logging, suppress_zarr_warnings
-from data.preprocess.config import REGION_COORD
 
 suppress_zarr_warnings()
 logger = logging.getLogger(__name__)
@@ -64,8 +63,9 @@ def generate_input_plots(
     config = EpiForecasterConfig.from_file(config_path)
 
     # Get all node IDs from dataset
-    from data.epi_dataset import EpiDataset
     import xarray as xr
+
+    from data.epi_dataset import EpiDataset
 
     zarr_path = Path(config.data.dataset_path).resolve()
     dataset = xr.open_zarr(zarr_path)
@@ -112,7 +112,6 @@ def generate_input_plots(
             cases_feature_idx=0,
             biomarker_feature_idx=None,
             include_biomarkers=config.model.type.biomarkers,
-            include_biomarkers_locf=config.model.type.biomarkers,
             include_mobility=config.model.type.mobility,
             shuffle=False,
             seed=seed,
@@ -123,21 +122,19 @@ def generate_input_plots(
             cases_feature_idx=0,
             biomarker_feature_idx=None,
             include_biomarkers=config.model.type.biomarkers,
-            include_biomarkers_locf=config.model.type.biomarkers,
             include_mobility=config.model.type.mobility,
             shuffle=True,
             seed=seed,
         )
         samples = shuffled_samples if shuffle else ordered_samples
     elif generate_tables:
-        logger.info(f"Collecting {num_samples} samples (LOCF mode with ribbon)...")
+        logger.info(f"Collecting {num_samples} samples...")
         samples = collect_case_window_samples(
             loader=loader,
             n=num_samples,
             cases_feature_idx=0,
             biomarker_feature_idx=None,
             include_biomarkers=config.model.type.biomarkers and generate_plots,
-            include_biomarkers_locf=config.model.type.biomarkers and generate_plots,
             include_mobility=config.model.type.mobility and generate_plots,
             shuffle=shuffle,
             seed=seed,
@@ -186,18 +183,7 @@ def generate_input_plots(
                 fig_cases_shuffled.savefig(cases_path, dpi=150, bbox_inches="tight")
                 logger.info(f"    Saved: {cases_path}")
 
-        # Figure 2: LOCF biomarkers with ribbons (always use ribbon)
-        if config.model.type.biomarkers:
-            logger.info("  - Creating LOCF biomarker figure with ribbons...")
-            fig_locf = make_biomarker_locf_figure(
-                samples, history_length, age_visualization="ribbon"
-            )
-            if fig_locf is not None:
-                locf_path = output_dir / "biomarker_locf.png"
-                fig_locf.savefig(locf_path, dpi=150, bbox_inches="tight")
-                logger.info(f"    Saved: {locf_path}")
-
-        # Figure 3: Biomarker sparsity analysis (all regions)
+        # Figure 2: Biomarker sparsity analysis (all regions)
         if (
             config.model.type.biomarkers
             and epi_dataset.biomarker_available_mask is not None
@@ -209,6 +195,7 @@ def generate_input_plots(
                 epi_dataset.biomarker_available_mask,
                 region_ids,
                 history_length,
+                variant_names=epi_dataset.biomarker_variants,
             )
             if fig_sparsity is not None:
                 sparsity_path = output_dir / "biomarker_sparsity.png"
@@ -246,6 +233,7 @@ def generate_input_plots(
                 epi_dataset.biomarker_available_mask,
                 region_ids,
                 output_dir,
+                variant_names=epi_dataset.biomarker_variants,
             )
             biomarker_tables, context = biomarker_tables
             exported_tables.update(biomarker_tables)
@@ -280,7 +268,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/train_epifor_mn5_full.yaml",
+        default="configs/train_epifor_full.yaml",
         help="Path to training config YAML",
     )
     parser.add_argument(
