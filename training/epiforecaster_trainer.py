@@ -1094,7 +1094,7 @@ class EpiForecasterTrainer:
         config_path = run_dir / "config.yaml"
 
         with open(config_path, "w") as f:
-            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+            yaml.safe_dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
     def _log_epoch(
         self,

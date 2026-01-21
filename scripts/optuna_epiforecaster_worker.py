@@ -35,11 +35,9 @@ import importlib
 import json
 import logging
 import os
-import signal
 import time
 from pathlib import Path
 from typing import Any
-
 
 import click
 
