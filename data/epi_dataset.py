@@ -13,7 +13,6 @@ from graph.node_encoder import Region2Vec
 from models.configs import EpiForecasterConfig
 
 from constants import (
-    EDAR_BIOMARKER_CHANNEL_SUFFIXES,
     EDAR_BIOMARKER_PREFIX,
     EDAR_BIOMARKER_VARIANTS,
 )
@@ -75,9 +74,11 @@ class EpiDataset(Dataset):
         biomarker_preprocessor: BiomarkerPreprocessor | None = None,
         cases_preprocessor: CasesPreprocessor | None = None,
         mobility_preprocessor: MobilityPreprocessor | None = None,
+        time_range: tuple[int, int] | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
+        self.time_range = time_range
 
         # Load dataset
         self._dataset = xr.open_zarr(self.aligned_data_path)
@@ -151,6 +152,20 @@ class EpiDataset(Dataset):
             f"Mobility preloaded: {self.preloaded_mobility.shape}, "
             f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
         )
+
+        # Cache for full graphs keyed by time step (CPU tensors only)
+        self._full_graph_cache: dict[int, Data] = {}
+
+        # Cache for adjacency matrices keyed by time step (CPU tensors only)
+        self._adjacency_cache: dict[int, torch.Tensor] = {}
+
+        # Cache for global-to-local node index mapping keyed by time step
+        # Each entry is a (N,) tensor with local indices or -1 for non-context nodes
+        self._global_to_local_cache: dict[int, torch.Tensor] = {}
+
+        # Cache for dense k-hop reachability keyed by (time_step, num_hops)
+        # Each entry is a (N, N) boolean tensor where reach[target, node] = True if node is within k hops
+        self._k_hop_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         # Setup biomarker preprocessor
         if biomarker_preprocessor is None:
@@ -280,13 +295,18 @@ class EpiDataset(Dataset):
         Looks for edar_biomarker_{variant} variables where variant is one of
         EDAR_BIOMARKER_VARIANTS (N1, N2, IP4), excluding channel suffixes.
         """
-        expected_names = [f"{EDAR_BIOMARKER_PREFIX}{v}" for v in EDAR_BIOMARKER_VARIANTS]
-        variant_names = [
-            str(name)
-            for name in self.dataset.data_vars
-            if str(name) in expected_names
+        expected_names = [
+            f"{EDAR_BIOMARKER_PREFIX}{v}" for v in EDAR_BIOMARKER_VARIANTS
         ]
-        return sorted(variant_names, key=lambda x: EDAR_BIOMARKER_VARIANTS.index(x.replace(EDAR_BIOMARKER_PREFIX, "")))
+        variant_names = [
+            str(name) for name in self.dataset.data_vars if str(name) in expected_names
+        ]
+        return sorted(
+            variant_names,
+            key=lambda x: EDAR_BIOMARKER_VARIANTS.index(
+                x.replace(EDAR_BIOMARKER_PREFIX, "")
+            ),
+        )
 
     @property
     def dataset(self) -> xr.Dataset:
@@ -452,15 +472,59 @@ class EpiDataset(Dataset):
 
         mob_graphs: list[Data] = []
         for t in range(L):
-            mob_graphs.append(
-                self._dense_graph_to_ego_pyg(
-                    mobility_history[t],
-                    case_history[t],
-                    biomarker_history[t],
-                    target_idx,
-                    time_id=t,
+            global_t = range_start + t
+
+            # Get cached full graph topology for this time step
+            base_graph = self._build_full_graph_topology_at_time(global_t)
+
+            # Build node features for this time step
+            case_t = case_history[t]  # (N, C)
+            bio_t = biomarker_history[t]  # (N, B)
+
+            # Build feature tensor for all nodes in context
+            node_ids = base_graph.node_ids
+            feat = []
+            if self.config.model.type.cases:
+                feat.append(case_t[node_ids])
+            if self.config.model.type.biomarkers:
+                feat.append(bio_t[node_ids])
+            x = torch.cat(feat, dim=-1)  # (num_nodes, feat_dim)
+
+            # Apply k-hop feature masking based on target node
+            if self.config.model.gnn_depth > 0:
+                # Get k-hop neighbors (global indices)
+                k_hop_mask = self._get_k_hop_neighbors_mask(
+                    target_idx, global_t, self.config.model.gnn_depth
                 )
+
+                # Map global mask to local indices
+                local_k_hop_mask = k_hop_mask[node_ids]
+
+                # Zero out features for nodes outside k-hop
+                x_masked = x.clone()
+                x_masked[~local_k_hop_mask] = 0
+            else:
+                # No masking (all nodes contribute)
+                x_masked = x
+                local_k_hop_mask = torch.ones(x.size(0), dtype=torch.bool)
+
+            # Find local index of target node
+            global_to_local = self._get_global_to_local_at_time(global_t)
+            local_target_idx = int(global_to_local[target_idx].item())
+
+            mob_graph = Data(
+                x=x_masked,
+                edge_index=base_graph.edge_index,
+                edge_weight=base_graph.edge_weight,
             )
+            mob_graph.num_nodes = base_graph.num_nodes
+            mob_graph.target_node = torch.tensor([local_target_idx], dtype=torch.long)
+            mob_graph.node_ids = base_graph.node_ids
+            mob_graph.time_id = torch.tensor(
+                [t], dtype=torch.long
+            )  # Relative time in sequence
+
+            mob_graphs.append(mob_graph)
 
         # Slice history for mean and std
         # mean/std are (TotalTime, N) -> need to slice [range_start:range_end] and select target_idx
@@ -513,14 +577,32 @@ class EpiDataset(Dataset):
         }
 
     def _compute_window_starts(self) -> list[int]:
-        """Compute window start indices given history, horizon, and stride."""
+        """Compute window start indices given history, horizon, and stride.
+
+        If time_range is set, only windows fully contained within that range
+        (i.e., start + L + H <= end) are included.
+        """
         L = self.config.model.history_length
         H = self.config.model.forecast_horizon
         T = len(self.dataset[TEMPORAL_COORD].values)
         seg = L + H
         if T < seg:
             return []
-        return list(range(0, T - seg + 1, self.window_stride))
+
+        all_starts = list(range(0, T - seg + 1, self.window_stride))
+
+        # Filter by time_range if specified
+        if self.time_range is not None:
+            start_idx, end_idx = self.time_range
+            # Only include windows where:
+            # - Start is within or after start_idx
+            # - Window fits entirely (start + L + H <= end_idx)
+            valid_starts = [
+                ws for ws in all_starts if ws >= start_idx and (ws + L + H) <= end_idx
+            ]
+            return valid_starts
+
+        return all_starts
 
     def _compute_valid_window_starts(self) -> dict[int, list[int]]:
         """Compute valid window starts per target node using missingness permit.
@@ -613,85 +695,137 @@ class EpiDataset(Dataset):
                     index_lookup[(target_idx, start)] = idx
         return index_map, index_lookup
 
-    def _dense_graph_to_ego_pyg(
+    def _get_adjacency_at_time(self, time_step: int) -> torch.Tensor:
+        if time_step in self._adjacency_cache:
+            return self._adjacency_cache[time_step]
+
+        mobility_matrix = self.preloaded_mobility[time_step]
+        adjacency = mobility_matrix > 0
+        if self.context_mask is not None:
+            mask = self.context_mask
+            adjacency = adjacency & mask[:, None] & mask[None, :]
+
+        self._adjacency_cache[time_step] = adjacency
+        return adjacency
+
+    def _get_global_to_local_at_time(self, time_step: int) -> torch.Tensor:
+        if time_step in self._global_to_local_cache:
+            return self._global_to_local_cache[time_step]
+
+        if self.context_mask is not None:
+            node_ids = torch.where(self.context_mask)[0]
+        else:
+            node_ids = torch.arange(self.num_nodes)
+
+        global_to_local = torch.full(
+            (self.num_nodes,), -1, dtype=torch.long, device=node_ids.device
+        )
+        global_to_local[node_ids] = torch.arange(
+            node_ids.numel(), device=node_ids.device
+        )
+        self._global_to_local_cache[time_step] = global_to_local
+        return global_to_local
+
+    def _get_k_hop_neighbors_mask(
         self,
-        inflow_t: torch.Tensor,
-        case_t: torch.Tensor,
-        bio_t: torch.Tensor,
-        dst_idx: int,
-        time_id: int | None = None,
-    ) -> Data:
-        """Convert a dense mobility slice into a PyG ego-graph for one target node.
+        target_idx: int,
+        time_step: int,
+        num_hops: int,
+    ) -> torch.Tensor:
+        """Get k-hop neighbors of target_idx using cached dense reachability.
 
-        Nodes include the target and all origins with non-zero incoming flow. Edges
-        are directed origin -> target and store the raw flow weight.
-
-        Vectorized Logic:
-            We construct node_ids as [neighbor_1, ..., neighbor_k, target].
-            We then blindly create edges 0 -> k, 1 -> k, etc.
-            If a self-loop exists (neighbor_i == target), we generate an edge i -> k.
-            Since x[i] and x[k] are identical feature vectors (derived from the same region),
-            the Message Passing Neural Network (MPNN) receives the exact same information
-            as a k -> k self-loop.
+        For each (time_step, num_hops) pair, compute a dense (N, N) reachability
+        matrix where reach[target, node] is True if node is within num_hops of target.
 
         Args:
-            inflow_t: Vector (N,) of inflow values to dst_idx
-            case_t: Vector (N, C) of case features
-            bio_t: Vector (N, B) of biomarker features
-            dst_idx: Index of the target node
-            time_id: Optional time step index
+            target_idx: Target node index
+            time_step: Time step index
+            num_hops: Number of hops to expand (gnn_depth)
+
+        Returns:
+            Boolean mask (N,) where True = within k-hops of target (excludes target itself)
         """
+        cache_key = (time_step, num_hops)
+        if cache_key not in self._k_hop_cache:
+            adjacency = self._get_adjacency_at_time(time_step)
+            reach = adjacency.clone()
+
+            if num_hops > 1:
+                adj_f = adjacency.to(torch.float32)
+                reach_f = reach.to(torch.float32)
+                for _ in range(1, num_hops):
+                    new_reach = (reach_f @ adj_f) > 0
+                    reach = reach | new_reach
+                    reach_f = reach.to(torch.float32)
+
+            # Exclude self
+            reach.fill_diagonal_(False)
+            self._k_hop_cache[cache_key] = reach
+
+        reach = self._k_hop_cache[cache_key]
+        return reach[target_idx]
+
+    def _build_full_graph_topology_at_time(
+        self,
+        time_step: int,
+    ) -> Data:
+        """Build full PyG graph topology for a given time step (cached).
+
+        The graph includes all context nodes with full topology.
+        Only edge structure is cached - features are added per-sample in __getitem__
+        since they require k-hop masking per target node.
+
+        Args:
+            time_step: Global time index
+
+        Returns:
+            PyG Data object with full graph topology (edge_index, edge_weight, node_ids)
+        """
+        # Check cache first
+        if time_step in self._full_graph_cache:
+            return self._full_graph_cache[time_step]
+
+        # Warm adjacency cache for this time step
+        _ = self._get_adjacency_at_time(time_step)
+
+        # Get full mobility matrix at this time step
+        mobility_matrix = self.preloaded_mobility[time_step]  # (N, N)
+
+        # Apply context mask if set
         if self.context_mask is not None:
-            inflow_t = inflow_t.clone()
-            inflow_t[~self.context_mask] = 0
+            mobility_matrix = mobility_matrix.clone()
+            mobility_matrix[~self.context_mask] = 0
+            mobility_matrix[:, ~self.context_mask] = 0
 
-        # Now inflow_t is already the inflow vector (N,)
-        origins = inflow_t.nonzero(as_tuple=False).flatten()
+        # Find all non-zero edges
+        edge_mask = mobility_matrix > 0
+        origins, destinations = torch.where(edge_mask)
+        edge_weight = mobility_matrix[origins, destinations]
 
-        # Limit to max_neighbors by selecting top-k by inflow
-        max_neighbors = self.config.model.max_neighbors
-        if origins.numel() > max_neighbors:
-            # Get top-k neighbors by inflow value
-            top_values = inflow_t[origins]
-            top_k_indices = torch.topk(top_values, k=max_neighbors).indices
-            origins = origins[top_k_indices]
+        # Map global to local node indices
+        node_mask = (
+            self.context_mask
+            if self.context_mask is not None
+            else torch.ones(self.num_nodes, dtype=torch.bool)
+        )
+        node_ids = torch.where(node_mask)[0]
+        global_to_local = {int(idx): i for i, idx in enumerate(node_ids.tolist())}
 
-        # Construct node_ids: [neighbor_1, ..., neighbor_k, target_node]
-        # Note: 'origins' might contain dst_idx if self-loop exists.
-        # We append dst_idx at the end regardless, effectively treating it as a
-        # distinct node in the graph structure if it also appears in origins.
-        # This simplifies edge construction to "all nodes in list -> last node".
-        target_node_tensor = torch.tensor([dst_idx], dtype=torch.long)
-        node_ids = torch.cat([origins, target_node_tensor], dim=0)
+        local_origins = torch.tensor(
+            [global_to_local[int(o)] for o in origins], dtype=torch.long
+        )
+        local_destinations = torch.tensor(
+            [global_to_local[int(d)] for d in destinations], dtype=torch.long
+        )
+        edge_index = torch.stack([local_origins, local_destinations], dim=0)
 
-        num_neighbors = origins.numel()
-        # Edge index: all neighbor indices (0 to num_neighbors-1) -> target index (num_neighbors)
-        # Shape (2, num_edges)
-        if num_neighbors > 0:
-            sources = torch.arange(num_neighbors, dtype=torch.long)
-            targets = torch.full((num_neighbors,), num_neighbors, dtype=torch.long)
-            edge_index = torch.stack([sources, targets], dim=0)
-            edge_weight = inflow_t[origins]
-        else:
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weight = torch.empty((0,), dtype=inflow_t.dtype)
-
-        # TODO: find a better way to do this. the feature concatenation logic is scattered
-        # through the model.
-        feat = []
-        if self.config.model.type.cases:
-            feat.append(case_t[node_ids])
-        if self.config.model.type.biomarkers:
-            feat.append(bio_t[node_ids])
-
-        x = torch.cat(feat, dim=-1)
-
-        g = Data(x=x, edge_index=edge_index, edge_weight=edge_weight)
+        # Create topology-only graph (no features yet)
+        g = Data(edge_index=edge_index, edge_weight=edge_weight)
         g.num_nodes = node_ids.numel()
-        # The target node is always the last one in our construction
-        g.target_node = torch.tensor([num_neighbors], dtype=torch.long)
-        if time_id is not None:
-            g.time_id = torch.tensor([time_id], dtype=torch.long)
+        g.node_ids = node_ids  # Store global node ids for mapping
+
+        # Cache and return
+        self._full_graph_cache[time_step] = g
         return g
 
     def __repr__(self) -> str:
@@ -738,3 +872,119 @@ class EpiDataset(Dataset):
     def load_canonical_dataset(cls, aligned_data_path: Path) -> xr.Dataset:
         "Load the canonical dataset from the aligned data path."
         return xr.open_zarr(aligned_data_path)
+
+    @classmethod
+    def create_temporal_splits(
+        cls,
+        config: EpiForecasterConfig,
+        train_end_date: str,
+        val_end_date: str,
+        test_end_date: str | None = None,
+    ) -> tuple["EpiDataset", "EpiDataset", "EpiDataset"]:
+        """Create train/val/test datasets with the same nodes but different time ranges.
+
+        All splits use all available nodes as targets, but data is divided by date ranges.
+        Preprocessors are fitted on the train data only and shared across splits.
+
+        Args:
+            config: EpiForecasterConfig with dataset path and model parameters.
+            train_end_date: Train split end date (YYYY-MM-DD). Exclusive.
+            val_end_date: Validation split end date (YYYY-MM-DD). Exclusive.
+            test_end_date: Optional test split end date. If None, uses end of dataset.
+
+        Returns:
+            Tuple of (train_dataset, val_dataset, test_dataset).
+
+        Raises:
+            ValueError: If temporal boundaries are invalid or out of range.
+        """
+        from utils.temporal import (
+            format_date_range,
+            get_temporal_boundaries,
+            validate_temporal_range,
+        )
+
+        # Load canonical dataset to get node list and temporal boundaries
+        aligned_dataset = cls.load_canonical_dataset(Path(config.data.dataset_path))
+        num_nodes = aligned_dataset[REGION_COORD].size
+        all_nodes = list(range(num_nodes))
+
+        # Check for valid_targets filter
+        if config.data.use_valid_targets and "valid_targets" in aligned_dataset:
+            valid_mask = aligned_dataset.valid_targets.values.astype(bool)
+            all_nodes = [i for i in all_nodes if valid_mask[i]]
+            logger.info(
+                f"Using valid_targets filter: {len(all_nodes)}/{num_nodes} training regions"
+            )
+
+        # Get temporal boundaries
+        train_start, train_end, val_end, test_end = get_temporal_boundaries(
+            aligned_dataset,
+            train_end_date=train_end_date,
+            val_end_date=val_end_date,
+            test_end_date=test_end_date,
+        )
+
+        L = config.model.history_length
+        H = config.model.forecast_horizon
+        total_time_steps = len(aligned_dataset[TEMPORAL_COORD])
+
+        # Validate each temporal range
+        for name, time_range in [
+            ("train", (train_start, train_end)),
+            ("val", (train_end, val_end)),
+            ("test", (val_end, test_end)),
+        ]:
+            try:
+                validate_temporal_range(time_range, L, H, total_time_steps)
+            except ValueError as e:
+                raise ValueError(
+                    f"{name.upper()} split temporal range invalid: {e}"
+                ) from e
+
+        # Log date ranges
+        logger.info("Temporal split boundaries:")
+        logger.info(
+            f"  TRAIN: {format_date_range(aligned_dataset, (train_start, train_end))}"
+        )
+        logger.info(
+            f"  VAL:   {format_date_range(aligned_dataset, (train_end, val_end))}"
+        )
+        logger.info(
+            f"  TEST:  {format_date_range(aligned_dataset, (val_end, test_end))}"
+        )
+
+        # Create train dataset with time range - preprocessors fitted internally
+        train_dataset = cls(
+            config=config,
+            target_nodes=all_nodes,
+            context_nodes=all_nodes,
+            biomarker_preprocessor=None,
+            mobility_preprocessor=None,
+            time_range=(train_start, train_end),
+        )
+
+        # Reuse train dataset's fitted preprocessors for val/test
+        fitted_bio_preprocessor = train_dataset.biomarker_preprocessor
+        fitted_mobility_preprocessor = train_dataset.mobility_preprocessor
+
+        # Create val and test datasets with their time ranges
+        val_dataset = cls(
+            config=config,
+            target_nodes=all_nodes,
+            context_nodes=all_nodes,
+            biomarker_preprocessor=fitted_bio_preprocessor,
+            mobility_preprocessor=fitted_mobility_preprocessor,
+            time_range=(train_end, val_end),
+        )
+
+        test_dataset = cls(
+            config=config,
+            target_nodes=all_nodes,
+            context_nodes=all_nodes,
+            biomarker_preprocessor=fitted_bio_preprocessor,
+            mobility_preprocessor=fitted_mobility_preprocessor,
+            time_range=(val_end, test_end),
+        )
+
+        return train_dataset, val_dataset, test_dataset

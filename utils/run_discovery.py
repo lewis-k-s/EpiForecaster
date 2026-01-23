@@ -51,7 +51,9 @@ def discover_runs(
 
     for exp_dir in experiment_dirs:
         exp_name = exp_dir.name
-        run_dirs = [d for d in exp_dir.iterdir() if d.is_dir() and d.name.startswith("run_")]
+        run_dirs = [
+            d for d in exp_dir.iterdir() if d.is_dir() and d.name.startswith("run_")
+        ]
 
         for run_dir in run_dirs:
             run_id = run_dir.name
@@ -80,6 +82,42 @@ def discover_runs(
     return runs
 
 
+def resolve_trace_paths(
+    *,
+    experiment_name: str,
+    run_id: str,
+    outputs_root: Path = DEFAULT_OUTPUTS_ROOT,
+) -> list[Path]:
+    """Resolve profiler trace paths from experiment/run.
+
+    Args:
+        experiment_name: Name of the experiment
+        run_id: Run ID (e.g., 'run_1767364191170741000')
+        outputs_root: Root outputs directory
+
+    Returns:
+        List of trace JSON paths.
+
+    Raises:
+        FileNotFoundError: If run or traces do not exist
+    """
+    run_dir = outputs_root / "training" / experiment_name / run_id
+    if not run_dir.is_dir():
+        available = list_available_runs(
+            outputs_root=outputs_root, experiment_name=experiment_name
+        )
+        raise FileNotFoundError(f"Run directory not found: {run_dir}\n{available}")
+
+    trace_paths = list(run_dir.glob("**/*.pt.trace.json"))
+    if not trace_paths:
+        trace_paths = list(run_dir.glob("**/*trace*.json"))
+
+    if not trace_paths:
+        raise FileNotFoundError(f"No trace JSON files found under {run_dir}")
+
+    return sorted(trace_paths)
+
+
 def resolve_checkpoint_path(
     *,
     experiment_name: str,
@@ -100,7 +138,12 @@ def resolve_checkpoint_path(
         FileNotFoundError: If checkpoint doesn't exist
     """
     checkpoint_path = (
-        outputs_root / "training" / experiment_name / run_id / "checkpoints" / "best_model.pt"
+        outputs_root
+        / "training"
+        / experiment_name
+        / run_id
+        / "checkpoints"
+        / "best_model.pt"
     )
     if not checkpoint_path.is_file():
         raise FileNotFoundError(
@@ -275,7 +318,9 @@ def extract_run_from_checkpoint_path(
 
     # Pattern 1: outputs_root/training/{experiment}/{run_id}/checkpoints/best_model.pt
     # Pattern 2: outputs_root/optuna/{experiment}/{run_id}/checkpoints/best_model.pt
-    training_pattern = rf"{re.escape(outputs_str)}/(training|optuna)/([^/]+)/([^/]+)/checkpoints/"
+    training_pattern = (
+        rf"{re.escape(outputs_str)}/(training|optuna)/([^/]+)/([^/]+)/checkpoints/"
+    )
     match = re.search(training_pattern, checkpoint_str)
 
     if not match:

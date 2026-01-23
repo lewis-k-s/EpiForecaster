@@ -284,12 +284,18 @@ def plot_group():
     "--log-dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Optional TensorBoard log dir for eval metrics.",
+    help="Optional TensorBoard log directory for eval metrics.",
 )
 @click.option(
     "--override",
     multiple=True,
-    help="Override config values using dotted keys (e.g., training.val_workers=4).",
+    help="Override config values (e.g., training.device=cpu, training.val_workers=4)",
+)
+@click.option(
+    "--eval-batch-size",
+    type=int,
+    default=None,
+    help="Override evaluation batch size (useful for memory-heavy mobility graphs).",
 )
 def eval_epiforecaster(
     experiment: str | None,
@@ -300,6 +306,7 @@ def eval_epiforecaster(
     output_csv: Path | None,
     log_dir: Path | None,
     override: tuple[str, ...],
+    eval_batch_size: int | None,
 ):
     """Evaluate an EpiForecaster checkpoint and generate quartile-based forecast plots.
 
@@ -371,12 +378,12 @@ def eval_epiforecaster(
                     if output_csv is None:
                         output_csv = eval_dir / f"{split}_node_metrics.csv"
                 else:
-                    click.echo("Skipping persistence. Use --output to specify save location.")
+                    click.echo(
+                        "Skipping persistence. Use --output to specify save location."
+                    )
             else:
                 # Could not extract - default to current directory
-                click.echo(
-                    "Could not auto-detect experiment/run from checkpoint path."
-                )
+                click.echo("Could not auto-detect experiment/run from checkpoint path.")
                 if output is None:
                     output = Path(f"{split}_forecasts.png")
                 if output_csv is None:
@@ -403,6 +410,7 @@ def eval_epiforecaster(
             log_dir=log_dir,
             overrides=list(override) if override else None,
             output_csv_path=output_csv,
+            batch_size=eval_batch_size,
         )
 
         # Get samples_per_group from config (default 3)
