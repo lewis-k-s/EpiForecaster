@@ -62,39 +62,47 @@ class EpiForecasterTrainer:
         self.model_id = self._resolve_model_id()
         self.resume = self.config.training.resume
 
-        train_nodes, val_nodes, test_nodes = self._split_dataset()
-        train_nodes = list(train_nodes)
-        val_nodes = list(val_nodes)
-        test_nodes = list(test_nodes)
+        # Branch on split strategy
+        if config.training.split_strategy == "time":
+            # Temporal splits: all nodes, different time ranges
+            self.train_dataset, self.val_dataset, self.test_dataset = (
+                self._split_dataset_temporal()
+            )
+        else:
+            # Node-based splits: different nodes, all time windows
+            train_nodes, val_nodes, test_nodes = self._split_dataset_by_nodes()
+            train_nodes = list(train_nodes)
+            val_nodes = list(val_nodes)
+            test_nodes = list(test_nodes)
 
-        # Build train dataset with None so it fits scaler internally on train regions
-        self.train_dataset = EpiDataset(
-            config=self.config,
-            target_nodes=train_nodes,
-            context_nodes=train_nodes,
-            biomarker_preprocessor=None,
-            mobility_preprocessor=None,
-        )
+            # Build train dataset with None so it fits scaler internally on train regions
+            self.train_dataset = EpiDataset(
+                config=self.config,
+                target_nodes=train_nodes,
+                context_nodes=train_nodes,
+                biomarker_preprocessor=None,
+                mobility_preprocessor=None,
+            )
 
-        # Reuse train dataset's fitted preprocessors for val/test
-        fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
-        fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
+            # Reuse train dataset's fitted preprocessors for val/test
+            fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
+            fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
 
-        self.val_dataset = EpiDataset(
-            config=self.config,
-            target_nodes=val_nodes,
-            context_nodes=train_nodes + val_nodes,
-            biomarker_preprocessor=fitted_bio_preprocessor,
-            mobility_preprocessor=fitted_mobility_preprocessor,
-        )
+            self.val_dataset = EpiDataset(
+                config=self.config,
+                target_nodes=val_nodes,
+                context_nodes=train_nodes + val_nodes,
+                biomarker_preprocessor=fitted_bio_preprocessor,
+                mobility_preprocessor=fitted_mobility_preprocessor,
+            )
 
-        self.test_dataset = EpiDataset(
-            config=self.config,
-            target_nodes=test_nodes,
-            context_nodes=train_nodes + val_nodes,
-            biomarker_preprocessor=fitted_bio_preprocessor,
-            mobility_preprocessor=fitted_mobility_preprocessor,
-        )
+            self.test_dataset = EpiDataset(
+                config=self.config,
+                target_nodes=test_nodes,
+                context_nodes=train_nodes + val_nodes,
+                biomarker_preprocessor=fitted_bio_preprocessor,
+                mobility_preprocessor=fitted_mobility_preprocessor,
+            )
 
         # Optional static region embeddings from dataset
         self.region_embeddings = None
@@ -173,13 +181,13 @@ class EpiForecasterTrainer:
         self._status(f"  Dataset: {config.data.dataset_path}")
         self._status(f"  Device: {self.device}")
         self._status(
-            f"  Train samples: {len(self.train_dataset)} ({len(train_nodes)} nodes)"
+            f"  Train samples: {len(self.train_dataset)} ({len(self.train_dataset.target_nodes)} nodes)"
         )
         self._status(
-            f"  Val samples:   {len(self.val_dataset)} ({len(val_nodes)} nodes)"
+            f"  Val samples:   {len(self.val_dataset)} ({len(self.val_dataset.target_nodes)} nodes)"
         )
         self._status(
-            f"  Test samples:  {len(self.test_dataset)} ({len(test_nodes)} nodes)"
+            f"  Test samples:  {len(self.test_dataset)} ({len(self.test_dataset.target_nodes)} nodes)"
         )
         self._status(f"  Cases dim: {self.train_dataset.cases_output_dim}")
         self._status(f"  Biomarkers dim: {self.train_dataset.biomarkers_output_dim}")
@@ -211,11 +219,12 @@ class EpiForecasterTrainer:
             # Ignore errors during garbage collection
             pass
 
-    def _split_dataset(self) -> tuple[list[int], list[int], list[int]]:
+    def _split_dataset_by_nodes(self) -> tuple[list[int], list[int], list[int]]:
         """
-        Split dataset into train, val, and test sets.
-        We use node holdouts for splitting so that we can evaluate
-        ability of model to generalize to new regions.
+        Split dataset into train, val, and test sets using node holdouts.
+
+        This is the default split strategy - we use different regions for train/val/test
+        to evaluate ability of model to generalize to new regions.
         """
         train_split = (
             1 - self.config.training.val_split - self.config.training.test_split
@@ -255,6 +264,27 @@ class EpiForecasterTrainer:
         )
 
         return list(train_nodes), list(val_nodes), list(test_nodes)
+
+    def _split_dataset_temporal(
+        self,
+    ) -> tuple[EpiDataset, EpiDataset, EpiDataset]:
+        """
+        Split dataset into train, val, and test sets using temporal boundaries.
+
+        All nodes are used as targets in each split, but data is divided by date ranges.
+        This returns pre-created datasets instead of node lists.
+        """
+        # TrainingParams.__post_init__ guarantees these are not None when split_strategy == "time"
+        train_end: str = self.config.training.train_end_date or ""
+        val_end: str = self.config.training.val_end_date or ""
+        test_end: str | None = self.config.training.test_end_date
+
+        return EpiDataset.create_temporal_splits(
+            config=self.config,
+            train_end_date=train_end,
+            val_end_date=val_end,
+            test_end_date=test_end,
+        )
 
     def _setup_device(self) -> torch.device:
         """Setup computation device with MPS support and validation."""
@@ -1138,7 +1168,7 @@ class EpiForecasterTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
             "best_val_loss": self.best_val_loss,
-            "config": self.config,
+            "config": self.config.to_dict(),
             "training_history": self.training_history,
         }
 

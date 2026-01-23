@@ -8,9 +8,10 @@ GNN_TYPES = ["gcn", "gat"]
 FORECASTER_HEAD_TYPES = ["transformer"]
 
 
+# Kept for backwards compatibility with old checkpoints - DO NOT USE
 @dataclass
 class SmoothingConfig:
-    """Temporal smoothing configuration for case data."""
+    """Deprecated: Unused smoothing config for backwards compatibility only."""
 
     enabled: bool = False
     window: int = 5
@@ -72,8 +73,6 @@ class DataConfig:
     missing_permit: int = 0
     # Dataset sample ordering: "node" (node-major) or "time" (time-major)
     sample_ordering: str = "node"
-    # Temporal smoothing configuration for case data
-    smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
     # Log transformation for cases and biomarkers
     log_scale: bool = False
     # Mobility preprocessing configuration
@@ -82,9 +81,6 @@ class DataConfig:
     mobility_scale_epsilon: float = 1e-6
 
     def __post_init__(self) -> None:
-        if isinstance(self.smoothing, (dict, DictConfig)):
-            self.smoothing = SmoothingConfig(**self.smoothing)  # type: ignore[arg-type]
-
         if self.window_stride <= 0:
             raise ValueError("window_stride must be positive")
 
@@ -118,12 +114,20 @@ class ModelConfig:
     forecast_horizon: int
 
     # -- graph params --#
+    # DEPRECATED: Now uses full graphs with k-hop feature masking
+    # max_neighbors is kept for config compatibility but not used
+    # Neighborhood size is determined by gnn_depth
     max_neighbors: int
 
     # -- dimensionality --#
     # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
     biomarkers_dim: int = 13
     cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
+    # GNN depth determines message passing depth AND k-hop neighborhood size
+    # - gnn_depth=0: No masking (all nodes contribute)
+    # - gnn_depth=1: 1-hop neighbors (direct neighbors only)
+    # - gnn_depth=2: 2-hop neighbors (neighbors of neighbors)
+    # Full graphs are always used; k-hop is applied via feature masking
     gnn_depth: int = 2
     gnn_hidden_dim: int = 32
 
@@ -181,6 +185,12 @@ class TrainingParams:
     nan_loss_patience: int | None = None
     val_split: float = 0.2
     test_split: float = 0.1
+    # Split strategy: "node" (default, region holdouts) or "time" (temporal splits)
+    split_strategy: str = "node"
+    # Temporal split boundaries (YYYY-MM-DD format) when split_strategy="time"
+    train_end_date: str | None = None
+    val_end_date: str | None = None
+    test_end_date: str | None = None
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 0
@@ -204,6 +214,51 @@ class TrainingParams:
             raise ValueError(
                 "model_id must be provided when resume is True. If you are not resuming, leave model_id empty."
             )
+
+        # Validate split_strategy
+        valid_strategies = {"node", "time"}
+        if self.split_strategy not in valid_strategies:
+            raise ValueError(
+                f"Invalid split_strategy: {self.split_strategy}. "
+                f"Valid options: {sorted(valid_strategies)}"
+            )
+
+        # Validate temporal split requirements
+        if self.split_strategy == "time":
+            import logging
+
+            logger = logging.getLogger(__name__)
+            missing_dates = []
+            if self.train_end_date is None:
+                missing_dates.append("train_end_date")
+            if self.val_end_date is None:
+                missing_dates.append("val_end_date")
+
+            if missing_dates:
+                raise ValueError(
+                    f"When split_strategy='time', the following dates are required: {', '.join(missing_dates)}"
+                )
+
+            # Validate date format (YYYY-MM-DD)
+            import re
+
+            date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+            for date_name, date_val in [
+                ("train_end_date", self.train_end_date),
+                ("val_end_date", self.val_end_date),
+                ("test_end_date", self.test_end_date),
+            ]:
+                if date_val is not None and not date_pattern.match(date_val):
+                    raise ValueError(
+                        f"{date_name} must be in YYYY-MM-DD format, got: {date_val}"
+                    )
+
+            # Warn that val_split/test_split are ignored
+            if self.val_split != 0.2 or self.test_split != 0.1:
+                logger.warning(
+                    "split_strategy='time': val_split and test_split are ignored; "
+                    "using train_end_date, val_end_date, test_end_date instead"
+                )
 
 
 @dataclass
@@ -298,7 +353,7 @@ class EpiForecasterConfig:
         Example:
             >>> cfg = EpiForecasterConfig.load(
             ...     "configs/train_epifor_full.yaml",
-            ...     overrides=["training.learning_rate=0.001", "data.smoothing.window=7"],
+            ...     overrides=["training.learning_rate=0.001", "data.log_scale=true"],
             ...     strict=True,
             ... )
         """
@@ -341,3 +396,24 @@ class EpiForecasterConfig:
     def to_dict(self) -> dict:
         """Serialize configuration to a plain dictionary for YAML export."""
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, config_dict: dict) -> "EpiForecasterConfig":
+        """Reconstruct config from plain dict (e.g., loaded from checkpoint).
+
+        This is the inverse of :meth:`to_dict` and is used when loading configs
+        from checkpoints where they are stored as dictionaries instead of pickled
+        objects. This makes checkpoints robust to config class changes.
+
+        Args:
+            config_dict: Plain dictionary with keys 'model', 'data', 'training', 'output'.
+
+        Returns:
+            Reconstructed EpiForecasterConfig instance.
+        """
+        return cls(
+            model=ModelConfig(**config_dict["model"]),
+            data=DataConfig(**config_dict["data"]),
+            training=TrainingParams(**config_dict["training"]),
+            output=OutputConfig(**config_dict["output"]),
+        )

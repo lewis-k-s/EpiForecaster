@@ -138,13 +138,20 @@ def load_model_from_checkpoint(
             f"This checkpoint may be from an incompatible version or corrupted."
         )
 
-    config = checkpoint["config"]
+    config_raw = checkpoint["config"]
 
-    # Validate config type
-    if not isinstance(config, EpiForecasterConfig):
+    # Handle backwards compatibility: old checkpoints have pickled EpiForecasterConfig,
+    # new checkpoints have plain dicts (robust to config class changes)
+    if isinstance(config_raw, dict):
+        # New format: plain dict (YAML-compatible)
+        config = EpiForecasterConfig.from_dict(config_raw)
+    elif isinstance(config_raw, EpiForecasterConfig):
+        # Old format: pickled EpiForecasterConfig (for backwards compatibility)
+        config = config_raw
+    else:
         raise ValueError(
-            f"Checkpoint config has invalid type: {type(config).__name__}. "
-            f"Expected EpiForecasterConfig. "
+            f"Checkpoint config has invalid type: {type(config_raw).__name__}. "
+            f"Expected EpiForecasterConfig or dict. "
             f"Please check that the checkpoint was created with a compatible version."
         )
 
@@ -283,6 +290,15 @@ def select_nodes_by_loss(
     if rng is None:
         rng = _GLOBAL_RNG
 
+    if not node_mae:
+        logger.warning("[eval] No node MAE values available for selection")
+        return {
+            "Q1 (Worst)": [],
+            "Q2 (Poor)": [],
+            "Q3 (Average)": [],
+            "Q4 (Best)": [],
+        }
+
     if strategy == "random":
         all_nodes = list(node_mae.keys())
         k = min(k, len(all_nodes))
@@ -403,6 +419,7 @@ def evaluate_checkpoint_topk_forecasts(
     output_path: Path | None = None,
     log_dir: Path | None = None,
     eval_csv_path: Path | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """
     End-to-end: load checkpoint, compute top-k nodes, collect series, and (optionally) save figure.
@@ -422,7 +439,7 @@ def evaluate_checkpoint_topk_forecasts(
         f"[eval] Building {split} loader from dataset: {config.data.dataset_path}"
     )
     loader, region_embeddings = build_loader_from_config(
-        config, split=split, device=device
+        config, split=split, device=device, batch_size=batch_size
     )
     logger.info(f"[eval] {split} samples: {len(loader.dataset)}")
     logger.info(f"[eval] Scanning for top-k nodes by MAE (k={k})...")
@@ -567,12 +584,47 @@ def evaluate_loader(
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
-                predictions, targets, target_mean, target_scale = _forward_batch(
-                    model=model,
-                    batch_data=batch_data,
-                    device=device,
-                    region_embeddings=region_embeddings,
-                )
+                try:
+                    predictions, targets, target_mean, target_scale = _forward_batch(
+                        model=model,
+                        batch_data=batch_data,
+                        device=device,
+                        region_embeddings=region_embeddings,
+                    )
+                except Exception as exc:  # pragma: no cover - debug diagnostics
+                    logger.exception(
+                        "%s evaluation failed on batch %d", split_name, batch_idx
+                    )
+                    for key, value in batch_data.items():
+                        if isinstance(value, torch.Tensor):
+                            logger.error(
+                                "Batch %d tensor %s shape=%s dtype=%s device=%s",
+                                batch_idx,
+                                key,
+                                tuple(value.shape),
+                                value.dtype,
+                                value.device,
+                            )
+                        elif (
+                            isinstance(value, list)
+                            and value
+                            and hasattr(value[0], "__class__")
+                        ):
+                            logger.error(
+                                "Batch %d list %s length=%d item_type=%s",
+                                batch_idx,
+                                key,
+                                len(value),
+                                type(value[0]).__name__,
+                            )
+                        else:
+                            logger.error(
+                                "Batch %d value %s type=%s",
+                                batch_idx,
+                                key,
+                                type(value).__name__,
+                            )
+                    raise
 
                 loss = criterion(predictions, targets, target_mean, target_scale)
                 total_loss += loss.detach()
@@ -803,6 +855,7 @@ def eval_checkpoint(
     log_dir: Path | None = None,
     overrides: list[str] | None = None,
     output_csv_path: Path | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """
     Evaluate checkpoint - pure evaluation, no selection or plotting.
@@ -837,7 +890,7 @@ def eval_checkpoint(
         f"[eval] Building {split} loader from dataset: {config.data.dataset_path}"
     )
     loader, region_embeddings = build_loader_from_config(
-        config, split=split, device=device
+        config, split=split, device=device, batch_size=batch_size
     )
     logger.info(f"[eval] {split} samples: {len(loader.dataset)}")
 
@@ -893,6 +946,7 @@ def plot_forecasts_from_csv(
     window: str = "last",
     device: str = "auto",
     output_path: Path | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     """
     Load evaluation CSV, sample nodes from quartiles, and generate forecast plots.
@@ -981,7 +1035,7 @@ def plot_forecasts_from_csv(
     )
 
     loader, _region_embeddings = build_loader_from_config(
-        config, split="val", device=device
+        config, split="val", device=device, batch_size=batch_size
     )
     logger.info(
         f"[plot] Collecting forecast samples for {len(selected_nodes)} nodes..."
