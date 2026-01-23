@@ -584,47 +584,12 @@ def evaluate_loader(
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
-                try:
-                    predictions, targets, target_mean, target_scale = _forward_batch(
-                        model=model,
-                        batch_data=batch_data,
-                        device=device,
-                        region_embeddings=region_embeddings,
-                    )
-                except Exception as exc:  # pragma: no cover - debug diagnostics
-                    logger.exception(
-                        "%s evaluation failed on batch %d", split_name, batch_idx
-                    )
-                    for key, value in batch_data.items():
-                        if isinstance(value, torch.Tensor):
-                            logger.error(
-                                "Batch %d tensor %s shape=%s dtype=%s device=%s",
-                                batch_idx,
-                                key,
-                                tuple(value.shape),
-                                value.dtype,
-                                value.device,
-                            )
-                        elif (
-                            isinstance(value, list)
-                            and value
-                            and hasattr(value[0], "__class__")
-                        ):
-                            logger.error(
-                                "Batch %d list %s length=%d item_type=%s",
-                                batch_idx,
-                                key,
-                                len(value),
-                                type(value[0]).__name__,
-                            )
-                        else:
-                            logger.error(
-                                "Batch %d value %s type=%s",
-                                batch_idx,
-                                key,
-                                type(value).__name__,
-                            )
-                    raise
+                predictions, targets, target_mean, target_scale = _forward_batch(
+                    model=model,
+                    batch_data=batch_data,
+                    device=device,
+                    region_embeddings=region_embeddings,
+                )
 
                 loss = criterion(predictions, targets, target_mean, target_scale)
                 total_loss += loss.detach()

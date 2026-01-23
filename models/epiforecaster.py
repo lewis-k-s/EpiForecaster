@@ -248,32 +248,6 @@ class EpiForecaster(nn.Module):
 
         mob_batch = mob_batch.to(self.device)  # type: ignore[attr-defined]
 
-        if not getattr(self, "_logged_mob_batch", False):
-            edge_index = mob_batch.edge_index  # type: ignore[attr-defined]
-            edge_weight = getattr(mob_batch, "edge_weight", None)
-            num_nodes = mob_batch.num_nodes  # type: ignore[attr-defined]
-            max_edge = int(edge_index.max().item()) if edge_index.numel() > 0 else -1
-            min_edge = int(edge_index.min().item()) if edge_index.numel() > 0 else -1
-            logger.info(
-                "MobBatch debug: x=%s edge_index=%s edge_weight=%s num_nodes=%s max_edge=%s min_edge=%s",
-                tuple(mob_batch.x.shape),  # type: ignore[attr-defined]
-                tuple(edge_index.shape),
-                None if edge_weight is None else tuple(edge_weight.shape),
-                num_nodes,
-                max_edge,
-                min_edge,
-            )
-            ptr = mob_batch.ptr  # type: ignore[attr-defined]
-            logger.info(
-                "MobBatch debug: ptr_len=%s graphs=%s batch_vec=%s",
-                ptr.numel(),
-                ptr.numel() - 1,
-                None
-                if not hasattr(mob_batch, "batch")
-                else int(getattr(mob_batch, "batch").max().item()),
-            )
-            self._logged_mob_batch = True
-
         node_emb = self.mobility_gnn(
             mob_batch.x,  # type: ignore[attr-defined]
             mob_batch.edge_index,  # type: ignore[attr-defined]
