@@ -242,7 +242,9 @@ class EDARProcessor:
                 region_censor = variant_censor_filled.where(contributing_sites).max(
                     dim="edar_id"
                 )
-                result.loc[{"variant": variant, REGION_COORD: region}] = region_censor.values
+                result.loc[{"variant": variant, REGION_COORD: region}] = (
+                    region_censor.values
+                )
 
         return result
 
@@ -320,17 +322,24 @@ class EDARProcessor:
 
         return xr.DataArray(
             age_normalized,
-            coords={"date": values["date"].values, REGION_COORD: values[REGION_COORD].values},
+            coords={
+                "date": values["date"].values,
+                REGION_COORD: values[REGION_COORD].values,
+            },
             dims=["date", REGION_COORD],
         )
 
     def process(self, wastewater_file: str, region_metadata_file: str) -> xr.Dataset:
         """
-        Process EDAR wastewater biomarker data into a canonical xarray Dataset.
+        Process real EDAR wastewater data from CSV file.
+
+        This is the entry point for real EDAR data processing. It loads and tidies
+        the raw CSV data, then processes it using the shared aggregation logic
+        that is also used for synthetic data.
 
         Args:
             wastewater_file: Path to CSV/Excel file with wastewater data
-            edar_mapping: Optional mapping from EDAR plants to municipalities
+            region_metadata_file: Path to EDAR-to-region contribution matrix
 
         Returns:
             Biomarker time series aggregated to regions, as an xarray Dataset
@@ -338,6 +347,28 @@ class EDARProcessor:
         """
         print(f"Processing EDAR wastewater data from {wastewater_file}")
 
+        # Load and tidy raw data (CSV → xarray)
+        flow_xr, censor_xr = self._load_and_tidy_raw_data(wastewater_file)
+
+        # Process from xarray (shared with synthetic)
+        return self.process_from_xarray(flow_xr, censor_xr, region_metadata_file)
+
+    def _load_and_tidy_raw_data(
+        self,
+        wastewater_file: str,
+    ) -> tuple[xr.DataArray, xr.DataArray]:
+        """
+        Load and tidy raw CSV wastewater data into xarray intermediate format.
+
+        This is the only step that differs between real and synthetic data.
+        Synthetic data is already in xarray format.
+
+        The intermediate format has dimensions (run_id, date, edar_id, variant).
+        Real data gets run_id="real" to match synthetic format.
+
+        Returns:
+            Tuple of (flow_xr, censor_xr) with dimensions (run_id, date, edar_id, variant)
+        """
         # Load wastewater data
         wastewater_df = self._load_wastewater_data(wastewater_file)
 
@@ -366,6 +397,41 @@ class EDARProcessor:
         else:
             # Create default censor flags (all uncensored = 0)
             daily_data_xr_censor = daily_data_xr_flow * 0
+
+        # Add run_id dimension to match synthetic format
+        # Real data gets run_id="real" to distinguish from synthetic runs
+        flow_xr = daily_data_xr_flow.expand_dims(run_id=["real"])
+        censor_xr = daily_data_xr_censor.expand_dims(run_id=["real"])
+
+        return flow_xr, censor_xr
+
+    def process_from_xarray(
+        self,
+        flow_xr: xr.DataArray,
+        censor_xr: xr.DataArray,
+        region_metadata_file: str,
+    ) -> xr.Dataset:
+        """
+        Process EDAR data from xarray intermediate format to regions.
+
+        This is the shared code path for both real and synthetic data.
+        Both real and synthetic data use this method for aggregation.
+
+        Args:
+            flow_xr: Flow/concentration values with dimensions (run_id, date, edar_id, variant)
+            censor_xr: Censor flags with dimensions (run_id, date, edar_id, variant)
+            region_metadata_file: Path to EDAR-to-region contribution matrix
+
+        Returns:
+            Dataset with biomarker variables indexed by region_id
+        """
+        # Select first run_id (synthetic may have multiple, real has "real")
+        if "run_id" in flow_xr.dims and len(flow_xr["run_id"]) > 0:
+            flow_xr = flow_xr.isel(run_id=0).drop_vars("run_id")
+        if "run_id" in censor_xr.dims and len(censor_xr["run_id"]) > 0:
+            censor_xr = censor_xr.isel(run_id=0).drop_vars("run_id")
+
+        # Load contribution matrix
         emap = xr.open_dataarray(region_metadata_file)
         # EDAR contribution matrices are typically stored sparsely with NaNs where
         # there is no contribution. `xr.dot` does not skip NaNs, so we must treat
@@ -376,10 +442,10 @@ class EDARProcessor:
         print(
             f"Transforming EDAR data to regions using contribution matrix from {region_metadata_file}"
         )
-        if "edar_id" not in daily_data_xr_flow.dims:
+        if "edar_id" not in flow_xr.dims:
             raise ValueError(
                 "Expected 'edar_id' dimension in processed wastewater data, "
-                f"got dims={tuple(daily_data_xr_flow.dims)!r}"
+                f"got dims={tuple(flow_xr.dims)!r}"
             )
         if "edar_id" not in emap.dims:
             raise ValueError(
@@ -389,15 +455,11 @@ class EDARProcessor:
 
         # Align IDs before dot product. A common silent failure mode is that
         # `xr.dot` aligns on labels and produces all-NaNs when there is no overlap.
-        daily_data_xr_flow = daily_data_xr_flow.assign_coords(
-            edar_id=daily_data_xr_flow["edar_id"].astype(str)
-        )
-        daily_data_xr_censor = daily_data_xr_censor.assign_coords(
-            edar_id=daily_data_xr_censor["edar_id"].astype(str)
-        )
+        flow_xr = flow_xr.assign_coords(edar_id=flow_xr["edar_id"].astype(str))
+        censor_xr = censor_xr.assign_coords(edar_id=censor_xr["edar_id"].astype(str))
         emap = emap.assign_coords(edar_id=emap["edar_id"].astype(str))
 
-        wastewater_ids = set(daily_data_xr_flow["edar_id"].values.tolist())
+        wastewater_ids = set(flow_xr["edar_id"].values.tolist())
         mapping_ids = set(emap["edar_id"].values.tolist())
         overlap = sorted(wastewater_ids.intersection(mapping_ids))
         if not overlap:
@@ -413,12 +475,8 @@ class EDARProcessor:
             )
 
         # Align both flow and censor data with emap
-        daily_data_xr_flow_aligned, emap_aligned = xr.align(
-            daily_data_xr_flow, emap, join="inner"
-        )
-        daily_data_xr_censor_aligned, _ = xr.align(
-            daily_data_xr_censor, emap, join="inner"
-        )
+        flow_xr_aligned, emap_aligned = xr.align(flow_xr, emap, join="inner")
+        censor_xr_aligned, _ = xr.align(censor_xr, emap, join="inner")
 
         # xr.dot propagates NaN values, causing all-NaN output even when only
         # some EDAR sites have missing data. We need a masked dot product that
@@ -426,8 +484,8 @@ class EDARProcessor:
         # number of contributing sites.
         # Note: This is before Kalman imputation; NaN values represent truly
         # missing measurements that shouldn't contribute zero flow.
-        mask = daily_data_xr_flow_aligned.notnull()
-        masked_data = daily_data_xr_flow_aligned.fillna(0)
+        mask = flow_xr_aligned.notnull()
+        masked_data = flow_xr_aligned.fillna(0)
         weighted_sum = xr.dot(masked_data, emap_aligned, dim="edar_id")
         contribution_count = xr.dot(
             mask.astype(float),
@@ -439,7 +497,7 @@ class EDARProcessor:
 
         # Aggregate censor flags to regions using max-severity
         censor_aggregated = self._aggregate_censor_flags(
-            daily_data_xr_censor_aligned, emap_aligned
+            censor_xr_aligned, emap_aligned
         )
 
         thresholds = DataQualityThresholds(
@@ -461,12 +519,16 @@ class EDARProcessor:
 
             # Mask channel: 1.0 if measured, 0.0 otherwise
             # Fill NaN with 0.0 (no measurement) to prevent NaN propagation
-            mask = xr.where(variant_da.notnull() & (variant_da > 0), 1.0, 0.0).fillna(0.0)
+            mask = xr.where(variant_da.notnull() & (variant_da > 0), 1.0, 0.0).fillna(
+                0.0
+            )
             biomarkers[f"{variant_name}_mask"] = mask
 
             # Censor flag channel: 0=uncensored, 1=censored, 2=missing
             # Fill NaN with 0.0 (uncensored) for regions without EDAR data
-            censor_variant = censor_aggregated.sel(variant=variant).drop_vars("variant").fillna(0.0)
+            censor_variant = (
+                censor_aggregated.sel(variant=variant).drop_vars("variant").fillna(0.0)
+            )
             biomarkers[f"{variant_name}_censor"] = censor_variant
 
             # Age channel: normalized days since last measurement
