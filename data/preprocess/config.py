@@ -28,6 +28,9 @@ class PreprocessingConfig:
 
     Attributes:
         data_dir: Base directory for raw data files
+        synthetic_path: Optional path to synthetic data zarr bundle. If provided,
+            individual data paths (cases_file, mobility_path, etc.) are ignored
+            and SyntheticProcessor is used instead.
         mobility_path: Path to NetCDF mobility data
         cases_file: Path to COVID case data CSV
         wastewater_file: Path to wastewater biomarker data
@@ -36,8 +39,6 @@ class PreprocessingConfig:
 
         start_date: Start date for temporal processing
         end_date: End date for temporal processing
-        forecast_horizon: Number of days to forecast into the future
-        sequence_length: Length of input sequences for models
 
         min_flow_threshold: Minimum flow threshold for mobility pairs (i,j)
         wastewater_flow_mode: "total_flow" or "concentration" for EDAR
@@ -73,13 +74,12 @@ class PreprocessingConfig:
     output_path: str
     dataset_name: str
 
+    # Optional synthetic data path
+    synthetic_path: str | None = None
+
     # Feature processing options
     min_flow_threshold: int = 10
     wastewater_flow_mode: str = "total_flow"  # "total_flow" or "concentration"
-
-    # Temporal processing parameters
-    forecast_horizon: int = 7
-    sequence_length: int = 1
 
     # Region filtering
     min_density_threshold: float = (
@@ -134,47 +134,53 @@ class PreprocessingConfig:
 
     def _validate_paths(self):
         """Validate that input paths exist and are correctly formatted."""
-        data_dir_path = Path(self.data_dir)
-        if not data_dir_path.exists():
-            raise ValueError(f"Data directory does not exist: {self.data_dir}")
-
-        if self.mobility_path:
-            mobility_path = Path(self.mobility_path)
-            if not mobility_path.exists():
-                raise ValueError(f"Mobility file does not exist: {self.mobility_path}")
-
-        cases_path = Path(self.cases_file)
-        if not cases_path.exists():
-            raise ValueError(f"Cases file does not exist: {self.cases_file}")
-
-        if self.wastewater_file:
-            wastewater_path = Path(self.wastewater_file)
-            if not wastewater_path.exists():
+        # If synthetic_path is provided, validate it and skip individual file checks
+        if self.synthetic_path:
+            synthetic_path = Path(self.synthetic_path)
+            if not synthetic_path.exists():
                 raise ValueError(
-                    f"Wastewater file does not exist: {self.wastewater_file}"
+                    f"Synthetic data file does not exist: {self.synthetic_path}"
                 )
+        else:
+            # Standard real data validation
+            data_dir_path = Path(self.data_dir)
+            if not data_dir_path.exists():
+                raise ValueError(f"Data directory does not exist: {self.data_dir}")
+
+            if self.mobility_path:
+                mobility_path = Path(self.mobility_path)
+                if not mobility_path.exists():
+                    raise ValueError(
+                        f"Mobility file does not exist: {self.mobility_path}"
+                    )
+
+            cases_path = Path(self.cases_file)
+            if not cases_path.exists():
+                raise ValueError(f"Cases file does not exist: {self.cases_file}")
+
+            if self.wastewater_file:
+                wastewater_path = Path(self.wastewater_file)
+                if not wastewater_path.exists():
+                    raise ValueError(
+                        f"Wastewater file does not exist: {self.wastewater_file}"
+                    )
 
         # Validate output path is writable
         output_path = Path(self.output_path)
         output_path.mkdir(parents=True, exist_ok=True)
 
+        # Validate region_metadata_file (needed for both real and synthetic)
+        if self.region_metadata_file:
+            metadata_path = Path(self.region_metadata_file)
+            if not metadata_path.exists():
+                raise ValueError(
+                    f"Region metadata file does not exist: {self.region_metadata_file}"
+                )
+
     def _validate_temporal_parameters(self):
         """Validate temporal parameters are sensible."""
         if self.start_date >= self.end_date:
             raise ValueError("start_date must be before end_date")
-
-        temporal_range = self.end_date - self.start_date
-        if temporal_range.days < self.forecast_horizon:
-            raise ValueError(
-                f"Temporal range ({temporal_range.days} days) must be greater than "
-                f"forecast_horizon ({self.forecast_horizon} days)"
-            )
-
-        if self.forecast_horizon <= 0:
-            raise ValueError("forecast_horizon must be positive")
-
-        if self.sequence_length <= 0:
-            raise ValueError("sequence_length must be positive")
 
     def _validate_processing_options(self):
         """Validate processing options."""
@@ -280,10 +286,7 @@ class PreprocessingConfig:
                 "wastewater": self.wastewater_file,
                 "population": self.population_file,
             },
-            "processing_parameters": {
-                "forecast_horizon": self.forecast_horizon,
-                "sequence_length": self.sequence_length,
-            },
+            "processing_parameters": {},
             "alignment": {
                 "strategy": self.alignment_strategy,
                 "target_dataset": self.target_dataset,

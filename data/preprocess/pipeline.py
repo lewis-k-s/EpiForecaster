@@ -19,6 +19,7 @@ from .processors.alignment_processor import AlignmentProcessor
 from .processors.cases_processor import CasesProcessor
 from .processors.edar_processor import EDARProcessor
 from .processors.mobility_processor import MobilityProcessor
+from .processors.synthetic_processor import SyntheticProcessor
 
 
 class OfflinePreprocessingPipeline:
@@ -132,6 +133,27 @@ class OfflinePreprocessingPipeline:
         print("Stage 1: Loading and processing raw data sources")
         print("-" * 50)
 
+        # Check if using synthetic data
+        if self.config.synthetic_path:
+            print("Using synthetic data processor...")
+            synthetic_processor = SyntheticProcessor(self.config)
+            processed = synthetic_processor.process(self.config.synthetic_path)
+
+            # Process EDAR using the same code path as real data!
+            print("Processing synthetic EDAR data through shared aggregation path...")
+            edar_processor = self.processors["edar"]
+            processed["edar"] = edar_processor.process_from_xarray(
+                processed["edar_flow"],
+                processed["edar_censor"],
+                self.config.region_metadata_file,
+            )
+            # Remove temporary flow/censor keys
+            del processed["edar_flow"]
+            del processed["edar_censor"]
+
+            return processed
+
+        # Standard real data processing
         raw_data = {}
 
         # Process cases data (required)

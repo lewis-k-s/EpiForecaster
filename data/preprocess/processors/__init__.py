@@ -11,6 +11,7 @@ canonical tensor formats. Each processor handles a specific data type:
 - CataloniaCasesProcessor: Catalonia official COVID case data → xarray tensors
 - DeathsProcessor: Catalonia COVID deaths data → xarray tensors
 - MunicipalityMappingProcessor: Municipality to comarca mapping table
+- SyntheticProcessor: Bundled synthetic zarr data → extracted components
 
 These processors are used by the main preprocessing pipeline to convert
 raw data into the canonical EpiBatch format.
@@ -23,6 +24,7 @@ from .edar_processor import EDARProcessor
 from .deaths_processor import DeathsProcessor
 from .mobility_processor import MobilityProcessor
 from .municipality_mapping_processor import MunicipalityMappingProcessor
+from .synthetic_processor import SyntheticProcessor
 
 __all__ = [
     "MobilityProcessor",
@@ -32,4 +34,5 @@ __all__ = [
     "CataloniaCasesProcessor",
     "DeathsProcessor",
     "MunicipalityMappingProcessor",
+    "SyntheticProcessor",
 ]
