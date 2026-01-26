@@ -16,12 +16,14 @@ Usage:
 """
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.skill_output import SkillOutputBuilder, print_output
 
 
 # Try to import tensorboard, provide helpful error if missing
@@ -451,7 +453,7 @@ def compute_component_loss_correlation(
     return None
 
 
-def analyze_events(event_dir: str | Path) -> GradnormAnalysis:
+def analyze_events(event_dir: str | Path) -> tuple[GradnormAnalysis, list[str]]:
     """Analyze gradnorm from TensorBoard event directory."""
     event_dir = Path(event_dir)
     if not event_dir.exists():
@@ -527,11 +529,12 @@ def analyze_events(event_dir: str | Path) -> GradnormAnalysis:
     )
 
     # Generate flags
-    generate_flags(analysis)
-    return analysis
+    flags = generate_flags(analysis)
+    analysis.flags = flags
+    return analysis, flags
 
 
-def generate_flags(analysis: GradnormAnalysis) -> None:
+def generate_flags(analysis: GradnormAnalysis) -> list[str]:
     """Generate warning flags based on thresholds."""
     flags = []
 
@@ -609,7 +612,7 @@ def generate_flags(analysis: GradnormAnalysis) -> None:
             f"(indicates aggressive clipping)"
         )
 
-    analysis.flags = flags
+    return flags
 
 
 def print_analysis(analysis: GradnormAnalysis) -> None:
@@ -763,7 +766,7 @@ def resolve_event_path(
     return base
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(
         description="Analyze TensorBoard gradnorm logs for EpiForecaster"
     )
@@ -785,12 +788,20 @@ def main() -> int:
         help="Run ID (if using experiment/run format)",
     )
     parser.add_argument(
-        "--json",
+        "--text",
         action="store_true",
-        help="Output results as JSON",
+        help="Output results as human-readable text (default: JSON)",
+    )
+    parser.add_argument(
+        "--compact", action="store_true", help="Output compact JSON (no indentation)"
     )
 
     args = parser.parse_args()
+
+    builder = SkillOutputBuilder(
+        skill_name="gradnorm-analyze",
+        input_path=args.path,
+    )
 
     try:
         event_path = resolve_event_path(
@@ -799,24 +810,25 @@ def main() -> int:
             experiment=args.experiment,
             run_id=args.run_id,
         )
-        analysis = analyze_events(event_path)
+        analysis, flags = analyze_events(event_path)
 
-        if args.json:
-            print(json.dumps(analysis.to_dict(), indent=2))
-        else:
+        data = analysis.to_dict()
+        builder.warnings = flags
+
+        output = builder.success(data)
+
+        if args.text:
             print_analysis(analysis)
+        else:
+            indent = 0 if args.compact else 2
+            print_output(output, indent=indent)
 
         return 0
 
     except FileNotFoundError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        print_output(builder.error("FileNotFoundError", str(e)))
     except Exception as e:
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        import traceback
-
-        traceback.print_exc()
-        return 1
+        print_output(builder.error(type(e).__name__, str(e), {"traceback": str(e)}))
 
 
 if __name__ == "__main__":

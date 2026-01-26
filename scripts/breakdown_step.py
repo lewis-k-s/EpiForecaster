@@ -26,7 +26,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent))
 from utils.run_discovery import resolve_trace_paths
+from utils.skill_output import SkillOutputBuilder, print_output
 
 
 @dataclass
@@ -170,11 +173,7 @@ def extract_step_breakdown(trace_path: str) -> StepBreakdown:
         sys.exit(1)
 
     # Filter complete events with duration
-    complete_events = [
-        e
-        for e in events
-        if "dur" in e and "ts" in e and e["dur"] > 0
-    ]
+    complete_events = [e for e in events if "dur" in e and "ts" in e and e["dur"] > 0]
 
     if not complete_events:
         print("No complete events found in trace.", file=sys.stderr)
@@ -196,11 +195,10 @@ def extract_step_breakdown(trace_path: str) -> StepBreakdown:
         phase_ops[phase][name].append(duration_us)
 
     # Build top ops per phase (name, total_duration, count)
-    def build_top_ops(phase_ops_dict: defaultdict[str, list[float]]) -> list[tuple[str, float, int]]:
-        return [
-            (name, sum(durs), len(durs))
-            for name, durs in phase_ops_dict.items()
-        ]
+    def build_top_ops(
+        phase_ops_dict: defaultdict[str, list[float]],
+    ) -> list[tuple[str, float, int]]:
+        return [(name, sum(durs), len(durs)) for name, durs in phase_ops_dict.items()]
 
     forward_ops = sorted(
         build_top_ops(phase_ops["forward"]), key=lambda x: x[1], reverse=True
@@ -213,7 +211,9 @@ def extract_step_breakdown(trace_path: str) -> StepBreakdown:
     )
     # Combine data_wait and data_preprocessing for data_ops (for backward compatibility)
     data_ops = sorted(
-        build_top_ops(phase_ops["data_wait"] | phase_ops["data_preprocessing"]), key=lambda x: x[1], reverse=True
+        build_top_ops(phase_ops["data_wait"] | phase_ops["data_preprocessing"]),
+        key=lambda x: x[1],
+        reverse=True,
     )
 
     # Calculate total step duration
@@ -224,7 +224,9 @@ def extract_step_breakdown(trace_path: str) -> StepBreakdown:
     # Phase times
     data_preprocessing_time_us = phase_times["data_preprocessing"]
     data_wait_time_us = phase_times["data_wait"]
-    data_load_time_us = data_preprocessing_time_us + data_wait_time_us  # For compatibility
+    data_load_time_us = (
+        data_preprocessing_time_us + data_wait_time_us
+    )  # For compatibility
     forward_time_us = phase_times["forward"]
     backward_time_us = phase_times["backward"]
     optimizer_time_us = phase_times["optimizer"]
@@ -299,45 +301,59 @@ def format_text(breakdown: StepBreakdown) -> str:
     if breakdown.forward_ops:
         for name, dur_us, count in breakdown.forward_ops[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
     else:
         lines.append("(No forward operations detected)")
 
-    lines.extend([
-        "",
-        "TOP BACKWARD OPERATIONS (name | total_us | count | avg_us)",
-        "-" * 70,
-    ])
+    lines.extend(
+        [
+            "",
+            "TOP BACKWARD OPERATIONS (name | total_us | count | avg_us)",
+            "-" * 70,
+        ]
+    )
 
     if breakdown.backward_ops:
         for name, dur_us, count in breakdown.backward_ops[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
     else:
         lines.append("(No backward operations detected)")
 
-    lines.extend([
-        "",
-        "TOP OPTIMIZER OPERATIONS (name | total_us | count | avg_us)",
-        "-" * 70,
-    ])
+    lines.extend(
+        [
+            "",
+            "TOP OPTIMIZER OPERATIONS (name | total_us | count | avg_us)",
+            "-" * 70,
+        ]
+    )
 
     if breakdown.optimizer_ops:
         for name, dur_us, count in breakdown.optimizer_ops[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
     else:
         lines.append("(No optimizer operations detected)")
 
     if breakdown.data_ops:
-        lines.extend([
-            "",
-            "TOP DATA LOADING OPERATIONS (name | total_us | count | avg_us)",
-            "-" * 70,
-        ])
+        lines.extend(
+            [
+                "",
+                "TOP DATA LOADING OPERATIONS (name | total_us | count | avg_us)",
+                "-" * 70,
+            ]
+        )
         for name, dur_us, count in breakdown.data_ops[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
 
     lines.append("=" * 70)
     return "\n".join(lines)
@@ -387,7 +403,8 @@ def format_json(breakdown: StepBreakdown) -> str:
             },
         },
         "top_forward_ops": [
-            {"name": n, "duration_us": d, "count": c} for n, d, c in breakdown.forward_ops
+            {"name": n, "duration_us": d, "count": c}
+            for n, d, c in breakdown.forward_ops
         ],
         "top_backward_ops": [
             {"name": n, "duration_us": d, "count": c}
@@ -427,30 +444,34 @@ def format_aggregated_text(
     data_wait_pcts = [b.data_wait_pct for _, b in all_breakdowns]
     data_preprocessing_pcts = [b.data_preprocessing_pct for _, b in all_breakdowns]
 
-    lines.extend([
-        "AGGREGATE PHASE STATISTICS (mean ± std)",
-        "-" * 70,
-        f"Step duration:     {np.mean(durations) / 1000:>8.2f} ± {np.std(durations) / 1000:>5.2f} ms",
-        f"Forward:           {np.mean(forward_pcts):>5.1f} ± {np.std(forward_pcts):>4.1f} %",
-        f"Backward:          {np.mean(backward_pcts):>5.1f} ± {np.std(backward_pcts):>4.1f} %",
-        f"Data Preprocess:   {np.mean(data_preprocessing_pcts):>5.1f} ± {np.std(data_preprocessing_pcts):>4.1f} %",
-        f"Data Wait:         {np.mean(data_wait_pcts):>5.1f} ± {np.std(data_wait_pcts):>4.1f} %",
-        f"Data Load (total): {np.mean(data_load_pcts):>5.1f} ± {np.std(data_load_pcts):>4.1f} %",
-        "",
-        "PER-TRACE BREAKDOWN",
-        "-" * 70,
-    ])
+    lines.extend(
+        [
+            "AGGREGATE PHASE STATISTICS (mean ± std)",
+            "-" * 70,
+            f"Step duration:     {np.mean(durations) / 1000:>8.2f} ± {np.std(durations) / 1000:>5.2f} ms",
+            f"Forward:           {np.mean(forward_pcts):>5.1f} ± {np.std(forward_pcts):>4.1f} %",
+            f"Backward:          {np.mean(backward_pcts):>5.1f} ± {np.std(backward_pcts):>4.1f} %",
+            f"Data Preprocess:   {np.mean(data_preprocessing_pcts):>5.1f} ± {np.std(data_preprocessing_pcts):>4.1f} %",
+            f"Data Wait:         {np.mean(data_wait_pcts):>5.1f} ± {np.std(data_wait_pcts):>4.1f} %",
+            f"Data Load (total): {np.mean(data_load_pcts):>5.1f} ± {np.std(data_load_pcts):>4.1f} %",
+            "",
+            "PER-TRACE BREAKDOWN",
+            "-" * 70,
+        ]
+    )
 
     for i, (trace_path, breakdown) in enumerate(all_breakdowns, 1):
         trace_name = trace_path.stem[:35]
-        lines.extend([
-            f"Trace {i} ({trace_name}):",
-            f"  Step: {breakdown.step_duration_us / 1000:.2f} ms | "
-            f"F: {breakdown.forward_pct:.1f}% | "
-            f"B: {breakdown.backward_pct:.1f}% | "
-            f"DP: {breakdown.data_preprocessing_pct:.1f}% | "
-            f"DW: {breakdown.data_wait_pct:.1f}%",
-        ])
+        lines.extend(
+            [
+                f"Trace {i} ({trace_name}):",
+                f"  Step: {breakdown.step_duration_us / 1000:.2f} ms | "
+                f"F: {breakdown.forward_pct:.1f}% | "
+                f"B: {breakdown.backward_pct:.1f}% | "
+                f"DP: {breakdown.data_preprocessing_pct:.1f}% | "
+                f"DW: {breakdown.data_wait_pct:.1f}%",
+            ]
+        )
 
     lines.append("=" * 70)
     return "\n".join(lines)
@@ -476,12 +497,30 @@ def format_aggregated_json(
     data_preprocessing_pcts = [b.data_preprocessing_pct for _, b in all_breakdowns]
 
     aggregated["aggregate_stats"] = {
-        "step_duration_ms": {"mean": float(np.mean(durations) / 1000), "std": float(np.std(durations) / 1000)},
-        "forward_pct": {"mean": float(np.mean(forward_pcts)), "std": float(np.std(forward_pcts))},
-        "backward_pct": {"mean": float(np.mean(backward_pcts)), "std": float(np.std(backward_pcts))},
-        "data_preprocessing_pct": {"mean": float(np.mean(data_preprocessing_pcts)), "std": float(np.std(data_preprocessing_pcts))},
-        "data_wait_pct": {"mean": float(np.mean(data_wait_pcts)), "std": float(np.std(data_wait_pcts))},
-        "data_load_pct": {"mean": float(np.mean(data_load_pcts)), "std": float(np.std(data_load_pcts))},
+        "step_duration_ms": {
+            "mean": float(np.mean(durations) / 1000),
+            "std": float(np.std(durations) / 1000),
+        },
+        "forward_pct": {
+            "mean": float(np.mean(forward_pcts)),
+            "std": float(np.std(forward_pcts)),
+        },
+        "backward_pct": {
+            "mean": float(np.mean(backward_pcts)),
+            "std": float(np.std(backward_pcts)),
+        },
+        "data_preprocessing_pct": {
+            "mean": float(np.mean(data_preprocessing_pcts)),
+            "std": float(np.std(data_preprocessing_pcts)),
+        },
+        "data_wait_pct": {
+            "mean": float(np.mean(data_wait_pcts)),
+            "std": float(np.std(data_wait_pcts)),
+        },
+        "data_load_pct": {
+            "mean": float(np.mean(data_load_pcts)),
+            "std": float(np.std(data_load_pcts)),
+        },
     }
 
     for trace_path, breakdown in all_breakdowns:
@@ -511,26 +550,42 @@ Examples:
         help="Either: experiment_name run_id OR path to single trace JSON file",
     )
     parser.add_argument(
-        "--json", action="store_true", help="Output as JSON instead of text"
+        "--text",
+        action="store_true",
+        help="Output as human-readable text (default: JSON)",
+    )
+    parser.add_argument(
+        "--compact", action="store_true", help="Output compact JSON (no indentation)"
     )
 
     args = parser.parse_args()
+
+    builder = SkillOutputBuilder(
+        skill_name="step-breakdown",
+        input_path=", ".join(args.inputs),
+    )
 
     # Determine input mode
     if len(args.inputs) == 2:
         # Experiment + run ID mode
         experiment_name, run_id = args.inputs
         try:
-            trace_paths = resolve_trace_paths(experiment_name=experiment_name, run_id=run_id)
+            trace_paths = resolve_trace_paths(
+                experiment_name=experiment_name, run_id=run_id
+            )
         except FileNotFoundError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+            print_output(builder.error("FileNotFoundError", str(e)))
+            return
     elif len(args.inputs) == 1:
         # Single file mode (backward compatible)
         trace_path = Path(args.inputs[0])
         if not trace_path.exists():
-            print(f"Error: Trace file not found: {trace_path}", file=sys.stderr)
-            sys.exit(1)
+            print_output(
+                builder.error(
+                    "FileNotFoundError", f"Trace file not found: {trace_path}"
+                )
+            )
+            return
         trace_paths = [trace_path]
         experiment_name = run_id = None
     else:
@@ -544,26 +599,44 @@ Examples:
             breakdown = extract_step_breakdown(str(trace_path))
             all_breakdowns.append((trace_path, breakdown))
         except Exception as e:
-            print(f"Warning: Failed to analyze {trace_path}: {e}", file=sys.stderr)
+            builder.add_warning(f"Failed to analyze {trace_path}: {e}")
 
     if not all_breakdowns:
-        print("Error: No valid traces found", file=sys.stderr)
-        sys.exit(1)
+        print_output(builder.error("ValueError", "No valid traces found"))
+        return
 
     # Output
     if len(all_breakdowns) == 1 and experiment_name is None:
         # Single trace, legacy format
         _, breakdown = all_breakdowns[0]
-        if args.json:
-            print(format_json(breakdown))
-        else:
-            print(format_text(breakdown))
+        data = json.loads(format_json(breakdown))
     else:
         # Multiple traces or run mode, aggregated format
-        if args.json:
-            print(format_aggregated_json(all_breakdowns, experiment_name or "unknown", run_id or "unknown"))
+        data = json.loads(
+            format_aggregated_json(
+                all_breakdowns,
+                experiment_name or "unknown",
+                run_id or "unknown",
+            )
+        )
+
+    output = builder.success(data)
+
+    if args.text:
+        if len(all_breakdowns) == 1 and experiment_name is None:
+            _, breakdown = all_breakdowns[0]
+            print(format_text(breakdown))
         else:
-            print(format_aggregated_text(all_breakdowns, experiment_name or "unknown", run_id or "unknown"))
+            print(
+                format_aggregated_text(
+                    all_breakdowns,
+                    experiment_name or "unknown",
+                    run_id or "unknown",
+                )
+            )
+    else:
+        indent = 0 if args.compact else 2
+        print_output(output, indent=indent)
 
 
 if __name__ == "__main__":

@@ -79,3 +79,4 @@ The canonical data pipeline follows: raw data → preprocessing → Zarr dataset
 - Keep patches minimal and consistent with existing style; avoid unrelated refactors. If heavy compute is required, add flags and default to lightweight settings.
 - This project is a work in progress. It is ok to make breaking changes as the interface evolves.
 - Use configuration-driven development: copy and modify templates from the `configs/` directory rather than hardcoding parameters.
+- **Zarr Data Access**: Always use `xarray.open_zarr()` instead of `zarr.open()` for inspecting or loading zarr datasets. Xarray provides labeled dimensions, coordinates, and better integration with the data pipeline.

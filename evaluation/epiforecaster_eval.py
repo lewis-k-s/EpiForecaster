@@ -577,7 +577,12 @@ def evaluate_loader(
     model_was_training = model.training
     model.eval()
     try:
-        with torch.no_grad():
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"
+            ),
+        ):
             for batch_idx, batch_data in enumerate(eval_iter):
                 if max_batches and batch_idx >= max_batches:
                     break

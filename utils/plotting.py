@@ -391,7 +391,7 @@ def plot_training_history(
     if training_history.get("early_stopping_epoch") is not None:
         lines.append(ax1.lines[-1])  # Early stopping line
 
-    labels = [l.get_label() for l in lines]
+    labels = [line.get_label() for line in lines]
     ax1.legend(lines, labels, loc="upper right", bbox_to_anchor=(1, 1))
 
     plt.title("Training History: Loss Curves and Learning Rate")

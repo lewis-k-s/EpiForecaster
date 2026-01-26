@@ -142,6 +142,12 @@ def suggest_epiforecaster_params(
     #     "data.log_scale", _categorical_choices((False, True))
     # )
 
+    # Node vs time iteration order; independent of split_strategy.
+    overrides["data.sample_ordering"] = trial.suggest_categorical(
+        "data.sample_ordering",
+        _categorical_choices(("node", "time")),
+    )
+
     # Neighborhood mask uses RAW mobility (not normalized). Using a categorical grid is
     # safer than continuous until we confirm the mobility unit scale in your dataset.
     overrides["data.mobility_threshold"] = trial.suggest_categorical(

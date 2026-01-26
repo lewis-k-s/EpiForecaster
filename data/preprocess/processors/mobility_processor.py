@@ -50,6 +50,49 @@ class MobilityProcessor:
         ds = xr.open_zarr(  # type: ignore[arg-type]
             str(mobility_path), chunks={"date": self.config.chunk_size}
         )
+
+        # Detect and reconstruct synthetic data format (factorized mobility)
+        # Synthetic data stores: mobility_base + mobility_kappa0 instead of full tensor
+        # to avoid OOM errors on large datasets. Reconstruct to standard format.
+        if "mobility_base" in ds and "mobility_kappa0" in ds:
+            print(
+                "Detected factorized mobility format (synthetic data). Reconstructing..."
+            )
+            base = ds["mobility_base"].values  # (origin, target)
+            kappa0 = ds[
+                "mobility_kappa0"
+            ]  # (run_id, date) - keep as DataArray for chunking
+
+            # Reconstruct mobility tensor: mobility[run, date, origin, target]
+            # Using the formula: mobility[run, date] = mobility_base * (1 - kappa0[run, date])
+            # This is done lazily using xarray's broadcasting to avoid loading all data
+            reduction_factor = 1.0 - kappa0  # (run_id, date)
+
+            # Broadcast to (run_id, date, origin, target)
+            # reduction_factor[:, :, None, None] adds two new dimensions at the end
+            mobility_reconstructed = (
+                base[None, None, :, :] * reduction_factor[:, :, None, None]
+            )
+
+            ds["mobility"] = xr.DataArray(
+                mobility_reconstructed,
+                dims=("run_id", "date", "origin", "target"),
+                coords={
+                    "run_id": kappa0["run_id"].values,
+                    "date": kappa0["date"].values,
+                    "origin": ds["origin"].values,
+                    "target": ds["target"].values,
+                },
+            )
+
+            # For single-run data (real data), squeeze the run_id dimension
+            # to match existing behavior where real data has no run_id
+            if len(ds["run_id"]) == 1:
+                print("Single run detected - squeezing run_id dimension")
+                ds["mobility"] = ds["mobility"].isel(run_id=0).squeeze(drop=True)
+
+            print(f"Reconstructed mobility tensor: {ds['mobility'].shape}")
+
         ds = ds.rename({"target": "destination"})
 
         assert (ds["origin"].values == ds["destination"].values).all(), (

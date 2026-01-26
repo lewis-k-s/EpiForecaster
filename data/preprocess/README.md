@@ -20,7 +20,7 @@ Because `cases` and EDAR biomarkers resolve to `(time, region)` series, the comb
 3. **Tensor assembly (`OfflinePreprocessingPipeline._create_epibatches`)** – Uses the aligned dictionaries to build `EpiBatch` objects with:
    - node features = `[cases, biomarker variants]` concatenated with optional mobility-derived node stats,
    - edge structures = mobility OD graphs or zero-edge placeholders,
-   - targets = future case sequences per config `forecast_horizon`.
+   - targets = future case sequences.
 4. **Validation and storage** – Consistency checks guarantee every batch has identical node/edge counts and no NaNs before persisting via `DatasetStorage.save_dataset()`.
 5. **Reporting** – A JSON report (same directory as the Zarr store) captures configuration, alignment outcomes, statistics, and warnings for reproducibility.
 

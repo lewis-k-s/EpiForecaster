@@ -476,7 +476,6 @@ class DataAnalytics:
         if save_path is None:
             save_path = self.output_dir / "data_distributions.png"
 
-        n_datasets = len(dataset_names)
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle("Data Distribution Analysis", fontsize=16, fontweight="bold")
 

@@ -100,7 +100,9 @@ class CasesPreprocessor:
 
         # Clip to age_max and normalize to [0, 1]
         final_age = np.where(
-            valid_history_mask, np.minimum(current_age, self.config.age_max), self.config.age_max
+            valid_history_mask,
+            np.minimum(current_age, self.config.age_max),
+            self.config.age_max,
         )
         age_channel = (final_age / self.config.age_max).astype(np.float32)
 

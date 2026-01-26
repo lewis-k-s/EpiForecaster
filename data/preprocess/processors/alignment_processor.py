@@ -5,7 +5,6 @@ import pandas as pd
 import xarray as xr
 
 from constants import (
-    EDAR_BIOMARKER_CHANNEL_SUFFIXES,
     EDAR_BIOMARKER_PREFIX,
     EDAR_BIOMARKER_VARIANTS,
 )
@@ -91,14 +90,19 @@ class AlignmentProcessor:
         assert np.isin(edar_data[TEMPORAL_COORD].values, target_dates.values).all(), (
             "EDAR subset dates are not the same"
         )
-        assert not edar_data[TEMPORAL_COORD].values[0] == target_dates.values[0], (
-            "UNEXPECTED: EDAR start date has already been expanded to target dates"
+
+        # Check if EDAR already matches target range (e.g., synthetic data)
+        edar_matches_target = (
+            edar_data[TEMPORAL_COORD].values[0] == target_dates.values[0]
+            and edar_data[TEMPORAL_COORD].values[-1] == target_dates.values[-1]
         )
-        assert not edar_data[TEMPORAL_COORD].values[-1] == target_dates.values[-1], (
-            "UNEXPECTED: EDAR end date has already been expanded to target dates"
-        )
-        print("Expanding EDAR dates to target dates (preserving NaNs)")
-        edar_aligned = edar_data.reindex({TEMPORAL_COORD: target_dates})
+
+        if edar_matches_target:
+            print("EDAR dates already match target range (no expansion needed)")
+            edar_aligned = edar_data
+        else:
+            print("Expanding EDAR dates to target dates (preserving NaNs)")
+            edar_aligned = edar_data.reindex({TEMPORAL_COORD: target_dates})
 
         # STEP 2: Spatial alignment - identify common regions
         # All datasets should use REGION_COORD for spatial dimension
@@ -165,7 +169,9 @@ class AlignmentProcessor:
             # Stack to (n_variants, T) array
             data = region_biomarkers.to_array().values
             has_data = (data > 0) & np.isfinite(data)
-            has_data_any = np.any(has_data, axis=0)  # (T,) - True if any variant has data
+            has_data_any = np.any(
+                has_data, axis=0
+            )  # (T,) - True if any variant has data
 
             if has_data_any.any():
                 first_idx = int(np.argmax(has_data_any))

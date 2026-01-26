@@ -51,7 +51,9 @@ class TraceMetrics:
     cpu_gpu_ratio: float  # cpu_time / gpu_time
     data_compute_ratio: float  # data_time / compute_time
     gpu_utilization_pct: float  # gpu_time / trace_duration
-    worker_saturation_pct: float  # % of dataloader events that are >100ms (indicates worker bottleneck)
+    worker_saturation_pct: (
+        float  # % of dataloader events that are >100ms (indicates worker bottleneck)
+    )
 
     # Top operations (name, duration_us, count)
     top_cpu_ops: list[tuple[str, float, int]] = field(default_factory=list)
@@ -177,13 +179,19 @@ def extract_metrics(trace_path: str) -> TraceMetrics:
 
     # Calculate ratios
     cpu_gpu_ratio = cpu_time_us / gpu_time_us if gpu_time_us > 0 else float("inf")
-    data_compute_ratio = data_time_us / compute_time_us if compute_time_us > 0 else float("inf")
-    gpu_utilization_pct = (gpu_time_us / trace_duration_us * 100) if trace_duration_us > 0 else 0
+    data_compute_ratio = (
+        data_time_us / compute_time_us if compute_time_us > 0 else float("inf")
+    )
+    gpu_utilization_pct = (
+        (gpu_time_us / trace_duration_us * 100) if trace_duration_us > 0 else 0
+    )
 
     # Calculate dataloader-specific metrics
     dataloader_wait_time_us = sum(dataloader_waits)
     if dataloader_waits:
-        long_waits = sum(1 for w in dataloader_waits if w > 100_000)  # >100ms indicates worker saturation
+        long_waits = sum(
+            1 for w in dataloader_waits if w > 100_000
+        )  # >100ms indicates worker saturation
         worker_saturation_pct = (long_waits / len(dataloader_waits)) * 100
     else:
         worker_saturation_pct = 0.0
@@ -250,41 +258,53 @@ def format_text(metrics: TraceMetrics) -> str:
     elif metrics.dataloader_wait_time_us / metrics.trace_duration_us > 0.3:
         lines.append("⚠️  DATALOADER BOTTLENECK: Workers can't keep up with GPU")
 
-    lines.extend([
-        "",
-        "TOP 10 GPU KERNELS (name | total_us | count | avg_us)",
-        "-" * 70,
-    ])
+    lines.extend(
+        [
+            "",
+            "TOP 10 GPU KERNELS (name | total_us | count | avg_us)",
+            "-" * 70,
+        ]
+    )
 
     if metrics.top_gpu_kernels:
         for name, dur_us, count in metrics.top_gpu_kernels[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
     else:
         lines.append("(No GPU kernels found)")
 
-    lines.extend([
-        "",
-        "TOP 10 CPU OPS (name | total_us | count | avg_us)",
-        "-" * 70,
-    ])
+    lines.extend(
+        [
+            "",
+            "TOP 10 CPU OPS (name | total_us | count | avg_us)",
+            "-" * 70,
+        ]
+    )
 
     if metrics.top_cpu_ops:
         for name, dur_us, count in metrics.top_cpu_ops[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
     else:
         lines.append("(No CPU ops found)")
 
     if metrics.top_data_ops:
-        lines.extend([
-            "",
-            "TOP DATA LOADING OPS (name | total_us | count | avg_us)",
-            "-" * 70,
-        ])
+        lines.extend(
+            [
+                "",
+                "TOP DATA LOADING OPS (name | total_us | count | avg_us)",
+                "-" * 70,
+            ]
+        )
         for name, dur_us, count in metrics.top_data_ops[:10]:
             avg_us = dur_us / count if count > 0 else 0
-            lines.append(f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}")
+            lines.append(
+                f"{name[:45]:<45} | {dur_us:>10.0f} | {count:>4} | {avg_us:>8.1f}"
+            )
 
     lines.append("=" * 70)
     return "\n".join(lines)
@@ -311,8 +331,7 @@ def format_json(metrics: TraceMetrics) -> str:
         "worker_saturation_pct": metrics.worker_saturation_pct,
         "categories": sorted(metrics.categories),
         "top_cpu_ops": [
-            {"name": n, "duration_us": d, "count": c}
-            for n, d, c in metrics.top_cpu_ops
+            {"name": n, "duration_us": d, "count": c} for n, d, c in metrics.top_cpu_ops
         ],
         "top_gpu_kernels": [
             {"name": n, "duration_us": d, "count": c}
@@ -349,30 +368,34 @@ def format_aggregated_text(
     dataloader_waits = [m.dataloader_wait_time_us for _, m in all_metrics]
     worker_saturations = [m.worker_saturation_pct for _, m in all_metrics]
 
-    lines.extend([
-        "AGGREGATE METRICS (mean ± std)",
-        "-" * 70,
-        f"Trace duration:    {np.mean(durations):>12.0f} ± {np.std(durations):>8.0f} us",
-        f"GPU utilization:   {np.mean(gpu_utils):>8.1f} ± {np.std(gpu_utils):>4.1f} %",
-        f"CPU/GPU ratio:     {np.mean(cpu_gpu_ratios):>8.2f} ± {np.std(cpu_gpu_ratios):>4.2f}",
-        f"Data/Compute:      {np.mean(data_compute_ratios):>8.2f} ± {np.std(data_compute_ratios):>4.2f}",
-        f"Dataloader wait:   {np.mean(dataloader_waits):>12.0f} ± {np.std(dataloader_waits):>8.0f} us",
-        f"Worker saturation: {np.mean(worker_saturations):>8.1f} ± {np.std(worker_saturations):>4.1f} %",
-        "",
-        "PER-TRACE BREAKDOWN",
-        "-" * 70,
-    ])
+    lines.extend(
+        [
+            "AGGREGATE METRICS (mean ± std)",
+            "-" * 70,
+            f"Trace duration:    {np.mean(durations):>12.0f} ± {np.std(durations):>8.0f} us",
+            f"GPU utilization:   {np.mean(gpu_utils):>8.1f} ± {np.std(gpu_utils):>4.1f} %",
+            f"CPU/GPU ratio:     {np.mean(cpu_gpu_ratios):>8.2f} ± {np.std(cpu_gpu_ratios):>4.2f}",
+            f"Data/Compute:      {np.mean(data_compute_ratios):>8.2f} ± {np.std(data_compute_ratios):>4.2f}",
+            f"Dataloader wait:   {np.mean(dataloader_waits):>12.0f} ± {np.std(dataloader_waits):>8.0f} us",
+            f"Worker saturation: {np.mean(worker_saturations):>8.1f} ± {np.std(worker_saturations):>4.1f} %",
+            "",
+            "PER-TRACE BREAKDOWN",
+            "-" * 70,
+        ]
+    )
 
     for i, (trace_path, metrics) in enumerate(all_metrics, 1):
         trace_name = trace_path.stem[:40]  # Truncate long names
-        lines.extend([
-            f"Trace {i} ({trace_name}):",
-            f"  Duration: {metrics.trace_duration_us / 1000:.1f} ms, "
-            f"GPU util: {metrics.gpu_utilization_pct:.1f}%, "
-            f"CPU/GPU: {metrics.cpu_gpu_ratio:.2f}",
-            f"  Dataloader wait: {metrics.dataloader_wait_time_us / 1000:.1f} ms, "
-            f"Worker saturation: {metrics.worker_saturation_pct:.1f}%",
-        ])
+        lines.extend(
+            [
+                f"Trace {i} ({trace_name}):",
+                f"  Duration: {metrics.trace_duration_us / 1000:.1f} ms, "
+                f"GPU util: {metrics.gpu_utilization_pct:.1f}%, "
+                f"CPU/GPU: {metrics.cpu_gpu_ratio:.2f}",
+                f"  Dataloader wait: {metrics.dataloader_wait_time_us / 1000:.1f} ms, "
+                f"Worker saturation: {metrics.worker_saturation_pct:.1f}%",
+            ]
+        )
 
         # Top 3 kernels for this trace
         if metrics.top_gpu_kernels:
@@ -403,11 +426,26 @@ def format_aggregated_json(
     worker_saturations = [m.worker_saturation_pct for _, m in all_metrics]
 
     aggregated["aggregate_stats"] = {
-        "trace_duration_us": {"mean": float(np.mean(durations)), "std": float(np.std(durations))},
-        "gpu_utilization_pct": {"mean": float(np.mean(gpu_utils)), "std": float(np.std(gpu_utils))},
-        "cpu_gpu_ratio": {"mean": float(np.mean(cpu_gpu_ratios)), "std": float(np.std(cpu_gpu_ratios))},
-        "dataloader_wait_time_us": {"mean": float(np.mean(dataloader_waits)), "std": float(np.std(dataloader_waits))},
-        "worker_saturation_pct": {"mean": float(np.mean(worker_saturations)), "std": float(np.std(worker_saturations))},
+        "trace_duration_us": {
+            "mean": float(np.mean(durations)),
+            "std": float(np.std(durations)),
+        },
+        "gpu_utilization_pct": {
+            "mean": float(np.mean(gpu_utils)),
+            "std": float(np.std(gpu_utils)),
+        },
+        "cpu_gpu_ratio": {
+            "mean": float(np.mean(cpu_gpu_ratios)),
+            "std": float(np.std(cpu_gpu_ratios)),
+        },
+        "dataloader_wait_time_us": {
+            "mean": float(np.mean(dataloader_waits)),
+            "std": float(np.std(dataloader_waits)),
+        },
+        "worker_saturation_pct": {
+            "mean": float(np.mean(worker_saturations)),
+            "std": float(np.std(worker_saturations)),
+        },
     }
 
     for trace_path, metrics in all_metrics:
@@ -447,7 +485,9 @@ Examples:
         # Experiment + run ID mode
         experiment_name, run_id = args.inputs
         try:
-            trace_paths = resolve_trace_paths(experiment_name=experiment_name, run_id=run_id)
+            trace_paths = resolve_trace_paths(
+                experiment_name=experiment_name, run_id=run_id
+            )
         except FileNotFoundError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
@@ -487,9 +527,17 @@ Examples:
     else:
         # Multiple traces or run mode, aggregated format
         if args.json:
-            print(format_aggregated_json(all_metrics, experiment_name or "unknown", run_id or "unknown"))
+            print(
+                format_aggregated_json(
+                    all_metrics, experiment_name or "unknown", run_id or "unknown"
+                )
+            )
         else:
-            print(format_aggregated_text(all_metrics, experiment_name or "unknown", run_id or "unknown"))
+            print(
+                format_aggregated_text(
+                    all_metrics, experiment_name or "unknown", run_id or "unknown"
+                )
+            )
 
 
 if __name__ == "__main__":

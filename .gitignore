@@ -23,6 +23,8 @@ MANIFEST
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# we use pyproject.toml
+requirements.txt
 
 # PyTorch
 *.pth
@@ -30,11 +32,10 @@ MANIFEST
 checkpoints/
 
 # Data files
-data/*.csv
-data/*.parquet
-data/*.h5
-data/*.zarr
-data/processed/
+data/files/*.csv
+data/files/*.parquet
+data/files/*.h5
+data/processed/*.zarr
 outputs/
 logs/
 

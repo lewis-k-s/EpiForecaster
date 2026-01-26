@@ -103,6 +103,9 @@ class TrainingConfig:
     gradient_clip: float = 1.0
     seed: int | None = None
     checkpoint_every: int = 0
+    enable_tf32: bool = True
+    enable_mixed_precision: bool = True
+    mixed_precision_dtype: str = "bfloat16"  # "bfloat16" or "float16"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> TrainingConfig:
@@ -434,6 +437,9 @@ class Region2VecTrainer:
             normalize=self.config.encoder.normalize,
         ).to(self.device)
 
+        # Enable TF32 for better performance on Ampere+ GPUs
+        self._setup_tensor_core_optimizations()
+
         self.optimizer = torch.optim.Adam(
             self.encoder.parameters(),
             lr=self.config.training.learning_rate,
@@ -516,16 +522,28 @@ class Region2VecTrainer:
         self.encoder.train()
         self.optimizer.zero_grad()
 
-        embeddings = self.encoder(self.features, self.edge_index)
-        loss_outputs = self._compute_primary_loss(embeddings)
-        total_loss = loss_outputs["total_loss"]
+        if self.config.training.enable_mixed_precision:
+            dtype = (
+                torch.bfloat16
+                if self.config.training.mixed_precision_dtype == "bfloat16"
+                else torch.float16
+            )
+            autocast_enabled = self.device.type == "cuda"
+        else:
+            dtype = torch.float32
+            autocast_enabled = False
 
-        pair_losses = self._compute_region2vec_losses(embeddings)
-        total_loss = (
-            total_loss
-            + self.config.loss.ratio_weight * pair_losses["ratio_loss"]
-            + self.config.loss.hop_weight * pair_losses["hop_loss"]
-        )
+        with torch.autocast(device_type="cuda", dtype=dtype, enabled=autocast_enabled):
+            embeddings = self.encoder(self.features, self.edge_index)
+            loss_outputs = self._compute_primary_loss(embeddings)
+            total_loss = loss_outputs["total_loss"]
+
+            pair_losses = self._compute_region2vec_losses(embeddings)
+            total_loss = (
+                total_loss
+                + self.config.loss.ratio_weight * pair_losses["ratio_loss"]
+                + self.config.loss.hop_weight * pair_losses["hop_loss"]
+            )
 
         total_loss.backward()
         if self.config.training.gradient_clip > 0:
@@ -716,3 +734,24 @@ class Region2VecTrainer:
         if device_str == "auto":
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return torch.device(device_str)
+
+    def _setup_tensor_core_optimizations(self):
+        """Enable TF32 and configure precision settings for Tensor Core utilization."""
+        if self.device.type == "cuda":
+            if self.config.training.enable_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision("high")
+                logger.info("TF32 optimizations enabled")
+            else:
+                logger.info("TF32 optimizations disabled")
+
+            if self.config.training.enable_mixed_precision:
+                dtype_name = self.config.training.mixed_precision_dtype
+                logger.info(
+                    f"Mixed precision ({dtype_name}): will be used in forward pass"
+                )
+            else:
+                logger.info("Mixed precision disabled")
+        else:
+            logger.info("Tensor Core optimizations skipped (non-CUDA device)")

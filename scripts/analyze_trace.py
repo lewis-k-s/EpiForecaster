@@ -1,38 +1,33 @@
+import argparse
 import json
 import sys
 from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).parent))
+from utils.skill_output import SkillOutputBuilder, print_output
 
 
-def analyze_trace(trace_path):
-    print(f"Loading trace: {trace_path}")
+def analyze_trace(trace_path: str) -> dict[str, Any]:
+    """Analyze PyTorch profiler trace and return structured data."""
     with open(trace_path, "r") as f:
         try:
             data = json.load(f)
         except json.JSONDecodeError as e:
-            print(f"Error decoding JSON: {e}")
-            return
+            raise ValueError(f"Error decoding JSON: {e}") from e
 
     events = data.get("traceEvents", [])
     if not events:
-        print("No traceEvents found.")
-        return
-
-    print(f"Total events: {len(events)}")
+        raise ValueError("No traceEvents found in file")
 
     # Aggregators
     op_duration: defaultdict[str, float] = defaultdict(float)
     op_count: defaultdict[str, int] = defaultdict(int)
 
-    # Categories to potentially filter or split by
-    # PyTorch traces often have 'cat' field: 'cpu_op', 'cuda_kernel', etc.
-
     categories = set()
 
     for event in events:
-        # We only care about complete events (X) or duration events usually,
-        # but 'dur' is present in 'X' (Complete) type events.
-        # Some traces use B (Begin) and E (End). PyTorch typically uses X.
-
         if "dur" not in event:
             continue
 
@@ -40,21 +35,11 @@ def analyze_trace(trace_path):
         cat = event.get("cat", "unknown")
         categories.add(cat)
 
-        # Duration is usually in microseconds
         duration = event["dur"]
-
-        # Key can be name + category to distinguish cpu vs gpu
         key = f"[{cat}] {name}"
 
         op_duration[key] += duration
         op_count[key] += 1
-
-    print(f"Event categories found: {categories}")
-    print("-" * 60)
-    print(
-        f"{'Operation':<50} | {'Count':<8} | {'Total Time (ms)':<15} | {'Avg Time (us)':<15}"
-    )
-    print("-" * 60)
 
     # Sort by total duration descending
     sorted_ops = sorted(op_duration.items(), key=lambda x: x[1], reverse=True)
@@ -72,46 +57,132 @@ def analyze_trace(trace_path):
         else:
             other_ops.append((key, duration))
 
-    def print_table(title, items, limit=20):
-        print(f"\n--- {title} ---")
-        print(
-            f"{'Operation':<60} | {'Count':<8} | {'Total (ms)':<10} | {'Avg (us)':<10}"
-        )
-        print("-" * 95)
-        for _i, (key, total_dur_us) in enumerate(items[:limit]):
-            count = op_count[key]
-            avg_dur_us = total_dur_us / count
-            total_dur_ms = total_dur_us / 1000.0
-            # Remove the category prefix for cleaner printing if desired, or keep it
-            clean_name = key.split("] ", 1)[1] if "] " in key else key
-            print(
-                f"{clean_name[:60]:<60} | {count:<8} | {total_dur_ms:<10.2f} | {avg_dur_us:<10.2f}"
-            )
-
     # Calculate global timeline
     start_times = [e["ts"] for e in events if "ts" in e]
     end_times = [e["ts"] + e["dur"] for e in events if "ts" in e and "dur" in e]
 
+    result: dict[str, Any] = {
+        "categories": list(categories),
+        "total_events": len(events),
+    }
+
     if start_times and end_times:
         global_start = min(start_times)
         global_end = max(end_times)
-        total_trace_duration_ms = (global_end - global_start) / 1000.0
-        print(f"\nTotal Trace Duration: {total_trace_duration_ms:.2f} ms")
+        total_trace_duration_us = global_end - global_start
 
-        total_cpu_time = sum(dur for _, dur in cpu_ops) / 1000.0
-        total_gpu_time = sum(dur for _, dur in gpu_kernels) / 1000.0
+        total_cpu_time = sum(dur for _, dur in cpu_ops)
+        total_gpu_time = sum(dur for _, dur in gpu_kernels)
 
-        print(f"Total CPU Op Time:    {total_cpu_time:.2f} ms")
-        print(f"Total GPU Kernel Time:{total_gpu_time:.2f} ms")
+        result["trace_duration_us"] = total_trace_duration_us
+        result["trace_duration_ms"] = total_trace_duration_us / 1000.0
+        result["total_cpu_time_us"] = total_cpu_time
+        result["total_cpu_time_ms"] = total_cpu_time / 1000.0
+        result["total_gpu_time_us"] = total_gpu_time
+        result["total_gpu_time_ms"] = total_gpu_time / 1000.0
 
-    print_table("Top GPU Kernels", gpu_kernels)
-    print_table("Top CPU Operations", cpu_ops)
-    print_table("Other (Runtime/Annotations)", other_ops)
+    # Format operations
+    def format_ops(items):
+        formatted = []
+        for key, total_dur_us in items:
+            count = op_count[key]
+            avg_dur_us = total_dur_us / count
+            total_dur_ms = total_dur_us / 1000.0
+            clean_name = key.split("] ", 1)[1] if "] " in key else key
+
+            formatted.append(
+                {
+                    "name": clean_name,
+                    "original_key": key,
+                    "count": count,
+                    "avg_duration_us": avg_dur_us,
+                    "total_duration_us": total_dur_us,
+                    "total_duration_ms": total_dur_ms,
+                }
+            )
+        return formatted
+
+    result["gpu_kernels"] = format_ops(gpu_kernels)
+    result["cpu_ops"] = format_ops(cpu_ops)
+    result["other_ops"] = format_ops(other_ops)
+
+    return result
+
+
+def main():
+    """CLI entry point for perf-analyze."""
+    parser = argparse.ArgumentParser(
+        description="Analyze PyTorch profiler Chrome trace JSON files"
+    )
+    parser.add_argument("trace_path", help="Path to trace JSON file")
+    parser.add_argument(
+        "--text",
+        action="store_true",
+        help="Output as human-readable text (default: JSON)",
+    )
+    parser.add_argument(
+        "--compact", action="store_true", help="Output compact JSON (no indentation)"
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=20,
+        help="Number of top operations to show in text mode",
+    )
+
+    args = parser.parse_args()
+
+    builder = SkillOutputBuilder(
+        skill_name="perf-analyze",
+        input_path=args.trace_path,
+    )
+
+    try:
+        data = analyze_trace(args.trace_path)
+        output = builder.success(data)
+
+        if args.text:
+            # Print human-readable output
+            print(f"Loading trace: {args.trace_path}")
+            print(f"Total events: {data['total_events']}")
+            print(f"Event categories found: {data['categories']}")
+            print("-" * 60)
+
+            if "trace_duration_ms" in data:
+                print(f"\nTotal Trace Duration: {data['trace_duration_ms']:.2f} ms")
+                print(f"Total CPU Op Time:    {data['total_cpu_time_ms']:.2f} ms")
+                print(f"Total GPU Kernel Time:{data['total_gpu_time_ms']:.2f} ms")
+
+            for title, ops in [
+                ("Top GPU Kernels", data["gpu_kernels"]),
+                ("Top CPU Operations", data["cpu_ops"]),
+                ("Other (Runtime/Annotations)", data["other_ops"]),
+            ]:
+                print(f"\n--- {title} ---")
+                print(
+                    f"{'Operation':<60} | {'Count':<8} | {'Total (ms)':<10} | {'Avg (us)':<10}"
+                )
+                print("-" * 95)
+                for op in ops[: args.top]:
+                    print(
+                        f"{op['name'][:60]:<60} | {op['count']:<8} | "
+                        f"{op['total_duration_ms']:<10.2f} | {op['avg_duration_us']:<10.2f}"
+                    )
+        else:
+            indent = 0 if args.compact else 2
+            print_output(output, indent=indent)
+
+    except FileNotFoundError:
+        print_output(
+            builder.error(
+                "FileNotFoundError", f"Trace file not found: {args.trace_path}"
+            )
+        )
+    except ValueError as e:
+        print_output(builder.error("ValueError", str(e)))
+    except Exception as e:
+        print_output(builder.error(type(e).__name__, str(e), {"traceback": str(e)}))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python analyze_trace.py <path_to_trace_json>")
-        sys.exit(1)
-
-    analyze_trace(sys.argv[1])
+    main()

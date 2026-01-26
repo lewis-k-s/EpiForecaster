@@ -260,11 +260,10 @@ def make_forecast_figure(
             actual_context = np.asarray(sample["actual_context"]).reshape(-1)
             pred_series = np.asarray(sample["prediction"]).reshape(-1)
             t_rel = np.asarray(sample["t_rel"]).reshape(-1)
-            L = sample["L"]
             H = sample["H"]
 
             forecast_series_full = np.full(len(t_rel), np.nan, dtype=np.float32)
-            
+
             # Mask for the forecast horizon: 0 <= t < H
             horizon_mask = (t_rel >= 0) & (t_rel < H)
             # Only take as many predictions as we have matching time points (handles truncation)
