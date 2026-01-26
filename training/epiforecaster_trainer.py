@@ -136,6 +136,9 @@ class EpiForecasterTrainer:
 
         self.model.to(self.device)
 
+        # Enable TF32 for better performance on Ampere+ GPUs
+        self._setup_tensor_core_optimizations()
+
         # Setup data loaders
         self.train_loader, self.val_loader, self.test_loader = (
             self._create_data_loaders()
@@ -317,6 +320,24 @@ class EpiForecasterTrainer:
 
         return device
 
+    def _setup_tensor_core_optimizations(self):
+        """Enable TF32 and configure precision settings for Tensor Core utilization."""
+        if self.device.type == "cuda":
+            if self.config.training.enable_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision("high")
+                self._status("TF32 optimizations enabled")
+            else:
+                self._status("TF32 optimizations disabled")
+
+            if self.config.training.enable_mixed_precision:
+                self._status("Mixed precision (BF16): will be used in forward pass")
+            else:
+                self._status("Mixed precision disabled")
+        else:
+            self._status("Tensor Core optimizations skipped (non-CUDA device)")
+
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on configuration."""
         return torch.optim.Adam(
@@ -465,7 +486,9 @@ class EpiForecasterTrainer:
         # This enables fully-vectorized target gathering in the model without CUDA `.item()` syncs.
         if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
             # Use dict assignment to ensure it's in the store and moves with .to(device)
-            mob_batch["target_index"] = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(-1)  # type: ignore[index]
+            mob_batch["target_index"] = mob_batch.ptr[
+                :-1
+            ] + mob_batch.target_node.reshape(-1)  # type: ignore[index]
 
         return {
             "CaseNode": case_node,  # (B, L, C)
@@ -679,6 +702,12 @@ class EpiForecasterTrainer:
 
         sjid = os.getenv("SLURM_JOB_ID", "")
         if sjid:
+            # Detect interactive SLURM session - use datetime ID instead
+            job_name = os.getenv("SLURM_JOB_NAME", "")
+            job_qos = os.getenv("SLURM_JOB_QOS", "")
+            if job_name == "interactive" or "_interactive" in job_qos:
+                # Interactive session - use unique datetime ID
+                return f"run_{time.time_ns()}"
             return sjid
 
         return f"run_{time.time_ns()}"
@@ -881,46 +910,37 @@ class EpiForecasterTrainer:
 
                 data_time_s = time.time() - fetch_start_time
                 batch_start_time = time.time()
-                predictions, targets, target_mean, target_scale = self._forward_batch(
-                    model=self.model,
-                    batch_data=batch_data,
-                    device=self.device,
-                    region_embeddings=self.region_embeddings,
-                )
 
-                loss = self.criterion(
-                    predictions,
-                    targets,
-                    target_mean,
-                    target_scale,
-                )
-                # import torch as tf
-                # loss = tf.tensor(float("nan"))
-                # if not torch.isfinite(loss):
-                #     self.nan_loss_counter += 1
-                #     patience = self.config.training.nan_loss_patience
-                #     self._status(
-                #         "Non-finite training loss detected "
-                #         f"(step={self.global_step}, "
-                #         f"count={self.nan_loss_counter}/{patience})."
-                #     )
-                #     self.writer.add_scalar("Loss/Train_non_finite", 1, self.global_step)
-                #     self.global_step += 1
-                #     fetch_start_time = time.time()
-                #     if patience is not None and self.nan_loss_counter >= patience:
-                #         self._status(
-                #             "NaN loss patience exceeded; "
-                #             "saving checkpoint and stopping training."
-                #         )
-                #         if self.config.output.save_checkpoints:
-                #             self._save_checkpoint(
-                #                 self.current_epoch, self.best_val_loss, is_final=True
-                #             )
-                #         self.nan_loss_triggered = True
-                #         break
-                #     continue
-                if self.nan_loss_counter:
-                    self.nan_loss_counter = 0
+                if self.config.training.enable_mixed_precision:
+                    dtype = (
+                        torch.bfloat16
+                        if self.config.training.mixed_precision_dtype == "bfloat16"
+                        else torch.float16
+                    )
+                    autocast_enabled = self.device.type == "cuda"
+                else:
+                    dtype = torch.float32
+                    autocast_enabled = False
+
+                with torch.autocast(
+                    device_type="cuda", dtype=dtype, enabled=autocast_enabled
+                ):
+                    predictions, targets, target_mean, target_scale = (
+                        self._forward_batch(
+                            model=self.model,
+                            batch_data=batch_data,
+                            device=self.device,
+                            region_embeddings=self.region_embeddings,
+                        )
+                    )
+
+                    loss = self.criterion(
+                        predictions,
+                        targets,
+                        target_mean,
+                        target_scale,
+                    )
+
                 loss.backward()
                 self._log_gradient_norms(step=self.global_step)
                 grad_norm = torch.nn.utils.clip_grad_norm_(

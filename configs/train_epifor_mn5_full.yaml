@@ -3,13 +3,9 @@ data:
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
-  missing_permit: 0
+  missing_permit: 2
   window_stride: 1
-  #-- smoothing --#
-  smoothing:
-    enabled: false
-    window: 5
-    smoothing_type: rolling_mean
+  sample_ordering: "time"
   log_scale: true
 model:
   type:
@@ -22,17 +18,17 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    history_length: 14
+    history_length: 28
     forecast_horizon: 7
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
 output:
-  experiment_name: mn5_epiforecaster_full
+  experiment_name: mn5_epiforecaster_temporal
   log_dir: outputs/training
 training:
   device: "cuda"
-  batch_size: 256
+  batch_size: 64
   early_stopping_patience: 5
   nan_loss_patience: 5
   epochs: 10
@@ -40,10 +36,21 @@ training:
   weight_decay: 1.0e-05
   num_workers: 16
   val_workers: 2
+  prefetch_factor: 4
+  pin_memory: true
+
+  # Temporal split configuration
+  split_strategy: "time"
+  train_end_date: "2021-01-31"
+  val_end_date: "2021-03-31"
+  # test_end_date omitted - uses all remaining data
+
+  # ignored
   val_split: 0.1
   test_split: 0.1
+
   profiler:
-    enabled: false
+    enabled: true
     profile_batches: 20
     log_dir: auto
   plot_forecasts: true
