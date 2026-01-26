@@ -113,7 +113,9 @@ class MobilityPreprocessor:
         try:
             return mobility_da.sel({origin_dim: train_ids, dest_dim: train_ids})
         except (KeyError, ValueError):
-            return mobility_da.isel({origin_dim: train_indices, dest_dim: train_indices})
+            return mobility_da.isel(
+                {origin_dim: train_indices, dest_dim: train_indices}
+            )
 
     def _ensure_time_first(self, mobility_da: xr.DataArray) -> xr.DataArray:
         if TEMPORAL_COORD in mobility_da.dims:
@@ -122,5 +124,71 @@ class MobilityPreprocessor:
                 raise ValueError(
                     f"Expected mobility array with 2 spatial dims, got {mobility_da.dims}"
                 )
-            return mobility_da.transpose(TEMPORAL_COORD, spatial_dims[0], spatial_dims[1])
+            return mobility_da.transpose(
+                TEMPORAL_COORD, spatial_dims[0], spatial_dims[1]
+            )
         return mobility_da
+
+    @staticmethod
+    def compute_imported_risk(
+        cases: np.ndarray,
+        mobility: np.ndarray,
+        lags: list[int],
+        epsilon: float = 1e-8,
+    ) -> np.ndarray:
+        """Compute mobility-weighted lagged case features (imported risk).
+
+        Computes Risk[t, i] = sum_j (Mobility[t, j, i] * Cases[t-lag, j])
+        using normalized incoming flow weights.
+
+        Args:
+            cases: Normalized cases array (T, N, 1) or (T, N)
+            mobility: Mobility matrix (T, N, N) or (N, N)
+                      mobility[..., j, i] is flow from j to i
+            lags: List of lag days to compute (e.g. [1, 7, 14])
+            epsilon: Small constant for normalization stability
+
+        Returns:
+            Array of shape (T, N, len(lags)) containing imported risk features.
+        """
+        if not lags:
+            if cases.ndim == 2:
+                T, N = cases.shape
+            else:
+                T, N, _ = cases.shape
+            return np.zeros((T, N, 0), dtype=np.float32)
+
+        # Ensure cases is (T, N, 1)
+        if cases.ndim == 2:
+            cases = cases[..., None]
+
+        T, N, _ = cases.shape
+
+        # Normalize mobility (incoming flow normalization)
+        # Sum over origins (axis -2) for each destination
+        # Mobility shape: (..., origin, dest)
+        incoming_sums = np.sum(mobility, axis=-2, keepdims=True)
+        mobility_norm = mobility / (incoming_sums + epsilon)
+
+        # Transpose to (..., dest, origin) for matmul: Dest <- Origin
+        if mobility_norm.ndim == 3:
+            # (T, N, N) -> (T, N, N)
+            mob_t = mobility_norm.transpose(0, 2, 1)
+        else:
+            # (N, N) -> (N, N)
+            mob_t = mobility_norm.transpose(1, 0)
+
+        features = []
+        for lag in lags:
+            # Shift cases by lag (pad with 0 at start)
+            # cases[t] should be cases[t-lag]
+            shifted = np.zeros_like(cases)
+            if lag < T:
+                shifted[lag:] = cases[:-lag]
+
+            # Compute Risk = M.T @ C_shifted
+            # (..., N, N) @ (..., N, 1) -> (..., N, 1)
+            risk = np.matmul(mob_t, shifted)
+            features.append(risk)
+
+        return np.concatenate(features, axis=-1).astype(np.float32)

@@ -153,6 +153,25 @@ class EpiDataset(Dataset):
             f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
         )
 
+        # Lagged Mobility Features
+        self.mobility_lags = config.data.mobility_lags
+        self.use_imported_risk = config.data.use_imported_risk
+        self.lagged_risk = None
+        if self.mobility_lags:
+            logger.info(f"Pre-computing imported risk for lags: {self.mobility_lags}")
+            # Ensure cases are (T, N, 1) - use value channel (index 0)
+            # precomputed_cases is (T, N, C) - channel 0 is value
+            # Convert to numpy if tensor
+            cases_val = self.precomputed_cases[..., 0]
+            if isinstance(cases_val, torch.Tensor):
+                cases_val = cases_val.numpy()
+
+            # Compute risk using dense mobility (supports time-varying)
+            risk_np = self.mobility_preprocessor.compute_imported_risk(
+                cases_val, self.preloaded_mobility.numpy(), self.mobility_lags
+            )
+            self.lagged_risk = torch.from_numpy(risk_np).to(torch.float32)
+
         # Cache for full graphs keyed by time step (CPU tensors only)
         self._full_graph_cache: dict[int, Data] = {}
 
@@ -331,8 +350,15 @@ class EpiDataset(Dataset):
 
     @property
     def cases_output_dim(self) -> int:
-        """Temporal input dimension (value, mask, age)."""
-        return 3
+        """Temporal input dimension (value, mask, age) + imported_risk_lags.
+
+        Note: Imported risk lag features are value-only (no mask/age channels).
+        """
+        base_dim = 3
+        if self.use_imported_risk:
+            lag_dim = len(self.mobility_lags) if hasattr(self, "mobility_lags") else 0
+            return base_dim + lag_dim
+        return base_dim
 
     @property
     def biomarkers_output_dim(self) -> int:
@@ -434,6 +460,20 @@ class EpiDataset(Dataset):
         neigh_mask_t = neigh_mask.to(torch.float32).unsqueeze(-1)
         case_history = case_history * neigh_mask_t
 
+        # Concatenate lagged risk features if available
+        # Lag features are value-only (no mask/age channels) for efficiency
+        if self.use_imported_risk and self.lagged_risk is not None:
+            # Slice lagged risk for the current window [range_start:range_end]
+            # (L, N, Lags) - value channels only, no mask/age
+            risk_slice = self.lagged_risk[range_start:range_end]
+
+            # Apply neighborhood mask (broadcasts to all lag channels)
+            risk_slice = risk_slice * neigh_mask_t
+
+            # Concat to case history: (L, N, 3) + (L, N, Lags) -> (L, N, 3+Lags)
+            # Cases keep their 3 channels (value, mask, age); lags are value-only
+            case_history = torch.cat([case_history, risk_slice], dim=-1)
+
         # Encode all regions in context using biomarker encoding
         # Optimized: Use precomputed biomarkers + dynamic has_data based on data start offset
 
@@ -456,13 +496,16 @@ class EpiDataset(Dataset):
         biomarker_history = torch.cat([bio_slice, has_data_3d], dim=-1)
 
         target_np = future_cases[:, target_idx, 0]  # Only value channel for targets
-        targets = target_np.squeeze(-1)
+        # target_np is already 1D with shape (H,), no squeeze needed
+        targets = target_np
 
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
         )
-        assert case_history.shape == (L, self.num_nodes, 3), (
-            f"Case history shape mismatch: expected ({L}, {self.num_nodes}, 3), got {case_history.shape}"
+        expected_case_dim = self.cases_output_dim
+        assert case_history.shape == (L, self.num_nodes, expected_case_dim), (
+            f"Case history shape mismatch: expected ({L}, {self.num_nodes}, {expected_case_dim}), "
+            f"got {case_history.shape}"
         )
         expected_bio_dim = self.biomarkers_output_dim
         assert biomarker_history.shape == (L, self.num_nodes, expected_bio_dim), (
@@ -490,6 +533,10 @@ class EpiDataset(Dataset):
                 feat.append(bio_t[node_ids])
             x = torch.cat(feat, dim=-1)  # (num_nodes, feat_dim)
 
+            # Find local index of target node (needed for masking and mob_graph.target_node)
+            global_to_local = self._get_global_to_local_at_time(global_t)
+            local_target_idx = int(global_to_local[target_idx].item())
+
             # Apply k-hop feature masking based on target node
             if self.config.model.gnn_depth > 0:
                 # Get k-hop neighbors (global indices)
@@ -497,20 +544,18 @@ class EpiDataset(Dataset):
                     target_idx, global_t, self.config.model.gnn_depth
                 )
 
-                # Map global mask to local indices
-                local_k_hop_mask = k_hop_mask[node_ids]
-
-                # Zero out features for nodes outside k-hop
+                # Map global mask to local indices and ensure target is included
+                # NOTE: k_hop_mask excludes the target node (diagonal is False),
+                # so we need to ensure the target node is NOT masked
+                local_k_hop_mask = k_hop_mask[node_ids].clone()
+                local_k_hop_mask[local_target_idx] = True
+                # Zero out features for nodes outside k-hop (including target would be wrong)
                 x_masked = x.clone()
                 x_masked[~local_k_hop_mask] = 0
             else:
                 # No masking (all nodes contribute)
                 x_masked = x
                 local_k_hop_mask = torch.ones(x.size(0), dtype=torch.bool)
-
-            # Find local index of target node
-            global_to_local = self._get_global_to_local_at_time(global_t)
-            local_target_idx = int(global_to_local[target_idx].item())
 
             mob_graph = Data(
                 x=x_masked,
@@ -589,7 +634,11 @@ class EpiDataset(Dataset):
         if T < seg:
             return []
 
-        all_starts = list(range(0, T - seg + 1, self.window_stride))
+        max_lag = (
+            max(self.mobility_lags, default=0) if hasattr(self, "mobility_lags") else 0
+        )
+        # Start at max_lag to avoid leakage/padding at start
+        all_starts = list(range(max_lag, T - seg + 1, self.window_stride))
 
         # Filter by time_range if specified
         if self.time_range is not None:

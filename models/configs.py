@@ -79,10 +79,21 @@ class DataConfig:
     mobility_log_scale: bool = True
     mobility_clip_range: tuple[float, float] = (-8.0, 8.0)
     mobility_scale_epsilon: float = 1e-6
+    # Lags for mobility-weighted case features (e.g. [1, 7, 14])
+    mobility_lags: list[int] = field(default_factory=list)
+    # Whether to use mobility-weighted lagged case features (imported risk)
+    # Lag features are value-only (no mask/age channels) for efficiency
+    use_imported_risk: bool = False
 
     def __post_init__(self) -> None:
         if self.window_stride <= 0:
             raise ValueError("window_stride must be positive")
+
+        if self.use_imported_risk and not self.mobility_lags:
+            raise ValueError(
+                "use_imported_risk=True requires mobility_lags to be non-empty. "
+                "Specify at least one lag value (e.g., [1, 7, 14])."
+            )
 
         if self.missing_permit < 0:
             raise ValueError("missing_permit must be non-negative")
@@ -123,11 +134,22 @@ class ModelConfig:
     # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
     biomarkers_dim: int = 13
     cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
-    # GNN depth determines message passing depth AND k-hop neighborhood size
+    # GNN depth determines message passing depth AND feature masking radius
     # - gnn_depth=0: No masking (all nodes contribute)
     # - gnn_depth=1: 1-hop neighbors (direct neighbors only)
     # - gnn_depth=2: 2-hop neighbors (neighbors of neighbors)
-    # Full graphs are always used; k-hop is applied via feature masking
+    #
+    # IMPLEMENTATION NOTE:
+    # Full graphs are always used with complete edge connectivity. K-hop limiting
+    # is achieved via FEATURE MASKING: nodes outside k-hops have their initial
+    # features zeroed out. The target node is always included (never masked).
+    #
+    # IMPORTANT: Due to message passing over the full graph topology, the GNN's
+    # computational receptive field may extend beyond k-hops. For example, with
+    # gnn_depth=2, information from nodes beyond 2-hops can still influence the
+    # target via intermediate propagation through unmasked nodes. This is a known
+    # design choice - true k-hop receptive field would require building k-hop
+    # subgraphs instead of full graphs.
     gnn_depth: int = 2
     gnn_hidden_dim: int = 32
 
@@ -194,7 +216,7 @@ class TrainingParams:
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 0
-    prefetch_factor: int | None = None
+    prefetch_factor: int | None = 4
     pin_memory: bool = True
     eval_frequency: int = 5
     eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
@@ -208,6 +230,10 @@ class TrainingParams:
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    # Precision settings for Tensor Core optimization
+    enable_tf32: bool = True
+    enable_mixed_precision: bool = True
+    mixed_precision_dtype: str = "bfloat16"  # "bfloat16" or "float16"
 
     def __post_init__(self) -> None:
         if self.resume and not self.model_id:
