@@ -59,6 +59,7 @@ dependencies = [
   "statsmodels>=0.14.6",
   "optuna>=4.7.0",
   "optuna-dashboard>=0.20.0",
+  "vulture>=2.14",
 ]
 
 # Note: torch-scatter and torch-sparse are installed separately using:
@@ -80,6 +81,11 @@ profiling = ["memory-profiler>=0.60.0", "line-profiler>=4.0.0"]
 main = "cli:cli"
 preprocess = "cli:preprocess_cli"
 train = "cli:train_cli"
+# Analysis CLI tools
+perf-analyze = "scripts.analyze_trace:main"
+step-breakdown = "scripts.breakdown_step:main"
+gradnorm-analyze = "scripts.analyze_gradnorm:main"
+dead-code-analyze = "scripts.dead_code_analyze:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
