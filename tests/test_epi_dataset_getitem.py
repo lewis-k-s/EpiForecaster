@@ -64,7 +64,10 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
             "cases": ((TEMPORAL_COORD, REGION_COORD, "feature"), cases),
             "edar_biomarker_N1": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
             "edar_biomarker_N1_mask": ((TEMPORAL_COORD, REGION_COORD), biomarker_mask),
-            "edar_biomarker_N1_censor": ((TEMPORAL_COORD, REGION_COORD), biomarker_censor),
+            "edar_biomarker_N1_censor": (
+                (TEMPORAL_COORD, REGION_COORD),
+                biomarker_censor,
+            ),
             "edar_biomarker_N1_age": ((TEMPORAL_COORD, REGION_COORD), biomarker_age),
             "mobility": ((TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
             "population": ((REGION_COORD,), population),
@@ -170,3 +173,32 @@ def test_index_ordering_time_major(tmp_path):
 
     assert node_dataset[1]["window_start"] == 1
     assert time_dataset[1]["window_start"] == 0
+
+
+def test_imported_risk_gating(tmp_path):
+    """Test that use_imported_risk flag correctly gates lag features.
+
+    Lag features are value-only (no mask/age channels) to reduce dimensionality.
+    """
+    zarr_path = tmp_path / "risk_test.zarr"
+    # Need enough periods for max lag (7) + history (3) + horizon (2)
+    _write_tiny_dataset(str(zarr_path), periods=15)
+
+    # Test 1: use_imported_risk=False (default) -> cases_output_dim = 3
+    config = _make_config(str(zarr_path))
+    dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+    assert dataset.cases_output_dim == 3
+
+    # Test 2: use_imported_risk=True with lags -> cases_output_dim = 3 + len(lags)
+    from copy import deepcopy
+
+    config2 = deepcopy(config)
+    config2.data.use_imported_risk = True
+    config2.data.mobility_lags = [1, 7]
+
+    dataset2 = EpiDataset(config=config2, target_nodes=[0, 1], context_nodes=[0, 1])
+    assert dataset2.cases_output_dim == 5  # 3 + 2 lags
+
+    # Test 3: Verify item shape matches expected dimension
+    item = dataset2[0]
+    assert item["case_node"].shape[-1] == 5  # 3 case channels + 2 lag channels

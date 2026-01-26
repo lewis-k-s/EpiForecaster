@@ -12,8 +12,13 @@ class TestExtractRunFromCheckpointPath:
         """Test extraction with standard training checkpoint path."""
         # Create a mock checkpoint path
         checkpoint = (
-            tmp_path / "outputs" / "training" / "my_experiment" / "run_1234567890"
-            / "checkpoints" / "best_model.pt"
+            tmp_path
+            / "outputs"
+            / "training"
+            / "my_experiment"
+            / "run_1234567890"
+            / "checkpoints"
+            / "best_model.pt"
         )
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
@@ -27,8 +32,13 @@ class TestExtractRunFromCheckpointPath:
     def test_extract_from_optuna_path(self, tmp_path: Path):
         """Test extraction with optuna checkpoint path."""
         checkpoint = (
-            tmp_path / "outputs" / "optuna" / "hpo_experiment"
-            / "local_trial29_1768952246597587000" / "checkpoints" / "best_model.pt"
+            tmp_path
+            / "outputs"
+            / "optuna"
+            / "hpo_experiment"
+            / "local_trial29_1768952246597587000"
+            / "checkpoints"
+            / "best_model.pt"
         )
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
@@ -42,14 +52,23 @@ class TestExtractRunFromCheckpointPath:
     def test_extract_from_relative_path(self, tmp_path: Path):
         """Test extraction with relative path from cwd."""
         # Create a mock outputs directory structure in tmp_path
-        (tmp_path / "outputs" / "training" / "test_exp" / "run_999" / "checkpoints").mkdir(
-            parents=True
+        (
+            tmp_path / "outputs" / "training" / "test_exp" / "run_999" / "checkpoints"
+        ).mkdir(parents=True)
+        checkpoint = (
+            tmp_path
+            / "outputs"
+            / "training"
+            / "test_exp"
+            / "run_999"
+            / "checkpoints"
+            / "best_model.pt"
         )
-        checkpoint = tmp_path / "outputs" / "training" / "test_exp" / "run_999" / "checkpoints" / "best_model.pt"
         checkpoint.touch()
 
         # Change to tmp_path to simulate cwd being the project root
         import os
+
         original_cwd = os.getcwd()
         try:
             os.chdir(tmp_path)
@@ -76,8 +95,13 @@ class TestExtractRunFromCheckpointPath:
         """Test extraction fails for run_id not matching expected patterns."""
         # Create a checkpoint with invalid run_id (doesn't start with run_ or contain trial_)
         checkpoint = (
-            tmp_path / "outputs" / "training" / "my_experiment" / "invalid_run_name"
-            / "checkpoints" / "best_model.pt"
+            tmp_path
+            / "outputs"
+            / "training"
+            / "my_experiment"
+            / "invalid_run_name"
+            / "checkpoints"
+            / "best_model.pt"
         )
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
@@ -92,7 +116,11 @@ class TestExtractRunFromCheckpointPath:
         """Test extraction fails when checkpoints directory is not in path."""
         # Path without /checkpoints/ in it
         checkpoint = (
-            tmp_path / "outputs" / "training" / "my_experiment" / "run_12345"
+            tmp_path
+            / "outputs"
+            / "training"
+            / "my_experiment"
+            / "run_12345"
             / "best_model.pt"
         )
         checkpoint.parent.mkdir(parents=True)
@@ -114,8 +142,13 @@ class TestExtractRunFromCheckpointPath:
 
         for run_id in test_cases:
             checkpoint = (
-                tmp_path / "outputs" / "optuna" / "hpo_exp" / run_id
-                / "checkpoints" / "best_model.pt"
+                tmp_path
+                / "outputs"
+                / "optuna"
+                / "hpo_exp"
+                / run_id
+                / "checkpoints"
+                / "best_model.pt"
             )
             checkpoint.parent.mkdir(parents=True)
             checkpoint.touch()

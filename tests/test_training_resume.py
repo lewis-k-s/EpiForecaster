@@ -34,6 +34,50 @@ def test_resolve_model_id_falls_back_to_slurm(monkeypatch) -> None:
     assert trainer._resolve_model_id() == "456"
 
 
+def test_resolve_model_id_interactive_slurm_uses_datetime(monkeypatch) -> None:
+    """Interactive SLURM sessions should use datetime ID, not SLURM_JOB_ID."""
+    config = SimpleNamespace(
+        training=SimpleNamespace(model_id=""),
+        output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
+    )
+    trainer = _make_trainer_stub(config)
+    # Simulate interactive SLURM session
+    monkeypatch.setenv("SLURM_JOB_ID", "35320487")
+    monkeypatch.setenv("SLURM_JOB_NAME", "interactive")
+    result = trainer._resolve_model_id()
+    assert result.startswith("run_")
+    assert result != "35320487"
+
+
+def test_resolve_model_id_interactive_qos_detection(monkeypatch) -> None:
+    """Detect interactive sessions via _interactive in QOS."""
+    config = SimpleNamespace(
+        training=SimpleNamespace(model_id=""),
+        output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
+    )
+    trainer = _make_trainer_stub(config)
+    # Simulate interactive SLURM via QOS
+    monkeypatch.setenv("SLURM_JOB_ID", "35320487")
+    monkeypatch.setenv("SLURM_JOB_QOS", "acc_interactive")
+    result = trainer._resolve_model_id()
+    assert result.startswith("run_")
+    assert result != "35320487"
+
+
+def test_resolve_model_id_batch_job_uses_slurm_id(monkeypatch) -> None:
+    """Batch jobs should still use SLURM_JOB_ID."""
+    config = SimpleNamespace(
+        training=SimpleNamespace(model_id=""),
+        output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
+    )
+    trainer = _make_trainer_stub(config)
+    # Simulate batch job (no interactive markers)
+    monkeypatch.setenv("SLURM_JOB_ID", "35320487")
+    monkeypatch.setenv("SLURM_JOB_NAME", "train_epoch")
+    monkeypatch.setenv("SLURM_JOB_QOS", "normal")
+    assert trainer._resolve_model_id() == "35320487"
+
+
 def test_find_checkpoint_for_model_id_prefers_best(tmp_path) -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(model_id=""),

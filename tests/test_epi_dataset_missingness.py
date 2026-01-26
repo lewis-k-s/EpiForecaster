@@ -58,7 +58,10 @@ def _write_tiny_dataset(path) -> None:
             "cases": ((TEMPORAL_COORD, REGION_COORD, "feature"), cases),
             "edar_biomarker_N1": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
             "edar_biomarker_N1_mask": ((TEMPORAL_COORD, REGION_COORD), biomarker_mask),
-            "edar_biomarker_N1_censor": ((TEMPORAL_COORD, REGION_COORD), biomarker_censor),
+            "edar_biomarker_N1_censor": (
+                (TEMPORAL_COORD, REGION_COORD),
+                biomarker_censor,
+            ),
             "edar_biomarker_N1_age": ((TEMPORAL_COORD, REGION_COORD), biomarker_age),
             "mobility": ((TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
             "population": ((REGION_COORD,), population),

@@ -12,8 +12,6 @@ mobility_path: "data/files/mobility.zarr"
 # Temporal processing parameters - maximum coverage
 start_date: "2020-03-01" # Earliest case data available
 end_date: "2021-05-09" # Latest mobility data available
-forecast_horizon: 7
-sequence_length: 14
 
 # Feature processing options
 min_flow_threshold: 10

@@ -56,12 +56,14 @@ def _create_dataset_with_channels(
         coords={"date": range(T), "region_id": range(N)},
     )
 
-    return xr.Dataset({
-        "edar_biomarker_N1": da,
-        "edar_biomarker_N1_mask": mask_da,
-        "edar_biomarker_N1_censor": censor_da,
-        "edar_biomarker_N1_age": age_da,
-    })
+    return xr.Dataset(
+        {
+            "edar_biomarker_N1": da,
+            "edar_biomarker_N1_mask": mask_da,
+            "edar_biomarker_N1_censor": censor_da,
+            "edar_biomarker_N1_age": age_da,
+        }
+    )
 
 
 def test_value_channel_log_transform():
@@ -188,36 +190,46 @@ def test_multiple_regions():
     """Verify preprocessing works correctly with multiple regions."""
     preprocessor = BiomarkerPreprocessor()
 
-    values = np.array([
-        [1.0, 2.0, np.nan],
-        [np.nan, 3.0, 4.0],
-        [5.0, np.nan, np.nan],
-    ])
-    mask = np.array([
-        [1.0, 1.0, 0.0],
-        [0.0, 1.0, 1.0],
-        [1.0, 0.0, 0.0],
-    ])
-    censor = np.array([
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.0],
-    ])
-    age = np.array([
-        [0.0, 0.0, 1.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 1.0],
-    ])
+    values = np.array(
+        [
+            [1.0, 2.0, np.nan],
+            [np.nan, 3.0, 4.0],
+            [5.0, np.nan, np.nan],
+        ]
+    )
+    mask = np.array(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ]
+    )
+    censor = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    age = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0],
+        ]
+    )
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
     # Value channel: check each region
-    expected_value = np.array([
-        [np.log1p(1.0), np.log1p(2.0), 0.0],
-        [0.0, np.log1p(3.0), np.log1p(4.0)],
-        [np.log1p(5.0), 0.0, 0.0],
-    ])
+    expected_value = np.array(
+        [
+            [np.log1p(1.0), np.log1p(2.0), 0.0],
+            [0.0, np.log1p(3.0), np.log1p(4.0)],
+            [np.log1p(5.0), 0.0, 0.0],
+        ]
+    )
     np.testing.assert_array_almost_equal(encoded[:, :, 0], expected_value)
     np.testing.assert_array_equal(encoded[:, :, 1], mask)
     np.testing.assert_array_equal(encoded[:, :, 2], censor)
@@ -229,16 +241,20 @@ def test_required_channels_validation():
     preprocessor = BiomarkerPreprocessor()
 
     values = np.array([[1.0], [np.nan]])
-    ds_incomplete = xr.Dataset({
-        "edar_biomarker_N1": xr.DataArray(
-            values,
-            dims=("date", "region_id"),
-            coords={"date": range(2), "region_id": [0]},
-        ),
-        # Missing mask, censor, and age channels
-    })
+    ds_incomplete = xr.Dataset(
+        {
+            "edar_biomarker_N1": xr.DataArray(
+                values,
+                dims=("date", "region_id"),
+                coords={"date": range(2), "region_id": [0]},
+            ),
+            # Missing mask, censor, and age channels
+        }
+    )
 
-    with pytest.raises(ValueError, match="Missing required channel: edar_biomarker_N1_mask"):
+    with pytest.raises(
+        ValueError, match="Missing required channel: edar_biomarker_N1_mask"
+    ):
         preprocessor.preprocess_dataset(ds_incomplete)
 
 
@@ -319,6 +335,7 @@ def test_region_without_biomarker_data():
     # No biomarker data: value=0, mask=0, censor=0, age=max (normalized to 1.0)
     # Shape (T, N, 4) -> (3, 1, 4)
     expected = np.array(
-        [[[0.0, 0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0, 1.0]]], dtype=np.float32
+        [[[0.0, 0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0, 1.0]]],
+        dtype=np.float32,
     )
     np.testing.assert_array_almost_equal(encoded, expected)

@@ -162,7 +162,10 @@ def _expected_edar_output(
                     age_data[t, n] = 1.0
         age_da = xr.DataArray(
             age_data,
-            coords={"date": variant_da["date"].values, REGION_COORD: variant_da[REGION_COORD].values},
+            coords={
+                "date": variant_da["date"].values,
+                REGION_COORD: variant_da[REGION_COORD].values,
+            },
             dims=["date", REGION_COORD],
         )
         outputs[f"{variant_name}_age"] = age_da
