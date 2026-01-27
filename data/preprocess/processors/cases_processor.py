@@ -52,10 +52,13 @@ class CasesProcessor:
             columns={"id": REGION_COORD, "evend": "date", "d.cases": "cases"}
         )
 
-        assert not cases_df.empty, "No data found in cases file"
-        assert {"date", REGION_COORD, "cases"} == set(cases_df.columns), (
-            "Cases columns mismatch"
-        )
+        if cases_df.empty:
+            raise ValueError("No data found in cases file")
+        if {"date", REGION_COORD, "cases"} != set(cases_df.columns):
+            raise ValueError(
+                f"Cases columns mismatch: expected {{'date', '{REGION_COORD}', 'cases'}}, "
+                f"got {set(cases_df.columns)}"
+            )
 
         # Convert date column and handle timezone information
         cases_df["date"] = pd.to_datetime(cases_df["date"]).dt.tz_localize(None)
@@ -94,7 +97,11 @@ class CasesProcessor:
             (cases_df["date"] >= self.config.start_date)
             & (cases_df["date"] <= self.config.end_date)
         ]
-        assert not cases_df.empty, "No data found in temporal range"
+        if cases_df.empty:
+            raise ValueError(
+                f"No data found in temporal range: {self.config.start_date} to {self.config.end_date}. "
+                f"Check your config dates match the data."
+            )
 
         # Pivot to wide format: date as index, region_id as columns. Assume unique but sum if not
         cases_pivot = cases_df.pivot_table(
