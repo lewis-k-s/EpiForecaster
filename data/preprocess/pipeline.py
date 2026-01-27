@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from .config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
+from .config import REGION_COORD, PreprocessingConfig
 from .processors.alignment_processor import AlignmentProcessor
 from .processors.cases_processor import CasesProcessor
 from .processors.edar_processor import EDARProcessor
@@ -82,6 +82,23 @@ class OfflinePreprocessingPipeline:
             # Stage 1: Load and process raw data sources
             processed_data = self._load_raw_sources()
 
+            self._log_sample_stats(
+                processed_data["cases"]["cases"],
+                label="raw cases",
+                sample=self._default_sample_indexer(processed_data["cases"]["cases"]),
+            )
+            self._log_sample_stats(
+                processed_data["mobility"]["mobility"],
+                label="raw mobility",
+                sample=self._default_sample_indexer(
+                    processed_data["mobility"]["mobility"]
+                ),
+                check_coords={"origin": REGION_COORD, "destination": REGION_COORD},
+                dataset=processed_data["mobility"]
+                if isinstance(processed_data["mobility"], xr.Dataset)
+                else None,
+            )
+
             alignment_result = self.processors["alignment"].align_datasets(
                 cases_data=processed_data["cases"],
                 mobility_data=processed_data["mobility"],
@@ -89,13 +106,18 @@ class OfflinePreprocessingPipeline:
                 population_data=processed_data["population"],
             )
 
+            self._log_sample_stats(
+                alignment_result["mobility"],
+                label="aligned mobility",
+                sample=self._default_sample_indexer(alignment_result["mobility"]),
+                check_coords={"origin": REGION_COORD, "destination": REGION_COORD},
+                dataset=alignment_result,
+            )
+
+            # Only chunk run_id dimension for memory efficiency
+            # Other dimensions are kept unchunked to avoid performance warnings
             alignment_result = alignment_result.chunk(
-                {
-                    TEMPORAL_COORD: self.config.chunk_size,
-                    REGION_COORD: -1,
-                    "origin": -1,
-                    "destination": -1,
-                }
+                {"run_id": self.config.run_id_chunk_size}
             )
 
             # Compute valid_targets mask based on data density
@@ -220,32 +242,39 @@ class OfflinePreprocessingPipeline:
         """Compute boolean mask for regions that meet minimum density threshold.
 
         Args:
-            aligned_dataset: Aligned dataset with cases data
+            aligned_dataset: Aligned dataset with cases data (run_id, date, region_id)
 
         Returns:
-            DataArray of shape (num_regions,) with boolean values
+            DataArray of shape (run_id, num_regions) with boolean values
         """
         print("Computing valid_targets mask...")
 
         cases_da = aligned_dataset.cases
         density_threshold = self.config.min_density_threshold
 
-        # Compute data density per region (fraction of non-NaN values)
-        missing_mask = cases_da.isnull().values
-        density = 1 - (missing_mask.sum(axis=0) / missing_mask.shape[0])
+        # Compute data density per (run_id, region) (fraction of non-NaN values)
+        # cases_da has shape (run_id, date, region_id)
+        valid_count = cases_da.notnull().sum(dim="date")
+        total_per_region = cases_da["date"].size
+        density = valid_count / total_per_region
 
         # Create boolean mask
         valid_mask = density >= density_threshold
 
         print(
-            f"  Regions with density >= {density_threshold}: {valid_mask.sum()}/{valid_mask.size}"
+            f"  (run_id, region) pairs with density >= {density_threshold}: {valid_mask.sum()}/{valid_mask.size}"
         )
-        print(f"  Average density: {density.mean():.3f}")
+        # Compute mean for printing (dask arrays need compute() before formatting)
+        avg_density = density.mean().compute()
+        print(f"  Average density: {avg_density:.3f}")
 
         valid_targets_da = xr.DataArray(
             valid_mask.astype(np.int32),
-            dims=[REGION_COORD],
-            coords={REGION_COORD: cases_da[REGION_COORD].values},
+            dims=["run_id", REGION_COORD],
+            coords={
+                "run_id": cases_da["run_id"].values,
+                REGION_COORD: cases_da[REGION_COORD].values,
+            },
         )
 
         return valid_targets_da
@@ -275,8 +304,62 @@ class OfflinePreprocessingPipeline:
             self.config.dataset_name + ".zarr"
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
-        # allow overwrite mode w
-        aligned_dataset.to_zarr(aligned_dataset_path, mode="w")
+
+        # Rechunk to uniform chunks for Zarr compatibility
+        # Chunk run_id, date, and spatial dims to avoid oversized chunks
+        # that cause data corruption when written to Zarr
+        rechunked_dict = {}
+        for var_name, var in aligned_dataset.data_vars.items():
+            chunks = {}
+            for dim in var.dims:
+                if dim == "run_id":
+                    dim_size = var.sizes[dim]
+                    chunks[dim] = min(self.config.run_id_chunk_size, dim_size)
+                elif dim == "date":
+                    # Use configured date chunk size for time series
+                    chunks[dim] = min(self.config.date_chunk_size, var.sizes[dim])
+                elif dim in ("origin", "destination", "region_id"):
+                    # Chunk spatial dims to avoid huge chunks (945x945 creates ~7.6GB chunks)
+                    chunks[dim] = min(self.config.mobility_chunk_size, var.sizes[dim])
+                else:
+                    chunks[dim] = -1
+            rechunked_dict[var_name] = var.chunk(chunks)
+
+        rechunked_dataset = xr.Dataset(rechunked_dict, coords=aligned_dataset.coords)
+
+        # Clear conflicting encodings from data variables and coordinates.
+        # Variables from source zarr files retain v3-specific encodings that
+        # are incompatible with zarr v2 format used for output.
+        v3_encoding_keys = {
+            'chunks',  # old chunk sizes conflict with rechunking
+            'preferred_chunks',
+            'compressors',  # v3 uses tuple of codecs
+            'compressor',  # clear both styles
+            'filters',  # v3 uses tuple of filters
+            'serializer',  # v3-specific
+            'object_codec',  # v3-specific
+            'shards',  # v3-specific
+        }
+        for var_name in rechunked_dataset.data_vars:
+            var = rechunked_dataset.data_vars[var_name]
+            for key in v3_encoding_keys:
+                var.encoding.pop(key, None)
+
+        for coord_name in rechunked_dataset.coords:
+            coord = rechunked_dataset.coords[coord_name]
+            for key in v3_encoding_keys:
+                coord.encoding.pop(key, None)
+
+        # Save with uniform chunking, using Zarr v2 for NFS stability
+        rechunked_dataset.to_zarr(
+            aligned_dataset_path,
+            mode="w",
+            zarr_format=2,  # Use v2 for better NFS compatibility
+            align_chunks=False,  # False since we already manually rechunked
+            safe_chunks=True,  # True to prevent data corruption from partial chunks
+            consolidated=True,  # True for better metadata performance
+        )
+        self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
 
@@ -288,3 +371,74 @@ class OfflinePreprocessingPipeline:
             )
         self.pipeline_state["current_stage"] = stage_name
         print(f"Entering stage: {stage_name.replace('_', ' ').title()}")
+
+    def _default_sample_indexer(self, data: xr.DataArray) -> dict[str, int | slice]:
+        indexer: dict[str, int | slice] = {}
+        for dim in data.dims:
+            dim_name = str(dim)
+            size = data.sizes[dim]
+            if dim_name in {"origin", "destination", REGION_COORD}:
+                indexer[dim_name] = slice(0, min(20, size))
+            elif dim_name == "date":
+                indexer[dim_name] = 0
+            elif dim_name == "run_id":
+                indexer[dim_name] = 0
+            else:
+                indexer[dim_name] = 0
+        return indexer
+
+    def _log_sample_stats(
+        self,
+        data: xr.DataArray,
+        *,
+        label: str,
+        sample: dict[str, int | slice],
+        check_coords: dict[str, str] | None = None,
+        dataset: xr.Dataset | None = None,
+    ) -> None:
+        sample_da = data.isel(sample)
+        if hasattr(sample_da, "compute"):
+            sample_da = sample_da.compute()
+
+        nan_count = int(sample_da.isnull().sum())
+        nonzero_count = int((sample_da > 0).sum())
+        min_val = float(sample_da.min())
+        max_val = float(sample_da.max())
+        all_nan = bool(sample_da.isnull().all())
+
+        print(
+            f"Sample stats [{label}]: shape={sample_da.shape}, "
+            f"nan={nan_count}, nonzero={nonzero_count}, "
+            f"min={min_val}, max={max_val}, all_nan={all_nan}"
+        )
+
+        if check_coords and dataset is not None:
+            for dim, ref in check_coords.items():
+                if dim in data.coords and ref in dataset.coords:
+                    coords_match = np.array_equal(
+                        data.coords[dim].values, dataset.coords[ref].values
+                    )
+                    print(f"Sample coords [{label}]: {dim} == {ref} -> {coords_match}")
+
+    def _log_postwrite_summary(self, dataset_path: Path) -> None:
+        """Verify the saved dataset is valid (e.g., mobility not all NaN)."""
+        ds = xr.open_zarr(dataset_path)
+        try:
+            if "mobility" in ds:
+                # Check a sample to ensure data was preserved (not all NaN)
+                sample = ds["mobility"].isel(
+                    self._default_sample_indexer(ds["mobility"])
+                )
+                if hasattr(sample, "compute"):
+                    sample = sample.compute()
+                if bool(sample.isnull().all()):
+                    raise ValueError(
+                        "Saved mobility sample is all NaN; preprocessing failed."
+                    )
+                non_null_count = ds["mobility"].notnull().sum().compute()
+                print(f"  Verified mobility data: {non_null_count.values} non-null values")
+            if "cases" in ds:
+                non_null_count = ds["cases"].notnull().sum().compute()
+                print(f"  Verified cases data: {non_null_count.values} non-null values")
+        finally:
+            ds.close()

@@ -33,6 +33,10 @@ compression: "blosc"
 num_workers: 4
 # time dim chunk size
 chunk_size: 14
+# run_id dim chunk size (for synthetic multi-run datasets)
+run_id_chunk_size: 5
+date_chunk_size: 30   # Chunk size for date dimension in zarr output
+mobility_chunk_size: 100  # Chunk size for spatial dims (origin/destination)
 memory_limit_gb: 8.0
 
 # Graph construction options - minimal for cases-only model

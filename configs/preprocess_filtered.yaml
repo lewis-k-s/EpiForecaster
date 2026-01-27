@@ -35,6 +35,9 @@ compression: "blosc"
 # Processing configuration
 num_workers: 4
 chunk_size: 14
+run_id_chunk_size: 5  # Chunk size for run_id dimension
+date_chunk_size: 30   # Chunk size for date dimension in zarr output
+mobility_chunk_size: 100  # Chunk size for spatial dims (origin/destination)
 memory_limit_gb: 8.0
 
 # Graph construction options
