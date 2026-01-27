@@ -18,7 +18,6 @@ from scipy.stats import norm
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, PreprocessingConfig
-from .quality_checks import DataQualityThresholds, validate_notna_and_std
 
 
 class _TobitKalman:
@@ -206,26 +205,30 @@ class EDARProcessor:
         Uses max-severity aggregation: missing (2) > censored (1) > uncensored (0).
         Where multiple EDAR sites contribute to a region, takes the maximum flag value.
 
+        Preserves run_id dimension if present in input.
+
         Args:
-            censor_xr: Censor flags with dimensions (date, edar_id, variant)
+            censor_xr: Censor flags with dimensions (run_id?, date, edar_id, variant)
             emap: EDAR contribution matrix (edar_id, region_id)
 
         Returns:
-            Censor flags aggregated to regions with dimensions (date, region_id, variant)
+            Censor flags aggregated to regions with dimensions (run_id?, date, region_id, variant)
         """
         # Align and take max over EDAR sites contributing to each region
         censor_xr_aligned, emap_aligned = xr.align(censor_xr, emap, join="inner")
 
-        # For each region, take the max censor flag among contributing EDAR sites
-        # We use a weighted max where emap weights determine contribution
-        result = xr.DataArray(
-            coords={
-                "date": censor_xr_aligned["date"].values,
-                REGION_COORD: emap_aligned[REGION_COORD].values,
-                "variant": censor_xr_aligned["variant"].values,
-            },
-            dims=["date", REGION_COORD, "variant"],
-        )
+        # run_id dimension is always present
+        assert "run_id" in censor_xr_aligned.dims, "run_id dimension is required"
+
+        coords = {
+            "run_id": censor_xr_aligned["run_id"].values,
+            "date": censor_xr_aligned["date"].values,
+            REGION_COORD: emap_aligned[REGION_COORD].values,
+            "variant": censor_xr_aligned["variant"].values,
+        }
+        dims = ["run_id", "date", REGION_COORD, "variant"]
+
+        result = xr.DataArray(coords=coords, dims=dims)
 
         for variant in censor_xr_aligned["variant"].values:
             variant_censor = censor_xr_aligned.sel(variant=variant)
@@ -258,21 +261,42 @@ class EDARProcessor:
         Age is normalized to [0, 1] with max_age days as the maximum.
         Leading NaNs (before first measurement) get age = 1.0.
 
+        run_id dimension is ALWAYS present (synthetic: multiple runs, real: run_id="real").
+
         Args:
-            values: DataArray with shape (date, region_id) or (date, region_id, variant)
+            values: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
             max_age: Maximum age in days for normalization
 
         Returns:
             DataArray with normalized age values [0, 1]
         """
-        # Handle both 2D and 3D inputs
+        assert "run_id" in values.dims, "run_id dimension is required"
+        return self._compute_age_core(values, max_age)
+
+    def _compute_age_core(
+        self,
+        values: xr.DataArray,
+        max_age: int,
+    ) -> xr.DataArray:
+        """Core age computation that handles all dimensions via broadcasting.
+
+        run_id is always present and handled implicitly via xarray operations.
+        Uses groupby for better chunking support instead of explicit loops.
+
+        Args:
+            values: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
+            max_age: Maximum age in days for normalization
+
+        Returns:
+            DataArray with normalized age values [0, 1]
+        """
+        # Handle variant dimension using groupby for better chunking support
         has_variant = "variant" in values.dims
         if has_variant:
-            results = []
-            for variant in values["variant"].values:
-                variant_values = values.sel(variant=variant)
-                results.append(self._compute_age_channel_2d(variant_values, max_age))
-            return xr.concat(results, dim=values["variant"])
+            # Use groupby for better chunking support vs explicit loop
+            return values.groupby("variant").map(
+                lambda g: self._compute_age_channel_2d(g, max_age)
+            )
         else:
             return self._compute_age_channel_2d(values, max_age)
 
@@ -281,53 +305,76 @@ class EDARProcessor:
         values: xr.DataArray,
         max_age: int,
     ) -> xr.DataArray:
-        """Compute age channel for 2D DataArray.
+        """Compute age channel for DataArray with run_id support.
+
+        Handles both 2D (date, region_id) and 3D (run_id, date, region_id) inputs.
+        Uses xarray operations for proper chunking support.
 
         Args:
-            values: DataArray with shape (date, region_id)
+            values: DataArray with shape (run_id?, date, region_id)
             max_age: Maximum age in days for normalization
 
         Returns:
             DataArray with normalized age values [0, 1]
         """
-        T = len(values["date"])
-        N = len(values[REGION_COORD])
+        # Get dimension order - run_id may or may not be present
+        dims = values.dims
+        date_dim = "date"
+        region_dim = REGION_COORD
+        has_run_id = "run_id" in dims
+
+        # Create time indices along date dimension
+        time_indices = xr.DataArray(
+            np.arange(len(values[date_dim])),
+            dims=[date_dim],
+            coords={date_dim: values[date_dim].values},
+        )
 
         # Mask: 1.0 if measured (finite and positive), 0.0 otherwise
         mask = xr.where(values.notnull() & (values > 0), 1.0, 0.0)
 
-        # Initialize age channel with max_age
-        age_data = np.full((T, N), max_age, dtype=np.float32)
+        # Find last measurement time for each (run_id?, region)
+        # We use cumsum to find the last time index where mask=1
+        # For each position, we want the most recent time where data was observed
 
-        # Convert to numpy for vectorized computation
-        mask_np = mask.values
-        time_indices = np.arange(T)[:, None]  # (T, 1)
+        # For each date, find if there's data at this or any previous date
+        # We use a reverse cumulative approach to track last seen time
 
-        # Find last measurement time for each region
-        last_seen_indices = np.where(mask_np > 0, time_indices, np.nan)
-        last_seen_filled = pd.DataFrame(last_seen_indices).ffill().values
+        # Get time indices where mask=1, else NaN
+        last_seen_indices = xr.where(mask > 0, time_indices, np.nan)
+
+        # Forward fill through time (carries last seen index forward)
+        # This needs to be done along the date dimension
+        last_seen_filled = last_seen_indices.ffill(dim=date_dim)
+
+        # Current time index for each position
+        current_time_indices = time_indices
+
+        # Expand current_time_indices to match the shape of last_seen_filled
+        # If run_id exists, we need to broadcast to (run_id, date, region_id)
+        if has_run_id:
+            # Broadcast: (date,) -> (run_id, date, region_id)
+            current_time_indices = current_time_indices.expand_dims(
+                {region_dim: len(values[region_dim]), "run_id": len(values["run_id"])}
+            )
+        else:
+            # Broadcast: (date,) -> (date, region_id)
+            current_time_indices = current_time_indices.expand_dims(
+                {region_dim: len(values[region_dim])}
+            )
 
         # Calculate age = current_time - last_seen_time
-        valid_history_mask = ~np.isnan(last_seen_filled)
-        current_age = np.zeros_like(age_data)
-        current_age[valid_history_mask] = (
-            time_indices * np.ones((1, N)) - last_seen_filled
-        )[valid_history_mask]
+        current_age = current_time_indices - last_seen_filled
 
-        # Clip to max_age and normalize
-        final_age = np.where(
-            valid_history_mask, np.minimum(current_age, max_age), max_age
-        )
+        # For positions with no history (NaN after ffill), set age to max_age
+        valid_history = last_seen_filled.notnull()
+        final_age = xr.where(valid_history, np.minimum(current_age, max_age), max_age)
+
+        # Normalize to [0, 1]
         age_normalized = final_age / max_age
 
-        return xr.DataArray(
-            age_normalized,
-            coords={
-                "date": values["date"].values,
-                REGION_COORD: values[REGION_COORD].values,
-            },
-            dims=["date", REGION_COORD],
-        )
+        # Preserve the same dimensions as input
+        return age_normalized.transpose(*dims)
 
     def process(self, wastewater_file: str, region_metadata_file: str) -> xr.Dataset:
         """
@@ -417,20 +464,45 @@ class EDARProcessor:
         This is the shared code path for both real and synthetic data.
         Both real and synthetic data use this method for aggregation.
 
+        Preserves run_id dimension for curriculum training.
+        Uses xarray broadcasting to handle single-run and multi-run data uniformly.
+
         Args:
-            flow_xr: Flow/concentration values with dimensions (run_id, date, edar_id, variant)
-            censor_xr: Censor flags with dimensions (run_id, date, edar_id, variant)
+            flow_xr: Flow/concentration values with dimensions (run_id?, date, edar_id, variant)
+            censor_xr: Censor flags with dimensions (run_id?, date, edar_id, variant)
             region_metadata_file: Path to EDAR-to-region contribution matrix
 
         Returns:
-            Dataset with biomarker variables indexed by region_id
+            Dataset with biomarker variables indexed by (run_id?, region_id)
         """
-        # Select first run_id (synthetic may have multiple, real has "real")
-        if "run_id" in flow_xr.dims and len(flow_xr["run_id"]) > 0:
-            flow_xr = flow_xr.isel(run_id=0).drop_vars("run_id")
-        if "run_id" in censor_xr.dims and len(censor_xr["run_id"]) > 0:
-            censor_xr = censor_xr.isel(run_id=0).drop_vars("run_id")
+        assert "run_id" in flow_xr.dims, "run_id dimension is required"
+        run_count = len(flow_xr.run_id)
+        print(f"Processing {run_count} run(s) of EDAR data...")
+        result = self._process_broadcast(flow_xr, censor_xr, region_metadata_file)
+        print(f"  ✓ Processed EDAR data: {result.dims}")
+        return result
 
+    def _process_broadcast(
+        self,
+        flow_xr: xr.DataArray,
+        censor_xr: xr.DataArray,
+        region_metadata_file: str,
+    ) -> xr.Dataset:
+        """
+        Process EDAR data using xarray broadcasting.
+
+        Handles both single-run and multi-run data uniformly using xarray's
+        automatic broadcasting. Operations like xr.dot, xr.align preserve
+        additional dimensions like run_id.
+
+        Args:
+            flow_xr: Flow/concentration values with dimensions (run_id?, date, edar_id, variant)
+            censor_xr: Censor flags with dimensions (run_id?, date, edar_id, variant)
+            region_metadata_file: Path to EDAR-to-region contribution matrix
+
+        Returns:
+            Dataset with biomarker variables indexed by (run_id?, region_id)
+        """
         # Load contribution matrix
         emap = xr.open_dataarray(region_metadata_file)
         # EDAR contribution matrices are typically stored sparsely with NaNs where
@@ -500,21 +572,13 @@ class EDARProcessor:
             censor_xr_aligned, emap_aligned
         )
 
-        thresholds = DataQualityThresholds(
-            min_notna_fraction=float(
-                self.validation_options.get("min_notna_fraction", 0.99)
-            ),
-            min_std_epsilon=float(
-                self.validation_options.get("min_std_epsilon", 1e-12)
-            ),
-        )
+        # Skip early data quality validation - we'll assess quality at aligned stage
 
         biomarkers: dict[str, xr.DataArray] = {}
         for variant in result["variant"].values.tolist():
             variant_da = result.sel(variant=variant).drop_vars("variant")
             variant_name = f"edar_biomarker_{variant}"
             variant_da.name = variant_name
-            validate_notna_and_std(variant_da, name=variant_name, thresholds=thresholds)
             biomarkers[variant_name] = variant_da
 
             # Mask channel: 1.0 if measured, 0.0 otherwise

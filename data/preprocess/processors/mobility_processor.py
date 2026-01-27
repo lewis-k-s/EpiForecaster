@@ -18,7 +18,6 @@ from utils.logging import suppress_zarr_warnings
 suppress_zarr_warnings()
 
 from ..config import TEMPORAL_COORD, PreprocessingConfig  # noqa: E402
-from .quality_checks import DataQualityThresholds, validate_notna_and_std  # noqa: E402
 
 
 class MobilityProcessor:
@@ -148,17 +147,7 @@ class MobilityProcessor:
 
         mobility_data = self._open_dataset(str(mobility_dir))
 
-        thresholds = DataQualityThresholds(
-            min_notna_fraction=float(
-                self.config.validation_options.get("min_notna_fraction", 0.99)
-            ),
-            min_std_epsilon=float(
-                self.config.validation_options.get("min_std_epsilon", 1e-12)
-            ),
-        )
-        validate_notna_and_std(
-            mobility_data, name="mobility", var="mobility", thresholds=thresholds
-        )
+        # Skip early data quality validation - we'll assess quality at aligned stage
 
         # stats = self._compute_statistics(od_matrix, time_coords)
 

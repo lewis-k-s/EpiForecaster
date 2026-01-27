@@ -1,5 +1,6 @@
 rsync -avz --progress . dt:/home/bsc/bsc008913/EpiForecaster \
---exclude="outputs" \
+--exclude "outputs" \
+--exclude "data/processed" \
 --exclude ".git" \
 --exclude ".venv" \
 --exclude "__pycache__" \

@@ -152,7 +152,6 @@ exclude = [
   "**/dataviz/**",
   "**/plotting/**",
   "**/utils/plotting.py",
-  "**/utils/data_analytics.py",
   "docker/**",
   "checkpoints/**",
   "outputs/**",

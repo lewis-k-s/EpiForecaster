@@ -196,6 +196,8 @@ class EpiForecasterTrainer:
         self._status(f"  Biomarkers dim: {self.train_dataset.biomarkers_output_dim}")
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
+        # Log run_id configuration
+        self._status(f"  Run ID: {self.config.training.run_id}")
         # Check max_batches limit
         if self.config.training.max_batches is not None:
             self._status(

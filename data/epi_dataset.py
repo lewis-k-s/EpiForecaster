@@ -53,6 +53,7 @@ class EpiDatasetItem(TypedDict):
     target_mean: torch.Tensor
     mob: list[Data]
     population: torch.Tensor
+    run_id: int | str | None
 
 
 class EpiDataset(Dataset):
@@ -80,8 +81,17 @@ class EpiDataset(Dataset):
         self.config = config
         self.time_range = time_range
 
-        # Load dataset
-        self._dataset = xr.open_zarr(self.aligned_data_path)
+        # Load dataset with optional run_id chunking for memory efficiency
+        self._dataset = self.load_canonical_dataset(
+            self.aligned_data_path,
+            run_id_chunk_size=config.data.run_id_chunk_size,
+        )
+
+        # Filter by run_id (always present, no conditional logic)
+        self._dataset = self._filter_dataset_by_runs(
+            self._dataset, config.training.run_id
+        )
+
         self.num_nodes = self._dataset[REGION_COORD].size
 
         # Load biomarker data start offset if available
@@ -130,7 +140,7 @@ class EpiDataset(Dataset):
         else:
             self.mobility_preprocessor = mobility_preprocessor
 
-        # Always preload mobility data into memory (RAM) to avoid Zarr chunking I/O overhead.
+        # Mobility: load full tensor into memory
         mobility_da = self._dataset.mobility
         # Ensure proper dimension ordering: Time, Origin, Destination
         mobility_da = self.mobility_preprocessor._ensure_time_first(mobility_da)
@@ -157,11 +167,10 @@ class EpiDataset(Dataset):
         self.mobility_lags = config.data.mobility_lags
         self.use_imported_risk = config.data.use_imported_risk
         self.lagged_risk = None
-        if self.mobility_lags:
+
+        if self.mobility_lags and self.use_imported_risk:
             logger.info(f"Pre-computing imported risk for lags: {self.mobility_lags}")
             # Ensure cases are (T, N, 1) - use value channel (index 0)
-            # precomputed_cases is (T, N, C) - channel 0 is value
-            # Convert to numpy if tensor
             cases_val = self.precomputed_cases[..., 0]
             if isinstance(cases_val, torch.Tensor):
                 cases_val = cases_val.numpy()
@@ -332,7 +341,7 @@ class EpiDataset(Dataset):
         if self._dataset is not None:
             return self._dataset
 
-        # Always cache the dataset handle
+        # Reload dataset after unpickling
         ds = xr.open_zarr(self.aligned_data_path)
         self._dataset = ds
         return ds
@@ -341,7 +350,6 @@ class EpiDataset(Dataset):
         """Allow pickling by clearing the dataset handle."""
         state = self.__dict__.copy()
         state["_dataset"] = None
-        # preloaded_mobility is a tensor, so it picks fine.
         return state
 
     def num_windows(self) -> int:
@@ -431,11 +439,18 @@ class EpiDataset(Dataset):
         if forecast_targets > T:
             raise IndexError("Requested window exceeds available time steps")
 
-        # Optimization: Only slice mobility from RAM tensor, never from disk/zarr
-        # preloaded_mobility is (TotalTime, Origin, Destination)
-        # We want [range_start:range_end, :, target_idx]
+        # Get mobility history from preloaded tensor
         mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
         neigh_mask = self.mobility_mask[range_start:range_end, :, target_idx]
+
+        # Get run_id from dataset (run_id is always present)
+        run_id_val = self.dataset.mobility.run_id.values[range_start]
+        # Handle both integer and string run_ids
+        try:
+            run_id = int(run_id_val) if run_id_val is not None else None
+        except (ValueError, TypeError):
+            # String run_id (e.g., "0_Baseline", "real")
+            run_id = str(run_id_val).strip() if run_id_val is not None else None
 
         # Cases Processing (delegate window normalization to the preprocessor)
         norm_window, mean_anchor, std_anchor = (
@@ -605,6 +620,7 @@ class EpiDataset(Dataset):
             "target_mean": mean_anchor[target_idx].squeeze(-1),
             "mob": mob_graphs,
             "population": population,
+            "run_id": run_id,
         }
 
     def static_covariates(self) -> StaticCovariates:
@@ -626,6 +642,9 @@ class EpiDataset(Dataset):
 
         If time_range is set, only windows fully contained within that range
         (i.e., start + L + H <= end) are included.
+
+        For multi-run datasets, also filters out windows that cross run boundaries
+        to prevent context leakage between simulation runs.
         """
         L = self.config.model.history_length
         H = self.config.model.forecast_horizon
@@ -649,9 +668,42 @@ class EpiDataset(Dataset):
             valid_starts = [
                 ws for ws in all_starts if ws >= start_idx and (ws + L + H) <= end_idx
             ]
-            return valid_starts
+            all_starts = valid_starts
 
-        return all_starts
+        # Filter out windows that cross run boundaries
+        # run_id coordinate is always present (per curriculum architecture)
+        ds = self.dataset
+        mobility_da = ds.mobility
+
+        # Assert run_id coordinate exists (required for curriculum architecture)
+        assert "run_id" in mobility_da.coords, (
+            "run_id coordinate must be present in mobility data"
+        )
+
+        run_ids = mobility_da.run_id.values
+
+        # Find run boundaries: indices where run_id changes
+        run_boundaries = []
+        for i in range(1, len(run_ids)):
+            if run_ids[i] != run_ids[i - 1]:
+                run_boundaries.append(i)
+
+        # Filter out windows that cross run boundaries
+        # A window crosses a boundary if: start < boundary <= start + L + H
+        filtered_starts = []
+        for ws in all_starts:
+            window_end = ws + L + H
+            crosses_boundary = any(
+                ws < boundary <= window_end for boundary in run_boundaries
+            )
+            if not crosses_boundary:
+                filtered_starts.append(ws)
+
+        logger.info(
+            f"Run boundary filtering: {len(all_starts)} -> {len(filtered_starts)} windows "
+            f"({len(run_boundaries)} run boundaries detected)"
+        )
+        return filtered_starts
 
     def _compute_valid_window_starts(self) -> dict[int, list[int]]:
         """Compute valid window starts per target node using missingness permit.
@@ -748,7 +800,9 @@ class EpiDataset(Dataset):
         if time_step in self._adjacency_cache:
             return self._adjacency_cache[time_step]
 
+        # Get mobility matrix for this time step from preloaded tensor
         mobility_matrix = self.preloaded_mobility[time_step]
+
         adjacency = mobility_matrix > 0
         if self.context_mask is not None:
             mask = self.context_mask
@@ -837,7 +891,7 @@ class EpiDataset(Dataset):
         # Warm adjacency cache for this time step
         _ = self._get_adjacency_at_time(time_step)
 
-        # Get full mobility matrix at this time step
+        # Get full mobility matrix at this time step from preloaded tensor
         mobility_matrix = self.preloaded_mobility[time_step]  # (N, N)
 
         # Apply context mask if set
@@ -918,9 +972,68 @@ class EpiDataset(Dataset):
         return torch.from_numpy(features).to(torch.float32)
 
     @classmethod
-    def load_canonical_dataset(cls, aligned_data_path: Path) -> xr.Dataset:
-        "Load the canonical dataset from the aligned data path."
-        return xr.open_zarr(aligned_data_path)
+    def load_canonical_dataset(
+        cls, aligned_data_path: Path, run_id_chunk_size: int = -1
+    ) -> xr.Dataset:
+        """Load the canonical dataset from the aligned data path.
+
+        Args:
+            aligned_data_path: Path to the Zarr dataset
+            run_id_chunk_size: Chunk size for run_id dimension.
+                -1 (default): Load all runs at once (no chunking, previous behavior)
+                Positive value: Chunk runs for memory efficiency (e.g., 5 for low-resource)
+
+        Returns:
+            xarray Dataset with optional run_id chunking
+        """
+        if run_id_chunk_size == -1:
+            # No chunking: load all runs at once (previous behavior)
+            return xr.open_zarr(aligned_data_path)
+        else:
+            # Apply run_id chunking for memory efficiency
+            return xr.open_zarr(aligned_data_path, chunks={"run_id": run_id_chunk_size})
+
+    @classmethod
+    def _filter_dataset_by_runs(
+        cls, dataset: xr.Dataset, run_id: str | None
+    ) -> xr.Dataset:
+        """Filter dataset by run_id (always present, no conditional logic).
+
+        Args:
+            dataset: xarray Dataset with run_id dimension/coordinate
+            run_id: Single run_id string to filter by (e.g., "real", "synth_run_001")
+                   If None, returns all runs (for future curriculum mode)
+
+        Returns:
+            Filtered xarray Dataset
+        """
+        assert "run_id" in dataset.coords or "run_id" in dataset.dims, (
+            "run_id dimension or coordinate must be present in dataset"
+        )
+
+        if run_id is None:
+            return dataset
+
+        # Filter 1: Dimension-based (e.g., valid_targets with run_id dim)
+        if "run_id" in dataset.dims:
+            # Use flexible matching to handle whitespace padding
+            mask = dataset.run_id.str.strip() == run_id
+            dataset = dataset.sel(run_id=mask)
+            # Load data into memory to avoid zarr indexing issues
+            dataset = dataset.load()
+            # Squeeze run_id dimension if it has size 1
+            if dataset.sizes.get("run_id") == 1:
+                dataset = dataset.squeeze("run_id")
+
+        # Filter 2: Coordinate-based (e.g., mobility with run_id as time coord)
+        if TEMPORAL_COORD in dataset.dims and "run_id" in dataset.coords:
+            if dataset.run_id.dims == (TEMPORAL_COORD,):
+                mask = dataset.run_id.str.strip() == run_id
+                dataset = dataset.sel({TEMPORAL_COORD: mask})
+                # Load data into memory
+                dataset = dataset.load()
+
+        return dataset
 
     @classmethod
     def create_temporal_splits(
@@ -954,13 +1067,27 @@ class EpiDataset(Dataset):
         )
 
         # Load canonical dataset to get node list and temporal boundaries
-        aligned_dataset = cls.load_canonical_dataset(Path(config.data.dataset_path))
+        aligned_dataset = cls.load_canonical_dataset(
+            Path(config.data.dataset_path),
+            run_id_chunk_size=config.data.run_id_chunk_size,
+        )
+        # Filter by run_id (always present, no conditional logic)
+        aligned_dataset = cls._filter_dataset_by_runs(
+            aligned_dataset, config.training.run_id
+        )
+
         num_nodes = aligned_dataset[REGION_COORD].size
         all_nodes = list(range(num_nodes))
 
         # Check for valid_targets filter
         if config.data.use_valid_targets and "valid_targets" in aligned_dataset:
-            valid_mask = aligned_dataset.valid_targets.values.astype(bool)
+            valid_targets = aligned_dataset.valid_targets
+
+            # Aggregate across run_id dimension (always present)
+            if "run_id" in valid_targets.dims:
+                valid_targets = valid_targets.any(dim="run_id")
+
+            valid_mask = valid_targets.values.astype(bool)
             all_nodes = [i for i in all_nodes if valid_mask[i]]
             logger.info(
                 f"Using valid_targets filter: {len(all_nodes)}/{num_nodes} training regions"

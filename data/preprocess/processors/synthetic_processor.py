@@ -49,7 +49,7 @@ class SyntheticProcessor:
             )
 
     def process(
-        self, synthetic_path: str, run_filter: list[int] | None = None
+        self, synthetic_path: str, run_filter: list[str] | list[int] | None = None
     ) -> dict[str, xr.DataArray | xr.Dataset]:
         """
         Load and extract synthetic data from bundled zarr.
@@ -63,7 +63,10 @@ class SyntheticProcessor:
         """
         print(f"Loading synthetic data from {synthetic_path}")
 
-        ds = xr.open_zarr(synthetic_path)
+        ds = xr.open_zarr(
+            synthetic_path,
+            chunks={"run_id": self.config.run_id_chunk_size},  # type: ignore[arg-type]
+        )
         print(ds)
         print()
 
@@ -108,44 +111,37 @@ class SyntheticProcessor:
         """Extract cases data from synthetic bundle.
 
         Expected shape: (run_id, date, region_id)
-        We need to stack all runs into the temporal dimension.
+        Preserves run_id dimension for curriculum training.
         """
         print("Extracting cases...")
 
-        # Cases: (run_id, date, region_id) → restructure to match expected format
-        cases = ds["cases"]  # (run_id, date, region_id)
-
-        # For synthetic data with multiple runs, we have a few options:
-        # 1. Stack runs into the temporal dimension (concatenate time series)
-        # 2. Select a single run
-        # 3. Process each run separately
-
-        # For now, let's use the first run (typically Baseline) as the canonical dataset
-        # TODO: Add support for multi-run training
-        cases_0 = cases.isel(run_id=0)
+        # Cases: (run_id, date, region_id) → preserve run_id dimension
+        cases = ds["cases"]
 
         # Verify temporal dimension matches config
-        cases_0 = cases_0.rename({TEMPORAL_COORD: TEMPORAL_COORD})
+        cases = cases.rename({TEMPORAL_COORD: TEMPORAL_COORD})
 
-        # Crop to config date range
+        # Crop to config date range (applies to all runs)
         start_date = np.datetime64(self.config.start_date)
         end_date = np.datetime64(self.config.end_date)
 
-        time_mask = (cases_0[TEMPORAL_COORD] >= start_date) & (
-            cases_0[TEMPORAL_COORD] <= end_date
+        time_mask = (cases[TEMPORAL_COORD] >= start_date) & (
+            cases[TEMPORAL_COORD] <= end_date
         )
-        cases_filtered = cases_0.isel({TEMPORAL_COORD: time_mask})
+        cases_filtered = cases.isel({TEMPORAL_COORD: time_mask})
 
         assert not cases_filtered.sizes[TEMPORAL_COORD] == 0, (
             "No cases data in temporal range"
         )
 
-        print(f"  ✓ Extracted cases: {cases_filtered.shape}")
+        num_runs = len(cases_filtered.run_id)
+        print(f"  ✓ Extracted cases with {num_runs} runs: {cases_filtered.shape}")
         return cases_filtered.to_dataset(name="cases")
 
     def _extract_mobility(self, ds: xr.Dataset) -> xr.Dataset:
         """Extract and reconstruct mobility data from factorized format.
 
+        Preserves run_id dimension.
         Returns dataset with reconstructed mobility tensor.
         """
         print("Extracting mobility (factorized format)...")
@@ -153,69 +149,69 @@ class SyntheticProcessor:
         mobility_base = ds["mobility_base"]  # (origin, target)
         mobility_kappa0 = ds["mobility_kappa0"]  # (run_id, date)
 
-        # Use first run's kappa0
-        kappa0_0 = mobility_kappa0.isel(run_id=0)
-
         # Rename to match expected coords
         mobility_base = mobility_base.rename(
             {"origin": REGION_COORD, "target": "destination"}
         )
         mobility_base = mobility_base.rename({REGION_COORD: "origin"})
 
-        # Filter by date range
+        # Filter by date range (applies to all runs)
         start_date = np.datetime64(self.config.start_date)
         end_date = np.datetime64(self.config.end_date)
 
-        time_mask = (kappa0_0[TEMPORAL_COORD] >= start_date) & (
-            kappa0_0[TEMPORAL_COORD] <= end_date
+        time_mask = (mobility_kappa0[TEMPORAL_COORD] >= start_date) & (
+            mobility_kappa0[TEMPORAL_COORD] <= end_date
         )
-        kappa0_filtered = kappa0_0.isel({TEMPORAL_COORD: time_mask})
+        kappa0_filtered = mobility_kappa0.isel({TEMPORAL_COORD: time_mask})
 
-        # Reconstruct mobility tensor: mobility[date, origin, destination]
+        # Reconstruct mobility tensor: mobility[run_id, date, origin, destination]
         # Using formula: mobility[date] = mobility_base * (1 - kappa0[date])
         # Use xarray broadcasting to preserve dask chunking
-        reduction_factor = 1.0 - kappa0_filtered  # (date,)
+        reduction_factor = 1.0 - kappa0_filtered  # (run_id, date)
+
         # Expand dims with actual coordinate values for proper alignment
+        # reduction_factor: (run_id, date) -> (run_id, date, origin, destination)
         reduction_factor_expanded = reduction_factor.expand_dims(
             {
                 "origin": mobility_base["origin"].values,
                 "destination": mobility_base["destination"].values,
             }
         )
+
+        # mobility_base: (origin, destination) -> broadcast to (run_id, date, origin, destination)
         mobility_reconstructed = mobility_base * reduction_factor_expanded
 
-        # Reorder dimensions to (date, origin, destination)
+        # Reorder dimensions to (run_id, date, origin, destination)
         mobility_reconstructed = mobility_reconstructed.transpose(
-            TEMPORAL_COORD, "origin", "destination"
+            "run_id", TEMPORAL_COORD, "origin", "destination"
         )
 
-        mobility_da = xr.DataArray(
-            mobility_reconstructed,
-            dims=(TEMPORAL_COORD, "origin", "destination"),
+        mobility_ds = mobility_reconstructed.to_dataset(name="mobility")
+
+        num_runs = len(mobility_reconstructed.run_id)
+        print(
+            f"  ✓ Reconstructed mobility tensor with {num_runs} runs: {mobility_reconstructed.shape}"
         )
-
-        mobility_ds = mobility_da.to_dataset(name="mobility")
-
-        print(f"  ✓ Reconstructed mobility tensor: {mobility_da.shape}")
         return mobility_ds
 
     def _extract_edar(self, ds: xr.Dataset) -> tuple[xr.DataArray, xr.DataArray]:
         """
         Extract EDAR biomarker data in the same intermediate format as real data.
 
+        Preserves run_id dimension.
+
         Expected variables:
         - edar_biomarker_N1, N2, IP4: (run_id, date, edar_id)
         - edar_biomarker_N1_LoD, N2_LoD, IP4_LoD: (run_id, edar_id)
 
         Returns:
-            Tuple of (flow_xr, censor_xr) with dimensions (date, edar_id, variant)
+            Tuple of (flow_xr, censor_xr) with dimensions (run_id, date, edar_id, variant)
             Compatible with EDARProcessor.process_from_xarray()
         """
         print("Extracting EDAR biomarkers...")
 
         from constants import EDAR_BIOMARKER_PREFIX, EDAR_BIOMARKER_VARIANTS
 
-        run_idx = 0  # Use first run (typically Baseline)
         flow_list = []
         censor_list = []
 
@@ -229,9 +225,9 @@ class SyntheticProcessor:
                 print(f"  Warning: {lod_name} not found, skipping {variant}")
                 continue
 
-            # Extract biomarker values: (date, edar_id)
-            biomarker = ds[var_name].isel(run_id=run_idx)
-            lod = ds[lod_name].isel(run_id=run_idx)  # (edar_id,)
+            # Extract biomarker values: (run_id, date, edar_id)
+            biomarker = ds[var_name]
+            lod = ds[lod_name]  # (run_id, edar_id,)
 
             # Filter by date range
             start_date = np.datetime64(self.config.start_date)
@@ -241,10 +237,13 @@ class SyntheticProcessor:
                 biomarker[TEMPORAL_COORD] <= end_date
             )
             biomarker_filtered = biomarker.isel({TEMPORAL_COORD: time_mask})
+            lod_filtered = lod  # LoD doesn't vary by time
 
             # Compute censor flag: 1.0 if value <= LoD, else 0.0 (for finite values only)
             censor = xr.where(
-                (biomarker_filtered <= lod) & biomarker_filtered.notnull(), 1.0, 0.0
+                (biomarker_filtered <= lod_filtered) & biomarker_filtered.notnull(),
+                1.0,
+                0.0,
             ).fillna(0.0)
 
             flow_list.append(biomarker_filtered)
@@ -253,7 +252,7 @@ class SyntheticProcessor:
         if not flow_list:
             raise ValueError("No EDAR biomarker data found in synthetic dataset")
 
-        # Stack into (date, edar_id, variant) format - same as real data!
+        # Stack into (run_id, date, edar_id, variant) format
         flow_xr = xr.concat(flow_list, dim="variant").assign_coords(
             variant=EDAR_BIOMARKER_VARIANTS[: len(flow_list)]
         )
@@ -261,21 +260,24 @@ class SyntheticProcessor:
             variant=EDAR_BIOMARKER_VARIANTS[: len(censor_list)]
         )
 
-        print(f"  ✓ Extracted {len(flow_list)} biomarker variants")
+        num_runs = len(flow_xr.run_id)
+        print(f"  ✓ Extracted {len(flow_list)} biomarker variants with {num_runs} runs")
         return flow_xr, censor_xr
 
     def _extract_population(self, ds: xr.Dataset) -> xr.DataArray:
         """Extract population data.
 
-        Expected: (run_id, region_id) - use first run.
+        Preserves run_id dimension.
+
+        Expected: (run_id, region_id)
         """
         print("Extracting population...")
 
-        # Use first run
-        pop = ds["population"].isel(run_id=0)
+        pop = ds["population"]  # (run_id, region_id)
 
         # Verify region coord matches
         pop = pop.rename({"region_id": REGION_COORD})
 
-        print(f"  ✓ Extracted population: {pop.shape}")
+        num_runs = len(pop.run_id)
+        print(f"  ✓ Extracted population with {num_runs} runs: {pop.shape}")
         return pop

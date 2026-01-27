@@ -26,7 +26,7 @@ generate_alignment_report: true
 
 # Output configuration
 output_path: "data/processed"
-dataset_name: "new_interp"
+dataset_name: "real_with_id"
 compression: "blosc"
 
 # Processing configuration
@@ -35,8 +35,8 @@ num_workers: 4
 chunk_size: 14
 # run_id dim chunk size (for synthetic multi-run datasets)
 run_id_chunk_size: 5
-date_chunk_size: 30   # Chunk size for date dimension in zarr output
-mobility_chunk_size: 100  # Chunk size for spatial dims (origin/destination)
+date_chunk_size: 30 # Chunk size for date dimension in zarr output
+mobility_chunk_size: 100 # Chunk size for spatial dims (origin/destination)
 memory_limit_gb: 8.0
 
 # Graph construction options - minimal for cases-only model
@@ -55,4 +55,3 @@ validation_options:
   temporal_consistency_check: true
   spatial_consistency_check: true
   generate_plots: true
-

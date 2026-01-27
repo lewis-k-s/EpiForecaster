@@ -84,6 +84,14 @@ class DataConfig:
     # Whether to use mobility-weighted lagged case features (imported risk)
     # Lag features are value-only (no mask/age channels) for efficiency
     use_imported_risk: bool = False
+    # Chunk size for run_id dimension when loading multi-run synthetic datasets
+    # Set to -1 to load all runs at once (full loading, previous behavior)
+    # Set to a small value (e.g., 5) for memory-efficient processing on low-resource machines
+    # Set to a larger value (e.g., 50) for better performance on high-resource machines
+    run_id_chunk_size: int = -1  # Default: -1 means load all runs (no chunking)
+    # Single run_id for filtering dataset (e.g., "real", "synth_run_001")
+    # Required when curriculum training is disabled
+    run_id: str = "real"
 
     def __post_init__(self) -> None:
         if self.window_stride <= 0:
@@ -213,6 +221,8 @@ class TrainingParams:
     train_end_date: str | None = None
     val_end_date: str | None = None
     test_end_date: str | None = None
+    # Placeholder for curriculum mode (future implementation)
+    curriculum_enabled: bool = False
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 0

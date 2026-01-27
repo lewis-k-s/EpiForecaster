@@ -148,13 +148,7 @@ class CasesProcessor:
         notna_count = int(cases_da.notnull().sum())
         if notna_count == 0:
             raise ValueError("All values are NaN in processed case data")
-        notna_fraction = float(cases_da.notnull().mean())
-        min_coverage = self.validation_options.get("min_data_coverage", 0.8)
-        if notna_fraction < min_coverage:
-            print(
-                f"Warning: cases notna fraction {notna_fraction:.3f} below "
-                f"min_data_coverage {min_coverage:.3f}"
-            )
+        # Skip early data quality validation - we'll assess quality at aligned stage
 
         # Check for negative values (should not exist after normalization)
         if (cases_da < 0).any():

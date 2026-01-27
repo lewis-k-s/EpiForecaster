@@ -145,17 +145,10 @@ class AlignmentProcessor:
             elif var_name.endswith("_age"):
                 edar_final[var_name] = edar_final[var_name].fillna(1.0)
 
-        # Compute biomarker data start offset for each region
-        # For each region, find the first time index where biomarker data > 0
+        # Compute biomarker data start offset for each (run_id, region) pair
+        # For each pair, find the first time index where biomarker data > 0
         # Use -1 for regions with no biomarker data
-        print("Computing biomarker data start offset per region...")
-        biomarker_data_start = xr.DataArray(
-            np.full(len(common_regions), -1, dtype=np.int32),
-            dims=[REGION_COORD],
-            coords={REGION_COORD: common_regions},
-            name="biomarker_data_start",
-        )
-
+        print("Computing biomarker data start offset per (run_id, region)...")
         # Get only true biomarker variables (exclude mask/censor/age channels)
         biomarker_vars = [
             f"{EDAR_BIOMARKER_PREFIX}{v}"
@@ -163,22 +156,42 @@ class AlignmentProcessor:
             if f"{EDAR_BIOMARKER_PREFIX}{v}" in edar_final.data_vars
         ]
 
-        for i, region in enumerate(common_regions):
-            # Select only biomarker value variables for this region
-            region_biomarkers = edar_final[biomarker_vars].sel({REGION_COORD: region})
-            # Stack to (n_variants, T) array
-            data = region_biomarkers.to_array().values
-            has_data = (data > 0) & np.isfinite(data)
-            has_data_any = np.any(
-                has_data, axis=0
-            )  # (T,) - True if any variant has data
+        # run_id always exists on all data variables
+        first_biomarker = edar_final[biomarker_vars[0]]
+        run_ids = first_biomarker["run_id"].values
 
-            if has_data_any.any():
-                first_idx = int(np.argmax(has_data_any))
-                biomarker_data_start[i] = first_idx
+        # Create 2D array for (run_id, region) pairs
+        biomarker_data_start = xr.DataArray(
+            np.full((len(run_ids), len(common_regions)), -1, dtype=np.int32),
+            dims=["run_id", REGION_COORD],
+            coords={"run_id": run_ids, REGION_COORD: common_regions},
+            name="biomarker_data_start",
+        )
+
+        # Vectorized approach using xarray operations
+        # Stack all biomarkers: (n_variants, n_runs, n_dates, n_regions)
+        all_biomarkers = edar_final[biomarker_vars].to_array(dim="variant")
+
+        # Find where any biomarker has valid data: (n_runs, n_dates, n_regions)
+        has_data = (all_biomarkers > 0) & all_biomarkers.notnull()
+        has_data_any = has_data.any(dim="variant")
+
+        # Use argmax along date dimension to find first True
+        # argmax on boolean returns first True index (0 if all False, but we handle that)
+        first_idx = has_data_any.argmax(
+            dim="date"
+        ).compute()  # Compute for use as indexer
+
+        # Handle all-False case: check if there's actually data at the argmax position
+        has_data_at_first = has_data_any.isel(date=first_idx)
+        first_idx_corrected = xr.where(has_data_at_first, first_idx, -1)
+
+        # Convert to numpy and assign to biomarker_data_start
+        # Note: first_idx_corrected already has dims (run_id, region_id)
+        biomarker_data_start.values = first_idx_corrected.astype(np.int32).values
 
         print(
-            f"  Regions with biomarker data: {(biomarker_data_start.values >= 0).sum()}/{len(common_regions)}"
+            f"  (run_id, region) pairs with biomarker data: {(biomarker_data_start.values >= 0).sum()}/{biomarker_data_start.size}"
         )
         if (biomarker_data_start.values >= 0).sum() > 0:
             valid_starts = biomarker_data_start.values[biomarker_data_start.values >= 0]
