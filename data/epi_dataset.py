@@ -89,7 +89,7 @@ class EpiDataset(Dataset):
 
         # Filter by run_id (always present, no conditional logic)
         self._dataset = self._filter_dataset_by_runs(
-            self._dataset, config.training.run_id
+            self._dataset, config.data.run_id
         )
 
         self.num_nodes = self._dataset[REGION_COORD].size
@@ -1073,7 +1073,7 @@ class EpiDataset(Dataset):
         )
         # Filter by run_id (always present, no conditional logic)
         aligned_dataset = cls._filter_dataset_by_runs(
-            aligned_dataset, config.training.run_id
+            aligned_dataset, config.data.run_id
         )
 
         num_nodes = aligned_dataset[REGION_COORD].size

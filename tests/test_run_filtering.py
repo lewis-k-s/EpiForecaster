@@ -1,7 +1,6 @@
 """Test run_id filtering logic for EpiDataset."""
 
 import numpy as np
-import pytest
 import xarray as xr
 from data.epi_dataset import EpiDataset
 
@@ -125,8 +124,8 @@ def test_valid_targets_aggregation():
     )
 
     # Region 0 should be valid, region 1 should not
-    assert valid_mask[0] == True, "Region 0 should be valid"
-    assert valid_mask[1] == False, "Region 1 should not be valid"
+    assert valid_mask[0], "Region 0 should be valid"
+    assert not valid_mask[1], "Region 1 should not be valid"
 
     print("✓ valid_targets aggregation test passed")
 

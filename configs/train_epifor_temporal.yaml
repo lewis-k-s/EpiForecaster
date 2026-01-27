@@ -18,6 +18,7 @@ data:
   missing_permit: 4
   sample_ordering: "time"
   log_scale: true
+  run_id: "real"  # Real data run
 
 model:
   type:

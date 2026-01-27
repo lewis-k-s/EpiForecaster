@@ -155,18 +155,14 @@ class CasesProcessor:
         notna_count = int(cases_da.notnull().sum())
         if notna_count == 0:
             raise ValueError("All values are NaN in processed case data")
-        # Skip early data quality validation - we'll assess quality at aligned stage
 
         # Check for negative values (should not exist after normalization)
         if (cases_da < 0).any():
             print("Warning: Negative values found in case data")
 
-        # Check temporal consistency
-        self._check_temporal_consistency_xr(cases_da)
-
-        # Check for outliers
-        if self.validation_options.get("outlier_detection", True):
-            self._detect_outliers_xr(cases_da)
+        # Skip early data quality validation - we'll assess quality at aligned stage
+        # These checks (temporal consistency, outliers) cause segfaults on some platforms
+        # and aren't useful for raw data validation anyway.
 
     def _create_region_info(
         self, cases_xr: xr.Dataset, region_mapping: dict[str, Any] | None
@@ -197,44 +193,6 @@ class CasesProcessor:
             "region_id_to_index": region_id_to_index,
             "region_mapping": region_mapping,
         }
-
-    def _check_temporal_consistency_xr(self, cases_da: xr.DataArray):
-        """Check for temporal consistency in case data."""
-        # Compute day-to-day changes
-        case_changes = cases_da.diff(dim=TEMPORAL_COORD)
-
-        # Check for extreme changes (potential data errors)
-        extreme_threshold = self.validation_options.get("outlier_threshold", 3.0)
-        mean_change = case_changes.mean()
-        std_change = case_changes.std()
-
-        extreme_changes = (
-            xr.ufuncs.abs(case_changes - mean_change) > extreme_threshold * std_change
-        )
-
-        if extreme_changes.any():
-            num_extreme = int(extreme_changes.sum())
-            total_changes = extreme_changes.size
-            print(
-                f"Warning: {num_extreme}/{total_changes} extreme temporal changes detected"
-            )
-
-    def _detect_outliers_xr(self, cases_da: xr.DataArray):
-        """Detect outliers in case data using z-score method."""
-        mean_cases = cases_da.mean()
-        std_cases = cases_da.std()
-
-        z_scores = xr.ufuncs.abs((cases_da - mean_cases) / (std_cases + 1e-8))
-        outlier_threshold = self.validation_options.get("outlier_threshold", 3.0)
-
-        outliers = z_scores > outlier_threshold
-
-        if outliers.any():
-            num_outliers = int(outliers.sum())
-            total_values = outliers.size
-            print(
-                f"Warning: {num_outliers}/{total_values} outliers detected (z-score > {outlier_threshold})"
-            )
 
     def _compute_case_statistics(self, cases_tensor: torch.Tensor) -> dict[str, float]:
         """Compute statistics for case data."""
