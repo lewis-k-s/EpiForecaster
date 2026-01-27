@@ -46,9 +46,10 @@ class MobilityProcessor:
 
     def _open_dataset(self, mobility_path: str) -> xr.Dataset:
         print("Opening OD dataset...")
-        # Open zarr with chunking on temporal dimension
+        # Open zarr with chunking on run_id dimension only
         ds = xr.open_zarr(  # type: ignore[arg-type]
-            str(mobility_path), chunks={"date": self.config.chunk_size}
+            str(mobility_path),
+            chunks={"run_id": self.config.run_id_chunk_size},
         )
 
         # Detect and reconstruct synthetic data format (factorized mobility)
@@ -85,15 +86,13 @@ class MobilityProcessor:
                 },
             )
 
-            # For single-run data (real data), squeeze the run_id dimension
-            # to match existing behavior where real data has no run_id
-            if len(ds["run_id"]) == 1:
-                print("Single run detected - squeezing run_id dimension")
-                ds["mobility"] = ds["mobility"].isel(run_id=0).squeeze(drop=True)
-
             print(f"Reconstructed mobility tensor: {ds['mobility'].shape}")
 
         ds = ds.rename({"target": "destination"})
+
+        # For real (non-synthetic) data, add run_id dimension to match synthetic format
+        if "run_id" not in ds.dims:
+            ds["mobility"] = ds["mobility"].expand_dims(run_id=["real"])
 
         assert (ds["origin"].values == ds["destination"].values).all(), (
             "Square OD matrix"

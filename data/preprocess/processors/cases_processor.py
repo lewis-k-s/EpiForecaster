@@ -113,7 +113,7 @@ class CasesProcessor:
 
         # Convert to xarray DataArray with proper coordinates
         # DataFrame index becomes temporal dimension, columns become region dimension
-        cases_ds = xr.DataArray(
+        cases_da = xr.DataArray(
             cases_pivot.values,
             dims=[TEMPORAL_COORD, REGION_COORD],
             coords={
@@ -121,7 +121,9 @@ class CasesProcessor:
                 REGION_COORD: cases_pivot.columns,
             },
         )
-        cases_ds = cases_ds.to_dataset(name="cases")
+        # Add run_id dimension to match synthetic data format (real data gets run_id="real")
+        cases_da = cases_da.expand_dims(run_id=["real"])
+        cases_ds = cases_da.to_dataset(name="cases")
 
         # Preserve missing values for downstream, window-scoped processing.
 
