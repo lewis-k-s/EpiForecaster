@@ -9,6 +9,7 @@ from .run_discovery import (
     resolve_eval_csv_path,
     resolve_node_metrics_csv_path,
 )
+from .tensor_core import setup_tensor_core_optimizations
 
 __all__ = [
     "RunInfo",
@@ -18,4 +19,5 @@ __all__ = [
     "resolve_checkpoint_path",
     "resolve_eval_csv_path",
     "resolve_node_metrics_csv_path",
+    "setup_tensor_core_optimizations",
 ]

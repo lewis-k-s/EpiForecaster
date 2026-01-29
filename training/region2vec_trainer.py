@@ -16,6 +16,7 @@ from sklearn.cluster import AgglomerativeClustering
 from torch import nn
 
 from graph.node_encoder import Region2Vec
+from utils import setup_tensor_core_optimizations
 from models.region_losses import (
     CommunityOrientedLoss,
     SpatialContiguityPrior,
@@ -737,21 +738,10 @@ class Region2VecTrainer:
 
     def _setup_tensor_core_optimizations(self):
         """Enable TF32 and configure precision settings for Tensor Core utilization."""
-        if self.device.type == "cuda":
-            if self.config.training.enable_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                torch.set_float32_matmul_precision("high")
-                logger.info("TF32 optimizations enabled")
-            else:
-                logger.info("TF32 optimizations disabled")
-
-            if self.config.training.enable_mixed_precision:
-                dtype_name = self.config.training.mixed_precision_dtype
-                logger.info(
-                    f"Mixed precision ({dtype_name}): will be used in forward pass"
-                )
-            else:
-                logger.info("Mixed precision disabled")
-        else:
-            logger.info("Tensor Core optimizations skipped (non-CUDA device)")
+        setup_tensor_core_optimizations(
+            device=self.device,
+            enable_tf32=self.config.training.enable_tf32,
+            enable_mixed_precision=self.config.training.enable_mixed_precision,
+            mixed_precision_dtype=self.config.training.mixed_precision_dtype,
+            logger=logger,
+        )
