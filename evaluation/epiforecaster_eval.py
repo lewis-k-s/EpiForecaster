@@ -375,10 +375,8 @@ def topk_target_nodes_by_mae(
         with torch.no_grad():
             eval_iter = loader
             for batch in eval_iter:
-                predictions, targets, _target_mean, _target_scale = _forward_batch(
-                    model=model,
+                predictions, targets, _target_mean, _target_scale = model.forward_batch(
                     batch_data=batch,
-                    device=device,
                     region_embeddings=region_embeddings,
                 )
                 abs_diff = (predictions - targets).abs()
@@ -589,10 +587,8 @@ def evaluate_loader(
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
-                predictions, targets, target_mean, target_scale = _forward_batch(
-                    model=model,
+                predictions, targets, target_mean, target_scale = model.forward_batch(
                     batch_data=batch_data,
-                    device=device,
                     region_embeddings=region_embeddings,
                 )
 
@@ -691,29 +687,6 @@ def evaluate_loader(
 
     logger.info("EVAL COMPLETE")
     return mean_loss, metrics, node_mae
-
-
-def _forward_batch(
-    *,
-    model: torch.nn.Module,
-    batch_data: dict[str, Any],
-    device: torch.device,
-    region_embeddings: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    targets = batch_data["Target"].to(device)
-    target_mean = batch_data["TargetMean"].to(device)
-    target_scale = batch_data["TargetScale"].to(device)
-    predictions = model.forward(
-        cases_norm=batch_data["CaseNode"].to(device),
-        cases_mean=batch_data["CaseMean"].to(device),
-        cases_std=batch_data["CaseStd"].to(device),
-        biomarkers_hist=batch_data["BioNode"].to(device),
-        mob_graphs=batch_data["MobBatch"],
-        target_nodes=batch_data["TargetNode"].to(device),
-        region_embeddings=region_embeddings,
-        population=batch_data["Population"].to(device),
-    )
-    return predictions, targets, target_mean, target_scale
 
 
 def generate_forecast_plots(
