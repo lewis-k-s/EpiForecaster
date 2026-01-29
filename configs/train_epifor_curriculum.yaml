@@ -1,0 +1,64 @@
+model:
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  mobility_embedding_dim: 32
+  region_embedding_dim: 64
+  history_length: 14
+  forecast_horizon: 14
+  max_neighbors: 30
+  gnn_module: "gcn"
+  gnn_depth: 1
+  forecaster_head: "transformer"
+  head_d_model: 32
+  head_n_heads: 4
+  head_num_layers: 2
+  use_population: true
+
+data:
+  dataset_path: "data/processed/synthetic_full.zarr"
+  regions_data_path: "data/files/geo/fl_municipios_catalonia.geojson"
+  region2vec_path: "checkpoints/region_embedding/region_embeddings.pt"
+  window_stride: 1
+  missing_permit: 4
+  log_scale: true
+  run_id: "real" # Default/Real run ID
+
+training:
+  epochs: 100
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 0.001
+  model_id: "curriculum_test"
+  device: "auto"
+  
+  curriculum:
+    enabled: true
+    active_runs: 1
+    chunk_size: 512
+    run_sampling: "round_robin"
+    schedule:
+      - start_epoch: 0
+        end_epoch: 10
+        synth_ratio: 1.0
+        mode: "time_major" # 100% Synthetic Pretraining
+      - start_epoch: 10
+        end_epoch: 30
+        synth_ratio: 0.8
+        mode: "time_major" # Physics Pre-training
+      - start_epoch: 30
+        end_epoch: 60
+        synth_ratio: 0.5
+        mode: "time_major" # Domain Adaptation
+      - start_epoch: 60
+        end_epoch: 100
+        synth_ratio: 0.05
+        mode: "node_major" # Specialist Fine-tuning
+
+output:
+  log_dir: "outputs/training"
+  experiment_name: "epifor_curriculum_v1"
+  save_checkpoints: true
+  checkpoint_frequency: 10

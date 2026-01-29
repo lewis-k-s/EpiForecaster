@@ -1,12 +1,12 @@
 data:
   # Use valid_targets mask from dataset to filter target nodes
   use_valid_targets: true
-  dataset_path: data/processed/new_interp.zarr
+  dataset_path: data/processed/real_with_id.zarr
   # Mobility-weighted lagged case features (imported risk)
   # Set use_imported_risk=true to enable, then specify lags
   # Lag features are value-only (no mask/age channels) for efficiency
   use_imported_risk: false
-  mobility_lags: [1, 7, 14]  # Lags in days (only used when use_imported_risk=true)
+  mobility_lags: [1, 7, 14] # Lags in days (only used when use_imported_risk=true)
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
   mobility_threshold: 10
   window_stride: 1
@@ -34,7 +34,8 @@ output:
   log_dir: outputs/training
 training:
   device: "cpu"
-  batch_size: 32
+  batch_size: 16
+  gradient_accumulation_steps: 2
   early_stopping_patience: 5
   nan_loss_patience: 5
   # max_batches: 20
