@@ -1,13 +1,13 @@
 import logging
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, Any
 
 import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
 from torch.utils.data import Dataset
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
 
 from graph.node_encoder import Region2Vec
 from models.configs import EpiForecasterConfig
@@ -76,6 +76,7 @@ class EpiDataset(Dataset):
         cases_preprocessor: CasesPreprocessor | None = None,
         mobility_preprocessor: MobilityPreprocessor | None = None,
         time_range: tuple[int, int] | None = None,
+        run_id: str | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
@@ -87,9 +88,12 @@ class EpiDataset(Dataset):
             run_id_chunk_size=config.data.run_id_chunk_size,
         )
 
+        # Determine effective run_id (argument overrides config)
+        effective_run_id = run_id if run_id is not None else config.data.run_id
+
         # Filter by run_id (always present, no conditional logic)
         self._dataset = self._filter_dataset_by_runs(
-            self._dataset, config.data.run_id
+            self._dataset, effective_run_id
         )
 
         self.num_nodes = self._dataset[REGION_COORD].size
@@ -123,6 +127,7 @@ class EpiDataset(Dataset):
             self.rolling_mean,
             self.rolling_std,
         ) = self.cases_preprocessor.preprocess_dataset(self._dataset)
+        # Note: rolling_mean and rolling_std are already float32 torch.Tensors from preprocess_dataset()
 
         # Setup mobility preprocessor
         if mobility_preprocessor is None:
@@ -157,6 +162,8 @@ class EpiDataset(Dataset):
         # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
         mobility_threshold = float(config.data.mobility_threshold)
         self.mobility_mask = self.preloaded_mobility >= mobility_threshold
+        # Pre-convert mask to float32 to avoid repeated .to(torch.float32) in __getitem__
+        self.mobility_mask_float = self.mobility_mask.to(torch.float32)
 
         logger.info(
             f"Mobility preloaded: {self.preloaded_mobility.shape}, "
@@ -343,6 +350,9 @@ class EpiDataset(Dataset):
 
         # Reload dataset after unpickling
         ds = xr.open_zarr(self.aligned_data_path)
+        # Re-apply run_id filter (critical for DataLoader workers)
+        effective_run_id = self.config.data.run_id
+        ds = self._filter_dataset_by_runs(ds, effective_run_id)
         self._dataset = ds
         return ds
 
@@ -443,8 +453,9 @@ class EpiDataset(Dataset):
         mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
         neigh_mask = self.mobility_mask[range_start:range_end, :, target_idx]
 
-        # Get run_id from dataset (run_id is always present)
-        run_id_val = self.dataset.mobility.run_id.values[range_start]
+        # Get run_id from dataset (scalar after filtering)
+        # Per curriculum architecture, run_id is always a singleton scalar
+        run_id_val = self.dataset.mobility.run_id.item()
         # Handle both integer and string run_ids
         try:
             run_id = int(run_id_val) if run_id_val is not None else None
@@ -472,7 +483,8 @@ class EpiDataset(Dataset):
             neigh_mask[:, target_idx] = True
 
         # Apply mask to case_history (both channels)
-        neigh_mask_t = neigh_mask.to(torch.float32).unsqueeze(-1)
+        # Use pre-converted float32 mask from __init__ to avoid repeated dtype conversion
+        neigh_mask_t = self.mobility_mask_float[range_start:range_end, :, target_idx].unsqueeze(-1)
         case_history = case_history * neigh_mask_t
 
         # Concatenate lagged risk features if available
@@ -588,17 +600,14 @@ class EpiDataset(Dataset):
 
         # Slice history for mean and std
         # mean/std are (TotalTime, N) -> need to slice [range_start:range_end] and select target_idx
-        # rolling_mean/std are numpy arrays (T, N, 1) or (T, N)
-        # Check dim of rolling_mean
-
-        # Original code used rolling_mean[stat_idx] which is one time step.
-        # Now we want the sequence.
+        # rolling_mean/std are already float32 tensors from __init__
+        # No .float() conversion needed - removes redundant dtype conversion
 
         # Ensure rolling stats are dense and correct shape (L, 1)
         mean_seq = self.rolling_mean[
             range_start:range_end, target_idx
-        ].float()  # (L, 1)
-        std_seq = self.rolling_std[range_start:range_end, target_idx].float()  # (L, 1)
+        ]  # (L, 1)
+        std_seq = self.rolling_std[range_start:range_end, target_idx]  # (L, 1)
 
         if mean_seq.ndim == 1:
             mean_seq = mean_seq.unsqueeze(-1)
@@ -670,40 +679,10 @@ class EpiDataset(Dataset):
             ]
             all_starts = valid_starts
 
-        # Filter out windows that cross run boundaries
-        # run_id coordinate is always present (per curriculum architecture)
-        ds = self.dataset
-        mobility_da = ds.mobility
-
-        # Assert run_id coordinate exists (required for curriculum architecture)
-        assert "run_id" in mobility_da.coords, (
-            "run_id coordinate must be present in mobility data"
-        )
-
-        run_ids = mobility_da.run_id.values
-
-        # Find run boundaries: indices where run_id changes
-        run_boundaries = []
-        for i in range(1, len(run_ids)):
-            if run_ids[i] != run_ids[i - 1]:
-                run_boundaries.append(i)
-
-        # Filter out windows that cross run boundaries
-        # A window crosses a boundary if: start < boundary <= start + L + H
-        filtered_starts = []
-        for ws in all_starts:
-            window_end = ws + L + H
-            crosses_boundary = any(
-                ws < boundary <= window_end for boundary in run_boundaries
-            )
-            if not crosses_boundary:
-                filtered_starts.append(ws)
-
-        logger.info(
-            f"Run boundary filtering: {len(all_starts)} -> {len(filtered_starts)} windows "
-            f"({len(run_boundaries)} run boundaries detected)"
-        )
-        return filtered_starts
+        # Per curriculum architecture, EpiDataset always receives a singleton run_id.
+        # The curriculum sampler handles run mixing at a higher level, so no run
+        # boundary filtering is needed here.
+        return all_starts
 
     def _compute_valid_window_starts(self) -> dict[int, list[int]]:
         """Compute valid window starts per target node using missingness permit.
@@ -728,8 +707,10 @@ class EpiDataset(Dataset):
                 f"Expected cases array with 2 or 3 dims, got shape {cases_np.shape}"
             )
 
-        valid = np.isfinite(cases_np).all(axis=2)
-        valid_int = valid.astype(np.int32)
+        # Check for both finite AND non-zero values
+        # This filters out all-zero sequences which are common in synthetic data
+        has_valid_signal = (np.isfinite(cases_np) & (cases_np > 0)).any(axis=2)
+        valid_int = has_valid_signal.astype(np.int32)
 
         L = self.config.model.history_length
         H = self.config.model.forecast_horizon
@@ -973,25 +954,76 @@ class EpiDataset(Dataset):
 
     @classmethod
     def load_canonical_dataset(
-        cls, aligned_data_path: Path, run_id_chunk_size: int = -1
+        cls,
+        aligned_data_path: Path,
+        run_id_chunk_size: int = -1,
+        run_id: str | None = None,
     ) -> xr.Dataset:
         """Load the canonical dataset from the aligned data path.
 
         Args:
             aligned_data_path: Path to the Zarr dataset
-            run_id_chunk_size: Chunk size for run_id dimension.
+            run_id_chunk_size: Chunk size for run_id dimension when loading all runs.
                 -1 (default): Load all runs at once (no chunking, previous behavior)
                 Positive value: Chunk runs for memory efficiency (e.g., 5 for low-resource)
+                Ignored if run_id is provided (single run doesn't need chunking).
+            run_id: Specific run_id to filter by (e.g., "real", "0_Baseline").
+                If provided, filters the dataset to this run_id immediately.
 
         Returns:
-            xarray Dataset with optional run_id chunking
+            xarray Dataset with optional run_id chunking and filtering
         """
-        if run_id_chunk_size == -1:
-            # No chunking: load all runs at once (previous behavior)
-            return xr.open_zarr(aligned_data_path)
-        else:
-            # Apply run_id chunking for memory efficiency
-            return xr.open_zarr(aligned_data_path, chunks={"run_id": run_id_chunk_size})
+        # When filtering by run_id, don't chunk - we're loading a single run
+        chunks = None if run_id is not None else (
+            {"run_id": run_id_chunk_size} if run_id_chunk_size != -1 else None
+        )
+
+        dataset = xr.open_zarr(
+            aligned_data_path,
+            chunks=chunks,
+            zarr_format=2
+        )
+
+        # Filter by run_id if provided (handle whitespace padding)
+        if run_id is not None and "run_id" in dataset.coords:
+            mask = dataset.run_id.str.strip() == run_id
+            dataset = dataset.sel(run_id=mask).squeeze(drop=True)
+
+        return dataset
+
+    @classmethod
+    def get_valid_nodes(
+        cls,
+        dataset_path: Path,
+        run_id: str,
+    ) -> np.ndarray:
+        """Get valid node mask for a specific run_id.
+
+        This is a lightweight method for the trainer to determine which nodes
+        are valid before creating EpiDataset instances. It uses xarray's lazy
+        loading to avoid loading the full dataset into memory.
+
+        Args:
+            dataset_path: Path to the Zarr dataset
+            run_id: Specific run_id to get valid nodes for (e.g., "real", "0_Baseline").
+
+        Returns:
+            Boolean numpy array of shape (num_nodes,) where True indicates valid nodes.
+
+        Raises:
+            ValueError: If run_id is not found in the dataset.
+        """
+        aligned_dataset = cls.load_canonical_dataset(
+            dataset_path, run_id_chunk_size=1, run_id=run_id
+        )
+
+        if "valid_targets" not in aligned_dataset:
+            # No valid_targets filter - all nodes are valid
+            num_nodes = aligned_dataset[REGION_COORD].size
+            return np.ones(num_nodes, dtype=bool)
+
+        # valid_targets is now 1D since we filtered by run_id at load time
+        return aligned_dataset.valid_targets.values.astype(bool)
 
     @classmethod
     def _filter_dataset_by_runs(
@@ -1164,3 +1196,72 @@ class EpiDataset(Dataset):
         )
 
         return train_dataset, val_dataset, test_dataset
+
+
+def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
+    """
+    Collate function for curriculum training (List of Batches).
+
+    Unlike the default collate which flattens all graphs into one huge Batch,
+    this creates a List[Batch], one per time step. This allows the model
+    to process time steps sequentially or in parallel chunks.
+    """
+    import torch
+
+    B = len(batch)
+    if B == 0:
+        return {}
+
+    # 1. Stack standard tensors
+    case_node = torch.stack([item["case_node"] for item in batch], dim=0)
+    bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
+    case_mean = torch.stack([item["case_mean"] for item in batch], dim=0)
+    case_std = torch.stack([item["case_std"] for item in batch], dim=0)
+    targets = torch.stack([item["target"] for item in batch], dim=0)
+    target_scales = torch.stack([item["target_scale"] for item in batch], dim=0)
+    target_mean = torch.stack([item["target_mean"] for item in batch], dim=0)
+    target_nodes = torch.tensor(
+        [item["target_node"] for item in batch], dtype=torch.long
+    )
+    window_starts = torch.tensor(
+        [item["window_start"] for item in batch], dtype=torch.long
+    )
+    population = torch.stack([item["population"] for item in batch], dim=0)
+
+    # 2. Batch Temporal Graphs (List[Batch] per time step)
+    # batch[0]["mob"] is a list of Data objects (length T)
+    T = len(batch[0]["mob"])
+    
+    mob_batches: list[Batch] = []
+    for t in range(T):
+        graphs_at_t = [item["mob"][t] for item in batch]
+        batch_t = Batch.from_data_list(graphs_at_t)
+        
+        # Precompute target_index for this batch
+        # batch_t.ptr maps graph index -> node index range
+        # batch_t.target_node is list of local target indices
+        if hasattr(batch_t, "ptr") and hasattr(batch_t, "target_node"):
+            # batch_t.target_node is (B, 1) or (B,) - ensure flat
+            tgt = batch_t.target_node.reshape(-1)
+            # ptr[:-1] gives start index for each graph
+            starts = batch_t.ptr[:-1]
+            batch_t["target_index"] = starts + tgt
+            
+        mob_batches.append(batch_t)
+
+    return {
+        "CaseNode": case_node,  # (B, L, C)
+        "CaseMean": case_mean,  # (B, L, 1)
+        "CaseStd": case_std,  # (B, L, 1)
+        "BioNode": bio_node,  # (B, L, B)
+        "MobBatch": mob_batches,  # List[Batch]
+        "Population": population,  # (B,)
+        "B": B,
+        "T": T,
+        "Target": targets,  # (B, H)
+        "TargetScale": target_scales,  # (B, C)
+        "TargetMean": target_mean,  # (B, 1)
+        "TargetNode": target_nodes,  # (B,)
+        "WindowStart": window_starts,  # (B,)
+        "NodeLabels": [item["node_label"] for item in batch],
+    }
