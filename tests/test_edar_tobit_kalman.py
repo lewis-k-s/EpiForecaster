@@ -170,7 +170,11 @@ def _expected_edar_output(
         )
         outputs[f"{variant_name}_age"] = age_da
 
-    return xr.Dataset(outputs)
+    # Add run_id dimension to match real data format
+    # Real data gets run_id="real" to distinguish from synthetic runs
+    result_ds = xr.Dataset(outputs)
+    result_ds = result_ds.expand_dims(run_id=["real"])
+    return result_ds
 
 
 def test_edar_processor_applies_tobit_kalman(

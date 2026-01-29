@@ -36,37 +36,40 @@ def _make_config(dataset_path: str, missing_permit: int = 0) -> EpiForecasterCon
 def _write_tiny_dataset(path) -> None:
     dates = pd.date_range("2020-01-01", periods=6, freq="D")
     regions = np.array([0, 1], dtype=np.int64)
+    # Use padded run_id to match production data format
+    run_id = "real                                            "
 
-    cases = np.ones((6, 2, 1), dtype=np.float32)
-    cases[4, 0, 0] = np.nan  # target NaN for node 0
-    cases[1, 1, 0] = np.nan  # history NaN for node 1
+    cases = np.ones((1, 6, 2, 1), dtype=np.float32)
+    cases[0, 4, 0, 0] = np.nan  # target NaN for node 0
+    cases[0, 1, 1, 0] = np.nan  # history NaN for node 1
 
     # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
-    biomarkers = np.zeros((6, 2), dtype=np.float32)
-    biomarkers[:, 0] = 1.0  # Node 0 has non-zero biomarkers
+    biomarkers = np.zeros((1, 6, 2), dtype=np.float32)
+    biomarkers[0, :, 0] = 1.0  # Node 0 has non-zero biomarkers
 
     # Required mask, censor, and age channels for biomarkers
-    biomarker_mask = np.ones((6, 2), dtype=np.float32)
-    biomarker_censor = np.zeros((6, 2), dtype=np.float32)
-    biomarker_age = np.zeros((6, 2), dtype=np.float32)
+    biomarker_mask = np.ones((1, 6, 2), dtype=np.float32)
+    biomarker_censor = np.zeros((1, 6, 2), dtype=np.float32)
+    biomarker_age = np.zeros((1, 6, 2), dtype=np.float32)
 
-    mobility = np.zeros((6, 2, 2), dtype=np.float32)
+    mobility = np.zeros((1, 6, 2, 2), dtype=np.float32)
     population = np.array([100.0, 200.0], dtype=np.float32)
 
     ds = xr.Dataset(
         data_vars={
-            "cases": ((TEMPORAL_COORD, REGION_COORD, "feature"), cases),
-            "edar_biomarker_N1": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": ((TEMPORAL_COORD, REGION_COORD), biomarker_mask),
+            "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
+            "edar_biomarker_N1_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_mask),
             "edar_biomarker_N1_censor": (
-                (TEMPORAL_COORD, REGION_COORD),
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
                 biomarker_censor,
             ),
-            "edar_biomarker_N1_age": ((TEMPORAL_COORD, REGION_COORD), biomarker_age),
-            "mobility": ((TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
+            "edar_biomarker_N1_age": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_age),
+            "mobility": (("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
             "population": ((REGION_COORD,), population),
         },
         coords={
+            "run_id": [run_id],
             TEMPORAL_COORD: dates,
             REGION_COORD: regions,
             "region_id_to": regions,

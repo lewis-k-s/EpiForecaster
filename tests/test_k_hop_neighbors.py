@@ -57,41 +57,44 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
     """
     dates = pd.date_range("2020-01-01", periods=periods, freq="D")
     regions = np.arange(num_nodes, dtype=np.int64)
+    # Use padded run_id to match production data format
+    run_id = "real                                            "
 
     # Constant cases for all nodes - raw data only has 1 channel (value)
-    # The preprocessor adds mask and age channels
-    cases = np.full((periods, num_nodes, 1), 100.0, dtype=np.float32)
+    # The preprocessor adds mask and age channels - add run_id dimension
+    cases = np.full((1, periods, num_nodes, 1), 100.0, dtype=np.float32)
 
     # Biomarkers (required for dataset, even if not all are used)
     # Need non-zero values for scaler fitting (zeros are excluded)
     # Give all nodes non-zero values to support any target_node choice
-    biomarkers = np.ones((periods, num_nodes), dtype=np.float32)
-    biomarker_mask = np.ones((periods, num_nodes), dtype=np.float32)
-    biomarker_censor = np.zeros((periods, num_nodes), dtype=np.float32)
-    biomarker_age = np.zeros((periods, num_nodes), dtype=np.float32)
+    biomarkers = np.ones((1, periods, num_nodes), dtype=np.float32)
+    biomarker_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
+    biomarker_censor = np.zeros((1, periods, num_nodes), dtype=np.float32)
+    biomarker_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
 
-    # Mobility: chain connectivity (0-1-2-3-...)
-    mobility = np.zeros((periods, num_nodes, num_nodes), dtype=np.float32)
+    # Mobility: chain connectivity (0-1-2-3-...) - add run_id dimension
+    mobility = np.zeros((1, periods, num_nodes, num_nodes), dtype=np.float32)
     for i in range(num_nodes - 1):
-        mobility[:, i, i + 1] = 1.0  # Forward edge
-        mobility[:, i + 1, i] = 1.0  # Backward edge
+        mobility[0, :, i, i + 1] = 1.0  # Forward edge
+        mobility[0, :, i + 1, i] = 1.0  # Backward edge
 
     population = np.full(num_nodes, 1000.0, dtype=np.float32)
 
     ds = xr.Dataset(
         data_vars={
-            "cases": ((TEMPORAL_COORD, REGION_COORD, "feature"), cases),
-            "edar_biomarker_N1": ((TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": ((TEMPORAL_COORD, REGION_COORD), biomarker_mask),
+            "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
+            "edar_biomarker_N1_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_mask),
             "edar_biomarker_N1_censor": (
-                (TEMPORAL_COORD, REGION_COORD),
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
                 biomarker_censor,
             ),
-            "edar_biomarker_N1_age": ((TEMPORAL_COORD, REGION_COORD), biomarker_age),
-            "mobility": ((TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
+            "edar_biomarker_N1_age": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_age),
+            "mobility": (("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
             "population": ((REGION_COORD,), population),
         },
         coords={
+            "run_id": [run_id],
             TEMPORAL_COORD: dates,
             REGION_COORD: regions,
             "region_id_to": regions,
