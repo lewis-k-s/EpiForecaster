@@ -130,7 +130,10 @@ def suggest_epiforecaster_params(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
     overrides["training.batch_size"] = trial.suggest_categorical(
-        "training.batch_size", _categorical_choices((16, 32, 64, 128))
+        "training.batch_size", _categorical_choices((4, 8, 12, 16))
+    )
+    overrides["training.gradient_accumulation_steps"] = trial.suggest_categorical(
+        "training.gradient_accumulation_steps", _categorical_choices((1, 2, 3, 4))
     )
     # # Early stopping affects compute/overfit tradeoff; keep it moderate.
     # overrides["training.early_stopping_patience"] = trial.suggest_int(

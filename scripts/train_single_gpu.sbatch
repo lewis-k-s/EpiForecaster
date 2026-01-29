@@ -13,7 +13,7 @@ set -euo pipefail
 # Root of the repository (defaults to submission directory).
 PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 # Path to the training config file (override per run).
-CONFIG="${CONFIG:-configs/train_epifor_mn5_full.yaml}"
+CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 

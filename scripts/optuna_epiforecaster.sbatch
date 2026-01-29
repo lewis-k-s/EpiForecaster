@@ -14,7 +14,7 @@ set -euo pipefail
 # Root of the repository (defaults to submission directory).
 PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 # Base training config (override per run).
-CONFIG="${CONFIG:-configs/train_epifor_mn5_full.yaml}"
+CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 # Optuna study identity.
 STUDY_NAME="${STUDY_NAME:-epiforecaster_hpo_v1}"
 # Shared journal file for coordination (must be on shared filesystem).
