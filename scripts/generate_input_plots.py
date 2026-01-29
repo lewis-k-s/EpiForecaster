@@ -155,8 +155,13 @@ def generate_input_plots(
     cases_da = None
 
     # Extract cases data for LOCF age/sparsity analysis
+    # Use EpiDataset.load_canonical_dataset for consistent run_id filtering
     logger.info("Extracting full cases data for sparsity analysis...")
-    full_dataset = xr.open_zarr(zarr_path)
+    full_dataset = EpiDataset.load_canonical_dataset(
+        zarr_path,
+        run_id_chunk_size=config.data.run_id_chunk_size,
+        run_id=config.data.run_id,
+    )
     if "cases" in full_dataset:
         cases_da = full_dataset.cases
     full_dataset.close()
