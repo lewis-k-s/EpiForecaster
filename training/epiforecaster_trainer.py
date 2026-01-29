@@ -24,13 +24,15 @@ from torch.profiler import (
     schedule,
     tensorboard_trace_handler,
 )
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Batch  # type: ignore[import-not-found]
 
-from data.epi_dataset import EpiDataset, EpiDatasetItem
+from data.epi_dataset import EpiDataset, EpiDatasetItem, curriculum_collate_fn
 from data.preprocess.config import REGION_COORD
+from data.samplers import EpidemicCurriculumSampler
 from evaluation.epiforecaster_eval import evaluate_loader
+from utils import setup_tensor_core_optimizations
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
 
@@ -75,38 +77,105 @@ class EpiForecasterTrainer:
             val_nodes = list(val_nodes)
             test_nodes = list(test_nodes)
 
-            # Build train dataset with None so it fits scaler internally on train regions
-            self.train_dataset = EpiDataset(
-                config=self.config,
-                target_nodes=train_nodes,
-                context_nodes=train_nodes,
-                biomarker_preprocessor=None,
-                mobility_preprocessor=None,
-            )
+            # --- Curriculum Training Setup ---
+            if self.config.training.curriculum.enabled:
+                real_run, synth_runs = self._discover_runs()
+                self._status(
+                    f"Curriculum enabled. Found runs: Real='{real_run}', Synth={synth_runs}"
+                )
 
-            # Reuse train dataset's fitted preprocessors for val/test
-            fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
-            fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
+                # 1. Real Dataset (Run ID = real)
+                real_train_ds = EpiDataset(
+                    config=self.config,
+                    target_nodes=train_nodes,
+                    context_nodes=train_nodes,
+                    biomarker_preprocessor=None,
+                    mobility_preprocessor=None,
+                    run_id=real_run,
+                )
 
-            self.val_dataset = EpiDataset(
-                config=self.config,
-                target_nodes=val_nodes,
-                context_nodes=train_nodes + val_nodes,
-                biomarker_preprocessor=fitted_bio_preprocessor,
-                mobility_preprocessor=fitted_mobility_preprocessor,
-            )
+                # Reuse preprocessors from Real Train
+                fitted_bio_preprocessor = real_train_ds.biomarker_preprocessor
+                fitted_mobility_preprocessor = real_train_ds.mobility_preprocessor
 
-            self.test_dataset = EpiDataset(
-                config=self.config,
-                target_nodes=test_nodes,
-                context_nodes=train_nodes + val_nodes,
-                biomarker_preprocessor=fitted_bio_preprocessor,
-                mobility_preprocessor=fitted_mobility_preprocessor,
-            )
+                # 2. Synthetic Datasets (One per run_id)
+                synth_datasets = []
+                for s_run in synth_runs:
+                    s_ds = EpiDataset(
+                        config=self.config,
+                        target_nodes=train_nodes,
+                        context_nodes=train_nodes,
+                        biomarker_preprocessor=fitted_bio_preprocessor,
+                        mobility_preprocessor=fitted_mobility_preprocessor,
+                        run_id=s_run,
+                    )
+                    synth_datasets.append(s_ds)
+
+                # Combine into ConcatDataset
+                # Important: Real dataset must be first for the sampler to identify it (index 0)
+                # unless sampler inspects run_id (which it does).
+                self.train_dataset = ConcatDataset([real_train_ds] + synth_datasets)
+
+                # 3. Val/Test are ALWAYS Real Data
+                self.val_dataset = EpiDataset(
+                    config=self.config,
+                    target_nodes=val_nodes,
+                    context_nodes=train_nodes + val_nodes,
+                    biomarker_preprocessor=fitted_bio_preprocessor,
+                    mobility_preprocessor=fitted_mobility_preprocessor,
+                    run_id=real_run,
+                )
+
+                self.test_dataset = EpiDataset(
+                    config=self.config,
+                    target_nodes=test_nodes,
+                    context_nodes=train_nodes + val_nodes,
+                    biomarker_preprocessor=fitted_bio_preprocessor,
+                    mobility_preprocessor=fitted_mobility_preprocessor,
+                    run_id=real_run,
+                )
+
+            else:
+                # --- Standard Training Setup ---
+                # Build train dataset with None so it fits scaler internally on train regions
+                self.train_dataset = EpiDataset(
+                    config=self.config,
+                    target_nodes=train_nodes,
+                    context_nodes=train_nodes,
+                    biomarker_preprocessor=None,
+                    mobility_preprocessor=None,
+                )
+
+                # Reuse train dataset's fitted preprocessors for val/test
+                fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
+                fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
+
+                self.val_dataset = EpiDataset(
+                    config=self.config,
+                    target_nodes=val_nodes,
+                    context_nodes=train_nodes + val_nodes,
+                    biomarker_preprocessor=fitted_bio_preprocessor,
+                    mobility_preprocessor=fitted_mobility_preprocessor,
+                )
+
+                self.test_dataset = EpiDataset(
+                    config=self.config,
+                    target_nodes=test_nodes,
+                    context_nodes=train_nodes + val_nodes,
+                    biomarker_preprocessor=fitted_bio_preprocessor,
+                    mobility_preprocessor=fitted_mobility_preprocessor,
+                )
+
+        # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
+        if isinstance(self.train_dataset, ConcatDataset):
+            # Access the first dataset (Real)
+            train_example_ds = self.train_dataset.datasets[0]
+        else:
+            train_example_ds = self.train_dataset
 
         # Optional static region embeddings from dataset
         self.region_embeddings = None
-        embeddings = getattr(self.train_dataset, "region_embeddings", None)
+        embeddings = getattr(train_example_ds, "region_embeddings", None)
         if embeddings is not None:
             self.region_embeddings = embeddings.to(self.device)
         elif self.config.model.type.regions:
@@ -116,8 +185,8 @@ class EpiForecasterTrainer:
 
         self.model = EpiForecaster(
             variant_type=self.config.model.type,
-            temporal_input_dim=self.train_dataset.cases_output_dim,
-            biomarkers_dim=self.train_dataset.biomarkers_output_dim,
+            temporal_input_dim=train_example_ds.cases_output_dim,
+            biomarkers_dim=train_example_ds.biomarkers_output_dim,
             region_embedding_dim=self.config.model.region_embedding_dim,
             mobility_embedding_dim=self.config.model.mobility_embedding_dim,
             gnn_depth=self.config.model.gnn_depth,
@@ -197,7 +266,7 @@ class EpiForecasterTrainer:
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
         # Log run_id configuration
-        self._status(f"  Run ID: {self.config.training.run_id}")
+        self._status(f"  Run ID: {self.config.data.run_id}")
         # Check max_batches limit
         if self.config.training.max_batches is not None:
             self._status(
@@ -224,6 +293,50 @@ class EpiForecasterTrainer:
             # Ignore errors during garbage collection
             pass
 
+    def _discover_runs(self) -> tuple[str, list[str]]:
+        """Discover available runs in the dataset (real vs synthetic)."""
+        # Load metadata only to check runs
+        ds = EpiDataset.load_canonical_dataset(
+            Path(self.config.data.dataset_path), run_id_chunk_size=1
+        )
+
+        has_run_id = "run_id" in ds.coords or "run_id" in ds.dims
+        if not has_run_id:
+            return "real", []
+
+        if "run_id" in ds.coords:
+            run_vals = ds.run_id.values
+        else:
+            run_vals = ds.coords["run_id"].values
+
+        unique_runs = np.unique(run_vals)
+        # Convert to strings and strip
+        unique_runs = sorted([str(r).strip() for r in unique_runs])
+
+        if "real" in unique_runs:
+            real_run = "real"
+            synth_runs = [r for r in unique_runs if r != real_run]
+        elif len(unique_runs) > 0:
+            logger.warning(
+                f"'real' run not found in dataset. Using '{unique_runs[0]}' as real run."
+            )
+            real_run = unique_runs[0]
+            synth_runs = unique_runs[1:]
+        else:
+            # Empty dataset?
+            real_run = "real"
+            synth_runs = []
+
+        # Limit synthetic runs to avoid OOM during preloading (temporary for dev/testing)
+        # In production, we might need a lazier EpiDataset or fewer runs.
+        if len(synth_runs) > 5:
+            logger.warning(
+                f"Limiting synthetic runs from {len(synth_runs)} to 5 for memory safety."
+            )
+            synth_runs = synth_runs[:5]
+
+        return real_run, synth_runs
+
     def _split_dataset_by_nodes(self) -> tuple[list[int], list[int], list[int]]:
         """
         Split dataset into train, val, and test sets using node holdouts.
@@ -241,20 +354,21 @@ class EpiForecasterTrainer:
         N = aligned_dataset[REGION_COORD].size
         all_nodes = np.arange(N)
 
-        # Check for valid_targets filter
-        valid_targets_count = N
+        # Get valid nodes using EpiDataset class method
         valid_mask = None
-        if self.config.data.use_valid_targets and "valid_targets" in aligned_dataset:
-            valid_mask = aligned_dataset.valid_targets.values.astype(bool)
-            valid_targets_count = int(valid_mask.sum())
+        if self.config.data.use_valid_targets:
+            valid_mask = EpiDataset.get_valid_nodes(
+                dataset_path=Path(self.config.data.dataset_path),
+                run_id=self.config.data.run_id,
+            )
+            self._status(f"Using valid_targets filter: {valid_mask.sum()} valid regions")
+        else:
+            self._status(f"Total regions: {N}")
 
-        self._status(f"Total regions: {N} | Valid targets: {valid_targets_count}")
-
-        # Filter by valid_targets if enabled
+        # Filter by valid_targets mask
         if valid_mask is not None:
             all_nodes = all_nodes[valid_mask]
             N = len(all_nodes)
-            self._status(f"Using valid_targets filter: {N} training regions")
 
         rng = np.random.default_rng(42)
         rng.shuffle(all_nodes)
@@ -324,21 +438,13 @@ class EpiForecasterTrainer:
 
     def _setup_tensor_core_optimizations(self):
         """Enable TF32 and configure precision settings for Tensor Core utilization."""
-        if self.device.type == "cuda":
-            if self.config.training.enable_tf32:
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                torch.set_float32_matmul_precision("high")
-                self._status("TF32 optimizations enabled")
-            else:
-                self._status("TF32 optimizations disabled")
-
-            if self.config.training.enable_mixed_precision:
-                self._status("Mixed precision (BF16): will be used in forward pass")
-            else:
-                self._status("Mixed precision disabled")
-        else:
-            self._status("Tensor Core optimizations skipped (non-CUDA device)")
+        setup_tensor_core_optimizations(
+            device=self.device,
+            enable_tf32=self.config.training.enable_tf32,
+            enable_mixed_precision=self.config.training.enable_mixed_precision,
+            mixed_precision_dtype=self.config.training.mixed_precision_dtype,
+            logger=logger,
+        )
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on configuration."""
@@ -407,16 +513,35 @@ class EpiForecasterTrainer:
         persistent_workers = num_workers > 0
         train_loader_kwargs = {
             "dataset": self.train_dataset,
-            "batch_size": self.config.training.batch_size,
-            "shuffle": False,
             "num_workers": num_workers,
             "pin_memory": pin_memory,
-            "collate_fn": self._collate_fn,
             "multiprocessing_context": mp_context,
         }
+
+        # Configure Sampler & Collate based on Curriculum
+        if self.config.training.curriculum.enabled and isinstance(
+            self.train_dataset, ConcatDataset
+        ):
+            self._status("Creating EpidemicCurriculumSampler...")
+            self.curriculum_sampler = EpidemicCurriculumSampler(
+                dataset=self.train_dataset,
+                batch_size=self.config.training.batch_size,
+                config=self.config.training.curriculum,
+                drop_last=False,
+            )
+            # When using batch_sampler, batch_size and shuffle must be omitted
+            train_loader_kwargs["batch_sampler"] = self.curriculum_sampler
+            train_loader_kwargs["collate_fn"] = curriculum_collate_fn
+        else:
+            # Standard training
+            self.curriculum_sampler = None
+            train_loader_kwargs["batch_size"] = self.config.training.batch_size
+            train_loader_kwargs["shuffle"] = False
+            train_loader_kwargs["collate_fn"] = self._collate_fn
+
         if persistent_workers:
             train_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None:
+        if self.config.training.prefetch_factor is not None and num_workers > 0:
             train_loader_kwargs["prefetch_factor"] = (
                 self.config.training.prefetch_factor
             )
@@ -435,7 +560,7 @@ class EpiForecasterTrainer:
         }
         if val_persistent_workers:
             val_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None:
+        if self.config.training.prefetch_factor is not None and val_num_workers > 0:
             val_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
         val_loader = DataLoader(**val_loader_kwargs)
 
@@ -450,7 +575,7 @@ class EpiForecasterTrainer:
         }
         if persistent_workers:
             test_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None:
+        if self.config.training.prefetch_factor is not None and num_workers > 0:
             test_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
         test_loader = DataLoader(**test_loader_kwargs)
         return train_loader, val_loader, test_loader
@@ -509,42 +634,6 @@ class EpiForecasterTrainer:
             "NodeLabels": [item["node_label"] for item in batch],
         }
 
-    @staticmethod
-    def _forward_batch(
-        *,
-        model: torch.nn.Module,
-        batch_data: dict[str, Any],
-        device: torch.device,
-        region_embeddings: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Unified forward pass with non-blocking device transfers.
-
-        Returns:
-            Tuple of (predictions, targets, target_mean, target_scale)
-        """
-        # Non-blocking transfer for all PyTorch tensors
-        batch = {
-            k: v.to(device, non_blocking=True)
-            for k, v in batch_data.items()
-            if isinstance(v, torch.Tensor)
-        }
-
-        # PyG Batch handles its own device transfer
-        mob_batch = batch_data["MobBatch"].to(device)
-
-        predictions = model.forward(
-            cases_norm=batch["CaseNode"],
-            cases_mean=batch["CaseMean"],
-            cases_std=batch["CaseStd"],
-            biomarkers_hist=batch["BioNode"],
-            mob_graphs=mob_batch,
-            target_nodes=batch["TargetNode"],
-            region_embeddings=region_embeddings,
-            population=batch["Population"],
-        )
-
-        return predictions, batch["Target"], batch["TargetMean"], batch["TargetScale"]
-
     def setup_logging(self):
         """Setup logging and experiment tracking."""
         # Create experiment directory
@@ -575,8 +664,6 @@ class EpiForecasterTrainer:
             "use_mobility": self.config.model.type.mobility,
             "history_length": self.config.model.history_length,
             "forecast_horizon": self.config.model.forecast_horizon,
-            "cases_dim": self.train_dataset.cases_output_dim,
-            "biomarkers_dim": self.train_dataset.biomarkers_output_dim,
             "mobility_embedding_dim": self.config.model.mobility_embedding_dim,
             "region_embedding_dim": self.config.model.region_embedding_dim,
             "use_population": self.config.model.use_population,
@@ -885,6 +972,11 @@ class EpiForecasterTrainer:
     def _train_epoch(self) -> float:
         """Train for one epoch."""
         self.model.train()
+
+        # Update Curriculum
+        if self.curriculum_sampler is not None:
+            self.curriculum_sampler.set_curriculum(self.current_epoch)
+
         total_loss = 0.0
         _num_batches = len(self.train_loader)
         counted_batches = 0
@@ -893,20 +985,33 @@ class EpiForecasterTrainer:
         profiler = None
         profiler_active = False
         profiler_complete_announced = False
-        if self.config.training.profiler.enabled:
-            profiler = self._setup_profiler()
-            profiler.__enter__()
-            profiler_active = True
-            self._status("==== PROFILING ACTIVE ====")
+        # NOTE: Profiler initialization moved below, after first batch fetch
+        # to avoid CUDA context deadlock with multiprocessing workers
 
         fetch_start_time = time.time()
         max_batches = getattr(self.config.training, "max_batches", None)
+        first_iteration_done = False
+
+        # Gradient accumulation setup
+        accum_steps = self.config.training.gradient_accumulation_steps
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # Track last gradnorm for progress logging (so we always show the most recent value)
+        last_gradnorm = torch.tensor(0.0)
+
         try:
             for batch_idx, batch_data in enumerate(train_iter):
+                # Initialize profiler AFTER first batch is fetched successfully
+                # This avoids CUDA context deadlock with multiprocessing workers
+                if not first_iteration_done:
+                    first_iteration_done = True
+                    if self.config.training.profiler.enabled:
+                        profiler = self._setup_profiler()
+                        profiler.__enter__()
+                        profiler_active = True
+                        self._status("==== PROFILING ACTIVE ====")
                 if max_batches is not None and batch_idx >= max_batches:
                     break
-                # print(f"Start train iteration {batch_idx + 1}/{num_batches}")
-                self.optimizer.zero_grad()
 
                 self._status(f"Batch {batch_idx}", logging.DEBUG)
 
@@ -928,10 +1033,8 @@ class EpiForecasterTrainer:
                     device_type="cuda", dtype=dtype, enabled=autocast_enabled
                 ):
                     predictions, targets, target_mean, target_scale = (
-                        self._forward_batch(
-                            model=self.model,
+                        self.model.forward_batch(
                             batch_data=batch_data,
-                            device=self.device,
                             region_embeddings=self.region_embeddings,
                         )
                     )
@@ -943,16 +1046,30 @@ class EpiForecasterTrainer:
                         target_scale,
                     )
 
-                loss.backward()
-                self._log_gradient_norms(step=self.global_step)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.training.gradient_clip_value
-                )
-                self.optimizer.step()
+                # Scale loss for gradient accumulation
+                scaled_loss = loss / accum_steps
 
-                # Per-step scheduler update (e.g., for CosineAnnealingLR)
-                if self.scheduler and self.config.training.scheduler_type == "cosine":
-                    self.scheduler.step()
+                scaled_loss.backward()
+
+                # Only step optimizer every N batches (gradient accumulation)
+                should_step = (batch_idx + 1) % accum_steps == 0
+                is_last_batch = batch_idx == len(self.train_loader) - 1
+
+                grad_norm = torch.tensor(0.0)
+                if should_step or is_last_batch:
+                    self._log_gradient_norms(step=self.global_step)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.training.gradient_clip_value,
+                    )
+                    last_gradnorm = grad_norm  # Update for progress logging
+                    self.optimizer.step()
+
+                    # Per-step scheduler update (e.g., for CosineAnnealingLR)
+                    if self.scheduler and self.config.training.scheduler_type == "cosine":
+                        self.scheduler.step()
+
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 total_loss += loss.detach()
                 counted_batches += 1
@@ -973,7 +1090,7 @@ class EpiForecasterTrainer:
                 if log_this_step:
                     loss_value = loss.item()
                     self._status(
-                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.6f} | Lr: {lr:.2e} | Grad: {float(grad_norm):.3f} | SPS: {samples_per_s:7.1f}",
+                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.6f} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
                     )
                     self.writer.add_scalar(
                         "Loss/Train_step", loss_value, self.global_step

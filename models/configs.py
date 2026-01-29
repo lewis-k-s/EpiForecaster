@@ -48,6 +48,65 @@ class ProfilerConfig:
 
 
 @dataclass
+class CurriculumPhaseConfig:
+    """Configuration for a single curriculum phase."""
+
+    start_epoch: int
+    end_epoch: int
+    synth_ratio: float  # Ratio of synthetic samples (0.0 to 1.0)
+    mode: str  # "time_major" or "node_major"
+
+    def __post_init__(self) -> None:
+        if self.start_epoch >= self.end_epoch:
+            raise ValueError(
+                f"start_epoch ({self.start_epoch}) must be less than end_epoch ({self.end_epoch})"
+            )
+        if not 0.0 <= self.synth_ratio <= 1.0:
+            raise ValueError(f"synth_ratio must be in [0, 1], got {self.synth_ratio}")
+        if self.mode not in {"time_major", "node_major"}:
+            raise ValueError(
+                f"mode must be 'time_major' or 'node_major', got {self.mode}"
+            )
+
+
+@dataclass
+class CurriculumConfig:
+    """Curriculum training configuration from ``training.curriculum`` YAML block."""
+
+    enabled: bool = False
+    # Number of synthetic runs to sample from per epoch (1-2 recommended for locality)
+    active_runs: int = 1
+    # Contiguous windows per run before rotating to next run
+    chunk_size: int = 512
+    # How to select runs: "round_robin" or "random"
+    run_sampling: str = "round_robin"
+    # List of phase configs defining the curriculum schedule
+    schedule: list[CurriculumPhaseConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        valid_run_sampling = {"round_robin", "random"}
+        if self.run_sampling not in valid_run_sampling:
+            raise ValueError(
+                f"run_sampling must be one of {valid_run_sampling}, got {self.run_sampling}"
+            )
+        if self.active_runs < 1:
+            raise ValueError(f"active_runs must be >= 1, got {self.active_runs}")
+        if self.chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
+
+        # Validate schedule phases don't overlap
+        for i, phase in enumerate(self.schedule):
+            for j, other in enumerate(self.schedule):
+                if i != j and not (
+                    phase.end_epoch <= other.start_epoch
+                    or phase.start_epoch >= other.end_epoch
+                ):
+                    raise ValueError(
+                        f"Curriculum phases {i} and {j} have overlapping epoch ranges"
+                    )
+
+
+@dataclass
 class ModelVariant:
     cases: bool = field(default=True)
     regions: bool = field(default=False)
@@ -116,6 +175,13 @@ class DataConfig:
         if self.sample_ordering not in valid_orderings:
             raise ValueError(
                 f"sample_ordering must be one of: {sorted(valid_orderings)}"
+            )
+
+        # Validate run_id is present and non-empty
+        if not self.run_id or not isinstance(self.run_id, str) or not self.run_id.strip():
+            raise ValueError(
+                "run_id must be a non-empty string. "
+                "This is required for valid_targets filtering with multi-run datasets."
             )
 
 
@@ -204,6 +270,7 @@ class TrainingParams:
 
     epochs: int = 100
     batch_size: int = 32
+    gradient_accumulation_steps: int = 1
     max_batches: int | None = None
     learning_rate: float = 1.0e-3
     weight_decay: float = 1.0e-5
@@ -221,8 +288,10 @@ class TrainingParams:
     train_end_date: str | None = None
     val_end_date: str | None = None
     test_end_date: str | None = None
-    # Placeholder for curriculum mode (future implementation)
-    curriculum_enabled: bool = False
+    # Curriculum training configuration
+    # When enabled, uses mixed synthetic/real data sampling
+    # When disabled, uses single run_id from data config
+    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 0
@@ -235,7 +304,7 @@ class TrainingParams:
     num_forecast_samples: int = (
         3  # Number of samples per category (best, worst, random)
     )
-    grad_norm_log_frequency: int = 100
+    grad_norm_log_frequency: int = 5
     progress_log_frequency: int = (
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
@@ -294,6 +363,17 @@ class TrainingParams:
                 logger.warning(
                     "split_strategy='time': val_split and test_split are ignored; "
                     "using train_end_date, val_end_date, test_end_date instead"
+                )
+
+        # Validate curriculum configuration
+        if self.curriculum.enabled:
+            if not self.curriculum.schedule:
+                import logging
+
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "curriculum.enabled=True but schedule is empty. "
+                    "Curriculum training will have no effect."
                 )
 
 
@@ -447,9 +527,14 @@ class EpiForecasterConfig:
         Returns:
             Reconstructed EpiForecasterConfig instance.
         """
+        # Reconstruct nested dataclass for curriculum
+        training_dict = config_dict["training"].copy()
+        if "curriculum" in training_dict:
+            training_dict["curriculum"] = CurriculumConfig(**training_dict["curriculum"])
+
         return cls(
             model=ModelConfig(**config_dict["model"]),
             data=DataConfig(**config_dict["data"]),
-            training=TrainingParams(**config_dict["training"]),
+            training=TrainingParams(**training_dict),
             output=OutputConfig(**config_dict["output"]),
         )
