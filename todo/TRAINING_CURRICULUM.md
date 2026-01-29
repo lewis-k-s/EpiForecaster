@@ -11,26 +11,27 @@ To avoid "catastrophic forgetting" of the disease dynamics, we use a **gradually
 0.  **Phase 0: Synthetic Pretraining (Synthetic Only)**
     *   **Goal:** Learn broad disease dynamics across many synthetic runs before mixing.
     *   **Sampling:** 100% Synthetic.
-    *   **Mode:** **Time-Major** (default; configurable).
-    *   **Notes:** Phase length and sampling details are fully configurable.
+    *   **Mode:** Determined by dataset ordering (`data.sample_ordering`).
+    *   **Notes:** Each epoch can correspond to a *new* synthetic run, so we can
+        run many fully synthetic epochs before mixing in real data.
 
 1.  **Phase 1: Physics Pre-training (Synthetic Heavy)**
     *   **Goal:** Teach the model fundamental disease dynamics and causal effects of interventions.
     *   **Data Source:** Synthetic Generator (Twin Scenarios).
     *   **Sampling:** 80% Synthetic / 20% Real.
-    *   **Mode:** **Time-Major** (Snapshot-based) to stabilize spatial gradients.
+    *   **Mode:** Determined by dataset ordering (`data.sample_ordering`).
     *   **Complexity:** Start with clean synthetic data, ramping up to noisy (`missing_rate=0.05`).
 
 2.  **Phase 2: Domain Adaptation (Balanced)**
     *   **Goal:** Adapt to real-world artifacts (delays, noise) while maintaining causal reasoning.
     *   **Sampling:** 50% Synthetic / 50% Real.
-    *   **Mode:** **Time-Major**.
+    *   **Mode:** Determined by dataset ordering (`data.sample_ordering`).
     *   **Synthetic Sampling:** Prioritize "Twin Scenarios" with strong interventions to reinforce the signal of mobility reduction.
 
 3.  **Phase 3: Specialist Fine-tuning (Real Heavy)**
     *   **Goal:** Maximize performance on the specific target distribution (e.g., Catalonia).
     *   **Sampling:** 5% Synthetic (Regularizer) / 95% Real.
-    *   **Mode:** **Node-Major** + **Importance Sampling** (Focus on Lockdowns/High-Quality Nodes).
+    *   **Mode:** Determined by dataset ordering (`data.sample_ordering`).
 
 ---
 
@@ -59,21 +60,16 @@ class EpidemicCurriculumSampler(BatchSampler):
     def set_curriculum(self, epoch):
         # Update state based on epoch schedule
         if epoch < 10:
-            self.state.mode = "time_major"; self.state.synth_ratio = 0.8
+            self.state.synth_ratio = 0.8
         elif epoch < 50:
-            self.state.mode = "time_major"; self.state.synth_ratio = 0.2
+            self.state.synth_ratio = 0.2
         else:
-            self.state.mode = "node_major"; self.state.synth_ratio = 0.05
+            self.state.synth_ratio = 0.05
 
     def __iter__(self):
-        if self.state.mode == "time_major":
-            # Yield batches of ALL nodes for specific time steps
-            # (Snapshot-based training)
-            ...
-        elif self.state.mode == "node_major":
-            # Yield sequences for specific nodes
-            # (Importance sampling on Lockdowns)
-            ...
+        # Dataset ordering (time-major vs node-major) is handled at dataset creation.
+        # The sampler mixes real/synthetic batches without reordering samples.
+        ...
 ```
 
 ### Dataset Contract for Curriculum Mixing (Per-Run Datasets)
@@ -92,6 +88,8 @@ The training set is a `ConcatDataset` over those per-run datasets.
 *   **Sampler Split:** `synth_datasets` and `real_dataset` are grouped at the
     dataset level. The sampler chooses a dataset (run) first, then samples
     windows/nodes from that dataset.
+*   **Memory behavior:** We only keep **one synthetic run + one real dataset**
+    active per epoch to limit memory and preserve locality.
 
 This preserves per-run validity/missingness logic while enabling curriculum
 mixing without forcing a 4D run dimension through the dataset pipeline.
@@ -105,9 +103,9 @@ patterns, the sampler uses **chunked interleaving**:
    * Build `dataset_id -> [window_indices]` for synthetic run datasets.
    * Build `real_indices` for the real dataset.
 
-2. **Select active synthetic runs**
-   * For each epoch, choose `active_runs` (e.g., round-robin or random subset).
-   * Keep **1–2 active runs** to preserve mobility locality and limit memory.
+2. **Select active synthetic run**
+   * Each epoch corresponds to **exactly one synthetic run** (round-robin or random).
+   * This lets us generate many synthetic runs and avoid overfitting any one run.
 
 3. **Yield in chunks**
    * For each active run, take a **contiguous chunk** of `chunk_size` windows
@@ -117,7 +115,7 @@ patterns, the sampler uses **chunked interleaving**:
 
 4. **Rotate**
    * Move to the next chunk within the same run dataset until exhausted, then
-     rotate to the next run dataset.
+     rotate to the next run dataset on the next epoch.
 
 This keeps time-contiguous access for synthetic mobility slices while still
 achieving a balanced mixture at the batch level.
@@ -137,14 +135,13 @@ training:
   run_id: "real"  # used when curriculum.enabled = false
   curriculum:
     enabled: true
-    active_runs: 1          # keep 1-2 active runs for locality
     chunk_size: 512         # contiguous windows per run
     run_sampling: "round_robin"  # or "random"
     schedule:
       - start_epoch: 0
         end_epoch: 5
         synth_ratio: 1.0
-        mode: "time_major"
+        mode: "time_major"  # kept constant; dataset ordering determines mode
       - start_epoch: 5
         end_epoch: 10
         synth_ratio: 0.8
@@ -156,7 +153,7 @@ training:
       - start_epoch: 50
         end_epoch: 999
         synth_ratio: 0.05
-        mode: "node_major"
+        mode: "time_major"
 ```
 
 ---
@@ -165,27 +162,14 @@ training:
 
 Since we use complex temporal graphs, we manually batch the PyG objects.
 
-### `curriculum_collate_fn`
+### Standard Collate (Current)
 
 *   **Input:** List of `EpiDatasetItem` (each containing a list of $L$ graphs).
-*   **Output:** `MobBatch` containing a **List** of $L$ `Batch` objects (one per time step).
+*   **Output:** `MobBatch` is a single flattened `Batch` with `B` and `T` stored
+    on the batch for reshaping in the model.
 
-```python
-def curriculum_collate_fn(batch_list):
-    # 1. Stack standard tensors (Cases, Biomarkers)
-    # ...
-    
-    # 2. Batch Temporal Graphs
-    # Transform [Sample1_TimeList, Sample2_TimeList] -> [Batch_Time0, Batch_Time1...]
-    batched_graphs = []
-    for t in range(history_len):
-        graphs_at_t = [sample["mob"][t] for sample in batch_list]
-        batched_graphs.append(Batch.from_data_list(graphs_at_t))
-        
-    return {..., "MobBatch": batched_graphs}
-```
-
-*Note: The model's `forward` pass must be updated to accept `List[Batch]` instead of a single flattened `Batch`.*
+This keeps the model interface unchanged even when curriculum is enabled.
+Batch ordering handles real/synthetic mixing; we do not mix within a batch.
 
 ### Imported Risk Note (Dense Mobility Only)
 

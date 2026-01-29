@@ -68,6 +68,14 @@ The installation provides access to the `epiforecaster` command-line interface:
 - After `pip install -e .`: Use `epiforecaster` directly
 - With `uv`: Use `uv run python -m cli` (recommended for development)
 
+## Configuration Files
+
+> **WARNING: Production Configs**
+>
+> Do not run configs in `configs/production_only/` locally. They require 100GB+ memory and GPU cluster resources, and will cause out-of-memory crashes on typical development machines. See `configs/production_only/README.md` for details.
+>
+> For local development, use configs in the main `configs/` directory instead.
+
 ## Usage
 
 EpiForecaster follows a two-step workflow: data preprocessing followed by model training. All operations are managed through the `epiforecaster` CLI with YAML configuration files.
