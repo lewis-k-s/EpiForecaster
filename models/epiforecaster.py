@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -196,9 +197,20 @@ class EpiForecaster(nn.Module):
 
         if self.variant_type.mobility:
             assert mob_graphs is not None, "Mobility graphs required but not provided."
-            if not isinstance(mob_graphs, Batch):
-                raise TypeError("Expected mob_graphs to be a PyG Batch after collate.")
-            mobility_embeddings = self._process_mobility_sequence_pyg(mob_graphs, B, T)
+            if isinstance(mob_graphs, list):
+                # New curriculum format: List[Batch] (one per time step)
+                mobility_embeddings = self._process_mobility_sequence_pyg_list(
+                    mob_graphs, B, T
+                )
+            elif isinstance(mob_graphs, Batch):
+                # Legacy format: Single flattened Batch (B*T graphs)
+                mobility_embeddings = self._process_mobility_sequence_pyg(
+                    mob_graphs, B, T
+                )
+            else:
+                raise TypeError(
+                    f"Expected mob_graphs to be PyG Batch or list[Batch], got {type(mob_graphs)}"
+                )
             features.append(mobility_embeddings)
 
         if self.variant_type.regions:
@@ -229,6 +241,95 @@ class EpiForecaster(nn.Module):
 
         return forecasts
 
+    def forward_batch(
+        self,
+        *,
+        batch_data: dict[str, Any],
+        region_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with automatic device transfers and non-blocking I/O.
+
+        This is the preferred entry point for training/evaluation, as it handles
+        all device transfers consistently with non-blocking transfers to reduce
+        CPU-GPU sync time.
+
+        Args:
+            batch_data: Dict containing batch tensors (CaseNode, CaseMean, CaseStd,
+                        BioNode, MobBatch, Population, Target, TargetMean, TargetScale,
+                        TargetNode, WindowStart, B, T)
+            region_embeddings: Optional static region embeddings [num_regions, region_dim]
+
+        Returns:
+            Tuple of (predictions, targets, target_mean, target_scale)
+        """
+        # Non-blocking transfer for all PyTorch tensors
+        batch = {
+            k: v.to(self.device, non_blocking=True)
+            for k, v in batch_data.items()
+            if isinstance(v, torch.Tensor)
+        }
+
+        # PyG Batch handles its own device transfer (not a torch.Tensor, so not in dict above)
+        # Use non_blocking for consistency with tensor transfers
+        mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
+
+        predictions = self.forward(
+            cases_norm=batch["CaseNode"],
+            cases_mean=batch["CaseMean"],
+            cases_std=batch["CaseStd"],
+            biomarkers_hist=batch["BioNode"],
+            mob_graphs=mob_batch,
+            target_nodes=batch["TargetNode"],
+            region_embeddings=region_embeddings,
+            population=batch["Population"],
+        )
+
+        return predictions, batch["Target"], batch["TargetMean"], batch["TargetScale"]
+
+    def _process_mobility_sequence_pyg_list(
+        self, mob_graphs_list: list[Batch], B: int, T: int
+    ) -> torch.Tensor:
+        """Process list of per-time-step batches (Curriculum format)."""
+        if not self.variant_type.mobility or self.mobility_gnn is None:
+            raise RuntimeError(
+                "Mobility processing requested but MobilityGNN is not enabled."
+            )
+        
+        if len(mob_graphs_list) != T:
+            raise ValueError(
+                f"Expected {T} mobility batches (one per time step), got {len(mob_graphs_list)}"
+            )
+
+        embeddings_list = []
+        for t, batch_t in enumerate(mob_graphs_list):
+            batch_t = batch_t.to(self.device)
+            
+            # GNN Forward
+            node_emb = self.mobility_gnn(
+                batch_t.x, 
+                batch_t.edge_index, 
+                getattr(batch_t, "edge_weight", None)
+            )
+            
+            # Gather targets
+            # Target index should be precomputed in collate_fn
+            if hasattr(batch_t, "target_index"):
+                 target_indices = batch_t.target_index.reshape(-1)
+            else:
+                 # Fallback
+                 ptr = batch_t.ptr
+                 start = ptr[:-1]
+                 tgt_local = batch_t.target_node.reshape(-1).to(start.device)
+                 target_indices = start + tgt_local
+            
+            target_emb = node_emb[target_indices]  # (B, dim)
+            embeddings_list.append(target_emb)
+            
+        # Stack -> (B, T, dim)
+        mobility_embeddings = torch.stack(embeddings_list, dim=1)
+        return mobility_embeddings
+
     def _process_mobility_sequence_pyg(
         self, mob_batch: Batch, B: int, T: int
     ) -> torch.Tensor:
@@ -246,7 +347,8 @@ class EpiForecaster(nn.Module):
                 f"!= expected {self.temporal_node_dim}"
             )
 
-        mob_batch = mob_batch.to(self.device)  # type: ignore[attr-defined]
+        # Note: mob_batch is already transferred to device in trainer._forward_batch
+        # Redundant .to(self.device) call removed to avoid device synchronization
 
         node_emb = self.mobility_gnn(
             mob_batch.x,  # type: ignore[attr-defined]
