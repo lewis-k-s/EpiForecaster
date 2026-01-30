@@ -361,7 +361,9 @@ class EpiForecasterTrainer:
                 dataset_path=Path(self.config.data.dataset_path),
                 run_id=self.config.data.run_id,
             )
-            self._status(f"Using valid_targets filter: {valid_mask.sum()} valid regions")
+            self._status(
+                f"Using valid_targets filter: {valid_mask.sum()} valid regions"
+            )
         else:
             self._status(f"Total regions: {N}")
 
@@ -477,9 +479,9 @@ class EpiForecasterTrainer:
 
     def _create_criterion(self) -> nn.Module:
         """Create loss criterion."""
-        from evaluation.epiforecaster_eval import get_loss_function
+        from evaluation.epiforecaster_eval import get_loss_from_config
 
-        return get_loss_function("smape")
+        return get_loss_from_config(self.config.training.loss)
 
     def _create_data_loaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
         """Create training and validation data loaders with device-aware optimizations."""
@@ -1066,7 +1068,10 @@ class EpiForecasterTrainer:
                     self.optimizer.step()
 
                     # Per-step scheduler update (e.g., for CosineAnnealingLR)
-                    if self.scheduler and self.config.training.scheduler_type == "cosine":
+                    if (
+                        self.scheduler
+                        and self.config.training.scheduler_type == "cosine"
+                    ):
                         self.scheduler.step()
 
                     self.optimizer.zero_grad(set_to_none=True)

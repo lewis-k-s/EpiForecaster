@@ -50,5 +50,12 @@ training:
     enabled: false
     profile_batches: 10
     log_dir: auto
+  loss:
+    name: "composite"
+    components:
+      - name: "smape"
+        weight: 1.0
+      - name: "mse_unscaled"
+        weight: 1.0
   plot_forecasts: true
   num_forecast_samples: 3
