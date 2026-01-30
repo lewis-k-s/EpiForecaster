@@ -1,6 +1,7 @@
 """Test run_id filtering logic for EpiDataset."""
 
 import numpy as np
+import pytest
 import xarray as xr
 from data.epi_dataset import EpiDataset
 
@@ -39,6 +40,7 @@ def create_mock_dataset(run_ids, time_steps=10, regions=5):
     return ds
 
 
+@pytest.mark.epiforecaster
 def test_filter_dataset_by_runs():
     """Test run_id filtering works correctly."""
     run_ids = [
@@ -67,6 +69,7 @@ def test_filter_dataset_by_runs():
     print("✓ _filter_dataset_by_runs test passed")
 
 
+@pytest.mark.epiforecaster
 def test_filter_with_none():
     """Test that None returns original dataset."""
     run_ids = [
@@ -81,6 +84,7 @@ def test_filter_with_none():
     print("✓ filter with None test passed")
 
 
+@pytest.mark.epiforecaster
 def test_valid_targets_aggregation():
     """Test valid_targets aggregation across run_id dimension."""
     run_ids = ["run_0", "run_1"]
@@ -130,6 +134,7 @@ def test_valid_targets_aggregation():
     print("✓ valid_targets aggregation test passed")
 
 
+@pytest.mark.epiforecaster
 def test_whitespace_handling():
     """Test that whitespace-padded run_ids are matched correctly."""
     # Create run_ids with padding (like in real dataset)

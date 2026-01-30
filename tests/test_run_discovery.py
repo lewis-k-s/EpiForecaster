@@ -1,10 +1,12 @@
 """Tests for run_discovery utilities."""
 
+import pytest
 from pathlib import Path
 
 from utils.run_discovery import extract_run_from_checkpoint_path
 
 
+@pytest.mark.epiforecaster
 class TestExtractRunFromCheckpointPath:
     """Tests for extract_run_from_checkpoint_path function."""
 

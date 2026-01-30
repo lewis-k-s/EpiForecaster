@@ -177,6 +177,7 @@ def _expected_edar_output(
     return result_ds
 
 
+@pytest.mark.epiforecaster
 def test_edar_processor_applies_tobit_kalman(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -195,6 +196,7 @@ def test_edar_processor_applies_tobit_kalman(
     xr.testing.assert_allclose(result, expected)
 
 
+@pytest.mark.epiforecaster
 def test_edar_processor_skips_tobit_without_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

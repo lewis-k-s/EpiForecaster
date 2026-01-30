@@ -1,11 +1,13 @@
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
 
 from data.cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig
 
 
+@pytest.mark.epiforecaster
 def test_cases_preprocessor_basic():
     # Create dummy dataset
     dates = pd.date_range("2020-01-01", periods=10)
