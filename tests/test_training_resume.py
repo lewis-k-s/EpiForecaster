@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from training.epiforecaster_trainer import EpiForecasterTrainer
@@ -14,6 +15,7 @@ def _make_trainer_stub(config) -> EpiForecasterTrainer:
     return trainer
 
 
+@pytest.mark.epiforecaster
 def test_resolve_model_id_prefers_config(monkeypatch) -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(model_id="explicit"),
@@ -24,6 +26,7 @@ def test_resolve_model_id_prefers_config(monkeypatch) -> None:
     assert trainer._resolve_model_id() == "explicit"
 
 
+@pytest.mark.epiforecaster
 def test_resolve_model_id_falls_back_to_slurm(monkeypatch) -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(model_id=""),
@@ -34,6 +37,7 @@ def test_resolve_model_id_falls_back_to_slurm(monkeypatch) -> None:
     assert trainer._resolve_model_id() == "456"
 
 
+@pytest.mark.epiforecaster
 def test_resolve_model_id_interactive_slurm_uses_datetime(monkeypatch) -> None:
     """Interactive SLURM sessions should use datetime ID, not SLURM_JOB_ID."""
     config = SimpleNamespace(
@@ -49,6 +53,7 @@ def test_resolve_model_id_interactive_slurm_uses_datetime(monkeypatch) -> None:
     assert result != "35320487"
 
 
+@pytest.mark.epiforecaster
 def test_resolve_model_id_interactive_qos_detection(monkeypatch) -> None:
     """Detect interactive sessions via _interactive in QOS."""
     config = SimpleNamespace(
@@ -64,6 +69,7 @@ def test_resolve_model_id_interactive_qos_detection(monkeypatch) -> None:
     assert result != "35320487"
 
 
+@pytest.mark.epiforecaster
 def test_resolve_model_id_batch_job_uses_slurm_id(monkeypatch) -> None:
     """Batch jobs should still use SLURM_JOB_ID."""
     config = SimpleNamespace(
@@ -78,6 +84,7 @@ def test_resolve_model_id_batch_job_uses_slurm_id(monkeypatch) -> None:
     assert trainer._resolve_model_id() == "35320487"
 
 
+@pytest.mark.epiforecaster
 def test_find_checkpoint_for_model_id_prefers_best(tmp_path) -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(model_id=""),
@@ -98,6 +105,7 @@ def test_find_checkpoint_for_model_id_prefers_best(tmp_path) -> None:
     assert trainer._find_checkpoint_for_model_id() == best_path
 
 
+@pytest.mark.epiforecaster
 def test_find_checkpoint_for_model_id_falls_back_to_latest(tmp_path) -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(model_id=""),
@@ -118,6 +126,7 @@ def test_find_checkpoint_for_model_id_falls_back_to_latest(tmp_path) -> None:
     assert trainer._find_checkpoint_for_model_id() == last
 
 
+@pytest.mark.epiforecaster
 def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     config = SimpleNamespace(
         training=SimpleNamespace(model_id=""),
