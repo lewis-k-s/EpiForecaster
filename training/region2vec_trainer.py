@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ import yaml
 from scipy import sparse
 from sklearn.cluster import AgglomerativeClustering
 from torch import nn
+from torch.utils.tensorboard import SummaryWriter
 
 from graph.node_encoder import Region2Vec
 from utils import setup_tensor_core_optimizations
@@ -108,13 +110,30 @@ class TrainingConfig:
     enable_mixed_precision: bool = True
     mixed_precision_dtype: str = "bfloat16"  # "bfloat16" or "float16"
 
+    # Learning rate scheduling
+    lr_scheduler: str = "plateau"  # "plateau", "cosine", "step", "none"
+    lr_warmup_epochs: int = 0  # Number of warmup epochs (0 = disabled)
+    lr_min_factor: float = 0.01  # Minimum LR as fraction of base LR (for cosine)
+    # ReduceLROnPlateau parameters
+    lr_patience: int = 15  # Epochs with no improvement before reducing LR
+    lr_factor: float = 0.5  # Factor to reduce LR (new_lr = lr * factor)
+    lr_threshold: float = 1e-4  # Minimum change to qualify as improvement
+
+    # Early stopping
+    early_stopping_patience: int = 0  # 0 = disabled
+    early_stopping_min_delta: float = 1e-4
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> TrainingConfig:
         raw = raw or {}
         defaults = cls()
-        values = {
-            f.name: raw.get(f.name, getattr(defaults, f.name)) for f in fields(cls)
-        }
+        values = {}
+        for f in fields(cls):
+            val = raw.get(f.name, getattr(defaults, f.name))
+            # Ensure float fields are actually floats (YAML may parse scientific notation as str)
+            if f.type in (float, "float") and isinstance(val, str):
+                val = float(val)
+            values[f.name] = val
         return cls(**values)
 
 
@@ -170,19 +189,28 @@ class OutputConfig:
     metrics_filename: str = "region_training_metrics.json"
     cluster_labels_filename: str = "region_clusters.json"
     save_numpy: bool = True
+    log_dir: str = "outputs/region_training"
+    experiment_name: str = "region_embeddings_experiment"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> OutputConfig:
         raw = raw or {}
-        output_dir = _resolve_path(base_dir, raw.get("output_dir", cls.output_dir))
+        # Resolve output_dir relative to cwd, not config file location
+        output_dir_str = raw.get("output_dir", cls.output_dir)
+        output_dir_path = Path(output_dir_str)
+        if not output_dir_path.is_absolute():
+            output_dir_path = Path.cwd() / output_dir_path
+        output_dir = output_dir_path.resolve()
         return cls(
-            output_dir=output_dir or cls.output_dir,
+            output_dir=output_dir,
             embedding_filename=raw.get("embedding_filename", cls.embedding_filename),
             metrics_filename=raw.get("metrics_filename", cls.metrics_filename),
             cluster_labels_filename=raw.get(
                 "cluster_labels_filename", cls.cluster_labels_filename
             ),
             save_numpy=raw.get("save_numpy", cls.save_numpy),
+            log_dir=raw.get("log_dir", cls.log_dir),
+            experiment_name=raw.get("experiment_name", cls.experiment_name),
         )
 
 
@@ -447,6 +475,9 @@ class Region2VecTrainer:
             weight_decay=self.config.training.weight_decay,
         )
 
+        # Setup learning rate scheduler
+        self.scheduler = self._build_scheduler()
+
         self.spatial_prior = SpatialContiguityPrior(
             max_hops=self.config.sampling.max_hops, cache_distances=True
         )
@@ -467,19 +498,97 @@ class Region2VecTrainer:
         self.best_state: dict[str, Any] | None = None
         self.history: list[dict[str, float]] = []
 
+        # Precompute projector metadata (compute once, reuse for logging)
+        self.projector_metadata = self._build_projector_metadata()
+        logger.info(f"Precomputed metadata for {len(self.projector_metadata)} regions")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def setup_logging(self):
+        """Setup TensorBoard logging and experiment tracking."""
+        # Create experiment directory
+        experiment_dir = (
+            Path(self.config.output.log_dir)
+            / self.config.output.experiment_name
+            / f"run_{time.time_ns()}"
+        )
+        experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        # Setup tensorboard writer
+        self.writer = SummaryWriter(log_dir=str(experiment_dir))
+
+        # Log hyperparameters
+        hyperparams = {
+            "encoder_hidden_dim": self.config.encoder.hidden_dim,
+            "embedding_dim": self.config.encoder.embedding_dim,
+            "num_layers": self.config.encoder.num_layers,
+            "dropout": self.config.encoder.dropout,
+            "aggregation": self.config.encoder.aggregation,
+            "residual": self.config.encoder.residual,
+            "normalize": self.config.encoder.normalize,
+            "loss_type": self.config.loss.loss_type,
+            "learning_rate": self.config.training.learning_rate,
+            "weight_decay": self.config.training.weight_decay,
+            "gradient_clip": self.config.training.gradient_clip,
+            "num_nodes": self.num_nodes,
+            "feature_dim": self.feature_dim,
+            "num_epochs": self.config.training.epochs,
+        }
+
+        for key, value in hyperparams.items():
+            self.writer.add_text(f"hyperparams/{key}", str(value), 0)
+
+        logger.info(f"TensorBoard logging to: {experiment_dir}")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
+        self.setup_logging()
+
         epochs = self.config.training.epochs
+        patience_counter = 0
         for epoch in range(1, epochs + 1):
             metrics = self._train_one_epoch(epoch)
             self.history.append(metrics)
-            if metrics["total_loss"] < self.best_loss:
+
+            # Track best loss for early stopping
+            if (
+                metrics["total_loss"]
+                < self.best_loss - self.config.training.early_stopping_min_delta
+            ):
                 self.best_loss = metrics["total_loss"]
                 self.best_state = {
                     k: v.detach().cpu() for k, v in self.encoder.state_dict().items()
                 }
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            # Early stopping check
+            if (
+                self.config.training.early_stopping_patience > 0
+                and patience_counter >= self.config.training.early_stopping_patience
+            ):
+                logger.info(
+                    "Early stopping triggered at epoch %d (patience=%d, best_loss=%.4f)",
+                    epoch,
+                    self.config.training.early_stopping_patience,
+                    self.best_loss,
+                )
+                break
+
+            # Step the scheduler (ReduceLROnPlateau requires metric, others don't)
+            if self.scheduler is not None:
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step(metrics["total_loss"])
+                else:
+                    self.scheduler.step()
+
+            # Log embeddings every N epochs (optional, can be expensive)
+            if epoch % 20 == 0:
+                self._log_embeddings(epoch)
 
         if self.best_state is not None:
             self.encoder.load_state_dict(self.best_state)
@@ -496,6 +605,8 @@ class Region2VecTrainer:
         )
 
         artifacts = self._save_artifacts(embeddings, clusters)
+
+        self.writer.close()
 
         return {
             "best_loss": float(self.best_loss),
@@ -515,6 +626,141 @@ class Region2VecTrainer:
             "device": str(self.device),
             "epochs": self.config.training.epochs,
         }
+
+    def close_writer(self):
+        """Close TensorBoard writer."""
+        if hasattr(self, "writer"):
+            self.writer.close()
+
+    def _compute_deciles(self, values: list[float] | np.ndarray) -> list[int]:
+        """Compute decile (1-10) for each value in the array.
+
+        Args:
+            values: Array of numeric values
+
+        Returns:
+            List of decile labels (1-10) for each value
+        """
+        values = np.array(values)
+        # Handle constant arrays
+        if values.std() == 0:
+            return [1] * len(values)
+        # Compute deciles using pandas qcut for robust binning
+        import pandas as pd
+
+        try:
+            deciles = pd.qcut(values, q=10, labels=False, duplicates="drop") + 1
+            # If fewer than 10 unique bins, still return 1-based labels
+            return deciles.tolist()
+        except ValueError:
+            # Fallback if qcut fails (e.g., too few unique values)
+            return [1] * len(values)
+
+    def _compute_flow_based_clusters(self, n_clusters: int = 8) -> list[int]:
+        """Compute spatial clusters using flow-based connectivity.
+
+        Uses sklearn AgglomerativeClustering with a connectivity matrix
+        that combines spatial adjacency and flow strength.
+
+        Args:
+            n_clusters: Number of clusters to create
+
+        Returns:
+            List of cluster labels (0-indexed) for each region
+        """
+        # Build connectivity matrix combining spatial edges and flow weights
+        edge_index = self.edge_index.cpu().numpy()
+        num_nodes = self.num_nodes
+
+        # Start with binary adjacency from edge_index
+        connectivity = np.zeros((num_nodes, num_nodes), dtype=float)
+        connectivity[edge_index[0], edge_index[1]] = 1.0
+
+        # If flow matrix exists, use it to weight the connectivity
+        if self.flow_matrix is not None:
+            flow_np = self.flow_matrix.cpu().numpy()
+            # Normalize flows to [0, 1] for each node
+            row_sums = flow_np.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1  # Avoid division by zero
+            normalized_flows = flow_np / row_sums
+            # Add flow weights to connectivity (edges with more flow = stronger connection)
+            connectivity += normalized_flows
+
+        # Ensure symmetry for clustering
+        connectivity = np.maximum(connectivity, connectivity.T)
+
+        # Perform clustering
+        clusterer = AgglomerativeClustering(
+            n_clusters=min(n_clusters, num_nodes),
+            connectivity=connectivity,
+            linkage="ward",
+        )
+        labels = clusterer.fit_predict(self.features.cpu().numpy())
+
+        return labels.tolist()
+
+    def _build_projector_metadata(self) -> list[list[str]]:
+        """Build metadata columns for TensorBoard Projector.
+
+        Returns:
+            List of metadata rows, each row is a list of column values.
+            Columns: [region_id, cluster, pop_decile, density_decile, area_decile]
+        """
+        # Get raw (unnormalized) features from dataset if available
+        # The features are: [area, perimeter, population, density, lon, lat]
+        features_np = self.features.cpu().numpy()
+
+        # Extract feature columns (indices based on region_graph_preprocessor.py)
+        # 0: area (km²), 1: perimeter, 2: population, 3: density, 4: lon, 5: lat
+        area = features_np[:, 0]
+        population = features_np[:, 2]
+        density = features_np[:, 3]
+
+        # Compute deciles
+        area_deciles = self._compute_deciles(area)
+        pop_deciles = self._compute_deciles(population)
+        density_deciles = self._compute_deciles(density)
+
+        # Compute flow-based clusters
+        cluster_labels = self._compute_flow_based_clusters(
+            n_clusters=self.config.clustering.num_clusters
+        )
+
+        # Build metadata rows with separate columns for TensorBoard
+        metadata = []
+        for i, region_id in enumerate(self.region_ids):
+            row = [
+                str(region_id),  # region_id
+                f"cluster_{cluster_labels[i]}",  # cluster
+                f"pop_q{pop_deciles[i]}",  # pop_decile
+                f"density_q{density_deciles[i]}",  # density_decile
+                f"area_q{area_deciles[i]}",  # area_decile
+            ]
+            metadata.append(row)
+
+        return metadata
+
+    def _log_embeddings(self, epoch: int):
+        """Log region embeddings to TensorBoard Projector with rich metadata."""
+        self.encoder.eval()
+        with torch.no_grad():
+            embeddings = self.encoder(self.features, self.edge_index)
+
+        # Use precomputed metadata with column headers for color-by options
+        self.writer.add_embedding(
+            mat=embeddings.detach().cpu(),
+            metadata=self.projector_metadata,
+            metadata_header=[
+                "region_id",
+                "cluster",
+                "pop_decile",
+                "density_decile",
+                "area_decile",
+            ],
+            tag="region_embeddings/train",
+            global_step=epoch,
+        )
+        self.encoder.train()
 
     # ------------------------------------------------------------------
     # Training internals
@@ -569,6 +815,15 @@ class Region2VecTrainer:
                 metrics["ratio_loss"],
                 metrics["hop_loss"],
             )
+
+        # Log to TensorBoard
+        self.writer.add_scalar("Loss/Total", metrics["total_loss"], epoch)
+        self.writer.add_scalar("Loss/Base", metrics["base_loss"], epoch)
+        self.writer.add_scalar("Loss/Ratio", metrics["ratio_loss"], epoch)
+        self.writer.add_scalar("Loss/Hop", metrics["hop_loss"], epoch)
+        self.writer.add_scalar(
+            "Learning_Rate/epoch", self.optimizer.param_groups[0]["lr"], epoch
+        )
 
         return metrics
 
@@ -730,6 +985,77 @@ class Region2VecTrainer:
     # ------------------------------------------------------------------
     # Misc helpers
     # ------------------------------------------------------------------
+
+    def _build_scheduler(self) -> torch.optim.lr_scheduler.LRScheduler | None:
+        """Build the learning rate scheduler based on config."""
+        scheduler_type = self.config.training.lr_scheduler.lower()
+
+        if scheduler_type == "none":
+            return None
+
+        warmup_epochs = self.config.training.lr_warmup_epochs
+        total_epochs = self.config.training.epochs
+
+        if scheduler_type == "plateau":
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+            return ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=self.config.training.lr_factor,
+                patience=self.config.training.lr_patience,
+                threshold=self.config.training.lr_threshold,
+            )
+
+        if scheduler_type == "cosine":
+            # Cosine annealing with optional warmup
+            if warmup_epochs > 0:
+                # Combine warmup + cosine decay
+                from torch.optim.lr_scheduler import (
+                    SequentialLR,
+                    LinearLR,
+                    CosineAnnealingLR,
+                )
+
+                warmup = LinearLR(
+                    self.optimizer,
+                    start_factor=0.1,
+                    total_iters=warmup_epochs,
+                )
+                cosine = CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=total_epochs - warmup_epochs,
+                    eta_min=self.config.training.learning_rate
+                    * self.config.training.lr_min_factor,
+                )
+                return SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                from torch.optim.lr_scheduler import CosineAnnealingLR
+
+                return CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=total_epochs,
+                    eta_min=self.config.training.learning_rate
+                    * self.config.training.lr_min_factor,
+                )
+
+        elif scheduler_type == "step":
+            from torch.optim.lr_scheduler import StepLR
+
+            return StepLR(
+                self.optimizer,
+                step_size=max(1, total_epochs // 3),
+                gamma=0.1,
+            )
+
+        else:
+            logger.warning(f"Unknown scheduler type: {scheduler_type}, using None")
+            return None
+
     @staticmethod
     def _select_device(device_str: str) -> torch.device:
         if device_str == "auto":
