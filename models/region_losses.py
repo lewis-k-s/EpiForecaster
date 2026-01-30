@@ -358,14 +358,54 @@ class SpatialAutocorrelationLoss(nn.Module):
         """
         try:
             embeddings_np = embeddings.detach().cpu().numpy()
-            _n_nodes, embed_dim = embeddings_np.shape
+            n_nodes, embed_dim = embeddings_np.shape
+
+            # Early exit for insufficient nodes
+            if n_nodes < 2:
+                logger.debug(
+                    f"Moran's I requires at least 2 regions, got {n_nodes}. Skipping."
+                )
+                return torch.tensor(0.0, device=embeddings.device)
+
+            # Check for islands - they cause seI_sim = 0 in permutation simulation
+            # which triggers RuntimeWarning: division by zero in esda/moran.py:1354
+            if hasattr(spatial_weights, "islands") and spatial_weights.islands:
+                logger.debug(
+                    f"Skipping Moran's I: spatial weights contain {len(spatial_weights.islands)} "
+                    f"island(s) {spatial_weights.islands} which cause unstable seI_sim computation"
+                )
+                return torch.tensor(0.0, device=embeddings.device)
 
             moran_losses = []
+            eps = 1e-10  # Numerical stability threshold
 
             # Compute Moran's I for each embedding dimension
             for dim in range(embed_dim):
+                values = embeddings_np[:, dim]
+
+                # Pre-computation validation checks to prevent division by zero warnings
+                value_std = float(np.std(values))
+                n_unique = int(np.unique(values).size)
+
+                # Skip dimensions with no variance (causes seI_sim = 0 or NaN)
+                if value_std < eps:
+                    logger.debug(
+                        f"Skipping dim {dim}: constant values (std={value_std:.2e})"
+                    )
+                    moran_losses.append(0.0)
+                    continue
+
+                # Skip dimensions with insufficient unique values
+                if n_unique < 2:
+                    logger.debug(
+                        f"Skipping dim {dim}: only {n_unique} unique value(s)"
+                    )
+                    moran_losses.append(0.0)
+                    continue
+
+                # Now safe to compute Moran's I
                 try:
-                    moran = esda.Moran(embeddings_np[:, dim], spatial_weights)
+                    moran = esda.Moran(values, spatial_weights)
                     # Penalty: encourage positive spatial autocorrelation
                     moran_penalty = (self.target_moran_i - moran.I) ** 2
                     moran_losses.append(moran_penalty)
@@ -374,7 +414,7 @@ class SpatialAutocorrelationLoss(nn.Module):
                     moran_losses.append(0.0)
 
             # Average across dimensions
-            avg_moran_loss = np.mean(moran_losses)
+            avg_moran_loss = np.mean(moran_losses) if moran_losses else 0.0
             return torch.tensor(avg_moran_loss, device=embeddings.device)
 
         except Exception as e:
@@ -396,14 +436,53 @@ class SpatialAutocorrelationLoss(nn.Module):
         """
         try:
             embeddings_np = embeddings.detach().cpu().numpy()
-            _n_nodes, embed_dim = embeddings_np.shape
+            n_nodes, embed_dim = embeddings_np.shape
+
+            # Early exit for insufficient nodes
+            if n_nodes < 2:
+                logger.debug(
+                    f"LISA requires at least 2 regions, got {n_nodes}. Skipping."
+                )
+                return torch.tensor(0.0, device=embeddings.device)
+
+            # Check for islands - they cause unstable LISA computation
+            if hasattr(spatial_weights, "islands") and spatial_weights.islands:
+                logger.debug(
+                    f"Skipping LISA: spatial weights contain {len(spatial_weights.islands)} "
+                    f"island(s) {spatial_weights.islands}"
+                )
+                return torch.tensor(0.0, device=embeddings.device)
 
             lisa_losses = []
+            eps = 1e-10  # Numerical stability threshold
 
             # Compute LISA for each embedding dimension
             for dim in range(embed_dim):
+                values = embeddings_np[:, dim]
+
+                # Pre-computation validation checks to prevent division by zero warnings
+                value_std = float(np.std(values))
+                n_unique = int(np.unique(values).size)
+
+                # Skip dimensions with no variance (causes unstable LISA computation)
+                if value_std < eps:
+                    logger.debug(
+                        f"Skipping dim {dim}: constant values (std={value_std:.2e})"
+                    )
+                    lisa_losses.append(0.0)
+                    continue
+
+                # Skip dimensions with insufficient unique values
+                if n_unique < 2:
+                    logger.debug(
+                        f"Skipping dim {dim}: only {n_unique} unique value(s)"
+                    )
+                    lisa_losses.append(0.0)
+                    continue
+
+                # Now safe to compute LISA
                 try:
-                    lisa = esda.Moran_Local(embeddings_np[:, dim], spatial_weights)
+                    lisa = esda.Moran_Local(values, spatial_weights)
 
                     # LISA loss: penalize negative local autocorrelation
                     # Focus on high-high and low-low clusters (positive autocorr)
@@ -419,7 +498,7 @@ class SpatialAutocorrelationLoss(nn.Module):
                     lisa_losses.append(0.0)
 
             # Average across dimensions
-            avg_lisa_loss = np.mean(lisa_losses)
+            avg_lisa_loss = np.mean(lisa_losses) if lisa_losses else 0.0
             return torch.tensor(avg_lisa_loss, device=embeddings.device)
 
         except Exception as e:
