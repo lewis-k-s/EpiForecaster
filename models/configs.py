@@ -1,6 +1,8 @@
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from typing import Any, cast
+
 import yaml
 from omegaconf import MISSING, DictConfig, OmegaConf
 
@@ -48,13 +50,50 @@ class ProfilerConfig:
 
 
 @dataclass
+class LossComponentConfig:
+    """Single loss component for composite objectives."""
+
+    name: str
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.weight < 0:
+            raise ValueError("loss component weight must be non-negative")
+
+
+@dataclass
+class LossConfig:
+    """Loss configuration from ``training.loss`` YAML block."""
+
+    name: str = "smape"
+    components: list[LossComponentConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.components, list):
+            normalized: list[LossComponentConfig] = []
+            for component in self.components:
+                if isinstance(component, LossComponentConfig):
+                    normalized.append(component)
+                elif isinstance(component, (dict, DictConfig)):
+                    normalized.append(LossComponentConfig(**component))
+                else:
+                    raise ValueError(
+                        "loss.components must be LossComponentConfig or dict entries"
+                    )
+            self.components = normalized
+
+
+@dataclass
 class CurriculumPhaseConfig:
     """Configuration for a single curriculum phase."""
 
     start_epoch: int
     end_epoch: int
     synth_ratio: float  # Ratio of synthetic samples (0.0 to 1.0)
-    mode: str  # "time_major" or "node_major"
+    mode: str = "time_major"  # "time_major" or "node_major"
+    # Sparsity filtering for progressive curriculum (optional)
+    min_sparsity: float | None = None  # Minimum sparsity (0.0-1.0)
+    max_sparsity: float | None = None  # Maximum sparsity (0.0-1.0)
 
     def __post_init__(self) -> None:
         if self.start_epoch >= self.end_epoch:
@@ -68,6 +107,16 @@ class CurriculumPhaseConfig:
                 f"mode must be 'time_major' or 'node_major', got {self.mode}"
             )
 
+        # Validate sparsity bounds
+        if self.min_sparsity is not None and self.max_sparsity is not None:
+            if self.min_sparsity > self.max_sparsity:
+                raise ValueError(
+                    f"min_sparsity ({self.min_sparsity}) > max_sparsity ({self.max_sparsity})"
+                )
+        for val in [self.min_sparsity, self.max_sparsity]:
+            if val is not None and not (0.0 <= val <= 1.0):
+                raise ValueError(f"Sparsity must be in [0.0, 1.0], got {val}")
+
 
 @dataclass
 class CurriculumConfig:
@@ -80,6 +129,8 @@ class CurriculumConfig:
     chunk_size: int = 512
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
+    # Path to raw zarr dataset for reading sparsity metadata (optional)
+    raw_dataset_path: str = ""
     # List of phase configs defining the curriculum schedule
     schedule: list[CurriculumPhaseConfig] = field(default_factory=list)
 
@@ -178,7 +229,11 @@ class DataConfig:
             )
 
         # Validate run_id is present and non-empty
-        if not self.run_id or not isinstance(self.run_id, str) or not self.run_id.strip():
+        if (
+            not self.run_id
+            or not isinstance(self.run_id, str)
+            or not self.run_id.strip()
+        ):
             raise ValueError(
                 "run_id must be a non-empty string. "
                 "This is required for valid_targets filtering with multi-run datasets."
@@ -299,6 +354,8 @@ class TrainingParams:
     pin_memory: bool = True
     eval_frequency: int = 5
     eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
+    # Loss configuration (single or composite)
+    loss: LossConfig = field(default_factory=LossConfig)
     # forecast plotting during validation/test evaluation
     plot_forecasts: bool = True
     num_forecast_samples: int = (
@@ -318,6 +375,31 @@ class TrainingParams:
         if self.resume and not self.model_id:
             raise ValueError(
                 "model_id must be provided when resume is True. If you are not resuming, leave model_id empty."
+            )
+
+        if isinstance(self.loss, (dict, DictConfig)):
+            loss_dict = cast(dict[str, Any], self.loss)
+            self.loss = LossConfig(**loss_dict)
+
+        valid_loss_names = {"smape", "mse", "mae", "l1", "mse_unscaled", "composite"}
+        loss_name = (self.loss.name or "").lower()
+        if loss_name not in valid_loss_names:
+            raise ValueError(
+                f"Invalid loss.name: {self.loss.name}. Valid options: {sorted(valid_loss_names)}"
+            )
+        if loss_name == "composite":
+            if not self.loss.components:
+                raise ValueError("loss.components must be provided for composite loss")
+            for component in self.loss.components:
+                comp_name = (component.name or "").lower()
+                if comp_name not in valid_loss_names - {"composite"}:
+                    raise ValueError(
+                        f"Invalid loss component: {component.name}. "
+                        f"Valid options: {sorted(valid_loss_names - {'composite'})}"
+                    )
+        elif self.loss.components:
+            raise ValueError(
+                "loss.components is only valid when loss.name is 'composite'"
             )
 
         # Validate split_strategy
@@ -530,7 +612,9 @@ class EpiForecasterConfig:
         # Reconstruct nested dataclass for curriculum
         training_dict = config_dict["training"].copy()
         if "curriculum" in training_dict:
-            training_dict["curriculum"] = CurriculumConfig(**training_dict["curriculum"])
+            training_dict["curriculum"] = CurriculumConfig(
+                **training_dict["curriculum"]
+            )
 
         return cls(
             model=ModelConfig(**config_dict["model"]),
