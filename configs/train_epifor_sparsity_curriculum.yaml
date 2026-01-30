@@ -1,0 +1,121 @@
+# Sparsity-based curriculum learning configuration
+# This configuration demonstrates progressive training from low sparsity (clean data)
+# to high sparsity (real-world conditions) using synthetic data with varying
+# sparsity levels [0.05, 0.2, 0.4, 0.6, 0.8].
+#
+# The curriculum sampler filters synthetic runs by sparsity range at each phase,
+# enabling the model to first learn dynamics from clean data, then progressively
+# adapt to noisier, more realistic conditions.
+
+data:
+  # Use valid_targets mask from dataset to filter target nodes
+  use_valid_targets: false
+  # Path to the processed zarr dataset containing both real and synthetic runs
+  dataset_path: data/processed/synthetic_full.zarr
+  # Mobility-weighted lagged case features (imported risk)
+  use_imported_risk: false
+  mobility_lags: [1, 7, 14] # Lags in days (only used when use_imported_risk=true)
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
+  mobility_threshold: 10
+  window_stride: 1
+  missing_permit: 2
+  sample_ordering: "time"
+  log_scale: true
+  # run_id is ignored when curriculum is enabled (sampler handles run selection)
+  run_id: "0_Baseline"
+
+model:
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 16
+    region_embedding_dim: 64
+    gnn_module: "gcn"
+    #-- seq sizes --#
+    history_length: 14
+    forecast_horizon: 7
+    #-- graph params --#
+    max_neighbors: 20
+    gnn_depth: 2
+
+output:
+  experiment_name: sparsity_curriculum
+  log_dir: outputs/training
+
+training:
+  device: "auto"
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  early_stopping_patience: 10
+  nan_loss_patience: 5
+  # max_batches: 20
+  epochs: 20
+  learning_rate: 0.001
+  weight_decay: 1.0e-05
+  num_workers: 4
+  val_workers: 2
+  val_split: 0.2
+  test_split: 0.1
+
+  # Sparsity-based curriculum configuration
+  curriculum:
+    enabled: true
+    # Number of synthetic runs to sample from per epoch
+    # 2 is recommended to maintain locality while exposing the model to diversity
+    active_runs: 2
+    # Contiguous windows per run before rotating to next run
+    chunk_size: 512
+    # How to select runs within sparsity range: "round_robin" or "random"
+    run_sampling: "round_robin"
+    # Raw dataset path for sparsity metadata
+    raw_dataset_path: data/files/raw_synthetic_observations.zarr
+
+    schedule:
+      # Phase 0: Clean synthetic only (learn dynamics without noise)
+      - start_epoch: 0
+        end_epoch: 3
+        synth_ratio: 1.0 # 100% synthetic data
+        mode: "time_major"
+        min_sparsity: 0.0 # Only 5% sparsity runs (cleanest data)
+        max_sparsity: 0.10
+
+      # Phase 1: Add light noise + mix with real data
+      - start_epoch: 3
+        end_epoch: 7
+        synth_ratio: 0.8 # 80% synthetic, 20% real
+        mode: "time_major"
+        min_sparsity: 0.0 # 5% + 20% sparsity
+        max_sparsity: 0.25
+
+      # Phase 2: Medium noise, balance synthetic/real
+      - start_epoch: 7
+        end_epoch: 12
+        synth_ratio: 0.5 # 50% synthetic, 50% real
+        mode: "time_major"
+        min_sparsity: 0.15 # 20% + 40% sparsity
+        max_sparsity: 0.50
+
+      # Phase 3: High noise (approach real-world conditions)
+      - start_epoch: 12
+        end_epoch: 20
+        synth_ratio: 0.2 # 20% synthetic, 80% real
+        mode: "time_major"
+        min_sparsity: 0.50 # 60% + 80% sparsity
+        max_sparsity: 1.0
+
+  profiler:
+    enabled: false
+    profile_batches: 10
+    log_dir: auto
+  loss:
+    name: "composite"
+    components:
+      - name: "smape"
+        weight: 1.0
+      - name: "mse_unscaled"
+        weight: 1.0
+  plot_forecasts: true
+  num_forecast_samples: 3
