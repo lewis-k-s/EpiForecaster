@@ -564,7 +564,9 @@ class Region2VecTrainer:
             max_epochs = self.config.training.epochs
 
         patience_counter = 0
+        actual_epoch = 0
         for epoch in range(1, max_epochs + 1):
+            actual_epoch = epoch
             metrics = self._train_one_epoch(epoch)
             self.history.append(metrics)
 
@@ -645,7 +647,7 @@ class Region2VecTrainer:
 
         return {
             "best_loss": float(self.best_loss),
-            "epochs": epochs,
+            "epochs": actual_epoch,
             "artifacts": artifacts,
             "cluster_labels": clusters,
             "region_ids": self.region_ids,
