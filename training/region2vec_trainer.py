@@ -118,6 +118,9 @@ class TrainingConfig:
     lr_patience: int = 15  # Epochs with no improvement before reducing LR
     lr_factor: float = 0.5  # Factor to reduce LR (new_lr = lr * factor)
     lr_threshold: float = 1e-4  # Minimum change to qualify as improvement
+    # Unconstrained training: train until LR reduced N times (ignores epochs limit)
+    train_until_plateau: bool = False
+    max_lr_reductions: int = 3  # Stop after this many LR reductions
 
     # Early stopping
     early_stopping_patience: int = 0  # 0 = disabled
@@ -547,9 +550,21 @@ class Region2VecTrainer:
     def run(self) -> dict[str, Any]:
         self.setup_logging()
 
-        epochs = self.config.training.epochs
+        # Track LR reductions for unconstrained training
+        lr_reduction_count = 0
+        prev_lr = self.config.training.learning_rate
+
+        if self.config.training.train_until_plateau:
+            logger.info(
+                "Unconstrained training: will run until LR is reduced %d times",
+                self.config.training.max_lr_reductions,
+            )
+            max_epochs = 999_999
+        else:
+            max_epochs = self.config.training.epochs
+
         patience_counter = 0
-        for epoch in range(1, epochs + 1):
+        for epoch in range(1, max_epochs + 1):
             metrics = self._train_one_epoch(epoch)
             self.history.append(metrics)
 
@@ -585,6 +600,26 @@ class Region2VecTrainer:
                     self.scheduler.step(metrics["total_loss"])
                 else:
                     self.scheduler.step()
+
+                # Check for LR reduction (for unconstrained training)
+                if self.config.training.train_until_plateau:
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                    if current_lr < prev_lr - 1e-9:  # LR was reduced
+                        lr_reduction_count += 1
+                        logger.info(
+                            "LR reduced to %.6f (reduction %d/%d)",
+                            current_lr,
+                            lr_reduction_count,
+                            self.config.training.max_lr_reductions,
+                        )
+                        if lr_reduction_count >= self.config.training.max_lr_reductions:
+                            logger.info(
+                                "Reached max LR reductions (%d), stopping at epoch %d",
+                                self.config.training.max_lr_reductions,
+                                epoch,
+                            )
+                            break
+                    prev_lr = current_lr
 
             # Log embeddings every N epochs (optional, can be expensive)
             if epoch % 20 == 0:
