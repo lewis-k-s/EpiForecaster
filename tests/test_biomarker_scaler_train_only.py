@@ -4,6 +4,7 @@ import xarray as xr
 from data.biomarker_preprocessor import BiomarkerPreprocessor
 
 
+@pytest.mark.region
 def test_scaler_fitted_on_train_only():
     """Verify scalers are computed using only train nodes."""
     dataset = xr.Dataset(
@@ -28,6 +29,7 @@ def test_scaler_fitted_on_train_only():
     )
 
 
+@pytest.mark.region
 def test_scaler_reused_for_val_test():
     """Verify same scaler params are used for val/test."""
     dataset = xr.Dataset(
@@ -52,6 +54,7 @@ def test_scaler_reused_for_val_test():
     assert preprocessor.scaler_params.scale == train_params.scale
 
 
+@pytest.mark.region
 def test_near_constant_biomarker():
     """Verify scale=1.0 when IQR≈0."""
     dataset = xr.Dataset(
@@ -70,6 +73,7 @@ def test_near_constant_biomarker():
     assert preprocessor.scaler_params.scale["edar_biomarker_N1"] == 1.0
 
 
+@pytest.mark.region
 def test_scaler_no_finite_values_error():
     """Verify error raised when no finite values in train nodes."""
     dataset = xr.Dataset(
@@ -87,6 +91,7 @@ def test_scaler_no_finite_values_error():
         preprocessor.fit_scaler(dataset, [0])
 
 
+@pytest.mark.region
 def test_scaler_log_transform():
     """Verify scaler is computed on log1p transformed values, excluding zeros."""
     dataset = xr.Dataset(

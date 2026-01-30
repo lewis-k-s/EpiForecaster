@@ -72,6 +72,7 @@ def config(temp_data_dir: Path) -> PreprocessingConfig:
     )
 
 
+@pytest.mark.region
 def test_municipality_mapping_loads(temp_data_dir: Path):
     """Test mapping processor loads data correctly."""
     proc = MunicipalityMappingProcessor(temp_data_dir)
@@ -87,6 +88,7 @@ def test_municipality_mapping_loads(temp_data_dir: Path):
     assert df["municipality_code"].iloc[0] == "08019"  # Leading zero preserved
 
 
+@pytest.mark.region
 def test_catalonia_cases_output_format(
     config: PreprocessingConfig, temp_data_dir: Path
 ):
@@ -101,6 +103,7 @@ def test_catalonia_cases_output_format(
     assert result.cases.sum() == 15  # 5+3+7
 
 
+@pytest.mark.region
 def test_deaths_processor_comarca_level(
     config: PreprocessingConfig, temp_data_dir: Path
 ):
@@ -113,6 +116,7 @@ def test_deaths_processor_comarca_level(
     assert result.deaths.sum() == 3  # 2+1
 
 
+@pytest.mark.region
 def test_deaths_processor_municipality_allocation(
     config: PreprocessingConfig, temp_data_dir: Path
 ):

@@ -1,7 +1,9 @@
+import pytest
 import torch
 from utils.normalization import unscale_forecasts
 
 
+@pytest.mark.epiforecaster
 def test_unscale_forecasts_shapes():
     B, H = 2, 5
     predictions = torch.randn(B, H)
@@ -17,6 +19,7 @@ def test_unscale_forecasts_shapes():
     assert targets_unscaled.shape == (B, H)
 
 
+@pytest.mark.epiforecaster
 def test_unscale_forecasts_correctness():
     # Simple case
     # Mean = 10, Scale = 2
@@ -35,6 +38,7 @@ def test_unscale_forecasts_correctness():
     assert torch.allclose(targets_unscaled, torch.tensor([[10.0]]))
 
 
+@pytest.mark.epiforecaster
 def test_unscale_forecasts_broadcasting():
     # Mean/Scale are 1D (B,)
     B, H = 2, 3

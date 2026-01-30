@@ -66,6 +66,7 @@ def _create_dataset_with_channels(
     )
 
 
+@pytest.mark.region
 def test_value_channel_log_transform():
     """Verify value channel gets log1p transform without LOCF."""
     preprocessor = BiomarkerPreprocessor()
@@ -86,6 +87,7 @@ def test_value_channel_log_transform():
     np.testing.assert_array_almost_equal(encoded[:, 0, 0], expected_value)
 
 
+@pytest.mark.region
 def test_mask_channel_correctness():
     """Verify mask channel is passed through correctly."""
     preprocessor = BiomarkerPreprocessor()
@@ -102,6 +104,7 @@ def test_mask_channel_correctness():
     np.testing.assert_array_equal(encoded[:, 0, 1], expected_mask)
 
 
+@pytest.mark.region
 def test_censor_channel_passthrough():
     """Verify censor channel is passed through correctly."""
     preprocessor = BiomarkerPreprocessor()
@@ -118,6 +121,7 @@ def test_censor_channel_passthrough():
     np.testing.assert_array_equal(encoded[:, 0, 2], expected_censor)
 
 
+@pytest.mark.region
 def test_age_channel_passthrough():
     """Verify age channel is passed through correctly."""
     preprocessor = BiomarkerPreprocessor()
@@ -135,6 +139,7 @@ def test_age_channel_passthrough():
     np.testing.assert_array_almost_equal(encoded[:, 0, 3], age.flatten())
 
 
+@pytest.mark.region
 def test_log_transform_and_scaling():
     """Verify log1p, robust scaling, and clipping are applied correctly."""
     preprocessor = BiomarkerPreprocessor()
@@ -160,6 +165,7 @@ def test_log_transform_and_scaling():
     np.testing.assert_array_almost_equal(encoded[:, 0, 0], expected_value)
 
 
+@pytest.mark.region
 def test_zeros_below_detection_limit():
     """Verify zero values are handled correctly (below-LD)."""
     preprocessor = BiomarkerPreprocessor()
@@ -186,6 +192,7 @@ def test_zeros_below_detection_limit():
     np.testing.assert_array_almost_equal(encoded[:, 0, 3], age.flatten())
 
 
+@pytest.mark.region
 def test_multiple_regions():
     """Verify preprocessing works correctly with multiple regions."""
     preprocessor = BiomarkerPreprocessor()
@@ -236,6 +243,7 @@ def test_multiple_regions():
     np.testing.assert_array_equal(encoded[:, :, 3], age)
 
 
+@pytest.mark.region
 def test_required_channels_validation():
     """Verify that missing required channels raise ValueError."""
     preprocessor = BiomarkerPreprocessor()
@@ -258,6 +266,7 @@ def test_required_channels_validation():
         preprocessor.preprocess_dataset(ds_incomplete)
 
 
+@pytest.mark.region
 def test_censor_flag_validation():
     """Verify censor channel values are validated (0.0 or 1.0 flags)."""
     preprocessor = BiomarkerPreprocessor()
@@ -275,6 +284,7 @@ def test_censor_flag_validation():
     np.testing.assert_array_equal(encoded[:, 0, 2], [0.0, 1.0, 0.0])
 
 
+@pytest.mark.region
 def test_censor_alignment_with_mask():
     """Verify censored points align with mask=0 (unmeasured)."""
     preprocessor = BiomarkerPreprocessor()
@@ -294,6 +304,7 @@ def test_censor_alignment_with_mask():
             assert encoded[i, 0, 1] == 0.0, "Censored points should have mask=0"
 
 
+@pytest.mark.region
 def test_clip_range():
     """Verify values are clipped to the configured range."""
     preprocessor = BiomarkerPreprocessor(clip_range=(-2.0, 2.0))
@@ -320,6 +331,7 @@ def test_clip_range():
     assert encoded[1, 0, 0] == 0.0
 
 
+@pytest.mark.region
 def test_region_without_biomarker_data():
     """Verify regions without biomarker data get zero encoding."""
     preprocessor = BiomarkerPreprocessor(age_max=10)
