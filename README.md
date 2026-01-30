@@ -98,6 +98,28 @@ uv run python -m cli list-datasets --data-dir data/processed
 uv run python -m cli info --dataset data/processed/dataset.zarr --validate
 ```
 
+### Development & Testing
+
+```bash
+# Run all tests
+uv run pytest tests/
+
+# Run tests with specific markers
+uv run pytest -m region -v              # Region-related tests only
+uv run pytest -m epiforecaster -v        # EpiForecaster tests only
+uv run pytest -m "not region" -v         # All tests except region
+
+# Linting and formatting
+uv run ruff check .
+uv run ruff format .
+```
+
+Tests are organized with pytest markers:
+- `@pytest.mark.region`: Tests for region2vec, region losses, spatial autocorrelation
+- `@pytest.mark.epiforecaster`: Tests for the main epidemiological forecaster model
+
+Run `uv run pytest --markers` to see all available markers.
+
 ## References
 
 [1] Hamilton, W., Ying, Z., & Leskovec, J. (2017). **Inductive Representation Learning on Large Graphs**. *Advances in Neural Information Processing Systems (NeurIPS)*, 30. [arXiv:1706.02216](https://arxiv.org/abs/1706.02216)

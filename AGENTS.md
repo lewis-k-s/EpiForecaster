@@ -48,6 +48,28 @@ uv run pyright .           # type checking (best-effort; excludes dataviz/plotti
 - Use fixtures for sample data; keep tests deterministic (seed RNGs).
 - Quick examples: `uv run pytest -k graph tests/`, `uv run pytest -q tests/`.
 
+### Pytest Markers
+
+Tests are organized with markers for selective execution:
+
+- `@pytest.mark.region`: Tests related to region2vec, region losses, spatial autocorrelation
+- `@pytest.mark.epiforecaster`: Tests related to the main epidemiological forecaster model
+
+Usage:
+```bash
+# Run only region tests
+uv run pytest -m region -v
+
+# Run only epiforecaster tests
+uv run pytest -m epiforecaster -v
+
+# Run all tests except region
+uv run pytest -m "not region" -v
+
+# List all markers
+uv run pytest --markers
+```
+
 ## Configuration-Driven Development
 
 This project uses YAML configuration files for reproducible experiments:
