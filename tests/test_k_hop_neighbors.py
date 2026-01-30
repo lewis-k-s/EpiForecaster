@@ -7,6 +7,7 @@ feature masking works correctly with the full graph topology.
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 import xarray as xr
 
@@ -100,7 +101,7 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
             "region_id_to": regions,
         },
     )
-    ds.to_zarr(zarr_path, mode="w")
+    ds.to_zarr(zarr_path, mode="w", zarr_format=2)
 
 
 def _verify_node_features_masked(
@@ -135,6 +136,7 @@ def _verify_node_features_masked(
         )
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_masking_gnn_depth_0(tmp_path):
     """GNN depth 0 should include all nodes (no masking)."""
     zarr_path = tmp_path / "chain.zarr"
@@ -155,6 +157,7 @@ def test_k_hop_masking_gnn_depth_0(tmp_path):
         ), f"Node {local_idx} should have non-zero features with gnn_depth=0"
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_masking_gnn_depth_1(tmp_path):
     """GNN depth 1 should only include direct neighbors.
 
@@ -202,6 +205,7 @@ def test_k_hop_masking_gnn_depth_1(tmp_path):
             ), f"Time {t}: Node 3 (3-hop) should have zero features"
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_masking_gnn_depth_2(tmp_path):
     """GNN depth 2 should include 2-hop neighbors.
 
@@ -247,6 +251,7 @@ def test_k_hop_masking_gnn_depth_2(tmp_path):
             ), f"Time {t}: Node 3 (3-hop) should have zero features"
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_masking_middle_node(tmp_path):
     """Test k-hop masking for a middle target node.
 
@@ -293,6 +298,7 @@ def test_k_hop_masking_middle_node(tmp_path):
             ), "Node 3 (2-hop) should have zero features"
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_masking_time_ordering(tmp_path):
     """Test k-hop masking with sample_ordering='time'."""
     zarr_path = tmp_path / "chain_time.zarr"
@@ -328,6 +334,7 @@ def test_k_hop_masking_time_ordering(tmp_path):
             ), "Node 2 should have zero features with time ordering"
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_masking_node_ordering(tmp_path):
     """Test k-hop masking with sample_ordering='node'."""
     zarr_path = tmp_path / "chain_node.zarr"
@@ -362,6 +369,7 @@ def test_k_hop_masking_node_ordering(tmp_path):
             ), "Node 2 should have zero features with node ordering"
 
 
+@pytest.mark.epiforecaster
 def test_k_hop_reachability_cache(tmp_path):
     """Verify that _k_hop_cache is populated correctly."""
     zarr_path = tmp_path / "cache.zarr"
@@ -435,6 +443,7 @@ def _create_gnn_model(gnn_depth: int, in_dim: int = 8) -> MobilityPyGEncoder:
     )
 
 
+@pytest.mark.epiforecaster
 def test_gnn_receptive_field_depth_1_chain(tmp_path):
     """Test that GNN depth 1 only aggregates from 1-hop neighbors during forward pass.
 
@@ -483,6 +492,7 @@ def test_gnn_receptive_field_depth_1_chain(tmp_path):
     )
 
 
+@pytest.mark.epiforecaster
 def test_gnn_receptive_field_depth_2_chain(tmp_path):
     """Test that GNN depth 2 can aggregate from 2-hop neighbors during forward pass.
 
@@ -513,6 +523,7 @@ def test_gnn_receptive_field_depth_2_chain(tmp_path):
     )
 
 
+@pytest.mark.epiforecaster
 def test_gnn_receptive_field_full_graph_issue(tmp_path):
     """Demonstrate the full graph issue: information flows beyond k-hop.
 
@@ -566,6 +577,7 @@ def test_gnn_receptive_field_full_graph_issue(tmp_path):
     )
 
 
+@pytest.mark.epiforecaster
 def test_gnn_receptive_field_depth_2_full_graph_propagation(tmp_path):
     """Test that WITH full graph and depth=2, information propagates beyond 2-hops.
 

@@ -6,6 +6,7 @@ from omegaconf import errors
 from models.configs import EpiForecasterConfig
 
 
+@pytest.mark.epiforecaster
 def test_load_config_with_simple_overrides():
     """Test that simple dotted overrides work correctly."""
     cfg = EpiForecasterConfig.load(
@@ -17,6 +18,7 @@ def test_load_config_with_simple_overrides():
     assert cfg.data.log_scale is False
 
 
+@pytest.mark.epiforecaster
 def test_load_config_with_nested_overrides():
     """Test that nested overrides work correctly."""
     cfg = EpiForecasterConfig.load(
@@ -33,6 +35,7 @@ def test_load_config_with_nested_overrides():
     assert cfg.model.type.biomarkers is True
 
 
+@pytest.mark.epiforecaster
 def test_load_config_with_bool_override():
     """Test that boolean overrides are handled correctly."""
     cfg = EpiForecasterConfig.load(
@@ -44,6 +47,7 @@ def test_load_config_with_bool_override():
     assert cfg.data.log_scale is True
 
 
+@pytest.mark.epiforecaster
 def test_load_config_without_overrides():
     """Test that config loads correctly without overrides."""
     cfg = EpiForecasterConfig.load("configs/train_epifor_full.yaml")
@@ -52,6 +56,7 @@ def test_load_config_without_overrides():
     assert cfg.data.log_scale is True
 
 
+@pytest.mark.epiforecaster
 def test_load_config_strict_mode_rejects_unknown_keys():
     """Test that strict mode rejects unknown keys."""
     with pytest.raises((errors.ConfigKeyError, errors.ValidationError, KeyError)):
@@ -62,6 +67,7 @@ def test_load_config_strict_mode_rejects_unknown_keys():
         )
 
 
+@pytest.mark.epiforecaster
 def test_load_config_model_type_overrides():
     """Test that model.type overrides work correctly."""
     cfg = EpiForecasterConfig.load(
@@ -80,6 +86,7 @@ def test_load_config_model_type_overrides():
     assert cfg.model.type.mobility is True
 
 
+@pytest.mark.epiforecaster
 def test_load_config_with_gnn_depth_override():
     """Test that GNN depth overrides work correctly."""
     cfg = EpiForecasterConfig.load(
@@ -90,6 +97,7 @@ def test_load_config_with_gnn_depth_override():
     assert cfg.model.gnn_depth == 3
 
 
+@pytest.mark.epiforecaster
 def test_load_config_with_multiple_overrides_same_section():
     """Test that multiple overrides in the same section work correctly."""
     cfg = EpiForecasterConfig.load(
@@ -108,6 +116,7 @@ def test_load_config_with_multiple_overrides_same_section():
     assert cfg.training.early_stopping_patience == 15
 
 
+@pytest.mark.epiforecaster
 def test_backward_compatibility_from_file():
     """Test that from_file() method still works."""
     cfg = EpiForecasterConfig.from_file("configs/train_epifor_full.yaml")
@@ -116,6 +125,7 @@ def test_backward_compatibility_from_file():
     assert cfg.data.log_scale is True
 
 
+@pytest.mark.epiforecaster
 def test_from_dict_reconstructs_config():
     """Test that from_dict() correctly reconstructs a config from to_dict()."""
     # Load a config and convert to dict (as would be saved in checkpoint)
