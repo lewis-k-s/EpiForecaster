@@ -5,7 +5,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -18,7 +18,7 @@ from data.collate import collate_epidataset_batch
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD
 from utils.normalization import unscale_forecasts
-from models.configs import EpiForecasterConfig
+from models.configs import EpiForecasterConfig, LossConfig
 from models.epiforecaster import EpiForecaster
 from plotting.forecast_plots import (
     collect_forecast_samples_for_target_nodes,
@@ -78,16 +78,71 @@ class SMAPELoss(ForecastLoss):
         return (numerator / denominator).mean()
 
 
+class UnscaledMSELoss(ForecastLoss):
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        target_mean: torch.Tensor,
+        target_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        pred_unscaled, targets_unscaled = unscale_forecasts(
+            predictions, targets, target_mean, target_scale
+        )
+        diff = pred_unscaled - targets_unscaled
+        return (diff**2).mean()
+
+
+class CompositeLoss(ForecastLoss):
+    def __init__(self, components: list[tuple[ForecastLoss, float]]):
+        super().__init__()
+        self.losses = nn.ModuleList([loss for loss, _weight in components])
+        self.loss_fns: list[ForecastLoss] = [loss for loss, _weight in components]
+        self.weights = [float(weight) for _loss, weight in components]
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        target_mean: torch.Tensor,
+        target_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        total = predictions.new_zeros(())
+        for loss_fn, weight in zip(self.loss_fns, self.weights, strict=False):
+            if weight == 0:
+                continue
+            total = total + weight * loss_fn.forward(
+                predictions, targets, target_mean, target_scale
+            )
+        return total
+
+
 def get_loss_function(name: str) -> ForecastLoss:
     name_lower = name.lower()
     if name_lower == "mse":
         return WrappedTorchLoss(nn.MSELoss())
+    elif name_lower == "mse_unscaled":
+        return UnscaledMSELoss()
     elif name_lower in ("mae", "l1"):
         return WrappedTorchLoss(nn.L1Loss())
     elif name_lower == "smape":
         return SMAPELoss()
     else:
         raise ValueError(f"Unknown loss function: {name}")
+
+
+def get_loss_from_config(loss_config: LossConfig | None) -> ForecastLoss:
+    if loss_config is None:
+        return get_loss_function("smape")
+    name_lower = loss_config.name.lower()
+    if name_lower == "composite":
+        if not loss_config.components:
+            raise ValueError("Composite loss requires components")
+        components: list[tuple[ForecastLoss, float]] = []
+        for component in loss_config.components:
+            components.append((get_loss_function(component.name), component.weight))
+        return CompositeLoss(components)
+    return get_loss_function(loss_config.name)
 
 
 def resolve_device(device: str) -> torch.device:
@@ -110,7 +165,7 @@ def resolve_device(device: str) -> torch.device:
 
 def load_model_from_checkpoint(
     checkpoint_path: Path, *, device: str = "auto"
-) -> tuple[torch.nn.Module, EpiForecasterConfig, dict[str, Any]]:
+) -> tuple[EpiForecaster, EpiForecasterConfig, dict[str, Any]]:
     """Load an EpiForecaster model + config from a saved trainer checkpoint.
 
     Args:
@@ -365,6 +420,7 @@ def topk_target_nodes_by_mae(
 ) -> list[int]:
     """Compute top-k target node ids by average per-window MAE over the loader."""
     device = next(model.parameters()).device
+    forward_model = cast(EpiForecaster, model)
 
     node_mae_sum: dict[int, torch.Tensor] = {}
     node_mae_count: dict[int, int] = {}
@@ -375,7 +431,12 @@ def topk_target_nodes_by_mae(
         with torch.no_grad():
             eval_iter = loader
             for batch in eval_iter:
-                predictions, targets, _target_mean, _target_scale = model.forward_batch(
+                (
+                    predictions,
+                    targets,
+                    _target_mean,
+                    _target_scale,
+                ) = forward_model.forward_batch(
                     batch_data=batch,
                     region_embeddings=region_embeddings,
                 )
@@ -439,7 +500,8 @@ def evaluate_checkpoint_topk_forecasts(
     loader, region_embeddings = build_loader_from_config(
         config, split=split, device=device, batch_size=batch_size
     )
-    logger.info(f"[eval] {split} samples: {len(loader.dataset)}")
+    dataset = cast(EpiDataset, loader.dataset)
+    logger.info(f"[eval] {split} samples: {len(dataset)}")
     logger.info(f"[eval] Scanning for top-k nodes by MAE (k={k})...")
 
     topk_nodes = topk_target_nodes_by_mae(
@@ -471,7 +533,7 @@ def evaluate_checkpoint_topk_forecasts(
     eval_metrics: dict[str, Any] = {}
     node_mae_dict: dict[int, float] = {}
     try:
-        criterion = get_loss_function("smape")
+        criterion = get_loss_from_config(config.training.loss)
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
             loader=loader,
@@ -574,6 +636,7 @@ def evaluate_loader(
     epsilon = 1e-6
     model_was_training = model.training
     model.eval()
+    forward_model = cast(EpiForecaster, model)
     try:
         with (
             torch.no_grad(),
@@ -587,12 +650,19 @@ def evaluate_loader(
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
-                predictions, targets, target_mean, target_scale = model.forward_batch(
+                (
+                    predictions,
+                    targets,
+                    target_mean,
+                    target_scale,
+                ) = forward_model.forward_batch(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
                 )
 
-                loss = criterion(predictions, targets, target_mean, target_scale)
+                loss = criterion.forward(
+                    predictions, targets, target_mean, target_scale
+                )
                 total_loss += loss.detach()
 
                 pred_unscaled, targets_unscaled = unscale_forecasts(
@@ -761,7 +831,8 @@ def generate_forecast_plots(
             grouped_samples[group_name].append(sample)
 
     # Generate figure using existing generic function
-    config = loader.dataset.config
+    dataset = cast(EpiDataset, loader.dataset)
+    config = dataset.config
     fig = make_forecast_figure(
         samples=grouped_samples,
         history_length=int(config.model.history_length),
@@ -835,14 +906,15 @@ def eval_checkpoint(
     loader, region_embeddings = build_loader_from_config(
         config, split=split, device=device, batch_size=batch_size
     )
-    logger.info(f"[eval] {split} samples: {len(loader.dataset)}")
+    dataset = cast(EpiDataset, loader.dataset)
+    logger.info(f"[eval] {split} samples: {len(dataset)}")
 
     # Run evaluation - returns node_mae_dict as third value
     eval_loss = float("nan")
     eval_metrics: dict[str, Any] = {}
     node_mae_dict: dict[int, float] = {}
     try:
-        criterion = get_loss_function("smape")
+        criterion = get_loss_from_config(config.training.loss)
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
             loader=loader,
