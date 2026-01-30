@@ -14,7 +14,7 @@ encoder:
   normalize: true
 
 training:
-  epochs: 200
+  epochs: 200  # Ignored when train_until_plateau=true
   learning_rate: 0.001
   weight_decay: 0.0005
   device: "auto"
@@ -22,17 +22,28 @@ training:
   gradient_clip: 1.0
   seed: 42
   checkpoint_every: 0
+  # Learning rate scheduling
+  lr_scheduler: "plateau"  # "plateau", "cosine", "step", or "none"
+  lr_patience: 15  # Epochs with no improvement before reducing LR
+  lr_factor: 0.5  # Reduce LR by half when plateau detected
+  lr_threshold: 0.0001  # Minimum change to qualify as improvement
+  # Unconstrained training: train until LR reduced N times (ignores epochs limit)
+  train_until_plateau: true
+  max_lr_reductions: 3  # Stop after 3 LR reductions
+  # Early stopping (disabled, let plateau scheduler do its job)
+  early_stopping_patience: 0
+  early_stopping_min_delta: 0.0001
 
 sampling:
-  positive_pairs: 8192
-  negative_pairs: 8192
-  hop_pairs: 4096
+  positive_pairs: 16384  # Increased from 8192
+  negative_pairs: 16384  # Increased from 8192
+  hop_pairs: 8192  # Increased from 4096
   min_flow_threshold: 5.0
   hop_threshold: 2
   max_hops: 5
 
 loss:
-  loss_type: "community"        # or "spatial" when flows are unavailable
+  loss_type: "community" # or "spatial" when flows are unavailable
   spatial_weight: 1.0
   autocorr_weight: 0.5
   ratio_weight: 1.0
@@ -42,6 +53,8 @@ loss:
 
 output:
   output_dir: "outputs/region_embeddings"
+  log_dir: "outputs/region_training"
+  experiment_name: "region_embeddings_experiment"
   embedding_filename: "region_embeddings.pt"
   metrics_filename: "region_training_metrics.json"
   cluster_labels_filename: "region_clusters.json"
