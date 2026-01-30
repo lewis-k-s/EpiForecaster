@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
 from data.epi_dataset import EpiDataset
@@ -75,9 +76,10 @@ def _write_tiny_dataset(path) -> None:
             "region_id_to": regions,
         },
     )
-    ds.to_zarr(path, mode="w")
+    ds.to_zarr(path, mode="w", zarr_format=2)
 
 
+@pytest.mark.epiforecaster
 def test_missing_permit_allows_history_nan_but_excludes_target_nan(tmp_path):
     zarr_path = tmp_path / "tiny.zarr"
     _write_tiny_dataset(zarr_path)
@@ -91,6 +93,7 @@ def test_missing_permit_allows_history_nan_but_excludes_target_nan(tmp_path):
     assert len(dataset) == 2
 
 
+@pytest.mark.epiforecaster
 def test_missing_permit_zero_filters_history_nan(tmp_path):
     zarr_path = tmp_path / "tiny.zarr"
     _write_tiny_dataset(zarr_path)

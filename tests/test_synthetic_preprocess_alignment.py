@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import numpy as np
+import pytest
 import pandas as pd
 import xarray as xr
 
@@ -80,6 +81,7 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
     )
 
 
+@pytest.mark.epiforecaster
 def test_alignment_preserves_mobility_coords(tmp_path):
     config = _make_config(tmp_path)
     processor = SyntheticProcessor(config)

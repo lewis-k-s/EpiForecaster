@@ -3,6 +3,7 @@ from datetime import datetime
 import dask.array as da
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
 from data.preprocess.config import PreprocessingConfig
@@ -63,7 +64,7 @@ def _write_minimal_synthetic_zarr(path, *, run_ids, dates, region_ids, edar_ids)
         }
     )
 
-    ds.to_zarr(path, mode="w")
+    ds.to_zarr(path, mode="w", zarr_format=2)
 
 
 def _write_region_metadata(path, *, region_ids, edar_ids):
@@ -105,6 +106,7 @@ def _make_config(tmp_path, synthetic_path):
     )
 
 
+@pytest.mark.epiforecaster
 def test_synthetic_processor_preserves_run_id(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     run_ids = np.array(["synth_a", "synth_b"], dtype="U50")
@@ -134,6 +136,7 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
     assert len(cases.run_id) == 2
 
 
+@pytest.mark.epiforecaster
 def test_synthetic_processor_run_filter(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     run_ids = np.array(["synth_a", "synth_b", "synth_c"], dtype="U50")
@@ -157,6 +160,7 @@ def test_synthetic_processor_run_filter(tmp_path):
     assert list(cases.run_id.values) == ["synth_b"]
 
 
+@pytest.mark.epiforecaster
 def test_mobility_reconstruction_matches_formula(tmp_path):
     run_ids = np.array(["synth_a", "synth_b"], dtype="U50")
     dates = pd.date_range("2020-01-01", periods=2, freq="D")
@@ -192,6 +196,7 @@ def test_mobility_reconstruction_matches_formula(tmp_path):
             assert np.allclose(mobility.values[run_idx, t], expected[run_idx, t])
 
 
+@pytest.mark.epiforecaster
 def test_pipeline_save_rechunks_run_only(tmp_path):
     run_ids = np.array(["s1", "s2", "s3"], dtype="U50")
     dates = pd.date_range("2020-01-01", periods=5, freq="D")
@@ -232,6 +237,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     saved.close()
 
 
+@pytest.mark.epiforecaster
 def test_pipeline_end_to_end_synthetic(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     region_metadata_path = tmp_path / "edar_map.nc"
@@ -268,6 +274,7 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     ds.close()
 
 
+@pytest.mark.epiforecaster
 def test_save_aligned_dataset_preserves_mobility(tmp_path):
     run_ids = np.array(["r1", "r2"], dtype="U10")
     dates = pd.date_range("2020-01-01", periods=3, freq="D")

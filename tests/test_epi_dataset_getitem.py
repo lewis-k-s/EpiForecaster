@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 import xarray as xr
 
@@ -44,8 +45,10 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
     run_id = "real                                            "
 
     # Use 3D cases to test squeeze - add run_id dimension
+    # Both nodes need non-zero cases to be valid (all-zero sequences are filtered)
     cases = np.zeros((1, periods, 2, 1), dtype=np.float32)
-    cases[0, :, 0, 0] = 100.0
+    cases[0, :, 0, 0] = 100.0  # Node 0
+    cases[0, :, 1, 0] = 50.0   # Node 1
 
     # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
     biomarkers = np.zeros((1, periods, 2), dtype=np.float32)
@@ -81,9 +84,10 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
             "region_id_to": regions,
         },
     )
-    ds.to_zarr(zarr_path, mode="w")
+    ds.to_zarr(zarr_path, mode="w", zarr_format=2)
 
 
+@pytest.mark.epiforecaster
 def test_getitem_values(tmp_path):
     zarr_path = tmp_path / "tiny.zarr"
     _write_tiny_dataset(str(zarr_path))
@@ -147,6 +151,7 @@ def test_getitem_values(tmp_path):
         )
 
 
+@pytest.mark.epiforecaster
 def test_index_ordering_time_major(tmp_path):
     zarr_path = tmp_path / "ordering.zarr"
     _write_tiny_dataset(str(zarr_path), periods=8)
@@ -178,6 +183,7 @@ def test_index_ordering_time_major(tmp_path):
     assert time_dataset[1]["window_start"] == 0
 
 
+@pytest.mark.epiforecaster
 def test_imported_risk_gating(tmp_path):
     """Test that use_imported_risk flag correctly gates lag features.
 
