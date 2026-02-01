@@ -85,13 +85,22 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
         data_vars={
             "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
             "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_mask),
+            "edar_biomarker_N1_mask": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                biomarker_mask,
+            ),
             "edar_biomarker_N1_censor": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD),
                 biomarker_censor,
             ),
-            "edar_biomarker_N1_age": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_age),
-            "mobility": (("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
+            "edar_biomarker_N1_age": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                biomarker_age,
+            ),
+            "mobility": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"),
+                mobility,
+            ),
             "population": ((REGION_COORD,), population),
         },
         coords={
@@ -102,6 +111,46 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
         },
     )
     ds.to_zarr(zarr_path, mode="w", zarr_format=2)
+
+
+def _reconstruct_mob_graph(item, t: int, dataset):
+    """Reconstruct PyG Data object from new EpiDatasetItem components.
+
+    Args:
+        item: EpiDatasetItem with mob_x, mob_edge_index, mob_edge_weight, etc.
+        t: Time step index within the history window
+        dataset: EpiDataset instance to get node_ids mapping
+
+    Returns:
+        PyG Data object with node features, edges, and node_ids
+    """
+    from torch_geometric.data import Data
+
+    # Get components for time step t
+    mob_x_t = item["mob_x"][t]  # (N_ctx, F)
+    edge_index = item["mob_edge_index"][t]  # (2, E)
+    edge_weight = item["mob_edge_weight"][t]  # (E)
+
+    # Get node_ids from dataset's global_to_local mapping
+    window_start = item["window_start"]
+    global_t = window_start + t
+    global_to_local = dataset._get_global_to_local_at_time(global_t)
+
+    # Get all context node_ids (those with valid local indices)
+    node_mask = global_to_local >= 0
+    node_ids = torch.where(node_mask)[0]
+
+    # Create Data object
+    g = Data(
+        x=mob_x_t,
+        edge_index=edge_index,
+        edge_weight=edge_weight,
+    )
+    g.num_nodes = mob_x_t.size(0)
+    g.node_ids = node_ids
+    g.target_node = item["mob_target_node_idx"]
+
+    return g
 
 
 def _verify_node_features_masked(
@@ -146,7 +195,7 @@ def test_k_hop_masking_gnn_depth_0(tmp_path):
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
 
     item = dataset[0]
-    mob_graph = item["mob"][0]  # First mobility graph in the sequence
+    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
 
     # With gnn_depth=0, all nodes should have non-zero features
     assert mob_graph.num_nodes == 4, "All context nodes should be in graph"
@@ -174,7 +223,10 @@ def test_k_hop_masking_gnn_depth_1(tmp_path):
     item = dataset[0]
 
     # Verify for each time step in the history window
-    for t, mob_graph in enumerate(item["mob"]):
+    L = dataset.config.model.history_length
+    for t in range(L):
+        mob_graph = _reconstruct_mob_graph(item, t, dataset)
+
         # Map local indices to global indices using node_ids
         global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
 
@@ -221,7 +273,10 @@ def test_k_hop_masking_gnn_depth_2(tmp_path):
 
     item = dataset[0]
 
-    for t, mob_graph in enumerate(item["mob"]):
+    L = dataset.config.model.history_length
+    for t in range(L):
+        mob_graph = _reconstruct_mob_graph(item, t, dataset)
+
         global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
 
         # Node 0 (target): non-zero
@@ -267,7 +322,10 @@ def test_k_hop_masking_middle_node(tmp_path):
 
     item = dataset[0]
 
-    for mob_graph in item["mob"]:
+    L = dataset.config.model.history_length
+    for t in range(L):
+        mob_graph = _reconstruct_mob_graph(item, t, dataset)
+
         global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
 
         # Node 1 (target): non-zero
@@ -310,7 +368,10 @@ def test_k_hop_masking_time_ordering(tmp_path):
     # Get the first sample for target node 0
     item = dataset[0]
 
-    for mob_graph in item["mob"]:
+    L = dataset.config.model.history_length
+    for t in range(L):
+        mob_graph = _reconstruct_mob_graph(item, t, dataset)
+
         global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
 
         # Node 0 (target): non-zero
@@ -345,7 +406,10 @@ def test_k_hop_masking_node_ordering(tmp_path):
 
     item = dataset[0]
 
-    for mob_graph in item["mob"]:
+    L = dataset.config.model.history_length
+    for t in range(L):
+        mob_graph = _reconstruct_mob_graph(item, t, dataset)
+
         global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
 
         # Node 0 (target): non-zero
@@ -381,31 +445,31 @@ def test_k_hop_reachability_cache(tmp_path):
     # Access an item to populate the cache
     _ = dataset[0]
 
-    # Check that cache has entries for (time_step, num_hops)
-    # The cache keys should be tuples of (time_step, num_hops)
-    assert hasattr(dataset, "_k_hop_cache"), "Dataset should have _k_hop_cache"
+    # Check that cache has entries for time steps
+    assert hasattr(dataset, "_precomputed_k_hop_masks"), (
+        "Dataset should have _precomputed_k_hop_masks"
+    )
 
-    # With gnn_depth=2, we should have cache entries for num_hops=2
-    cache_keys = list(dataset._k_hop_cache.keys())
+    # With gnn_depth=2, we should have cache entries for all time steps
+    cache_keys = list(dataset._precomputed_k_hop_masks.keys())
     assert len(cache_keys) > 0, "Cache should be populated"
 
-    # Each key should be a tuple (time_step, num_hops)
+    # Each key should be an integer (time_step)
     for key in cache_keys:
-        assert isinstance(key, tuple), f"Cache key should be tuple, got {type(key)}"
-        assert len(key) == 2, f"Cache key should be (time_step, num_hops), got {key}"
+        assert isinstance(key, int), f"Cache key should be int, got {type(key)}"
 
     # Verify reachability for a specific case
     # For chain 0-1-2-3 at time 0:
     # - 1-hop from node 0: {1}
     # - 2-hop from node 0: {1, 2}
     time_step = 0
-    num_hops = 2
-    cache_key = (time_step, num_hops)
 
-    assert cache_key in dataset._k_hop_cache, f"Cache key {cache_key} should exist"
+    assert time_step in dataset._precomputed_k_hop_masks, (
+        f"Cache key {time_step} should exist"
+    )
 
-    reach_matrix = dataset._k_hop_cache[cache_key]
-    # reach_matrix is (N, N) where reach[i, j] is True if j is within num_hops of i
+    reach_matrix = dataset._precomputed_k_hop_masks[time_step]
+    # reach_matrix is (N, N) where reach[i, j] is True if j is within k-hop of i
     assert reach_matrix.shape == (4, 4), (
         f"Reach matrix should be (4, 4), got {reach_matrix.shape}"
     )
@@ -457,7 +521,7 @@ def test_gnn_receptive_field_depth_1_chain(tmp_path):
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
 
     item = dataset[0]
-    mob_graph = item["mob"][0]
+    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
 
     # Get feature dimension
     feat_dim = mob_graph.x.shape[1]
@@ -506,7 +570,7 @@ def test_gnn_receptive_field_depth_2_chain(tmp_path):
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
 
     item = dataset[0]
-    mob_graph = item["mob"][0]
+    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
     feat_dim = mob_graph.x.shape[1]
 
     model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
@@ -538,7 +602,7 @@ def test_gnn_receptive_field_full_graph_issue(tmp_path):
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
 
     item = dataset[0]
-    mob_graph = item["mob"][0]
+    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
     feat_dim = mob_graph.x.shape[1]
 
     model = _create_gnn_model(gnn_depth=1, in_dim=feat_dim)
@@ -593,7 +657,7 @@ def test_gnn_receptive_field_depth_2_full_graph_propagation(tmp_path):
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
 
     item = dataset[0]
-    mob_graph = item["mob"][0]
+    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
     feat_dim = mob_graph.x.shape[1]
 
     model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
