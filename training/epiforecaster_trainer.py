@@ -29,7 +29,12 @@ from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Batch  # type: ignore[import-not-found]
 
-from data.epi_dataset import EpiDataset, EpiDatasetItem, curriculum_collate_fn
+from data.epi_dataset import (
+    EpiDataset,
+    EpiDatasetItem,
+    curriculum_collate_fn,
+    optimized_collate_graphs,
+)
 from data.preprocess.config import REGION_COORD
 from data.samplers import EpidemicCurriculumSampler
 from evaluation.epiforecaster_eval import evaluate_loader
@@ -902,21 +907,15 @@ class EpiForecasterTrainer:
         )
         population = torch.stack([item["population"] for item in batch], dim=0)
 
-        # Flatten mobility graphs efficiently
-        graph_list = list(itertools.chain.from_iterable(item["mob"] for item in batch))
+        # Use optimized manual batching
+        mob_batch = optimized_collate_graphs(batch)
 
-        mob_batch = Batch.from_data_list(graph_list)  # type: ignore[arg-type]
-        T = len(batch[0]["mob"]) if B > 0 else 0
+        T = batch[0]["mob_x"].shape[0] if B > 0 else 0
         # store B and T on the batch for downstream reshaping
         mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
         mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
-        # Precompute a global target node index per ego-graph in the batched `x`.
-        # This enables fully-vectorized target gathering in the model without CUDA `.item()` syncs.
-        if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
-            # Use dict assignment to ensure it's in the store and moves with .to(device)
-            mob_batch["target_index"] = mob_batch.ptr[
-                :-1
-            ] + mob_batch.target_node.reshape(-1)  # type: ignore[index]
+
+        # Target index is now precomputed inside optimized_collate_graphs
 
         return {
             "CaseNode": case_node,  # (B, L, C)

@@ -51,7 +51,11 @@ class EpiDatasetItem(TypedDict):
     target: torch.Tensor
     target_scale: torch.Tensor
     target_mean: torch.Tensor
-    mob: list[Data]
+    # mob: list[Data]  <-- REMOVED
+    mob_x: torch.Tensor
+    mob_edge_index: list[torch.Tensor]
+    mob_edge_weight: list[torch.Tensor]
+    mob_target_node_idx: int  # Local index of target node (constant across time window)
     population: torch.Tensor
     run_id: int | str | None
     target_region_index: int | None
@@ -598,7 +602,14 @@ class EpiDataset(Dataset):
         )
         assert targets.shape == (H,), "Targets shape mismatch"
 
-        mob_graphs: list[Data] = []
+        mob_x_list: list[torch.Tensor] = []
+        mob_edge_index_list: list[torch.Tensor] = []
+        mob_edge_weight_list: list[torch.Tensor] = []
+
+        # Find local index of target node (constant across window)
+        global_to_local = self._get_global_to_local_at_time(range_start)
+        local_target_idx = int(global_to_local[target_idx].item())
+
         for t in range(L):
             global_t = range_start + t
 
@@ -617,10 +628,6 @@ class EpiDataset(Dataset):
             if self.config.model.type.biomarkers:
                 feat.append(bio_t[node_ids])
             x = torch.cat(feat, dim=-1)  # (num_nodes, feat_dim)
-
-            # Find local index of target node (needed for masking and mob_graph.target_node)
-            global_to_local = self._get_global_to_local_at_time(global_t)
-            local_target_idx = int(global_to_local[target_idx].item())
 
             # Apply k-hop feature masking based on target node
             # Use precomputed masks to avoid expensive CPU matrix operations
@@ -646,19 +653,13 @@ class EpiDataset(Dataset):
                 x_masked = x
                 local_k_hop_mask = torch.ones(x.size(0), dtype=torch.bool)
 
-            mob_graph = Data(
-                x=x_masked,
-                edge_index=base_graph.edge_index,
-                edge_weight=base_graph.edge_weight,
-            )
-            mob_graph.num_nodes = base_graph.num_nodes
-            mob_graph.target_node = torch.tensor([local_target_idx], dtype=torch.long)
-            mob_graph.node_ids = base_graph.node_ids
-            mob_graph.time_id = torch.tensor(
-                [t], dtype=torch.long
-            )  # Relative time in sequence
-
-            mob_graphs.append(mob_graph)
+            # --- OPTIMIZED BATCHING CHANGE ---
+            mob_x_list.append(x_masked)
+            # Ensure not None for type safety
+            assert base_graph.edge_index is not None
+            assert base_graph.edge_weight is not None
+            mob_edge_index_list.append(base_graph.edge_index)
+            mob_edge_weight_list.append(base_graph.edge_weight)
 
         # Slice history for mean and std
         # mean/std are (TotalTime, N) -> need to slice [range_start:range_end] and select target_idx
@@ -688,7 +689,10 @@ class EpiDataset(Dataset):
             "target": targets,
             "target_scale": std_anchor[target_idx].squeeze(-1),
             "target_mean": mean_anchor[target_idx].squeeze(-1),
-            "mob": mob_graphs,
+            "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
+            "mob_edge_index": mob_edge_index_list,  # List[Tensor(2, E)]
+            "mob_edge_weight": mob_edge_weight_list,  # List[Tensor(E)]
+            "mob_target_node_idx": local_target_idx,
             "population": population,
             "run_id": run_id,
         }
@@ -1321,6 +1325,112 @@ class EpiDataset(Dataset):
         return train_dataset, val_dataset, test_dataset
 
 
+def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
+    """
+    Optimized batch construction for dynamic mobility graphs.
+
+    Constructs a PyG Batch object directly from tensor lists, avoiding the overhead
+    of Batch.from_data_list().
+
+    Args:
+        batch: List of EpiDatasetItem (must contain mob_x, mob_edge_index, mob_edge_weight)
+
+    Returns:
+        A single PyG Batch object containing all time-steps for all samples.
+    """
+    B = len(batch)
+    if B == 0:
+        return Batch()
+
+    # 1. Flatten Features
+    # (B, L, N, F) -> (B*L*N, F)
+    # Note: item["mob_x"] is (L, N, F)
+    all_x = torch.cat(
+        [item["mob_x"].view(-1, item["mob_x"].size(-1)) for item in batch], dim=0
+    )
+
+    # 2. Flatten Edge Indices & Weights
+    # We assume constant number of nodes per graph in the batch (context nodes)
+    # Check first item for dimensions
+    L, num_nodes, _ = batch[0]["mob_x"].shape
+
+    # Collect flattened lists
+    all_edge_indices = []
+    all_edge_weights = []
+
+    # Iterate samples and time steps
+    # Offset calculation: graph_idx * num_nodes
+    # Total graphs = B * L
+    current_graph_idx = 0
+
+    for item in batch:
+        # Check consistency of num_nodes
+        if item["mob_x"].shape[1] != num_nodes:
+            # If variable node counts are needed later, we must track cumulative nodes.
+            # For now, EpiDataset guarantees fixed context size.
+            pass
+
+        edge_indices = item["mob_edge_index"]  # List of L tensors
+        edge_weights = item["mob_edge_weight"]  # List of L tensors
+
+        for t in range(len(edge_indices)):
+            offset = current_graph_idx * num_nodes
+            # Shift edge indices
+            all_edge_indices.append(edge_indices[t] + offset)
+            all_edge_weights.append(edge_weights[t])
+            current_graph_idx += 1
+
+    # Concatenate all edges
+    if all_edge_indices:
+        big_edge_index = torch.cat(all_edge_indices, dim=1)
+        big_edge_weight = torch.cat(all_edge_weights, dim=0)
+    else:
+        big_edge_index = torch.empty((2, 0), dtype=torch.long)
+        big_edge_weight = torch.empty((0,), dtype=torch.float32)
+
+    # 3. Create Batch Vector
+    # Maps each node to its graph index
+    total_nodes = current_graph_idx * num_nodes
+    # Verify shape matches x
+    assert total_nodes == all_x.size(0)
+
+    batch_vec = torch.arange(current_graph_idx, device=all_x.device).repeat_interleave(
+        num_nodes
+    )
+
+    # 4. Create Batch Object
+    mob_batch = Batch(
+        x=all_x, edge_index=big_edge_index, edge_weight=big_edge_weight, batch=batch_vec
+    )
+
+    # 5. Add custom attributes needed by model
+    # Reconstruct target_node tensor: (B*L,)
+    target_nodes_list = []
+    for item in batch:
+        tgt = item["mob_target_node_idx"]
+        # Repeat L times (once per timestep graph)
+        target_nodes_list.extend([tgt] * L)
+
+    target_node_tensor = torch.tensor(
+        target_nodes_list, dtype=torch.long, device=all_x.device
+    )
+    mob_batch.target_node = target_node_tensor
+
+    # Add target_index for model optimization
+    # Since we have fixed num_nodes, start index of graph i is i * num_nodes
+    # target_index[i] = start[i] + target_node[i]
+    num_graphs = len(target_nodes_list)
+    graph_starts = torch.arange(num_graphs, device=all_x.device) * num_nodes
+    mob_batch["target_index"] = graph_starts + target_node_tensor
+
+    # Add ptr for completeness (standard PyG Batch attribute)
+    # ptr = [0, N, 2N, ..., num_graphs*N]
+    ptr = torch.arange(num_graphs + 1, device=all_x.device) * num_nodes
+    mob_batch.ptr = ptr
+
+    return mob_batch
+
+
 def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     """
     Collate function for curriculum training.
@@ -1328,7 +1438,6 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     This mirrors the standard collate: it flattens per-time-step graphs into
     a single PyG Batch for a consistent model contract.
     """
-    import itertools
     import torch
 
     B = len(batch)
@@ -1351,18 +1460,13 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     )
     population = torch.stack([item["population"] for item in batch], dim=0)
 
-    # 2. Batch Temporal Graphs (flatten all time steps)
-    graph_list = list(itertools.chain.from_iterable(item["mob"] for item in batch))
-    mob_batch = Batch.from_data_list(graph_list)  # type: ignore[arg-type]
-    T = len(batch[0]["mob"]) if B > 0 else 0
-    # store B and T on the batch for downstream reshaping
+    # 2. Batch Temporal Graphs (Optimized Manual Batching)
+    mob_batch = optimized_collate_graphs(batch)
+
+    # Store B and T on the batch for downstream reshaping
+    T = batch[0]["mob_x"].shape[0] if B > 0 else 0
     mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
     mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
-    # Precompute a global target node index per ego-graph in the batched `x`.
-    if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
-        mob_batch["target_index"] = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(
-            -1
-        )  # type: ignore[index]
 
     target_region_indices = [item["target_region_index"] for item in batch]
     if any(idx is None for idx in target_region_indices):
