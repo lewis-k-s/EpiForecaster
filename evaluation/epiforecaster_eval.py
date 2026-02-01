@@ -237,7 +237,12 @@ def load_model_from_checkpoint(
 def split_nodes(config: EpiForecasterConfig) -> tuple[list[int], list[int], list[int]]:
     """Match the node holdout split logic used during training."""
     train_split = 1 - config.training.val_split - config.training.test_split
-    aligned_dataset = EpiDataset.load_canonical_dataset(Path(config.data.dataset_path))
+    if not config.data.run_id:
+        raise ValueError("run_id must be specified in config")
+    aligned_dataset = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+    )
     N = aligned_dataset[REGION_COORD].size
     all_nodes = np.arange(N)
     rng = np.random.default_rng(42)

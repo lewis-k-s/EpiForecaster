@@ -46,7 +46,7 @@ generate_alignment_report: true
 # Processing configuration
 num_workers: 8
 chunk_size: 365
-run_id_chunk_size: 10
+run_id_chunk_size: 1
 date_chunk_size: 30   # Chunk size for date dimension in zarr output
 mobility_chunk_size: 100  # Chunk size for spatial dims (origin/destination)
 memory_limit_gb: 100.0

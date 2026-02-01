@@ -197,20 +197,13 @@ class EpiForecaster(nn.Module):
 
         if self.variant_type.mobility:
             assert mob_graphs is not None, "Mobility graphs required but not provided."
-            if isinstance(mob_graphs, list):
-                # New curriculum format: List[Batch] (one per time step)
-                mobility_embeddings = self._process_mobility_sequence_pyg_list(
-                    mob_graphs, B, T
-                )
-            elif isinstance(mob_graphs, Batch):
-                # Legacy format: Single flattened Batch (B*T graphs)
-                mobility_embeddings = self._process_mobility_sequence_pyg(
-                    mob_graphs, B, T
-                )
-            else:
+            if not isinstance(mob_graphs, Batch):
                 raise TypeError(
-                    f"Expected mob_graphs to be PyG Batch or list[Batch], got {type(mob_graphs)}"
+                    f"Expected mob_graphs to be PyG Batch, got {type(mob_graphs)}"
                 )
+            mobility_embeddings = self._process_mobility_sequence_pyg(
+                mob_graphs, B, T
+            )
             features.append(mobility_embeddings)
 
         if self.variant_type.regions:
@@ -274,13 +267,15 @@ class EpiForecaster(nn.Module):
         # Use non_blocking for consistency with tensor transfers
         mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
 
+        target_nodes = batch.get("TargetRegionIndex", batch["TargetNode"])
+
         predictions = self.forward(
             cases_norm=batch["CaseNode"],
             cases_mean=batch["CaseMean"],
             cases_std=batch["CaseStd"],
             biomarkers_hist=batch["BioNode"],
             mob_graphs=mob_batch,
-            target_nodes=batch["TargetNode"],
+            target_nodes=target_nodes,
             region_embeddings=region_embeddings,
             population=batch["Population"],
         )
