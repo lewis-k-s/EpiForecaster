@@ -10,6 +10,7 @@ The trainer works with the EpiForecaster model.
 
 import logging
 import os
+import platform
 import time
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,13 @@ from data.preprocess.config import REGION_COORD
 from data.samplers import EpidemicCurriculumSampler
 from evaluation.epiforecaster_eval import evaluate_loader
 from utils import setup_tensor_core_optimizations
+from utils.platform import (
+    cleanup_nvme_staging,
+    get_nvme_path,
+    is_slurm_cluster,
+    select_multiprocessing_context,
+    stage_dataset_to_nvme,
+)
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
 
@@ -60,9 +68,16 @@ class EpiForecasterTrainer:
             dataset: Optional pre-loaded dataset (will be loaded if None)
         """
         self.config = config
-        self.device = self._setup_device()
+        self._device_hint = self._resolve_device_hint()
+        # Keep CPU until DataLoader workers are forked to avoid CUDA init before forking.
+        self.device = torch.device("cpu")
         self.model_id = self._resolve_model_id()
         self.resume = self.config.training.resume
+
+        # Stage data to NVMe if running on SLURM cluster
+        self._nvme_staging_path: Path | None = None
+        if is_slurm_cluster():
+            self._stage_data_to_nvme()
 
         # Branch on split strategy
         if config.training.split_strategy == "time":
@@ -71,43 +86,148 @@ class EpiForecasterTrainer:
                 self._split_dataset_temporal()
             )
         else:
-            # Node-based splits: different nodes, all time windows
-            train_nodes, val_nodes, test_nodes = self._split_dataset_by_nodes()
-            train_nodes = list(train_nodes)
-            val_nodes = list(val_nodes)
-            test_nodes = list(test_nodes)
+            train_nodes: list[int]
+            val_nodes: list[int]
+            test_nodes: list[int]
+            real_run_for_split: str | None = None
+            split_dataset_path: Path | None = None
 
             # --- Curriculum Training Setup ---
             if self.config.training.curriculum.enabled:
                 real_run, synth_runs = self._discover_runs()
+                self.real_run_id = real_run
                 self._status(
                     f"Curriculum enabled. Found runs: Real='{real_run}', Synth={synth_runs}"
                 )
+                real_run_for_split = real_run
+                split_dataset_path = (
+                    Path(self.config.data.real_dataset_path)
+                    if self.config.data.real_dataset_path
+                    else Path(self.config.data.dataset_path)
+                )
 
+                train_nodes, val_nodes, test_nodes = self._split_dataset_by_nodes(
+                    dataset_path=split_dataset_path,
+                    run_id=real_run_for_split,
+                )
+                train_nodes = list(train_nodes)
+                val_nodes = list(val_nodes)
+                test_nodes = list(test_nodes)
+            else:
+                # Node-based splits: different nodes, all time windows
+                # Use config run_id for splitting
+                if not self.config.data.run_id:
+                    raise ValueError(
+                        "run_id must be specified in config for node-based splits"
+                    )
+                train_nodes, val_nodes, test_nodes = self._split_dataset_by_nodes(
+                    run_id=self.config.data.run_id
+                )
+                train_nodes = list(train_nodes)
+                val_nodes = list(val_nodes)
+                test_nodes = list(test_nodes)
+
+            if self.config.training.curriculum.enabled:
                 # 1. Real Dataset (Run ID = real)
+                # If using separate real dataset, create a config copy for it
+                if self.config.data.real_dataset_path:
+                    import copy
+
+                    real_config = copy.deepcopy(self.config)
+                    real_config.data.dataset_path = self.config.data.real_dataset_path
+                else:
+                    real_config = self.config
+
+                # Resolve region IDs from real dataset for mapping into synthetic datasets
+                assert real_run_for_split is not None, (
+                    "real_run_for_split must be set in curriculum mode"
+                )
+                real_region_ids = self._load_region_ids(
+                    dataset_path=split_dataset_path
+                    or Path(self.config.data.dataset_path),
+                    run_id=real_run_for_split,
+                )
+                train_region_ids = [real_region_ids[n] for n in train_nodes]
+                region_id_index = {
+                    region_id: idx for idx, region_id in enumerate(real_region_ids)
+                }
+
                 real_train_ds = EpiDataset(
-                    config=self.config,
+                    config=real_config,
                     target_nodes=train_nodes,
                     context_nodes=train_nodes,
                     biomarker_preprocessor=None,
                     mobility_preprocessor=None,
                     run_id=real_run,
+                    region_id_index=region_id_index,
                 )
 
-                # Reuse preprocessors from Real Train
+                # Reuse preprocessors from Real Train for real val/test only
                 fitted_bio_preprocessor = real_train_ds.biomarker_preprocessor
                 fitted_mobility_preprocessor = real_train_ds.mobility_preprocessor
+
+                # Fit synthetic preprocessors separately to avoid leakage
+                synth_scaler_run = self._select_synthetic_scaler_run(synth_runs)
+                synth_train_nodes = self._map_region_ids_to_nodes(
+                    train_region_ids,
+                    dataset_path=Path(self.config.data.dataset_path),
+                    run_id=synth_scaler_run,
+                )
+                if not synth_train_nodes:
+                    synth_train_nodes = self._fallback_all_nodes(
+                        dataset_path=Path(self.config.data.dataset_path),
+                        run_id=synth_scaler_run,
+                    )
+                    logger.warning(
+                        "Synthetic scaler run '%s' has no overlap with real regions; "
+                        "fitting synthetic scalers on all nodes instead.",
+                        synth_scaler_run,
+                    )
+
+                synth_scaler_ds = EpiDataset(
+                    config=self.config,
+                    target_nodes=synth_train_nodes,
+                    context_nodes=synth_train_nodes,
+                    biomarker_preprocessor=None,
+                    mobility_preprocessor=None,
+                    run_id=synth_scaler_run,
+                    region_id_index=region_id_index,
+                )
+
+                synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
+                synth_mobility_preprocessor = synth_scaler_ds.mobility_preprocessor
 
                 # 2. Synthetic Datasets (One per run_id)
                 synth_datasets = []
                 for s_run in synth_runs:
+                    if s_run == synth_scaler_run:
+                        synth_datasets.append(synth_scaler_ds)
+                        continue
+
+                    mapped_train_nodes = self._map_region_ids_to_nodes(
+                        train_region_ids,
+                        dataset_path=Path(self.config.data.dataset_path),
+                        run_id=s_run,
+                    )
+                    if not mapped_train_nodes:
+                        mapped_train_nodes = self._fallback_all_nodes(
+                            dataset_path=Path(self.config.data.dataset_path),
+                            run_id=s_run,
+                        )
+                        logger.warning(
+                            "Synthetic run '%s' has no overlap with real regions; "
+                            "using all nodes for training targets.",
+                            s_run,
+                        )
+
                     s_ds = EpiDataset(
                         config=self.config,
-                        target_nodes=train_nodes,
-                        context_nodes=train_nodes,
-                        biomarker_preprocessor=fitted_bio_preprocessor,
-                        mobility_preprocessor=fitted_mobility_preprocessor,
+                        target_nodes=mapped_train_nodes,
+                        context_nodes=mapped_train_nodes,
+                        biomarker_preprocessor=synth_bio_preprocessor,
+                        mobility_preprocessor=synth_mobility_preprocessor,
                         run_id=s_run,
+                        region_id_index=region_id_index,
                     )
                     synth_datasets.append(s_ds)
 
@@ -118,21 +238,23 @@ class EpiForecasterTrainer:
 
                 # 3. Val/Test are ALWAYS Real Data
                 self.val_dataset = EpiDataset(
-                    config=self.config,
+                    config=real_config,
                     target_nodes=val_nodes,
                     context_nodes=train_nodes + val_nodes,
                     biomarker_preprocessor=fitted_bio_preprocessor,
                     mobility_preprocessor=fitted_mobility_preprocessor,
                     run_id=real_run,
+                    region_id_index=region_id_index,
                 )
 
                 self.test_dataset = EpiDataset(
-                    config=self.config,
+                    config=real_config,
                     target_nodes=test_nodes,
                     context_nodes=train_nodes + val_nodes,
                     biomarker_preprocessor=fitted_bio_preprocessor,
                     mobility_preprocessor=fitted_mobility_preprocessor,
                     run_id=real_run,
+                    region_id_index=region_id_index,
                 )
 
             else:
@@ -177,7 +299,7 @@ class EpiForecasterTrainer:
         self.region_embeddings = None
         embeddings = getattr(train_example_ds, "region_embeddings", None)
         if embeddings is not None:
-            self.region_embeddings = embeddings.to(self.device)
+            self.region_embeddings = embeddings
         elif self.config.model.type.regions:
             raise ValueError(
                 "Region embeddings requested by config but region2vec_path was not provided."
@@ -203,15 +325,25 @@ class EpiForecasterTrainer:
             head_dropout=self.config.model.head_dropout,
         )
 
+        # Setup data loaders before CUDA initialization when using fork
+        self.train_loader, self.val_loader, self.test_loader = (
+            self._create_data_loaders()
+        )
+        if self._should_prestart_dataloader_workers():
+            self._prestart_dataloader_workers(
+                self.train_loader, self.val_loader, self.test_loader
+            )
+
+        # Resolve actual device after worker prestart to avoid CUDA fork issues
+        self.device = self._setup_device()
+        self.model.device = self.device
+        if self.region_embeddings is not None:
+            self.region_embeddings = self.region_embeddings.to(self.device)
+
         self.model.to(self.device)
 
         # Enable TF32 for better performance on Ampere+ GPUs
         self._setup_tensor_core_optimizations()
-
-        # Setup data loaders
-        self.train_loader, self.val_loader, self.test_loader = (
-            self._create_data_loaders()
-        )
 
         # Setup training components (optimizer, scheduler, criterion)
         self.optimizer = self._create_optimizer()
@@ -253,7 +385,7 @@ class EpiForecasterTrainer:
         self._status(f"  Dataset: {config.data.dataset_path}")
         self._status(f"  Device: {self.device}")
         self._status(
-            f"  Train samples: {len(self.train_dataset)} ({len(self.train_dataset.target_nodes)} nodes)"
+            f"  Train samples: {len(self.train_dataset)} ({len(train_example_ds.target_nodes)} nodes)"
         )
         self._status(
             f"  Val samples:   {len(self.val_dataset)} ({len(self.val_dataset.target_nodes)} nodes)"
@@ -261,8 +393,8 @@ class EpiForecasterTrainer:
         self._status(
             f"  Test samples:  {len(self.test_dataset)} ({len(self.test_dataset.target_nodes)} nodes)"
         )
-        self._status(f"  Cases dim: {self.train_dataset.cases_output_dim}")
-        self._status(f"  Biomarkers dim: {self.train_dataset.biomarkers_output_dim}")
+        self._status(f"  Cases dim: {train_example_ds.cases_output_dim}")
+        self._status(f"  Biomarkers dim: {train_example_ds.biomarkers_output_dim}")
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
         # Log run_id configuration
@@ -293,39 +425,65 @@ class EpiForecasterTrainer:
             # Ignore errors during garbage collection
             pass
 
+        # Cleanup NVMe staging if used
+        try:
+            if self._nvme_staging_path is not None:
+                cleanup_nvme_staging(self._nvme_staging_path)
+        except Exception:
+            pass
+
+    def _stage_data_to_nvme(self) -> None:
+        """Stage dataset(s) to node-local NVMe storage for improved I/O.
+
+        Updates config paths to point to staged locations on NVMe.
+        Only runs when on a SLURM cluster with NVMe available.
+        """
+        enable_staging = os.getenv("EPFORECASTER_STAGE_TO_NVME", "1") != "0"
+        if not enable_staging:
+            logger.info("NVMe staging disabled via EPFORECASTER_STAGE_TO_NVME=0")
+            return
+
+        logger.info("Detected SLURM cluster - staging data to NVMe")
+        self._nvme_staging_path = get_nvme_path()
+
+        # Stage main dataset
+        main_path = Path(self.config.data.dataset_path)
+        if main_path.exists():
+            staged_main = stage_dataset_to_nvme(
+                main_path, self._nvme_staging_path, enable_staging=True
+            )
+            if staged_main != main_path:
+                self.config.data.dataset_path = str(staged_main)
+                logger.info(f"Using staged dataset: {staged_main}")
+
+        # Stage real dataset if different (curriculum mode)
+        if self.config.data.real_dataset_path:
+            real_path = Path(self.config.data.real_dataset_path)
+            if real_path.exists() and real_path != main_path:
+                staged_real = stage_dataset_to_nvme(
+                    real_path, self._nvme_staging_path, enable_staging=True
+                )
+                if staged_real != real_path:
+                    self.config.data.real_dataset_path = str(staged_real)
+                    logger.info(f"Using staged real dataset: {staged_real}")
+
     def _discover_runs(self) -> tuple[str, list[str]]:
         """Discover available runs in the dataset (real vs synthetic)."""
-        # Load metadata only to check runs
-        ds = EpiDataset.load_canonical_dataset(
-            Path(self.config.data.dataset_path), run_id_chunk_size=1
-        )
+        real_run = "real"  # User mandate: always "real"
+        synth_runs = []
 
-        has_run_id = "run_id" in ds.coords or "run_id" in ds.dims
-        if not has_run_id:
-            return "real", []
+        # Discover Synth Runs from Main Dataset
+        ds_path = Path(self.config.data.dataset_path)
+        if not ds_path.exists():
+            logger.warning(f"Dataset path not found: {ds_path}")
+            return real_run, []
 
-        if "run_id" in ds.coords:
-            run_vals = ds.run_id.values
-        else:
-            run_vals = ds.coords["run_id"].values
-
-        unique_runs = np.unique(run_vals)
-        # Convert to strings and strip
-        unique_runs = sorted([str(r).strip() for r in unique_runs])
-
-        if "real" in unique_runs:
-            real_run = "real"
-            synth_runs = [r for r in unique_runs if r != real_run]
-        elif len(unique_runs) > 0:
-            logger.warning(
-                f"'real' run not found in dataset. Using '{unique_runs[0]}' as real run."
-            )
-            real_run = unique_runs[0]
-            synth_runs = unique_runs[1:]
-        else:
-            # Empty dataset?
-            real_run = "real"
-            synth_runs = []
+        try:
+            all_runs = EpiDataset.discover_available_runs(ds_path)
+            # Synthetic runs are everything in dataset_path except "real"
+            synth_runs = [r for r in all_runs if r != real_run]
+        except Exception as e:
+            logger.warning(f"Failed to discover runs from {ds_path}: {e}")
 
         # Limit synthetic runs to avoid OOM during preloading (temporary for dev/testing)
         # In production, we might need a lazier EpiDataset or fewer runs.
@@ -337,7 +495,11 @@ class EpiForecasterTrainer:
 
         return real_run, synth_runs
 
-    def _split_dataset_by_nodes(self) -> tuple[list[int], list[int], list[int]]:
+    def _split_dataset_by_nodes(
+        self,
+        dataset_path: Path | None = None,
+        run_id: str | None = None,
+    ) -> tuple[list[int], list[int], list[int]]:
         """
         Split dataset into train, val, and test sets using node holdouts.
 
@@ -348,8 +510,17 @@ class EpiForecasterTrainer:
             1 - self.config.training.val_split - self.config.training.test_split
         )
 
+        target_path = dataset_path or Path(self.config.data.dataset_path)
+        # Determine which run_id to use for loading
+        effective_run_id = run_id or self.config.data.run_id
+        if not effective_run_id:
+            raise ValueError(
+                "run_id must be provided either as argument or in config.data.run_id"
+            )
         aligned_dataset = EpiDataset.load_canonical_dataset(
-            Path(self.config.data.dataset_path)
+            target_path,
+            run_id=effective_run_id,
+            run_id_chunk_size=self.config.data.run_id_chunk_size,
         )
         N = aligned_dataset[REGION_COORD].size
         all_nodes = np.arange(N)
@@ -357,9 +528,10 @@ class EpiForecasterTrainer:
         # Get valid nodes using EpiDataset class method
         valid_mask = None
         if self.config.data.use_valid_targets:
+            run_id_for_valid = run_id or self.config.data.run_id
             valid_mask = EpiDataset.get_valid_nodes(
-                dataset_path=Path(self.config.data.dataset_path),
-                run_id=self.config.data.run_id,
+                dataset_path=target_path,
+                run_id=run_id_for_valid,
             )
             self._status(
                 f"Using valid_targets filter: {valid_mask.sum()} valid regions"
@@ -384,7 +556,89 @@ class EpiForecasterTrainer:
             "Dataset split is not correct"
         )
 
+        aligned_dataset.close()
         return list(train_nodes), list(val_nodes), list(test_nodes)
+
+    def _load_region_ids(
+        self,
+        dataset_path: Path,
+        run_id: str,
+    ) -> list[str]:
+        aligned_dataset = EpiDataset.load_canonical_dataset(
+            dataset_path,
+            run_id=run_id,
+            run_id_chunk_size=1,
+        )
+        region_ids = [str(r) for r in aligned_dataset[REGION_COORD].values]
+        aligned_dataset.close()
+        return region_ids
+
+    def _map_region_ids_to_nodes(
+        self,
+        region_ids: list[str],
+        dataset_path: Path,
+        run_id: str,
+    ) -> list[int]:
+        target_region_ids = self._load_region_ids(dataset_path, run_id)
+        region_id_index = {rid: i for i, rid in enumerate(target_region_ids)}
+        missing = [rid for rid in region_ids if rid not in region_id_index]
+        if missing:
+            logger.warning(
+                "Region ID mapping missing %d/%d regions for run '%s' from %s.",
+                len(missing),
+                len(region_ids),
+                run_id,
+                dataset_path,
+            )
+        return [region_id_index[rid] for rid in region_ids if rid in region_id_index]
+
+    def _fallback_all_nodes(self, dataset_path: Path, run_id: str) -> list[int]:
+        aligned_dataset = EpiDataset.load_canonical_dataset(
+            dataset_path,
+            run_id_chunk_size=1,
+            run_id=run_id,
+        )
+        num_nodes = aligned_dataset[REGION_COORD].size
+        aligned_dataset.close()
+        return list(range(num_nodes))
+
+    def _select_synthetic_scaler_run(self, synth_runs: list[str]) -> str:
+        if not synth_runs:
+            raise ValueError("No synthetic runs available for scaler fitting.")
+
+        raw_path = self.config.training.curriculum.raw_dataset_path
+        if raw_path:
+            from data.samplers import _load_sparsity_mapping
+
+            mapping = _load_sparsity_mapping(raw_path)
+
+            def resolve_sparsity(run_id: str) -> float | None:
+                if run_id in mapping:
+                    return mapping[run_id]
+                if "_" in run_id:
+                    suffix = run_id.split("_", 1)[1]
+                    for k, v in mapping.items():
+                        if "_" in k and k.split("_", 1)[1] == suffix:
+                            return v
+                return None
+
+            candidates = [(run_id, resolve_sparsity(run_id)) for run_id in synth_runs]
+            candidates = [c for c in candidates if c[1] is not None]
+            if candidates:
+                selected_run, selected_sparsity = max(candidates, key=lambda x: x[1])
+                logger.info(
+                    "Synthetic scalers fitted on run '%s' (sparsity=%.3f).",
+                    selected_run,
+                    selected_sparsity,
+                )
+                return selected_run
+
+        fallback_run = synth_runs[-1]
+        logger.info(
+            "Synthetic scalers fitted on run '%s' (no sparsity metadata available).",
+            fallback_run,
+        )
+        return fallback_run
 
     def _split_dataset_temporal(
         self,
@@ -485,18 +739,18 @@ class EpiForecasterTrainer:
 
     def _create_data_loaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
         """Create training and validation data loaders with device-aware optimizations."""
-        # Set multiprocessing context to avoid CUDA fork deadlocks
-        # 'spawn' is required when using CUDA with num_workers > 0
+        # Select multiprocessing context for DataLoader workers
         all_num_workers_zero = (
             self.config.training.num_workers == 0
             and self.config.training.val_workers == 0
         )
-        mp_context = (
-            "spawn" if self.device.type == "cuda" and not all_num_workers_zero else None
+        mp_context = select_multiprocessing_context(
+            self._device_hint, all_num_workers_zero=all_num_workers_zero
         )
+        self._multiprocessing_context = mp_context
 
         # Device-aware hardware optimizations
-        pin_memory = self.config.training.pin_memory and self.device.type == "cuda"
+        pin_memory = self.config.training.pin_memory and self._device_hint == "cuda"
 
         avail_cores = (os.cpu_count() or 1) - 1
         cfg_workers = self.config.training.num_workers
@@ -512,13 +766,15 @@ class EpiForecasterTrainer:
         else:
             val_num_workers = min(max(0, avail_cores), cfg_val_workers)
 
-        persistent_workers = num_workers > 0
+        persistent_workers = self.config.training.persistent_workers and num_workers > 0
         train_loader_kwargs = {
             "dataset": self.train_dataset,
             "num_workers": num_workers,
             "pin_memory": pin_memory,
-            "multiprocessing_context": mp_context,
         }
+        # Only pass multiprocessing_context when using workers
+        if num_workers > 0:
+            train_loader_kwargs["multiprocessing_context"] = mp_context
 
         # Configure Sampler & Collate based on Curriculum
         if self.config.training.curriculum.enabled and isinstance(
@@ -530,6 +786,7 @@ class EpiForecasterTrainer:
                 batch_size=self.config.training.batch_size,
                 config=self.config.training.curriculum,
                 drop_last=False,
+                real_run_id=getattr(self, "real_run_id", "real"),
             )
             # When using batch_sampler, batch_size and shuffle must be omitted
             train_loader_kwargs["batch_sampler"] = self.curriculum_sampler
@@ -549,38 +806,80 @@ class EpiForecasterTrainer:
             )
         train_loader = DataLoader(**train_loader_kwargs)
 
-        val_persistent_workers = val_num_workers > 0
+        val_persistent_workers = (
+            self.config.training.persistent_workers and val_num_workers > 0
+        )
         val_loader_kwargs = {
             "dataset": self.val_dataset,
             "batch_size": self.config.training.batch_size,
             "shuffle": False,
             "num_workers": val_num_workers,
-            "persistent_workers": val_persistent_workers,
             "pin_memory": pin_memory,
             "collate_fn": self._collate_fn,
-            "multiprocessing_context": mp_context,
         }
+        # Only pass multiprocessing_context when using workers
+        if val_num_workers > 0:
+            val_loader_kwargs["multiprocessing_context"] = mp_context
         if val_persistent_workers:
             val_loader_kwargs["persistent_workers"] = True
         if self.config.training.prefetch_factor is not None and val_num_workers > 0:
             val_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
         val_loader = DataLoader(**val_loader_kwargs)
 
+        # Compute test_workers (default to 0 since test runs once at end)
+        cfg_test_workers = getattr(self.config.training, "test_workers", 0)
+        if cfg_test_workers == -1:
+            test_num_workers = max(0, avail_cores)
+        else:
+            test_num_workers = min(max(0, avail_cores), cfg_test_workers)
+
+        test_persistent_workers = (
+            self.config.training.persistent_workers and test_num_workers > 0
+        )
         test_loader_kwargs = {
             "dataset": self.test_dataset,
             "batch_size": self.config.training.batch_size,
             "shuffle": False,
-            "num_workers": num_workers,
+            "num_workers": test_num_workers,
             "pin_memory": pin_memory,
             "collate_fn": self._collate_fn,
-            "multiprocessing_context": mp_context,
         }
-        if persistent_workers:
+        # Only pass multiprocessing_context when using workers
+        if test_num_workers > 0:
+            test_loader_kwargs["multiprocessing_context"] = mp_context
+        if test_persistent_workers:
             test_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None and num_workers > 0:
+        if self.config.training.prefetch_factor is not None and test_num_workers > 0:
             test_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
         test_loader = DataLoader(**test_loader_kwargs)
         return train_loader, val_loader, test_loader
+
+    def _should_prestart_dataloader_workers(self) -> bool:
+        if self._multiprocessing_context != "fork":
+            return False
+        if self._device_hint != "cuda":
+            return False
+        return True
+
+    def _resolve_device_hint(self) -> str:
+        requested = str(self.config.training.device)
+        if requested == "auto":
+            return "cuda" if platform.system() == "Linux" else "cpu"
+        try:
+            return torch.device(requested).type
+        except (TypeError, ValueError):
+            return requested
+
+    def _prestart_dataloader_workers(self, *loaders: DataLoader) -> None:
+        """Start DataLoader workers before CUDA initialization.
+
+        This allows forked workers to inherit preloaded mobility tensors without
+        copying once CUDA is initialized in the parent process.
+        """
+        for loader in loaders:
+            if loader is None or loader.num_workers == 0:
+                continue
+            _ = iter(loader)
 
     @staticmethod
     def _collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
@@ -675,9 +974,6 @@ class EpiForecasterTrainer:
         for key, value in hyperparams.items():
             self.writer.add_text(f"hyperparams/{key}", str(value), 0)
 
-        # Enable TensorBoard Projector by logging embeddings (if available)
-        self._log_projector_embeddings()
-
     # def _log_model_graph(self):
     #     """
     #     Write the model graph to TensorBoard using a real minibatch.
@@ -722,32 +1018,6 @@ class EpiForecasterTrainer:
     #     finally:
     #         if was_training:
     #             self.model.train()
-
-    def _log_projector_embeddings(self):
-        """
-        Export embeddings to TensorBoard Projector.
-
-        TensorBoard's projector tab expects either a checkpoint or an
-        embedding summary (tensors + metadata). When we only write scalar
-        summaries, the projector UI shows "No checkpoint was found". By
-        proactively writing embeddings here, the projector can render
-        without TensorFlow checkpoints.
-        """
-        if self.region_embeddings is None:
-            return
-
-        # Use region labels from the dataset for metadata so points are readable
-        region_labels = [
-            str(label) for label in self.train_dataset.dataset[REGION_COORD].values
-        ]
-
-        # The projector expects CPU tensors; ensure a detached copy
-        self.writer.add_embedding(
-            mat=self.region_embeddings.detach().cpu(),
-            metadata=region_labels,
-            tag="region_embeddings/static",
-            global_step=0,
-        )
 
     def _setup_profiler(self):
         activities = [ProfilerActivity.CPU]
@@ -936,7 +1206,7 @@ class EpiForecasterTrainer:
 
         self._status(f"\n{'=' * 60}")
         self._status("TRAINING COMPLETED")
-        self._status(f"Best validation loss: {self.best_val_loss:.6f}")
+        self._status(f"Best validation loss: {self.best_val_loss:.4g}")
         self._status(f"Total epochs trained: {self.current_epoch}")
         self._status(f"{'=' * 60}")
 
@@ -947,15 +1217,17 @@ class EpiForecasterTrainer:
         # Test phase
         test_start_time = time.time()
         test_loss, test_metrics, _test_node_mae = self.test_epoch()
+        # Shutdown test iterator after evaluation
+        self._shutdown_loader_iterator(self.test_loader)
         test_time = time.time() - test_start_time
         self._status(f"{'=' * 60}")
         self._status("TESTING COMPLETED")
         self._status(
-            f"Test loss: {test_loss:.6f} | "
-            f"MAE: {test_metrics['mae']:.6f} | "
-            f"RMSE: {test_metrics['rmse']:.6f} | "
-            f"sMAPE: {test_metrics['smape']:.6f} | "
-            f"R2: {test_metrics['r2']:.6f} | "
+            f"Test loss: {test_loss:.4g} | "
+            f"MAE: {test_metrics['mae']:.4g} | "
+            f"RMSE: {test_metrics['rmse']:.4g} | "
+            f"sMAPE: {test_metrics['smape']:.4g} | "
+            f"R2: {test_metrics['r2']:.4g} | "
             f"Time: {test_time:.2f}s"
         )
         self._status(f"{'=' * 60}")
@@ -1095,7 +1367,7 @@ class EpiForecasterTrainer:
                 if log_this_step:
                     loss_value = loss.item()
                     self._status(
-                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.6f} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
+                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
                     )
                     self.writer.add_scalar(
                         "Loss/Train_step", loss_value, self.global_step
@@ -1293,7 +1565,7 @@ class EpiForecasterTrainer:
             self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
 
         self._status(
-            f"{prefix} loss: {loss:.6f} | MAE: {metrics['mae']:.6f} | RMSE: {metrics['rmse']:.6f} | sMAPE: {metrics['smape']:.6f} | R2: {metrics['r2']:.6f}"
+            f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"
         )
         for idx, (mae_h, rmse_h) in enumerate(
             zip(metrics["mae_per_h"], metrics["rmse_per_h"], strict=False)
@@ -1328,11 +1600,39 @@ class EpiForecasterTrainer:
         torch.save(checkpoint, checkpoint_path)
         self._status(f"Saved checkpoint to: {checkpoint_path}")
 
+    def _shutdown_loader_iterator(self, loader) -> None:
+        """Shutdown DataLoader iterator to release workers and resources.
+
+        Call this between training phases (e.g., after train epoch, before validation)
+        to prevent semaphore leaks from overlapping worker lifetimes.
+
+        The iterator holds worker processes that keep Zarr file handles open.
+        Shutting it down between phases allows proper resource cleanup.
+
+        Args:
+            loader: DataLoader instance whose iterator should be shut down
+        """
+        if (
+            loader is not None
+            and hasattr(loader, "_iterator")
+            and loader._iterator is not None
+        ):
+            loader._iterator._shutdown_workers()
+            loader._iterator = None
+
     def cleanup_dataloaders(self) -> None:
         """Explicitly cleanup DataLoader workers to prevent orphaned processes.
 
         This is critical for HPC/SLURM environments where persistent workers
-        can cause hangs and memory leaks if not properly terminated.
+        can cause hangs and resource leaks if not properly terminated.
+
+        The cleanup process:
+        1. Gracefully shutdown iterator workers first (allows dataset cleanup)
+        2. If workers persist, terminate and join them (ensures process cleanup)
+        3. Clear loader references to prevent access to cleaned-up resources
+
+        This prevents semaphore leaks caused by Zarr file handles remaining open
+        when workers are forcefully terminated without proper cleanup.
         """
         loaders = [
             ("train", self.train_loader) if hasattr(self, "train_loader") else None,
@@ -1341,12 +1641,12 @@ class EpiForecasterTrainer:
         ]
         for name, loader in loaders:
             if loader is not None:
-                # For persistent_workers=True, we need to explicitly shutdown
-                # The DataLoader's __del__ method should handle this, but in
-                # HPC environments with signal handling issues, explicit cleanup
-                # is more reliable
                 try:
-                    # Store reference to workers before cleanup
+                    # First, shut down the iterator if it exists (graceful shutdown)
+                    # This allows workers to close file handles and release resources
+                    self._shutdown_loader_iterator(loader)
+
+                    # Then cleanup workers directly if any remain
                     if hasattr(loader, "_workers"):
                         workers = loader._workers  # type: ignore[attr-defined]
                         if workers:
@@ -1354,10 +1654,18 @@ class EpiForecasterTrainer:
                                 f"Cleaning up {name} loader ({len(workers)} workers)...",
                                 logging.DEBUG,
                             )
-                            # Terminate workers explicitly
                             for worker in workers:
                                 if worker.is_alive():
+                                    # Graceful shutdown via iterator should have handled this
+                                    # but terminate any remaining workers and wait for cleanup
                                     worker.terminate()
+                                    worker.join(timeout=5.0)
+                                    if worker.is_alive():
+                                        self._status(
+                                            f"Worker {worker} did not shut down gracefully",
+                                            logging.WARNING,
+                                        )
+
                     # Clear the loader reference
                     setattr(self, f"{name}_loader", None)
                 except Exception as e:

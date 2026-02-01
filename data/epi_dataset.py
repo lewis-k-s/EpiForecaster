@@ -54,6 +54,7 @@ class EpiDatasetItem(TypedDict):
     mob: list[Data]
     population: torch.Tensor
     run_id: int | str | None
+    target_region_index: int | None
 
 
 class EpiDataset(Dataset):
@@ -77,23 +78,31 @@ class EpiDataset(Dataset):
         mobility_preprocessor: MobilityPreprocessor | None = None,
         time_range: tuple[int, int] | None = None,
         run_id: str | None = None,
+        region_id_index: dict[str, int] | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
         self.time_range = time_range
 
-        # Load dataset with optional run_id chunking for memory efficiency
-        self._dataset = self.load_canonical_dataset(
-            self.aligned_data_path,
-            run_id_chunk_size=config.data.run_id_chunk_size,
-        )
-
         # Determine effective run_id (argument overrides config)
         effective_run_id = run_id if run_id is not None else config.data.run_id
 
-        # Filter by run_id (always present, no conditional logic)
-        self._dataset = self._filter_dataset_by_runs(
-            self._dataset, effective_run_id
+        if not effective_run_id:
+            raise ValueError(
+                "run_id must be provided either as argument or in config.data.run_id. "
+                "This is required to prevent loading all runs into memory."
+            )
+
+        # Store run_id for curriculum sampler to identify real vs synthetic datasets
+        self.run_id = effective_run_id
+        self._region_id_index = region_id_index
+
+        # Load dataset with run_id filtering for memory efficiency
+        # This ensures only the required run is loaded, not all runs
+        self._dataset = self.load_canonical_dataset(
+            self.aligned_data_path,
+            run_id=effective_run_id,
+            run_id_chunk_size=config.data.run_id_chunk_size,
         )
 
         self.num_nodes = self._dataset[REGION_COORD].size
@@ -198,9 +207,10 @@ class EpiDataset(Dataset):
         # Each entry is a (N,) tensor with local indices or -1 for non-context nodes
         self._global_to_local_cache: dict[int, torch.Tensor] = {}
 
-        # Cache for dense k-hop reachability keyed by (time_step, num_hops)
-        # Each entry is a (N, N) boolean tensor where reach[target, node] = True if node is within k hops
-        self._k_hop_cache: dict[tuple[int, int], torch.Tensor] = {}
+        # Precomputed k-hop reachability masks for all timesteps
+        # Dict mapping time_step -> (N, N) boolean tensor
+        # This replaces on-demand computation to eliminate CPU bottleneck in __getitem__
+        self._precomputed_k_hop_masks: dict[int, torch.Tensor] = {}
 
         # Setup biomarker preprocessor
         if biomarker_preprocessor is None:
@@ -320,6 +330,28 @@ class EpiDataset(Dataset):
             )
             self.config.model.biomarkers_dim = expected_bio_dim
 
+        # Extract metadata for workers to avoid zarr access in forked processes
+        # This prevents hangs when workers try to reopen zarr files
+        self._region_labels = list(self._dataset[REGION_COORD].values)
+        self._temporal_coords = list(self._dataset[TEMPORAL_COORD].values)
+
+        # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
+        # This moves expensive matrix operations from per-sample to startup time
+        # Must be done after _temporal_coords is set but before dataset is closed
+        self._precomputed_k_hop_masks = self._precompute_k_hop_masks()
+
+        # Get run_id once and store as scalar
+        try:
+            run_id_val = self._dataset.mobility.run_id.item()
+            try:
+                self._run_id_value = int(run_id_val) if run_id_val is not None else None
+            except (ValueError, TypeError):
+                self._run_id_value = (
+                    str(run_id_val).strip() if run_id_val is not None else None
+                )
+        except Exception:
+            self._run_id_value = self.run_id  # Fallback to config value
+
         # Close dataset and clear reference to avoid pickling issues
         self._dataset.close()
         self._dataset = None
@@ -351,7 +383,9 @@ class EpiDataset(Dataset):
         # Reload dataset after unpickling
         ds = xr.open_zarr(self.aligned_data_path)
         # Re-apply run_id filter (critical for DataLoader workers)
-        effective_run_id = self.config.data.run_id
+        effective_run_id = (
+            self.run_id if self.run_id is not None else self.config.data.run_id
+        )
         ds = self._filter_dataset_by_runs(ds, effective_run_id)
         self._dataset = ds
         return ds
@@ -361,6 +395,28 @@ class EpiDataset(Dataset):
         state = self.__dict__.copy()
         state["_dataset"] = None
         return state
+
+    def close(self) -> None:
+        """Explicitly close the zarr dataset to release resources.
+
+        This is important for preventing semaphore leaks when used with
+        PyTorch DataLoader workers. Each worker opens a zarr dataset,
+        and without proper cleanup, file handles and semaphores accumulate.
+        """
+        if self._dataset is not None:
+            try:
+                self._dataset.close()
+            except Exception:
+                pass
+            self._dataset = None
+
+    def __del__(self) -> None:
+        """Cleanup zarr dataset on garbage collection.
+
+        Provides automatic resource cleanup when the dataset object is
+        destroyed, even if close() was not explicitly called.
+        """
+        self.close()
 
     def num_windows(self) -> int:
         """Number of window start positions valid for at least one target node."""
@@ -441,11 +497,18 @@ class EpiDataset(Dataset):
         except IndexError as exc:
             raise IndexError("Sample index out of range") from exc
 
-        node_label = self.dataset[REGION_COORD].values[target_idx]
+        # Use pre-extracted metadata to avoid zarr access in workers
+        node_label = self._region_labels[target_idx]
+        target_region_index = None
+        if self._region_id_index is not None:
+            key = str(node_label)
+            if key not in self._region_id_index:
+                raise ValueError(f"Region ID '{key}' missing from embedding index.")
+            target_region_index = self._region_id_index[key]
 
         range_end = range_start + L
         forecast_targets = range_end + H
-        T = len(self.dataset[TEMPORAL_COORD].values)
+        T = len(self._temporal_coords)
         if forecast_targets > T:
             raise IndexError("Requested window exceeds available time steps")
 
@@ -453,15 +516,8 @@ class EpiDataset(Dataset):
         mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
         neigh_mask = self.mobility_mask[range_start:range_end, :, target_idx]
 
-        # Get run_id from dataset (scalar after filtering)
-        # Per curriculum architecture, run_id is always a singleton scalar
-        run_id_val = self.dataset.mobility.run_id.item()
-        # Handle both integer and string run_ids
-        try:
-            run_id = int(run_id_val) if run_id_val is not None else None
-        except (ValueError, TypeError):
-            # String run_id (e.g., "0_Baseline", "real")
-            run_id = str(run_id_val).strip() if run_id_val is not None else None
+        # Use pre-extracted run_id to avoid zarr access in workers
+        run_id = self._run_id_value
 
         # Cases Processing (delegate window normalization to the preprocessor)
         norm_window, mean_anchor, std_anchor = (
@@ -484,7 +540,9 @@ class EpiDataset(Dataset):
 
         # Apply mask to case_history (both channels)
         # Use pre-converted float32 mask from __init__ to avoid repeated dtype conversion
-        neigh_mask_t = self.mobility_mask_float[range_start:range_end, :, target_idx].unsqueeze(-1)
+        neigh_mask_t = self.mobility_mask_float[
+            range_start:range_end, :, target_idx
+        ].unsqueeze(-1)
         case_history = case_history * neigh_mask_t
 
         # Concatenate lagged risk features if available
@@ -565,11 +623,15 @@ class EpiDataset(Dataset):
             local_target_idx = int(global_to_local[target_idx].item())
 
             # Apply k-hop feature masking based on target node
-            if self.config.model.gnn_depth > 0:
-                # Get k-hop neighbors (global indices)
-                k_hop_mask = self._get_k_hop_neighbors_mask(
-                    target_idx, global_t, self.config.model.gnn_depth
-                )
+            # Use precomputed masks to avoid expensive CPU matrix operations
+            if (
+                self.config.model.gnn_depth > 0
+                and global_t in self._precomputed_k_hop_masks
+            ):
+                # Get precomputed k-hop mask for this timestep (N, N) boolean
+                k_hop_mask_full = self._precomputed_k_hop_masks[global_t]
+                # Extract mask for target node: (N,) boolean
+                k_hop_mask = k_hop_mask_full[target_idx]
 
                 # Map global mask to local indices and ensure target is included
                 # NOTE: k_hop_mask excludes the target node (diagonal is False),
@@ -580,7 +642,7 @@ class EpiDataset(Dataset):
                 x_masked = x.clone()
                 x_masked[~local_k_hop_mask] = 0
             else:
-                # No masking (all nodes contribute)
+                # No masking (all nodes contribute) or no precomputed mask
                 x_masked = x
                 local_k_hop_mask = torch.ones(x.size(0), dtype=torch.bool)
 
@@ -604,9 +666,7 @@ class EpiDataset(Dataset):
         # No .float() conversion needed - removes redundant dtype conversion
 
         # Ensure rolling stats are dense and correct shape (L, 1)
-        mean_seq = self.rolling_mean[
-            range_start:range_end, target_idx
-        ]  # (L, 1)
+        mean_seq = self.rolling_mean[range_start:range_end, target_idx]  # (L, 1)
         std_seq = self.rolling_std[range_start:range_end, target_idx]  # (L, 1)
 
         if mean_seq.ndim == 1:
@@ -619,6 +679,7 @@ class EpiDataset(Dataset):
         return {
             "node_label": node_label,
             "target_node": target_idx,
+            "target_region_index": target_region_index,
             "window_start": range_start,
             "case_node": case_history[:, target_idx, :],  # Already normalized
             "case_mean": mean_seq,
@@ -810,44 +871,47 @@ class EpiDataset(Dataset):
         self._global_to_local_cache[time_step] = global_to_local
         return global_to_local
 
-    def _get_k_hop_neighbors_mask(
-        self,
-        target_idx: int,
-        time_step: int,
-        num_hops: int,
-    ) -> torch.Tensor:
-        """Get k-hop neighbors of target_idx using cached dense reachability.
+    def _precompute_k_hop_masks(self) -> dict[int, torch.Tensor]:
+        """Precompute k-hop reachability masks for all timesteps at startup.
 
-        For each (time_step, num_hops) pair, compute a dense (N, N) reachability
-        matrix where reach[target, node] is True if node is within num_hops of target.
-
-        Args:
-            target_idx: Target node index
-            time_step: Time step index
-            num_hops: Number of hops to expand (gnn_depth)
+        This moves expensive CPU matrix operations from per-sample __getitem__
+        to initialization time, eliminating the 67% data loading bottleneck.
+        Masks are stored as CPU tensors and shared across forked workers.
 
         Returns:
-            Boolean mask (N,) where True = within k-hops of target (excludes target itself)
+            Dict mapping time_step -> (N, N) boolean tensor where
+            mask[target_idx, node_idx] = True if node is within k-hop of target
         """
-        cache_key = (time_step, num_hops)
-        if cache_key not in self._k_hop_cache:
-            adjacency = self._get_adjacency_at_time(time_step)
-            reach = adjacency.clone()
+        if self.config.model.gnn_depth <= 0:
+            return {}
 
-            if num_hops > 1:
+        gnn_depth = self.config.model.gnn_depth
+        logger.info(
+            f"Precomputing k-hop masks for {len(self._temporal_coords)} timesteps "
+            f"(depth={gnn_depth}, nodes={self.num_nodes})..."
+        )
+
+        masks = {}
+        for time_step in range(len(self._temporal_coords)):
+            # Get adjacency for this timestep
+            adjacency = self._get_adjacency_at_time(time_step)
+
+            # Compute k-hop reachability via matrix multiplication
+            reach = adjacency.clone()
+            if gnn_depth > 1:
                 adj_f = adjacency.to(torch.float32)
                 reach_f = reach.to(torch.float32)
-                for _ in range(1, num_hops):
+                for _ in range(1, gnn_depth):
                     new_reach = (reach_f @ adj_f) > 0
                     reach = reach | new_reach
                     reach_f = reach.to(torch.float32)
 
-            # Exclude self
+            # Exclude self (diagonal = False)
             reach.fill_diagonal_(False)
-            self._k_hop_cache[cache_key] = reach
+            masks[time_step] = reach
 
-        reach = self._k_hop_cache[cache_key]
-        return reach[target_idx]
+        logger.info(f"K-hop mask precomputation complete: {len(masks)} masks")
+        return masks
 
     def _build_full_graph_topology_at_time(
         self,
@@ -956,40 +1020,100 @@ class EpiDataset(Dataset):
     def load_canonical_dataset(
         cls,
         aligned_data_path: Path,
-        run_id_chunk_size: int = -1,
-        run_id: str | None = None,
+        run_id: str,
+        run_id_chunk_size: int = 1,
     ) -> xr.Dataset:
         """Load the canonical dataset from the aligned data path.
 
         Args:
             aligned_data_path: Path to the Zarr dataset
-            run_id_chunk_size: Chunk size for run_id dimension when loading all runs.
-                -1 (default): Load all runs at once (no chunking, previous behavior)
-                Positive value: Chunk runs for memory efficiency (e.g., 5 for low-resource)
-                Ignored if run_id is provided (single run doesn't need chunking).
             run_id: Specific run_id to filter by (e.g., "real", "0_Baseline").
-                If provided, filters the dataset to this run_id immediately.
+                This is now mandatory to prevent accidental loading of all runs.
+            run_id_chunk_size: Chunk size for run_id dimension. Default is 1 to
+                ensure memory-efficient loading. Must be a positive integer.
 
         Returns:
-            xarray Dataset with optional run_id chunking and filtering
+            xarray Dataset filtered to the specified run_id with chunked loading.
+
+        Raises:
+            ValueError: If run_id is empty or not found in the dataset.
         """
-        # When filtering by run_id, don't chunk - we're loading a single run
-        chunks = None if run_id is not None else (
-            {"run_id": run_id_chunk_size} if run_id_chunk_size != -1 else None
-        )
+        if not run_id:
+            raise ValueError(
+                "run_id is mandatory and must be a non-empty string. "
+                "This prevents accidental loading of all runs which can cause OOM."
+            )
 
-        dataset = xr.open_zarr(
-            aligned_data_path,
-            chunks=chunks,
-            zarr_format=2
-        )
+        if run_id_chunk_size < 1:
+            raise ValueError(
+                f"run_id_chunk_size must be >= 1, got {run_id_chunk_size}. "
+                "Use 1 for memory-efficient loading of a single run."
+            )
 
-        # Filter by run_id if provided (handle whitespace padding)
-        if run_id is not None and "run_id" in dataset.coords:
+        # Always chunk by run_id to prevent loading entire dataset into memory
+        chunks = {"run_id": run_id_chunk_size}
+
+        dataset = xr.open_zarr(aligned_data_path, chunks=chunks, zarr_format=2)
+
+        # Validate run_id exists in dataset
+        if "run_id" not in dataset.coords and "run_id" not in dataset.dims:
+            dataset.close()
+            raise ValueError(
+                f"Dataset at {aligned_data_path} does not have a run_id dimension or coordinate."
+            )
+
+        # Filter by run_id (handle whitespace padding)
+        if "run_id" in dataset.coords:
+            available_runs = [str(r).strip() for r in dataset.run_id.values]
+            if run_id not in available_runs:
+                dataset.close()
+                raise ValueError(
+                    f"run_id '{run_id}' not found in dataset. "
+                    f"Available runs: {available_runs[:10]}{'...' if len(available_runs) > 10 else ''}"
+                )
             mask = dataset.run_id.str.strip() == run_id
             dataset = dataset.sel(run_id=mask).squeeze(drop=True)
 
         return dataset
+
+    @classmethod
+    def discover_available_runs(
+        cls,
+        aligned_data_path: Path,
+    ) -> list[str]:
+        """Discover all available run_ids in the dataset without loading data.
+
+        This is a lightweight method that only reads the run_id coordinate
+        to discover what runs are available. It does not load any actual data.
+
+        Args:
+            aligned_data_path: Path to the Zarr dataset
+
+        Returns:
+            List of available run_id strings
+
+        Raises:
+            ValueError: If the dataset does not have a run_id dimension or coordinate.
+        """
+        # Use chunking to prevent loading all data
+        dataset = xr.open_zarr(aligned_data_path, chunks={"run_id": 1}, zarr_format=2)
+
+        try:
+            if "run_id" not in dataset.coords and "run_id" not in dataset.dims:
+                raise ValueError(
+                    f"Dataset at {aligned_data_path} does not have a run_id dimension or coordinate."
+                )
+
+            # Get run_id values without loading the full dataset
+            if "run_id" in dataset.coords:
+                run_vals = dataset.run_id.values
+            else:
+                run_vals = dataset.coords["run_id"].values
+
+            unique_runs = np.unique(run_vals)
+            return sorted([str(r).strip() for r in unique_runs])
+        finally:
+            dataset.close()
 
     @classmethod
     def get_valid_nodes(
@@ -1099,13 +1223,12 @@ class EpiDataset(Dataset):
         )
 
         # Load canonical dataset to get node list and temporal boundaries
+        if not config.data.run_id:
+            raise ValueError("run_id must be specified in config for temporal splits")
         aligned_dataset = cls.load_canonical_dataset(
             Path(config.data.dataset_path),
+            run_id=config.data.run_id,
             run_id_chunk_size=config.data.run_id_chunk_size,
-        )
-        # Filter by run_id (always present, no conditional logic)
-        aligned_dataset = cls._filter_dataset_by_runs(
-            aligned_dataset, config.data.run_id
         )
 
         num_nodes = aligned_dataset[REGION_COORD].size
@@ -1200,12 +1323,12 @@ class EpiDataset(Dataset):
 
 def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     """
-    Collate function for curriculum training (List of Batches).
+    Collate function for curriculum training.
 
-    Unlike the default collate which flattens all graphs into one huge Batch,
-    this creates a List[Batch], one per time step. This allows the model
-    to process time steps sequentially or in parallel chunks.
+    This mirrors the standard collate: it flattens per-time-step graphs into
+    a single PyG Batch for a consistent model contract.
     """
+    import itertools
     import torch
 
     B = len(batch)
@@ -1228,33 +1351,32 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     )
     population = torch.stack([item["population"] for item in batch], dim=0)
 
-    # 2. Batch Temporal Graphs (List[Batch] per time step)
-    # batch[0]["mob"] is a list of Data objects (length T)
-    T = len(batch[0]["mob"])
-    
-    mob_batches: list[Batch] = []
-    for t in range(T):
-        graphs_at_t = [item["mob"][t] for item in batch]
-        batch_t = Batch.from_data_list(graphs_at_t)
-        
-        # Precompute target_index for this batch
-        # batch_t.ptr maps graph index -> node index range
-        # batch_t.target_node is list of local target indices
-        if hasattr(batch_t, "ptr") and hasattr(batch_t, "target_node"):
-            # batch_t.target_node is (B, 1) or (B,) - ensure flat
-            tgt = batch_t.target_node.reshape(-1)
-            # ptr[:-1] gives start index for each graph
-            starts = batch_t.ptr[:-1]
-            batch_t["target_index"] = starts + tgt
-            
-        mob_batches.append(batch_t)
+    # 2. Batch Temporal Graphs (flatten all time steps)
+    graph_list = list(itertools.chain.from_iterable(item["mob"] for item in batch))
+    mob_batch = Batch.from_data_list(graph_list)  # type: ignore[arg-type]
+    T = len(batch[0]["mob"]) if B > 0 else 0
+    # store B and T on the batch for downstream reshaping
+    mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
+    mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
+    # Precompute a global target node index per ego-graph in the batched `x`.
+    if hasattr(mob_batch, "ptr") and hasattr(mob_batch, "target_node"):
+        mob_batch["target_index"] = mob_batch.ptr[:-1] + mob_batch.target_node.reshape(
+            -1
+        )  # type: ignore[index]
+
+    target_region_indices = [item["target_region_index"] for item in batch]
+    if any(idx is None for idx in target_region_indices):
+        raise ValueError(
+            "TargetRegionIndex missing for curriculum batch. "
+            "Ensure region_id_index is provided to all EpiDataset instances."
+        )
 
     return {
         "CaseNode": case_node,  # (B, L, C)
         "CaseMean": case_mean,  # (B, L, 1)
         "CaseStd": case_std,  # (B, L, 1)
         "BioNode": bio_node,  # (B, L, B)
-        "MobBatch": mob_batches,  # List[Batch]
+        "MobBatch": mob_batch,  # Batched PyG graphs
         "Population": population,  # (B,)
         "B": B,
         "T": T,
@@ -1262,6 +1384,7 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
         "TargetScale": target_scales,  # (B, C)
         "TargetMean": target_mean,  # (B, 1)
         "TargetNode": target_nodes,  # (B,)
+        "TargetRegionIndex": torch.tensor(target_region_indices, dtype=torch.long),
         "WindowStart": window_starts,  # (B,)
         "NodeLabels": [item["node_label"] for item in batch],
     }

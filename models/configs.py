@@ -170,6 +170,8 @@ class DataConfig:
     """Dataset configuration loaded from ``data`` YAML block."""
 
     dataset_path: str = ""
+    # Optional separate path for real data (used in curriculum training if real/synth are split)
+    real_dataset_path: str = ""
     regions_data_path: str = ""
     # .pt file containing region2vec encoder model weights
     region2vec_path: str = ""
@@ -196,9 +198,10 @@ class DataConfig:
     use_imported_risk: bool = False
     # Chunk size for run_id dimension when loading multi-run synthetic datasets
     # Set to -1 to load all runs at once (full loading, previous behavior)
-    # Set to a small value (e.g., 5) for memory-efficient processing on low-resource machines
-    # Set to a larger value (e.g., 50) for better performance on high-resource machines
-    run_id_chunk_size: int = -1  # Default: -1 means load all runs (no chunking)
+    # Chunk size for run_id dimension. Default is 1 to ensure memory-efficient loading.
+    # Each chunk loads one run at a time, preventing OOM when dataset has many runs.
+    # This should NOT be set to -1 (load all runs) as it causes memory issues.
+    run_id_chunk_size: int = 1  # Default: 1 means load one run at a time
     # Single run_id for filtering dataset (e.g., "real", "synth_run_001")
     # Required when curriculum training is disabled
     run_id: str = "real"
@@ -350,6 +353,12 @@ class TrainingParams:
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 0
+    test_workers: int = (
+        0  # Test loader workers (typically 0 since test runs once at end)
+    )
+    # Keep DataLoader workers alive across epochs when using fork+CUDA.
+    # Disabling this can re-fork workers after CUDA init and cause hangs.
+    persistent_workers: bool = True
     prefetch_factor: int | None = 4
     pin_memory: bool = True
     eval_frequency: int = 5
