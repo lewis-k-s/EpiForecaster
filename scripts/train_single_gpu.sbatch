@@ -14,6 +14,8 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 # Path to the training config file (override per run).
 CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
+# Space-separated config overrides (e.g., "training.batch_size=24 training.epochs=5").
+OVERRIDES="${OVERRIDES:-}"
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 
@@ -30,9 +32,19 @@ fi
 # Keep thread counts aligned with allocation.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
+# Build override arguments.
+OVERRIDE_ARGS=""
+if [ -n "$OVERRIDES" ]; then
+  for override in $OVERRIDES; do
+    OVERRIDE_ARGS="$OVERRIDE_ARGS --override $override"
+  done
+fi
+
 # Prefer uv runner if available; fall back to plain python.
 if command -v uv >/dev/null 2>&1; then
-  uv run main train epiforecaster --config "$CONFIG"
+  # shellcheck disable=SC2086
+  uv run main train epiforecaster --config "$CONFIG" $OVERRIDE_ARGS
 else
-  python -m cli train epiforecaster --config "$CONFIG"
+  # shellcheck disable=SC2086
+  python -m cli train epiforecaster --config "$CONFIG" $OVERRIDE_ARGS
 fi

@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from data.epi_dataset import EpiDataset
 from models.configs import EpiForecasterConfig
 from training.epiforecaster_trainer import EpiForecasterTrainer
+from utils.platform import select_multiprocessing_context
 
 
 @dataclass
@@ -91,7 +92,12 @@ def split_dataset_nodes(
 
     train_split = 1 - config.training.val_split - config.training.test_split
 
-    aligned_dataset = EpiDataset.load_canonical_dataset(Path(config.data.dataset_path))
+    if not config.data.run_id:
+        raise ValueError("run_id must be specified in config")
+    aligned_dataset = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+    )
     n = aligned_dataset[REGION_COORD].size
     all_nodes = np.arange(n)
 
@@ -135,8 +141,9 @@ def create_train_dataloader(
 
     # Dataloader configuration matching _create_data_loaders()
     all_num_workers_zero = config.training.num_workers == 0
-
-    mp_context = "spawn" if device.type == "cuda" and not all_num_workers_zero else None
+    mp_context = select_multiprocessing_context(
+        device, all_num_workers_zero=all_num_workers_zero
+    )
 
     pin_memory = config.training.pin_memory and device.type == "cuda"
 
@@ -205,6 +212,15 @@ def run_benchmark(
     print("[2/4] Creating dataloader...", file=sys.stderr, flush=True)
     train_loader, train_dataset = create_train_dataloader(config, train_nodes, device)
 
+    def _prestart_workers(loader: DataLoader, context: str | None) -> None:
+        if context != "fork":
+            return
+        if device.type != "cuda":
+            return
+        if loader.num_workers == 0:
+            return
+        _ = iter(loader)
+
     # Get configuration values for result
     avail_cores = (os.cpu_count() or 1) - 1
     cfg_workers = config.training.num_workers
@@ -214,11 +230,15 @@ def run_benchmark(
         num_workers = min(avail_cores, cfg_workers)
 
     all_num_workers_zero = num_workers == 0
-    mp_context = "spawn" if device.type == "cuda" and not all_num_workers_zero else None
+    mp_context = select_multiprocessing_context(
+        device, all_num_workers_zero=all_num_workers_zero
+    )
     pin_memory = config.training.pin_memory and device.type == "cuda"
     persistent_workers = num_workers > 0
 
     dataset_path = str(Path(config.data.dataset_path).resolve())
+
+    _prestart_workers(train_loader, mp_context)
 
     # Warmup phase
     print(

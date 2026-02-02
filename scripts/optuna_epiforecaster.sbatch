@@ -25,6 +25,8 @@ RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
 EPOCHS="${EPOCHS:-2}"
 MAX_BATCHES="${MAX_BATCHES:-}"
 SEED="${SEED:-}"
+# Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
+OVERRIDES="${OVERRIDES:-}"
 # Worker timeout in seconds (defaults to SLURM time limit minus buffer).
 # Format HH:MM:SS is converted to seconds.
 TIMEOUT_SECS="${TIMEOUT_SECS:-14200}" # 4 hours - buffer
@@ -50,6 +52,10 @@ ARGS=(
   --journal-file "$JOURNAL_FILE"
   --run-root "$RUN_ROOT"
 )
+
+# Note: OVERRIDES are not directly supported by optuna worker.
+# Use a custom base config file instead, or modify the worker to accept --override flags.
+# The worker applies its own search space overrides to the base config.
 
 if [ -n "$EPOCHS" ]; then
   ARGS+=(--epochs "$EPOCHS")
