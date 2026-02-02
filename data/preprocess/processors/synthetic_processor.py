@@ -79,10 +79,36 @@ class SyntheticProcessor:
             print()
 
         # Validate required variables exist
-        required_vars = ["cases", "mobility_base", "mobility_kappa0", "population"]
+        # Mobility can be in two formats:
+        # - New: mobility_time_varying (pre-computed with kappa0 applied)
+        # - Legacy: mobility_base + mobility_kappa0 (factorized format)
+        required_vars = ["cases", "population"]
         missing = [v for v in required_vars if v not in ds]
         if missing:
             raise ValueError(f"Synthetic data missing required variables: {missing}")
+
+        # Check mobility format
+        has_time_varying = "mobility_time_varying" in ds
+        has_factorized = "mobility_base" in ds and "mobility_kappa0" in ds
+        if not has_time_varying and not has_factorized:
+            raise ValueError(
+                "Synthetic data missing mobility data. "
+                "Expected either 'mobility_time_varying' or "
+                "('mobility_base' + 'mobility_kappa0')"
+            )
+
+        synthetic_sparsity_level = None
+        if "synthetic_sparsity_level" in ds:
+            synthetic_sparsity_level = ds["synthetic_sparsity_level"]
+            print(
+                "  ✓ Found synthetic_sparsity_level metadata: "
+                f"{synthetic_sparsity_level.shape}"
+            )
+        else:
+            print(
+                "Warning: synthetic_sparsity_level not found; "
+                "curriculum sparsity filtering will be unavailable."
+            )
 
         # Check for EDAR biomarkers (optional but recommended)
         # type: ignore[reportOperatorIssue] (xarray data_vars iteration)
@@ -104,6 +130,9 @@ class SyntheticProcessor:
             "edar_censor": edar_censor,  # Censor flags
             "population": self._extract_population(ds),
         }
+
+        if synthetic_sparsity_level is not None:
+            result["synthetic_sparsity_level"] = synthetic_sparsity_level
 
         return result
 
@@ -139,12 +168,41 @@ class SyntheticProcessor:
         return cases_filtered.to_dataset(name="cases")
 
     def _extract_mobility(self, ds: xr.Dataset) -> xr.Dataset:
-        """Extract and reconstruct mobility data from factorized format.
+        """Extract mobility data from synthetic dataset.
+
+        Supports two formats:
+        1. New: mobility_time_varying (pre-computed with kappa0 applied)
+        2. Legacy: mobility_base + mobility_kappa0 (factorized format)
 
         Preserves run_id dimension.
-        Returns dataset with reconstructed mobility tensor.
+        Returns dataset with dimensions (run_id, date, origin, destination).
         """
-        print("Extracting mobility (factorized format)...")
+        print("Extracting mobility...")
+
+        # Check for time-varying format (new synthetic data)
+        if "mobility_time_varying" in ds:
+            print("  Found mobility_time_varying (pre-computed format)")
+            mobility = ds["mobility_time_varying"]
+
+            # Transpose to match expected dimension order: (run_id, date, origin, destination)
+            # Input dims: (run_id, origin, target, date)
+            mobility = mobility.transpose("run_id", TEMPORAL_COORD, "origin", "target")
+            mobility = mobility.rename({"target": "destination"})
+
+            # Filter by date range
+            start_date = np.datetime64(self.config.start_date)
+            end_date = np.datetime64(self.config.end_date)
+            time_mask = (mobility[TEMPORAL_COORD] >= start_date) & (
+                mobility[TEMPORAL_COORD] <= end_date
+            )
+            mobility_filtered = mobility.isel({TEMPORAL_COORD: time_mask})
+
+            num_runs = len(mobility_filtered.run_id)
+            print(f"  ✓ Extracted mobility with {num_runs} runs: {mobility_filtered.shape}")
+            return mobility_filtered.to_dataset(name="mobility")
+
+        # Fall back to factorized format (legacy synthetic data)
+        print("  Using factorized format (mobility_base + mobility_kappa0)")
 
         mobility_base = ds["mobility_base"]  # (origin, target)
         mobility_kappa0 = ds["mobility_kappa0"]  # (run_id, date)

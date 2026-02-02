@@ -89,6 +89,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         config: CurriculumConfig,
         drop_last: bool = False,
         raw_dataset_path: str | Path | None = None,
+        real_run_id: str = "real",
     ):
         """
         Args:
@@ -100,6 +101,7 @@ class EpidemicCurriculumSampler(BatchSampler):
             drop_last: Whether to drop the last incomplete batch.
             raw_dataset_path: Path to raw zarr dataset for reading sparsity metadata (optional).
                               If not provided, uses config.raw_dataset_path.
+            real_run_id: The run_id that identifies the "real" dataset.
         """
         # We don't call super().__init__ because we override __iter__ completely
         # and don't need the default sampler behavior.
@@ -107,6 +109,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.batch_size = batch_size
         self.config = config
         self.drop_last = drop_last
+        self.real_run_id = real_run_id.strip()
 
         # Determine raw dataset path for sparsity metadata
         self._raw_dataset_path = raw_dataset_path or config.raw_dataset_path or None
@@ -144,6 +147,21 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.cumulative_sizes = self.dataset.cumulative_sizes
         self.dataset_offsets = [0] + self.cumulative_sizes[:-1]
 
+        # Helper to find sparsity with flexible matching
+        def find_sparsity(run_id_str: str) -> float | None:
+            # 1. Exact match
+            if run_id_str in self._run_sparsity_map:
+                return self._run_sparsity_map[run_id_str]
+            
+            # 2. Try matching without leading index (e.g. "0_Baseline" -> "Baseline")
+            if "_" in run_id_str:
+                suffix = run_id_str.split("_", 1)[1]
+                # Look for any key in map that has the same suffix
+                for k, v in self._run_sparsity_map.items():
+                    if "_" in k and k.split("_", 1)[1] == suffix:
+                        return v
+            return None
+
         for i, ds in enumerate(self.sub_datasets):
             # Check run_id to distinguish real vs synthetic
             # We assume 'real' run_id is "real" or similar
@@ -152,15 +170,16 @@ class EpidemicCurriculumSampler(BatchSampler):
             run_id_str = str(run_id).strip()
 
             # Look up sparsity from pre-loaded mapping
-            if run_id_str in self._run_sparsity_map:
-                self._dataset_sparsity[i] = self._run_sparsity_map[run_id_str]
+            sparsity = find_sparsity(run_id_str)
+            if sparsity is not None:
+                self._dataset_sparsity[i] = sparsity
 
             logger.info(
                 f"Sampler Dataset {i}: run_id='{run_id}', "
                 f"sparsity={self._dataset_sparsity.get(i, 'N/A')}"
             )
 
-            if run_id_str == "real":
+            if run_id_str == self.real_run_id:
                 self.real_dataset_indices.append(i)
             else:
                 self.synth_dataset_indices.append(i)
@@ -327,6 +346,12 @@ class EpidemicCurriculumSampler(BatchSampler):
                 f"Sparsity filtering: {len(self.synth_dataset_indices)} -> "
                 f"{len(available_synth)} synthetic runs available"
             )
+            if not available_synth:
+                logger.warning(
+                    "Sparsity filtering excluded all synthetic runs; "
+                    "falling back to all synthetic runs for this epoch."
+                )
+                available_synth = self.synth_dataset_indices
 
         # Then select active runs from filtered set
         n_synth = len(available_synth)

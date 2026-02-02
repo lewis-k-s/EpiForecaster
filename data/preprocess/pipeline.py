@@ -114,6 +114,15 @@ class OfflinePreprocessingPipeline:
                 dataset=alignment_result,
             )
 
+            if "synthetic_sparsity_level" in processed_data:
+                sparsity = processed_data["synthetic_sparsity_level"]
+                if "run_id" in sparsity.dims and "run_id" in alignment_result.coords:
+                    sparsity = sparsity.reindex(
+                        run_id=alignment_result["run_id"].values
+                    )
+                alignment_result["synthetic_sparsity_level"] = sparsity
+                print("  ✓ Preserved synthetic_sparsity_level metadata")
+
             # Only chunk run_id dimension for memory efficiency
             # Other dimensions are kept unchunked to avoid performance warnings
             alignment_result = alignment_result.chunk(
@@ -331,14 +340,14 @@ class OfflinePreprocessingPipeline:
         # Variables from source zarr files retain v3-specific encodings that
         # are incompatible with zarr v2 format used for output.
         v3_encoding_keys = {
-            'chunks',  # old chunk sizes conflict with rechunking
-            'preferred_chunks',
-            'compressors',  # v3 uses tuple of codecs
-            'compressor',  # clear both styles
-            'filters',  # v3 uses tuple of filters
-            'serializer',  # v3-specific
-            'object_codec',  # v3-specific
-            'shards',  # v3-specific
+            "chunks",  # old chunk sizes conflict with rechunking
+            "preferred_chunks",
+            "compressors",  # v3 uses tuple of codecs
+            "compressor",  # clear both styles
+            "filters",  # v3 uses tuple of filters
+            "serializer",  # v3-specific
+            "object_codec",  # v3-specific
+            "shards",  # v3-specific
         }
         for var_name in rechunked_dataset.data_vars:
             var = rechunked_dataset.data_vars[var_name]
@@ -436,7 +445,9 @@ class OfflinePreprocessingPipeline:
                         "Saved mobility sample is all NaN; preprocessing failed."
                     )
                 non_null_count = ds["mobility"].notnull().sum().compute()
-                print(f"  Verified mobility data: {non_null_count.values} non-null values")
+                print(
+                    f"  Verified mobility data: {non_null_count.values} non-null values"
+                )
             if "cases" in ds:
                 non_null_count = ds["cases"].notnull().sum().compute()
                 print(f"  Verified cases data: {non_null_count.values} non-null values")
