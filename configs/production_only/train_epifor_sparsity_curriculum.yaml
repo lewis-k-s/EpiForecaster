@@ -12,6 +12,7 @@ data:
   use_valid_targets: false
   # Path to the processed zarr dataset containing both real and synthetic runs
   dataset_path: data/processed/synthetic_full.zarr
+  real_dataset_path: data/processed/real_with_id.zarr
   # Mobility-weighted lagged case features (imported risk)
   use_imported_risk: false
   mobility_lags: [1, 7, 14] # Lags in days (only used when use_imported_risk=true)
@@ -35,7 +36,7 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    history_length: 14
+    history_length: 21
     forecast_horizon: 7
     #-- graph params --#
     max_neighbors: 20
@@ -46,17 +47,18 @@ output:
   log_dir: outputs/training
 
 training:
-  device: "auto"
-  batch_size: 16
+  device: "cuda"
+  batch_size: 12
   gradient_accumulation_steps: 2
   early_stopping_patience: 10
   nan_loss_patience: 5
   # max_batches: 20
   epochs: 20
-  learning_rate: 0.001
+  learning_rate: 0.0005
   weight_decay: 1.0e-05
-  num_workers: 4
+  num_workers: 6
   val_workers: 2
+  prefetch_factor: 2
   val_split: 0.2
   test_split: 0.1
 
@@ -64,8 +66,8 @@ training:
   curriculum:
     enabled: true
     # Number of synthetic runs to sample from per epoch
-    # 2 is recommended to maintain locality while exposing the model to diversity
-    active_runs: 2
+    # 3 is recommended for diversity while maintaining reasonable memory overhead
+    active_runs: 3
     # Contiguous windows per run before rotating to next run
     chunk_size: 512
     # How to select runs within sparsity range: "round_robin" or "random"
@@ -79,31 +81,31 @@ training:
         end_epoch: 3
         synth_ratio: 1.0 # 100% synthetic data
         mode: "time_major"
-        min_sparsity: 0.0 # Only 5% sparsity runs (cleanest data)
-        max_sparsity: 0.10
+        min_sparsity: 0.0 # Captures 0.05, 0.20 (2 runs)
+        max_sparsity: 0.25
 
       # Phase 1: Add light noise + mix with real data
       - start_epoch: 3
         end_epoch: 7
         synth_ratio: 0.8 # 80% synthetic, 20% real
         mode: "time_major"
-        min_sparsity: 0.0 # 5% + 20% sparsity
-        max_sparsity: 0.25
+        min_sparsity: 0.0 # Captures 0.05, 0.20, 0.40 (3 runs)
+        max_sparsity: 0.45
 
       # Phase 2: Medium noise, balance synthetic/real
       - start_epoch: 7
         end_epoch: 12
         synth_ratio: 0.5 # 50% synthetic, 50% real
         mode: "time_major"
-        min_sparsity: 0.15 # 20% + 40% sparsity
-        max_sparsity: 0.50
+        min_sparsity: 0.15 # Captures 0.20, 0.40, 0.60, 0.80 (4 runs)
+        max_sparsity: 0.85
 
       # Phase 3: High noise (approach real-world conditions)
       - start_epoch: 12
         end_epoch: 20
         synth_ratio: 0.2 # 20% synthetic, 80% real
         mode: "time_major"
-        min_sparsity: 0.50 # 60% + 80% sparsity
+        min_sparsity: 0.35 # Captures 0.40, 0.60, 0.80 (3 runs)
         max_sparsity: 1.0
 
   profiler:

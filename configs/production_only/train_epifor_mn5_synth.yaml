@@ -54,15 +54,15 @@ training:
   early_stopping_patience: 5
   nan_loss_patience: 5
   epochs: 10
-  learning_rate: 0.001
+  learning_rate: 0.0005
   weight_decay: 1.0e-05
   pin_memory: true
   # Worker configuration: treat total workers as shared budget across loaders
   # With 3 loaders (train/val/test), num_workers applies to each unless overridden
-  num_workers: 12      # Training workers - main bottleneck
+  num_workers: 16      # Training workers - increased from 12 after memory analysis
   val_workers: 4       # Validation workers - runs periodically
   test_workers: 0      # Test workers - runs once at end, no prefetching needed
-  prefetch_factor: 4   # Batches to prefetch per worker
+  prefetch_factor: 4   # Batches to prefetch per worker (kept at 4)
 
   # Temporal split configuration
   # for synthetic, there is no real horizon so we should split by node to train on the whole series
