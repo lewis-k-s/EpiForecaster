@@ -315,7 +315,12 @@ def main() -> None:
     args = parser.parse_args()
 
     config = EpiForecasterConfig.from_file(str(args.config))
-    dataset = EpiDataset.load_canonical_dataset(Path(config.data.dataset_path))
+    if not config.data.run_id:
+        raise ValueError("run_id must be specified in config")
+    dataset = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+    )
 
     cases_da = dataset["cases"]
     mobility = resolve_mobility_array(dataset["mobility"])

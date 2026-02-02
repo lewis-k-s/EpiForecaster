@@ -727,7 +727,12 @@ def main() -> None:
     config = EpiForecasterConfig.from_file(str(args.config))
 
     logger.info("Loading dataset from %s", config.data.dataset_path)
-    dataset = EpiDataset.load_canonical_dataset(Path(config.data.dataset_path))
+    if not config.data.run_id:
+        raise ValueError("run_id must be specified in config")
+    dataset = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+    )
 
     dates = pd.DatetimeIndex(dataset[TEMPORAL_COORD].values)
     logger.info(

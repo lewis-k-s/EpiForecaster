@@ -617,7 +617,12 @@ def main() -> None:
 
     # Load config and dataset
     config = EpiForecasterConfig.from_file(str(args.config))
-    dataset = EpiDataset.load_canonical_dataset(Path(config.data.dataset_path))
+    if not config.data.run_id:
+        raise ValueError("run_id must be specified in config")
+    dataset = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+    )
 
     logger.info("Loaded dataset: %s", dataset)
 
