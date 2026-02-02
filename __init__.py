@@ -9,7 +9,14 @@ __version__ = "0.1.0"
 __author__ = "Lewis Knox"
 __description__ = "Graph Neural Network for Mobility-Based Epidemiological Forecasting"
 
-# Make main modules easily accessible
-from . import data, graph, models, plotting
+# Import with absolute imports to avoid issues when run directly
+# These will be available when the package is properly installed
 
-__all__ = ["data", "graph", "models", "plotting"]
+try:
+    from models import sir_rollforward
+    from models.sir_rollforward import SIRRollForward
+
+    __all__ = ["sir_rollforward", "SIRRollForward"]
+except ImportError:
+    # When run directly without package installation
+    __all__ = []
