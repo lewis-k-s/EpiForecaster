@@ -56,6 +56,7 @@ Tests are organized with markers for selective execution:
 - `@pytest.mark.epiforecaster`: Tests related to the main epidemiological forecaster model
 
 Usage:
+
 ```bash
 # Run only region tests
 uv run pytest -m region -v
@@ -102,3 +103,7 @@ The canonical data pipeline follows: raw data → preprocessing → Zarr dataset
 - This project is a work in progress. It is ok to make breaking changes as the interface evolves.
 - Use configuration-driven development: copy and modify templates from the `configs/` directory rather than hardcoding parameters.
 - **Zarr Data Access**: Always use `xarray.open_zarr()` instead of `zarr.open()` for inspecting or loading zarr datasets. Xarray provides labeled dimensions, coordinates, and better integration with the data pipeline.
+
+## Remote run advice
+
+@PROD_RUN.md

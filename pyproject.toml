@@ -86,6 +86,8 @@ perf-analyze = "scripts.analyze_trace:main"
 step-breakdown = "scripts.breakdown_step:main"
 gradnorm-analyze = "scripts.analyze_gradnorm:main"
 dead-code-analyze = "scripts.dead_code_analyze:main"
+remote-train = "scripts.remote_train:main"
+remote-preprocess = "scripts.remote_preprocess:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]

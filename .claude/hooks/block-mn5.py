@@ -18,6 +18,10 @@ _BLOCKED_PATTERNS = [
 
 def _check_blocked(command: str) -> str | None:
     """Check if command matches blocked patterns. Returns error message if blocked."""
+    # Allow remote-train and remote-preprocess - they submit to cluster, don't run locally
+    if re.search(r"remote-(train|preprocess)\s+|remote_(train|preprocess)\.py", command):
+        return None
+
     # Only block actual training/preprocessing commands (python/uv run)
     # Allow git, editor, and other safe operations on these files
     training_prefixes = [
