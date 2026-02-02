@@ -70,3 +70,7 @@ Thumbs.db
 
 # agents
 .claude/
+
+# No leaking cluster details
+docs/marenostrum5_hardware.md
+PROD_RUN.md

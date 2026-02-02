@@ -335,7 +335,7 @@ class TrainingParams:
     model_id: str = ""
     resume: bool = False
     scheduler_type: str = "cosine"
-    gradient_clip_value: float = 1.0
+    gradient_clip_value: float = 2.0
     early_stopping_patience: int = 10
     nan_loss_patience: int | None = None
     val_split: float = 0.2

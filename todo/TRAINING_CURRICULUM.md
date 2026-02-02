@@ -170,6 +170,8 @@ Since we use complex temporal graphs, we manually batch the PyG objects.
 
 This keeps the model interface unchanged even when curriculum is enabled.
 Batch ordering handles real/synthetic mixing; we do not mix within a batch.
+We intentionally avoid a List[Batch] curriculum path so the model always
+expects a single flattened PyG Batch for mobility.
 
 ### Imported Risk Note (Dense Mobility Only)
 
