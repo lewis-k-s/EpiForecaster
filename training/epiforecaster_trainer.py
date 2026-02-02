@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import xarray as xr
 import yaml
 from torch.profiler import (
     ProfilerActivity,
@@ -27,7 +28,6 @@ from torch.profiler import (
 )
 from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch_geometric.data import Batch  # type: ignore[import-not-found]
 
 from data.epi_dataset import (
     EpiDataset,
@@ -382,6 +382,10 @@ class EpiForecasterTrainer:
         }
         self._model_graph_logged = False
         self._last_node_mae: dict[int, float] = {}
+        # Curriculum phase tracking for LR warmup at transitions
+        self._last_curriculum_phase_idx: int | None = None
+        self._lr_warmup_remaining: int = 0
+        self._lr_warmup_target_lr: float = 0.0  # Target LR to restore after warmup
 
         self._status("=" * 60)
         self._status("EpiForecasterTrainer initialized:")
@@ -472,12 +476,123 @@ class EpiForecasterTrainer:
                     self.config.data.real_dataset_path = str(staged_real)
                     logger.info(f"Using staged real dataset: {staged_real}")
 
+    def _load_sparsity_mapping(self) -> dict[str, float]:
+        """Load run_id -> sparsity mapping from raw zarr dataset.
+
+        Reads the synthetic_sparsity_level variable once at initialization.
+        Returns dict mapping run_id string to sparsity float (0.0-1.0).
+
+        Returns:
+            Dictionary mapping run_id strings to sparsity values.
+            Returns empty dict if dataset is unavailable or variable is missing.
+        """
+        raw_dataset_path = self.config.training.curriculum.raw_dataset_path
+        if not raw_dataset_path:
+            return {}
+
+        try:
+            ds = xr.open_zarr(str(raw_dataset_path), zarr_format=2)
+            if "synthetic_sparsity_level" not in ds:
+                logger.warning(
+                    f"Variable 'synthetic_sparsity_level' not found in {raw_dataset_path}. "
+                    "Sparsity-based run selection will be disabled."
+                )
+                ds.close()
+                return {}
+
+            run_ids = ds["run_id"].values
+            sparsity = ds["synthetic_sparsity_level"].values
+
+            mapping = {
+                str(run_id).strip(): float(spars)
+                for run_id, spars in zip(run_ids, sparsity)
+            }
+            ds.close()
+            logger.info(
+                f"Loaded sparsity mapping for {len(mapping)} runs from {raw_dataset_path}"
+            )
+            return mapping
+        except Exception as e:
+            logger.warning(
+                f"Failed to load sparsity mapping from {raw_dataset_path}: {e}. "
+                "Sparsity-based run selection will be disabled."
+            )
+            return {}
+
+    def _select_runs_for_curriculum(
+        self,
+        synth_runs: list[str],
+        sparsity_map: dict[str, float],
+        max_runs: int = 5,
+    ) -> list[str]:
+        """Select synthetic runs to maximize sparsity diversity for curriculum training.
+
+        First selects one run from each sparsity bucket (0.05, 0.20, 0.40, 0.60, 0.80)
+        to ensure coverage across all curriculum phases. Then fills remaining slots
+        randomly from available runs. Falls back to random selection if sparsity data
+        unavailable.
+
+        Args:
+            synth_runs: List of available synthetic run IDs
+            sparsity_map: Mapping from run_id to sparsity value
+            max_runs: Maximum number of runs to return (memory limit)
+
+        Returns:
+            Selected list of run IDs
+        """
+        if not sparsity_map:
+            logger.info("No sparsity map available, using random selection")
+            import random
+
+            return synth_runs[:max_runs]
+
+        target_sparsities = [0.05, 0.20, 0.40, 0.60, 0.80]
+        selected = []
+
+        # Phase 1: Select one run from each sparsity bucket
+        for target in target_sparsities:
+            if len(selected) >= max_runs:
+                break
+
+            candidates = [
+                (run_id, sparsity_map[run_id])
+                for run_id in synth_runs
+                if run_id not in selected
+                and abs(sparsity_map.get(run_id, -1.0) - target) < 0.01
+            ]
+
+            if candidates:
+                # Pick the run closest to target sparsity
+                best_match = min(candidates, key=lambda x: abs(x[1] - target))
+                selected.append(best_match[0])
+                logger.info(
+                    f"Selected run '{best_match[0]}' with sparsity {best_match[1]:.2f} "
+                    f"for target sparsity {target:.2f}"
+                )
+
+        # Phase 2: Fill remaining slots randomly from available runs
+        if len(selected) < min(max_runs, len(synth_runs)):
+            remaining_needed = min(max_runs, len(synth_runs)) - len(selected)
+            available = [r for r in synth_runs if r not in selected]
+
+            if available:
+                logger.info(
+                    f"Adding {remaining_needed} random runs to fill quota (have {len(selected)})"
+                )
+                import random
+
+                remaining = random.sample(
+                    available, min(remaining_needed, len(available))
+                )
+                selected.extend(remaining)
+
+        return selected
+
     def _discover_runs(self) -> tuple[str, list[str]]:
         """Discover available runs in the dataset (real vs synthetic)."""
         real_run = "real"  # User mandate: always "real"
         synth_runs = []
 
-        # Discover Synth Runs from Main Dataset
         ds_path = Path(self.config.data.dataset_path)
         if not ds_path.exists():
             logger.warning(f"Dataset path not found: {ds_path}")
@@ -485,18 +600,34 @@ class EpiForecasterTrainer:
 
         try:
             all_runs = EpiDataset.discover_available_runs(ds_path)
-            # Synthetic runs are everything in dataset_path except "real"
             synth_runs = [r for r in all_runs if r != real_run]
         except Exception as e:
             logger.warning(f"Failed to discover runs from {ds_path}: {e}")
+            return real_run, []
 
-        # Limit synthetic runs to avoid OOM during preloading (temporary for dev/testing)
-        # In production, we might need a lazier EpiDataset or fewer runs.
-        if len(synth_runs) > 5:
+        max_runs = 5
+
+        if self.config.training.curriculum.enabled and len(synth_runs) > max_runs:
+            sparsity_map = self._load_sparsity_mapping()
+
+            if sparsity_map:
+                logger.info(
+                    f"Curriculum mode: selecting {max_runs} runs for sparsity diversity "
+                    f"from {len(synth_runs)} available runs"
+                )
+                synth_runs = self._select_runs_for_curriculum(
+                    synth_runs, sparsity_map, max_runs
+                )
+            else:
+                logger.warning(
+                    f"Limiting synthetic runs from {len(synth_runs)} to {max_runs} for memory safety."
+                )
+                synth_runs = synth_runs[:max_runs]
+        elif len(synth_runs) > max_runs:
             logger.warning(
-                f"Limiting synthetic runs from {len(synth_runs)} to 5 for memory safety."
+                f"Limiting synthetic runs from {len(synth_runs)} to {max_runs} for memory safety."
             )
-            synth_runs = synth_runs[:5]
+            synth_runs = synth_runs[:max_runs]
 
         return real_run, synth_runs
 
@@ -630,7 +761,10 @@ class EpiForecasterTrainer:
             candidates = [(run_id, resolve_sparsity(run_id)) for run_id in synth_runs]
             candidates = [c for c in candidates if c[1] is not None]
             if candidates:
-                selected_run, selected_sparsity = max(candidates, key=lambda x: x[1])
+                # FIX: Select LOWEST sparsity (cleanest data) for scaler fitting
+                # Previously used max() which selected noisiest data, causing spikes
+                # when curriculum progressed to cleaner sparsity levels
+                selected_run, selected_sparsity = min(candidates, key=lambda x: x[1])
                 logger.info(
                     "Synthetic scalers fitted on run '%s' (sparsity=%.3f).",
                     selected_run,
@@ -889,7 +1023,6 @@ class EpiForecasterTrainer:
     @staticmethod
     def _collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
         "Custom collate for per-node samples with PyG mobility graphs."
-        import itertools
 
         B = len(batch)
         case_node = torch.stack([item["case_node"] for item in batch], dim=0)
@@ -1242,6 +1375,33 @@ class EpiForecasterTrainer:
     def _status(self, message: str, level: int = logging.INFO) -> None:
         logging.log(level, message)
 
+    def _detect_curriculum_transition(self) -> bool:
+        """Detect if we just transitioned to a new curriculum phase.
+
+        Returns True if the current curriculum phase index differs from the previous
+        epoch's phase. Used to trigger LR warmup after sparsity/synth_ratio changes.
+        """
+        if self.curriculum_sampler is None:
+            return False
+        if not hasattr(self.curriculum_sampler, "config"):
+            return False
+
+        current_idx = None
+        for i, phase in enumerate(self.curriculum_sampler.config.schedule):
+            if phase.start_epoch <= self.current_epoch < phase.end_epoch:
+                current_idx = i
+                break
+
+        if current_idx is None:
+            return False
+
+        transition = (
+            self._last_curriculum_phase_idx is not None
+            and current_idx != self._last_curriculum_phase_idx
+        )
+        self._last_curriculum_phase_idx = current_idx
+        return transition
+
     def _train_epoch(self) -> float:
         """Train for one epoch."""
         self.model.train()
@@ -1249,6 +1409,21 @@ class EpiForecasterTrainer:
         # Update Curriculum
         if self.curriculum_sampler is not None:
             self.curriculum_sampler.set_curriculum(self.current_epoch)
+            # Apply LR warmup after curriculum phase transitions to reduce
+            # gradient explosions from sudden sparsity/synth_ratio changes
+            if self._detect_curriculum_transition():
+                # Save current LR (which may have been decayed by scheduler)
+                # before reducing it, so we can restore to the correct value
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                self._lr_warmup_target_lr = current_lr
+
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] *= 0.5
+                self._lr_warmup_remaining = 100
+                self._status(
+                    f"Curriculum phase transition - LR warmup: {current_lr:.2e} -> {current_lr * 0.5:.2e} (will restore to {current_lr:.2e})",
+                    logging.INFO,
+                )
 
         total_loss = 0.0
         _num_batches = len(self.train_loader)
@@ -1338,6 +1513,19 @@ class EpiForecasterTrainer:
                     last_gradnorm = grad_norm  # Update for progress logging
                     self.optimizer.step()
 
+                    # LR warmup restore: after curriculum transition, gradually
+                    # restore learning rate over 100 steps
+                    if self._lr_warmup_remaining > 0:
+                        self._lr_warmup_remaining -= 1
+                        if self._lr_warmup_remaining == 0:
+                            # Restore to the LR we saved before reducing
+                            for param_group in self.optimizer.param_groups:
+                                param_group["lr"] = self._lr_warmup_target_lr
+                            self._status(
+                                f"LR warmup complete - restored to {self._lr_warmup_target_lr:.2e}",
+                                logging.INFO,
+                            )
+
                     # Per-step scheduler update (e.g., for CosineAnnealingLR)
                     if (
                         self.scheduler
@@ -1384,6 +1572,19 @@ class EpiForecasterTrainer:
                 self.writer.add_scalar("Time/Batch_s", batch_time_s, self.global_step)
                 self.writer.add_scalar("Time/DataLoad_s", data_time_s, self.global_step)
                 self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
+
+                # Log curriculum metrics for loss-curve-critic analysis
+                if (
+                    self.curriculum_sampler is not None
+                    and hasattr(self.curriculum_sampler, "state")
+                ):
+                    self.writer.add_scalar(
+                        "Train/Sparsity",
+                        self.curriculum_sampler.state.max_sparsity or 0.0,
+                        self.global_step,
+                    )
+
+                self.writer.add_scalar("epoch", self.current_epoch, self.global_step)
 
                 self.global_step += 1
 
@@ -1562,6 +1763,22 @@ class EpiForecasterTrainer:
         ):
             self.writer.add_scalar(f"Metrics/{prefix}/MAE_h{idx + 1}", mae_h, epoch)
             self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
+
+        # Log curriculum metrics for loss-curve-critic analysis
+        if (
+            self.curriculum_sampler is not None
+            and hasattr(self.curriculum_sampler, "state")
+        ):
+            self.writer.add_scalar(
+                "Train/Sparsity",
+                self.curriculum_sampler.state.max_sparsity or 0.0,
+                self.current_epoch,
+            )
+            self.writer.add_scalar(
+                "Train/SynthRatio",
+                self.curriculum_sampler.state.synth_ratio,
+                self.current_epoch,
+            )
 
         self._status(
             f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"
