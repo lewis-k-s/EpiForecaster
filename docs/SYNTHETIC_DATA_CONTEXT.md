@@ -58,20 +58,39 @@ These variables represent the "raw" data that would be available in a real-world
 | `edar_biomarker_IP4` | `(run_id, date, edar_id)` | Raw IP4 gene target concentration with log-normal noise (sigma ~0.6) and censoring (LoD = 800) |
 | `edar_biomarker_*_censor_hints` | `(run_id, date, edar_id)` | Censoring flags: 0=observed, 1=censored, 2=missing (optional reference) |
 | `edar_biomarker_*_LoD` | `(run_id, edar_id)` | Limit of Detection values per EDAR (constant across runs) |
-| `mobility_base` | `(origin, target)` | Base mobility matrix (shared across all runs) |
-| `mobility_kappa0` | `(run_id, date)` | Mobility reduction factor per run and date (κ₀) |
+| `mobility_base` | `(origin, target)` | Base mobility matrix (shared across all runs) - factorized format |
+| `mobility_kappa0` | `(run_id, date)` | Mobility reduction factor per run and date (κ₀) - factorized format |
+| `mobility_time_varying` | `(run_id, origin, target, date)` | Full time-varying mobility matrix per run (optional, large format) |
 | `population` | `(run_id, region_id)` | Static population per region |
 
-#### Factorized Mobility Reconstruction
+#### Mobility Storage Formats
 
-Mobility is stored in **factorized format** to avoid OOM errors:
+Mobility data is available in two formats:
 
+**Factorized Format** (memory-efficient, default):
 ```python
 # Reconstruct full mobility matrix for a specific run and date
 mobility_reconstructed = ds["mobility_base"].values * (1 - ds["mobility_kappa0"][run_id, date].values)
 ```
+- **Memory usage**: ~500MB for 100 runs × 100 days × 2850 regions (99.8% reduction)
+- **Recommended for**: Most use cases, large datasets
 
-**Why factorized?** For 100 runs × 100 days × 2850 regions, this reduces memory from ~325GB to ~500MB (99.8% reduction).
+**Time-Varying Format** (optional, direct access):
+```python
+# Access full mobility matrix directly (no reconstruction needed)
+mobility_full = ds["mobility_time_varying"]  # Shape: (run_id, origin, target, date)
+```
+- **Memory usage**: ~19GB for 23 runs × 114 days × 945 regions
+- **Use case**: When direct access is needed without reconstruction overhead
+
+**Check format per run:**
+```python
+# The synthetic_mobility_type variable indicates which format is used
+mobility_type = ds["synthetic_mobility_type"].values
+# Values: "factorized" or "time_varying"
+```
+
+EpiForecaster's `mobility_processor.py` automatically detects and handles both formats.
 
 ### Ground Truth (for Evaluation Only)
 
@@ -143,6 +162,7 @@ Wastewater uses **age-stratified shedding kernels**:
 |----------|-------|-------------|
 | `synthetic_scenario_type` | `(run_id,)` | Scenario type: "Baseline", "Global_Timed", or "Local_Static" |
 | `synthetic_strength` | `(run_id,)` | Intervention strength (0.0 to 1.0) |
+| `synthetic_mobility_type` | `(run_id,)` | Mobility storage format: "factorized" or "time_varying" |
 
 **Scenario Types**:
 - **Baseline**: No intervention (strength = 0.0)
@@ -164,8 +184,9 @@ Wastewater uses **age-stratified shedding kernels**:
 
 ### Factorized Mobility
 
-Mobility is stored as two separate components:
+Mobility is stored in two possible formats:
 
+**Factorized Format** (memory-efficient):
 ```python
 # Base OD matrix (shared across all runs)
 mobility_base = ds["mobility_base"]  # (origin, target)
@@ -176,6 +197,19 @@ mobility_kappa0 = ds["mobility_kappa0"]  # (run_id, date)
 # Reconstruct for specific run and date
 kappa0_value = ds["mobility_kappa0"].isel(run_id=0, date=10).values
 mobility_at_date = ds["mobility_base"].values * (1 - kappa0_value)
+```
+
+**Time-Varying Format** (direct access):
+```python
+# Full mobility matrix (no reconstruction needed)
+mobility_full = ds["mobility_time_varying"]  # (run_id, origin, target, date)
+mobility_at_date = mobility_full.isel(run_id=0, date=10).values
+```
+
+Check which format a run uses:
+```python
+mobility_type = ds["synthetic_mobility_type"].isel(run_id=0).values
+# Returns: "factorized" or "time_varying"
 ```
 
 ### NaN Conventions
@@ -217,7 +251,8 @@ This creates realistic "school signatures" (residential areas) vs. "workforce si
 The dataset uses:
 - **Chunking**: Variables are chunked for efficient partial access (default: 256)
 - **Compression**: Zstd compression (level 3) by default
-- **Factorized mobility**: Reduces memory by 99.8%
+- **Factorized mobility**: Reduces memory by 99.8% (~325GB → ~500MB)
+- **Time-varying mobility**: Full format available when direct access is needed (~19GB for 23 runs)
 
 ## Usage Examples
 
@@ -245,13 +280,20 @@ cases = ds["cases"]  # Shape: (run_id, date, region_id)
 # Ground truth infections (for evaluation)
 infections_true = ds["infections_true"]  # Shape: (run_id, region_id, date)
 
-# Mobility reconstruction
+# Mobility - factorized format (memory-efficient)
 base_mobility = ds["mobility_base"].values  # (origin, target)
 kappa0 = ds["mobility_kappa0"]  # (run_id, date)
-
-# Get first run, first date
 kappa0_t0 = kappa0.isel(run_id=0, date=0).values
 mobility_t0 = base_mobility * (1 - kappa0_t0)
+
+# Mobility - time-varying format (direct access)
+if "mobility_time_varying" in ds:
+    mobility_full = ds["mobility_time_varying"]  # (run_id, origin, target, date)
+    mobility_t0 = mobility_full.isel(run_id=0, date=0).values
+
+# Check which mobility format is used
+mobility_type = ds["synthetic_mobility_type"].isel(run_id=0).values
+print(f"Mobility format: {mobility_type}")  # "factorized" or "time_varying"
 ```
 
 ### Separating Training from Evaluation Data
@@ -260,7 +302,12 @@ mobility_t0 = base_mobility * (1 - kappa0_t0)
 # Training data: Raw observations (goes into preprocessing pipeline)
 training_vars = ["cases", "hospitalizations", "deaths",
                  "edar_biomarker_N1", "edar_biomarker_N2", "edar_biomarker_IP4",
-                 "mobility_base", "mobility_kappa0", "population"]
+                 "mobility_base", "mobility_kappa0", "mobility_time_varying",
+                 "population"]
+
+# Note: mobility_time_varying is optional; check if present before using
+if "mobility_time_varying" not in ds:
+    training_vars.remove("mobility_time_varying")
 
 # Evaluation data: Ground truth (for metrics only)
 eval_vars = ["infections_true", "hospitalizations_true", "deaths_true"]
