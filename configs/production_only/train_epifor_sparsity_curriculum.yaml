@@ -72,8 +72,6 @@ training:
     chunk_size: 512
     # How to select runs within sparsity range: "round_robin" or "random"
     run_sampling: "round_robin"
-    # Raw dataset path for sparsity metadata
-    raw_dataset_path: data/files/raw_synthetic_observations.zarr
 
     schedule:
       # Phase 0: Clean synthetic only (learn dynamics without noise)

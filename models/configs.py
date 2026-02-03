@@ -129,8 +129,6 @@ class CurriculumConfig:
     chunk_size: int = 512
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
-    # Path to raw zarr dataset for reading sparsity metadata (optional)
-    raw_dataset_path: str = ""
     # List of phase configs defining the curriculum schedule
     schedule: list[CurriculumPhaseConfig] = field(default_factory=list)
 

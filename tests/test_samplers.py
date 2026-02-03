@@ -1,11 +1,9 @@
 """Tests for curriculum sampler sparsity functionality."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 
-from data.samplers import _load_sparsity_mapping
 from models.configs import CurriculumConfig, CurriculumPhaseConfig
 
 
@@ -82,101 +80,6 @@ class TestCurriculumPhaseConfig:
 
 
 @pytest.mark.epiforecaster
-class TestLoadSparsityMapping:
-    """Tests for _load_sparsity_mapping function."""
-
-    def test_load_sparsity_mapping_success(self):
-        """Test successful loading of sparsity mapping."""
-        # Create mock data arrays
-        run_ids = np.array(["0_Baseline", "1_Global_Timed_s20", "2_Another_s40"])
-        sparsity_levels = np.array([0.05, 0.20, 0.40])
-
-        # Create mock objects for dataset access
-        mock_run_id_var = MagicMock()
-        mock_run_id_var.values = run_ids
-
-        mock_sparsity_var = MagicMock()
-        mock_sparsity_var.values = sparsity_levels
-
-        # Create a mock dataset that returns the mock variables
-        mock_ds = MagicMock()
-        mock_ds.__contains__ = lambda self, key: key == "synthetic_sparsity_level"
-
-        # Use side_effect to properly return values based on key
-        def get_item(key):
-            if key == "run_id":
-                return mock_run_id_var
-            elif key == "synthetic_sparsity_level":
-                return mock_sparsity_var
-            raise KeyError(key)
-
-        mock_ds.__getitem__.side_effect = get_item
-
-        with patch("data.samplers.xr.open_zarr", return_value=mock_ds):
-            mapping = _load_sparsity_mapping("dummy_path.zarr")
-
-        assert mapping == {
-            "0_Baseline": 0.05,
-            "1_Global_Timed_s20": 0.20,
-            "2_Another_s40": 0.40,
-        }
-
-    def test_load_sparsity_missing_variable(self):
-        """Test handling of missing synthetic_sparsity_level variable."""
-        # Create a mock dataset without the sparsity variable
-        mock_ds = MagicMock()
-        mock_ds.__contains__ = lambda self, key: False
-
-        with patch("data.samplers.xr.open_zarr", return_value=mock_ds):
-            mapping = _load_sparsity_mapping("dummy_path.zarr")
-
-        assert mapping == {}
-
-    def test_load_sparsity_exception_handling(self):
-        """Test exception handling when zarr file cannot be opened."""
-        with patch("data.samplers.xr.open_zarr", side_effect=IOError("File not found")):
-            mapping = _load_sparsity_mapping("nonexistent.zarr")
-
-        assert mapping == {}
-
-    def test_load_sparsity_whitespace_stripping(self):
-        """Test that whitespace is stripped from run_id strings."""
-        # Create mock data arrays with whitespace
-        run_ids = np.array(["  0_Baseline  ", "\t1_Global\n", "2_Another"])
-        sparsity_levels = np.array([0.05, 0.20, 0.40])
-
-        # Create mock objects for dataset access
-        mock_run_id_var = MagicMock()
-        mock_run_id_var.values = run_ids
-
-        mock_sparsity_var = MagicMock()
-        mock_sparsity_var.values = sparsity_levels
-
-        # Create a mock dataset that returns the mock variables
-        mock_ds = MagicMock()
-        mock_ds.__contains__ = lambda self, key: key == "synthetic_sparsity_level"
-
-        # Use side_effect to properly return values based on key
-        def get_item(key):
-            if key == "run_id":
-                return mock_run_id_var
-            elif key == "synthetic_sparsity_level":
-                return mock_sparsity_var
-            raise KeyError(key)
-
-        mock_ds.__getitem__.side_effect = get_item
-
-        with patch("data.samplers.xr.open_zarr", return_value=mock_ds):
-            mapping = _load_sparsity_mapping("dummy_path.zarr")
-
-        assert mapping == {
-            "0_Baseline": 0.05,
-            "1_Global": 0.20,
-            "2_Another": 0.40,
-        }
-
-
-@pytest.mark.epiforecaster
 class TestSparsityFiltering:
     """Tests for sparsity filtering logic in EpidemicCurriculumSampler."""
 
@@ -197,13 +100,11 @@ class TestSparsityFiltering:
             chunk_size=512,
         )
 
-        with patch("data.samplers._load_sparsity_mapping", return_value={}):
-            sampler = EpidemicCurriculumSampler(
-                dataset=mock_dataset,
-                batch_size=16,
-                config=config,
-                raw_dataset_path=None,
-            )
+        sampler = EpidemicCurriculumSampler(
+            dataset=mock_dataset,
+            batch_size=16,
+            config=config,
+        )
 
         # Manually set up sparsity data
         sampler._dataset_sparsity = {
@@ -272,17 +173,7 @@ class TestSparsityFiltering:
 
 @pytest.mark.epiforecaster
 class TestCurriculumConfig:
-    """Tests for CurriculumConfig with raw_dataset_path."""
-
-    def test_raw_dataset_path_default(self):
-        """Test that raw_dataset_path defaults to empty string."""
-        config = CurriculumConfig()
-        assert config.raw_dataset_path == ""
-
-    def test_raw_dataset_path_set(self):
-        """Test setting raw_dataset_path."""
-        config = CurriculumConfig(raw_dataset_path="/path/to/dataset.zarr")
-        assert config.raw_dataset_path == "/path/to/dataset.zarr"
+    """Tests for CurriculumConfig with sparsity curriculum schedule."""
 
     def test_curriculum_config_with_schedule(self):
         """Test CurriculumConfig with schedule including sparsity bounds."""
@@ -290,7 +181,6 @@ class TestCurriculumConfig:
             enabled=True,
             active_runs=2,
             chunk_size=512,
-            raw_dataset_path="data/files/raw_synthetic_observations.zarr",
             schedule=[
                 CurriculumPhaseConfig(
                     start_epoch=0,
@@ -308,7 +198,6 @@ class TestCurriculumConfig:
                 ),
             ],
         )
-        assert config.raw_dataset_path == "data/files/raw_synthetic_observations.zarr"
         assert len(config.schedule) == 2
         assert config.schedule[0].max_sparsity == 0.1
         assert config.schedule[1].min_sparsity == 0.1

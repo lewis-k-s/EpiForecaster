@@ -2,61 +2,13 @@ import logging
 import math
 import random
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterator
 
-import xarray as xr
 from torch.utils.data import BatchSampler, ConcatDataset
 
 from models.configs import CurriculumConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _load_sparsity_mapping(
-    dataset_path: str | Path,
-) -> dict[str, float]:
-    """Load run_id → sparsity mapping from raw zarr dataset.
-
-    Reads the synthetic_sparsity_level variable once at initialization.
-    Returns dict mapping run_id string to sparsity float (0.0-1.0).
-
-    Args:
-        dataset_path: Path to the raw zarr dataset.
-
-    Returns:
-        Dictionary mapping run_id strings to sparsity values.
-        Returns empty dict if dataset is unavailable or variable is missing.
-    """
-    try:
-        ds = xr.open_zarr(str(dataset_path), zarr_format=2)
-        if "synthetic_sparsity_level" not in ds:
-            logger.info(
-                f"Variable 'synthetic_sparsity_level' not found in {dataset_path}. "
-                "Sparsity filtering will be disabled."
-            )
-            ds.close()
-            return {}
-
-        run_ids = ds["run_id"].values
-        sparsity = ds["synthetic_sparsity_level"].values
-
-        # Strip whitespace and build mapping
-        mapping = {
-            str(run_id).strip(): float(spars)
-            for run_id, spars in zip(run_ids, sparsity)
-        }
-        ds.close()
-        logger.info(
-            f"Loaded sparsity mapping for {len(mapping)} runs from {dataset_path}"
-        )
-        return mapping
-    except Exception as e:
-        logger.warning(
-            f"Failed to load sparsity mapping from {dataset_path}: {e}. "
-            "Sparsity filtering will be disabled."
-        )
-        return {}
 
 
 @dataclass
@@ -88,7 +40,6 @@ class EpidemicCurriculumSampler(BatchSampler):
         batch_size: int,
         config: CurriculumConfig,
         drop_last: bool = False,
-        raw_dataset_path: str | Path | None = None,
         real_run_id: str = "real",
     ):
         """
@@ -99,8 +50,6 @@ class EpidemicCurriculumSampler(BatchSampler):
             batch_size: Size of mini-batches.
             config: CurriculumConfig object.
             drop_last: Whether to drop the last incomplete batch.
-            raw_dataset_path: Path to raw zarr dataset for reading sparsity metadata (optional).
-                              If not provided, uses config.raw_dataset_path.
             real_run_id: The run_id that identifies the "real" dataset.
         """
         # We don't call super().__init__ because we override __iter__ completely
@@ -111,19 +60,24 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.drop_last = drop_last
         self.real_run_id = real_run_id.strip()
 
-        # Determine raw dataset path for sparsity metadata
-        self._raw_dataset_path = raw_dataset_path or config.raw_dataset_path or None
-
         self.state = CurriculumState()
-
-        # Load sparsity mapping if path is provided
-        self._run_sparsity_map: dict[str, float] = {}
-        if self._raw_dataset_path:
-            self._run_sparsity_map = _load_sparsity_mapping(self._raw_dataset_path)
 
         # Analyze the ConcatDataset to identify runs
         self._analyze_datasets()
         
+    def _extract_sparsity_from_dataset(self, dataset) -> float | None:
+        """Extract sparsity from EpiDataset's synthetic_sparsity_level variable."""
+        if hasattr(dataset, '_dataset') and 'synthetic_sparsity_level' in dataset._dataset:
+            run_id_str = str(dataset.run_id).strip()
+            sparsity_var = dataset._dataset['synthetic_sparsity_level']
+            if 'run_id' in sparsity_var.dims:
+                try:
+                    matching = sparsity_var.sel(run_id=run_id_str)
+                    return float(matching.values) if matching.size == 1 else None
+                except KeyError:
+                    return None
+        return None
+
     def _analyze_datasets(self):
         """Identify which sub-datasets are real and which are synthetic.
 
@@ -132,7 +86,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         """
         self.real_dataset_indices = []
         self.synth_dataset_indices = []
-        # Map dataset_idx → sparsity level (from pre-loaded mapping)
+        # Map dataset_idx → sparsity level (from processed dataset)
         self._dataset_sparsity: dict[int, float] = {}
 
         if not isinstance(self.dataset, ConcatDataset):
@@ -147,21 +101,6 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.cumulative_sizes = self.dataset.cumulative_sizes
         self.dataset_offsets = [0] + self.cumulative_sizes[:-1]
 
-        # Helper to find sparsity with flexible matching
-        def find_sparsity(run_id_str: str) -> float | None:
-            # 1. Exact match
-            if run_id_str in self._run_sparsity_map:
-                return self._run_sparsity_map[run_id_str]
-            
-            # 2. Try matching without leading index (e.g. "0_Baseline" -> "Baseline")
-            if "_" in run_id_str:
-                suffix = run_id_str.split("_", 1)[1]
-                # Look for any key in map that has the same suffix
-                for k, v in self._run_sparsity_map.items():
-                    if "_" in k and k.split("_", 1)[1] == suffix:
-                        return v
-            return None
-
         for i, ds in enumerate(self.sub_datasets):
             # Check run_id to distinguish real vs synthetic
             # We assume 'real' run_id is "real" or similar
@@ -169,8 +108,8 @@ class EpidemicCurriculumSampler(BatchSampler):
             run_id = getattr(ds, "run_id", "real")
             run_id_str = str(run_id).strip()
 
-            # Look up sparsity from pre-loaded mapping
-            sparsity = find_sparsity(run_id_str)
+            # Extract sparsity directly from the processed dataset
+            sparsity = self._extract_sparsity_from_dataset(ds)
             if sparsity is not None:
                 self._dataset_sparsity[i] = sparsity
 
