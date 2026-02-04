@@ -18,12 +18,13 @@ Args:
 import argparse
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 
 def analyze_synthetic_sparsity(
     zarr_path: str = "data/files/raw_synthetic_observations.zarr",
-) -> dict:
+) -> dict[str, pd.DataFrame]:
     """Analyze sparsity in synthetic data.
 
     Args:
@@ -42,10 +43,10 @@ def analyze_synthetic_sparsity(
 
     results = {
         "path": zarr_path,
-        "dimensions": dict(ds.dims),
-        "num_runs": ds.dims["run_id"],
-        "num_dates": ds.dims["date"],
-        "num_regions": ds.dims["region_id"],
+        "dimensions": dict(ds.sizes),
+        "num_runs": ds.sizes["run_id"],
+        "num_dates": ds.sizes["date"],
+        "num_regions": ds.sizes["region_id"],
     }
 
     print(f"Dataset: {zarr_path}")
@@ -101,19 +102,28 @@ def analyze_synthetic_sparsity(
         "max": float(run_sparsity.max()),
     }
 
-    print("PER-RUN SPARSITY DISTRIBUTION")
-    print(f"  Mean: {run_sparsity.mean():.2f}%")
-    print(f"  Std dev: {run_sparsity.std():.2f}%")
-    print(f"  Range: [{run_sparsity.min():.2f}%, {run_sparsity.max():.2f}%]")
+    # Per-run sparsity table
+    run_sparsity_df = pd.DataFrame({
+        "run_id": ds["run_id"].values,
+        "sparsity_meta": sparsity_meta,
+        "actual_sparsity_pct": run_sparsity,
+    })
+    print("PER-RUN SPARSITY:")
+    print(run_sparsity_df.to_string(index=False))
     print()
 
     # Sparsity distribution bins
     bins = [0, 5, 10, 20, 30, 50, 100]
-    print("SPARSITY DISTRIBUTION ACROSS RUNS:")
-    for i in range(len(bins) - 1):
-        count = np.sum((run_sparsity >= bins[i]) & (run_sparsity < bins[i + 1]))
-        pct = 100 * count / len(run_sparsity)
-        print(f"  [{bins[i]:3d}%, {bins[i+1]:3d}%): {count:3d} runs ({pct:5.1f}%)")
+    sparsity_bins_df = pd.DataFrame({
+        "min_pct": bins[:-1],
+        "max_pct": bins[1:],
+        "run_count": [np.sum((run_sparsity >= bins[i]) & (run_sparsity < bins[i + 1]))
+                      for i in range(len(bins) - 1)],
+        "run_pct": [100 * np.sum((run_sparsity >= bins[i]) & (run_sparsity < bins[i + 1]))
+                    / len(run_sparsity) for i in range(len(bins) - 1)]
+    })
+    print("SPARSITY DISTRIBUTION:")
+    print(sparsity_bins_df.to_string(index=False))
     print()
 
     # Per-region sparsity
@@ -132,11 +142,13 @@ def analyze_synthetic_sparsity(
         "max": float(region_sparsity.max()),
     }
 
-    print("PER-REGION SPARSITY STATISTICS")
-    print(f"  Mean: {region_sparsity.mean():.2f}%")
-    print(f"  Median: {np.median(region_sparsity):.2f}%")
-    print(f"  Std: {region_sparsity.std():.2f}%")
-    print(f"  Range: [{region_sparsity.min():.2f}%, {region_sparsity.max():.2f}%]")
+    # Per-region sparsity table
+    region_sparsity_df = pd.DataFrame({
+        "region_id": np.arange(cases.shape[2]),
+        "sparsity_pct": region_sparsity,
+    })
+    print("PER-REGION SPARSITY:")
+    print(region_sparsity_df.to_string(index=False))
     print()
 
     # High sparsity regions
@@ -189,20 +201,17 @@ def analyze_synthetic_sparsity(
     sparsity_gap = real_sparsity_mean - actual_sparsity
     sparsity_ratio = real_sparsity_mean / actual_sparsity if actual_sparsity > 0 else float("inf")
 
-    print(f"{'Metric':<35} {'Synthetic':>15} {'Real':>15} {'Gap':>15}")
-    print("-" * 80)
-    print(
-        f"{'Mean sparsity %':<35} {actual_sparsity:>14.2f}% {real_sparsity_mean:>14.2f}% {sparsity_gap:>+14.2f}%"
-    )
-    print(
-        f"{'Sparsity ratio (real/synth)':<35} {sparsity_ratio:>15.1f}x"
-    )
-    print(
-        f"{'Regions with >10% sparsity':<35} {high_sparsity_pct:>14.1f}% {real_high_sparsity_pct:>14.1f}% N/A"
-    )
-    print(
-        f"{'Fresh data (0-1 days LOCF)':<35} {'~99.9%':>15} {real_fresh_locf_pct:>14.1f}% N/A"
-    )
+    # Comparison table
+    comparison_df = pd.DataFrame({
+        "metric": ["Mean sparsity %", "Sparsity ratio (real/synth)",
+                   "Regions with >10% sparsity", "Fresh data (0-1 days LOCF)"],
+        "synthetic": [f"{actual_sparsity:.2f}%", f"{sparsity_ratio:.1f}x",
+                      f"{high_sparsity_pct:.1f}%", "~99.9%"],
+        "real": [f"{real_sparsity_mean:.2f}%", "",
+                 f"{real_high_sparsity_pct:.1f}%", f"{real_fresh_locf_pct:.1f}%"],
+    })
+    print("COMPARISON WITH REAL DATA:")
+    print(comparison_df.to_string(index=False))
     print()
 
     # Recommendations
@@ -255,7 +264,12 @@ def analyze_synthetic_sparsity(
     print(f"Gap to real data: {sparsity_gap:.1f}% (need {sparsity_ratio:.1f}x increase)")
     print()
 
-    return results
+    return {
+        "run_sparsity": run_sparsity_df,
+        "region_sparsity": region_sparsity_df,
+        "sparsity_bins": sparsity_bins_df,
+        "comparison": comparison_df,
+    }
 
 
 if __name__ == "__main__":
