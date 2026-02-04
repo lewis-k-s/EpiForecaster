@@ -1,9 +1,22 @@
 # Cases-only preprocessing configuration for Catalan COVID-19 epidemiological data
 # Base model configuration: cases only (no wastewater, no mobility)
 
-# Data source paths - cases only
+# Data source paths - all available sources enabled
 data_dir: "data/files"
+
+# Cases data source - TOGGLE: Comment out one, enable the other
+# Option 1: Flowmaps cases (original source)
 cases_file: "data/files/flowmaps_cat_municipio_cases.csv"
+# Option 2: Official Catalonia cases (alternative source)
+# catalonia_cases_file: "data/files/Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv"
+
+# Deaths data (pre-aggregated municipality-level)
+deaths_file: "data/files/deaths_municipality.csv"
+
+# Hospitalizations data (pre-aggregated municipality-level)
+hospitalizations_file: "data/files/hospitalizations_municipality.csv"
+
+# Other data sources
 wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
 region_metadata_file: "data/files/edar_muni_edges.nc"
 population_file: "data/files/fl_population_por_municipis.csv"
