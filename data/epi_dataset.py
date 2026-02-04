@@ -344,6 +344,14 @@ class EpiDataset(Dataset):
         # Must be done after _temporal_coords is set but before dataset is closed
         self._precomputed_k_hop_masks = self._precompute_k_hop_masks()
 
+        # Extract sparsity level once during initialization (before dataset is closed)
+        # Dataset is already filtered to a single run, so synthetic_sparsity_level is a scalar
+        # Use .values to handle dask arrays (chunked loading)
+        if "synthetic_sparsity_level" in self._dataset:
+            self.sparsity_level = float(self._dataset["synthetic_sparsity_level"].values.item())
+        else:
+            self.sparsity_level = None
+
         # Get run_id once and store as scalar
         try:
             run_id_val = self._dataset.mobility.run_id.item()

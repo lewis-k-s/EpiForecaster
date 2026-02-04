@@ -64,19 +64,6 @@ class EpidemicCurriculumSampler(BatchSampler):
 
         # Analyze the ConcatDataset to identify runs
         self._analyze_datasets()
-        
-    def _extract_sparsity_from_dataset(self, dataset) -> float | None:
-        """Extract sparsity from EpiDataset's synthetic_sparsity_level variable."""
-        if hasattr(dataset, '_dataset') and 'synthetic_sparsity_level' in dataset._dataset:
-            run_id_str = str(dataset.run_id).strip()
-            sparsity_var = dataset._dataset['synthetic_sparsity_level']
-            if 'run_id' in sparsity_var.dims:
-                try:
-                    matching = sparsity_var.sel(run_id=run_id_str)
-                    return float(matching.values) if matching.size == 1 else None
-                except KeyError:
-                    return None
-        return None
 
     def _analyze_datasets(self):
         """Identify which sub-datasets are real and which are synthetic.
@@ -108,10 +95,9 @@ class EpidemicCurriculumSampler(BatchSampler):
             run_id = getattr(ds, "run_id", "real")
             run_id_str = str(run_id).strip()
 
-            # Extract sparsity directly from the processed dataset
-            sparsity = self._extract_sparsity_from_dataset(ds)
-            if sparsity is not None:
-                self._dataset_sparsity[i] = sparsity
+            # Extract sparsity from dataset's precomputed sparsity_level attribute
+            if hasattr(ds, 'sparsity_level') and ds.sparsity_level is not None:
+                self._dataset_sparsity[i] = ds.sparsity_level
 
             logger.info(
                 f"Sampler Dataset {i}: run_id='{run_id}', "
