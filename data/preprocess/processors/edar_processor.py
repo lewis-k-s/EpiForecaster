@@ -789,7 +789,7 @@ class EDARProcessor:
         df = df.set_index("date")
         df = (
             df.groupby(["edar_id", "variant"])
-            .resample("D")
+            .resample("D", include_groups=False)
             .sum(numeric_only=True)
             .reset_index()
         )
