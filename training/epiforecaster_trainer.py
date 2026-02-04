@@ -477,24 +477,28 @@ class EpiForecasterTrainer:
                     logger.info(f"Using staged real dataset: {staged_real}")
 
     def _load_sparsity_mapping(self) -> dict[str, float]:
-        """Load run_id -> sparsity mapping from raw zarr dataset.
+        """Load run_id -> sparsity mapping from processed zarr dataset.
 
-        Reads the synthetic_sparsity_level variable once at initialization.
+        Reads the synthetic_sparsity_level variable from the processed dataset.
         Returns dict mapping run_id string to sparsity float (0.0-1.0).
 
         Returns:
             Dictionary mapping run_id strings to sparsity values.
             Returns empty dict if dataset is unavailable or variable is missing.
         """
-        raw_dataset_path = self.config.training.curriculum.raw_dataset_path
-        if not raw_dataset_path:
+        dataset_path = Path(self.config.data.dataset_path)
+        if not dataset_path.exists():
+            logger.warning(
+                f"Processed dataset not found at {dataset_path}. "
+                "Sparsity-based run selection will be disabled."
+            )
             return {}
 
         try:
-            ds = xr.open_zarr(str(raw_dataset_path), zarr_format=2)
+            ds = xr.open_zarr(str(dataset_path), chunks=None)
             if "synthetic_sparsity_level" not in ds:
                 logger.warning(
-                    f"Variable 'synthetic_sparsity_level' not found in {raw_dataset_path}. "
+                    f"Variable 'synthetic_sparsity_level' not found in {dataset_path}. "
                     "Sparsity-based run selection will be disabled."
                 )
                 ds.close()
@@ -509,12 +513,12 @@ class EpiForecasterTrainer:
             }
             ds.close()
             logger.info(
-                f"Loaded sparsity mapping for {len(mapping)} runs from {raw_dataset_path}"
+                f"Loaded sparsity mapping for {len(mapping)} runs from {dataset_path}"
             )
             return mapping
         except Exception as e:
             logger.warning(
-                f"Failed to load sparsity mapping from {raw_dataset_path}: {e}. "
+                f"Failed to load sparsity mapping from {dataset_path}: {e}. "
                 "Sparsity-based run selection will be disabled."
             )
             return {}
@@ -742,12 +746,8 @@ class EpiForecasterTrainer:
         if not synth_runs:
             raise ValueError("No synthetic runs available for scaler fitting.")
 
-        raw_path = self.config.training.curriculum.raw_dataset_path
-        if raw_path:
-            from data.samplers import _load_sparsity_mapping
-
-            mapping = _load_sparsity_mapping(raw_path)
-
+        mapping = self._load_sparsity_mapping()
+        if mapping:
             def resolve_sparsity(run_id: str) -> float | None:
                 if run_id in mapping:
                     return mapping[run_id]
@@ -759,12 +759,12 @@ class EpiForecasterTrainer:
                 return None
 
             candidates = [(run_id, resolve_sparsity(run_id)) for run_id in synth_runs]
-            candidates = [c for c in candidates if c[1] is not None]
+            candidates = [(run_id, sparsity) for run_id, sparsity in candidates if sparsity is not None]
             if candidates:
                 # FIX: Select LOWEST sparsity (cleanest data) for scaler fitting
                 # Previously used max() which selected noisiest data, causing spikes
                 # when curriculum progressed to cleaner sparsity levels
-                selected_run, selected_sparsity = min(candidates, key=lambda x: x[1])
+                selected_run, selected_sparsity = min(candidates, key=lambda x: x[1])  # type: ignore[arg-type]
                 logger.info(
                     "Synthetic scalers fitted on run '%s' (sparsity=%.3f).",
                     selected_run,
