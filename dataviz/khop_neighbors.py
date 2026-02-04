@@ -14,6 +14,8 @@ import torch
 import xarray as xr
 from torch_geometric.utils import k_hop_subgraph
 
+from utils.plotting import FigureSizes
+
 # Optional dependencies with graceful fallbacks
 try:
     import networkx as nx
@@ -319,7 +321,7 @@ class KHopVisualizer:
         df = self.analyzer.analyze_receptive_field(max_k, sample_nodes)
 
         # Create figure
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(2, 2, figsize=FigureSizes.MULTI_PANEL)
 
         # Plot 1: Average number of neighbors vs k
         ax = axes[0, 0]
@@ -416,7 +418,7 @@ class KHopVisualizer:
             stats.append(stat)
 
         # Create figure
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(2, 2, figsize=FigureSizes.MULTI_PANEL)
 
         # Plot 1: Recommended batch sizes for different k values
         ax = axes[0, 0]

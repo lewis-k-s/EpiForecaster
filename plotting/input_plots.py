@@ -10,6 +10,8 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader
 
+from utils.plotting import Colors, FigureSizes
+
 
 def _split_biomarker_channels(
     biomarkers: torch.Tensor,
@@ -207,15 +209,15 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
     sns.set_theme(style="whitegrid")
     n = len(samples)
     fig, axes = plt.subplots(
-        nrows=n, ncols=1, figsize=(12, max(2.5 * n, 3.0)), sharex=True
+        nrows=n, ncols=1, figsize=(FigureSizes.TIME_SERIES[0], max(2.5 * n, 3.0)), sharex=True
     )
     if n == 1:
         axes = [axes]
 
     colors = {
-        "Cases": "#1f77b4",
-        "Biomarkers": "#ff7f0e",
-        "Incoming mobility": "#2ca02c",
+        "Cases": Colors.CASES,
+        "Biomarkers": Colors.BIOMARKER,
+        "Incoming mobility": Colors.MOBILITY,
     }
 
     for ax, sample in zip(axes, samples, strict=False):

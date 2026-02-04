@@ -16,7 +16,6 @@ import argparse
 import logging
 from pathlib import Path
 
-import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -28,24 +27,15 @@ if sys_path not in __import__("sys").path:
     __import__("sys").path.append(sys_path)
 
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
+from utils.plotting import (  # noqa: E402
+    Colors,
+    Style,
+    format_date_axis,
+    robust_bounds,
+    save_figure,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _robust_bounds(
-    values: np.ndarray,
-    *,
-    lower: float = 1.0,
-    upper: float = 99.0,
-    positive_only: bool = True,
-) -> tuple[float, float] | None:
-    finite = values[np.isfinite(values)]
-    if positive_only:
-        finite = finite[finite > 0]
-    if finite.size == 0:
-        return None
-    low, high = np.percentile(finite, [lower, upper])
-    return float(low), float(high)
 
 
 def _load_biomarkers(
@@ -123,19 +113,17 @@ def plot_region_series(
         with np.errstate(all="ignore"):
             global_mean = np.nanmean(values_positive, axis=1)
             global_median = np.nanmedian(values_positive, axis=1)
-        ax.plot(dates, global_mean, color="black", linewidth=2, label="Global mean")
+        ax.plot(dates, global_mean, color=Colors.GLOBAL_MEAN, linewidth=2, label="Global mean")
         ax.plot(
-            dates, global_median, color="tab:blue", linewidth=2, label="Global median"
+            dates, global_median, color=Colors.GLOBAL_MEDIAN, linewidth=2, label="Global median"
         )
 
-    bounds = _robust_bounds(values[:, indices])
+    bounds = robust_bounds(values[:, indices], positive_only=True)
     if bounds is not None:
         _, upper = bounds
         ax.set_ylim(bottom=0, top=upper * 1.05)
 
-    locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    format_date_axis(ax)
 
     ax.set_xlabel("Date")
     ax.set_ylabel("log1p biomarker")
@@ -146,9 +134,7 @@ def plot_region_series(
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-    logger.info("Saved time series plot to %s", output_path)
+    save_figure(fig, output_path, dpi=Style.DPI, log_msg="Saved time series plot")
 
 
 def plot_heatmap(
@@ -163,7 +149,7 @@ def plot_heatmap(
     heatmap_df = pd.DataFrame(subset, index=dates, columns=region_ids[indices])
 
     fig, ax = plt.subplots(figsize=(14, 6))
-    bounds = _robust_bounds(subset)
+    bounds = robust_bounds(subset, positive_only=True)
     vmin = 0.0
     vmax = bounds[1] if bounds is not None else None
     sns.heatmap(
@@ -184,9 +170,7 @@ def plot_heatmap(
     ax.set_title(f"Biomarker Heatmap ({variant_label})")
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-    logger.info("Saved heatmap to %s", output_path)
+    save_figure(fig, output_path, dpi=Style.DPI, log_msg="Saved heatmap")
 
 
 def plot_distribution(
@@ -208,9 +192,7 @@ def plot_distribution(
     )
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-    logger.info("Saved distribution plot to %s", output_path)
+    save_figure(fig, output_path, dpi=Style.DPI, log_msg="Saved distribution plot")
 
 
 def compute_summary_statistics(
@@ -413,9 +395,7 @@ def plot_per_region_boxplot(
     ax.legend(handles=legend_elements, loc="lower right")
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved boxplot to %s", output_path)
+    save_figure(fig, output_path, dpi=Style.DPI, log_msg="Saved boxplot")
 
 
 def plot_time_window_zoom(
@@ -465,19 +445,17 @@ def plot_time_window_zoom(
         with np.errstate(all="ignore"):
             zoom_mean = np.nanmean(zoom_positive, axis=1)
             zoom_median = np.nanmedian(zoom_positive, axis=1)
-        ax.plot(zoom_dates, zoom_mean, color="black", linewidth=2.5, label="Mean")
+        ax.plot(zoom_dates, zoom_mean, color=Colors.GLOBAL_MEAN, linewidth=2.5, label="Mean")
         ax.plot(
-            zoom_dates, zoom_median, color="tab:blue", linewidth=2.5, label="Median"
+            zoom_dates, zoom_median, color=Colors.GLOBAL_MEDIAN, linewidth=2.5, label="Median"
         )
 
-    bounds = _robust_bounds(zoom_values)
+    bounds = robust_bounds(zoom_values, positive_only=True)
     if bounds is not None:
         _, upper = bounds
         ax.set_ylim(bottom=0, top=upper * 1.05)
 
-    locator = mdates.AutoDateLocator(minticks=5, maxticks=8)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    format_date_axis(ax)
 
     ax.set_xlabel("Date")
     ax.set_ylabel("log1p biomarker")
@@ -491,9 +469,7 @@ def plot_time_window_zoom(
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
-    logger.info("Saved time window zoom to %s", output_path)
+    save_figure(fig, output_path, dpi=Style.DPI, log_msg="Saved time window zoom")
 
 
 def _select_regions_by_coverage(

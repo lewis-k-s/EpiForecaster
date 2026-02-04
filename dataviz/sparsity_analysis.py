@@ -23,6 +23,7 @@ if sys_path not in __import__("sys").path:
 from data.epi_dataset import EpiDataset  # noqa: E402
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 from models.configs import EpiForecasterConfig  # noqa: E402
+from utils.plotting import Style  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ def plot_choropleth(
     ax.set_axis_off()
 
     plt.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved choropleth map to %s", output_path)
 
@@ -200,7 +201,7 @@ def plot_windowed_sparsity_scatter(
 
     plt.tight_layout()
     output_path = output_dir / "windowed_sparsity_scatter.png"
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved windowed sparsity scatter to %s", output_path)
 
@@ -245,7 +246,7 @@ def plot_sparsity_distribution(
 
     plt.tight_layout()
     output_path = output_dir / "sparsity_distribution.png"
-    fig.savefig(output_path, dpi=200)
+    fig.savefig(output_path, dpi=Style.DPI)
     plt.close(fig)
     logger.info("Saved sparsity distribution plot to %s", output_path)
 
@@ -306,7 +307,7 @@ def plot_sparsity_heatmap(
 
     plt.tight_layout()
     output_path = output_dir / "sparsity_heatmap.png"
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved sparsity heatmap to %s", output_path)
 
@@ -339,7 +340,7 @@ def plot_sparsity_vs_population(
 
     plt.tight_layout()
     output_path = output_dir / "sparsity_vs_population.png"
-    fig.savefig(output_path, dpi=200)
+    fig.savefig(output_path, dpi=Style.DPI)
     plt.close(fig)
     logger.info("Saved sparsity vs population plot to %s", output_path)
 

@@ -30,15 +30,9 @@ sys.path.append(str(Path(__file__).parent.parent))
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from models.configs import EpiForecasterConfig
+from utils.plotting import Style, add_grid, ensure_3d
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_3d(arr: np.ndarray) -> np.ndarray:
-    """Ensure array is 3D (time, region, feature), adding trailing dim if needed."""
-    if arr.ndim == 2:
-        return arr[..., None]
-    return arr
 
 
 def resolve_mobility_array(mobility_da: xr.DataArray | xr.Dataset) -> np.ndarray:
@@ -87,7 +81,7 @@ def compute_valid_window_mask(
 
     other_dims = [d for d in cases_da.dims if d not in (TEMPORAL_COORD, REGION_COORD)]
     cases_da = cases_da.transpose(TEMPORAL_COORD, REGION_COORD, *other_dims)
-    cases_np = _ensure_3d(cases_da.values)
+    cases_np = ensure_3d(cases_da.values)
     if cases_np.ndim != 3:
         raise ValueError(f"Expected cases array with 2 or 3 dims, got {cases_np.shape}")
 
@@ -397,7 +391,7 @@ def plot_scatter_samples(
             f"Window {start}-{end}, Node {target_node}\n"
             f"Slope={row['slope']:.3f}, R²={row['r2']:.3f}, N={row['n_neighbors']}"
         )
-        ax.grid(True, alpha=0.3)
+        add_grid(ax, alpha=Style.GRID_ALPHA)
 
     plt.suptitle("Neighborhood vs Global Trends: Sample Windows", fontsize=14)
     plt.tight_layout()
