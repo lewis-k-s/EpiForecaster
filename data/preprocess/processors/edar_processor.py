@@ -99,6 +99,86 @@ class _TobitKalman:
         return filtered, flags
 
 
+class _KalmanFilter:
+    """
+    Standard Kalman filter for time series smoothing.
+
+    Simpler version of _TobitKalman without censoring support.
+    Used for hospitalization data where there's no detection limit.
+
+    State space model:
+    - State transition: x_t = x_{t-1} + w_t,  w_t ~ N(0, process_var)
+    - Measurement: z_t = x_t + v_t,  v_t ~ N(0, measurement_var)
+    """
+
+    def __init__(
+        self,
+        *,
+        process_var: float,
+        measurement_var: float,
+    ) -> None:
+        self.process_var = float(process_var)
+        self.measurement_var = float(measurement_var)
+        self.state = 0.0
+        self.state_var = 1.0
+        self.initialized = False
+
+    def _initialize(self, first_log_value: float) -> None:
+        self.state = float(first_log_value)
+        self.state_var = float(self.measurement_var)
+        self.initialized = True
+
+    def filter_series(self, values: np.ndarray) -> tuple[list[float], list[int]]:
+        """
+        Apply Kalman filter to a time series.
+
+        Args:
+            values: Array of measurements (can contain NaN for missing)
+
+        Returns:
+            Tuple of (filtered_values, flags)
+            flags: 0=normal, 2=missing
+        """
+        filtered: list[float] = []
+        flags: list[int] = []
+
+        finite_mask = np.isfinite(values) & (values > 0)
+        if finite_mask.any():
+            first_value = float(np.log(values[finite_mask][0]))
+            self._initialize(first_value)
+
+        for value in values:
+            # Predict
+            pred_state = self.state
+            pred_var = self.state_var + self.process_var
+
+            if not np.isfinite(value) or value <= 0:
+                # Missing observation - use prediction only
+                z_eff = pred_state
+                r_eff = 1e9
+                flag = 2
+            else:
+                # Normal observation
+                log_value = float(np.log(value + 1e-9))
+                if not self.initialized:
+                    self._initialize(log_value)
+                    pred_state = self.state
+                z_eff = log_value
+                r_eff = self.measurement_var
+                flag = 0
+
+            # Update
+            s = pred_var + r_eff
+            k_gain = pred_var / s if s > 0 else 0.0
+            self.state = pred_state + k_gain * (z_eff - pred_state)
+            self.state_var = (1 - k_gain) * pred_var
+
+            filtered.append(float(self.state))
+            flags.append(flag)
+
+        return filtered, flags
+
+
 class EDARProcessor:
     """
     Converts EDAR wastewater biomarker data to canonical tensors.
@@ -154,7 +234,7 @@ class EDARProcessor:
         if not np.isfinite(daily_data["limit_flow"]).any():
             return daily_data
 
-        censor_inflation = float(self.validation_options.get("censor_inflation", 4.0))
+        censor_inflation = float(self.config.censor_inflation)
         fallback_process = float(self.validation_options.get("process_var", 0.05))
         fallback_measure = float(self.validation_options.get("measurement_var", 0.5))
 

@@ -36,6 +36,9 @@ class PreprocessingConfig:
         wastewater_file: Path to wastewater biomarker data
         population_file: Path to population data for normalization
         region_metadata_file: Path to regional metadata
+        hospitalizations_file: Optional path to hospitalizations data CSV
+        deaths_file: Optional path to deaths data CSV (comarca-level)
+        catalonia_cases_file: Optional path to Catalonia official cases data
 
         start_date: Start date for temporal processing
         end_date: End date for temporal processing
@@ -76,12 +79,25 @@ class PreprocessingConfig:
     output_path: str
     dataset_name: str
 
-    # Optional synthetic data path
+    # Optional data paths
     synthetic_path: str | None = None
+    hospitalizations_file: str | None = None
+    deaths_file: str | None = None  # Deaths data (comarca-level)
+    catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
 
     # Feature processing options
     min_flow_threshold: int = 10
     wastewater_flow_mode: str = "total_flow"  # "total_flow" or "concentration"
+
+    # Censor inflation multiplier for Tobit-Kalman filtering.
+    # Multiplier applied to the measurement variance when an observation is censored
+    # (i.e., below the detection limit). In _TobitKalman.filter_series
+    # (see data/preprocess/processors/edar_processor.py), when value <= limit,
+    # the effective measurement variance is:
+    #   r_eff = measurement_var * censor_inflation
+    # So a higher censor_inflation down-weights censored observations (trusts them
+    # less) and yields smoother state updates.
+    censor_inflation: float = 4.0
 
     # Temporal processing parameters
     forecast_horizon: int = 7
@@ -108,7 +124,9 @@ class PreprocessingConfig:
     chunk_size: int = 1000
     run_id_chunk_size: int = 5  # Chunk size for run_id dimension
     date_chunk_size: int = 30  # Chunk size for date dimension in zarr output
-    mobility_chunk_size: int = 100  # Chunk size for spatial dims (origin/destination/region_id)
+    mobility_chunk_size: int = (
+        100  # Chunk size for spatial dims (origin/destination/region_id)
+    )
     memory_limit_gb: float = 8.0
 
     # Graph construction options
@@ -161,6 +179,27 @@ class PreprocessingConfig:
             if not wastewater_path.exists():
                 raise ValueError(
                     f"Wastewater file does not exist: {self.wastewater_file}"
+                )
+
+        if self.hospitalizations_file:
+            hospitalizations_path = Path(self.hospitalizations_file)
+            if not hospitalizations_path.exists():
+                raise ValueError(
+                    f"Hospitalizations file does not exist: {self.hospitalizations_file}"
+                )
+
+        if self.deaths_file:
+            deaths_path = Path(self.deaths_file)
+            if not deaths_path.exists():
+                raise ValueError(
+                    f"Deaths file does not exist: {self.deaths_file}"
+                )
+
+        if self.catalonia_cases_file:
+            catalonia_cases_path = Path(self.catalonia_cases_file)
+            if not catalonia_cases_path.exists():
+                raise ValueError(
+                    f"Catalonia cases file does not exist: {self.catalonia_cases_file}"
                 )
 
         # Validate output path is writable
@@ -297,6 +336,9 @@ class PreprocessingConfig:
                 "cases": self.cases_file,
                 "wastewater": self.wastewater_file,
                 "population": self.population_file,
+                "hospitalizations": self.hospitalizations_file,
+                "deaths": self.deaths_file,
+                "catalonia_cases": self.catalonia_cases_file,
             },
             "processing_parameters": {
                 "forecast_horizon": self.forecast_horizon,
