@@ -54,8 +54,8 @@ def test_filter_dataset_by_runs():
 
     # Check run_id dimension is squeezed
     assert "run_id" not in filtered.dims, "run_id should be squeezed after filtering"
-    assert filtered.dims["time"] == 10, "time dimension should remain"
-    assert filtered.dims["region"] == 5, "region dimension should remain"
+    assert filtered.sizes["time"] == 10, "time dimension should remain"
+    assert filtered.sizes["region"] == 5, "region dimension should remain"
 
     # Check valid_targets aggregation works
     valid_targets = filtered.valid_targets
@@ -149,7 +149,7 @@ def test_whitespace_handling():
 
     # Should successfully filter
     assert "run_id" not in filtered.dims, "run_id should be squeezed"
-    assert filtered.dims["time"] == 10, "time dimension should remain"
+    assert filtered.sizes["time"] == 10, "time dimension should remain"
 
     print("✓ whitespace handling test passed")
 
