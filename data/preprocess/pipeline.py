@@ -11,13 +11,16 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import xarray as xr
 
 from .config import REGION_COORD, PreprocessingConfig
+from .utils import load_csv_with_string_ids
 from .processors.alignment_processor import AlignmentProcessor
 from .processors.cases_processor import CasesProcessor
+from .processors.catalonia_cases_processor import CataloniaCasesProcessor
+from .processors.deaths_processor import DeathsProcessor
 from .processors.edar_processor import EDARProcessor
+from .processors.hospitalizations_processor import HospitalizationsProcessor
 from .processors.mobility_processor import MobilityProcessor
 from .processors.synthetic_processor import SyntheticProcessor
 
@@ -52,6 +55,20 @@ class OfflinePreprocessingPipeline:
             "edar": EDARProcessor(self.config),
             "alignment": AlignmentProcessor(self.config),
         }
+
+        # Initialize CataloniaCasesProcessor if configured (alternative to CasesProcessor)
+        if self.config.catalonia_cases_file:
+            self.processors["catalonia_cases"] = CataloniaCasesProcessor(self.config)
+
+        # Initialize DeathsProcessor if configured
+        if self.config.deaths_file:
+            self.processors["deaths"] = DeathsProcessor(self.config)
+
+        # Initialize hospitalizations processor if hospitalizations file is provided
+        if self.config.hospitalizations_file:
+            self.processors["hospitalizations"] = HospitalizationsProcessor(
+                self.config
+            )
 
         # Initialize state tracking
         self.pipeline_state = {
@@ -104,6 +121,8 @@ class OfflinePreprocessingPipeline:
                 mobility_data=processed_data["mobility"],
                 edar_data=processed_data["edar"],
                 population_data=processed_data["population"],
+                hospitalizations_data=processed_data.get("hospitalizations"),
+                deaths_data=processed_data.get("deaths"),
             )
 
             self._log_sample_stats(
@@ -187,13 +206,24 @@ class OfflinePreprocessingPipeline:
         # Standard real data processing
         raw_data = {}
 
-        # Process cases data (required)
-        print("Processing cases data...")
-        try:
-            cases_data = self.processors["cases"].process(self.config.cases_file)
-            raw_data["cases"] = cases_data
-        except Exception as e:
-            raise RuntimeError(f"Failed to process cases data: {str(e)}") from e
+        # Process cases data (required) - toggle between sources
+        if self.config.catalonia_cases_file and "catalonia_cases" in self.processors:
+            print("Using CataloniaCasesProcessor (official data)...")
+            try:
+                cases_dir = str(Path(self.config.catalonia_cases_file).parent)
+                cases_data = self.processors["catalonia_cases"].process(cases_dir)
+                raw_data["cases"] = cases_data
+            except Exception as e:
+                raise RuntimeError(f"Failed to process Catalonia cases data: {str(e)}") from e
+        elif self.config.cases_file:
+            print("Using CasesProcessor (flowmaps data)...")
+            try:
+                cases_data = self.processors["cases"].process(self.config.cases_file)
+                raw_data["cases"] = cases_data
+            except Exception as e:
+                raise RuntimeError(f"Failed to process cases data: {str(e)}") from e
+        else:
+            raise RuntimeError("No case data source configured")
 
         # Process mobility data (required)
         if not self.config.mobility_path:
@@ -232,17 +262,46 @@ class OfflinePreprocessingPipeline:
         except Exception as e:
             raise RuntimeError(f"Failed to process population data: {str(e)}") from e
 
+        # Process hospitalizations data (optional)
+        if self.config.hospitalizations_file and "hospitalizations" in self.processors:
+            print("Processing hospitalizations data...")
+            try:
+                # HospitalizationsProcessor expects data_dir, extracts directory from file path
+                hospitalizations_dir = str(Path(self.config.hospitalizations_file).parent)
+                hospitalizations_data = self.processors["hospitalizations"].process(
+                    hospitalizations_dir
+                )
+                raw_data["hospitalizations"] = hospitalizations_data
+            except Exception as e:
+                print(f"Warning: Failed to process hospitalizations: {e}")
+                raw_data["hospitalizations"] = None
+        else:
+            raw_data["hospitalizations"] = None
+
+        # Process deaths data (optional)
+        if self.config.deaths_file and "deaths" in self.processors:
+            print("Processing deaths data...")
+            try:
+                # DeathsProcessor expects data_dir
+                deaths_dir = str(Path(self.config.deaths_file).parent)
+                deaths_data = self.processors["deaths"].process(deaths_dir)
+                raw_data["deaths"] = deaths_data
+            except Exception as e:
+                print(f"Warning: Failed to process deaths: {e}")
+                raw_data["deaths"] = None
+        else:
+            raw_data["deaths"] = None
+
         print()
         return raw_data
 
     def _load_population_data(self, population_file: str) -> xr.DataArray:
         from .config import REGION_COORD
 
-        # Load population data with proper dtypes to preserve leading zeros
-        df = pd.read_csv(
+        # Load population data using canonical CSV loader to preserve leading zeros
+        df = load_csv_with_string_ids(
             population_file,
-            usecols=["id", "d.population"],  # type: ignore[arg-type]
-            dtype={"id": str, "d.population": int},
+            usecols=["id", "d.population"],
         )
         df = df.rename(columns={"id": REGION_COORD, "d.population": "population"})
         return df.set_index(REGION_COORD)["population"].to_xarray()
