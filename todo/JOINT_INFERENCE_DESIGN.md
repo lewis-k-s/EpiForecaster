@@ -109,12 +109,12 @@ Lock these details before coding to avoid churn and mismatched interfaces:
 
 ## 7. Implementation Checklist
 
-- [ ] **Define `ObservationHead` Class:**
-    - [ ] `SheddingConvolution` layer.
-    - [ ] `HospitalizationDelay` layer.
-- [ ] **Define `SIRRollForward` Class:**
-    - [ ] Differentiable SIR step function.
-    - [ ] Roll-forward logic for $(\hat{S}, \hat{I}, \hat{R})$.
+- [x] **Define `ObservationHead` Class:**
+    - [x] `SheddingConvolution` layer.
+    - [x] `HospitalizationDelay` layer.
+- [x] **Define `SIRRollForward` Class:**
+    - [x] Differentiable SIR step function.
+    - [x] Roll-forward logic for $(\hat{S}, \hat{I}, \hat{R})$.
 - [ ] **Update `EpiForecaster` Model:**
     - [ ] Integrate roll-forward SIR and heads into the forward pass.
     - [ ] Return dictionary of `{latent_I, pred_ww, pred_hosp, physics_residuals, obs_context}`.
