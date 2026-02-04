@@ -52,6 +52,8 @@ class AlignmentProcessor:
         mobility_data: xr.Dataset,
         edar_data: xr.Dataset,
         population_data: xr.DataArray,
+        hospitalizations_data: xr.Dataset | None = None,
+        deaths_data: xr.Dataset | None = None,
     ) -> xr.Dataset:
         """
         Align all datasets to common temporal and spatial grid using xarray.
@@ -61,6 +63,8 @@ class AlignmentProcessor:
             mobility_data: Processed mobility dataset (OD matrix)
             edar_data: Processed EDAR dataset (per-variant variables)
             population_data: Processed population dataset
+            hospitalizations_data: Optional processed hospitalizations dataset
+            deaths_data: Optional processed deaths dataset
 
         Returns:
             xr.Dataset of all aligned datasets
@@ -121,6 +125,30 @@ class AlignmentProcessor:
             "EDAR regions are not subset of common regions"
         )
 
+        # Validate hospitalizations regions if provided
+        if hospitalizations_data is not None:
+            hosp_regions = set(hospitalizations_data[REGION_COORD].values)
+            # Check that there's at least some overlap between hospitalizations and common regions
+            # Hospitalizations data may have additional regions that will be filtered via reindex
+            common_regions_set = set(common_regions)
+            overlap = hosp_regions.intersection(common_regions_set)
+            if not overlap:
+                raise ValueError("No hospitalizations regions found in common regions")
+            dropped = hosp_regions - common_regions_set
+            print(f"  Hospitalizations data: {len(hosp_regions)} regions, {len(overlap)} overlap with common")
+            if dropped:
+                print(f"  Dropping {len(dropped)} hospitalizations regions not in common regions (not in cases): {sorted(list(dropped))[:10]}...")
+
+        # Validate deaths regions if provided
+        if deaths_data is not None:
+            deaths_regions = set(deaths_data[REGION_COORD].values)
+            # Check that there's at least some overlap between deaths and common regions
+            # Deaths data may have additional regions that will be filtered via reindex
+            overlap = deaths_regions.intersection(common_regions)
+            if not overlap:
+                raise ValueError("No deaths regions found in common regions")
+            print(f"  Deaths data: {len(deaths_regions)} regions, {len(overlap)} overlap with common")
+
         if not common_regions:
             raise ValueError("No common regions found between datasets")
 
@@ -134,6 +162,51 @@ class AlignmentProcessor:
         )
         population_final = population_data.sel({REGION_COORD: common_regions})
         edar_final = edar_aligned.reindex({REGION_COORD: common_regions})
+
+        # Align hospitalizations if provided
+        if hospitalizations_data is not None:
+            hosp_final = hospitalizations_data.reindex({REGION_COORD: common_regions})
+            # Fill mask/age channels for hospitalizations
+            if "hospitalizations_mask" in hosp_final.data_vars:
+                hosp_final["hospitalizations_mask"] = hosp_final[
+                    "hospitalizations_mask"
+                ].fillna(0.0)
+            if "hospitalizations_age" in hosp_final.data_vars:
+                hosp_final["hospitalizations_age"] = hosp_final[
+                    "hospitalizations_age"
+                ].fillna(1.0)
+        else:
+            hosp_final = None
+
+        # Align deaths if provided
+        if deaths_data is not None:
+            deaths_final = deaths_data.reindex({REGION_COORD: common_regions})
+            # Fill deaths values with 0 for regions without data
+            if "deaths" in deaths_final.data_vars:
+                deaths_final["deaths"] = deaths_final["deaths"].fillna(0.0)
+            # Fill mask/age channels for deaths if present
+            if "deaths_mask" in deaths_final.data_vars:
+                deaths_final["deaths_mask"] = deaths_final["deaths_mask"].fillna(0.0)
+            if "deaths_age" in deaths_final.data_vars:
+                deaths_final["deaths_age"] = deaths_final["deaths_age"].fillna(1.0)
+            else:
+                # Add deaths_age channel with default value 1.0 for consistency
+                # Create age channel matching deaths dimensions
+                deaths_final["deaths_age"] = xr.DataArray(
+                    np.ones_like(deaths_final["deaths"].values),
+                    dims=deaths_final["deaths"].dims,
+                    coords=deaths_final["deaths"].coords,
+                )
+            # Add deaths_mask channel if not present
+            if "deaths_mask" not in deaths_final.data_vars:
+                # Mask: 1.0 where deaths data exists, 0.0 otherwise
+                deaths_final["deaths_mask"] = xr.DataArray(
+                    (deaths_final["deaths"].notnull()).astype(float).fillna(0.0),
+                    dims=deaths_final["deaths"].dims,
+                    coords=deaths_final["deaths"].coords,
+                )
+        else:
+            deaths_final = None
 
         # Fill mask/censor/age channels with proper defaults for regions without EDAR data
         # Mask: 0.0 (no measurement), Censor: 0.0 (not censored), Age: 1.0 (max age)
@@ -205,16 +278,20 @@ class AlignmentProcessor:
         }
         # TODO: write report?
 
-        aligned_dataset = xr.merge(
-            [
-                cases_final,
-                mobility_final,
-                population_final,
-                edar_final,
-                biomarker_data_start,
-            ],
-            join="exact",
-        )
+        # Build merge list with optional hospitalizations and deaths
+        datasets_to_merge = [
+            cases_final,
+            mobility_final,
+            population_final,
+            edar_final,
+            biomarker_data_start,
+        ]
+        if hosp_final is not None:
+            datasets_to_merge.append(hosp_final)
+        if deaths_final is not None:
+            datasets_to_merge.append(deaths_final)
+
+        aligned_dataset = xr.merge(datasets_to_merge, join="exact")
         print("-" * 50)
         print("Aligned Dataset")
         print("-" * 50)
