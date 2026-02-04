@@ -88,6 +88,8 @@ gradnorm-analyze = "scripts.analyze_gradnorm:main"
 dead-code-analyze = "scripts.dead_code_analyze:main"
 remote-train = "scripts.remote_train:main"
 remote-preprocess = "scripts.remote_preprocess:main"
+# Data visualization runner
+dataviz = "scripts.dataviz_runner:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
