@@ -11,11 +11,11 @@ from typing import Any
 
 import numpy as np
 import torch
+import wandb
 import yaml
 from scipy import sparse
 from sklearn.cluster import AgglomerativeClustering
 from torch import nn
-from torch.utils.tensorboard import SummaryWriter
 
 from graph.node_encoder import Region2Vec
 from utils import setup_tensor_core_optimizations
@@ -194,6 +194,11 @@ class OutputConfig:
     save_numpy: bool = True
     log_dir: str = "outputs/region_training"
     experiment_name: str = "region_embeddings_experiment"
+    wandb_project: str = "epiforecaster"
+    wandb_entity: str | None = None
+    wandb_group: str | None = None
+    wandb_tags: list[str] = field(default_factory=list)
+    wandb_mode: str = "online"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None, base_dir: Path) -> OutputConfig:
@@ -214,6 +219,11 @@ class OutputConfig:
             save_numpy=raw.get("save_numpy", cls.save_numpy),
             log_dir=raw.get("log_dir", cls.log_dir),
             experiment_name=raw.get("experiment_name", cls.experiment_name),
+            wandb_project=raw.get("wandb_project", cls.wandb_project),
+            wandb_entity=raw.get("wandb_entity", cls.wandb_entity),
+            wandb_group=raw.get("wandb_group", cls.wandb_group),
+            wandb_tags=raw.get("wandb_tags"),
+            wandb_mode=raw.get("wandb_mode", cls.wandb_mode),
         )
 
 
@@ -248,6 +258,7 @@ class RegionTrainerConfig:
     output: OutputConfig = field(default_factory=OutputConfig)
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
     config_path: Path | None = None
+    env: str | None = None
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> RegionTrainerConfig:
@@ -276,6 +287,7 @@ class RegionTrainerConfig:
             output=output_cfg,
             clustering=clustering_cfg,
             config_path=config_path,
+            env=raw.get("env"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -294,6 +306,7 @@ class RegionTrainerConfig:
                 "output_dir": str(self.output.output_dir),
             },
             "clustering": asdict(self.clustering),
+            "env": self.env,
         }
 
 
@@ -415,6 +428,8 @@ class PairSampler:
 class Region2VecTrainer:
     def __init__(self, config: RegionTrainerConfig) -> None:
         self.config = config
+        self.experiment_dir: Path | None = None
+        self.wandb_run: wandb.sdk.wandb_run.Run | None = None
         self.device = self._select_device(config.training.device)
         if config.training.seed is not None:
             torch.manual_seed(config.training.seed)
@@ -509,17 +524,32 @@ class Region2VecTrainer:
     # Public API
     # ------------------------------------------------------------------
     def setup_logging(self):
-        """Setup TensorBoard logging and experiment tracking."""
+        """Setup W&B logging and experiment tracking."""
         # Create experiment directory
+        self.run_id = f"run_{time.time_ns()}"
         experiment_dir = (
             Path(self.config.output.log_dir)
             / self.config.output.experiment_name
-            / f"run_{time.time_ns()}"
+            / self.run_id
         )
         experiment_dir.mkdir(parents=True, exist_ok=True)
+        self.experiment_dir = experiment_dir
 
-        # Setup tensorboard writer
-        self.writer = SummaryWriter(log_dir=str(experiment_dir))
+        if wandb.run is None:
+            group = self.config.output.wandb_group or self.config.output.experiment_name
+            self.wandb_run = wandb.init(
+                project=self.config.output.wandb_project,
+                entity=self.config.output.wandb_entity,
+                group=group,
+                name=self.run_id,
+                dir=str(experiment_dir),
+                config=self.config.to_dict(),
+                tags=self.config.output.wandb_tags or None,
+                job_type="train",
+                mode=self.config.output.wandb_mode,
+            )
+        else:
+            self.wandb_run = wandb.run
 
         # Log hyperparameters
         hyperparams = {
@@ -539,10 +569,10 @@ class Region2VecTrainer:
             "num_epochs": self.config.training.epochs,
         }
 
-        for key, value in hyperparams.items():
-            self.writer.add_text(f"hyperparams/{key}", str(value), 0)
+        if self.wandb_run is not None:
+            wandb.config.update(hyperparams, allow_val_change=True)
 
-        logger.info(f"TensorBoard logging to: {experiment_dir}")
+        logger.info(f"W&B run directory: {experiment_dir}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -598,7 +628,9 @@ class Region2VecTrainer:
 
             # Step the scheduler (ReduceLROnPlateau requires metric, others don't)
             if self.scheduler is not None:
-                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                if isinstance(
+                    self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau
+                ):
                     self.scheduler.step(metrics["total_loss"])
                 else:
                     self.scheduler.step()
@@ -643,7 +675,9 @@ class Region2VecTrainer:
 
         artifacts = self._save_artifacts(embeddings, clusters)
 
-        self.writer.close()
+        if self.wandb_run is not None:
+            self.wandb_run.summary["best_loss"] = float(self.best_loss)
+            self.wandb_run.finish()
 
         return {
             "best_loss": float(self.best_loss),
@@ -665,9 +699,9 @@ class Region2VecTrainer:
         }
 
     def close_writer(self):
-        """Close TensorBoard writer."""
-        if hasattr(self, "writer"):
-            self.writer.close()
+        """Close W&B run."""
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
 
     def _compute_deciles(self, values: list[float] | np.ndarray) -> list[int]:
         """Compute decile (1-10) for each value in the array.
@@ -737,7 +771,7 @@ class Region2VecTrainer:
         return labels.tolist()
 
     def _build_projector_metadata(self) -> list[list[str]]:
-        """Build metadata columns for TensorBoard Projector.
+        """Build metadata columns for W&B embedding tables.
 
         Returns:
             List of metadata rows, each row is a list of column values.
@@ -763,7 +797,7 @@ class Region2VecTrainer:
             n_clusters=self.config.clustering.num_clusters
         )
 
-        # Build metadata rows with separate columns for TensorBoard
+        # Build metadata rows with separate columns for W&B
         metadata = []
         for i, region_id in enumerate(self.region_ids):
             row = [
@@ -778,25 +812,28 @@ class Region2VecTrainer:
         return metadata
 
     def _log_embeddings(self, epoch: int):
-        """Log region embeddings to TensorBoard Projector with rich metadata."""
+        """Log region embeddings to W&B with rich metadata."""
         self.encoder.eval()
         with torch.no_grad():
             embeddings = self.encoder(self.features, self.edge_index)
 
-        # Use precomputed metadata with column headers for color-by options
-        self.writer.add_embedding(
-            mat=embeddings.detach().cpu(),
-            metadata=self.projector_metadata,
-            metadata_header=[
-                "region_id",
-                "cluster",
-                "pop_decile",
-                "density_decile",
-                "area_decile",
-            ],
-            tag="region_embeddings/train",
-            global_step=epoch,
-        )
+        if self.wandb_run is not None:
+            table = wandb.Table(
+                columns=[
+                    "embedding",
+                    "region_id",
+                    "cluster",
+                    "pop_decile",
+                    "density_decile",
+                    "area_decile",
+                ]
+            )
+            embeddings_cpu = embeddings.detach().cpu().numpy()
+            for embedding, metadata in zip(
+                embeddings_cpu, self.projector_metadata, strict=False
+            ):
+                table.add_data(embedding.tolist(), *metadata)
+            wandb.log({"region_embeddings": table, "epoch": epoch}, step=epoch)
         self.encoder.train()
 
     # ------------------------------------------------------------------
@@ -853,14 +890,19 @@ class Region2VecTrainer:
                 metrics["hop_loss"],
             )
 
-        # Log to TensorBoard
-        self.writer.add_scalar("Loss/Total", metrics["total_loss"], epoch)
-        self.writer.add_scalar("Loss/Base", metrics["base_loss"], epoch)
-        self.writer.add_scalar("Loss/Ratio", metrics["ratio_loss"], epoch)
-        self.writer.add_scalar("Loss/Hop", metrics["hop_loss"], epoch)
-        self.writer.add_scalar(
-            "Learning_Rate/epoch", self.optimizer.param_groups[0]["lr"], epoch
-        )
+        # Log to W&B
+        if self.wandb_run is not None:
+            wandb.log(
+                {
+                    "loss_total": metrics["total_loss"],
+                    "loss_base": metrics["base_loss"],
+                    "loss_ratio": metrics["ratio_loss"],
+                    "loss_hop": metrics["hop_loss"],
+                    "learning_rate_epoch": self.optimizer.param_groups[0]["lr"],
+                    "epoch": epoch,
+                },
+                step=epoch,
+            )
 
         return metrics
 

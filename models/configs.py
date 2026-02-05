@@ -43,7 +43,7 @@ class ProfilerConfig:
     # each epoch. When reached, the profiler is shut off and training continues.
     profile_batches: int | None = None
     # Where to write profiler traces. Use "auto" to place traces inside the
-    # TensorBoard run directory so they appear alongside scalars for that run.
+    # experiment log directory so they appear alongside other artifacts.
     log_dir: str = "auto"
     record_memory: bool = True
     with_stack: bool = False
@@ -475,6 +475,11 @@ class OutputConfig:
     save_checkpoints: bool = True
     checkpoint_frequency: int = 10
     save_best_only: bool = True
+    wandb_project: str = "epiforecaster"
+    wandb_entity: str | None = None
+    wandb_group: str | None = None
+    wandb_tags: list[str] = field(default_factory=list)
+    wandb_mode: str = "online"
 
 
 @dataclass
@@ -498,6 +503,7 @@ class EpiForecasterConfig:
     data: DataConfig = MISSING
     training: TrainingParams = MISSING
     output: OutputConfig = MISSING
+    env: str | None = None
 
     @classmethod
     def from_file(cls, config_path: str) -> "EpiForecasterConfig":
@@ -581,6 +587,7 @@ class EpiForecasterConfig:
             "data": raw.get("data", {}) or {},
             "training": raw.get("training", {}) or {},
             "output": raw.get("output", {}) or {},
+            "env": raw.get("env"),
         }
 
         schema = OmegaConf.structured(cls)
@@ -628,4 +635,5 @@ class EpiForecasterConfig:
             data=DataConfig(**config_dict["data"]),
             training=TrainingParams(**training_dict),
             output=OutputConfig(**config_dict["output"]),
+            env=config_dict.get("env"),
         )

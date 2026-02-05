@@ -1,4 +1,6 @@
 # Sparsity-based curriculum learning configuration
+
+env: "mn5"
 # This configuration demonstrates progressive training from low sparsity (clean data)
 # to high sparsity (real-world conditions) using synthetic data with varying
 # sparsity levels [0.05, 0.2, 0.4, 0.6, 0.8].
@@ -45,6 +47,7 @@ model:
 output:
   experiment_name: sparsity_curriculum
   log_dir: outputs/training
+  wandb_mode: offline
 
 training:
   device: "cuda"

@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
 import xarray as xr
 import yaml
 from torch.profiler import (
@@ -27,7 +28,6 @@ from torch.profiler import (
     tensorboard_trace_handler,
 )
 from torch.utils.data import ConcatDataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
 from data.epi_dataset import (
     EpiDataset,
@@ -78,6 +78,8 @@ class EpiForecasterTrainer:
         self.device = torch.device("cpu")
         self.model_id = self._resolve_model_id()
         self.resume = self.config.training.resume
+        self.experiment_dir: Path | None = None
+        self.wandb_run: wandb.sdk.wandb_run.Run | None = None
 
         # Stage data to NVMe if running on SLURM cluster
         self._nvme_staging_path: Path | None = None
@@ -1078,8 +1080,23 @@ class EpiForecasterTrainer:
         experiment_dir.mkdir(parents=True, exist_ok=True)
         self._persist_run_config(experiment_dir)
 
-        # Setup tensorboard writer
-        self.writer = SummaryWriter(log_dir=str(experiment_dir))
+        self.experiment_dir = experiment_dir
+
+        if wandb.run is None:
+            group = self.config.output.wandb_group or self.config.output.experiment_name
+            self.wandb_run = wandb.init(
+                project=self.config.output.wandb_project,
+                entity=self.config.output.wandb_entity,
+                group=group,
+                name=self.model_id,
+                dir=str(experiment_dir),
+                config=self.config.to_dict(),
+                tags=self.config.output.wandb_tags or None,
+                job_type="train",
+                mode=self.config.output.wandb_mode,
+            )
+        else:
+            self.wandb_run = wandb.run
 
         # Setup checkpoint directory
         if self.config.output.save_checkpoints:
@@ -1103,15 +1120,15 @@ class EpiForecasterTrainer:
             "population_dim": self.config.model.population_dim,
         }
 
-        for key, value in hyperparams.items():
-            self.writer.add_text(f"hyperparams/{key}", str(value), 0)
+        if self.wandb_run is not None:
+            wandb.config.update(hyperparams, allow_val_change=True)
 
     # def _log_model_graph(self):
     #     """
-    #     Write the model graph to TensorBoard using a real minibatch.
+    #     Write the model graph using a real minibatch.
 
     #     This runs once before training to make the module shapes discoverable in the
-    #     TensorBoard Graph tab. Failures are non-fatal to avoid blocking training on
+    #     Graph viewer. Failures are non-fatal to avoid blocking training on
     #     tracing issues with complex inputs (e.g., PyG batches).
     #     """
     #     if self._model_graph_logged:
@@ -1121,7 +1138,7 @@ class EpiForecasterTrainer:
     #         example_batch = next(iter(self.train_loader))
     #     except StopIteration:
     #         print(
-    #             "Skipping TensorBoard graph logging: training dataset is empty."
+    #             "Skipping graph logging: training dataset is empty."
     #         )
     #         self._model_graph_logged = True
     #         return
@@ -1145,7 +1162,7 @@ class EpiForecasterTrainer:
     #             self.writer.add_graph(self.model, example_inputs, verbose=False)
     #         self._model_graph_logged = True
     #     except Exception as exc:  # pragma: no cover - trace failures are non-fatal
-    #         print(f"Skipping TensorBoard graph logging: {exc}")
+    #         print(f"Skipping graph logging: {exc}")
     #         self._model_graph_logged = True
     #     finally:
     #         if was_training:
@@ -1176,9 +1193,8 @@ class EpiForecasterTrainer:
     def _resolve_profiler_log_dir(self) -> Path:
         configured = getattr(self.config.training.profiler, "log_dir", "auto")
         if configured == "auto":
-            writer_log_dir = getattr(self.writer, "log_dir", None)
-            if writer_log_dir is not None:
-                return Path(writer_log_dir)
+            if self.experiment_dir is not None:
+                return self.experiment_dir
 
             return (
                 Path(self.config.output.log_dir)
@@ -1261,9 +1277,12 @@ class EpiForecasterTrainer:
         self._status(f"\n{'=' * 60}")
         self._status(f"STARTING TRAINING: {self.config.output.experiment_name}")
         self._status(f"{'=' * 60}")
-        writer_log_dir = getattr(self.writer, "log_dir", None)
-        if writer_log_dir is not None:
-            self._status(f"TensorBoard: {writer_log_dir}")
+        if self.experiment_dir is not None:
+            self._status(f"Run directory: {self.experiment_dir}")
+        if self.wandb_run is not None:
+            self._status(
+                f"W&B run: {self.wandb_run.project}/{self.wandb_run.name}"
+            )
         if self.config.training.profiler.enabled:
             self._status(f"Profiler: {self._resolve_profiler_log_dir()}")
 
@@ -1332,7 +1351,8 @@ class EpiForecasterTrainer:
             self._status("Reason: non-finite training loss exceeded patience.")
             self._status(f"Total epochs trained: {self.current_epoch}")
             self._status(f"{'=' * 60}")
-            self.writer.close()
+            if self.wandb_run is not None:
+                self.wandb_run.finish()
             self.cleanup_dataloaders()
             return self.get_training_results()
 
@@ -1364,8 +1384,14 @@ class EpiForecasterTrainer:
         )
         self._status(f"{'=' * 60}")
 
-        # Close tensorboard writer
-        self.writer.close()
+        if self.wandb_run is not None:
+            self.wandb_run.summary["loss_test"] = test_loss
+            self.wandb_run.summary["mae_test"] = test_metrics["mae"]
+            self.wandb_run.summary["rmse_test"] = test_metrics["rmse"]
+            self.wandb_run.summary["smape_test"] = test_metrics["smape"]
+            self.wandb_run.summary["r2_test"] = test_metrics["r2"]
+            self.wandb_run.summary["best_val_loss"] = self.best_val_loss
+            self.wandb_run.finish()
 
         # Cleanup dataloader workers to prevent orphaned processes
         self.cleanup_dataloaders()
@@ -1556,35 +1582,31 @@ class EpiForecasterTrainer:
                     self._status(
                         f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
                     )
-                    self.writer.add_scalar(
-                        "Loss/Train_step", loss_value, self.global_step
-                    )
-                self.writer.add_scalar("Learning_Rate/step", lr, self.global_step)
-                self.writer.add_scalar(
-                    "GradNorm/Clipped_Total", float(grad_norm), self.global_step
-                )
+                log_data = {
+                    "learning_rate_step": lr,
+                    "gradnorm_clipped_total": float(grad_norm),
+                    "time_batch_s": batch_time_s,
+                    "time_dataload_s": data_time_s,
+                    "time_step_s": batch_time_s,
+                    "epoch": self.current_epoch,
+                }
+                if log_this_step:
+                    log_data["loss_train_step"] = loss_value
                 window_start_mean = float(
                     batch_data["WindowStart"].float().mean().item()
                 )
-                self.writer.add_scalar(
-                    "Time/WindowStart", window_start_mean, self.global_step
-                )
-                self.writer.add_scalar("Time/Batch_s", batch_time_s, self.global_step)
-                self.writer.add_scalar("Time/DataLoad_s", data_time_s, self.global_step)
-                self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
+                log_data["time_window_start"] = window_start_mean
 
                 # Log curriculum metrics for loss-curve-critic analysis
                 if (
                     self.curriculum_sampler is not None
                     and hasattr(self.curriculum_sampler, "state")
                 ):
-                    self.writer.add_scalar(
-                        "Train/Sparsity",
-                        self.curriculum_sampler.state.max_sparsity or 0.0,
-                        self.global_step,
+                    log_data["train_sparsity_step"] = (
+                        self.curriculum_sampler.state.max_sparsity or 0.0
                     )
-
-                self.writer.add_scalar("epoch", self.current_epoch, self.global_step)
+                if self.wandb_run is not None:
+                    wandb.log(log_data, step=self.global_step)
 
                 self.global_step += 1
 
@@ -1640,9 +1662,7 @@ class EpiForecasterTrainer:
             node_groups=node_groups,
             window="last",
             output_path=plot_path,
-            log_dir=getattr(self, "writer.log_dir", None)
-            if hasattr(self, "writer")
-            else None,
+            log_dir=self.experiment_dir,
         )
 
     def _evaluate_split(
@@ -1716,11 +1736,16 @@ class EpiForecasterTrainer:
 
         gnn_norm, head_norm, other_norm, total_norm = all_norms
 
-        # Log to TensorBoard
-        self.writer.add_scalar("GradNorm/Total_PreClip", total_norm, step)
-        self.writer.add_scalar("GradNorm/MobilityGNN", gnn_norm, step)
-        self.writer.add_scalar("GradNorm/ForecasterHead", head_norm, step)
-        self.writer.add_scalar("GradNorm/Other", other_norm, step)
+        if self.wandb_run is not None:
+            wandb.log(
+                {
+                    "gradnorm_total_preclip": total_norm,
+                    "gradnorm_mobility_gnn": gnn_norm,
+                    "gradnorm_forecaster_head": head_norm,
+                    "gradnorm_other": other_norm,
+                },
+                step=step,
+            )
 
         # Log to console/file
         self._status(
@@ -1753,32 +1778,33 @@ class EpiForecasterTrainer:
         if epoch is None:
             return
         prefix = split_name.capitalize()
-        self.writer.add_scalar(f"Loss/{prefix}", loss, epoch)
-        self.writer.add_scalar(f"Metrics/{prefix}/MAE", metrics["mae"], epoch)
-        self.writer.add_scalar(f"Metrics/{prefix}/RMSE", metrics["rmse"], epoch)
-        self.writer.add_scalar(f"Metrics/{prefix}/sMAPE", metrics["smape"], epoch)
-        self.writer.add_scalar(f"Metrics/{prefix}/R2", metrics["r2"], epoch)
+        log_data = {
+            "epoch": epoch,
+            f"loss_{prefix.lower()}": loss,
+            f"mae_{prefix.lower()}": metrics["mae"],
+            f"rmse_{prefix.lower()}": metrics["rmse"],
+            f"smape_{prefix.lower()}": metrics["smape"],
+            f"r2_{prefix.lower()}": metrics["r2"],
+        }
         for idx, (mae_h, rmse_h) in enumerate(
             zip(metrics["mae_per_h"], metrics["rmse_per_h"], strict=False)
         ):
-            self.writer.add_scalar(f"Metrics/{prefix}/MAE_h{idx + 1}", mae_h, epoch)
-            self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
+            log_data[f"mae_{prefix.lower()}_h{idx + 1}"] = mae_h
+            log_data[f"rmse_{prefix.lower()}_h{idx + 1}"] = rmse_h
 
         # Log curriculum metrics for loss-curve-critic analysis
         if (
             self.curriculum_sampler is not None
             and hasattr(self.curriculum_sampler, "state")
         ):
-            self.writer.add_scalar(
-                "Train/Sparsity",
-                self.curriculum_sampler.state.max_sparsity or 0.0,
-                self.current_epoch,
+            log_data["train_sparsity_epoch"] = (
+                self.curriculum_sampler.state.max_sparsity or 0.0
             )
-            self.writer.add_scalar(
-                "Train/SynthRatio",
-                self.curriculum_sampler.state.synth_ratio,
-                self.current_epoch,
+            log_data["train_synth_ratio_epoch"] = (
+                self.curriculum_sampler.state.synth_ratio
             )
+        if self.wandb_run is not None:
+            wandb.log(log_data, step=self.global_step)
 
         self._status(
             f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"

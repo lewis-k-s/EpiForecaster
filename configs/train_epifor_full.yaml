@@ -7,7 +7,7 @@ data:
   # Lag features are value-only (no mask/age channels) for efficiency
   use_imported_risk: false
   mobility_lags: [1, 7, 14] # Lags in days (only used when use_imported_risk=true)
-  region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
   mobility_threshold: 10
   window_stride: 1
   missing_permit: 2
@@ -24,7 +24,7 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    history_length: 14
+    history_length: 21
     forecast_horizon: 7
     #-- graph params --#
     max_neighbors: 20
@@ -33,8 +33,8 @@ output:
   experiment_name: local_full
   log_dir: outputs/training
 training:
-  device: "cpu"
-  batch_size: 16
+  device: "mps"
+  batch_size: 32
   gradient_accumulation_steps: 2
   early_stopping_patience: 5
   nan_loss_patience: 5
@@ -42,8 +42,9 @@ training:
   epochs: 5
   learning_rate: 0.001
   weight_decay: 1.0e-05
-  num_workers: 4
+  num_workers: 6
   val_workers: 2
+  prefetch_factor: 2
   val_split: 0.2
   test_split: 0.1
   profiler:

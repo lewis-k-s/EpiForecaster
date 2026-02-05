@@ -1,4 +1,6 @@
 # Preprocessing configuration for synthetic epidemiological data
+
+env: "mn5"
 #
 # WARNING: DO NOT RUN THIS CONFIG LOCALLY. This config is designed for MN5-scale
 # synthetic data processing and requires significant memory and compute resources.

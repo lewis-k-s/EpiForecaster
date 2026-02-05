@@ -79,6 +79,9 @@ class PreprocessingConfig:
     # Optional synthetic data path
     synthetic_path: str | None = None
 
+    # Optional environment
+    env: str | None = None
+
     # Feature processing options
     min_flow_threshold: int = 10
     wastewater_flow_mode: str = "total_flow"  # "total_flow" or "concentration"

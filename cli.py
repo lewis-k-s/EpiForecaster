@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+import wandb
 
 from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
 from data.preprocess.region_graph_preprocessor import (
@@ -27,6 +28,7 @@ from training.epiforecaster_trainer import (
 )
 from training.region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
 from utils.logging import setup_logging
+from utils.platform import is_slurm_cluster
 
 VALID_DEVICES = ["auto", "cpu", "cuda", "mps"]
 
@@ -175,6 +177,10 @@ def preprocess_epiforecaster(config: str):
     """Run the standard EpiForecaster preprocessing pipeline."""
     try:
         preprocess_config = PreprocessingConfig.from_file(config)
+        if preprocess_config.env == "mn5" and not is_slurm_cluster():
+            raise click.ClickException(
+                "Production preprocessing configs (env=mn5) must run on SLURM."
+            )
 
         logger = logging.getLogger(__name__)
         logger.info(f"Loading configuration from: {config}")
@@ -284,7 +290,7 @@ def plot_group():
     "--log-dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Optional TensorBoard log directory for eval metrics.",
+    help="Optional W&B run directory for eval metrics.",
 )
 @click.option(
     "--override",
@@ -451,6 +457,8 @@ def eval_epiforecaster(
             click.echo(f"Saved plot to: {output}")
         if output_csv is not None:
             click.echo(f"Saved node metrics to: {output_csv}")
+        if wandb.run is not None:
+            wandb.finish()
     except Exception as exc:
         click.echo(f"❌ Evaluation failed: {exc}", err=True)
         click.echo(traceback.format_exc(), err=True)
@@ -671,6 +679,10 @@ def train_regions(
     """Train the Region2Vec-style region embedder via configuration."""
     try:
         region_config = RegionTrainerConfig.from_file(config)
+        if region_config.env == "mn5" and not is_slurm_cluster():
+            raise click.ClickException(
+                "Production training configs (env=mn5) must run on SLURM."
+            )
 
         trainer = Region2VecTrainer(region_config)
 
@@ -754,6 +766,10 @@ def _run_forecaster_training(
         trainer_config = EpiForecasterConfig.load(
             config, overrides=override_list if override_list else None
         )
+        if trainer_config.env == "mn5" and not is_slurm_cluster():
+            raise click.ClickException(
+                "Production training configs (env=mn5) must run on SLURM."
+            )
 
         logger = logging.getLogger(__name__)
         logger.info(f"Loading training configuration from: {config}")
