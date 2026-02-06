@@ -9,15 +9,60 @@ data:
   mobility_lags: [1, 7, 14] # Lags in days (only used when use_imported_risk=true)
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   mobility_threshold: 10
+  window_stride: 1
+  missing_permit: 2
+  sample_ordering: "time"
+  log_scale: true
 
+model:
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 16
+    region_embedding_dim: 64
+    gnn_module: "gcn"
+    #-- seq sizes --#
+    history_length: 21
+    forecast_horizon: 7
+    #-- graph params --#
+    max_neighbors: 20
+    gnn_depth: 1
+    #-- SIR physics --#
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+    #-- observation heads --#
+    observation_heads:
+      kernel_length_ww: 14
+      kernel_length_hosp: 21
+      learnable_kernel_ww: true
+      learnable_kernel_hosp: true
+      learnable_scale_ww: true
+      learnable_scale_hosp: true
+      residual_mode: "additive"
+      residual_scale: 0.2
+      residual_hidden_dim: 32
+      residual_layers: 2
+      residual_dropout: 0.1
+      obs_context_dim: 96
+
+output:
+  experiment_name: local_full
+  log_dir: outputs/training
+
+training:
   device: "mps"
   batch_size: 32
   gradient_accumulation_steps: 2
   early_stopping_patience: 5
   nan_loss_patience: 5
   # max_batches: 20
-  epochs: 2
-  learning_rate: 0.001
+  epochs: 5
+  learning_rate: 0.0003
   weight_decay: 1.0e-05
   num_workers: 6
   val_workers: 2
@@ -28,12 +73,14 @@ data:
     enabled: false
     profile_batches: 10
     log_dir: auto
+  # Joint inference loss configuration
   loss:
-    name: "composite"
-    components:
-      - name: "smape"
-        weight: 1.0
-      - name: "mse_unscaled"
-        weight: 1.0
+    name: "joint_inference"
+    joint:
+      w_ww: 1.0
+      w_hosp: 1.0
+      w_cases: 1.0
+      w_deaths: 1.0
+      w_sir: 0.1
   plot_forecasts: true
   num_forecast_samples: 3
