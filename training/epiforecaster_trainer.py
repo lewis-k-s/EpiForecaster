@@ -412,6 +412,45 @@ class EpiForecasterTrainer:
         )
         self._status(f"  Cases dim: {train_example_ds.cases_output_dim}")
         self._status(f"  Biomarkers dim: {train_example_ds.biomarkers_output_dim}")
+
+        # Log Observation Heads configuration
+        if self.config.model.observation_heads:
+            self._status("  Observation Heads:")
+            heads = self.config.model.observation_heads
+            self._status(
+                f"    - Wastewater: kernel={heads.kernel_length_ww}, learnable={heads.learnable_kernel_ww}"
+            )
+            self._status(
+                f"    - Hospital:   kernel={heads.kernel_length_hosp}, learnable={heads.learnable_kernel_hosp}"
+            )
+            self._status(
+                f"    - Cases:      kernel={heads.kernel_length_cases}, learnable={heads.learnable_kernel_cases}"
+            )
+            self._status(
+                f"    - Deaths:     kernel={heads.kernel_length_deaths}, learnable={heads.learnable_kernel_deaths}"
+            )
+            self._status(
+                f"    - Residual:   mode={heads.residual_mode}, scale={heads.residual_scale}"
+            )
+
+        # Log Physics configuration
+        if self.config.model.sir_physics:
+            self._status("  SIR Physics:")
+            physics = self.config.model.sir_physics
+            self._status(f"    - dt: {physics.dt}")
+            self._status(f"    - Mass cons: {physics.enforce_mass_conservation}")
+            self._status(f"    - Non-neg:   {physics.enforce_nonnegativity}")
+
+        # Log Loss configuration
+        if self.config.training.loss.name == "joint_inference":
+            self._status("  Joint Inference Loss Weights:")
+            weights = self.config.training.loss.joint
+            self._status(f"    - WW:    {weights.w_ww}")
+            self._status(f"    - Hosp:  {weights.w_hosp}")
+            self._status(f"    - Cases: {weights.w_cases}")
+            self._status(f"    - Deaths: {weights.w_deaths}")
+            self._status(f"    - SIR:   {weights.w_sir}")
+
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
         # Log run_id configuration
