@@ -29,6 +29,7 @@ output:
   experiment_name: mn5_epiforecaster_temporal
   log_dir: outputs/training
   wandb_mode: offline
+  wandb_tags: [mn5]
 training:
   device: "cuda"
   batch_size: 16

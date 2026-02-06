@@ -48,10 +48,11 @@ output:
   experiment_name: sparsity_curriculum
   log_dir: outputs/training
   wandb_mode: offline
+  wandb_tags: [mn5]
 
 training:
   device: "cuda"
-  batch_size: 12
+  batch_size: 32
   gradient_accumulation_steps: 2
   early_stopping_patience: 10
   nan_loss_patience: 5
@@ -59,7 +60,7 @@ training:
   epochs: 20
   learning_rate: 0.0005
   weight_decay: 1.0e-05
-  num_workers: 6
+  num_workers: 8
   val_workers: 2
   prefetch_factor: 2
   val_split: 0.2

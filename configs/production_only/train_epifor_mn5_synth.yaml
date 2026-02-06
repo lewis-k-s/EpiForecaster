@@ -49,6 +49,7 @@ output:
   experiment_name: mn5_synth_temporal
   log_dir: outputs/training
   wandb_mode: offline
+  wandb_tags: [mn5]
 
 training:
   device: "cuda"
