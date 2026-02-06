@@ -32,6 +32,21 @@ To avoid "catastrophic forgetting" of the disease dynamics, we use a **gradually
     *   **Goal:** Maximize performance on the specific target distribution (e.g., Catalonia).
     *   **Sampling:** 5% Synthetic (Regularizer) / 95% Real.
     *   **Mode:** Determined by dataset ordering (`data.sample_ordering`).
+    *   **Mechanism:** "Lock-in" phase. The model adapts the *biases* of the inference engine to the specific static properties of the target region (e.g., specific reporting delays or hospital capacity quirks) that may differ from the synthetic physics.
+
+---
+
+## Parameter Identifiability Strategy (The "Inference-First" Balance)
+
+A key challenge is balancing **Generality** (learning valid SIR dynamics across rotating synthetic worlds) with **Specificity** (locking into the specific parameters of the real region).
+
+**The Solution: Amortized System Identification**
+Instead of learning global constant parameters (which would average out across simulations), the Encoder is trained to perform **Amortized System Identification**:
+*   **Input:** Recent history ($I_{t-k:t}$, Mobility, Variants).
+*   **Output:** The *local* SIR parameters ($\beta_t, \gamma_t, \mu_t$) that best explain that history.
+
+1.  **Phases 0-2 (Generalist):** The model sees varying synthetic worlds (e.g., world A has fast recovery, world B has slow recovery). Since the encoder sees the history, it learns the function $f(\text{History}) \to \gamma_t$. It learns *how to infer* $\gamma$ from the decay rate of the curve, rather than memorizing a fixed $\gamma$.
+2.  **Phase 3 (Specialist):** The model is fine-tuned on Real Data. The "Inference Engine" is already robust (from synthetic training), so it correctly infers the Real World parameters. The fine-tuning merely adjusts the "static biases" (e.g., embedding layers) to account for data artifacts specific to the real pipeline.
 
 ---
 
