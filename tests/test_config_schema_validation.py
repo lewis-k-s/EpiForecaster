@@ -11,6 +11,7 @@ from training.region2vec_trainer import RegionTrainerConfig
 EPIFORECASTER_TRAINING_CONFIGS = [
     "configs/train_epifor_curriculum.yaml",
     "configs/train_epifor_full.yaml",
+    "configs/train_joint_inference.yaml",
     "configs/train_epifor_real_local.yaml",
     "configs/train_epifor_synth_local.yaml",
     "configs/train_epifor_temporal.yaml",

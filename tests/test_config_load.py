@@ -52,7 +52,7 @@ def test_load_config_without_overrides():
     """Test that config loads correctly without overrides."""
     cfg = EpiForecasterConfig.load("configs/train_epifor_full.yaml")
 
-    assert cfg.training.learning_rate == 0.001
+    assert cfg.training.learning_rate == 0.0003
     assert cfg.data.log_scale is True
 
 
@@ -121,7 +121,7 @@ def test_backward_compatibility_from_file():
     """Test that from_file() method still works."""
     cfg = EpiForecasterConfig.from_file("configs/train_epifor_full.yaml")
 
-    assert cfg.training.learning_rate == 0.001
+    assert cfg.training.learning_rate == 0.0003
     assert cfg.data.log_scale is True
 
 
