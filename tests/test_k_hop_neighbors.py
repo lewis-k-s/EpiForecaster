@@ -14,6 +14,7 @@ import xarray as xr
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
+from models.mobility_gnn import MobilityPyGEncoder
 
 
 def _make_config(
@@ -491,8 +492,6 @@ def test_k_hop_reachability_cache(tmp_path):
 # These tests verify that the GNN's computational receptive field respects
 # the k-hop limit during message passing, not just feature masking.
 # ============================================================================
-
-from models.mobility_gnn import MobilityPyGEncoder
 
 
 def _create_gnn_model(gnn_depth: int, in_dim: int = 8) -> MobilityPyGEncoder:

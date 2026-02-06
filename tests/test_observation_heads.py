@@ -380,8 +380,8 @@ class TestClinicalObservationHead:
         """Test initialization with default parameters."""
         head = ClinicalObservationHead()
         assert head.delay_kernel.kernel_length == 21
-        assert head.get_observation_rate().item() == pytest.approx(0.1, abs=1e-6)
-        assert head.learnable_rate is True
+        assert head.get_scale().item() == pytest.approx(1.0, abs=1e-6)
+        assert head.learnable_scale is True
 
     def test_forward_shape(self):
         """Test forward produces correct shape."""
@@ -390,48 +390,57 @@ class TestClinicalObservationHead:
         batch_size = 2
         time_steps = 20
 
-        I_trajectory = torch.rand(batch_size, time_steps) * 100
+        I_trajectory = torch.rand(batch_size, time_steps) * 0.1  # Fractions, not counts
 
         output = head(I_trajectory)
 
         assert output.shape == (batch_size, time_steps)
 
-    def test_observation_rate_effect(self):
-        """Test that observation rate scales output correctly."""
-        # Frozen kernel, different observation rates
+    def test_scale_effect(self):
+        """Test that scale parameter scales output correctly."""
+        # Frozen kernel, different scales
         head_low = ClinicalObservationHead(
             kernel_length=7,
             learnable_kernel=False,
-            observation_rate_init=0.05,
-            learnable_rate=False,
+            scale_init=0.5,
+            learnable_scale=False,
         )
         head_high = ClinicalObservationHead(
             kernel_length=7,
             learnable_kernel=False,
-            observation_rate_init=0.20,
-            learnable_rate=False,
+            scale_init=2.0,
+            learnable_scale=False,
         )
 
-        I_trajectory = torch.rand(1, 10) * 100
+        I_trajectory = torch.rand(1, 10) * 0.1  # Fractions
 
         output_low = head_low(I_trajectory)
         output_high = head_high(I_trajectory)
 
-        # High rate should produce ~4x more observations (0.20 / 0.05 = 4)
-        ratio = output_high.sum() / output_low.sum()
-        assert 3.5 < ratio < 4.5
+        # High scale should produce higher log1p values
+        assert output_high.sum() > output_low.sum()
 
-    def test_gradients_learnable_rate(self):
-        """Test gradients flow through learnable observation rate."""
-        head = ClinicalObservationHead(learnable_rate=True)
+    def test_gradients_learnable_scale(self):
+        """Test gradients flow through learnable scale."""
+        head = ClinicalObservationHead(learnable_scale=True)
 
-        I_trajectory = torch.rand(2, 10) * 100
+        I_trajectory = torch.rand(2, 10) * 0.1  # Fractions
         output = head(I_trajectory)
         loss = output.sum()
         loss.backward()
 
-        assert head.observation_rate.grad is not None
-        assert not torch.all(head.observation_rate.grad == 0)
+        assert head.scale.grad is not None
+        assert not torch.all(head.scale.grad == 0)
+
+    def test_log1p_output_range(self):
+        """Test that output is in log1p space (non-negative)."""
+        head = ClinicalObservationHead()
+
+        I_trajectory = torch.rand(2, 10) * 0.1  # Fractions
+        output = head(I_trajectory)
+
+        # log1p(x) >= 0 for x >= 0
+        assert torch.all(output >= 0)
 
 
 class TestWastewaterObservationHead:
@@ -441,9 +450,7 @@ class TestWastewaterObservationHead:
         """Test initialization."""
         head = WastewaterObservationHead()
         assert head.shedding_conv.kernel_length == 14
-        assert head.shedding_conv.get_sensitivity_scale().item() == pytest.approx(
-            1.0, abs=1e-6
-        )
+        assert head.get_scale().item() == pytest.approx(1.0, abs=1e-6)
 
     def test_forward_shape(self):
         """Test forward produces correct shape."""
@@ -452,77 +459,48 @@ class TestWastewaterObservationHead:
         batch_size = 2
         time_steps = 20
 
-        I_trajectory = torch.rand(batch_size, time_steps) * 100
+        I_trajectory = torch.rand(batch_size, time_steps) * 0.1  # Fractions
         population = torch.rand(batch_size, time_steps) * 10000 + 1000
 
         output = head(I_trajectory, population)
 
         assert output.shape == (batch_size, time_steps)
 
-    def test_sensitivity_scale_effect(self):
-        """Test that sensitivity scale affects output magnitude."""
-        # Fixed kernel, different sensitivity scales
+    def test_scale_effect(self):
+        """Test that scale parameter affects output magnitude."""
+        # Fixed kernel, different scales
         head_low = WastewaterObservationHead(
             kernel_length=7,
-            sensitivity_scale=0.5,
+            scale_init=0.5,
             learnable_kernel=False,
             learnable_scale=False,
         )
         head_high = WastewaterObservationHead(
             kernel_length=7,
-            sensitivity_scale=2.0,
+            scale_init=2.0,
             learnable_kernel=False,
             learnable_scale=False,
         )
 
-        I_trajectory = torch.rand(1, 10) * 100
+        I_trajectory = torch.rand(1, 10) * 0.1  # Fractions
         population = torch.ones(1, 10) * 10000.0
 
         output_low = head_low(I_trajectory, population)
         output_high = head_high(I_trajectory, population)
 
-        # High sensitivity should produce ~4x higher concentration (2.0 / 0.5 = 4)
-        ratio = output_high.sum() / output_low.sum()
-        assert 3.5 < ratio < 4.5
+        # High scale should produce higher log1p values
+        assert output_high.sum() > output_low.sum()
 
-    def test_get_shedding_stats(self):
-        """Test shedding stats retrieval."""
-        head = WastewaterObservationHead(kernel_length=14)
+    def test_log1p_output_range(self):
+        """Test that output is in log1p space (non-negative)."""
+        head = WastewaterObservationHead()
 
-        stats = head.get_shedding_stats()
+        I_trajectory = torch.rand(2, 10) * 0.1  # Fractions
+        population = torch.ones(2, 10) * 10000.0
+        output = head(I_trajectory, population)
 
-        assert "peak_shedding_day" in stats
-        assert "kernel_length" in stats
-        assert "sensitivity_scale" in stats
-        assert stats["kernel_length"] == 14
-
-    def test_calibrate_to_lod(self):
-        """Test calibration to Limit of Detection."""
-        head = WastewaterObservationHead(
-            kernel_length=5,  # Shorter kernel for faster testing
-            sensitivity_scale=1.0,
-            learnable_kernel=False,
-            learnable_scale=True,
-        )
-
-        # Calibrate such that 50 infections in 10k pop → 375 copies/L
-        head.calibrate_to_lod(
-            lod_copies_per_liter=375.0,
-            typical_infections=50.0,
-            typical_population=10000.0,
-            calibration_window=20,
-        )
-
-        # Verify calibration worked with the same trajectory pattern used in calibration
-        I_test = torch.ones(1, 20) * 50.0  # 50 infections sustained
-        pop_test = torch.ones(1, 20) * 10000.0
-
-        output = head(I_test, pop_test)
-
-        # Output should be approximately 375 copies/L
-        # Check a point in the middle where convolution has full history
-        mid_point = 10
-        assert 350 < output[0, mid_point].item() < 400
+        # log1p(x) >= 0 for x >= 0
+        assert torch.all(output >= 0)
 
 
 class TestIntegration:
@@ -533,11 +511,11 @@ class TestIntegration:
         batch_size = 1
         time_steps = 60
 
-        # Simulate SIR-like epidemic wave
+        # Simulate SIR-like epidemic wave (fractions, not counts)
         t = torch.arange(time_steps).float()
-        I_trajectory = 1000 * torch.exp(
+        I_trajectory = 0.01 * torch.exp(
             -((t - 30) ** 2) / 200
-        )  # Gaussian wave centered at t=30
+        )  # Gaussian wave centered at t=30 (1% peak infection rate)
         I_trajectory = I_trajectory.unsqueeze(0)  # Add batch dimension
 
         population = torch.ones(batch_size, time_steps) * 100000.0
@@ -547,16 +525,16 @@ class TestIntegration:
             kernel_length=14,
             gamma_shape=5.0,
             gamma_scale=2.0,
-            observation_rate_init=0.05,
+            scale_init=1.0,
             learnable_kernel=False,
-            learnable_rate=False,
+            learnable_scale=False,
         )
         hosp_obs = hosp_head(I_trajectory)
 
         # Wastewater observation
         ww_head = WastewaterObservationHead(
             kernel_length=14,
-            sensitivity_scale=1000.0,
+            scale_init=1.0,
             learnable_kernel=False,
             learnable_scale=False,
         )
@@ -582,23 +560,23 @@ class TestIntegration:
 
         # Learnable parameters everywhere
         hosp_head = ClinicalObservationHead(
-            kernel_length=7, learnable_kernel=True, learnable_rate=True
+            kernel_length=7, learnable_kernel=True, learnable_scale=True
         )
         ww_head = WastewaterObservationHead(
             kernel_length=7, learnable_kernel=True, learnable_scale=True
         )
 
-        # Infections and population as "inputs" from upstream model
-        I_trajectory = torch.rand(batch_size, time_steps) * 100
+        # Infections and population as "inputs" from upstream model (fractions)
+        I_trajectory = torch.rand(batch_size, time_steps) * 0.1
         population = torch.rand(batch_size, time_steps) * 10000 + 1000
 
         # Forward pass
         hosp_pred = hosp_head(I_trajectory)
         ww_pred = ww_head(I_trajectory, population)
 
-        # Simulated targets
-        hosp_target = torch.rand(batch_size, time_steps) * 10
-        ww_target = torch.rand(batch_size, time_steps) * 1000
+        # Simulated targets (log1p per-100k space)
+        hosp_target = torch.rand(batch_size, time_steps) * 5  # log1p values
+        ww_target = torch.rand(batch_size, time_steps) * 5
 
         # Loss
         hosp_loss = ((hosp_pred - hosp_target) ** 2).mean()
@@ -610,9 +588,9 @@ class TestIntegration:
 
         # Check all parameters have gradients
         assert hosp_head.delay_kernel.kernel.grad is not None
-        assert hosp_head.observation_rate.grad is not None
+        assert hosp_head.scale.grad is not None
         assert ww_head.shedding_conv.kernel.grad is not None
-        assert ww_head.shedding_conv.sensitivity_scale.grad is not None
+        assert ww_head.scale.grad is not None
 
 
 class TestEdgeCases:
@@ -621,7 +599,7 @@ class TestEdgeCases:
     def test_zero_infections(self):
         """Test behavior with zero infections."""
         hosp_head = ClinicalObservationHead(
-            learnable_kernel=False, learnable_rate=False
+            learnable_kernel=False, learnable_scale=False
         )
         ww_head = WastewaterObservationHead(
             learnable_kernel=False, learnable_scale=False
@@ -636,7 +614,7 @@ class TestEdgeCases:
         hosp_output = hosp_head(I_zero)
         ww_output = ww_head(I_zero, population)
 
-        # Both should be zero
+        # Both should be zero (log1p(0) = 0)
         assert torch.allclose(hosp_output, torch.zeros_like(hosp_output))
         assert torch.allclose(ww_output, torch.zeros_like(ww_output))
 
@@ -691,13 +669,13 @@ class TestEdgeCases:
         """Test with trajectory shorter than kernel length."""
         kernel_length = 21
         hosp_head = ClinicalObservationHead(
-            kernel_length=kernel_length, learnable_kernel=False, learnable_rate=False
+            kernel_length=kernel_length, learnable_kernel=False, learnable_scale=False
         )
 
         batch_size = 1
         time_steps = 5  # Shorter than kernel
 
-        I_trajectory = torch.rand(batch_size, time_steps) * 100
+        I_trajectory = torch.rand(batch_size, time_steps) * 0.1  # Fractions
 
         # Should not crash
         output = hosp_head(I_trajectory)

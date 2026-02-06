@@ -203,7 +203,7 @@ class GradnormAnalysis:
     # Component metrics
     total_preclip: ComponentMetrics
     mobility_gnn: ComponentMetrics
-    forecaster_head: ComponentMetrics
+    backbone: ComponentMetrics
     other: ComponentMetrics
     clipped_total: ComponentMetrics
 
@@ -230,7 +230,7 @@ class GradnormAnalysis:
             "components": {
                 "Total_PreClip": self._component_to_dict(self.total_preclip),
                 "MobilityGNN": self._component_to_dict(self.mobility_gnn),
-                "ForecasterHead": self._component_to_dict(self.forecaster_head),
+                "Backbone": self._component_to_dict(self.backbone),
                 "Other": self._component_to_dict(self.other),
                 "Clipped_Total": self._component_to_dict(self.clipped_total),
             },
@@ -463,19 +463,23 @@ def analyze_events(event_dir: str | Path) -> tuple[GradnormAnalysis, list[str]]:
     ea = event_accumulator.EventAccumulator(str(event_dir))
     ea.Reload()
 
-    # Load all gradnorm scalars
-    tags = [
-        "GradNorm/Total_PreClip",
-        "GradNorm/MobilityGNN",
-        "GradNorm/ForecasterHead",
-        "GradNorm/Other",
-        "GradNorm/Clipped_Total",
-    ]
+    # Load all gradnorm scalars. Backward-compatible with legacy ForecasterHead tag.
+    component_tags = {
+        "Total_PreClip": ["GradNorm/Total_PreClip"],
+        "MobilityGNN": ["GradNorm/MobilityGNN"],
+        "Backbone": ["GradNorm/Backbone", "GradNorm/ForecasterHead"],
+        "Other": ["GradNorm/Other"],
+        "Clipped_Total": ["GradNorm/Clipped_Total"],
+    }
 
-    components = {}
-    for tag in tags:
-        name = tag.replace("GradNorm/", "")
-        steps, values = load_scalars(ea, tag)
+    components: dict[str, ComponentMetrics] = {}
+    for name, tags in component_tags.items():
+        steps: list[int] = []
+        values: list[float] = []
+        for tag in tags:
+            steps, values = load_scalars(ea, tag)
+            if values:
+                break
         components[name] = ComponentMetrics(name=name, values=values, steps=steps)
 
     # Load learning rate
@@ -495,7 +499,7 @@ def analyze_events(event_dir: str | Path) -> tuple[GradnormAnalysis, list[str]]:
 
     # Compute effective signal for each component
     for name, comp in components.items():
-        if name in ["MobilityGNN", "ForecasterHead", "Other"]:
+        if name in ["MobilityGNN", "Backbone", "Other"]:
             compute_effective_signal(comp, lr_values)
 
     # Clip diagnostics
@@ -508,7 +512,7 @@ def analyze_events(event_dir: str | Path) -> tuple[GradnormAnalysis, list[str]]:
     component_loss_corr = {}
     for name, comp in [
         ("MobilityGNN", components["MobilityGNN"]),
-        ("ForecasterHead", components["ForecasterHead"]),
+        ("Backbone", components["Backbone"]),
     ]:
         corr = compute_component_loss_correlation(loss_steps, loss_values, comp)
         if corr is not None:
@@ -517,7 +521,7 @@ def analyze_events(event_dir: str | Path) -> tuple[GradnormAnalysis, list[str]]:
     analysis = GradnormAnalysis(
         total_preclip=total,
         mobility_gnn=components["MobilityGNN"],
-        forecaster_head=components["ForecasterHead"],
+        backbone=components["Backbone"],
         other=components["Other"],
         clipped_total=components["Clipped_Total"],
         lr_median=lr_median,
@@ -541,7 +545,7 @@ def generate_flags(analysis: GradnormAnalysis) -> list[str]:
     # Check for dead components
     for name, comp in [
         ("MobilityGNN", analysis.mobility_gnn),
-        ("ForecasterHead", analysis.forecaster_head),
+        ("Backbone", analysis.backbone),
         ("Other", analysis.other),
     ]:
         if comp.deadness_rate > DEADNESS_THRESHOLD_PCT:
@@ -571,10 +575,10 @@ def generate_flags(analysis: GradnormAnalysis) -> list[str]:
         )
 
     # Check head dominance
-    head_share = analysis.forecaster_head.share_median
-    if head_share > 95:
+    backbone_share = analysis.backbone.share_median
+    if backbone_share > 95:
         flags.append(
-            f"Dominance: ForecasterHead at {head_share:.1f}% "
+            f"Dominance: Backbone at {backbone_share:.1f}% "
             f"(may indicate component imbalance)"
         )
 
@@ -588,7 +592,7 @@ def generate_flags(analysis: GradnormAnalysis) -> list[str]:
     # Check share stability
     for name, comp in [
         ("MobilityGNN", analysis.mobility_gnn),
-        ("ForecasterHead", analysis.forecaster_head),
+        ("Backbone", analysis.backbone),
     ]:
         if comp.share_cv > 0.5:
             flags.append(
@@ -599,7 +603,7 @@ def generate_flags(analysis: GradnormAnalysis) -> list[str]:
     # Check for regime shifts
     for comp_name, comp in [
         ("MobilityGNN", analysis.mobility_gnn),
-        ("ForecasterHead", analysis.forecaster_head),
+        ("Backbone", analysis.backbone),
     ]:
         if comp.regime_shifts:
             shift_str = ", ".join(f"{s} ({d})" for s, d in comp.regime_shifts[:3])
@@ -632,7 +636,7 @@ def print_analysis(analysis: GradnormAnalysis) -> None:
 
     for name, comp in [
         ("MobilityGNN", analysis.mobility_gnn),
-        ("ForecasterHead", analysis.forecaster_head),
+        ("Backbone", analysis.backbone),
         ("Other", analysis.other),
     ]:
         sparkline = ascii_sparkline(
@@ -705,7 +709,7 @@ def print_analysis(analysis: GradnormAnalysis) -> None:
 
     for name, comp in [
         ("MobilityGNN", analysis.mobility_gnn),
-        ("ForecasterHead", analysis.forecaster_head),
+        ("Backbone", analysis.backbone),
     ]:
         if comp.share_trend_slope != 0:
             direction = "increasing" if comp.share_trend_slope > 0 else "decreasing"
@@ -716,7 +720,7 @@ def print_analysis(analysis: GradnormAnalysis) -> None:
     # Regime shifts
     for name, comp in [
         ("MobilityGNN", analysis.mobility_gnn),
-        ("ForecasterHead", analysis.forecaster_head),
+        ("Backbone", analysis.backbone),
     ]:
         if comp.regime_shifts:
             shifts_str = ", ".join(f"{s} ({d})" for s, d in comp.regime_shifts[:3])

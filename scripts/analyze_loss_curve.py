@@ -778,7 +778,7 @@ def print_analysis(analysis: LossCurveAnalysis) -> None:
 
     if total_spikes > 0:
         all_spikes = sorted(analysis.spikes.high_spikes + analysis.spikes.severe_spikes, key=lambda x: x[0])
-        print(f"\nFirst 10 spikes:")
+        print("\nFirst 10 spikes:")
         for s, v in all_spikes[:10]:
             x_median = v / analysis.median_val
             marker = " ← SEVERE" if v >= analysis.median_val * SPIKE_SEVERE_THRESHOLD else ""

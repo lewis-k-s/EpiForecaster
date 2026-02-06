@@ -21,7 +21,7 @@ class TestSIRRollForwardBasics:
     def test_initialization(self):
         """Test module initialization with default parameters."""
         module = SIRRollForward()
-        assert module.gamma == 0.2
+        # Gamma and mortality are no longer in init
         assert module.dt == 1.0
         assert module.enforce_nonnegativity is True
         assert module.enforce_mass_conservation is True
@@ -29,12 +29,10 @@ class TestSIRRollForwardBasics:
     def test_initialization_custom_params(self):
         """Test module initialization with custom parameters."""
         module = SIRRollForward(
-            gamma=0.15,
             dt=0.5,
             enforce_nonnegativity=False,
             enforce_mass_conservation=False,
         )
-        assert module.gamma == 0.15
         assert module.dt == 0.5
         assert module.enforce_nonnegativity is False
         assert module.enforce_mass_conservation is False
@@ -47,6 +45,8 @@ class TestSIRRollForwardBasics:
         module = SIRRollForward()
 
         beta_t = torch.rand(batch_size, horizon) * 0.5  # Random beta in [0, 0.5]
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 2000.0, 5000.0, 10000.0])
 
         # Initial state: mostly susceptible, some infected
@@ -54,7 +54,7 @@ class TestSIRRollForwardBasics:
         I0 = population * 0.05
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Check all outputs exist
         assert "S_trajectory" in result
@@ -78,12 +78,14 @@ class TestSIRRollForwardBasics:
         module = SIRRollForward()
 
         beta_t = torch.rand(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 2000.0])
         S0 = population * 0.9
         I0 = population * 0.1
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # All outputs should be on CPU (same as inputs)
         for key, tensor in result.items():
@@ -101,12 +103,14 @@ class TestSIRPhysics:
         module = SIRRollForward()
 
         beta_t = torch.ones(batch_size, horizon) * 0.3
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 2000.0, 5000.0])
         S0 = torch.tensor([950.0, 1900.0, 4750.0])
         I0 = torch.tensor([50.0, 100.0, 250.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Check initial states are preserved
         assert torch.allclose(result["S_trajectory"][:, 0], S0)
@@ -122,12 +126,14 @@ class TestSIRPhysics:
 
         # High transmission rate
         beta_t = torch.ones(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
         S_traj = result["S_trajectory"]
 
         # Check that S is non-increasing
@@ -142,12 +148,14 @@ class TestSIRPhysics:
         module = SIRRollForward()
 
         beta_t = torch.ones(batch_size, horizon) * 0.3
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
         R_traj = result["R_trajectory"]
 
         # Check that R is non-decreasing
@@ -163,12 +171,14 @@ class TestSIRPhysics:
 
         # High transmission rate initially
         beta_t = torch.ones(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([10000.0])
         S0 = torch.tensor([9900.0])
         I0 = torch.tensor([100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
         I_traj = result["I_trajectory"][0]
 
         # Find peak
@@ -190,12 +200,14 @@ class TestSIRPhysics:
 
         # Zero transmission rate
         beta_t = torch.zeros(batch_size, horizon)
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # S should remain constant (no new infections)
         assert torch.allclose(
@@ -221,14 +233,19 @@ class TestSIRConstraints:
         module = SIRRollForward(enforce_mass_conservation=True)
 
         beta_t = torch.rand(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 2000.0, 5000.0])
         S0 = population * 0.9
         I0 = population * 0.1
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         total = result["S_trajectory"] + result["I_trajectory"] + result["R_trajectory"]
+        # Allow small deviation due to D not being summed here if D > 0
+        # In SIRD, S+I+R+D = N.
+        # Since mu=0 here, D=0 so S+I+R=N should hold.
         expected_total = population.unsqueeze(1).expand(-1, horizon + 1)
 
         assert torch.allclose(total, expected_total, rtol=1e-4, atol=1e-4)
@@ -242,12 +259,14 @@ class TestSIRConstraints:
 
         # Very high beta to stress test
         beta_t = torch.ones(batch_size, horizon) * 1.0
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([100.0, 100.0])
         S0 = torch.tensor([50.0, 50.0])
         I0 = torch.tensor([50.0, 50.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         assert torch.all(result["S_trajectory"] >= -1e-6)
         assert torch.all(result["I_trajectory"] >= -1e-6)
@@ -267,12 +286,14 @@ class TestSIRGradients:
         # Create beta as a leaf tensor for gradient tracking
         beta_raw = torch.rand(batch_size, horizon)
         beta_t = (beta_raw * 0.5).requires_grad_(True)
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Compute some loss on the output
         loss = result["I_trajectory"].sum()
@@ -291,6 +312,8 @@ class TestSIRGradients:
         module = SIRRollForward()
 
         beta_t = torch.rand(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
 
         S0 = torch.tensor([900.0, 900.0], requires_grad=True)
@@ -302,7 +325,7 @@ class TestSIRGradients:
         # R0 is derived to maintain mass conservation
         R0 = population - S0 - I0
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         loss = result["S_trajectory"].sum() + result["I_trajectory"].sum()
         loss.backward()
@@ -322,12 +345,14 @@ class TestSIRGradients:
         # Create beta as a leaf tensor for gradient tracking
         beta_raw = torch.rand(batch_size, horizon)
         beta_t = (beta_raw * 0.5).requires_grad_(True)
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Compute SIR loss
         loss = module.compute_sir_loss(
@@ -335,6 +360,8 @@ class TestSIRGradients:
             result["I_trajectory"],
             result["R_trajectory"],
             beta_t,
+            gamma_t,
+            mortality_t,
             population,
         )
 
@@ -355,18 +382,22 @@ class TestSIRLoss:
         module = SIRRollForward()
 
         beta_t = torch.rand(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         loss = module.compute_sir_loss(
             result["S_trajectory"],
             result["I_trajectory"],
             result["R_trajectory"],
             beta_t,
+            gamma_t,
+            mortality_t,
             population,
         )
 
@@ -383,18 +414,22 @@ class TestSIRLoss:
         module = SIRRollForward(dt=0.01)
 
         beta_t = torch.ones(batch_size, horizon) * 0.3
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         loss = module.compute_sir_loss(
             result["S_trajectory"],
             result["I_trajectory"],
             result["R_trajectory"],
             beta_t,
+            gamma_t,
+            mortality_t,
             population,
         )
 
@@ -413,15 +448,19 @@ class TestReproductionNumber:
         module = SIRRollForward()
 
         beta_t = torch.rand(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         R_t = module.get_basic_reproduction_number(
             beta_t,
+            gamma_t,
+            mortality_t,
             result["S_trajectory"],
             population,
         )
@@ -433,18 +472,22 @@ class TestReproductionNumber:
         batch_size = 1
         horizon = 5
 
-        module = SIRRollForward(gamma=0.2)
+        module = SIRRollForward()
 
         beta_t = torch.ones(batch_size, horizon) * 0.4
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0])
         S0 = torch.tensor([500.0])
         I0 = torch.tensor([500.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         R_t = module.get_basic_reproduction_number(
             beta_t,
+            gamma_t,
+            mortality_t,
             result["S_trajectory"],
             population,
         )
@@ -464,25 +507,29 @@ class TestValidation:
         module = SIRRollForward()
 
         beta_t = torch.rand(1, 5) * 0.5
+        gamma_t = torch.ones(1, 5) * 0.2
+        mortality_t = torch.zeros(1, 5)
         population = torch.tensor([1000.0])
         S0 = torch.tensor([900.0])
         I0 = torch.tensor([-100.0])  # Negative!
         R0 = torch.tensor([200.0])
 
         with pytest.raises(ValueError, match="non-negative"):
-            module(beta_t, S0, I0, R0, population)
+            module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
     def test_initial_states_mass_violation_normalized(self):
         """Test that S+I+R != N gets normalized when mass conservation is on."""
         module = SIRRollForward(enforce_mass_conservation=True)
 
         beta_t = torch.rand(1, 5) * 0.5
+        gamma_t = torch.ones(1, 5) * 0.2
+        mortality_t = torch.zeros(1, 5)
         population = torch.tensor([1000.0])
         S0 = torch.tensor([900.0])
         I0 = torch.tensor([200.0])  # Too high!
         R0 = torch.zeros(1)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         total = (
             result["S_trajectory"][:, 0]
@@ -496,26 +543,30 @@ class TestValidation:
         module = SIRRollForward()
 
         beta_t = torch.rand(2, 5)  # batch_size=2
+        gamma_t = torch.ones(2, 5) * 0.2
+        mortality_t = torch.zeros(2, 5)
         population = torch.tensor([1000.0])  # batch_size=1
         S0 = torch.tensor([900.0])
         I0 = torch.tensor([100.0])
         R0 = torch.zeros(1)
 
         with pytest.raises(ValueError):
-            module(beta_t, S0, I0, R0, population)
+            module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
     def test_invalid_population_non_positive(self):
         """Test that non-positive population raises error."""
         module = SIRRollForward()
 
         beta_t = torch.rand(1, 5) * 0.5
+        gamma_t = torch.ones(1, 5) * 0.2
+        mortality_t = torch.zeros(1, 5)
         population = torch.tensor([0.0])
         S0 = torch.tensor([0.0])
         I0 = torch.tensor([0.0])
         R0 = torch.tensor([0.0])
 
         with pytest.raises(ValueError, match="Population must be positive"):
-            module(beta_t, S0, I0, R0, population)
+            module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
 
 class TestEdgeCases:
@@ -529,12 +580,14 @@ class TestEdgeCases:
         module = SIRRollForward()
 
         beta_t = torch.ones(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = population.clone()
         I0 = torch.zeros(batch_size)
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # With no infected, nothing should change
         assert torch.allclose(
@@ -555,12 +608,14 @@ class TestEdgeCases:
         module = SIRRollForward()
 
         beta_t = torch.ones(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0])
         S0 = torch.zeros(batch_size)
         I0 = population.clone()
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Everyone should recover (no new infections possible)
         # With gamma=0.2, dt=1: I_t = 1000 * 0.8^t
@@ -577,12 +632,14 @@ class TestEdgeCases:
         module = SIRRollForward()
 
         beta_t = torch.ones(batch_size, horizon) * 0.3
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([10000.0])
         S0 = torch.tensor([9900.0])
         I0 = torch.tensor([100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Check mass conservation throughout
         total = result["S_trajectory"] + result["I_trajectory"] + result["R_trajectory"]
@@ -607,13 +664,15 @@ class TestEdgeCases:
             ],
             dim=1,
         )
+        gamma_t = torch.ones(1, 20) * 0.2
+        mortality_t = torch.zeros(1, 20)
 
         population = torch.tensor([10000.0])
         S0 = torch.tensor([9900.0])
         I0 = torch.tensor([100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
         I_traj = result["I_trajectory"][0]
 
         # Should see peak during high-beta period
@@ -630,12 +689,14 @@ class TestEdgeCases:
         module = SIRRollForward()
 
         beta_t = torch.rand(batch_size, horizon) * 0.5
+        gamma_t = torch.ones(batch_size, horizon) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon)
         population = torch.tensor([1000.0, 1000.0])
         S0 = torch.tensor([900.0, 900.0])
         I0 = torch.tensor([100.0, 100.0])
         R0 = torch.zeros(batch_size)
 
-        result = module(beta_t, S0, I0, R0, population)
+        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
         # Should still produce correct shapes
         assert result["S_trajectory"].shape == (batch_size, 2)

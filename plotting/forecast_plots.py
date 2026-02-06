@@ -8,8 +8,6 @@ from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
-from utils.normalization import unscale_forecasts
-
 
 def indices_for_target_nodes_in_window(
     *,
@@ -139,7 +137,7 @@ def collect_forecast_samples_for_target_nodes(
             region_embeddings = region_embeddings.to(device)
 
         with torch.no_grad():
-            predictions = model.forward(
+            model_outputs = model.forward(
                 cases_norm=batch["CaseNode"].to(device),
                 cases_mean=batch["CaseMean"].to(device),
                 cases_std=batch["CaseStd"].to(device),
@@ -149,25 +147,33 @@ def collect_forecast_samples_for_target_nodes(
                 region_embeddings=region_embeddings,
                 population=batch["Population"].to(device),
             )
+            if not isinstance(model_outputs, dict):
+                raise ValueError(
+                    "Joint inference plotting expects model outputs as a dict."
+                )
+            if "pred_hosp" not in model_outputs:
+                raise ValueError(
+                    "Joint inference plotting expects 'pred_hosp' in model outputs."
+                )
+            if "HospTarget" not in batch:
+                raise ValueError(
+                    "Joint inference plotting expects 'HospTarget' in the batch."
+                )
+            if "HospHistory" not in batch:
+                raise ValueError(
+                    "Joint inference plotting expects 'HospHistory' in the batch."
+                )
 
-            pred_unscaled, targets_unscaled = unscale_forecasts(
-                predictions,
-                batch["Target"].to(device),
-                batch["TargetMean"].to(device),
-                batch["TargetScale"].to(device),
-            )
-
-            history_norm = batch["CaseNode"].to(device)
-            case_mean = batch["CaseMean"].to(device)
-            case_std = batch["CaseStd"].to(device)
-            history_unscaled = history_norm * case_std + case_mean
+            pred_unscaled = model_outputs["pred_hosp"]
+            targets_unscaled = batch["HospTarget"].to(device)
+            history_unscaled = batch["HospHistory"].to(device)
 
         samples: list[dict[str, Any]] = []
         L = dataset.config.model.history_length
         H = dataset.config.model.forecast_horizon
         T_total = dataset.precomputed_cases.shape[0]
 
-        for i in range(int(predictions.shape[0])):
+        for i in range(int(pred_unscaled.shape[0])):
             target_node = int(batch["TargetNode"][i].item())
             node_idx = target_node
             start_idx = start_indices[i] if i < len(start_indices) else -1
@@ -176,7 +182,11 @@ def collect_forecast_samples_for_target_nodes(
             t_min = max(0, t0 - context_pre)
             t_max = min(T_total, t0 + H + context_post)
 
-            actual_context_full = dataset.precomputed_cases[
+            if not hasattr(dataset, "precomputed_hosp"):
+                raise ValueError(
+                    "Joint inference plotting expects dataset.precomputed_hosp."
+                )
+            actual_context_full = dataset.precomputed_hosp[
                 t_min:t_max, node_idx, 0
             ].numpy()
             t_rel = np.arange(t_min, t_max, dtype=np.int64) - t0

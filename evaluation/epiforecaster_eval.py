@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -117,6 +118,176 @@ class CompositeLoss(ForecastLoss):
         return total
 
 
+class JointInferenceLoss(nn.Module):
+    """
+    Joint inference loss combining wastewater, hospitalization, and SIR physics losses.
+
+    This loss is designed for the joint inference framework where the model outputs
+    latent SIR states and observation predictions rather than direct forecasts.
+    """
+
+    def __init__(
+        self,
+        w_ww: float = 1.0,
+        w_hosp: float = 1.0,
+        w_cases: float = 1.0,
+        w_deaths: float = 1.0,
+        w_sir: float = 0.1,
+    ):
+        super().__init__()
+        self.w_ww = w_ww
+        self.w_hosp = w_hosp
+        self.w_cases = w_cases
+        self.w_deaths = w_deaths
+        self.w_sir = w_sir
+
+    @staticmethod
+    def _masked_mse(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # Always exclude non-finite targets from supervision to avoid NaN loss/gradients.
+        finite_mask = torch.isfinite(target).to(prediction.dtype)
+        if mask is None:
+            mask_f = finite_mask
+        else:
+            mask_f = mask.to(prediction.dtype) * finite_mask
+
+        denom = mask_f.sum()
+        if denom.item() <= 0:
+            # Keep graph connectivity for all-masked batches.
+            return prediction.sum() * 0.0
+
+        target_clean = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+        sq = (prediction - target_clean) ** 2
+        return (sq * mask_f).sum() / denom
+
+    def forward(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor | None],
+    ) -> torch.Tensor:
+        components = self.compute_components(model_outputs, targets)
+        return components["total"]
+
+    def compute_components(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor | None],
+    ) -> dict[str, torch.Tensor]:
+        """
+        Compute joint inference loss components.
+
+        Args:
+            model_outputs: Dict from EpiForecaster.forward() containing:
+                - pred_ww: [B, H] predicted wastewater
+                - pred_hosp: [B, H] predicted hospitalizations
+                - pred_cases: [B, H] predicted reported cases
+                - pred_deaths: [B, H] predicted deaths
+                - physics_residual: [B, H] SIR dynamics residual
+            targets: Dict containing target tensors:
+                - ww: [B, H] wastewater targets (optional)
+                - hosp: [B, H] hospitalization targets (optional)
+                - cases: [B, H] reported cases targets (optional)
+                - deaths: [B, H] deaths targets (optional)
+
+        Returns:
+            Dict with unweighted and weighted component losses plus total:
+                - ww, hosp, cases, deaths, sir
+                - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted, sir_weighted
+                - total
+        """
+        # Keep total loss attached to model graph, even if all components are masked out.
+        total_loss = model_outputs["pred_ww"].sum() * 0.0
+        ww_loss = model_outputs["pred_ww"].sum() * 0.0
+        hosp_loss = model_outputs["pred_ww"].sum() * 0.0
+        cases_loss = model_outputs["pred_ww"].sum() * 0.0
+        deaths_loss = model_outputs["pred_ww"].sum() * 0.0
+        sir_loss = model_outputs["pred_ww"].sum() * 0.0
+
+        # Wastewater loss
+        if self.w_ww > 0 and targets.get("ww") is not None:
+            ww_loss = self._masked_mse(
+                model_outputs["pred_ww"], targets["ww"], targets.get("ww_mask")
+            )
+            total_loss = total_loss + self.w_ww * ww_loss
+
+        # Hospitalization loss
+        if self.w_hosp > 0 and targets.get("hosp") is not None:
+            hosp_loss = self._masked_mse(
+                model_outputs["pred_hosp"], targets["hosp"], targets.get("hosp_mask")
+            )
+            total_loss = total_loss + self.w_hosp * hosp_loss
+
+        # Cases loss (reported cases observation)
+        if targets.get("cases") is not None:
+            cases_loss = self._masked_mse(
+                model_outputs["pred_cases"], targets["cases"], targets.get("cases_mask")
+            )
+            if self.w_cases > 0:
+                total_loss = total_loss + self.w_cases * cases_loss
+
+        # Deaths loss (mortality observation)
+        if targets.get("deaths") is not None:
+            deaths_loss = self._masked_mse(
+                model_outputs["pred_deaths"],
+                targets["deaths"],
+                targets.get("deaths_mask"),
+            )
+            if self.w_deaths > 0:
+                total_loss = total_loss + self.w_deaths * deaths_loss
+
+        # SIR physics loss (always computed from residual)
+        if self.w_sir > 0:
+            physics_residual = model_outputs["physics_residual"]
+            ww_mask = targets.get("ww_mask")
+            hosp_mask = targets.get("hosp_mask")
+            cases_mask = targets.get("cases_mask")
+            deaths_mask = targets.get("deaths_mask")
+
+            combined_mask: torch.Tensor | None = None
+            masks = [
+                m
+                for m in [ww_mask, hosp_mask, cases_mask, deaths_mask]
+                if m is not None
+            ]
+            if masks:
+                combined_mask = masks[0]
+                for m in masks[1:]:
+                    combined_mask = torch.maximum(combined_mask, m)
+
+            if combined_mask is None:
+                sir_loss = physics_residual.mean()
+            else:
+                sir_loss = self._masked_mse(
+                    physics_residual,
+                    torch.zeros_like(physics_residual),
+                    combined_mask,
+                )
+            total_loss = total_loss + self.w_sir * sir_loss
+
+        ww_weighted = self.w_ww * ww_loss
+        hosp_weighted = self.w_hosp * hosp_loss
+        cases_weighted = self.w_cases * cases_loss
+        deaths_weighted = self.w_deaths * deaths_loss
+        sir_weighted = self.w_sir * sir_loss
+
+        return {
+            "ww": ww_loss,
+            "hosp": hosp_loss,
+            "cases": cases_loss,
+            "deaths": deaths_loss,
+            "sir": sir_loss,
+            "ww_weighted": ww_weighted,
+            "hosp_weighted": hosp_weighted,
+            "cases_weighted": cases_weighted,
+            "deaths_weighted": deaths_weighted,
+            "sir_weighted": sir_weighted,
+            "total": total_loss,
+        }
+
+
 def get_loss_function(name: str) -> ForecastLoss:
     name_lower = name.lower()
     if name_lower == "mse":
@@ -131,10 +302,22 @@ def get_loss_function(name: str) -> ForecastLoss:
         raise ValueError(f"Unknown loss function: {name}")
 
 
-def get_loss_from_config(loss_config: LossConfig | None) -> ForecastLoss:
+def get_loss_from_config(
+    loss_config: LossConfig | None,
+) -> ForecastLoss | JointInferenceLoss:
     if loss_config is None:
         return get_loss_function("smape")
     name_lower = loss_config.name.lower()
+    if name_lower == "joint_inference":
+        # Joint inference loss for SIR + observation heads
+        joint_cfg = loss_config.joint
+        return JointInferenceLoss(
+            w_ww=joint_cfg.w_ww,
+            w_hosp=joint_cfg.w_hosp,
+            w_cases=joint_cfg.w_cases,
+            w_deaths=joint_cfg.w_deaths,
+            w_sir=joint_cfg.w_sir,
+        )
     if name_lower == "composite":
         if not loss_config.components:
             raise ValueError("Composite loss requires components")
@@ -228,6 +411,8 @@ def load_model_from_checkpoint(
         head_n_heads=config.model.head_n_heads,
         head_num_layers=config.model.head_num_layers,
         head_dropout=config.model.head_dropout,
+        sir_physics=config.model.sir_physics,
+        observation_heads=config.model.observation_heads,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(resolve_device(device))
@@ -316,7 +501,10 @@ def build_loader_from_config(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate_epidataset_batch,
+        collate_fn=partial(
+            collate_epidataset_batch,
+            require_region_index=bool(config.model.type.regions),
+        ),
         worker_init_fn=_suppress_zarr_warnings if num_workers > 0 else None,
     )
     return loader, region_embeddings
@@ -436,21 +624,31 @@ def topk_target_nodes_by_mae(
         with torch.no_grad():
             eval_iter = loader
             for batch in eval_iter:
-                (
-                    predictions,
-                    targets,
-                    _target_mean,
-                    _target_scale,
-                ) = forward_model.forward_batch(
+                model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch,
                     region_embeddings=region_embeddings,
                 )
+                predictions = model_outputs.get("pred_hosp")
+                targets = targets_dict.get("hosp")
+                mask = targets_dict.get("hosp_mask")
+                if predictions is None or targets is None:
+                    raise ValueError(
+                        "topk_target_nodes_by_mae requires hospitalization targets "
+                        "('HospTarget') to be present in the batch."
+                    )
+                if mask is None:
+                    mask = torch.ones_like(targets)
                 abs_diff = (predictions - targets).abs()
-                per_sample_mae = abs_diff.mean(dim=1)
+                valid_per_sample = mask.sum(dim=1) > 0
+                per_sample_mae = (abs_diff * mask).sum(dim=1) / mask.sum(
+                    dim=1
+                ).clamp_min(1.0)
                 target_nodes = batch["TargetNode"]
-                for sample_mae, target_node in zip(
-                    per_sample_mae, target_nodes, strict=False
+                for sample_mae, target_node, is_valid in zip(
+                    per_sample_mae, target_nodes, valid_per_sample, strict=False
                 ):
+                    if not bool(is_valid):
+                        continue
                     node_id = int(target_node)
                     if node_id not in node_mae_sum:
                         node_mae_sum[node_id] = torch.tensor(0.0, device=device)
@@ -539,6 +737,11 @@ def evaluate_checkpoint_topk_forecasts(
     node_mae_dict: dict[int, float] = {}
     try:
         criterion = get_loss_from_config(config.training.loss)
+        if not isinstance(criterion, JointInferenceLoss):
+            raise ValueError(
+                "Evaluation now requires JointInferenceLoss. "
+                "Set training.loss.name=joint_inference in the config."
+            )
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
             loader=loader,
@@ -603,7 +806,7 @@ def evaluate_loader(
     *,
     model: torch.nn.Module,
     loader: DataLoader,
-    criterion: ForecastLoss,
+    criterion: JointInferenceLoss,
     horizon: int,
     device: torch.device,
     region_embeddings: torch.Tensor | None = None,
@@ -618,17 +821,33 @@ def evaluate_loader(
     logger.info(f"{split_name} evaluation started...")
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
-    mae_sum = torch.tensor(0.0, device=device)
-    mse_sum = torch.tensor(0.0, device=device)
-    smape_sum = torch.tensor(0.0, device=device)
-
-    total_count = 0
-    # Welford's algorithm for variance - keep on device
-    target_mean_acc = torch.tensor(0.0, device=device)
-    target_m2 = torch.tensor(0.0, device=device)
+    hosp_mae_sum = torch.tensor(0.0, device=device)
+    hosp_mse_sum = torch.tensor(0.0, device=device)
+    hosp_smape_sum = torch.tensor(0.0, device=device)
+    hosp_total_count = 0
+    hosp_target_mean_acc = torch.tensor(0.0, device=device)
+    hosp_target_m2 = torch.tensor(0.0, device=device)
 
     per_h_mae_sum = torch.zeros(horizon, device=device)
     per_h_mse_sum = torch.zeros(horizon, device=device)
+    per_h_count_sum = torch.zeros(horizon, device=device)
+
+    ww_mae_sum = torch.tensor(0.0, device=device)
+    ww_mse_sum = torch.tensor(0.0, device=device)
+    ww_smape_sum = torch.tensor(0.0, device=device)
+    ww_total_count = 0
+    ww_target_mean_acc = torch.tensor(0.0, device=device)
+    ww_target_m2 = torch.tensor(0.0, device=device)
+    loss_ww_sum = torch.tensor(0.0, device=device)
+    loss_hosp_sum = torch.tensor(0.0, device=device)
+    loss_cases_sum = torch.tensor(0.0, device=device)
+    loss_deaths_sum = torch.tensor(0.0, device=device)
+    loss_sir_sum = torch.tensor(0.0, device=device)
+    loss_ww_weighted_sum = torch.tensor(0.0, device=device)
+    loss_hosp_weighted_sum = torch.tensor(0.0, device=device)
+    loss_cases_weighted_sum = torch.tensor(0.0, device=device)
+    loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
+    loss_sir_weighted_sum = torch.tensor(0.0, device=device)
 
     # For node-level MAE, accumulate in dict but defer item() calls
     node_mae_sum: dict[int, torch.Tensor] = {}
@@ -655,63 +874,127 @@ def evaluate_loader(
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
-                (
-                    predictions,
-                    targets,
-                    target_mean,
-                    target_scale,
-                ) = forward_model.forward_batch(
+                model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
                 )
 
-                loss = criterion.forward(
-                    predictions, targets, target_mean, target_scale
-                )
+                components = criterion.compute_components(model_outputs, targets_dict)
+                loss = components["total"]
                 total_loss += loss.detach()
+                loss_ww_sum += components["ww"].detach()
+                loss_hosp_sum += components["hosp"].detach()
+                loss_cases_sum += components["cases"].detach()
+                loss_deaths_sum += components["deaths"].detach()
+                loss_sir_sum += components["sir"].detach()
+                loss_ww_weighted_sum += components["ww_weighted"].detach()
+                loss_hosp_weighted_sum += components["hosp_weighted"].detach()
+                loss_cases_weighted_sum += components["cases_weighted"].detach()
+                loss_deaths_weighted_sum += components["deaths_weighted"].detach()
+                loss_sir_weighted_sum += components["sir_weighted"].detach()
 
-                pred_unscaled, targets_unscaled = unscale_forecasts(
-                    predictions, targets, target_mean, target_scale
-                )
+                pred_hosp = model_outputs.get("pred_hosp")
+                hosp_targets = targets_dict.get("hosp")
+                hosp_mask = targets_dict.get("hosp_mask")
+                if pred_hosp is not None and hosp_targets is not None:
+                    if hosp_mask is None:
+                        hosp_mask = torch.ones_like(hosp_targets)
+                    mask = hosp_mask.to(pred_hosp.dtype)
 
-                diff = pred_unscaled - targets_unscaled
-                abs_diff = diff.abs()
-                mae_sum += abs_diff.sum()
-                mse_sum += (diff**2).sum()
-                smape_sum += (
-                    2
-                    * abs_diff
-                    / (pred_unscaled.abs() + targets_unscaled.abs() + epsilon)
-                ).sum()
+                    # Clean targets for metric calculation
+                    hosp_targets_clean = torch.nan_to_num(hosp_targets, nan=0.0)
 
-                # Per-node MAE - keep tensors on device until end
-                per_sample_mae = abs_diff.mean(dim=1)
-                target_nodes = batch_data["TargetNode"]
-                for sample_mae, target_node in zip(
-                    per_sample_mae, target_nodes, strict=False
-                ):
-                    node_id = int(target_node)
-                    if node_id not in node_mae_sum:
-                        node_mae_sum[node_id] = torch.tensor(0.0, device=device)
-                    node_mae_sum[node_id] += sample_mae.detach()
-                    node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
+                    diff = pred_hosp - hosp_targets_clean
+                    abs_diff = diff.abs()
+                    hosp_mae_sum += (abs_diff * mask).sum()
+                    hosp_mse_sum += ((diff**2) * mask).sum()
+                    hosp_smape_sum += (
+                        2
+                        * abs_diff
+                        / (pred_hosp.abs() + hosp_targets_clean.abs() + epsilon)
+                        * mask
+                    ).sum()
 
-                # Welford's algorithm for variance (device-local)
-                flat_targets = targets_unscaled.detach().float().reshape(-1)
-                batch_count = flat_targets.numel()
-                batch_mean = flat_targets.mean()
-                batch_m2 = ((flat_targets - batch_mean) ** 2).sum()
+                    # Per-node MAE - keep tensors on device until end
+                    valid_per_sample = mask.sum(dim=1) > 0
+                    per_sample_mae = (abs_diff * mask).sum(dim=1) / mask.sum(
+                        dim=1
+                    ).clamp_min(1.0)
+                    target_nodes = batch_data["TargetNode"]
+                    for sample_mae, target_node, is_valid in zip(
+                        per_sample_mae, target_nodes, valid_per_sample, strict=False
+                    ):
+                        if not bool(is_valid):
+                            continue
+                        node_id = int(target_node)
+                        if node_id not in node_mae_sum:
+                            node_mae_sum[node_id] = torch.tensor(0.0, device=device)
+                        node_mae_sum[node_id] += sample_mae.detach()
+                        node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
 
-                delta = batch_mean - target_mean_acc
-                new_count = total_count + batch_count
-                target_mean_acc += delta * batch_count / new_count
-                target_m2 += (
-                    batch_m2 + (delta**2) * (total_count * batch_count) / new_count
-                )
-                total_count = new_count
+                    # Welford's algorithm for variance (device-local)
+                    # Use cleaned targets masked by validity
+                    flat_targets = (
+                        hosp_targets_clean[mask > 0].detach().float().reshape(-1)
+                    )
+                    batch_count = flat_targets.numel()
+                    if batch_count > 0:
+                        batch_mean = flat_targets.mean()
+                        batch_m2 = ((flat_targets - batch_mean) ** 2).sum()
 
-                per_h_mae_sum += abs_diff.sum(dim=0)
-                per_h_mse_sum += (diff**2).sum(dim=0)
+                        delta = batch_mean - hosp_target_mean_acc
+                        new_count = hosp_total_count + batch_count
+                        hosp_target_mean_acc += delta * batch_count / new_count
+                        hosp_target_m2 += (
+                            batch_m2
+                            + (delta**2) * (hosp_total_count * batch_count) / new_count
+                        )
+                        hosp_total_count = new_count
+
+                    per_h_mae_sum += (abs_diff * mask).sum(dim=0)
+                    per_h_mse_sum += ((diff**2) * mask).sum(dim=0)
+                    per_h_count_sum += mask.sum(dim=0)
+
+                pred_ww = model_outputs.get("pred_ww")
+                ww_targets = targets_dict.get("ww")
+                ww_mask = targets_dict.get("ww_mask")
+                if pred_ww is not None and ww_targets is not None:
+                    if ww_mask is None:
+                        ww_mask = torch.ones_like(ww_targets)
+                    mask_ww = ww_mask.to(pred_ww.dtype)
+
+                    # Clean targets for metric calculation
+                    ww_targets_clean = torch.nan_to_num(ww_targets, nan=0.0)
+
+                    diff_ww = pred_ww - ww_targets_clean
+                    abs_diff_ww = diff_ww.abs()
+                    ww_mae_sum += (abs_diff_ww * mask_ww).sum()
+                    ww_mse_sum += ((diff_ww**2) * mask_ww).sum()
+                    ww_smape_sum += (
+                        2
+                        * abs_diff_ww
+                        / (pred_ww.abs() + ww_targets_clean.abs() + epsilon)
+                        * mask_ww
+                    ).sum()
+
+                    flat_targets_ww = (
+                        ww_targets_clean[mask_ww > 0].detach().float().reshape(-1)
+                    )
+                    batch_count_ww = flat_targets_ww.numel()
+                    if batch_count_ww > 0:
+                        batch_mean_ww = flat_targets_ww.mean()
+                        batch_m2_ww = ((flat_targets_ww - batch_mean_ww) ** 2).sum()
+
+                        delta_ww = batch_mean_ww - ww_target_mean_acc
+                        new_count_ww = ww_total_count + batch_count_ww
+                        ww_target_mean_acc += delta_ww * batch_count_ww / new_count_ww
+                        ww_target_m2 += (
+                            batch_m2_ww
+                            + (delta_ww**2)
+                            * (ww_total_count * batch_count_ww)
+                            / new_count_ww
+                        )
+                        ww_total_count = new_count_ww
 
     finally:
         if model_was_training:
@@ -719,15 +1002,31 @@ def evaluate_loader(
 
     # Final sync - transfer metrics to CPU once
     mean_loss = (total_loss / max(1, num_batches)).item()
-    mean_mae = (mae_sum / max(1, total_count)).item()
-    mean_rmse = (
-        math.sqrt((mse_sum / max(1, total_count)).item()) if total_count else 0.0
-    )
-    mean_smape = (smape_sum / max(1, total_count)).item()
+    if hosp_total_count:
+        mean_mae = (hosp_mae_sum / max(1, hosp_total_count)).item()
+        mean_rmse = math.sqrt((hosp_mse_sum / max(1, hosp_total_count)).item())
+        mean_smape = (hosp_smape_sum / max(1, hosp_total_count)).item()
+        ss_res = hosp_mse_sum.item()
+        ss_tot = hosp_target_m2.item()
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    else:
+        mean_mae = float("nan")
+        mean_rmse = float("nan")
+        mean_smape = float("nan")
+        r2 = float("nan")
 
-    ss_res = mse_sum.item()
-    ss_tot = target_m2.item()
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    if ww_total_count:
+        mean_mae_ww = (ww_mae_sum / max(1, ww_total_count)).item()
+        mean_rmse_ww = math.sqrt((ww_mse_sum / max(1, ww_total_count)).item())
+        mean_smape_ww = (ww_smape_sum / max(1, ww_total_count)).item()
+        ss_res_ww = ww_mse_sum.item()
+        ss_tot_ww = ww_target_m2.item()
+        r2_ww = 1 - ss_res_ww / ss_tot_ww if ss_tot_ww > 0 else float("nan")
+    else:
+        mean_mae_ww = float("nan")
+        mean_rmse_ww = float("nan")
+        mean_smape_ww = float("nan")
+        r2_ww = float("nan")
 
     # Convert node MAE tensors to scalars
     node_mae = {
@@ -745,11 +1044,13 @@ def evaluate_loader(
             for node_id in sorted(node_mae.keys()):
                 writer.writerow([node_id, node_mae[node_id], node_mae_count[node_id]])
 
-    per_h_count = total_count / max(1, horizon)
-    per_h_mae = (per_h_mae_sum / max(1, per_h_count)).tolist()
-    per_h_rmse = (
-        (per_h_mse_sum / max(1, per_h_count)).sqrt().tolist() if per_h_count else []
-    )
+    if hosp_total_count:
+        per_h_denom = per_h_count_sum.clamp_min(1.0)
+        per_h_mae = (per_h_mae_sum / per_h_denom).tolist()
+        per_h_rmse = (per_h_mse_sum / per_h_denom).sqrt().tolist()
+    else:
+        per_h_mae = []
+        per_h_rmse = []
 
     metrics = {
         "mae": mean_mae,
@@ -758,6 +1059,27 @@ def evaluate_loader(
         "r2": r2,
         "mae_per_h": per_h_mae,
         "rmse_per_h": per_h_rmse,
+        # Hospitalization metrics in log1p(per-100k) space
+        "mae_hosp_log1p_per_100k": mean_mae,
+        "rmse_hosp_log1p_per_100k": mean_rmse,
+        "smape_hosp_log1p_per_100k": mean_smape,
+        "r2_hosp_log1p_per_100k": r2,
+        # Wastewater metrics in log1p(per-100k) space
+        "mae_ww_log1p_per_100k": mean_mae_ww,
+        "rmse_ww_log1p_per_100k": mean_rmse_ww,
+        "smape_ww_log1p_per_100k": mean_smape_ww,
+        "r2_ww_log1p_per_100k": r2_ww,
+        # Joint loss components (averaged per batch, same reduction as mean_loss)
+        "loss_ww": (loss_ww_sum / max(1, num_batches)).item(),
+        "loss_hosp": (loss_hosp_sum / max(1, num_batches)).item(),
+        "loss_cases": (loss_cases_sum / max(1, num_batches)).item(),
+        "loss_deaths": (loss_deaths_sum / max(1, num_batches)).item(),
+        "loss_sir": (loss_sir_sum / max(1, num_batches)).item(),
+        "loss_ww_weighted": (loss_ww_weighted_sum / max(1, num_batches)).item(),
+        "loss_hosp_weighted": (loss_hosp_weighted_sum / max(1, num_batches)).item(),
+        "loss_cases_weighted": (loss_cases_weighted_sum / max(1, num_batches)).item(),
+        "loss_deaths_weighted": (loss_deaths_weighted_sum / max(1, num_batches)).item(),
+        "loss_sir_weighted": (loss_sir_weighted_sum / max(1, num_batches)).item(),
     }
 
     logger.info("EVAL COMPLETE")

@@ -84,6 +84,7 @@ train = "cli:train_cli"
 # Analysis CLI tools
 perf-analyze = "scripts.analyze_trace:main"
 step-breakdown = "scripts.breakdown_step:main"
+loss-curve-critic = "scripts.analyze_loss_curve:main"
 gradnorm-analyze = "scripts.analyze_gradnorm:main"
 dead-code-analyze = "scripts.dead_code_analyze:main"
 remote-train = "scripts.remote_train:main"

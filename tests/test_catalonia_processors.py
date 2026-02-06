@@ -3,7 +3,6 @@
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
 import pytest
 
 from data.preprocess.config import PreprocessingConfig
@@ -36,15 +35,13 @@ def temp_data_dir(tmp_path: Path) -> Path:
         "02/01/2022,01,08019,1,Positiu PCR,7\n"
     )
 
-    # Deaths data (comarca level, DD/MM/YYYY format)
-    deaths_file = (
-        tmp_path
-        / "Registre_de_defuncions_per_COVID-19_a_Catalunya_per_comarca_i_sexe.csv"
-    )
+    # Deaths data (municipality level from pre-aggregated CSV)
+    deaths_file = tmp_path / "deaths_municipality.csv"
     deaths_file.write_text(
-        "Data defunció,Codi Comarca,Sexe,Nombre defuncions\n"
-        "01/01/2022,01,Home,2\n"
-        "01/01/2022,11,Dona,1\n"
+        "Data defunció,municipality_code,municipality_name,defuncions_muni\n"
+        "01/01/2022,08019,Barcelona,2.0\n"
+        "01/01/2022,08021,Abrera,1.0\n"
+        "02/01/2022,08019,Barcelona,3.0\n"
     )
 
     # Dummy files for config validation
@@ -104,37 +101,19 @@ def test_catalonia_cases_output_format(
 
 
 @pytest.mark.region
-def test_deaths_processor_comarca_level(
+def test_deaths_processor_municipality_level(
     config: PreprocessingConfig, temp_data_dir: Path
 ):
-    """Test deaths processor at comarca level."""
+    """Test deaths processor at municipality level from pre-aggregated data."""
     proc = DeathsProcessor(config)
-    result = proc.process(temp_data_dir, allocate_to_municipalities=False)
+    result = proc.process(temp_data_dir)
 
     assert "deaths" in result
     assert result.deaths.dims == ("date", "region_id")
-    assert result.deaths.sum() == 3  # 2+1
-
-
-@pytest.mark.region
-def test_deaths_processor_municipality_allocation(
-    config: PreprocessingConfig, temp_data_dir: Path
-):
-    """Test deaths processor allocation to municipalities."""
-    proc = DeathsProcessor(config)
-
-    # Mock population data
-    pop_df = pd.DataFrame({"region_id": ["08019", "08021"], "population": [1000, 500]})
-
-    mapping_proc = MunicipalityMappingProcessor(temp_data_dir)
-    result = proc.process(
-        temp_data_dir,
-        population_df=pop_df,
-        allocate_to_municipalities=True,
-        mapping_processor=mapping_proc,
-    )
-
-    assert "deaths" in result
+    assert result.deaths.sizes["date"] == 15  # full date range (reindexed)
     assert result.deaths.sizes["region_id"] == 2  # 2 municipalities
-    # Comarca 01 has 2 deaths, allocated to 08019 (100% of comarca population)
-    assert result.deaths.sel(region_id="08019").sum() == 2
+    # Total deaths: 2.0 + 1.0 + 3.0 = 6.0
+    assert result.deaths.sum() == 6.0
+    # Check specific municipality
+    assert result.deaths.sel(region_id="08019").sum() == 5.0  # 2.0 + 3.0
+    assert result.deaths.sel(region_id="08021").sum() == 1.0
