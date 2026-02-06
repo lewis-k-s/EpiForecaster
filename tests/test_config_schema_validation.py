@@ -41,6 +41,8 @@ def test_epiforecaster_training_configs_parse(config_path):
     assert cfg.data is not None
     assert cfg.training is not None
     assert cfg.output is not None
+    # Verify that the config uses joint_inference loss (required by EpiForecasterTrainer)
+    assert cfg.training.loss.name == "joint_inference"
 
 
 @pytest.mark.region

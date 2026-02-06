@@ -33,7 +33,7 @@ training:
   learning_rate: 0.001
   model_id: "curriculum_test"
   device: "auto"
-  
+
   curriculum:
     enabled: true
     active_runs: 1
@@ -55,7 +55,16 @@ training:
       - start_epoch: 60
         end_epoch: 100
         synth_ratio: 0.05
-        mode: "node_major" # Specialist Fine-tuning
+  progress_log_frequency: 10 # Log progress every N steps to reduce CPU-GPU sync
+  # Joint inference loss configuration
+  loss:
+    name: "joint_inference"
+    joint:
+      w_ww: 1.0
+      w_hosp: 1.0
+      w_cases: 1.0
+      w_deaths: 1.0
+      w_sir: 0.1
 
 output:
   log_dir: "outputs/training"

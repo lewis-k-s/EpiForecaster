@@ -87,7 +87,7 @@ class JointLossConfig:
 class LossConfig:
     """Loss configuration from ``training.loss`` YAML block."""
 
-    name: str = "smape"
+    name: str = "joint_inference"
     components: list[LossComponentConfig] = field(default_factory=list)
     # Joint inference loss weights (used when training with SIR + observation heads)
     joint: JointLossConfig = field(default_factory=JointLossConfig)

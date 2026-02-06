@@ -26,7 +26,7 @@ data:
   sample_ordering: "time"
   log_scale: true
   run_id: "0_Baseline" # Synthetic run to use for training
-  run_id_chunk_size: 1  # Load one run at a time for memory safety
+  run_id_chunk_size: 1 # Load one run at a time for memory safety
 
 model:
   type:
@@ -63,10 +63,10 @@ training:
   pin_memory: true
   # Worker configuration: treat total workers as shared budget across loaders
   # With 3 loaders (train/val/test), num_workers applies to each unless overridden
-  num_workers: 16      # Training workers - increased from 12 after memory analysis
-  val_workers: 4       # Validation workers - runs periodically
-  test_workers: 0      # Test workers - runs once at end, no prefetching needed
-  prefetch_factor: 4   # Batches to prefetch per worker (kept at 4)
+  num_workers: 16 # Training workers - increased from 12 after memory analysis
+  val_workers: 4 # Validation workers - runs periodically
+  test_workers: 0 # Test workers - runs once at end, no prefetching needed
+  prefetch_factor: 4 # Batches to prefetch per worker (kept at 4)
 
   # Temporal split configuration
   # for synthetic, there is no real horizon so we should split by node to train on the whole series
@@ -87,3 +87,12 @@ training:
     log_dir: auto
   plot_forecasts: true
   num_forecast_samples: 3
+  # Joint inference loss configuration
+  loss:
+    name: "joint_inference"
+    joint:
+      w_ww: 1.0
+      w_hosp: 1.0
+      w_cases: 1.0
+      w_deaths: 1.0
+      w_sir: 0.1

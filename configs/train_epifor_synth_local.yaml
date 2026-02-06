@@ -10,14 +10,14 @@
 data:
     dataset_path: data/processed/synthetic_full.zarr
     region2vec_path: checkpoints/region_embedding/region_embeddings.pt
-    use_valid_targets: false  # Reduces dataset size
+    use_valid_targets: false # Reduces dataset size
     mobility_threshold: 10
     missing_permit: 2
     window_stride: 1
     sample_ordering: "time"
     log_scale: true
     run_id: "0_Baseline"
-    run_id_chunk_size: 1  # Load data in small chunks for memory safety
+    run_id_chunk_size: 1 # Load data in small chunks for memory safety
 
 model:
     type:
@@ -39,15 +39,15 @@ output:
     log_dir: outputs/training
 
 training:
-    device: "auto"  # Will use CPU if no GPU available
-    batch_size: 2  # Tiny micro-batch for local testing
-    gradient_accumulation_steps: 2  # Effective batch = 4
+    device: "auto" # Will use CPU if no GPU available
+    batch_size: 2 # Tiny micro-batch for local testing
+    gradient_accumulation_steps: 2 # Effective batch = 4
     early_stopping_patience: 3
     nan_loss_patience: 3
-    epochs: 2  # Quick test - just 2 epochs
+    epochs: 2 # Quick test - just 2 epochs
     learning_rate: 0.001
     weight_decay: 1.0e-05
-    num_workers: 0  # No multiprocessing for simplicity
+    num_workers: 0 # No multiprocessing for simplicity
     val_workers: 0
     prefetch_factor: null
 
@@ -58,6 +58,15 @@ training:
     test_split: 0.1
 
     profiler:
-        enabled: false  # Disable profiling for local test
-    plot_forecasts: false  # Disable plotting for faster test
-    enable_mixed_precision: false  # Disable for CPU compatibility
+        enabled: false # Disable profiling for local test
+    plot_forecasts: false # Disable plotting for faster test
+    enable_mixed_precision: false # Disable for CPU compatibility
+    # Joint inference loss configuration
+    loss:
+        name: "joint_inference"
+        joint:
+            w_ww: 1.0
+            w_hosp: 1.0
+            w_cases: 1.0
+            w_deaths: 1.0
+            w_sir: 0.1
