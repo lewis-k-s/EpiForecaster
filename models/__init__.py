@@ -9,7 +9,7 @@ from .aggregators import (
     create_aggregator,
 )
 from .epiforecaster import EpiForecaster
-from .forecaster_head import ForecasterHead
+from .transformer_backbone import TransformerBackbone
 from .mobility_gnn import MobilityGNN
 from .observation_heads import (
     ClinicalObservationHead,
@@ -30,7 +30,7 @@ __all__ = [
     "MaxPoolAggregator",
     "create_aggregator",
     "EpiForecaster",
-    "ForecasterHead",
+    "TransformerBackbone",
     "MobilityGNN",
     "SIRRollForward",
     "DelayKernel",

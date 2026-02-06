@@ -76,7 +76,7 @@ class DelayKernel(nn.Module):
         else:
             self.register_buffer("kernel", kernel_weights)
 
-        logger.info(
+        logger.debug(
             f"Initialized DelayKernel: length={kernel_length}, "
             f"gamma({gamma_shape}, {gamma_scale}), learnable={learnable}"
         )
@@ -233,7 +233,7 @@ class SheddingConvolution(nn.Module):
         else:
             self.register_buffer("sensitivity_scale", torch.tensor(sensitivity_scale))
 
-        logger.info(
+        logger.debug(
             f"Initialized SheddingConvolution: length={kernel_length}, "
             f"sensitivity_scale={sensitivity_scale:.4f}, "
             f"learnable_kernel={learnable_kernel}, learnable_scale={learnable_scale}"
@@ -372,21 +372,34 @@ class ClinicalObservationHead(nn.Module):
     """
     Observation head wrapper for clinical signals (cases, hospitalizations, deaths).
 
-    Combines DelayKernel with optional learnable scaling factors for observation rates.
-    Supports variant-specific adjustments if variant proportions are provided.
+    Combines DelayKernel with learnable scaling to map infection fractions to
+    log1p(per-100k) space for joint inference.
+
+    Unit Contract:
+        This head expects I_trajectory as population FRACTIONS (sum of S+I+R = 1.0),
+        not absolute counts. The "per-100k" conversion assumes these fractions are
+        relative to a normalized population of 100,000. The learnable scale factor
+        absorbs the true population-to-fraction relationship during training.
+
+        Input: I_t ∈ [0, 1] (fraction of population infected)
+        Output: log1p(cases per 100,000 population)
 
     Architecture:
-        1. DelayKernel: I_trajectory → delayed_infections
-        2. Observation scaling: delayed_infections × observation_rate
-        3. (Optional) Variant adjustment: Σ_v (I × Prop_v × Rate_v)
+        1. DelayKernel: I_trajectory → delayed_infections (fractions)
+        2. Convert to per-100k: delayed_infections × 100,000
+        3. Apply learnable scale: per_100k × scale
+        4. Apply log1p: log1p(scaled)
+        5. Add residual: pred_log + alpha × residual(obs_context)
 
     Args:
         kernel_length: Length of delay kernel
         gamma_shape: Gamma shape parameter for kernel init
         gamma_scale: Gamma scale parameter for kernel init
         learnable_kernel: If True, delay kernel is trainable
-        observation_rate_init: Initial observation rate (fraction of infections observed)
-        learnable_rate: If True, observation rate is trainable
+        scale_init: Initial scale for per-100k conversion (default 1.0)
+        learnable_scale: If True, scale is trainable
+        residual_dim: Dimension of observation context for residual
+        alpha_init: Initial weight for residual connection
     """
 
     def __init__(
@@ -395,8 +408,10 @@ class ClinicalObservationHead(nn.Module):
         gamma_shape: float = 5.0,
         gamma_scale: float = 2.0,
         learnable_kernel: bool = True,
-        observation_rate_init: float = 0.1,
-        learnable_rate: bool = True,
+        scale_init: float = 1.0,
+        learnable_scale: bool = True,
+        residual_dim: int = 0,
+        alpha_init: float = 0.1,
     ):
         super().__init__()
 
@@ -407,55 +422,76 @@ class ClinicalObservationHead(nn.Module):
             learnable=learnable_kernel,
         )
 
-        # Observation rate: fraction of infections that become observed cases/hosp/deaths
-        if learnable_rate:
-            rate_tensor = torch.tensor(float(observation_rate_init))
-            self.observation_rate = nn.Parameter(_inverse_softplus(rate_tensor))
+        # Learnable scale for per-100k conversion (constrained positive)
+        if learnable_scale:
+            self.scale = nn.Parameter(torch.log(torch.tensor(float(scale_init))))
         else:
-            self.register_buffer(
-                "observation_rate", torch.tensor(observation_rate_init)
-            )
+            self.register_buffer("scale", torch.tensor(scale_init))
+        self.learnable_scale = learnable_scale
 
-        self.learnable_rate = learnable_rate
+        # Residual connection from observation context
+        self.use_residual = residual_dim > 0
+        if self.use_residual:
+            self.residual_proj = nn.Linear(residual_dim, 1)
+            nn.init.zeros_(self.residual_proj.weight)
+            nn.init.zeros_(self.residual_proj.bias)
+            if learnable_scale:
+                self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+            else:
+                self.register_buffer("alpha", torch.tensor(alpha_init))
+        else:
+            self.residual_proj = None
+            self.alpha = None
 
         logger.info(
-            f"Initialized ClinicalObservationHead: rate_init={observation_rate_init}, "
-            f"learnable_rate={learnable_rate}"
+            f"Initialized ClinicalObservationHead: scale_init={scale_init}, "
+            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}"
         )
 
     def forward(
         self,
         I_trajectory: torch.Tensor,
-        variant_proportions: torch.Tensor | None = None,
+        obs_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Generate clinical observations from infection trajectory.
+        Generate clinical observations from infection trajectory in log1p(per-100k) space.
 
         Args:
-            I_trajectory: Infected population trajectory [batch_size, time_steps]
-            variant_proportions: Optional variant proportions [batch_size, time_steps, n_variants]
-                If provided, applies variant-specific observation rates.
+            I_trajectory: Infected population fraction trajectory [batch_size, time_steps]
+            obs_context: Optional observation context [batch_size, time_steps, residual_dim]
+                If provided, adds residual connection.
 
         Returns:
-            Observed counts [batch_size, time_steps]
+            Predicted log1p(per-100k) values [batch_size, time_steps]
 
-        Note:
-            - For variant-aware prediction, use variant-specific observation rates
-            - Without variant info, uses single observation_rate for all infections
+        Formula:
+            pred = log1p(I_delayed × 100,000 × scale) + alpha × residual(obs_context)
         """
-        # Apply delay kernel
+        # Apply delay kernel to infection trajectory
         delayed_infections = self.delay_kernel(I_trajectory)
-        observation_rate = self.get_observation_rate()
 
-        if variant_proportions is not None:
-            # Variant-aware: weighted by variant proportions (placeholder for future)
-            # For now, use same observation rate (extensible structure)
-            observed = delayed_infections * observation_rate
-        else:
-            # Single observation rate
-            observed = delayed_infections * observation_rate
+        # Convert fraction to per-100k
+        per_100k = delayed_infections * 100_000.0
 
-        return observed
+        # Apply learnable scale
+        scale = self.get_scale()
+        scaled = per_100k * scale
+
+        # Apply log1p transform
+        pred_log = torch.log1p(scaled)
+
+        # Add residual from observation context if provided
+        if (
+            self.use_residual
+            and obs_context is not None
+            and self.residual_proj is not None
+        ):
+            residual = self.residual_proj(obs_context).squeeze(-1)
+            alpha = self.get_alpha()
+            if alpha is not None:
+                pred_log = pred_log + alpha * residual
+
+        return pred_log
 
     def get_delay_stats(self) -> dict:
         """Get statistics about the delay kernel."""
@@ -464,16 +500,22 @@ class ClinicalObservationHead(nn.Module):
             "kernel_length": self.delay_kernel.kernel_length,
         }
 
-    def get_observation_rate(self) -> torch.Tensor:
-        """Get positive observation rate."""
-        if self.learnable_rate:
-            return F.softplus(self.observation_rate)
-        return self.observation_rate
+    def get_scale(self) -> torch.Tensor:
+        """Get positive scale parameter."""
+        if self.learnable_scale:
+            return torch.exp(self.scale)
+        return self.scale
+
+    def get_alpha(self) -> torch.Tensor | None:
+        """Get residual weight alpha."""
+        if self.alpha is not None and isinstance(self.alpha, nn.Parameter):
+            return self.alpha
+        return self.alpha
 
     def __repr__(self) -> str:
         return (
             f"ClinicalObservationHead(delay={self.delay_kernel}, "
-            f"rate={self.get_observation_rate().item():.4f}, learnable_rate={self.learnable_rate})"
+            f"scale={self.get_scale().item():.4f}, learnable_scale={self.learnable_scale})"
         )
 
 
@@ -481,62 +523,127 @@ class WastewaterObservationHead(nn.Module):
     """
     Observation head wrapper for wastewater viral concentration.
 
-    Combines SheddingConvolution with sensitivity scaling for wastewater surveillance.
-    Models the physical dilution process and measurement sensitivity.
+    Combines SheddingConvolution with learnable scaling to map infection fractions to
+    log1p(per-100k) space for joint inference.
 
     Architecture:
-        1. SheddingConvolution: (I_trajectory, population) → viral_concentration
-        2. Observation noise model: (Optional) Add measurement noise calibration
+        1. SheddingConvolution: (I_trajectory, population) → viral_load
+        2. Convert to per-100k: viral_load × 100,000 / population
+        3. Apply log1p: log1p(per_100k × scale)
+        4. Add residual: pred_log + alpha × residual(obs_context)
 
     Args:
         kernel_length: Length of shedding kernel (default 14 days)
-        sensitivity_scale: Measurement sensitivity (default 1.0)
+        scale_init: Initial scale for per-100k conversion (default 1.0)
         learnable_kernel: If True, shedding profile is trainable
-        learnable_scale: If True, sensitivity scale is trainable
+        learnable_scale: If True, scale is trainable
+        residual_dim: Dimension of observation context for residual
+        alpha_init: Initial weight for residual connection
     """
 
     def __init__(
         self,
         kernel_length: int = 14,
-        sensitivity_scale: float = 1.0,
+        scale_init: float = 1.0,
         learnable_kernel: bool = True,
         learnable_scale: bool = True,
+        residual_dim: int = 0,
+        alpha_init: float = 0.1,
     ):
         super().__init__()
 
         self.shedding_conv = SheddingConvolution(
             kernel_length=kernel_length,
-            sensitivity_scale=sensitivity_scale,
+            sensitivity_scale=1.0,  # Fixed, we'll handle scaling separately
             learnable_kernel=learnable_kernel,
-            learnable_scale=learnable_scale,
+            learnable_scale=False,  # We handle scale separately
         )
 
-        logger.info(f"Initialized WastewaterObservationHead: {self.shedding_conv}")
+        # Learnable scale for per-100k conversion (constrained positive)
+        if learnable_scale:
+            self.scale = nn.Parameter(torch.log(torch.tensor(float(scale_init))))
+        else:
+            self.register_buffer("scale", torch.tensor(scale_init))
+        self.learnable_scale = learnable_scale
+
+        # Residual connection from observation context
+        self.use_residual = residual_dim > 0
+        if self.use_residual:
+            self.residual_proj = nn.Linear(residual_dim, 1)
+            nn.init.zeros_(self.residual_proj.weight)
+            nn.init.zeros_(self.residual_proj.bias)
+            if learnable_scale:
+                self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+            else:
+                self.register_buffer("alpha", torch.tensor(alpha_init))
+        else:
+            self.residual_proj = None
+            self.alpha = None
+
+        logger.info(
+            f"Initialized WastewaterObservationHead: scale_init={scale_init}, "
+            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}"
+        )
 
     def forward(
-        self, I_trajectory: torch.Tensor, population: torch.Tensor
+        self,
+        I_trajectory: torch.Tensor,
+        population: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Generate wastewater viral concentration from infection trajectory.
+        Generate wastewater predictions from infection trajectory in log1p(per-100k) space.
 
         Args:
-            I_trajectory: Infected population trajectory [batch_size, time_steps]
+            I_trajectory: Infected population fraction trajectory [batch_size, time_steps]
             population: Population time series [batch_size, time_steps]
-                Time-varying population accounts for mobility-adjusted flow
+            obs_context: Optional observation context [batch_size, time_steps, residual_dim]
+                If provided, adds residual connection.
 
         Returns:
-            Viral concentration [batch_size, time_steps]
-                Calibrated units via sensitivity_scale (e.g., copies/L)
+            Predicted log1p(per-100k) values [batch_size, time_steps]
 
         Formula:
-            viral_concentration_t = sensitivity_scale × Σ_k(I_{t-k} × shedding_k) / population_t
-
-        Key Physical Properties:
-            - Same infections in small population → high concentration (detectable)
-            - Same infections in large population → low concentration (diluted)
-            - Calibratable to match real-world LoD (e.g., 375 copies/L)
+            viral_load = conv(I, shedding_kernel) / population
+            pred = log1p(viral_load × 100,000 × scale) + alpha × residual(obs_context)
         """
-        return self.shedding_conv(I_trajectory, population)
+        # Apply shedding convolution (returns viral load normalized by population)
+        viral_load = self.shedding_conv(I_trajectory, population)
+
+        # Convert to per-100k
+        per_100k = viral_load * 100_000.0
+
+        # Apply learnable scale
+        scale = self.get_scale()
+        scaled = per_100k * scale
+
+        # Apply log1p transform
+        pred_log = torch.log1p(scaled)
+
+        # Add residual from observation context if provided
+        if (
+            self.use_residual
+            and obs_context is not None
+            and self.residual_proj is not None
+        ):
+            residual = self.residual_proj(obs_context).squeeze(-1)
+            alpha = self.get_alpha()
+            if alpha is not None:
+                pred_log = pred_log + alpha * residual
+
+        return pred_log
+
+    def get_scale(self) -> torch.Tensor:
+        """Get positive scale parameter."""
+        if self.learnable_scale:
+            return torch.exp(self.scale)
+        return self.scale
+
+    def get_alpha(self) -> torch.Tensor | None:
+        """Get residual weight alpha."""
+        if self.alpha is not None and isinstance(self.alpha, nn.Parameter):
+            return self.alpha
+        return self.alpha
 
     def get_shedding_stats(self) -> dict:
         """Get statistics about the shedding kernel."""
