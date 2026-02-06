@@ -4,6 +4,7 @@ import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
+import warnings
 import xarray as xr
 
 from data.preprocess.config import PreprocessingConfig
@@ -98,7 +99,7 @@ def _make_config(tmp_path, synthetic_path):
         output_path=str(tmp_path / "out"),
         dataset_name="synthetic_test",
         wastewater_flow_mode="concentration",
-        run_id_chunk_size=2,
+        run_id_chunk_size=1,
         chunk_size=10,
         min_density_threshold=0.0,
         validate_alignment=False,
@@ -154,7 +155,14 @@ def test_synthetic_processor_run_filter(tmp_path):
     config = _make_config(tmp_path, synthetic_path)
     processor = SyntheticProcessor(config)
 
-    result = processor.process(str(synthetic_path), run_filter=["synth_b"])
+    # Suppress chunking warning when filtering runs - this is expected behavior
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The specified chunks separate the stored chunks",
+            category=UserWarning,
+        )
+        result = processor.process(str(synthetic_path), run_filter=["synth_b"])
     cases = result["cases"]["cases"]
 
     assert list(cases.run_id.values) == ["synth_b"]

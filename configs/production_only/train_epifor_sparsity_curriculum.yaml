@@ -1,4 +1,6 @@
 # Sparsity-based curriculum learning configuration
+
+env: "mn5"
 # This configuration demonstrates progressive training from low sparsity (clean data)
 # to high sparsity (real-world conditions) using synthetic data with varying
 # sparsity levels [0.05, 0.2, 0.4, 0.6, 0.8].
@@ -45,10 +47,12 @@ model:
 output:
   experiment_name: sparsity_curriculum
   log_dir: outputs/training
+  wandb_mode: offline
+  wandb_tags: [mn5]
 
 training:
   device: "cuda"
-  batch_size: 12
+  batch_size: 32
   gradient_accumulation_steps: 2
   early_stopping_patience: 10
   nan_loss_patience: 5
@@ -56,7 +60,7 @@ training:
   epochs: 20
   learning_rate: 0.0005
   weight_decay: 1.0e-05
-  num_workers: 6
+  num_workers: 8
   val_workers: 2
   prefetch_factor: 2
   val_split: 0.2
@@ -72,8 +76,6 @@ training:
     chunk_size: 512
     # How to select runs within sparsity range: "round_robin" or "random"
     run_sampling: "round_robin"
-    # Raw dataset path for sparsity metadata
-    raw_dataset_path: data/files/raw_synthetic_observations.zarr
 
     schedule:
       # Phase 0: Clean synthetic only (learn dynamics without noise)

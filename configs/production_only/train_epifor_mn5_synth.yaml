@@ -1,4 +1,6 @@
 # Production config for training on synthetic data with MN5-scale settings
+
+env: "mn5"
 #
 # WARNING: DO NOT RUN THIS CONFIG LOCALLY. This config uses MN5-scale settings
 # with high memory requirements. Even with reduced workers/batch size, the
@@ -46,6 +48,8 @@ model:
 output:
   experiment_name: mn5_synth_temporal
   log_dir: outputs/training
+  wandb_mode: offline
+  wandb_tags: [mn5]
 
 training:
   device: "cuda"

@@ -85,6 +85,9 @@ class PreprocessingConfig:
     deaths_file: str | None = None  # Deaths data (comarca-level)
     catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
 
+    # Optional environment
+    env: str | None = None
+
     # Feature processing options
     min_flow_threshold: int = 10
     wastewater_flow_mode: str = "total_flow"  # "total_flow" or "concentration"

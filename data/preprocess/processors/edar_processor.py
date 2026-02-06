@@ -868,10 +868,9 @@ class EDARProcessor:
     def _resample_to_daily(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.set_index("date")
         # Select only numeric columns after groupby to avoid deprecation warning
-        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
         df = (
-            df.groupby(["edar_id", "variant"])[numeric_cols]
-            .resample("D")
+            df.groupby(["edar_id", "variant"])
+            .resample("D", include_groups=False)
             .sum(numeric_only=True)
             .reset_index()
         )

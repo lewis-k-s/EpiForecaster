@@ -1,3 +1,5 @@
+env: "mn5"
+
 data:
   dataset_path: data/processed/real_with_id.zarr
   region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
@@ -26,6 +28,8 @@ model:
 output:
   experiment_name: mn5_epiforecaster_temporal
   log_dir: outputs/training
+  wandb_mode: offline
+  wandb_tags: [mn5]
 training:
   device: "cuda"
   batch_size: 16

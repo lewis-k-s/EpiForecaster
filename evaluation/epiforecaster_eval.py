@@ -11,8 +11,8 @@ from typing import Any, cast
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import zarr.errors
 
 from data.collate import collate_epidataset_batch
@@ -30,6 +30,36 @@ logger = logging.getLogger(__name__)
 
 # Global seeded RNG for reproducibility across evaluation/plotting
 _GLOBAL_RNG = np.random.default_rng(42)
+
+
+def _ensure_wandb_run(
+    *,
+    config: EpiForecasterConfig | None,
+    log_dir: Path | None,
+    name: str,
+    job_type: str,
+) -> wandb.sdk.wandb_run.Run | None:
+    if wandb.run is not None:
+        return wandb.run
+    if log_dir is None:
+        return None
+    project = config.output.wandb_project if config is not None else "epiforecaster"
+    entity = config.output.wandb_entity if config is not None else None
+    group = None
+    mode = "online"
+    if config is not None:
+        group = config.output.wandb_group or config.output.experiment_name
+        mode = config.output.wandb_mode
+    return wandb.init(
+        project=project,
+        entity=entity,
+        group=group,
+        name=name,
+        dir=str(log_dir),
+        config=config.to_dict() if config is not None else None,
+        job_type=job_type,
+        mode=mode,
+    )
 
 
 class ForecastLoss(nn.Module):
@@ -755,18 +785,22 @@ def evaluate_checkpoint_topk_forecasts(
     except Exception as exc:  # pragma: no cover - evaluation best-effort
         logger.warning(f"[eval] Metrics evaluation failed: {exc}")
 
-    if log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        writer = SummaryWriter(log_dir=str(log_dir))
-        writer.add_text(
-            "eval/summary", _format_eval_summary(eval_loss, eval_metrics), 0
+    if log_dir is not None or wandb.run is not None:
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        run_name = f"eval_{split}_{checkpoint_path.parent.parent.name}"
+        _ensure_wandb_run(
+            config=config, log_dir=log_dir, name=run_name, job_type="eval"
         )
-        if math.isfinite(eval_loss):
-            writer.add_scalar(f"eval/{split}/loss", eval_loss, 0)
-        for key in ("mae", "rmse", "smape", "r2"):
-            if key in eval_metrics:
-                writer.add_scalar(f"eval/{split}/{key}", eval_metrics[key], 0)
-        writer.close()
+        if wandb.run is not None:
+            log_data: dict[str, Any] = {}
+            if math.isfinite(eval_loss):
+                log_data[f"loss_{split}"] = eval_loss
+            for key in ("mae", "rmse", "smape", "r2"):
+                if key in eval_metrics:
+                    log_data[f"{key}_{split}"] = eval_metrics[key]
+            if log_data:
+                wandb.log(log_data, step=0)
 
     return {
         "checkpoint": checkpoint,
@@ -1109,7 +1143,7 @@ def generate_forecast_plots(
         context_pre: Days before forecast start
         context_post: Days after forecast end
         output_path: Optional path to save figure
-        log_dir: Optional TensorBoard log directory
+    log_dir: Optional W&B run directory for eval metrics
 
     Returns:
         Dict with figure, all_samples, selected_nodes, node_groups
@@ -1173,12 +1207,17 @@ def generate_forecast_plots(
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
         logger.info(f"[plot] Saved figure to: {output_path}")
 
-    # Log to TensorBoard if provided
-    if fig is not None and log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        writer = SummaryWriter(log_dir=str(log_dir))
-        writer.add_figure("forecasts", fig, 0)
-        writer.close()
+    if fig is not None and (log_dir is not None or wandb.run is not None):
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_wandb_run(
+            config=dataset.config,
+            log_dir=log_dir,
+            name="forecast_plots",
+            job_type="eval",
+        )
+        if wandb.run is not None:
+            wandb.log({"forecasts": wandb.Image(fig)}, step=0)
 
     return {
         "figure": fig,
@@ -1205,7 +1244,7 @@ def eval_checkpoint(
         checkpoint_path: Path to checkpoint file
         split: Which split to evaluate ("val" or "test")
         device: Device to use for evaluation
-        log_dir: Optional TensorBoard log directory
+    log_dir: Optional W&B run directory for forecast plots
         overrides: Optional list of dotted-key config overrides (e.g., ["training.val_workers=4"])
         output_csv_path: Optional path to save node-level metrics CSV
 
@@ -1255,19 +1294,22 @@ def eval_checkpoint(
     except Exception as exc:
         logger.warning(f"[eval] Metrics evaluation failed: {exc}")
 
-    # Log to TensorBoard
-    if log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        writer = SummaryWriter(log_dir=str(log_dir))
-        writer.add_text(
-            "eval/summary", _format_eval_summary(eval_loss, eval_metrics), 0
+    if log_dir is not None or wandb.run is not None:
+        if log_dir is not None:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        run_name = f"eval_{split}_{checkpoint_path.parent.parent.name}"
+        _ensure_wandb_run(
+            config=config, log_dir=log_dir, name=run_name, job_type="eval"
         )
-        if math.isfinite(eval_loss):
-            writer.add_scalar(f"eval/{split}/loss", eval_loss, 0)
-        for key in ("mae", "rmse", "smape", "r2"):
-            if key in eval_metrics:
-                writer.add_scalar(f"eval/{split}/{key}", eval_metrics[key], 0)
-        writer.close()
+        if wandb.run is not None:
+            log_data: dict[str, Any] = {}
+            if math.isfinite(eval_loss):
+                log_data[f"loss_{split}"] = eval_loss
+            for key in ("mae", "rmse", "smape", "r2"):
+                if key in eval_metrics:
+                    log_data[f"{key}_{split}"] = eval_metrics[key]
+            if log_data:
+                wandb.log(log_data, step=0)
 
     return {
         "checkpoint": checkpoint,
