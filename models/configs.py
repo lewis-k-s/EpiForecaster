@@ -62,11 +62,35 @@ class LossComponentConfig:
 
 
 @dataclass
+class JointLossConfig:
+    """Loss weights for joint inference training."""
+
+    w_ww: float = 1.0
+    w_hosp: float = 1.0
+    w_cases: float = 1.0
+    w_deaths: float = 1.0
+    w_sir: float = 0.1
+
+    def __post_init__(self) -> None:
+        for name, value in [
+            ("w_ww", self.w_ww),
+            ("w_hosp", self.w_hosp),
+            ("w_cases", self.w_cases),
+            ("w_deaths", self.w_deaths),
+            ("w_sir", self.w_sir),
+        ]:
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+
+@dataclass
 class LossConfig:
     """Loss configuration from ``training.loss`` YAML block."""
 
     name: str = "smape"
     components: list[LossComponentConfig] = field(default_factory=list)
+    # Joint inference loss weights (used when training with SIR + observation heads)
+    joint: JointLossConfig = field(default_factory=JointLossConfig)
 
     def __post_init__(self) -> None:
         if isinstance(self.components, list):
@@ -81,6 +105,9 @@ class LossConfig:
                         "loss.components must be LossComponentConfig or dict entries"
                     )
             self.components = normalized
+
+        if isinstance(self.joint, (dict, DictConfig)):
+            self.joint = JointLossConfig(**self.joint)
 
 
 @dataclass
@@ -163,6 +190,86 @@ class ModelVariant:
     regions: bool = field(default=False)
     biomarkers: bool = field(default=False)
     mobility: bool = field(default=False)
+
+
+@dataclass
+class SIRPhysicsConfig:
+    """SIR dynamics configuration for the physics roll-forward core."""
+
+    dt: float = 1.0
+    enforce_nonnegativity: bool = True
+    enforce_mass_conservation: bool = True
+
+    def __post_init__(self) -> None:
+        if self.dt <= 0:
+            raise ValueError(f"dt must be positive, got {self.dt}")
+
+
+@dataclass
+class ObservationHeadConfig:
+    """Configuration for observation heads (wastewater, hospitalization, cases, deaths)."""
+
+    # Kernel lengths
+    kernel_length_ww: int = 14
+    kernel_length_hosp: int = 21
+    kernel_length_cases: int = 14
+    kernel_length_deaths: int = 21
+
+    # Learnable parameters
+    learnable_kernel_ww: bool = True
+    learnable_kernel_hosp: bool = True
+    learnable_kernel_cases: bool = True
+    learnable_kernel_deaths: bool = True
+    learnable_scale_ww: bool = True
+    learnable_scale_hosp: bool = True
+    learnable_scale_cases: bool = True
+    learnable_scale_deaths: bool = True
+
+    # Residual connection settings
+    residual_mode: str = "additive"  # "additive" | "modulation"
+    residual_scale: float = 0.2  # alpha in pred = base + alpha * residual
+    residual_hidden_dim: int = 32
+    residual_layers: int = 2
+    residual_dropout: float = 0.1
+
+    # Observation context dimension
+    obs_context_dim: int = 96
+
+    def __post_init__(self) -> None:
+        for name, value in [
+            ("kernel_length_ww", self.kernel_length_ww),
+            ("kernel_length_hosp", self.kernel_length_hosp),
+            ("kernel_length_cases", self.kernel_length_cases),
+            ("kernel_length_deaths", self.kernel_length_deaths),
+        ]:
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.residual_scale < 0:
+            raise ValueError(
+                f"residual_scale must be non-negative, got {self.residual_scale}"
+            )
+        if self.residual_hidden_dim <= 0:
+            raise ValueError(
+                f"residual_hidden_dim must be positive, got {self.residual_hidden_dim}"
+            )
+        if self.residual_layers < 0:
+            raise ValueError(
+                f"residual_layers must be non-negative, got {self.residual_layers}"
+            )
+        if not 0 <= self.residual_dropout <= 1:
+            raise ValueError(
+                f"residual_dropout must be in [0, 1], got {self.residual_dropout}"
+            )
+        if self.obs_context_dim <= 0:
+            raise ValueError(
+                f"obs_context_dim must be positive, got {self.obs_context_dim}"
+            )
+
+        valid_modes = {"additive", "modulation"}
+        if self.residual_mode not in valid_modes:
+            raise ValueError(
+                f"residual_mode must be one of {valid_modes}, got {self.residual_mode}"
+            )
 
 
 @dataclass
@@ -299,12 +406,24 @@ class ModelConfig:
     head_num_layers: int = 3
     head_dropout: float = 0.1
 
+    # -- SIR physics and observation heads --#
+    sir_physics: SIRPhysicsConfig = field(default_factory=SIRPhysicsConfig)
+    observation_heads: ObservationHeadConfig = field(
+        default_factory=ObservationHeadConfig
+    )
+
     # pretrained region2vec encoder model weights
     region2vec_path: str = ""
 
     def __post_init__(self) -> None:
         if isinstance(self.type, (dict, DictConfig)):
             self.type = ModelVariant(**self.type)  # type: ignore[arg-type]
+
+        if isinstance(self.sir_physics, (dict, DictConfig)):
+            self.sir_physics = SIRPhysicsConfig(**self.sir_physics)
+
+        if isinstance(self.observation_heads, (dict, DictConfig)):
+            self.observation_heads = ObservationHeadConfig(**self.observation_heads)
 
         if self.type.mobility:
             if not self.gnn_module:
@@ -390,7 +509,15 @@ class TrainingParams:
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
 
-        valid_loss_names = {"smape", "mse", "mae", "l1", "mse_unscaled", "composite"}
+        valid_loss_names = {
+            "smape",
+            "mse",
+            "mae",
+            "l1",
+            "mse_unscaled",
+            "composite",
+            "joint_inference",
+        }
         loss_name = (self.loss.name or "").lower()
         if loss_name not in valid_loss_names:
             raise ValueError(

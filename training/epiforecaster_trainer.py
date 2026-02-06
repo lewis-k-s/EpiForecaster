@@ -12,6 +12,7 @@ import logging
 import os
 import platform
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +32,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data.epi_dataset import (
     EpiDataset,
-    EpiDatasetItem,
-    curriculum_collate_fn,
-    optimized_collate_graphs,
+    collate_epiforecaster_batch,
 )
 from data.preprocess.config import REGION_COORD
 from data.samplers import EpidemicCurriculumSampler
-from evaluation.epiforecaster_eval import evaluate_loader
+from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from utils import setup_tensor_core_optimizations
 from utils.platform import (
     cleanup_nvme_staging,
@@ -312,6 +311,8 @@ class EpiForecasterTrainer:
 
         self.model = EpiForecaster(
             variant_type=self.config.model.type,
+            sir_physics=self.config.model.sir_physics,
+            observation_heads=self.config.model.observation_heads,
             temporal_input_dim=train_example_ds.cases_output_dim,
             biomarkers_dim=train_example_ds.biomarkers_output_dim,
             region_embedding_dim=self.config.model.region_embedding_dim,
@@ -357,6 +358,11 @@ class EpiForecasterTrainer:
         total_steps = self.config.training.epochs * len(self.train_loader)
         self.scheduler = self._create_scheduler(total_steps=total_steps)
         self.criterion = self._create_criterion()
+        if not isinstance(self.criterion, JointInferenceLoss):
+            raise ValueError(
+                "EpiForecasterTrainer now requires JointInferenceLoss. "
+                "Set training.loss.name=joint_inference in the config."
+            )
 
         # Setup logging and checkpointing
         self.setup_logging()
@@ -916,6 +922,10 @@ class EpiForecasterTrainer:
             train_loader_kwargs["multiprocessing_context"] = mp_context
 
         # Configure Sampler & Collate based on Curriculum
+        shared_collate = partial(
+            collate_epiforecaster_batch,
+            require_region_index=bool(self.config.model.type.regions),
+        )
         if self.config.training.curriculum.enabled and isinstance(
             self.train_dataset, ConcatDataset
         ):
@@ -929,13 +939,13 @@ class EpiForecasterTrainer:
             )
             # When using batch_sampler, batch_size and shuffle must be omitted
             train_loader_kwargs["batch_sampler"] = self.curriculum_sampler
-            train_loader_kwargs["collate_fn"] = curriculum_collate_fn
+            train_loader_kwargs["collate_fn"] = shared_collate
         else:
             # Standard training
             self.curriculum_sampler = None
             train_loader_kwargs["batch_size"] = self.config.training.batch_size
             train_loader_kwargs["shuffle"] = False
-            train_loader_kwargs["collate_fn"] = self._collate_fn
+            train_loader_kwargs["collate_fn"] = shared_collate
 
         if persistent_workers:
             train_loader_kwargs["persistent_workers"] = True
@@ -954,7 +964,7 @@ class EpiForecasterTrainer:
             "shuffle": False,
             "num_workers": val_num_workers,
             "pin_memory": pin_memory,
-            "collate_fn": self._collate_fn,
+            "collate_fn": shared_collate,
         }
         # Only pass multiprocessing_context when using workers
         if val_num_workers > 0:
@@ -981,7 +991,7 @@ class EpiForecasterTrainer:
             "shuffle": False,
             "num_workers": test_num_workers,
             "pin_memory": pin_memory,
-            "collate_fn": self._collate_fn,
+            "collate_fn": shared_collate,
         }
         # Only pass multiprocessing_context when using workers
         if test_num_workers > 0:
@@ -1019,53 +1029,6 @@ class EpiForecasterTrainer:
             if loader is None or loader.num_workers == 0:
                 continue
             _ = iter(loader)
-
-    @staticmethod
-    def _collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
-        "Custom collate for per-node samples with PyG mobility graphs."
-
-        B = len(batch)
-        case_node = torch.stack([item["case_node"] for item in batch], dim=0)
-        bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
-        case_mean = torch.stack([item["case_mean"] for item in batch], dim=0)
-        case_std = torch.stack([item["case_std"] for item in batch], dim=0)
-        targets = torch.stack([item["target"] for item in batch], dim=0)
-        target_scales = torch.stack([item["target_scale"] for item in batch], dim=0)
-        target_mean = torch.stack([item["target_mean"] for item in batch], dim=0)
-        target_nodes = torch.tensor(
-            [item["target_node"] for item in batch], dtype=torch.long
-        )
-        window_starts = torch.tensor(
-            [item["window_start"] for item in batch], dtype=torch.long
-        )
-        population = torch.stack([item["population"] for item in batch], dim=0)
-
-        # Use optimized manual batching
-        mob_batch = optimized_collate_graphs(batch)
-
-        T = batch[0]["mob_x"].shape[0] if B > 0 else 0
-        # store B and T on the batch for downstream reshaping
-        mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
-        mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
-
-        # Target index is now precomputed inside optimized_collate_graphs
-
-        return {
-            "CaseNode": case_node,  # (B, L, C)
-            "CaseMean": case_mean,  # (B, L, 1)
-            "CaseStd": case_std,  # (B, L, 1)
-            "BioNode": bio_node,  # (B, L, B)
-            "MobBatch": mob_batch,  # Batched PyG graphs
-            "Population": population,  # (B,)
-            "B": B,
-            "T": T,
-            "Target": targets,  # (B, H)
-            "TargetScale": target_scales,  # (B, C)
-            "TargetMean": target_mean,  # (B, 1)
-            "TargetNode": target_nodes,  # (B,)
-            "WindowStart": window_starts,  # (B,)
-            "NodeLabels": [item["node_label"] for item in batch],
-        }
 
     def setup_logging(self):
         """Setup logging and experiment tracking."""
@@ -1480,19 +1443,12 @@ class EpiForecasterTrainer:
                 with torch.autocast(
                     device_type="cuda", dtype=dtype, enabled=autocast_enabled
                 ):
-                    predictions, targets, target_mean, target_scale = (
-                        self.model.forward_batch(
-                            batch_data=batch_data,
-                            region_embeddings=self.region_embeddings,
-                        )
+                    model_outputs, targets_dict = self.model.forward_batch(
+                        batch_data=batch_data,
+                        region_embeddings=self.region_embeddings,
                     )
 
-                    loss = self.criterion(
-                        predictions,
-                        targets,
-                        target_mean,
-                        target_scale,
-                    )
+                    loss = self.criterion(model_outputs, targets_dict)
 
                 # Scale loss for gradient accumulation
                 scaled_loss = loss / accum_steps
@@ -1574,9 +1530,8 @@ class EpiForecasterTrainer:
                 self.writer.add_scalar("Time/Step_s", batch_time_s, self.global_step)
 
                 # Log curriculum metrics for loss-curve-critic analysis
-                if (
-                    self.curriculum_sampler is not None
-                    and hasattr(self.curriculum_sampler, "state")
+                if self.curriculum_sampler is not None and hasattr(
+                    self.curriculum_sampler, "state"
                 ):
                     self.writer.add_scalar(
                         "Train/Sparsity",
@@ -1693,7 +1648,7 @@ class EpiForecasterTrainer:
 
         # Vectorized calculation on GPU to avoid CPU-GPU sync bottleneck
         gnn_sq_sum = torch.tensor(0.0, device=self.device)
-        head_sq_sum = torch.tensor(0.0, device=self.device)
+        backbone_sq_sum = torch.tensor(0.0, device=self.device)
         other_sq_sum = torch.tensor(0.0, device=self.device)
 
         for name, param in self.model.named_parameters():
@@ -1701,32 +1656,34 @@ class EpiForecasterTrainer:
                 grad_sq_sum = param.grad.detach().pow(2).sum()
                 if "mobility_gnn" in name:
                     gnn_sq_sum += grad_sq_sum
-                elif "forecaster_head" in name:
-                    head_sq_sum += grad_sq_sum
+                elif "backbone" in name or "forecaster_head" in name:
+                    backbone_sq_sum += grad_sq_sum
                 else:
                     other_sq_sum += grad_sq_sum
 
         # Single synchronization for all group results
-        group_sq_sums = torch.stack([gnn_sq_sum, head_sq_sum, other_sq_sum])
+        group_sq_sums = torch.stack([gnn_sq_sum, backbone_sq_sum, other_sq_sum])
         total_sq_sum = group_sq_sums.sum()
 
         # Move all squared sums to CPU at once
         all_metrics = torch.cat([group_sq_sums, total_sq_sum.unsqueeze(0)])
         all_norms = all_metrics.sqrt().cpu().numpy()
 
-        gnn_norm, head_norm, other_norm, total_norm = all_norms
+        gnn_norm, backbone_norm, other_norm, total_norm = all_norms
 
         # Log to TensorBoard
         self.writer.add_scalar("GradNorm/Total_PreClip", total_norm, step)
         self.writer.add_scalar("GradNorm/MobilityGNN", gnn_norm, step)
-        self.writer.add_scalar("GradNorm/ForecasterHead", head_norm, step)
+        self.writer.add_scalar("GradNorm/Backbone", backbone_norm, step)
+        # Backward-compatible alias for older analysis tooling.
+        self.writer.add_scalar("GradNorm/ForecasterHead", backbone_norm, step)
         self.writer.add_scalar("GradNorm/Other", other_norm, step)
 
         # Log to console/file
         self._status(
             f"Grad norms @ step {step}: Total={total_norm:.4f} | "
             f"GNN={gnn_norm:.4f} | "
-            f"Head={head_norm:.4f} | "
+            f"Backbone={backbone_norm:.4f} | "
             f"Other={other_norm:.4f}",
             logging.DEBUG,
         )
@@ -1754,6 +1711,38 @@ class EpiForecasterTrainer:
             return
         prefix = split_name.capitalize()
         self.writer.add_scalar(f"Loss/{prefix}", loss, epoch)
+        if "loss_ww" in metrics:
+            self.writer.add_scalar(f"Loss/{prefix}_WW", metrics["loss_ww"], epoch)
+        if "loss_hosp" in metrics:
+            self.writer.add_scalar(f"Loss/{prefix}_Hosp", metrics["loss_hosp"], epoch)
+        if "loss_cases" in metrics:
+            self.writer.add_scalar(f"Loss/{prefix}_Cases", metrics["loss_cases"], epoch)
+        if "loss_deaths" in metrics:
+            self.writer.add_scalar(
+                f"Loss/{prefix}_Deaths", metrics["loss_deaths"], epoch
+            )
+        if "loss_sir" in metrics:
+            self.writer.add_scalar(f"Loss/{prefix}_SIR", metrics["loss_sir"], epoch)
+        if "loss_ww_weighted" in metrics:
+            self.writer.add_scalar(
+                f"Loss/{prefix}_WW_weighted", metrics["loss_ww_weighted"], epoch
+            )
+        if "loss_hosp_weighted" in metrics:
+            self.writer.add_scalar(
+                f"Loss/{prefix}_Hosp_weighted", metrics["loss_hosp_weighted"], epoch
+            )
+        if "loss_cases_weighted" in metrics:
+            self.writer.add_scalar(
+                f"Loss/{prefix}_Cases_weighted", metrics["loss_cases_weighted"], epoch
+            )
+        if "loss_deaths_weighted" in metrics:
+            self.writer.add_scalar(
+                f"Loss/{prefix}_Deaths_weighted", metrics["loss_deaths_weighted"], epoch
+            )
+        if "loss_sir_weighted" in metrics:
+            self.writer.add_scalar(
+                f"Loss/{prefix}_SIR_weighted", metrics["loss_sir_weighted"], epoch
+            )
         self.writer.add_scalar(f"Metrics/{prefix}/MAE", metrics["mae"], epoch)
         self.writer.add_scalar(f"Metrics/{prefix}/RMSE", metrics["rmse"], epoch)
         self.writer.add_scalar(f"Metrics/{prefix}/sMAPE", metrics["smape"], epoch)
@@ -1765,9 +1754,8 @@ class EpiForecasterTrainer:
             self.writer.add_scalar(f"Metrics/{prefix}/RMSE_h{idx + 1}", rmse_h, epoch)
 
         # Log curriculum metrics for loss-curve-critic analysis
-        if (
-            self.curriculum_sampler is not None
-            and hasattr(self.curriculum_sampler, "state")
+        if self.curriculum_sampler is not None and hasattr(
+            self.curriculum_sampler, "state"
         ):
             self.writer.add_scalar(
                 "Train/Sparsity",
@@ -1783,6 +1771,25 @@ class EpiForecasterTrainer:
         self._status(
             f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"
         )
+        if (
+            "loss_ww" in metrics
+            and "loss_hosp" in metrics
+            and "loss_sir" in metrics
+            and "loss_ww_weighted" in metrics
+            and "loss_hosp_weighted" in metrics
+            and "loss_sir_weighted" in metrics
+        ):
+            # Build component strings, only including non-zero cases/deaths
+            components_str = (
+                f"WW={metrics['loss_ww']:.4g} (w={metrics['loss_ww_weighted']:.4g}) | "
+                f"Hosp={metrics['loss_hosp']:.4g} (w={metrics['loss_hosp_weighted']:.4g}) | "
+                f"SIR={metrics['loss_sir']:.4g} (w={metrics['loss_sir_weighted']:.4g})"
+            )
+            if "loss_cases" in metrics:
+                components_str += f" | Cases={metrics['loss_cases']:.4g} (w={metrics.get('loss_cases_weighted', 0):.4g})"
+            if "loss_deaths" in metrics:
+                components_str += f" | Deaths={metrics['loss_deaths']:.4g} (w={metrics.get('loss_deaths_weighted', 0):.4g})"
+            self._status(f"{prefix} loss components: {components_str}")
         for idx, (mae_h, rmse_h) in enumerate(
             zip(metrics["mae_per_h"], metrics["rmse_per_h"], strict=False)
         ):

@@ -59,6 +59,15 @@ class EpiDatasetItem(TypedDict):
     population: torch.Tensor
     run_id: int | str | None
     target_region_index: int | None
+    # Joint inference targets (log1p per-100k space)
+    hosp_target: torch.Tensor  # [H] Hospitalization targets in log1p(per-100k)
+    ww_target: torch.Tensor  # [H] Wastewater targets in log1p(per-100k)
+    cases_target: torch.Tensor  # [H] Reported cases targets in log1p(per-100k)
+    deaths_target: torch.Tensor  # [H] Deaths targets in log1p(per-100k)
+    hosp_target_mask: torch.Tensor  # [H] 1.0 if hospitalization target is observed
+    ww_target_mask: torch.Tensor  # [H] 1.0 if wastewater target is observed
+    cases_target_mask: torch.Tensor  # [H] 1.0 if cases target is observed
+    deaths_target_mask: torch.Tensor  # [H] 1.0 if deaths target is observed
 
 
 class EpiDataset(Dataset):
@@ -141,6 +150,23 @@ class EpiDataset(Dataset):
             self.rolling_std,
         ) = self.cases_preprocessor.preprocess_dataset(self._dataset)
         # Note: rolling_mean and rolling_std are already float32 torch.Tensors from preprocess_dataset()
+
+        # Precompute joint inference targets + masks.
+        # Clinical targets use log1p(per-100k), while wastewater targets stay in
+        # measurement space (log1p on raw concentration/proxy values).
+        self.precomputed_hosp, self.precomputed_hosp_mask = (
+            self._precompute_joint_target("hospitalizations", per_100k=True)
+        )
+        self.precomputed_ww, self.precomputed_ww_mask = (
+            self._precompute_wastewater_target()
+        )
+        # Reported cases and deaths (optional, default to all-missing if not in dataset)
+        self.precomputed_cases_target, self.precomputed_cases_mask = (
+            self._precompute_joint_target("cases", per_100k=True)
+        )
+        self.precomputed_deaths, self.precomputed_deaths_mask = (
+            self._precompute_joint_target("deaths", per_100k=True)
+        )
 
         # Setup mobility preprocessor
         if mobility_preprocessor is None:
@@ -503,7 +529,7 @@ class EpiDataset(Dataset):
 
         # Use pre-extracted metadata to avoid zarr access in workers
         node_label = self._region_labels[target_idx]
-        target_region_index = None
+        target_region_index = target_idx
         if self._region_id_index is not None:
             key = str(node_label)
             if key not in self._region_id_index:
@@ -587,6 +613,27 @@ class EpiDataset(Dataset):
         target_np = future_cases[:, target_idx, 0]  # Only value channel for targets
         # target_np is already 1D with shape (H,), no squeeze needed
         targets = target_np
+
+        # Extract joint inference targets (hospitalizations and wastewater in log1p per-100k)
+        # These are already precomputed in __init__
+        hosp_target = self.precomputed_hosp[range_end:forecast_targets, target_idx]
+        hosp_target_mask = self.precomputed_hosp_mask[
+            range_end:forecast_targets, target_idx
+        ]
+        ww_target = self.precomputed_ww[range_end:forecast_targets, target_idx]
+        ww_target_mask = self.precomputed_ww_mask[
+            range_end:forecast_targets, target_idx
+        ]
+        cases_target = self.precomputed_cases_target[
+            range_end:forecast_targets, target_idx
+        ]
+        cases_target_mask = self.precomputed_cases_mask[
+            range_end:forecast_targets, target_idx
+        ]
+        deaths_target = self.precomputed_deaths[range_end:forecast_targets, target_idx]
+        deaths_target_mask = self.precomputed_deaths_mask[
+            range_end:forecast_targets, target_idx
+        ]
 
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
@@ -695,7 +742,162 @@ class EpiDataset(Dataset):
             "mob_target_node_idx": local_target_idx,
             "population": population,
             "run_id": run_id,
+            "hosp_target": hosp_target,
+            "ww_target": ww_target,
+            "cases_target": cases_target,
+            "deaths_target": deaths_target,
+            "hosp_target_mask": hosp_target_mask,
+            "ww_target_mask": ww_target_mask,
+            "cases_target_mask": cases_target_mask,
+            "deaths_target_mask": deaths_target_mask,
         }
+
+    def _load_target_values_and_mask(
+        self, var_name: str
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Load a target variable and its observation mask from the canonical dataset."""
+        ds = self._dataset
+        if ds is None:
+            raise RuntimeError(
+                "Dataset not loaded. Call load_canonical_dataset() first."
+            )
+
+        if var_name not in ds.data_vars:
+            return None, None
+
+        da = ds[var_name]
+        if da.ndim == 3:
+            da = da.squeeze(drop=True)
+        da = da.transpose(TEMPORAL_COORD, REGION_COORD)
+        values = da.values.astype(np.float32)
+
+        mask_name = f"{var_name}_mask"
+        if mask_name in ds.data_vars:
+            mask_da = ds[mask_name]
+            if mask_da.ndim == 3:
+                mask_da = mask_da.squeeze(drop=True)
+            mask_da = mask_da.transpose(TEMPORAL_COORD, REGION_COORD)
+            mask = (mask_da.values > 0).astype(np.float32)
+        else:
+            mask = np.isfinite(values).astype(np.float32)
+
+        mask = (mask > 0) & np.isfinite(values) & (values >= 0.0)
+        return values, mask.astype(np.float32)
+
+    def _precompute_wastewater_target(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build wastewater supervision target from canonical variable or EDAR proxies."""
+        ds = self._dataset
+        if ds is None:
+            raise RuntimeError(
+                "Dataset not loaded. Call load_canonical_dataset() first."
+            )
+
+        if "wastewater" in ds.data_vars:
+            return self._precompute_joint_target("wastewater", per_100k=False)
+
+        # Fallback: aggregate EDAR biomarkers into a single wastewater proxy.
+        ww_components = [
+            "edar_biomarker_N1",
+            "edar_biomarker_N2",
+            "edar_biomarker_IP4",
+        ]
+        component_tensors: list[np.ndarray] = []
+        component_masks: list[np.ndarray] = []
+
+        for var_name in ww_components:
+            values, mask = self._load_target_values_and_mask(var_name)
+            if values is None or mask is None:
+                continue
+            component_tensors.append(values)
+            component_masks.append(mask)
+
+        if not component_tensors:
+            logger.info(
+                "No wastewater variable or EDAR components found; using all-missing WW target."
+            )
+            T = len(ds[TEMPORAL_COORD])
+            zeros = torch.zeros((T, self.num_nodes), dtype=torch.float32)
+            return zeros, zeros
+
+        stacked_values = np.stack(component_tensors, axis=0)  # (C, T, N)
+        stacked_masks = np.stack(component_masks, axis=0).astype(
+            np.float32
+        )  # (C, T, N)
+
+        observed_count = stacked_masks.sum(axis=0)  # (T, N)
+        weighted_sum = (stacked_values * stacked_masks).sum(axis=0)  # (T, N)
+        combined_values = np.zeros_like(weighted_sum, dtype=np.float32)
+        np.divide(
+            weighted_sum,
+            observed_count,
+            out=combined_values,
+            where=observed_count > 0,
+        )
+        combined_mask = observed_count > 0
+
+        combined_values = np.log1p(np.clip(combined_values, a_min=0.0, a_max=None))
+        combined_values = np.nan_to_num(combined_values, nan=0.0)
+
+        logger.info(
+            "Using EDAR WW proxy target from components: %s",
+            ",".join(ww_components),
+        )
+        return (
+            torch.from_numpy(combined_values.astype(np.float32)),
+            torch.from_numpy(combined_mask.astype(np.float32)),
+        )
+
+    def _precompute_joint_target(
+        self,
+        var_name: str,
+        *,
+        per_100k: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Precompute joint inference target in log1p(per-100k) space.
+
+        Args:
+            var_name: Name of the variable in the dataset (e.g., "hospitalizations", "wastewater")
+
+        Returns:
+            Tuple of:
+                - values: (T, N) tensor with log1p(per-100k) values (NaN-filled with 0)
+                - mask: (T, N) tensor where 1.0 indicates observed/valid target
+        """
+        ds = self._dataset
+        if ds is None:
+            raise RuntimeError(
+                "Dataset not loaded. Call load_canonical_dataset() first."
+            )
+
+        values, mask = self._load_target_values_and_mask(var_name)
+        if values is None or mask is None:
+            logger.info(
+                f"Joint target '{var_name}' not found in dataset, using all-missing mask"
+            )
+            T = len(ds[TEMPORAL_COORD])
+            return (
+                torch.zeros((T, self.num_nodes), dtype=torch.float32),
+                torch.zeros((T, self.num_nodes), dtype=torch.float32),
+            )
+
+        # Convert to per-100k using population
+        if per_100k and "population" in ds:
+            pop_values = ds.population.values
+            pop_values = np.where(
+                (pop_values > 0) & np.isfinite(pop_values), pop_values, np.nan
+            )
+            per_100k = 100000.0 / pop_values
+            values = values * per_100k
+
+        # Apply log1p transform
+        values = np.log1p(np.clip(values, a_min=0.0, a_max=None))
+        mask = (mask > 0) & np.isfinite(values)
+
+        # Handle NaN values (set to 0 for missing data)
+        values = np.nan_to_num(values, nan=0.0)
+        mask_t = torch.from_numpy(mask.astype(np.float32)).to(torch.float32)
+
+        return torch.from_numpy(values).to(torch.float32), mask_t
 
     def static_covariates(self) -> StaticCovariates:
         "Returns static covariates for the dataset. (num_nodes, num_features)"
@@ -1431,15 +1633,18 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     return mob_batch
 
 
-def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
+def collate_epiforecaster_batch(
+    batch: list[EpiDatasetItem],
+    *,
+    require_region_index: bool = True,
+) -> dict[str, Any]:
     """
-    Collate function for curriculum training.
+    Collate function for EpiForecaster batches.
 
-    This mirrors the standard collate: it flattens per-time-step graphs into
-    a single PyG Batch for a consistent model contract.
+    This function is shared by curriculum and standard training/evaluation paths.
+    It flattens per-time-step graphs into a single PyG Batch for a consistent model
+    contract and can enforce region-index availability when region embeddings are used.
     """
-    import torch
-
     B = len(batch)
     if B == 0:
         return {}
@@ -1460,6 +1665,20 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     )
     population = torch.stack([item["population"] for item in batch], dim=0)
 
+    # Stack joint inference targets (log1p per-100k)
+    hosp_targets = torch.stack([item["hosp_target"] for item in batch], dim=0)
+    ww_targets = torch.stack([item["ww_target"] for item in batch], dim=0)
+    cases_targets = torch.stack([item["cases_target"] for item in batch], dim=0)
+    deaths_targets = torch.stack([item["deaths_target"] for item in batch], dim=0)
+    hosp_target_masks = torch.stack([item["hosp_target_mask"] for item in batch], dim=0)
+    ww_target_masks = torch.stack([item["ww_target_mask"] for item in batch], dim=0)
+    cases_target_masks = torch.stack(
+        [item["cases_target_mask"] for item in batch], dim=0
+    )
+    deaths_target_masks = torch.stack(
+        [item["deaths_target_mask"] for item in batch], dim=0
+    )
+
     # 2. Batch Temporal Graphs (Optimized Manual Batching)
     mob_batch = optimized_collate_graphs(batch)
 
@@ -1469,13 +1688,13 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
     mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
 
     target_region_indices = [item["target_region_index"] for item in batch]
-    if any(idx is None for idx in target_region_indices):
+    if require_region_index and any(idx is None for idx in target_region_indices):
         raise ValueError(
-            "TargetRegionIndex missing for curriculum batch. "
-            "Ensure region_id_index is provided to all EpiDataset instances."
+            "TargetRegionIndex missing for batch while region matching is required. "
+            "Ensure region_id_index is provided when model.type.regions is enabled."
         )
 
-    return {
+    out = {
         "CaseNode": case_node,  # (B, L, C)
         "CaseMean": case_mean,  # (B, L, 1)
         "CaseStd": case_std,  # (B, L, 1)
@@ -1491,4 +1710,20 @@ def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
         "TargetRegionIndex": torch.tensor(target_region_indices, dtype=torch.long),
         "WindowStart": window_starts,  # (B,)
         "NodeLabels": [item["node_label"] for item in batch],
+        "HospTarget": hosp_targets,  # (B, H) - log1p per-100k
+        "WWTarget": ww_targets,  # (B, H) - log1p per-100k
+        "CasesTarget": cases_targets,  # (B, H) - log1p per-100k
+        "DeathsTarget": deaths_targets,  # (B, H) - log1p per-100k
+        "HospTargetMask": hosp_target_masks,  # (B, H)
+        "WWTargetMask": ww_target_masks,  # (B, H)
+        "CasesTargetMask": cases_target_masks,  # (B, H)
+        "DeathsTargetMask": deaths_target_masks,  # (B, H)
     }
+    if all(idx is not None for idx in target_region_indices):
+        out["TargetRegionIndex"] = torch.tensor(target_region_indices, dtype=torch.long)
+    return out
+
+
+def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
+    """Backward-compatible curriculum collate wrapper."""
+    return collate_epiforecaster_batch(batch, require_region_index=True)

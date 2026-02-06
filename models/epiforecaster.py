@@ -1,32 +1,37 @@
 import logging
-from collections.abc import Sequence
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # type: ignore[import-not-found] (PyTorch Geometric has incomplete type stubs)
-from torch_geometric.data import Batch, Data
+from torch_geometric.data import Batch
 
-from .configs import ModelVariant
-from .forecaster_head import ForecasterHead
+from .configs import ModelVariant, ObservationHeadConfig, SIRPhysicsConfig
 from .mobility_gnn import MobilityPyGEncoder
+from .observation_heads import ClinicalObservationHead, WastewaterObservationHead
+from .sir_rollforward import SIRRollForward
+from .transformer_backbone import TransformerBackbone
 
 logger = logging.getLogger(__name__)
 
 
 class EpiForecaster(nn.Module):
     """
-    Three-layer epidemiological forecaster implementing the design document architecture.
+    Joint Inference-Observation epidemiological forecaster.
 
-    Combines static spatial embeddings (RegionEmbedder), mobility-weighted spatial
-    processing (MobilityGNN), and temporal modeling (ForecasterHead) to forecast
-    future disease incidence.
+    Three-stage architecture:
+    1. Encoder (TransformerBackbone): Estimates beta_t, initial states, obs_context
+    2. Physics Core (SIRRollForward): Generates latent SIR trajectories
+    3. Observation Heads: Map latent I(t) to observable signals (WW, Hosp)
     """
 
     def __init__(
         self,
         variant_type: ModelVariant,
+        sir_physics: SIRPhysicsConfig,
+        observation_heads: ObservationHeadConfig,
         temporal_input_dim: int = 1,
         biomarkers_dim: int = 1,
         region_embedding_dim: int = 64,
@@ -45,9 +50,12 @@ class EpiForecaster(nn.Module):
         head_dropout: float = 0.1,
     ):
         """
-        Initialize EpiForecaster with three-layer architecture.
+        Initialize EpiForecaster with joint inference architecture.
 
         Args:
+            variant_type: ModelVariant with flags for cases/regions/biomarkers/mobility
+            sir_physics: SIR physics configuration
+            observation_heads: Observation head configuration
             temporal_input_dim: Dimension of temporal input features (cases)
             biomarkers_dim: Dimension of biomarker features
             region_embedding_dim: Dimension of static region embeddings
@@ -67,6 +75,8 @@ class EpiForecaster(nn.Module):
         super().__init__()
 
         self.variant_type = variant_type
+        self.sir_physics = sir_physics
+        self.observation_heads_config = observation_heads
         self.temporal_input_dim = temporal_input_dim
         self.biomarkers_dim = biomarkers_dim
         self.region_embedding_dim = region_embedding_dim
@@ -78,27 +88,29 @@ class EpiForecaster(nn.Module):
         self.device = device or torch.device("cpu")
         self.gnn_module = gnn_module
 
+        # Compute temporal node dimension for GNN
         self.temporal_node_dim = 0
         if self.variant_type.cases:
             self.temporal_node_dim += temporal_input_dim
         if self.variant_type.biomarkers:
             self.temporal_node_dim += biomarkers_dim
 
-        self.forecaster_input_dim = 0
+        # Compute backbone input dimension
+        self.backbone_input_dim = 0
         if self.variant_type.cases:
-            self.forecaster_input_dim += temporal_input_dim
-            # We add mean and std as features
-            self.forecaster_input_dim += 1
-            self.forecaster_input_dim += 1
+            self.backbone_input_dim += temporal_input_dim
+            self.backbone_input_dim += 1  # mean
+            self.backbone_input_dim += 1  # std
         if self.variant_type.biomarkers:
-            self.forecaster_input_dim += biomarkers_dim
+            self.backbone_input_dim += biomarkers_dim
         if self.variant_type.mobility:
-            self.forecaster_input_dim += mobility_embedding_dim
+            self.backbone_input_dim += mobility_embedding_dim
         if self.variant_type.regions:
-            self.forecaster_input_dim += region_embedding_dim
+            self.backbone_input_dim += region_embedding_dim
         if self.use_population:
-            self.forecaster_input_dim += population_dim
+            self.backbone_input_dim += population_dim
 
+        # Stage 1: Mobility GNN (optional)
         if self.variant_type.mobility:
             assert self.temporal_node_dim > 0, (
                 "Mobility GNN requires temporal node features (cases/biomarkers)."
@@ -114,32 +126,74 @@ class EpiForecaster(nn.Module):
                 )
             else:
                 raise ValueError(f"Unsupported GNN module: {gnn_module}")
-                # # Fallback to legacy dense MobilityGNN (kept for backward compatibility)
-                # self.mobility_gnn = MobilityGNN(
-                #     in_dim=self.temporal_node_dim,
-                #     hidden_dim=16,
-                #     out_dim=self.mobility_embedding_dim,
-                #     num_layers=gnn_depth,
-                #     aggregator_type="mean",
-                #     dropout=0.1,
-                # )
         else:
             self.mobility_gnn = None
 
-        self.forecaster_head = ForecasterHead(
-            in_dim=self.forecaster_input_dim,
+        # Stage 1: Transformer Backbone (encoder)
+        self.backbone = TransformerBackbone(
+            in_dim=self.backbone_input_dim,
             d_model=head_d_model,
             n_heads=head_n_heads,
             num_layers=head_num_layers,
             horizon=forecast_horizon,
             dropout=head_dropout,
             device=device,
+            obs_context_dim=observation_heads.obs_context_dim,
+        )
+
+        # Stage 2: SIR Roll-Forward (physics core)
+        self.sir_rollforward = SIRRollForward(
+            dt=sir_physics.dt,
+            enforce_nonnegativity=sir_physics.enforce_nonnegativity,
+            enforce_mass_conservation=sir_physics.enforce_mass_conservation,
+        )
+
+        # Stage 3: Observation Heads
+        # Wastewater head
+        self.ww_head = WastewaterObservationHead(
+            kernel_length=observation_heads.kernel_length_ww,
+            scale_init=1.0,  # Will be learned if learnable_scale_ww=True
+            learnable_scale=observation_heads.learnable_scale_ww,
+            learnable_kernel=observation_heads.learnable_kernel_ww,
+            residual_dim=observation_heads.obs_context_dim,
+            alpha_init=observation_heads.residual_scale,
+        )
+
+        # Hospitalization head
+        self.hosp_head = ClinicalObservationHead(
+            kernel_length=observation_heads.kernel_length_hosp,
+            scale_init=0.05,  # ~5% hospitalization rate
+            learnable_scale=observation_heads.learnable_scale_hosp,
+            learnable_kernel=observation_heads.learnable_kernel_hosp,
+            residual_dim=observation_heads.obs_context_dim,
+            alpha_init=observation_heads.residual_scale,
+        )
+
+        # Cases head (reported cases observation)
+        self.cases_head = ClinicalObservationHead(
+            kernel_length=observation_heads.kernel_length_cases,
+            scale_init=0.3,  # ~30% ascertainment/reporting rate
+            learnable_scale=observation_heads.learnable_scale_cases,
+            learnable_kernel=observation_heads.learnable_kernel_cases,
+            residual_dim=observation_heads.obs_context_dim,
+            alpha_init=observation_heads.residual_scale,
+        )
+
+        # Deaths head (mortality observation)
+        # Input is death_flow (fraction dying), so scale is reporting rate (start at 0.5)
+        self.deaths_head = ClinicalObservationHead(
+            kernel_length=observation_heads.kernel_length_deaths,
+            scale_init=0.5,
+            learnable_scale=observation_heads.learnable_scale_deaths,
+            learnable_kernel=observation_heads.learnable_kernel_deaths,
+            residual_dim=observation_heads.obs_context_dim,
+            alpha_init=observation_heads.residual_scale,
         )
 
         # Store parameter counts for logging
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
-            f"Initialized EpiForecaster with variants: "
+            f"Initialized EpiForecaster (Joint Inference) with variants: "
             f"regions={self.variant_type.regions}, mobility={self.variant_type.mobility}, "
             f"total_params={total_params:,}"
         )
@@ -150,28 +204,37 @@ class EpiForecaster(nn.Module):
         cases_mean: torch.Tensor,
         cases_std: torch.Tensor,
         biomarkers_hist: torch.Tensor,
-        mob_graphs: Sequence[Sequence[Data]] | None,
+        mob_graphs: Batch | None,
         target_nodes: torch.Tensor,
         region_embeddings: torch.Tensor | None = None,
         population: torch.Tensor | None = None,
         temporal_covariates: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         """
-        Forward pass of three-layer EpiForecaster.
+        Forward pass of joint inference EpiForecaster.
 
         Args:
             cases_norm: Normalized case counts [batch_size, seq_len, cases_dim]
             cases_mean: Rolling mean of cases [batch_size, seq_len, 1]
             cases_std: Rolling std of cases [batch_size, seq_len, 1]
             biomarkers_hist: Historical biomarker measurements [batch_size, seq_len, biomarkers_dim]
-            mob_graphs: Per-batch list of per-time-step PyG graphs
+            mob_graphs: PyG Batch of mobility graphs (B*T graphs)
             target_nodes: Indices of target nodes in the global region list [batch_size]
             region_embeddings: Optional static region embeddings [num_regions, region_embedding_dim]
             population: Optional per-node population [batch_size]
             temporal_covariates: Optional generic temporal covariates [batch_size, seq_len, k]
 
         Returns:
-            Forecasts [batch_size, forecast_horizon] for future time steps
+            Dictionary containing:
+                - beta_t: [batch_size, horizon] - transmission rates
+                - S_trajectory: [batch_size, horizon+1] - susceptible trajectory
+                - I_trajectory: [batch_size, horizon+1] - infected trajectory (latent)
+                - R_trajectory: [batch_size, horizon+1] - recovered trajectory
+                - physics_residual: [batch_size, horizon] - SIR dynamics residual
+                - pred_ww: [batch_size, horizon] - predicted wastewater signal
+                - pred_hosp: [batch_size, horizon] - predicted hospitalizations
+                - obs_context: [batch_size, horizon, obs_context_dim] - observation context
+                - initial_states: [batch_size, 3] - S0, I0, R0 proportions (sum=1)
         """
         B, T, _ = cases_norm.shape
 
@@ -186,6 +249,7 @@ class EpiForecaster(nn.Module):
                 self.variant_type.regions,
             )
 
+        # Build input features for backbone
         features: list[torch.Tensor] = []
 
         if self.variant_type.cases:
@@ -201,9 +265,7 @@ class EpiForecaster(nn.Module):
                 raise TypeError(
                     f"Expected mob_graphs to be PyG Batch, got {type(mob_graphs)}"
                 )
-            mobility_embeddings = self._process_mobility_sequence_pyg(
-                mob_graphs, B, T
-            )
+            mobility_embeddings = self._process_mobility_sequence_pyg(mob_graphs, B, T)
             features.append(mobility_embeddings)
 
         if self.variant_type.regions:
@@ -229,17 +291,104 @@ class EpiForecaster(nn.Module):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("EpiForecaster.forward: x_seq=%s", tuple(x_seq.shape))
 
-        forecasts = self.forecaster_head(x_seq)
-        assert forecasts.shape == (B, self.forecast_horizon), "forecasts shape mismatch"
+        # Stage 1: Encoder outputs SIR parameters and observation context
+        encoder_outputs = self.backbone(x_seq)
+        beta_t = encoder_outputs["beta_t"]  # [B, H]
+        mortality_t = encoder_outputs["mortality_t"]  # [B, H]
+        gamma_t = encoder_outputs["gamma_t"]  # [B, H]
+        initial_states_logits = encoder_outputs["initial_states_logits"]  # [B, 3]
+        obs_context = encoder_outputs["obs_context"]  # [B, H, C_obs]
 
-        return forecasts
+        # Convert logits to proportions (softmax ensures sum=1, nonnegative)
+        initial_states = F.softmax(initial_states_logits, dim=-1)  # [B, 3]
+
+        # Keep SIR states in fraction space (sum to 1 per sample)
+        S0 = initial_states[:, 0]  # [B]
+        I0 = initial_states[:, 1]  # [B]
+        R0 = initial_states[:, 2]  # [B]
+
+        # Stage 2: SIR Roll-Forward
+        sir_outputs = self.sir_rollforward(
+            beta_t=beta_t,
+            gamma_t=gamma_t,
+            mortality_t=mortality_t,
+            S0=S0,
+            I0=I0,
+            R0=R0,
+            population=torch.ones(B, device=beta_t.device),
+        )
+
+        S_traj = sir_outputs["S_trajectory"]  # [B, H+1]
+        I_traj = sir_outputs["I_trajectory"]  # [B, H+1]
+        R_traj = sir_outputs["R_trajectory"]  # [B, H+1]
+        death_flow = sir_outputs["death_flow"]  # [B, H]
+        physics_residual = sir_outputs["physics_residual"]  # [B, H]
+
+        # Stage 3: Observation Heads
+        # Note: I_traj includes I0 at index 0, so we use all of it
+        # The heads expect [B, time_steps] and output [B, time_steps]
+
+        # Observation context needs to align with I trajectory length (H+1).
+        # Use the first forecast context as a proxy for t=0.
+        obs_context_with_init = torch.cat([obs_context[:, :1, :], obs_context], dim=1)
+
+        # Wastewater prediction
+        pred_ww = self.ww_head(
+            I_trajectory=I_traj,
+            population=torch.ones(B, device=beta_t.device),
+            obs_context=obs_context_with_init,
+        )  # [B, H+1]
+
+        # Hospitalization prediction
+        pred_hosp = self.hosp_head(
+            I_trajectory=I_traj,
+            obs_context=obs_context_with_init,
+        )  # [B, H+1]
+
+        # Cases prediction (reported cases observation)
+        pred_cases = self.cases_head(
+            I_trajectory=I_traj,
+            obs_context=obs_context_with_init,
+        )  # [B, H+1]
+
+        # Deaths prediction (mortality observation)
+        # Input is death_flow (fraction dying)
+        pred_deaths = self.deaths_head(
+            I_trajectory=death_flow,
+            obs_context=obs_context,
+        )  # [B, H]
+
+        # Trim initial state (t=0) from predictions to match horizon
+        # We want predictions for the forecast horizon only
+        if pred_ww.shape[1] > self.forecast_horizon:
+            pred_ww = pred_ww[:, 1 : 1 + self.forecast_horizon]  # [B, H]
+        if pred_hosp.shape[1] > self.forecast_horizon:
+            pred_hosp = pred_hosp[:, 1 : 1 + self.forecast_horizon]  # [B, H]
+        if pred_cases.shape[1] > self.forecast_horizon:
+            pred_cases = pred_cases[:, 1 : 1 + self.forecast_horizon]  # [B, H]
+        if pred_deaths.shape[1] > self.forecast_horizon:
+            pred_deaths = pred_deaths[:, 1 : 1 + self.forecast_horizon]  # [B, H]
+
+        return {
+            "beta_t": beta_t,
+            "S_trajectory": S_traj,
+            "I_trajectory": I_traj,
+            "R_trajectory": R_traj,
+            "physics_residual": physics_residual,
+            "pred_ww": pred_ww,
+            "pred_hosp": pred_hosp,
+            "pred_cases": pred_cases,
+            "pred_deaths": pred_deaths,
+            "obs_context": obs_context,
+            "initial_states": initial_states,
+        }
 
     def forward_batch(
         self,
         *,
         batch_data: dict[str, Any],
         region_embeddings: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
         """
         Forward pass with automatic device transfers and non-blocking I/O.
 
@@ -254,7 +403,9 @@ class EpiForecaster(nn.Module):
             region_embeddings: Optional static region embeddings [num_regions, region_dim]
 
         Returns:
-            Tuple of (predictions, targets, target_mean, target_scale)
+            Tuple of (model_outputs, targets_dict) where:
+                - model_outputs: Dict from forward() with predictions and latents
+                - targets_dict: Dict with target tensors for loss computation
         """
         # Non-blocking transfer for all PyTorch tensors
         batch = {
@@ -263,13 +414,13 @@ class EpiForecaster(nn.Module):
             if isinstance(v, torch.Tensor)
         }
 
-        # PyG Batch handles its own device transfer (not a torch.Tensor, so not in dict above)
-        # Use non_blocking for consistency with tensor transfers
+        # PyG Batch handles its own device transfer
         mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
 
         target_nodes = batch.get("TargetRegionIndex", batch["TargetNode"])
 
-        predictions = self.forward(
+        # Forward pass
+        model_outputs = self.forward(
             cases_norm=batch["CaseNode"],
             cases_mean=batch["CaseMean"],
             cases_std=batch["CaseStd"],
@@ -280,50 +431,20 @@ class EpiForecaster(nn.Module):
             population=batch["Population"],
         )
 
-        return predictions, batch["Target"], batch["TargetMean"], batch["TargetScale"]
+        # Prepare targets dict
+        # Joint inference targets: WW, Hosp, Cases, Deaths with per-target masks
+        targets_dict = {
+            "ww": batch.get("WWTarget"),
+            "hosp": batch.get("HospTarget"),
+            "cases": batch.get("CasesTarget"),
+            "deaths": batch.get("DeathsTarget"),
+            "ww_mask": batch.get("WWTargetMask"),
+            "hosp_mask": batch.get("HospTargetMask"),
+            "cases_mask": batch.get("CasesTargetMask"),
+            "deaths_mask": batch.get("DeathsTargetMask"),
+        }
 
-    def _process_mobility_sequence_pyg_list(
-        self, mob_graphs_list: list[Batch], B: int, T: int
-    ) -> torch.Tensor:
-        """Process list of per-time-step batches (Curriculum format)."""
-        if not self.variant_type.mobility or self.mobility_gnn is None:
-            raise RuntimeError(
-                "Mobility processing requested but MobilityGNN is not enabled."
-            )
-        
-        if len(mob_graphs_list) != T:
-            raise ValueError(
-                f"Expected {T} mobility batches (one per time step), got {len(mob_graphs_list)}"
-            )
-
-        embeddings_list = []
-        for t, batch_t in enumerate(mob_graphs_list):
-            batch_t = batch_t.to(self.device)
-            
-            # GNN Forward
-            node_emb = self.mobility_gnn(
-                batch_t.x, 
-                batch_t.edge_index, 
-                getattr(batch_t, "edge_weight", None)
-            )
-            
-            # Gather targets
-            # Target index should be precomputed in collate_fn
-            if hasattr(batch_t, "target_index"):
-                 target_indices = batch_t.target_index.reshape(-1)
-            else:
-                 # Fallback
-                 ptr = batch_t.ptr
-                 start = ptr[:-1]
-                 tgt_local = batch_t.target_node.reshape(-1).to(start.device)
-                 target_indices = start + tgt_local
-            
-            target_emb = node_emb[target_indices]  # (B, dim)
-            embeddings_list.append(target_emb)
-            
-        # Stack -> (B, T, dim)
-        mobility_embeddings = torch.stack(embeddings_list, dim=1)
-        return mobility_embeddings
+        return model_outputs, targets_dict
 
     def _process_mobility_sequence_pyg(
         self, mob_batch: Batch, B: int, T: int
@@ -342,18 +463,13 @@ class EpiForecaster(nn.Module):
                 f"!= expected {self.temporal_node_dim}"
             )
 
-        # Note: mob_batch is already transferred to device in trainer._forward_batch
-        # Redundant .to(self.device) call removed to avoid device synchronization
-
         node_emb = self.mobility_gnn(
             mob_batch.x,  # type: ignore[attr-defined]
             mob_batch.edge_index,  # type: ignore[attr-defined]
             getattr(mob_batch, "edge_weight", None),
         )
 
-        # Gather target embeddings via ptr offsets (start index per graph).
-        # IMPORTANT: keep this fully tensorized to avoid `.item()` on CUDA tensors
-        # which forces device synchronization and DtoH copies.
+        # Gather target embeddings via ptr offsets
         ptr = mob_batch.ptr  # type: ignore[attr-defined]
         num_graphs = ptr.numel() - 1
         expected_graphs = B * T
@@ -379,7 +495,7 @@ class EpiForecaster(nn.Module):
         return (
             "EpiForecaster("
             f"gnn_module={self.gnn_module}, "
-            f"forecaster_head={self.forecaster_head}, "
+            f"backbone={self.backbone}, "
             f"device={self.device}, "
             f"variant_type={self.variant_type})"
         )

@@ -101,7 +101,7 @@ def stage_dataset_to_nvme(
         if shutil.which("rsync"):
             import subprocess
 
-            result = subprocess.run(
+            subprocess.run(
                 [
                     "rsync",
                     "-a",
