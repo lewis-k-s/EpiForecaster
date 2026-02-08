@@ -4,7 +4,7 @@
 #SBATCH --qos=acc_bscls
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=20
-#SBATCH --time=04:00:00 # remember to update the timeout_secs below if you change this
+#SBATCH --time=05:00:00 # 5 hours for 50-epoch trials with pruning
 #SBATCH --array=0-3 # saturate the node with parallel tasks on each GPU
 #SBATCH --output=slurm-%x-%A_%a.out # stdout/stderr log per array task
 
@@ -22,14 +22,23 @@ JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal
 # Trial outputs root (log_dir override).
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
 # Optional speed knobs (set to empty to disable).
-EPOCHS="${EPOCHS:-2}"
+EPOCHS="${EPOCHS:-50}"  # Default 50 epochs for meaningful HPO rankings
 MAX_BATCHES="${MAX_BATCHES:-}"
-SEED="${SEED:-}"
+SEED="${SEED:-42}"  # Reproducibility seed
+SAMPLER="${SAMPLER:-tpe}"  # tpe (default), cmaes, or random
+PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"  # Start pruning after N epochs
+LOSS_WEIGHT_MODE="${LOSS_WEIGHT_MODE:-fixed}"  # fixed (recommended), bounded
+LOSS_WEIGHT_MAX_RATIO="${LOSS_WEIGHT_MAX_RATIO:-2.0}"  # for bounded mode
 # Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
 OVERRIDES="${OVERRIDES:-}"
-# Worker timeout in seconds (defaults to SLURM time limit minus buffer).
-# Format HH:MM:SS is converted to seconds.
-TIMEOUT_SECS="${TIMEOUT_SECS:-14200}" # 4 hours - buffer
+# Worker timeout in seconds (auto-calculated from SLURM time limit minus 15min buffer).
+# Falls back to 5 hours - 15 minutes if SLURM_TIME_LIMIT is not set.
+if [ -n "${SLURM_TIME_LIMIT:-}" ]; then
+    # Convert SLURM_TIME_LIMIT (in minutes) to seconds and subtract 15min buffer
+    TIMEOUT_SECS="${TIMEOUT_SECS:-$((SLURM_TIME_LIMIT * 60 - 900))}"
+else
+    TIMEOUT_SECS="${TIMEOUT_SECS:-17100}"  # 5 hours - 15 minutes (in seconds)
+fi
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 
@@ -53,9 +62,10 @@ ARGS=(
   --run-root "$RUN_ROOT"
 )
 
-# Note: OVERRIDES are not directly supported by optuna worker.
-# Use a custom base config file instead, or modify the worker to accept --override flags.
-# The worker applies its own search space overrides to the base config.
+# Optional dotted-key overrides are supported by repeating:
+#   --override key=value
+# In this sbatch script, OVERRIDES is currently not expanded into repeated args.
+# Use a custom base config for bulk overrides.
 
 if [ -n "$EPOCHS" ]; then
   ARGS+=(--epochs "$EPOCHS")
@@ -65,6 +75,18 @@ if [ -n "$MAX_BATCHES" ]; then
 fi
 if [ -n "$SEED" ]; then
   ARGS+=(--seed "$SEED")
+fi
+if [ -n "$SAMPLER" ]; then
+  ARGS+=(--sampler "$SAMPLER")
+fi
+if [ -n "$PRUNING_START_EPOCH" ]; then
+  ARGS+=(--pruning-start-epoch "$PRUNING_START_EPOCH")
+fi
+if [ -n "$LOSS_WEIGHT_MODE" ]; then
+  ARGS+=(--loss-weight-mode "$LOSS_WEIGHT_MODE")
+fi
+if [ -n "$LOSS_WEIGHT_MAX_RATIO" ]; then
+  ARGS+=(--loss-weight-max-ratio "$LOSS_WEIGHT_MAX_RATIO")
 fi
 if [ -n "$TIMEOUT_SECS" ]; then
   ARGS+=(--timeout-s "$TIMEOUT_SECS")

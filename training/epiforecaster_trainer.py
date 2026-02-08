@@ -8,6 +8,7 @@ model while maintaining the flexibility to support various data configurations.
 The trainer works with the EpiForecaster model.
 """
 
+import importlib
 import logging
 import os
 import platform
@@ -63,13 +64,19 @@ class EpiForecasterTrainer:
     The trainer is designed to be model-agnostic, with variant-specific behavior controlled through model configuration.
     """
 
-    def __init__(self, config: EpiForecasterConfig):
+    def __init__(
+        self,
+        config: EpiForecasterConfig,
+        trial: Any | None = None,
+        pruning_start_epoch: int = 10,
+    ):
         """
         Initialize the unified trainer.
 
         Args:
             config: Trainer configuration
-            dataset: Optional pre-loaded dataset (will be loaded if None)
+            trial: Optional Optuna trial for intermediate pruning
+            pruning_start_epoch: Epoch to start checking for pruning (default: 10)
         """
         self.config = config
         self._device_hint = self._resolve_device_hint()
@@ -79,6 +86,10 @@ class EpiForecasterTrainer:
         self.resume = self.config.training.resume
         self.experiment_dir: Path | None = None
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
+
+        # Optuna pruning support
+        self.trial = trial
+        self.pruning_start_epoch = pruning_start_epoch
 
         # Stage data to NVMe if running on SLURM cluster
         self._nvme_staging_path: Path | None = None
@@ -1345,6 +1356,18 @@ class EpiForecasterTrainer:
                     should_stop = True
 
             _prev_val_loss = val_loss
+
+            # Optuna pruning: report intermediate value and check if trial should be pruned
+            if self.trial is not None and epoch >= self.pruning_start_epoch:
+                self.trial.report(val_loss, epoch)
+                if self.trial.should_prune():
+                    self._status(
+                        f"Trial pruned by Optuna at epoch {epoch} "
+                        f"(val_loss={val_loss:.6f})"
+                    )
+                    # Lazy import to avoid hard dependency on optuna
+                    optuna_module = importlib.import_module("optuna")
+                    raise optuna_module.TrialPruned()
 
             if should_stop:
                 break

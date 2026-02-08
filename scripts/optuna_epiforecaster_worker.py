@@ -22,8 +22,10 @@ Example:
     --n-trials 1
 
 Notes:
-- The current training loop does not expose intermediate metrics to Optuna, so
-  pruning is not wired up yet.
+- Uses CMA-ES sampler by default for better convergence on high-dimensional spaces.
+- Implements early pruning to kill unpromising trials and save compute.
+- Default: 50 epochs per trial with pruning after epoch 10.
+- Joint loss weights are fixed by default to avoid objective drift across trials.
 - We force `training.plot_forecasts=False` by default to avoid workers clobbering
   shared forecast images (trainer writes `{split}_forecasts.png` at the
   experiment root).
@@ -35,20 +37,27 @@ import importlib
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
-import click
+# Ensure repo root is in path before other imports (fixes scripts/utils conflict)
+_REPO_ROOT = Path(__file__).parent.parent.resolve()
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-from models.configs import EpiForecasterConfig
-from training.epiforecaster_trainer import EpiForecasterTrainer
-from utils.logging import setup_logging
+import click  # noqa: E402
+
+from models.configs import EpiForecasterConfig  # noqa: E402
+from training.epiforecaster_trainer import EpiForecasterTrainer  # noqa: E402
+from utils.logging import setup_logging  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 # Global flag for signal handling
 _shutdown_requested = False
+_JOINT_WEIGHT_KEYS = ("w_ww", "w_hosp", "w_cases", "w_deaths", "w_sir")
 
 
 def _handle_shutdown(signum: int, frame: Any) -> None:
@@ -108,8 +117,58 @@ def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
     return dotlist
 
 
+def _bounded_joint_loss_weight_overrides(
+    *,
+    trial: Any,
+    base_cfg: EpiForecasterConfig,
+    max_ratio: float,
+) -> dict[str, float]:
+    """Tune joint loss weights in a bounded simplex around base config values.
+
+    Keeps the total joint weight sum fixed to the base config and limits each
+    component's relative movement by `max_ratio`.
+    """
+    if max_ratio < 1.0:
+        raise ValueError("loss_weight_max_ratio must be >= 1.0")
+
+    base_joint = base_cfg.training.loss.joint
+    base_weights = {
+        key: float(getattr(base_joint, key))
+        for key in _JOINT_WEIGHT_KEYS
+    }
+    total = sum(base_weights.values())
+    if total <= 0:
+        raise ValueError("Sum of joint loss weights must be > 0 for bounded tuning")
+
+    lower = 1.0 / max_ratio
+    upper = max_ratio
+    scaled = {}
+    for key, base in base_weights.items():
+        mult = trial.suggest_float(
+            f"training.loss.joint.mult_{key}",
+            lower,
+            upper,
+            log=True,
+        )
+        scaled[key] = max(base, 1e-12) * mult
+
+    scaled_sum = sum(scaled.values())
+    normalized = {
+        key: total * (value / scaled_sum)
+        for key, value in scaled.items()
+    }
+    return {
+        f"training.loss.joint.{key}": value
+        for key, value in normalized.items()
+    }
+
+
 def suggest_epiforecaster_params(
-    *, trial: Any, base_cfg: EpiForecasterConfig
+    *,
+    trial: Any,
+    base_cfg: EpiForecasterConfig,
+    loss_weight_mode: str = "fixed",
+    loss_weight_max_ratio: float = 2.0,
 ) -> dict[str, Any]:
     """Define the search space and return dotted-key overrides.
 
@@ -176,6 +235,56 @@ def suggest_epiforecaster_params(
         # Keep it fixed in HPO; tune it in the region2vec trainer instead.
         pass
 
+    # --- SIR joint inference knobs (high leverage for observation heads) ---
+    # Only tune if using joint_inference loss
+    if base_cfg.training.loss.name == "joint_inference":
+        # Loss-weight policy:
+        # - fixed: keep base config objective unchanged across trials.
+        # - bounded: small relative re-balancing around base config proportions.
+        if loss_weight_mode == "bounded":
+            overrides.update(
+                _bounded_joint_loss_weight_overrides(
+                    trial=trial,
+                    base_cfg=base_cfg,
+                    max_ratio=loss_weight_max_ratio,
+                )
+            )
+        elif loss_weight_mode != "fixed":
+            raise ValueError(
+                f"Unknown loss_weight_mode={loss_weight_mode!r}; expected fixed|bounded"
+            )
+
+        # Residual connection params - affects model capacity for observation heads
+        overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
+            "model.observation_heads.residual_scale", 0.05, 0.5
+        )
+        overrides["model.observation_heads.residual_hidden_dim"] = (
+            trial.suggest_categorical(
+                "model.observation_heads.residual_hidden_dim",
+                _categorical_choices((16, 32, 64, 128)),
+            )
+        )
+        overrides["model.observation_heads.residual_layers"] = trial.suggest_int(
+            "model.observation_heads.residual_layers", 1, 4
+        )
+        overrides["model.observation_heads.residual_dropout"] = trial.suggest_float(
+            "model.observation_heads.residual_dropout", 0.0, 0.3
+        )
+
+        # Observation context dimension - affects representational power
+        overrides["model.observation_heads.obs_context_dim"] = (
+            trial.suggest_categorical(
+                "model.observation_heads.obs_context_dim",
+                _categorical_choices((32, 64, 96, 128, 192)),
+            )
+        )
+
+        # Residual mode - additive vs modulation
+        overrides["model.observation_heads.residual_mode"] = trial.suggest_categorical(
+            "model.observation_heads.residual_mode",
+            _categorical_choices(("additive", "modulation")),
+        )
+
     return overrides
 
 
@@ -188,6 +297,10 @@ def objective(
     fixed_epochs: int | None,
     fixed_max_batches: int | None,
     seed: int | None,
+    cli_overrides: list[str],
+    pruning_start_epoch: int = 10,
+    loss_weight_mode: str = "fixed",
+    loss_weight_max_ratio: float = 2.0,
 ) -> float:
     start_time = time.time()
     logger.info("=== Trial %d started ===", trial.number)
@@ -196,16 +309,29 @@ def objective(
     cfg = EpiForecasterConfig.from_file(str(base_config_path))
 
     # Sample trial-specific overrides.
-    overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
+    overrides = suggest_epiforecaster_params(
+        trial=trial,
+        base_cfg=cfg,
+        loss_weight_mode=loss_weight_mode,
+        loss_weight_max_ratio=loss_weight_max_ratio,
+    )
     override_list = _overrides_to_dotlist(overrides)
 
     # Add runtime-specific overrides
     override_list.append("training.plot_forecasts=false")
     override_list.append("training.profiler.enabled=false")
+    # Disable WandB by default for Optuna sweeps (Optuna tracks metrics/parameters)
+    override_list.append("output.wandb_mode=disabled")
+    # Disable early stopping for HPO - rely on Optuna pruning instead
+    override_list.append("training.early_stopping_patience=0")
     if fixed_epochs is not None:
         override_list.append(f"training.epochs={fixed_epochs}")
     if fixed_max_batches is not None:
         override_list.append(f"training.max_batches={fixed_max_batches}")
+
+    # Add CLI-provided overrides (dotted keys, same as train CLI)
+    for override in cli_overrides:
+        override_list.append(override)
 
     # Reload config with all overrides via OmegaConf
     cfg = EpiForecasterConfig.load(
@@ -246,9 +372,21 @@ def objective(
     trial.set_user_attr("overrides", overrides)
 
     # Run training and return objective.
-    trainer = EpiForecasterTrainer(cfg)
-    results = trainer.run()
-    best_val = float(results.get("best_val_loss", float("inf")))
+    # Pass trial to trainer for intermediate pruning support.
+    trainer = EpiForecasterTrainer(
+        cfg, trial=trial, pruning_start_epoch=pruning_start_epoch
+    )
+
+    try:
+        results = trainer.run()
+        best_val = float(results.get("best_val_loss", float("inf")))
+    except Exception as exc:
+        # Check if this is an Optuna TrialPruned exception
+        if hasattr(exc, "__class__") and exc.__class__.__name__ == "TrialPruned":
+            logger.info("Trial %d pruned by Optuna", trial.number)
+            raise
+        # Re-raise other exceptions
+        raise
 
     duration_s = time.time() - start_time
     logger.info(
@@ -339,8 +477,9 @@ def objective(
 @click.option(
     "--epochs",
     type=int,
-    default=None,
-    help="Optional fixed epochs override for HPO speed.",
+    default=50,
+    show_default=True,
+    help="Fixed epochs per trial for HPO (default: 50).",
 )
 @click.option(
     "--max-batches",
@@ -351,8 +490,50 @@ def objective(
 @click.option(
     "--seed",
     type=int,
-    default=None,
-    help="Optional base RNG seed; trial.number is added.",
+    default=42,
+    show_default=True,
+    help="Base RNG seed for reproducibility (default: 42).",
+)
+@click.option(
+    "--sampler",
+    type=click.Choice(["cmaes", "tpe", "random"], case_sensitive=False),
+    default="cmaes",
+    show_default=True,
+    help="Optuna sampler algorithm to use.",
+)
+@click.option(
+    "--pruning-start-epoch",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Epoch to start checking for pruning (default: 10).",
+)
+@click.option(
+    "--loss-weight-mode",
+    type=click.Choice(["fixed", "bounded"], case_sensitive=False),
+    default="fixed",
+    show_default=True,
+    help=(
+        "Joint loss weight search mode: fixed (recommended), "
+        "bounded (re-balance around config)"
+    ),
+)
+@click.option(
+    "--loss-weight-max-ratio",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help=(
+        "Max multiplicative deviation for --loss-weight-mode=bounded. "
+        "Example: 2.0 means each weight multiplier is in [0.5, 2.0]."
+    ),
+)
+@click.option(
+    "--override",
+    "cli_overrides",
+    type=str,
+    multiple=True,
+    help="Override config values using dotted keys (e.g., env=mn5, training.device=cuda). Can be repeated.",
 )
 def main(
     *,
@@ -362,9 +543,14 @@ def main(
     n_trials: int | None,
     timeout_s: int | None,
     run_root: Path,
-    epochs: int | None,
+    epochs: int,
     max_batches: int | None,
-    seed: int | None,
+    seed: int,
+    sampler: str,
+    pruning_start_epoch: int,
+    loss_weight_mode: str,
+    loss_weight_max_ratio: float,
+    cli_overrides: tuple[str, ...],
 ) -> None:
     """Run one Optuna worker process."""
     setup_logging()
@@ -383,18 +569,53 @@ def main(
     run_root.mkdir(parents=True, exist_ok=True)
     journal_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Select sampler based on CLI choice
+    # Note: CMA-ES doesn't support categorical parameters well, so we default to TPE
+    if sampler == "cmaes":
+        try:
+            from optuna.samplers import CmaEsSampler
+
+            # CMA-ES doesn't support categorical parameters; warn user
+            logger.warning(
+                "CMA-ES selected but search space contains categorical parameters. "
+                "CMA-ES will fall back to RandomSampler for categoricals. "
+                "Consider using 'tpe' sampler instead for mixed spaces."
+            )
+            selected_sampler = CmaEsSampler(seed=seed, warn_independent_sampling=False)
+            logger.info("Using CMA-ES sampler (seed=%d)", seed)
+        except ImportError:
+            logger.warning("CMA-ES not available, falling back to TPE sampler")
+            selected_sampler = optuna.samplers.TPESampler(multivariate=True, seed=seed)
+    elif sampler == "tpe":
+        # Use multivariate=True for better handling of parameter correlations
+        selected_sampler = optuna.samplers.TPESampler(multivariate=True, seed=seed)
+        logger.info("Using TPE sampler with multivariate=True (seed=%d)", seed)
+    else:  # random
+        selected_sampler = optuna.samplers.RandomSampler(seed=seed)
+        logger.info("Using Random sampler (seed=%d)", seed)
+
     storage = JournalStorage(JournalFileBackend(str(journal_file)))
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
         direction="minimize",
         load_if_exists=True,
+        sampler=selected_sampler,
     )
 
     logger.info("Starting Optuna worker for study '%s'", study_name)
     logger.info("Config: %s", config_path)
     logger.info("Journal file: %s", journal_file)
     logger.info("Run root: %s", run_root)
+    logger.info(
+        "Settings: epochs=%d, pruning_start_epoch=%d, seed=%d, "
+        "loss_weight_mode=%s, loss_weight_max_ratio=%.3f",
+        epochs,
+        pruning_start_epoch,
+        seed,
+        loss_weight_mode,
+        loss_weight_max_ratio,
+    )
     slurm = _slurm_identity()
     if any(slurm.values()):
         logger.info("SLURM identity: %s", slurm)
@@ -410,6 +631,9 @@ def main(
             study.study_name,
         )
 
+    # Build override list from CLI (dotted keys, same as train CLI)
+    base_overrides = list(cli_overrides)
+
     study.optimize(
         lambda t: objective(
             t,
@@ -419,10 +643,15 @@ def main(
             fixed_epochs=epochs,
             fixed_max_batches=max_batches,
             seed=seed,
+            cli_overrides=base_overrides,
+            pruning_start_epoch=pruning_start_epoch,
+            loss_weight_mode=loss_weight_mode,
+            loss_weight_max_ratio=loss_weight_max_ratio,
         ),
         n_trials=n_trials,
         timeout=timeout_s,
         callbacks=[_log_trial_complete],
+        catch=(Exception,),
     )
 
     logger.info(

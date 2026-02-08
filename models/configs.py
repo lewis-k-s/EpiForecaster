@@ -65,11 +65,12 @@ class LossComponentConfig:
 class JointLossConfig:
     """Loss weights for joint inference training."""
 
-    w_ww: float = 1.0
-    w_hosp: float = 1.0
-    w_cases: float = 1.0
-    w_deaths: float = 1.0
-    w_sir: float = 0.1
+    # Default balance with higher weight on low-noise signals
+    w_hosp: float = 0.4
+    w_deaths: float = 0.25
+    w_cases: float = 0.15
+    w_ww: float = 0.15
+    w_sir: float = 0.05
 
     def __post_init__(self) -> None:
         for name, value in [
@@ -81,6 +82,10 @@ class JointLossConfig:
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
+
+        lsum = sum([self.w_deaths, self.w_hosp, self.w_cases, self.w_ww, self.w_sir])
+        if lsum > 1:
+            print(f"WARNING: composite loss sum {lsum} > 1")
 
 
 @dataclass
