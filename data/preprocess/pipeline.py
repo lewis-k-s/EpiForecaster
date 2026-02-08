@@ -66,9 +66,7 @@ class OfflinePreprocessingPipeline:
 
         # Initialize hospitalizations processor if hospitalizations file is provided
         if self.config.hospitalizations_file:
-            self.processors["hospitalizations"] = HospitalizationsProcessor(
-                self.config
-            )
+            self.processors["hospitalizations"] = HospitalizationsProcessor(self.config)
 
         # Initialize state tracking
         self.pipeline_state = {
@@ -201,6 +199,13 @@ class OfflinePreprocessingPipeline:
             del processed["edar_flow"]
             del processed["edar_censor"]
 
+            # Ensure hospitalizations and deaths are set to None if not present
+            # (the pipeline expects these keys to exist)
+            if "hospitalizations" not in processed:
+                processed["hospitalizations"] = None
+            if "deaths" not in processed:
+                processed["deaths"] = None
+
             return processed
 
         # Standard real data processing
@@ -214,7 +219,9 @@ class OfflinePreprocessingPipeline:
                 cases_data = self.processors["catalonia_cases"].process(cases_dir)
                 raw_data["cases"] = cases_data
             except Exception as e:
-                raise RuntimeError(f"Failed to process Catalonia cases data: {str(e)}") from e
+                raise RuntimeError(
+                    f"Failed to process Catalonia cases data: {str(e)}"
+                ) from e
         elif self.config.cases_file:
             print("Using CasesProcessor (flowmaps data)...")
             try:
@@ -267,7 +274,9 @@ class OfflinePreprocessingPipeline:
             print("Processing hospitalizations data...")
             try:
                 # HospitalizationsProcessor expects data_dir, extracts directory from file path
-                hospitalizations_dir = str(Path(self.config.hospitalizations_file).parent)
+                hospitalizations_dir = str(
+                    Path(self.config.hospitalizations_file).parent
+                )
                 hospitalizations_data = self.processors["hospitalizations"].process(
                     hospitalizations_dir
                 )

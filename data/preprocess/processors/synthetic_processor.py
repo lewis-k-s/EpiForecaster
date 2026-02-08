@@ -131,6 +131,15 @@ class SyntheticProcessor:
             "population": self._extract_population(ds),
         }
 
+        # Extract optional hospitalizations and deaths data
+        hosp_data = self._extract_hospitalizations(ds)
+        if hosp_data is not None:
+            result["hospitalizations"] = hosp_data
+
+        deaths_data = self._extract_deaths(ds)
+        if deaths_data is not None:
+            result["deaths"] = deaths_data
+
         if synthetic_sparsity_level is not None:
             result["synthetic_sparsity_level"] = synthetic_sparsity_level
 
@@ -198,7 +207,9 @@ class SyntheticProcessor:
             mobility_filtered = mobility.isel({TEMPORAL_COORD: time_mask})
 
             num_runs = len(mobility_filtered.run_id)
-            print(f"  ✓ Extracted mobility with {num_runs} runs: {mobility_filtered.shape}")
+            print(
+                f"  ✓ Extracted mobility with {num_runs} runs: {mobility_filtered.shape}"
+            )
             return mobility_filtered.to_dataset(name="mobility")
 
         # Fall back to factorized format (legacy synthetic data)
@@ -339,3 +350,109 @@ class SyntheticProcessor:
         num_runs = len(pop.run_id)
         print(f"  ✓ Extracted population with {num_runs} runs: {pop.shape}")
         return pop
+
+    def _extract_hospitalizations(self, ds: xr.Dataset) -> xr.Dataset | None:
+        """Extract hospitalizations data from synthetic bundle.
+
+        Expected shape: (run_id, date, region_id)
+        Preserves run_id dimension for curriculum training.
+
+        Returns None if hospitalizations not present in synthetic data.
+        """
+        if "hospitalizations" not in ds:
+            print("  Hospitalizations not found in synthetic data")
+            return None
+
+        print("Extracting hospitalizations...")
+
+        # Hospitalizations: (run_id, date, region_id) → preserve run_id dimension
+        hosp = ds["hospitalizations"]
+
+        # Verify temporal dimension matches config
+        hosp = hosp.rename({TEMPORAL_COORD: TEMPORAL_COORD})
+
+        # Crop to config date range (applies to all runs)
+        start_date = np.datetime64(self.config.start_date)
+        end_date = np.datetime64(self.config.end_date)
+
+        time_mask = (hosp[TEMPORAL_COORD] >= start_date) & (
+            hosp[TEMPORAL_COORD] <= end_date
+        )
+        hosp_filtered = hosp.isel({TEMPORAL_COORD: time_mask})
+
+        if hosp_filtered.sizes[TEMPORAL_COORD] == 0:
+            print("  Warning: No hospitalizations data in temporal range")
+            return None
+
+        # Create mask and age channels matching EDAR conventions
+        # Mask: 1.0 if data available, 0.0 if missing/NaN
+        hosp_mask = xr.where(hosp_filtered.notnull(), 1.0, 0.0)
+        hosp_mask = hosp_mask.fillna(0.0)
+
+        # Age: Days since last measurement (synthetic data is complete, so age=1)
+        hosp_age = xr.ones_like(hosp_filtered)
+
+        num_runs = len(hosp_filtered.run_id)
+        print(
+            f"  ✓ Extracted hospitalizations with {num_runs} runs: {hosp_filtered.shape}"
+        )
+
+        return xr.Dataset(
+            {
+                "hospitalizations": hosp_filtered,
+                "hospitalizations_mask": hosp_mask,
+                "hospitalizations_age": hosp_age,
+            }
+        )
+
+    def _extract_deaths(self, ds: xr.Dataset) -> xr.Dataset | None:
+        """Extract deaths data from synthetic bundle.
+
+        Expected shape: (run_id, date, region_id)
+        Preserves run_id dimension for curriculum training.
+
+        Returns None if deaths not present in synthetic data.
+        """
+        if "deaths" not in ds:
+            print("  Deaths not found in synthetic data")
+            return None
+
+        print("Extracting deaths...")
+
+        # Deaths: (run_id, date, region_id) → preserve run_id dimension
+        deaths = ds["deaths"]
+
+        # Verify temporal dimension matches config
+        deaths = deaths.rename({TEMPORAL_COORD: TEMPORAL_COORD})
+
+        # Crop to config date range (applies to all runs)
+        start_date = np.datetime64(self.config.start_date)
+        end_date = np.datetime64(self.config.end_date)
+
+        time_mask = (deaths[TEMPORAL_COORD] >= start_date) & (
+            deaths[TEMPORAL_COORD] <= end_date
+        )
+        deaths_filtered = deaths.isel({TEMPORAL_COORD: time_mask})
+
+        if deaths_filtered.sizes[TEMPORAL_COORD] == 0:
+            print("  Warning: No deaths data in temporal range")
+            return None
+
+        # Create mask and age channels matching EDAR conventions
+        # Mask: 1.0 if data available, 0.0 if missing/NaN
+        deaths_mask = xr.where(deaths_filtered.notnull(), 1.0, 0.0)
+        deaths_mask = deaths_mask.fillna(0.0)
+
+        # Age: Days since last measurement (synthetic data is complete, so age=1)
+        deaths_age = xr.ones_like(deaths_filtered)
+
+        num_runs = len(deaths_filtered.run_id)
+        print(f"  ✓ Extracted deaths with {num_runs} runs: {deaths_filtered.shape}")
+
+        return xr.Dataset(
+            {
+                "deaths": deaths_filtered,
+                "deaths_mask": deaths_mask,
+                "deaths_age": deaths_age,
+            }
+        )
