@@ -48,7 +48,7 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
     # Both nodes need non-zero cases to be valid (all-zero sequences are filtered)
     cases = np.zeros((1, periods, 2, 1), dtype=np.float32)
     cases[0, :, 0, 0] = 100.0  # Node 0
-    cases[0, :, 1, 0] = 50.0   # Node 1
+    cases[0, :, 1, 0] = 50.0  # Node 1
 
     # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
     biomarkers = np.zeros((1, periods, 2), dtype=np.float32)
@@ -68,13 +68,22 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
         data_vars={
             "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
             "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_mask),
+            "edar_biomarker_N1_mask": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                biomarker_mask,
+            ),
             "edar_biomarker_N1_censor": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD),
                 biomarker_censor,
             ),
-            "edar_biomarker_N1_age": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_age),
-            "mobility": (("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
+            "edar_biomarker_N1_age": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                biomarker_age,
+            ),
+            "mobility": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"),
+                mobility,
+            ),
             "population": ((REGION_COORD,), population),
         },
         coords={
@@ -85,6 +94,36 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
         },
     )
     ds.to_zarr(zarr_path, mode="w", zarr_format=2)
+
+
+@pytest.mark.epiforecaster
+def test_getitem_preserves_target_history_when_self_edge_missing(tmp_path):
+    """Test that target history is preserved even when self-mobility is below threshold.
+
+    This exposes a bug where target inclusion is forced on neigh_mask, but masking
+    is applied with mobility_mask_float instead, causing target history to be zeroed
+    when self-edges are missing.
+    """
+    zarr_path = tmp_path / "self_edge_missing.zarr"
+    _write_tiny_dataset(str(zarr_path), periods=8)
+
+    config = _make_config(str(zarr_path), log_scale=False)
+    config.data.mobility_threshold = 0.5  # require positive flow
+    dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+
+    # Remove all self-mobility so target self-edge is below threshold
+    dataset.preloaded_mobility[:, 0, 0] = 0.0
+    dataset.preloaded_mobility[:, 1, 1] = 0.0
+    dataset.mobility_mask = dataset.preloaded_mobility >= config.data.mobility_threshold
+    dataset.mobility_mask_float = dataset.mobility_mask.to(torch.float32)
+
+    item = dataset[0]  # target node 0, first window
+    case_node = item["case_node"]  # (L, C), channels [value, mask, age]
+
+    # If target inclusion is honored, target mask should remain observed
+    assert torch.all(case_node[:, 1] > 0.5), (
+        "target history mask got zeroed by mobility masking"
+    )
 
 
 @pytest.mark.epiforecaster

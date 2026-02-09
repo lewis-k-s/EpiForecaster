@@ -333,7 +333,7 @@ class EDARProcessor:
 
     def _compute_age_channel(
         self,
-        values: xr.DataArray,
+        mask: xr.DataArray,
         max_age: int = 14,
     ) -> xr.DataArray:
         """Compute age channel (days since last measurement).
@@ -344,18 +344,19 @@ class EDARProcessor:
         run_id dimension is ALWAYS present (synthetic: multiple runs, real: run_id="real").
 
         Args:
-            values: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
+            mask: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
+                  where 1.0 indicates a valid observation.
             max_age: Maximum age in days for normalization
 
         Returns:
             DataArray with normalized age values [0, 1]
         """
-        assert "run_id" in values.dims, "run_id dimension is required"
-        return self._compute_age_core(values, max_age)
+        assert "run_id" in mask.dims, "run_id dimension is required"
+        return self._compute_age_core(mask, max_age)
 
     def _compute_age_core(
         self,
-        values: xr.DataArray,
+        mask: xr.DataArray,
         max_age: int,
     ) -> xr.DataArray:
         """Core age computation that handles all dimensions via broadcasting.
@@ -364,25 +365,25 @@ class EDARProcessor:
         Uses groupby for better chunking support instead of explicit loops.
 
         Args:
-            values: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
+            mask: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
             max_age: Maximum age in days for normalization
 
         Returns:
             DataArray with normalized age values [0, 1]
         """
         # Handle variant dimension using groupby for better chunking support
-        has_variant = "variant" in values.dims
+        has_variant = "variant" in mask.dims
         if has_variant:
             # Use groupby for better chunking support vs explicit loop
-            return values.groupby("variant").map(
+            return mask.groupby("variant").map(
                 lambda g: self._compute_age_channel_2d(g, max_age)
             )
         else:
-            return self._compute_age_channel_2d(values, max_age)
+            return self._compute_age_channel_2d(mask, max_age)
 
     def _compute_age_channel_2d(
         self,
-        values: xr.DataArray,
+        mask: xr.DataArray,
         max_age: int,
     ) -> xr.DataArray:
         """Compute age channel for DataArray with run_id support.
@@ -391,27 +392,24 @@ class EDARProcessor:
         Uses xarray operations for proper chunking support.
 
         Args:
-            values: DataArray with shape (run_id?, date, region_id)
+            mask: DataArray with shape (run_id?, date, region_id)
             max_age: Maximum age in days for normalization
 
         Returns:
             DataArray with normalized age values [0, 1]
         """
         # Get dimension order - run_id may or may not be present
-        dims = values.dims
+        dims = mask.dims
         date_dim = "date"
         region_dim = REGION_COORD
         has_run_id = "run_id" in dims
 
         # Create time indices along date dimension
         time_indices = xr.DataArray(
-            np.arange(len(values[date_dim])),
+            np.arange(len(mask[date_dim])),
             dims=[date_dim],
-            coords={date_dim: values[date_dim].values},
+            coords={date_dim: mask[date_dim].values},
         )
-
-        # Mask: 1.0 if measured (finite and positive), 0.0 otherwise
-        mask = xr.where(values.notnull() & (values > 0), 1.0, 0.0)
 
         # Find last measurement time for each (run_id?, region)
         # We use cumsum to find the last time index where mask=1
@@ -435,12 +433,12 @@ class EDARProcessor:
         if has_run_id:
             # Broadcast: (date,) -> (run_id, date, region_id)
             current_time_indices = current_time_indices.expand_dims(
-                {region_dim: len(values[region_dim]), "run_id": len(values["run_id"])}
+                {region_dim: len(mask[region_dim]), "run_id": len(mask["run_id"])}
             )
         else:
             # Broadcast: (date,) -> (date, region_id)
             current_time_indices = current_time_indices.expand_dims(
-                {region_dim: len(values[region_dim])}
+                {region_dim: len(mask[region_dim])}
             )
 
         # Calculate age = current_time - last_seen_time
@@ -661,23 +659,22 @@ class EDARProcessor:
             variant_da.name = variant_name
             biomarkers[variant_name] = variant_da
 
-            # Mask channel: 1.0 if measured, 0.0 otherwise
-            # Fill NaN with 0.0 (no measurement) to prevent NaN propagation
-            mask = xr.where(variant_da.notnull() & (variant_da > 0), 1.0, 0.0).fillna(
-                0.0
-            )
-            biomarkers[f"{variant_name}_mask"] = mask
-
             # Censor flag channel: 0=uncensored, 1=censored, 2=missing
-            # Fill NaN with 0.0 (uncensored) for regions without EDAR data
+            # Fill NaN with 2.0 (missing) for regions without EDAR data
             censor_variant = (
-                censor_aggregated.sel(variant=variant).drop_vars("variant").fillna(0.0)
+                censor_aggregated.sel(variant=variant).drop_vars("variant").fillna(2.0)
             )
             biomarkers[f"{variant_name}_censor"] = censor_variant
 
-            # Age channel: normalized days since last measurement
-            # Fill NaN with 1.0 (max age) for regions without data
-            age = self._compute_age_channel(variant_da).fillna(1.0)
+            # Mask channel: 1.0 if measured (not missing), 0.0 otherwise
+            # Value is considered "measured" if it's not missing (censor < 2)
+            # and it has a positive value (to exclude zero-fill artifacts)
+            mask = xr.where((censor_variant < 1.5) & (variant_da > 0), 1.0, 0.0)
+            biomarkers[f"{variant_name}_mask"] = mask
+
+            # Age channel: normalized days since last actual measurement
+            # Compute age based on the mask (which now correctly identifies actual measurements)
+            age = self._compute_age_channel(mask).fillna(1.0)
             biomarkers[f"{variant_name}_age"] = age
 
         return xr.Dataset(biomarkers)
@@ -868,10 +865,11 @@ class EDARProcessor:
     def _resample_to_daily(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.set_index("date")
         # Select only numeric columns after groupby to avoid deprecation warning
+        # Use min_count=1 to preserve NaNs for days with no measurements
         df = (
             df.groupby(["edar_id", "variant"])
             .resample("D", include_groups=False)
-            .sum(numeric_only=True)
+            .sum(numeric_only=True, min_count=1)
             .reset_index()
         )
         return df

@@ -374,7 +374,9 @@ class EpiDataset(Dataset):
         # Dataset is already filtered to a single run, so synthetic_sparsity_level is a scalar
         # Use .values to handle dask arrays (chunked loading)
         if "synthetic_sparsity_level" in self._dataset:
-            self.sparsity_level = float(self._dataset["synthetic_sparsity_level"].values.item())
+            self.sparsity_level = float(
+                self._dataset["synthetic_sparsity_level"].values.item()
+            )
         else:
             self.sparsity_level = None
 
@@ -573,14 +575,13 @@ class EpiDataset(Dataset):
         if self.context_mask is not None:
             # self.context_mask is a tensor
             neigh_mask = neigh_mask & self.context_mask[None, :]
-            # Force target node to be included
-            neigh_mask[:, target_idx] = True
+
+        # Force target node to be included (always, regardless of context_mask)
+        neigh_mask[:, target_idx] = True
 
         # Apply mask to case_history (both channels)
-        # Use pre-converted float32 mask from __init__ to avoid repeated dtype conversion
-        neigh_mask_t = self.mobility_mask_float[
-            range_start:range_end, :, target_idx
-        ].unsqueeze(-1)
+        # Use the updated neigh_mask that includes target node, not the raw mobility_mask_float
+        neigh_mask_t = neigh_mask.unsqueeze(-1).to(torch.float32)
         case_history = case_history * neigh_mask_t
 
         # Concatenate lagged risk features if available

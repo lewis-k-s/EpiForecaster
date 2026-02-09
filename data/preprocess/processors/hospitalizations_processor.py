@@ -288,26 +288,52 @@ class HospitalizationsProcessor:
         """
         Create mask and age channels matching EDAR/cases conventions.
 
-        Mask: 1.0 if data available, 0.0 if missing
-        Age: Integer days since last observation (1 = original, 2-7 = interpolated)
+        Mask: 1.0 ONLY if it's an original weekly measurement (age=1) and not missing.
+        Age: Days since last ACTUAL observation (age=1 means today was measured).
         """
         daily_df = daily_df.copy()
 
-        # Create mask (1.0 for valid, 0.0 for missing/NaN)
-        daily_df["hospitalizations_mask"] = (
-            daily_df["hospitalizations"].notna()
-            & np.isfinite(daily_df["hospitalizations"])
-        ).astype(float)
-
-        # Use age from resampling if available, otherwise default to 1
-        # Age was computed in _resample_weekly_to_daily: 1 on week start, 2-7 on subsequent days
-        if "age" in daily_df.columns:
-            daily_df["hospitalizations_age"] = daily_df["age"].astype(float)
+        # Identify actual measurements: must be week start AND not marked as missing by Kalman
+        is_week_start = (
+            (daily_df["age"] == 1) if "age" in daily_df.columns else pd.Series(True, index=daily_df.index)
+        )
+        if "missing_flag" in daily_df.columns:
+            is_not_missing = daily_df["missing_flag"] < 1.5
         else:
-            # Fallback: all days have age 1 (original observation)
-            daily_df["hospitalizations_age"] = 1.0
+            is_not_missing = daily_df["hospitalizations"].notna()
 
-        return daily_df
+        # Mask: 1.0 for actual measurements, 0.0 for all interpolated/missing values
+        mask = is_week_start & is_not_missing
+        daily_df["hospitalizations_mask"] = mask.astype(float)
+
+        # Recompute age to correctly track staleness across missing weeks
+        # Age = days since last measurement (mask == True)
+        age_series_list = []
+        for muni_code in daily_df["municipality_code"].unique():
+            muni_data = daily_df[daily_df["municipality_code"] == muni_code].sort_values("date")
+            muni_mask = muni_data["hospitalizations_mask"] > 0.5
+            
+            # Use pandas to calculate days since last True
+            # 1. Create a group ID that increments each time a measurement is seen
+            groups = muni_mask.cumsum()
+            # 2. Count days within each group
+            # If no measurement seen yet, groups will be 0.
+            age = muni_data.groupby(groups).cumcount() + 1
+            
+            # Handle the leading zeros (before first measurement) - age should be max
+            # Actually, groups.cumsum() for False, False, True, False starts with 0, 0, 1, 1
+            # We want to detect the segment before the first True.
+            first_true_idx = muni_mask.idxmax() if muni_mask.any() else None
+            if first_true_idx is not None:
+                # Set age to a large value (e.g. 14) for dates before first measurement
+                age.loc[muni_data["date"] < muni_data.loc[first_true_idx, "date"]] = 14
+            else:
+                age[:] = 14
+                
+            muni_data["hospitalizations_age"] = age.clip(upper=14).astype(float)
+            age_series_list.append(muni_data)
+            
+        return pd.concat(age_series_list, ignore_index=True)
 
     def process(
         self,
