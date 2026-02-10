@@ -288,10 +288,31 @@ class TransformerBackbone(nn.Module):
                 -1, seq_len, -1
             )  # [batch_size, seq_len, seq_len]
 
+        if attn_mask is not None:
+            # ensure attn_mask's dim is 3
+            if attn_mask.dim() == 2:
+                correct_2d_size = (seq_len, seq_len)
+                if attn_mask.shape != correct_2d_size:
+                    raise RuntimeError(
+                        f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}."
+                    )
+                attn_mask = attn_mask.unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                # If we have a 3D mask (B, L, S), we need to expand it to (B*num_heads, L, S)
+                # because PyTorch MultiHeadAttention expects the first dimension to be B*num_heads
+                if attn_mask.size(0) == batch_size:
+                    attn_mask = attn_mask.repeat_interleave(self.n_heads, dim=0)
+
+                correct_3d_size = (batch_size * self.n_heads, seq_len, seq_len)
+                if attn_mask.shape != correct_3d_size:
+                    raise RuntimeError(
+                        f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}."
+                    )
+
         # Apply Transformer encoder
         # Note: PyTorch's TransformerEncoder expects src_key_padding_mask for padding
         encoded = self.transformer_encoder(
-            x, src_key_padding_mask=attn_mask if attn_mask is not None else None
+            x, mask=attn_mask if attn_mask is not None else None
         )
 
         # Sequence-to-vector: use final time step for parameter prediction

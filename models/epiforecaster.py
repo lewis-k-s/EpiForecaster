@@ -88,27 +88,9 @@ class EpiForecaster(nn.Module):
         self.device = device or torch.device("cpu")
         self.gnn_module = gnn_module
 
-        # Compute temporal node dimension for GNN
-        self.temporal_node_dim = 0
-        if self.variant_type.cases:
-            self.temporal_node_dim += temporal_input_dim
-        if self.variant_type.biomarkers:
-            self.temporal_node_dim += biomarkers_dim
-
-        # Compute backbone input dimension
-        self.backbone_input_dim = 0
-        if self.variant_type.cases:
-            self.backbone_input_dim += temporal_input_dim
-            self.backbone_input_dim += 1  # mean
-            self.backbone_input_dim += 1  # std
-        if self.variant_type.biomarkers:
-            self.backbone_input_dim += biomarkers_dim
-        if self.variant_type.mobility:
-            self.backbone_input_dim += mobility_embedding_dim
-        if self.variant_type.regions:
-            self.backbone_input_dim += region_embedding_dim
-        if self.use_population:
-            self.backbone_input_dim += population_dim
+        # Compute dimensions using helpers
+        self.temporal_node_dim = self._get_temporal_node_dim()
+        self.backbone_input_dim = self._get_backbone_input_dim()
 
         # Stage 1: Mobility GNN (optional)
         if self.variant_type.mobility:
@@ -200,9 +182,9 @@ class EpiForecaster(nn.Module):
 
     def forward(
         self,
-        cases_norm: torch.Tensor,
-        cases_mean: torch.Tensor,
-        cases_std: torch.Tensor,
+        hosp_hist: torch.Tensor,
+        deaths_hist: torch.Tensor,
+        cases_hist: torch.Tensor,
         biomarkers_hist: torch.Tensor,
         mob_graphs: Batch | None,
         target_nodes: torch.Tensor,
@@ -214,9 +196,9 @@ class EpiForecaster(nn.Module):
         Forward pass of joint inference EpiForecaster.
 
         Args:
-            cases_norm: Normalized case counts [batch_size, seq_len, cases_dim]
-            cases_mean: Rolling mean of cases [batch_size, seq_len, 1]
-            cases_std: Rolling std of cases [batch_size, seq_len, 1]
+            hosp_hist: Hospitalization history [batch_size, seq_len, 3] (value, mask, age)
+            deaths_hist: Deaths history [batch_size, seq_len, 3] (value, mask, age)
+            cases_hist: Reported cases history [batch_size, seq_len, 3] (value, mask, age)
             biomarkers_hist: Historical biomarker measurements [batch_size, seq_len, biomarkers_dim]
             mob_graphs: PyG Batch of mobility graphs (B*T graphs)
             target_nodes: Indices of target nodes in the global region list [batch_size]
@@ -236,14 +218,14 @@ class EpiForecaster(nn.Module):
                 - obs_context: [batch_size, horizon, obs_context_dim] - observation context
                 - initial_states: [batch_size, 3] - S0, I0, R0 proportions (sum=1)
         """
-        B, T, _ = cases_norm.shape
+        B, T, _ = hosp_hist.shape
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "EpiForecaster.forward: B=%d T=%d cases=%s biomarkers=%s mobility=%s regions=%s",
+                "EpiForecaster.forward: B=%d T=%d clinical=%s biomarkers=%s mobility=%s regions=%s",
                 B,
                 T,
-                tuple(cases_norm.shape),
+                (B, T, 9),  # 3 series x 3 channels
                 tuple(biomarkers_hist.shape),
                 self.variant_type.mobility,
                 self.variant_type.regions,
@@ -253,9 +235,11 @@ class EpiForecaster(nn.Module):
         features: list[torch.Tensor] = []
 
         if self.variant_type.cases:
-            features.append(cases_norm)
-            features.append(cases_mean)
-            features.append(cases_std)
+            # Concatenate all clinical series: hosp + deaths + cases
+            # Each is (B, T, 3) with [value, mask, age]
+            features.append(hosp_hist)
+            features.append(deaths_hist)
+            features.append(cases_hist)
         if self.variant_type.biomarkers:
             features.append(biomarkers_hist)
 
@@ -315,6 +299,8 @@ class EpiForecaster(nn.Module):
             S0=S0,
             I0=I0,
             R0=R0,
+            # SIR is modeled in fraction space (S+I+R=1), so population N=1.0 ensures
+            # the standard SIR equations (beta*S*I/N) work correctly with fractions.
             population=torch.ones(B, device=beta_t.device),
         )
 
@@ -333,6 +319,7 @@ class EpiForecaster(nn.Module):
         obs_context_with_init = torch.cat([obs_context[:, :1, :], obs_context], dim=1)
 
         # Wastewater prediction
+        # SIR is modeled in fraction space (S+I+R=1), so population N=1.0
         pred_ww = self.ww_head(
             I_trajectory=I_traj,
             population=torch.ones(B, device=beta_t.device),
@@ -359,15 +346,10 @@ class EpiForecaster(nn.Module):
         )  # [B, H]
 
         # Trim initial state (t=0) from predictions to match horizon
-        # We want predictions for the forecast horizon only
-        if pred_ww.shape[1] > self.forecast_horizon:
-            pred_ww = pred_ww[:, 1 : 1 + self.forecast_horizon]  # [B, H]
-        if pred_hosp.shape[1] > self.forecast_horizon:
-            pred_hosp = pred_hosp[:, 1 : 1 + self.forecast_horizon]  # [B, H]
-        if pred_cases.shape[1] > self.forecast_horizon:
-            pred_cases = pred_cases[:, 1 : 1 + self.forecast_horizon]  # [B, H]
-        if pred_deaths.shape[1] > self.forecast_horizon:
-            pred_deaths = pred_deaths[:, 1 : 1 + self.forecast_horizon]  # [B, H]
+        pred_ww = self._trim_prediction(pred_ww)
+        pred_hosp = self._trim_prediction(pred_hosp)
+        pred_cases = self._trim_prediction(pred_cases)
+        pred_deaths = self._trim_prediction(pred_deaths)
 
         return {
             "beta_t": beta_t,
@@ -397,9 +379,8 @@ class EpiForecaster(nn.Module):
         CPU-GPU sync time.
 
         Args:
-            batch_data: Dict containing batch tensors (CaseNode, CaseMean, CaseStd,
-                        BioNode, MobBatch, Population, Target, TargetMean, TargetScale,
-                        TargetNode, WindowStart, B, T)
+            batch_data: Dict containing batch tensors (HospHist, DeathsHist, CasesHist,
+                        BioNode, MobBatch, Population, TargetNode, WindowStart, B, T)
             region_embeddings: Optional static region embeddings [num_regions, region_dim]
 
         Returns:
@@ -421,9 +402,9 @@ class EpiForecaster(nn.Module):
 
         # Forward pass
         model_outputs = self.forward(
-            cases_norm=batch["CaseNode"],
-            cases_mean=batch["CaseMean"],
-            cases_std=batch["CaseStd"],
+            hosp_hist=batch["HospHist"],
+            deaths_hist=batch["DeathsHist"],
+            cases_hist=batch["CasesHist"],
             biomarkers_hist=batch["BioNode"],
             mob_graphs=mob_batch,
             target_nodes=target_nodes,
@@ -450,26 +431,68 @@ class EpiForecaster(nn.Module):
         self, mob_batch: Batch, B: int, T: int
     ) -> torch.Tensor:
         """Process mobility graphs (batched) with MobilityGNN."""
-
         if not self.variant_type.mobility or self.mobility_gnn is None:
             raise RuntimeError(
                 "Mobility processing requested but MobilityGNN is not enabled."
             )
 
-        # type: ignore[attr-defined] (PyTorch Geometric Batch class missing type stubs)
+        node_emb = self._get_mobility_node_embeddings(mob_batch)
+        mobility_embeddings = self._gather_target_mobility_embeddings(
+            node_emb, mob_batch, B, T
+        )
+        return mobility_embeddings
+
+    def _get_temporal_node_dim(self) -> int:
+        """Compute temporal node dimension based on enabled variants."""
+        dim = 0
+        if self.variant_type.cases:
+            dim += self.temporal_input_dim
+        if self.variant_type.biomarkers:
+            dim += self.biomarkers_dim
+        return dim
+
+    def _get_backbone_input_dim(self) -> int:
+        """Compute backbone input dimension based on enabled variants."""
+        dim = 0
+        if self.variant_type.cases:
+            # 3 clinical series (hosp, deaths, cases) x 3 channels each = 9
+            dim += 9
+        if self.variant_type.biomarkers:
+            dim += self.biomarkers_dim
+        if self.variant_type.mobility:
+            dim += self.mobility_embedding_dim
+        if self.variant_type.regions:
+            dim += self.region_embedding_dim
+        if self.use_population:
+            dim += self.population_dim
+        return dim
+
+    def _trim_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
+        """Trim prediction to match forecast horizon, removing t=0 if present."""
+        if prediction.shape[1] > self.forecast_horizon:
+            return prediction[:, 1 : 1 + self.forecast_horizon]
+        return prediction
+
+    def _get_mobility_node_embeddings(self, mob_batch: Batch) -> torch.Tensor:
+        """Run GNN encoder on mobility batch."""
+        # type: ignore[attr-defined]
         if mob_batch.x.size(-1) != self.temporal_node_dim:  # type: ignore[attr-defined]
-            raise ValueError(  # type: ignore[attr-defined]
+            raise ValueError(
                 f"Mobility graph feature dim {mob_batch.x.size(-1)} "  # type: ignore[attr-defined]
                 f"!= expected {self.temporal_node_dim}"
             )
 
-        node_emb = self.mobility_gnn(
+        return self.mobility_gnn(
             mob_batch.x,  # type: ignore[attr-defined]
             mob_batch.edge_index,  # type: ignore[attr-defined]
             getattr(mob_batch, "edge_weight", None),
         )
 
-        # Gather target embeddings via ptr offsets
+    def _gather_target_mobility_embeddings(
+        self, node_emb: torch.Tensor, mob_batch: Batch, B: int, T: int
+    ) -> torch.Tensor:
+        """Gather embeddings for target nodes from the full graph batch."""
+        # Check batch size consistency
         ptr = mob_batch.ptr  # type: ignore[attr-defined]
         num_graphs = ptr.numel() - 1
         expected_graphs = B * T
@@ -487,9 +510,7 @@ class EpiForecaster(nn.Module):
             target_indices = start + tgt_local
 
         target_embeddings = node_emb[target_indices]
-        mobility_embeddings = target_embeddings.view(B, T, self.mobility_embedding_dim)
-
-        return mobility_embeddings
+        return target_embeddings.view(B, T, self.mobility_embedding_dim)
 
     def __repr__(self) -> str:
         return (

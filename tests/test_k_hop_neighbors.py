@@ -82,9 +82,34 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
 
     population = np.full(num_nodes, 1000.0, dtype=np.float32)
 
+    # Create clinical variables required by EpiDataset
+    hosp = np.full((1, periods, num_nodes, 1), 10.0, dtype=np.float32)
+    hosp_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
+    hosp_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
+
+    # Create clinical variables required by EpiDataset
+    hosp = np.full((1, periods, num_nodes, 1), 10.0, dtype=np.float32)
+    hosp_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
+    hosp_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
+
     ds = xr.Dataset(
         data_vars={
             "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "hospitalizations": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD, "feature"),
+                hosp,
+            ),
+            "hospitalizations_mask": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hosp_mask,
+            ),
+            "hospitalizations_age": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hosp_age,
+            ),
+            "deaths": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), hosp),
+            "deaths_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), hosp_mask),
+            "deaths_age": (("run_id", TEMPORAL_COORD, REGION_COORD), hosp_age),
             "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
             "edar_biomarker_N1_mask": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD),

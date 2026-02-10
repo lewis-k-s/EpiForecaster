@@ -397,9 +397,7 @@ class SpatialAutocorrelationLoss(nn.Module):
 
                 # Skip dimensions with insufficient unique values
                 if n_unique < 2:
-                    logger.debug(
-                        f"Skipping dim {dim}: only {n_unique} unique value(s)"
-                    )
+                    logger.debug(f"Skipping dim {dim}: only {n_unique} unique value(s)")
                     moran_losses.append(0.0)
                     continue
 
@@ -474,9 +472,7 @@ class SpatialAutocorrelationLoss(nn.Module):
 
                 # Skip dimensions with insufficient unique values
                 if n_unique < 2:
-                    logger.debug(
-                        f"Skipping dim {dim}: only {n_unique} unique value(s)"
-                    )
+                    logger.debug(f"Skipping dim {dim}: only {n_unique} unique value(s)")
                     lisa_losses.append(0.0)
                     continue
 
@@ -811,8 +807,8 @@ class SpatialOnlyLoss(nn.Module):
         )
 
         # Compute spatial autocorrelation loss
-        autocorr_loss_dict = self.autocorrelation_loss(embeddings)
-        autocorr_loss = autocorr_loss_dict["total_loss"]
+        autocorr_loss_dict = self.autocorrelation_loss(embeddings, edge_index)
+        autocorr_loss = autocorr_loss_dict["spatial_autocorr_loss"]
 
         # Combine losses
         total_loss = contrastive_loss + autocorr_loss
