@@ -69,6 +69,10 @@ def _load_biomarkers(
         )
 
     for name, biomarker in variant_vars.items():
+        # Handle run_id dimension if present (multi-run datasets)
+        if "run_id" in biomarker.dims:
+            biomarker = biomarker.isel(run_id=0)  # Select first run
+            variant_vars[name] = biomarker
         variant_vars[name] = biomarker.transpose(TEMPORAL_COORD, REGION_COORD)
 
     data_start_values = data_start.values if data_start is not None else None

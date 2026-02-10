@@ -175,7 +175,7 @@ def load_or_compute_regression_results(
     history_len = int(config.model.history_length)
     horizon = int(config.model.forecast_horizon)
     window_len = history_len + horizon
-    missing_permit = int(config.model.missing_permit)
+    missing_permit = int(config.data.missing_permit)
 
     starts, valid_mask = compute_valid_window_mask(
         cases_da, history_len, horizon, window_stride, missing_permit

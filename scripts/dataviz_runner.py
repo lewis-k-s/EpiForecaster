@@ -23,25 +23,31 @@ import yaml
 def get_dataset_path(preprocess_config: Path, train_config: Path) -> str | None:
     """Extract dataset path from config files."""
     try:
-        if preprocess_config.exists():
-            with open(preprocess_config) as f:
-                config = yaml.safe_load(f)
-                if "output_path" in config:
-                    return config["output_path"]
+        if train_config.exists():
+            with open(train_config) as f:
+                config = yaml.safe_load(f) or {}
+                dataset_path = config.get("dataset", {}).get("path")
+                if dataset_path:
+                    return str(dataset_path)
+                dataset_path = config.get("data", {}).get("dataset_path")
+                if dataset_path:
+                    return str(dataset_path)
     except Exception:
         pass
 
     try:
-        if train_config.exists():
-            with open(train_config) as f:
-                config = yaml.safe_load(f)
-                dataset_path = config.get("dataset", {}).get("path")
-                if dataset_path:
-                    return dataset_path
-                # Also check data.dataset_path
-                dataset_path = config.get("data", {}).get("dataset_path")
-                if dataset_path:
-                    return dataset_path
+        if preprocess_config.exists():
+            with open(preprocess_config) as f:
+                config = yaml.safe_load(f) or {}
+                if "output_path" in config:
+                    output_path = Path(str(config["output_path"]))
+                    dataset_name = config.get("dataset_name")
+                    if dataset_name:
+                        candidate = output_path / f"{dataset_name}.zarr"
+                        if candidate.exists():
+                            return str(candidate)
+                        return str(candidate)
+                    return str(output_path)
     except Exception:
         pass
 
@@ -76,12 +82,85 @@ def check_dataset_variables(dataset_path: str | None) -> dict[str, bool]:
     return available
 
 
+def get_preprocess_paths(preprocess_config: Path) -> tuple[str, str, str]:
+    """Extract raw-data input paths from preprocess config with sensible defaults."""
+    defaults = (
+        "data/files/hospitalizations_municipality.csv",
+        "data/files/deaths_municipality.csv",
+        "data/files/mobility.zarr",
+    )
+    if not preprocess_config.exists():
+        return defaults
+
+    try:
+        with open(preprocess_config) as f:
+            config = yaml.safe_load(f) or {}
+        return (
+            str(config.get("hospitalizations_file", defaults[0])),
+            str(config.get("deaths_file", defaults[1])),
+            str(config.get("mobility_path", defaults[2])),
+        )
+    except Exception:
+        return defaults
+
+
+def has_edge_weight_source_data(
+    data_path: Path = Path("data/files/mobility.zarr"),
+) -> bool:
+    """Return True if mobility.zarr exists for edge-weight analysis."""
+    return data_path.exists()
+
+
+def dataset_has_run_id_dimension(dataset_path: str | None) -> bool:
+    """Check whether dataset contains a run_id dimension."""
+    if not dataset_path:
+        return False
+    try:
+        import xarray as xr
+
+        ds = xr.open_zarr(dataset_path)
+        has_run_id = "run_id" in ds.dims or "run_id" in ds.coords
+        ds.close()
+        return has_run_id
+    except Exception:
+        return False
+
+
+def get_train_run_id(train_config: Path) -> str:
+    """Get run_id from train config, defaulting to 'real'."""
+    if not train_config.exists():
+        return "real"
+    try:
+        with open(train_config) as f:
+            config = yaml.safe_load(f) or {}
+        return str(config.get("data", {}).get("run_id", "real"))
+    except Exception:
+        return "real"
+
+
+def supports_model_missing_permit(train_config: Path) -> bool:
+    """Return True if train config defines missing_permit (data or model section)."""
+    if not train_config.exists():
+        return False
+    try:
+        with open(train_config) as f:
+            config = yaml.safe_load(f) or {}
+        model_cfg = config.get("model", {})
+        data_cfg = config.get("data", {})
+        return "missing_permit" in model_cfg or "missing_permit" in data_cfg
+    except Exception:
+        return False
+
+
 def run_script(script_path: Path, args: list[str]) -> bool:
     """Run a dataviz script with given arguments."""
-    # Convert script path to module name for use with -m flag
-    # e.g., "dataviz/raw_hospitalizations.py" -> "dataviz.raw_hospitalizations"
-    module_name = str(script_path.with_suffix("")).replace("/", ".").replace("\\", ".")
-    cmd = [sys.executable, "-m", module_name] + args
+    if str(script_path).startswith("scripts/"):
+        cmd = [sys.executable, str(script_path)] + args
+    else:
+        module_name = (
+            str(script_path.with_suffix("")).replace("/", ".").replace("\\", ".")
+        )
+        cmd = [sys.executable, "-m", module_name] + args
     print(f"Running: {' '.join(cmd)}")
     try:
         result = subprocess.run(cmd, check=True, capture_output=False)
@@ -127,31 +206,9 @@ Examples:
         default=Path("outputs/reports"),
         help="Output directory (default: outputs/reports)",
     )
-    parser.add_argument(
-        "--only",
-        type=str,
-        default=None,
-        help="Run only specific visualization type (raw_hospitalizations, raw_deaths, canonical_hospitalizations, canonical_deaths, canonical_biomarkers, or analysis)",
-    )
-    parser.add_argument(
-        "--skip-raw",
-        action="store_true",
-        help="Skip raw data visualizations",
-    )
-    parser.add_argument(
-        "--skip-canonical",
-        action="store_true",
-        help="Skip canonical dataset visualizations",
-    )
-    parser.add_argument(
-        "--skip-analysis",
-        action="store_true",
-        help="Skip analysis visualizations",
-    )
 
     args = parser.parse_args()
 
-    # Ensure output directory exists
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
@@ -162,54 +219,122 @@ Examples:
     print(f"Output directory: {args.output_dir}")
     print("=" * 80)
 
-    # Get dataset path for biomarkers
     dataset_path = get_dataset_path(args.preprocess_config, args.train_config)
+    hosp_csv, deaths_csv, mobility_path = get_preprocess_paths(args.preprocess_config)
+    run_id = get_train_run_id(args.train_config)
+    biomarker_compatible = not dataset_has_run_id_dimension(dataset_path)
+    regression_compatible = supports_model_missing_permit(args.train_config)
 
-    # Check which variables are available in the dataset
     available_vars = check_dataset_variables(dataset_path)
     if dataset_path:
         print(f"Dataset: {dataset_path}")
         print(f"Available variables: {available_vars}")
         print("-" * 80)
 
-    # Define all analyses
-    analyses: list[tuple[str, Path, list[str]]] = []
+    analyses: list[tuple[str, Path, list[str]]] = [
+        (
+            "raw_hospitalizations",
+            Path("dataviz/raw_hospitalizations.py"),
+            [
+                "--hospitalization-csv",
+                hosp_csv,
+                "--output-dir",
+                str(args.output_dir / "raw_hospitalizations"),
+            ],
+        ),
+        (
+            "raw_deaths",
+            Path("dataviz/raw_deaths.py"),
+            [
+                "--deaths-csv",
+                deaths_csv,
+                "--output-dir",
+                str(args.output_dir / "raw_deaths"),
+            ],
+        ),
+        (
+            "input_series_plots",
+            Path("dataviz/input_series_plots.py"),
+            [
+                "--config",
+                str(args.train_config),
+                "--output-dir",
+                str(args.output_dir / "input_series"),
+                "--num-samples",
+                "5",
+            ],
+        ),
+        (
+            "age_mask_plots",
+            Path("dataviz/age_mask_plots.py"),
+            [
+                "--config",
+                str(args.train_config),
+                "--output-dir",
+                str(args.output_dir / "age_mask"),
+            ],
+        ),
+        (
+            "sparsity",
+            Path("dataviz/sparsity_analysis.py"),
+            [
+                "--config",
+                str(args.train_config),
+                "--geo-path",
+                "data/files/geo/fl_municipios_catalonia.geojson",
+                "--output-dir",
+                str(args.output_dir / "sparsity"),
+                "--window-size",
+                "7",
+            ],
+        ),
+        (
+            "interp_norm",
+            Path("dataviz/interp_norm_raw_analysis.py"),
+            [
+                "--config",
+                str(args.train_config),
+                "--output-dir",
+                str(args.output_dir / "interp_norm_raw_analysis"),
+            ],
+        ),
+        (
+            "khop",
+            Path("dataviz/khop_neighbors.py"),
+            [
+                "--config",
+                str(args.train_config),
+                "--output-dir",
+                str(args.output_dir / "khop_neighbors"),
+                "--k",
+                "3",
+            ],
+        ),
+        (
+            "mobility_regime",
+            Path("dataviz/mobility_regime_analysis.py"),
+            [
+                "--mobility-path",
+                mobility_path,
+                "--output-dir",
+                str(args.output_dir / "mobility_regime"),
+            ],
+        ),
+        (
+            "neighborhood_density",
+            Path("dataviz/neighborhood_trace_density.py"),
+            [
+                "--config",
+                str(args.train_config),
+                "--output-dir",
+                str(args.output_dir / "neighborhood_density"),
+                "--split",
+                "all",
+            ],
+        ),
+    ]
 
-    # Raw data visualizations
-    if not args.skip_raw and args.only in (None, "raw_hospitalizations"):
-        analyses.append(
-            (
-                "raw_hospitalizations",
-                Path("dataviz/raw_hospitalizations.py"),
-                [
-                    "--hospitalization-csv",
-                    "data/files/COVID-19__Persones_hospitalitzades.csv",
-                    "--output-dir",
-                    str(args.output_dir / "raw_hospitalizations"),
-                ],
-            )
-        )
-
-    if not args.skip_raw and args.only in (None, "raw_deaths"):
-        analyses.append(
-            (
-                "raw_deaths",
-                Path("dataviz/raw_deaths.py"),
-                [
-                    "--deaths-csv",
-                    "data/files/Registre_de_defuncions_per_COVID-19_a_Catalunya_per_comarca_i_sexe.csv",
-                    "--output-dir",
-                    str(args.output_dir / "raw_deaths"),
-                ],
-            )
-        )
-
-    # Canonical dataset visualizations (only if data is available)
-    if (
-        not args.skip_canonical
-        and args.only in (None, "canonical_hospitalizations")
-        and available_vars["hospitalizations"]
-    ):
+    if available_vars["hospitalizations"]:
         analyses.append(
             (
                 "canonical_hospitalizations",
@@ -223,29 +348,23 @@ Examples:
             )
         )
 
-    if (
-        not args.skip_canonical
-        and args.only in (None, "canonical_deaths")
-        and available_vars["deaths"]
-    ):
+    if available_vars["deaths"]:
         analyses.append(
             (
                 "canonical_deaths",
                 Path("dataviz/canonical_deaths.py"),
                 [
-                    "--config",
-                    str(args.train_config),
+                    "--dataset",
+                    str(dataset_path),
+                    "--run-id",
+                    run_id,
                     "--output-dir",
                     str(args.output_dir / "canonical_deaths"),
                 ],
             )
         )
 
-    if (
-        not args.skip_canonical
-        and args.only in (None, "canonical_biomarkers")
-        and dataset_path
-    ):
+    if available_vars["biomarkers"] and dataset_path and biomarker_compatible:
         analyses.append(
             (
                 "canonical_biomarkers",
@@ -259,73 +378,13 @@ Examples:
             )
         )
 
-    # Analysis visualizations (only if no specific 'only' filter or if 'analysis' is requested)
-    if not args.skip_analysis and args.only in (None, "analysis"):
-        analysis_scripts = [
-            (
-                "sparsity",
-                Path("dataviz/sparsity_analysis.py"),
-                [
-                    "--config",
-                    str(args.train_config),
-                    "--geo-path",
-                    "data/files/geo/fl_municipios_catalonia.geojson",
-                    "--output-dir",
-                    str(args.output_dir / "sparsity"),
-                    "--window-size",
-                    "7",
-                ],
-            ),
-            (
-                "interp_norm",
-                Path("dataviz/interp_norm_raw_analysis.py"),
-                [
-                    "--config",
-                    str(args.train_config),
-                    "--output-dir",
-                    str(args.output_dir / "interp_norm_raw_analysis"),
-                ],
-            ),
-            (
-                "edge_weight",
-                Path("dataviz/edge_weight_analysis.py"),
-                [
-                    "--output-dir",
-                    str(args.output_dir / "edge_weight"),
-                ],
-            ),
-            (
-                "khop",
-                Path("dataviz/khop_neighbors.py"),
-                [
-                    "--config",
-                    str(args.train_config),
-                    "--output-dir",
-                    str(args.output_dir / "khop_neighbors"),
-                    "--k",
-                    "3",
-                ],
-            ),
-            (
-                "mobility_lockdown",
-                Path("dataviz/mobility_lockdown_analysis.py"),
-                [
-                    "--config",
-                    str(args.train_config),
-                    "--output-dir",
-                    str(args.output_dir / "mobility_lockdown"),
-                ],
-            ),
-            (
-                "mobility_regime",
-                Path("dataviz/mobility_regime_analysis.py"),
-                [
-                    "--config",
-                    str(args.train_config),
-                    "--output-dir",
-                    str(args.output_dir / "mobility_regime"),
-                ],
-            ),
+    if regression_compatible:
+        regression_results_path = (
+            args.output_dir
+            / "neighborhood_regression"
+            / "neighborhood_global_regression_results.csv"
+        )
+        analyses.append(
             (
                 "neighborhood_regression",
                 Path("dataviz/neighborhood_global_regression.py"),
@@ -334,46 +393,45 @@ Examples:
                     str(args.train_config),
                     "--output-dir",
                     str(args.output_dir / "neighborhood_regression"),
-                    "--target",
-                    "cases",
                 ],
-            ),
+            )
+        )
+        analyses.append(
             (
-                "neighborhood_density",
-                Path("dataviz/neighborhood_trace_density.py"),
+                "mobility_lockdown",
+                Path("dataviz/mobility_lockdown_analysis.py"),
                 [
                     "--config",
                     str(args.train_config),
+                    "--regression-results",
+                    str(regression_results_path),
                     "--output-dir",
-                    str(args.output_dir / "neighborhood_density"),
-                    "--split",
-                    "all",
+                    str(args.output_dir / "mobility_lockdown"),
                 ],
-            ),
-        ]
-        analyses.extend(analysis_scripts)
+            )
+        )
 
-    # Run all analyses
+    if has_edge_weight_source_data():
+        analyses.append(("edge_weight", Path("dataviz/edge_weight_analysis.py"), []))
+
     failed = []
     succeeded = []
 
     for name, script_path, script_args in analyses:
-        if not script_path.exists():
-            print(f"\n⚠️  Skipping {name}: script not found at {script_path}")
-            continue
-
         print(f"\n{'─' * 80}")
         print(f"▶️  Running: {name}")
         print(f"{'─' * 80}")
-
-        if run_script(script_path, script_args):
-            succeeded.append(name)
-            print(f"✅ Completed: {name}")
-        else:
+        try:
+            if run_script(script_path, script_args):
+                succeeded.append(name)
+                print(f"✅ Completed: {name}")
+            else:
+                failed.append(name)
+                print(f"❌ Failed: {name}")
+        except Exception as e:
             failed.append(name)
-            print(f"❌ Failed: {name}")
+            print(f"❌ Exception in {name}: {e}")
 
-    # Summary
     print(f"\n{'=' * 80}")
     print("SUMMARY")
     print(f"{'=' * 80}")

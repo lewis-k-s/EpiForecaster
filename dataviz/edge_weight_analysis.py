@@ -31,63 +31,55 @@ logger = logging.getLogger(__name__)
 class EdgeWeightAnalyzer:
     """Analyzes edge weight distributions in OD mobility networks."""
 
-    def __init__(self, data_dir: str = "data/files/daily_dynpop_mitma/"):
-        self.data_dir = Path(data_dir)
+    def __init__(self, mobility_path: str = "data/files/mobility.zarr"):
+        self.mobility_path = Path(mobility_path)
         self.results = {}
         self.lockdown_periods = LOCKDOWNS
         self._self_edge_cache = {}  # Cache self-edge mappings per dataset
 
     def load_all_data(self) -> dict[str, xr.Dataset]:
-        """Load all monthly OD data files."""
-        datasets = {}
-        nc_files = sorted(self.data_dir.glob("*.nc"))
+        """Load mobility data from zarr file."""
+        logger.info(f"Loading mobility data from {self.mobility_path}...")
 
-        logger.info(f"Loading {len(nc_files)} OD data files...")
-
-        for file_path in nc_files:
-            # Extract date from filename
-            filename = file_path.stem
-            date_part = filename.split(".")[-1]  # e.g., "2020-02-01_2020-02-29"
-            month_key = date_part.split("_")[0][:7]  # e.g., "2020-02"
-
-            try:
-                ds = xr.open_dataset(file_path, engine="h5netcdf")
-                datasets[month_key] = ds
-                logger.info(f"Loaded {month_key}: {ds.person_hours.shape}")
-            except Exception as e:
-                logger.warning(f"Failed to load {file_path}: {e}")
-
-        return datasets
+        ds = xr.open_zarr(self.mobility_path)
+        # Use the entire dataset as a single entry keyed by date range
+        dates = ds["date"].values
+        date_key = f"{dates[0]}_{dates[-1]}"
+        return {date_key: ds}
 
     def _get_self_edge_mapping(self, ds: xr.Dataset) -> list[tuple[int, int]]:
         """Get mapping of self-edge indices for a dataset.
 
         Args:
-            ds: xarray Dataset with home and destination coordinates
+            ds: xarray Dataset with origin and target coordinates
 
         Returns:
-            List of (home_idx, dest_idx) tuples for self-edges (same region ID)
+            List of (origin_idx, target_idx) tuples for self-edges (same region ID)
         """
         ds_id = id(ds)  # Use object ID as cache key
 
         if ds_id not in self._self_edge_cache:
-            home_to_idx = {
-                region_id: idx for idx, region_id in enumerate(ds.home.values)
+            # Support both old (home/destination) and new (origin/target) naming
+            origin_name = "origin" if "origin" in ds else "home"
+            target_name = "target" if "target" in ds else "destination"
+
+            origin_to_idx = {
+                region_id: idx for idx, region_id in enumerate(ds[origin_name].values)
             }
-            dest_to_idx = {
-                region_id: idx for idx, region_id in enumerate(ds.destination.values)
+            target_to_idx = {
+                region_id: idx for idx, region_id in enumerate(ds[target_name].values)
             }
 
-            home_ids = set(ds.home.values)
-            dest_ids = set(ds.destination.values)
-            overlap = home_ids.intersection(dest_ids)
+            origin_ids = set(ds[origin_name].values)
+            target_ids = set(ds[target_name].values)
+            overlap = origin_ids.intersection(target_ids)
 
             self_edge_pairs = []
             for region_id in overlap:
-                if region_id in home_to_idx and region_id in dest_to_idx:
-                    home_idx = home_to_idx[region_id]
-                    dest_idx = dest_to_idx[region_id]
-                    self_edge_pairs.append((home_idx, dest_idx))
+                if region_id in origin_to_idx and region_id in target_to_idx:
+                    origin_idx = origin_to_idx[region_id]
+                    target_idx = target_to_idx[region_id]
+                    self_edge_pairs.append((origin_idx, target_idx))
 
             self._self_edge_cache[ds_id] = self_edge_pairs
             logger.info(f"Cached {len(self_edge_pairs)} self-edge mappings")
@@ -169,11 +161,13 @@ class EdgeWeightAnalyzer:
         stats_list = []
 
         for month, ds in datasets.items():
-            data = ds.person_hours.values  # Shape: (time, home, destination)
+            data = ds.mobility.values  # Shape: (time, home, destination)
             num_days = data.shape[0]
 
             # Get time range for this dataset
-            time_values = ds.time.values
+            # Support both old (time) and new (date) naming for time coordinate
+            time_coord = "date" if "date" in ds else "time"
+            time_values = ds[time_coord].values
             start_date = pd.Timestamp(time_values[0])
             end_date = pd.Timestamp(time_values[-1])
 
@@ -448,7 +442,7 @@ class EdgeWeightAnalyzer:
 
                 if not (month_end < start_date or month_start > end_date):
                     # This month overlaps with lockdown
-                    data = ds.person_hours.values
+                    data = ds.mobility.values
                     filtered_data, self_edge_stats = self._filter_self_edges(
                         data, ds, exclude_self_edges=True
                     )
@@ -483,7 +477,7 @@ class EdgeWeightAnalyzer:
             for month_key, ds in datasets.items():
                 month_date = pd.Timestamp(f"{month_key}-15")
                 if baseline_start <= month_date < start_date:
-                    data = ds.person_hours.values
+                    data = ds.mobility.values
                     filtered_data, _ = self._filter_self_edges(
                         data, ds, exclude_self_edges=True
                     )
@@ -498,7 +492,7 @@ class EdgeWeightAnalyzer:
                 for month_key in sorted(datasets.keys()):
                     month_date = pd.Timestamp(f"{month_key}-15")
                     if month_date < start_date:
-                        data = datasets[month_key].person_hours.values
+                        data = datasets[month_key].mobility.values
                         filtered_data, _ = self._filter_self_edges(
                             data, datasets[month_key], exclude_self_edges=True
                         )
@@ -682,7 +676,7 @@ class EdgeWeightAnalyzer:
 
         # Collect all data (using filtered mobility-only data)
         for month, ds in datasets.items():
-            data = ds.person_hours.values
+            data = ds.mobility.values
             filtered_data, _ = self._filter_self_edges(
                 data, ds, exclude_self_edges=True
             )
@@ -743,7 +737,7 @@ class EdgeWeightAnalyzer:
         # Calculate sparsities considering only mobility (inter-regional) flows
         sparsities = []
         for m in months:
-            data = datasets[m].person_hours.values
+            data = datasets[m].mobility.values
             total_possible_flows = data.size
             active_mobility_flows = len(
                 monthly_data[m]
