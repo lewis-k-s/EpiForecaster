@@ -16,7 +16,6 @@ import xarray as xr
 from .config import REGION_COORD, PreprocessingConfig
 from .utils import load_csv_with_string_ids
 from .processors.alignment_processor import AlignmentProcessor
-from .processors.cases_processor import CasesProcessor
 from .processors.catalonia_cases_processor import CataloniaCasesProcessor
 from .processors.deaths_processor import DeathsProcessor
 from .processors.edar_processor import EDARProcessor
@@ -51,14 +50,13 @@ class OfflinePreprocessingPipeline:
         self.config = config
         self.processors = {
             "mobility": MobilityProcessor(self.config),
-            "cases": CasesProcessor(self.config),
             "edar": EDARProcessor(self.config),
             "alignment": AlignmentProcessor(self.config),
         }
 
-        # Initialize CataloniaCasesProcessor if configured (alternative to CasesProcessor)
-        if self.config.catalonia_cases_file:
-            self.processors["catalonia_cases"] = CataloniaCasesProcessor(self.config)
+        # Initialize cases processor if cases file is configured
+        if self.config.cases_file:
+            self.processors["cases"] = CataloniaCasesProcessor(self.config)
 
         # Initialize DeathsProcessor if configured
         if self.config.deaths_file:
@@ -211,19 +209,9 @@ class OfflinePreprocessingPipeline:
         # Standard real data processing
         raw_data = {}
 
-        # Process cases data (required) - toggle between sources
-        if self.config.catalonia_cases_file and "catalonia_cases" in self.processors:
-            print("Using CataloniaCasesProcessor (official data)...")
-            try:
-                cases_dir = str(Path(self.config.catalonia_cases_file).parent)
-                cases_data = self.processors["catalonia_cases"].process(cases_dir)
-                raw_data["cases"] = cases_data
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to process Catalonia cases data: {str(e)}"
-                ) from e
-        elif self.config.cases_file:
-            print("Using CasesProcessor (flowmaps data)...")
+        # Process cases data (required)
+        if self.config.cases_file and "cases" in self.processors:
+            print("Processing cases data...")
             try:
                 cases_data = self.processors["cases"].process(self.config.cases_file)
                 raw_data["cases"] = cases_data
@@ -269,37 +257,35 @@ class OfflinePreprocessingPipeline:
         except Exception as e:
             raise RuntimeError(f"Failed to process population data: {str(e)}") from e
 
-        # Process hospitalizations data (optional)
-        if self.config.hospitalizations_file and "hospitalizations" in self.processors:
-            print("Processing hospitalizations data...")
-            try:
-                # HospitalizationsProcessor expects data_dir, extracts directory from file path
-                hospitalizations_dir = str(
-                    Path(self.config.hospitalizations_file).parent
-                )
-                hospitalizations_data = self.processors["hospitalizations"].process(
-                    hospitalizations_dir
-                )
-                raw_data["hospitalizations"] = hospitalizations_data
-            except Exception as e:
-                print(f"Warning: Failed to process hospitalizations: {e}")
-                raw_data["hospitalizations"] = None
-        else:
-            raw_data["hospitalizations"] = None
+        # Process hospitalizations data (required)
+        if not self.config.hospitalizations_file:
+            raise RuntimeError(
+                "Hospitalizations data path is required but not configured"
+            )
 
-        # Process deaths data (optional)
-        if self.config.deaths_file and "deaths" in self.processors:
-            print("Processing deaths data...")
-            try:
-                # DeathsProcessor expects data_dir
-                deaths_dir = str(Path(self.config.deaths_file).parent)
-                deaths_data = self.processors["deaths"].process(deaths_dir)
-                raw_data["deaths"] = deaths_data
-            except Exception as e:
-                print(f"Warning: Failed to process deaths: {e}")
-                raw_data["deaths"] = None
+        if "hospitalizations" in self.processors:
+            print("Processing hospitalizations data...")
+            # HospitalizationsProcessor expects data_dir, extracts directory from file path
+            hospitalizations_dir = str(Path(self.config.hospitalizations_file).parent)
+            hospitalizations_data = self.processors["hospitalizations"].process(
+                hospitalizations_dir
+            )
+            raw_data["hospitalizations"] = hospitalizations_data
         else:
-            raw_data["deaths"] = None
+            raise RuntimeError("Hospitalizations processor not initialized")
+
+        # Process deaths data (required)
+        if not self.config.deaths_file:
+            raise RuntimeError("Deaths data path is required but not configured")
+
+        if "deaths" in self.processors:
+            print("Processing deaths data...")
+            # DeathsProcessor expects data_dir
+            deaths_dir = str(Path(self.config.deaths_file).parent)
+            deaths_data = self.processors["deaths"].process(deaths_dir)
+            raw_data["deaths"] = deaths_data
+        else:
+            raise RuntimeError("Deaths processor not initialized")
 
         print()
         return raw_data

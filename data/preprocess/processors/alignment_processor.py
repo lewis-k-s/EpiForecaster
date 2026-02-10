@@ -46,6 +46,28 @@ class AlignmentProcessor:
         # Graph options for mobility processing
         self.graph_options = config.graph_options or {}
 
+    @staticmethod
+    def _compute_age_from_mask(mask: xr.DataArray, max_age: int = 14) -> xr.DataArray:
+        """Compute integer age channel from binary observation mask."""
+        if TEMPORAL_COORD not in mask.dims:
+            raise ValueError(f"Mask must include '{TEMPORAL_COORD}' dimension")
+
+        mask_binary = xr.where(mask > 0, 1.0, 0.0)
+        time_indices = xr.DataArray(
+            np.arange(mask_binary.sizes[TEMPORAL_COORD], dtype=np.float32),
+            dims=[TEMPORAL_COORD],
+            coords={TEMPORAL_COORD: mask_binary[TEMPORAL_COORD]},
+        )
+
+        last_seen = xr.where(mask_binary > 0, time_indices, np.nan)
+        last_seen_filled = last_seen.ffill(dim=TEMPORAL_COORD)
+        valid_history = ~np.isnan(last_seen_filled)
+
+        current_time, _ = xr.broadcast(time_indices, mask_binary)
+        current_age = current_time - last_seen_filled + 1.0
+        final_age = xr.where(valid_history, np.minimum(current_age, max_age), max_age)
+        return final_age.transpose(*mask.dims).astype(np.float32)
+
     def align_datasets(
         self,
         cases_data: xr.DataArray,
@@ -135,9 +157,13 @@ class AlignmentProcessor:
             if not overlap:
                 raise ValueError("No hospitalizations regions found in common regions")
             dropped = hosp_regions - common_regions_set
-            print(f"  Hospitalizations data: {len(hosp_regions)} regions, {len(overlap)} overlap with common")
+            print(
+                f"  Hospitalizations data: {len(hosp_regions)} regions, {len(overlap)} overlap with common"
+            )
             if dropped:
-                print(f"  Dropping {len(dropped)} hospitalizations regions not in common regions (not in cases): {sorted(list(dropped))[:10]}...")
+                print(
+                    f"  Dropping {len(dropped)} hospitalizations regions not in common regions (not in cases): {sorted(list(dropped))[:10]}..."
+                )
 
         # Validate deaths regions if provided
         if deaths_data is not None:
@@ -147,7 +173,9 @@ class AlignmentProcessor:
             overlap = deaths_regions.intersection(common_regions)
             if not overlap:
                 raise ValueError("No deaths regions found in common regions")
-            print(f"  Deaths data: {len(deaths_regions)} regions, {len(overlap)} overlap with common")
+            print(
+                f"  Deaths data: {len(deaths_regions)} regions, {len(overlap)} overlap with common"
+            )
 
         if not common_regions:
             raise ValueError("No common regions found between datasets")
@@ -166,45 +194,33 @@ class AlignmentProcessor:
         # Align hospitalizations if provided
         if hospitalizations_data is not None:
             hosp_final = hospitalizations_data.reindex({REGION_COORD: common_regions})
-            # Fill mask/age channels for hospitalizations
+            # Build a stable mask first, then derive age from the mask to ensure consistency.
             if "hospitalizations_mask" in hosp_final.data_vars:
-                hosp_final["hospitalizations_mask"] = hosp_final[
-                    "hospitalizations_mask"
-                ].fillna(0.0)
-            if "hospitalizations_age" in hosp_final.data_vars:
-                hosp_final["hospitalizations_age"] = hosp_final[
-                    "hospitalizations_age"
-                ].fillna(1.0)
+                hosp_mask = hosp_final["hospitalizations_mask"].fillna(0.0)
+            else:
+                hosp_mask = xr.where(hosp_final["hospitalizations"].notnull(), 1.0, 0.0)
+            hosp_final["hospitalizations_mask"] = xr.where(hosp_mask > 0, 1.0, 0.0)
+            hosp_final["hospitalizations_age"] = self._compute_age_from_mask(
+                hosp_final["hospitalizations_mask"]
+            )
         else:
             hosp_final = None
 
         # Align deaths if provided
         if deaths_data is not None:
             deaths_final = deaths_data.reindex({REGION_COORD: common_regions})
-            # Fill deaths values with 0 for regions without data
-            if "deaths" in deaths_final.data_vars:
-                deaths_final["deaths"] = deaths_final["deaths"].fillna(0.0)
-            # Fill mask/age channels for deaths if present
+            # Preserve missingness signal before zero-filling values.
             if "deaths_mask" in deaths_final.data_vars:
-                deaths_final["deaths_mask"] = deaths_final["deaths_mask"].fillna(0.0)
-            if "deaths_age" in deaths_final.data_vars:
-                deaths_final["deaths_age"] = deaths_final["deaths_age"].fillna(1.0)
+                deaths_mask = deaths_final["deaths_mask"].fillna(0.0)
             else:
-                # Add deaths_age channel with default value 1.0 for consistency
-                # Create age channel matching deaths dimensions
-                deaths_final["deaths_age"] = xr.DataArray(
-                    np.ones_like(deaths_final["deaths"].values),
-                    dims=deaths_final["deaths"].dims,
-                    coords=deaths_final["deaths"].coords,
-                )
-            # Add deaths_mask channel if not present
-            if "deaths_mask" not in deaths_final.data_vars:
-                # Mask: 1.0 where deaths data exists, 0.0 otherwise
-                deaths_final["deaths_mask"] = xr.DataArray(
-                    (deaths_final["deaths"].notnull()).astype(float).fillna(0.0),
-                    dims=deaths_final["deaths"].dims,
-                    coords=deaths_final["deaths"].coords,
-                )
+                deaths_mask = xr.where(deaths_final["deaths"].notnull(), 1.0, 0.0)
+            deaths_final["deaths_mask"] = xr.where(deaths_mask > 0, 1.0, 0.0)
+            deaths_final["deaths_age"] = self._compute_age_from_mask(
+                deaths_final["deaths_mask"]
+            )
+            # Do NOT fill deaths values with 0.0 - let them stay NaN so downstream dataset
+            # can properly differentiate between "observed zero" and "missing".
+            # The ClinicalSeriesPreprocessor handles NaNs correctly.
         else:
             deaths_final = None
 

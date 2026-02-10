@@ -252,9 +252,22 @@ class EDARProcessor:
             censored_mask = np.isfinite(limits) & (values <= limits)
             fit_series = fit_series.mask(censored_mask)
 
+            # Fully missing windows should propagate as missing observations
+            # rather than failing preprocessing for the entire dataset.
+            valid_fit = fit_series.where(fit_series > 0).dropna()
+            if valid_fit.empty:
+                series["total_covid_flow"] = np.nan
+                series["censor_flag"] = 2
+                series["process_var"] = fallback_process
+                series["measurement_var"] = fallback_measure
+                series["edar_id"] = edar_id
+                series["variant"] = variant
+                filtered_frames.append(series.reset_index())
+                continue
+
             try:
                 process_var, measurement_var = self._fit_kalman_params(fit_series)
-            except ValueError:
+            except (ValueError, RuntimeError):
                 process_var = fallback_process
                 measurement_var = fallback_measure
 
@@ -312,8 +325,8 @@ class EDARProcessor:
 
         for variant in censor_xr_aligned["variant"].values:
             variant_censor = censor_xr_aligned.sel(variant=variant)
-            # Fill NaN with 0 (uncensored) for sites without data
-            variant_censor_filled = variant_censor.fillna(0)
+            # Fill NaN with 2 (missing) for sites without data
+            variant_censor_filled = variant_censor.fillna(2)
 
             # Max-severity aggregation: for each region, take max of contributing sites
             # We compute this by iterating over regions and taking max where emap > 0

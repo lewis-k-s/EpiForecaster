@@ -70,9 +70,7 @@ class HospitalizationsProcessor:
         df = df.rename(columns=self.COLUMN_MAPPING)
 
         # Drop rows where municipality_code is NaN or empty string
-        df = df[
-            df["municipality_code"].notna() & (df["municipality_code"] != "")
-        ]
+        df = df[df["municipality_code"].notna() & (df["municipality_code"] != "")]
 
         # Municipality codes are already strings from dasymetric_mob output
         # Ensure they are strings
@@ -239,11 +237,7 @@ class HospitalizationsProcessor:
             fit_series = pd.Series(values, index=muni_data.index)
             fit_series = fit_series.where(fit_series > 0)
 
-            try:
-                process_var, measurement_var = self._fit_kalman_params(fit_series)
-            except (ValueError, RuntimeError):
-                process_var = fallback_process
-                measurement_var = fallback_measure
+            process_var, measurement_var = self._fit_kalman_params(fit_series)
 
             # Initialize Kalman filter with fitted params
             kf = _KalmanFilter(
@@ -295,7 +289,9 @@ class HospitalizationsProcessor:
 
         # Identify actual measurements: must be week start AND not marked as missing by Kalman
         is_week_start = (
-            (daily_df["age"] == 1) if "age" in daily_df.columns else pd.Series(True, index=daily_df.index)
+            (daily_df["age"] == 1)
+            if "age" in daily_df.columns
+            else pd.Series(True, index=daily_df.index)
         )
         if "missing_flag" in daily_df.columns:
             is_not_missing = daily_df["missing_flag"] < 1.5
@@ -310,16 +306,18 @@ class HospitalizationsProcessor:
         # Age = days since last measurement (mask == True)
         age_series_list = []
         for muni_code in daily_df["municipality_code"].unique():
-            muni_data = daily_df[daily_df["municipality_code"] == muni_code].sort_values("date")
+            muni_data = daily_df[
+                daily_df["municipality_code"] == muni_code
+            ].sort_values("date")
             muni_mask = muni_data["hospitalizations_mask"] > 0.5
-            
+
             # Use pandas to calculate days since last True
             # 1. Create a group ID that increments each time a measurement is seen
             groups = muni_mask.cumsum()
             # 2. Count days within each group
             # If no measurement seen yet, groups will be 0.
             age = muni_data.groupby(groups).cumcount() + 1
-            
+
             # Handle the leading zeros (before first measurement) - age should be max
             # Actually, groups.cumsum() for False, False, True, False starts with 0, 0, 1, 1
             # We want to detect the segment before the first True.
@@ -329,10 +327,10 @@ class HospitalizationsProcessor:
                 age.loc[muni_data["date"] < muni_data.loc[first_true_idx, "date"]] = 14
             else:
                 age[:] = 14
-                
+
             muni_data["hospitalizations_age"] = age.clip(upper=14).astype(float)
             age_series_list.append(muni_data)
-            
+
         return pd.concat(age_series_list, ignore_index=True)
 
     def process(
