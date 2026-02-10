@@ -4,11 +4,10 @@
 # Data source paths - all available sources enabled
 data_dir: "data/files"
 
-# Cases data source - TOGGLE: Comment out one, enable the other
-# Option 1: Flowmaps cases (original source)
-cases_file: "data/files/flowmaps_cat_municipio_cases.csv"
-# Option 2: Official Catalonia cases (alternative source)
-# catalonia_cases_file: "data/files/Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv"
+# Cases data source - Official Catalonia format only
+# This file should be the official Registre de casos CSV with columns:
+# TipusCasData, MunicipiCodi, TipusCasDescripcio, NumCasos
+cases_file: "data/files/Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv"
 
 # Deaths data (pre-aggregated municipality-level)
 deaths_file: "data/files/deaths_municipality.csv"

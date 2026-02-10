@@ -22,6 +22,12 @@ wastewater_file: "data/files/raw_synthetic_observations.zarr"
 population_file: "data/files/raw_synthetic_observations.zarr"
 region_metadata_file: "data/files/edar_muni_edges.nc"
 
+# Optional: Hospitalizations and deaths data (also from synthetic zarr if available)
+# When synthetic_path is set, these are extracted from the same zarr bundle
+# Leave commented out to auto-detect from synthetic data
+# hospitalizations_file: "data/files/raw_synthetic_observations.zarr"
+# deaths_file: "data/files/raw_synthetic_observations.zarr"
+
 # Temporal processing parameters - match synthetic data range
 start_date: "2020-02-09"
 end_date: "2020-06-01"

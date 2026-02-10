@@ -54,7 +54,7 @@ output:
 training:
   device: "cuda"
   batch_size: 12 # Increased from 8 for better GPU utilization
-  gradient_accumulation_steps: 3 # Effective batch = 36 (reduced from 4)
+  gradient_accumulation_steps: 2 # Effective batch = 24
   early_stopping_patience: 5
   nan_loss_patience: 5
   epochs: 10
@@ -69,17 +69,16 @@ training:
   prefetch_factor: 4 # Batches to prefetch per worker (kept at 4)
 
   # Temporal split configuration
-  # for synthetic, there is no real horizon so we should split by node to train on the whole series
-  split_strategy: "node"
-
-  # ignored when split_strategy="node"
-  # train_end_date: "2020-04-01"
-  # val_end_date: "2020-05-01"
-  # test_end_date omitted - uses all remaining data (2020-05-01 to 2020-06-01)
+  # Using temporal split for synthetic data to maximize training samples
+  # With 113 days total (2020-02-09 to 2020-06-01), this gives more samples than node split
+  split_strategy: "time"
+  train_end_date: "2020-04-20"  # ~70% for training
+  val_end_date: "2020-05-15"     # ~15% for validation
+  # test_end_date omitted - uses all remaining data (2020-05-15 to 2020-06-01)
 
   # ignored when split_strategy="time"
-  val_split: 0.1
-  test_split: 0.1
+  # val_split: 0.1
+  # test_split: 0.1
 
   profiler:
     enabled: true
@@ -90,9 +89,4 @@ training:
   # Joint inference loss configuration
   loss:
     name: "joint_inference"
-    joint:
-      w_ww: 1.0
-      w_hosp: 1.0
-      w_cases: 1.0
-      w_deaths: 1.0
-      w_sir: 0.1
+    joint: {}

@@ -117,11 +117,6 @@ training:
   # Joint inference loss configuration
   loss:
     name: "joint_inference"
-    joint:
-      w_ww: 1.0
-      w_hosp: 1.0
-      w_cases: 1.0
-      w_deaths: 1.0
-      w_sir: 0.1
+    joint: {}
   plot_forecasts: true
   num_forecast_samples: 3
