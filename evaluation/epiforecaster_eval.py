@@ -22,8 +22,10 @@ from utils.normalization import unscale_forecasts
 from models.configs import EpiForecasterConfig, LossConfig
 from models.epiforecaster import EpiForecaster
 from plotting.forecast_plots import (
+    DEFAULT_PLOT_TARGETS,
     collect_forecast_samples_for_target_nodes,
     make_forecast_figure,
+    make_joint_forecast_figure,
 )
 
 logger = logging.getLogger(__name__)
@@ -457,9 +459,16 @@ def split_nodes(config: EpiForecasterConfig) -> tuple[list[int], list[int], list
     aligned_dataset = EpiDataset.load_canonical_dataset(
         Path(config.data.dataset_path),
         run_id=config.data.run_id,
+        run_id_chunk_size=config.data.run_id_chunk_size,
     )
     N = aligned_dataset[REGION_COORD].size
     all_nodes = np.arange(N)
+    if config.data.use_valid_targets:
+        valid_mask = EpiDataset.get_valid_nodes(
+            dataset_path=Path(config.data.dataset_path),
+            run_id=config.data.run_id,
+        )
+        all_nodes = all_nodes[valid_mask]
     rng = np.random.default_rng(42)
     rng.shuffle(all_nodes)
     n_train = int(len(all_nodes) * train_split)
@@ -490,27 +499,45 @@ def build_loader_from_config(
         Tuple of (DataLoader, region_embeddings). Region embeddings are pre-loaded
         to the target device to avoid repeated transfers during evaluation.
     """
-    train_nodes, val_nodes, test_nodes = split_nodes(config)
     split_key = split.lower()
     if split_key not in {"val", "test"}:
         raise ValueError("split must be 'val' or 'test'")
 
-    if split_key == "val":
-        dataset = EpiDataset(
+    if config.training.split_strategy == "time":
+        train_end: str = config.training.train_end_date or ""
+        val_end: str = config.training.val_end_date or ""
+        test_end: str | None = config.training.test_end_date
+        _train_dataset, val_dataset, test_dataset = EpiDataset.create_temporal_splits(
             config=config,
-            target_nodes=val_nodes,
-            context_nodes=train_nodes + val_nodes,
+            train_end_date=train_end,
+            val_end_date=val_end,
+            test_end_date=test_end,
         )
+        dataset = val_dataset if split_key == "val" else test_dataset
     else:
-        dataset = EpiDataset(
-            config=config,
-            target_nodes=test_nodes,
-            context_nodes=train_nodes + val_nodes,
-        )
+        train_nodes, val_nodes, test_nodes = split_nodes(config)
+        if split_key == "val":
+            dataset = EpiDataset(
+                config=config,
+                target_nodes=val_nodes,
+                context_nodes=train_nodes + val_nodes,
+            )
+        else:
+            dataset = EpiDataset(
+                config=config,
+                target_nodes=test_nodes,
+                context_nodes=train_nodes + val_nodes,
+            )
 
-    # Worker configuration - use val_workers for val/test splits
+    # Worker configuration mirrors training defaults:
+    # - validation loader uses val_workers
+    # - test loader uses test_workers
     avail_cores = (os.cpu_count() or 1) - 1
-    cfg_workers = config.training.val_workers
+    cfg_workers = (
+        config.training.val_workers
+        if split_key == "val"
+        else getattr(config.training, "test_workers", 0)
+    )
     if cfg_workers == -1:
         num_workers = max(0, avail_cores)
     else:
@@ -1130,6 +1157,8 @@ def generate_forecast_plots(
     context_post: int = 30,
     output_path: Path | None = None,
     log_dir: Path | None = None,
+    target_names: list[str] | None = None,
+    wandb_prefix: str = "forecasts",
 ) -> dict[str, Any]:
     """
     Generate forecast plots for given node groups (generic).
@@ -1167,6 +1196,8 @@ def generate_forecast_plots(
     )
 
     # Use existing function - it handles subset creation internally
+    resolved_targets = target_names or list(DEFAULT_PLOT_TARGETS)
+
     samples = collect_forecast_samples_for_target_nodes(
         target_node_ids=all_selected_nodes,
         model=model,
@@ -1174,6 +1205,7 @@ def generate_forecast_plots(
         window=window,
         context_pre=context_pre,
         context_post=context_post,
+        target_names=resolved_targets,
     )
 
     # Group samples by original group names
@@ -1194,18 +1226,39 @@ def generate_forecast_plots(
     # Generate figure using existing generic function
     dataset = cast(EpiDataset, loader.dataset)
     config = dataset.config
-    fig = make_forecast_figure(
+    fig = make_joint_forecast_figure(
         samples=grouped_samples,
         history_length=int(config.model.history_length),
         forecast_horizon=int(config.model.forecast_horizon),
         context_pre=context_pre,
         context_post=context_post,
+        target_names=resolved_targets,
     )
 
     if fig is not None and output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
         logger.info(f"[plot] Saved figure to: {output_path}")
+
+    separate_figures: dict[str, Any] = {}
+    for target_name in resolved_targets:
+        target_fig = make_forecast_figure(
+            samples=grouped_samples,
+            history_length=int(config.model.history_length),
+            forecast_horizon=int(config.model.forecast_horizon),
+            context_pre=context_pre,
+            context_post=context_post,
+            target=target_name,
+        )
+        if target_fig is None:
+            continue
+        separate_figures[target_name] = target_fig
+        if output_path is not None:
+            target_output_path = output_path.with_name(
+                f"{output_path.stem}_{target_name}{output_path.suffix}"
+            )
+            target_fig.savefig(target_output_path, dpi=200, bbox_inches="tight")
+            logger.info(f"[plot] Saved figure to: {target_output_path}")
 
     if fig is not None and (log_dir is not None or wandb.run is not None):
         if log_dir is not None:
@@ -1217,10 +1270,18 @@ def generate_forecast_plots(
             job_type="eval",
         )
         if wandb.run is not None:
-            wandb.log({"forecasts": wandb.Image(fig)}, step=0)
+            log_payload: dict[str, Any] = {}
+            if fig is not None:
+                log_payload[f"{wandb_prefix}/joint"] = wandb.Image(fig)
+            for target_name, target_fig in separate_figures.items():
+                log_payload[f"{wandb_prefix}/{target_name}"] = wandb.Image(target_fig)
+            if log_payload:
+                wandb.log(log_payload, step=0)
 
     return {
         "figure": fig,
+        "joint_figure": fig,
+        "separate_figures": separate_figures,
         "all_samples": samples,
         "selected_nodes": all_selected_nodes,
         "node_groups": node_groups,
@@ -1294,6 +1355,36 @@ def eval_checkpoint(
     except Exception as exc:
         logger.warning(f"[eval] Metrics evaluation failed: {exc}")
 
+    forecast_plot_result: dict[str, Any] | None = None
+    if split.lower() == "test" and node_mae_dict:
+        k = max(1, int(config.training.num_forecast_samples))
+        worst_nodes = select_nodes_by_loss(
+            node_mae=node_mae_dict, strategy="worst", k=k
+        ).get("Worst", [])
+        best_nodes = select_nodes_by_loss(
+            node_mae=node_mae_dict, strategy="best", k=k
+        ).get("Best", [])
+        node_groups = {"Poorly-performing": worst_nodes, "Well-performing": best_nodes}
+
+        if any(node_groups.values()):
+            output_path = None
+            if log_dir is not None:
+                output_path = log_dir / f"{split}_forecasts_joint.png"
+            forecast_plot_result = generate_forecast_plots(
+                model=model,
+                loader=loader,
+                node_groups=node_groups,
+                window="last",
+                context_pre=30,
+                context_post=30,
+                output_path=output_path,
+                log_dir=log_dir,
+                target_names=list(DEFAULT_PLOT_TARGETS),
+                wandb_prefix=f"forecasts_{split}",
+            )
+        else:
+            logger.warning("[plot] Could not select test nodes for forecast plots")
+
     if log_dir is not None or wandb.run is not None:
         if log_dir is not None:
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -1319,6 +1410,7 @@ def eval_checkpoint(
         "node_mae": node_mae_dict,
         "eval_loss": eval_loss,
         "eval_metrics": eval_metrics,
+        "forecast_plots": forecast_plot_result,
     }
 
 

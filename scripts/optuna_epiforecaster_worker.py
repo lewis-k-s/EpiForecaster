@@ -132,10 +132,7 @@ def _bounded_joint_loss_weight_overrides(
         raise ValueError("loss_weight_max_ratio must be >= 1.0")
 
     base_joint = base_cfg.training.loss.joint
-    base_weights = {
-        key: float(getattr(base_joint, key))
-        for key in _JOINT_WEIGHT_KEYS
-    }
+    base_weights = {key: float(getattr(base_joint, key)) for key in _JOINT_WEIGHT_KEYS}
     total = sum(base_weights.values())
     if total <= 0:
         raise ValueError("Sum of joint loss weights must be > 0 for bounded tuning")
@@ -153,14 +150,8 @@ def _bounded_joint_loss_weight_overrides(
         scaled[key] = max(base, 1e-12) * mult
 
     scaled_sum = sum(scaled.values())
-    normalized = {
-        key: total * (value / scaled_sum)
-        for key, value in scaled.items()
-    }
-    return {
-        f"training.loss.joint.{key}": value
-        for key, value in normalized.items()
-    }
+    normalized = {key: total * (value / scaled_sum) for key, value in scaled.items()}
+    return {f"training.loss.joint.{key}": value for key, value in normalized.items()}
 
 
 def suggest_epiforecaster_params(
@@ -188,12 +179,26 @@ def suggest_epiforecaster_params(
     overrides["training.weight_decay"] = trial.suggest_float(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
-    overrides["training.batch_size"] = trial.suggest_categorical(
-        "training.batch_size", _categorical_choices((4, 8, 12, 16))
+    # Sample batch_size first, then conditionally sample grad_accum to ensure
+    # effective batch size >= 32 (batch_size * grad_accum >= 32)
+    batch_size = trial.suggest_categorical(
+        "training.batch_size", _categorical_choices((16, 32, 64, 128))
     )
-    overrides["training.gradient_accumulation_steps"] = trial.suggest_categorical(
-        "training.gradient_accumulation_steps", _categorical_choices((1, 2, 3, 4))
+    overrides["training.batch_size"] = batch_size
+
+    # Compute valid grad_accum choices: ceil(32 / batch_size) to 8
+    min_grad_accum = (32 + batch_size - 1) // batch_size  # Ceiling division
+    valid_grad_accum = [g for g in (1, 2, 4, 8) if g >= min_grad_accum]
+    if not valid_grad_accum:
+        # Fallback: if batch_size=128 and min_grad_accum > 8, use 8 anyway
+        # (effective batch will be 1024 which is fine)
+        valid_grad_accum = [8]
+
+    grad_accum = trial.suggest_categorical(
+        "training.gradient_accumulation_steps",
+        _categorical_choices(tuple(valid_grad_accum)),
     )
+    overrides["training.gradient_accumulation_steps"] = grad_accum
     # # Early stopping affects compute/overfit tradeoff; keep it moderate.
     # overrides["training.early_stopping_patience"] = trial.suggest_int(
     #     "training.early_stopping_patience", 5, 20
@@ -309,12 +314,15 @@ def objective(
     cfg = EpiForecasterConfig.from_file(str(base_config_path))
 
     # Sample trial-specific overrides.
+    # Note: effective batch size constraint (batch_size * grad_accum >= 32) is
+    # enforced in suggest_epiforecaster_params via conditional sampling.
     overrides = suggest_epiforecaster_params(
         trial=trial,
         base_cfg=cfg,
         loss_weight_mode=loss_weight_mode,
         loss_weight_max_ratio=loss_weight_max_ratio,
     )
+
     override_list = _overrides_to_dotlist(overrides)
 
     # Add runtime-specific overrides
@@ -323,7 +331,7 @@ def objective(
     # Disable WandB by default for Optuna sweeps (Optuna tracks metrics/parameters)
     override_list.append("output.wandb_mode=disabled")
     # Disable early stopping for HPO - rely on Optuna pruning instead
-    override_list.append("training.early_stopping_patience=0")
+    override_list.append("training.early_stopping_patience=null")
     if fixed_epochs is not None:
         override_list.append(f"training.epochs={fixed_epochs}")
     if fixed_max_batches is not None:
@@ -595,12 +603,20 @@ def main(
         logger.info("Using Random sampler (seed=%d)", seed)
 
     storage = JournalStorage(JournalFileBackend(str(journal_file)))
+    # Use PercentilePruner to enable early pruning even with few workers
+    # Prunes trials in the bottom 25th percentile after just 2 trials complete
+    selected_pruner = optuna.pruners.PercentilePruner(
+        percentile=25.0,
+        n_startup_trials=2,
+        n_warmup_steps=pruning_start_epoch,
+    )
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
         direction="minimize",
         load_if_exists=True,
         sampler=selected_sampler,
+        pruner=selected_pruner,
     )
 
     logger.info("Starting Optuna worker for study '%s'", study_name)
@@ -609,7 +625,8 @@ def main(
     logger.info("Run root: %s", run_root)
     logger.info(
         "Settings: epochs=%d, pruning_start_epoch=%d, seed=%d, "
-        "loss_weight_mode=%s, loss_weight_max_ratio=%.3f",
+        "loss_weight_mode=%s, loss_weight_max_ratio=%.3f, "
+        "pruner=PercentilePruner(25%%)",
         epochs,
         pruning_start_epoch,
         seed,

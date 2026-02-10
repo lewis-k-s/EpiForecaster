@@ -458,7 +458,7 @@ class TrainingParams:
     resume: bool = False
     scheduler_type: str = "cosine"
     gradient_clip_value: float = 2.0
-    early_stopping_patience: int = 10
+    early_stopping_patience: int | None = 10  # None = disabled
     nan_loss_patience: int | None = None
     val_split: float = 0.2
     test_split: float = 0.1
@@ -511,6 +511,12 @@ class TrainingParams:
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
+        if isinstance(self.curriculum, (dict, DictConfig)):
+            curriculum_dict = cast(dict[str, Any], self.curriculum)
+            self.curriculum = CurriculumConfig(**curriculum_dict)
+        if isinstance(self.profiler, (dict, DictConfig)):
+            profiler_dict = cast(dict[str, Any], self.profiler)
+            self.profiler = ProfilerConfig(**profiler_dict)
 
         valid_loss_names = {
             "smape",

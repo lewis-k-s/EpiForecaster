@@ -379,10 +379,8 @@ class EpiForecasterTrainer:
 
         # Setup logging and checkpointing
         self.setup_logging()
-        if self.resume:
-            self._resume_from_checkpoint()
 
-        # Training state
+        # Training state - initialize best_val_loss BEFORE resume to avoid AttributeError
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float("inf")
@@ -405,6 +403,10 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx: int | None = None
         self._lr_warmup_remaining: int = 0
         self._lr_warmup_target_lr: float = 0.0  # Target LR to restore after warmup
+
+        # Resume from checkpoint after all state is initialized
+        if self.resume:
+            self._resume_from_checkpoint()
 
         self._status("=" * 60)
         self._status("EpiForecasterTrainer initialized:")
@@ -1336,7 +1338,7 @@ class EpiForecasterTrainer:
             ):
                 self._save_checkpoint(epoch, val_loss)
 
-            # Early stopping
+            # Early stopping (disabled if patience is None)
             should_stop = False
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
@@ -1346,7 +1348,8 @@ class EpiForecasterTrainer:
             else:
                 self.patience_counter += 1
                 if (
-                    self.patience_counter
+                    self.config.training.early_stopping_patience is not None
+                    and self.patience_counter
                     >= self.config.training.early_stopping_patience
                 ):
                     self._status(
@@ -1410,6 +1413,14 @@ class EpiForecasterTrainer:
             f"R2: {test_metrics['r2']:.4g} | "
             f"Time: {test_time:.2f}s"
         )
+        if self.config.training.plot_forecasts:
+            try:
+                self._generate_forecast_plots(self.test_loader, split="test")
+            except Exception as exc:
+                self._status(
+                    f"[plot] Test forecast plotting failed: {exc}",
+                    level=logging.WARNING,
+                )
         self._status(f"{'=' * 60}")
 
         if self.wandb_run is not None:
@@ -1657,25 +1668,36 @@ class EpiForecasterTrainer:
         return result.item() if isinstance(result, torch.Tensor) else float(result)
 
     def _generate_forecast_plots(self, loader: DataLoader, split: str):
-        """Generate and save forecast plots using quartile strategy."""
+        """Generate and save forecast plots for best/worst performing regions."""
         from evaluation.epiforecaster_eval import (
             generate_forecast_plots,
             select_nodes_by_loss,
         )
 
-        # Select nodes using quartile strategy
-        node_groups = select_nodes_by_loss(
+        sample_count = max(1, int(self.config.training.num_forecast_samples))
+        worst_nodes = select_nodes_by_loss(
             node_mae=self._last_node_mae,
-            strategy="quartile",
-            samples_per_group=4,
-        )
+            strategy="worst",
+            k=sample_count,
+        ).get("Worst", [])
+        best_nodes = select_nodes_by_loss(
+            node_mae=self._last_node_mae,
+            strategy="best",
+            k=sample_count,
+        ).get("Best", [])
+        node_groups = {
+            "Poorly-performing": worst_nodes,
+            "Well-performing": best_nodes,
+        }
+        if not any(node_groups.values()):
+            self._status(f"[plot] No nodes selected for {split} forecast plotting")
+            return
 
-        # Generate plots (generic - works with any node_groups)
         output_dir = (
             Path(self.config.output.log_dir) / self.config.output.experiment_name
         )
         output_dir.mkdir(parents=True, exist_ok=True)
-        plot_path = output_dir / f"{split}_forecasts.png"
+        plot_path = output_dir / f"{split}_forecasts_joint.png"
         generate_forecast_plots(
             model=self.model,
             loader=loader,
@@ -1683,6 +1705,7 @@ class EpiForecasterTrainer:
             window="last",
             output_path=plot_path,
             log_dir=self.experiment_dir,
+            wandb_prefix=f"forecasts_{split}",
         )
 
     def _evaluate_split(
