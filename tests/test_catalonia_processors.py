@@ -89,15 +89,26 @@ def test_municipality_mapping_loads(temp_data_dir: Path):
 def test_catalonia_cases_output_format(
     config: PreprocessingConfig, temp_data_dir: Path
 ):
-    """Test cases processor produces correct xarray format."""
+    """Test cases processor produces correct xarray format with mask/age channels."""
     proc = CataloniaCasesProcessor(config)
-    result = proc.process(temp_data_dir)
+    cases_file = (
+        temp_data_dir
+        / "Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv"
+    )
+    result = proc.process(cases_file, apply_smoothing=False)
 
     assert "cases" in result
-    assert result.cases.dims == ("date", "region_id")
+    assert "cases_mask" in result
+    assert "cases_age" in result
+    # Cases now has run_id dimension like other datasets
+    assert result.cases.dims == ("run_id", "date", "region_id")
+    assert result.cases.sizes["run_id"] == 1  # single run
     assert result.cases.sizes["date"] == 15  # full date range (reindexed)
     assert result.cases.sizes["region_id"] == 2  # 2 municipalities
     assert result.cases.sum() == 15  # 5+3+7
+    # Check mask and age are present and have correct shape
+    assert result.cases_mask.dims == ("run_id", "date", "region_id")
+    assert result.cases_age.dims == ("run_id", "date", "region_id")
 
 
 @pytest.mark.region
@@ -109,6 +120,8 @@ def test_deaths_processor_municipality_level(
     result = proc.process(temp_data_dir)
 
     assert "deaths" in result
+    assert "deaths_mask" in result
+    assert "deaths_age" in result
     assert result.deaths.dims == ("date", "region_id")
     assert result.deaths.sizes["date"] == 15  # full date range (reindexed)
     assert result.deaths.sizes["region_id"] == 2  # 2 municipalities
@@ -117,3 +130,7 @@ def test_deaths_processor_municipality_level(
     # Check specific municipality
     assert result.deaths.sel(region_id="08019").sum() == 5.0  # 2.0 + 3.0
     assert result.deaths.sel(region_id="08021").sum() == 1.0
+    # Mask tracks true observations only (3 observed rows from fixture)
+    assert float(result.deaths_mask.sum()) == 3.0
+    # Age channel should include staleness beyond observation days
+    assert float(result.deaths_age.max()) > 1.0

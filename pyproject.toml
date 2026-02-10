@@ -59,6 +59,7 @@ dependencies = [
   "optuna>=4.7.0",
   "optuna-dashboard>=0.20.0",
   "vulture>=2.14",
+  "cmaes>=0.12.0",
 ]
 
 # Note: torch-scatter and torch-sparse are installed separately using:
@@ -90,6 +91,8 @@ remote-train = "scripts.remote_train:main"
 remote-preprocess = "scripts.remote_preprocess:main"
 # Data visualization runner
 dataviz = "scripts.dataviz_runner:main"
+# Optuna HPO worker for manual SLURM array jobs
+optuna-worker = "scripts.optuna_epiforecaster_worker:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]

@@ -81,6 +81,20 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
     )
 
 
+def _expected_age_from_mask(mask: np.ndarray, max_age: int = 14) -> np.ndarray:
+    """Compute integer age channel from a (date, region) binary mask."""
+    age = np.full(mask.shape, max_age, dtype=np.float32)
+    for region_idx in range(mask.shape[1]):
+        last_seen = None
+        for t in range(mask.shape[0]):
+            if mask[t, region_idx] > 0:
+                last_seen = t
+                age[t, region_idx] = 1.0
+            elif last_seen is not None:
+                age[t, region_idx] = float(min((t - last_seen) + 1, max_age))
+    return age
+
+
 @pytest.mark.epiforecaster
 def test_alignment_preserves_mobility_coords(tmp_path):
     config = _make_config(tmp_path)
@@ -114,3 +128,148 @@ def test_alignment_preserves_mobility_coords(tmp_path):
         run_id=0, date=0, origin=slice(0, 2), destination=slice(0, 2)
     )
     assert not bool(sample.isnull().all())
+
+
+@pytest.mark.epiforecaster
+def test_alignment_derives_deaths_mask_and_age_from_observations(tmp_path):
+    config = _make_config(tmp_path)
+    aligner = AlignmentProcessor(config)
+
+    run_ids = np.array(["real"], dtype="U10")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["001", "002"], dtype="U10")
+
+    ds = _make_synthetic_dataset(run_ids, dates, region_ids)
+
+    cases_da = ds["cases"]
+    mobility = xr.Dataset(
+        {
+            "mobility": xr.DataArray(
+                np.ones((1, 4, 2, 2), dtype=np.float32),
+                dims=("run_id", "date", "origin", "destination"),
+                coords={
+                    "run_id": run_ids,
+                    "date": dates,
+                    "origin": region_ids,
+                    "destination": region_ids,
+                },
+            )
+        }
+    )
+    population_da = xr.DataArray(
+        np.array([1000.0, 2000.0], dtype=np.float32),
+        dims=("region_id",),
+        coords={"region_id": region_ids},
+        name="population",
+    )
+    edar_ds = xr.Dataset({"edar_biomarker_N1": ds["edar_biomarker_N1"]})
+
+    # Deaths values include true missing observations (NaN) that should remain mask=0.
+    deaths_values = np.array(
+        [
+            [5.0, np.nan],
+            [np.nan, np.nan],
+            [np.nan, 3.0],
+            [1.0, np.nan],
+        ],
+        dtype=np.float32,
+    )
+    deaths_ds = xr.Dataset(
+        {
+            "deaths": xr.DataArray(
+                deaths_values,
+                dims=("date", "region_id"),
+                coords={"date": dates, "region_id": region_ids},
+            )
+        }
+    )
+
+    aligned = aligner.align_datasets(
+        cases_data=cases_da,
+        mobility_data=mobility,
+        edar_data=edar_ds,
+        population_data=population_da,
+        deaths_data=deaths_ds,
+    )
+
+    deaths_mask = aligned["deaths_mask"].values
+    expected_mask = np.isfinite(deaths_values).astype(np.float32)
+    np.testing.assert_array_equal(deaths_mask, expected_mask)
+
+    deaths_age = aligned["deaths_age"].values
+    expected_age = _expected_age_from_mask(expected_mask)
+    np.testing.assert_array_equal(deaths_age, expected_age)
+
+
+@pytest.mark.epiforecaster
+def test_alignment_recomputes_hospitalization_age_from_mask(tmp_path):
+    config = _make_config(tmp_path)
+    aligner = AlignmentProcessor(config)
+
+    run_ids = np.array(["real"], dtype="U10")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["001", "002"], dtype="U10")
+
+    ds = _make_synthetic_dataset(run_ids, dates, region_ids)
+    cases_da = ds["cases"]
+    mobility = xr.Dataset(
+        {
+            "mobility": xr.DataArray(
+                np.ones((1, 4, 2, 2), dtype=np.float32),
+                dims=("run_id", "date", "origin", "destination"),
+                coords={
+                    "run_id": run_ids,
+                    "date": dates,
+                    "origin": region_ids,
+                    "destination": region_ids,
+                },
+            )
+        }
+    )
+    population_da = xr.DataArray(
+        np.array([1000.0, 2000.0], dtype=np.float32),
+        dims=("region_id",),
+        coords={"region_id": region_ids},
+        name="population",
+    )
+    edar_ds = xr.Dataset({"edar_biomarker_N1": ds["edar_biomarker_N1"]})
+
+    hosp_values = np.array(
+        [[[10.0, 20.0], [9.0, 19.0], [8.0, 18.0], [7.0, 17.0]]], dtype=np.float32
+    )
+    hosp_mask = np.array(
+        [[[1.0, 1.0], [0.0, 0.0], [0.0, 1.0], [1.0, 0.0]]], dtype=np.float32
+    )
+    # Broken upstream age channel that currently passes through unchanged.
+    broken_age = np.ones((1, 4, 2), dtype=np.float32)
+    hospitalizations_ds = xr.Dataset(
+        {
+            "hospitalizations": xr.DataArray(
+                hosp_values,
+                dims=("run_id", "date", "region_id"),
+                coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+            ),
+            "hospitalizations_mask": xr.DataArray(
+                hosp_mask,
+                dims=("run_id", "date", "region_id"),
+                coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+            ),
+            "hospitalizations_age": xr.DataArray(
+                broken_age,
+                dims=("run_id", "date", "region_id"),
+                coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+            ),
+        }
+    )
+
+    aligned = aligner.align_datasets(
+        cases_data=cases_da,
+        mobility_data=mobility,
+        edar_data=edar_ds,
+        population_data=population_da,
+        hospitalizations_data=hospitalizations_ds,
+    )
+
+    out_age = aligned["hospitalizations_age"].values.squeeze(0)
+    expected_age = _expected_age_from_mask(hosp_mask.squeeze(0))
+    np.testing.assert_array_equal(out_age, expected_age)

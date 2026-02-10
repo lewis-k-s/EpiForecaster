@@ -156,7 +156,7 @@ Lock these details before coding to avoid churn and mismatched interfaces:
 
 ### Next Milestone
 - [x] Document latent space contract (fraction vs count) in architecture docs.
-    - **Decision:** Latent states ($S, I, R, D$) are **counts** (number of people), not fractions. The `SIRRollForward` module explicitly divides by $N$ in the interaction term ($-\beta SI/N$) and enforces mass conservation where $S+I+R+D = N$.
+    - **Decision:** Latent states ($S, I, R, D$) are **fractions** (normalized to sum to 1.0). The `SIRRollForward` module is passed a dummy population of $N=1.0$, which ensures the interaction term $-\beta (S/N_{actual}) (I/N_{actual}) / (1/N_{actual})$ scales correctly when working in fraction space ($s = S/N_{actual}, i = I/N_{actual}$). Mass conservation enforces $s+i+r+d = 1.0$.
 
 ## 8. Parameter Stability & Curriculum Strategy
 

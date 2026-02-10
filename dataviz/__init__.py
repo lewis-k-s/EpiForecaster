@@ -1,32 +1,17 @@
-"""
-Data visualization module for mobility graph analysis.
+"""Data visualization package."""
 
-This module provides tools for visualizing and analyzing k-hop neighborhoods
-in mobility graphs to optimize minibatch sizes for GraphSAGE training.
-
-Main components:
-- KHopNeighborAnalyzer: Analyze receptive fields and neighborhood growth
-- KHopVisualizer: Create visualizations of k-hop subgraphs
-- neighborhood_global_regression: Compare neighborhood vs global trends
-
-Example usage:
-    from dataviz.khop_neighbors import KHopNeighborAnalyzer, load_mobility_graph_from_nc
-
-    # Load graph
-    edge_index, metadata = load_mobility_graph_from_nc('data/mobility.nc')
-
-    # Analyze k-hop neighborhoods
-    analyzer = KHopNeighborAnalyzer(edge_index, metadata['num_nodes'])
-"""
-
-from .khop_neighbors import (
-    KHopNeighborAnalyzer,
-    KHopVisualizer,
-    load_mobility_graph_from_nc,
-)
+from importlib import import_module
 
 __all__ = [
     "KHopNeighborAnalyzer",
     "KHopVisualizer",
     "load_mobility_graph_from_nc",
 ]
+
+
+def __getattr__(name: str):
+    """Lazy export to avoid importing heavy modules at package import time."""
+    if name in __all__:
+        module = import_module("dataviz.khop_neighbors")
+        return getattr(module, name)
+    raise AttributeError(f"module 'dataviz' has no attribute {name!r}")

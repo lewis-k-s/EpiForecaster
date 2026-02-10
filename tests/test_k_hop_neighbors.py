@@ -62,9 +62,10 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
     # Use padded run_id to match production data format
     run_id = "real                                            "
 
-    # Constant cases for all nodes - raw data only has 1 channel (value)
-    # The preprocessor adds mask and age channels - add run_id dimension
+    # Constant cases for all nodes - need value, mask, and age channels
     cases = np.full((1, periods, num_nodes, 1), 100.0, dtype=np.float32)
+    cases_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
+    cases_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
 
     # Biomarkers (required for dataset, even if not all are used)
     # Need non-zero values for scaler fitting (zeros are excluded)
@@ -87,14 +88,11 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
     hosp_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
     hosp_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
 
-    # Create clinical variables required by EpiDataset
-    hosp = np.full((1, periods, num_nodes, 1), 10.0, dtype=np.float32)
-    hosp_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
-    hosp_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
-
     ds = xr.Dataset(
         data_vars={
             "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "cases_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_mask),
+            "cases_age": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_age),
             "hospitalizations": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD, "feature"),
                 hosp,
