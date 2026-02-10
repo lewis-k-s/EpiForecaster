@@ -89,6 +89,32 @@ class DeathsProcessor:
 
         return aggregated
 
+    def _create_mask_and_age_channels(self, daily_df: pd.DataFrame) -> pd.DataFrame:
+        """Create deaths mask and age channels from observation availability."""
+        daily_df = daily_df.copy()
+        daily_df["deaths_mask"] = daily_df["deaths"].notna().astype(float)
+
+        age_series_list = []
+        for muni_code in daily_df["municipality_code"].unique():
+            muni_data = daily_df[
+                daily_df["municipality_code"] == muni_code
+            ].sort_values("date")
+            muni_mask = muni_data["deaths_mask"] > 0.5
+
+            groups = muni_mask.cumsum()
+            age = muni_data.groupby(groups).cumcount() + 1
+
+            first_true_idx = muni_mask.idxmax() if muni_mask.any() else None
+            if first_true_idx is not None:
+                age.loc[muni_data["date"] < muni_data.loc[first_true_idx, "date"]] = 14
+            else:
+                age[:] = 14
+
+            muni_data["deaths_age"] = age.clip(upper=14).astype(float)
+            age_series_list.append(muni_data)
+
+        return pd.concat(age_series_list, ignore_index=True)
+
     def process(
         self,
         data_dir: str | Path,
@@ -126,41 +152,105 @@ class DeathsProcessor:
                 dims=[TEMPORAL_COORD, REGION_COORD],
                 coords={TEMPORAL_COORD: date_range, REGION_COORD: []},
             )
-            return xr.Dataset({"deaths": deaths_da})
+            mask_da = xr.DataArray(
+                np.zeros((len(date_range), 0)),
+                dims=[TEMPORAL_COORD, REGION_COORD],
+                coords={TEMPORAL_COORD: date_range, REGION_COORD: []},
+            )
+            age_da = xr.DataArray(
+                np.ones((len(date_range), 0)),
+                dims=[TEMPORAL_COORD, REGION_COORD],
+                coords={TEMPORAL_COORD: date_range, REGION_COORD: []},
+            )
+            return xr.Dataset(
+                {"deaths": deaths_da, "deaths_mask": mask_da, "deaths_age": age_da}
+            )
 
         # Aggregate to municipality-day
         muni_deaths = self._aggregate_to_municipality_day(deaths_df)
 
-        # Create pivot table
+        # Create sparse pivot (NaN where unobserved)
         pivot = muni_deaths.pivot_table(
             index="date",
             columns="municipality_code",
             values="deaths",
             aggfunc="sum",
-            fill_value=0,
         )
 
         # Reindex to complete date range
         date_range = pd.date_range(
             start=self.config.start_date, end=self.config.end_date, freq="D"
         )
-        pivot = pivot.reindex(date_range, fill_value=0)
+        pivot = pivot.reindex(date_range)
 
         # Rename to standard coordinate names
         pivot.columns.name = REGION_COORD
         pivot.index.name = TEMPORAL_COORD
 
+        # Convert to long format for channel construction
+        daily_df = pivot.reset_index().melt(
+            id_vars=[TEMPORAL_COORD],
+            var_name="municipality_code",
+            value_name="deaths",
+        )
+        daily_df = self._create_mask_and_age_channels(daily_df)
+
+        # Pivot values/mask/age back to wide format
+        pivot_deaths = daily_df.pivot_table(
+            index="date",
+            columns="municipality_code",
+            values="deaths",
+            aggfunc="sum",
+        ).reindex(date_range)
+        pivot_mask = daily_df.pivot_table(
+            index="date",
+            columns="municipality_code",
+            values="deaths_mask",
+            aggfunc="max",
+        ).reindex(date_range, fill_value=0)
+        pivot_age = daily_df.pivot_table(
+            index="date",
+            columns="municipality_code",
+            values="deaths_age",
+            aggfunc="max",
+        ).reindex(date_range, fill_value=14)
+
+        pivot_deaths.columns.name = REGION_COORD
+        pivot_deaths.index.name = TEMPORAL_COORD
+        pivot_mask.columns.name = REGION_COORD
+        pivot_mask.index.name = TEMPORAL_COORD
+        pivot_age.columns.name = REGION_COORD
+        pivot_age.index.name = TEMPORAL_COORD
+
         # Convert to xarray
         deaths_da = xr.DataArray(
-            pivot.values,
+            pivot_deaths.values,
             dims=[TEMPORAL_COORD, REGION_COORD],
             coords={
-                TEMPORAL_COORD: pivot.index,
-                REGION_COORD: pivot.columns.astype(str),
+                TEMPORAL_COORD: pivot_deaths.index,
+                REGION_COORD: pivot_deaths.columns.astype(str),
+            },
+        )
+        mask_da = xr.DataArray(
+            pivot_mask.values,
+            dims=[TEMPORAL_COORD, REGION_COORD],
+            coords={
+                TEMPORAL_COORD: pivot_mask.index,
+                REGION_COORD: pivot_mask.columns.astype(str),
+            },
+        )
+        age_da = xr.DataArray(
+            pivot_age.values,
+            dims=[TEMPORAL_COORD, REGION_COORD],
+            coords={
+                TEMPORAL_COORD: pivot_age.index,
+                REGION_COORD: pivot_age.columns.astype(str),
             },
         )
 
-        result_ds = xr.Dataset({"deaths": deaths_da})
+        result_ds = xr.Dataset(
+            {"deaths": deaths_da, "deaths_mask": mask_da, "deaths_age": age_da}
+        )
 
         print(
             f"  Processed deaths: {deaths_da.sizes[TEMPORAL_COORD]} dates x {deaths_da.sizes[REGION_COORD]} regions"
