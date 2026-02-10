@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -8,6 +9,98 @@ from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
+
+logger = logging.getLogger(__name__)
+
+
+TARGET_PLOT_SPECS: dict[str, dict[str, str]] = {
+    "hosp": {
+        "model_output": "pred_hosp",
+        "batch_target": "HospTarget",
+        "dataset_attr": "precomputed_hosp",
+        "label": "Hospitalizations",
+    },
+    "ww": {
+        "model_output": "pred_ww",
+        "batch_target": "WWTarget",
+        "dataset_attr": "precomputed_ww",
+        "label": "Wastewater",
+    },
+    "cases": {
+        "model_output": "pred_cases",
+        "batch_target": "CasesTarget",
+        "dataset_attr": "precomputed_cases_target",
+        "label": "Cases",
+    },
+    "deaths": {
+        "model_output": "pred_deaths",
+        "batch_target": "DeathsTarget",
+        "dataset_attr": "precomputed_deaths",
+        "label": "Deaths",
+    },
+}
+
+DEFAULT_PLOT_TARGETS = ["hosp", "ww", "cases", "deaths"]
+
+
+def _resolve_target_names(target_names: list[str] | None) -> list[str]:
+    requested = target_names or list(DEFAULT_PLOT_TARGETS)
+    out: list[str] = []
+    for target in requested:
+        if target not in TARGET_PLOT_SPECS:
+            raise ValueError(
+                f"Unknown target '{target}'. Valid targets: {sorted(TARGET_PLOT_SPECS)}"
+            )
+        out.append(target)
+    return out
+
+
+def _as_numpy_1d(value: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy().reshape(-1)
+    return np.asarray(value).reshape(-1)
+
+
+def _dataset_series_window(
+    series_tensor: torch.Tensor,
+    *,
+    t_min: int,
+    t_max: int,
+    node_idx: int,
+) -> np.ndarray:
+    return series_tensor[t_min:t_max, node_idx].detach().cpu().numpy().reshape(-1)
+
+
+def _history_window(
+    series_tensor: torch.Tensor,
+    *,
+    start_idx: int,
+    history_length: int,
+    node_idx: int,
+) -> np.ndarray:
+    return (
+        series_tensor[start_idx : start_idx + history_length, node_idx]
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1)
+    )
+
+
+def _extract_target_payload(
+    sample: dict[str, Any], *, target: str | None
+) -> tuple[np.ndarray, np.ndarray]:
+    if target is not None and "targets" in sample and target in sample["targets"]:
+        payload = sample["targets"][target]
+        return (
+            np.asarray(payload["actual_context"]).reshape(-1),
+            np.asarray(payload["prediction"]).reshape(-1),
+        )
+    return (
+        np.asarray(sample["actual_context"]).reshape(-1),
+        np.asarray(sample["prediction"]).reshape(-1),
+    )
+
 
 def indices_for_target_nodes_in_window(
     *,
@@ -54,6 +147,7 @@ def collect_forecast_samples_for_target_nodes(
     window: str = "last",
     context_pre: int = 30,
     context_post: int = 30,
+    target_names: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run model inference for a specific subset of target nodes and return raw series.
@@ -80,6 +174,7 @@ def collect_forecast_samples_for_target_nodes(
 
     if dataset.num_windows() == 0:
         return []
+    resolved_targets = _resolve_target_names(target_names)
 
     indices: list[int] = []
     start_times: list[Any] = []
@@ -137,43 +232,37 @@ def collect_forecast_samples_for_target_nodes(
             region_embeddings = region_embeddings.to(device)
 
         with torch.no_grad():
-            model_outputs = model.forward(
-                cases_norm=batch["CaseNode"].to(device),
-                cases_mean=batch["CaseMean"].to(device),
-                cases_std=batch["CaseStd"].to(device),
-                biomarkers_hist=batch["BioNode"].to(device),
-                mob_graphs=mob_batch,
-                target_nodes=batch["TargetNode"].to(device),
-                region_embeddings=region_embeddings,
-                population=batch["Population"].to(device),
-            )
+            if hasattr(model, "forward_batch"):
+                model_outputs, _targets_dict = model.forward_batch(
+                    batch_data=batch,
+                    region_embeddings=region_embeddings,
+                )
+            else:
+                target_nodes = batch.get("TargetRegionIndex", batch["TargetNode"]).to(
+                    device
+                )
+                model_outputs = model.forward(
+                    hosp_hist=batch["HospHist"].to(device),
+                    deaths_hist=batch["DeathsHist"].to(device),
+                    cases_hist=batch["CasesHist"].to(device),
+                    biomarkers_hist=batch["BioNode"].to(device),
+                    mob_graphs=mob_batch,
+                    target_nodes=target_nodes,
+                    region_embeddings=region_embeddings,
+                    population=batch["Population"].to(device),
+                )
             if not isinstance(model_outputs, dict):
                 raise ValueError(
                     "Joint inference plotting expects model outputs as a dict."
                 )
-            if "pred_hosp" not in model_outputs:
-                raise ValueError(
-                    "Joint inference plotting expects 'pred_hosp' in model outputs."
-                )
-            if "HospTarget" not in batch:
-                raise ValueError(
-                    "Joint inference plotting expects 'HospTarget' in the batch."
-                )
-            if "HospHistory" not in batch:
-                raise ValueError(
-                    "Joint inference plotting expects 'HospHistory' in the batch."
-                )
-
-            pred_unscaled = model_outputs["pred_hosp"]
-            targets_unscaled = batch["HospTarget"].to(device)
-            history_unscaled = batch["HospHistory"].to(device)
 
         samples: list[dict[str, Any]] = []
         L = dataset.config.model.history_length
         H = dataset.config.model.forecast_horizon
-        T_total = dataset.precomputed_cases.shape[0]
+        T_total = dataset.precomputed_cases_hist.shape[0]
 
-        for i in range(int(pred_unscaled.shape[0])):
+        batch_size = int(batch["TargetNode"].shape[0])
+        for i in range(batch_size):
             target_node = int(batch["TargetNode"][i].item())
             node_idx = target_node
             start_idx = start_indices[i] if i < len(start_indices) else -1
@@ -181,33 +270,69 @@ def collect_forecast_samples_for_target_nodes(
 
             t_min = max(0, t0 - context_pre)
             t_max = min(T_total, t0 + H + context_post)
-
-            if not hasattr(dataset, "precomputed_hosp"):
-                raise ValueError(
-                    "Joint inference plotting expects dataset.precomputed_hosp."
-                )
-            actual_context_full = dataset.precomputed_hosp[
-                t_min:t_max, node_idx, 0
-            ].numpy()
             t_rel = np.arange(t_min, t_max, dtype=np.int64) - t0
 
-            pred_series = pred_unscaled[i].detach().cpu().numpy().reshape(-1)
-            target_series = targets_unscaled[i].detach().cpu().numpy().reshape(-1)
-            history_series = history_unscaled[i].detach().cpu().numpy().reshape(-1)
+            target_payloads: dict[str, dict[str, np.ndarray]] = {}
+            for target_name in resolved_targets:
+                spec = TARGET_PLOT_SPECS[target_name]
+                pred_key = spec["model_output"]
+                batch_key = spec["batch_target"]
+                dataset_attr = spec["dataset_attr"]
+
+                if pred_key not in model_outputs or batch_key not in batch:
+                    continue
+                if not hasattr(dataset, dataset_attr):
+                    continue
+
+                pred_series = _as_numpy_1d(model_outputs[pred_key][i])
+                target_series = _as_numpy_1d(batch[batch_key][i])
+                dataset_tensor = getattr(dataset, dataset_attr)
+                actual_context_full = _dataset_series_window(
+                    dataset_tensor,
+                    t_min=t_min,
+                    t_max=t_max,
+                    node_idx=node_idx,
+                ).astype(np.float32)
+                history_series = _history_window(
+                    dataset_tensor,
+                    start_idx=start_idx,
+                    history_length=L,
+                    node_idx=node_idx,
+                ).astype(np.float32)
+
+                target_payloads[target_name] = {
+                    "actual_context": actual_context_full,
+                    "prediction": np.asarray(pred_series, dtype=np.float32),
+                    "target": np.asarray(target_series, dtype=np.float32),
+                    "history": history_series,
+                }
+
+            if not target_payloads:
+                logger.debug(
+                    "[plot] Skipping node %s because no target payload was available",
+                    target_node,
+                )
+                continue
+
+            primary_target = resolved_targets[0]
+            if primary_target not in target_payloads:
+                primary_target = next(iter(target_payloads.keys()))
+            primary = target_payloads[primary_target]
 
             samples.append(
                 {
                     "node_id": target_node,
                     "node_label": str(batch["NodeLabels"][i]),
-                    "actual_context": actual_context_full.astype(np.float32),
-                    "prediction": np.asarray(pred_series, dtype=np.float32),
-                    "target": np.asarray(target_series, dtype=np.float32),
-                    "history": np.asarray(history_series, dtype=np.float32),
+                    "actual_context": primary["actual_context"],
+                    "prediction": primary["prediction"],
+                    "target": primary["target"],
+                    "history": primary["history"],
                     "t_rel": t_rel,
                     "t0_idx_in_context": t0 - t_min,
                     "start_time": start_times[i] if i < len(start_times) else "",
                     "L": L,
                     "H": H,
+                    "targets": target_payloads,
                 }
             )
         return samples
@@ -223,6 +348,8 @@ def make_forecast_figure(
     forecast_horizon: int,
     context_pre: int = 30,
     context_post: int = 30,
+    target: str | None = "hosp",
+    target_label: str | None = None,
 ):
     """
     Build a figure showing actual series vs forecasts with wider context.
@@ -267,8 +394,7 @@ def make_forecast_figure(
         row_samples = groups[row_name]
         for j, sample in enumerate(row_samples):
             ax = axes[i, j]
-            actual_context = np.asarray(sample["actual_context"]).reshape(-1)
-            pred_series = np.asarray(sample["prediction"]).reshape(-1)
+            actual_context, pred_series = _extract_target_payload(sample, target=target)
             t_rel = np.asarray(sample["t_rel"]).reshape(-1)
             H = sample["H"]
 
@@ -309,7 +435,13 @@ def make_forecast_figure(
                 title_parts.append(f"({start_time})")
 
             if j == 0:
-                ax.set_ylabel(f"{row_name}\nCases", fontweight="bold")
+                if target_label is None and target in TARGET_PLOT_SPECS:
+                    axis_label = TARGET_PLOT_SPECS[target]["label"]
+                elif target_label is not None:
+                    axis_label = target_label
+                else:
+                    axis_label = "Target"
+                ax.set_ylabel(f"{row_name}\n{axis_label}", fontweight="bold")
             else:
                 ax.set_ylabel("")
 
@@ -325,3 +457,56 @@ def make_forecast_figure(
 
     fig.tight_layout()
     return fig
+
+
+def make_joint_forecast_figure(
+    *,
+    samples: list[dict[str, Any]] | dict[str, list[dict[str, Any]]],
+    history_length: int,
+    forecast_horizon: int,
+    context_pre: int = 30,
+    context_post: int = 30,
+    target_names: list[str] | None = None,
+):
+    """Build a single figure containing all requested targets by group."""
+    if isinstance(samples, list):
+        base_groups = {"All": samples}
+    else:
+        base_groups = samples
+
+    base_groups = {k: v for k, v in base_groups.items() if v}
+    if not base_groups:
+        return None
+
+    resolved_targets = _resolve_target_names(target_names)
+    expanded_groups: dict[str, list[dict[str, Any]]] = {}
+    for target_name in resolved_targets:
+        target_label = TARGET_PLOT_SPECS[target_name]["label"]
+        for group_name, group_samples in base_groups.items():
+            materialized: list[dict[str, Any]] = []
+            for sample in group_samples:
+                if "targets" in sample and target_name not in sample["targets"]:
+                    continue
+                row_sample = dict(sample)
+                if "targets" in sample and target_name in sample["targets"]:
+                    payload = sample["targets"][target_name]
+                    row_sample["actual_context"] = payload["actual_context"]
+                    row_sample["prediction"] = payload["prediction"]
+                    row_sample["target"] = payload["target"]
+                    row_sample["history"] = payload["history"]
+                materialized.append(row_sample)
+            if materialized:
+                expanded_groups[f"{group_name} | {target_label}"] = materialized
+
+    if not expanded_groups:
+        return None
+
+    return make_forecast_figure(
+        samples=expanded_groups,
+        history_length=history_length,
+        forecast_horizon=forecast_horizon,
+        context_pre=context_pre,
+        context_post=context_post,
+        target=None,
+        target_label=None,
+    )
