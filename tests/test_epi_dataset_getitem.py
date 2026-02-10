@@ -50,6 +50,26 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
     cases[0, :, 0, 0] = 100.0  # Node 0
     cases[0, :, 1, 0] = 50.0  # Node 1
 
+    # Required mask and age channels for cases (now required by ClinicalSeriesPreprocessor)
+    cases_mask = np.ones((1, periods, 2), dtype=np.float32)
+    cases_age = np.ones(
+        (1, periods, 2), dtype=np.float32
+    )  # Age = 1 (fresh observations)
+
+    # Hospitalizations data (required by ClinicalSeriesPreprocessor)
+    hospitalizations = np.zeros((1, periods, 2), dtype=np.float32)
+    hospitalizations[0, :, 0] = 10.0  # Node 0
+    hospitalizations[0, :, 1] = 5.0  # Node 1
+    hosp_mask = np.ones((1, periods, 2), dtype=np.float32)
+    hosp_age = np.ones((1, periods, 2), dtype=np.float32)
+
+    # Deaths data (required by ClinicalSeriesPreprocessor)
+    deaths = np.zeros((1, periods, 2), dtype=np.float32)
+    deaths[0, :, 0] = 1.0  # Node 0
+    deaths[0, :, 1] = 0.5  # Node 1
+    deaths_mask = np.ones((1, periods, 2), dtype=np.float32)
+    deaths_age = np.ones((1, periods, 2), dtype=np.float32)
+
     # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
     biomarkers = np.zeros((1, periods, 2), dtype=np.float32)
     biomarkers[0, :, 0] = 1.0  # Node 0 has non-zero biomarkers
@@ -67,6 +87,23 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
     ds = xr.Dataset(
         data_vars={
             "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "cases_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_mask),
+            "cases_age": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_age),
+            "hospitalizations": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hospitalizations,
+            ),
+            "hospitalizations_mask": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hosp_mask,
+            ),
+            "hospitalizations_age": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hosp_age,
+            ),
+            "deaths": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths),
+            "deaths_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths_mask),
+            "deaths_age": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths_age),
             "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
             "edar_biomarker_N1_mask": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD),
@@ -118,10 +155,10 @@ def test_getitem_preserves_target_history_when_self_edge_missing(tmp_path):
     dataset.mobility_mask_float = dataset.mobility_mask.to(torch.float32)
 
     item = dataset[0]  # target node 0, first window
-    case_node = item["case_node"]  # (L, C), channels [value, mask, age]
+    cases_hist = item["cases_hist"]  # (L, 3), channels [value, mask, age]
 
     # If target inclusion is honored, target mask should remain observed
-    assert torch.all(case_node[:, 1] > 0.5), (
+    assert torch.all(cases_hist[:, 1] > 0.5), (
         "target history mask got zeroed by mobility masking"
     )
 
@@ -150,43 +187,45 @@ def test_getitem_values(tmp_path):
 
     if item["node_label"] == 0:
         # Node 0: constant cases.
-        # Mean should be approx log1p(10000). Std should be epsilon.
-        # Normalized values should be approx 0.
-        cases_hist = item["case_node"]  # (L, 2) - value, mask
+        # Values are now in log1p(per-100k) space directly from ClinicalSeriesPreprocessor
+        cases_hist = item["cases_hist"]  # (L, 3) - value, mask, age
 
-        # Channel 0 (value) should be 0 (normalized constant)
+        # Channel 0 (value) should be log1p(10000) ~ 9.21 (not normalized to 0)
+        expected_value = np.log1p(10000.0)  # ~9.21
         assert torch.allclose(
-            cases_hist[..., 0], torch.zeros_like(cases_hist[..., 0]), atol=1e-3
+            cases_hist[..., 0],
+            torch.full_like(cases_hist[..., 0], expected_value),
+            atol=1e-3,
         )
         # Channel 1 (mask) should be 1 (finite data)
         assert torch.allclose(
             cases_hist[..., 1], torch.ones_like(cases_hist[..., 1]), atol=1e-3
         )
-
-        # Check target scale
-        # Should be epsilon
-        assert item["target_scale"].item() < 1e-4
-
-        # Check target mean
-        # Should be approx log1p(10000) ~ 9.21
-        assert abs(item["target_mean"].item() - 9.21) < 0.1
-
-        # Check case mean/std sequences
-        assert item["case_mean"].shape == (3, 1)  # history_length
-        assert abs(item["case_mean"][-1].item() - 9.21) < 0.1
-        assert item["case_std"].shape == (3, 1)
-        assert item["case_std"][-1].item() < 1e-4
+        # Channel 2 (age) should be 1/14 ~ 0.0714 (normalized by age_max=14)
+        expected_age = 1.0 / 14.0
+        assert torch.allclose(
+            cases_hist[..., 2],
+            torch.full_like(cases_hist[..., 2], expected_age),
+            atol=1e-3,
+        )
 
     elif item["node_label"] == 1:
         # Node 1: 0 cases.
-        cases_hist = item["case_node"]
-        # Channel 0 (value) should be 0
+        cases_hist = item["cases_hist"]
+        # Channel 0 (value) should be 0 (log1p(0) = 0)
         assert torch.allclose(
             cases_hist[..., 0], torch.zeros_like(cases_hist[..., 0]), atol=1e-3
         )
         # Channel 1 (mask) should be 1
         assert torch.allclose(
             cases_hist[..., 1], torch.ones_like(cases_hist[..., 1]), atol=1e-3
+        )
+        # Channel 2 (age) should be 1/14 ~ 0.0714 (normalized by age_max=14)
+        expected_age = 1.0 / 14.0
+        assert torch.allclose(
+            cases_hist[..., 2],
+            torch.full_like(cases_hist[..., 2], expected_age),
+            atol=1e-3,
         )
 
 
@@ -232,12 +271,12 @@ def test_imported_risk_gating(tmp_path):
     # Need enough periods for max lag (7) + history (3) + horizon (2)
     _write_tiny_dataset(str(zarr_path), periods=15)
 
-    # Test 1: use_imported_risk=False (default) -> cases_output_dim = 3
+    # Test 1: use_imported_risk=False (default) -> cases_output_dim = 9 (3 series x 3 channels)
     config = _make_config(str(zarr_path))
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
-    assert dataset.cases_output_dim == 3
+    assert dataset.cases_output_dim == 9  # 3 series x 3 channels
 
-    # Test 2: use_imported_risk=True with lags -> cases_output_dim = 3 + len(lags)
+    # Test 2: use_imported_risk=True with lags -> cases_output_dim = 9 + len(lags)
     from copy import deepcopy
 
     config2 = deepcopy(config)
@@ -245,8 +284,12 @@ def test_imported_risk_gating(tmp_path):
     config2.data.mobility_lags = [1, 7]
 
     dataset2 = EpiDataset(config=config2, target_nodes=[0, 1], context_nodes=[0, 1])
-    assert dataset2.cases_output_dim == 5  # 3 + 2 lags
+    assert dataset2.cases_output_dim == 11  # 9 + 2 lags
 
     # Test 3: Verify item shape matches expected dimension
     item = dataset2[0]
-    assert item["case_node"].shape[-1] == 5  # 3 case channels + 2 lag channels
+    # Only cases_hist has lag features concatenated
+    # hosp_hist and deaths_hist remain 3 channels (value, mask, age)
+    assert item["hosp_hist"].shape[-1] == 3  # 3 channels, no lags
+    assert item["deaths_hist"].shape[-1] == 3  # 3 channels, no lags
+    assert item["cases_hist"].shape[-1] == 5  # 3 case channels + 2 lag channels

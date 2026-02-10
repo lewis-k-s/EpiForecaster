@@ -21,7 +21,10 @@ from utils.logging import suppress_zarr_warnings
 suppress_zarr_warnings()
 
 from .biomarker_preprocessor import BiomarkerPreprocessor  # noqa: E402
-from .cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig  # noqa: E402
+from .clinical_series_preprocessor import (  # noqa: E402
+    ClinicalSeriesPreprocessor,
+    ClinicalSeriesPreprocessorConfig,
+)
 from .mobility_preprocessor import (  # noqa: E402
     MobilityPreprocessor,
     MobilityPreprocessorConfig,
@@ -44,13 +47,11 @@ class EpiDatasetItem(TypedDict):
     node_label: str
     target_node: int
     window_start: int
-    case_node: torch.Tensor
-    case_mean: torch.Tensor
-    case_std: torch.Tensor
     bio_node: torch.Tensor
-    target: torch.Tensor
-    target_scale: torch.Tensor
-    target_mean: torch.Tensor
+    # Clinical series inputs (3-channel: value, mask, age)
+    hosp_hist: torch.Tensor  # [L, 3] Hospitalization history
+    deaths_hist: torch.Tensor  # [L, 3] Deaths history
+    cases_hist: torch.Tensor  # [L, 3] Reported cases history
     # mob: list[Data]  <-- REMOVED
     mob_x: torch.Tensor
     mob_edge_index: list[torch.Tensor]
@@ -87,7 +88,6 @@ class EpiDataset(Dataset):
         target_nodes: list[int],
         context_nodes: list[int],
         biomarker_preprocessor: BiomarkerPreprocessor | None = None,
-        cases_preprocessor: CasesPreprocessor | None = None,
         mobility_preprocessor: MobilityPreprocessor | None = None,
         time_range: tuple[int, int] | None = None,
         run_id: str | None = None,
@@ -131,27 +131,44 @@ class EpiDataset(Dataset):
 
         self.biomarker_variants = self._get_biomarker_variants()
 
-        # Setup cases preprocessor
-        if cases_preprocessor is None:
-            cp_config = CasesPreprocessorConfig(
-                history_length=config.model.history_length,
-                log_scale=config.data.log_scale,
-                scale_epsilon=1e-6,
-                per_100k=True,
-            )
-            self.cases_preprocessor = CasesPreprocessor(cp_config)
-        else:
-            self.cases_preprocessor = cases_preprocessor
+        # Setup clinical series preprocessors for 3-channel [value, mask, age] format
+        clinical_config = ClinicalSeriesPreprocessorConfig(
+            per_100k=True,
+            log_transform=True,
+            age_max=14,
+        )
 
-        # Precompute cases
-        (
-            self.precomputed_cases,
-            self.rolling_mean,
-            self.rolling_std,
-        ) = self.cases_preprocessor.preprocess_dataset(self._dataset)
-        # Note: rolling_mean and rolling_std are already float32 torch.Tensors from preprocess_dataset()
+        # Precompute hospitalizations (3-channel)
+        self.hosp_preprocessor = ClinicalSeriesPreprocessor(
+            config=clinical_config,
+            var_name="hospitalizations",
+        )
+        self.precomputed_hosp_hist = self.hosp_preprocessor.preprocess_dataset(
+            self._dataset,
+            population=self._dataset.get("population"),
+        )
 
-        # Precompute joint inference targets + masks.
+        # Precompute deaths (3-channel)
+        self.deaths_preprocessor = ClinicalSeriesPreprocessor(
+            config=clinical_config,
+            var_name="deaths",
+        )
+        self.precomputed_deaths_hist = self.deaths_preprocessor.preprocess_dataset(
+            self._dataset,
+            population=self._dataset.get("population"),
+        )
+
+        # Precompute reported cases (3-channel)
+        self.cases_preprocessor = ClinicalSeriesPreprocessor(
+            config=clinical_config,
+            var_name="cases",
+        )
+        self.precomputed_cases_hist = self.cases_preprocessor.preprocess_dataset(
+            self._dataset,
+            population=self._dataset.get("population"),
+        )
+
+        # Precompute joint inference targets + masks (1D for loss computation).
         # Clinical targets use log1p(per-100k), while wastewater targets stay in
         # measurement space (log1p on raw concentration/proxy values).
         self.precomputed_hosp, self.precomputed_hosp_mask = (
@@ -216,8 +233,8 @@ class EpiDataset(Dataset):
 
         if self.mobility_lags and self.use_imported_risk:
             logger.info(f"Pre-computing imported risk for lags: {self.mobility_lags}")
-            # Ensure cases are (T, N, 1) - use value channel (index 0)
-            cases_val = self.precomputed_cases[..., 0]
+            # Use cases history value channel (index 0) for imported risk
+            cases_val = self.precomputed_cases_hist[..., 0]
             if isinstance(cases_val, torch.Tensor):
                 cases_val = cases_val.numpy()
 
@@ -342,16 +359,21 @@ class EpiDataset(Dataset):
         self.scale_epsilon = 1e-6
 
         # Validate config dims match dataset expectations
-        expected_cases_dim = self.cases_output_dim  # 3
+        # Clinical series: 3 channels (value, mask, age) per series, 3 series total
+        expected_clinical_dim = 9  # hosp(3) + deaths(3) + cases(3)
+        if self.use_imported_risk:
+            lag_dim = len(self.mobility_lags) if hasattr(self, "mobility_lags") else 0
+            expected_clinical_dim += lag_dim
         expected_bio_dim = self.biomarkers_output_dim
 
-        if self.config.model.cases_dim != expected_cases_dim:
+        # Note: cases_dim is deprecated, clinical series use fixed 3-channel format
+        if self.config.model.cases_dim != expected_clinical_dim:
             logger.info(
-                "Updating cases_dim from %d to %d based on dataset",
+                "Updating cases_dim from %d to %d (3 clinical series x 3 channels)",
                 self.config.model.cases_dim,
-                expected_cases_dim,
+                expected_clinical_dim,
             )
-            self.config.model.cases_dim = expected_cases_dim
+            self.config.model.cases_dim = expected_clinical_dim
         if self.config.model.biomarkers_dim != expected_bio_dim:
             logger.info(
                 "Updating biomarkers_dim from %d to %d based on dataset",
@@ -464,11 +486,15 @@ class EpiDataset(Dataset):
 
     @property
     def cases_output_dim(self) -> int:
-        """Temporal input dimension (value, mask, age) + imported_risk_lags.
+        """DEPRECATED: Clinical series now use 3-channel format per series.
 
-        Note: Imported risk lag features are value-only (no mask/age channels).
+        Returns total dimension for all clinical series inputs:
+        - hospitalizations: 3 channels (value, mask, age)
+        - deaths: 3 channels (value, mask, age)
+        - cases: 3 channels (value, mask, age)
+        Plus optional imported risk lag features (value-only).
         """
-        base_dim = 3
+        base_dim = 9  # 3 series x 3 channels
         if self.use_imported_risk:
             lag_dim = len(self.mobility_lags) if hasattr(self, "mobility_lags") else 0
             return base_dim + lag_dim
@@ -559,18 +585,13 @@ class EpiDataset(Dataset):
         # Use pre-extracted run_id to avoid zarr access in workers
         run_id = self._run_id_value
 
-        # Cases Processing (delegate window normalization to the preprocessor)
-        norm_window, mean_anchor, std_anchor = (
-            self.cases_preprocessor.make_normalized_window(
-                range_start=range_start,
-                history_length=L,
-                forecast_horizon=H,
-            )
-        )
-
-        # Split into history and future
-        case_history = norm_window[:L]  # (L, N, 2)
-        future_cases = norm_window[L:]  # (H, N, 2)
+        # Clinical Series Processing - extract 3-channel history windows
+        # Each is (L, N, 3) with [value, mask, age] channels
+        hosp_history = self.precomputed_hosp_hist[range_start:range_end]  # (L, N, 3)
+        deaths_history = self.precomputed_deaths_hist[
+            range_start:range_end
+        ]  # (L, N, 3)
+        cases_history = self.precomputed_cases_hist[range_start:range_end]  # (L, N, 3)
 
         if self.context_mask is not None:
             # self.context_mask is a tensor
@@ -579,10 +600,11 @@ class EpiDataset(Dataset):
         # Force target node to be included (always, regardless of context_mask)
         neigh_mask[:, target_idx] = True
 
-        # Apply mask to case_history (both channels)
-        # Use the updated neigh_mask that includes target node, not the raw mobility_mask_float
+        # Apply neighborhood mask to clinical histories
         neigh_mask_t = neigh_mask.unsqueeze(-1).to(torch.float32)
-        case_history = case_history * neigh_mask_t
+        hosp_history = hosp_history * neigh_mask_t
+        deaths_history = deaths_history * neigh_mask_t
+        cases_history = cases_history * neigh_mask_t
 
         # Concatenate lagged risk features if available
         # Lag features are value-only (no mask/age channels) for efficiency
@@ -594,9 +616,9 @@ class EpiDataset(Dataset):
             # Apply neighborhood mask (broadcasts to all lag channels)
             risk_slice = risk_slice * neigh_mask_t
 
-            # Concat to case history: (L, N, 3) + (L, N, Lags) -> (L, N, 3+Lags)
+            # Concat to cases history: (L, N, 3) + (L, N, Lags) -> (L, N, 3+Lags)
             # Cases keep their 3 channels (value, mask, age); lags are value-only
-            case_history = torch.cat([case_history, risk_slice], dim=-1)
+            cases_history = torch.cat([cases_history, risk_slice], dim=-1)
 
         # Encode all regions in context using biomarker encoding
         # Optimized: Use precomputed biomarkers + dynamic has_data based on data start offset
@@ -618,10 +640,6 @@ class EpiDataset(Dataset):
 
         # 4. Concatenate -> (L, N, 4)
         biomarker_history = torch.cat([bio_slice, has_data_3d], dim=-1)
-
-        target_np = future_cases[:, target_idx, 0]  # Only value channel for targets
-        # target_np is already 1D with shape (H,), no squeeze needed
-        targets = target_np
 
         # Extract joint inference targets (hospitalizations and wastewater in log1p per-100k)
         # These are already precomputed in __init__
@@ -647,16 +665,27 @@ class EpiDataset(Dataset):
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
         )
-        expected_case_dim = self.cases_output_dim
-        assert case_history.shape == (L, self.num_nodes, expected_case_dim), (
-            f"Case history shape mismatch: expected ({L}, {self.num_nodes}, {expected_case_dim}), "
-            f"got {case_history.shape}"
+        # Clinical series: always 3 channels (value, mask, age)
+        # Only cases_hist gets lag features concatenated
+        assert hosp_history.shape == (L, self.num_nodes, 3), (
+            f"Hosp history shape mismatch: expected ({L}, {self.num_nodes}, 3), "
+            f"got {hosp_history.shape}"
+        )
+        assert deaths_history.shape == (L, self.num_nodes, 3), (
+            f"Deaths history shape mismatch: expected ({L}, {self.num_nodes}, 3), "
+            f"got {deaths_history.shape}"
+        )
+        expected_cases_dim = 3 + (
+            len(self.mobility_lags) if self.use_imported_risk else 0
+        )
+        assert cases_history.shape == (L, self.num_nodes, expected_cases_dim), (
+            f"Cases history shape mismatch: expected ({L}, {self.num_nodes}, {expected_cases_dim}), "
+            f"got {cases_history.shape}"
         )
         expected_bio_dim = self.biomarkers_output_dim
         assert biomarker_history.shape == (L, self.num_nodes, expected_bio_dim), (
             "Biomarker history shape mismatch - expected (T, N, B)"
         )
-        assert targets.shape == (H,), "Targets shape mismatch"
 
         mob_x_list: list[torch.Tensor] = []
         mob_edge_index_list: list[torch.Tensor] = []
@@ -673,14 +702,19 @@ class EpiDataset(Dataset):
             base_graph = self._build_full_graph_topology_at_time(global_t)
 
             # Build node features for this time step
-            case_t = case_history[t]  # (N, C)
+            hosp_t = hosp_history[t]  # (N, 3)
+            deaths_t = deaths_history[t]  # (N, 3)
+            cases_t = cases_history[t]  # (N, 3)
             bio_t = biomarker_history[t]  # (N, B)
 
             # Build feature tensor for all nodes in context
             node_ids = base_graph.node_ids
             feat = []
             if self.config.model.type.cases:
-                feat.append(case_t[node_ids])
+                # Concatenate all clinical series: hosp + deaths + cases
+                feat.append(hosp_t[node_ids])
+                feat.append(deaths_t[node_ids])
+                feat.append(cases_t[node_ids])
             if self.config.model.type.biomarkers:
                 feat.append(bio_t[node_ids])
             x = torch.cat(feat, dim=-1)  # (num_nodes, feat_dim)
@@ -717,20 +751,6 @@ class EpiDataset(Dataset):
             mob_edge_index_list.append(base_graph.edge_index)
             mob_edge_weight_list.append(base_graph.edge_weight)
 
-        # Slice history for mean and std
-        # mean/std are (TotalTime, N) -> need to slice [range_start:range_end] and select target_idx
-        # rolling_mean/std are already float32 tensors from __init__
-        # No .float() conversion needed - removes redundant dtype conversion
-
-        # Ensure rolling stats are dense and correct shape (L, 1)
-        mean_seq = self.rolling_mean[range_start:range_end, target_idx]  # (L, 1)
-        std_seq = self.rolling_std[range_start:range_end, target_idx]  # (L, 1)
-
-        if mean_seq.ndim == 1:
-            mean_seq = mean_seq.unsqueeze(-1)
-        if std_seq.ndim == 1:
-            std_seq = std_seq.unsqueeze(-1)
-
         population = self.node_static_covariates["Pop"][target_idx]
 
         return {
@@ -738,13 +758,10 @@ class EpiDataset(Dataset):
             "target_node": target_idx,
             "target_region_index": target_region_index,
             "window_start": range_start,
-            "case_node": case_history[:, target_idx, :],  # Already normalized
-            "case_mean": mean_seq,
-            "case_std": std_seq,
+            "hosp_hist": hosp_history[:, target_idx, :],  # (L, 3)
+            "deaths_hist": deaths_history[:, target_idx, :],  # (L, 3)
+            "cases_hist": cases_history[:, target_idx, :],  # (L, 3)
             "bio_node": biomarker_history[:, target_idx, :],
-            "target": targets,
-            "target_scale": std_anchor[target_idx].squeeze(-1),
-            "target_mean": mean_anchor[target_idx].squeeze(-1),
             "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
             "mob_edge_index": mob_edge_index_list,  # List[Tensor(2, E)]
             "mob_edge_weight": mob_edge_weight_list,  # List[Tensor(E)]
@@ -1659,13 +1676,13 @@ def collate_epiforecaster_batch(
         return {}
 
     # 1. Stack standard tensors
-    case_node = torch.stack([item["case_node"] for item in batch], dim=0)
+    # Clinical series (3-channel: value, mask, age)
+    hosp_hist = torch.stack([item["hosp_hist"] for item in batch], dim=0)  # (B, L, 3)
+    deaths_hist = torch.stack(
+        [item["deaths_hist"] for item in batch], dim=0
+    )  # (B, L, 3)
+    cases_hist = torch.stack([item["cases_hist"] for item in batch], dim=0)  # (B, L, 3)
     bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
-    case_mean = torch.stack([item["case_mean"] for item in batch], dim=0)
-    case_std = torch.stack([item["case_std"] for item in batch], dim=0)
-    targets = torch.stack([item["target"] for item in batch], dim=0)
-    target_scales = torch.stack([item["target_scale"] for item in batch], dim=0)
-    target_mean = torch.stack([item["target_mean"] for item in batch], dim=0)
     target_nodes = torch.tensor(
         [item["target_node"] for item in batch], dtype=torch.long
     )
@@ -1704,25 +1721,24 @@ def collate_epiforecaster_batch(
         )
 
     out = {
-        "CaseNode": case_node,  # (B, L, C)
-        "CaseMean": case_mean,  # (B, L, 1)
-        "CaseStd": case_std,  # (B, L, 1)
+        # Clinical series inputs (3-channel: value, mask, age)
+        "HospHist": hosp_hist,  # (B, L, 3)
+        "DeathsHist": deaths_hist,  # (B, L, 3)
+        "CasesHist": cases_hist,  # (B, L, 3)
         "BioNode": bio_node,  # (B, L, B)
         "MobBatch": mob_batch,  # Batched PyG graphs
         "Population": population,  # (B,)
         "B": B,
         "T": T,
-        "Target": targets,  # (B, H)
-        "TargetScale": target_scales,  # (B, C)
-        "TargetMean": target_mean,  # (B, 1)
         "TargetNode": target_nodes,  # (B,)
         "TargetRegionIndex": torch.tensor(target_region_indices, dtype=torch.long),
         "WindowStart": window_starts,  # (B,)
         "NodeLabels": [item["node_label"] for item in batch],
-        "HospTarget": hosp_targets,  # (B, H) - log1p per-100k
-        "WWTarget": ww_targets,  # (B, H) - log1p per-100k
-        "CasesTarget": cases_targets,  # (B, H) - log1p per-100k
-        "DeathsTarget": deaths_targets,  # (B, H) - log1p per-100k
+        # Joint inference targets (log1p per-100k)
+        "HospTarget": hosp_targets,  # (B, H)
+        "WWTarget": ww_targets,  # (B, H)
+        "CasesTarget": cases_targets,  # (B, H)
+        "DeathsTarget": deaths_targets,  # (B, H)
         "HospTargetMask": hosp_target_masks,  # (B, H)
         "WWTargetMask": ww_target_masks,  # (B, H)
         "CasesTargetMask": cases_target_masks,  # (B, H)

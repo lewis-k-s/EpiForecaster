@@ -43,6 +43,20 @@ def _write_tiny_dataset(path) -> None:
     cases = np.ones((1, 6, 2, 1), dtype=np.float32)
     cases[0, 4, 0, 0] = np.nan  # target NaN for node 0
     cases[0, 1, 1, 0] = np.nan  # history NaN for node 1
+    cases_mask = np.ones((1, 6, 2), dtype=np.float32)
+    cases_mask[0, 4, 0] = 0.0  # mask=0 for NaN
+    cases_mask[0, 1, 1] = 0.0  # mask=0 for NaN
+    cases_age = np.ones((1, 6, 2), dtype=np.float32)
+
+    # Hospitalizations data (required by ClinicalSeriesPreprocessor)
+    hospitalizations = np.ones((1, 6, 2), dtype=np.float32)
+    hosp_mask = np.ones((1, 6, 2), dtype=np.float32)
+    hosp_age = np.ones((1, 6, 2), dtype=np.float32)
+
+    # Deaths data (required by ClinicalSeriesPreprocessor)
+    deaths = np.ones((1, 6, 2), dtype=np.float32)
+    deaths_mask = np.ones((1, 6, 2), dtype=np.float32)
+    deaths_age = np.ones((1, 6, 2), dtype=np.float32)
 
     # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
     biomarkers = np.zeros((1, 6, 2), dtype=np.float32)
@@ -59,14 +73,40 @@ def _write_tiny_dataset(path) -> None:
     ds = xr.Dataset(
         data_vars={
             "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
+            "cases_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_mask),
+            "cases_age": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_age),
+            "hospitalizations": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hospitalizations,
+            ),
+            "hospitalizations_mask": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hosp_mask,
+            ),
+            "hospitalizations_age": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                hosp_age,
+            ),
+            "deaths": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths),
+            "deaths_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths_mask),
+            "deaths_age": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths_age),
             "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_mask),
+            "edar_biomarker_N1_mask": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                biomarker_mask,
+            ),
             "edar_biomarker_N1_censor": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD),
                 biomarker_censor,
             ),
-            "edar_biomarker_N1_age": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarker_age),
-            "mobility": (("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"), mobility),
+            "edar_biomarker_N1_age": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD),
+                biomarker_age,
+            ),
+            "mobility": (
+                ("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"),
+                mobility,
+            ),
             "population": ((REGION_COORD,), population),
         },
         coords={
