@@ -15,11 +15,10 @@ import wandb
 from torch.utils.data import DataLoader
 import zarr.errors
 
-from data.collate import collate_epidataset_batch
-from data.epi_dataset import EpiDataset
+from data.epi_dataset import EpiDataset, collate_epiforecaster_batch
 from data.preprocess.config import REGION_COORD
 from utils.normalization import unscale_forecasts
-from models.configs import EpiForecasterConfig, LossConfig
+from models.configs import DataConfig, EpiForecasterConfig, LossConfig
 from models.epiforecaster import EpiForecaster
 from plotting.forecast_plots import (
     DEFAULT_PLOT_TARGETS,
@@ -32,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 # Global seeded RNG for reproducibility across evaluation/plotting
 _GLOBAL_RNG = np.random.default_rng(42)
+_LOSS_VALUE_CLAMP = 1.0e6
 
 
 def _ensure_wandb_run(
@@ -165,6 +165,15 @@ class JointInferenceLoss(nn.Module):
         w_cases: float = 1.0,
         w_deaths: float = 1.0,
         w_sir: float = 0.1,
+        ww_imputed_weight: float = 0.0,
+        hosp_imputed_weight: float = 0.0,
+        cases_imputed_weight: float = 0.0,
+        deaths_imputed_weight: float = 0.0,
+        sir_residual_clip: float = 1.0e3,
+        ww_min_observed: int = 0,
+        hosp_min_observed: int = 0,
+        cases_min_observed: int = 0,
+        deaths_min_observed: int = 0,
     ):
         super().__init__()
         self.w_ww = w_ww
@@ -172,28 +181,66 @@ class JointInferenceLoss(nn.Module):
         self.w_cases = w_cases
         self.w_deaths = w_deaths
         self.w_sir = w_sir
+        self.ww_imputed_weight = ww_imputed_weight
+        self.hosp_imputed_weight = hosp_imputed_weight
+        self.cases_imputed_weight = cases_imputed_weight
+        self.deaths_imputed_weight = deaths_imputed_weight
+        self.sir_residual_clip = float(sir_residual_clip)
+        self.ww_min_observed = int(ww_min_observed)
+        self.hosp_min_observed = int(hosp_min_observed)
+        self.cases_min_observed = int(cases_min_observed)
+        self.deaths_min_observed = int(deaths_min_observed)
 
     @staticmethod
-    def _masked_mse(
+    def _weighted_masked_mse(
         prediction: torch.Tensor,
         target: torch.Tensor,
-        mask: torch.Tensor | None,
+        observed_mask: torch.Tensor | None,
+        imputed_weight: float,
+        min_observed: int = 0,
     ) -> torch.Tensor:
-        # Always exclude non-finite targets from supervision to avoid NaN loss/gradients.
-        finite_mask = torch.isfinite(target).to(prediction.dtype)
-        if mask is None:
-            mask_f = finite_mask
+        """Weighted MSE with robust masking and float32 reductions for AMP stability."""
+        prediction_f32 = prediction.float()
+        target_f32 = target.float()
+        finite_mask = torch.isfinite(target_f32).to(prediction_f32.dtype)
+        observed_binary: torch.Tensor | None = None
+        if observed_mask is None:
+            weights = finite_mask
+            observed_binary = finite_mask
         else:
-            mask_f = mask.to(prediction.dtype) * finite_mask
+            observed = torch.nan_to_num(
+                observed_mask.float(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(min=0.0, max=1.0)
+            weights = (
+                observed + (1.0 - observed) * float(imputed_weight)
+            ) * finite_mask
+            observed_binary = (observed > 0.5).to(prediction_f32.dtype) * finite_mask
 
-        denom = mask_f.sum()
-        if denom.item() <= 0:
-            # Keep graph connectivity for all-masked batches.
-            return prediction.sum() * 0.0
+        if min_observed > 0:
+            assert observed_binary is not None
+            observed_counts = observed_binary.sum(dim=1, keepdim=True)
+            eligible = (observed_counts >= float(min_observed)).to(prediction_f32.dtype)
+            weights = weights * eligible
 
-        target_clean = torch.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
-        sq = (prediction - target_clean) ** 2
-        return (sq * mask_f).sum() / denom
+        active = weights > 0
+        prediction_clean = torch.nan_to_num(
+            prediction_f32, nan=0.0, posinf=_LOSS_VALUE_CLAMP, neginf=-_LOSS_VALUE_CLAMP
+        ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+        target_clean = torch.nan_to_num(
+            target_f32, nan=0.0, posinf=_LOSS_VALUE_CLAMP, neginf=-_LOSS_VALUE_CLAMP
+        ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+        prediction_safe = torch.where(
+            active, prediction_clean, torch.zeros_like(prediction_clean)
+        )
+        target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
+
+        sq = (prediction_safe - target_safe) ** 2
+        numerator = (sq * weights).sum()
+        denominator = weights.sum().clamp_min(1e-8)
+        return numerator / denominator
 
     def forward(
         self,
@@ -230,42 +277,62 @@ class JointInferenceLoss(nn.Module):
                 - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted, sir_weighted
                 - total
         """
-        # Keep total loss attached to model graph, even if all components are masked out.
-        total_loss = model_outputs["pred_ww"].sum() * 0.0
-        ww_loss = model_outputs["pred_ww"].sum() * 0.0
-        hosp_loss = model_outputs["pred_ww"].sum() * 0.0
-        cases_loss = model_outputs["pred_ww"].sum() * 0.0
-        deaths_loss = model_outputs["pred_ww"].sum() * 0.0
-        sir_loss = model_outputs["pred_ww"].sum() * 0.0
+        # Keep losses attached to graph while avoiding NaN propagation from non-finite preds.
+        zero_anchor = (
+            torch.nan_to_num(
+                model_outputs["pred_ww"].float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).sum()
+            * 0.0
+        )
+        total_loss = zero_anchor
+        ww_loss = zero_anchor
+        hosp_loss = zero_anchor
+        cases_loss = zero_anchor
+        deaths_loss = zero_anchor
+        sir_loss = zero_anchor
 
         # Wastewater loss
         if self.w_ww > 0 and targets.get("ww") is not None:
-            ww_loss = self._masked_mse(
-                model_outputs["pred_ww"], targets["ww"], targets.get("ww_mask")
+            ww_loss = self._weighted_masked_mse(
+                model_outputs["pred_ww"],
+                targets["ww"],
+                targets.get("ww_mask"),
+                self.ww_imputed_weight,
+                self.ww_min_observed,
             )
             total_loss = total_loss + self.w_ww * ww_loss
 
         # Hospitalization loss
         if self.w_hosp > 0 and targets.get("hosp") is not None:
-            hosp_loss = self._masked_mse(
-                model_outputs["pred_hosp"], targets["hosp"], targets.get("hosp_mask")
+            hosp_loss = self._weighted_masked_mse(
+                model_outputs["pred_hosp"],
+                targets["hosp"],
+                targets.get("hosp_mask"),
+                self.hosp_imputed_weight,
+                self.hosp_min_observed,
             )
             total_loss = total_loss + self.w_hosp * hosp_loss
 
         # Cases loss (reported cases observation)
         if targets.get("cases") is not None:
-            cases_loss = self._masked_mse(
-                model_outputs["pred_cases"], targets["cases"], targets.get("cases_mask")
+            cases_loss = self._weighted_masked_mse(
+                model_outputs["pred_cases"],
+                targets["cases"],
+                targets.get("cases_mask"),
+                self.cases_imputed_weight,
+                self.cases_min_observed,
             )
             if self.w_cases > 0:
                 total_loss = total_loss + self.w_cases * cases_loss
 
         # Deaths loss (mortality observation)
         if targets.get("deaths") is not None:
-            deaths_loss = self._masked_mse(
+            deaths_loss = self._weighted_masked_mse(
                 model_outputs["pred_deaths"],
                 targets["deaths"],
                 targets.get("deaths_mask"),
+                self.deaths_imputed_weight,
+                self.deaths_min_observed,
             )
             if self.w_deaths > 0:
                 total_loss = total_loss + self.w_deaths * deaths_loss
@@ -273,6 +340,12 @@ class JointInferenceLoss(nn.Module):
         # SIR physics loss (always computed from residual)
         if self.w_sir > 0:
             physics_residual = model_outputs["physics_residual"]
+            if self.sir_residual_clip > 0:
+                physics_residual = torch.clamp(
+                    physics_residual,
+                    min=-self.sir_residual_clip,
+                    max=self.sir_residual_clip,
+                )
             ww_mask = targets.get("ww_mask")
             hosp_mask = targets.get("hosp_mask")
             cases_mask = targets.get("cases_mask")
@@ -292,10 +365,11 @@ class JointInferenceLoss(nn.Module):
             if combined_mask is None:
                 sir_loss = physics_residual.mean()
             else:
-                sir_loss = self._masked_mse(
+                sir_loss = self._weighted_masked_mse(
                     physics_residual,
                     torch.zeros_like(physics_residual),
                     combined_mask,
+                    0.0,
                 )
             total_loss = total_loss + self.w_sir * sir_loss
 
@@ -336,6 +410,9 @@ def get_loss_function(name: str) -> ForecastLoss:
 
 def get_loss_from_config(
     loss_config: LossConfig | None,
+    *,
+    data_config: DataConfig | None = None,
+    forecast_horizon: int | None = None,
 ) -> ForecastLoss | JointInferenceLoss:
     if loss_config is None:
         return get_loss_function("smape")
@@ -343,12 +420,34 @@ def get_loss_from_config(
     if name_lower == "joint_inference":
         # Joint inference loss for SIR + observation heads
         joint_cfg = loss_config.joint
+        min_obs = {"cases": 0, "hospitalizations": 0, "deaths": 0, "wastewater": 0}
+        if data_config is not None and forecast_horizon is not None:
+            permits = data_config.resolve_missing_permit_map()
+            min_obs = {
+                "cases": max(0, int(forecast_horizon) - int(permits["cases"])),
+                "hospitalizations": max(
+                    0, int(forecast_horizon) - int(permits["hospitalizations"])
+                ),
+                "deaths": max(0, int(forecast_horizon) - int(permits["deaths"])),
+                "wastewater": max(
+                    0, int(forecast_horizon) - int(permits["wastewater"])
+                ),
+            }
         return JointInferenceLoss(
             w_ww=joint_cfg.w_ww,
             w_hosp=joint_cfg.w_hosp,
             w_cases=joint_cfg.w_cases,
             w_deaths=joint_cfg.w_deaths,
             w_sir=joint_cfg.w_sir,
+            ww_imputed_weight=joint_cfg.ww_imputed_weight,
+            hosp_imputed_weight=joint_cfg.hosp_imputed_weight,
+            cases_imputed_weight=joint_cfg.cases_imputed_weight,
+            deaths_imputed_weight=joint_cfg.deaths_imputed_weight,
+            sir_residual_clip=joint_cfg.sir_residual_clip,
+            ww_min_observed=min_obs["wastewater"],
+            hosp_min_observed=min_obs["hospitalizations"],
+            cases_min_observed=min_obs["cases"],
+            deaths_min_observed=min_obs["deaths"],
         )
     if name_lower == "composite":
         if not loss_config.components:
@@ -445,6 +544,7 @@ def load_model_from_checkpoint(
         head_dropout=config.model.head_dropout,
         sir_physics=config.model.sir_physics,
         observation_heads=config.model.observation_heads,
+        temporal_covariates_dim=config.model.temporal_covariates_dim,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(resolve_device(device))
@@ -559,7 +659,7 @@ def build_loader_from_config(
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=partial(
-            collate_epidataset_batch,
+            collate_epiforecaster_batch,
             require_region_index=bool(config.model.type.regions),
         ),
         worker_init_fn=_suppress_zarr_warnings if num_workers > 0 else None,
@@ -793,7 +893,11 @@ def evaluate_checkpoint_topk_forecasts(
     eval_metrics: dict[str, Any] = {}
     node_mae_dict: dict[int, float] = {}
     try:
-        criterion = get_loss_from_config(config.training.loss)
+        criterion = get_loss_from_config(
+            config.training.loss,
+            data_config=config.data,
+            forecast_horizon=config.model.forecast_horizon,
+        )
         if not isinstance(criterion, JointInferenceLoss):
             raise ValueError(
                 "Evaluation now requires JointInferenceLoss. "
@@ -1341,7 +1445,11 @@ def eval_checkpoint(
     eval_metrics: dict[str, Any] = {}
     node_mae_dict: dict[int, float] = {}
     try:
-        criterion = get_loss_from_config(config.training.loss)
+        criterion = get_loss_from_config(
+            config.training.loss,
+            data_config=config.data,
+            forecast_horizon=config.model.forecast_horizon,
+        )
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
             loader=loader,

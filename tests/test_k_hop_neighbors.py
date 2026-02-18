@@ -44,7 +44,12 @@ def _make_config(
     data_cfg = DataConfig(
         dataset_path=str(dataset_path),
         mobility_threshold=0.0,
-        missing_permit=0,
+        missing_permit={
+            "biomarkers_joint": 0,
+            "cases": 0,
+            "hospitalizations": 0,
+            "deaths": 0,
+        },
         log_scale=log_scale,
         sample_ordering=sample_ordering,
     )
@@ -553,14 +558,14 @@ def test_gnn_receptive_field_depth_1_chain(tmp_path):
 
     # Test 1: All nodes zero except 1-hop neighbor (node 1)
     # Node 0 SHOULD be influenced
-    x_test1 = torch.zeros_like(mob_graph.x)
+    x_test1 = torch.zeros_like(mob_graph.x, dtype=torch.float32)
     x_test1[1] = 1.0  # Node 1 (1-hop) has signal
     out1 = model(x_test1, mob_graph.edge_index, mob_graph.edge_weight)
     target_out1 = out1[mob_graph.target_node]
 
     # Test 2: All nodes zero except 2-hop neighbor (node 2)
     # Node 0 should NOT be influenced (if receptive field is correct)
-    x_test2 = torch.zeros_like(mob_graph.x)
+    x_test2 = torch.zeros_like(mob_graph.x, dtype=torch.float32)
     x_test2[2] = 1.0  # Node 2 (2-hop) has signal
     out2 = model(x_test2, mob_graph.edge_index, mob_graph.edge_weight)
     target_out2 = out2[mob_graph.target_node]
@@ -598,7 +603,7 @@ def test_gnn_receptive_field_depth_2_chain(tmp_path):
     model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
 
     # Test: Only node 2 (2-hop) has signal
-    x_test = torch.zeros_like(mob_graph.x)
+    x_test = torch.zeros_like(mob_graph.x, dtype=torch.float32)
     x_test[2] = 1.0
     out = model(x_test, mob_graph.edge_index, mob_graph.edge_weight)
     target_out = out[mob_graph.target_node]
@@ -630,7 +635,7 @@ def test_gnn_receptive_field_full_graph_issue(tmp_path):
     model = _create_gnn_model(gnn_depth=1, in_dim=feat_dim)
 
     # Only node 4 (4-hop away) has signal
-    x_test = torch.zeros_like(mob_graph.x)
+    x_test = torch.zeros_like(mob_graph.x, dtype=torch.float32)
     x_test[4] = 1.0
 
     out = model(x_test, mob_graph.edge_index, mob_graph.edge_weight)
@@ -664,13 +669,11 @@ def test_gnn_receptive_field_full_graph_issue(tmp_path):
 
 
 @pytest.mark.epiforecaster
-def test_gnn_receptive_field_depth_2_full_graph_propagation(tmp_path):
-    """Test that WITH full graph and depth=2, information propagates beyond 2-hops.
+def test_gnn_receptive_field_depth_2_khop_masking_prevents_propagation(tmp_path):
+    """Test that k-hop feature masking prevents information from propagating beyond k-hops.
 
-    This demonstrates the issue: with depth=2 on full graph, node 0 can be
-    influenced by node 4 (4-hop away) because:
-    Layer 1: node 4 → node 3 → node 2 → node 1 → node 0 (each step 1-hop)
-    Layer 2: node 0 sees updated node 1, which contains info from node 2, etc.
+    With gnn_depth=2 and k-hop feature masking, node 0 (target) should NOT be
+    influenced by node 4 (4-hop away) because node 4's features are masked to 0.
     """
     zarr_path = tmp_path / "depth2_propagation.zarr"
     _write_chain_dataset(str(zarr_path), num_nodes=5, periods=10)
@@ -685,16 +688,14 @@ def test_gnn_receptive_field_depth_2_full_graph_propagation(tmp_path):
     model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
 
     # Only node 4 (4-hop away) has signal
-    x_test = torch.zeros_like(mob_graph.x)
+    x_test = torch.zeros_like(mob_graph.x, dtype=torch.float32)
     x_test[4] = 1.0
 
     out = model(x_test, mob_graph.edge_index, mob_graph.edge_weight)
     target_out = out[mob_graph.target_node]
 
-    # This WILL be non-zero with full graph, demonstrating the issue
-    # With proper k-hop subgraph, node 4 wouldn't even be in the graph
-    assert torch.norm(target_out) > 0, (
-        "BUG: With depth=2 and full graph, 4-hop neighbor influences target "
-        "via intermediate propagation. This should NOT happen with proper "
-        "k-hop subgraph construction."
+    # With k-hop feature masking, node 4's features are masked to 0 for target node 0
+    # So the target should NOT be influenced by the 4-hop neighbor
+    assert torch.norm(target_out) == 0, (
+        "With k-hop feature masking, 4-hop neighbor should NOT influence target"
     )

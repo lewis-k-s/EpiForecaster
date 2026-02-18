@@ -10,7 +10,7 @@ from .aggregators import (
 )
 from .epiforecaster import EpiForecaster
 from .transformer_backbone import TransformerBackbone
-from .mobility_gnn import MobilityGNN
+from .mobility_gnn import MobilityPyGEncoder
 from .observation_heads import (
     ClinicalObservationHead,
     CompositeObservationLoss,
@@ -31,7 +31,7 @@ __all__ = [
     "create_aggregator",
     "EpiForecaster",
     "TransformerBackbone",
-    "MobilityGNN",
+    "MobilityPyGEncoder",
     "SIRRollForward",
     "DelayKernel",
     "SheddingConvolution",
