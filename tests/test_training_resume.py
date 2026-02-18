@@ -128,6 +128,8 @@ def test_find_checkpoint_for_model_id_falls_back_to_latest(tmp_path) -> None:
 
 @pytest.mark.epiforecaster
 def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
+    from utils.precision_policy import PrecisionPolicy
+
     config = SimpleNamespace(
         training=SimpleNamespace(model_id=""),
         output=SimpleNamespace(
@@ -144,6 +146,13 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     trainer.best_val_loss = float("inf")
     trainer.training_history = {"train_loss": []}
     trainer.current_epoch = 0
+    trainer.precision_policy = PrecisionPolicy(
+        param_dtype=torch.float32,
+        autocast_dtype=torch.bfloat16,
+        autocast_enabled=False,
+        optimizer_eps=1e-8,
+        device_type="cpu",
+    )
 
     checkpoint_dir = tmp_path / "exp" / trainer.model_id / "checkpoints"
     checkpoint_dir.mkdir(parents=True)
