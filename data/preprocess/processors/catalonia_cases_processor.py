@@ -112,38 +112,6 @@ class CataloniaCasesProcessor:
 
         return df
 
-        # Read with explicit dtypes to preserve leading zeros
-        df = pd.read_csv(  # type: ignore[call-arg]
-            cases_file,
-            dtype=self.DTYPES,
-            usecols=list(self.DTYPES.keys()) + ["TipusCasDescripcio"],
-        )
-
-        # Rename columns to English
-        df = df.rename(columns=self.COLUMN_MAPPING)
-
-        # Parse dates from DD/MM/YYYY format
-        df["date"] = (
-            pd.to_datetime(df["date"], format="%d/%m/%Y", errors="coerce")
-            .dt.tz_localize(None)
-            .dt.floor("D")
-        )
-
-        # Remove invalid rows
-        df = df.dropna(subset=["date", "municipality_code", "n_cases"])
-
-        # Filter to valid cases only (remove empty municipality codes)
-        df = df[df["municipality_code"] != ""]
-
-        # Remove negative cases if any
-        df = df[df["n_cases"] >= 0]
-
-        print(f"  Loaded {len(df):,} case records")
-        print(f"  Date range: {df['date'].min()} to {df['date'].max()}")
-        print(f"  Unique municipalities: {df['municipality_code'].nunique()}")
-
-        return df
-
     def _categorize_test_types(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add standardized test type category column."""
         df["test_category"] = df["test_type"].map(self.TEST_TYPE_CATEGORIES)  # type: ignore[arg-type]
@@ -229,7 +197,9 @@ class CataloniaCasesProcessor:
             try:
                 process_var, measurement_var = self._fit_kalman_params(fit_series)
             except Exception as e:
-                print(f"    ! Falling back to configured variances for {muni_code}: {e}")
+                print(
+                    f"    ! Falling back to configured variances for {muni_code}: {e}"
+                )
                 process_var = fallback_process
                 measurement_var = fallback_measure
 

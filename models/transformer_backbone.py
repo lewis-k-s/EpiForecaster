@@ -453,35 +453,6 @@ class TransformerBackbone(nn.Module):
             "obs_context": obs_context,
         }
 
-    def forward_with_attention(
-        self, x_seq: torch.Tensor, return_attention: bool = True
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
-        """
-        Forward pass with attention weights for interpretability.
-
-        Args:
-            x_seq: Input sequence [batch_size, seq_len, in_dim]
-            return_attention: Whether to return attention weights
-
-        Returns:
-            outputs: Dictionary with beta_t, initial_states_logits, obs_context
-            attention_weights: Optional attention weights for analysis
-        """
-        outputs = self.forward(x_seq)
-
-        if not return_attention:
-            return outputs, None
-
-        # For attention visualization, we'd need to modify the TransformerEncoder
-        # For now, just return the outputs
-        attention_weights = None  # TODO: Implement attention extraction if needed
-
-        return outputs, attention_weights
-
-    def get_forecast_dimension(self) -> int:
-        """Get the forecasting horizon."""
-        return self.horizon
-
     def count_parameters(self) -> int:
         """Count total number of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

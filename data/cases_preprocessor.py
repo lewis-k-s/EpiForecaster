@@ -177,29 +177,3 @@ class CasesPreprocessor:
             cases_window=cases_window, mean=mean_anchor, std=std_anchor
         )
         return norm_window, mean_anchor, std_anchor
-
-    def get_stats_sequence_for_target(
-        self, *, range_start: int, history_length: int, target_idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return rolling mean/std sequences for the target node over history.
-
-        These are used as additional model inputs (not for unscaling).
-
-        Returns:
-            mean_seq: (L, 1)
-            std_seq: (L, 1)
-        """
-        _processed_cases, rolling_mean, rolling_std = self._require_fitted()
-
-        L = int(history_length)
-        range_end = int(range_start) + L
-
-        mean_seq = rolling_mean[range_start:range_end, target_idx].float()
-        std_seq = rolling_std[range_start:range_end, target_idx].float()
-
-        if mean_seq.ndim == 1:
-            mean_seq = mean_seq.unsqueeze(-1)
-        if std_seq.ndim == 1:
-            std_seq = std_seq.unsqueeze(-1)
-
-        return mean_seq, std_seq

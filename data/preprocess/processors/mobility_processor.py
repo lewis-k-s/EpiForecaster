@@ -6,9 +6,7 @@ This module handles the loading of mobility data from Zarr files, enforcing a st
 matrix for downstream alignment and graph construction.
 """
 
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import xarray as xr
@@ -158,24 +156,3 @@ class MobilityProcessor:
         )
 
         return mobility_data
-
-    def _compute_statistics(
-        self, od_matrix: np.ndarray, time_coords: Sequence[Any] | None
-    ) -> dict[str, Any]:
-        """Compute dataset statistics for metadata."""
-
-        stats: dict[str, Any] = {
-            "total_flows": float(np.sum(od_matrix)),
-            "mean_flow": float(np.mean(od_matrix)),
-            "std_flow": float(np.std(od_matrix)),
-            "max_flow": float(np.max(od_matrix)),
-            "min_flow": float(np.min(od_matrix)),
-        }
-
-        if time_coords is not None and len(time_coords) > 0:
-            stats["time_range"] = {  # type: ignore[assignment]
-                "start": str(time_coords[0]),
-                "end": str(time_coords[-1]),
-            }
-
-        return stats

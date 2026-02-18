@@ -551,13 +551,6 @@ class ClinicalObservationHead(nn.Module):
 
         return pred_log.to(I_trajectory.dtype)
 
-    def get_delay_stats(self) -> dict:
-        """Get statistics about the delay kernel."""
-        return {
-            "mean_delay_days": self.delay_kernel.get_mean_delay(),
-            "kernel_length": self.delay_kernel.kernel_length,
-        }
-
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
@@ -712,71 +705,6 @@ class WastewaterObservationHead(nn.Module):
                 neginf=-1.0,
             )
         return self.alpha
-
-    def get_shedding_stats(self) -> dict:
-        """Get statistics about the shedding kernel."""
-        return {
-            "peak_shedding_day": self.shedding_conv.get_peak_shedding_day(),
-            "kernel_length": self.shedding_conv.kernel_length,
-            "sensitivity_scale": self.shedding_conv.get_sensitivity_scale().item(),
-        }
-
-    def calibrate_to_lod(
-        self,
-        lod_copies_per_liter: float,
-        typical_infections: float,
-        typical_population: float,
-        calibration_window: int = 20,
-    ) -> None:
-        """
-        Calibrate sensitivity scale to match real-world Limit of Detection (LoD).
-
-        Args:
-            lod_copies_per_liter: Limit of detection in copies/L
-            typical_infections: Reference number of infected individuals
-            typical_population: Reference population size
-            calibration_window: Number of time steps to use for calibration
-                (needs to be >= kernel_length for accurate calibration)
-
-        Note:
-            This sets sensitivity_scale such that typical_infections in typical_population
-            produces viral concentration equal to lod_copies_per_liter.
-        """
-        with torch.no_grad():
-            if calibration_window < self.shedding_conv.kernel_length:
-                raise ValueError(
-                    "calibration_window must be >= kernel_length for calibration"
-                )
-
-            # Use a trajectory with sufficient history for the convolution
-            I_ref = torch.ones(1, calibration_window) * typical_infections
-            pop_ref = torch.ones(1, calibration_window) * typical_population
-
-            # Get shedding without sensitivity scale (divide out the scale factor)
-            raw_concentration = (
-                self.shedding_conv(I_ref, pop_ref)
-                / self.shedding_conv.get_sensitivity_scale()
-            )
-
-            # Use the middle value where convolution has full history
-            mid_point = calibration_window // 2
-            raw_value = raw_concentration[0, mid_point].item()
-            if raw_value <= 0:
-                raise ValueError(
-                    "Calibration failed: raw concentration is non-positive"
-                )
-
-            # Calibrate: lod = sensitivity_scale × raw_concentration
-            # sensitivity_scale = lod / raw_concentration
-            new_scale = lod_copies_per_liter / raw_value
-            if self.shedding_conv.learnable_scale:
-                self.shedding_conv.sensitivity_scale.fill_(math.log(new_scale))
-            else:
-                self.shedding_conv.sensitivity_scale.fill_(new_scale)
-
-            logger.info(
-                f"Calibrated sensitivity_scale to {new_scale:.4f} for LoD={lod_copies_per_liter} copies/L"
-            )
 
     def __repr__(self) -> str:
         return f"WastewaterObservationHead({self.shedding_conv})"
@@ -1062,13 +990,6 @@ class CompositeObservationLoss(nn.Module):
                 total_loss = total_loss + weight * head_loss
 
         return total_loss, per_head_losses
-
-    def _get_device(self, preds: dict[str, torch.Tensor]) -> torch.device:
-        """Infer device from prediction tensors."""
-        if not preds:
-            return torch.device("cpu")
-        first_pred = next(iter(preds.values()))
-        return first_pred.device
 
     def __repr__(self) -> str:
         specs_str = ", ".join(

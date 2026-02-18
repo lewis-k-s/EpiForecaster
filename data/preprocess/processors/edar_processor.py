@@ -8,11 +8,9 @@ creates temporal tensors for downstream aggregation to target regions.
 """
 
 import warnings
-from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
 import xarray as xr
 from scipy.stats import norm
 from statsmodels.tsa.statespace.kalman_filter import KalmanFilter as SMKalmanFilter
@@ -926,66 +924,3 @@ class EDARProcessor:
             .reset_index()
         )
         return df
-
-    def _compute_edar_statistics(self, edar_features: torch.Tensor) -> dict[str, float]:
-        """Compute statistics for EDAR data."""
-        return {
-            "total_measurements": float(torch.sum(edar_features > 0)),
-            "mean_viral_load": float(edar_features[:, :, 0].mean()),
-            "mean_flow_rate": float(edar_features[:, :, 1].mean()),
-            "mean_viral_concentration": float(edar_features[:, :, 2].mean()),
-            "mean_total_covid_flow": float(edar_features[:, :, 3].mean()),
-            "sites_with_data": int(torch.sum(edar_features.sum(dim=0).sum(dim=1) > 0)),
-            "temporal_coverage": float(
-                torch.mean(edar_features.sum(dim=1).sum(dim=1) > 0)
-            ),
-        }
-
-    def _compute_quality_metrics(self, edar_features: torch.Tensor) -> dict[str, Any]:
-        """Compute data quality metrics for EDAR data."""
-        # Site-level coverage
-        site_coverage = (edar_features.sum(dim=0).sum(dim=1) > 0).float().tolist()
-
-        # Temporal coverage per site
-        temporal_coverage = []
-        for site_idx in range(edar_features.shape[1]):
-            site_data = edar_features[:, site_idx, :] > 0
-            coverage = site_data.any(dim=1).float().mean().item()
-            temporal_coverage.append(coverage)
-
-        return {
-            "site_coverage": site_coverage,
-            "mean_temporal_coverage": float(np.mean(temporal_coverage)),
-            "median_temporal_coverage": float(np.median(temporal_coverage)),
-            "data_completeness_score": float(np.mean(temporal_coverage)),
-            "sites_with_continuous_data": int(
-                np.sum(np.array(temporal_coverage) > 0.9)
-            ),
-        }
-
-    def transform_to_regions(
-        self,
-        single_covid: pd.DataFrame,
-        edar_muni_mapping: xr.DataArray,
-    ) -> dict[str, Any]:
-        """
-        Transform wastewater data to region features using EDAR to municipality mapping.
-        """
-        print(single_covid.info())
-        print(edar_muni_mapping)
-
-        assert set(single_covid.edar_id) == set(edar_muni_mapping.edar_id.values), (
-            "EDAR IDs in single_covid and edar_muni_mapping do not match"
-        )
-
-        edar_features = (
-            single_covid.groupby(["date", "edar_id"])["total_covid_flow"]
-            .sum()
-            .to_xarray()
-        )
-        print(edar_features)
-
-        result = xr.dot(edar_features, edar_muni_mapping, dims="edar_id")
-        print(result)
-
-        return result

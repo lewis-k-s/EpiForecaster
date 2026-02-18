@@ -171,30 +171,6 @@ class ClinicalSeriesPreprocessor:
             )
         return self.processed_data
 
-    def slice_window(self, start_idx: int, length: int) -> torch.Tensor:
-        """Extract a time window from the preprocessed data.
-
-        Args:
-            start_idx: Start index of the window
-            length: Length of the window
-
-        Returns:
-            (length, N, 3) tensor with the sliced window
-
-        Raises:
-            RuntimeError: If preprocess_dataset has not been called
-            IndexError: If window exceeds data bounds
-        """
-        data = self.get_processed_data()
-        T = data.shape[0]
-
-        if start_idx + length > T:
-            raise IndexError(
-                f"Window [{start_idx}, {start_idx + length}) exceeds data bounds [0, {T})"
-            )
-
-        return data[start_idx : start_idx + length]
-
     def __repr__(self) -> str:
         """String representation of the preprocessor."""
         return (

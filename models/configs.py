@@ -11,26 +11,6 @@ FORECASTER_HEAD_TYPES = ["transformer"]
 POSITIONAL_ENCODING_TYPES = ["sinusoidal", "learned"]
 
 
-# Kept for backwards compatibility with old checkpoints - DO NOT USE
-@dataclass
-class SmoothingConfig:
-    """Deprecated: Unused smoothing config for backwards compatibility only."""
-
-    enabled: bool = False
-    window: int = 5
-    smoothing_type: str = "none"
-
-    def __post_init__(self) -> None:
-        valid_types = {"none", "rolling_mean", "rolling_sum"}
-        if self.smoothing_type not in valid_types:
-            raise ValueError(
-                f"Invalid smoothing_type: {self.smoothing_type}. "
-                f"Valid options: {sorted(valid_types)}"
-            )
-        if self.window <= 0:
-            raise ValueError("smoothing.window must be positive")
-
-
 @dataclass
 class ProfilerConfig:
     """Lightweight toggle for torch.profiler sampling during training."""

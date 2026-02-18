@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import TypedDict, Any
 
 import numpy as np
-import pandas as pd
 import torch
 import xarray as xr
 from torch.utils.data import Dataset
@@ -386,7 +385,6 @@ class EpiDataset(Dataset):
             self.region_embeddings = _replace_non_finite(self.region_embeddings)
 
         self.target_nodes = target_nodes
-        self._target_node_to_local_idx = {n: i for i, n in enumerate(target_nodes)}
         self.context_mask = torch.zeros(
             self.num_nodes, dtype=dtype_utils.STORAGE_DTYPES["mask"]
         )
@@ -1258,38 +1256,6 @@ class EpiDataset(Dataset):
             f"nodes={self.num_nodes})"
         )
 
-    def missingness_features(self, data: xr.DataArray) -> torch.Tensor:
-        """Return a missingness indicator tensor for a (time, region[, feature]) array."""
-        if not isinstance(data, xr.DataArray):
-            raise TypeError("missingness_features expects an xarray DataArray")
-        mask = _ensure_3d(data.isnull().values)
-        return torch.from_numpy(mask).to(torch.float16)
-
-    def calendar_features(
-        self, time_index: pd.DatetimeIndex | None = None
-    ) -> torch.Tensor:
-        """Return simple calendar covariates for each timestamp.
-
-        Features: day-of-week one-hot (7), month one-hot (12), day-of-year sin/cos (2).
-        Shape: (time, 21).
-        """
-        if time_index is None:
-            time_index = pd.DatetimeIndex(self.dataset[TEMPORAL_COORD].values)
-
-        # type: ignore[attr-defined] (pandas type stubs incomplete for DatetimeIndex)
-        dow = time_index.day_of_week.to_numpy()  # type: ignore[attr-defined]
-        months = time_index.month.to_numpy()  # type: ignore[attr-defined]
-        doy = time_index.dayofyear.to_numpy()  # type: ignore[attr-defined]
-
-        dow_oh = np.eye(7, dtype=np.float16)[dow]
-        month_oh = np.eye(12, dtype=np.float16)[months - 1]
-        doy_angle = 2 * np.pi * (doy / 365.25)
-        doy_sin = np.sin(doy_angle).astype(np.float16)[:, None]
-        doy_cos = np.cos(doy_angle).astype(np.float16)[:, None]
-
-        features = np.concatenate([dow_oh, month_oh, doy_sin, doy_cos], axis=1)
-        return torch.from_numpy(features).to(torch.float16)
-
     @classmethod
     def load_canonical_dataset(
         cls,
@@ -1811,8 +1777,3 @@ def collate_epiforecaster_batch(
         out["TargetRegionIndex"] = torch.tensor(target_region_indices, dtype=torch.long)
 
     return out
-
-
-def curriculum_collate_fn(batch: list[EpiDatasetItem]) -> dict[str, Any]:
-    """Backward-compatible curriculum collate wrapper."""
-    return collate_epiforecaster_batch(batch, require_region_index=True)

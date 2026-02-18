@@ -160,7 +160,7 @@ def resolve_precision_policy(
 
 def validate_old_checkpoint_compatible(
     checkpoint: dict,
-    current_policy: PrecisionPolicy,
+    _current_policy: PrecisionPolicy,
 ) -> None:
     """Validate that a checkpoint is compatible with current precision policy.
 

@@ -7,7 +7,6 @@ mapping table for spatial alignment across data sources.
 
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 
@@ -80,27 +79,3 @@ class MunicipalityMappingProcessor:
         print(f"  Unique comarcas: {df['comarca_code'].nunique()}")
 
         return df
-
-    def get_comarca_for_municipalities(
-        self, municipality_codes: list[str] | np.ndarray
-    ) -> dict[str, str]:
-        """
-        Get comarca code for each municipality code.
-
-        Args:
-            municipality_codes: List of municipality codes
-
-        Returns:
-            Dictionary mapping municipality_code -> comarca_code
-        """
-        mapping_df = self.load_mapping()
-
-        # Create lookup dictionary
-        lookup = dict(zip(mapping_df["municipality_code"], mapping_df["comarca_code"]))
-
-        # Check for missing municipalities
-        missing = set(municipality_codes) - set(lookup.keys())
-        if missing:
-            print(f"  Warning: {len(missing)} municipalities not in mapping")
-
-        return lookup

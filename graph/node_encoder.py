@@ -155,52 +155,6 @@ class Region2Vec(nn.Module):
 
         return x
 
-    def encode_subgraph(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        batch_size: int | None = None,
-    ) -> torch.Tensor:
-        """
-        Encode node features using neighbor sampling for large graphs.
-
-        Args:
-            x: Node features
-            edge_index: Edge connectivity
-            batch_size: Batch size for neighbor sampling
-
-        Returns:
-            Node embeddings
-        """
-        if batch_size is None or x.size(0) <= batch_size:
-            return self.forward(x, edge_index)
-
-        # Mini-batch processing for large graphs
-        embeddings = []
-        num_nodes = x.size(0)
-
-        for start_idx in range(0, num_nodes, batch_size):
-            end_idx = min(start_idx + batch_size, num_nodes)
-
-            # Extract subgraph for this batch
-            node_mask = torch.zeros(num_nodes, dtype=torch.bool)
-            node_mask[start_idx:end_idx] = True
-
-            # Get edges within this subgraph
-            edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
-            sub_edge_index = edge_index[:, edge_mask]
-
-            # Remap node indices
-            node_mapping = torch.cumsum(node_mask, dim=0) - 1
-            sub_edge_index = node_mapping[sub_edge_index]
-
-            # Encode subgraph
-            sub_x = x[node_mask]
-            sub_embeddings = self.forward(sub_x, sub_edge_index)
-            embeddings.append(sub_embeddings)
-
-        return torch.cat(embeddings, dim=0)
-
     # ------------------------------------------------------------------
     # Serialization helpers
     # ------------------------------------------------------------------
@@ -263,15 +217,3 @@ class Region2Vec(nn.Module):
         encoder.load_state_dict(state_dict)
         encoder.eval()
         return encoder, region_artifact
-
-
-def load_pretrained_region_encoder(
-    checkpoint_path: str | Path, map_location: str | torch.device | None = "cpu"
-) -> tuple[Region2Vec, RegionEncoderArtifact]:
-    """
-    Backwards-compatible helper used by tests/legacy code.
-    """
-
-    return Region2Vec.from_weights(
-        checkpoint_path=checkpoint_path, map_location=map_location
-    )

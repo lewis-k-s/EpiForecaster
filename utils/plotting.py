@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -25,43 +25,25 @@ class Colors:
     MOBILITY = "#2ca02c"  # green
     GLOBAL_MEAN = "black"
     GLOBAL_MEDIAN = "tab:blue"
-    RESIDUAL_POS = "blue"
-    RESIDUAL_NEG = "red"
 
 
 class FigureSizes:
     """Common figure size presets."""
 
     TIME_SERIES = (14, 6)
-    DISTRIBUTION = (10, 6)
     MULTI_PANEL = (15, 10)
-    SINGLE = (12, 8)
 
 
 class Style:
     """Default style settings."""
 
     DPI = 200
-    ALPHA_INDIVIDUAL = 0.35
-    ALPHA_FILL = 0.6
     GRID_ALPHA = 0.3
 
 
 # =============================================================================
 # FIGURE SETUP UTILITIES
 # =============================================================================
-
-
-def setup_figure(
-    figsize: tuple[float, float] = FigureSizes.TIME_SERIES,
-    style: Literal["white", "dark", "whitegrid", "darkgrid", "ticks"] = "whitegrid",
-) -> tuple[Figure, Axes]:
-    """Create a figure with consistent styling."""
-    import seaborn as sns
-
-    sns.set_theme(style=style)
-    fig, ax = plt.subplots(figsize=figsize)
-    return fig, ax
 
 
 def save_figure(
@@ -105,34 +87,9 @@ def add_grid(
     ax.grid(True, alpha=alpha, axis=axis)
 
 
-def add_reference_line(
-    ax: Axes,
-    orientation: Literal["horizontal", "vertical"] = "horizontal",
-    color: str = "red",
-    linestyle: str = "--",
-    alpha: float = 0.5,
-) -> None:
-    """Add horizontal or vertical reference line at zero."""
-    if orientation == "horizontal":
-        ax.axhline(y=0, color=color, linestyle=linestyle, alpha=alpha)
-    else:
-        ax.axvline(x=0, color=color, linestyle=linestyle, alpha=alpha)
-
-
 # =============================================================================
 # DATA PROCESSING UTILITIES
 # =============================================================================
-
-
-def normalize_min_max(
-    values: np.ndarray,
-    vmin: float | None = None,
-    vmax: float | None = None,
-) -> np.ndarray:
-    """Min-max normalization to [0, 1] range."""
-    computed_vmin = float(values.min()) if vmin is None else vmin
-    computed_vmax = float(values.max()) if vmax is None else vmax
-    return (values - computed_vmin) / (computed_vmax - computed_vmin)
 
 
 def robust_bounds(
@@ -202,6 +159,7 @@ def compute_consecutive_missing(
 
     Returns int for 1D input, ndarray for 2D+ input.
     """
+
     def max_consecutive_nans(arr):
         mask = np.isnan(arr)
         max_count = 0
@@ -217,53 +175,3 @@ def compute_consecutive_missing(
     if data.ndim == 1:
         return max_consecutive_nans(data)
     return np.apply_along_axis(max_consecutive_nans, axis, data)
-
-
-# =============================================================================
-# ANNOTATION UTILITIES
-# =============================================================================
-
-
-def add_stats_textbox(
-    ax: Axes,
-    stats: dict[str, float | str],
-    position: str = "upper left",
-    **kwargs,
-) -> None:
-    """Add statistics textbox to axes."""
-    positions = {
-        "upper left": (0.02, 0.98),
-        "upper right": (0.98, 0.98),
-        "lower left": (0.02, 0.02),
-        "lower right": (0.98, 0.02),
-    }
-    x, y = positions.get(position, (0.02, 0.98))
-
-    text = "\n".join(f"{k}: {v}" for k, v in stats.items())
-    bbox = kwargs.pop("bbox", {"boxstyle": "round", "facecolor": "white", "alpha": 0.8})
-
-    ax.text(
-        x,
-        y,
-        text,
-        transform=ax.transAxes,
-        va="top" if "upper" in position else "bottom",
-        ha="left" if "left" in position else "right",
-        bbox=bbox,
-        **kwargs,
-    )
-
-
-# =============================================================================
-# OPTIONAL DEPENDENCY HANDLING
-# =============================================================================
-
-
-def import_optional(name: str) -> tuple[bool, Any | None]:
-    """Safely import optional dependencies."""
-    try:
-        module = __import__(name)
-        return True, module
-    except ImportError:
-        logger.warning(f"Optional dependency {name} not available")
-        return False, None

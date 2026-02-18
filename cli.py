@@ -672,8 +672,8 @@ def train_regions(
     config: str,
     epochs: int | None,
     device: str | None,
-    output_dir: Path | None,
-    no_cluster: bool,
+    output_dir: Path | None,  # noqa: ARG001
+    no_cluster: bool,  # noqa: ARG001
     dry_run: bool,
 ):
     """Train the Region2Vec-style region embedder via configuration."""
