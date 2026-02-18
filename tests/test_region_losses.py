@@ -1,6 +1,5 @@
 import pytest
 import torch
-import numpy as np
 from models.region_losses import (
     FlowWeightedContrastiveLoss,
     SpatialAutocorrelationLoss,

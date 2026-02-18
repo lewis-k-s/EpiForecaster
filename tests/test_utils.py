@@ -1,23 +1,17 @@
 import pytest
 import os
-import shutil
-import subprocess
 import torch
 import xarray as xr
 import pandas as pd
-import numpy as np
-from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from utils.remote_runner import (
     SlurmJobSpec,
     submit_job_with_script,
-    JobStatus,
     generate_training_script,
 )
 from utils.platform import (
     is_slurm_cluster,
-    get_nvme_path,
     stage_dataset_to_nvme,
     select_multiprocessing_context,
 )

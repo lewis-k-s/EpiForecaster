@@ -1,7 +1,6 @@
 import pytest
 import numpy as np
 import pandas as pd
-from datetime import datetime
 
 @pytest.fixture(params=["sparse", "dense", "gap_heavy"])
 def synthetic_time_series(request):

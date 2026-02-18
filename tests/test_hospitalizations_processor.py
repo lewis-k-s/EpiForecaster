@@ -3,7 +3,6 @@
 import pytest
 import pandas as pd
 import numpy as np
-import xarray as xr
 from datetime import datetime
 from data.preprocess.processors.hospitalizations_processor import HospitalizationsProcessor
 from data.preprocess.config import PreprocessingConfig

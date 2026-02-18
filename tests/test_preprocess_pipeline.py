@@ -3,7 +3,6 @@
 import pytest
 from unittest.mock import Mock, patch
 from datetime import datetime
-from pathlib import Path
 import numpy as np
 import xarray as xr
 import pandas as pd

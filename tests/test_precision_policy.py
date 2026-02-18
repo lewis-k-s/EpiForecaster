@@ -1,6 +1,5 @@
 """Tests for precision policy module."""
 
-import re
 from unittest.mock import MagicMock, patch
 
 import pytest

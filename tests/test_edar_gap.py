@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
-from data.preprocess.config import PreprocessingConfig, REGION_COORD
+from data.preprocess.config import PreprocessingConfig
 from data.preprocess.processors.edar_processor import EDARProcessor
 
 def _write_dummy_files(tmp_path: Path) -> dict[str, Path]:
