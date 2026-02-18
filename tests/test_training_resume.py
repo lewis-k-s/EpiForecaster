@@ -138,7 +138,7 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     )
     trainer = _make_trainer_stub(config)
     trainer.model_id = "run_003"
-    trainer.model = torch.nn.Linear(2, 2)
+    trainer.model = torch.nn.Linear(2, 2, dtype=torch.float32)
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
     trainer.scheduler = None
     trainer.best_val_loss = float("inf")

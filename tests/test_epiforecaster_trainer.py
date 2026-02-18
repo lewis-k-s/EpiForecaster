@@ -1,8 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
 import torch
-import torch.nn as nn
-from pathlib import Path
 
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from models.configs import (
@@ -43,6 +41,7 @@ class TestEpiForecasterTrainer:
                 batch_size=4,
                 loss=LossConfig(name="joint_inference"),
                 curriculum=CurriculumConfig(enabled=False),
+                enable_mixed_precision=False,  # Disable for tests on non-CUDA devices
             ),
             output=OutputConfig(log_dir="test_outputs", experiment_name="test_exp"),
         )
@@ -56,9 +55,11 @@ class TestEpiForecasterTrainer:
         """Test trainer initialization and component creation."""
         # Mock model parameters for optimizer
         mock_model_instance = MagicMock()
-        mock_model_instance.parameters.return_value = [
-            torch.nn.Parameter(torch.randn(1))
-        ]
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        # Trainer calls .to() for device/dtype conversion
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
 
         # Mock dataset behavior
@@ -99,9 +100,10 @@ class TestEpiForecasterTrainer:
         """Test correct loss function is created."""
         # Mock model
         mock_model_instance = MagicMock()
-        mock_model_instance.parameters.return_value = [
-            torch.nn.Parameter(torch.randn(1))
-        ]
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
 
         # Mock dataset
@@ -129,9 +131,10 @@ class TestEpiForecasterTrainer:
         """Test scheduler creation options."""
         # Mock model
         mock_model_instance = MagicMock()
-        mock_model_instance.parameters.return_value = [
-            torch.nn.Parameter(torch.randn(1))
-        ]
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
 
         # Mock dataset
@@ -164,9 +167,12 @@ class TestEpiForecasterTrainer:
         """Test checkpoint discovery/resume logic."""
         # Mock model
         mock_model_instance = MagicMock()
-        mock_model_instance.parameters.return_value = [
-            torch.nn.Parameter(torch.randn(1))
-        ]
+        # Use float32 dtype (only supported dtype)
+        param = torch.nn.Parameter(torch.randn(1, dtype=torch.float32))
+        mock_model_instance.parameters.return_value = [param]
+        # Track the parameter through dtype conversion
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
 
         mock_dataset_instance = MagicMock()
@@ -206,9 +212,10 @@ class TestEpiForecasterTrainer:
         """Test curriculum config validation."""
         # Mock model
         mock_model_instance = MagicMock()
-        mock_model_instance.parameters.return_value = [
-            torch.nn.Parameter(torch.randn(1))
-        ]
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
 
         mock_dataset_instance = MagicMock()

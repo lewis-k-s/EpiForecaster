@@ -36,9 +36,11 @@ from data.epi_dataset import (
     collate_epiforecaster_batch,
 )
 from data.preprocess.config import REGION_COORD
-from data.samplers import EpidemicCurriculumSampler
+from data.samplers import EpidemicCurriculumSampler, ShuffledBatchSampler
 from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from utils import setup_tensor_core_optimizations
+from utils.gradient_debug import GradientDebugger
+from utils.sparsity_logging import log_sparsity_loss_correlation
 from utils.platform import (
     cleanup_nvme_staging,
     get_nvme_path,
@@ -82,6 +84,19 @@ class EpiForecasterTrainer:
         self._device_hint = self._resolve_device_hint()
         # Keep CPU until DataLoader workers are forked to avoid CUDA init before forking.
         self.device = torch.device("cpu")
+
+        # Set random seeds for reproducibility
+        if config.training.seed is not None:
+            import random
+
+            random.seed(config.training.seed)
+            np.random.seed(config.training.seed)
+            torch.manual_seed(config.training.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(config.training.seed)
+                # Enable deterministic behavior for reproducibility
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
         self.model_id = self._resolve_model_id()
         self.resume = self.config.training.resume
         self.experiment_dir: Path | None = None
@@ -322,6 +337,11 @@ class EpiForecasterTrainer:
                 "Region embeddings requested by config but region2vec_path was not provided."
             )
 
+        if self.config.model.temporal_covariates_dim > 0:
+            temporal_covariates_dim = self.config.model.temporal_covariates_dim
+        else:
+            temporal_covariates_dim = train_example_ds.temporal_covariates_dim
+
         self.model = EpiForecaster(
             variant_type=self.config.model.type,
             sir_physics=self.config.model.sir_physics,
@@ -342,6 +362,8 @@ class EpiForecasterTrainer:
             head_n_heads=self.config.model.head_n_heads,
             head_num_layers=self.config.model.head_num_layers,
             head_dropout=self.config.model.head_dropout,
+            head_positional_encoding=self.config.model.head_positional_encoding,
+            temporal_covariates_dim=temporal_covariates_dim,
         )
 
         # Setup data loaders before CUDA initialization when using fork
@@ -356,10 +378,38 @@ class EpiForecasterTrainer:
         # Resolve actual device after worker prestart to avoid CUDA fork issues
         self.device = self._setup_device()
         self.model.device = self.device
+
+        # Setup precision policy (FP32 params + optional BF16 autocast)
+        from utils.precision_policy import resolve_precision_policy
+
+        self.precision_policy = resolve_precision_policy(
+            self.config.training, self.device
+        )
+
+        # Log precision configuration
+        if self.precision_policy.autocast_enabled:
+            self._status(
+                f"Using FP32 parameters with BF16 autocast on {self.device.type.upper()}",
+                logging.INFO,
+            )
+        else:
+            self._status(
+                f"Using FP32 parameters on {self.device.type.upper()}",
+                logging.INFO,
+            )
+
         if self.region_embeddings is not None:
             self.region_embeddings = self.region_embeddings.to(self.device)
 
         self.model.to(self.device)
+
+        # Ensure model is FP32 (precision policy enforces this)
+        if self.model.dtype != torch.float32:
+            self._status(
+                f"Converting model from {self.model.dtype} to float32",
+                logging.INFO,
+            )
+            self.model = self.model.to(torch.float32)
 
         # Enable TF32 for better performance on Ampere+ GPUs
         self._setup_tensor_core_optimizations()
@@ -367,9 +417,17 @@ class EpiForecasterTrainer:
         # Setup training components (optimizer, scheduler, criterion)
         self.optimizer = self._create_optimizer()
 
-        # Calculate total steps for scheduler if needed
-        total_steps = self.config.training.epochs * len(self.train_loader)
-        self.scheduler = self._create_scheduler(total_steps=total_steps)
+        from training.schedulers import compute_scheduler_steps
+
+        total_steps, warmup_steps = compute_scheduler_steps(
+            epochs=self.config.training.epochs,
+            batches_per_epoch=len(self.train_loader),
+            gradient_accumulation_steps=self.config.training.gradient_accumulation_steps,
+            warmup_batches=self.config.training.warmup_steps,
+        )
+        self.scheduler = self._create_scheduler(
+            total_steps=total_steps, warmup_steps=warmup_steps
+        )
         self.criterion = self._create_criterion()
         if not isinstance(self.criterion, JointInferenceLoss):
             raise ValueError(
@@ -403,6 +461,24 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx: int | None = None
         self._lr_warmup_remaining: int = 0
         self._lr_warmup_target_lr: float = 0.0  # Target LR to restore after warmup
+
+        # Initialize gradient debugger (zero overhead when disabled)
+        grad_debug_dir = self.config.training.gradient_debug_log_dir
+        if grad_debug_dir is None and self.config.training.enable_gradient_debug:
+            # Auto-set to experiment directory if enabled but not specified
+            grad_debug_dir = (
+                self.experiment_dir / "gradient_debug" if self.experiment_dir else None
+            )
+        self.gradient_debugger = GradientDebugger(
+            enabled=self.config.training.enable_gradient_debug,
+            log_dir=grad_debug_dir,
+            logger_instance=logger,
+        )
+        if self.gradient_debugger.enabled and self.gradient_debugger.log_dir:
+            self._status(
+                f"Gradient debugging enabled. Reports will be saved to: {self.gradient_debugger.log_dir}",
+                logging.INFO,
+            )
 
         # Resume from checkpoint after all state is initialized
         if self.resume:
@@ -466,6 +542,15 @@ class EpiForecasterTrainer:
 
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
+        if self.curriculum_sampler is not None:
+            self._status("  Train shuffle: enabled (curriculum batch sampler)")
+        else:
+            shuffle_status = (
+                "enabled (random batch order, contiguous samples within batch)"
+                if self.config.training.shuffle_train_batches
+                else "disabled (sequential batch order)"
+            )
+            self._status(f"  Train shuffle: {shuffle_status}")
         # Log run_id configuration
         self._status(f"  Run ID: {self.config.data.run_id}")
         # Check max_batches limit
@@ -476,10 +561,23 @@ class EpiForecasterTrainer:
         else:
             self._status(f"  Epochs: {config.training.epochs}")
             self._status(f"  {len(self.train_loader)} batches per epoch")
+            accum = self.config.training.gradient_accumulation_steps
+            total_sched_steps = (
+                config.training.epochs * len(self.train_loader)
+            ) // accum
+            self._status(f"  {total_sched_steps} scheduler steps (accum={accum})")
         self._status(
             f"  Optimizer: Adam (weight_decay={self.config.training.weight_decay})"
         )
         self._status(f"  Scheduler: {self.config.training.scheduler_type}")
+        if self.config.training.warmup_steps > 0:
+            accum = self.config.training.gradient_accumulation_steps
+            effective_warmup = self.config.training.warmup_steps // accum
+            self._status(
+                f"  Warmup steps: {self.config.training.warmup_steps} batches "
+                f"({effective_warmup} scheduler steps, accum={accum})"
+            )
+        self._status(f"  Gradient clip: {self.config.training.gradient_clip_value}")
         self._status(f"  Resume: {'enabled' if self.resume else 'disabled'}")
         self._status("=" * 60)
 
@@ -744,7 +842,7 @@ class EpiForecasterTrainer:
             all_nodes = all_nodes[valid_mask]
             N = len(all_nodes)
 
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(self.config.training.seed)
         rng.shuffle(all_nodes)
         n_train = int(len(all_nodes) * train_split)
         n_val = int(len(all_nodes) * self.config.training.val_split)
@@ -912,19 +1010,35 @@ class EpiForecasterTrainer:
             self.model.parameters(),
             lr=self.config.training.learning_rate,
             weight_decay=self.config.training.weight_decay,
+            eps=self.precision_policy.optimizer_eps,
         )
 
     def _create_scheduler(
-        self, total_steps: int
+        self, total_steps: int, warmup_steps: int = 0
     ) -> torch.optim.lr_scheduler.LRScheduler | None:
         """Create learning rate scheduler."""
         if self.config.training.scheduler_type == "cosine":
-            # T_max is set to total_steps for a smooth curve across all epochs
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=total_steps
-            )
+            if warmup_steps > 0:
+                from training.schedulers import WarmupCosineScheduler
+
+                return WarmupCosineScheduler(
+                    self.optimizer,
+                    warmup_steps=warmup_steps,
+                    total_steps=total_steps,
+                )
+            else:
+                return torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=total_steps
+                )
         elif self.config.training.scheduler_type == "step":
-            # StepLR remains per-epoch based for simplicity
+            if warmup_steps > 0:
+                import logging
+
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "warmup_steps is set but StepLR scheduler does not support warmup. "
+                    "Warmup will be ignored. Use scheduler_type='cosine' for warmup support."
+                )
             return torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=self.config.training.epochs // 3, gamma=0.1
             )
@@ -939,7 +1053,11 @@ class EpiForecasterTrainer:
         """Create loss criterion."""
         from evaluation.epiforecaster_eval import get_loss_from_config
 
-        return get_loss_from_config(self.config.training.loss)
+        return get_loss_from_config(
+            self.config.training.loss,
+            data_config=self.config.data,
+            forecast_horizon=self.config.model.forecast_horizon,
+        )
 
     def _create_data_loaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
         """Create training and validation data loaders with device-aware optimizations."""
@@ -1002,8 +1120,16 @@ class EpiForecasterTrainer:
         else:
             # Standard training
             self.curriculum_sampler = None
-            train_loader_kwargs["batch_size"] = self.config.training.batch_size
-            train_loader_kwargs["shuffle"] = False
+            if self.config.training.shuffle_train_batches:
+                train_loader_kwargs["batch_sampler"] = ShuffledBatchSampler(
+                    dataset_size=len(self.train_dataset),
+                    batch_size=self.config.training.batch_size,
+                    drop_last=False,
+                    seed=self.config.training.seed,
+                )
+            else:
+                train_loader_kwargs["batch_size"] = self.config.training.batch_size
+                train_loader_kwargs["shuffle"] = False
             train_loader_kwargs["collate_fn"] = shared_collate
 
         if persistent_workers:
@@ -1196,6 +1322,9 @@ class EpiForecasterTrainer:
         profile_log_dir = self._resolve_profiler_log_dir()
         profile_log_dir.mkdir(parents=True, exist_ok=True)
 
+        # Traces saved locally, use perf-analyze to inspect
+        tb_handler = tensorboard_trace_handler(str(profile_log_dir))
+
         return profile(
             activities=activities,
             schedule=schedule(
@@ -1204,7 +1333,7 @@ class EpiForecasterTrainer:
                 active=self.config.training.profiler.active_steps,
                 repeat=self.config.training.profiler.repeat,
             ),
-            on_trace_ready=tensorboard_trace_handler(str(profile_log_dir)),
+            on_trace_ready=tb_handler,
             record_shapes=True,
             profile_memory=self.config.training.profiler.record_memory,
             with_stack=self.config.training.profiler.with_stack,
@@ -1276,10 +1405,25 @@ class EpiForecasterTrainer:
         )
 
     def _resume_from_checkpoint(self) -> None:
+        from utils.precision_policy import validate_old_checkpoint_compatible
+
         checkpoint_path = self._find_checkpoint_for_model_id()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
+        # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
+        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+
         self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Assert resumed model is FP32
+        actual_dtype = next(iter(self.model.parameters())).dtype
+        if actual_dtype != torch.float32:
+            raise ValueError(
+                f"Checkpoint dtype mismatch: model has {actual_dtype}, "
+                f"but only float32 parameters are supported. "
+                "Please retrain with current precision settings."
+            )
+
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if self.scheduler and "scheduler_state_dict" in checkpoint:
@@ -1303,6 +1447,9 @@ class EpiForecasterTrainer:
             self._status(f"W&B run: {self.wandb_run.project}/{self.wandb_run.name}")
         if self.config.training.profiler.enabled:
             self._status(f"Profiler: {self._resolve_profiler_log_dir()}")
+            profile_epochs = self.config.training.profiler.profile_epochs
+            if profile_epochs:
+                self._status(f"Profiler epochs: {profile_epochs}")
 
         # Training loop
         # self._log_model_graph()
@@ -1508,6 +1655,8 @@ class EpiForecasterTrainer:
         # Gradient accumulation setup
         accum_steps = self.config.training.gradient_accumulation_steps
         self.optimizer.zero_grad(set_to_none=True)
+        # NaN check frequency matches progress log frequency to reduce GPU-CPU syncs
+        nan_check_frequency = self.config.training.progress_log_frequency
 
         # Track last gradnorm for progress logging (so we always show the most recent value)
         last_gradnorm = torch.tensor(0.0)
@@ -1518,7 +1667,13 @@ class EpiForecasterTrainer:
                 # This avoids CUDA context deadlock with multiprocessing workers
                 if not first_iteration_done:
                     first_iteration_done = True
-                    if self.config.training.profiler.enabled:
+                    # Check if this epoch should be profiled
+                    profile_epochs = self.config.training.profiler.profile_epochs
+                    should_profile = self.config.training.profiler.enabled and (
+                        profile_epochs is None
+                        or (self.current_epoch + 1) in profile_epochs
+                    )
+                    if should_profile:
                         profiler = self._setup_profiler()
                         profiler.__enter__()
                         profiler_active = True
@@ -1531,19 +1686,11 @@ class EpiForecasterTrainer:
                 data_time_s = time.time() - fetch_start_time
                 batch_start_time = time.time()
 
-                if self.config.training.enable_mixed_precision:
-                    dtype = (
-                        torch.bfloat16
-                        if self.config.training.mixed_precision_dtype == "bfloat16"
-                        else torch.float16
-                    )
-                    autocast_enabled = self.device.type == "cuda"
-                else:
-                    dtype = torch.float32
-                    autocast_enabled = False
-
+                # Use precision policy for autocast settings
                 with torch.autocast(
-                    device_type="cuda", dtype=dtype, enabled=autocast_enabled
+                    device_type=self.device.type,
+                    dtype=self.precision_policy.autocast_dtype,
+                    enabled=self.precision_policy.autocast_enabled,
                 ):
                     model_outputs, targets_dict = self.model.forward_batch(
                         batch_data=batch_data,
@@ -1551,6 +1698,33 @@ class EpiForecasterTrainer:
                     )
 
                     loss = self.criterion(model_outputs, targets_dict)
+
+                # Guard against non-finite losses to prevent corrupt optimizer state.
+                # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
+                should_check_nan = self.global_step % nan_check_frequency == 0
+                if should_check_nan and not torch.isfinite(loss):
+                    self.nan_loss_counter += 1
+                    self._status(
+                        "Non-finite training loss detected at "
+                        f"epoch={self.current_epoch}, step={self.global_step}, "
+                        f"batch={batch_idx} (counter={self.nan_loss_counter}).",
+                        logging.WARNING,
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    patience = self.config.training.nan_loss_patience
+                    if (
+                        patience is not None
+                        and patience > 0
+                        and self.nan_loss_counter >= patience
+                    ):
+                        self.nan_loss_triggered = True
+                        break
+                    fetch_start_time = time.time()
+                    self.global_step += 1
+                    continue
+
+                # Reset counter once we see a valid loss.
+                self.nan_loss_counter = 0
 
                 # Scale loss for gradient accumulation
                 scaled_loss = loss / accum_steps
@@ -1564,10 +1738,54 @@ class EpiForecasterTrainer:
                 grad_norm = torch.tensor(0.0)
                 if should_step or is_last_batch:
                     self._log_gradient_norms(step=self.global_step)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.training.gradient_clip_value,
+                    self._log_sparsity_loss_correlation(
+                        batch_data=batch_data,
+                        model_outputs=model_outputs,
+                        targets_dict=targets_dict,
+                        step=self.global_step,
                     )
+                    try:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.config.training.gradient_clip_value,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as exc:
+                        self.nan_loss_counter += 1
+                        self._status(
+                            "Non-finite gradient norm detected during clipping at "
+                            f"epoch={self.current_epoch}, step={self.global_step}, "
+                            f"batch={batch_idx} (counter={self.nan_loss_counter}). "
+                            f"Error: {exc}. Skipping optimizer step.",
+                            logging.WARNING,
+                        )
+
+                        # Capture gradient diagnostics if debugging is enabled
+                        if self.gradient_debugger.enabled:
+                            snapshot = self.gradient_debugger.capture_snapshot(
+                                self.model,
+                                loss=loss,
+                                step_info={
+                                    "step": self.global_step,
+                                    "epoch": self.current_epoch,
+                                    "batch_idx": batch_idx,
+                                },
+                            )
+                            self.gradient_debugger.log_summary(snapshot)
+                            self.gradient_debugger.save_report(snapshot)
+
+                        self.optimizer.zero_grad(set_to_none=True)
+                        patience = self.config.training.nan_loss_patience
+                        if (
+                            patience is not None
+                            and patience > 0
+                            and self.nan_loss_counter >= patience
+                        ):
+                            self.nan_loss_triggered = True
+                            break
+                        fetch_start_time = time.time()
+                        self.global_step += 1
+                        continue
                     last_gradnorm = grad_norm  # Update for progress logging
                     self.optimizer.step()
 
@@ -1600,33 +1818,31 @@ class EpiForecasterTrainer:
                 fetch_start_time = time.time()
                 lr = self.optimizer.param_groups[0]["lr"]
 
-                bsz = int(batch_data["CaseNode"].shape[0])
+                bsz = batch_data["B"]
                 samples_per_s = (
                     (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
                 )
-                # Progress logging - only sync to CPU periodically to reduce overhead
-                log_frequency = getattr(
-                    self.config.training, "progress_log_frequency", 1
-                )
+                log_frequency = self.config.training.progress_log_frequency
                 log_this_step = self.global_step % log_frequency == 0
-                if log_this_step:
-                    loss_value = loss.item()
-                    self._status(
-                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
-                    )
                 log_data = {
                     "learning_rate_step": lr,
-                    "gradnorm_clipped_total": float(grad_norm),
+                    "gradnorm_clipped_total": grad_norm,
                     "time_batch_s": batch_time_s,
                     "time_dataload_s": data_time_s,
                     "time_step_s": batch_time_s,
                     "epoch": self.current_epoch,
                 }
                 if log_this_step:
-                    log_data["loss_train_step"] = loss_value
-                window_start_mean = float(
-                    batch_data["WindowStart"].float().mean().item()
-                )
+                    # Use detach() instead of item() - wandb handles tensor conversion
+                    loss_detached = loss.detach()
+                    log_data["loss_train_step"] = loss_detached
+                    # Convert to scalar only for console logging
+                    loss_value = float(loss_detached)
+                    self._status(
+                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
+                    )
+                # Keep as tensor - wandb handles CPU tensor conversion
+                window_start_mean = batch_data["WindowStart"].float().mean()
                 log_data["time_window_start"] = window_start_mean
 
                 # Log curriculum metrics for loss-curve-critic analysis
@@ -1693,9 +1909,9 @@ class EpiForecasterTrainer:
             self._status(f"[plot] No nodes selected for {split} forecast plotting")
             return
 
-        output_dir = (
-            Path(self.config.output.log_dir) / self.config.output.experiment_name
-        )
+        output_dir = self.experiment_dir
+        if output_dir is None:
+            raise RuntimeError("experiment_dir not set; call setup_logging() first")
         output_dir.mkdir(parents=True, exist_ok=True)
         plot_path = output_dir / f"{split}_forecasts_joint.png"
         generate_forecast_plots(
@@ -1746,7 +1962,15 @@ class EpiForecasterTrainer:
         return test_loss, test_metrics, test_node_mae
 
     def _log_gradient_norms(self, step: int):
-        """Calculates and logs the gradient norms for model components."""
+        """Calculates and logs the gradient norms for model components.
+
+        Groups parameters into semantically meaningful categories:
+        - SIRD physics: beta/gamma/mortality/initial_states projections
+        - Observation heads: ww_head, hosp_head, cases_head, deaths_head (per-head + total)
+        - Backbone encoder: remaining backbone params (transformer, embeddings)
+        - Mobility GNN: graph neural network parameters
+        - Other: catch-all for any remaining parameters
+        """
         frequency = self.config.training.grad_norm_log_frequency
         if frequency <= 0 or (step % frequency != 0 and step != 0):
             return
@@ -1754,51 +1978,140 @@ class EpiForecasterTrainer:
         if not any(p.requires_grad for p in self.model.parameters()):
             return
 
-        # Vectorized calculation on GPU to avoid CPU-GPU sync bottleneck
+        sird_sq_sum = torch.tensor(0.0, device=self.device)
+        encoder_sq_sum = torch.tensor(0.0, device=self.device)
         gnn_sq_sum = torch.tensor(0.0, device=self.device)
-        backbone_sq_sum = torch.tensor(0.0, device=self.device)
         other_sq_sum = torch.tensor(0.0, device=self.device)
+
+        ww_sq_sum = torch.tensor(0.0, device=self.device)
+        hosp_sq_sum = torch.tensor(0.0, device=self.device)
+        cases_sq_sum = torch.tensor(0.0, device=self.device)
+        deaths_sq_sum = torch.tensor(0.0, device=self.device)
+
+        sird_projections = {
+            "beta_projection",
+            "gamma_projection",
+            "mortality_projection",
+            "initial_states_projection",
+        }
 
         for name, param in self.model.named_parameters():
             if param.grad is not None and param.requires_grad:
                 grad_sq_sum = param.grad.detach().pow(2).sum()
+
                 if "mobility_gnn" in name:
                     gnn_sq_sum += grad_sq_sum
-                elif "backbone" in name or "forecaster_head" in name:
-                    backbone_sq_sum += grad_sq_sum
+                elif "ww_head" in name:
+                    ww_sq_sum += grad_sq_sum
+                elif "hosp_head" in name:
+                    hosp_sq_sum += grad_sq_sum
+                elif "cases_head" in name:
+                    cases_sq_sum += grad_sq_sum
+                elif "deaths_head" in name:
+                    deaths_sq_sum += grad_sq_sum
+                elif any(proj in name for proj in sird_projections):
+                    sird_sq_sum += grad_sq_sum
+                elif "backbone" in name:
+                    encoder_sq_sum += grad_sq_sum
                 else:
                     other_sq_sum += grad_sq_sum
 
-        # Single synchronization for all group results
-        group_sq_sums = torch.stack([gnn_sq_sum, backbone_sq_sum, other_sq_sum])
-        total_sq_sum = group_sq_sums.sum()
+        obs_heads_sq_sum = ww_sq_sum + hosp_sq_sum + cases_sq_sum + deaths_sq_sum
 
-        # Move all squared sums to CPU at once
-        all_metrics = torch.cat([group_sq_sums, total_sq_sum.unsqueeze(0)])
-        all_norms = all_metrics.sqrt().cpu().numpy()
+        component_sq_sums = torch.stack(
+            [
+                sird_sq_sum,
+                encoder_sq_sum,
+                gnn_sq_sum,
+                obs_heads_sq_sum,
+                other_sq_sum,
+            ]
+        )
+        total_sq_sum = component_sq_sums.sum()
 
-        gnn_norm, backbone_norm, other_norm, total_norm = all_norms
+        per_head_sq_sums = torch.stack(
+            [ww_sq_sum, hosp_sq_sum, cases_sq_sum, deaths_sq_sum]
+        )
+
+        all_sq_sums = torch.cat(
+            [
+                total_sq_sum.unsqueeze(0),
+                component_sq_sums,
+                per_head_sq_sums,
+            ]
+        )
+        all_norms = all_sq_sums.sqrt().cpu().numpy()
+
+        (
+            total_norm,
+            sird_norm,
+            encoder_norm,
+            gnn_norm,
+            obs_heads_norm,
+            other_norm,
+            ww_norm,
+            hosp_norm,
+            cases_norm,
+            deaths_norm,
+        ) = all_norms
 
         if self.wandb_run is not None:
             wandb.log(
                 {
                     "gradnorm_total_preclip": total_norm,
+                    "gradnorm_sird_physics": sird_norm,
+                    "gradnorm_backbone_encoder": encoder_norm,
                     "gradnorm_mobility_gnn": gnn_norm,
-                    "gradnorm_backbone": backbone_norm,
-                    # Backward-compatible alias
-                    "gradnorm_forecaster_head": backbone_norm,
+                    "gradnorm_observation_heads": obs_heads_norm,
+                    "gradnorm_obs_ww": ww_norm,
+                    "gradnorm_obs_hosp": hosp_norm,
+                    "gradnorm_obs_cases": cases_norm,
+                    "gradnorm_obs_deaths": deaths_norm,
                     "gradnorm_other": other_norm,
+                    "gradnorm_backbone": encoder_norm + sird_norm,
                 },
                 step=step,
             )
 
-        # Log to console/file
         self._status(
             f"Grad norms @ step {step}: Total={total_norm:.4f} | "
-            f"GNN={gnn_norm:.4f} | "
-            f"Backbone={backbone_norm:.4f} | "
-            f"Other={other_norm:.4f}",
+            f"SIRD={sird_norm:.4f} | Enc={encoder_norm:.4f} | "
+            f"GNN={gnn_norm:.4f} | Obs={obs_heads_norm:.4f} | Other={other_norm:.4f}",
             logging.DEBUG,
+        )
+
+    def _log_sparsity_loss_correlation(
+        self,
+        batch_data: dict[str, Any],
+        model_outputs: dict[str, torch.Tensor],
+        targets_dict: dict[str, torch.Tensor | None],
+        step: int,
+    ) -> None:
+        """Log per-sample sparsity and loss distributions for correlation analysis.
+
+        Uses the same frequency as gradient norm logging (grad_norm_log_frequency).
+        Logs W&B histograms for:
+        - Input history sparsity: hosp_hist, cases_hist, deaths_hist, bio_hist, mob_hist
+        - Target sparsity: hosp_target, ww_target, cases_target, deaths_target
+        - Per-sample losses: loss_hosp, loss_ww, loss_cases, loss_deaths
+
+        Args:
+            batch_data: Collated batch from EpiDataset
+            model_outputs: Dict from EpiForecaster.forward() with predictions
+            targets_dict: Dict with observation targets and masks
+            step: Global training step
+        """
+        frequency = self.config.training.grad_norm_log_frequency
+        if frequency <= 0 or (step % frequency != 0 and step != 0):
+            return
+
+        log_sparsity_loss_correlation(
+            batch=batch_data,
+            model_outputs=model_outputs,
+            targets=targets_dict,
+            wandb_run=self.wandb_run,
+            step=step,
+            epoch=self.current_epoch,
         )
 
     def _persist_run_config(self, run_dir: Path) -> None:
@@ -1923,6 +2236,8 @@ class EpiForecasterTrainer:
         self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False
     ):
         """Save model checkpoint."""
+        from utils.precision_policy import create_precision_signature
+
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -1931,6 +2246,7 @@ class EpiForecasterTrainer:
             "best_val_loss": self.best_val_loss,
             "config": self.config.to_dict(),
             "training_history": self.training_history,
+            "precision_signature": create_precision_signature(self.precision_policy),
         }
 
         if self.scheduler:
