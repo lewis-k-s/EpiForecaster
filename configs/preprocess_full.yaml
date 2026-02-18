@@ -51,6 +51,11 @@ date_chunk_size: 30 # Chunk size for date dimension in zarr output
 mobility_chunk_size: 100 # Chunk size for spatial dims (origin/destination)
 memory_limit_gb: 8.0
 
+temporal_covariates:
+  include_day_of_week: true
+  include_holidays: true
+  holiday_calendar_file: data/files/catalonia_holidays.csv
+
 # Graph construction options - minimal for cases-only model
 graph_options:
   edge_strategy: "knn"

@@ -21,7 +21,11 @@ data:
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   mobility_threshold: 10
   window_stride: 1
-  missing_permit: 2
+  missing_permit:
+    biomarkers_joint: 2
+    cases: 2
+    hospitalizations: 2
+    deaths: 2
   sample_ordering: "time"
   log_scale: true
   # run_id is ignored when curriculum is enabled (sampler handles run selection)
@@ -43,6 +47,18 @@ model:
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
+    #-- SIR physics bounds (prevent gradient explosion) --#
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
 
 output:
   experiment_name: sparsity_curriculum
@@ -51,6 +67,7 @@ output:
   wandb_tags: [mn5]
 
 training:
+  seed: 42
   device: "cuda"
   batch_size: 32
   gradient_accumulation_steps: 2
@@ -60,7 +77,10 @@ training:
   epochs: 20
   learning_rate: 0.0005
   weight_decay: 1.0e-05
-  num_workers: 8
+  warmup_steps: 500
+  gradient_clip_value: 5.0
+  # Worker configuration for 1 GPU + 20 CPUs
+  num_workers: 14
   val_workers: 2
   prefetch_factor: 2
   val_split: 0.2
@@ -114,9 +134,11 @@ training:
     enabled: false
     profile_batches: 10
     log_dir: auto
-  # Joint inference loss configuration
+  # Joint inference loss configuration (lower w_sir for stability)
   loss:
     name: "joint_inference"
-    joint: {}
+    joint:
+      w_sir: 0.01
+      sir_residual_clip: 100.0
   plot_forecasts: true
   num_forecast_samples: 3

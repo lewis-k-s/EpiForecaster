@@ -21,7 +21,11 @@ data:
   region2vec_path: checkpoints/region_embedding/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
-  missing_permit: 2
+  missing_permit:
+    biomarkers_joint: 2
+    cases: 2
+    hospitalizations: 2
+    deaths: 2
   window_stride: 1
   sample_ordering: "time"
   log_scale: true
@@ -44,6 +48,18 @@ model:
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
+    #-- SIR physics bounds (prevent gradient explosion) --#
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
 
 output:
   experiment_name: mn5_synth_temporal
@@ -52,6 +68,7 @@ output:
   wandb_tags: [mn5]
 
 training:
+  seed: 42
   device: "cuda"
   batch_size: 12 # Increased from 8 for better GPU utilization
   gradient_accumulation_steps: 2 # Effective batch = 24
@@ -61,12 +78,12 @@ training:
   learning_rate: 0.0005
   weight_decay: 1.0e-05
   pin_memory: true
-  # Worker configuration: treat total workers as shared budget across loaders
+  # Worker configuration for 1 GPU + 20 CPUs
   # With 3 loaders (train/val/test), num_workers applies to each unless overridden
-  num_workers: 16 # Training workers - increased from 12 after memory analysis
-  val_workers: 4 # Validation workers - runs periodically
+  num_workers: 16 # Training workers
+  val_workers: 2 # Validation workers - runs periodically
   test_workers: 0 # Test workers - runs once at end, no prefetching needed
-  prefetch_factor: 4 # Batches to prefetch per worker (kept at 4)
+  prefetch_factor: 2 # Batches to prefetch per worker
 
   # Temporal split configuration
   # Using temporal split for synthetic data to maximize training samples
@@ -86,7 +103,9 @@ training:
     log_dir: auto
   plot_forecasts: true
   num_forecast_samples: 3
-  # Joint inference loss configuration
+  # Joint inference loss configuration (lower w_sir for stability)
   loss:
     name: "joint_inference"
-    joint: {}
+    joint:
+      w_sir: 0.01
+      sir_residual_clip: 100.0

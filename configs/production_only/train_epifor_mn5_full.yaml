@@ -2,10 +2,14 @@ env: "mn5"
 
 data:
   dataset_path: data/processed/real_with_id.zarr
-  region2vec_path: configs/outputs/region_embeddings/region_embeddings.pt
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
-  missing_permit: 2
+  missing_permit:
+    biomarkers_joint: 24
+    cases: 14
+    hospitalizations: 14
+    deaths: 14
   window_stride: 1
   sample_ordering: "time"
   log_scale: true
@@ -21,46 +25,66 @@ model:
     gnn_module: "gcn"
     #-- seq sizes --#
     history_length: 28
-    forecast_horizon: 7
+    forecast_horizon: 28
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
+    #-- SIR physics bounds (prevent gradient explosion) --#
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
 output:
-  experiment_name: mn5_epiforecaster_temporal
+  experiment_name: mn5_epiforecaster
   log_dir: outputs/training
   wandb_mode: offline
   wandb_tags: [mn5]
 training:
+  seed: 42
   device: "cuda"
   batch_size: 16
+  shuffle_train_batches: true
   gradient_accumulation_steps: 4
+  gradient_clip_value: 5.0
   early_stopping_patience: 5
   nan_loss_patience: 5
-  epochs: 10
+  epochs: 5
   learning_rate: 0.001
   weight_decay: 1.0e-05
+  warmup_steps: 3000
+  # Worker config for 1 GPU + 20 CPUs
   num_workers: 16
-  val_workers: 2
-  prefetch_factor: 4
+  val_workers: 4
+  prefetch_factor: 2
   pin_memory: true
 
   # Temporal split configuration
-  split_strategy: "time"
-  train_end_date: "2021-01-31"
-  val_end_date: "2021-03-31"
+  split_strategy: "node"
+  # train_end_date: "2021-01-31"
+  # val_end_date: "2021-03-31"
   # test_end_date omitted - uses all remaining data
 
   # ignored
-  val_split: 0.1
+  val_split: 0.2
   test_split: 0.1
 
   profiler:
     enabled: true
     profile_batches: 20
     log_dir: auto
+    profile_epochs: [1, 2]
   plot_forecasts: true
   num_forecast_samples: 3
-  # Joint inference loss configuration
+  # Joint inference loss configuration (lower w_sir for stability)
   loss:
     name: "joint_inference"
-    joint: {}
+    joint:
+      w_sir: 0.01
+      sir_residual_clip: 100.0

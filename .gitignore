@@ -25,6 +25,7 @@ MANIFEST
 .ruff_cache/
 # we use pyproject.toml
 requirements.txt
+.cache
 
 # PyTorch
 *.pth
@@ -38,6 +39,8 @@ data/files/*.h5
 data/processed/*.zarr
 outputs/
 logs/
+test_outputs/
+test_output/
 
 # Jupyter Notebook
 .ipynb_checkpoints

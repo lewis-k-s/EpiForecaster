@@ -159,6 +159,10 @@ def collect_case_window_samples(
                     name: channels["age"]
                     for name, channels in biomarker_channels.items()
                 }
+                sample["biomarkers_mask"] = {
+                    name: channels["mask"]
+                    for name, channels in biomarker_channels.items()
+                }
                 sample["biomarkers_censor"] = {
                     name: channels["censor"]
                     for name, channels in biomarker_channels.items()
@@ -233,6 +237,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         cases_age = sample.get("cases_age")
         biomarker_series = sample.get("biomarkers") or {}
         biomarker_age = sample.get("biomarkers_age") or {}
+        biomarker_mask = sample.get("biomarkers_mask") or {}
         biomarker_censor = sample.get("biomarkers_censor") or {}
         mobility_mean = sample.get("mobility_mean")
         mobility_std = sample.get("mobility_std")
@@ -242,6 +247,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         # Extract and pad biomarkers for plotting (history only)
         biomarker_padded: dict[str, np.ndarray] = {}
         biomarker_age_padded: dict[str, np.ndarray] = {}
+        biomarker_mask_padded: dict[str, np.ndarray] = {}
         if biomarker_series:
             for name, series_values in biomarker_series.items():
                 series_values = np.asarray(series_values, dtype=np.float32).reshape(-1)
@@ -262,6 +268,14 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                     assert age_values.shape[0] == history_length
                     biomarker_age_padded[label] = np.concatenate(
                         [age_values, np.full(horizon_length, np.nan)]
+                    )
+
+                mask_values = biomarker_mask.get(name)
+                if mask_values is not None:
+                    mask_values = np.asarray(mask_values, dtype=np.float32).reshape(-1)
+                    assert mask_values.shape[0] == history_length
+                    biomarker_mask_padded[label] = np.concatenate(
+                        [mask_values, np.full(horizon_length, np.nan)]
                     )
 
         # Extract and pad mobility for plotting (history only)
@@ -359,6 +373,34 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                     linewidth=1.5,
                     alpha=0.85,
                 )
+
+                # Mark observed vs interpolated points using the mask
+                mask = biomarker_mask_padded.get(label)
+                if mask is not None:
+                    finite = np.isfinite(biomarker_norm)
+                    observed = (mask == 1.0) & finite
+                    interpolated = (mask == 0.0) & finite
+
+                    if observed.any():
+                        ax.scatter(
+                            t[observed],
+                            biomarker_norm[observed],
+                            s=10,
+                            color=biomarker_colors[label],
+                            alpha=0.9,
+                            linewidths=0,
+                            zorder=3,
+                        )
+                    if interpolated.any():
+                        ax.scatter(
+                            t[interpolated],
+                            biomarker_norm[interpolated],
+                            s=14,
+                            color="#ff7f0e",
+                            alpha=0.9,
+                            linewidths=0,
+                            zorder=3,
+                        )
 
             # Add age ribbon at bottom of plot (just above x-axis)
             if biomarker_age_padded:

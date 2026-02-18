@@ -164,7 +164,7 @@ def collect_forecast_samples_for_target_nodes(
     import random
 
     from torch.utils.data import Subset
-    from data.collate import collate_epidataset_batch
+    from data.epi_dataset import collate_epiforecaster_batch
 
     dataset = loader.dataset
     if not isinstance(dataset, EpiDataset):
@@ -217,7 +217,7 @@ def collect_forecast_samples_for_target_nodes(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        collate_fn=collate_epidataset_batch,
+        collate_fn=collate_epiforecaster_batch,
     )
 
     batch = next(iter(sample_loader))

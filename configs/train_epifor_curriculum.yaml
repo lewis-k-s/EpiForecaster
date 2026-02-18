@@ -22,11 +22,16 @@ data:
   regions_data_path: "data/files/geo/fl_municipios_catalonia.geojson"
   region2vec_path: "checkpoints/region_embedding/region_embeddings.pt"
   window_stride: 1
-  missing_permit: 4
+  missing_permit:
+    biomarkers_joint: 4
+    cases: 4
+    hospitalizations: 4
+    deaths: 4
   log_scale: true
   run_id: "real" # Default/Real run ID
 
 training:
+  seed: 42
   epochs: 100
   batch_size: 16
   gradient_accumulation_steps: 2

@@ -2,54 +2,77 @@
 # Minimal config for comparing real vs synthetic input statistics
 
 data:
-    dataset_path: data/processed/real_with_id.zarr
-    region2vec_path: checkpoints/region_embedding/region_embeddings.pt
-    use_valid_targets: true
-    mobility_threshold: 10
-    missing_permit: 2
-    window_stride: 1
-    sample_ordering: "time"
-    log_scale: true
+  dataset_path: data/processed/real_with_id.zarr
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
+  use_valid_targets: true
+  mobility_threshold: 10
+  missing_permit:
+    biomarkers_joint: 24
+    cases: 24
+    hospitalizations: 24
+    deaths: 24
+  window_stride: 1
+  sample_ordering: "time"
+  log_scale: true
 
 model:
-    type:
-        cases: true
-        regions: true
-        biomarkers: true
-        mobility: true
-    params:
-        mobility_embedding_dim: 16
-        region_embedding_dim: 64
-        gnn_module: "gcn"
-        history_length: 14
-        forecast_horizon: 7
-        max_neighbors: 20
-        gnn_depth: 2
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 16
+    region_embedding_dim: 64
+    include_day_of_week: true
+    include_holidays: true
+    gnn_module: "gcn"
+    history_length: 28
+    forecast_horizon: 28
+    max_neighbors: 20
+    gnn_depth: 2
+    # SIR physics bounds (prevent gradient explosion)
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
 
 output:
-    experiment_name: real_local_analysis
-    log_dir: outputs/training
+  experiment_name: real_local_analysis
+  log_dir: outputs/training
 
 training:
-    device: "auto"
-    batch_size: 2
-    gradient_accumulation_steps: 2
-    early_stopping_patience: 3
-    nan_loss_patience: 3
-    epochs: 1
-    learning_rate: 0.001
-    weight_decay: 1.0e-05
-    num_workers: 0
-    val_workers: 0
-    prefetch_factor: null
-    split_strategy: "node"
-    val_split: 0.2
-    test_split: 0.1
-    profiler:
-        enabled: false
-    plot_forecasts: false
-    enable_mixed_precision: false
-    # Joint inference loss configuration
-    loss:
-        name: "joint_inference"
-        joint: {}
+  seed: 42
+  device: "cpu"
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  gradient_clip_value: 5.0
+  warmup_steps: 50
+  early_stopping_patience: 3
+  nan_loss_patience: 3
+  epochs: 1
+  learning_rate: 0.0001
+  weight_decay: 1.0e-05
+  num_workers: 0
+  val_workers: 0
+  prefetch_factor: null
+  split_strategy: "node"
+  val_split: 0.2
+  test_split: 0.1
+  profiler:
+    enabled: false
+  plot_forecasts: false
+  enable_mixed_precision: false
+  # Joint inference loss configuration
+  loss:
+    name: "joint_inference"
+    joint:
+      w_sir: 0.005
+      sir_residual_clip: 100

@@ -240,6 +240,24 @@ def suggest_epiforecaster_params(
         # Keep it fixed in HPO; tune it in the region2vec trainer instead.
         pass
 
+    if base_cfg.model.temporal_covariates_dim > 0:
+        use_temporal_covariates = trial.suggest_categorical(
+            "model.use_temporal_covariates",
+            _categorical_choices((True, False)),
+        )
+        overrides["model.include_day_of_week"] = (
+            base_cfg.model.include_day_of_week if use_temporal_covariates else False
+        )
+        overrides["model.include_holidays"] = (
+            base_cfg.model.include_holidays if use_temporal_covariates else False
+        )
+
+    # Backbone positional encoding type (already implemented in TransformerBackbone).
+    overrides["model.head_positional_encoding"] = trial.suggest_categorical(
+        "model.head_positional_encoding",
+        _categorical_choices(("sinusoidal", "learned")),
+    )
+
     # --- SIR joint inference knobs (high leverage for observation heads) ---
     # Only tune if using joint_inference loss
     if base_cfg.training.loss.name == "joint_inference":
