@@ -53,6 +53,7 @@ def collect_window_samples(
     n: int = 5,
     shuffle: bool = False,
     seed: int | None = None,
+    prefer_ww_horizon: bool = True,
 ) -> list[dict[str, Any]]:
     """Collect window samples from DataLoader's dataset.
 
@@ -63,11 +64,30 @@ def collect_window_samples(
     dataset = loader.dataset
     k = min(int(n), len(dataset))
 
-    if shuffle:
-        rng = random.Random(seed)
-        indices = rng.sample(range(len(dataset)), k=k)
+    ww_positive_indices: list[int] = []
+    if prefer_ww_horizon and hasattr(dataset, "_index_map"):
+        L = int(dataset.config.model.history_length)
+        H = int(dataset.config.model.forecast_horizon)
+        for sample_idx, (target_idx, start_idx) in enumerate(dataset._index_map):
+            ww_slice = dataset.precomputed_ww_mask[
+                start_idx + L : start_idx + L + H,
+                target_idx,
+            ]
+            if bool(torch.any(ww_slice > 0).item()):
+                ww_positive_indices.append(sample_idx)
+
+    if ww_positive_indices:
+        if shuffle:
+            rng = random.Random(seed)
+            indices = rng.sample(ww_positive_indices, k=min(k, len(ww_positive_indices)))
+        else:
+            indices = ww_positive_indices[:k]
     else:
-        indices = list(range(k))
+        if shuffle:
+            rng = random.Random(seed)
+            indices = rng.sample(range(len(dataset)), k=k)
+        else:
+            indices = list(range(k))
 
     # Get biomarker variant names from dataset if available
     variant_names = getattr(dataset, "biomarker_variants", None)
@@ -92,6 +112,8 @@ def collect_window_samples(
         deaths_hist = item["deaths_hist"]  # (L, 3)
         deaths_target = item["deaths_target"]  # (H,)
         deaths_target_mask = item["deaths_target_mask"]  # (H,)
+        ww_target = item["ww_target"]  # (H,)
+        ww_target_mask = item["ww_target_mask"]  # (H,)
 
         # Extract biomarkers (4 channels per variant: value, mask, censor, age)
         bio_node = item.get("bio_node")  # (L, 12) for 3 variants
@@ -166,7 +188,20 @@ def collect_window_samples(
             .cpu()
             .numpy()
             .astype(np.float32),
+            "ww_target": ww_target.detach().cpu().numpy().astype(np.float32),
+            "ww_target_mask": ww_target_mask.detach().cpu().numpy().astype(np.float32),
         }
+
+        # Full-window observation masks used to color observed vs interpolated points.
+        sample["cases_obs_mask_full"] = np.concatenate(
+            [sample["cases_mask"], sample["cases_target_mask"]]
+        ).astype(np.float32)
+        sample["hosp_obs_mask_full"] = np.concatenate(
+            [sample["hosp_mask"], sample["hosp_target_mask"]]
+        ).astype(np.float32)
+        sample["deaths_obs_mask_full"] = np.concatenate(
+            [sample["deaths_mask"], sample["deaths_target_mask"]]
+        ).astype(np.float32)
 
         # Extract biomarkers (3 variants, 4 channels each)
         if isinstance(bio_node, torch.Tensor):
@@ -183,6 +218,24 @@ def collect_window_samples(
                     "age": bio_hist[:, base + AGE_IDX],
                 }
             sample["biomarkers"] = biomarkers
+
+            # Use precomputed WW target-space trajectory for both history+horizon.
+            # This keeps WW on a consistent scale across the full window.
+            target_node = int(item["target_node"])
+            window_start = int(item["window_start"])
+            ww_full = dataset.precomputed_ww[
+                window_start : window_start + len(cases_hist) + len(cases_target),
+                target_node,
+            ]
+            ww_full_mask = dataset.precomputed_ww_mask[
+                window_start : window_start + len(cases_hist) + len(cases_target),
+                target_node,
+            ]
+            ww_series_full = ww_full.detach().cpu().numpy().astype(np.float32)
+            ww_mask_full = ww_full_mask.detach().cpu().numpy().astype(np.float32)
+            ww_series_full = np.where(ww_mask_full > 0.5, ww_series_full, np.nan)
+            sample["ww_series"] = ww_series_full.astype(np.float32)
+            sample["ww_obs_mask_full"] = ww_mask_full.astype(np.float32)
 
         samples.append(sample)
 
@@ -245,7 +298,7 @@ def make_input_series_figure(
             ax=ax_cases,
             series=sample["cases_series"],
             age=sample["cases_age"],
-            mask=sample["cases_mask"],
+            observed_mask_full=sample["cases_obs_mask_full"],
             history_length=history_length,
             horizon_length=horizon_length,
             t=t,
@@ -260,6 +313,8 @@ def make_input_series_figure(
         _plot_biomarkers(
             ax=ax_bio,
             biomarkers=biomarkers,
+            ww_series=sample.get("ww_series"),
+            ww_obs_mask_full=sample.get("ww_obs_mask_full"),
             history_length=history_length,
             horizon_length=horizon_length,
             t=t,
@@ -272,7 +327,7 @@ def make_input_series_figure(
             ax=ax_hosp,
             series=sample["hosp_series"],
             age=sample["hosp_age"],
-            mask=sample["hosp_mask"],
+            observed_mask_full=sample["hosp_obs_mask_full"],
             history_length=history_length,
             horizon_length=horizon_length,
             t=t,
@@ -287,7 +342,7 @@ def make_input_series_figure(
             ax=ax_deaths,
             series=sample["deaths_series"],
             age=sample["deaths_age"],
-            mask=sample["deaths_mask"],
+            observed_mask_full=sample["deaths_obs_mask_full"],
             history_length=history_length,
             horizon_length=horizon_length,
             t=t,
@@ -330,7 +385,7 @@ def _plot_single_series(
     ax: Any,
     series: np.ndarray,
     age: np.ndarray,
-    mask: np.ndarray,
+    observed_mask_full: np.ndarray,
     history_length: int,
     horizon_length: int,
     t: np.ndarray,
@@ -362,13 +417,41 @@ def _plot_single_series(
                 zorder=-1,
             )
 
-    # Plot series line
+    # Plot smoothed/interpolated series line
     ax.plot(t, series, color=color, linewidth=1.5, label=label)
+
+    # Mark observed vs interpolated points using the mask.
+    finite = np.isfinite(series)
+    observed = (observed_mask_full > 0.5) & finite
+    interpolated = (observed_mask_full <= 0.5) & finite
+
+    if observed.any():
+        ax.scatter(
+            t[observed],
+            series[observed],
+            s=10,
+            color=color,
+            alpha=0.9,
+            linewidths=0,
+            zorder=3,
+        )
+    if interpolated.any():
+        ax.scatter(
+            t[interpolated],
+            series[interpolated],
+            s=14,
+            color="#ff7f0e",
+            alpha=0.9,
+            linewidths=0,
+            zorder=3,
+        )
 
     # Draw history/horizon separator
     ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
 
     # Set y-limits with padding for ribbon
+    if np.all(np.isnan(series)):
+        return
     ymin, ymax = np.nanmin(series), np.nanmax(series)
     if np.isfinite(ymin) and np.isfinite(ymax) and ymax > ymin:
         padding = (ymax - ymin) * 0.1
@@ -378,6 +461,8 @@ def _plot_single_series(
 def _plot_biomarkers(
     ax: Any,
     biomarkers: dict[str, dict[str, np.ndarray]],
+    ww_series: np.ndarray | None,
+    ww_obs_mask_full: np.ndarray | None,
     history_length: int,
     horizon_length: int,
     t: np.ndarray,
@@ -432,11 +517,42 @@ def _plot_biomarkers(
     # Draw history/horizon separator
     ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
 
+    # Overlay WW target/trajectory as the biomarker aggregate used in loss.
+    if ww_series is not None and ww_obs_mask_full is not None:
+        ax.plot(t, ww_series, color="black", linewidth=1.2, linestyle="--", label="WW mean")
+        finite = np.isfinite(ww_series)
+        observed = (ww_obs_mask_full > 0.5) & finite
+        interpolated = (ww_obs_mask_full <= 0.5) & finite
+        if observed.any():
+            ax.scatter(
+                t[observed],
+                ww_series[observed],
+                s=10,
+                color="black",
+                alpha=0.9,
+                linewidths=0,
+                zorder=3,
+            )
+        if interpolated.any():
+            ax.scatter(
+                t[interpolated],
+                ww_series[interpolated],
+                s=14,
+                color="#ff7f0e",
+                alpha=0.9,
+                linewidths=0,
+                zorder=3,
+            )
+
     # Add legend
     ax.legend(loc="upper left", fontsize=8)
 
     # Set y-limits with padding for ribbons
     all_values = np.concatenate([ch["value"] for ch in biomarkers.values()])
+    if ww_series is not None:
+        ww_finite = ww_series[np.isfinite(ww_series)]
+        if ww_finite.size > 0:
+            all_values = np.concatenate([all_values, ww_finite])
     ymin, ymax = np.nanmin(all_values), np.nanmax(all_values)
     if np.isfinite(ymin) and np.isfinite(ymax) and ymax > ymin:
         padding = (ymax - ymin) * 0.15  # Extra padding for 3 ribbons
@@ -477,6 +593,7 @@ def generate_input_series_plots(
     output_dir: str | Path | None = None,
     num_samples: int = 5,
     seed: int = 42,
+    biomarker_source_only: bool = True,
 ) -> tuple[list, dict[str, Path]]:
     """Generate input series window plots from a training config.
 
@@ -503,6 +620,13 @@ def generate_input_series_plots(
     zarr_path = Path(config.data.dataset_path).resolve()
     dataset = xr.open_zarr(zarr_path)
     all_nodes = list(range(dataset[REGION_COORD].size))
+    biomarker_source_nodes: set[int] | None = None
+    if biomarker_source_only and "edar_has_source" in dataset:
+        source_da = dataset["edar_has_source"]
+        if "run_id" in source_da.dims:
+            source_da = source_da.isel(run_id=0)
+        source_mask = source_da.values.astype(bool)
+        biomarker_source_nodes = set(np.where(source_mask)[0].tolist())
     dataset.close()
 
     # Split nodes (train/val/test) - use a simple split for visualization
@@ -514,6 +638,22 @@ def generate_input_series_plots(
 
     val_nodes = all_nodes[:n_val]
     train_nodes = all_nodes[n_val + n_test :]
+    context_nodes = train_nodes + val_nodes
+
+    if biomarker_source_nodes is not None:
+        train_source_nodes = [n for n in train_nodes if n in biomarker_source_nodes]
+        if train_source_nodes:
+            logger.info(
+                "Restricting input-series target sampling to biomarker source regions: "
+                "%d -> %d train nodes",
+                len(train_nodes),
+                len(train_source_nodes),
+            )
+            train_nodes = train_source_nodes
+        else:
+            logger.warning(
+                "No train nodes overlap with edar_has_source==1; using unfiltered train nodes."
+            )
 
     logger.info(f"Total nodes: {len(all_nodes)}")
     logger.info(f"Train nodes: {len(train_nodes)}, Val nodes: {len(val_nodes)}")
@@ -522,7 +662,7 @@ def generate_input_series_plots(
     epi_dataset = EpiDataset(
         config=config,
         target_nodes=train_nodes,
-        context_nodes=train_nodes + val_nodes,
+        context_nodes=context_nodes,
     )
 
     # Create dataloader
@@ -620,6 +760,14 @@ def main():
         default=42,
         help="Random seed (default: 42)",
     )
+    parser.add_argument(
+        "--include-all-targets",
+        action="store_true",
+        help=(
+            "Disable biomarker-source filtering and sample target nodes from all regions "
+            "(default behavior is biomarker source nodes only when edar_has_source exists)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -628,6 +776,7 @@ def main():
         output_dir=args.output_dir,
         num_samples=args.num_samples,
         seed=args.seed,
+        biomarker_source_only=not args.include_all_targets,
     )
 
 
