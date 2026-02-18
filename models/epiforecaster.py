@@ -48,6 +48,9 @@ class EpiForecaster(nn.Module):
         head_n_heads: int = 2,
         head_num_layers: int = 2,
         head_dropout: float = 0.1,
+        head_positional_encoding: str = "sinusoidal",
+        temporal_covariates_dim: int = 0,
+        dtype: torch.dtype = torch.float32,
     ):
         """
         Initialize EpiForecaster with joint inference architecture.
@@ -71,6 +74,9 @@ class EpiForecaster(nn.Module):
             head_n_heads: Transformer heads
             head_num_layers: Transformer layers
             head_dropout: Transformer dropout
+            head_positional_encoding: Transformer positional encoding
+            temporal_covariates_dim: Dimension of temporal covariates (0=disabled, 3=dow_sin/cos+holiday)
+            dtype: Data type for model parameters (default: float32)
         """
         super().__init__()
 
@@ -87,6 +93,9 @@ class EpiForecaster(nn.Module):
         self.population_dim = population_dim
         self.device = device or torch.device("cpu")
         self.gnn_module = gnn_module
+        self.dtype = dtype
+        self.temporal_covariates_dim = temporal_covariates_dim
+        self.head_positional_encoding = head_positional_encoding
 
         # Compute dimensions using helpers
         self.temporal_node_dim = self._get_temporal_node_dim()
@@ -119,8 +128,10 @@ class EpiForecaster(nn.Module):
             num_layers=head_num_layers,
             horizon=forecast_horizon,
             dropout=head_dropout,
+            positional_encoding=head_positional_encoding,
             device=device,
             obs_context_dim=observation_heads.obs_context_dim,
+            sir_physics=sir_physics,
         )
 
         # Stage 2: SIR Roll-Forward (physics core)
@@ -128,6 +139,7 @@ class EpiForecaster(nn.Module):
             dt=sir_physics.dt,
             enforce_nonnegativity=sir_physics.enforce_nonnegativity,
             enforce_mass_conservation=sir_physics.enforce_mass_conservation,
+            residual_clip=sir_physics.residual_clip,
         )
 
         # Stage 3: Observation Heads
@@ -172,12 +184,15 @@ class EpiForecaster(nn.Module):
             alpha_init=observation_heads.residual_scale,
         )
 
+        # Cast all parameters to the specified dtype (default float32)
+        self.to(self.dtype)
+
         # Store parameter counts for logging
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
             f"Initialized EpiForecaster (Joint Inference) with variants: "
             f"regions={self.variant_type.regions}, mobility={self.variant_type.mobility}, "
-            f"total_params={total_params:,}"
+            f"dtype={self.dtype}, total_params={total_params:,}"
         )
 
     def forward(
@@ -264,7 +279,10 @@ class EpiForecaster(nn.Module):
             assert population is not None, (
                 "Population feature enabled but not provided."
             )
-            pop_seq = population.view(B, 1, -1).expand(-1, T, -1)
+            # Use log1p scaling to avoid projection instability from large raw counts.
+            # Convert to float32 for log1p to handle large values, then to model dtype.
+            pop_feature = torch.log1p(population.float()).to(hosp_hist.dtype)
+            pop_seq = pop_feature.view(B, 1, -1).expand(-1, T, -1)
             features.append(pop_seq)
 
         if temporal_covariates is not None:
@@ -301,7 +319,7 @@ class EpiForecaster(nn.Module):
             R0=R0,
             # SIR is modeled in fraction space (S+I+R=1), so population N=1.0 ensures
             # the standard SIR equations (beta*S*I/N) work correctly with fractions.
-            population=torch.ones(B, device=beta_t.device),
+            population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
         )
 
         S_traj = sir_outputs["S_trajectory"]  # [B, H+1]
@@ -322,7 +340,7 @@ class EpiForecaster(nn.Module):
         # SIR is modeled in fraction space (S+I+R=1), so population N=1.0
         pred_ww = self.ww_head(
             I_trajectory=I_traj,
-            population=torch.ones(B, device=beta_t.device),
+            population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
             obs_context=obs_context_with_init,
         )  # [B, H+1]
 
@@ -389,16 +407,30 @@ class EpiForecaster(nn.Module):
                 - targets_dict: Dict with target tensors for loss computation
         """
         # Non-blocking transfer for all PyTorch tensors
-        batch = {
-            k: v.to(self.device, non_blocking=True)
-            for k, v in batch_data.items()
-            if isinstance(v, torch.Tensor)
-        }
+        # Convert float tensors to model dtype, keep integer tensors as-is
+        batch = {}
+        for k, v in batch_data.items():
+            if isinstance(v, torch.Tensor):
+                v = v.to(self.device, non_blocking=True)
+                # Only convert floating point tensors to model dtype
+                if v.dtype in (torch.float16, torch.float32, torch.float64):
+                    v = v.to(self.dtype)
+                batch[k] = v
 
         # PyG Batch handles its own device transfer
         mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
+        # Convert node features and edge attributes to model dtype
+        if hasattr(mob_batch, "x") and mob_batch.x is not None:
+            mob_batch.x = mob_batch.x.to(self.dtype)
+        if hasattr(mob_batch, "edge_attr") and mob_batch.edge_attr is not None:
+            mob_batch.edge_attr = mob_batch.edge_attr.to(self.dtype)
+        if hasattr(mob_batch, "edge_weight") and mob_batch.edge_weight is not None:
+            mob_batch.edge_weight = mob_batch.edge_weight.to(self.dtype)
 
         target_nodes = batch.get("TargetRegionIndex", batch["TargetNode"])
+
+        # Extract temporal covariates if present
+        temporal_covariates = batch.get("TemporalCovariates")
 
         # Forward pass
         model_outputs = self.forward(
@@ -410,6 +442,7 @@ class EpiForecaster(nn.Module):
             target_nodes=target_nodes,
             region_embeddings=region_embeddings,
             population=batch["Population"],
+            temporal_covariates=temporal_covariates,
         )
 
         # Prepare targets dict
@@ -465,6 +498,8 @@ class EpiForecaster(nn.Module):
             dim += self.region_embedding_dim
         if self.use_population:
             dim += self.population_dim
+        if self.temporal_covariates_dim > 0:
+            dim += self.temporal_covariates_dim
         return dim
 
     def _trim_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
@@ -492,7 +527,6 @@ class EpiForecaster(nn.Module):
         self, node_emb: torch.Tensor, mob_batch: Batch, B: int, T: int
     ) -> torch.Tensor:
         """Gather embeddings for target nodes from the full graph batch."""
-        # Check batch size consistency
         ptr = mob_batch.ptr  # type: ignore[attr-defined]
         num_graphs = ptr.numel() - 1
         expected_graphs = B * T
@@ -503,10 +537,10 @@ class EpiForecaster(nn.Module):
             )
 
         if hasattr(mob_batch, "target_index"):
-            target_indices = mob_batch.target_index.reshape(-1)  # type: ignore[attr-defined]
+            target_indices = mob_batch.target_index.reshape(-1).to(node_emb.device)
         else:
-            start = ptr[:-1]
-            tgt_local = mob_batch.target_node.reshape(-1).to(start.device)  # type: ignore[attr-defined]
+            start = ptr[:-1].to(node_emb.device)
+            tgt_local = mob_batch.target_node.reshape(-1).to(node_emb.device)
             target_indices = start + tgt_local
 
         target_embeddings = node_emb[target_indices]

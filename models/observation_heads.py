@@ -11,6 +11,7 @@ kernels are normalized to sum to 1 for probabilistic interpretation.
 
 import logging
 import math
+from contextlib import nullcontext
 from collections.abc import Mapping
 
 import torch
@@ -22,10 +23,71 @@ from utils.normalization import unscale_forecasts
 logger = logging.getLogger(__name__)
 
 
+_KERNEL_EPS = 1e-8
+_EXP_CLAMP_MIN = -20.0
+_EXP_CLAMP_MAX = 20.0
+_OBS_CLAMP_MAX = 1.0e12
+# Safety clamp for unconstrained kernel logits prior to softplus.
+# If we ever see many logits pinned at these bounds, add boundary-hit logging
+# to track whether this stabilization starts constraining learned kernels.
+_KERNEL_LOGIT_CLAMP_MIN = -30.0
+_KERNEL_LOGIT_CLAMP_MAX = 30.0
+
+
+def _autocast_disabled_for(tensor: torch.Tensor):
+    """Disable autocast for numerically sensitive blocks on supported devices."""
+    if tensor.device.type in {"cpu", "cuda", "mps"}:
+        return torch.autocast(device_type=tensor.device.type, enabled=False)
+    return nullcontext()
+
+
+def _safe_exp_from_log(log_param: torch.Tensor) -> torch.Tensor:
+    """Exponentiate log-parameter with clamping to avoid overflow."""
+    sanitized = torch.nan_to_num(
+        log_param.float(),
+        nan=0.0,
+        posinf=_EXP_CLAMP_MAX,
+        neginf=_EXP_CLAMP_MIN,
+    )
+    clamped = torch.clamp(sanitized, min=_EXP_CLAMP_MIN, max=_EXP_CLAMP_MAX)
+    return torch.exp(clamped).clamp_min(_KERNEL_EPS)
+
+
+def _sanitize_kernel_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Sanitize unconstrained kernel logits before softplus."""
+    sanitized = torch.nan_to_num(
+        logits.float(),
+        nan=0.0,
+        posinf=_KERNEL_LOGIT_CLAMP_MAX,
+        neginf=_KERNEL_LOGIT_CLAMP_MIN,
+    )
+    return torch.clamp(
+        sanitized, min=_KERNEL_LOGIT_CLAMP_MIN, max=_KERNEL_LOGIT_CLAMP_MAX
+    )
+
+
+def _safe_normalize(weights: torch.Tensor) -> torch.Tensor:
+    """Normalize positive weights with clamped denominator for stability."""
+    weights_f32 = torch.nan_to_num(
+        weights.float(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    denom = weights_f32.sum().clamp_min(_KERNEL_EPS)
+    return weights_f32 / denom
+
+
 def _inverse_softplus(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Inverse softplus transform for positive tensors."""
     x = torch.clamp(x, min=eps)
     return torch.log(torch.expm1(x).clamp_min(eps))
+
+
+def _zero_linear(layer: nn.Linear) -> None:
+    """Set a linear layer to an exact zero map."""
+    nn.init.zeros_(layer.weight)
+    nn.init.zeros_(layer.bias)
 
 
 class DelayKernel(nn.Module):
@@ -98,9 +160,7 @@ class DelayKernel(nn.Module):
         )
 
         kernel = torch.exp(log_gamma_pdf)
-
-        # Normalize to sum to 1
-        kernel = kernel / kernel.sum()
+        kernel = _safe_normalize(kernel)
 
         return kernel
 
@@ -124,47 +184,44 @@ class DelayKernel(nn.Module):
         """
         batch_size, time_steps = I_trajectory.shape
 
-        # Normalize kernel (ensure probabilities sum to 1)
-        if self.learnable:
-            kernel_weights = F.softplus(self.kernel)
-        else:
-            kernel_weights = self.kernel
-        normalized_kernel = kernel_weights / kernel_weights.sum()
+        with _autocast_disabled_for(I_trajectory):
+            if self.learnable:
+                kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+            else:
+                kernel_weights = self.kernel
+            normalized_kernel = _safe_normalize(kernel_weights)
 
-        # Reshape for 1D convolution: [batch_size, 1, time_steps]
-        I_reshaped = I_trajectory.unsqueeze(1)
+            I_reshaped = torch.nan_to_num(
+                I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).unsqueeze(1)
+            kernel_reshaped = normalized_kernel.view(1, 1, -1)
 
-        # Prepare kernel for conv1d: [1, 1, kernel_length]
-        kernel_reshaped = normalized_kernel.view(1, 1, -1)
-
-        # Apply causal convolution with left padding
-        # Padding = kernel_length - 1 ensures causality (output t only sees <= t)
-        output = F.conv1d(
-            I_reshaped,
-            kernel_reshaped,
-            padding=self.kernel_length - 1,
-            groups=1,
-        )
-
-        # Trim to original time length (remove extra padding at end)
-        output = output[:, :, :time_steps]
-
-        # Reshape back: [batch_size, time_steps]
-        return output.squeeze(1)
+            output = F.conv1d(
+                I_reshaped,
+                kernel_reshaped,
+                padding=self.kernel_length - 1,
+                groups=1,
+            )
+            output = output[:, :, :time_steps].squeeze(1)
+        return output.to(I_trajectory.dtype)
 
     def get_kernel_weights(self) -> torch.Tensor:
         """Get current kernel weights (normalized)."""
         if self.learnable:
-            kernel_weights = F.softplus(self.kernel)
+            kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+            output_dtype = self.kernel.dtype
         else:
             kernel_weights = self.kernel
-        return kernel_weights / kernel_weights.sum()
+            output_dtype = kernel_weights.dtype
+        return _safe_normalize(kernel_weights).to(output_dtype)
 
     def get_mean_delay(self) -> float:
         """Compute mean delay in days based on current kernel."""
         weights = self.get_kernel_weights()
-        positions = torch.arange(len(weights), dtype=torch.float32)
-        return (weights * positions).sum().item()
+        positions = torch.arange(
+            len(weights), device=weights.device, dtype=torch.float32
+        )
+        return (weights.float() * positions).sum().item()
 
     def __repr__(self) -> str:
         return (
@@ -266,9 +323,7 @@ class SheddingConvolution(nn.Module):
         )
 
         kernel = torch.exp(log_gamma_pdf)
-
-        # Normalize
-        kernel = kernel / kernel.sum()
+        kernel = _safe_normalize(kernel)
 
         return kernel
 
@@ -304,56 +359,60 @@ class SheddingConvolution(nn.Module):
                 "population must be [batch_size, time_steps] or [batch_size]"
             )
 
+        if not torch.all(torch.isfinite(population)):
+            raise ValueError("population must be finite and positive")
         if torch.any(population <= 0):
             raise ValueError("population must be positive")
 
-        # Normalize kernel
-        if self.learnable_kernel:
-            kernel_weights = F.softplus(self.kernel)
-        else:
-            kernel_weights = self.kernel
-        normalized_kernel = kernel_weights / kernel_weights.sum()
+        with _autocast_disabled_for(I_trajectory):
+            if self.learnable_kernel:
+                kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+            else:
+                kernel_weights = self.kernel
+            normalized_kernel = _safe_normalize(kernel_weights)
 
-        # Reshape for 1D convolution: [batch_size, 1, time_steps]
-        I_reshaped = I_trajectory.unsqueeze(1)
+            I_reshaped = torch.nan_to_num(
+                I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).unsqueeze(1)
+            kernel_reshaped = normalized_kernel.view(1, 1, -1)
 
-        # Prepare kernel: [1, 1, kernel_length]
-        kernel_reshaped = normalized_kernel.view(1, 1, -1)
+            total_shedding = F.conv1d(
+                I_reshaped,
+                kernel_reshaped,
+                padding=self.kernel_length - 1,
+                groups=1,
+            )
+            total_shedding = total_shedding[:, :, :time_steps].squeeze(1)
 
-        # Causal convolution with left padding
-        total_shedding = F.conv1d(
-            I_reshaped,
-            kernel_reshaped,
-            padding=self.kernel_length - 1,
-            groups=1,
-        )
+            population_f32 = population.float().clamp_min(_KERNEL_EPS)
+            viral_concentration = total_shedding / population_f32
+            viral_concentration = viral_concentration * self.get_sensitivity_scale()
+            viral_concentration = torch.nan_to_num(
+                viral_concentration,
+                nan=0.0,
+                posinf=_OBS_CLAMP_MAX,
+                neginf=0.0,
+            ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
 
-        # Trim to original length
-        total_shedding = total_shedding[:, :, :time_steps]
-        total_shedding = total_shedding.squeeze(1)  # [batch_size, time_steps]
-
-        # Apply dilution physics: divide by population
-        # This is the key physical insight: more people = more wastewater flow = dilution
-        viral_concentration = total_shedding / (population + 1e-8)  # Avoid div by zero
-
-        # Apply sensitivity scale (measurement calibration)
-        viral_concentration = viral_concentration * self.get_sensitivity_scale()
-
-        return viral_concentration
+        return viral_concentration.to(I_trajectory.dtype)
 
     def get_kernel_weights(self) -> torch.Tensor:
         """Get current shedding kernel weights (normalized)."""
         if self.learnable_kernel:
-            kernel_weights = F.softplus(self.kernel)
+            kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+            output_dtype = self.kernel.dtype
         else:
             kernel_weights = self.kernel
-        return kernel_weights / kernel_weights.sum()
+            output_dtype = kernel_weights.dtype
+        return _safe_normalize(kernel_weights).to(output_dtype)
 
     def get_sensitivity_scale(self) -> torch.Tensor:
         """Get positive sensitivity scale."""
         if self.learnable_scale:
-            return torch.exp(self.sensitivity_scale)
-        return self.sensitivity_scale
+            return _safe_exp_from_log(self.sensitivity_scale).to(
+                self.sensitivity_scale.dtype
+            )
+        return self.sensitivity_scale.clamp_min(_KERNEL_EPS)
 
     def get_peak_shedding_day(self) -> int:
         """Get the day of peak shedding based on current kernel."""
@@ -433,8 +492,7 @@ class ClinicalObservationHead(nn.Module):
         self.use_residual = residual_dim > 0
         if self.use_residual:
             self.residual_proj = nn.Linear(residual_dim, 1)
-            nn.init.zeros_(self.residual_proj.weight)
-            nn.init.zeros_(self.residual_proj.bias)
+            _zero_linear(self.residual_proj)
             if learnable_scale:
                 self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
             else:
@@ -467,18 +525,18 @@ class ClinicalObservationHead(nn.Module):
         Formula:
             pred = log1p(I_delayed × 100,000 × scale) + alpha × residual(obs_context)
         """
-        # Apply delay kernel to infection trajectory
-        delayed_infections = self.delay_kernel(I_trajectory)
-
-        # Convert fraction to per-100k
-        per_100k = delayed_infections * 100_000.0
-
-        # Apply learnable scale
-        scale = self.get_scale()
-        scaled = per_100k * scale
-
-        # Apply log1p transform
-        pred_log = torch.log1p(scaled)
+        with _autocast_disabled_for(I_trajectory):
+            delayed_infections = self.delay_kernel(I_trajectory.float())
+            per_100k = delayed_infections * 100_000.0
+            scale = self.get_scale().float()
+            scaled = per_100k * scale
+            scaled = torch.nan_to_num(
+                scaled,
+                nan=0.0,
+                posinf=_OBS_CLAMP_MAX,
+                neginf=0.0,
+            ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
+            pred_log = torch.log1p(scaled)
 
         # Add residual from observation context if provided
         if (
@@ -489,9 +547,9 @@ class ClinicalObservationHead(nn.Module):
             residual = self.residual_proj(obs_context).squeeze(-1)
             alpha = self.get_alpha()
             if alpha is not None:
-                pred_log = pred_log + alpha * residual
+                pred_log = pred_log + alpha.float() * residual.float()
 
-        return pred_log
+        return pred_log.to(I_trajectory.dtype)
 
     def get_delay_stats(self) -> dict:
         """Get statistics about the delay kernel."""
@@ -503,13 +561,18 @@ class ClinicalObservationHead(nn.Module):
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
-            return torch.exp(self.scale)
-        return self.scale
+            return _safe_exp_from_log(self.scale).to(self.scale.dtype)
+        return self.scale.clamp_min(_KERNEL_EPS)
 
     def get_alpha(self) -> torch.Tensor | None:
         """Get residual weight alpha."""
         if self.alpha is not None and isinstance(self.alpha, nn.Parameter):
-            return self.alpha
+            return torch.nan_to_num(
+                self.alpha,
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0,
+            )
         return self.alpha
 
     def __repr__(self) -> str:
@@ -570,8 +633,7 @@ class WastewaterObservationHead(nn.Module):
         self.use_residual = residual_dim > 0
         if self.use_residual:
             self.residual_proj = nn.Linear(residual_dim, 1)
-            nn.init.zeros_(self.residual_proj.weight)
-            nn.init.zeros_(self.residual_proj.bias)
+            _zero_linear(self.residual_proj)
             if learnable_scale:
                 self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
             else:
@@ -607,18 +669,19 @@ class WastewaterObservationHead(nn.Module):
             viral_load = conv(I, shedding_kernel) / population
             pred = log1p(viral_load × 100,000 × scale) + alpha × residual(obs_context)
         """
-        # Apply shedding convolution (returns viral load normalized by population)
         viral_load = self.shedding_conv(I_trajectory, population)
 
-        # Convert to per-100k
-        per_100k = viral_load * 100_000.0
-
-        # Apply learnable scale
-        scale = self.get_scale()
-        scaled = per_100k * scale
-
-        # Apply log1p transform
-        pred_log = torch.log1p(scaled)
+        with _autocast_disabled_for(I_trajectory):
+            per_100k = viral_load.float() * 100_000.0
+            scale = self.get_scale().float()
+            scaled = per_100k * scale
+            scaled = torch.nan_to_num(
+                scaled,
+                nan=0.0,
+                posinf=_OBS_CLAMP_MAX,
+                neginf=0.0,
+            ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
+            pred_log = torch.log1p(scaled)
 
         # Add residual from observation context if provided
         if (
@@ -629,20 +692,25 @@ class WastewaterObservationHead(nn.Module):
             residual = self.residual_proj(obs_context).squeeze(-1)
             alpha = self.get_alpha()
             if alpha is not None:
-                pred_log = pred_log + alpha * residual
+                pred_log = pred_log + alpha.float() * residual.float()
 
-        return pred_log
+        return pred_log.to(I_trajectory.dtype)
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
-            return torch.exp(self.scale)
-        return self.scale
+            return _safe_exp_from_log(self.scale).to(self.scale.dtype)
+        return self.scale.clamp_min(_KERNEL_EPS)
 
     def get_alpha(self) -> torch.Tensor | None:
         """Get residual weight alpha."""
         if self.alpha is not None and isinstance(self.alpha, nn.Parameter):
-            return self.alpha
+            return torch.nan_to_num(
+                self.alpha,
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0,
+            )
         return self.alpha
 
     def get_shedding_stats(self) -> dict:

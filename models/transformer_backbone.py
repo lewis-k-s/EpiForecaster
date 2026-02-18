@@ -29,7 +29,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .configs import SIRPhysicsConfig
+
 logger = logging.getLogger(__name__)
+
+
+def _inverse_softplus(value: float, eps: float = 1e-8) -> float:
+    """Numerically stable inverse of softplus for positive scalars."""
+    clamped = max(float(value), eps)
+    return math.log(math.expm1(clamped))
 
 
 class PositionalEncoding(nn.Module):
@@ -150,6 +158,7 @@ class TransformerBackbone(nn.Module):
         use_layer_norm: bool = True,
         device=None,
         obs_context_dim: int = 96,
+        sir_physics: SIRPhysicsConfig | None = None,
     ):
         """
         Initialize TransformerBackbone.
@@ -166,6 +175,7 @@ class TransformerBackbone(nn.Module):
             max_seq_len: Maximum sequence length for positional encoding
             use_layer_norm: Whether to use layer normalization in encoder
             obs_context_dim: Dimension of observation context output
+            sir_physics: SIR physics config for parameter bounds
         """
         super().__init__()
 
@@ -180,6 +190,7 @@ class TransformerBackbone(nn.Module):
         self.positional_encoding = positional_encoding
         self.max_seq_len = max_seq_len
         self.obs_context_dim = obs_context_dim
+        self.sir_physics = sir_physics or SIRPhysicsConfig()
 
         # Input projection layer
         self.input_projection = nn.Linear(in_dim, d_model)
@@ -244,12 +255,92 @@ class TransformerBackbone(nn.Module):
             nn.Linear(d_model // 2, obs_context_dim),
         )
 
+        self._initialize_conservative_weights()
+
         # Log initialization
         logger.info(
             f"Initialized TransformerBackbone: {in_dim}->{d_model}, "
             f"layers={num_layers}, heads={n_heads}, horizon={horizon}, "
             f"obs_context_dim={obs_context_dim}"
         )
+
+    def _initialize_conservative_weights(self) -> None:
+        """Initialize projections with epidemiology-informed conservative priors."""
+        self._init_linear_xavier(self.input_projection)
+
+        projection_stems = [
+            self.beta_projection[0],
+            self.gamma_projection[0],
+            self.mortality_projection[0],
+            self.initial_states_projection[0],
+            self.obs_context_projection[0],
+        ]
+        for layer in projection_stems:
+            self._init_linear_xavier(layer)
+
+        cfg = self.sir_physics
+        self._init_rate_head(
+            self.beta_projection[2],
+            prior=0.25,
+            min_value=cfg.beta_min,
+            max_value=cfg.beta_max,
+        )
+        self._init_rate_head(
+            self.gamma_projection[2],
+            prior=0.14,
+            min_value=cfg.gamma_min,
+            max_value=cfg.gamma_max,
+        )
+        self._init_rate_head(
+            self.mortality_projection[2],
+            prior=0.002,
+            min_value=cfg.mortality_min,
+            max_value=cfg.mortality_max,
+        )
+
+        # Encourage plausible initial composition at startup: S >> I > R.
+        # Use default dtype (float32) for initial prior
+        initial_prior = torch.tensor([0.995, 0.004, 0.001])
+        initial_bias = torch.log(initial_prior)
+        self._init_linear_with_bias(
+            self.initial_states_projection[2], initial_bias.tolist()
+        )
+
+        self._init_linear_with_bias(self.obs_context_projection[2], 0.0)
+
+        if isinstance(self.pos_encoding, LearnedPositionalEncoding):
+            nn.init.normal_(self.pos_encoding.pos_embedding.weight, mean=0.0, std=0.02)
+
+    def _init_rate_head(
+        self,
+        layer: nn.Linear,
+        *,
+        prior: float,
+        min_value: float,
+        max_value: float,
+    ) -> None:
+        clipped_prior = min(max(prior, min_value), max_value)
+        bias_value = _inverse_softplus(clipped_prior)
+        self._init_linear_with_bias(layer, bias_value)
+
+    def _init_linear_xavier(self, layer: nn.Linear) -> None:
+        nn.init.xavier_uniform_(layer.weight)
+        nn.init.zeros_(layer.bias)
+
+    def _init_linear_with_bias(
+        self, layer: nn.Linear, bias: float | list[float]
+    ) -> None:
+        nn.init.zeros_(layer.weight)
+        with torch.no_grad():
+            if isinstance(bias, list):
+                bias_tensor = torch.tensor(
+                    bias,
+                    dtype=layer.bias.dtype,
+                    device=layer.bias.device,
+                )
+                layer.bias.copy_(bias_tensor)
+            else:
+                layer.bias.fill_(float(bias))
 
     def forward(
         self, x_seq: torch.Tensor, mask: torch.Tensor | None = None
@@ -318,15 +409,23 @@ class TransformerBackbone(nn.Module):
         # Sequence-to-vector: use final time step for parameter prediction
         final_hidden = encoded[:, -1, :]  # [batch_size, d_model]
 
-        # Output projections
-        beta_t = self.beta_projection(final_hidden)  # [batch_size, horizon]
-        beta_t = F.softplus(beta_t)  # Ensure positive transmission rate
-
-        mortality_t = self.mortality_projection(final_hidden)  # [batch_size, horizon]
-        mortality_t = F.softplus(mortality_t)  # Ensure positive mortality rate
-
-        gamma_t = self.gamma_projection(final_hidden)  # [batch_size, horizon]
-        gamma_t = F.softplus(gamma_t)  # Ensure positive recovery rate
+        # Output projections with bounded softplus for numerical stability
+        cfg = self.sir_physics
+        beta_t = torch.clamp(
+            F.softplus(self.beta_projection(final_hidden)),
+            min=cfg.beta_min,
+            max=cfg.beta_max,
+        )
+        mortality_t = torch.clamp(
+            F.softplus(self.mortality_projection(final_hidden)),
+            min=cfg.mortality_min,
+            max=cfg.mortality_max,
+        )
+        gamma_t = torch.clamp(
+            F.softplus(self.gamma_projection(final_hidden)),
+            min=cfg.gamma_min,
+            max=cfg.gamma_max,
+        )
 
         initial_states_logits = self.initial_states_projection(
             final_hidden

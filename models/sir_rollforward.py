@@ -45,15 +45,18 @@ class SIRRollForward(nn.Module):
         dt: float = 1.0,
         enforce_nonnegativity: bool = True,
         enforce_mass_conservation: bool = True,
+        residual_clip: float = 1e4,
     ):
         super().__init__()
         self.dt = dt
         self.enforce_nonnegativity = enforce_nonnegativity
         self.enforce_mass_conservation = enforce_mass_conservation
+        self.residual_clip = residual_clip
 
         logger.info(
             f"Initialized SIRRollForward: dt={dt}, "
-            f"nonneg={enforce_nonnegativity}, mass_cons={enforce_mass_conservation}"
+            f"nonneg={enforce_nonnegativity}, mass_cons={enforce_mass_conservation}, "
+            f"residual_clip={residual_clip}"
         )
 
     def forward(
@@ -196,10 +199,11 @@ class SIRRollForward(nn.Module):
             # Store flow for observation heads
             death_flow_list.append(death_flow)
 
-            # Compute physics residual on constrained step
+            # Compute physics residual on constrained step (clip at source for stability)
             dI_expected = beta_SI_over_N - recovery_flow - death_flow
             dI_actual = (I_next - I_t) / self.dt
-            physics_residual_list.append((dI_actual - dI_expected) ** 2)
+            residual = (dI_actual - dI_expected) ** 2
+            physics_residual_list.append(torch.clamp(residual, max=self.residual_clip))
 
         # Stack lists into tensors
         S_traj = torch.stack(S_list, dim=1)  # [B, H+1]
@@ -227,6 +231,11 @@ class SIRRollForward(nn.Module):
         population: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Validate and normalize initial states to satisfy SIR constraints."""
+        # Ensure consistent dtype between states and population
+        target_dtype = S0.dtype
+        if population.dtype != target_dtype:
+            population = population.to(target_dtype)
+
         total = S0 + I0 + R0
         # Note: D0 is assumed 0 for the start of the window, so we check S+I+R against N.
         # If we start tracking accumulated D, we'd need D0 input.
