@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from typing import Any, cast
@@ -8,6 +8,7 @@ from omegaconf import MISSING, DictConfig, OmegaConf
 
 GNN_TYPES = ["gcn", "gat"]
 FORECASTER_HEAD_TYPES = ["transformer"]
+POSITIONAL_ENCODING_TYPES = ["sinusoidal", "learned"]
 
 
 # Kept for backwards compatibility with old checkpoints - DO NOT USE
@@ -42,6 +43,8 @@ class ProfilerConfig:
     # Optional cap on the number of *training* batches to profile at the start of
     # each epoch. When reached, the profiler is shut off and training continues.
     profile_batches: int | None = None
+    # Which epochs to profile. If None, profiles all epochs. Use [1, 2] to limit.
+    profile_epochs: list[int] | None = None
     # Where to write profiler traces. Use "auto" to place traces inside the
     # experiment log directory so they appear alongside other artifacts.
     log_dir: str = "auto"
@@ -71,6 +74,15 @@ class JointLossConfig:
     w_cases: float = 0.15
     w_ww: float = 0.15
     w_sir: float = 0.05
+    # Relative per-timestep weights for imputed (mask=0) supervision.
+    # 0.0 disables imputed supervision; observed (mask=1) always has weight 1.0.
+    ww_imputed_weight: float = 0.25
+    hosp_imputed_weight: float = 0.25
+    cases_imputed_weight: float = 0.25
+    deaths_imputed_weight: float = 0.25
+    # Cap on absolute physics residual before squaring in SIR loss.
+    # Prevents occasional residual spikes from dominating gradients.
+    sir_residual_clip: float = 1.0e3
 
     def __post_init__(self) -> None:
         for name, value in [
@@ -79,6 +91,11 @@ class JointLossConfig:
             ("w_cases", self.w_cases),
             ("w_deaths", self.w_deaths),
             ("w_sir", self.w_sir),
+            ("ww_imputed_weight", self.ww_imputed_weight),
+            ("hosp_imputed_weight", self.hosp_imputed_weight),
+            ("cases_imputed_weight", self.cases_imputed_weight),
+            ("deaths_imputed_weight", self.deaths_imputed_weight),
+            ("sir_residual_clip", self.sir_residual_clip),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
@@ -202,10 +219,35 @@ class SIRPhysicsConfig:
     dt: float = 1.0
     enforce_nonnegativity: bool = True
     enforce_mass_conservation: bool = True
+    # Parameter bounds for numerical stability (prevent gradient explosion)
+    beta_min: float = 0.01
+    beta_max: float = 2.0
+    gamma_min: float = 0.05
+    gamma_max: float = 0.5
+    mortality_min: float = 1e-4
+    mortality_max: float = 0.05
+    # Physics residual clipping at source (prevents extreme gradients)
+    residual_clip: float = 1e4
 
     def __post_init__(self) -> None:
         if self.dt <= 0:
             raise ValueError(f"dt must be positive, got {self.dt}")
+        if self.beta_min >= self.beta_max:
+            raise ValueError(
+                f"beta_min ({self.beta_min}) must be < beta_max ({self.beta_max})"
+            )
+        if self.gamma_min >= self.gamma_max:
+            raise ValueError(
+                f"gamma_min ({self.gamma_min}) must be < gamma_max ({self.gamma_max})"
+            )
+        if self.mortality_min >= self.mortality_max:
+            raise ValueError(
+                f"mortality_min ({self.mortality_min}) must be < mortality_max ({self.mortality_max})"
+            )
+        if self.residual_clip <= 0:
+            raise ValueError(
+                f"residual_clip must be positive, got {self.residual_clip}"
+            )
 
 
 @dataclass
@@ -291,14 +333,20 @@ class DataConfig:
     use_valid_targets: bool = False
     # Sliding window stride for training samples
     window_stride: int = 1
-    # Maximum allowed missing values in a history window
-    missing_permit: int = 0
+    # Maximum allowed missing values by target for both history and horizon windows.
+    # Preferred schema:
+    #   missing_permit:
+    #     biomarkers_joint: 24
+    #     cases: 24
+    #     hospitalizations: 24
+    #     deaths: 24
+    #
+    missing_permit: dict[str, int] = field(default_factory=dict)
     # Dataset sample ordering: "node" (node-major) or "time" (time-major)
     sample_ordering: str = "node"
-    # Log transformation for cases and biomarkers
+    # Log transformation for cases (used by legacy CasesPreprocessor only)
     log_scale: bool = False
-    # Mobility preprocessing configuration
-    mobility_log_scale: bool = True
+    # Mobility preprocessing configuration (data already log1p-transformed from pipeline)
     mobility_clip_range: tuple[float, float] = (-8.0, 8.0)
     mobility_scale_epsilon: float = 1e-6
     # Lags for mobility-weighted case features (e.g. [1, 7, 14])
@@ -326,8 +374,20 @@ class DataConfig:
                 "Specify at least one lag value (e.g., [1, 7, 14])."
             )
 
-        if self.missing_permit < 0:
-            raise ValueError("missing_permit must be non-negative")
+        valid_targets = {
+            "biomarkers_joint",
+            "cases",
+            "hospitalizations",
+            "deaths",
+        }
+        for name, permit in self.missing_permit.items():
+            if name not in valid_targets:
+                raise ValueError(
+                    f"missing_permit has unsupported key '{name}'. "
+                    f"Expected one of: {sorted(valid_targets)}"
+                )
+            if int(permit) < 0:
+                raise ValueError(f"missing_permit['{name}'] must be non-negative")
 
         if len(self.mobility_clip_range) != 2:
             raise ValueError("mobility_clip_range must be a tuple of (min, max)")
@@ -351,6 +411,22 @@ class DataConfig:
                 "run_id must be a non-empty string. "
                 "This is required for valid_targets filtering with multi-run datasets."
             )
+
+    def resolve_missing_permit_map(self) -> dict[str, int]:
+        """Resolve per-target missing permits used for window inclusion and loss gating.
+
+        Returns keys in dataset/loss naming:
+        - cases
+        - hospitalizations
+        - deaths
+        - wastewater
+        """
+        return {
+            "cases": int(self.missing_permit.get("cases", 0)),
+            "hospitalizations": int(self.missing_permit.get("hospitalizations", 0)),
+            "deaths": int(self.missing_permit.get("deaths", 0)),
+            "wastewater": int(self.missing_permit.get("biomarkers_joint", 0)),
+        }
 
 
 @dataclass
@@ -398,6 +474,9 @@ class ModelConfig:
     # -- static/temporal covariates --#
     use_population: bool = True
     population_dim: int = 1
+    include_day_of_week: bool = False
+    include_holidays: bool = False
+    temporal_covariates_dim: int = field(init=False)
 
     # -- module choices --#
     gnn_module: str = ""
@@ -408,6 +487,7 @@ class ModelConfig:
     head_n_heads: int = 4
     head_num_layers: int = 3
     head_dropout: float = 0.1
+    head_positional_encoding: str = "sinusoidal"
 
     # -- SIR physics and observation heads --#
     sir_physics: SIRPhysicsConfig = field(default_factory=SIRPhysicsConfig)
@@ -419,6 +499,10 @@ class ModelConfig:
     region2vec_path: str = ""
 
     def __post_init__(self) -> None:
+        self.temporal_covariates_dim = (2 if self.include_day_of_week else 0) + (
+            1 if self.include_holidays else 0
+        )
+
         if isinstance(self.type, (dict, DictConfig)):
             self.type = ModelVariant(**self.type)  # type: ignore[arg-type]
 
@@ -442,6 +526,11 @@ class ModelConfig:
         assert self.forecaster_head in FORECASTER_HEAD_TYPES, (
             f"Invalid forecaster head: {self.forecaster_head}"
         )
+        if self.head_positional_encoding not in POSITIONAL_ENCODING_TYPES:
+            raise ValueError(
+                "head_positional_encoding must be one of "
+                f"{POSITIONAL_ENCODING_TYPES}, got {self.head_positional_encoding!r}"
+            )
 
 
 @dataclass
@@ -449,7 +538,11 @@ class TrainingParams:
     """Trainer hyper-parameters from ``training`` YAML block."""
 
     epochs: int = 100
+    seed: int | None = 42  # Random seed for reproducibility (None = non-deterministic)
     batch_size: int = 32
+    # Preserve sample_ordering within each batch and shuffle batch order each epoch.
+    # When False, training iterates through batches in deterministic dataset order.
+    shuffle_train_batches: bool = True
     gradient_accumulation_steps: int = 1
     max_batches: int | None = None
     learning_rate: float = 1.0e-3
@@ -457,7 +550,8 @@ class TrainingParams:
     model_id: str = ""
     resume: bool = False
     scheduler_type: str = "cosine"
-    gradient_clip_value: float = 2.0
+    warmup_steps: int = 0
+    gradient_clip_value: float = 5.0
     early_stopping_patience: int | None = 10  # None = disabled
     nan_loss_patience: int | None = None
     val_split: float = 0.2
@@ -474,7 +568,7 @@ class TrainingParams:
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
     device: str = "auto"
     num_workers: int = 4
-    val_workers: int = 0
+    val_workers: int = 4
     test_workers: int = (
         0  # Test loader workers (typically 0 since test runs once at end)
     )
@@ -492,7 +586,7 @@ class TrainingParams:
     num_forecast_samples: int = (
         3  # Number of samples per category (best, worst, random)
     )
-    grad_norm_log_frequency: int = 5
+    grad_norm_log_frequency: int = 10
     progress_log_frequency: int = (
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
@@ -500,7 +594,14 @@ class TrainingParams:
     # Precision settings for Tensor Core optimization
     enable_tf32: bool = True
     enable_mixed_precision: bool = True
-    mixed_precision_dtype: str = "bfloat16"  # "bfloat16" or "float16"
+    mixed_precision_dtype: str = "bfloat16"  # Only "bfloat16" is supported
+    # Parameter dtype (currently only float32 is supported)
+    parameter_dtype: str = "float32"
+    # Optimizer epsilon (None = use default 1e-8)
+    optimizer_eps: float | None = None
+    # Gradient debugging (toggleable, disabled by default for zero overhead)
+    enable_gradient_debug: bool = False
+    gradient_debug_log_dir: str | None = None  # Auto-set if None and enabled
 
     def __post_init__(self) -> None:
         if self.resume and not self.model_id:
@@ -592,6 +693,11 @@ class TrainingParams:
                     "using train_end_date, val_end_date, test_end_date instead"
                 )
 
+        if self.warmup_steps < 0:
+            raise ValueError(
+                f"warmup_steps must be non-negative, got {self.warmup_steps}"
+            )
+
         # Validate curriculum configuration
         if self.curriculum.enabled:
             if not self.curriculum.schedule:
@@ -602,6 +708,35 @@ class TrainingParams:
                     "curriculum.enabled=True but schedule is empty. "
                     "Curriculum training will have no effect."
                 )
+
+        # Validate precision settings
+        # Only float32 parameters are supported
+        if self.parameter_dtype != "float32":
+            raise ValueError(
+                f"Unsupported parameter_dtype: '{self.parameter_dtype}'. "
+                "Only 'float32' is supported."
+            )
+
+        # Only bfloat16 autocast is supported (FP16 removed)
+        if self.enable_mixed_precision:
+            mp_dtype = self.mixed_precision_dtype.lower()
+            if mp_dtype == "float16":
+                raise ValueError(
+                    "FP16 is no longer supported. "
+                    "Use 'bfloat16' for autocast or disable mixed precision "
+                    "by setting enable_mixed_precision=false."
+                )
+            if mp_dtype != "bfloat16":
+                raise ValueError(
+                    f"Unsupported mixed_precision_dtype: '{mp_dtype}'. "
+                    "Only 'bfloat16' is supported."
+                )
+
+        # Validate optimizer epsilon if provided
+        if self.optimizer_eps is not None and self.optimizer_eps <= 0:
+            raise ValueError(
+                f"optimizer_eps must be positive, got {self.optimizer_eps}"
+            )
 
 
 @dataclass
@@ -761,6 +896,13 @@ class EpiForecasterConfig:
         Returns:
             Reconstructed EpiForecasterConfig instance.
         """
+
+        def _filter_init_fields(config_class, data_dict: dict) -> dict:
+            """Filter dict to only include fields that are in the class __init__."""
+            # Get the set of field names that have init=True
+            init_fields = {f.name for f in fields(config_class) if f.init}
+            return {k: v for k, v in data_dict.items() if k in init_fields}
+
         # Reconstruct nested dataclass for curriculum
         training_dict = config_dict["training"].copy()
         if "curriculum" in training_dict:
@@ -769,9 +911,13 @@ class EpiForecasterConfig:
             )
 
         return cls(
-            model=ModelConfig(**config_dict["model"]),
-            data=DataConfig(**config_dict["data"]),
-            training=TrainingParams(**training_dict),
-            output=OutputConfig(**config_dict["output"]),
+            model=ModelConfig(**_filter_init_fields(ModelConfig, config_dict["model"])),
+            data=DataConfig(**_filter_init_fields(DataConfig, config_dict["data"])),
+            training=TrainingParams(
+                **_filter_init_fields(TrainingParams, training_dict)
+            ),
+            output=OutputConfig(
+                **_filter_init_fields(OutputConfig, config_dict["output"])
+            ),
             env=config_dict.get("env"),
         )

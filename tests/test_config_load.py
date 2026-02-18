@@ -5,12 +5,14 @@ from omegaconf import errors
 
 from models.configs import EpiForecasterConfig
 
+BASE_LOCAL_CONFIG = "configs/train_epifor_real_local.yaml"
+
 
 @pytest.mark.epiforecaster
 def test_load_config_with_simple_overrides():
     """Test that simple dotted overrides work correctly."""
     cfg = EpiForecasterConfig.load(
-        "configs/train_epifor_full.yaml",
+        BASE_LOCAL_CONFIG,
         overrides=["training.learning_rate=0.0005", "data.log_scale=false"],
     )
 
@@ -22,7 +24,7 @@ def test_load_config_with_simple_overrides():
 def test_load_config_with_nested_overrides():
     """Test that nested overrides work correctly."""
     cfg = EpiForecasterConfig.load(
-        "configs/train_epifor_full.yaml",
+        BASE_LOCAL_CONFIG,
         overrides=[
             "model.type.cases=true",
             "model.type.regions=false",
@@ -39,7 +41,7 @@ def test_load_config_with_nested_overrides():
 def test_load_config_with_bool_override():
     """Test that boolean overrides are handled correctly."""
     cfg = EpiForecasterConfig.load(
-        "configs/train_epifor_full.yaml",
+        BASE_LOCAL_CONFIG,
         overrides=["training.plot_forecasts=false", "data.log_scale=true"],
     )
 
@@ -50,9 +52,9 @@ def test_load_config_with_bool_override():
 @pytest.mark.epiforecaster
 def test_load_config_without_overrides():
     """Test that config loads correctly without overrides."""
-    cfg = EpiForecasterConfig.load("configs/train_epifor_full.yaml")
+    cfg = EpiForecasterConfig.load(BASE_LOCAL_CONFIG)
 
-    assert cfg.training.learning_rate == 0.0003
+    assert cfg.training.learning_rate == 0.0001
     assert cfg.data.log_scale is True
 
 
@@ -61,7 +63,7 @@ def test_load_config_strict_mode_rejects_unknown_keys():
     """Test that strict mode rejects unknown keys."""
     with pytest.raises((errors.ConfigKeyError, errors.ValidationError, KeyError)):
         EpiForecasterConfig.load(
-            "configs/train_epifor_full.yaml",
+            BASE_LOCAL_CONFIG,
             overrides=["training.unknown_field=123"],
             strict=True,
         )
@@ -71,7 +73,7 @@ def test_load_config_strict_mode_rejects_unknown_keys():
 def test_load_config_model_type_overrides():
     """Test that model.type overrides work correctly."""
     cfg = EpiForecasterConfig.load(
-        "configs/train_epifor_full.yaml",
+        BASE_LOCAL_CONFIG,
         overrides=[
             "model.type.cases=true",
             "model.type.regions=true",
@@ -90,7 +92,7 @@ def test_load_config_model_type_overrides():
 def test_load_config_with_gnn_depth_override():
     """Test that GNN depth overrides work correctly."""
     cfg = EpiForecasterConfig.load(
-        "configs/train_epifor_full.yaml",
+        BASE_LOCAL_CONFIG,
         overrides=["model.gnn_depth=3"],
     )
 
@@ -101,7 +103,7 @@ def test_load_config_with_gnn_depth_override():
 def test_load_config_with_multiple_overrides_same_section():
     """Test that multiple overrides in the same section work correctly."""
     cfg = EpiForecasterConfig.load(
-        "configs/train_epifor_full.yaml",
+        BASE_LOCAL_CONFIG,
         overrides=[
             "training.learning_rate=0.0001",
             "training.batch_size=64",
@@ -119,9 +121,9 @@ def test_load_config_with_multiple_overrides_same_section():
 @pytest.mark.epiforecaster
 def test_backward_compatibility_from_file():
     """Test that from_file() method still works."""
-    cfg = EpiForecasterConfig.from_file("configs/train_epifor_full.yaml")
+    cfg = EpiForecasterConfig.from_file(BASE_LOCAL_CONFIG)
 
-    assert cfg.training.learning_rate == 0.0003
+    assert cfg.training.learning_rate == 0.0001
     assert cfg.data.log_scale is True
 
 
@@ -129,7 +131,7 @@ def test_backward_compatibility_from_file():
 def test_from_dict_reconstructs_config():
     """Test that from_dict() correctly reconstructs a config from to_dict()."""
     # Load a config and convert to dict (as would be saved in checkpoint)
-    original = EpiForecasterConfig.load("configs/train_epifor_full.yaml")
+    original = EpiForecasterConfig.load(BASE_LOCAL_CONFIG)
     config_dict = original.to_dict()
 
     # Reconstruct from dict (as would be loaded from checkpoint)

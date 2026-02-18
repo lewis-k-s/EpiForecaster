@@ -10,11 +10,8 @@ from training.region2vec_trainer import RegionTrainerConfig
 # Config file lists by type
 EPIFORECASTER_TRAINING_CONFIGS = [
     "configs/train_epifor_curriculum.yaml",
-    "configs/train_epifor_full.yaml",
-    "configs/train_joint_inference.yaml",
     "configs/train_epifor_real_local.yaml",
     "configs/train_epifor_synth_local.yaml",
-    "configs/train_epifor_temporal.yaml",
     "configs/production_only/train_epifor_mn5_full.yaml",
     "configs/production_only/train_epifor_mn5_synth.yaml",
     "configs/production_only/train_epifor_sparsity_curriculum.yaml",
@@ -25,7 +22,6 @@ REGION2VEC_CONFIGS = [
 ]
 
 PREPROCESSING_CONFIGS = [
-    "configs/preprocess_filtered.yaml",
     "configs/preprocess_full.yaml",
     "configs/production_only/preprocess_mn5_synth.yaml",
 ]
