@@ -4,6 +4,14 @@ This repo defines a forecasting pipeline for time series data and variants of th
 
 We model an epidemiological task to forecast disease incidence and prevalence metrics.
 
+## Mission & Safety Scope
+
+- Mission: build epidemiological forecasting tools for public-health situational awareness, early outbreak monitoring, and planning support.
+- Model framing: this project uses a transformer-based forecaster with physics-grounded SIR roll-forward dynamics, plus optional mobility/geospatial context, to handle sparse multivariate signals and predict public-health outcomes.
+- Intended use: forecasting, uncertainty analysis, retrospective evaluation, and operational decision support for public-health officials and researchers.
+- Out of scope: any request that enables pathogen design, biological optimization, lab protocol development, transmission enhancement, or operational misuse.
+- Agent behavior: if a task drifts into out-of-scope bio guidance, decline that part and redirect to safe, high-level epidemiological modeling and public-health analytics.
+
 For detailed information on the forecaster model design see EPIFORECASTER.md
 For detailed information on the region embedding model design see REGION2VEC.md
 

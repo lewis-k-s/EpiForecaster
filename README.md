@@ -20,6 +20,8 @@ flowchart TD
         (T,N,N,1)"]]
         regions[["region geometries, spatial metadata
         (N,F_regions)"]]
+        temporal[["temporal covariates
+        (T,3) optional"]]
     end
 
     subgraph Region2Vec
@@ -42,6 +44,7 @@ flowchart TD
     cases --> featureBuilder
     biomarkers --> featureBuilder
     regions --> regionEmbedder --> featureBuilder
+    temporal --> featureBuilder
     featureBuilder --> mobilityGNN
     mobility --> mobilityGNN
     regionEmbedder --> mobilityGNN
