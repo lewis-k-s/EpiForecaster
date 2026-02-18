@@ -31,7 +31,12 @@ def _make_config(
     data_cfg = DataConfig(
         dataset_path=str(dataset_path),
         mobility_threshold=0.0,
-        missing_permit=0,
+        missing_permit={
+            "biomarkers_joint": 0,
+            "cases": 0,
+            "hospitalizations": 0,
+            "deaths": 0,
+        },
         log_scale=log_scale,
         sample_ordering=sample_ordering,
     )
@@ -169,10 +174,11 @@ def test_getitem_values(tmp_path):
     _write_tiny_dataset(str(zarr_path))
 
     # Constant cases for easy verification
-    # Node 0: 100 cases per day. Pop 1000. -> 10,000 per 100k. Log1p(10000) ~ 9.21
-    # Node 1: 0 cases. Pop 1000. -> 0. Log1p(0) = 0.
+    # Node 0: 100 cases per day. Pop 1000. -> 10,000 per 100k.
+    # Node 1: 50 cases per day. Pop 1000. -> 5,000 per 100k.
+    # Note: Log scaling is now done in offline preprocessor, so dataset receives raw values
 
-    config = _make_config(str(zarr_path), log_scale=True)
+    config = _make_config(str(zarr_path), log_scale=False)
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
     # Check item 0 (window start 0)
@@ -187,11 +193,10 @@ def test_getitem_values(tmp_path):
 
     if item["node_label"] == 0:
         # Node 0: constant cases.
-        # Values are now in log1p(per-100k) space directly from ClinicalSeriesPreprocessor
         cases_hist = item["cases_hist"]  # (L, 3) - value, mask, age
 
-        # Channel 0 (value) should be log1p(10000) ~ 9.21 (not normalized to 0)
-        expected_value = np.log1p(10000.0)  # ~9.21
+        # Channel 0 (value) should be 100.0 (raw cases value from dataset)
+        expected_value = 100.0
         assert torch.allclose(
             cases_hist[..., 0],
             torch.full_like(cases_hist[..., 0], expected_value),
@@ -210,11 +215,14 @@ def test_getitem_values(tmp_path):
         )
 
     elif item["node_label"] == 1:
-        # Node 1: 0 cases.
+        # Node 1: 50 cases.
         cases_hist = item["cases_hist"]
-        # Channel 0 (value) should be 0 (log1p(0) = 0)
+        # Channel 0 (value) should be 50.0 (raw cases value)
+        expected_value = 50.0
         assert torch.allclose(
-            cases_hist[..., 0], torch.zeros_like(cases_hist[..., 0]), atol=1e-3
+            cases_hist[..., 0],
+            torch.full_like(cases_hist[..., 0], expected_value),
+            atol=1e-3,
         )
         # Channel 1 (mask) should be 1
         assert torch.allclose(

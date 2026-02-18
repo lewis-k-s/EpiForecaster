@@ -10,6 +10,10 @@ def _create_dataset_with_channels(
     """Helper to create xarray dataset with all required channels.
 
     Channel layout: [value, mask, censor, age] - 4 channels per variant
+
+    Note:
+    - Values should be already log1p-transformed (from preprocessing pipeline)
+    - Age is stored as uint8 (0-14 raw days), normalized to [0,1] at load time.
     """
     T, N = values.shape
     da = xr.DataArray(
@@ -18,27 +22,27 @@ def _create_dataset_with_channels(
         coords={"date": range(T), "region_id": range(N)},
     )
 
-    # Default mask: 1.0 if measured (finite and positive), 0.0 otherwise
+    # Default mask: bool (True if measured, False otherwise)
     if mask is None:
-        mask = (np.isfinite(values) & (values > 0)).astype(np.float32)
+        mask = np.isfinite(values) & (values > 0)
 
-    # Default censor: 0.0 (no censoring by default)
+    # Default censor: uint8 (0=uncensored, 1=censored, 2=missing)
     if censor is None:
-        censor = np.zeros_like(values, dtype=np.float32)
+        censor = np.zeros_like(values, dtype=np.uint8)
 
-    # Default age: compute days since last measurement
+    # Default age: uint8 (0-14 raw days since last measurement)
     if age is None:
-        age = np.zeros_like(values)
+        age = np.zeros_like(values, dtype=np.uint8)
         for i in range(N):
             last_seen = -1
             for t in range(T):
-                if mask[t, i] > 0:
+                if mask[t, i]:
                     last_seen = t
-                    age[t, i] = 0.0
+                    age[t, i] = 0
                 elif last_seen >= 0:
-                    age[t, i] = min(t - last_seen, 14) / 14.0
+                    age[t, i] = min(t - last_seen, 14)
                 else:
-                    age[t, i] = 1.0  # Never observed
+                    age[t, i] = 14  # Never observed
 
     mask_da = xr.DataArray(
         mask,
@@ -67,23 +71,24 @@ def _create_dataset_with_channels(
 
 
 @pytest.mark.region
-def test_value_channel_log_transform():
-    """Verify value channel gets log1p transform without LOCF."""
+def test_value_channel_passthrough():
+    """Verify value channel passes through already-log1p-transformed values."""
     preprocessor = BiomarkerPreprocessor()
 
-    # Values with NaN gaps - no LOCF should be applied
-    values = np.array([[1.0], [np.nan], [np.nan], [4.0], [np.nan]])
-    mask = np.array([[1.0], [0.0], [0.0], [1.0], [0.0]])
-    censor = np.array([[0.0], [0.0], [0.0], [0.0], [0.0]])
-    age = np.array([[0.0], [1.0], [1.0], [0.0], [1.0]])
+    # Values are already log1p-transformed from preprocessing pipeline
+    # e.g., log1p(1.0) = 0.693, log1p(4.0) = 1.609
+    values = np.array([[0.693], [np.nan], [np.nan], [1.609], [np.nan]])
+    mask = np.array([[True], [False], [False], [True], [False]])
+    censor = np.array([[0], [0], [0], [0], [0]], dtype=np.uint8)
+    age = np.array([[0], [1], [2], [0], [1]], dtype=np.uint8)  # Raw days
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
     # Shape: (5, 1, 4) - 4 channels: [value, mask, censor, age]
 
-    # Value channel: NaN becomes 0.0, valid values get log1p
+    # Value channel: NaN becomes 0.0, valid values pass through (already log1p)
     # No LOCF, so NaN values stay as 0.0
-    expected_value = np.array([np.log1p(1.0), 0.0, 0.0, np.log1p(4.0), 0.0])
+    expected_value = np.array([0.693, 0.0, 0.0, 1.609, 0.0])
     np.testing.assert_array_almost_equal(encoded[:, 0, 0], expected_value)
 
 
@@ -93,9 +98,9 @@ def test_mask_channel_correctness():
     preprocessor = BiomarkerPreprocessor()
 
     values = np.array([[1.0], [np.nan], [np.nan], [4.0], [np.nan]])
-    mask = np.array([[1.0], [0.0], [0.0], [1.0], [0.0]])
-    censor = np.array([[0.0], [0.0], [0.0], [0.0], [0.0]])
-    age = np.array([[0.0], [1.0], [1.0], [0.0], [1.0]])
+    mask = np.array([[True], [False], [False], [True], [False]])
+    censor = np.array([[0], [0], [0], [0], [0]], dtype=np.uint8)
+    age = np.array([[0], [1], [2], [0], [1]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
@@ -110,9 +115,9 @@ def test_censor_channel_passthrough():
     preprocessor = BiomarkerPreprocessor()
 
     values = np.array([[1.0], [np.nan], [0.0], [4.0], [np.nan]])
-    mask = np.array([[1.0], [0.0], [0.0], [1.0], [0.0]])
-    censor = np.array([[0.0], [0.0], [1.0], [0.0], [0.0]])  # One censored value
-    age = np.array([[0.0], [1.0], [1.0], [0.0], [1.0]])
+    mask = np.array([[True], [False], [False], [True], [False]])
+    censor = np.array([[0], [0], [1], [0], [0]], dtype=np.uint8)  # One censored value
+    age = np.array([[0], [1], [2], [0], [1]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
@@ -123,25 +128,26 @@ def test_censor_channel_passthrough():
 
 @pytest.mark.region
 def test_age_channel_passthrough():
-    """Verify age channel is passed through correctly."""
+    """Verify age channel is normalized from uint8 (0-14) to float (0-1)."""
     preprocessor = BiomarkerPreprocessor()
 
     values = np.array([[1.0], [np.nan], [np.nan]])
-    # Pre-computed age: different from what online computation would produce
-    age = np.array([[0.5], [0.3], [0.2]])
-    mask = np.array([[1.0], [0.0], [0.0]])
-    censor = np.array([[0.0], [0.0], [0.0]])
+    # Age stored as raw days (0-14), not normalized
+    age = np.array([[7], [4], [3]], dtype=np.uint8)  # 7, 4, 3 days
+    mask = np.array([[True], [False], [False]])
+    censor = np.array([[0], [0], [0]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # Age channel should match the pre-computed age
-    np.testing.assert_array_almost_equal(encoded[:, 0, 3], age.flatten())
+    # Age channel should be normalized: 7/14=0.5, 4/14≈0.286, 3/14≈0.214
+    expected_age = np.array([7 / 14, 4 / 14, 3 / 14])
+    np.testing.assert_array_almost_equal(encoded[:, 0, 3], expected_age)
 
 
 @pytest.mark.region
-def test_log_transform_and_scaling():
-    """Verify log1p, robust scaling, and clipping are applied correctly."""
+def test_robust_scaling_only():
+    """Verify robust scaling is applied to already-log-transformed values."""
     preprocessor = BiomarkerPreprocessor()
 
     scaler_params = BiomarkerScalerParams(
@@ -151,15 +157,16 @@ def test_log_transform_and_scaling():
     )
     preprocessor.set_scaler_params(scaler_params)
 
-    values = np.array([[np.e - 1], [np.nan]])
-    mask = np.array([[1.0], [0.0]])
-    censor = np.array([[0.0], [0.0]])
-    age = np.array([[0.0], [1.0]])
+    # Values are already log1p-transformed
+    values = np.array([[1.0], [np.nan]])
+    mask = np.array([[True], [False]])
+    censor = np.array([[0], [0]], dtype=np.uint8)
+    age = np.array([[0], [1]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # log1p(e-1) = 1.0. (1.0 - 2.0) / 1.0 = -1.0
+    # (1.0 - 2.0) / 1.0 = -1.0
     # NaN value becomes 0.0, then (0.0 - 2.0) / 1.0 = -2.0
     expected_value = np.array([-1.0, -2.0])
     np.testing.assert_array_almost_equal(encoded[:, 0, 0], expected_value)
@@ -170,26 +177,30 @@ def test_zeros_below_detection_limit():
     """Verify zero values are handled correctly (below-LD)."""
     preprocessor = BiomarkerPreprocessor()
 
-    # Values with zeros (below-LD), NaN (missing), and positive (valid measurements)
-    values = np.array([[5.0], [0.0], [0.0], [np.nan], [3.0], [np.nan]])
-    # Mask: 0 for zeros (below-LD), 0 for NaN (missing), 1 for positive (valid)
-    mask = np.array([[1.0], [0.0], [0.0], [0.0], [1.0], [0.0]])
-    # Censor: 1.0 for zeros (censored at LD), 0.0 for others
-    censor = np.array([[0.0], [1.0], [1.0], [0.0], [0.0], [0.0]])
-    # Age: increments through gaps
-    age = np.array([[0.0], [1.0], [2.0], [3.0], [0.0], [1.0]]) / 14.0
+    # Values are already log1p-transformed
+    # log1p(5.0) = 1.79, log1p(3.0) = 1.39
+    # Zeros represent below-detection-limit values (already 0.0 after pipeline)
+    values = np.array([[1.79], [0.0], [0.0], [np.nan], [1.39], [np.nan]])
+    # Mask: False for zeros (below-LD), False for NaN (missing), True for positive
+    mask = np.array([[True], [False], [False], [False], [True], [False]])
+    # Censor: 1 for zeros (censored at LD), 0 for others
+    censor = np.array([[0], [1], [1], [0], [0], [0]], dtype=np.uint8)
+    # Age: raw days (0-14), increments through gaps
+    age = np.array([[0], [1], [2], [3], [0], [1]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # Value channel: zeros become 0.0 (log(0) would be -inf)
-    expected_value = np.array([np.log1p(5.0), 0.0, 0.0, 0.0, np.log1p(3.0), 0.0])
+    # Value channel: zeros and NaN become 0.0 (no measurement)
+    expected_value = np.array([1.79, 0.0, 0.0, 0.0, 1.39, 0.0])
     np.testing.assert_array_almost_equal(encoded[:, 0, 0], expected_value)
 
-    # Mask, censor, and age should pass through
-    np.testing.assert_array_equal(encoded[:, 0, 1], mask.flatten())
-    np.testing.assert_array_equal(encoded[:, 0, 2], censor.flatten())
-    np.testing.assert_array_almost_equal(encoded[:, 0, 3], age.flatten())
+    # Mask and censor should be converted to float
+    np.testing.assert_array_equal(encoded[:, 0, 1], mask.astype(float).flatten())
+    np.testing.assert_array_equal(encoded[:, 0, 2], censor.astype(float).flatten())
+    # Age should be normalized: age/14
+    expected_age = age.flatten().astype(float) / 14.0
+    np.testing.assert_array_almost_equal(encoded[:, 0, 3], expected_age)
 
 
 @pytest.mark.region
@@ -197,50 +208,56 @@ def test_multiple_regions():
     """Verify preprocessing works correctly with multiple regions."""
     preprocessor = BiomarkerPreprocessor()
 
+    # Values are already log1p-transformed
+    # log1p(1.0) = 0.69, log1p(2.0) = 1.10, log1p(3.0) = 1.39, log1p(4.0) = 1.61, log1p(5.0) = 1.79
     values = np.array(
         [
-            [1.0, 2.0, np.nan],
-            [np.nan, 3.0, 4.0],
-            [5.0, np.nan, np.nan],
+            [0.69, 1.10, np.nan],
+            [np.nan, 1.39, 1.61],
+            [1.79, np.nan, np.nan],
         ]
     )
     mask = np.array(
         [
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 0.0, 0.0],
+            [True, True, False],
+            [False, True, True],
+            [True, False, False],
         ]
     )
     censor = np.array(
         [
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 0.0, 0.0],
-        ]
+            [0, 0, 0],
+            [0, 0, 1],
+            [0, 0, 0],
+        ],
+        dtype=np.uint8,
     )
     age = np.array(
         [
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 1.0],
-        ]
+            [0, 0, 14],
+            [1, 0, 0],
+            [0, 1, 1],
+        ],
+        dtype=np.uint8,
     )
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # Value channel: check each region
+    # Value channel: NaN becomes 0.0, valid values pass through
     expected_value = np.array(
         [
-            [np.log1p(1.0), np.log1p(2.0), 0.0],
-            [0.0, np.log1p(3.0), np.log1p(4.0)],
-            [np.log1p(5.0), 0.0, 0.0],
+            [0.69, 1.10, 0.0],
+            [0.0, 1.39, 1.61],
+            [1.79, 0.0, 0.0],
         ]
     )
     np.testing.assert_array_almost_equal(encoded[:, :, 0], expected_value)
-    np.testing.assert_array_equal(encoded[:, :, 1], mask)
-    np.testing.assert_array_equal(encoded[:, :, 2], censor)
-    np.testing.assert_array_equal(encoded[:, :, 3], age)
+    np.testing.assert_array_equal(encoded[:, :, 1], mask.astype(float))
+    np.testing.assert_array_equal(encoded[:, :, 2], censor.astype(float))
+    # Age normalized to [0, 1]
+    expected_age = age.astype(float) / 14.0
+    np.testing.assert_array_almost_equal(encoded[:, :, 3], expected_age)
 
 
 @pytest.mark.region
@@ -268,19 +285,19 @@ def test_required_channels_validation():
 
 @pytest.mark.region
 def test_censor_flag_validation():
-    """Verify censor channel values are validated (0.0 or 1.0 flags)."""
+    """Verify censor channel values are validated (0, 1, or 2 flags)."""
     preprocessor = BiomarkerPreprocessor()
 
     values = np.array([[5.0], [0.0], [3.0]])
-    mask = np.array([[1.0], [0.0], [1.0]])
-    # Censor flags should be 0.0 or 1.0
-    censor = np.array([[0.0], [1.0], [0.0]])
-    age = np.array([[0.0], [1.0], [0.0]])
+    mask = np.array([[True], [False], [True]])
+    # Censor flags: 0=uncensored, 1=censored
+    censor = np.array([[0], [1], [0]], dtype=np.uint8)
+    age = np.array([[0], [1], [0]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # Verify censor flags are preserved correctly
+    # Verify censor flags are preserved correctly (as float)
     np.testing.assert_array_equal(encoded[:, 0, 2], [0.0, 1.0, 0.0])
 
 
@@ -289,11 +306,13 @@ def test_censor_alignment_with_mask():
     """Verify censored points align with mask=0 (unmeasured)."""
     preprocessor = BiomarkerPreprocessor()
 
-    # When a point is censored, mask should be 0 (no valid measurement)
+    # When a point is censored, mask should be False (no valid measurement)
     values = np.array([[5.0], [0.0], [3.0], [0.0]])
-    mask = np.array([[1.0], [0.0], [1.0], [0.0]])  # Mask 0 for censored values
-    censor = np.array([[0.0], [1.0], [0.0], [1.0]])  # Censor flag for zeros
-    age = np.array([[0.0], [1.0], [0.0], [1.0]])
+    mask = np.array(
+        [[True], [False], [True], [False]]
+    )  # Mask False for censored values
+    censor = np.array([[0], [1], [0], [1]], dtype=np.uint8)  # Censor flag for zeros
+    age = np.array([[0], [1], [0], [1]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
@@ -306,7 +325,7 @@ def test_censor_alignment_with_mask():
 
 @pytest.mark.region
 def test_clip_range():
-    """Verify values are clipped to the configured range."""
+    """Verify values are clipped to the configured range after scaling."""
     preprocessor = BiomarkerPreprocessor(clip_range=(-2.0, 2.0))
 
     scaler_params = BiomarkerScalerParams(
@@ -316,16 +335,16 @@ def test_clip_range():
     )
     preprocessor.set_scaler_params(scaler_params)
 
-    # Large positive and negative values after scaling
+    # Large positive value (already log1p-transformed)
     values = np.array([[100.0], [0.0]])
-    mask = np.array([[1.0], [0.0]])
-    censor = np.array([[0.0], [0.0]])
-    age = np.array([[0.0], [1.0]])
+    mask = np.array([[True], [False]])
+    censor = np.array([[0], [0]], dtype=np.uint8)
+    age = np.array([[0], [1]], dtype=np.uint8)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # log1p(100) ≈ 4.6, should be clipped to 2.0
+    # 100.0 should be clipped to 2.0 (upper bound)
     # 0.0 stays at 0.0
     assert encoded[0, 0, 0] == 2.0
     assert encoded[1, 0, 0] == 0.0
@@ -334,17 +353,17 @@ def test_clip_range():
 @pytest.mark.region
 def test_region_without_biomarker_data():
     """Verify regions without biomarker data get zero encoding."""
-    preprocessor = BiomarkerPreprocessor(age_max=10)
+    preprocessor = BiomarkerPreprocessor(age_max=14)
 
     values = np.array([[np.nan], [np.nan], [np.nan]])
-    mask = np.array([[0.0], [0.0], [0.0]])  # No measurements
-    censor = np.array([[0.0], [0.0], [0.0]])  # No censoring
-    age = np.array([[1.0], [1.0], [1.0]])  # Never observed (normalized to 1.0)
+    mask = np.array([[False], [False], [False]])  # No measurements
+    censor = np.array([[0], [0], [0]], dtype=np.uint8)  # No censoring
+    age = np.array([[14], [14], [14]], dtype=np.uint8)  # Never observed (max age)
     ds = _create_dataset_with_channels(values, mask=mask, censor=censor, age=age)
 
     encoded = preprocessor.preprocess_dataset(ds)
 
-    # No biomarker data: value=0, mask=0, censor=0, age=max (normalized to 1.0)
+    # No biomarker data: value=0, mask=0, censor=0, age=14/14=1.0 (normalized)
     # Shape (T, N, 4) -> (3, 1, 4)
     expected = np.array(
         [[[0.0, 0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0, 1.0]], [[0.0, 0.0, 0.0, 1.0]]],

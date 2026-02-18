@@ -5,7 +5,7 @@ This module provides preprocessing for clinical observation series (hospitalizat
 deaths, reported cases) into a unified 3-channel format suitable for model input.
 
 The 3-channel format:
-- Channel 0: Value (observation count, optionally per-100k and log1p transformed)
+- Channel 0: Value (already log1p(per-100k) transformed in preprocessing pipeline)
 - Channel 1: Mask (1.0 if observed, 0.0 if missing/interpolated)
 - Channel 2: Age (days since last observation, normalized to [0, 1])
 
@@ -20,6 +20,8 @@ import numpy as np
 import torch
 import xarray as xr
 
+from utils import dtypes as dtype_utils
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,13 +30,9 @@ class ClinicalSeriesPreprocessorConfig:
     """Configuration for ClinicalSeriesPreprocessor.
 
     Args:
-        per_100k: Whether to normalize values per 100,000 population
-        log_transform: Whether to apply log1p transform to values
         age_max: Maximum age in days for normalization (default 14)
     """
 
-    per_100k: bool = True
-    log_transform: bool = True
     age_max: int = 14
 
 
@@ -48,7 +46,7 @@ class ClinicalSeriesPreprocessor:
     Contract:
         - Input: xarray Dataset with {var_name}, {var_name}_mask, {var_name}_age
         - Output: (T, N, 3) tensor with [value, mask, age] channels
-        - Value channel is optionally per-100k normalized and log1p transformed
+        - Value channel is already log1p(per-100k) transformed from preprocessing
         - Age channel is normalized to [0, 1] range (age / age_max)
 
     Unlike CasesPreprocessor, this does NOT compute rolling mean/std since SIR-based
@@ -73,7 +71,7 @@ class ClinicalSeriesPreprocessor:
 
         Args:
             dataset: xarray Dataset containing {var_name}, {var_name}_mask, {var_name}_age
-            population: Optional population DataArray for per-100k normalization
+            population: Ignored (kept for API compatibility; values already normalized)
 
         Returns:
             (T, N, 3) tensor with [value, mask, age] channels
@@ -91,27 +89,18 @@ class ClinicalSeriesPreprocessor:
         mask = self._ensure_2d(mask_da)
         age = self._ensure_2d(age_da)
 
-        # Convert to per-100k if requested
-        if self.config.per_100k and population is not None:
-            pop_values = population.values
-            pop_values = np.where(
-                (pop_values > 0) & np.isfinite(pop_values), pop_values, np.nan
-            )
-            per_100k_factor = 100000.0 / pop_values
-            values = values * per_100k_factor
-
-        # Apply log1p transform if requested
-        if self.config.log_transform:
-            # Only transform positive values, keep non-positive as 0
-            values = np.where(values > 0, np.log1p(values), 0.0)
+        # Values are already log1p(per-100k) transformed from preprocessing pipeline
+        # Fill NaN with 0 to prevent propagation through model (mask indicates validity)
+        values = np.nan_to_num(values, nan=0.0)
 
         # Normalize age to [0, 1]
         age_normalized = np.clip(age / self.config.age_max, 0.0, 1.0)
 
-        # Stack into 3-channel tensor
-        values_t = torch.from_numpy(values).to(torch.float32)
-        mask_t = torch.from_numpy(mask).to(torch.float32)
-        age_t = torch.from_numpy(age_normalized).to(torch.float32)
+        # Stack into 3-channel tensor using centralized storage dtype
+        storage_dtype = dtype_utils.STORAGE_DTYPES["continuous"]
+        values_t = torch.from_numpy(values).to(storage_dtype)
+        mask_t = torch.from_numpy(mask).to(storage_dtype)
+        age_t = torch.from_numpy(age_normalized).to(storage_dtype)
 
         data_3ch = torch.stack([values_t, mask_t, age_t], dim=-1)
 
@@ -211,8 +200,6 @@ class ClinicalSeriesPreprocessor:
         return (
             f"ClinicalSeriesPreprocessor("
             f"var_name='{self.var_name}', "
-            f"per_100k={self.config.per_100k}, "
-            f"log_transform={self.config.log_transform}, "
             f"age_max={self.config.age_max}"
             f")"
         )

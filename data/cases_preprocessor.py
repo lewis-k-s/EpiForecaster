@@ -6,6 +6,8 @@ import pandas as pd
 import torch
 import xarray as xr
 
+from utils import dtypes as dtype_utils
+
 
 @dataclass
 class CasesPreprocessorConfig:
@@ -106,14 +108,15 @@ class CasesPreprocessor:
         )
         age_channel = (final_age / self.config.age_max).astype(np.float32)
 
-        # Stack channels: (T, N, 3) -> [value, mask, age]
-        values_t = torch.from_numpy(values).to(torch.float32)
-        mask_t = torch.from_numpy(mask).to(torch.float32)
-        age_t = torch.from_numpy(age_channel).to(torch.float32)
+        # Stack channels: (T, N, 3) -> [value, mask, age] using centralized storage dtype
+        storage_dtype = dtype_utils.STORAGE_DTYPES["continuous"]
+        values_t = torch.from_numpy(values).to(storage_dtype)
+        mask_t = torch.from_numpy(mask).to(storage_dtype)
+        age_t = torch.from_numpy(age_channel).to(storage_dtype)
         cases_3ch = torch.stack([values_t, mask_t, age_t], dim=-1)
 
-        mean_t = torch.from_numpy(rolling_mean).to(torch.float32).unsqueeze(-1)
-        std_t = torch.from_numpy(rolling_std).to(torch.float32).unsqueeze(-1)
+        mean_t = torch.from_numpy(rolling_mean).to(storage_dtype).unsqueeze(-1)
+        std_t = torch.from_numpy(rolling_std).to(storage_dtype).unsqueeze(-1)
 
         self.processed_cases = cases_3ch
         self.rolling_mean = mean_t

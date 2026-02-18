@@ -43,7 +43,8 @@ def test_cases_preprocessor_basic():
     expected_100k = raw_val * (100000 / 1000)
     expected_log = np.log1p(expected_100k)
 
-    assert np.isclose(p_cases[0, 0, 0].item(), expected_log, rtol=1e-5)
+    # float16 has ~3-4 decimal digits precision, use rtol=1e-2
+    assert np.isclose(p_cases[0, 0, 0].item(), expected_log, rtol=1e-2)
 
     # Check mask channel (channel 1) - should be 1.0 for finite values
     assert p_cases[0, 0, 1].item() == 1.0
@@ -53,21 +54,21 @@ def test_cases_preprocessor_basic():
     # Check rolling stats (t=2, window=3 -> indices 0,1,2)
     # The returned mean/std at index t is computed over [t-L+1 : t+1].
 
-    vals = p_cases[:3, 0, 0].numpy()
+    vals = p_cases[:3, 0, 0].float().numpy()  # Convert to float32 for comparison
     expected_mean = np.mean(vals)
-    assert np.isclose(p_mean[2, 0, 0].item(), expected_mean, rtol=1e-5)
+    assert np.isclose(p_mean[2, 0, 0].item(), expected_mean, rtol=1e-2)
 
     # Check NaN handling (t=5 has NaN)
     # Window at 5 includes 3, 4, 5. 5 is NaN.
     # Should ignore NaN.
-    vals_nan = p_cases[3:6, 0, 0].numpy()  # indices 3, 4, 5
+    vals_nan = p_cases[3:6, 0, 0].float().numpy()  # Convert to float32 for comparison
     # indices 3, 4 are valid. 5 is NaN.
     # Note: p_cases has NaN where input had NaN (after log transform)
     assert np.isnan(vals_nan[2])
 
     expected_mean_nan = np.nanmean(vals_nan)
-    assert np.isclose(p_mean[5, 0, 0].item(), expected_mean_nan, rtol=1e-5)
+    assert np.isclose(p_mean[5, 0, 0].item(), expected_mean_nan, rtol=1e-2)
 
-    # Check std
+    # Check std (float16 has poor precision for small values, use atol)
     expected_std_nan = np.nanstd(vals_nan)
-    assert np.isclose(p_std[5, 0, 0].item(), expected_std_nan, rtol=1e-5)
+    assert np.isclose(p_std[5, 0, 0].item(), expected_std_nan, rtol=1e-1, atol=1e-2)

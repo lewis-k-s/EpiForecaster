@@ -2,10 +2,9 @@ import pytest
 import torch
 import numpy as np
 import xarray as xr
-from unittest.mock import MagicMock, patch
-from pathlib import Path
+from unittest.mock import patch
 from models.configs import EpiForecasterConfig, DataConfig, ModelConfig, ModelVariant
-from data.epi_dataset import EpiDataset
+from data.epi_dataset import EpiDataset, collate_epiforecaster_batch
 
 
 class TestEpiDataset:
@@ -22,6 +21,8 @@ class TestEpiDataset:
 
         # Mobility (T, N, N)
         mobility = np.random.rand(T, N, N)
+        temporal_covariates = np.random.rand(T, 3)
+        temporal_covariates[3, 1] = np.nan
 
         # Population
         pop = np.ones(N) * 1000
@@ -39,6 +40,7 @@ class TestEpiDataset:
                 "cases_mask": (("date", "region_id"), hosp_mask),
                 "cases_age": (("date", "region_id"), hosp_age),
                 "mobility": (("date", "origin", "target"), mobility),
+                "temporal_covariates": (("date", "covariate"), temporal_covariates),
                 "population": (("region_id"), pop),
                 "run_id": "real",
                 "synthetic_sparsity_level": 0.0,
@@ -48,6 +50,7 @@ class TestEpiDataset:
                 "region_id": regions,
                 "origin": regions,
                 "target": regions,
+                "covariate": np.arange(3),
             },
         )
         return ds
@@ -95,7 +98,6 @@ class TestEpiDataset:
             item = ds[0]
 
             L = config.model.history_length
-            N = ds.num_nodes
 
             assert item["hosp_hist"].shape == (L, 3)
             assert item["mob_x"].shape[2] >= 9
@@ -141,3 +143,53 @@ class TestEpiDataset:
                 context_nodes=[0],
             )
             assert ds.preloaded_mobility is not None
+
+    def test_value_channels_are_finite_after_getitem(self, config, mock_xarray_dataset):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0],
+                context_nodes=[0, 1, 2],
+            )
+            item = ds[0]
+
+            assert torch.isfinite(item["hosp_hist"][..., 0]).all()
+            assert torch.isfinite(item["deaths_hist"][..., 0]).all()
+            assert torch.isfinite(item["cases_hist"][..., 0]).all()
+            assert torch.isfinite(item["bio_node"][..., 0::4]).all()
+            assert torch.isfinite(item["temporal_covariates"]).all()
+            assert torch.isfinite(item["mob_x"]).all()
+
+    def test_collate_sanitizes_non_finite_value_channels(
+        self, config, mock_xarray_dataset
+    ):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1, 2],
+            )
+            item_a = ds[0]
+            item_b = ds[1]
+
+            item_a["hosp_hist"][0, 0] = float("nan")
+            item_a["deaths_hist"][0, 0] = float("inf")
+            item_a["cases_hist"][0, 0] = float("-inf")
+            item_a["bio_node"][0, 0] = float("nan")
+            item_a["temporal_covariates"][0, 0] = float("nan")
+            item_a["mob_x"][0, 0, 0] = float("inf")
+            item_a["mob_edge_weight"][0][0] = float("nan")
+
+            batch = collate_epiforecaster_batch([item_a, item_b], require_region_index=False)
+
+            assert torch.isfinite(batch["HospHist"]).all()
+            assert torch.isfinite(batch["DeathsHist"]).all()
+            assert torch.isfinite(batch["CasesHist"]).all()
+            assert torch.isfinite(batch["BioNode"]).all()
+            assert torch.isfinite(batch["TemporalCovariates"]).all()
+            assert torch.isfinite(batch["MobBatch"].x).all()
+            assert torch.isfinite(batch["MobBatch"].edge_weight).all()

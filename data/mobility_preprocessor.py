@@ -9,6 +9,37 @@ from .preprocess.config import REGION_COORD, TEMPORAL_COORD
 logger = logging.getLogger(__name__)
 
 
+def _compute_quantiles_via_sort(
+    values: np.ndarray, quantiles: list[float]
+) -> list[float]:
+    """Compute quantiles via sorting to avoid float16 overflow in np.percentile.
+
+    np.percentile internally computes (n-1) * q which overflows float16
+    for large arrays (256M+ values). Sorting stays in the input dtype,
+    and index calculation uses Python int (unlimited precision).
+
+    Args:
+        values: 1D array of finite values (any dtype including float16)
+        quantiles: List of quantile values in [0, 1] (e.g., [0.25, 0.5, 0.75])
+
+    Returns:
+        List of quantile values as Python floats
+    """
+    if len(values) == 0:
+        raise ValueError("Cannot compute quantiles of empty array")
+
+    sorted_vals = np.sort(values)
+    n = len(sorted_vals)
+
+    results = []
+    for q in quantiles:
+        idx = int((n - 1) * q)
+        idx = max(0, min(idx, n - 1))  # Clamp to valid range
+        results.append(float(sorted_vals[idx]))
+
+    return results
+
+
 @dataclass
 class MobilityScalerParams:
     """Fitted scaler parameters for train-only mobility scaling.
@@ -23,15 +54,22 @@ class MobilityScalerParams:
 
 @dataclass
 class MobilityPreprocessorConfig:
-    """Configuration for mobility preprocessing."""
+    """Configuration for mobility preprocessing.
 
-    log_scale: bool = True
+    Note: log1p transform is applied in the preprocessing pipeline, not here.
+    This preprocessor only applies robust scaling to already-log-transformed values.
+    """
+
     clip_range: tuple[float, float] = (-8.0, 8.0)
     scale_epsilon: float = 1e-6
 
 
 class MobilityPreprocessor:
-    """Handles mobility normalization with train-only robust scaling."""
+    """Handles mobility normalization with train-only robust scaling.
+
+    Values are already log1p-transformed from the preprocessing pipeline.
+    This preprocessor applies robust scaling (median/IQR normalization) only.
+    """
 
     def __init__(self, config: MobilityPreprocessorConfig | None = None) -> None:
         self.config = config or MobilityPreprocessorConfig()
@@ -41,14 +79,14 @@ class MobilityPreprocessor:
         """Fit robust scaler on train nodes only (all timesteps).
 
         Args:
-            dataset: xarray Dataset containing mobility variable
+            dataset: xarray Dataset containing mobility variable (already log1p-transformed)
             train_nodes: List of region indices or region IDs for training split
         """
         mobility_da = dataset.mobility
         mobility_train = self._select_train_mobility(mobility_da, train_nodes, dataset)
 
         values = mobility_train.values
-        finite_values = values[np.isfinite(values)]
+        finite_values = values[np.isfinite(values)].astype(np.float32)
         if len(finite_values) == 0:
             logger.warning(
                 "No finite mobility values in train nodes. Using default scaler (center=0, scale=1). "
@@ -59,9 +97,8 @@ class MobilityPreprocessor:
             )
             return
 
-        if self.config.log_scale:
-            finite_values = np.log1p(finite_values)
-
+        # Values are already log1p-transformed from preprocessing pipeline
+        # Fit scaler directly on log-transformed values
         center = np.median(finite_values)
         q75 = np.percentile(finite_values, 75)
         q25 = np.percentile(finite_values, 25)
@@ -86,12 +123,18 @@ class MobilityPreprocessor:
         return self.transform_values(mobility_da.values)
 
     def transform_values(self, values: np.ndarray) -> np.ndarray:
-        """Apply log + robust scaling to a mobility array."""
+        """Apply robust scaling to a mobility array (already log1p-transformed).
+
+        Args:
+            values: Mobility array with log1p-transformed values
+
+        Returns:
+            Robust-scaled mobility array
+        """
         out = values.astype(np.float32, copy=True)
 
-        if self.config.log_scale:
-            out = np.log1p(out)
-
+        # Values are already log1p-transformed from preprocessing pipeline
+        # Apply robust scaling only
         if self.scaler_params and self.scaler_params.is_fitted:
             scale = max(self.scaler_params.scale, self.config.scale_epsilon)
             out = (out - self.scaler_params.center) / scale

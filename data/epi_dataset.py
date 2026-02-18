@@ -16,6 +16,7 @@ from constants import (
     EDAR_BIOMARKER_PREFIX,
     EDAR_BIOMARKER_VARIANTS,
 )
+from utils import dtypes as dtype_utils
 from utils.logging import suppress_zarr_warnings
 
 suppress_zarr_warnings()
@@ -43,6 +44,13 @@ def _ensure_3d(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _replace_non_finite(tensor: torch.Tensor) -> torch.Tensor:
+    """Replace NaN/Inf values in floating tensors with finite zeros."""
+    if not torch.is_floating_point(tensor):
+        return tensor
+    return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 class EpiDatasetItem(TypedDict):
     node_label: str
     target_node: int
@@ -56,10 +64,12 @@ class EpiDatasetItem(TypedDict):
     mob_x: torch.Tensor
     mob_edge_index: list[torch.Tensor]
     mob_edge_weight: list[torch.Tensor]
-    mob_target_node_idx: int  # Local index of target node (constant across time window)
+    mob_target_node_idx: torch.Tensor  # Local index of target node as 0-dim tensor
     population: torch.Tensor
     run_id: int | str | None
     target_region_index: int | None
+    # Temporal covariates (day-of-week sin/cos + holiday indicator)
+    temporal_covariates: torch.Tensor  # [L, 3] or [L, 0] if not available
     # Joint inference targets (log1p per-100k space)
     hosp_target: torch.Tensor  # [H] Hospitalization targets in log1p(per-100k)
     ww_target: torch.Tensor  # [H] Wastewater targets in log1p(per-100k)
@@ -132,9 +142,8 @@ class EpiDataset(Dataset):
         self.biomarker_variants = self._get_biomarker_variants()
 
         # Setup clinical series preprocessors for 3-channel [value, mask, age] format
+        # Data is already log1p(per-100k) transformed from preprocessing pipeline
         clinical_config = ClinicalSeriesPreprocessorConfig(
-            per_100k=True,
-            log_transform=True,
             age_max=14,
         )
 
@@ -147,6 +156,9 @@ class EpiDataset(Dataset):
             self._dataset,
             population=self._dataset.get("population"),
         )
+        self.precomputed_hosp_hist[..., 0] = _replace_non_finite(
+            self.precomputed_hosp_hist[..., 0]
+        )
 
         # Precompute deaths (3-channel)
         self.deaths_preprocessor = ClinicalSeriesPreprocessor(
@@ -157,6 +169,9 @@ class EpiDataset(Dataset):
             self._dataset,
             population=self._dataset.get("population"),
         )
+        self.precomputed_deaths_hist[..., 0] = _replace_non_finite(
+            self.precomputed_deaths_hist[..., 0]
+        )
 
         # Precompute reported cases (3-channel)
         self.cases_preprocessor = ClinicalSeriesPreprocessor(
@@ -166,6 +181,9 @@ class EpiDataset(Dataset):
         self.precomputed_cases_hist = self.cases_preprocessor.preprocess_dataset(
             self._dataset,
             population=self._dataset.get("population"),
+        )
+        self.precomputed_cases_hist[..., 0] = _replace_non_finite(
+            self.precomputed_cases_hist[..., 0]
         )
 
         # Precompute joint inference targets + masks (1D for loss computation).
@@ -186,9 +204,9 @@ class EpiDataset(Dataset):
         )
 
         # Setup mobility preprocessor
+        # Data is already log1p-transformed from preprocessing pipeline
         if mobility_preprocessor is None:
             mp_config = MobilityPreprocessorConfig(
-                log_scale=config.data.mobility_log_scale,
                 clip_range=config.data.mobility_clip_range,
                 scale_epsilon=config.data.mobility_scale_epsilon,
             )
@@ -212,14 +230,15 @@ class EpiDataset(Dataset):
         # Apply preprocessing/scaling once
         mobility_np = self.mobility_preprocessor.transform_values(mobility_np)
 
-        # Convert to torch tensor
-        self.preloaded_mobility = torch.from_numpy(mobility_np).to(torch.float32)
+        # Convert to torch tensor (float16 for memory efficiency)
+        self.preloaded_mobility = torch.from_numpy(mobility_np).to(
+            dtype_utils.STORAGE_DTYPES["continuous"]
+        )
+        self.preloaded_mobility = _replace_non_finite(self.preloaded_mobility)
 
         # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
         mobility_threshold = float(config.data.mobility_threshold)
         self.mobility_mask = self.preloaded_mobility >= mobility_threshold
-        # Pre-convert mask to float32 to avoid repeated .to(torch.float32) in __getitem__
-        self.mobility_mask_float = self.mobility_mask.to(torch.float32)
 
         logger.info(
             f"Mobility preloaded: {self.preloaded_mobility.shape}, "
@@ -242,7 +261,10 @@ class EpiDataset(Dataset):
             risk_np = self.mobility_preprocessor.compute_imported_risk(
                 cases_val, self.preloaded_mobility.numpy(), self.mobility_lags
             )
-            self.lagged_risk = torch.from_numpy(risk_np).to(torch.float32)
+            self.lagged_risk = torch.from_numpy(risk_np).to(
+                dtype_utils.STORAGE_DTYPES["continuous"]
+            )
+            self.lagged_risk = _replace_non_finite(self.lagged_risk)
 
         # Cache for full graphs keyed by time step (CPU tensors only)
         self._full_graph_cache: dict[int, Data] = {}
@@ -298,19 +320,41 @@ class EpiDataset(Dataset):
         if self.biomarker_variants:
             self.precomputed_biomarkers = torch.from_numpy(
                 self.biomarker_preprocessor.preprocess_dataset(self._dataset)
-            ).to(torch.float32)
+            ).to(dtype_utils.STORAGE_DTYPES["continuous"])
+            self.precomputed_biomarkers[..., 0::4] = _replace_non_finite(
+                self.precomputed_biomarkers[..., 0::4]
+            )
         else:
             T_total = len(self._dataset[TEMPORAL_COORD])
             # 4 channels per variant: value, mask, censor, age
             channel_count = max(1, len(self.biomarker_variants)) * 4
             # channels: value=0, mask=0, censor=0, age=1
             dummy = torch.zeros(
-                (T_total, self.num_nodes, channel_count), dtype=torch.float32
+                (T_total, self.num_nodes, channel_count),
+                dtype=dtype_utils.STORAGE_DTYPES["continuous"],
             )
             # For 4-channel layout [value, mask, censor, age], age is at indices 3, 7, 11, ...
             for idx in range(3, channel_count, 4):
                 dummy[:, :, idx] = 1.0
             self.precomputed_biomarkers = dummy
+
+        # Load temporal covariates if available in dataset
+        if "temporal_covariates" in self._dataset:
+            self.temporal_covariates = torch.from_numpy(
+                self._dataset["temporal_covariates"].values
+            ).to(dtype_utils.STORAGE_DTYPES["continuous"])
+            self.temporal_covariates = _replace_non_finite(self.temporal_covariates)
+            self.temporal_covariates_dim = self.temporal_covariates.shape[1]
+            logger.info(
+                f"Loaded temporal covariates: shape={self.temporal_covariates.shape}"
+            )
+        else:
+            T_total = len(self._dataset[TEMPORAL_COORD])
+            self.temporal_covariates = torch.zeros(
+                (T_total, 0), dtype=dtype_utils.STORAGE_DTYPES["continuous"]
+            )
+            self.temporal_covariates_dim = 0
+            logger.info("No temporal covariates found in dataset")
 
         self.region_embeddings = None
         if config.data.region2vec_path:
@@ -337,19 +381,22 @@ class EpiDataset(Dataset):
             ), "Static embeddings shape mismatch"
 
             self.region_embeddings = torch.as_tensor(
-                region_embeddings, dtype=torch.float32
+                region_embeddings, dtype=dtype_utils.STORAGE_DTYPES["continuous"]
             )
+            self.region_embeddings = _replace_non_finite(self.region_embeddings)
 
         self.target_nodes = target_nodes
         self._target_node_to_local_idx = {n: i for i, n in enumerate(target_nodes)}
-        self.context_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+        self.context_mask = torch.zeros(
+            self.num_nodes, dtype=dtype_utils.STORAGE_DTYPES["mask"]
+        )
         self.context_mask[target_nodes] = True
         self.context_mask[context_nodes] = True
 
         # Set dimensions
         self.time_dim_size = config.model.history_length + config.model.forecast_horizon
         self.window_stride = int(config.data.window_stride)
-        self.missing_permit = int(config.data.missing_permit)
+        self.missing_permit_map = config.data.resolve_missing_permit_map()
         self.window_starts = self._compute_window_starts()
         self._valid_window_starts_by_node = self._compute_valid_window_starts()
         self.window_starts = self._collect_valid_window_starts()
@@ -519,7 +566,7 @@ class EpiDataset(Dataset):
         regions with sentinel -1 don't have data (0.0).
         """
         # Create (N, B) tensor with 1.0 for regions with data, 0.0 otherwise
-        has_data = (self.biomarker_data_start >= 0).to(torch.float32)
+        has_data = (self.biomarker_data_start >= 0).to(torch.float16)
         return has_data.unsqueeze(-1).expand(-1, self.biomarkers_output_dim)
 
     def index_for_target_node_window(self, *, target_node: int, window_idx: int) -> int:
@@ -601,7 +648,7 @@ class EpiDataset(Dataset):
         neigh_mask[:, target_idx] = True
 
         # Apply neighborhood mask to clinical histories
-        neigh_mask_t = neigh_mask.unsqueeze(-1).to(torch.float32)
+        neigh_mask_t = neigh_mask.unsqueeze(-1).to(torch.float16)
         hosp_history = hosp_history * neigh_mask_t
         deaths_history = deaths_history * neigh_mask_t
         cases_history = cases_history * neigh_mask_t
@@ -631,7 +678,7 @@ class EpiDataset(Dataset):
         # has_data = 1.0 if current time >= region's data start, else 0.0
         # Use -1 sentinel for regions with no data
         range_end_idx = range_end - 1  # Last index of history window
-        has_data = (range_end_idx >= self.biomarker_data_start).to(torch.float32)
+        has_data = (range_end_idx >= self.biomarker_data_start).to(torch.float16)
         # Regions with sentinel -1 never have data
         has_data[self.biomarker_data_start < 0] = 0.0
 
@@ -692,8 +739,11 @@ class EpiDataset(Dataset):
         mob_edge_weight_list: list[torch.Tensor] = []
 
         # Find local index of target node (constant across window)
+        # Use tensor to defer GPU->CPU sync until actually needed
         global_to_local = self._get_global_to_local_at_time(range_start)
-        local_target_idx = int(global_to_local[target_idx].item())
+        local_target_idx_tensor = global_to_local[target_idx]
+        # Extract Python int once for indexing operations inside the loop
+        local_target_idx = int(local_target_idx_tensor.item())
 
         for t in range(L):
             global_t = range_start + t
@@ -753,6 +803,9 @@ class EpiDataset(Dataset):
 
         population = self.node_static_covariates["Pop"][target_idx]
 
+        # Extract temporal covariates for the history window
+        temporal_covariates_hist = self.temporal_covariates[range_start:range_end]
+
         return {
             "node_label": node_label,
             "target_node": target_idx,
@@ -765,9 +818,10 @@ class EpiDataset(Dataset):
             "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
             "mob_edge_index": mob_edge_index_list,  # List[Tensor(2, E)]
             "mob_edge_weight": mob_edge_weight_list,  # List[Tensor(E)]
-            "mob_target_node_idx": local_target_idx,
+            "mob_target_node_idx": local_target_idx_tensor,
             "population": population,
             "run_id": run_id,
+            "temporal_covariates": temporal_covariates_hist,  # (L, cov_dim)
             "hosp_target": hosp_target,
             "ww_target": ww_target,
             "cases_target": cases_target,
@@ -811,17 +865,18 @@ class EpiDataset(Dataset):
         return values, mask.astype(np.float32)
 
     def _precompute_wastewater_target(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build wastewater supervision target from canonical variable or EDAR proxies."""
+        """Build wastewater (biomarker) supervision target from EDAR variant channels.
+
+        Values are already log1p-transformed from preprocessing pipeline.
+        Returns masked mean across available biomarker variants.
+        """
         ds = self._dataset
         if ds is None:
             raise RuntimeError(
                 "Dataset not loaded. Call load_canonical_dataset() first."
             )
 
-        if "wastewater" in ds.data_vars:
-            return self._precompute_joint_target("wastewater", per_100k=False)
-
-        # Fallback: aggregate EDAR biomarkers into a single wastewater proxy.
+        # WW target is defined as masked mean across biomarker variants.
         ww_components = [
             "edar_biomarker_N1",
             "edar_biomarker_N2",
@@ -842,51 +897,53 @@ class EpiDataset(Dataset):
                 "No wastewater variable or EDAR components found; using all-missing WW target."
             )
             T = len(ds[TEMPORAL_COORD])
-            zeros = torch.zeros((T, self.num_nodes), dtype=torch.float32)
+            zeros = torch.zeros((T, self.num_nodes), dtype=torch.float16)
             return zeros, zeros
 
         stacked_values = np.stack(component_tensors, axis=0)  # (C, T, N)
         stacked_masks = np.stack(component_masks, axis=0).astype(
-            np.float32
+            np.float16
         )  # (C, T, N)
 
-        observed_count = stacked_masks.sum(axis=0)  # (T, N)
-        weighted_sum = (stacked_values * stacked_masks).sum(axis=0)  # (T, N)
-        combined_values = np.zeros_like(weighted_sum, dtype=np.float32)
-        np.divide(
+        valid = (stacked_masks > 0.0) & np.isfinite(stacked_values)
+        valid_count = valid.sum(axis=0).astype(np.float16)
+        weighted_sum = np.where(valid, stacked_values, 0.0).sum(axis=0)
+        combined_values = np.divide(
             weighted_sum,
-            observed_count,
-            out=combined_values,
-            where=observed_count > 0,
-        )
-        combined_mask = observed_count > 0
+            np.where(valid_count > 0.0, valid_count, 1.0),
+        ).astype(np.float16)
+        combined_mask = np.any(valid, axis=0)
 
-        combined_values = np.log1p(np.clip(combined_values, a_min=0.0, a_max=None))
-        combined_values = np.nan_to_num(combined_values, nan=0.0)
+        # Values are already log1p-transformed from preprocessing pipeline
+        # Preserve missingness in WW targets when no observed variant is available.
+        combined_values = np.where(combined_mask, combined_values, np.nan).astype(
+            np.float16
+        )
 
         logger.info(
-            "Using EDAR WW proxy target from components: %s",
+            "Using WW target from biomarker components (masked mean): %s",
             ",".join(ww_components),
         )
         return (
-            torch.from_numpy(combined_values.astype(np.float32)),
-            torch.from_numpy(combined_mask.astype(np.float32)),
+            torch.from_numpy(combined_values),
+            torch.from_numpy(combined_mask.astype(np.float16)),
         )
 
     def _precompute_joint_target(
         self,
         var_name: str,
         *,
-        per_100k: bool,
+        per_100k: bool,  # Ignored - kept for API compatibility
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Precompute joint inference target in log1p(per-100k) space.
+        """Precompute joint inference target (already log1p(per-100k) transformed).
 
         Args:
-            var_name: Name of the variable in the dataset (e.g., "hospitalizations", "wastewater")
+            var_name: Name of the variable in the dataset (e.g., "hospitalizations", "cases")
+            per_100k: Ignored - values are already log1p(per-100k) transformed from pipeline
 
         Returns:
             Tuple of:
-                - values: (T, N) tensor with log1p(per-100k) values (NaN-filled with 0)
+                - values: (T, N) tensor with log1p(per-100k) values (NaNs preserved)
                 - mask: (T, N) tensor where 1.0 indicates observed/valid target
         """
         ds = self._dataset
@@ -902,35 +959,25 @@ class EpiDataset(Dataset):
             )
             T = len(ds[TEMPORAL_COORD])
             return (
-                torch.zeros((T, self.num_nodes), dtype=torch.float32),
-                torch.zeros((T, self.num_nodes), dtype=torch.float32),
+                torch.zeros((T, self.num_nodes), dtype=torch.float16),
+                torch.zeros((T, self.num_nodes), dtype=torch.float16),
             )
 
-        # Convert to per-100k using population
-        if per_100k and "population" in ds:
-            pop_values = ds.population.values
-            pop_values = np.where(
-                (pop_values > 0) & np.isfinite(pop_values), pop_values, np.nan
-            )
-            per_100k = 100000.0 / pop_values
-            values = values * per_100k
-
-        # Apply log1p transform
-        values = np.log1p(np.clip(values, a_min=0.0, a_max=None))
+        # Values are already log1p(per-100k) transformed from preprocessing pipeline
+        # No additional transforms needed
         mask = (mask > 0) & np.isfinite(values)
+        values = np.where(np.isfinite(values), values, np.nan)
+        mask_t = torch.from_numpy(mask.astype(np.float16)).to(torch.float16)
 
-        # Handle NaN values (set to 0 for missing data)
-        values = np.nan_to_num(values, nan=0.0)
-        mask_t = torch.from_numpy(mask.astype(np.float32)).to(torch.float32)
-
-        return torch.from_numpy(values).to(torch.float32), mask_t
+        return torch.from_numpy(values.astype(np.float16)).to(torch.float16), mask_t
 
     def static_covariates(self) -> StaticCovariates:
         "Returns static covariates for the dataset. (num_nodes, num_features)"
         population_cov = self.dataset.population
         population_tensor = torch.from_numpy(population_cov.to_numpy()).to(
-            torch.float32
+            torch.float16
         )
+        population_tensor = _replace_non_finite(population_tensor)
         assert population_tensor.shape == (self.num_nodes,), (
             f"Static covariates shape mismatch: expected ({self.num_nodes},), got {population_tensor.shape}"
         )
@@ -978,55 +1025,50 @@ class EpiDataset(Dataset):
         return all_starts
 
     def _compute_valid_window_starts(self) -> dict[int, list[int]]:
-        """Compute valid window starts per target node using missingness permit.
-
-        History windows may include up to ``missing_permit`` missing values, but
-        forecast targets must be fully observed (no NaNs).
-        """
+        """Compute valid window starts per target node using mask-based permits."""
         if not self.window_starts:
             return {target_idx: [] for target_idx in self.target_nodes}
 
-        other_dims = [
-            d
-            for d in self.dataset.cases.dims
-            if d not in (TEMPORAL_COORD, REGION_COORD)
-        ]
-        cases_da = self.dataset.cases.transpose(
-            TEMPORAL_COORD, REGION_COORD, *other_dims
-        )
-        cases_np = _ensure_3d(cases_da.values)
-        if cases_np.ndim != 3:
-            raise ValueError(
-                f"Expected cases array with 2 or 3 dims, got shape {cases_np.shape}"
-            )
-
-        # Check for both finite AND non-zero values
-        # This filters out all-zero sequences which are common in synthetic data
-        has_valid_signal = (np.isfinite(cases_np) & (cases_np > 0)).any(axis=2)
-        valid_int = has_valid_signal.astype(np.int32)
-
         L = self.config.model.history_length
         H = self.config.model.forecast_horizon
-
-        cumsum = np.concatenate(
-            [
-                np.zeros((1, self.num_nodes), dtype=np.int32),
-                np.cumsum(valid_int, axis=0),
-            ],
-            axis=0,
-        )
-
-        history_counts = cumsum[L:] - cumsum[:-L]
-        target_counts = cumsum[L + H :] - cumsum[L:-H]
-
         starts = np.asarray(self.window_starts, dtype=np.int64)
-        history_counts = history_counts[starts]
-        target_counts = target_counts[starts]
 
-        history_threshold = max(0, L - self.missing_permit)
-        history_ok = history_counts >= history_threshold
-        target_ok = target_counts >= H
-        valid_mask = history_ok & target_ok
+        mask_by_target = {
+            "cases": self.precomputed_cases_mask,
+            "deaths": self.precomputed_deaths_mask,
+            "hospitalizations": self.precomputed_hosp_mask,
+            "wastewater": self.precomputed_ww_mask,
+        }
+
+        # Presentation logic:
+        # Include a window for a node if ANY target has enough observed values
+        # in both history and forecast horizon for that target.
+        valid_mask = np.zeros((len(starts), self.num_nodes), dtype=bool)
+        for target_name, target_mask_t in mask_by_target.items():
+            target_mask = target_mask_t.detach().cpu().numpy()
+            observed = (target_mask > 0).astype(np.int32)
+
+            cumsum = np.concatenate(
+                [
+                    np.zeros((1, self.num_nodes), dtype=np.int32),
+                    np.cumsum(observed, axis=0),
+                ],
+                axis=0,
+            )
+
+            history_counts = cumsum[L:] - cumsum[:-L]
+            target_counts = cumsum[L + H :] - cumsum[L:-H]
+
+            history_counts = history_counts[starts]
+            target_counts = target_counts[starts]
+
+            permit = int(self.missing_permit_map.get(target_name, 0))
+            history_threshold = max(0, L - permit)
+            target_threshold = max(0, H - permit)
+            target_valid = (history_counts >= history_threshold) & (
+                target_counts >= target_threshold
+            )
+            valid_mask |= target_valid
 
         starts_by_node: dict[int, list[int]] = {}
         for target_idx in self.target_nodes:
@@ -1221,7 +1263,7 @@ class EpiDataset(Dataset):
         if not isinstance(data, xr.DataArray):
             raise TypeError("missingness_features expects an xarray DataArray")
         mask = _ensure_3d(data.isnull().values)
-        return torch.from_numpy(mask).to(torch.float32)
+        return torch.from_numpy(mask).to(torch.float16)
 
     def calendar_features(
         self, time_index: pd.DatetimeIndex | None = None
@@ -1239,14 +1281,14 @@ class EpiDataset(Dataset):
         months = time_index.month.to_numpy()  # type: ignore[attr-defined]
         doy = time_index.dayofyear.to_numpy()  # type: ignore[attr-defined]
 
-        dow_oh = np.eye(7, dtype=np.float32)[dow]
-        month_oh = np.eye(12, dtype=np.float32)[months - 1]
+        dow_oh = np.eye(7, dtype=np.float16)[dow]
+        month_oh = np.eye(12, dtype=np.float16)[months - 1]
         doy_angle = 2 * np.pi * (doy / 365.25)
-        doy_sin = np.sin(doy_angle).astype(np.float32)[:, None]
-        doy_cos = np.cos(doy_angle).astype(np.float32)[:, None]
+        doy_sin = np.sin(doy_angle).astype(np.float16)[:, None]
+        doy_cos = np.cos(doy_angle).astype(np.float16)[:, None]
 
         features = np.concatenate([dow_oh, month_oh, doy_sin, doy_cos], axis=1)
-        return torch.from_numpy(features).to(torch.float32)
+        return torch.from_numpy(features).to(torch.float16)
 
     @classmethod
     def load_canonical_dataset(
@@ -1614,7 +1656,7 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
         big_edge_weight = torch.cat(all_edge_weights, dim=0)
     else:
         big_edge_index = torch.empty((2, 0), dtype=torch.long)
-        big_edge_weight = torch.empty((0,), dtype=torch.float32)
+        big_edge_weight = torch.empty((0,), dtype=torch.float16)
 
     # 3. Create Batch Vector
     # Maps each node to its graph index
@@ -1633,21 +1675,25 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
 
     # 5. Add custom attributes needed by model
     # Reconstruct target_node tensor: (B*L,)
+    # mob_target_node_idx can be int (legacy) or 0-dim tensor (optimized)
     target_nodes_list = []
     for item in batch:
         tgt = item["mob_target_node_idx"]
-        # Repeat L times (once per timestep graph)
-        target_nodes_list.extend([tgt] * L)
+        # Handle both int (legacy) and tensor (new optimized format)
+        if isinstance(tgt, torch.Tensor):
+            target_nodes_list.append(tgt)
+        else:
+            target_nodes_list.append(torch.tensor(tgt, dtype=torch.long))
 
-    target_node_tensor = torch.tensor(
-        target_nodes_list, dtype=torch.long, device=all_x.device
-    )
+    # Stack 0-dim tensors and repeat L times for each timestep
+    target_nodes_stacked = torch.stack(target_nodes_list).long()
+    target_node_tensor = target_nodes_stacked.repeat_interleave(L).to(all_x.device)
     mob_batch.target_node = target_node_tensor
 
     # Add target_index for model optimization
     # Since we have fixed num_nodes, start index of graph i is i * num_nodes
     # target_index[i] = start[i] + target_node[i]
-    num_graphs = len(target_nodes_list)
+    num_graphs = target_node_tensor.size(0)  # B * L graphs total
     graph_starts = torch.arange(num_graphs, device=all_x.device) * num_nodes
     mob_batch["target_index"] = graph_starts + target_node_tensor
 
@@ -1705,8 +1751,23 @@ def collate_epiforecaster_batch(
         [item["deaths_target_mask"] for item in batch], dim=0
     )
 
+    # Stack temporal covariates
+    temporal_covariates = torch.stack(
+        [item["temporal_covariates"] for item in batch], dim=0
+    )  # (B, L, cov_dim)
+
     # 2. Batch Temporal Graphs (Optimized Manual Batching)
     mob_batch = optimized_collate_graphs(batch)
+    if hasattr(mob_batch, "x") and mob_batch.x is not None:
+        mob_batch.x = _replace_non_finite(mob_batch.x)
+    if hasattr(mob_batch, "edge_weight") and mob_batch.edge_weight is not None:
+        mob_batch.edge_weight = _replace_non_finite(mob_batch.edge_weight)
+
+    hosp_hist = _replace_non_finite(hosp_hist)
+    deaths_hist = _replace_non_finite(deaths_hist)
+    cases_hist = _replace_non_finite(cases_hist)
+    bio_node = _replace_non_finite(bio_node)
+    temporal_covariates = _replace_non_finite(temporal_covariates)
 
     # Store B and T on the batch for downstream reshaping
     T = batch[0]["mob_x"].shape[0] if B > 0 else 0
@@ -1734,6 +1795,8 @@ def collate_epiforecaster_batch(
         "TargetRegionIndex": torch.tensor(target_region_indices, dtype=torch.long),
         "WindowStart": window_starts,  # (B,)
         "NodeLabels": [item["node_label"] for item in batch],
+        # Temporal covariates
+        "TemporalCovariates": temporal_covariates,  # (B, L, cov_dim)
         # Joint inference targets (log1p per-100k)
         "HospTarget": hosp_targets,  # (B, H)
         "WWTarget": ww_targets,  # (B, H)
@@ -1746,6 +1809,7 @@ def collate_epiforecaster_batch(
     }
     if all(idx is not None for idx in target_region_indices):
         out["TargetRegionIndex"] = torch.tensor(target_region_indices, dtype=torch.long)
+
     return out
 
 
