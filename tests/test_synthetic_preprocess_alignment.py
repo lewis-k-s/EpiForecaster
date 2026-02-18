@@ -82,16 +82,20 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
 
 
 def _expected_age_from_mask(mask: np.ndarray, max_age: int = 14) -> np.ndarray:
-    """Compute integer age channel from a (date, region) binary mask."""
-    age = np.full(mask.shape, max_age, dtype=np.float32)
+    """Compute integer age channel from a (date, region) binary mask.
+
+    Returns raw uint8 days (0-14), matching the new schema.
+    Age formula: current_time - last_seen_time + 1 (so observation day has age=1).
+    """
+    age = np.full(mask.shape, max_age, dtype=np.uint8)
     for region_idx in range(mask.shape[1]):
         last_seen = None
         for t in range(mask.shape[0]):
             if mask[t, region_idx] > 0:
                 last_seen = t
-                age[t, region_idx] = 1.0
+                age[t, region_idx] = 1  # Age 1 on observation day (t - t + 1 = 1)
             elif last_seen is not None:
-                age[t, region_idx] = float(min((t - last_seen) + 1, max_age))
+                age[t, region_idx] = min(t - last_seen + 1, max_age)
     return age
 
 

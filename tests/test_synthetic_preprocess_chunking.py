@@ -321,7 +321,9 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     )
     saved_mob = saved_mob.compute()
     assert not bool(saved_mob.isnull().all())
-    assert float(saved_mob.min()) >= 1.0
-    assert float(saved_mob.max()) <= 1.0
+    # Values are log1p-transformed: log1p(1.0) = 0.693
+    expected_log_value = np.log1p(1.0)
+    assert float(saved_mob.min()) >= expected_log_value - 0.01
+    assert float(saved_mob.max()) <= expected_log_value + 0.01
 
     saved.close()

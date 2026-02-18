@@ -15,6 +15,29 @@ import yaml
 
 REGION_COORD = "region_id"
 TEMPORAL_COORD = "date"
+TEMPORAL_COVARIATE_DIM = 3
+
+
+@dataclass
+class TemporalCovariatesConfig:
+    include_day_of_week: bool = True
+    include_holidays: bool = True
+    holiday_calendar_file: str | None = None
+
+    def __post_init__(self):
+        if self.include_holidays and not self.holiday_calendar_file:
+            raise ValueError(
+                "holiday_calendar_file is required when include_holidays=True"
+            )
+
+    @property
+    def output_dim(self) -> int:
+        dim = 0
+        if self.include_day_of_week:
+            dim += 2
+        if self.include_holidays:
+            dim += 1
+        return dim
 
 
 @dataclass
@@ -155,8 +178,14 @@ class PreprocessingConfig:
         }
     )
 
+    temporal_covariates: TemporalCovariatesConfig | None = None
+
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if isinstance(self.temporal_covariates, dict):
+            self.temporal_covariates = TemporalCovariatesConfig(
+                **self.temporal_covariates
+            )
         self._validate_paths()
         self._validate_temporal_parameters()
         self._validate_processing_options()
@@ -194,9 +223,7 @@ class PreprocessingConfig:
         if self.deaths_file:
             deaths_path = Path(self.deaths_file)
             if not deaths_path.exists():
-                raise ValueError(
-                    f"Deaths file does not exist: {self.deaths_file}"
-                )
+                raise ValueError(f"Deaths file does not exist: {self.deaths_file}")
 
         if self.catalonia_cases_file:
             catalonia_cases_path = Path(self.catalonia_cases_file)
@@ -327,6 +354,15 @@ class PreprocessingConfig:
         """Get summary of configuration parameters."""
         temporal_range = self.end_date - self.start_date
 
+        temporal_covariates_summary = None
+        if self.temporal_covariates:
+            temporal_covariates_summary = {
+                "include_day_of_week": self.temporal_covariates.include_day_of_week,
+                "include_holidays": self.temporal_covariates.include_holidays,
+                "holiday_calendar_file": self.temporal_covariates.holiday_calendar_file,
+                "output_dim": self.temporal_covariates.output_dim,
+            }
+
         return {
             "dataset_name": self.dataset_name,
             "temporal_range": {
@@ -360,4 +396,5 @@ class PreprocessingConfig:
             },
             "graph_options": self.graph_options,
             "validation": self.validation_options,
+            "temporal_covariates": temporal_covariates_summary,
         }

@@ -2,16 +2,20 @@
 Processor for Catalonia COVID-19 deaths data from pre-aggregated municipality CSV files.
 
 This module handles the conversion of deaths data from municipality-level
-data (pre-aggregated by polygon overlap).
+data (pre-aggregated by polygon overlap), including Kalman smoothing on a
+daily grid while preserving an observation mask for true measurement days.
 """
 
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
+from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
+from .edar_processor import _KalmanFilter
 
 
 class DeathsProcessor:
@@ -89,10 +93,91 @@ class DeathsProcessor:
 
         return aggregated
 
+    def _fit_kalman_params(self, series: pd.Series) -> tuple[float, float]:
+        """Fit Kalman process/measurement variances from positive observations."""
+        series = series.where(series > 0)
+        series_log = pd.Series(np.log(series), index=series.index)
+
+        if series_log.dropna().empty:
+            raise ValueError("No finite observations to fit Kalman params")
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = UnobservedComponents(series_log, level="local level")
+            result = model.fit(disp=False)
+
+        params = dict(zip(result.param_names, result.params, strict=False))
+        process_var = max(float(params.get("sigma2.level", 0.0)), 1e-6)
+        measurement_var = max(float(params.get("sigma2.irregular", 0.0)), 1e-6)
+        return process_var, measurement_var
+
+    def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
+        """Smooth deaths time series and interpolate missing days per municipality."""
+        print("  Applying Kalman smoothing to deaths...")
+
+        fallback_process = float(
+            self.config.validation_options.get("process_var", 0.05)
+        )
+        fallback_measure = float(
+            self.config.validation_options.get("measurement_var", 0.5)
+        )
+
+        smoothed_records: list[dict[str, object]] = []
+        for muni_code in daily_df["municipality_code"].unique():
+            muni_data = daily_df[daily_df["municipality_code"] == muni_code].copy()
+            muni_data = muni_data.set_index("date").sort_index()
+
+            # Preserve true observation mask before smoothing/interpolation.
+            observed = muni_data["deaths"].notna().to_numpy()
+            values = muni_data["deaths"].to_numpy()
+
+            fit_series = pd.Series(values, index=muni_data.index).where(
+                lambda s: s > 0
+            )
+            try:
+                process_var, measurement_var = self._fit_kalman_params(fit_series)
+            except Exception as e:
+                print(f"    ! Falling back to configured variances for {muni_code}: {e}")
+                process_var = fallback_process
+                measurement_var = fallback_measure
+
+            kf = _KalmanFilter(
+                process_var=process_var,
+                measurement_var=measurement_var,
+            )
+            filtered_values, flags = kf.filter_series(values)
+
+            for i, date in enumerate(muni_data.index):
+                smoothed_records.append(
+                    {
+                        "date": date,
+                        "municipality_code": muni_code,
+                        "deaths": float(np.exp(filtered_values[i])),
+                        "deaths_missing_flag": float(flags[i]),
+                        "deaths_observed": float(observed[i]),
+                    }
+                )
+
+        smoothed_df = pd.DataFrame(smoothed_records)
+        non_finite = (~np.isfinite(smoothed_df["deaths"])).sum()
+        if non_finite > 0:
+            print(f"  Warning: {non_finite} non-finite values after deaths smoothing")
+            smoothed_df["deaths"] = smoothed_df["deaths"].replace(
+                [np.inf, -np.inf], np.nan
+            )
+
+        print(
+            f"  Smoothing complete for {smoothed_df['municipality_code'].nunique()} municipalities"
+        )
+        return smoothed_df
+
     def _create_mask_and_age_channels(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """Create deaths mask and age channels from observation availability."""
         daily_df = daily_df.copy()
-        daily_df["deaths_mask"] = daily_df["deaths"].notna().astype(float)
+        if "deaths_observed" in daily_df.columns:
+            daily_df["deaths_mask"] = (daily_df["deaths_observed"] > 0.5).astype(float)
+        else:
+            daily_df["deaths_mask"] = daily_df["deaths"].notna().astype(float)
 
         age_series_list = []
         for muni_code in daily_df["municipality_code"].unique():
@@ -118,12 +203,14 @@ class DeathsProcessor:
     def process(
         self,
         data_dir: str | Path,
+        apply_smoothing: bool = True,
     ) -> xr.Dataset:
         """
         Process deaths data into xarray Dataset.
 
         Args:
             data_dir: Directory containing deaths CSV file
+            apply_smoothing: Whether to apply Kalman smoothing/interpolation
 
         Returns:
             xarray Dataset with deaths variable
@@ -174,7 +261,7 @@ class DeathsProcessor:
             index="date",
             columns="municipality_code",
             values="deaths",
-            aggfunc="sum",
+            aggfunc="first",
         )
 
         # Reindex to complete date range
@@ -193,6 +280,10 @@ class DeathsProcessor:
             var_name="municipality_code",
             value_name="deaths",
         )
+
+        if apply_smoothing:
+            daily_df = self._apply_kalman_smoothing(daily_df)
+
         daily_df = self._create_mask_and_age_channels(daily_df)
 
         # Pivot values/mask/age back to wide format
@@ -200,7 +291,7 @@ class DeathsProcessor:
             index="date",
             columns="municipality_code",
             values="deaths",
-            aggfunc="sum",
+            aggfunc="first",
         ).reindex(date_range)
         pivot_mask = daily_df.pivot_table(
             index="date",

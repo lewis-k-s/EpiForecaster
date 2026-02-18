@@ -23,6 +23,59 @@ class CurriculumState:
     max_sparsity: float | None = None
 
 
+class ShuffledBatchSampler(BatchSampler):
+    """Shuffle batch order each epoch while preserving contiguous in-batch indices.
+
+    This keeps `EpiDataset.sample_ordering` semantics *within* each mini-batch
+    and randomizes only the order in which those mini-batches are seen.
+    """
+
+    def __init__(
+        self,
+        dataset_size: int,
+        batch_size: int,
+        drop_last: bool = False,
+        seed: int | None = None,
+    ):
+        if dataset_size < 0:
+            raise ValueError(f"dataset_size must be >= 0, got {dataset_size}")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+
+        self.dataset_size = dataset_size
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.seed = seed
+        self._epoch = 0
+
+    def __iter__(self) -> Iterator[list[int]]:
+        full_batches = self.dataset_size // self.batch_size
+        has_tail = (self.dataset_size % self.batch_size) > 0 and not self.drop_last
+
+        batch_starts = [i * self.batch_size for i in range(full_batches)]
+        if has_tail:
+            batch_starts.append(full_batches * self.batch_size)
+
+        if self.seed is not None:
+            rng = random.Random(self.seed + self._epoch)
+        else:
+            rng = random.Random()
+        rng.shuffle(batch_starts)
+
+        for start in batch_starts:
+            stop = min(start + self.batch_size, self.dataset_size)
+            batch = list(range(start, stop))
+            if len(batch) == self.batch_size or not self.drop_last:
+                yield batch
+
+        self._epoch += 1
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self.dataset_size // self.batch_size
+        return math.ceil(self.dataset_size / self.batch_size)
+
+
 class EpidemicCurriculumSampler(BatchSampler):
     """
     Curriculum sampler that mixes synthetic and real data.

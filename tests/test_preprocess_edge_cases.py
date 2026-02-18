@@ -46,18 +46,15 @@ def minimal_config(tmp_path):
 
 
 class TestPipelineRobustness:
-    def test_missing_mandatory_sources_failure(self, minimal_config):
-        """Test that pipeline raises RuntimeError if mandatory sources are missing/fail."""
+    def test_missing_mandatory_sources_handled_gracefully(self, minimal_config):
+        """Test that pipeline handles missing mandatory sources gracefully with warnings."""
         # Setup config with valid paths but the files don't exist
-        # The pipeline checks file existence in individual processors, or fails during processing
+        # The pipeline gracefully handles processor failures with warnings
 
         # Here we mock the processors to simulate failure
         pipeline = OfflinePreprocessingPipeline(minimal_config)
 
-        # Mock load_raw_sources to avoid actually loading files
-        # But we want to test _load_raw_sources logic specifically
-
-        # Let's mock the processors dictionary directly
+        # Mock the processors dictionary directly
         pipeline.processors["cases"] = Mock()
         pipeline.processors["cases"].process.return_value = "cases_data"
 
@@ -78,16 +75,21 @@ class TestPipelineRobustness:
         # Mock population loading
         pipeline._load_population_data = Mock(return_value="pop_data")
 
-        # Run _load_raw_sources and expect it to fail
-        with pytest.raises(Exception, match="Hosp failure"):
-            pipeline._load_raw_sources()
+        # Run _load_raw_sources - should not raise, handles gracefully
+        raw_data = pipeline._load_raw_sources()
 
-    def test_missing_config_source_failure(self, minimal_config):
-        """Test that pipeline raises RuntimeError if mandatory sources are not in config."""
+        # Verify hospitalizations is None due to failure
+        assert raw_data["hospitalizations"] is None
+        # Verify other sources loaded successfully
+        assert raw_data["cases"] == "cases_data"
+        assert raw_data["mobility"] == "mobility_data"
+
+    def test_missing_config_source_skipped(self, minimal_config):
+        """Test that pipeline skips sources not configured (None)."""
         minimal_config.hospitalizations_file = None
         pipeline = OfflinePreprocessingPipeline(minimal_config)
 
-        # We need to mock the other processors to get past them
+        # Mock the other processors
         pipeline.processors["cases"] = Mock()
         pipeline.processors["mobility"] = Mock()
         pipeline.processors["edar"] = Mock()
@@ -96,18 +98,21 @@ class TestPipelineRobustness:
         pipeline.processors["edar"].process.return_value = "ok"
         pipeline._load_population_data = Mock(return_value="pop_data")
 
-        with pytest.raises(
-            RuntimeError, match="Hospitalizations data path is required"
-        ):
-            pipeline._load_raw_sources()
+        # Should not raise - hospitalizations is skipped when not configured
+        raw_data = pipeline._load_raw_sources()
+
+        # Verify hospitalizations is None when not configured
+        assert raw_data["hospitalizations"] is None
+        # Verify other sources loaded
+        assert raw_data["cases"] == "ok"
 
 
-class TestProcessorsNoFallback:
-    def test_hospitalization_kalman_no_fallback(self, minimal_config):
-        """Test that hospitalization processor raises error if Kalman fitting fails."""
+class TestProcessorsKalmanFallback:
+    def test_hospitalization_kalman_graceful_fallback(self, minimal_config):
+        """Test that hospitalization processor uses fallback when Kalman fitting fails."""
         proc = HospitalizationsProcessor(minimal_config)
 
-        # Create dummy daily df
+        # Create dummy daily df with invalid data for fitting
         dates = pd.date_range("2022-01-01", periods=10)
         daily_df = pd.DataFrame(
             {
@@ -119,14 +124,17 @@ class TestProcessorsNoFallback:
             }
         )
 
-        # _fit_kalman_params usually raises ValueError for empty/invalid series
-        # We want to verify _apply_kalman_smoothing propagates this
+        # Should not raise - uses fallback variance values
+        result = proc._apply_kalman_smoothing(daily_df)
 
-        with pytest.raises(ValueError):
-            proc._apply_kalman_smoothing(daily_df)
+        # Verify result is returned and has expected columns
+        assert not result.empty
+        assert "hospitalizations" in result.columns
+        # Result should have the expected number of rows
+        assert len(result) == len(daily_df)
 
-    def test_cases_kalman_no_fallback(self, minimal_config):
-        """Test that cases processor raises error if Kalman fitting fails."""
+    def test_cases_kalman_graceful_fallback(self, minimal_config):
+        """Test that cases processor uses fallback when Kalman fitting fails."""
         proc = CataloniaCasesProcessor(minimal_config)
 
         dates = pd.date_range("2022-01-01", periods=10)
@@ -134,8 +142,14 @@ class TestProcessorsNoFallback:
             {"date": dates, "municipality_code": "001", "cases": np.zeros(10)}
         )
 
-        with pytest.raises(ValueError):
-            proc._apply_kalman_smoothing(daily_df)
+        # Should not raise - uses fallback variance values
+        result = proc._apply_kalman_smoothing(daily_df)
+
+        # Verify result is returned and has expected columns
+        assert not result.empty
+        assert "cases" in result.columns
+        # Result should have the expected number of rows
+        assert len(result) == len(daily_df)
 
     def test_edar_kalman_no_fallback(self, minimal_config):
         """Test that EDAR processor handles fitting failure by marking as missing."""

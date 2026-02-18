@@ -226,7 +226,12 @@ class CataloniaCasesProcessor:
             fit_series = pd.Series(values, index=muni_data.index)
             fit_series = fit_series.where(fit_series > 0)
 
-            process_var, measurement_var = self._fit_kalman_params(fit_series)
+            try:
+                process_var, measurement_var = self._fit_kalman_params(fit_series)
+            except Exception as e:
+                print(f"    ! Falling back to configured variances for {muni_code}: {e}")
+                process_var = fallback_process
+                measurement_var = fallback_measure
 
             # Initialize Kalman filter with fitted params
             kf = _KalmanFilter(

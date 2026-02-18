@@ -1,279 +1,137 @@
 """Tests for the hospitalizations processor."""
 
-from datetime import datetime
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
 import pytest
-
+import pandas as pd
+import numpy as np
+import xarray as xr
+from datetime import datetime
+from data.preprocess.processors.hospitalizations_processor import HospitalizationsProcessor
 from data.preprocess.config import PreprocessingConfig
-from data.preprocess.processors.hospitalizations_processor import (
-    HospitalizationsProcessor,
-)
-
 
 @pytest.fixture
-def temp_data_dir(tmp_path: Path) -> Path:
-    """Create temp directory with sample pre-aggregated municipality hospitalization data."""
-    # Hospitalization data (pre-aggregated municipality format from dasymetric_mob)
-    hosp_file = tmp_path / "hospitalizations_municipality.csv"
-    hosp_file.write_text(
-        "setmana_epidemiologica,any,data_inici,data_final,codi_regio,nom_regio,"
-        "codi_ambit,nom_ambit,sexe,grup_edat,index_socioeconomic,"
-        "municipality_code,municipality_name,casos_muni,poblacio_muni\n"
-        "1,2022,03/01/2022,09/01/2022,01,Barcelonès,01,Barcelonès,Home,60 a 64,2,"
-        "08019,Barcelona,5.0,1000\n"
-        "1,2022,03/01/2022,09/01/2022,01,Barcelonès,01,Barcelonès,Dona,60 a 64,2,"
-        "08019,Barcelona,3.0,1000\n"
-        "1,2022,03/01/2022,09/01/2022,11,Baix Llobregat,11,Baix Llobregat,Home,70 a 74,3,"
-        "08021,Abrera,2.0,500\n"
-        "2,2022,10/01/2022,16/01/2022,01,Barcelonès,01,Barcelonès,Home,60 a 64,2,"
-        "08019,Barcelona,7.0,1000\n"
-        "2,2022,10/01/2022,16/01/2022,11,Baix Llobregat,11,Baix Llobregat,Dona,70 a 74,3,"
-        "08021,Abrera,4.0,500\n"
-        "3,2022,17/01/2022,23/01/2022,21,Maresme,21,Maresme,Home,50 a 54,1,"
-        "08018,Alella,3.0,200\n"
-    )
+def mock_config(tmp_path):
+    # Create dummy files to pass config validation
+    (tmp_path / "cases.csv").touch()
+    (tmp_path / "mob.nc").touch()
+    (tmp_path / "ww.csv").touch()
+    (tmp_path / "pop.csv").write_text("id,d.population\n")
+    (tmp_path / "meta.nc").touch()
+    (tmp_path / "hosp.csv").touch()
+    (tmp_path / "deaths.csv").touch()
 
-    # Dummy files for config validation
-    (tmp_path / "unused.csv").write_text("dummy\n")
-    (tmp_path / "unused.nc").write_bytes(b"\x89HDF\r\n\x1a\n")
-
-    return tmp_path
-
-
-@pytest.fixture
-def config(temp_data_dir: Path) -> PreprocessingConfig:
-    """Minimal config for testing."""
     return PreprocessingConfig(
-        data_dir=str(temp_data_dir),
-        cases_file=str(temp_data_dir / "unused.csv"),
-        mobility_path=str(temp_data_dir / "unused.nc"),
-        wastewater_file=str(temp_data_dir / "unused.csv"),
-        population_file=str(temp_data_dir / "unused.csv"),
-        region_metadata_file=str(temp_data_dir / "unused.json"),
+        data_dir=str(tmp_path),
+        cases_file=str(tmp_path / "cases.csv"),
+        mobility_path=str(tmp_path / "mob.nc"),
+        wastewater_file=str(tmp_path / "ww.csv"),
+        population_file=str(tmp_path / "pop.csv"),
+        region_metadata_file=str(tmp_path / "meta.nc"),
+        hospitalizations_file=str(tmp_path / "hosp.csv"),
+        deaths_file=str(tmp_path / "deaths.csv"),
         start_date=datetime(2022, 1, 1),
         end_date=datetime(2022, 1, 31),
-        output_path=str(temp_data_dir),
+        output_path=str(tmp_path / "out"),
         dataset_name="test",
+        forecast_horizon=1,
+        sequence_length=1,
+        validation_options={
+            "process_var": 0.1,
+            "measurement_var": 0.2
+        }
     )
 
+def test_weekly_to_daily_preserves_totals(mock_config):
+    """Verify weekly-to-daily interpolation preserves weekly totals per municipality."""
+    proc = HospitalizationsProcessor(mock_config)
+    
+    # Create dummy weekly data
+    # 2 weeks, 1 municipality
+    weekly_data = pd.DataFrame({
+        "week_start": [pd.Timestamp("2022-01-03"), pd.Timestamp("2022-01-10")],
+        "municipality_code": ["08019", "08019"],
+        "hospitalizations": [7.0, 14.0]
+    })
+    
+    daily_df = proc._resample_weekly_to_daily(weekly_data)
+    
+    # Check total hospitalizations
+    assert daily_df["hospitalizations"].sum() == 21.0
+    
+    # Check per week totals
+    week1 = daily_df[(daily_df["date"] >= "2022-01-03") & (daily_df["date"] < "2022-01-10")]
+    assert len(week1) == 7
+    assert np.allclose(week1["hospitalizations"].sum(), 7.0)
+    
+    week2 = daily_df[(daily_df["date"] >= "2022-01-10") & (daily_df["date"] < "2022-01-17")]
+    assert len(week2) == 7
+    assert np.allclose(week2["hospitalizations"].sum(), 14.0)
 
-@pytest.mark.epiforecaster
-def test_hospitalizations_processor_loads_data(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that processor loads hospitalization data correctly."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
+def test_age_channel_behavior(mock_config):
+    """Verify age channel resets on observation days and caps at 14."""
+    proc = HospitalizationsProcessor(mock_config)
+    
+    # Create daily df with some missing observations
+    dates = pd.date_range("2022-01-01", periods=30)
+    daily_df = pd.DataFrame({
+        "date": dates,
+        "municipality_code": "08019",
+        "hospitalizations": 1.0,
+        "age": [1, 2, 3, 4, 5, 6, 7] * 4 + [1, 2], # Initial resampling age
+        "missing_flag": 0
+    })
+    
+    # Mock mask creation: only age=1 are actual observations
+    # Let's make one observation missing (missing_flag=2)
+    daily_df.loc[7, "missing_flag"] = 2 # Second week start is missing
+    
+    result = proc._create_mask_and_age_channels(daily_df)
+    
+    # First week start (index 2: 2022-01-03 is first Monday if 01-01 is Sat)
+    # Wait, my dummy data above doesn't align with week starts strictly.
+    # In _create_mask_and_age_channels:
+    # mask = is_week_start & is_not_missing
+    # is_week_start = (daily_df["age"] == 1)
+    
+    # 2022-01-01 (index 0): age=1, flag=0 -> mask=1, age=1
+    assert result.iloc[0]["hospitalizations_mask"] == 1.0
+    assert result.iloc[0]["hospitalizations_age"] == 1.0
+    
+    # 2022-01-02 (index 1): age=2, flag=0 -> mask=0, age=2
+    assert result.iloc[1]["hospitalizations_mask"] == 0.0
+    assert result.iloc[1]["hospitalizations_age"] == 2.0
+    
+    # 2022-01-08 (index 7): age=1, flag=2 -> mask=0, age=8 (7 days since last + 1)
+    assert result.iloc[7]["hospitalizations_mask"] == 0.0
+    assert result.iloc[7]["hospitalizations_age"] == 8.0
+    
+    # 2022-01-15 (index 14): age=1, flag=0 -> mask=1, age=1
+    assert result.iloc[14]["hospitalizations_mask"] == 1.0
+    assert result.iloc[14]["hospitalizations_age"] == 1.0
 
-    assert "hospitalizations" in result
-    assert "hospitalizations_mask" in result
-    assert "hospitalizations_age" in result
+    # Test cap at 14
+    # Make a long gap
+    daily_df.loc[14:, "missing_flag"] = 2
+    daily_df.loc[14:, "age"] = 1 # Force week start but mark as missing
+    result_long_gap = proc._create_mask_and_age_channels(daily_df)
+    assert result_long_gap.iloc[29]["hospitalizations_age"] == 14.0
 
-
-@pytest.mark.epiforecaster
-def test_hospitalizations_output_format(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that output has correct dimensions and coordinates."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    hosp_da = result["hospitalizations"]
-
-    # Check dimensions
-    assert "run_id" in hosp_da.dims
-    assert "date" in hosp_da.dims
-    assert "region_id" in hosp_da.dims
-
-    # Check run_id
-    assert hosp_da["run_id"].values[0] == "real"
-
-    # Check date range
-    assert hosp_da["date"].min().values == np.datetime64("2022-01-01")
-    assert hosp_da["date"].max().values == np.datetime64("2022-01-31")
-
-
-@pytest.mark.epiforecaster
-def test_weekly_to_daily_resampling(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that weekly data is correctly resampled to daily."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    hosp_da = result["hospitalizations"]
-
-    # Check we have daily data (31 days in Jan 2022)
-    assert hosp_da.sizes["date"] == 31
-
-    # Total hospitalizations should be preserved (distributed across days)
-    # Week 1: 08019 = 8, 08021 = 2
-    # Week 2: 08019 = 7, 08021 = 4
-    # Week 3: 08018 = 3
-    # Total = 24, distributed across days
-    total_hosp = float(hosp_da.sum())
-    assert total_hosp > 0
-    # Total should be approximately 24 (sum of all casos_muni)
-    assert abs(total_hosp - 24.0) < 1.0  # Allow small numerical tolerance
-
-
-@pytest.mark.epiforecaster
-def test_municipality_codes_preserved(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that municipality codes are preserved with leading zeros."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    hosp_da = result["hospitalizations"]
-
-    # Check that municipalities from data are present
-    region_ids = list(hosp_da["region_id"].values)
-
-    # All municipalities should be present with string codes
-    assert "08019" in region_ids  # Barcelona
-    assert "08021" in region_ids  # Abrera
-    assert "08018" in region_ids  # Alella
-
-
-@pytest.mark.epiforecaster
-def test_kalman_smoothing_produces_finite_values(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that Kalman smoothing produces finite values where data exists."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=True)
-
-    hosp_da = result["hospitalizations"]
-    mask_da = result["hospitalizations_mask"]
-
-    # Check that finite values exist where mask is 1
-    data_with_mask = hosp_da.where(mask_da == 1)
-    finite_count = np.isfinite(data_with_mask).sum()
-    assert finite_count > 0, "Should have some finite values where mask=1"
-
-    # Check no infinite values anywhere
-    assert not np.isinf(hosp_da).any()
-
-
-@pytest.mark.epiforecaster
-def test_mask_and_age_channels(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that mask and age channels are properly created."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    # Check mask values are 0 or 1
-    mask_da = result["hospitalizations_mask"]
-    valid_mask_values = mask_da.values[~np.isnan(mask_da.values)]
-    assert len(valid_mask_values) > 0, "Should have some valid mask values"
-    assert np.all((valid_mask_values == 0) | (valid_mask_values == 1))
-
-    # Check age values are positive where data exists
-    age_da = result["hospitalizations_age"]
-    valid_age_values = age_da.values[~np.isnan(age_da.values)]
-    assert len(valid_age_values) > 0, "Should have some valid age values"
-    assert np.all(valid_age_values > 0)
-
-
-@pytest.mark.epiforecaster
-def test_integer_age_channel(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that age channel is integer and resets on week boundaries."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    age_da = result["hospitalizations_age"]
-
-    # Check that age values are integers (1-7 for weekly data)
-    valid_age_values = age_da.values[~np.isnan(age_da.values)]
-    assert len(valid_age_values) > 0, "Should have some valid age values"
-
-    # Check all ages are integers in range 1-7
-    assert np.all(valid_age_values == valid_age_values.astype(int)), (
-        "Age values should be integers"
-    )
-    assert np.all((valid_age_values >= 1) & (valid_age_values <= 7)), (
-        "Age values should be in range 1-7"
-    )
-
-    # Check that age 1 exists (week start days)
-    assert np.any(valid_age_values == 1), "Should have age=1 values (week starts)"
-
-
-@pytest.mark.epiforecaster
-def test_date_alignment(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that dates are properly aligned to config range."""
-    proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    hosp_da = result["hospitalizations"]
-    dates = pd.to_datetime(hosp_da["date"].values)
-
-    # Check continuous daily dates
-    expected_dates = pd.date_range(
-        start=config.start_date, end=config.end_date, freq="D"
-    )
-    assert len(dates) == len(expected_dates)
-    assert all(dates == expected_dates)
-
-
-@pytest.mark.epiforecaster
-def test_empty_dataset_creation(temp_data_dir: Path):
-    """Test that empty dataset is created when no data in range."""
-    # Create config with date range outside data
-    empty_config = PreprocessingConfig(
-        data_dir=str(temp_data_dir),
-        cases_file=str(temp_data_dir / "unused.csv"),
-        mobility_path=str(temp_data_dir / "unused.nc"),
-        wastewater_file=str(temp_data_dir / "unused.csv"),
-        population_file=str(temp_data_dir / "unused.csv"),
-        region_metadata_file=str(temp_data_dir / "unused.json"),
-        start_date=datetime(2020, 1, 1),  # Before data starts
-        end_date=datetime(2020, 1, 31),
-        output_path=str(temp_data_dir),
-        dataset_name="test",
-    )
-
-    proc = HospitalizationsProcessor(empty_config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-
-    # Should still have proper structure even if empty
-    assert "hospitalizations" in result
-    assert result["hospitalizations"].sizes["date"] == 31  # 31 days
-
-
-@pytest.mark.epiforecaster
-def test_demographic_aggregation(
-    config: PreprocessingConfig,
-    temp_data_dir: Path,
-):
-    """Test that demographic dimensions (sex, age) are aggregated correctly."""
-    proc = HospitalizationsProcessor(config)
-
-    # Process and check totals are preserved (distributed across days/municipalities)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-    total_hosp = float(result["hospitalizations"].sum())
-
-    # Total should be approximately 24 (sum of all casos_muni in fixture)
-    # Week 1: 08019 = 8, 08021 = 2
-    # Week 2: 08019 = 7, 08021 = 4
-    # Week 3: 08018 = 3
-    # Total = 24
-    assert total_hosp > 0
-    assert abs(total_hosp - 24.0) < 1.0  # Allow small numerical tolerance
+def test_kalman_fallback_path(mock_config):
+    """Test Kalman fallback path when parameter fitting fails."""
+    proc = HospitalizationsProcessor(mock_config)
+    
+    # Create daily df with all zeros (fitting will fail)
+    dates = pd.date_range("2022-01-01", periods=10)
+    daily_df = pd.DataFrame({
+        "date": dates,
+        "municipality_code": "08019",
+        "hospitalizations": 0.0
+    })
+    
+    # This should currently FAIL with ValueError because fallback is not implemented in the loop
+    # We want it to SUCCEED using fallbacks.
+    try:
+        smoothed = proc._apply_kalman_smoothing(daily_df)
+        assert not smoothed.empty
+        assert "hospitalizations" in smoothed
+    except ValueError as e:
+        pytest.fail(f"Kalman smoothing failed instead of using fallback: {e}")

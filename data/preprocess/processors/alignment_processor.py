@@ -48,13 +48,16 @@ class AlignmentProcessor:
 
     @staticmethod
     def _compute_age_from_mask(mask: xr.DataArray, max_age: int = 14) -> xr.DataArray:
-        """Compute integer age channel from binary observation mask."""
+        """Compute integer age channel from binary observation mask.
+
+        Returns uint8 array with values 0-14 (days since last observation).
+        """
         if TEMPORAL_COORD not in mask.dims:
             raise ValueError(f"Mask must include '{TEMPORAL_COORD}' dimension")
 
-        mask_binary = xr.where(mask > 0, 1.0, 0.0)
+        mask_binary = xr.where(mask > 0, 1, 0)
         time_indices = xr.DataArray(
-            np.arange(mask_binary.sizes[TEMPORAL_COORD], dtype=np.float32),
+            np.arange(mask_binary.sizes[TEMPORAL_COORD], dtype=np.int32),
             dims=[TEMPORAL_COORD],
             coords={TEMPORAL_COORD: mask_binary[TEMPORAL_COORD]},
         )
@@ -64,9 +67,9 @@ class AlignmentProcessor:
         valid_history = ~np.isnan(last_seen_filled)
 
         current_time, _ = xr.broadcast(time_indices, mask_binary)
-        current_age = current_time - last_seen_filled + 1.0
+        current_age = current_time - last_seen_filled + 1
         final_age = xr.where(valid_history, np.minimum(current_age, max_age), max_age)
-        return final_age.transpose(*mask.dims).astype(np.float32)
+        return final_age.transpose(*mask.dims).astype(np.uint8)
 
     def align_datasets(
         self,
@@ -194,12 +197,12 @@ class AlignmentProcessor:
         # Align hospitalizations if provided
         if hospitalizations_data is not None:
             hosp_final = hospitalizations_data.reindex({REGION_COORD: common_regions})
-            # Build a stable mask first, then derive age from the mask to ensure consistency.
+            # Preserve missingness signal before zero-filling values.
             if "hospitalizations_mask" in hosp_final.data_vars:
-                hosp_mask = hosp_final["hospitalizations_mask"].fillna(0.0)
+                hosp_mask = hosp_final["hospitalizations_mask"].fillna(False)
             else:
-                hosp_mask = xr.where(hosp_final["hospitalizations"].notnull(), 1.0, 0.0)
-            hosp_final["hospitalizations_mask"] = xr.where(hosp_mask > 0, 1.0, 0.0)
+                hosp_mask = hosp_final["hospitalizations"].notnull()
+            hosp_final["hospitalizations_mask"] = hosp_mask
             hosp_final["hospitalizations_age"] = self._compute_age_from_mask(
                 hosp_final["hospitalizations_mask"]
             )
@@ -211,28 +214,25 @@ class AlignmentProcessor:
             deaths_final = deaths_data.reindex({REGION_COORD: common_regions})
             # Preserve missingness signal before zero-filling values.
             if "deaths_mask" in deaths_final.data_vars:
-                deaths_mask = deaths_final["deaths_mask"].fillna(0.0)
+                deaths_mask = deaths_final["deaths_mask"].fillna(False)
             else:
-                deaths_mask = xr.where(deaths_final["deaths"].notnull(), 1.0, 0.0)
-            deaths_final["deaths_mask"] = xr.where(deaths_mask > 0, 1.0, 0.0)
+                deaths_mask = deaths_final["deaths"].notnull()
+            deaths_final["deaths_mask"] = deaths_mask
             deaths_final["deaths_age"] = self._compute_age_from_mask(
                 deaths_final["deaths_mask"]
             )
-            # Do NOT fill deaths values with 0.0 - let them stay NaN so downstream dataset
-            # can properly differentiate between "observed zero" and "missing".
-            # The ClinicalSeriesPreprocessor handles NaNs correctly.
         else:
             deaths_final = None
 
         # Fill mask/censor/age channels with proper defaults for regions without EDAR data
-        # Mask: 0.0 (no measurement), Censor: 0.0 (not censored), Age: 1.0 (max age)
+        # Mask: False (no measurement), Censor: 0 (not censored), Age: 14 (max age)
         for var_name in edar_final.data_vars:
             if var_name.endswith("_mask"):
-                edar_final[var_name] = edar_final[var_name].fillna(0.0)
+                edar_final[var_name] = edar_final[var_name].fillna(False)
             elif var_name.endswith("_censor"):
-                edar_final[var_name] = edar_final[var_name].fillna(0.0)
+                edar_final[var_name] = edar_final[var_name].fillna(0)
             elif var_name.endswith("_age"):
-                edar_final[var_name] = edar_final[var_name].fillna(1.0)
+                edar_final[var_name] = edar_final[var_name].fillna(14)
 
         # Compute biomarker data start offset for each (run_id, region) pair
         # For each pair, find the first time index where biomarker data > 0

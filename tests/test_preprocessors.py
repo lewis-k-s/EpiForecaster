@@ -2,7 +2,7 @@ import pytest
 import torch
 import numpy as np
 import xarray as xr
-from unittest.mock import MagicMock
+import pandas as pd
 from data.clinical_series_preprocessor import (
     ClinicalSeriesPreprocessor,
     ClinicalSeriesPreprocessorConfig,
@@ -11,16 +11,21 @@ from data.cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig
 
 
 class TestClinicalSeriesPreprocessor:
-    """Tests for ClinicalSeriesPreprocessor."""
+    """Tests for ClinicalSeriesPreprocessor.
+
+    Note: Clinical data is already log1p(per-100k) transformed from preprocessing pipeline.
+    The preprocessor only normalizes age to [0,1] and stacks channels.
+    """
 
     @pytest.fixture
     def mock_dataset(self):
-        # Create a dummy xarray Dataset
+        # Create a dummy xarray Dataset with already log1p(per-100k) transformed values
         times = pd.date_range("2020-01-01", periods=10)
         regions = [0, 1]
 
-        # (Time, Region)
-        values = np.random.rand(10, 2).astype(np.float32)
+        # Values are already log1p(per-100k) transformed
+        # e.g., typical range might be [0, 10] after log1p transform
+        values = np.random.rand(10, 2).astype(np.float32) * 5.0
         mask = (values > 0.5).astype(np.float32)
         age = np.zeros_like(values)  # Simplified
 
@@ -33,6 +38,7 @@ class TestClinicalSeriesPreprocessor:
             coords={"date": times, "region_id": regions},
         )
 
+        # Population is no longer used for transforms (data is already transformed)
         population = xr.DataArray(
             np.array([1000, 2000]), dims="region_id", coords={"region_id": regions}
         )
@@ -41,7 +47,7 @@ class TestClinicalSeriesPreprocessor:
 
     def test_preprocess_shapes(self, mock_dataset):
         ds, pop = mock_dataset
-        config = ClinicalSeriesPreprocessorConfig(per_100k=False, log_transform=False)
+        config = ClinicalSeriesPreprocessorConfig()
         processor = ClinicalSeriesPreprocessor(config, var_name="hosp")
 
         output = processor.preprocess_dataset(ds, population=pop)
@@ -49,24 +55,24 @@ class TestClinicalSeriesPreprocessor:
         # Output should be (T, N, 3)
         assert output.shape == (10, 2, 3)
         # Channels: value, mask, age
+        # Output is float16, convert to float32 for comparison
+        output_float = output.float()
         assert torch.allclose(
-            output[..., 1], torch.from_numpy(ds.hosp_mask.values).float()
+            output_float[..., 1], torch.from_numpy(ds.hosp_mask.values).float()
         )
 
-    def test_transforms(self, mock_dataset):
+    def test_values_passthrough(self, mock_dataset):
+        """Verify values pass through unchanged (already log1p per-100k transformed)."""
         ds, pop = mock_dataset
-        # Enable transforms
-        config = ClinicalSeriesPreprocessorConfig(per_100k=True, log_transform=True)
+        config = ClinicalSeriesPreprocessorConfig()
         processor = ClinicalSeriesPreprocessor(config, var_name="hosp")
 
         output = processor.preprocess_dataset(ds, population=pop)
 
-        # Check logic manually for one point
+        # Values should pass through unchanged (already log1p transformed)
         val_raw = ds.hosp.values[0, 0]
-        pop_val = pop.values[0]
-        expected = np.log1p(val_raw * 100000 / pop_val)
-
-        assert np.isclose(output[0, 0, 0].item(), expected, atol=1e-5)
+        # float16 has ~3-4 decimal digits precision, use rtol=1e-2
+        assert np.isclose(output[0, 0, 0].item(), val_raw, rtol=1e-2)
 
     def test_missing_variable_error(self, mock_dataset):
         ds, pop = mock_dataset
@@ -129,6 +135,3 @@ class TestCasesPreprocessor:
         assert norm_window.shape == (8, 2, 3)
         assert mean.shape == (2, 1)
         assert std.shape == (2, 1)
-
-
-import pandas as pd

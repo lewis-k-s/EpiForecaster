@@ -125,12 +125,20 @@ def test_deaths_processor_municipality_level(
     assert result.deaths.dims == ("date", "region_id")
     assert result.deaths.sizes["date"] == 15  # full date range (reindexed)
     assert result.deaths.sizes["region_id"] == 2  # 2 municipalities
-    # Total deaths: 2.0 + 1.0 + 3.0 = 6.0
-    assert result.deaths.sum() == 6.0
-    # Check specific municipality
-    assert result.deaths.sel(region_id="08019").sum() == 5.0  # 2.0 + 3.0
-    assert result.deaths.sel(region_id="08021").sum() == 1.0
+    # Kalman smoothing/interpolation should produce finite daily trajectories.
+    assert result.deaths.notnull().all()
+    assert (result.deaths >= 0).all()
     # Mask tracks true observations only (3 observed rows from fixture)
     assert float(result.deaths_mask.sum()) == 3.0
     # Age channel should include staleness beyond observation days
     assert float(result.deaths_age.max()) > 1.0
+
+
+@pytest.mark.region
+def test_deaths_processor_can_disable_smoothing(
+    config: PreprocessingConfig, temp_data_dir: Path
+):
+    """Raw mode should preserve sparsity (NaNs on unobserved days)."""
+    proc = DeathsProcessor(config)
+    result = proc.process(temp_data_dir, apply_smoothing=False)
+    assert result.deaths.isnull().any()

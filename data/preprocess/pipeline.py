@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from utils import dtypes as dtype_utils
 from .config import REGION_COORD, PreprocessingConfig
 from .utils import load_csv_with_string_ids
 from .processors.alignment_processor import AlignmentProcessor
@@ -22,6 +23,7 @@ from .processors.edar_processor import EDARProcessor
 from .processors.hospitalizations_processor import HospitalizationsProcessor
 from .processors.mobility_processor import MobilityProcessor
 from .processors.synthetic_processor import SyntheticProcessor
+from .processors.temporal_covariates_processor import TemporalCovariatesProcessor
 
 
 class OfflinePreprocessingPipeline:
@@ -65,6 +67,12 @@ class OfflinePreprocessingPipeline:
         # Initialize hospitalizations processor if hospitalizations file is provided
         if self.config.hospitalizations_file:
             self.processors["hospitalizations"] = HospitalizationsProcessor(self.config)
+
+        # Initialize temporal covariates processor if configured
+        if self.config.temporal_covariates is not None:
+            self.processors["temporal_covariates"] = TemporalCovariatesProcessor(
+                self.config
+            )
 
         # Initialize state tracking
         self.pipeline_state = {
@@ -154,6 +162,15 @@ class OfflinePreprocessingPipeline:
                 alignment_result[REGION_COORD].values,
             )
             alignment_result["edar_has_source"] = edar_region_mask
+
+            # Add temporal covariates if configured
+            if "temporal_covariates" in self.processors:
+                temporal_covariates_da = self.processors["temporal_covariates"].process(
+                    start_date=alignment_result["date"].values[0],
+                    end_date=alignment_result["date"].values[-1],
+                )
+                alignment_result["temporal_covariates"] = temporal_covariates_da
+                print("  ✓ Added temporal covariates to dataset")
 
             # # Store alignment report in pipeline state
             # self.pipeline_state["alignment_report"] = alignment_report
@@ -257,35 +274,37 @@ class OfflinePreprocessingPipeline:
         except Exception as e:
             raise RuntimeError(f"Failed to process population data: {str(e)}") from e
 
-        # Process hospitalizations data (required)
-        if not self.config.hospitalizations_file:
-            raise RuntimeError(
-                "Hospitalizations data path is required but not configured"
-            )
-
-        if "hospitalizations" in self.processors:
+        # Process hospitalizations data (optional)
+        if self.config.hospitalizations_file and "hospitalizations" in self.processors:
             print("Processing hospitalizations data...")
-            # HospitalizationsProcessor expects data_dir, extracts directory from file path
-            hospitalizations_dir = str(Path(self.config.hospitalizations_file).parent)
-            hospitalizations_data = self.processors["hospitalizations"].process(
-                hospitalizations_dir
-            )
-            raw_data["hospitalizations"] = hospitalizations_data
+            try:
+                # HospitalizationsProcessor expects data_dir, extracts directory from file path
+                hospitalizations_dir = str(
+                    Path(self.config.hospitalizations_file).parent
+                )
+                hospitalizations_data = self.processors["hospitalizations"].process(
+                    hospitalizations_dir
+                )
+                raw_data["hospitalizations"] = hospitalizations_data
+            except Exception as e:
+                print(f"  ! Warning: Failed to process hospitalizations data: {str(e)}")
+                raw_data["hospitalizations"] = None
         else:
-            raise RuntimeError("Hospitalizations processor not initialized")
+            raw_data["hospitalizations"] = None
 
-        # Process deaths data (required)
-        if not self.config.deaths_file:
-            raise RuntimeError("Deaths data path is required but not configured")
-
-        if "deaths" in self.processors:
+        # Process deaths data (optional)
+        if self.config.deaths_file and "deaths" in self.processors:
             print("Processing deaths data...")
-            # DeathsProcessor expects data_dir
-            deaths_dir = str(Path(self.config.deaths_file).parent)
-            deaths_data = self.processors["deaths"].process(deaths_dir)
-            raw_data["deaths"] = deaths_data
+            try:
+                # DeathsProcessor expects data_dir
+                deaths_dir = str(Path(self.config.deaths_file).parent)
+                deaths_data = self.processors["deaths"].process(deaths_dir)
+                raw_data["deaths"] = deaths_data
+            except Exception as e:
+                print(f"  ! Warning: Failed to process deaths data: {str(e)}")
+                raw_data["deaths"] = None
         else:
-            raise RuntimeError("Deaths processor not initialized")
+            raw_data["deaths"] = None
 
         print()
         return raw_data
@@ -389,6 +408,97 @@ class OfflinePreprocessingPipeline:
             rechunked_dict[var_name] = var.chunk(chunks)
 
         rechunked_dataset = xr.Dataset(rechunked_dict, coords=aligned_dataset.coords)
+
+        # Apply static transforms before dtype conversion to prevent float16 overflow
+        # All continuous series are log1p-transformed; clinical series also get per_100k
+        print("Applying static transforms (log1p, per_100k)...")
+        population = rechunked_dataset.get("population")
+
+        for var_name in list(rechunked_dataset.data_vars):
+            var = rechunked_dataset[var_name]
+
+            # Clinical series: log1p(per_100k)
+            if var_name in ("cases", "hospitalizations", "deaths"):
+                if population is not None:
+                    # Apply per_100k then log1p using xarray operations (preserves chunks)
+                    pop_values = population.where(
+                        (population > 0) & np.isfinite(population)
+                    )
+                    per_100k_factor = 100000.0 / pop_values
+                    # Broadcast and multiply
+                    values_per_100k = var * per_100k_factor
+                    transformed = np.log1p(values_per_100k.clip(min=0))
+                    rechunked_dataset[var_name] = transformed
+                    print(f"  {var_name}: log1p(per_100k) applied")
+                else:
+                    # No population - just log1p
+                    transformed = np.log1p(var.clip(min=0))
+                    rechunked_dataset[var_name] = transformed
+                    print(f"  {var_name}: log1p applied (no population for per_100k)")
+
+            # Mobility: log1p only
+            elif var_name == "mobility":
+                transformed = np.log1p(var.clip(min=0))
+                rechunked_dataset[var_name] = transformed
+                print(f"  {var_name}: log1p applied")
+
+            # Biomarker values (not _mask, _censor, _age): log1p only
+            elif var_name.startswith("edar_biomarker_") and not var_name.endswith(
+                ("_mask", "_censor", "_age")
+            ):
+                transformed = np.log1p(var.clip(min=0))
+                rechunked_dataset[var_name] = transformed
+                print(f"  {var_name}: log1p applied")
+
+        # Add metadata attributes to indicate transforms applied
+        rechunked_dataset = rechunked_dataset.assign_attrs(
+            log_transformed=True,
+            population_norm=True,
+        )
+
+        # Convert float64 to float16 to reduce storage and memory usage
+        # Uses centralized dtype constants from utils/dtypes.py
+        print("Optimizing dtypes for storage efficiency...")
+        converted_dict = {}
+        for var_name, var in rechunked_dataset.data_vars.items():
+            # Default: keep original dtype
+            new_var = var
+            old_dtype = var.dtype
+
+            # Suffix-based rules take precedence (check these FIRST)
+            # Masks: binary 0/1 -> bool (1 byte)
+            if var_name.endswith("_mask"):
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["mask"])
+                print(f"  {var_name}: {old_dtype} -> bool")
+            # Age channels: 0-14 -> uint8 (1 byte)
+            elif var_name.endswith("_age"):
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["age"])
+                print(f"  {var_name}: {old_dtype} -> uint8")
+            # Censor flags: 0/1/2 -> uint8 (1 byte)
+            elif var_name.endswith("_censor"):
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["censor"])
+                print(f"  {var_name}: {old_dtype} -> uint8")
+            # Named variables with specific dtypes
+            elif var_name == "biomarker_data_start":
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["index"])
+                print(f"  {var_name}: {old_dtype} -> int16")
+            elif var_name in ("edar_has_source", "valid_targets"):
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["mask"])
+                print(f"  {var_name}: {old_dtype} -> bool")
+            elif var_name == "population":
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["population"])
+                print(f"  {var_name}: {old_dtype} -> int32")
+            # Temporal covariates: float32 -> float16 for consistency
+            elif var_name == "temporal_covariates" and var.dtype == np.float32:
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
+                print(f"  {var_name}: float32 -> float16")
+            # Generic float64 -> float16 (continuous values) - check LAST
+            elif var.dtype == np.float64:
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
+                print(f"  {var_name}: float64 -> float16")
+
+            converted_dict[var_name] = new_var
+        rechunked_dataset = xr.Dataset(converted_dict, coords=rechunked_dataset.coords)
 
         # Clear conflicting encodings from data variables and coordinates.
         # Variables from source zarr files retain v3-specific encodings that

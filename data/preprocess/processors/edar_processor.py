@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 import xarray as xr
 from scipy.stats import norm
+from statsmodels.tsa.statespace.kalman_filter import KalmanFilter as SMKalmanFilter
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, PreprocessingConfig
@@ -34,6 +35,10 @@ class _TobitKalman:
         self.state = 0.0
         self.state_var = 1.0
         self.initialized = False
+        self._last_actual_value: float | None = None
+        self._second_last_actual_value: float | None = None
+        self._actual_count: int = 0
+        self._consecutive_missing: int = 0
 
     def _initialize(self, first_log_value: float) -> None:
         self.state = float(first_log_value)
@@ -60,10 +65,24 @@ class _TobitKalman:
             limit_valid = np.isfinite(limit) and limit > 0
 
             if not np.isfinite(value):
-                # Missing observation
-                z_eff = pred_state
-                r_eff = 1e9
-                flag = 2
+                # Missing observation - apply drift extrapolation if we have enough actual measurements
+                if self.initialized and self._actual_count >= 2:
+                    # Compute slope from actual measurements only (not imputed values)
+                    slope = self._last_actual_value - self._second_last_actual_value
+                    # Decaying momentum: 0.5, 0.25, 0.125, ...
+                    self._consecutive_missing += 1
+                    momentum = 0.5**self._consecutive_missing
+                    self.state = pred_state + slope * momentum
+                    # Uncertainty grows faster during extrapolation gaps
+                    self.state_var = pred_var + self.process_var * 2.0
+                else:
+                    # Not enough actual measurements - stay flat (prediction only)
+                    self.state = pred_state
+                    self.state_var = pred_var
+
+                filtered.append(float(self.state))
+                flags.append(2)
+                continue
             elif limit_valid and value <= limit:
                 if not self.initialized:
                     self._initialize(float(np.log(limit) - 0.5))
@@ -92,6 +111,12 @@ class _TobitKalman:
             k_gain = pred_var / s
             self.state = pred_state + k_gain * (z_eff - pred_state)
             self.state_var = (1 - k_gain) * pred_var
+
+            # Track actual measurements for drift extrapolation
+            self._second_last_actual_value = self._last_actual_value
+            self._last_actual_value = float(self.state)
+            self._actual_count += 1
+            self._consecutive_missing = 0  # Reset decay counter on actual measurement
 
             filtered.append(float(self.state))
             flags.append(flag)
@@ -139,43 +164,61 @@ class _KalmanFilter:
             Tuple of (filtered_values, flags)
             flags: 0=normal, 2=missing
         """
-        filtered: list[float] = []
-        flags: list[int] = []
-
+        values = np.asarray(values, dtype=float).reshape(-1)
         finite_mask = np.isfinite(values) & (values > 0)
+        flags = np.where(finite_mask, 0, 2).astype(int).tolist()
+
         if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0]))
+            first_value = float(np.log(values[finite_mask][0] + 1e-9))
             self._initialize(first_value)
 
-        for value in values:
-            # Predict
-            pred_state = self.state
-            pred_var = self.state_var + self.process_var
+        log_values = np.full(values.shape, np.nan, dtype=float)
+        log_values[finite_mask] = np.log(values[finite_mask] + 1e-9)
 
-            if not np.isfinite(value) or value <= 0:
-                # Missing observation - use prediction only
-                z_eff = pred_state
-                r_eff = 1e9
-                flag = 2
-            else:
-                # Normal observation
-                log_value = float(np.log(value + 1e-9))
-                if not self.initialized:
-                    self._initialize(log_value)
-                    pred_state = self.state
-                z_eff = log_value
-                r_eff = self.measurement_var
-                flag = 0
+        model = SMKalmanFilter(k_endog=1, k_states=1, k_posdef=1)
+        model.bind(log_values)
+        model.design[:] = 1.0
+        model.transition[:] = 1.0
+        model.selection[:] = 1.0
+        model.state_cov[:] = max(self.process_var, 1e-12)
+        model.obs_cov[:] = max(self.measurement_var, 1e-12)
+        model.initialize_known(
+            np.array([float(self.state)], dtype=float),
+            np.array([[float(max(self.state_var, 1e-12))]], dtype=float),
+        )
 
-            # Update
-            s = pred_var + r_eff
-            k_gain = pred_var / s if s > 0 else 0.0
-            self.state = pred_state + k_gain * (z_eff - pred_state)
-            self.state_var = (1 - k_gain) * pred_var
+        result = model.filter()
+        filtered_state = result.filtered_state[0].copy()
+        filtered_cov = result.filtered_state_cov[0, 0]
 
-            filtered.append(float(self.state))
-            flags.append(flag)
+        # Apply drift extrapolation for gaps
+        # Find indices of actual measurements
+        actual_indices = np.where(finite_mask)[0]
 
+        if len(actual_indices) >= 2:
+            # Process each gap - use slope from last two actual measurements BEFORE the gap
+            consecutive_missing = 0
+            for i in range(len(filtered_state)):
+                if flags[i] == 2:  # Missing
+                    # Find the last two actual measurements before this point
+                    prior_actuals = actual_indices[actual_indices < i]
+                    if len(prior_actuals) >= 2:
+                        prev_idx = prior_actuals[-1]
+                        prev_prev_idx = prior_actuals[-2]
+                        slope = filtered_state[prev_idx] - filtered_state[prev_prev_idx]
+                        # Decaying momentum: 0.5, 0.25, 0.125, ...
+                        consecutive_missing += 1
+                        momentum = 0.5**consecutive_missing
+                        filtered_state[i] = filtered_state[i - 1] + slope * momentum
+                else:
+                    # Reset decay counter on actual measurement
+                    consecutive_missing = 0
+
+        if filtered_state.size > 0:
+            self.state = float(filtered_state[-1])
+            self.state_var = float(filtered_cov[-1])
+
+        filtered = filtered_state.astype(float).tolist()
         return filtered, flags
 
 
@@ -351,18 +394,18 @@ class EDARProcessor:
     ) -> xr.DataArray:
         """Compute age channel (days since last measurement).
 
-        Age is normalized to [0, 1] with max_age days as the maximum.
-        Leading NaNs (before first measurement) get age = 1.0.
+        Age is stored as raw integer days (0-14), not normalized.
+        Leading NaNs (before first measurement) get age = max_age (14).
 
         run_id dimension is ALWAYS present (synthetic: multiple runs, real: run_id="real").
 
         Args:
             mask: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
                   where 1.0 indicates a valid observation.
-            max_age: Maximum age in days for normalization
+            max_age: Maximum age in days
 
         Returns:
-            DataArray with normalized age values [0, 1]
+            DataArray with raw integer age values (0-14), dtype uint8
         """
         assert "run_id" in mask.dims, "run_id dimension is required"
         return self._compute_age_core(mask, max_age)
@@ -379,10 +422,10 @@ class EDARProcessor:
 
         Args:
             mask: DataArray with shape (run_id, date, region_id) or (run_id, date, region_id, variant)
-            max_age: Maximum age in days for normalization
+            max_age: Maximum age in days
 
         Returns:
-            DataArray with normalized age values [0, 1]
+            DataArray with raw integer age values (0-14), dtype uint8
         """
         # Handle variant dimension using groupby for better chunking support
         has_variant = "variant" in mask.dims
@@ -406,10 +449,10 @@ class EDARProcessor:
 
         Args:
             mask: DataArray with shape (run_id?, date, region_id)
-            max_age: Maximum age in days for normalization
+            max_age: Maximum age in days
 
         Returns:
-            DataArray with normalized age values [0, 1]
+            DataArray with raw integer age values (0-14), dtype uint8
         """
         # Get dimension order - run_id may or may not be present
         dims = mask.dims
@@ -461,11 +504,8 @@ class EDARProcessor:
         valid_history = last_seen_filled.notnull()
         final_age = xr.where(valid_history, np.minimum(current_age, max_age), max_age)
 
-        # Normalize to [0, 1]
-        age_normalized = final_age / max_age
-
-        # Preserve the same dimensions as input
-        return age_normalized.transpose(*dims)
+        # Return as uint8 (0-14), not normalized
+        return final_age.transpose(*dims).astype(np.uint8)
 
     def process(self, wastewater_file: str, region_metadata_file: str) -> xr.Dataset:
         """
