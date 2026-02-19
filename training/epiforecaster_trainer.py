@@ -41,7 +41,7 @@ from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from utils import setup_tensor_core_optimizations
 from utils.gradient_debug import GradientDebugger
 from utils.sparsity_logging import log_sparsity_loss_correlation
-from utils.training_utils import get_effective_optimizer_step
+from utils.training_utils import get_effective_optimizer_step, should_log_step
 from utils.platform import (
     cleanup_nvme_staging,
     get_nvme_path,
@@ -198,6 +198,9 @@ class EpiForecasterTrainer:
                 # Reuse preprocessors from Real Train for real val/test only
                 fitted_bio_preprocessor = real_train_ds.biomarker_preprocessor
                 fitted_mobility_preprocessor = real_train_ds.mobility_preprocessor
+                shared_real_mobility = real_train_ds.preloaded_mobility
+                shared_real_mobility_mask = real_train_ds.mobility_mask
+                shared_real_sparse_topology = real_train_ds.shared_sparse_topology
 
                 # Fit synthetic preprocessors separately to avoid leakage
                 synth_scaler_run = self._select_synthetic_scaler_run(synth_runs)
@@ -276,6 +279,9 @@ class EpiForecasterTrainer:
                     context_nodes=train_nodes + val_nodes,
                     biomarker_preprocessor=fitted_bio_preprocessor,
                     mobility_preprocessor=fitted_mobility_preprocessor,
+                    preloaded_mobility=shared_real_mobility,
+                    mobility_mask=shared_real_mobility_mask,
+                    shared_sparse_topology=shared_real_sparse_topology,
                     run_id=real_run,
                     region_id_index=region_id_index,
                 )
@@ -286,9 +292,19 @@ class EpiForecasterTrainer:
                     context_nodes=train_nodes + val_nodes,
                     biomarker_preprocessor=fitted_bio_preprocessor,
                     mobility_preprocessor=fitted_mobility_preprocessor,
+                    preloaded_mobility=shared_real_mobility,
+                    mobility_mask=shared_real_mobility_mask,
+                    shared_sparse_topology=shared_real_sparse_topology,
                     run_id=real_run,
                     region_id_index=region_id_index,
                 )
+
+                # Drop full shared sparse topology references after split caches are built.
+                real_train_ds.release_shared_sparse_topology()
+                self.val_dataset.release_shared_sparse_topology()
+                self.test_dataset.release_shared_sparse_topology()
+                for ds in synth_datasets:
+                    ds.release_shared_sparse_topology()
 
             else:
                 # --- Standard Training Setup ---
@@ -304,6 +320,9 @@ class EpiForecasterTrainer:
                 # Reuse train dataset's fitted preprocessors for val/test
                 fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
                 fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
+                shared_mobility = self.train_dataset.preloaded_mobility
+                shared_mobility_mask = self.train_dataset.mobility_mask
+                shared_sparse_topology = self.train_dataset.shared_sparse_topology
 
                 self.val_dataset = EpiDataset(
                     config=self.config,
@@ -311,6 +330,9 @@ class EpiForecasterTrainer:
                     context_nodes=train_nodes + val_nodes,
                     biomarker_preprocessor=fitted_bio_preprocessor,
                     mobility_preprocessor=fitted_mobility_preprocessor,
+                    preloaded_mobility=shared_mobility,
+                    mobility_mask=shared_mobility_mask,
+                    shared_sparse_topology=shared_sparse_topology,
                 )
 
                 self.test_dataset = EpiDataset(
@@ -319,7 +341,15 @@ class EpiForecasterTrainer:
                     context_nodes=train_nodes + val_nodes,
                     biomarker_preprocessor=fitted_bio_preprocessor,
                     mobility_preprocessor=fitted_mobility_preprocessor,
+                    preloaded_mobility=shared_mobility,
+                    mobility_mask=shared_mobility_mask,
+                    shared_sparse_topology=shared_sparse_topology,
                 )
+
+                # Drop full shared sparse topology references after split caches are built.
+                self.train_dataset.release_shared_sparse_topology()
+                self.val_dataset.release_shared_sparse_topology()
+                self.test_dataset.release_shared_sparse_topology()
 
         # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
         if isinstance(self.train_dataset, ConcatDataset):
@@ -332,7 +362,7 @@ class EpiForecasterTrainer:
         self.region_embeddings = None
         embeddings = getattr(train_example_ds, "region_embeddings", None)
         if embeddings is not None:
-            self.region_embeddings = embeddings
+            self.region_embeddings = embeddings.clone()
         elif self.config.model.type.regions:
             raise ValueError(
                 "Region embeddings requested by config but region2vec_path was not provided."
@@ -1828,8 +1858,8 @@ class EpiForecasterTrainer:
                 effective_step = get_effective_optimizer_step(
                     self.global_step, accum_steps
                 )
-                log_this_step = (
-                    effective_step % log_frequency == 0 and effective_step > 0
+                log_this_step = should_log_step(
+                    self.global_step, accum_steps, log_frequency
                 )
 
                 log_data = {

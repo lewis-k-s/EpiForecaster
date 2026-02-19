@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, Any
 
@@ -34,6 +35,16 @@ from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 logger = logging.getLogger(__name__)
 
 StaticCovariates = dict[str, torch.Tensor]
+
+
+@dataclass
+class SharedSparseTopology:
+    """Shared full-network sparse topology for all timesteps."""
+
+    edge_index_by_time: list[torch.Tensor]
+    edge_weight_by_time: list[torch.Tensor]
+    num_nodes: int
+    num_timesteps: int
 
 
 def _ensure_3d(arr: np.ndarray) -> np.ndarray:
@@ -98,6 +109,9 @@ class EpiDataset(Dataset):
         context_nodes: list[int],
         biomarker_preprocessor: BiomarkerPreprocessor | None = None,
         mobility_preprocessor: MobilityPreprocessor | None = None,
+        preloaded_mobility: torch.Tensor | None = None,
+        mobility_mask: torch.Tensor | None = None,
+        shared_sparse_topology: SharedSparseTopology | None = None,
         time_range: tuple[int, int] | None = None,
         run_id: str | None = None,
         region_id_index: dict[str, int] | None = None,
@@ -218,31 +232,46 @@ class EpiDataset(Dataset):
         else:
             self.mobility_preprocessor = mobility_preprocessor
 
-        # Mobility: load full tensor into memory
-        mobility_da = self._dataset.mobility
-        # Ensure proper dimension ordering: Time, Origin, Destination
-        mobility_da = self.mobility_preprocessor._ensure_time_first(mobility_da)
+        if (preloaded_mobility is None) != (mobility_mask is None):
+            raise ValueError(
+                "preloaded_mobility and mobility_mask must both be provided "
+                "together, or both be None."
+            )
 
-        # Load all values into memory
-        mobility_np = mobility_da.values
+        if preloaded_mobility is not None and mobility_mask is not None:
+            # Reuse shared tensors from another dataset (e.g., train -> val/test)
+            self.preloaded_mobility = preloaded_mobility
+            self.mobility_mask = mobility_mask
+            logger.info(
+                f"Reusing shared mobility tensor: {self.preloaded_mobility.shape}, "
+                f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
+            )
+        else:
+            # Mobility: load full tensor into memory
+            mobility_da = self._dataset.mobility
+            # Ensure proper dimension ordering: Time, Origin, Destination
+            mobility_da = self.mobility_preprocessor._ensure_time_first(mobility_da)
 
-        # Apply preprocessing/scaling once
-        mobility_np = self.mobility_preprocessor.transform_values(mobility_np)
+            # Load all values into memory
+            mobility_np = mobility_da.values
 
-        # Convert to torch tensor (float16 for memory efficiency)
-        self.preloaded_mobility = torch.from_numpy(mobility_np).to(
-            dtype_utils.STORAGE_DTYPES["continuous"]
-        )
-        self.preloaded_mobility = _replace_non_finite(self.preloaded_mobility)
+            # Apply preprocessing/scaling once
+            mobility_np = self.mobility_preprocessor.transform_values(mobility_np)
 
-        # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
-        mobility_threshold = float(config.data.mobility_threshold)
-        self.mobility_mask = self.preloaded_mobility >= mobility_threshold
+            # Convert to torch tensor (float16 for memory efficiency)
+            self.preloaded_mobility = torch.from_numpy(mobility_np).to(
+                dtype_utils.STORAGE_DTYPES["continuous"]
+            )
+            self.preloaded_mobility = _replace_non_finite(self.preloaded_mobility)
 
-        logger.info(
-            f"Mobility preloaded: {self.preloaded_mobility.shape}, "
-            f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
-        )
+            # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
+            mobility_threshold = float(config.data.mobility_threshold)
+            self.mobility_mask = self.preloaded_mobility >= mobility_threshold
+
+            logger.info(
+                f"Mobility preloaded: {self.preloaded_mobility.shape}, "
+                f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
+            )
 
         # Lagged Mobility Features
         self.mobility_lags = config.data.mobility_lags
@@ -267,6 +296,7 @@ class EpiDataset(Dataset):
 
         # Cache for full graphs keyed by time step (CPU tensors only)
         self._full_graph_cache: dict[int, Data] = {}
+        self.shared_sparse_topology: SharedSparseTopology | None = shared_sparse_topology
 
         # Cache for adjacency matrices keyed by time step (CPU tensors only)
         self._adjacency_cache: dict[int, torch.Tensor] = {}
@@ -390,6 +420,7 @@ class EpiDataset(Dataset):
         )
         self.context_mask[target_nodes] = True
         self.context_mask[context_nodes] = True
+        self._target_khop_mask: torch.Tensor | None = None
 
         # Set dimensions
         self.time_dim_size = config.model.history_length + config.model.forecast_horizon
@@ -462,6 +493,11 @@ class EpiDataset(Dataset):
         # Precompute sparse graphs for all timesteps to eliminate CPU bottleneck
         # in __getitem__. This converts dense mobility matrices to sparse edge
         # lists once at init rather than per-sample during training.
+        self._target_khop_mask = self._compute_target_khop_mask()
+        logger.info(
+            f"Target k-hop mask: {self._target_khop_mask.sum().item()}/{self.num_nodes} nodes "
+            f"(depth={self.config.model.gnn_depth}, targets={len(self.target_nodes)})"
+        )
         self._precompute_sparse_graphs()
 
         # Close dataset and clear reference to avoid pickling issues
@@ -506,6 +542,8 @@ class EpiDataset(Dataset):
         """Allow pickling by clearing the dataset handle."""
         state = self.__dict__.copy()
         state["_dataset"] = None
+        # Full shared topology is only needed during init-time pruning.
+        state["shared_sparse_topology"] = None
         return state
 
     def close(self) -> None:
@@ -521,6 +559,12 @@ class EpiDataset(Dataset):
             except Exception:
                 pass
             self._dataset = None
+
+    def release_shared_sparse_topology(self) -> None:
+        """Drop shared full sparse topology after split-specific pruning."""
+        if self.shared_sparse_topology is not None:
+            self.shared_sparse_topology = None
+            logger.info("Released shared full sparse topology")
 
     def __del__(self) -> None:
         """Cleanup zarr dataset on garbage collection.
@@ -1136,10 +1180,7 @@ class EpiDataset(Dataset):
         Since context_mask is immutable after initialization, this mapping
         is the same for all timesteps.
         """
-        if self.context_mask is not None:
-            node_ids = torch.where(self.context_mask)[0]
-        else:
-            node_ids = torch.arange(self.num_nodes)
+        node_ids = torch.where(self._get_graph_node_mask())[0]
 
         global_to_local = torch.full(
             (self.num_nodes,), -1, dtype=torch.long, device=node_ids.device
@@ -1149,6 +1190,14 @@ class EpiDataset(Dataset):
         )
         return global_to_local
 
+    def _get_graph_node_mask(self) -> torch.Tensor:
+        """Get the node mask used for sparse graph topology construction."""
+        if self._target_khop_mask is not None:
+            return self._target_khop_mask
+        if self.context_mask is not None:
+            return self.context_mask
+        return torch.ones(self.num_nodes, dtype=torch.bool)
+
     def _get_global_to_local_at_time(self, time_step: int) -> torch.Tensor:
         """Get global to local mapping (now static, ignores time_step)."""
         # Mapping is static since context_mask never changes after init
@@ -1156,6 +1205,41 @@ class EpiDataset(Dataset):
         if not hasattr(self, "_global_to_local_static"):
             self._global_to_local_static = self._get_global_to_local()
         return self._global_to_local_static
+
+    def _compute_target_khop_mask(self) -> torch.Tensor:
+        """Compute nodes that are within gnn_depth hops of any target node."""
+        if self.config.model.gnn_depth <= 0:
+            if self.context_mask is not None:
+                return self.context_mask.clone()
+            return torch.ones(self.num_nodes, dtype=torch.bool)
+
+        target_idx = torch.tensor(self.target_nodes, dtype=torch.long)
+        target_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+        target_mask[target_idx] = True
+        khop_mask = torch.zeros(self.num_nodes, dtype=torch.bool)
+        khop_mask[target_idx] = True
+
+        # Fast path: reuse precomputed per-target k-hop masks if available.
+        if self._precomputed_k_hop_masks:
+            for reach in self._precomputed_k_hop_masks.values():
+                if target_idx.numel() == 0:
+                    break
+                khop_mask = khop_mask | reach[target_idx].any(dim=0)
+        else:
+            # Fallback path for safety if precomputed masks are unavailable.
+            for time_step in range(len(self._temporal_coords)):
+                adjacency = self._get_adjacency_at_time(time_step).to(torch.float32)
+                reach = target_mask.clone()
+                frontier = target_mask.to(torch.float32)
+                for _ in range(self.config.model.gnn_depth):
+                    frontier = (adjacency @ frontier) > 0
+                    reach = reach | frontier
+                khop_mask = khop_mask | reach
+
+        if self.context_mask is not None:
+            khop_mask = khop_mask & self.context_mask
+        khop_mask[target_idx] = True
+        return khop_mask
 
     def _precompute_k_hop_masks(self) -> dict[int, torch.Tensor]:
         """Precompute k-hop reachability masks for all timesteps at startup.
@@ -1200,36 +1284,131 @@ class EpiDataset(Dataset):
         return masks
 
     def _precompute_sparse_graphs(self) -> None:
-        """Eagerly precompute sparse graph topology for all timesteps at init.
-
-        This moves the expensive dense->sparse conversion (torch.where, dict remapping)
-        from per-sample __getitem__ to initialization time, eliminating the CPU
-        bottleneck in the DataLoader hot loop.
-
-        Graphs are cached in self._full_graph_cache and accessed via
-        _build_full_graph_topology_at_time() during __getitem__.
-        """
+        """Precompute split-specific sparse graphs from shared full sparse topology."""
         num_timesteps = len(self._temporal_coords)
-        logger.info(f"Precomputing sparse graphs for {num_timesteps} timesteps...")
+        if self.shared_sparse_topology is None:
+            logger.info(
+                f"Precomputing FULL sparse mobility topology for {num_timesteps} timesteps..."
+            )
+            self.shared_sparse_topology = self._build_full_sparse_topology()
+        else:
+            logger.info(
+                f"Reusing FULL sparse mobility topology: {self.shared_sparse_topology.num_timesteps} timesteps"
+            )
+
+        self._validate_shared_sparse_topology(self.shared_sparse_topology)
+
+        node_mask = self._get_graph_node_mask()
+        node_ids = torch.where(node_mask)[0]
+        global_to_local = torch.full((self.num_nodes,), -1, dtype=torch.long)
+        global_to_local[node_ids] = torch.arange(node_ids.numel(), dtype=torch.long)
+        logger.info(
+            "Pruning shared sparse topology for split mask: %d/%d nodes",
+            int(node_mask.sum().item()),
+            self.num_nodes,
+        )
 
         total_edges = 0
         for time_step in range(num_timesteps):
-            # This populates _full_graph_cache via the existing method
-            g = self._build_full_graph_topology_at_time(time_step)
+            edge_index_global = self.shared_sparse_topology.edge_index_by_time[time_step]
+            edge_weight_global = self.shared_sparse_topology.edge_weight_by_time[time_step]
+            g = self._build_split_graph_from_shared(
+                edge_index_global=edge_index_global,
+                edge_weight_global=edge_weight_global,
+                node_mask=node_mask,
+                node_ids=node_ids,
+                global_to_local=global_to_local,
+            )
+            self._full_graph_cache[time_step] = g
             if g.edge_index is not None:
                 total_edges += g.edge_index.shape[1]
 
-        # Log memory estimate
-        # edge_index: int64, 2 x E
-        # edge_weight: float32, E
-        edge_index_bytes = total_edges * 2 * 8  # 2 coords × 8 bytes (int64)
-        edge_weight_bytes = total_edges * 4  # 4 bytes (float32)
+        # edge_index: int64, 2 x E; edge_weight: float32/float16, E
+        edge_index_bytes = total_edges * 2 * 8
+        edge_weight_bytes = total_edges * 4
         total_mb = (edge_index_bytes + edge_weight_bytes) / 1e6
-
         logger.info(
             f"Sparse graph precomputation complete: {num_timesteps} graphs, "
             f"{total_edges} total edges, ~{total_mb:.2f} MB"
         )
+
+    def _validate_shared_sparse_topology(self, topology: SharedSparseTopology) -> None:
+        """Validate shared sparse topology dimensions for this dataset."""
+        if topology.num_nodes != self.num_nodes:
+            raise ValueError(
+                "Shared sparse topology node count mismatch: "
+                f"{topology.num_nodes} != {self.num_nodes}"
+            )
+        expected_timesteps = len(self._temporal_coords)
+        if topology.num_timesteps != expected_timesteps:
+            raise ValueError(
+                "Shared sparse topology timestep count mismatch: "
+                f"{topology.num_timesteps} != {expected_timesteps}"
+            )
+        if (
+            len(topology.edge_index_by_time) != expected_timesteps
+            or len(topology.edge_weight_by_time) != expected_timesteps
+        ):
+            raise ValueError("Shared sparse topology lists do not match timestep count")
+
+    def _build_full_sparse_topology(self) -> SharedSparseTopology:
+        """Build full-network sparse topology (no split masking) for all timesteps."""
+        num_timesteps = len(self._temporal_coords)
+        edge_index_by_time: list[torch.Tensor] = []
+        edge_weight_by_time: list[torch.Tensor] = []
+        total_edges = 0
+
+        for time_step in range(num_timesteps):
+            mobility_matrix = self.preloaded_mobility[time_step]
+            edge_mask = mobility_matrix > 0
+            origins, destinations = torch.where(edge_mask)
+            edge_weight = mobility_matrix[origins, destinations]
+            edge_index = torch.stack([origins, destinations], dim=0)
+
+            edge_index_by_time.append(edge_index)
+            edge_weight_by_time.append(edge_weight)
+            total_edges += edge_index.shape[1]
+
+        edge_index_bytes = total_edges * 2 * 8
+        edge_weight_bytes = total_edges * 4
+        total_mb = (edge_index_bytes + edge_weight_bytes) / 1e6
+        logger.info(
+            "FULL sparse mobility topology complete: %d graphs, %d total edges, ~%.2f MB",
+            num_timesteps,
+            total_edges,
+            total_mb,
+        )
+
+        return SharedSparseTopology(
+            edge_index_by_time=edge_index_by_time,
+            edge_weight_by_time=edge_weight_by_time,
+            num_nodes=self.num_nodes,
+            num_timesteps=num_timesteps,
+        )
+
+    def _build_split_graph_from_shared(
+        self,
+        *,
+        edge_index_global: torch.Tensor,
+        edge_weight_global: torch.Tensor,
+        node_mask: torch.Tensor,
+        node_ids: torch.Tensor,
+        global_to_local: torch.Tensor,
+    ) -> Data:
+        """Build one split-specific graph from shared global sparse edges."""
+        origins = edge_index_global[0]
+        destinations = edge_index_global[1]
+        keep = node_mask[origins] & node_mask[destinations]
+
+        local_origins = global_to_local[origins[keep]]
+        local_destinations = global_to_local[destinations[keep]]
+        edge_index = torch.stack([local_origins, local_destinations], dim=0)
+        edge_weight = edge_weight_global[keep]
+
+        g = Data(edge_index=edge_index, edge_weight=edge_weight)
+        g.num_nodes = node_ids.numel()
+        g.node_ids = node_ids
+        return g
 
     def _build_full_graph_topology_at_time(
         self,
@@ -1251,44 +1430,21 @@ class EpiDataset(Dataset):
         if time_step in self._full_graph_cache:
             return self._full_graph_cache[time_step]
 
-        # Warm adjacency cache for this time step
-        _ = self._get_adjacency_at_time(time_step)
-
-        # Get full mobility matrix at this time step from preloaded tensor
-        mobility_matrix = self.preloaded_mobility[time_step]  # (N, N)
-
-        # Apply context mask if set
-        if self.context_mask is not None:
-            mobility_matrix = mobility_matrix.clone()
-            mobility_matrix[~self.context_mask] = 0
-            mobility_matrix[:, ~self.context_mask] = 0
-
-        # Find all non-zero edges
-        edge_mask = mobility_matrix > 0
-        origins, destinations = torch.where(edge_mask)
-        edge_weight = mobility_matrix[origins, destinations]
-
-        # Map global to local node indices
-        node_mask = (
-            self.context_mask
-            if self.context_mask is not None
-            else torch.ones(self.num_nodes, dtype=torch.bool)
-        )
+        # Fallback for safety if cache was not precomputed.
+        if self.shared_sparse_topology is None:
+            self.shared_sparse_topology = self._build_full_sparse_topology()
+        self._validate_shared_sparse_topology(self.shared_sparse_topology)
+        node_mask = self._get_graph_node_mask()
         node_ids = torch.where(node_mask)[0]
-        global_to_local = {int(idx): i for i, idx in enumerate(node_ids.tolist())}
-
-        local_origins = torch.tensor(
-            [global_to_local[int(o)] for o in origins], dtype=torch.long
+        global_to_local = torch.full((self.num_nodes,), -1, dtype=torch.long)
+        global_to_local[node_ids] = torch.arange(node_ids.numel(), dtype=torch.long)
+        g = self._build_split_graph_from_shared(
+            edge_index_global=self.shared_sparse_topology.edge_index_by_time[time_step],
+            edge_weight_global=self.shared_sparse_topology.edge_weight_by_time[time_step],
+            node_mask=node_mask,
+            node_ids=node_ids,
+            global_to_local=global_to_local,
         )
-        local_destinations = torch.tensor(
-            [global_to_local[int(d)] for d in destinations], dtype=torch.long
-        )
-        edge_index = torch.stack([local_origins, local_destinations], dim=0)
-
-        # Create topology-only graph (no features yet)
-        g = Data(edge_index=edge_index, edge_weight=edge_weight)
-        g.num_nodes = node_ids.numel()
-        g.node_ids = node_ids  # Store global node ids for mapping
 
         # Cache and return
         self._full_graph_cache[time_step] = g
@@ -1584,6 +1740,9 @@ class EpiDataset(Dataset):
         # Reuse train dataset's fitted preprocessors for val/test
         fitted_bio_preprocessor = train_dataset.biomarker_preprocessor
         fitted_mobility_preprocessor = train_dataset.mobility_preprocessor
+        shared_mobility = train_dataset.preloaded_mobility
+        shared_mobility_mask = train_dataset.mobility_mask
+        shared_sparse_topology = train_dataset.shared_sparse_topology
 
         # Create val and test datasets with their time ranges
         val_dataset = cls(
@@ -1592,6 +1751,9 @@ class EpiDataset(Dataset):
             context_nodes=all_nodes,
             biomarker_preprocessor=fitted_bio_preprocessor,
             mobility_preprocessor=fitted_mobility_preprocessor,
+            preloaded_mobility=shared_mobility,
+            mobility_mask=shared_mobility_mask,
+            shared_sparse_topology=shared_sparse_topology,
             time_range=(train_end, val_end),
         )
 
@@ -1601,8 +1763,15 @@ class EpiDataset(Dataset):
             context_nodes=all_nodes,
             biomarker_preprocessor=fitted_bio_preprocessor,
             mobility_preprocessor=fitted_mobility_preprocessor,
+            preloaded_mobility=shared_mobility,
+            mobility_mask=shared_mobility_mask,
+            shared_sparse_topology=shared_sparse_topology,
             time_range=(val_end, test_end),
         )
+
+        train_dataset.release_shared_sparse_topology()
+        val_dataset.release_shared_sparse_topology()
+        test_dataset.release_shared_sparse_topology()
 
         return train_dataset, val_dataset, test_dataset
 

@@ -248,3 +248,63 @@ class TestEpiForecasterTrainer:
                     ):
                         trainer = EpiForecasterTrainer(minimal_config)
                         assert trainer.config.training.curriculum.enabled is True
+
+    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("training.epiforecaster_trainer.EpiForecaster")
+    @patch("training.epiforecaster_trainer.wandb")
+    def test_standard_split_reuses_sparse_topology_and_releases(
+        self, mock_wandb, mock_model_cls, mock_dataset_cls, minimal_config
+    ):
+        """Val/test should reuse train full sparse topology and release references."""
+        mock_model_instance = MagicMock()
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
+        mock_model_cls.return_value = mock_model_instance
+
+        shared_mobility = object()
+        shared_mobility_mask = object()
+        shared_sparse_topology = object()
+
+        train_ds = MagicMock()
+        train_ds.cases_output_dim = 1
+        train_ds.biomarkers_output_dim = 1
+        train_ds.temporal_covariates_dim = 0
+        train_ds.target_nodes = [0, 1]
+        train_ds.__len__.return_value = 16
+        train_ds.preloaded_mobility = shared_mobility
+        train_ds.mobility_mask = shared_mobility_mask
+        train_ds.shared_sparse_topology = shared_sparse_topology
+        train_ds.biomarker_preprocessor = object()
+        train_ds.mobility_preprocessor = object()
+        train_ds.region_embeddings = None
+
+        val_ds = MagicMock()
+        val_ds.target_nodes = [2]
+        val_ds.__len__.return_value = 8
+        val_ds.cases_output_dim = 1
+        val_ds.biomarkers_output_dim = 1
+
+        test_ds = MagicMock()
+        test_ds.target_nodes = [3]
+        test_ds.__len__.return_value = 8
+        test_ds.cases_output_dim = 1
+        test_ds.biomarkers_output_dim = 1
+
+        mock_dataset_cls.side_effect = [train_ds, val_ds, test_ds]
+
+        with patch.object(
+            EpiForecasterTrainer, "_split_dataset_by_nodes", return_value=([0, 1], [2], [3])
+        ):
+            _ = EpiForecasterTrainer(minimal_config)
+
+        val_call = mock_dataset_cls.call_args_list[1]
+        test_call = mock_dataset_cls.call_args_list[2]
+        assert val_call.kwargs["shared_sparse_topology"] is shared_sparse_topology
+        assert test_call.kwargs["shared_sparse_topology"] is shared_sparse_topology
+        assert val_call.kwargs["preloaded_mobility"] is shared_mobility
+        assert test_call.kwargs["preloaded_mobility"] is shared_mobility
+        train_ds.release_shared_sparse_topology.assert_called_once()
+        val_ds.release_shared_sparse_topology.assert_called_once()
+        test_ds.release_shared_sparse_topology.assert_called_once()

@@ -223,3 +223,121 @@ class TestEpiDataset:
                 assert graph.edge_index.shape[0] == 2
                 # edge_weight should match number of edges
                 assert graph.edge_weight.shape[0] == graph.edge_index.shape[1]
+
+    def test_full_sparse_prune_matches_direct_dense_mask(
+        self, config, mock_xarray_dataset
+    ):
+        """Pruned shared sparse topology should match direct dense masking output."""
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0],
+                context_nodes=[0, 1, 2],
+            )
+
+            node_mask = ds._get_graph_node_mask()
+            node_ids = torch.where(node_mask)[0]
+            global_to_local = torch.full((ds.num_nodes,), -1, dtype=torch.long)
+            global_to_local[node_ids] = torch.arange(node_ids.numel(), dtype=torch.long)
+
+            for time_step, graph in ds._full_graph_cache.items():
+                dense = ds.preloaded_mobility[time_step].clone()
+                dense[~node_mask] = 0
+                dense[:, ~node_mask] = 0
+
+                edge_mask = dense > 0
+                origins, destinations = torch.where(edge_mask)
+                expected_edge_weight = dense[origins, destinations]
+                expected_edge_index = torch.stack(
+                    [global_to_local[origins], global_to_local[destinations]], dim=0
+                )
+
+                assert torch.equal(graph.node_ids, node_ids)
+                assert torch.equal(graph.edge_index, expected_edge_index)
+                assert torch.allclose(graph.edge_weight, expected_edge_weight)
+
+    def test_shared_sparse_topology_built_once_when_reused(
+        self, config, mock_xarray_dataset
+    ):
+        """Dense->sparse full topology conversion should happen once with reuse."""
+
+        def _dataset_factory(*_args, **_kwargs):
+            return mock_xarray_dataset.copy(deep=True)
+
+        builder = EpiDataset._build_full_sparse_topology
+        with patch.object(EpiDataset, "load_canonical_dataset", side_effect=_dataset_factory):
+            with patch.object(
+                EpiDataset,
+                "_build_full_sparse_topology",
+                autospec=True,
+                side_effect=builder,
+            ) as build_spy:
+                train_ds = EpiDataset(
+                    config=config,
+                    target_nodes=[0, 1],
+                    context_nodes=[0, 1],
+                )
+                val_ds = EpiDataset(
+                    config=config,
+                    target_nodes=[2],
+                    context_nodes=[0, 1, 2],
+                    biomarker_preprocessor=train_ds.biomarker_preprocessor,
+                    mobility_preprocessor=train_ds.mobility_preprocessor,
+                    preloaded_mobility=train_ds.preloaded_mobility,
+                    mobility_mask=train_ds.mobility_mask,
+                    shared_sparse_topology=train_ds.shared_sparse_topology,
+                )
+                _ = EpiDataset(
+                    config=config,
+                    target_nodes=[3],
+                    context_nodes=[0, 1, 2, 3],
+                    biomarker_preprocessor=train_ds.biomarker_preprocessor,
+                    mobility_preprocessor=train_ds.mobility_preprocessor,
+                    preloaded_mobility=train_ds.preloaded_mobility,
+                    mobility_mask=train_ds.mobility_mask,
+                    shared_sparse_topology=train_ds.shared_sparse_topology,
+                )
+
+                # Full dense->sparse build happens once on the train dataset only.
+                assert build_spy.call_count == 1
+                assert train_ds.shared_sparse_topology is not None
+                assert val_ds.shared_sparse_topology is train_ds.shared_sparse_topology
+
+    def test_create_temporal_splits_reuses_full_sparse_topology(
+        self, config, mock_xarray_dataset
+    ):
+        """Temporal split creation should build full sparse once and prune per split."""
+
+        def _dataset_factory(*_args, **_kwargs):
+            return mock_xarray_dataset.copy(deep=True)
+
+        builder = EpiDataset._build_full_sparse_topology
+        with patch.object(EpiDataset, "load_canonical_dataset", side_effect=_dataset_factory):
+            with patch("utils.temporal.get_temporal_boundaries", return_value=(0, 20, 25, 30)):
+                with patch("utils.temporal.validate_temporal_range", return_value=None):
+                    with patch(
+                        "utils.temporal.format_date_range",
+                        return_value="dummy-range",
+                    ):
+                        with patch.object(
+                            EpiDataset,
+                            "_build_full_sparse_topology",
+                            autospec=True,
+                            side_effect=builder,
+                        ) as build_spy:
+                            train_ds, val_ds, test_ds = EpiDataset.create_temporal_splits(
+                                config=config,
+                                train_end_date="2020-01-15",
+                                val_end_date="2020-01-25",
+                                test_end_date="2020-01-30",
+                            )
+
+        assert build_spy.call_count == 1
+        assert train_ds.shared_sparse_topology is None
+        assert val_ds.shared_sparse_topology is None
+        assert test_ds.shared_sparse_topology is None
+        assert len(train_ds._full_graph_cache) > 0
+        assert len(val_ds._full_graph_cache) > 0
+        assert len(test_ds._full_graph_cache) > 0
