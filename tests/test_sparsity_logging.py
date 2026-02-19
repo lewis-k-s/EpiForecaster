@@ -1,5 +1,6 @@
 """Tests for sparsity-loss correlation logging utilities."""
 
+import pytest
 import torch
 
 
@@ -233,3 +234,73 @@ class TestLogSparsityLossCorrelation:
         # Mean should be 0.25
         assert logged_data["sparsity_loss_hosp_mean"] == 0.25
         assert logged_data["sparsity_loss_hosp_max"] == 0.5
+
+    @pytest.mark.device
+    def test_cross_device_sparsity_loss_correlation(self, accelerator_device):
+        """Test that sparsity-loss correlation works when batch is CPU and losses are on accelerator.
+
+        This simulates the real training scenario where:
+        - Batch data comes from DataLoader on CPU
+        - Model outputs and targets are on GPU/MPS after forward pass
+
+        Regression test for device mismatch bug where sparsity_vals (CPU) was
+        multiplied by loss_vals (GPU) without device synchronization.
+        """
+        from utils.sparsity_logging import log_sparsity_loss_correlation
+
+        logged_data = {}
+
+        class MockWandbRun:
+            pass
+
+        def mock_log(data, step=None):
+            logged_data.update(data)
+
+        import sys
+        import types
+
+        mock_wandb = types.ModuleType("wandb")
+        mock_wandb.log = mock_log
+        sys.modules["wandb"] = mock_wandb
+
+        import importlib
+
+        import utils.sparsity_logging as sl_module
+
+        importlib.reload(sl_module)
+
+        B, L, H = 2, 28, 14
+
+        # Batch data on CPU (simulates DataLoader output)
+        batch = {
+            "B": B,
+            "HospHist": torch.zeros(B, L, 3),  # CPU
+            "BioNode": torch.zeros(B, L, 13),  # CPU
+        }
+        batch["HospHist"][:, :, 1] = 1.0  # mask channel: fully observed
+        batch["BioNode"][:, :, 1] = 1.0
+
+        # Model outputs and targets on accelerator (simulates GPU forward pass)
+        model_outputs = {
+            "pred_hosp": torch.ones(B, H).to(accelerator_device),
+            "pred_ww": torch.ones(B, H).to(accelerator_device),
+        }
+        targets = {
+            "hosp": torch.zeros(B, H).to(accelerator_device),
+            "hosp_mask": torch.ones(B, H).to(accelerator_device),
+            "ww": torch.zeros(B, H).to(accelerator_device),
+            "ww_mask": torch.ones(B, H).to(accelerator_device),
+        }
+
+        # This should NOT raise RuntimeError about device mismatch
+        log_sparsity_loss_correlation(
+            batch=batch,
+            model_outputs=model_outputs,
+            targets=targets,
+            wandb_run=MockWandbRun(),
+            step=0,
+            epoch=1,
+        )
+
+        # Verify logging happened
+        assert "sparsity_loss_hosp_mean" in logged_data

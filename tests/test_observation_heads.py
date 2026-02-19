@@ -493,9 +493,7 @@ class TestClinicalObservationHead:
         head = head.to(torch.float32)  # Match model dtype
 
         I_trajectory = _ones_tensor(2, 12) * 0.001  # Fixed small value
-        obs_context = (
-            torch.ones(2, 12, 4, dtype=torch.float32) * 0.1
-        )  # Fixed context
+        obs_context = torch.ones(2, 12, 4, dtype=torch.float32) * 0.1  # Fixed context
 
         no_context = head(I_trajectory, obs_context=None)
         with_context = head(I_trajectory, obs_context=obs_context)
@@ -569,9 +567,7 @@ class TestWastewaterObservationHead:
 
         I_trajectory = _ones_tensor(2, 12) * 0.001  # Fixed small value
         population = _ones_tensor(2, 12)  # Normalized population
-        obs_context = (
-            torch.ones(2, 12, 6, dtype=torch.float32) * 0.1
-        )  # Fixed context
+        obs_context = torch.ones(2, 12, 6, dtype=torch.float32) * 0.1  # Fixed context
 
         no_context = head(I_trajectory, population, obs_context=None)
         with_context = head(I_trajectory, population, obs_context=obs_context)
@@ -1229,3 +1225,40 @@ class TestCompositeObservationLoss:
         assert "CompositeObservationLoss" in repr_str
         assert "SMAPELoss" in repr_str
         assert "MSELoss" in repr_str
+
+    @pytest.mark.device
+    def test_cross_device_loss_computation(self, accelerator_device):
+        """Test that CompositeObservationLoss works when preds are on accelerator and targets on CPU.
+
+        This simulates the real training scenario where:
+        - Predictions come from model forward pass on GPU/MPS
+        - Targets come from DataLoader on CPU
+
+        Regression test for device mismatch bugs in loss computation.
+        """
+        head_specs = {
+            "hosp": (MSELoss(), 1.0),
+            "ww": (MSELoss(), 0.5),
+        }
+        loss_fn = CompositeObservationLoss(head_specs)
+
+        # Predictions on accelerator (simulates GPU forward pass)
+        preds = {
+            "hosp": torch.ones(2, 3, device=accelerator_device),
+            "ww": torch.ones(2, 3, device=accelerator_device),
+        }
+
+        # Targets on CPU (simulates DataLoader output)
+        targets = {
+            "hosp": torch.zeros(2, 3),  # CPU
+            "ww": torch.zeros(2, 3),  # CPU
+        }
+
+        # This should NOT raise RuntimeError about device mismatch
+        total_loss, per_head = loss_fn(preds, targets)
+
+        # Verify loss is computed correctly
+        assert torch.isfinite(total_loss)
+        # MSE of ones vs zeros = 1.0 for each head
+        # Total = 1.0 * 1.0 + 0.5 * 1.0 = 1.5
+        assert total_loss.item() == pytest.approx(1.5, abs=1e-5)

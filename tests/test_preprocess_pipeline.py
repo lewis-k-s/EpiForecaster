@@ -242,3 +242,15 @@ class TestPipelineStorage:
         assert mobility_chunks[1] == (10, 10)  # date
         assert mobility_chunks[2] == (5, 5)    # origin
         assert mobility_chunks[3] == (5, 5)    # destination
+
+        # Check smoothing metadata attrs are persisted in output dataset.
+        assert saved_ds.attrs["log_transformed"] is True
+        assert saved_ds.attrs["population_norm"] is True
+        assert saved_ds.attrs["smoothing_clinical_method"] == "kalman_v2"
+        assert saved_ds.attrs["smoothing_wastewater_method"] == "tobit_kalman_v2"
+        assert saved_ds.attrs["smoothing_missing_policy"] == "predict"
+        assert "preprocessing_config_yaml" in saved_ds.attrs
+        config_yaml = saved_ds.attrs["preprocessing_config_yaml"]
+        assert isinstance(config_yaml, str)
+        assert "dataset_name: test_chunk_schema" in config_yaml
+        assert "smoothing:" in config_yaml

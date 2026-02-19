@@ -7,11 +7,13 @@ handles validation, and provides comprehensive reporting throughout
 process.
 """
 
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import yaml
 
 from utils import dtypes as dtype_utils
 from .config import REGION_COORD, PreprocessingConfig
@@ -450,11 +452,16 @@ class OfflinePreprocessingPipeline:
                 rechunked_dataset[var_name] = transformed
                 print(f"  {var_name}: log1p applied")
 
-        # Add metadata attributes to indicate transforms applied
-        rechunked_dataset = rechunked_dataset.assign_attrs(
-            log_transformed=True,
-            population_norm=True,
-        )
+        # Metadata attrs are assigned after dtype conversion because we rebuild the
+        # Dataset object there and would otherwise drop attrs.
+        dataset_attrs = {
+            "log_transformed": True,
+            "population_norm": True,
+            "smoothing_clinical_method": self.config.smoothing.clinical_method,
+            "smoothing_wastewater_method": self.config.smoothing.wastewater_method,
+            "smoothing_missing_policy": self.config.smoothing.missing_policy,
+            "preprocessing_config_yaml": self._serialize_config_yaml(),
+        }
 
         # Convert float64 to float16 to reduce storage and memory usage
         # Uses centralized dtype constants from utils/dtypes.py
@@ -498,7 +505,11 @@ class OfflinePreprocessingPipeline:
                 print(f"  {var_name}: float64 -> float16")
 
             converted_dict[var_name] = new_var
-        rechunked_dataset = xr.Dataset(converted_dict, coords=rechunked_dataset.coords)
+        rechunked_dataset = xr.Dataset(
+            converted_dict,
+            coords=rechunked_dataset.coords,
+            attrs=dataset_attrs,
+        )
 
         # Clear conflicting encodings from data variables and coordinates.
         # Variables from source zarr files retain v3-specific encodings that
@@ -535,6 +546,16 @@ class OfflinePreprocessingPipeline:
         self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
+
+    def _serialize_config_yaml(self) -> str:
+        """Serialize full preprocessing config as YAML for dataset provenance."""
+        config_dict = self.config.__dict__.copy()
+        config_dict["start_date"] = self.config.start_date.isoformat()
+        config_dict["end_date"] = self.config.end_date.isoformat()
+        if self.config.temporal_covariates is not None:
+            config_dict["temporal_covariates"] = asdict(self.config.temporal_covariates)
+        config_dict["smoothing"] = asdict(self.config.smoothing)
+        return yaml.safe_dump(config_dict, default_flow_style=False, sort_keys=False)
 
     def _update_stage(self, stage_name: str):
         """Update pipeline stage tracking."""

@@ -70,26 +70,29 @@ class TestSIRRollForwardBasics:
         assert result["physics_residual"].shape == (batch_size, horizon)
         assert result["beta_t"].shape == (batch_size, horizon)
 
-    def test_forward_device_consistency(self):
+    @pytest.mark.device
+    def test_forward_device_consistency(self, accelerator_device):
         """Test that all outputs are on the same device as inputs."""
         batch_size = 2
         horizon = 5
 
         module = SIRRollForward()
 
-        beta_t = torch.rand(batch_size, horizon) * 0.5
-        gamma_t = torch.ones(batch_size, horizon) * 0.2
-        mortality_t = torch.zeros(batch_size, horizon)
-        population = torch.tensor([1000.0, 2000.0])
+        beta_t = torch.rand(batch_size, horizon, device=accelerator_device) * 0.5
+        gamma_t = torch.ones(batch_size, horizon, device=accelerator_device) * 0.2
+        mortality_t = torch.zeros(batch_size, horizon, device=accelerator_device)
+        population = torch.tensor([1000.0, 2000.0], device=accelerator_device)
         S0 = population * 0.9
         I0 = population * 0.1
-        R0 = torch.zeros(batch_size)
+        R0 = torch.zeros(batch_size, device=accelerator_device)
 
         result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
 
-        # All outputs should be on CPU (same as inputs)
+        # All outputs should be on the same device as inputs
         for key, tensor in result.items():
-            assert tensor.device == beta_t.device
+            assert tensor.device.type == beta_t.device.type, (
+                f"Output {key} on {tensor.device} but expected {beta_t.device}"
+            )
 
 
 class TestSIRPhysics:

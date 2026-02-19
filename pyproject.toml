@@ -190,6 +190,7 @@ pythonpath = ["."]
 markers = [
     "region: Tests related to region2vec, region losses, spatial autocorrelation",
     "epiforecaster: Tests related to the main epidemiological forecaster model",
+    "integration: Integration tests that may be slow or require external resources",
 ]
 
 [dependency-groups]

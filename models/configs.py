@@ -788,12 +788,26 @@ class EpiForecasterConfig:
         merged_dict = OmegaConf.to_container(merged_cfg)
         assert merged_dict is not None and isinstance(merged_dict, dict)
 
+        # Filter out fields with init=False (computed/derived fields)
+        def _filter_init_fields(dataclass_cls: type, field_dict: dict) -> dict:
+            """Remove fields that have init=False from the dict before construction."""
+            init_fields = {
+                f.name
+                for f in getattr(dataclass_cls, "__dataclass_fields__", {}).values()
+                if f.init
+            }
+            return {k: v for k, v in field_dict.items() if k in init_fields}
+
         # Recreate nested config objects and replace top-level config
         return cls(
-            model=ModelConfig(**merged_dict["model"]),
-            data=DataConfig(**merged_dict["data"]),
-            training=TrainingParams(**merged_dict["training"]),
-            output=OutputConfig(**merged_dict["output"]),
+            model=ModelConfig(**_filter_init_fields(ModelConfig, merged_dict["model"])),
+            data=DataConfig(**_filter_init_fields(DataConfig, merged_dict["data"])),
+            training=TrainingParams(
+                **_filter_init_fields(TrainingParams, merged_dict["training"])
+            ),
+            output=OutputConfig(
+                **_filter_init_fields(OutputConfig, merged_dict["output"])
+            ),
         )
 
     @classmethod

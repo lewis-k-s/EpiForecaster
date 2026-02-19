@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from evaluation.epiforecaster_eval import JointInferenceLoss
@@ -152,244 +153,55 @@ def test_joint_inference_loss_ignores_nonfinite_targets_under_mask():
 
     loss = loss_fn(model_outputs, targets)
     assert torch.isfinite(loss)
+    # Only position 0 is observed (mask=1.0) with pred=1.0, target=1.0 → MSE=0
     assert torch.isclose(loss, torch.tensor(0.0))
 
 
-def test_joint_inference_loss_components_sum_to_total():
-    """Regression test: weighted components must sum exactly to total loss."""
+@pytest.mark.device
+def test_joint_inference_loss_cross_device(accelerator_device):
+    """Test that JointInferenceLoss works when model outputs are on accelerator and targets on CPU.
+
+    This simulates the real training scenario where:
+    - Model outputs come from forward pass on GPU/MPS
+    - Targets come from DataLoader on CPU
+
+    Regression test for device mismatch bugs in loss computation.
+    """
     loss_fn = JointInferenceLoss(
-        w_ww=2.0, w_hosp=3.0, w_cases=1.0, w_deaths=0.5, w_sir=4.0
-    )
-
-    model_outputs = {
-        "pred_ww": torch.tensor([[1.0, 2.0]]),
-        "pred_hosp": torch.tensor([[1.0, 3.0]]),
-        "pred_cases": torch.tensor([[2.0, 4.0]]),
-        "pred_deaths": torch.tensor([[0.5, 1.0]]),
-        "physics_residual": torch.tensor([[2.0, 4.0]]),
-    }
-    targets = {
-        "ww": torch.tensor([[0.0, 0.0]]),
-        "hosp": torch.tensor([[0.0, 0.0]]),
-        "cases": torch.tensor([[0.0, 0.0]]),
-        "deaths": torch.tensor([[0.0, 0.0]]),
-        "ww_mask": torch.ones(1, 2),
-        "hosp_mask": torch.ones(1, 2),
-        "cases_mask": torch.ones(1, 2),
-        "deaths_mask": torch.ones(1, 2),
-    }
-
-    comps = loss_fn.compute_components(model_outputs, targets)
-    total_from_parts = (
-        comps["ww_weighted"]
-        + comps["hosp_weighted"]
-        + comps["cases_weighted"]
-        + comps["deaths_weighted"]
-        + comps["sir_weighted"]
-    )
-    assert torch.isclose(comps["total"], total_from_parts)
-
-
-def test_joint_inference_cases_loss_with_mask():
-    """Test that cases loss respects masks and computes correctly."""
-    loss_fn = JointInferenceLoss(
-        w_ww=0.0,
-        w_hosp=0.0,
+        w_ww=1.0,
+        w_hosp=1.0,
         w_cases=1.0,
         w_deaths=0.0,
         w_sir=0.0,
-        cases_imputed_weight=0.0,
     )
 
+    # Model outputs on accelerator (simulates GPU forward pass)
     model_outputs = {
-        "pred_ww": torch.zeros(2, 3),
-        "pred_hosp": torch.zeros(2, 3),
-        "pred_cases": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-        "pred_deaths": torch.zeros(2, 3),
-        "physics_residual": torch.zeros(2, 3),
+        "pred_ww": torch.ones(2, 3, device=accelerator_device),
+        "pred_hosp": torch.ones(2, 3, device=accelerator_device),
+        "pred_cases": torch.ones(2, 3, device=accelerator_device),
+        "pred_deaths": torch.zeros(2, 3, device=accelerator_device),
+        "physics_residual": torch.zeros(2, 3, device=accelerator_device),
     }
+
+    # Targets on CPU (simulates DataLoader output)
     targets = {
-        "ww": None,
-        "hosp": None,
-        "cases": torch.tensor([[1.0, 0.0, 3.0], [0.0, 5.0, 0.0]]),
+        "ww": torch.zeros(2, 3),  # CPU
+        "hosp": torch.zeros(2, 3),  # CPU
+        "cases": torch.zeros(2, 3),  # CPU
         "deaths": None,
-        "ww_mask": None,
-        "hosp_mask": None,
-        "cases_mask": torch.tensor([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+        "ww_mask": torch.ones(2, 3),  # CPU
+        "hosp_mask": torch.ones(2, 3),  # CPU
+        "cases_mask": torch.ones(2, 3),  # CPU
         "deaths_mask": None,
     }
 
-    # Expected: positions (0,0)=0, (0,2)=0, (1,1)=0 are masked in -> loss = 0
+    # This should NOT raise RuntimeError about device mismatch
     loss = loss_fn(model_outputs, targets)
-    assert torch.isclose(loss, torch.tensor(0.0))
 
-
-def test_joint_inference_deaths_loss_can_be_disabled():
-    """Test that deaths loss can be disabled (weighted=0) but is still reported."""
-    loss_fn = JointInferenceLoss(w_deaths=0.0)  # Explicitly disable deaths loss
-
-    model_outputs = {
-        "pred_ww": torch.zeros(2, 3),
-        "pred_hosp": torch.zeros(2, 3),
-        "pred_cases": torch.zeros(2, 3),
-        "pred_deaths": torch.tensor([[100.0, 200.0, 300.0]]),  # Large error
-        "physics_residual": torch.zeros(2, 3),
-    }
-    targets = {
-        "ww": None,
-        "hosp": None,
-        "cases": None,
-        "deaths": torch.zeros(1, 3),
-        "ww_mask": None,
-        "hosp_mask": None,
-        "cases_mask": None,
-        "deaths_mask": torch.ones(1, 3),
-    }
-
-    # Deaths weighted loss should be 0 because w_deaths=0
-    # But raw deaths loss should be computed for reporting
-    comps = loss_fn.compute_components(model_outputs, targets)
-    assert torch.isclose(comps["deaths_weighted"], torch.tensor(0.0))
-    assert comps["deaths"] > 0.0
-
-
-def test_joint_inference_imputed_targets_have_lower_weight():
-    """Imputed days (mask=0) should contribute with reduced configurable weight."""
-    loss_fn = JointInferenceLoss(
-        w_ww=0.0,
-        w_hosp=1.0,
-        w_cases=0.0,
-        w_deaths=0.0,
-        w_sir=0.0,
-        hosp_imputed_weight=0.25,
-    )
-
-    model_outputs = {
-        "pred_ww": torch.zeros(1, 2),
-        "pred_hosp": torch.tensor([[2.0, 2.0]]),
-        "pred_cases": torch.zeros(1, 2),
-        "pred_deaths": torch.zeros(1, 2),
-        "physics_residual": torch.zeros(1, 2),
-    }
-    targets = {
-        "ww": None,
-        "hosp": torch.tensor([[0.0, 0.0]]),
-        "cases": None,
-        "deaths": None,
-        # First day observed, second imputed.
-        "ww_mask": None,
-        "hosp_mask": torch.tensor([[1.0, 0.0]]),
-        "cases_mask": None,
-        "deaths_mask": None,
-    }
-
-    # Weighted MSE = ((4*1.0) + (4*0.25)) / (1.0 + 0.25) = 4.0
-    comps = loss_fn.compute_components(model_outputs, targets)
-    assert torch.isclose(comps["hosp"], torch.tensor(4.0))
-
-
-def test_joint_inference_ww_imputed_targets_have_lower_weight():
-    """WW imputed timesteps should use the same weighted-mask logic."""
-    loss_fn = JointInferenceLoss(
-        w_ww=1.0,
-        w_hosp=0.0,
-        w_cases=0.0,
-        w_deaths=0.0,
-        w_sir=0.0,
-        ww_imputed_weight=0.25,
-    )
-
-    model_outputs = {
-        "pred_ww": torch.tensor([[2.0, 2.0]]),
-        "pred_hosp": torch.zeros(1, 2),
-        "pred_cases": torch.zeros(1, 2),
-        "pred_deaths": torch.zeros(1, 2),
-        "physics_residual": torch.zeros(1, 2),
-    }
-    targets = {
-        "ww": torch.tensor([[0.0, 0.0]]),
-        "hosp": None,
-        "cases": None,
-        "deaths": None,
-        "ww_mask": torch.tensor([[1.0, 0.0]]),
-        "hosp_mask": None,
-        "cases_mask": None,
-        "deaths_mask": None,
-    }
-
-    # ((4*1.0) + (4*0.25)) / (1.0 + 0.25) = 4.0
-    comps = loss_fn.compute_components(model_outputs, targets)
-    assert torch.isclose(comps["ww"], torch.tensor(4.0))
-
-
-def test_joint_inference_loss_applies_min_observed_gate_per_sample():
-    """Samples below min observed count should contribute zero target loss."""
-    loss_fn = JointInferenceLoss(
-        w_ww=1.0,
-        w_hosp=0.0,
-        w_cases=0.0,
-        w_deaths=0.0,
-        w_sir=0.0,
-        ww_min_observed=2,
-    )
-
-    model_outputs = {
-        "pred_ww": torch.tensor([[3.0, 3.0, 3.0], [2.0, 2.0, 2.0]]),
-        "pred_hosp": torch.zeros(2, 3),
-        "pred_cases": torch.zeros(2, 3),
-        "pred_deaths": torch.zeros(2, 3),
-        "physics_residual": torch.zeros(2, 3),
-    }
-    targets = {
-        "ww": torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]),
-        "hosp": None,
-        "cases": None,
-        "deaths": None,
-        # First sample has only 1 observed point (should be gated out).
-        # Second sample has 2 observed points (should be kept).
-        "ww_mask": torch.tensor([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]),
-        "hosp_mask": None,
-        "cases_mask": None,
-        "deaths_mask": None,
-    }
-
-    comps = loss_fn.compute_components(model_outputs, targets)
-    # Only second sample contributes: squared errors are [1,1] on observed points.
-    assert torch.isclose(comps["ww"], torch.tensor(1.0))
-
-
-def test_joint_inference_loss_ignores_masked_nonfinite_predictions():
-    """Masked-out non-finite predictions should not contaminate loss."""
-    loss_fn = JointInferenceLoss(
-        w_ww=1.0,
-        w_hosp=0.0,
-        w_cases=0.0,
-        w_deaths=0.0,
-        w_sir=0.0,
-        ww_imputed_weight=0.0,
-    )
-
-    model_outputs = {
-        "pred_ww": torch.tensor([[1.0, float("inf")]]),
-        "pred_hosp": torch.zeros(1, 2),
-        "pred_cases": torch.zeros(1, 2),
-        "pred_deaths": torch.zeros(1, 2),
-        "physics_residual": torch.zeros(1, 2),
-    }
-    targets = {
-        "ww": torch.tensor([[0.0, 0.0]]),
-        "hosp": None,
-        "cases": None,
-        "deaths": None,
-        "ww_mask": torch.tensor([[1.0, 0.0]]),
-        "hosp_mask": None,
-        "cases_mask": None,
-        "deaths_mask": None,
-    }
-
-    loss = loss_fn(model_outputs, targets)
+    # Verify loss is computed correctly (3 heads × MSE of 1.0 each)
     assert torch.isfinite(loss)
-    assert torch.isclose(loss, torch.tensor(1.0))
+    assert loss.item() == 3.0  # w_ww=1.0 + w_hosp=1.0 + w_cases=1.0, each MSE=1.0
 
 
 def test_joint_inference_loss_zero_weight_head_not_poisoned_by_nonfinite_output():

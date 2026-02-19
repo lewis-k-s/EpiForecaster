@@ -98,3 +98,31 @@ class TestRegionLosses:
         # Should return 0 loss safely
         loss_dict = loss_fn(embeddings, edge_index)
         assert loss_dict["moran_loss"] == 0.0
+
+    @pytest.mark.device
+    def test_cross_device_contrastive_loss(self, accelerator_device):
+        """Test that contrastive loss works when embeddings are on accelerator and pairs on CPU.
+
+        This simulates the real training scenario where:
+        - Embeddings come from model forward pass on GPU/MPS
+        - Pair indices come from preprocessing on CPU
+
+        Regression test for device mismatch bugs in loss computation.
+        """
+        num_nodes, dim = 10, 8
+
+        # Embeddings on accelerator (simulates model output)
+        embeddings = torch.randn(num_nodes, dim, device=accelerator_device)
+
+        # Pair indices on CPU (simulates preprocessing output)
+        pos_pairs = torch.tensor([[0, 1], [1, 2]]).t()  # CPU
+        neg_pairs = torch.tensor([[0, 5], [1, 6]]).t()  # CPU
+        flow_weights = torch.tensor([1.0, 0.5])  # CPU
+
+        loss_fn = FlowWeightedContrastiveLoss()
+
+        # This should NOT raise RuntimeError about device mismatch
+        loss = loss_fn(embeddings, pos_pairs, flow_weights, neg_pairs)
+
+        assert loss.ndim == 0
+        assert torch.isfinite(loss)

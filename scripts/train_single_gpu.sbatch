@@ -5,7 +5,8 @@
 #SBATCH --gres=gpu:1                # one CUDA-capable GPU
 #SBATCH --cpus-per-task=20          # must be full node
 #SBATCH --time=04:00:00             # wall-clock limit
-#SBATCH --output=slurm-%x-%j.out    # stdout/stderr log per job
+#SBATCH --output=logs/slurm-%x-%j.out    # stdout/stderr log per job
+#SBATCH --error=logs/slurm-%x-%j.err    # stdout/stderr log per job
 
 # Fail fast on errors; print commands for easier debugging.
 set -euo pipefail

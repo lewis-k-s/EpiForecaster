@@ -24,6 +24,25 @@ Because `cases` and EDAR biomarkers resolve to `(time, region)` series, the comb
 4. **Validation and storage** – Consistency checks guarantee every batch has identical node/edge counts and no NaNs before persisting via `DatasetStorage.save_dataset()`.
 5. **Reporting** – A JSON report (same directory as the Zarr store) captures configuration, alignment outcomes, statistics, and warnings for reproducibility.
 
+## Causal Smoothing Modes
+
+The preprocessing pipeline supports configurable **offline but causal** smoothing.
+Each timestep is updated using only current/past observations (no look-ahead over
+future dates).
+
+### Clinical series (`cases`, `hospitalizations`, `deaths`)
+
+| Method | Config key | Behavior |
+| --- | --- | --- |
+| Kalman v2 | `smoothing.clinical_method: "kalman_v2"` | Random-walk Kalman filter with configurable missing policy (`predict` default, optional bounded `momentum`), innovation clipping, and re-entry gain capping to reduce hard jump artifacts after sparse gaps. |
+| Damped Holt | `smoothing.clinical_method: "holt_damped"` | Causal level+trend smoother (log space) with damped trend carry through missing intervals to avoid plateaus and spikes. |
+
+### Wastewater series (EDAR variants)
+
+| Method | Config key | Behavior |
+| --- | --- | --- |
+| Tobit Kalman v2 | `smoothing.wastewater_method: "tobit_kalman_v2"` | Causal Tobit-Kalman filtering for censored observations (LOD-aware), with the same missing-policy and robust re-entry controls as Kalman v2. |
+
 ## Wastewater (EDAR) Processing Methodology
 
 The wastewater processor (`EDARProcessor`) implements a sophisticated pipeline to handle the unique challenges of environmental surveillance data, particularly sparsity and limits of detection (LOD).
@@ -38,7 +57,7 @@ To address missing data and censored observations (values below the limit of det
 
 - **State Space Model:** We model the log-transformed viral flow as a local level process (random walk) observed with noise.
 - **Censored Data (Values $\le$ LOD):** Instead of treating these as zeros or missing, we use a Tobit update step. The filter updates the state estimate using the probability mass of the predicted distribution that falls below the LOD. This statistically imputes the most likely value consistent with the "non-detect" observation.
-- **Missing Data:** Days with no samples use drift extrapolation (after 2+ observations) to continue recent trends with decaying momentum (0.5, 0.25, 0.125...). This limits divergence from the next actual measurement. Uncertainty grows faster during gaps, and the censor flag remains 2 to indicate imputed values.
+- **Missing Data:** Days with no samples are handled causally according to `smoothing.missing_policy`. Default `predict` uses one-step prediction only; optional `momentum` enables bounded decayed extrapolation (with configurable max steps). Censor flag remains 2 to indicate imputed values.
 - **Parameter Estimation:** Process and measurement variances are fitted per-site using Maximum Likelihood Estimation (MLE) on the available non-censored data.
 
 ### 3. Spatial Aggregation

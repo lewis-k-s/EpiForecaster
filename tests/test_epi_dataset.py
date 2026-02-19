@@ -184,7 +184,9 @@ class TestEpiDataset:
             item_a["mob_x"][0, 0, 0] = float("inf")
             item_a["mob_edge_weight"][0][0] = float("nan")
 
-            batch = collate_epiforecaster_batch([item_a, item_b], require_region_index=False)
+            batch = collate_epiforecaster_batch(
+                [item_a, item_b], require_region_index=False
+            )
 
             assert torch.isfinite(batch["HospHist"]).all()
             assert torch.isfinite(batch["DeathsHist"]).all()
@@ -193,3 +195,31 @@ class TestEpiDataset:
             assert torch.isfinite(batch["TemporalCovariates"]).all()
             assert torch.isfinite(batch["MobBatch"].x).all()
             assert torch.isfinite(batch["MobBatch"].edge_weight).all()
+
+    def test_sparse_graphs_precomputed_at_init(self, config, mock_xarray_dataset):
+        """Verify that sparse graphs are eagerly precomputed during initialization."""
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1, 2],
+            )
+
+            # Check that all timesteps have precomputed graphs
+            T = len(mock_xarray_dataset.date)
+            assert len(ds._full_graph_cache) == T, (
+                f"Expected {T} precomputed graphs, got {len(ds._full_graph_cache)}"
+            )
+
+            # Verify each graph has valid structure
+            for time_step, graph in ds._full_graph_cache.items():
+                assert graph.edge_index is not None
+                assert graph.edge_weight is not None
+                assert graph.num_nodes > 0
+                assert graph.node_ids is not None
+                # edge_index should be (2, E)
+                assert graph.edge_index.shape[0] == 2
+                # edge_weight should match number of edges
+                assert graph.edge_weight.shape[0] == graph.edge_index.shape[1]

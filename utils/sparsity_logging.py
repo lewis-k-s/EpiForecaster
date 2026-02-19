@@ -12,6 +12,8 @@ from typing import Any
 
 import torch
 
+from utils.dtypes import sync_to_device
+
 logger = logging.getLogger(__name__)
 
 
@@ -232,6 +234,9 @@ def log_sparsity_loss_correlation(
 
         loss_vals = losses[loss_key]
         sparsity_vals = sparsity[sparsity_key]
+
+        # Sync sparsity to loss device (handles CPU batch -> GPU model outputs)
+        (sparsity_vals,) = sync_to_device(sparsity_vals, device=loss_vals.device)
 
         # Compute product: sparsity * loss
         product = sparsity_vals * loss_vals

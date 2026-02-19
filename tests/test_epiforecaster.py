@@ -283,9 +283,7 @@ class TestEpiForecaster:
                 Data(
                     x=_rand_tensor(4, model.temporal_node_dim),
                     edge_index=edge_index,
-                    edge_weight=torch.ones(
-                        edge_index.shape[1], dtype=torch.float32
-                    ),
+                    edge_weight=torch.ones(edge_index.shape[1], dtype=torch.float32),
                     target_node=torch.tensor([0], dtype=torch.long),
                 )
             )
@@ -312,3 +310,44 @@ class TestEpiForecaster:
         assert targets["cases"] is not None
         assert targets["cases"].dtype == expected_dtype
         assert mob_batch.edge_weight.dtype == expected_dtype
+
+    @pytest.mark.device
+    def test_forward_batch_cross_device(self, basic_config, accelerator_device):
+        """Test that forward_batch works when model is on accelerator and batch data on CPU.
+
+        This simulates the real training scenario where:
+        - Model is moved to GPU/MPS via .to(device)
+        - Batch data comes from DataLoader on CPU
+
+        Regression test for device mismatch bugs in forward_batch.
+        """
+        config = basic_config.copy()
+        model = EpiForecaster(**config).to(accelerator_device)
+
+        B, T = 2, config["sequence_length"]
+        horizon = config["forecast_horizon"]
+
+        # Batch data on CPU (simulates DataLoader output)
+        batch_data = {
+            "HospHist": _rand_tensor(B, T, 3),  # CPU
+            "DeathsHist": _rand_tensor(B, T, 3),  # CPU
+            "CasesHist": _rand_tensor(B, T, 3),  # CPU
+            "BioNode": torch.zeros(B, T, 1, dtype=torch.float32),  # CPU
+            "MobBatch": torch.zeros(1),  # Placeholder, mobility disabled
+            "Population": torch.full((B,), 1000.0, dtype=torch.float32),  # CPU
+            "TargetNode": torch.zeros(B, dtype=torch.long),  # CPU
+            "WWTarget": _rand_tensor(B, horizon),  # CPU
+            "HospTarget": _rand_tensor(B, horizon),  # CPU
+            "CasesTarget": _rand_tensor(B, horizon),  # CPU
+            "DeathsTarget": _rand_tensor(B, horizon),  # CPU
+        }
+
+        # This should NOT raise RuntimeError about device mismatch
+        outputs, targets = model.forward_batch(batch_data=batch_data)
+
+        # Verify outputs are on the correct device
+        assert outputs["pred_cases"].device.type == accelerator_device.type
+        assert outputs["pred_hosp"].device.type == accelerator_device.type
+
+        # Verify targets are also on accelerator (forward_batch moves them)
+        assert targets["cases"].device.type == accelerator_device.type

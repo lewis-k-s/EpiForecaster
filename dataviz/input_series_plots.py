@@ -79,7 +79,9 @@ def collect_window_samples(
     if ww_positive_indices:
         if shuffle:
             rng = random.Random(seed)
-            indices = rng.sample(ww_positive_indices, k=min(k, len(ww_positive_indices)))
+            indices = rng.sample(
+                ww_positive_indices, k=min(k, len(ww_positive_indices))
+            )
         else:
             indices = ww_positive_indices[:k]
     else:
@@ -233,7 +235,6 @@ def collect_window_samples(
             ]
             ww_series_full = ww_full.detach().cpu().numpy().astype(np.float32)
             ww_mask_full = ww_full_mask.detach().cpu().numpy().astype(np.float32)
-            ww_series_full = np.where(ww_mask_full > 0.5, ww_series_full, np.nan)
             sample["ww_series"] = ww_series_full.astype(np.float32)
             sample["ww_obs_mask_full"] = ww_mask_full.astype(np.float32)
 
@@ -514,12 +515,41 @@ def _plot_biomarkers(
         # Plot series line
         ax.plot(t[: len(values)], values, color=color, linewidth=1.5, label=name)
 
+        # Mark observed vs interpolated points using the mask channel
+        mask = channels["mask"]
+        finite = np.isfinite(values)
+        observed = (mask > 0.5) & finite
+        interpolated = (mask <= 0.5) & finite
+
+        if observed.any():
+            ax.scatter(
+                t[: len(values)][observed],
+                values[observed],
+                s=10,
+                color=color,
+                alpha=0.9,
+                linewidths=0,
+                zorder=3,
+            )
+        if interpolated.any():
+            ax.scatter(
+                t[: len(values)][interpolated],
+                values[interpolated],
+                s=14,
+                color="#ff7f0e",
+                alpha=0.9,
+                linewidths=0,
+                zorder=3,
+            )
+
     # Draw history/horizon separator
     ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
 
     # Overlay WW target/trajectory as the biomarker aggregate used in loss.
     if ww_series is not None and ww_obs_mask_full is not None:
-        ax.plot(t, ww_series, color="black", linewidth=1.2, linestyle="--", label="WW mean")
+        ax.plot(
+            t, ww_series, color="black", linewidth=1.2, linestyle="--", label="WW mean"
+        )
         finite = np.isfinite(ww_series)
         observed = (ww_obs_mask_full > 0.5) & finite
         interpolated = (ww_obs_mask_full <= 0.5) & finite
