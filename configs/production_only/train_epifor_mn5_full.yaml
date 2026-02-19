@@ -6,10 +6,10 @@ data:
   use_valid_targets: true
   mobility_threshold: 10
   missing_permit:
-    biomarkers_joint: 24
-    cases: 14
-    hospitalizations: 14
-    deaths: 14
+    biomarkers_joint: 53
+    cases: 20
+    hospitalizations: 53
+    deaths: 20
   window_stride: 1
   sample_ordering: "time"
   log_scale: true
@@ -24,8 +24,8 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    history_length: 28
-    forecast_horizon: 28
+    history_length: 60
+    forecast_horizon: 60
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
@@ -60,9 +60,9 @@ training:
   weight_decay: 1.0e-05
   warmup_steps: 3000
   # Worker config for 1 GPU + 20 CPUs
-  num_workers: 16
+  num_workers: 12
   val_workers: 4
-  prefetch_factor: 2
+  prefetch_factor: 4
   pin_memory: true
 
   # Temporal split configuration

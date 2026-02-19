@@ -1,0 +1,91 @@
+# Cases-only preprocessing configuration for Catalan COVID-19 epidemiological data
+# Base model configuration: cases only (no wastewater, no mobility)
+
+# Data source paths - all available sources enabled
+data_dir: "data/files"
+
+# Cases data source - Official Catalonia format only
+# This file should be the official Registre de casos CSV with columns:
+# TipusCasData, MunicipiCodi, TipusCasDescripcio, NumCasos
+cases_file: "data/files/Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv"
+
+# Deaths data (pre-aggregated municipality-level)
+deaths_file: "data/files/deaths_municipality.csv"
+
+# Hospitalizations data (pre-aggregated municipality-level)
+hospitalizations_file: "data/files/hospitalizations_municipality.csv"
+
+# Other data sources
+wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
+region_metadata_file: "data/files/edar_muni_edges.nc"
+population_file: "data/files/fl_population_por_municipis.csv"
+mobility_path: "data/files/mobility.zarr"
+
+# Temporal processing parameters - maximum coverage
+start_date: "2020-03-01" # Earliest case data available
+end_date: "2021-05-09" # Latest mobility data available
+
+# Feature processing options
+min_flow_threshold: 10
+wastewater_flow_mode: "concentration"
+
+# Alignment and validation options
+alignment_strategy: "interpolate"
+target_dataset: "cases"
+crop_datasets: true
+validate_alignment: true
+generate_alignment_report: true
+
+# Output configuration
+output_path: "data/processed"
+dataset_name: "real_with_id"
+compression: "blosc"
+
+# Processing configuration
+num_workers: 4
+# time dim chunk size
+chunk_size: 14
+# run_id dim chunk size (for synthetic multi-run datasets)
+run_id_chunk_size: 5
+date_chunk_size: 30 # Chunk size for date dimension in zarr output
+mobility_chunk_size: 100 # Chunk size for spatial dims (origin/destination)
+memory_limit_gb: 8.0
+
+temporal_covariates:
+  include_day_of_week: true
+  include_holidays: true
+  holiday_calendar_file: data/files/catalonia_holidays.csv
+
+# Offline causal smoothing configuration
+smoothing:
+  clinical_method: "holt_damped" # "kalman_v2" or "holt_damped"
+  wastewater_method: "tobit_kalman_v2"
+  missing_policy: "predict" # "predict" (default) or "momentum"
+  momentum_decay: 0.5
+  momentum_max_steps: 4
+  innovation_clip_sigma: 2.5
+  reentry_gain_cap: 0.35
+  reentry_steps: 2
+  process_var_floor: 1.0e-6
+  measurement_var_floor: 1.0e-6
+  holt_alpha: 0.30
+  holt_beta: 0.05
+  holt_phi: 0.90
+  holt_missing_trend_decay: 0.85
+
+# Graph construction options - minimal for cases-only model
+graph_options:
+  edge_strategy: "knn"
+  k_neighbors: 8
+  distance_threshold: 50.0 # 50km radius for regional connectivity
+  include_self_loops: false
+
+# Validation and quality control options
+validation_options:
+  max_missing_percentage: 0.15
+  min_data_coverage: 0.75
+  outlier_detection: true
+  outlier_threshold: 3.0
+  temporal_consistency_check: true
+  spatial_consistency_check: true
+  generate_plots: true
