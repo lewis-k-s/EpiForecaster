@@ -41,6 +41,7 @@ from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from utils import setup_tensor_core_optimizations
 from utils.gradient_debug import GradientDebugger
 from utils.sparsity_logging import log_sparsity_loss_correlation
+from utils.training_utils import get_effective_optimizer_step
 from utils.platform import (
     cleanup_nvme_staging,
     get_nvme_path,
@@ -1823,7 +1824,14 @@ class EpiForecasterTrainer:
                     (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
-                log_this_step = self.global_step % log_frequency == 0
+                accum_steps = self.config.training.gradient_accumulation_steps
+                effective_step = get_effective_optimizer_step(
+                    self.global_step, accum_steps
+                )
+                log_this_step = (
+                    effective_step % log_frequency == 0 and effective_step > 0
+                )
+
                 log_data = {
                     "learning_rate_step": lr,
                     "gradnorm_clipped_total": grad_norm,
@@ -1832,6 +1840,7 @@ class EpiForecasterTrainer:
                     "time_step_s": batch_time_s,
                     "epoch": self.current_epoch,
                 }
+
                 if log_this_step:
                     # Use detach() instead of item() - wandb handles tensor conversion
                     loss_detached = loss.detach()
@@ -1839,21 +1848,23 @@ class EpiForecasterTrainer:
                     # Convert to scalar only for console logging
                     loss_value = float(loss_detached)
                     self._status(
-                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
+                        f"Epoch {self.current_epoch} | Step {effective_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
                     )
-                # Keep as tensor - wandb handles CPU tensor conversion
-                window_start_mean = batch_data["WindowStart"].float().mean()
-                log_data["time_window_start"] = window_start_mean
 
-                # Log curriculum metrics for loss-curve-critic analysis
-                if self.curriculum_sampler is not None and hasattr(
-                    self.curriculum_sampler, "state"
-                ):
-                    log_data["train_sparsity_step"] = (
-                        self.curriculum_sampler.state.max_sparsity or 0.0
-                    )
-                if self.wandb_run is not None:
-                    wandb.log(log_data, step=self.global_step)
+                    # Keep as tensor - wandb handles CPU tensor conversion
+                    window_start_mean = batch_data["WindowStart"].float().mean()
+                    log_data["time_window_start"] = window_start_mean
+
+                    # Log curriculum metrics for loss-curve-critic analysis
+                    if self.curriculum_sampler is not None and hasattr(
+                        self.curriculum_sampler, "state"
+                    ):
+                        log_data["train_sparsity_step"] = (
+                            self.curriculum_sampler.state.max_sparsity or 0.0
+                        )
+
+                    if self.wandb_run is not None:
+                        wandb.log(log_data, step=effective_step)
 
                 self.global_step += 1
 
@@ -1972,7 +1983,10 @@ class EpiForecasterTrainer:
         - Other: catch-all for any remaining parameters
         """
         frequency = self.config.training.grad_norm_log_frequency
-        if frequency <= 0 or (step % frequency != 0 and step != 0):
+        accum_steps = self.config.training.gradient_accumulation_steps
+        effective_step = get_effective_optimizer_step(step, accum_steps)
+
+        if frequency <= 0 or (effective_step % frequency != 0 and effective_step != 0):
             return
 
         if not any(p.requires_grad for p in self.model.parameters()):
@@ -2102,7 +2116,10 @@ class EpiForecasterTrainer:
             step: Global training step
         """
         frequency = self.config.training.grad_norm_log_frequency
-        if frequency <= 0 or (step % frequency != 0 and step != 0):
+        accum_steps = self.config.training.gradient_accumulation_steps
+        effective_step = get_effective_optimizer_step(step, accum_steps)
+
+        if frequency <= 0 or (effective_step % frequency != 0 and effective_step != 0):
             return
 
         log_sparsity_loss_correlation(
