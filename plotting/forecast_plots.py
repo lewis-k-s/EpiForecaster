@@ -406,6 +406,13 @@ def make_forecast_figure(
             points_to_plot = horizon_mask.sum()
             forecast_series_full[horizon_mask] = pred_series[:points_to_plot]
 
+            # Include last history point (t=-1) so forecast line connects from history endpoint
+            history_end_mask = t_rel == -1
+            if history_end_mask.any():
+                forecast_series_full[history_end_mask] = actual_context[
+                    history_end_mask
+                ]
+
             df = pd.DataFrame(
                 {
                     "t": np.concatenate([t_rel, t_rel], axis=0),

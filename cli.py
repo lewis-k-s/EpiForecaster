@@ -470,39 +470,43 @@ def eval_epiforecaster(
     "--experiment",
     type=str,
     default=None,
-    help="Experiment name. Used with --run to auto-resolve paths.",
+    help="Experiment name. Used with --run to auto-resolve checkpoint path.",
 )
 @click.option(
     "--run",
     type=str,
     default=None,
-    help="Run ID. Used with --experiment to auto-resolve checkpoint and CSV.",
-)
-@click.option(
-    "--csv",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Path to evaluation CSV. Optional if --experiment and --run are provided.",
+    help="Run ID. Used with --experiment to auto-resolve checkpoint path.",
 )
 @click.option(
     "--checkpoint",
     type=click.Path(path_type=Path),
     default=None,
-    help="Path to model checkpoint. Optional if --experiment and --run are provided.",
+    help="Path to model checkpoint. Required if not using --experiment/--run.",
 )
 @click.option(
-    "--samples-per-quartile",
-    type=int,
-    default=2,
+    "--nodes",
+    type=str,
+    default="random:5",
     show_default=True,
-    help="Number of nodes to sample from each MAE quartile for plotting.",
+    help=(
+        "Node selection strategy: 'random:N', 'quartile:N', 'best:N', 'worst:N'. "
+        "Quartile/best/worst require a mini-eval to compute per-node MAE."
+    ),
+)
+@click.option(
+    "--split",
+    type=click.Choice(["val", "test"], case_sensitive=False),
+    default="test",
+    show_default=True,
+    help="Which split to use for plotting.",
 )
 @click.option(
     "--window",
-    type=click.Choice(["last"], case_sensitive=False),
-    default="last",
+    type=click.Choice(["last", "random"], case_sensitive=False),
+    default="random",
     show_default=True,
-    help="Which window to plot for each selected node.",
+    help="Which time window to plot: 'last' (final window) or 'random' (sample).",
 )
 @click.option(
     "--device",
@@ -517,24 +521,47 @@ def eval_epiforecaster(
     default=None,
     help="Optional output image path.",
 )
+@click.option(
+    "--override",
+    multiple=True,
+    help="Override config values (e.g., training.device=cuda, training.val_workers=0)",
+)
 def plot_forecasts(
     experiment: str | None,
     run: str | None,
-    csv: Path | None,
     checkpoint: Path | None,
-    samples_per_quartile: int,
+    nodes: str,
+    split: str,
     window: str,
     device: str,
     output: Path | None,
+    override: tuple[str, ...],
 ):
-    """Generate forecast plots from evaluation CSV using quartile sampling."""
+    """Generate forecast plots from checkpoint with flexible node selection.
+
+    \b
+    Node selection strategies (--nodes):
+      random:N    - Sample N random nodes (fast, no eval needed)
+      quartile:N  - N nodes per MAE quartile (requires mini-eval)
+      best:N      - N best-performing nodes (requires mini-eval)
+      worst:N     - N worst-performing nodes (requires mini-eval)
+
+    \b
+    Examples:
+      # Quick random sample (no eval)
+      uv run cli plot forecasts --checkpoint model.pt --nodes random:8
+
+      # Quartile-based from test split
+      uv run cli plot forecasts -e myexp -r 12345 --nodes quartile:2 --split test
+
+      # Best/worst performers on validation
+      uv run cli plot forecasts --checkpoint model.pt --nodes best:3 --nodes worst:3
+    """
     try:
-        # Resolve paths from experiment/run if provided
         if experiment and run:
             from utils.run_discovery import (
                 get_eval_output_dir,
                 resolve_checkpoint_path,
-                resolve_node_metrics_csv_path,
                 list_available_runs,
             )
 
@@ -551,71 +578,124 @@ def plot_forecasts(
                     )
                     raise click.ClickException("Cannot resolve checkpoint path")
 
-            # Resolve the per-node metrics CSV (written by eval_checkpoint)
-            if csv is None:
-                try:
-                    csv = resolve_node_metrics_csv_path(
-                        experiment_name=experiment,
-                        run_id=run,
-                        split="val",
-                    )
-                except FileNotFoundError as e:
-                    click.echo(
-                        f"Note: The per-node CSV (val_node_metrics.csv) may not exist yet. "
-                        f"Run 'eval epiforecaster --experiment {experiment} --run {run}' first.",
-                        err=True,
-                    )
-                    click.echo(f"❌ Evaluation CSV not found: {e}", err=True)
-                    click.echo(
-                        f"\n{list_available_runs(experiment_name=experiment)}", err=True
-                    )
-                    raise click.ClickException("Cannot resolve CSV path")
-
-            click.echo("Resolved paths:")
-            click.echo(f"  Checkpoint: {checkpoint}")
-            click.echo(f"  CSV: {csv}")
             if output is None:
                 eval_dir = get_eval_output_dir(experiment_name=experiment, run_id=run)
-                output = eval_dir / "val_forecasts.png"
-                click.echo(f"  Output: {output}")
+                output = eval_dir / f"{split}_forecasts.png"
 
-        # Validate required paths
-        if csv is None:
-            raise click.ClickException(
-                "Must provide --csv or both --experiment and --run"
-            )
         if checkpoint is None:
             raise click.ClickException(
                 "Must provide --checkpoint or both --experiment and --run"
             )
 
-        # Suppress zarr logging spam
         logging.getLogger("zarr").setLevel(logging.WARNING)
         logging.getLogger("numcodecs").setLevel(logging.WARNING)
 
-        from evaluation.epiforecaster_eval import plot_forecasts_from_csv
+        from evaluation.epiforecaster_eval import (
+            build_loader_from_config,
+            evaluate_loader,
+            generate_forecast_plots,
+            get_loss_from_config,
+            load_model_from_checkpoint,
+            select_nodes_by_loss,
+        )
 
-        click.echo(f"Loading evaluation CSV: {csv}")
-        result = plot_forecasts_from_csv(
-            csv_path=csv,
-            checkpoint_path=checkpoint,
-            samples_per_quartile=samples_per_quartile,
+        click.echo(f"Loading checkpoint: {checkpoint}")
+        overrides = list(override) if override else None
+        model, config, _ckpt = load_model_from_checkpoint(
+            checkpoint, device=device, overrides=overrides
+        )
+        click.echo(
+            f"Model loaded ({sum(p.numel() for p in model.parameters()):,} params)"
+        )
+
+        click.echo(f"Building {split} loader...")
+        loader, region_embeddings = build_loader_from_config(
+            config, split=split, device=device
+        )
+        click.echo(f"Dataset: {len(loader.dataset)} samples")
+
+        strategy, k = _parse_nodes_option(nodes)
+
+        node_mae: dict[int, float] | None = None
+        if strategy in ("quartile", "best", "worst"):
+            click.echo(f"Running mini-eval for {strategy} selection...")
+            criterion = get_loss_from_config(
+                config.training.loss,
+                data_config=config.data,
+                forecast_horizon=config.model.forecast_horizon,
+            )
+            _, _, node_mae = evaluate_loader(
+                model=model,
+                loader=loader,
+                criterion=criterion,
+                horizon=config.model.forecast_horizon,
+                device=next(model.parameters()).device,
+                region_embeddings=region_embeddings,
+                split_name=split.capitalize(),
+            )
+
+        if strategy == "random":
+            dataset = loader.dataset
+            all_nodes = list(dataset._valid_window_starts_by_node.keys())
+            import random
+
+            random.seed(42)
+            selected = random.sample(all_nodes, min(k, len(all_nodes)))
+            node_groups = {"Random": selected}
+        else:
+            node_groups = select_nodes_by_loss(
+                node_mae=node_mae or {},
+                strategy=strategy,
+                k=k,
+                samples_per_group=k,
+            )
+
+        total_nodes = sum(len(v) for v in node_groups.values())
+        click.echo(f"Selected {total_nodes} nodes via {strategy}:")
+        for group_name, group_nodes in node_groups.items():
+            click.echo(f"  {group_name}: {len(group_nodes)} nodes")
+
+        click.echo(f"Generating plots (window={window})...")
+        generate_forecast_plots(
+            model=model,
+            loader=loader,
+            node_groups=node_groups,
             window=window,
-            device=device,
             output_path=output,
         )
 
-        selected_nodes = result["selected_nodes"]
-        quartile_groups = result["quartile_groups"]
-        click.echo(f"Sampled {len(selected_nodes)} nodes from quartiles:")
-        for quartile_name, nodes in quartile_groups.items():
-            click.echo(f"  {quartile_name}: {nodes}")
         if output is not None:
             click.echo(f"Saved figure to: {output}")
-    except Exception as exc:  # pragma: no cover - Click will handle reporting
+
+        if wandb.run is not None:
+            wandb.finish()
+
+    except Exception as exc:
         click.echo(f"❌ Plot generation failed: {exc}", err=True)
         click.echo(traceback.format_exc(), err=True)
         raise click.ClickException(str(exc)) from exc
+
+
+def _parse_nodes_option(nodes: str) -> tuple[str, int]:
+    """Parse --nodes option like 'random:5' into (strategy, k)."""
+    parts = nodes.split(":")
+    if len(parts) != 2:
+        raise click.ClickException(
+            f"Invalid --nodes format: '{nodes}'. Expected 'strategy:N' (e.g., 'random:5')"
+        )
+    strategy, k_str = parts[0].lower(), parts[1]
+    valid_strategies = ("random", "quartile", "best", "worst")
+    if strategy not in valid_strategies:
+        raise click.ClickException(
+            f"Invalid strategy: '{strategy}'. Valid: {', '.join(valid_strategies)}"
+        )
+    try:
+        k = int(k_str)
+        if k < 1:
+            raise ValueError("k must be positive")
+    except ValueError as e:
+        raise click.ClickException(f"Invalid count in --nodes: {k_str}. {e}") from e
+    return strategy, k
 
 
 def _format_eval_summary(loss: float, metrics: dict) -> str:
