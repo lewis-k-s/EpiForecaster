@@ -9,16 +9,14 @@ Data source: Registre de casos de COVID-19 a Catalunya per municipi i sexe
 https://datos.gob.es/ca/catalogo/a09002970-registro-de-test-de-covid-19-realizados-en-catalunya-segregacion-por-sexo-y-municipio
 """
 
-import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from .edar_processor import _KalmanFilter
+from ..smoothing import DampedHoltSmoother, KalmanSmoother, fit_kalman_params
 
 
 class CataloniaCasesProcessor:
@@ -133,46 +131,13 @@ class CataloniaCasesProcessor:
 
         return aggregated
 
-    def _fit_kalman_params(self, series: pd.Series) -> tuple[float, float]:
-        """Fit Kalman filter parameters from time series data.
-
-        Uses statsmodels UnobservedComponents to fit a local level model
-        and extract the process and measurement variances.
-
-        Args:
-            series: Time series of case values
-
-        Returns:
-            Tuple of (process_var, measurement_var)
-        """
-        # Filter to positive values for log transform
-        series = series.where(series > 0)
-        series_log = pd.Series(np.log(series), index=series.index)
-
-        if series_log.dropna().empty:
-            raise ValueError("No finite observations to fit Kalman params")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = UnobservedComponents(series_log, level="local level")
-            result = model.fit(disp=False)
-
-        params = dict(zip(result.param_names, result.params, strict=False))
-        process_var = float(params.get("sigma2.level", 0.0))
-        measurement_var = float(params.get("sigma2.irregular", 0.0))
-
-        # Ensure positive variances
-        process_var = max(process_var, 1e-6)
-        measurement_var = max(measurement_var, 1e-6)
-
-        return process_var, measurement_var
-
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply standard Kalman filtering for case data smoothing.
+        """Apply configured causal smoothing for case data.
 
         Helps reduce reporting noise (weekend effects, holiday delays).
         """
-        print("  Applying Kalman smoothing to cases...")
+        method = self.config.smoothing.clinical_method
+        print(f"  Applying causal smoothing to cases (method={method})...")
 
         fallback_process = float(
             self.config.validation_options.get("process_var", 0.05)
@@ -190,27 +155,44 @@ class CataloniaCasesProcessor:
             # Get values as numpy array
             values = muni_data["cases"].values
 
-            # Fit Kalman parameters from data (mask zero/negative for fitting)
-            fit_series = pd.Series(values, index=muni_data.index)
-            fit_series = fit_series.where(fit_series > 0)
+            if method == "kalman_v2":
+                # Fit Kalman parameters from data (mask zero/negative for fitting)
+                fit_series = pd.Series(values, index=muni_data.index)
+                fit_series = fit_series.where(fit_series > 0)
 
-            try:
-                process_var, measurement_var = self._fit_kalman_params(fit_series)
-            except Exception as e:
-                print(
-                    f"    ! Falling back to configured variances for {muni_code}: {e}"
+                try:
+                    process_var, measurement_var = fit_kalman_params(fit_series)
+                except Exception as e:
+                    print(
+                        f"    ! Falling back to configured variances for {muni_code}: {e}"
+                    )
+                    process_var = fallback_process
+                    measurement_var = fallback_measure
+
+                smoother = KalmanSmoother(
+                    process_var=process_var,
+                    measurement_var=measurement_var,
+                    missing_policy=self.config.smoothing.missing_policy,
+                    momentum_decay=self.config.smoothing.momentum_decay,
+                    momentum_max_steps=self.config.smoothing.momentum_max_steps,
+                    innovation_clip_sigma=self.config.smoothing.innovation_clip_sigma,
+                    reentry_gain_cap=self.config.smoothing.reentry_gain_cap,
+                    reentry_steps=self.config.smoothing.reentry_steps,
+                    process_var_floor=self.config.smoothing.process_var_floor,
+                    measurement_var_floor=self.config.smoothing.measurement_var_floor,
                 )
-                process_var = fallback_process
-                measurement_var = fallback_measure
+            elif method == "holt_damped":
+                smoother = DampedHoltSmoother(
+                    alpha=self.config.smoothing.holt_alpha,
+                    beta=self.config.smoothing.holt_beta,
+                    phi=self.config.smoothing.holt_phi,
+                    missing_trend_decay=self.config.smoothing.holt_missing_trend_decay,
+                )
+            else:
+                raise ValueError(f"Unsupported clinical smoothing method: {method}")
 
-            # Initialize Kalman filter with fitted params
-            kf = _KalmanFilter(
-                process_var=process_var,
-                measurement_var=measurement_var,
-            )
-
-            # Apply filter
-            filtered_values, flags = kf.filter_series(values)
+            # Apply causal smoother
+            filtered_values, flags = smoother.filter_series(values)
 
             # Create smoothed records
             for i, date in enumerate(muni_data.index):

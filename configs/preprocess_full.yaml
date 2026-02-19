@@ -56,6 +56,23 @@ temporal_covariates:
   include_holidays: true
   holiday_calendar_file: data/files/catalonia_holidays.csv
 
+# Offline causal smoothing configuration
+smoothing:
+  clinical_method: "kalman_v2" # "kalman_v2" or "holt_damped"
+  wastewater_method: "tobit_kalman_v2"
+  missing_policy: "predict" # "predict" (default) or "momentum"
+  momentum_decay: 0.5
+  momentum_max_steps: 4
+  innovation_clip_sigma: 2.5
+  reentry_gain_cap: 0.35
+  reentry_steps: 2
+  process_var_floor: 1.0e-6
+  measurement_var_floor: 1.0e-6
+  holt_alpha: 0.30
+  holt_beta: 0.05
+  holt_phi: 0.90
+  holt_missing_trend_decay: 0.85
+
 # Graph construction options - minimal for cases-only model
 graph_options:
   edge_strategy: "knn"

@@ -6,16 +6,14 @@ data (pre-aggregated by polygon overlap), including Kalman smoothing on a
 daily grid while preserving an observation mask for true measurement days.
 """
 
-import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from .edar_processor import _KalmanFilter
+from ..smoothing import KalmanSmoother, fit_kalman_params
 
 
 class DeathsProcessor:
@@ -56,9 +54,7 @@ class DeathsProcessor:
         df = df.rename(columns=self.COLUMN_MAPPING)
 
         # Drop rows where municipality_code is NaN or empty string
-        df = df[
-            df["municipality_code"].notna() & (df["municipality_code"] != "")
-        ]
+        df = df[df["municipality_code"].notna() & (df["municipality_code"] != "")]
 
         # Municipality codes are already strings from dasymetric_mob output
         # Ensure they are strings
@@ -93,24 +89,6 @@ class DeathsProcessor:
 
         return aggregated
 
-    def _fit_kalman_params(self, series: pd.Series) -> tuple[float, float]:
-        """Fit Kalman process/measurement variances from positive observations."""
-        series = series.where(series > 0)
-        series_log = pd.Series(np.log(series), index=series.index)
-
-        if series_log.dropna().empty:
-            raise ValueError("No finite observations to fit Kalman params")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = UnobservedComponents(series_log, level="local level")
-            result = model.fit(disp=False)
-
-        params = dict(zip(result.param_names, result.params, strict=False))
-        process_var = max(float(params.get("sigma2.level", 0.0)), 1e-6)
-        measurement_var = max(float(params.get("sigma2.irregular", 0.0)), 1e-6)
-        return process_var, measurement_var
-
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """Smooth deaths time series and interpolate missing days per municipality."""
         print("  Applying Kalman smoothing to deaths...")
@@ -131,17 +109,17 @@ class DeathsProcessor:
             observed = muni_data["deaths"].notna().to_numpy()
             values = muni_data["deaths"].to_numpy()
 
-            fit_series = pd.Series(values, index=muni_data.index).where(
-                lambda s: s > 0
-            )
+            fit_series = pd.Series(values, index=muni_data.index).where(lambda s: s > 0)
             try:
-                process_var, measurement_var = self._fit_kalman_params(fit_series)
+                process_var, measurement_var = fit_kalman_params(fit_series)
             except Exception as e:
-                print(f"    ! Falling back to configured variances for {muni_code}: {e}")
+                print(
+                    f"    ! Falling back to configured variances for {muni_code}: {e}"
+                )
                 process_var = fallback_process
                 measurement_var = fallback_measure
 
-            kf = _KalmanFilter(
+            kf = KalmanSmoother(
                 process_var=process_var,
                 measurement_var=measurement_var,
             )

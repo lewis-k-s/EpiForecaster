@@ -4,21 +4,18 @@ Processor for COVID-19 hospitalization data from pre-aggregated municipality CSV
 This module handles the conversion of hospitalization data from weekly municipality-level
 to daily municipality-level time series. It includes:
 - Loading and parsing weekly hospitalization data (pre-aggregated by polygon overlap)
-- Weekly to daily resampling with distribution smoothing
-- Tobit-Kalman filtering for censored/missing data
+- Weekly to daily resampling with sparse observations (Kalman interpolates gaps)
 - Output as xarray Dataset with consistent dims and coordinates
 """
 
-import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import xarray as xr
-from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from .edar_processor import _KalmanFilter
+from ..smoothing import DampedHoltSmoother, KalmanSmoother, fit_kalman_params
 
 
 class HospitalizationsProcessor:
@@ -28,8 +25,8 @@ class HospitalizationsProcessor:
     Processing pipeline:
     1. Load pre-aggregated weekly hospitalization data (municipality level)
     2. Aggregate by municipality/week
-    3. Resample weekly to daily using equal distribution
-    4. Apply Tobit-Kalman smoothing for censored data
+    3. Resample weekly to daily with sparse observations (NaN on non-measurement days)
+    4. Apply configured causal smoothing for sparse gaps
     5. Output xarray Dataset with dims (run_id, date, region_id)
     """
 
@@ -117,105 +114,47 @@ class HospitalizationsProcessor:
 
     def _resample_weekly_to_daily(self, muni_weekly: pd.DataFrame) -> pd.DataFrame:
         """
-        Resample weekly hospitalization data to daily.
+        Resample weekly hospitalization data to daily with sparse observations.
 
-        Strategy: Distribute each week's total equally across 7 days.
-        This preserves the total while creating a daily series.
-
-        Also computes integer age channel:
-        - Age = 1 on week start (original observation day)
-        - Age = 2-7 on subsequent days (interpolated from weekly)
-        - Age resets to 1 at the start of each new week
+        Strategy: Place weekly total on the week_start date only, leave other days as NaN.
+        The Kalman filter will interpolate gaps using momentum-based extrapolation.
+        This matches the pattern used by DeathsProcessor and CataloniaCasesProcessor.
         """
-        daily_records = []
+        # Rename week_start to date for consistency with other processors
+        muni_weekly = muni_weekly.rename(columns={"week_start": "date"})
 
-        for muni_code in muni_weekly["municipality_code"].unique():
-            muni_data = muni_weekly[
-                muni_weekly["municipality_code"] == muni_code
-            ].copy()
-            muni_data = muni_data.set_index("week_start").sort_index()
-
-            # Distribute weekly values evenly across 7 days
-            for week_start, row in muni_data.iterrows():
-                weekly_total = row["hospitalizations"]
-                daily_value = weekly_total / 7.0
-
-                # Create 7 daily records with integer age
-                # Age 1 = week start (original data), Age 2-7 = interpolated
-                for day_offset in range(7):
-                    daily_date = week_start + pd.Timedelta(days=day_offset)
-                    age = day_offset + 1  # Integer age: 1 to 7
-                    daily_records.append(
-                        {
-                            "date": daily_date,
-                            "municipality_code": muni_code,
-                            "hospitalizations": daily_value,
-                            "age": age,  # Integer age since last observation
-                        }
-                    )
-
-        daily_df = pd.DataFrame(daily_records)
-
-        # Aggregate by date (in case weeks overlap)
-        # For age, use min (prioritize younger age if weeks overlap)
-        daily_df = (
-            daily_df.groupby(["date", "municipality_code"])
-            .agg(
-                {
-                    "hospitalizations": "sum",
-                    "age": "min",  # Use youngest age if overlapping
-                }
-            )
-            .reset_index()
+        # Pivot to wide format (municipalities as columns) for easier resampling
+        pivot = muni_weekly.pivot(
+            index="date", columns="municipality_code", values="hospitalizations"
         )
 
-        print(f"  Resampled to {len(daily_df):,} daily records with integer age")
+        # Resample to daily frequency - creates NaN for days without observations
+        pivot_daily = pivot.resample("D").asfreq()
+
+        # Melt back to long format
+        daily_df = pivot_daily.reset_index().melt(
+            id_vars=["date"],
+            var_name="municipality_code",
+            value_name="hospitalizations",
+        )
+
+        print(
+            f"  Resampled to {len(daily_df):,} daily records "
+            f"({daily_df['hospitalizations'].notna().sum():,} observations, "
+            f"{daily_df['hospitalizations'].isna().sum():,} to be interpolated)"
+        )
 
         return daily_df
 
-    def _fit_kalman_params(self, series: pd.Series) -> tuple[float, float]:
-        """
-        Fit Kalman filter parameters from time series data.
-
-        Uses statsmodels UnobservedComponents to fit a local level model
-        and extract the process and measurement variances.
-
-        Args:
-            series: Time series of hospitalization values
-
-        Returns:
-            Tuple of (process_var, measurement_var)
-        """
-        # Filter to positive values for log transform
-        series = series.where(series > 0)
-        series_log = pd.Series(np.log(series), index=series.index)
-
-        if series_log.dropna().empty:
-            raise ValueError("No finite observations to fit Kalman params")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = UnobservedComponents(series_log, level="local level")
-            result = model.fit(disp=False)
-
-        params = dict(zip(result.param_names, result.params, strict=False))
-        process_var = float(params.get("sigma2.level", 0.0))
-        measurement_var = float(params.get("sigma2.irregular", 0.0))
-
-        # Ensure positive variances
-        process_var = max(process_var, 1e-6)
-        measurement_var = max(measurement_var, 1e-6)
-
-        return process_var, measurement_var
-
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply standard Kalman filtering for time series smoothing.
+        Apply configured causal smoothing for time series.
 
         Unlike wastewater data, hospitalizations don't have detection limits,
-        so we use standard Kalman (not Tobit-Kalman) for smoothing.
+        so we use non-censored smoothers for preprocessing.
         """
-        print("  Applying Kalman smoothing...")
+        method = self.config.smoothing.clinical_method
+        print(f"  Applying causal smoothing (method={method})...")
 
         fallback_process = float(
             self.config.validation_options.get("process_var", 0.05)
@@ -230,28 +169,49 @@ class HospitalizationsProcessor:
             muni_data = daily_df[daily_df["municipality_code"] == muni_code].copy()
             muni_data = muni_data.set_index("date").sort_index()
 
-            # Get values as numpy array
+            # Get values as numpy array (NaN for missing days)
             values = muni_data["hospitalizations"].values
 
-            # Fit Kalman parameters from data (mask zero/negative for fitting)
-            fit_series = pd.Series(values, index=muni_data.index)
-            fit_series = fit_series.where(fit_series > 0)
+            # Preserve original observation mask
+            observed = muni_data["hospitalizations"].notna().to_numpy()
 
-            try:
-                process_var, measurement_var = self._fit_kalman_params(fit_series)
-            except Exception as e:
-                print(f"    ! Falling back to configured variances for {muni_code}: {e}")
-                process_var = fallback_process
-                measurement_var = fallback_measure
+            if method == "kalman_v2":
+                # Fit Kalman parameters from observed data only
+                fit_series = muni_data["hospitalizations"].where(lambda s: s > 0)
 
-            # Initialize Kalman filter with fitted params
-            kf = _KalmanFilter(
-                process_var=process_var,
-                measurement_var=measurement_var,
-            )
+                try:
+                    process_var, measurement_var = fit_kalman_params(fit_series)
+                except Exception as e:
+                    print(
+                        f"    ! Falling back to configured variances for {muni_code}: {e}"
+                    )
+                    process_var = fallback_process
+                    measurement_var = fallback_measure
 
-            # Apply filter
-            filtered_values, flags = kf.filter_series(values)
+                smoother = KalmanSmoother(
+                    process_var=process_var,
+                    measurement_var=measurement_var,
+                    missing_policy=self.config.smoothing.missing_policy,
+                    momentum_decay=self.config.smoothing.momentum_decay,
+                    momentum_max_steps=self.config.smoothing.momentum_max_steps,
+                    innovation_clip_sigma=self.config.smoothing.innovation_clip_sigma,
+                    reentry_gain_cap=self.config.smoothing.reentry_gain_cap,
+                    reentry_steps=self.config.smoothing.reentry_steps,
+                    process_var_floor=self.config.smoothing.process_var_floor,
+                    measurement_var_floor=self.config.smoothing.measurement_var_floor,
+                )
+            elif method == "holt_damped":
+                smoother = DampedHoltSmoother(
+                    alpha=self.config.smoothing.holt_alpha,
+                    beta=self.config.smoothing.holt_beta,
+                    phi=self.config.smoothing.holt_phi,
+                    missing_trend_decay=self.config.smoothing.holt_missing_trend_decay,
+                )
+            else:
+                raise ValueError(f"Unsupported clinical smoothing method: {method}")
+
+            # Apply smoother
+            filtered_values, flags = smoother.filter_series(values)
 
             # Create smoothed records
             for i, date in enumerate(muni_data.index):
@@ -263,7 +223,8 @@ class HospitalizationsProcessor:
                             filtered_values[i]
                         ),  # Back-transform from log space
                         "hospitalizations_log": filtered_values[i],
-                        "missing_flag": flags[i],  # 0=normal, 2=missing
+                        "missing_flag": flags[i],  # 0=normal, 2=missing/interpolated
+                        "hospitalizations_observed": float(observed[i]),
                     }
                 )
 
@@ -287,28 +248,28 @@ class HospitalizationsProcessor:
         """
         Create mask and age channels matching EDAR/cases conventions.
 
-        Mask: 1.0 ONLY if it's an original weekly measurement (age=1) and not missing.
+        Mask: 1.0 ONLY if it was an original observation (not interpolated by Kalman).
         Age: Days since last ACTUAL observation (age=1 means today was measured).
         """
         daily_df = daily_df.copy()
 
-        # Identify actual measurements: must be week start AND not marked as missing by Kalman
-        is_week_start = (
-            (daily_df["age"] == 1)
-            if "age" in daily_df.columns
-            else pd.Series(True, index=daily_df.index)
-        )
-        if "missing_flag" in daily_df.columns:
-            is_not_missing = daily_df["missing_flag"] < 1.5
+        # Mask: 1.0 for actual observations (hospitalizations_observed was True)
+        if "hospitalizations_observed" in daily_df.columns:
+            daily_df["hospitalizations_mask"] = (
+                daily_df["hospitalizations_observed"] > 0.5
+            ).astype(float)
         else:
-            is_not_missing = daily_df["hospitalizations"].notna()
+            # Fallback: use missing_flag if available
+            if "missing_flag" in daily_df.columns:
+                daily_df["hospitalizations_mask"] = (
+                    daily_df["missing_flag"] < 1.5
+                ).astype(float)
+            else:
+                daily_df["hospitalizations_mask"] = (
+                    daily_df["hospitalizations"].notna().astype(float)
+                )
 
-        # Mask: 1.0 for actual measurements, 0.0 for all interpolated/missing values
-        mask = is_week_start & is_not_missing
-        daily_df["hospitalizations_mask"] = mask.astype(float)
-
-        # Recompute age to correctly track staleness across missing weeks
-        # Age = days since last measurement (mask == True)
+        # Age: Days since last ACTUAL observation
         age_series_list = []
         for muni_code in daily_df["municipality_code"].unique():
             muni_data = daily_df[
@@ -320,15 +281,12 @@ class HospitalizationsProcessor:
             # 1. Create a group ID that increments each time a measurement is seen
             groups = muni_mask.cumsum()
             # 2. Count days within each group
-            # If no measurement seen yet, groups will be 0.
             age = muni_data.groupby(groups).cumcount() + 1
 
-            # Handle the leading zeros (before first measurement) - age should be max
-            # Actually, groups.cumsum() for False, False, True, False starts with 0, 0, 1, 1
-            # We want to detect the segment before the first True.
+            # Handle the leading period (before first measurement) - age should be max
             first_true_idx = muni_mask.idxmax() if muni_mask.any() else None
             if first_true_idx is not None:
-                # Set age to a large value (e.g. 14) for dates before first measurement
+                # Set age to max (14) for dates before first measurement
                 age.loc[muni_data["date"] < muni_data.loc[first_true_idx, "date"]] = 14
             else:
                 age[:] = 14
@@ -380,7 +338,7 @@ class HospitalizationsProcessor:
         # Aggregate to municipality-week
         muni_weekly = self._aggregate_to_municipality_week(hosp_df)
 
-        # Resample to daily
+        # Resample to daily (sparse observations)
         daily_df = self._resample_weekly_to_daily(muni_weekly)
 
         # Apply Kalman smoothing if requested

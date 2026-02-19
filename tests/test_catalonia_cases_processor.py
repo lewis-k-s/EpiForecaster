@@ -90,3 +90,28 @@ def test_cases_mask_age_semantics(mock_config):
     # 7: age 2, 8: age 3, 9: age 4
     assert result.iloc[9]["cases_mask"] == 0.0
     assert result.iloc[9]["cases_age"] == 4.0
+
+
+def test_cases_holt_damped_preserves_mask_age_semantics(mock_config):
+    """Verify holt_damped still preserves observation-driven mask/age semantics."""
+    mock_config.smoothing.clinical_method = "holt_damped"
+    proc = CataloniaCasesProcessor(mock_config)
+
+    dates = pd.date_range("2022-01-01", periods=6)
+    daily_df = pd.DataFrame(
+        {
+            "date": dates,
+            "municipality_code": "08019",
+            "cases": [10.0, np.nan, np.nan, 11.0, np.nan, 12.0],
+        }
+    )
+
+    smoothed = proc._apply_kalman_smoothing(daily_df)
+    result = proc._create_mask_and_age_channels(smoothed)
+
+    expected_mask = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0]
+    assert result["cases_mask"].tolist() == expected_mask
+    assert result.iloc[0]["cases_age"] == 1.0
+    assert result.iloc[1]["cases_age"] == 2.0
+    assert result.iloc[2]["cases_age"] == 3.0
+    assert result.iloc[3]["cases_age"] == 1.0

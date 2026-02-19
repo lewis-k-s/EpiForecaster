@@ -6,7 +6,7 @@ pipeline. It supports comprehensive validation, multiple alignment strategies,
 and flexible data source specification.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,6 +38,69 @@ class TemporalCovariatesConfig:
         if self.include_holidays:
             dim += 1
         return dim
+
+
+@dataclass
+class SmoothingConfig:
+    """Configuration for offline causal smoothing."""
+
+    clinical_method: str = "kalman_v2"
+    wastewater_method: str = "tobit_kalman_v2"
+    missing_policy: str = "predict"
+    momentum_decay: float = 0.5
+    momentum_max_steps: int = 4
+    innovation_clip_sigma: float = 2.5
+    reentry_gain_cap: float = 0.35
+    reentry_steps: int = 2
+    process_var_floor: float = 1e-6
+    measurement_var_floor: float = 1e-6
+    holt_alpha: float = 0.30
+    holt_beta: float = 0.05
+    holt_phi: float = 0.90
+    holt_missing_trend_decay: float = 0.85
+
+    def __post_init__(self):
+        valid_clinical = {"kalman_v2", "holt_damped"}
+        valid_wastewater = {"tobit_kalman_v2"}
+        valid_missing = {"predict", "momentum"}
+
+        if self.clinical_method not in valid_clinical:
+            raise ValueError(
+                f"Invalid clinical_method: {self.clinical_method}. "
+                f"Valid options: {sorted(valid_clinical)}"
+            )
+        if self.wastewater_method not in valid_wastewater:
+            raise ValueError(
+                f"Invalid wastewater_method: {self.wastewater_method}. "
+                f"Valid options: {sorted(valid_wastewater)}"
+            )
+        if self.missing_policy not in valid_missing:
+            raise ValueError(
+                f"Invalid missing_policy: {self.missing_policy}. "
+                f"Valid options: {sorted(valid_missing)}"
+            )
+        if not (0.0 <= self.momentum_decay <= 1.0):
+            raise ValueError("momentum_decay must be in [0, 1]")
+        if self.momentum_max_steps <= 0:
+            raise ValueError("momentum_max_steps must be positive")
+        if self.innovation_clip_sigma < 0.0:
+            raise ValueError("innovation_clip_sigma must be >= 0")
+        if not (0.0 < self.reentry_gain_cap <= 1.0):
+            raise ValueError("reentry_gain_cap must be in (0, 1]")
+        if self.reentry_steps < 0:
+            raise ValueError("reentry_steps must be >= 0")
+        if self.process_var_floor <= 0.0:
+            raise ValueError("process_var_floor must be positive")
+        if self.measurement_var_floor <= 0.0:
+            raise ValueError("measurement_var_floor must be positive")
+        if not (0.0 < self.holt_alpha <= 1.0):
+            raise ValueError("holt_alpha must be in (0, 1]")
+        if not (0.0 <= self.holt_beta <= 1.0):
+            raise ValueError("holt_beta must be in [0, 1]")
+        if not (0.0 <= self.holt_phi <= 1.0):
+            raise ValueError("holt_phi must be in [0, 1]")
+        if not (0.0 <= self.holt_missing_trend_decay <= 1.0):
+            raise ValueError("holt_missing_trend_decay must be in [0, 1]")
 
 
 @dataclass
@@ -88,6 +151,7 @@ class PreprocessingConfig:
 
         graph_options: Graph construction options
         validation_options: Validation and quality control options
+        smoothing: Causal smoothing method and robustness controls
     """
 
     # Required fields (no defaults)
@@ -117,8 +181,8 @@ class PreprocessingConfig:
 
     # Censor inflation multiplier for Tobit-Kalman filtering.
     # Multiplier applied to the measurement variance when an observation is censored
-    # (i.e., below the detection limit). In _TobitKalman.filter_series
-    # (see data/preprocess/processors/edar_processor.py), when value <= limit,
+    # (i.e., below the detection limit). In TobitKalmanSmoother.filter_series
+    # (see data/preprocess/smoothing.py), when value <= limit,
     # the effective measurement variance is:
     #   r_eff = measurement_var * censor_inflation
     # So a higher censor_inflation down-weights censored observations (trusts them
@@ -179,6 +243,7 @@ class PreprocessingConfig:
     )
 
     temporal_covariates: TemporalCovariatesConfig | None = None
+    smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -186,6 +251,8 @@ class PreprocessingConfig:
             self.temporal_covariates = TemporalCovariatesConfig(
                 **self.temporal_covariates
             )
+        if isinstance(self.smoothing, dict):
+            self.smoothing = SmoothingConfig(**self.smoothing)
         self._validate_paths()
         self._validate_temporal_parameters()
         self._validate_processing_options()
@@ -338,6 +405,9 @@ class PreprocessingConfig:
         config_dict = self.__dict__.copy()
         config_dict["start_date"] = self.start_date.isoformat()
         config_dict["end_date"] = self.end_date.isoformat()
+        if self.temporal_covariates is not None:
+            config_dict["temporal_covariates"] = asdict(self.temporal_covariates)
+        config_dict["smoothing"] = asdict(self.smoothing)
 
         with open(config_path, "w") as f:
             yaml.safe_dump(config_dict, f, default_flow_style=False, indent=2)
@@ -397,4 +467,5 @@ class PreprocessingConfig:
             "graph_options": self.graph_options,
             "validation": self.validation_options,
             "temporal_covariates": temporal_covariates_summary,
+            "smoothing": asdict(self.smoothing),
         }

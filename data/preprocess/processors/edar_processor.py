@@ -7,217 +7,13 @@ It processes variant selection, flow calculations, temporal alignment, and
 creates temporal tensors for downstream aggregation to target regions.
 """
 
-import warnings
-
 import numpy as np
 import pandas as pd
 import xarray as xr
 from scipy.stats import norm
-from statsmodels.tsa.statespace.kalman_filter import KalmanFilter as SMKalmanFilter
-from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 from ..config import REGION_COORD, PreprocessingConfig
-
-
-class _TobitKalman:
-    def __init__(
-        self,
-        *,
-        process_var: float,
-        measurement_var: float,
-        censor_inflation: float = 4.0,
-    ) -> None:
-        self.process_var = float(process_var)
-        self.measurement_var = float(measurement_var)
-        self.censor_inflation = float(censor_inflation)
-        self.state = 0.0
-        self.state_var = 1.0
-        self.initialized = False
-        self._last_actual_value: float | None = None
-        self._second_last_actual_value: float | None = None
-        self._actual_count: int = 0
-        self._consecutive_missing: int = 0
-
-    def _initialize(self, first_log_value: float) -> None:
-        self.state = float(first_log_value)
-        self.state_var = float(self.measurement_var)
-        self.initialized = True
-
-    def filter_series(
-        self, values: np.ndarray, limits: np.ndarray
-    ) -> tuple[list[float], list[int]]:
-        filtered: list[float] = []
-        flags: list[int] = []
-
-        finite_mask = np.isfinite(values) & (values > 0)
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0]))
-            self._initialize(first_value)
-
-        for value, limit in zip(values, limits, strict=False):
-            # Predict
-            pred_state = self.state
-            pred_var = self.state_var + self.process_var
-            pred_sigma = float(np.sqrt(pred_var + self.measurement_var))
-
-            limit_valid = np.isfinite(limit) and limit > 0
-
-            if not np.isfinite(value):
-                # Missing observation - apply drift extrapolation if we have enough actual measurements
-                if self.initialized and self._actual_count >= 2:
-                    # Compute slope from actual measurements only (not imputed values)
-                    slope = self._last_actual_value - self._second_last_actual_value
-                    # Decaying momentum: 0.5, 0.25, 0.125, ...
-                    self._consecutive_missing += 1
-                    momentum = 0.5**self._consecutive_missing
-                    self.state = pred_state + slope * momentum
-                    # Uncertainty grows faster during extrapolation gaps
-                    self.state_var = pred_var + self.process_var * 2.0
-                else:
-                    # Not enough actual measurements - stay flat (prediction only)
-                    self.state = pred_state
-                    self.state_var = pred_var
-
-                filtered.append(float(self.state))
-                flags.append(2)
-                continue
-            elif limit_valid and value <= limit:
-                if not self.initialized:
-                    self._initialize(float(np.log(limit) - 0.5))
-                    pred_state = self.state
-                    pred_var = self.state_var + self.process_var
-                    pred_sigma = float(np.sqrt(pred_var + self.measurement_var))
-
-                log_limit = float(np.log(limit + 1e-9))
-                alpha = (log_limit - pred_state) / pred_sigma
-                pdf = float(norm.pdf(alpha))
-                cdf = float(norm.cdf(alpha))
-                cdf = max(cdf, 1e-9)
-                z_eff = pred_state - pred_sigma * (pdf / cdf)
-                r_eff = self.measurement_var * self.censor_inflation
-                flag = 1
-            else:
-                log_value = float(np.log(value + 1e-9))
-                if not self.initialized:
-                    self._initialize(log_value)
-                    pred_state = self.state
-                z_eff = log_value
-                r_eff = self.measurement_var
-                flag = 0
-
-            s = pred_var + r_eff
-            k_gain = pred_var / s
-            self.state = pred_state + k_gain * (z_eff - pred_state)
-            self.state_var = (1 - k_gain) * pred_var
-
-            # Track actual measurements for drift extrapolation
-            self._second_last_actual_value = self._last_actual_value
-            self._last_actual_value = float(self.state)
-            self._actual_count += 1
-            self._consecutive_missing = 0  # Reset decay counter on actual measurement
-
-            filtered.append(float(self.state))
-            flags.append(flag)
-
-        return filtered, flags
-
-
-class _KalmanFilter:
-    """
-    Standard Kalman filter for time series smoothing.
-
-    Simpler version of _TobitKalman without censoring support.
-    Used for hospitalization data where there's no detection limit.
-
-    State space model:
-    - State transition: x_t = x_{t-1} + w_t,  w_t ~ N(0, process_var)
-    - Measurement: z_t = x_t + v_t,  v_t ~ N(0, measurement_var)
-    """
-
-    def __init__(
-        self,
-        *,
-        process_var: float,
-        measurement_var: float,
-    ) -> None:
-        self.process_var = float(process_var)
-        self.measurement_var = float(measurement_var)
-        self.state = 0.0
-        self.state_var = 1.0
-        self.initialized = False
-
-    def _initialize(self, first_log_value: float) -> None:
-        self.state = float(first_log_value)
-        self.state_var = float(self.measurement_var)
-        self.initialized = True
-
-    def filter_series(self, values: np.ndarray) -> tuple[list[float], list[int]]:
-        """
-        Apply Kalman filter to a time series.
-
-        Args:
-            values: Array of measurements (can contain NaN for missing)
-
-        Returns:
-            Tuple of (filtered_values, flags)
-            flags: 0=normal, 2=missing
-        """
-        values = np.asarray(values, dtype=float).reshape(-1)
-        finite_mask = np.isfinite(values) & (values > 0)
-        flags = np.where(finite_mask, 0, 2).astype(int).tolist()
-
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
-
-        log_values = np.full(values.shape, np.nan, dtype=float)
-        log_values[finite_mask] = np.log(values[finite_mask] + 1e-9)
-
-        model = SMKalmanFilter(k_endog=1, k_states=1, k_posdef=1)
-        model.bind(log_values)
-        model.design[:] = 1.0
-        model.transition[:] = 1.0
-        model.selection[:] = 1.0
-        model.state_cov[:] = max(self.process_var, 1e-12)
-        model.obs_cov[:] = max(self.measurement_var, 1e-12)
-        model.initialize_known(
-            np.array([float(self.state)], dtype=float),
-            np.array([[float(max(self.state_var, 1e-12))]], dtype=float),
-        )
-
-        result = model.filter()
-        filtered_state = result.filtered_state[0].copy()
-        filtered_cov = result.filtered_state_cov[0, 0]
-
-        # Apply drift extrapolation for gaps
-        # Find indices of actual measurements
-        actual_indices = np.where(finite_mask)[0]
-
-        if len(actual_indices) >= 2:
-            # Process each gap - use slope from last two actual measurements BEFORE the gap
-            consecutive_missing = 0
-            for i in range(len(filtered_state)):
-                if flags[i] == 2:  # Missing
-                    # Find the last two actual measurements before this point
-                    prior_actuals = actual_indices[actual_indices < i]
-                    if len(prior_actuals) >= 2:
-                        prev_idx = prior_actuals[-1]
-                        prev_prev_idx = prior_actuals[-2]
-                        slope = filtered_state[prev_idx] - filtered_state[prev_prev_idx]
-                        # Decaying momentum: 0.5, 0.25, 0.125, ...
-                        consecutive_missing += 1
-                        momentum = 0.5**consecutive_missing
-                        filtered_state[i] = filtered_state[i - 1] + slope * momentum
-                else:
-                    # Reset decay counter on actual measurement
-                    consecutive_missing = 0
-
-        if filtered_state.size > 0:
-            self.state = float(filtered_state[-1])
-            self.state_var = float(filtered_cov[-1])
-
-        filtered = filtered_state.astype(float).tolist()
-        return filtered, flags
+from ..smoothing import TobitKalmanSmoother, fit_kalman_params
 
 
 class EDARProcessor:
@@ -245,25 +41,6 @@ class EDARProcessor:
         """
         self.config = config
         self.validation_options = config.validation_options
-
-    def _fit_kalman_params(self, series: pd.Series) -> tuple[float, float]:
-        series = series.where(series > 0)
-        series_log = pd.Series(np.log(series), index=series.index)
-        if series_log.dropna().empty:
-            raise ValueError("No finite observations to fit Kalman params")
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = UnobservedComponents(series_log, level="local level")
-            result = model.fit(disp=False)
-
-        params = dict(zip(result.param_names, result.params, strict=False))
-        process_var = float(params.get("sigma2.level", 0.0))
-        measurement_var = float(params.get("sigma2.irregular", 0.0))
-
-        process_var = max(process_var, 1e-6)
-        measurement_var = max(measurement_var, 1e-6)
-        return process_var, measurement_var
 
     def _apply_tobit_kalman(self, daily_data: pd.DataFrame) -> pd.DataFrame:
         if daily_data.empty:
@@ -307,12 +84,12 @@ class EDARProcessor:
                 continue
 
             try:
-                process_var, measurement_var = self._fit_kalman_params(fit_series)
+                process_var, measurement_var = fit_kalman_params(fit_series)
             except (ValueError, RuntimeError):
                 process_var = fallback_process
                 measurement_var = fallback_measure
 
-            filter_model = _TobitKalman(
+            filter_model = TobitKalmanSmoother(
                 process_var=process_var,
                 measurement_var=measurement_var,
                 censor_inflation=censor_inflation,

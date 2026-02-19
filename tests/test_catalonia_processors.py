@@ -8,6 +8,9 @@ import pytest
 from data.preprocess.config import PreprocessingConfig
 from data.preprocess.processors.catalonia_cases_processor import CataloniaCasesProcessor
 from data.preprocess.processors.deaths_processor import DeathsProcessor
+from data.preprocess.processors.hospitalizations_processor import (
+    HospitalizationsProcessor,
+)
 from data.preprocess.processors.municipality_mapping_processor import (
     MunicipalityMappingProcessor,
 )
@@ -42,6 +45,17 @@ def temp_data_dir(tmp_path: Path) -> Path:
         "01/01/2022,08019,Barcelona,2.0\n"
         "01/01/2022,08021,Abrera,1.0\n"
         "02/01/2022,08019,Barcelona,3.0\n"
+    )
+
+    # Hospitalizations data (weekly municipality-level)
+    # Week 1: Jan 3-9 (epidemiological week)
+    hosp_file = tmp_path / "hospitalizations_municipality.csv"
+    hosp_file.write_text(
+        "setmana_epidemiologica,any,data_inici,data_final,municipality_code,municipality_name,casos_muni\n"
+        "1,2022,03/01/2022,09/01/2022,08019,Barcelona,14.0\n"
+        "1,2022,03/01/2022,09/01/2022,08021,Abrera,7.0\n"
+        "2,2022,10/01/2022,16/01/2022,08019,Barcelona,21.0\n"
+        "2,2022,10/01/2022,16/01/2022,08021,Abrera,14.0\n"
     )
 
     # Dummy files for config validation
@@ -142,3 +156,63 @@ def test_deaths_processor_can_disable_smoothing(
     proc = DeathsProcessor(config)
     result = proc.process(temp_data_dir, apply_smoothing=False)
     assert result.deaths.isnull().any()
+
+
+@pytest.mark.region
+def test_deaths_processor_holt_damped_keeps_mask_age_semantics(
+    config: PreprocessingConfig, temp_data_dir: Path
+):
+    """Switching to holt_damped should not change mask/age observation semantics."""
+    config.smoothing.clinical_method = "holt_damped"
+    proc = DeathsProcessor(config)
+    result = proc.process(temp_data_dir, apply_smoothing=True)
+
+    assert result.deaths.notnull().all()
+    assert float(result.deaths_mask.sum()) == 3.0
+    assert float(result.deaths_age.max()) > 1.0
+
+
+@pytest.mark.integration
+@pytest.mark.region
+def test_hospitalizations_processor_weekly_data(
+    config: PreprocessingConfig, temp_data_dir: Path
+):
+    """Integration test: Hospitalizations processor with weekly sparse data.
+
+    This test exercises the full pipeline from weekly observations to daily
+    interpolated output with Kalman smoothing. Marked as integration test
+    because it tests multiple components together (resample + smooth + mask).
+    """
+    proc = HospitalizationsProcessor(config)
+    result = proc.process(temp_data_dir, apply_smoothing=True)
+
+    assert "hospitalizations" in result
+    assert "hospitalizations_mask" in result
+    assert "hospitalizations_age" in result
+
+    # Should have run_id dimension like other datasets
+    assert result.hospitalizations.dims == ("run_id", "date", "region_id")
+    assert result.hospitalizations.sizes["run_id"] == 1
+
+    # Should have daily resolution covering full config range
+    assert result.hospitalizations.sizes["date"] == 15  # Jan 1-15
+
+    # Should have 2 municipalities
+    assert result.hospitalizations.sizes["region_id"] == 2
+
+    # Values between first and second observation should be interpolated
+    # Gap between Jan 3 and Jan 10 should be filled by Kalman
+    gap_period = result.hospitalizations.sel(date=slice("2022-01-03", "2022-01-09"))
+    assert gap_period.notnull().all()
+    assert (gap_period >= 0).all()
+
+    # Mask should track original weekly observations
+    # 2 weeks × 2 municipalities = 4 observations
+    # Note: mask is only 1.0 on actual observation days (week starts)
+    assert float(result.hospitalizations_mask.sum()) == 4.0
+
+    # Age channel should show staleness between weekly observations
+    # Week 1 obs on Jan 3, Week 2 obs on Jan 10
+    # Jan 9 should have age=7 (1 week since last obs)
+    jan_9_age = result.hospitalizations_age.sel(date="2022-01-09")
+    assert float(jan_9_age.max()) > 1.0

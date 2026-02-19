@@ -8,6 +8,7 @@ import xarray as xr
 
 from data.preprocess.config import PreprocessingConfig, REGION_COORD
 from data.preprocess.processors.edar_processor import EDARProcessor
+from data.preprocess import smoothing
 
 
 def _write_dummy_files(tmp_path: Path) -> dict[str, Path]:
@@ -188,12 +189,17 @@ def test_edar_processor_applies_tobit_kalman(
     config = _make_config(tmp_path, wastewater_path)
     processor = EDARProcessor(config)
 
-    monkeypatch.setattr(processor, "_fit_kalman_params", lambda series: (0.01, 0.04))
+    # Patch fit_kalman_params in the smoothing module
+    original_fit_kalman_params = smoothing.fit_kalman_params
+    monkeypatch.setattr(smoothing, "fit_kalman_params", lambda series: (0.01, 0.04))
 
-    result = processor.process(str(wastewater_path), str(mapping_path))
-    expected = _expected_edar_output(processor, wastewater_path, mapping_path)
-
-    xr.testing.assert_allclose(result, expected)
+    try:
+        result = processor.process(str(wastewater_path), str(mapping_path))
+        expected = _expected_edar_output(processor, wastewater_path, mapping_path)
+        xr.testing.assert_allclose(result, expected)
+    finally:
+        # Restore original function
+        smoothing.fit_kalman_params = original_fit_kalman_params
 
 
 @pytest.mark.epiforecaster
@@ -207,9 +213,14 @@ def test_edar_processor_skips_tobit_without_limits(
     config = _make_config(tmp_path, wastewater_path)
     processor = EDARProcessor(config)
 
-    monkeypatch.setattr(processor, "_fit_kalman_params", lambda series: (0.01, 0.04))
+    # Patch fit_kalman_params in the smoothing module
+    original_fit_kalman_params = smoothing.fit_kalman_params
+    monkeypatch.setattr(smoothing, "fit_kalman_params", lambda series: (0.01, 0.04))
 
-    result = processor.process(str(wastewater_path), str(mapping_path))
-    expected = _expected_edar_output(processor, wastewater_path, mapping_path)
-
-    xr.testing.assert_allclose(result, expected)
+    try:
+        result = processor.process(str(wastewater_path), str(mapping_path))
+        expected = _expected_edar_output(processor, wastewater_path, mapping_path)
+        xr.testing.assert_allclose(result, expected)
+    finally:
+        # Restore original function
+        smoothing.fit_kalman_params = original_fit_kalman_params
