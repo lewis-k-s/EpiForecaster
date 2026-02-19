@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.normalization import unscale_forecasts
+from utils.dtypes import sync_to_device
 
 logger = logging.getLogger(__name__)
 
@@ -747,6 +748,32 @@ class ObservationLoss(nn.Module):
         """
         raise NotImplementedError
 
+    def _sync_to_pred_device(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        target_mean: torch.Tensor | None = None,
+        target_scale: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+    ]:
+        """Sync all tensors to the same device as pred (model output).
+
+        Args:
+            pred: Prediction tensor (on accelerator from model forward pass)
+            target: Target tensor (may be on CPU from DataLoader)
+            mask: Optional mask tensor (may be on CPU)
+            target_mean: Optional mean tensor (may be on CPU)
+            target_scale: Optional scale tensor (may be on CPU)
+
+        Returns:
+            Tuple of (target, mask, target_mean, target_scale) all on pred.device
+        """
+        return sync_to_device(
+            target, mask, target_mean, target_scale, device=pred.device
+        )
+
     def _apply_mask(
         self, loss_values: torch.Tensor, mask: torch.Tensor | None
     ) -> torch.Tensor:
@@ -779,7 +806,7 @@ class MSELoss(ObservationLoss):
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MSE loss operates in normalized space; ignores mean/scale."""
-        _ = (target_mean, target_scale)
+        target, mask, _, _ = self._sync_to_pred_device(pred, target, mask)
         loss_values = (pred - target) ** 2
         return self._apply_mask(loss_values, mask)
 
@@ -797,7 +824,7 @@ class MAELoss(ObservationLoss):
         mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MAE loss operates in normalized space; ignores mean/scale."""
-        _ = (target_mean, target_scale)
+        target, mask, _, _ = self._sync_to_pred_device(pred, target, mask)
         loss_values = (pred - target).abs()
         return self._apply_mask(loss_values, mask)
 
@@ -829,6 +856,9 @@ class SMAPELoss(ObservationLoss):
         Requires target_mean and target_scale for unscaling.
         If not provided, computes sMAPE directly on normalized values.
         """
+        target, mask, target_mean, target_scale = self._sync_to_pred_device(
+            pred, target, mask, target_mean, target_scale
+        )
         if target_mean is not None and target_scale is not None:
             pred_unscaled, target_unscaled = unscale_forecasts(
                 pred, target, target_mean, target_scale
@@ -865,6 +895,9 @@ class UnscaledMSELoss(ObservationLoss):
         Requires target_mean and target_scale for unscaling.
         If not provided, computes MSE on normalized values (not recommended).
         """
+        target, mask, target_mean, target_scale = self._sync_to_pred_device(
+            pred, target, mask, target_mean, target_scale
+        )
         if target_mean is not None and target_scale is not None:
             pred_unscaled, target_unscaled = unscale_forecasts(
                 pred, target, target_mean, target_scale

@@ -208,3 +208,33 @@ def get_model_eps(device: torch.device | str, base_eps: float = 1e-8) -> float:
     """
     model_dtype = get_model_dtype_for_device(device)
     return get_dtype_safe_eps(model_dtype, base_eps)
+
+
+def sync_to_device(
+    *tensors: torch.Tensor | None,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, ...]:
+    """Sync tensors to a target device.
+
+    Moves tensors to the specified device if they are not already there.
+    Commonly used to move DataLoader outputs (CPU) to model device (GPU/MPS).
+
+    Args:
+        *tensors: Variable number of tensors (or None) to sync
+        device: Target device to move tensors to
+
+    Returns:
+        Tuple of tensors on the target device (or None for None inputs)
+
+    Example:
+        >>> target, mask, mean = sync_to_device(target, mask, mean, device=pred.device)
+    """
+    result = []
+    for t in tensors:
+        if t is None:
+            result.append(None)
+        elif t.device != device:
+            result.append(t.to(device))
+        else:
+            result.append(t)
+    return tuple(result)

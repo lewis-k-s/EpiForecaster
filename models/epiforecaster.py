@@ -546,6 +546,21 @@ class EpiForecaster(nn.Module):
         target_embeddings = node_emb[target_indices]
         return target_embeddings.view(B, T, self.mobility_embedding_dim)
 
+    def to(self, *args, **kwargs):
+        """Override to update self.device when model is moved to a new device.
+
+        This ensures forward_batch uses the correct device for tensor transfers.
+        """
+        result = super().to(*args, **kwargs)
+        # Extract device from args/kwargs
+        if args:
+            device_arg = args[0]
+            if isinstance(device_arg, (str, torch.device)):
+                self.device = torch.device(device_arg)
+        elif "device" in kwargs:
+            self.device = torch.device(kwargs["device"])
+        return result
+
     def __repr__(self) -> str:
         return (
             "EpiForecaster("

@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.dtypes import sync_to_device
+
 # PySAL imports for spatial autocorrelation
 from libpysal import weights
 from scipy.sparse import csr_matrix
@@ -268,6 +270,9 @@ class FlowWeightedContrastiveLoss(nn.Module):
         Returns:
             Contrastive loss value
         """
+        # Sync flow_weights to embeddings device (handles CPU DataLoader -> GPU model)
+        (flow_weights,) = sync_to_device(flow_weights, device=embeddings.device)
+
         # Normalize embeddings
         embeddings = F.normalize(embeddings, p=2, dim=1)
 

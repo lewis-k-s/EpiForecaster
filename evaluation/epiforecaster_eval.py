@@ -18,6 +18,7 @@ import zarr.errors
 from data.epi_dataset import EpiDataset, collate_epiforecaster_batch
 from data.preprocess.config import REGION_COORD
 from utils.normalization import unscale_forecasts
+from utils.dtypes import sync_to_device
 from models.configs import DataConfig, EpiForecasterConfig, LossConfig
 from models.epiforecaster import EpiForecaster
 from plotting.forecast_plots import (
@@ -200,6 +201,11 @@ class JointInferenceLoss(nn.Module):
         min_observed: int = 0,
     ) -> torch.Tensor:
         """Weighted MSE with robust masking and float32 reductions for AMP stability."""
+        # Sync target and mask to prediction device (handles CPU DataLoader -> GPU model)
+        target, observed_mask = sync_to_device(
+            target, observed_mask, device=prediction.device
+        )
+
         prediction_f32 = prediction.float()
         target_f32 = target.float()
         finite_mask = torch.isfinite(target_f32).to(prediction_f32.dtype)
@@ -478,13 +484,17 @@ def resolve_device(device: str) -> torch.device:
 
 
 def load_model_from_checkpoint(
-    checkpoint_path: Path, *, device: str = "auto"
+    checkpoint_path: Path,
+    *,
+    device: str = "auto",
+    overrides: list[str] | None = None,
 ) -> tuple[EpiForecaster, EpiForecasterConfig, dict[str, Any]]:
     """Load an EpiForecaster model + config from a saved trainer checkpoint.
 
     Args:
         checkpoint_path: Path to the checkpoint file (.pt)
         device: Device to load the model on
+        overrides: Optional list of dotted-key config overrides applied before model creation
 
     Returns:
         Tuple of (model, config, checkpoint_dict)
@@ -523,6 +533,11 @@ def load_model_from_checkpoint(
             f"Expected EpiForecasterConfig or dict. "
             f"Please check that the checkpoint was created with a compatible version."
         )
+
+    # Apply overrides BEFORE model creation (for architecture-affecting params)
+    if overrides:
+        config = EpiForecasterConfig.apply_overrides(config, overrides)
+        logger.info(f"Applied {len(overrides)} config overrides before model creation")
 
     model = EpiForecaster(
         variant_type=config.model.type,
@@ -1023,6 +1038,8 @@ def evaluate_loader(
     log_every = 10
 
     epsilon = 1e-6
+    hosp_min_observed = int(criterion.hosp_min_observed)
+    ww_min_observed = int(criterion.ww_min_observed)
     model_was_training = model.training
     model.eval()
     forward_model = cast(EpiForecaster, model)
@@ -1065,6 +1082,11 @@ def evaluate_loader(
                     if hosp_mask is None:
                         hosp_mask = torch.ones_like(hosp_targets)
                     mask = hosp_mask.to(pred_hosp.dtype)
+                    if hosp_min_observed > 0:
+                        hosp_eligible = (
+                            mask.sum(dim=1, keepdim=True) >= float(hosp_min_observed)
+                        ).to(mask.dtype)
+                        mask = mask * hosp_eligible
 
                     # Clean targets for metric calculation
                     hosp_targets_clean = torch.nan_to_num(hosp_targets, nan=0.0)
@@ -1127,6 +1149,11 @@ def evaluate_loader(
                     if ww_mask is None:
                         ww_mask = torch.ones_like(ww_targets)
                     mask_ww = ww_mask.to(pred_ww.dtype)
+                    if ww_min_observed > 0:
+                        ww_eligible = (
+                            mask_ww.sum(dim=1, keepdim=True) >= float(ww_min_observed)
+                        ).to(mask_ww.dtype)
+                        mask_ww = mask_ww * ww_eligible
 
                     # Clean targets for metric calculation
                     ww_targets_clean = torch.nan_to_num(ww_targets, nan=0.0)
@@ -1408,26 +1435,29 @@ def eval_checkpoint(
     Args:
         checkpoint_path: Path to checkpoint file
         split: Which split to evaluate ("val" or "test")
-        device: Device to use for evaluation
+        device: Device to use for evaluation (overridden by training.device in overrides)
     log_dir: Optional W&B run directory for forecast plots
         overrides: Optional list of dotted-key config overrides (e.g., ["training.val_workers=4"])
         output_csv_path: Optional path to save node-level metrics CSV
 
     Returns:
         Dict with: checkpoint, config, model, loader, node_mae_dict,
-                  eval_loss, eval_metrics
+                   eval_loss, eval_metrics
     """
+    # Extract training.device from overrides if present
+    resolved_device = device
+    if overrides:
+        for ov in overrides:
+            if ov.startswith("training.device="):
+                resolved_device = ov.split("=", 1)[1]
+                break
+
     logger.info(f"[eval] Loading checkpoint: {checkpoint_path}")
     model, config, checkpoint = load_model_from_checkpoint(
-        checkpoint_path, device=device
+        checkpoint_path,
+        device=resolved_device,
+        overrides=list(overrides) if overrides else None,
     )
-
-    # Apply config overrides if provided
-    if overrides:
-        from models.configs import EpiForecasterConfig
-
-        config = EpiForecasterConfig.apply_overrides(config, list(overrides))
-        logger.info(f"[eval] Applied {len(overrides)} config overrides")
     logger.info(
         f"[eval] Loaded model (params={sum(p.numel() for p in model.parameters()):,})"
     )
@@ -1435,7 +1465,7 @@ def eval_checkpoint(
         f"[eval] Building {split} loader from dataset: {config.data.dataset_path}"
     )
     loader, region_embeddings = build_loader_from_config(
-        config, split=split, device=device, batch_size=batch_size
+        config, split=split, device=resolved_device, batch_size=batch_size
     )
     dataset = cast(EpiDataset, loader.dataset)
     logger.info(f"[eval] {split} samples: {len(dataset)}")
