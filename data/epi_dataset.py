@@ -459,6 +459,11 @@ class EpiDataset(Dataset):
         except Exception:
             self._run_id_value = self.run_id  # Fallback to config value
 
+        # Precompute sparse graphs for all timesteps to eliminate CPU bottleneck
+        # in __getitem__. This converts dense mobility matrices to sparse edge
+        # lists once at init rather than per-sample during training.
+        self._precompute_sparse_graphs()
+
         # Close dataset and clear reference to avoid pickling issues
         self._dataset.close()
         self._dataset = None
@@ -1125,10 +1130,12 @@ class EpiDataset(Dataset):
         self._adjacency_cache[time_step] = adjacency
         return adjacency
 
-    def _get_global_to_local_at_time(self, time_step: int) -> torch.Tensor:
-        if time_step in self._global_to_local_cache:
-            return self._global_to_local_cache[time_step]
+    def _get_global_to_local(self) -> torch.Tensor:
+        """Compute global to local node index mapping (static, computed once).
 
+        Since context_mask is immutable after initialization, this mapping
+        is the same for all timesteps.
+        """
         if self.context_mask is not None:
             node_ids = torch.where(self.context_mask)[0]
         else:
@@ -1140,8 +1147,15 @@ class EpiDataset(Dataset):
         global_to_local[node_ids] = torch.arange(
             node_ids.numel(), device=node_ids.device
         )
-        self._global_to_local_cache[time_step] = global_to_local
         return global_to_local
+
+    def _get_global_to_local_at_time(self, time_step: int) -> torch.Tensor:
+        """Get global to local mapping (now static, ignores time_step)."""
+        # Mapping is static since context_mask never changes after init
+        # We compute it once lazily and cache
+        if not hasattr(self, "_global_to_local_static"):
+            self._global_to_local_static = self._get_global_to_local()
+        return self._global_to_local_static
 
     def _precompute_k_hop_masks(self) -> dict[int, torch.Tensor]:
         """Precompute k-hop reachability masks for all timesteps at startup.
@@ -1184,6 +1198,38 @@ class EpiDataset(Dataset):
 
         logger.info(f"K-hop mask precomputation complete: {len(masks)} masks")
         return masks
+
+    def _precompute_sparse_graphs(self) -> None:
+        """Eagerly precompute sparse graph topology for all timesteps at init.
+
+        This moves the expensive dense->sparse conversion (torch.where, dict remapping)
+        from per-sample __getitem__ to initialization time, eliminating the CPU
+        bottleneck in the DataLoader hot loop.
+
+        Graphs are cached in self._full_graph_cache and accessed via
+        _build_full_graph_topology_at_time() during __getitem__.
+        """
+        num_timesteps = len(self._temporal_coords)
+        logger.info(f"Precomputing sparse graphs for {num_timesteps} timesteps...")
+
+        total_edges = 0
+        for time_step in range(num_timesteps):
+            # This populates _full_graph_cache via the existing method
+            g = self._build_full_graph_topology_at_time(time_step)
+            if g.edge_index is not None:
+                total_edges += g.edge_index.shape[1]
+
+        # Log memory estimate
+        # edge_index: int64, 2 x E
+        # edge_weight: float32, E
+        edge_index_bytes = total_edges * 2 * 8  # 2 coords × 8 bytes (int64)
+        edge_weight_bytes = total_edges * 4  # 4 bytes (float32)
+        total_mb = (edge_index_bytes + edge_weight_bytes) / 1e6
+
+        logger.info(
+            f"Sparse graph precomputation complete: {num_timesteps} graphs, "
+            f"{total_edges} total edges, ~{total_mb:.2f} MB"
+        )
 
     def _build_full_graph_topology_at_time(
         self,
