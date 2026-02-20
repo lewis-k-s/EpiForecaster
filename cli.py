@@ -303,6 +303,15 @@ def plot_group():
     default=None,
     help="Override evaluation batch size (useful for memory-heavy mobility graphs).",
 )
+@click.option(
+    "--compare-baselines",
+    type=click.Path(path_type=Path),
+    default=None,
+    help=(
+        "Optional baseline metrics CSV (fold or aggregate) to compare against current "
+        "checkpoint metrics."
+    ),
+)
 def eval_epiforecaster(
     experiment: str | None,
     run: str | None,
@@ -313,6 +322,7 @@ def eval_epiforecaster(
     log_dir: Path | None,
     override: tuple[str, ...],
     eval_batch_size: int | None,
+    compare_baselines: Path | None,
 ):
     """Evaluate an EpiForecaster checkpoint and generate quartile-based forecast plots.
 
@@ -451,6 +461,23 @@ def eval_epiforecaster(
         summary = _format_eval_summary(loss, metrics)
         click.echo(f"\nEval summary ({split}):\n{summary}")
 
+        if compare_baselines is not None:
+            from evaluation.baseline_eval import compare_model_metrics_against_baselines
+
+            if output_csv is not None:
+                delta_csv = output_csv.with_name(f"{split}_baseline_deltas.csv")
+            elif output is not None:
+                delta_csv = output.with_name(f"{split}_baseline_deltas.csv")
+            else:
+                delta_csv = Path(f"{split}_baseline_deltas.csv")
+
+            compare_model_metrics_against_baselines(
+                eval_metrics=metrics,
+                baseline_results_csv=compare_baselines,
+                output_csv=delta_csv,
+            )
+            click.echo(f"Saved baseline deltas to: {delta_csv}")
+
         if log_dir is not None:
             click.echo(f"Eval metrics logged to: {log_dir}")
         if output is not None:
@@ -461,6 +488,96 @@ def eval_epiforecaster(
             wandb.finish()
     except Exception as exc:
         click.echo(f"❌ Evaluation failed: {exc}", err=True)
+        click.echo(traceback.format_exc(), err=True)
+        raise click.ClickException(str(exc)) from exc
+
+
+@eval_group.command("baselines")
+@click.option("--config", required=True, help="Path to training configuration file.")
+@click.option(
+    "--models",
+    type=click.Choice(
+        ["tiered", "exp_smoothing", "var_cross_target", "all"],
+        case_sensitive=False,
+    ),
+    default="tiered",
+    show_default=True,
+    help="Baseline model family to evaluate.",
+)
+@click.option(
+    "--rolling-folds",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Number of expanding rolling-origin folds.",
+)
+@click.option(
+    "--split",
+    type=click.Choice(["val", "test"], case_sensitive=False),
+    default="test",
+    show_default=True,
+    help="Which split to evaluate baselines on.",
+)
+@click.option(
+    "--seasonal-period",
+    type=int,
+    default=7,
+    show_default=True,
+    help="Seasonal period used by seasonal-naive and SARIMA-family baselines.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Directory where baseline artifacts will be written.",
+)
+@click.option(
+    "--disable-sparsity-bins",
+    is_flag=True,
+    help="Disable sparsity-decile stratified reporting.",
+)
+def eval_baselines(
+    config: str,
+    models: str,
+    rolling_folds: int,
+    split: str,
+    seasonal_period: int,
+    output_dir: Path,
+    disable_sparsity_bins: bool,
+):
+    """Run fair rolling-origin baseline benchmarking for EpiForecaster targets."""
+    try:
+        if rolling_folds <= 0:
+            raise click.ClickException("--rolling-folds must be positive.")
+        if seasonal_period <= 0:
+            raise click.ClickException("--seasonal-period must be positive.")
+
+        cfg = EpiForecasterConfig.load(config)
+
+        from evaluation.baseline_eval import run_baseline_evaluation
+
+        selected_models = (
+            ["tiered", "exp_smoothing", "var_cross_target"]
+            if models.lower() == "all"
+            else [models.lower()]
+        )
+
+        artifacts = run_baseline_evaluation(
+            config=cfg,
+            models=selected_models,
+            config_path=config,
+            output_dir=output_dir,
+            split=split,
+            rolling_folds=rolling_folds,
+            seasonal_period=seasonal_period,
+            include_sparsity_bins=not disable_sparsity_bins,
+        )
+
+        click.echo("Baseline evaluation completed.")
+        for name, path in artifacts.items():
+            click.echo(f"  {name}: {path}")
+    except Exception as exc:
+        click.echo(f"❌ Baseline evaluation failed: {exc}", err=True)
         click.echo(traceback.format_exc(), err=True)
         raise click.ClickException(str(exc)) from exc
 

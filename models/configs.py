@@ -526,6 +526,7 @@ class TrainingParams:
     gradient_accumulation_steps: int = 1
     max_batches: int | None = None
     learning_rate: float = 1.0e-3
+    optimizer: str = "adamw"
     weight_decay: float = 1.0e-5
     model_id: str = ""
     resume: bool = False
@@ -677,6 +678,14 @@ class TrainingParams:
             raise ValueError(
                 f"warmup_steps must be non-negative, got {self.warmup_steps}"
             )
+        valid_optimizers = {"adam", "adamw"}
+        optimizer_name = self.optimizer.lower()
+        if optimizer_name not in valid_optimizers:
+            raise ValueError(
+                f"Invalid optimizer: {self.optimizer}. "
+                f"Valid options: {sorted(valid_optimizers)}"
+            )
+        self.optimizer = optimizer_name
 
         # Validate curriculum configuration
         if self.curriculum.enabled:

@@ -17,6 +17,7 @@ import zarr.errors
 
 from data.epi_dataset import EpiDataset, collate_epiforecaster_batch
 from data.preprocess.config import REGION_COORD
+from evaluation.metrics import TorchMaskedMetricAccumulator
 from utils.normalization import unscale_forecasts
 from models.configs import DataConfig, EpiForecasterConfig, LossConfig
 from models.epiforecaster import EpiForecaster
@@ -986,23 +987,10 @@ def evaluate_loader(
     logger.info(f"{split_name} evaluation started...")
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
-    hosp_mae_sum = torch.tensor(0.0, device=device)
-    hosp_mse_sum = torch.tensor(0.0, device=device)
-    hosp_smape_sum = torch.tensor(0.0, device=device)
-    hosp_total_count = 0
-    hosp_target_mean_acc = torch.tensor(0.0, device=device)
-    hosp_target_m2 = torch.tensor(0.0, device=device)
-
-    per_h_mae_sum = torch.zeros(horizon, device=device)
-    per_h_mse_sum = torch.zeros(horizon, device=device)
-    per_h_count_sum = torch.zeros(horizon, device=device)
-
-    ww_mae_sum = torch.tensor(0.0, device=device)
-    ww_mse_sum = torch.tensor(0.0, device=device)
-    ww_smape_sum = torch.tensor(0.0, device=device)
-    ww_total_count = 0
-    ww_target_mean_acc = torch.tensor(0.0, device=device)
-    ww_target_m2 = torch.tensor(0.0, device=device)
+    hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    ww_metrics = TorchMaskedMetricAccumulator(device=device, horizon=None)
+    cases_metrics = TorchMaskedMetricAccumulator(device=device, horizon=None)
+    deaths_metrics = TorchMaskedMetricAccumulator(device=device, horizon=None)
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
@@ -1022,7 +1010,6 @@ def evaluate_loader(
     eval_iter = loader
     log_every = 10
 
-    epsilon = 1e-6
     model_was_training = model.training
     model.eval()
     forward_model = cast(EpiForecaster, model)
@@ -1062,24 +1049,11 @@ def evaluate_loader(
                 hosp_targets = targets_dict.get("hosp")
                 hosp_mask = targets_dict.get("hosp_mask")
                 if pred_hosp is not None and hosp_targets is not None:
-                    if hosp_mask is None:
-                        hosp_mask = torch.ones_like(hosp_targets)
-                    mask = hosp_mask.to(pred_hosp.dtype)
-
-                    # Clean targets for metric calculation
-                    hosp_targets_clean = torch.nan_to_num(hosp_targets, nan=0.0)
-
-                    diff = pred_hosp - hosp_targets_clean
-                    abs_diff = diff.abs()
-                    hosp_mae_sum += (abs_diff * mask).sum()
-                    hosp_mse_sum += ((diff**2) * mask).sum()
-                    hosp_smape_sum += (
-                        2
-                        * abs_diff
-                        / (pred_hosp.abs() + hosp_targets_clean.abs() + epsilon)
-                        * mask
-                    ).sum()
-
+                    _diff, abs_diff, mask = hosp_metrics.update(
+                        predictions=pred_hosp,
+                        targets=hosp_targets,
+                        observed_mask=hosp_mask,
+                    )
                     # Per-node MAE - keep tensors on device until end
                     valid_per_sample = mask.sum(dim=1) > 0
                     per_sample_mae = (abs_diff * mask).sum(dim=1) / mask.sum(
@@ -1097,69 +1071,35 @@ def evaluate_loader(
                         node_mae_sum[node_id] += sample_mae.detach()
                         node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
 
-                    # Welford's algorithm for variance (device-local)
-                    # Use cleaned targets masked by validity
-                    flat_targets = (
-                        hosp_targets_clean[mask > 0].detach().float().reshape(-1)
-                    )
-                    batch_count = flat_targets.numel()
-                    if batch_count > 0:
-                        batch_mean = flat_targets.mean()
-                        batch_m2 = ((flat_targets - batch_mean) ** 2).sum()
-
-                        delta = batch_mean - hosp_target_mean_acc
-                        new_count = hosp_total_count + batch_count
-                        hosp_target_mean_acc += delta * batch_count / new_count
-                        hosp_target_m2 += (
-                            batch_m2
-                            + (delta**2) * (hosp_total_count * batch_count) / new_count
-                        )
-                        hosp_total_count = new_count
-
-                    per_h_mae_sum += (abs_diff * mask).sum(dim=0)
-                    per_h_mse_sum += ((diff**2) * mask).sum(dim=0)
-                    per_h_count_sum += mask.sum(dim=0)
-
                 pred_ww = model_outputs.get("pred_ww")
                 ww_targets = targets_dict.get("ww")
                 ww_mask = targets_dict.get("ww_mask")
                 if pred_ww is not None and ww_targets is not None:
-                    if ww_mask is None:
-                        ww_mask = torch.ones_like(ww_targets)
-                    mask_ww = ww_mask.to(pred_ww.dtype)
-
-                    # Clean targets for metric calculation
-                    ww_targets_clean = torch.nan_to_num(ww_targets, nan=0.0)
-
-                    diff_ww = pred_ww - ww_targets_clean
-                    abs_diff_ww = diff_ww.abs()
-                    ww_mae_sum += (abs_diff_ww * mask_ww).sum()
-                    ww_mse_sum += ((diff_ww**2) * mask_ww).sum()
-                    ww_smape_sum += (
-                        2
-                        * abs_diff_ww
-                        / (pred_ww.abs() + ww_targets_clean.abs() + epsilon)
-                        * mask_ww
-                    ).sum()
-
-                    flat_targets_ww = (
-                        ww_targets_clean[mask_ww > 0].detach().float().reshape(-1)
+                    ww_metrics.update(
+                        predictions=pred_ww,
+                        targets=ww_targets,
+                        observed_mask=ww_mask,
                     )
-                    batch_count_ww = flat_targets_ww.numel()
-                    if batch_count_ww > 0:
-                        batch_mean_ww = flat_targets_ww.mean()
-                        batch_m2_ww = ((flat_targets_ww - batch_mean_ww) ** 2).sum()
 
-                        delta_ww = batch_mean_ww - ww_target_mean_acc
-                        new_count_ww = ww_total_count + batch_count_ww
-                        ww_target_mean_acc += delta_ww * batch_count_ww / new_count_ww
-                        ww_target_m2 += (
-                            batch_m2_ww
-                            + (delta_ww**2)
-                            * (ww_total_count * batch_count_ww)
-                            / new_count_ww
-                        )
-                        ww_total_count = new_count_ww
+                pred_cases = model_outputs.get("pred_cases")
+                cases_targets = targets_dict.get("cases")
+                cases_mask = targets_dict.get("cases_mask")
+                if pred_cases is not None and cases_targets is not None:
+                    cases_metrics.update(
+                        predictions=pred_cases,
+                        targets=cases_targets,
+                        observed_mask=cases_mask,
+                    )
+
+                pred_deaths = model_outputs.get("pred_deaths")
+                deaths_targets = targets_dict.get("deaths")
+                deaths_mask = targets_dict.get("deaths_mask")
+                if pred_deaths is not None and deaths_targets is not None:
+                    deaths_metrics.update(
+                        predictions=pred_deaths,
+                        targets=deaths_targets,
+                        observed_mask=deaths_mask,
+                    )
 
     finally:
         if model_was_training:
@@ -1167,31 +1107,10 @@ def evaluate_loader(
 
     # Final sync - transfer metrics to CPU once
     mean_loss = (total_loss / max(1, num_batches)).item()
-    if hosp_total_count:
-        mean_mae = (hosp_mae_sum / max(1, hosp_total_count)).item()
-        mean_rmse = math.sqrt((hosp_mse_sum / max(1, hosp_total_count)).item())
-        mean_smape = (hosp_smape_sum / max(1, hosp_total_count)).item()
-        ss_res = hosp_mse_sum.item()
-        ss_tot = hosp_target_m2.item()
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-    else:
-        mean_mae = float("nan")
-        mean_rmse = float("nan")
-        mean_smape = float("nan")
-        r2 = float("nan")
-
-    if ww_total_count:
-        mean_mae_ww = (ww_mae_sum / max(1, ww_total_count)).item()
-        mean_rmse_ww = math.sqrt((ww_mse_sum / max(1, ww_total_count)).item())
-        mean_smape_ww = (ww_smape_sum / max(1, ww_total_count)).item()
-        ss_res_ww = ww_mse_sum.item()
-        ss_tot_ww = ww_target_m2.item()
-        r2_ww = 1 - ss_res_ww / ss_tot_ww if ss_tot_ww > 0 else float("nan")
-    else:
-        mean_mae_ww = float("nan")
-        mean_rmse_ww = float("nan")
-        mean_smape_ww = float("nan")
-        r2_ww = float("nan")
+    hosp_summary = hosp_metrics.finalize()
+    ww_summary = ww_metrics.finalize()
+    cases_summary = cases_metrics.finalize()
+    deaths_summary = deaths_metrics.finalize()
 
     # Convert node MAE tensors to scalars
     node_mae = {
@@ -1209,31 +1128,38 @@ def evaluate_loader(
             for node_id in sorted(node_mae.keys()):
                 writer.writerow([node_id, node_mae[node_id], node_mae_count[node_id]])
 
-    if hosp_total_count:
-        per_h_denom = per_h_count_sum.clamp_min(1.0)
-        per_h_mae = (per_h_mae_sum / per_h_denom).tolist()
-        per_h_rmse = (per_h_mse_sum / per_h_denom).sqrt().tolist()
-    else:
-        per_h_mae = []
-        per_h_rmse = []
-
     metrics = {
-        "mae": mean_mae,
-        "rmse": mean_rmse,
-        "smape": mean_smape,
-        "r2": r2,
-        "mae_per_h": per_h_mae,
-        "rmse_per_h": per_h_rmse,
+        # Legacy primary metrics (hospitalizations)
+        "mae": hosp_summary.mae,
+        "rmse": hosp_summary.rmse,
+        "smape": hosp_summary.smape,
+        "r2": hosp_summary.r2,
+        "mae_per_h": hosp_summary.mae_per_h,
+        "rmse_per_h": hosp_summary.rmse_per_h,
         # Hospitalization metrics in log1p(per-100k) space
-        "mae_hosp_log1p_per_100k": mean_mae,
-        "rmse_hosp_log1p_per_100k": mean_rmse,
-        "smape_hosp_log1p_per_100k": mean_smape,
-        "r2_hosp_log1p_per_100k": r2,
+        "mae_hosp_log1p_per_100k": hosp_summary.mae,
+        "rmse_hosp_log1p_per_100k": hosp_summary.rmse,
+        "smape_hosp_log1p_per_100k": hosp_summary.smape,
+        "r2_hosp_log1p_per_100k": hosp_summary.r2,
+        "observed_count_hosp": hosp_summary.observed_count,
         # Wastewater metrics in log1p(per-100k) space
-        "mae_ww_log1p_per_100k": mean_mae_ww,
-        "rmse_ww_log1p_per_100k": mean_rmse_ww,
-        "smape_ww_log1p_per_100k": mean_smape_ww,
-        "r2_ww_log1p_per_100k": r2_ww,
+        "mae_ww_log1p_per_100k": ww_summary.mae,
+        "rmse_ww_log1p_per_100k": ww_summary.rmse,
+        "smape_ww_log1p_per_100k": ww_summary.smape,
+        "r2_ww_log1p_per_100k": ww_summary.r2,
+        "observed_count_ww": ww_summary.observed_count,
+        # Cases metrics in log1p(per-100k) space
+        "mae_cases_log1p_per_100k": cases_summary.mae,
+        "rmse_cases_log1p_per_100k": cases_summary.rmse,
+        "smape_cases_log1p_per_100k": cases_summary.smape,
+        "r2_cases_log1p_per_100k": cases_summary.r2,
+        "observed_count_cases": cases_summary.observed_count,
+        # Deaths metrics in log1p(per-100k) space
+        "mae_deaths_log1p_per_100k": deaths_summary.mae,
+        "rmse_deaths_log1p_per_100k": deaths_summary.rmse,
+        "smape_deaths_log1p_per_100k": deaths_summary.smape,
+        "r2_deaths_log1p_per_100k": deaths_summary.r2,
+        "observed_count_deaths": deaths_summary.observed_count,
         # Joint loss components (averaged per batch, same reduction as mean_loss)
         "loss_ww": (loss_ww_sum / max(1, num_batches)).item(),
         "loss_hosp": (loss_hosp_sum / max(1, num_batches)).item(),

@@ -567,7 +567,9 @@ class EpiForecasterTrainer:
             ) // accum
             self._status(f"  {total_sched_steps} scheduler steps (accum={accum})")
         self._status(
-            f"  Optimizer: Adam (weight_decay={self.config.training.weight_decay})"
+            "  Optimizer: "
+            f"{self.config.training.optimizer} "
+            f"(weight_decay={self.config.training.weight_decay})"
         )
         self._status(f"  Scheduler: {self.config.training.scheduler_type}")
         if self.config.training.warmup_steps > 0:
@@ -1006,10 +1008,40 @@ class EpiForecasterTrainer:
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on configuration."""
-        return torch.optim.Adam(
-            self.model.parameters(),
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            normalized_name = name.lower()
+            if (
+                name.endswith("bias")
+                or "norm" in normalized_name
+                or "alpha_" in normalized_name
+                or param.ndim < 2
+            ):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups = [
+            {"params": decay_params, "weight_decay": self.config.training.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        optimizer_name = self.config.training.optimizer.lower()
+        optimizer_cls: type[torch.optim.Optimizer]
+        if optimizer_name == "adam":
+            optimizer_cls = torch.optim.Adam
+        elif optimizer_name == "adamw":
+            optimizer_cls = torch.optim.AdamW
+        else:
+            raise ValueError(f"Unknown optimizer type: {self.config.training.optimizer}")
+
+        return optimizer_cls(
+            param_groups,
             lr=self.config.training.learning_rate,
-            weight_decay=self.config.training.weight_decay,
             eps=self.precision_policy.optimizer_eps,
         )
 

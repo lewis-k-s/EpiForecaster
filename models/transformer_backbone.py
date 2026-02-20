@@ -135,6 +135,71 @@ class LearnedPositionalEncoding(nn.Module):
         return self.dropout(x + pos_embeddings)
 
 
+class SwiGLUFeedForward(nn.Module):
+    """SwiGLU feed-forward network used in modern transformer variants."""
+
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.in_projection = nn.Linear(d_model, 2 * hidden_dim)
+        self.out_projection = nn.Linear(hidden_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, value = self.in_projection(x).chunk(2, dim=-1)
+        x = F.silu(gate) * value
+        x = self.dropout(x)
+        x = self.out_projection(x)
+        return self.dropout(x)
+
+
+class TransformerEncoderBlock(nn.Module):
+    """Pre-norm encoder block with RMSNorm and gated residual connections."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        ffn_dim: int,
+        dropout: float = 0.1,
+        rezero_init: float = 1.0e-3,
+        use_norm: bool = True,
+    ):
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = SwiGLUFeedForward(d_model=d_model, hidden_dim=ffn_dim, dropout=dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.norm1 = nn.RMSNorm(d_model) if use_norm else nn.Identity()
+        self.norm2 = nn.RMSNorm(d_model) if use_norm else nn.Identity()
+        self.alpha_attn = nn.Parameter(torch.tensor(rezero_init))
+        self.alpha_ffn = nn.Parameter(torch.tensor(rezero_init))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        attn_input = self.norm1(x)
+        attn_out = self.self_attention(
+            attn_input,
+            attn_input,
+            attn_input,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=False,
+        )[0]
+        x = x + self.alpha_attn * self.attn_dropout(attn_out)
+
+        ffn_input = self.norm2(x)
+        ffn_out = self.ffn(ffn_input)
+        return x + self.alpha_ffn * ffn_out
+
+
 class TransformerBackbone(nn.Module):
     """
     Transformer-based backbone for joint inference framework.
@@ -206,18 +271,20 @@ class TransformerBackbone(nn.Module):
             raise ValueError(f"Unknown positional encoding type: {positional_encoding}")
 
         # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
-            dropout=dropout,
-            activation=activation,
-            batch_first=True,
-            norm_first=use_layer_norm,
+        self.encoder_layers = nn.ModuleList(
+            [
+                TransformerEncoderBlock(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    ffn_dim=4 * d_model,
+                    dropout=dropout,
+                    rezero_init=1.0e-3,
+                    use_norm=use_layer_norm,
+                )
+                for _ in range(num_layers)
+            ]
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
-        )
+        self.final_norm = nn.RMSNorm(d_model) if use_layer_norm else nn.Identity()
 
         # Output heads for SIR parameters and observation context
         # Beta_t: time-varying transmission rate [B, H]
@@ -261,7 +328,7 @@ class TransformerBackbone(nn.Module):
         logger.info(
             f"Initialized TransformerBackbone: {in_dim}->{d_model}, "
             f"layers={num_layers}, heads={n_heads}, horizon={horizon}, "
-            f"obs_context_dim={obs_context_dim}"
+            f"obs_context_dim={obs_context_dim}, block=RMSNorm+SwiGLU+ReZero"
         )
 
     def _initialize_conservative_weights(self) -> None:
@@ -352,7 +419,7 @@ class TransformerBackbone(nn.Module):
             x_seq: Input sequence [batch_size, seq_len, in_dim]
                 Contains concatenated local features, mobility embeddings, and region embeddings
             mask: Optional attention mask [batch_size, seq_len]
-                True values indicate positions that should be masked
+                True indicates valid (non-padded) positions
 
         Returns:
             Dictionary containing:
@@ -369,42 +436,22 @@ class TransformerBackbone(nn.Module):
         # Apply positional encoding
         x = self.pos_encoding(x)  # [batch_size, seq_len, d_model]
 
-        # Handle attention mask (PyTorch uses different mask convention)
-        attn_mask = None
+        # Key padding mask expects True for padding positions.
+        key_padding_mask = None
         if mask is not None:
-            # Convert from boolean mask to additive mask
-            # True in input mask means valid positions, False means masked
-            attn_mask = ~mask  # Flip mask convention
-            attn_mask = attn_mask.unsqueeze(1).expand(
-                -1, seq_len, -1
-            )  # [batch_size, seq_len, seq_len]
+            if mask.shape != (batch_size, seq_len):
+                raise RuntimeError(
+                    f"mask has shape {mask.shape}, expected {(batch_size, seq_len)}"
+                )
+            if mask.dtype != torch.bool:
+                raise TypeError(f"mask must be bool, got {mask.dtype}")
+            key_padding_mask = ~mask
 
-        if attn_mask is not None:
-            # ensure attn_mask's dim is 3
-            if attn_mask.dim() == 2:
-                correct_2d_size = (seq_len, seq_len)
-                if attn_mask.shape != correct_2d_size:
-                    raise RuntimeError(
-                        f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}."
-                    )
-                attn_mask = attn_mask.unsqueeze(0)
-            elif attn_mask.dim() == 3:
-                # If we have a 3D mask (B, L, S), we need to expand it to (B*num_heads, L, S)
-                # because PyTorch MultiHeadAttention expects the first dimension to be B*num_heads
-                if attn_mask.size(0) == batch_size:
-                    attn_mask = attn_mask.repeat_interleave(self.n_heads, dim=0)
-
-                correct_3d_size = (batch_size * self.n_heads, seq_len, seq_len)
-                if attn_mask.shape != correct_3d_size:
-                    raise RuntimeError(
-                        f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}."
-                    )
-
-        # Apply Transformer encoder
-        # Note: PyTorch's TransformerEncoder expects src_key_padding_mask for padding
-        encoded = self.transformer_encoder(
-            x, mask=attn_mask if attn_mask is not None else None
-        )
+        # Apply encoder blocks
+        encoded = x
+        for layer in self.encoder_layers:
+            encoded = layer(encoded, key_padding_mask=key_padding_mask)
+        encoded = self.final_norm(encoded)
 
         # Sequence-to-vector: use final time step for parameter prediction
         final_hidden = encoded[:, -1, :]  # [batch_size, d_model]
