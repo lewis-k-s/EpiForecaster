@@ -598,7 +598,9 @@ class EpiForecasterTrainer:
             ) // accum
             self._status(f"  {total_sched_steps} scheduler steps (accum={accum})")
         self._status(
-            f"  Optimizer: Adam (weight_decay={self.config.training.weight_decay})"
+            "  Optimizer: "
+            f"{self.config.training.optimizer} "
+            f"(weight_decay={self.config.training.weight_decay})"
         )
         self._status(f"  Scheduler: {self.config.training.scheduler_type}")
         if self.config.training.warmup_steps > 0:
@@ -1037,10 +1039,42 @@ class EpiForecasterTrainer:
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on configuration."""
-        return torch.optim.Adam(
-            self.model.parameters(),
+        decay_params: list[torch.nn.Parameter] = []
+        no_decay_params: list[torch.nn.Parameter] = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            normalized_name = name.lower()
+            if (
+                name.endswith("bias")
+                or "norm" in normalized_name
+                or "alpha_" in normalized_name
+                or param.ndim < 2
+            ):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups = [
+            {"params": decay_params, "weight_decay": self.config.training.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        optimizer_name = self.config.training.optimizer.lower()
+        optimizer_cls: type[torch.optim.Optimizer]
+        if optimizer_name == "adam":
+            optimizer_cls = torch.optim.Adam
+        elif optimizer_name == "adamw":
+            optimizer_cls = torch.optim.AdamW
+        else:
+            raise ValueError(
+                f"Unknown optimizer type: {self.config.training.optimizer}"
+            )
+
+        return optimizer_cls(
+            param_groups,
             lr=self.config.training.learning_rate,
-            weight_decay=self.config.training.weight_decay,
             eps=self.precision_policy.optimizer_eps,
         )
 
@@ -2114,7 +2148,7 @@ class EpiForecasterTrainer:
                     "gradnorm_other": other_norm,
                     "gradnorm_backbone": encoder_norm + sird_norm,
                 },
-                step=step,
+                step=effective_step,
             )
 
         self._status(
@@ -2157,7 +2191,7 @@ class EpiForecasterTrainer:
             model_outputs=model_outputs,
             targets=targets_dict,
             wandb_run=self.wandb_run,
-            step=step,
+            step=effective_step,
             epoch=self.current_epoch,
         )
 
@@ -2183,6 +2217,8 @@ class EpiForecasterTrainer:
         if epoch is None:
             return
         prefix = split_name.capitalize()
+        accum_steps = self.config.training.gradient_accumulation_steps
+        effective_step = get_effective_optimizer_step(self.global_step, accum_steps)
         # Initial standard metrics
         log_data = {
             "epoch": epoch,
@@ -2248,7 +2284,7 @@ class EpiForecasterTrainer:
                 self.curriculum_sampler.state.synth_ratio
             )
         if self.wandb_run is not None:
-            wandb.log(log_data, step=self.global_step)
+            wandb.log(log_data, step=effective_step)
 
         self._status(
             f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"
