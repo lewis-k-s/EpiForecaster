@@ -16,7 +16,7 @@ import xarray as xr
 import yaml
 
 from utils import dtypes as dtype_utils
-from .config import REGION_COORD, PreprocessingConfig
+from .config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 from .utils import load_csv_with_string_ids
 from .processors.alignment_processor import AlignmentProcessor
 from .processors.catalonia_cases_processor import CataloniaCasesProcessor
@@ -165,11 +165,22 @@ class OfflinePreprocessingPipeline:
             )
             alignment_result["edar_has_source"] = edar_region_mask
 
-            # Add temporal covariates if configured
-            if "temporal_covariates" in self.processors:
+            if "temporal_covariates" in processed_data:
+                temporal_covariates_da = processed_data["temporal_covariates"]
+                target_dates = alignment_result[TEMPORAL_COORD].values
+                if not np.array_equal(
+                    temporal_covariates_da[TEMPORAL_COORD].values,
+                    target_dates,
+                ):
+                    temporal_covariates_da = temporal_covariates_da.reindex(
+                        {TEMPORAL_COORD: target_dates}
+                    )
+                alignment_result["temporal_covariates"] = temporal_covariates_da
+                print("  ✓ Added temporal covariates from synthetic preprocessing")
+            elif "temporal_covariates" in self.processors:
                 temporal_covariates_da = self.processors["temporal_covariates"].process(
-                    start_date=alignment_result["date"].values[0],
-                    end_date=alignment_result["date"].values[-1],
+                    start_date=alignment_result[TEMPORAL_COORD].values[0],
+                    end_date=alignment_result[TEMPORAL_COORD].values[-1],
                 )
                 alignment_result["temporal_covariates"] = temporal_covariates_da
                 print("  ✓ Added temporal covariates to dataset")
@@ -389,6 +400,24 @@ class OfflinePreprocessingPipeline:
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Clear source Zarr encodings before rechunking to avoid conflicts
+        # Variables loaded from source Zarr files retain chunk encodings that
+        # conflict with our desired chunking strategy
+        v3_encoding_keys = {
+            "chunks",
+            "preferred_chunks",
+            "compressors",
+            "compressor",
+            "filters",
+            "serializer",
+            "object_codec",
+            "shards",
+        }
+        for var_name in aligned_dataset.data_vars:
+            var = aligned_dataset.data_vars[var_name]
+            for key in v3_encoding_keys:
+                var.encoding.pop(key, None)
+
         # Rechunk to uniform chunks for Zarr compatibility
         # Chunk run_id, date, and spatial dims to avoid oversized chunks
         # that cause data corruption when written to Zarr
@@ -535,11 +564,13 @@ class OfflinePreprocessingPipeline:
                 coord.encoding.pop(key, None)
 
         # Save with uniform chunking, using Zarr v2 for NFS stability
+        # align_chunks=True allows xarray to handle chunk alignment when source
+        # and target chunk sizes differ (e.g., when reading from Zarr with different chunks)
         rechunked_dataset.to_zarr(
             aligned_dataset_path,
             mode="w",
             zarr_format=2,  # Use v2 for better NFS compatibility
-            align_chunks=False,  # False since we already manually rechunked
+            align_chunks=True,  # True to handle chunk alignment automatically
             safe_chunks=True,  # True to prevent data corruption from partial chunks
             consolidated=True,  # True for better metadata performance
         )

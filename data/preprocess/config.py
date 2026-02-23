@@ -299,6 +299,21 @@ class PreprocessingConfig:
                     f"Catalonia cases file does not exist: {self.catalonia_cases_file}"
                 )
 
+        if (
+            self.temporal_covariates is not None
+            and self.temporal_covariates.include_holidays
+        ):
+            holiday_calendar_file = self.temporal_covariates.holiday_calendar_file
+            if not holiday_calendar_file:
+                raise ValueError(
+                    "holiday_calendar_file is required when include_holidays=True"
+                )
+            holiday_path = Path(holiday_calendar_file)
+            if not holiday_path.exists():
+                raise ValueError(
+                    f"Holiday calendar file does not exist: {holiday_calendar_file}"
+                )
+
         # Validate output path is writable
         output_path = Path(self.output_path)
         output_path.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,18 @@ import numpy as np
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
+from .temporal_covariates_processor import TemporalCovariatesProcessor
+
+ZARR_ENCODING_KEYS_TO_CLEAR = {
+    "chunks",
+    "preferred_chunks",
+    "compressors",
+    "compressor",
+    "filters",
+    "serializer",
+    "object_codec",
+    "shards",
+}
 
 
 class SyntheticProcessor:
@@ -59,14 +71,17 @@ class SyntheticProcessor:
             run_filter: Optional list of run_ids to include. If None, includes all runs.
 
         Returns:
-            Dict with keys: cases, mobility, edar, population
+            Dict with keys: cases, mobility, edar, population, temporal_covariates
         """
+        self._validate_temporal_covariates_config()
+
         print(f"Loading synthetic data from {synthetic_path}")
 
         ds = xr.open_zarr(
             synthetic_path,
             chunks={"run_id": self.config.run_id_chunk_size},  # type: ignore[arg-type]
         )
+        self._clear_source_zarr_encodings(ds)
         print(ds)
         print()
 
@@ -122,13 +137,16 @@ class SyntheticProcessor:
 
         # EDAR returns tuple (flow_xr, censor_xr) for shared processing path
         edar_flow, edar_censor = self._extract_edar(ds)
+        cases_data = self._extract_cases(ds)
+        temporal_covariates = self._extract_temporal_covariates(cases_data["cases"])
 
         result = {
-            "cases": self._extract_cases(ds),
+            "cases": cases_data,
             "mobility": self._extract_mobility(ds),
             "edar_flow": edar_flow,  # Flow/concentration values
             "edar_censor": edar_censor,  # Censor flags
             "population": self._extract_population(ds),
+            "temporal_covariates": temporal_covariates,
         }
 
         # Extract optional hospitalizations and deaths data
@@ -145,13 +163,98 @@ class SyntheticProcessor:
 
         return result
 
+    def _clear_source_zarr_encodings(self, dataset: xr.Dataset) -> None:
+        """Remove inherited source chunk/compressor encodings from opened Zarr vars."""
+        for var_name in dataset.data_vars:
+            var = dataset[var_name]
+            for key in ZARR_ENCODING_KEYS_TO_CLEAR:
+                var.encoding.pop(key, None)
+
+        for coord_name in dataset.coords:
+            coord = dataset.coords[coord_name]
+            for key in ZARR_ENCODING_KEYS_TO_CLEAR:
+                coord.encoding.pop(key, None)
+
+    def _select_optional_observed_series(
+        self,
+        ds: xr.Dataset,
+        *,
+        channel_name: str,
+        candidate_vars: list[str],
+    ) -> xr.DataArray | None:
+        """Pick an observed channel, ignoring any *_true evaluation series."""
+        required_dims = {"run_id", TEMPORAL_COORD, REGION_COORD}
+
+        for var_name in candidate_vars:
+            if var_name not in ds:
+                continue
+            candidate = ds[var_name]
+            if set(candidate.dims) != required_dims:
+                print(
+                    f"  Warning: '{var_name}' has unexpected dims {candidate.dims}; "
+                    "skipping this candidate."
+                )
+                continue
+
+            candidate = candidate.transpose("run_id", TEMPORAL_COORD, REGION_COORD)
+            if var_name != channel_name:
+                print(f"  Using observed channel '{var_name}' for '{channel_name}'.")
+            return candidate
+
+        if f"{channel_name}_true" in ds:
+            print(
+                f"  Note: '{channel_name}_true' is available but ignored "
+                "(ground truth is evaluation-only)."
+            )
+        print(f"  No observed {channel_name} channel found; skipping.")
+        return None
+
+    def _validate_temporal_covariates_config(self) -> None:
+        """Enforce temporal covariates in synthetic preprocessing."""
+        if self.config.temporal_covariates is None:
+            raise ValueError(
+                "Synthetic preprocessing requires temporal_covariates configuration. "
+                "Add a `temporal_covariates` block with `include_day_of_week`, "
+                "`include_holidays`, and `holiday_calendar_file`."
+            )
+
+    def _extract_temporal_covariates(self, cases: xr.DataArray) -> xr.DataArray:
+        """Generate calendar-driven temporal covariates aligned to filtered dates."""
+        if cases.sizes[TEMPORAL_COORD] == 0:
+            raise ValueError("No dates available to generate temporal covariates")
+
+        processor = TemporalCovariatesProcessor(self.config)
+        temporal_covariates = processor.process(
+            start_date=cases[TEMPORAL_COORD].values[0],
+            end_date=cases[TEMPORAL_COORD].values[-1],
+        )
+        target_dates = cases[TEMPORAL_COORD].values
+        if not np.array_equal(
+            temporal_covariates[TEMPORAL_COORD].values,
+            target_dates,
+        ):
+            temporal_covariates = temporal_covariates.reindex(
+                {TEMPORAL_COORD: target_dates}
+            )
+        print("  ✓ Added temporal covariates to synthetic payload")
+        return temporal_covariates
+
     def _extract_cases(self, ds: xr.Dataset) -> xr.Dataset:
         """Extract cases data from synthetic bundle.
 
         Expected shape: (run_id, date, region_id)
         Preserves run_id dimension for curriculum training.
+        Extracts cases, computes cases_mask from notnull(), computes cases_age from mask.
         """
         print("Extracting cases...")
+
+        # Required variables for clinical series preprocessing
+        if "cases" not in ds:
+            available = list(ds.data_vars.keys())
+            raise KeyError(
+                f"Required variable 'cases' not found in synthetic dataset. "
+                f"Available variables: {available}"
+            )
 
         # Cases: (run_id, date, region_id) → preserve run_id dimension
         cases = ds["cases"]
@@ -172,9 +275,65 @@ class SyntheticProcessor:
             "No cases data in temporal range"
         )
 
+        # Compute mask from notnull(): True where observed, False where missing
+        cases_mask_filtered = cases_filtered.notnull()
+
+        # Compute age channel from mask: days since last observation
+        # Age formula: current_time - last_seen_time + 1 (so observation day has age=1)
+        # Max age is 14 (indicates no prior observation within window)
+        cases_age_filtered = self._compute_age_from_mask(cases_mask_filtered)
+
         num_runs = len(cases_filtered.run_id)
         print(f"  ✓ Extracted cases with {num_runs} runs: {cases_filtered.shape}")
-        return cases_filtered.to_dataset(name="cases")
+
+        # Return dataset with all three required variables
+        return xr.Dataset(
+            {
+                "cases": cases_filtered,
+                "cases_mask": cases_mask_filtered,
+                "cases_age": cases_age_filtered,
+            }
+        )
+
+    def _compute_age_from_mask(self, mask: xr.DataArray) -> xr.DataArray:
+        """Compute age channel from observation mask.
+
+        Age represents days since last observation (1-14).
+        Age 1 means observed on current day.
+        Age 14 means no observation within the last 14 days.
+
+        Args:
+            mask: Boolean mask DataArray with dims (run_id, date, region_id)
+                  True indicates observed, False indicates missing.
+
+        Returns:
+            Age DataArray with same dims as mask, values 1-14.
+        """
+        # Convert mask to numpy for computation
+        mask_values = mask.values  # shape: (run_id, date, region_id)
+        age_values = np.full(mask_values.shape, 14, dtype=np.uint8)
+
+        # Iterate over runs and regions
+        for run_idx in range(mask_values.shape[0]):
+            for region_idx in range(mask_values.shape[2]):
+                mask_1d = mask_values[run_idx, :, region_idx]
+                last_seen = None
+                for t in range(len(mask_1d)):
+                    if mask_1d[t]:
+                        last_seen = t
+                        age_values[run_idx, t, region_idx] = 1
+                    elif last_seen is not None:
+                        age_values[run_idx, t, region_idx] = min(t - last_seen + 1, 14)
+
+        # Create DataArray with same coords as mask
+        age_da = xr.DataArray(
+            age_values,
+            dims=mask.dims,
+            coords=mask.coords,
+            name="cases_age",
+        )
+
+        return age_da
 
     def _extract_mobility(self, ds: xr.Dataset) -> xr.Dataset:
         """Extract mobility data from synthetic dataset.
@@ -359,17 +518,15 @@ class SyntheticProcessor:
 
         Returns None if hospitalizations not present in synthetic data.
         """
-        if "hospitalizations" not in ds:
-            print("  Hospitalizations not found in synthetic data")
+        hosp = self._select_optional_observed_series(
+            ds,
+            channel_name="hospitalizations",
+            candidate_vars=["hospitalizations_raw", "hospitalizations"],
+        )
+        if hosp is None:
             return None
 
         print("Extracting hospitalizations...")
-
-        # Hospitalizations: (run_id, date, region_id) → preserve run_id dimension
-        hosp = ds["hospitalizations"]
-
-        # Verify temporal dimension matches config
-        hosp = hosp.rename({TEMPORAL_COORD: TEMPORAL_COORD})
 
         # Crop to config date range (applies to all runs)
         start_date = np.datetime64(self.config.start_date)
@@ -385,12 +542,11 @@ class SyntheticProcessor:
             return None
 
         # Create mask and age channels matching EDAR conventions
-        # Mask: 1.0 if data available, 0.0 if missing/NaN
-        hosp_mask = xr.where(hosp_filtered.notnull(), 1.0, 0.0)
-        hosp_mask = hosp_mask.fillna(0.0)
+        # Mask: True if data available, False if missing/NaN
+        hosp_mask = hosp_filtered.notnull()
 
-        # Age: Days since last measurement (synthetic data is complete, so age=1)
-        hosp_age = xr.ones_like(hosp_filtered)
+        # Age: Days since last measurement (computed from mask)
+        hosp_age = self._compute_age_from_mask(hosp_mask)
 
         num_runs = len(hosp_filtered.run_id)
         print(
@@ -413,17 +569,15 @@ class SyntheticProcessor:
 
         Returns None if deaths not present in synthetic data.
         """
-        if "deaths" not in ds:
-            print("  Deaths not found in synthetic data")
+        deaths = self._select_optional_observed_series(
+            ds,
+            channel_name="deaths",
+            candidate_vars=["deaths_raw", "deaths"],
+        )
+        if deaths is None:
             return None
 
         print("Extracting deaths...")
-
-        # Deaths: (run_id, date, region_id) → preserve run_id dimension
-        deaths = ds["deaths"]
-
-        # Verify temporal dimension matches config
-        deaths = deaths.rename({TEMPORAL_COORD: TEMPORAL_COORD})
 
         # Crop to config date range (applies to all runs)
         start_date = np.datetime64(self.config.start_date)
@@ -439,12 +593,11 @@ class SyntheticProcessor:
             return None
 
         # Create mask and age channels matching EDAR conventions
-        # Mask: 1.0 if data available, 0.0 if missing/NaN
-        deaths_mask = xr.where(deaths_filtered.notnull(), 1.0, 0.0)
-        deaths_mask = deaths_mask.fillna(0.0)
+        # Mask: True if data available, False if missing/NaN
+        deaths_mask = deaths_filtered.notnull()
 
-        # Age: Days since last measurement (synthetic data is complete, so age=1)
-        deaths_age = xr.ones_like(deaths_filtered)
+        # Age: Days since last measurement (computed from mask)
+        deaths_age = self._compute_age_from_mask(deaths_mask)
 
         num_runs = len(deaths_filtered.run_id)
         print(f"  ✓ Extracted deaths with {num_runs} runs: {deaths_filtered.shape}")
