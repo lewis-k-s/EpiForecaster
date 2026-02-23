@@ -5,9 +5,12 @@ rsync -avz --progress . dt:/home/bsc/bsc008913/EpiForecaster \
   --filter="+ /outputs/region_embeddings/***" \
   --filter="- /outputs/*/" \
   --filter="- /outputs/***" \
+  --exclude "test_outputs/" \
+  --exclude "test_output/" \
   --exclude "data/processed" \
   --exclude ".git" \
   --exclude ".venv" \
+  --exclude ".cache" \
   --exclude "__pycache__" \
   --exclude ".mypy_cache" \
   --exclude ".pytest_cache" \

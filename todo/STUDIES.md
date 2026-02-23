@@ -2,7 +2,7 @@
 
 Goal: produce credible evidence that the joint inference-observation model improves forecasting and latent-state inference under sparse, post-testing data (2022-2026).
 
-### Study 0: Evaluation Protocol Lock-In (must run first)
+### Study 0: Evaluation Protocol Lock-In
 
 - [ ] Freeze dataset slices and masks for all studies:
   - [ ] `dense-supervision` era: period with WW + cases + hosp (+ deaths where available)
@@ -23,8 +23,11 @@ Goal: produce credible evidence that the joint inference-observation model impro
 
 Question: does the new joint model outperform simpler alternatives in forecasting observed targets?
 
-- [ ] Compare against:
-  - [ ] transfer-function baseline (WW -> cases/hosp)
+- [x] Compare against non-DL statistical baselines:
+  - [x] Tiered univariate baseline (SARIMAX with calendar features -> SARIMA -> Seasonal Naive)
+  - [x] Exponential smoothing univariate baseline
+  - [x] Multivariate VAR (Vector Autoregression) cross-target baseline
+- [ ] Compare against alternative architectures:
   - [ ] pure DL forecaster without physics roll-forward
   - [ ] physics-only or reduced-parameter mechanistic baseline
 - [ ] Evaluate by horizon (1/2/4 weeks) and regime (dense vs sparse)
@@ -33,6 +36,7 @@ Question: does the new joint model outperform simpler alternatives in forecastin
   - [ ] reported cases
   - [ ] hospitalizations
   - [ ] deaths
+- [x] Report baseline fit success and fallback frequencies (e.g., how often SARIMAX drops to seasonal naive or median)
 
 Primary deliverable: table + figure showing error reduction (%) per target/horizon/regime.
 

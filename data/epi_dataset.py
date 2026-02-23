@@ -296,7 +296,9 @@ class EpiDataset(Dataset):
 
         # Cache for full graphs keyed by time step (CPU tensors only)
         self._full_graph_cache: dict[int, Data] = {}
-        self.shared_sparse_topology: SharedSparseTopology | None = shared_sparse_topology
+        self.shared_sparse_topology: SharedSparseTopology | None = (
+            shared_sparse_topology
+        )
 
         # Cache for adjacency matrices keyed by time step (CPU tensors only)
         self._adjacency_cache: dict[int, torch.Tensor] = {}
@@ -833,8 +835,10 @@ class EpiDataset(Dataset):
                 local_k_hop_mask = k_hop_mask[node_ids].clone()
                 local_k_hop_mask[local_target_idx] = True
                 # Zero out features for nodes outside k-hop (including target would be wrong)
-                x_masked = x.clone()
-                x_masked[~local_k_hop_mask] = 0
+                # Using torch.where instead of boolean indexing for better GPU performance
+                x_masked = torch.where(
+                    local_k_hop_mask.unsqueeze(-1).expand_as(x), x, torch.zeros_like(x)
+                )
             else:
                 # No masking (all nodes contribute) or no precomputed mask
                 x_masked = x
@@ -1310,8 +1314,12 @@ class EpiDataset(Dataset):
 
         total_edges = 0
         for time_step in range(num_timesteps):
-            edge_index_global = self.shared_sparse_topology.edge_index_by_time[time_step]
-            edge_weight_global = self.shared_sparse_topology.edge_weight_by_time[time_step]
+            edge_index_global = self.shared_sparse_topology.edge_index_by_time[
+                time_step
+            ]
+            edge_weight_global = self.shared_sparse_topology.edge_weight_by_time[
+                time_step
+            ]
             g = self._build_split_graph_from_shared(
                 edge_index_global=edge_index_global,
                 edge_weight_global=edge_weight_global,
@@ -1440,7 +1448,9 @@ class EpiDataset(Dataset):
         global_to_local[node_ids] = torch.arange(node_ids.numel(), dtype=torch.long)
         g = self._build_split_graph_from_shared(
             edge_index_global=self.shared_sparse_topology.edge_index_by_time[time_step],
-            edge_weight_global=self.shared_sparse_topology.edge_weight_by_time[time_step],
+            edge_weight_global=self.shared_sparse_topology.edge_weight_by_time[
+                time_step
+            ],
             node_mask=node_mask,
             node_ids=node_ids,
             global_to_local=global_to_local,

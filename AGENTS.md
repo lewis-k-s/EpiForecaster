@@ -1,4 +1,4 @@
-# Repository Guidelines
+# EpiForecaster project context
 
 This repo defines a forecasting pipeline for time series data and variants of the model which include mobility and geospatial embeddings.
 
@@ -12,8 +12,8 @@ We model an epidemiological task to forecast disease incidence and prevalence me
 - Out of scope: any request that enables pathogen design, biological optimization, lab protocol development, transmission enhancement, or operational misuse.
 - Agent behavior: if a task drifts into out-of-scope bio guidance, decline that part and redirect to safe, high-level epidemiological modeling and public-health analytics.
 
-For detailed information on the forecaster model design see EPIFORECASTER.md
-For detailed information on the region embedding model design see REGION2VEC.md
+For detailed information on the forecaster model design see @EPIFORECASTER.md
+For detailed information on the region embedding model design see @REGION2VEC.md
 
 ## Project Structure & Module Organization
 
@@ -112,7 +112,3 @@ The canonical data pipeline follows: raw data → preprocessing → Zarr dataset
 - This project is a work in progress. It is ok to make breaking changes as the interface evolves.
 - Use configuration-driven development: copy and modify templates from the `configs/` directory rather than hardcoding parameters.
 - **Zarr Data Access**: Always use `xarray.open_zarr()` instead of `zarr.open()` for inspecting or loading zarr datasets. Xarray provides labeled dimensions, coordinates, and better integration with the data pipeline.
-
-## Remote run advice
-
-@PROD_RUN.md
