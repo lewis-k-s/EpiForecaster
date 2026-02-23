@@ -1360,7 +1360,11 @@ class EpiDataset(Dataset):
             raise ValueError("Shared sparse topology lists do not match timestep count")
 
     def _build_full_sparse_topology(self) -> SharedSparseTopology:
-        """Build full-network sparse topology (no split masking) for all timesteps."""
+        """Build full-network sparse topology (no split masking) for all timesteps.
+
+        Self-loops are added once here (if missing) so runtime GNN layers can
+        skip dynamic self-loop insertion.
+        """
         num_timesteps = len(self._temporal_coords)
         edge_index_by_time: list[torch.Tensor] = []
         edge_weight_by_time: list[torch.Tensor] = []
@@ -1371,6 +1375,27 @@ class EpiDataset(Dataset):
             edge_mask = mobility_matrix > 0
             origins, destinations = torch.where(edge_mask)
             edge_weight = mobility_matrix[origins, destinations]
+
+            # Add only missing self-loops once at topology-build time.
+            # Existing loops from the mobility matrix are kept as-is.
+            has_self_loop = torch.zeros(
+                self.num_nodes, dtype=torch.bool, device=origins.device
+            )
+            if origins.numel() > 0:
+                loop_mask = origins == destinations
+                if loop_mask.any():
+                    has_self_loop[origins[loop_mask]] = True
+            missing_loop_nodes = torch.where(~has_self_loop)[0]
+            if missing_loop_nodes.numel() > 0:
+                loop_weight = torch.ones(
+                    missing_loop_nodes.numel(),
+                    dtype=edge_weight.dtype,
+                    device=edge_weight.device,
+                )
+                origins = torch.cat([origins, missing_loop_nodes], dim=0)
+                destinations = torch.cat([destinations, missing_loop_nodes], dim=0)
+                edge_weight = torch.cat([edge_weight, loop_weight], dim=0)
+
             edge_index = torch.stack([origins, destinations], dim=0)
 
             edge_index_by_time.append(edge_index)
@@ -1788,109 +1813,69 @@ class EpiDataset(Dataset):
 
 def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     """
-    Optimized batch construction for dynamic mobility graphs.
-
-    Constructs a PyG Batch object directly from tensor lists, avoiding the overhead
-    of Batch.from_data_list().
+    Optimized dense batch construction for dynamic mobility graphs.
 
     Args:
         batch: List of EpiDatasetItem (must contain mob_x, mob_edge_index, mob_edge_weight)
 
     Returns:
-        A single PyG Batch object containing all time-steps for all samples.
+        A PyG Batch-like container with:
+        - x_dense: [B*T, N, F]
+        - adj_dense: [B*T, N, N]
+        - target_node: [B*T]
+        - target_index: [B*T] flattened index into x_dense.view(B*T*N, F)
     """
     B = len(batch)
     if B == 0:
         return Batch()
 
-    # 1. Flatten Features
-    # (B, L, N, F) -> (B*L*N, F)
-    # Note: item["mob_x"] is (L, N, F)
-    all_x = torch.cat(
-        [item["mob_x"].view(-1, item["mob_x"].size(-1)) for item in batch], dim=0
-    )
-
-    # 2. Flatten Edge Indices & Weights
-    # We assume constant number of nodes per graph in the batch (context nodes)
-    # Check first item for dimensions
+    # Fixed-size dense contract per item: mob_x is (L, N, F)
     L, num_nodes, _ = batch[0]["mob_x"].shape
+    num_graphs = B * L
 
-    # Collect flattened lists
-    all_edge_indices = []
-    all_edge_weights = []
+    # 1) Dense node features [B*T, N, F]
+    x_dense = torch.cat([item["mob_x"] for item in batch], dim=0)
 
-    # Iterate samples and time steps
-    # Offset calculation: graph_idx * num_nodes
-    # Total graphs = B * L
-    current_graph_idx = 0
+    # 2) Dense adjacency [B*T, N, N]
+    adj_dense = x_dense.new_zeros((num_graphs, num_nodes, num_nodes))
 
+    # 3) Target node index per graph [B*T]
+    target_nodes_stacked = torch.stack(
+        [
+            item["mob_target_node_idx"]
+            if isinstance(item["mob_target_node_idx"], torch.Tensor)
+            else torch.tensor(item["mob_target_node_idx"], dtype=torch.long)
+            for item in batch
+        ]
+    ).long()
+    target_node_tensor = target_nodes_stacked.repeat_interleave(L).to(x_dense.device)
+
+    # 4) Materialize weighted dense adjacency per graph.
+    graph_idx = 0
     for item in batch:
-        # Check consistency of num_nodes
-        if item["mob_x"].shape[1] != num_nodes:
-            # If variable node counts are needed later, we must track cumulative nodes.
-            # For now, EpiDataset guarantees fixed context size.
-            pass
+        edge_indices = item["mob_edge_index"]
+        edge_weights = item["mob_edge_weight"]
+        for t in range(L):
+            ei = edge_indices[t]
+            ew = edge_weights[t]
+            if ei.numel() > 0:
+                adj_dense[graph_idx].index_put_(
+                    (ei[0], ei[1]), ew.to(adj_dense.dtype), accumulate=True
+                )
+            graph_idx += 1
 
-        edge_indices = item["mob_edge_index"]  # List of L tensors
-        edge_weights = item["mob_edge_weight"]  # List of L tensors
-
-        for t in range(len(edge_indices)):
-            offset = current_graph_idx * num_nodes
-            # Shift edge indices
-            all_edge_indices.append(edge_indices[t] + offset)
-            all_edge_weights.append(edge_weights[t])
-            current_graph_idx += 1
-
-    # Concatenate all edges
-    if all_edge_indices:
-        big_edge_index = torch.cat(all_edge_indices, dim=1)
-        big_edge_weight = torch.cat(all_edge_weights, dim=0)
-    else:
-        big_edge_index = torch.empty((2, 0), dtype=torch.long)
-        big_edge_weight = torch.empty((0,), dtype=torch.float16)
-
-    # 3. Create Batch Vector
-    # Maps each node to its graph index
-    total_nodes = current_graph_idx * num_nodes
-    # Verify shape matches x
-    assert total_nodes == all_x.size(0)
-
-    batch_vec = torch.arange(current_graph_idx, device=all_x.device).repeat_interleave(
-        num_nodes
-    )
-
-    # 4. Create Batch Object
-    mob_batch = Batch(
-        x=all_x, edge_index=big_edge_index, edge_weight=big_edge_weight, batch=batch_vec
-    )
-
-    # 5. Add custom attributes needed by model
-    # Reconstruct target_node tensor: (B*L,)
-    # mob_target_node_idx can be int (legacy) or 0-dim tensor (optimized)
-    target_nodes_list = []
-    for item in batch:
-        tgt = item["mob_target_node_idx"]
-        # Handle both int (legacy) and tensor (new optimized format)
-        if isinstance(tgt, torch.Tensor):
-            target_nodes_list.append(tgt)
-        else:
-            target_nodes_list.append(torch.tensor(tgt, dtype=torch.long))
-
-    # Stack 0-dim tensors and repeat L times for each timestep
-    target_nodes_stacked = torch.stack(target_nodes_list).long()
-    target_node_tensor = target_nodes_stacked.repeat_interleave(L).to(all_x.device)
+    # 5) Batch-like container
+    mob_batch = Batch()
+    mob_batch.x_dense = x_dense
+    mob_batch.adj_dense = adj_dense
     mob_batch.target_node = target_node_tensor
 
-    # Add target_index for model optimization
-    # Since we have fixed num_nodes, start index of graph i is i * num_nodes
-    # target_index[i] = start[i] + target_node[i]
-    num_graphs = target_node_tensor.size(0)  # B * L graphs total
-    graph_starts = torch.arange(num_graphs, device=all_x.device) * num_nodes
+    # target_index[i] = start[i] + target_node[i] on flattened [B*T*N, F]
+    graph_starts = torch.arange(num_graphs, device=x_dense.device) * num_nodes
     mob_batch["target_index"] = graph_starts + target_node_tensor
 
-    # Add ptr for completeness (standard PyG Batch attribute)
-    # ptr = [0, N, 2N, ..., num_graphs*N]
-    ptr = torch.arange(num_graphs + 1, device=all_x.device) * num_nodes
+    # Keep ptr for compatibility checks in model code paths.
+    ptr = torch.arange(num_graphs + 1, device=x_dense.device) * num_nodes
     mob_batch.ptr = ptr
 
     return mob_batch
@@ -1949,10 +1934,10 @@ def collate_epiforecaster_batch(
 
     # 2. Batch Temporal Graphs (Optimized Manual Batching)
     mob_batch = optimized_collate_graphs(batch)
-    if hasattr(mob_batch, "x") and mob_batch.x is not None:
-        mob_batch.x = _replace_non_finite(mob_batch.x)
-    if hasattr(mob_batch, "edge_weight") and mob_batch.edge_weight is not None:
-        mob_batch.edge_weight = _replace_non_finite(mob_batch.edge_weight)
+    if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
+        mob_batch.x_dense = _replace_non_finite(mob_batch.x_dense)
+    if hasattr(mob_batch, "adj_dense") and mob_batch.adj_dense is not None:
+        mob_batch.adj_dense = _replace_non_finite(mob_batch.adj_dense)
 
     hosp_hist = _replace_non_finite(hosp_hist)
     deaths_hist = _replace_non_finite(deaths_hist)

@@ -23,7 +23,10 @@ REGION2VEC_CONFIGS = [
 
 PREPROCESSING_CONFIGS = [
     "configs/preprocess_full.yaml",
+    "configs/preprocess_mn5_synth_holt_damped.yaml",
+    "configs/preprocess_real_holt.yaml",
     "configs/production_only/preprocess_mn5_synth.yaml",
+    "configs/production_only/preprocess_mn5_synth_kalman_predict.yaml",
 ]
 
 

@@ -193,8 +193,8 @@ class TestEpiDataset:
             assert torch.isfinite(batch["CasesHist"]).all()
             assert torch.isfinite(batch["BioNode"]).all()
             assert torch.isfinite(batch["TemporalCovariates"]).all()
-            assert torch.isfinite(batch["MobBatch"].x).all()
-            assert torch.isfinite(batch["MobBatch"].edge_weight).all()
+            assert torch.isfinite(batch["MobBatch"].x_dense).all()
+            assert torch.isfinite(batch["MobBatch"].adj_dense).all()
 
     def test_sparse_graphs_precomputed_at_init(self, config, mock_xarray_dataset):
         """Verify that sparse graphs are eagerly precomputed during initialization."""
@@ -239,24 +239,36 @@ class TestEpiDataset:
 
             node_mask = ds._get_graph_node_mask()
             node_ids = torch.where(node_mask)[0]
-            global_to_local = torch.full((ds.num_nodes,), -1, dtype=torch.long)
-            global_to_local[node_ids] = torch.arange(node_ids.numel(), dtype=torch.long)
 
             for time_step, graph in ds._full_graph_cache.items():
                 dense = ds.preloaded_mobility[time_step].clone()
                 dense[~node_mask] = 0
                 dense[:, ~node_mask] = 0
 
-                edge_mask = dense > 0
-                origins, destinations = torch.where(edge_mask)
-                expected_edge_weight = dense[origins, destinations]
-                expected_edge_index = torch.stack(
-                    [global_to_local[origins], global_to_local[destinations]], dim=0
+                # Topology now injects missing self-loops with unit weight once at init.
+                local_n = node_ids.numel()
+                expected_dense = dense[node_ids][:, node_ids]
+                expected_dense = torch.where(
+                    expected_dense > 0,
+                    expected_dense,
+                    torch.zeros_like(expected_dense),
+                )
+                diag_idx = torch.arange(local_n)
+                expected_dense[diag_idx, diag_idx] = torch.where(
+                    expected_dense[diag_idx, diag_idx] > 0,
+                    expected_dense[diag_idx, diag_idx],
+                    torch.ones_like(expected_dense[diag_idx, diag_idx]),
+                )
+
+                actual_dense = torch.zeros_like(expected_dense)
+                actual_dense.index_put_(
+                    (graph.edge_index[0], graph.edge_index[1]),
+                    graph.edge_weight,
+                    accumulate=True,
                 )
 
                 assert torch.equal(graph.node_ids, node_ids)
-                assert torch.equal(graph.edge_index, expected_edge_index)
-                assert torch.allclose(graph.edge_weight, expected_edge_weight)
+                assert torch.allclose(actual_dense, expected_dense)
 
     def test_shared_sparse_topology_built_once_when_reused(
         self, config, mock_xarray_dataset

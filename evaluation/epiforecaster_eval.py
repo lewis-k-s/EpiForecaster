@@ -313,9 +313,11 @@ class JointInferenceLoss(nn.Module):
 
         # Wastewater loss
         if self.w_ww > 0 and targets.get("ww") is not None:
+            ww_target = targets["ww"]
+            assert ww_target is not None
             ww_loss = self._weighted_masked_mse(
-                drop_nowcast(model_outputs["pred_ww"]),
-                targets["ww"],
+                drop_nowcast(model_outputs["pred_ww"], ww_target.shape[1]),
+                ww_target,
                 targets.get("ww_mask"),
                 self.ww_imputed_weight,
                 self.ww_min_observed,
@@ -324,9 +326,11 @@ class JointInferenceLoss(nn.Module):
 
         # Hospitalization loss
         if self.w_hosp > 0 and targets.get("hosp") is not None:
+            hosp_target = targets["hosp"]
+            assert hosp_target is not None
             hosp_loss = self._weighted_masked_mse(
-                drop_nowcast(model_outputs["pred_hosp"]),
-                targets["hosp"],
+                drop_nowcast(model_outputs["pred_hosp"], hosp_target.shape[1]),
+                hosp_target,
                 targets.get("hosp_mask"),
                 self.hosp_imputed_weight,
                 self.hosp_min_observed,
@@ -335,9 +339,11 @@ class JointInferenceLoss(nn.Module):
 
         # Cases loss (reported cases observation)
         if targets.get("cases") is not None:
+            cases_target = targets["cases"]
+            assert cases_target is not None
             cases_loss = self._weighted_masked_mse(
-                drop_nowcast(model_outputs["pred_cases"]),
-                targets["cases"],
+                drop_nowcast(model_outputs["pred_cases"], cases_target.shape[1]),
+                cases_target,
                 targets.get("cases_mask"),
                 self.cases_imputed_weight,
                 self.cases_min_observed,

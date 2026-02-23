@@ -1,6 +1,8 @@
 import torch
 import pytest
 from torch_geometric.data import Data, Batch
+from torch_geometric.utils import to_dense_adj
+
 from data.epi_dataset import optimized_collate_graphs
 
 # Mocking the structures for the test
@@ -98,15 +100,22 @@ def test_manual_batching_equivalence():
     # Use the ACTUAL function
     new_result = optimized_collate_graphs(new_batch_input)
 
-    # 3. Compare Results
-    assert torch.allclose(old_result.x, new_result.x)
-    assert torch.allclose(old_result.edge_index, new_result.edge_index)
-    assert torch.allclose(old_result.edge_weight, new_result.edge_weight)
-    assert torch.equal(old_result.batch, new_result.batch)
+    # 3. Compare Results (dense cutover)
+    # old_result.x is [B*L*N, F] while new_result.x_dense is [B*L, N, F]
+    old_x_dense = old_result.x.view(B * L, num_nodes, F)
+    assert torch.allclose(old_x_dense, new_result.x_dense)
+
+    old_adj_dense = to_dense_adj(
+        old_result.edge_index,
+        old_result.batch,
+        edge_attr=old_result.edge_weight,
+        max_num_nodes=num_nodes,
+    )
+    assert torch.allclose(old_adj_dense, new_result.adj_dense)
 
     # Check target_node reconstruction
     # Old result has target_node from Batch.from_data_list (concatenated list of tensors)
-    # New result has it constructed from mob_target_node_idx
+    # New result has it constructed from mob_target_node_idx and repeated over time.
     assert torch.equal(old_result.target_node, new_result.target_node)
 
     print("Verification successful!")
