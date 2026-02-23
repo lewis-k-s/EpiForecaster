@@ -63,6 +63,10 @@ class JointLossConfig:
     # Cap on absolute physics residual before squaring in SIR loss.
     # Prevents occasional residual spikes from dominating gradients.
     sir_residual_clip: float = 1.0e3
+    # Nowcast continuity penalty weight.
+    # Penalizes discontinuity between last observed value and first forecast prediction.
+    # 0.0 disables the penalty.
+    w_continuity: float = 0.0
 
     def __post_init__(self) -> None:
         for name, value in [
@@ -76,6 +80,7 @@ class JointLossConfig:
             ("cases_imputed_weight", self.cases_imputed_weight),
             ("deaths_imputed_weight", self.deaths_imputed_weight),
             ("sir_residual_clip", self.sir_residual_clip),
+            ("w_continuity", self.w_continuity),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
@@ -567,7 +572,7 @@ class TrainingParams:
     num_forecast_samples: int = (
         3  # Number of samples per category (best, worst, random)
     )
-    grad_norm_log_frequency: int = 10
+    grad_norm_log_frequency: int = 100
     progress_log_frequency: int = (
         10  # Log progress every N steps to reduce CPU-GPU sync
     )

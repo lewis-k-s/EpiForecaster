@@ -363,11 +363,8 @@ class EpiForecaster(nn.Module):
             obs_context=obs_context,
         )  # [B, H]
 
-        # Trim initial state (t=0) from predictions to match horizon
-        pred_ww = self._trim_prediction(pred_ww)
-        pred_hosp = self._trim_prediction(pred_hosp)
-        pred_cases = self._trim_prediction(pred_cases)
-        pred_deaths = self._trim_prediction(pred_deaths)
+        # Note: Predictions include t=0 (nowcast) and are [B, H+1] or [B, H].
+        # Trainer/eval should slice as needed.
 
         return {
             "beta_t": beta_t,

@@ -2,6 +2,44 @@
 Training utilities for the EpiForecaster project.
 """
 
+import torch
+
+
+def drop_nowcast(prediction: torch.Tensor, horizon: int | None = None) -> torch.Tensor:
+    """
+    Remove the t=0 nowcast from predictions to match forecast horizon.
+
+    Model predictions now include a nowcast at t=0 (the initial state prediction),
+    resulting in shape [B, H+1] instead of [B, H]. This utility slices off the
+    first timestep to align predictions with targets during loss computation.
+
+    Args:
+        prediction: Tensor of shape [B, T] where T >= horizon (typically H+1)
+        horizon: Expected forecast horizon. If None, assumes T-1.
+
+    Returns:
+        Sliced tensor of shape [B, horizon] with t=0 removed.
+
+    Example:
+        >>> pred = torch.randn(2, 8)  # [B=2, H+1=8] includes nowcast
+        >>> pred_forecast = drop_nowcast(pred, horizon=7)
+        >>> pred_forecast.shape
+        torch.Size([2, 7])
+    """
+    if prediction.ndim < 2:
+        return prediction
+
+    current_len = prediction.shape[1]
+    if horizon is None:
+        horizon = current_len - 1
+
+    if current_len <= horizon:
+        # Already correct shape or smaller, return as-is
+        return prediction
+
+    # Slice off t=0, keep horizon steps
+    return prediction[:, 1 : 1 + horizon]
+
 
 def get_effective_optimizer_step(batch_step: int, accumulation_steps: int) -> int:
     """
