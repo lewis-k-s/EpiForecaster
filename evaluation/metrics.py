@@ -148,6 +148,20 @@ def compute_masked_metrics_numpy(
     targets: np.ndarray,
     observed_mask: np.ndarray | None,
 ) -> MaskedMetricResult:
+    # Detect overflow issues early
+    if not np.all(np.isfinite(predictions)):
+        raise ValueError(
+            f"Non-finite values detected in predictions (inf={np.isinf(predictions).sum()}, "
+            f"nan={np.isnan(predictions).sum()}). This may indicate float16 overflow. "
+            f"Ensure data is upcast to float32/float64 before metric computation."
+        )
+    if not np.all(np.isfinite(targets)):
+        raise ValueError(
+            f"Non-finite values detected in targets (inf={np.isinf(targets).sum()}, "
+            f"nan={np.isnan(targets).sum()}). This may indicate float16 overflow. "
+            f"Ensure data is upcast to float32/float64 before metric computation."
+        )
+
     pred = np.nan_to_num(predictions.astype(np.float64), nan=0.0)
     target = np.nan_to_num(targets.astype(np.float64), nan=0.0)
     finite_target = np.isfinite(targets).astype(np.float64)

@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import torch
 
 from data.epi_dataset import EpiDataset
 from evaluation.baseline_models import (
@@ -16,7 +17,11 @@ from evaluation.baseline_models import (
     predict_with_tiered_fallback,
     predict_with_var_cross_target_fallback,
 )
-from evaluation.epiforecaster_eval import build_loader_from_config
+from evaluation.epiforecaster_eval import (
+    JointInferenceLoss,
+    build_loader_from_config,
+    get_loss_from_config,
+)
 from evaluation.metrics import compute_masked_metrics_numpy
 from models.configs import EpiForecasterConfig
 
@@ -30,6 +35,7 @@ _TARGET_SPECS = {
 }
 _SUPPORTED_BASELINE_MODELS = ["tiered", "exp_smoothing", "var_cross_target"]
 _VAR_TARGET_ORDER = ["hospitalizations", "wastewater", "cases", "deaths"]
+_JOINT_LOSS_VALUE_CLAMP = 1.0e6
 
 
 @dataclass
@@ -61,8 +67,27 @@ class TargetSeriesView:
     node_to_bin: dict[int, int]
 
 
+@dataclass
+class JointObservationLossSpec:
+    w_ww: float
+    w_hosp: float
+    w_cases: float
+    w_deaths: float
+    ww_imputed_weight: float
+    hosp_imputed_weight: float
+    cases_imputed_weight: float
+    deaths_imputed_weight: float
+    ww_min_observed: int
+    hosp_min_observed: int
+    cases_min_observed: int
+    deaths_min_observed: int
+
+
 def _torch_to_numpy_2d(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
+        # Upcast float16/bfloat16 to float32 before numpy conversion to prevent overflow
+        if value.dtype in (torch.float16, torch.bfloat16):
+            value = value.float()
         return value.detach().cpu().numpy().astype(np.float64)
     return np.asarray(value, dtype=np.float64)
 
@@ -217,7 +242,9 @@ def _prepare_target_views(
             if include_sparsity_bins
             else {}
         )
-        out[target_name] = TargetSeriesView(values=values, mask=mask, node_to_bin=node_to_bin)
+        out[target_name] = TargetSeriesView(
+            values=values, mask=mask, node_to_bin=node_to_bin
+        )
     return out
 
 
@@ -232,6 +259,163 @@ def _global_median_for_target(
     train_mask_view = mask[train_start:train_end]
     global_obs = train_view[train_mask_view > 0]
     return float(np.nanmedian(global_obs)) if global_obs.size > 0 else 0.0
+
+
+def _sanitize_metric_inputs(
+    *,
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    observed_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    pred = np.asarray(predictions, dtype=np.float64)
+    target = np.asarray(targets, dtype=np.float64)
+    mask = np.clip(
+        np.nan_to_num(np.asarray(observed_mask, dtype=np.float64), nan=0.0),
+        0.0,
+        1.0,
+    )
+    invalid = (~np.isfinite(pred)) | (~np.isfinite(target))
+    dropped_invalid_observed = int((invalid & (mask > 0)).sum())
+    if dropped_invalid_observed > 0:
+        mask = mask.copy()
+        mask[invalid] = 0.0
+    pred = np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+    return pred, target, mask, dropped_invalid_observed
+
+
+def _resolve_joint_observation_loss_spec(
+    *,
+    config: EpiForecasterConfig,
+    horizon: int,
+) -> JointObservationLossSpec | None:
+    if not hasattr(config, "training") or not hasattr(config.training, "loss"):
+        return None
+    criterion = get_loss_from_config(
+        config.training.loss,
+        data_config=config.data,
+        forecast_horizon=horizon,
+    )
+    if not isinstance(criterion, JointInferenceLoss):
+        return None
+
+    return JointObservationLossSpec(
+        w_ww=float(criterion.w_ww),
+        w_hosp=float(criterion.w_hosp),
+        w_cases=float(criterion.w_cases),
+        w_deaths=float(criterion.w_deaths),
+        ww_imputed_weight=float(criterion.ww_imputed_weight),
+        hosp_imputed_weight=float(criterion.hosp_imputed_weight),
+        cases_imputed_weight=float(criterion.cases_imputed_weight),
+        deaths_imputed_weight=float(criterion.deaths_imputed_weight),
+        ww_min_observed=int(criterion.ww_min_observed),
+        hosp_min_observed=int(criterion.hosp_min_observed),
+        cases_min_observed=int(criterion.cases_min_observed),
+        deaths_min_observed=int(criterion.deaths_min_observed),
+    )
+
+
+def _empty_metric_matrix(horizon: int) -> np.ndarray:
+    return np.zeros((1, horizon), dtype=np.float64)
+
+
+def _joint_weighted_masked_mse_numpy(
+    *,
+    prediction: np.ndarray,
+    target: np.ndarray,
+    observed_mask: np.ndarray,
+    imputed_weight: float,
+    min_observed: int,
+) -> float:
+    pred_t = torch.as_tensor(prediction, dtype=torch.float32)
+    target_t = torch.as_tensor(target, dtype=torch.float32)
+    observed_t = torch.as_tensor(observed_mask, dtype=torch.float32)
+
+    finite_mask = torch.isfinite(target_t).to(pred_t.dtype)
+    observed = torch.nan_to_num(observed_t, nan=0.0, posinf=1.0, neginf=0.0).clamp(
+        min=0.0, max=1.0
+    )
+    weights = (observed + (1.0 - observed) * float(imputed_weight)) * finite_mask
+    observed_binary = (observed > 0.5).to(pred_t.dtype) * finite_mask
+
+    if min_observed > 0:
+        observed_counts = observed_binary.sum(dim=1, keepdim=True)
+        eligible = (observed_counts >= float(min_observed)).to(pred_t.dtype)
+        weights = weights * eligible
+
+    active = weights > 0
+    prediction_clean = torch.nan_to_num(
+        pred_t,
+        nan=0.0,
+        posinf=_JOINT_LOSS_VALUE_CLAMP,
+        neginf=-_JOINT_LOSS_VALUE_CLAMP,
+    ).clamp(min=-_JOINT_LOSS_VALUE_CLAMP, max=_JOINT_LOSS_VALUE_CLAMP)
+    target_clean = torch.nan_to_num(
+        target_t,
+        nan=0.0,
+        posinf=_JOINT_LOSS_VALUE_CLAMP,
+        neginf=-_JOINT_LOSS_VALUE_CLAMP,
+    ).clamp(min=-_JOINT_LOSS_VALUE_CLAMP, max=_JOINT_LOSS_VALUE_CLAMP)
+    prediction_safe = torch.where(active, prediction_clean, torch.zeros_like(prediction_clean))
+    target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
+
+    sq = (prediction_safe - target_safe) ** 2
+    numerator = (sq * weights).sum()
+    denominator = weights.sum().clamp_min(1e-8)
+    return float((numerator / denominator).item())
+
+
+def _compute_joint_observation_loss_for_fold(
+    *,
+    fold_target_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    horizon: int,
+    joint_spec: JointObservationLossSpec,
+) -> dict[str, Any]:
+    target_aliases = {
+        "wastewater": "ww",
+        "hospitalizations": "hosp",
+        "cases": "cases",
+        "deaths": "deaths",
+    }
+    target_weights = {
+        "wastewater": joint_spec.w_ww,
+        "hospitalizations": joint_spec.w_hosp,
+        "cases": joint_spec.w_cases,
+        "deaths": joint_spec.w_deaths,
+    }
+    target_imputed_weights = {
+        "wastewater": joint_spec.ww_imputed_weight,
+        "hospitalizations": joint_spec.hosp_imputed_weight,
+        "cases": joint_spec.cases_imputed_weight,
+        "deaths": joint_spec.deaths_imputed_weight,
+    }
+    target_min_observed = {
+        "wastewater": joint_spec.ww_min_observed,
+        "hospitalizations": joint_spec.hosp_min_observed,
+        "cases": joint_spec.cases_min_observed,
+        "deaths": joint_spec.deaths_min_observed,
+    }
+
+    components: dict[str, Any] = {"joint_obs_loss_total": 0.0}
+    for target_name, alias in target_aliases.items():
+        pred, target, mask = fold_target_data.get(
+            target_name,
+            (_empty_metric_matrix(horizon), _empty_metric_matrix(horizon), _empty_metric_matrix(horizon)),
+        )
+        loss_value = _joint_weighted_masked_mse_numpy(
+            prediction=pred,
+            target=target,
+            observed_mask=mask,
+            imputed_weight=target_imputed_weights[target_name],
+            min_observed=target_min_observed[target_name],
+        )
+        weighted_value = target_weights[target_name] * loss_value
+        components[f"joint_loss_{alias}"] = loss_value
+        components[f"joint_loss_{alias}_weighted"] = weighted_value
+        components[f"joint_observed_count_{alias}"] = int((mask > 0).sum())
+        components["joint_obs_loss_total"] += weighted_value
+
+    return components
 
 
 def _predict_univariate_baseline(
@@ -283,7 +467,11 @@ def _evaluate_univariate_baseline_model(
     pair_rows: list[dict[str, Any]],
     sparsity_rows: list[dict[str, Any]],
     model_orders: list[dict[str, Any]],
+    joint_spec: JointObservationLossSpec | None,
+    joint_rows: list[dict[str, Any]],
 ) -> None:
+    joint_target_buffers: dict[int, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+
     for target_name, target_view in target_views.items():
         values = target_view.values
         mask = target_view.mask
@@ -312,6 +500,7 @@ def _evaluate_univariate_baseline_model(
             fit_success = 0
             node_pairs = 0
             scored_points = 0
+            dropped_invalid_observed = 0
 
             per_bin_preds: dict[int, list[np.ndarray]] = {}
             per_bin_targets: dict[int, list[np.ndarray]] = {}
@@ -326,7 +515,6 @@ def _evaluate_univariate_baseline_model(
                 train_mask = mask[fold.train_start : fold.train_end, node]
                 target_values = values[fold.forecast_start : fold.forecast_end, node]
                 target_mask = mask[fold.forecast_start : fold.forecast_end, node]
-                scored_points += int(target_mask.sum())
 
                 exog_train = None
                 exog_future = None
@@ -359,9 +547,19 @@ def _evaluate_univariate_baseline_model(
                         }
                     )
 
-                pred_rows.append(pred.predictions.astype(np.float64))
-                target_rows.append(target_values.astype(np.float64))
-                score_mask_rows.append(target_mask.astype(np.float64))
+                cleaned_pred, cleaned_target, cleaned_mask, dropped = (
+                    _sanitize_metric_inputs(
+                        predictions=pred.predictions,
+                        targets=target_values,
+                        observed_mask=target_mask,
+                    )
+                )
+                dropped_invalid_observed += dropped
+                scored_points += int(cleaned_mask.sum())
+
+                pred_rows.append(cleaned_pred)
+                target_rows.append(cleaned_target)
+                score_mask_rows.append(cleaned_mask)
                 pair_rows.append(
                     {
                         "model": baseline_model,
@@ -371,15 +569,26 @@ def _evaluate_univariate_baseline_model(
                         "selected_model": pred.model_name,
                         "fit_status": pred.fit_status,
                         "fallback_reason": pred.fallback_reason,
-                        "observed_count": int(target_mask.sum()),
+                        "observed_count": int(cleaned_mask.sum()),
+                        "invalid_observed_dropped": dropped,
                     }
                 )
 
                 if include_sparsity_bins:
                     bin_idx = node_to_bin.get(int(node), 0)
-                    per_bin_preds.setdefault(bin_idx, []).append(pred.predictions)
-                    per_bin_targets.setdefault(bin_idx, []).append(target_values)
-                    per_bin_masks.setdefault(bin_idx, []).append(target_mask)
+                    per_bin_preds.setdefault(bin_idx, []).append(cleaned_pred)
+                    per_bin_targets.setdefault(bin_idx, []).append(cleaned_target)
+                    per_bin_masks.setdefault(bin_idx, []).append(cleaned_mask)
+
+            if dropped_invalid_observed > 0:
+                logger.warning(
+                    "Dropped %d invalid observed points while scoring baseline=%s "
+                    "target=%s fold=%d",
+                    dropped_invalid_observed,
+                    baseline_model,
+                    target_name,
+                    fold.fold,
+                )
 
             if node_pairs == 0:
                 metric = compute_masked_metrics_numpy(
@@ -450,6 +659,36 @@ def _evaluate_univariate_baseline_model(
                         }
                     )
 
+            if joint_spec is not None:
+                fold_target_data = joint_target_buffers.setdefault(fold.fold, {})
+                if pred_rows:
+                    fold_target_data[target_name] = (
+                        np.vstack(pred_rows),
+                        np.vstack(target_rows),
+                        np.vstack(score_mask_rows),
+                    )
+                else:
+                    fold_target_data[target_name] = (
+                        _empty_metric_matrix(horizon),
+                        _empty_metric_matrix(horizon),
+                        _empty_metric_matrix(horizon),
+                    )
+
+    if joint_spec is not None:
+        for fold in folds:
+            components = _compute_joint_observation_loss_for_fold(
+                fold_target_data=joint_target_buffers.get(fold.fold, {}),
+                horizon=horizon,
+                joint_spec=joint_spec,
+            )
+            joint_rows.append(
+                {
+                    "model": baseline_model,
+                    "fold": fold.fold,
+                    **components,
+                }
+            )
+
 
 def _evaluate_var_cross_target_model(
     *,
@@ -467,6 +706,8 @@ def _evaluate_var_cross_target_model(
     pair_rows: list[dict[str, Any]],
     sparsity_rows: list[dict[str, Any]],
     model_orders: list[dict[str, Any]],
+    joint_spec: JointObservationLossSpec | None,
+    joint_rows: list[dict[str, Any]],
 ) -> None:
     var_targets = [t for t in _VAR_TARGET_ORDER if t in target_views]
     if not var_targets:
@@ -492,16 +733,25 @@ def _evaluate_var_cross_target_model(
             )
 
         pred_rows_by_target: dict[str, list[np.ndarray]] = {t: [] for t in var_targets}
-        target_rows_by_target: dict[str, list[np.ndarray]] = {t: [] for t in var_targets}
+        target_rows_by_target: dict[str, list[np.ndarray]] = {
+            t: [] for t in var_targets
+        }
         score_mask_by_target: dict[str, list[np.ndarray]] = {t: [] for t in var_targets}
         model_usage_by_target: dict[str, dict[str, int]] = {t: {} for t in var_targets}
         fit_success_by_target: dict[str, int] = {t: 0 for t in var_targets}
         node_pairs_by_target: dict[str, int] = {t: 0 for t in var_targets}
         scored_points_by_target: dict[str, int] = {t: 0 for t in var_targets}
+        dropped_invalid_by_target: dict[str, int] = {t: 0 for t in var_targets}
 
-        per_bin_preds: dict[str, dict[int, list[np.ndarray]]] = {t: {} for t in var_targets}
-        per_bin_targets: dict[str, dict[int, list[np.ndarray]]] = {t: {} for t in var_targets}
-        per_bin_masks: dict[str, dict[int, list[np.ndarray]]] = {t: {} for t in var_targets}
+        per_bin_preds: dict[str, dict[int, list[np.ndarray]]] = {
+            t: {} for t in var_targets
+        }
+        per_bin_targets: dict[str, dict[int, list[np.ndarray]]] = {
+            t: {} for t in var_targets
+        }
+        per_bin_masks: dict[str, dict[int, list[np.ndarray]]] = {
+            t: {} for t in var_targets
+        }
 
         for node in target_nodes:
             if not any(bool(valid_nodes_by_target[t][node]) for t in var_targets):
@@ -549,8 +799,17 @@ def _evaluate_var_cross_target_model(
                 ]
                 pred = preds[target_name]
 
+                cleaned_pred, cleaned_target, cleaned_mask, dropped = (
+                    _sanitize_metric_inputs(
+                        predictions=pred.predictions,
+                        targets=target_values,
+                        observed_mask=target_mask,
+                    )
+                )
+
                 node_pairs_by_target[target_name] += 1
-                scored_points_by_target[target_name] += int(target_mask.sum())
+                scored_points_by_target[target_name] += int(cleaned_mask.sum())
+                dropped_invalid_by_target[target_name] += dropped
                 if pred.fit_status == "fit_success":
                     fit_success_by_target[target_name] += 1
                 model_usage = model_usage_by_target[target_name]
@@ -568,9 +827,13 @@ def _evaluate_var_cross_target_model(
                         }
                     )
 
-                pred_rows_by_target[target_name].append(pred.predictions.astype(np.float64))
-                target_rows_by_target[target_name].append(target_values.astype(np.float64))
-                score_mask_by_target[target_name].append(target_mask.astype(np.float64))
+                pred_rows_by_target[target_name].append(
+                    cleaned_pred
+                )
+                target_rows_by_target[target_name].append(
+                    cleaned_target
+                )
+                score_mask_by_target[target_name].append(cleaned_mask)
                 pair_rows.append(
                     {
                         "model": "var_cross_target",
@@ -580,18 +843,34 @@ def _evaluate_var_cross_target_model(
                         "selected_model": pred.model_name,
                         "fit_status": pred.fit_status,
                         "fallback_reason": pred.fallback_reason,
-                        "observed_count": int(target_mask.sum()),
+                        "observed_count": int(cleaned_mask.sum()),
+                        "invalid_observed_dropped": dropped,
                     }
                 )
 
                 if include_sparsity_bins:
                     bin_idx = target_view.node_to_bin.get(int(node), 0)
-                    per_bin_preds[target_name].setdefault(bin_idx, []).append(pred.predictions)
-                    per_bin_targets[target_name].setdefault(bin_idx, []).append(target_values)
-                    per_bin_masks[target_name].setdefault(bin_idx, []).append(target_mask)
+                    per_bin_preds[target_name].setdefault(bin_idx, []).append(
+                        cleaned_pred
+                    )
+                    per_bin_targets[target_name].setdefault(bin_idx, []).append(
+                        cleaned_target
+                    )
+                    per_bin_masks[target_name].setdefault(bin_idx, []).append(
+                        cleaned_mask
+                    )
 
         for target_name in var_targets:
             node_pairs = node_pairs_by_target[target_name]
+            if dropped_invalid_by_target[target_name] > 0:
+                logger.warning(
+                    "Dropped %d invalid observed points while scoring baseline=%s "
+                    "target=%s fold=%d",
+                    dropped_invalid_by_target[target_name],
+                    "var_cross_target",
+                    target_name,
+                    fold.fold,
+                )
             if node_pairs == 0:
                 metric = compute_masked_metrics_numpy(
                     predictions=np.zeros((1, horizon), dtype=np.float64),
@@ -664,6 +943,37 @@ def _evaluate_var_cross_target_model(
                         }
                     )
 
+        if joint_spec is not None:
+            fold_target_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+            for target_name in _TARGET_SPECS:
+                pred_rows = pred_rows_by_target.get(target_name, [])
+                target_rows = target_rows_by_target.get(target_name, [])
+                mask_rows = score_mask_by_target.get(target_name, [])
+                if pred_rows:
+                    fold_target_data[target_name] = (
+                        np.vstack(pred_rows),
+                        np.vstack(target_rows),
+                        np.vstack(mask_rows),
+                    )
+                else:
+                    fold_target_data[target_name] = (
+                        _empty_metric_matrix(horizon),
+                        _empty_metric_matrix(horizon),
+                        _empty_metric_matrix(horizon),
+                    )
+            components = _compute_joint_observation_loss_for_fold(
+                fold_target_data=fold_target_data,
+                horizon=horizon,
+                joint_spec=joint_spec,
+            )
+            joint_rows.append(
+                {
+                    "model": "var_cross_target",
+                    "fold": fold.fold,
+                    **components,
+                }
+            )
+
 
 def run_baseline_evaluation(
     *,
@@ -702,6 +1012,7 @@ def run_baseline_evaluation(
     history_length = int(config.model.history_length)
     permit_map = config.data.resolve_missing_permit_map()
     calendar_exog = _resolve_calendar_exog(dataset)
+    joint_spec = _resolve_joint_observation_loss_spec(config=config, horizon=horizon)
     target_views = _prepare_target_views(
         dataset=dataset,
         split_start=split_start,
@@ -715,6 +1026,7 @@ def run_baseline_evaluation(
     pair_rows: list[dict[str, Any]] = []
     sparsity_rows: list[dict[str, Any]] = []
     model_orders: list[dict[str, Any]] = []
+    joint_rows: list[dict[str, Any]] = []
 
     for model_name in resolved_models:
         if model_name in {"tiered", "exp_smoothing"}:
@@ -734,6 +1046,8 @@ def run_baseline_evaluation(
                 pair_rows=pair_rows,
                 sparsity_rows=sparsity_rows,
                 model_orders=model_orders,
+                joint_spec=joint_spec,
+                joint_rows=joint_rows,
             )
         elif model_name == "var_cross_target":
             _evaluate_var_cross_target_model(
@@ -751,12 +1065,36 @@ def run_baseline_evaluation(
                 pair_rows=pair_rows,
                 sparsity_rows=sparsity_rows,
                 model_orders=model_orders,
+                joint_spec=joint_spec,
+                joint_rows=joint_rows,
             )
 
     fold_df = pd.DataFrame(fold_rows)
     coverage_df = pd.DataFrame(coverage_rows)
     pair_df = pd.DataFrame(pair_rows)
     sparsity_df = pd.DataFrame(sparsity_rows)
+    joint_cols = [
+        "model",
+        "fold",
+        "joint_obs_loss_total",
+        "joint_loss_ww",
+        "joint_loss_hosp",
+        "joint_loss_cases",
+        "joint_loss_deaths",
+        "joint_loss_ww_weighted",
+        "joint_loss_hosp_weighted",
+        "joint_loss_cases_weighted",
+        "joint_loss_deaths_weighted",
+        "joint_observed_count_ww",
+        "joint_observed_count_hosp",
+        "joint_observed_count_cases",
+        "joint_observed_count_deaths",
+    ]
+    joint_fold_df = (
+        pd.DataFrame(joint_rows)
+        if joint_rows
+        else pd.DataFrame(columns=joint_cols)
+    )
 
     aggregate_rows: list[dict[str, Any]] = []
     for (model_name, target_name), group in fold_df.groupby(["model", "target"]):
@@ -777,19 +1115,60 @@ def run_baseline_evaluation(
                 )
         aggregate_rows.append(row)
     aggregate_df = pd.DataFrame(aggregate_rows)
+    joint_aggregate_rows: list[dict[str, Any]] = []
+    if not joint_fold_df.empty:
+        value_cols = [
+            col for col in joint_fold_df.columns if col not in {"model", "fold"}
+        ]
+        for model_name, group in joint_fold_df.groupby("model"):
+            row: dict[str, Any] = {
+                "model": model_name,
+                "folds": int(group["fold"].nunique()),
+            }
+            for value_col in value_cols:
+                values = pd.to_numeric(group[value_col], errors="coerce").dropna()
+                if values.empty:
+                    row[f"{value_col}_median"] = float("nan")
+                    row[f"{value_col}_iqr"] = float("nan")
+                else:
+                    row[f"{value_col}_median"] = float(values.median())
+                    row[f"{value_col}_iqr"] = float(
+                        values.quantile(0.75) - values.quantile(0.25)
+                    )
+            joint_aggregate_rows.append(row)
+    joint_aggregate_df = pd.DataFrame(joint_aggregate_rows)
+    if joint_aggregate_df.empty:
+        joint_aggregate_df = pd.DataFrame(columns=["model", "folds"])
 
     baseline_fold_metrics = output_dir / "baseline_fold_metrics.csv"
     baseline_aggregate_metrics = output_dir / "baseline_aggregate_metrics.csv"
+    baseline_joint_loss_fold = output_dir / "baseline_joint_loss_fold.csv"
+    baseline_joint_loss_aggregate = output_dir / "baseline_joint_loss_aggregate.csv"
     baseline_coverage = output_dir / "baseline_coverage.csv"
     baseline_pair_details = output_dir / "baseline_pair_details.csv"
+    baseline_model_usage = output_dir / "baseline_model_usage.csv"
     baseline_sparsity = output_dir / "baseline_sparsity_stratified_metrics.csv"
     baseline_vs_model_deltas = output_dir / "baseline_vs_model_deltas.csv"
     baseline_metadata = output_dir / "baseline_metadata.json"
 
     fold_df.to_csv(baseline_fold_metrics, index=False)
     aggregate_df.to_csv(baseline_aggregate_metrics, index=False)
+    joint_fold_df.to_csv(baseline_joint_loss_fold, index=False)
+    joint_aggregate_df.to_csv(baseline_joint_loss_aggregate, index=False)
     coverage_df.to_csv(baseline_coverage, index=False)
     pair_df.to_csv(baseline_pair_details, index=False)
+    usage_df = (
+        pair_df.groupby(["model", "selected_model"], dropna=False)
+        .size()
+        .reset_index(name="count")
+    )
+    usage_df["count"] = usage_df["count"].astype(int)
+    usage_df = usage_df.sort_values(
+        by=["model", "count", "selected_model"],
+        ascending=[True, False, True],
+        ignore_index=True,
+    )
+    usage_df.to_csv(baseline_model_usage, index=False)
     if include_sparsity_bins:
         sparsity_df.to_csv(baseline_sparsity, index=False)
     pd.DataFrame(
@@ -812,6 +1191,23 @@ def run_baseline_evaluation(
         "seasonal_period": seasonal_period,
         "var_maxlags": var_maxlags,
         "models": resolved_models,
+        "joint_observation_loss_enabled": joint_spec is not None,
+        "joint_observation_loss_spec": None
+        if joint_spec is None
+        else {
+            "w_ww": joint_spec.w_ww,
+            "w_hosp": joint_spec.w_hosp,
+            "w_cases": joint_spec.w_cases,
+            "w_deaths": joint_spec.w_deaths,
+            "ww_imputed_weight": joint_spec.ww_imputed_weight,
+            "hosp_imputed_weight": joint_spec.hosp_imputed_weight,
+            "cases_imputed_weight": joint_spec.cases_imputed_weight,
+            "deaths_imputed_weight": joint_spec.deaths_imputed_weight,
+            "ww_min_observed": joint_spec.ww_min_observed,
+            "hosp_min_observed": joint_spec.hosp_min_observed,
+            "cases_min_observed": joint_spec.cases_min_observed,
+            "deaths_min_observed": joint_spec.deaths_min_observed,
+        },
         "missing_permit_map": permit_map,
         "split_start": split_start,
         "split_end": split_end,
@@ -825,8 +1221,11 @@ def run_baseline_evaluation(
     result = {
         "baseline_fold_metrics": baseline_fold_metrics,
         "baseline_aggregate_metrics": baseline_aggregate_metrics,
+        "baseline_joint_loss_fold": baseline_joint_loss_fold,
+        "baseline_joint_loss_aggregate": baseline_joint_loss_aggregate,
         "baseline_coverage": baseline_coverage,
         "baseline_pair_details": baseline_pair_details,
+        "baseline_model_usage": baseline_model_usage,
         "baseline_vs_model_deltas": baseline_vs_model_deltas,
         "baseline_metadata": baseline_metadata,
     }
@@ -864,7 +1263,17 @@ def compare_model_metrics_against_baselines(
     output_csv: Path,
 ) -> Path:
     baseline_df = pd.read_csv(baseline_results_csv)
-    if "fold" in baseline_df.columns:
+    has_fold = "fold" in baseline_df.columns
+    has_target_metrics = {
+        "target",
+        "mae",
+        "rmse",
+        "smape",
+        "r2",
+    }.issubset(set(baseline_df.columns))
+    has_joint_fold_metrics = "joint_obs_loss_total" in baseline_df.columns
+
+    if has_fold and has_target_metrics:
         agg_rows: list[dict[str, Any]] = []
         for (model_name, target_name), group in baseline_df.groupby(
             ["model", "target"]
@@ -883,6 +1292,17 @@ def compare_model_metrics_against_baselines(
                     "r2_median": pd.to_numeric(group["r2"], errors="coerce").median(),
                 }
             )
+        baseline_df = pd.DataFrame(agg_rows)
+    elif has_fold and has_joint_fold_metrics:
+        joint_value_cols = [
+            col for col in baseline_df.columns if col not in {"model", "fold"}
+        ]
+        agg_rows = []
+        for model_name, group in baseline_df.groupby("model"):
+            row: dict[str, Any] = {"model": model_name}
+            for col in joint_value_cols:
+                row[f"{col}_median"] = pd.to_numeric(group[col], errors="coerce").median()
+            agg_rows.append(row)
         baseline_df = pd.DataFrame(agg_rows)
 
     model_target_metrics = {
@@ -911,29 +1331,86 @@ def compare_model_metrics_against_baselines(
             "r2": eval_metrics.get("r2_deaths_log1p_per_100k"),
         },
     }
+    joint_component_metrics = {
+        "joint_loss_ww_weighted": eval_metrics.get("loss_ww_weighted"),
+        "joint_loss_hosp_weighted": eval_metrics.get("loss_hosp_weighted"),
+        "joint_loss_cases_weighted": eval_metrics.get("loss_cases_weighted"),
+        "joint_loss_deaths_weighted": eval_metrics.get("loss_deaths_weighted"),
+    }
+    joint_obs_total = 0.0
+    has_joint_obs_component = False
+    for value in joint_component_metrics.values():
+        if value is None:
+            continue
+        numeric_value = float(value)
+        if not np.isfinite(numeric_value):
+            continue
+        joint_obs_total += numeric_value
+        has_joint_obs_component = True
 
     rows: list[dict[str, Any]] = []
+    joint_total_recorded: set[str] = set()
+    joint_component_recorded: set[tuple[str, str]] = set()
     for baseline_row in baseline_df.to_dict(orient="records"):
-        target = str(baseline_row["target"])
+        target = str(baseline_row.get("target"))
         model_name = str(baseline_row["model"])
-        if target not in model_target_metrics:
-            continue
-        for metric_name in ["mae", "rmse", "smape", "r2"]:
-            baseline_value = baseline_row.get(f"{metric_name}_median")
-            model_value = model_target_metrics[target].get(metric_name)
-            if baseline_value is None or model_value is None:
+        if target in model_target_metrics:
+            for metric_name in ["mae", "rmse", "smape", "r2"]:
+                baseline_value = baseline_row.get(f"{metric_name}_median")
+                model_value = model_target_metrics[target].get(metric_name)
+                if baseline_value is None or model_value is None:
+                    continue
+                rows.append(
+                    {
+                        "target": target,
+                        "baseline_model": model_name,
+                        "metric": metric_name,
+                        "model_value": float(model_value),
+                        "baseline_value": float(baseline_value),
+                        "delta_model_minus_baseline": float(model_value)
+                        - float(baseline_value),
+                    }
+                )
+
+        if has_joint_obs_component and model_name not in joint_total_recorded:
+            baseline_joint_total = baseline_row.get("joint_obs_loss_total_median")
+            if baseline_joint_total is not None and pd.notna(baseline_joint_total):
+                rows.append(
+                    {
+                        "target": "joint_observation",
+                        "baseline_model": model_name,
+                        "metric": "joint_obs_loss_total",
+                        "model_value": float(joint_obs_total),
+                        "baseline_value": float(baseline_joint_total),
+                        "delta_model_minus_baseline": float(joint_obs_total)
+                        - float(baseline_joint_total),
+                    }
+                )
+                joint_total_recorded.add(model_name)
+
+        for baseline_key, model_metric in joint_component_metrics.items():
+            if (model_name, baseline_key) in joint_component_recorded:
+                continue
+            if model_metric is None:
+                continue
+            metric_value = float(model_metric)
+            if not np.isfinite(metric_value):
+                continue
+            baseline_value = baseline_row.get(f"{baseline_key}_median")
+            if baseline_value is None or not pd.notna(baseline_value):
                 continue
             rows.append(
                 {
-                    "target": target,
+                    "target": "joint_observation",
                     "baseline_model": model_name,
-                    "metric": metric_name,
-                    "model_value": float(model_value),
+                    "metric": baseline_key,
+                    "model_value": metric_value,
                     "baseline_value": float(baseline_value),
-                    "delta_model_minus_baseline": float(model_value)
+                    "delta_model_minus_baseline": metric_value
                     - float(baseline_value),
                 }
             )
+            joint_component_recorded.add((model_name, baseline_key))
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_csv, index=False)
