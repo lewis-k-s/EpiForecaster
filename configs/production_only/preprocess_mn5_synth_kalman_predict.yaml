@@ -41,7 +41,7 @@ min_density_threshold: 0.01  # Low threshold for synthetic data
 
 # Output configuration
 output_path: "data/processed"
-dataset_name: "synthetic_full"
+dataset_name: "synthetic_full_kalman_predict"
 compression: "blosc"
 
 # Alignment and validation options
@@ -64,6 +64,23 @@ temporal_covariates:
   include_day_of_week: true
   include_holidays: true
   holiday_calendar_file: data/files/catalonia_holidays.csv
+
+# Offline causal smoothing configuration
+smoothing:
+  clinical_method: "kalman_v2"
+  wastewater_method: "tobit_kalman_v2"
+  missing_policy: "predict"
+  momentum_decay: 0.5
+  momentum_max_steps: 4
+  innovation_clip_sigma: 2.5
+  reentry_gain_cap: 0.35
+  reentry_steps: 2
+  process_var_floor: 1.0e-6
+  measurement_var_floor: 1.0e-6
+  holt_alpha: 0.30
+  holt_beta: 0.05
+  holt_phi: 0.90
+  holt_missing_trend_decay: 0.85
 
 # Graph construction options
 graph_options:
