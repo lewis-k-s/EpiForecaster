@@ -18,6 +18,7 @@ import zarr.errors
 from data.epi_dataset import EpiDataset, collate_epiforecaster_batch
 from data.preprocess.config import REGION_COORD
 from evaluation.metrics import TorchMaskedMetricAccumulator
+from utils.sparsity_logging import log_sparsity_loss_correlation
 from utils.normalization import unscale_forecasts
 from utils.dtypes import sync_to_device
 from models.configs import DataConfig, EpiForecasterConfig, LossConfig
@@ -167,6 +168,7 @@ class JointInferenceLoss(nn.Module):
         w_cases: float = 1.0,
         w_deaths: float = 1.0,
         w_sir: float = 0.1,
+        w_continuity: float = 0.0,
         ww_imputed_weight: float = 0.0,
         hosp_imputed_weight: float = 0.0,
         cases_imputed_weight: float = 0.0,
@@ -183,6 +185,7 @@ class JointInferenceLoss(nn.Module):
         self.w_cases = w_cases
         self.w_deaths = w_deaths
         self.w_sir = w_sir
+        self.w_continuity = w_continuity
         self.ww_imputed_weight = ww_imputed_weight
         self.hosp_imputed_weight = hosp_imputed_weight
         self.cases_imputed_weight = cases_imputed_weight
@@ -253,35 +256,41 @@ class JointInferenceLoss(nn.Module):
         self,
         model_outputs: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor | None],
+        batch_data: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        components = self.compute_components(model_outputs, targets)
+        components = self.compute_components(model_outputs, targets, batch_data)
         return components["total"]
 
     def compute_components(
         self,
         model_outputs: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor | None],
+        batch_data: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute joint inference loss components.
 
         Args:
             model_outputs: Dict from EpiForecaster.forward() containing:
-                - pred_ww: [B, H] predicted wastewater
-                - pred_hosp: [B, H] predicted hospitalizations
-                - pred_cases: [B, H] predicted reported cases
-                - pred_deaths: [B, H] predicted deaths
+                - pred_ww: [B, H+1] predicted wastewater (includes t=0 nowcast)
+                - pred_hosp: [B, H+1] predicted hospitalizations (includes t=0 nowcast)
+                - pred_cases: [B, H+1] predicted reported cases (includes t=0 nowcast)
+                - pred_deaths: [B, H] predicted deaths (no nowcast needed)
                 - physics_residual: [B, H] SIR dynamics residual
             targets: Dict containing target tensors:
                 - ww: [B, H] wastewater targets (optional)
                 - hosp: [B, H] hospitalization targets (optional)
                 - cases: [B, H] reported cases targets (optional)
                 - deaths: [B, H] deaths targets (optional)
+            batch_data: Optional dict containing historical data for continuity penalty:
+                - HospHist: [B, T, 3] hospitalization history
+                - CasesHist: [B, T, 3] cases history
+                - DeathsHist: [B, T, 3] deaths history
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
-                - ww, hosp, cases, deaths, sir
-                - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted, sir_weighted
+                - ww, hosp, cases, deaths, sir, continuity
+                - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted, sir_weighted, continuity_weighted
                 - total
         """
         # Keep losses attached to graph while avoiding NaN propagation from non-finite preds.
@@ -297,11 +306,15 @@ class JointInferenceLoss(nn.Module):
         cases_loss = zero_anchor
         deaths_loss = zero_anchor
         sir_loss = zero_anchor
+        continuity_loss = zero_anchor
+
+        # Helper to slice predictions: remove t=0 (nowcast) for forecast loss
+        from utils.training_utils import drop_nowcast
 
         # Wastewater loss
         if self.w_ww > 0 and targets.get("ww") is not None:
             ww_loss = self._weighted_masked_mse(
-                model_outputs["pred_ww"],
+                drop_nowcast(model_outputs["pred_ww"]),
                 targets["ww"],
                 targets.get("ww_mask"),
                 self.ww_imputed_weight,
@@ -312,7 +325,7 @@ class JointInferenceLoss(nn.Module):
         # Hospitalization loss
         if self.w_hosp > 0 and targets.get("hosp") is not None:
             hosp_loss = self._weighted_masked_mse(
-                model_outputs["pred_hosp"],
+                drop_nowcast(model_outputs["pred_hosp"]),
                 targets["hosp"],
                 targets.get("hosp_mask"),
                 self.hosp_imputed_weight,
@@ -323,7 +336,7 @@ class JointInferenceLoss(nn.Module):
         # Cases loss (reported cases observation)
         if targets.get("cases") is not None:
             cases_loss = self._weighted_masked_mse(
-                model_outputs["pred_cases"],
+                drop_nowcast(model_outputs["pred_cases"]),
                 targets["cases"],
                 targets.get("cases_mask"),
                 self.cases_imputed_weight,
@@ -380,11 +393,17 @@ class JointInferenceLoss(nn.Module):
                 )
             total_loss = total_loss + self.w_sir * sir_loss
 
+        # Nowcast continuity penalty
+        if self.w_continuity > 0 and batch_data is not None:
+            continuity_loss = self._compute_continuity_loss(model_outputs, batch_data)
+            total_loss = total_loss + self.w_continuity * continuity_loss
+
         ww_weighted = self.w_ww * ww_loss
         hosp_weighted = self.w_hosp * hosp_loss
         cases_weighted = self.w_cases * cases_loss
         deaths_weighted = self.w_deaths * deaths_loss
         sir_weighted = self.w_sir * sir_loss
+        continuity_weighted = self.w_continuity * continuity_loss
 
         return {
             "ww": ww_loss,
@@ -392,13 +411,77 @@ class JointInferenceLoss(nn.Module):
             "cases": cases_loss,
             "deaths": deaths_loss,
             "sir": sir_loss,
+            "continuity": continuity_loss,
             "ww_weighted": ww_weighted,
             "hosp_weighted": hosp_weighted,
             "cases_weighted": cases_weighted,
             "deaths_weighted": deaths_weighted,
             "sir_weighted": sir_weighted,
+            "continuity_weighted": continuity_weighted,
             "total": total_loss,
         }
+
+    def _compute_continuity_loss(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        batch_data: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute nowcast continuity penalty.
+
+        Penalizes the discontinuity between the last observed value and the
+        model's first forecast prediction (t=0, the nowcast).
+
+        Args:
+            model_outputs: Dict containing predictions with t=0 (nowcast)
+            batch_data: Dict containing historical observations
+
+        Returns:
+            Scalar continuity loss
+        """
+        zero_anchor = (
+            torch.nan_to_num(
+                model_outputs["pred_hosp"].float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).sum()
+            * 0.0
+        )
+        total_continuity_loss = zero_anchor
+        num_components = 0
+
+        # Hospitalization continuity: compare pred_hosp[:, 0] with HospHist[:, -1, 0]
+        if "HospHist" in batch_data and model_outputs["pred_hosp"].shape[1] > 0:
+            last_observed = batch_data["HospHist"][:, -1, 0]  # value channel
+            nowcast_pred = model_outputs["pred_hosp"][:, 0]
+            # Only compute where observed value is finite
+            valid_mask = torch.isfinite(last_observed)
+            if valid_mask.any():
+                diff = (nowcast_pred[valid_mask] - last_observed[valid_mask]) ** 2
+                total_continuity_loss = total_continuity_loss + diff.mean()
+                num_components += 1
+
+        # Cases continuity: compare pred_cases[:, 0] with CasesHist[:, -1, 0]
+        if "CasesHist" in batch_data and model_outputs["pred_cases"].shape[1] > 0:
+            last_observed = batch_data["CasesHist"][:, -1, 0]
+            nowcast_pred = model_outputs["pred_cases"][:, 0]
+            valid_mask = torch.isfinite(last_observed)
+            if valid_mask.any():
+                diff = (nowcast_pred[valid_mask] - last_observed[valid_mask]) ** 2
+                total_continuity_loss = total_continuity_loss + diff.mean()
+                num_components += 1
+
+        # Deaths continuity: compare pred_deaths[:, 0] with DeathsHist[:, -1, 0]
+        if "DeathsHist" in batch_data and model_outputs["pred_deaths"].shape[1] > 0:
+            last_observed = batch_data["DeathsHist"][:, -1, 0]
+            nowcast_pred = model_outputs["pred_deaths"][:, 0]
+            valid_mask = torch.isfinite(last_observed)
+            if valid_mask.any():
+                diff = (nowcast_pred[valid_mask] - last_observed[valid_mask]) ** 2
+                total_continuity_loss = total_continuity_loss + diff.mean()
+                num_components += 1
+
+        if num_components > 0:
+            return total_continuity_loss / num_components
+        return zero_anchor
 
 
 def get_loss_function(name: str) -> ForecastLoss:
@@ -446,6 +529,7 @@ def get_loss_from_config(
             w_cases=joint_cfg.w_cases,
             w_deaths=joint_cfg.w_deaths,
             w_sir=joint_cfg.w_sir,
+            w_continuity=joint_cfg.w_continuity,
             ww_imputed_weight=joint_cfg.ww_imputed_weight,
             hosp_imputed_weight=joint_cfg.hosp_imputed_weight,
             cases_imputed_weight=joint_cfg.cases_imputed_weight,
@@ -1046,7 +1130,21 @@ def evaluate_loader(
                     region_embeddings=region_embeddings,
                 )
 
-                components = criterion.compute_components(model_outputs, targets_dict)
+                # Slice predictions to match target horizon (remove t=0 nowcast)
+                from utils.training_utils import drop_nowcast
+
+                # Create sliced model outputs for metric computation
+                sliced_model_outputs = {
+                    k: drop_nowcast(v, horizon)
+                    if k.startswith("pred_") and isinstance(v, torch.Tensor)
+                    else v
+                    for k, v in model_outputs.items()
+                }
+
+                # Compute loss with batch_data for continuity penalty
+                components = criterion.compute_components(
+                    model_outputs, targets_dict, batch_data
+                )
                 loss = components["total"]
                 total_loss += loss.detach()
                 loss_ww_sum += components["ww"].detach()
@@ -1054,13 +1152,26 @@ def evaluate_loader(
                 loss_cases_sum += components["cases"].detach()
                 loss_deaths_sum += components["deaths"].detach()
                 loss_sir_sum += components["sir"].detach()
+                if "continuity" in components:
+                    pass  # Don't accumulate continuity loss in metrics
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
                 loss_hosp_weighted_sum += components["hosp_weighted"].detach()
                 loss_cases_weighted_sum += components["cases_weighted"].detach()
                 loss_deaths_weighted_sum += components["deaths_weighted"].detach()
                 loss_sir_weighted_sum += components["sir_weighted"].detach()
 
-                pred_hosp = model_outputs.get("pred_hosp")
+                # Log sparsity-loss correlation during evaluation (moved from training)
+                if batch_idx % 10 == 0:
+                    log_sparsity_loss_correlation(
+                        batch=batch_data,
+                        model_outputs=model_outputs,
+                        targets=targets_dict,
+                        wandb_run=None,
+                        step=batch_idx,
+                        epoch=0,
+                    )
+
+                pred_hosp = sliced_model_outputs.get("pred_hosp")
                 hosp_targets = targets_dict.get("hosp")
                 hosp_mask = targets_dict.get("hosp_mask")
                 if pred_hosp is not None and hosp_targets is not None:
@@ -1086,7 +1197,7 @@ def evaluate_loader(
                         node_mae_sum[node_id] += sample_mae.detach()
                         node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
 
-                pred_ww = model_outputs.get("pred_ww")
+                pred_ww = sliced_model_outputs.get("pred_ww")
                 ww_targets = targets_dict.get("ww")
                 ww_mask = targets_dict.get("ww_mask")
                 if pred_ww is not None and ww_targets is not None:
@@ -1096,7 +1207,7 @@ def evaluate_loader(
                         observed_mask=ww_mask,
                     )
 
-                pred_cases = model_outputs.get("pred_cases")
+                pred_cases = sliced_model_outputs.get("pred_cases")
                 cases_targets = targets_dict.get("cases")
                 cases_mask = targets_dict.get("cases_mask")
                 if pred_cases is not None and cases_targets is not None:
@@ -1106,7 +1217,7 @@ def evaluate_loader(
                         observed_mask=cases_mask,
                     )
 
-                pred_deaths = model_outputs.get("pred_deaths")
+                pred_deaths = sliced_model_outputs.get("pred_deaths")
                 deaths_targets = targets_dict.get("deaths")
                 deaths_mask = targets_dict.get("deaths_mask")
                 if pred_deaths is not None and deaths_targets is not None:

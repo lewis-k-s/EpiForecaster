@@ -37,10 +37,11 @@ from data.epi_dataset import (
 )
 from data.preprocess.config import REGION_COORD
 from data.samplers import EpidemicCurriculumSampler, ShuffledBatchSampler
+from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from utils import setup_tensor_core_optimizations
 from utils.gradient_debug import GradientDebugger
-from utils.sparsity_logging import log_sparsity_loss_correlation
+
 from utils.training_utils import get_effective_optimizer_step, should_log_step
 from utils.platform import (
     cleanup_nvme_staging,
@@ -355,6 +356,9 @@ class EpiForecasterTrainer:
         if isinstance(self.train_dataset, ConcatDataset):
             # Access the first dataset (Real)
             train_example_ds = self.train_dataset.datasets[0]
+
+            # Validate all datasets have consistent dimensions for curriculum training
+            self._validate_curriculum_dataset_dimensions()
         else:
             train_example_ds = self.train_dataset
 
@@ -486,6 +490,7 @@ class EpiForecasterTrainer:
             "learning_rate": [],
             "epoch_times": [],
         }
+        self.metric_artifacts: dict[str, Path] = {}
         self._model_graph_logged = False
         self._last_node_mae: dict[int, float] = {}
         # Curriculum phase tracking for LR warmup at transitions
@@ -713,6 +718,70 @@ class EpiForecasterTrainer:
                 "Sparsity-based run selection will be disabled."
             )
             return {}
+
+    def _validate_curriculum_dataset_dimensions(self) -> None:
+        """Validate that all datasets in ConcatDataset have consistent dimensions.
+
+        When using curriculum training with mixed real and synthetic data, all
+        datasets must have the same feature dimensions. This method checks that
+        cases_output_dim, biomarkers_output_dim, and temporal_covariates_dim
+        are consistent across all datasets.
+
+        Raises:
+            ValueError: If any dataset has inconsistent dimensions.
+        """
+        if not isinstance(self.train_dataset, ConcatDataset):
+            return
+
+        datasets = self.train_dataset.datasets
+        if len(datasets) < 2:
+            return
+
+        # Get dimensions from first dataset (reference)
+        ref_ds = datasets[0]
+        ref_dims = {
+            "cases_output_dim": ref_ds.cases_output_dim,
+            "biomarkers_output_dim": ref_ds.biomarkers_output_dim,
+            "temporal_covariates_dim": ref_ds.temporal_covariates_dim,
+        }
+        ref_run_id = getattr(ref_ds, "run_id", "unknown")
+
+        # Check all other datasets
+        mismatches = []
+        for i, ds in enumerate(datasets[1:], start=1):
+            ds_run_id = getattr(ds, "run_id", f"dataset_{i}")
+            ds_dims = {
+                "cases_output_dim": ds.cases_output_dim,
+                "biomarkers_output_dim": ds.biomarkers_output_dim,
+                "temporal_covariates_dim": ds.temporal_covariates_dim,
+            }
+
+            for dim_name, ref_val in ref_dims.items():
+                ds_val = ds_dims[dim_name]
+                if ds_val != ref_val:
+                    mismatches.append(
+                        f"  {dim_name}: {ref_run_id}={ref_val} vs {ds_run_id}={ds_val}"
+                    )
+
+        if mismatches:
+            raise ValueError(
+                f"Curriculum training requires all datasets to have identical "
+                f"feature dimensions. Found {len(mismatches)} mismatch(es):\n"
+                + "\n".join(mismatches)
+                + "\n\nThis usually happens when:"
+                "\n  - Real and synthetic data have different biomarker variants"
+                "\n  - Real and synthetic data have different temporal_covariates config"
+                "\n  - Preprocessing configs are inconsistent between datasets"
+                "\n\nFix: Ensure all preprocessing configs include the same "
+                "temporal_covariates and biomarker settings."
+            )
+
+        logger.info(
+            f"Validated {len(datasets)} datasets have consistent dimensions: "
+            f"cases={ref_dims['cases_output_dim']}, "
+            f"biomarkers={ref_dims['biomarkers_output_dim']}, "
+            f"temporal_covariates={ref_dims['temporal_covariates_dim']}"
+        )
 
     def _select_runs_for_curriculum(
         self,
@@ -1538,6 +1607,10 @@ class EpiForecasterTrainer:
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
+            self._write_main_model_aggregate_csvs(
+                split_name="val",
+                eval_metrics=val_metrics,
+            )
 
             # Learning rate scheduling (if per-epoch)
             if self.scheduler and self.config.training.scheduler_type == "step":
@@ -1612,6 +1685,10 @@ class EpiForecasterTrainer:
         # Test phase
         test_start_time = time.time()
         test_loss, test_metrics, _test_node_mae = self.test_epoch()
+        self._write_main_model_aggregate_csvs(
+            split_name="test",
+            eval_metrics=test_metrics,
+        )
         # Shutdown test iterator after evaluation
         self._shutdown_loader_iterator(self.test_loader)
         test_time = time.time() - test_start_time
@@ -1762,31 +1839,34 @@ class EpiForecasterTrainer:
                         region_embeddings=self.region_embeddings,
                     )
 
-                    loss = self.criterion(model_outputs, targets_dict)
+                    loss = self.criterion(model_outputs, targets_dict, batch_data)
 
                 # Guard against non-finite losses to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
                 should_check_nan = self.global_step % nan_check_frequency == 0
-                if should_check_nan and not torch.isfinite(loss):
-                    self.nan_loss_counter += 1
-                    self._status(
-                        "Non-finite training loss detected at "
-                        f"epoch={self.current_epoch}, step={self.global_step}, "
-                        f"batch={batch_idx} (counter={self.nan_loss_counter}).",
-                        logging.WARNING,
-                    )
-                    self.optimizer.zero_grad(set_to_none=True)
-                    patience = self.config.training.nan_loss_patience
-                    if (
-                        patience is not None
-                        and patience > 0
-                        and self.nan_loss_counter >= patience
-                    ):
-                        self.nan_loss_triggered = True
-                        break
-                    fetch_start_time = time.time()
-                    self.global_step += 1
-                    continue
+                if should_check_nan:
+                    # Detach and move to CPU before checking to avoid GPU sync stall
+                    loss_cpu = loss.detach().cpu()
+                    if not torch.isfinite(loss_cpu):
+                        self.nan_loss_counter += 1
+                        self._status(
+                            "Non-finite training loss detected at "
+                            f"epoch={self.current_epoch}, step={self.global_step}, "
+                            f"batch={batch_idx} (counter={self.nan_loss_counter}).",
+                            logging.WARNING,
+                        )
+                        self.optimizer.zero_grad(set_to_none=True)
+                        patience = self.config.training.nan_loss_patience
+                        if (
+                            patience is not None
+                            and patience > 0
+                            and self.nan_loss_counter >= patience
+                        ):
+                            self.nan_loss_triggered = True
+                            break
+                        fetch_start_time = time.time()
+                        self.global_step += 1
+                        continue
 
                 # Reset counter once we see a valid loss.
                 self.nan_loss_counter = 0
@@ -1803,25 +1883,21 @@ class EpiForecasterTrainer:
                 grad_norm = torch.tensor(0.0)
                 if should_step or is_last_batch:
                     self._log_gradient_norms(step=self.global_step)
-                    self._log_sparsity_loss_correlation(
-                        batch_data=batch_data,
-                        model_outputs=model_outputs,
-                        targets_dict=targets_dict,
-                        step=self.global_step,
+                    # Clip gradients without error_if_nonfinite to avoid GPU-CPU sync
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.training.gradient_clip_value,
+                        error_if_nonfinite=False,
                     )
-                    try:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.config.training.gradient_clip_value,
-                            error_if_nonfinite=True,
-                        )
-                    except RuntimeError as exc:
+                    # Check for non-finite grad norm on CPU to avoid sync
+                    grad_norm_cpu = grad_norm.detach().cpu()
+                    if not torch.isfinite(grad_norm_cpu):
                         self.nan_loss_counter += 1
                         self._status(
                             "Non-finite gradient norm detected during clipping at "
                             f"epoch={self.current_epoch}, step={self.global_step}, "
                             f"batch={batch_idx} (counter={self.nan_loss_counter}). "
-                            f"Error: {exc}. Skipping optimizer step.",
+                            "Skipping optimizer step.",
                             logging.WARNING,
                         )
 
@@ -2158,43 +2234,6 @@ class EpiForecasterTrainer:
             logging.DEBUG,
         )
 
-    def _log_sparsity_loss_correlation(
-        self,
-        batch_data: dict[str, Any],
-        model_outputs: dict[str, torch.Tensor],
-        targets_dict: dict[str, torch.Tensor | None],
-        step: int,
-    ) -> None:
-        """Log per-sample sparsity and loss distributions for correlation analysis.
-
-        Uses the same frequency as gradient norm logging (grad_norm_log_frequency).
-        Logs W&B histograms for:
-        - Input history sparsity: hosp_hist, cases_hist, deaths_hist, bio_hist, mob_hist
-        - Target sparsity: hosp_target, ww_target, cases_target, deaths_target
-        - Per-sample losses: loss_hosp, loss_ww, loss_cases, loss_deaths
-
-        Args:
-            batch_data: Collated batch from EpiDataset
-            model_outputs: Dict from EpiForecaster.forward() with predictions
-            targets_dict: Dict with observation targets and masks
-            step: Global training step
-        """
-        frequency = self.config.training.grad_norm_log_frequency
-        accum_steps = self.config.training.gradient_accumulation_steps
-        effective_step = get_effective_optimizer_step(step, accum_steps)
-
-        if frequency <= 0 or (effective_step % frequency != 0 and effective_step != 0):
-            return
-
-        log_sparsity_loss_correlation(
-            batch=batch_data,
-            model_outputs=model_outputs,
-            targets=targets_dict,
-            wandb_run=self.wandb_run,
-            step=effective_step,
-            epoch=self.current_epoch,
-        )
-
     def _persist_run_config(self, run_dir: Path) -> None:
         """Copy the input configuration to the run directory.
         Note that the config is saved in the model snapshots eg. best_model.pt
@@ -2205,6 +2244,25 @@ class EpiForecasterTrainer:
 
         with open(config_path, "w") as f:
             yaml.safe_dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
+    def _write_main_model_aggregate_csvs(
+        self,
+        split_name: str,
+        eval_metrics: dict[str, Any],
+    ) -> dict[str, Path]:
+        if self.experiment_dir is None:
+            raise RuntimeError("experiment_dir not set; call setup_logging() first")
+
+        artifacts = write_main_model_aggregate_csvs(
+            run_dir=self.experiment_dir,
+            split=split_name.lower(),
+            eval_metrics=eval_metrics,
+            model_name="epiforecaster",
+        )
+        self.metric_artifacts.update(artifacts)
+        for artifact_name, artifact_path in artifacts.items():
+            self._status(f"Saved {artifact_name}: {artifact_path}", logging.DEBUG)
+        return artifacts
 
     def _log_epoch(
         self,
@@ -2422,6 +2480,7 @@ class EpiForecasterTrainer:
         return {
             "best_val_loss": self.best_val_loss,
             "total_epochs": self.current_epoch,
+            "metric_artifacts": dict(getattr(self, "metric_artifacts", {})),
             "model_info": {
                 "parameters": sum(p.numel() for p in self.model.parameters()),
                 "trainable_parameters": sum(

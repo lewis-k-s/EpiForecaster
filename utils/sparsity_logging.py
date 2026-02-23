@@ -147,6 +147,8 @@ def compute_per_sample_head_losses(
         ("deaths", "pred_deaths", "deaths", "deaths_mask"),
     ]
 
+    from utils.training_utils import drop_nowcast
+
     for head_name, pred_key, target_key, mask_key in head_pairs:
         pred = model_outputs.get(pred_key)
         target = targets.get(target_key)
@@ -154,6 +156,9 @@ def compute_per_sample_head_losses(
 
         if pred is None or target is None:
             continue
+
+        # Slice predictions to match target horizon (remove t=0 nowcast if present)
+        pred = drop_nowcast(pred, target.shape[1] if target is not None else None)
 
         if mask is None:
             mask = torch.ones_like(target)
