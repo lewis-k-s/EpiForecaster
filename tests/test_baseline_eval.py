@@ -237,6 +237,8 @@ def test_run_tiered_baseline_writes_artifacts(tmp_path: Path, monkeypatch):
     expected = [
         "baseline_fold_metrics",
         "baseline_aggregate_metrics",
+        "baseline_joint_loss_fold",
+        "baseline_joint_loss_aggregate",
         "baseline_coverage",
         "baseline_pair_details",
         "baseline_vs_model_deltas",
@@ -278,9 +280,15 @@ def test_run_baseline_evaluation_multiple_models_writes_artifacts(
         include_sparsity_bins=True,
     )
     assert artifacts["baseline_fold_metrics"].exists()
+    assert artifacts["baseline_joint_loss_fold"].exists()
+    assert artifacts["baseline_joint_loss_aggregate"].exists()
     fold_df = pd.read_csv(artifacts["baseline_fold_metrics"])
+    joint_fold_df = pd.read_csv(artifacts["baseline_joint_loss_fold"])
     assert {"tiered", "exp_smoothing", "var_cross_target"}.issubset(
         set(fold_df["model"].unique())
+    )
+    assert {"joint_obs_loss_total", "joint_loss_hosp_weighted"}.issubset(
+        set(joint_fold_df.columns)
     )
 
 
@@ -337,3 +345,39 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
         (deltas["target"] == "hospitalizations") & (deltas["metric"] == "mae")
     ]["delta_model_minus_baseline"].iloc[0]
     assert hosp_mae == pytest.approx(-0.1)
+
+
+def test_compare_model_metrics_against_joint_baseline_aggregate(tmp_path: Path):
+    baseline_csv = tmp_path / "baseline_joint_loss_aggregate.csv"
+    pd.DataFrame(
+        [
+            {
+                "model": "tiered",
+                "folds": 2,
+                "joint_obs_loss_total_median": 1.4,
+                "joint_loss_ww_weighted_median": 0.3,
+                "joint_loss_hosp_weighted_median": 0.4,
+                "joint_loss_cases_weighted_median": 0.5,
+                "joint_loss_deaths_weighted_median": 0.2,
+            }
+        ]
+    ).to_csv(baseline_csv, index=False)
+
+    output_csv = tmp_path / "joint_deltas.csv"
+    eval_metrics = {
+        "loss_ww_weighted": 0.2,
+        "loss_hosp_weighted": 0.35,
+        "loss_cases_weighted": 0.45,
+        "loss_deaths_weighted": 0.25,
+    }
+    compare_model_metrics_against_baselines(
+        eval_metrics=eval_metrics,
+        baseline_results_csv=baseline_csv,
+        output_csv=output_csv,
+    )
+    deltas = pd.read_csv(output_csv)
+    joint_total = deltas[
+        (deltas["target"] == "joint_observation")
+        & (deltas["metric"] == "joint_obs_loss_total")
+    ]["delta_model_minus_baseline"].iloc[0]
+    assert joint_total == pytest.approx(-0.15)

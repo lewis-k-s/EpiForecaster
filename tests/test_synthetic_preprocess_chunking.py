@@ -21,6 +21,14 @@ def _write_minimal_synthetic_zarr(path, *, run_ids, dates, region_ids, edar_ids)
         coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
     )
 
+    # Required mask channel for clinical series preprocessing
+    # cases_age is computed from mask by SyntheticProcessor
+    cases_mask = xr.DataArray(
+        rng.random((len(run_ids), len(dates), len(region_ids))) > 0.1,  # ~90% observed
+        dims=("run_id", "date", "region_id"),
+        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+    )
+
     mobility_base = xr.DataArray(
         rng.random((len(region_ids), len(region_ids))),
         dims=("origin", "target"),
@@ -58,6 +66,7 @@ def _write_minimal_synthetic_zarr(path, *, run_ids, dates, region_ids, edar_ids)
     ds = xr.Dataset(
         {
             "cases": cases,
+            "cases_mask": cases_mask,
             "mobility_base": mobility_base,
             "mobility_kappa0": mobility_kappa0,
             "population": population,
@@ -78,11 +87,28 @@ def _write_region_metadata(path, *, region_ids, edar_ids):
     emap.to_netcdf(path)
 
 
-def _make_config(tmp_path, synthetic_path):
+def _make_config(
+    tmp_path,
+    synthetic_path,
+    *,
+    include_temporal_covariates: bool = True,
+    holiday_calendar_path=None,
+):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     dummy = data_dir / "dummy.txt"
     dummy.write_text("ok")
+    if holiday_calendar_path is None:
+        holiday_calendar_path = data_dir / "holidays.csv"
+        holiday_calendar_path.write_text("date\n2020-01-01\n")
+
+    temporal_covariates = None
+    if include_temporal_covariates:
+        temporal_covariates = {
+            "include_day_of_week": True,
+            "include_holidays": True,
+            "holiday_calendar_file": str(holiday_calendar_path),
+        }
 
     return PreprocessingConfig(
         data_dir=str(data_dir),
@@ -104,6 +130,7 @@ def _make_config(tmp_path, synthetic_path):
         min_density_threshold=0.0,
         validate_alignment=False,
         generate_alignment_report=False,
+        temporal_covariates=temporal_covariates,
     )
 
 
@@ -138,6 +165,76 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
 
 
 @pytest.mark.epiforecaster
+def test_synthetic_processor_includes_temporal_covariates(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    run_ids = np.array(["synth_a", "synth_b"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+    edar_ids = np.array(["e1"], dtype="U10")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=run_ids,
+        dates=dates,
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+
+    config = _make_config(tmp_path, synthetic_path)
+    processor = SyntheticProcessor(config)
+    result = processor.process(str(synthetic_path))
+
+    temporal_covariates = result["temporal_covariates"]
+    assert temporal_covariates.dims == ("date", "covariate")
+    assert list(temporal_covariates["covariate"].values) == [
+        "dow_sin",
+        "dow_cos",
+        "is_holiday",
+    ]
+    np.testing.assert_array_equal(temporal_covariates["date"].values, dates.values)
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_requires_temporal_covariates_config(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+    edar_ids = np.array(["e1"], dtype="U10")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=run_ids,
+        dates=dates,
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+
+    config = _make_config(
+        tmp_path,
+        synthetic_path,
+        include_temporal_covariates=False,
+    )
+    processor = SyntheticProcessor(config)
+
+    with pytest.raises(
+        ValueError,
+        match="Synthetic preprocessing requires temporal_covariates configuration",
+    ):
+        processor.process(str(synthetic_path))
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_preprocess_missing_holiday_file_fails(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    missing_holiday_file = tmp_path / "missing_holidays.csv"
+    with pytest.raises(ValueError, match="Holiday calendar file does not exist"):
+        _make_config(
+            tmp_path,
+            synthetic_path,
+            holiday_calendar_path=missing_holiday_file,
+        )
+
+
+@pytest.mark.epiforecaster
 def test_synthetic_processor_run_filter(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     run_ids = np.array(["synth_a", "synth_b", "synth_c"], dtype="U50")
@@ -166,6 +263,62 @@ def test_synthetic_processor_run_filter(tmp_path):
     cases = result["cases"]["cases"]
 
     assert list(cases.run_id.values) == ["synth_b"]
+
+
+@pytest.mark.epiforecaster
+def test_hospitalizations_prefers_observed_over_true(tmp_path):
+    config = _make_config(tmp_path, synthetic_path=tmp_path / "raw_synth.zarr")
+    processor = SyntheticProcessor(config)
+
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+
+    observed = xr.DataArray(
+        np.full((1, 4, 2), 999, dtype=np.float32),
+        dims=("run_id", "date", "region_id"),
+        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+    )
+    truth = xr.DataArray(
+        np.arange(8, dtype=np.float32).reshape(1, 2, 4),
+        dims=("run_id", "region_id", "date"),
+        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
+    )
+    ds = xr.Dataset({"hospitalizations": observed, "hospitalizations_true": truth})
+
+    extracted = processor._extract_hospitalizations(ds)
+
+    assert extracted is not None
+    expected = observed.values
+    np.testing.assert_array_equal(extracted["hospitalizations"].values, expected)
+
+
+@pytest.mark.epiforecaster
+def test_deaths_prefers_raw_observed_channel(tmp_path):
+    config = _make_config(tmp_path, synthetic_path=tmp_path / "raw_synth.zarr")
+    processor = SyntheticProcessor(config)
+
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+
+    observed = xr.DataArray(
+        np.full((1, 4, 2), 999, dtype=np.float32),
+        dims=("run_id", "date", "region_id"),
+        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+    )
+    observed_raw = xr.DataArray(
+        np.arange(8, dtype=np.float32).reshape(1, 4, 2),
+        dims=("run_id", "date", "region_id"),
+        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+    )
+    ds = xr.Dataset({"deaths": observed, "deaths_raw": observed_raw})
+
+    extracted = processor._extract_deaths(ds)
+
+    assert extracted is not None
+    expected = observed_raw.values
+    np.testing.assert_array_equal(extracted["deaths"].values, expected)
 
 
 @pytest.mark.epiforecaster
@@ -277,6 +430,13 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     ds = xr.open_zarr(output_path)
     assert "run_id" in ds.dims
     assert "mobility" in ds
+    assert "temporal_covariates" in ds
+    assert ds["temporal_covariates"].dims == ("date", "covariate")
+    assert list(ds["temporal_covariates"]["covariate"].values) == [
+        "dow_sin",
+        "dow_cos",
+        "is_holiday",
+    ]
     assert ds["mobility"].dims[0] == "run_id"
     assert len(ds["run_id"]) == len(run_ids)
     ds.close()

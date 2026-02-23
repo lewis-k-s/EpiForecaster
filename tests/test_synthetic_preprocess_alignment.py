@@ -46,6 +46,14 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
         coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
     )
 
+    # Required mask channel for clinical series preprocessing
+    # cases_age is computed from mask by SyntheticProcessor
+    cases_mask = xr.DataArray(
+        rng.random((len(run_ids), len(dates), len(region_ids))) > 0.1,  # ~90% observed
+        dims=("run_id", "date", "region_id"),
+        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+    )
+
     mobility_base = xr.DataArray(
         rng.random((len(region_ids), len(region_ids))),
         dims=("origin", "target"),
@@ -73,6 +81,7 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
     return xr.Dataset(
         {
             "cases": cases,
+            "cases_mask": cases_mask,
             "mobility_base": mobility_base,
             "mobility_kappa0": mobility_kappa0,
             "population": population,

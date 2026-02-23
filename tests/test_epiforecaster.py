@@ -69,8 +69,10 @@ class TestEpiForecaster:
         horizon = basic_config["forecast_horizon"]
         batch_size = dummy_batch["hosp_hist"].shape[0]
 
-        assert out["pred_cases"].shape == (batch_size, horizon)
-        assert out["pred_hosp"].shape == (batch_size, horizon)
+        # Predictions include t=0 (nowcast) so they are H+1 shaped
+        assert out["pred_cases"].shape == (batch_size, horizon + 1)
+        assert out["pred_hosp"].shape == (batch_size, horizon + 1)
+        # Deaths uses death_flow which doesn't have nowcast
         assert out["pred_deaths"].shape == (batch_size, horizon)
         assert out["S_trajectory"].shape == (batch_size, horizon + 1)
 
@@ -194,7 +196,8 @@ class TestEpiForecaster:
             population=dummy_batch["population"],
         )
 
-        assert out["pred_cases"].shape == (2, config["forecast_horizon"])
+        # Predictions include t=0 (nowcast) so they are H+1 shaped
+        assert out["pred_cases"].shape == (2, config["forecast_horizon"] + 1)
 
     def test_gradient_flow(self, basic_config, dummy_batch):
         """Smoke test for parameter gradient flow under conservative initialization."""

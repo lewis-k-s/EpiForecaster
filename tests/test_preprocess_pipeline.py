@@ -71,6 +71,41 @@ class TestPipelineSourceSelection:
         assert processed["hospitalizations"] is None
         assert processed["deaths"] is None
 
+    @patch("data.preprocess.pipeline.SyntheticProcessor")
+    @patch("data.preprocess.pipeline.EDARProcessor")
+    def test_synthetic_source_dispatch_preserves_temporal_covariates(
+        self,
+        MockEDAR,
+        MockSynthetic,
+        mock_config,
+    ):
+        """Synthetic source loading should pass temporal covariates through."""
+        mock_config.synthetic_path = "synthetic_data.zarr"
+        temporal_covariates = xr.DataArray(
+            np.ones((3, 3), dtype=np.float16),
+            dims=["date", "covariate"],
+            coords={
+                "date": pd.date_range("2022-01-01", periods=3, freq="D"),
+                "covariate": ["dow_sin", "dow_cos", "is_holiday"],
+            },
+        )
+        mock_processed = {
+            "cases": xr.DataArray([1], dims=["x"]),
+            "mobility": xr.DataArray([1], dims=["x"]),
+            "population": xr.DataArray([1], dims=["x"]),
+            "edar_flow": xr.DataArray([1], dims=["x"]),
+            "edar_censor": xr.DataArray([1], dims=["x"]),
+            "temporal_covariates": temporal_covariates,
+        }
+        MockSynthetic.return_value.process.return_value = mock_processed
+
+        pipeline = OfflinePreprocessingPipeline(mock_config)
+        MockEDAR.return_value.process_from_xarray.return_value = xr.Dataset()
+        processed = pipeline._load_raw_sources()
+
+        assert "temporal_covariates" in processed
+        assert processed["temporal_covariates"].equals(temporal_covariates)
+
     @patch("data.preprocess.pipeline.CataloniaCasesProcessor")
     def test_cases_source_dispatch(self, MockCases, mock_config):
         """Verify real cases data source selection and processor dispatch."""
@@ -254,3 +289,35 @@ class TestPipelineStorage:
         assert isinstance(config_yaml, str)
         assert "dataset_name: test_chunk_schema" in config_yaml
         assert "smoothing:" in config_yaml
+
+
+class TestPreprocessingConfigValidation:
+    def test_missing_holiday_calendar_file_raises(self, tmp_path):
+        """Holiday calendar must exist when holidays are enabled."""
+        (tmp_path / "cases.csv").touch()
+        (tmp_path / "mob.nc").touch()
+        (tmp_path / "ww.csv").touch()
+        (tmp_path / "pop.csv").write_text("id,d.population\n")
+        (tmp_path / "meta.nc").touch()
+        missing_holiday_file = tmp_path / "does_not_exist.csv"
+
+        with pytest.raises(ValueError, match="Holiday calendar file does not exist"):
+            PreprocessingConfig(
+                data_dir=str(tmp_path),
+                cases_file=str(tmp_path / "cases.csv"),
+                mobility_path=str(tmp_path / "mob.nc"),
+                wastewater_file=str(tmp_path / "ww.csv"),
+                population_file=str(tmp_path / "pop.csv"),
+                region_metadata_file=str(tmp_path / "meta.nc"),
+                start_date=datetime(2022, 1, 1),
+                end_date=datetime(2022, 1, 10),
+                output_path=str(tmp_path / "out"),
+                dataset_name="test_dataset",
+                forecast_horizon=1,
+                sequence_length=1,
+                temporal_covariates={
+                    "include_day_of_week": True,
+                    "include_holidays": True,
+                    "holiday_calendar_file": str(missing_holiday_file),
+                },
+            )
