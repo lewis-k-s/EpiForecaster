@@ -22,22 +22,22 @@ JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal
 # Trial outputs root (log_dir override).
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
 # Optional speed knobs (set to empty to disable).
-EPOCHS="${EPOCHS:-50}"  # Default 50 epochs for meaningful HPO rankings
+EPOCHS="${EPOCHS:-20}"
 MAX_BATCHES="${MAX_BATCHES:-}"
-SEED="${SEED:-42}"  # Reproducibility seed
-SAMPLER="${SAMPLER:-tpe}"  # tpe (default), cmaes, or random
-PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"  # Start pruning after N epochs
-LOSS_WEIGHT_MODE="${LOSS_WEIGHT_MODE:-fixed}"  # fixed (recommended), bounded
-LOSS_WEIGHT_MAX_RATIO="${LOSS_WEIGHT_MAX_RATIO:-2.0}"  # for bounded mode
+SEED="${SEED:-42}"                                    # Reproducibility seed
+SAMPLER="${SAMPLER:-tpe}"                             # tpe (default), cmaes, or random
+PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N epochs
+LOSS_WEIGHT_MODE="${LOSS_WEIGHT_MODE:-fixed}"         # fixed (recommended), bounded
+LOSS_WEIGHT_MAX_RATIO="${LOSS_WEIGHT_MAX_RATIO:-2.0}" # for bounded mode
 # Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
 OVERRIDES="${OVERRIDES:-}"
 # Worker timeout in seconds (auto-calculated from SLURM time limit minus 15min buffer).
 # Falls back to 5 hours - 15 minutes if SLURM_TIME_LIMIT is not set.
 if [ -n "${SLURM_TIME_LIMIT:-}" ]; then
-    # Convert SLURM_TIME_LIMIT (in minutes) to seconds and subtract 15min buffer
-    TIMEOUT_SECS="${TIMEOUT_SECS:-$((SLURM_TIME_LIMIT * 60 - 900))}"
+  # Convert SLURM_TIME_LIMIT (in minutes) to seconds and subtract 15min buffer
+  TIMEOUT_SECS="${TIMEOUT_SECS:-$((SLURM_TIME_LIMIT * 60 - 900))}"
 else
-    TIMEOUT_SECS="${TIMEOUT_SECS:-17100}"  # 5 hours - 15 minutes (in seconds)
+  TIMEOUT_SECS="${TIMEOUT_SECS:-17100}" # 5 hours - 15 minutes (in seconds)
 fi
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"

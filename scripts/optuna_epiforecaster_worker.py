@@ -82,6 +82,45 @@ def _categorical_choices(choices: tuple[Any, ...] | list[Any]) -> tuple[Any, ...
     return tuple(normalized)
 
 
+def _decode_categorical_value(value: Any) -> Any:
+    """Decode JSON-encoded categorical values produced by _categorical_choices."""
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.startswith("[") or candidate.startswith("{"):
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON categorical value: {value!r}") from exc
+    return value
+
+
+def _parse_batch_grad_combo(value: Any) -> tuple[int, int]:
+    """Validate and parse (batch_size, grad_accum) from categorical value."""
+    decoded = _decode_categorical_value(value)
+    if not isinstance(decoded, (list, tuple)):
+        raise ValueError(
+            "training.batch_grad_combo must be a 2-item list/tuple like [32, 4]"
+        )
+    if len(decoded) != 2:
+        raise ValueError(
+            "training.batch_grad_combo must have exactly 2 values: "
+            "[batch_size, gradient_accumulation_steps]"
+        )
+
+    batch_size, grad_accum = decoded
+    if not isinstance(batch_size, int) or not isinstance(grad_accum, int):
+        raise ValueError(
+            "training.batch_grad_combo values must be positive integers: "
+            "[batch_size, gradient_accumulation_steps]"
+        )
+    if batch_size <= 0 or grad_accum <= 0:
+        raise ValueError(
+            "training.batch_grad_combo values must be > 0: "
+            "[batch_size, gradient_accumulation_steps]"
+        )
+    return batch_size, grad_accum
+
+
 def _slurm_identity() -> dict[str, str]:
     keys = [
         "SLURM_JOB_ID",
@@ -179,25 +218,23 @@ def suggest_epiforecaster_params(
     overrides["training.weight_decay"] = trial.suggest_float(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
-    # Sample batch_size first, then conditionally sample grad_accum to ensure
-    # effective batch size >= 32 (batch_size * grad_accum >= 32)
-    batch_size = trial.suggest_categorical(
-        "training.batch_size", _categorical_choices((16, 32, 64, 128))
+    # Jointly sample batch_size and grad_accum to guarantee constraints:
+    # - batch_size * grad_accum >= 8 (minimum effective batch)
+    # - batch_size * grad_accum <= 32 (maximum effective batch, reduced for OOM safety)
+    valid_batch_grad_combos: list[tuple[int, int]] = [
+        (8, 1),  # effective 8
+        (8, 2),  # effective 16
+        (8, 4),  # effective 32
+        (16, 1),  # effective 16
+        (16, 2),  # effective 32
+        (32, 1),  # effective 32
+    ]
+    combo = trial.suggest_categorical(
+        "training.batch_grad_combo",
+        _categorical_choices(valid_batch_grad_combos),
     )
+    batch_size, grad_accum = _parse_batch_grad_combo(combo)
     overrides["training.batch_size"] = batch_size
-
-    # Compute valid grad_accum choices: ceil(32 / batch_size) to 8
-    min_grad_accum = (32 + batch_size - 1) // batch_size  # Ceiling division
-    valid_grad_accum = [g for g in (1, 2, 4, 8) if g >= min_grad_accum]
-    if not valid_grad_accum:
-        # Fallback: if batch_size=128 and min_grad_accum > 8, use 8 anyway
-        # (effective batch will be 1024 which is fine)
-        valid_grad_accum = [8]
-
-    grad_accum = trial.suggest_categorical(
-        "training.gradient_accumulation_steps",
-        _categorical_choices(tuple(valid_grad_accum)),
-    )
     overrides["training.gradient_accumulation_steps"] = grad_accum
     # # Early stopping affects compute/overfit tradeoff; keep it moderate.
     # overrides["training.early_stopping_patience"] = trial.suggest_int(
@@ -223,7 +260,11 @@ def suggest_epiforecaster_params(
     )
 
     # Missingness filters dataset windows; can help robustness.
-    overrides["data.missing_permit"] = trial.suggest_int("data.missing_permit", 0, 3)
+    missing_permit_val = trial.suggest_int("data.missing_permit", 0, 3)
+    overrides["data.missing_permit.cases"] = missing_permit_val
+    overrides["data.missing_permit.hospitalizations"] = missing_permit_val
+    overrides["data.missing_permit.deaths"] = missing_permit_val
+    overrides["data.missing_permit.biomarkers_joint"] = missing_permit_val
 
     # --- model knobs (conditional) ---
     if base_cfg.model.type.mobility:
