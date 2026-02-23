@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import click
+import pandas as pd
 import wandb
 
 from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
@@ -513,7 +514,7 @@ def eval_epiforecaster(
 )
 @click.option(
     "--split",
-    type=click.Choice(["val", "test"], case_sensitive=False),
+    type=click.Choice(["val", "test", "both"], case_sensitive=False),
     default="test",
     show_default=True,
     help="Which split to evaluate baselines on.",
@@ -562,20 +563,37 @@ def eval_baselines(
             else [models.lower()]
         )
 
-        artifacts = run_baseline_evaluation(
-            config=cfg,
-            models=selected_models,
-            config_path=config,
-            output_dir=output_dir,
-            split=split,
-            rolling_folds=rolling_folds,
-            seasonal_period=seasonal_period,
-            include_sparsity_bins=not disable_sparsity_bins,
-        )
+        split_key = split.lower()
+        split_list = ["val", "test"] if split_key == "both" else [split_key]
 
-        click.echo("Baseline evaluation completed.")
-        for name, path in artifacts.items():
-            click.echo(f"  {name}: {path}")
+        for split_name in split_list:
+            run_output_dir = (
+                output_dir / split_name if len(split_list) > 1 else output_dir
+            )
+            artifacts = run_baseline_evaluation(
+                config=cfg,
+                models=selected_models,
+                config_path=config,
+                output_dir=run_output_dir,
+                split=split_name,
+                rolling_folds=rolling_folds,
+                seasonal_period=seasonal_period,
+                include_sparsity_bins=not disable_sparsity_bins,
+            )
+
+            click.echo(f"Baseline evaluation completed ({split_name}).")
+            for name, path in artifacts.items():
+                click.echo(f"  {name}: {path}")
+
+            usage_path = artifacts.get("baseline_model_usage")
+            if usage_path is not None and usage_path.exists():
+                usage_df = pd.read_csv(usage_path)
+                if not usage_df.empty:
+                    click.echo("Selected model usage:")
+                    for row in usage_df.itertuples(index=False):
+                        click.echo(
+                            f"  {row.model} -> {row.selected_model}: {int(row.count)}"
+                        )
     except Exception as exc:
         click.echo(f"❌ Baseline evaluation failed: {exc}", err=True)
         click.echo(traceback.format_exc(), err=True)
@@ -994,6 +1012,11 @@ def _run_forecaster_training(
         logger.info(
             f"Trainable parameters: {results['model_info']['trainable_parameters']:,}"
         )
+        metric_artifacts = results.get("metric_artifacts", {})
+        if metric_artifacts:
+            logger.info("Main-model aggregate metrics:")
+            for name in sorted(metric_artifacts.keys()):
+                logger.info(f"  {name}: {metric_artifacts[name]}")
         log_dir = (
             Path(trainer.config.output.log_dir)
             / trainer.config.output.experiment_name
