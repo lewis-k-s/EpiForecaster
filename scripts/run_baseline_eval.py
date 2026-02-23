@@ -14,7 +14,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from evaluation.baseline_eval import run_tiered_baseline_evaluation
+from evaluation.baseline_eval import run_baseline_evaluation
 from models.configs import EpiForecasterConfig
 
 
@@ -37,9 +37,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--models",
-        choices=["tiered"],
-        default="tiered",
-        help="Baseline model family.",
+        nargs="+",
+        default=["tiered"],
+        help="Baseline model families to run (e.g. tiered exp_smoothing var_cross_target all).",
     )
     parser.add_argument(
         "--split",
@@ -110,16 +110,18 @@ def main() -> int:
 
     logger.info("Running baseline eval")
     logger.info("  config: %s", args.config)
+    logger.info("  models: %s", args.models)
     logger.info("  split: %s", args.split)
     logger.info("  rolling_folds: %d", args.rolling_folds)
     logger.info("  output_dir: %s", args.output_dir)
     logger.info("  dataset_path: %s", cfg.data.dataset_path)
     logger.info("  run_id: %s", cfg.data.run_id)
 
-    artifacts = run_tiered_baseline_evaluation(
+    artifacts = run_baseline_evaluation(
         config=cfg,
         config_path=str(args.config),
         output_dir=args.output_dir,
+        models=args.models,
         split=args.split,
         rolling_folds=args.rolling_folds,
         seasonal_period=args.seasonal_period,
