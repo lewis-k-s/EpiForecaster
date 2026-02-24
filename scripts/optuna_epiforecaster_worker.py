@@ -134,6 +134,25 @@ def _slurm_identity() -> dict[str, str]:
     return {k: os.getenv(k, "") for k in keys if os.getenv(k)}
 
 
+def _compute_worker_seed(base_seed: int) -> int:
+    """Compute sampler seed offset by SLURM task ID for parallel worker diversity.
+
+    When multiple workers start simultaneously with the same seed, they sample
+    identical hyperparameters until TPE has completed trials to learn from.
+    Offsetting by SLURM_ARRAY_TASK_ID ensures each worker has a unique seed.
+
+    Args:
+        base_seed: The base seed from CLI --seed argument.
+
+    Returns:
+        Worker-specific seed (base_seed + SLURM_ARRAY_TASK_ID if set, else base_seed).
+    """
+    slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
+    if slurm_task_id is not None:
+        return base_seed + int(slurm_task_id)
+    return base_seed
+
+
 def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
     """Convert dict of overrides to dotlist format for OmegaConf.
 
@@ -678,6 +697,15 @@ def main(
     run_root.mkdir(parents=True, exist_ok=True)
     journal_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Offset seed by SLURM task ID to ensure diversity across parallel workers
+    worker_seed = _compute_worker_seed(seed)
+    if worker_seed != seed:
+        logger.info(
+            "Offsetting seed by SLURM_ARRAY_TASK_ID: %d -> %d",
+            seed,
+            worker_seed,
+        )
+
     # Select sampler based on CLI choice
     # Note: CMA-ES doesn't support categorical parameters well, so we default to TPE
     if sampler == "cmaes":
@@ -690,18 +718,24 @@ def main(
                 "CMA-ES will fall back to RandomSampler for categoricals. "
                 "Consider using 'tpe' sampler instead for mixed spaces."
             )
-            selected_sampler = CmaEsSampler(seed=seed, warn_independent_sampling=False)
-            logger.info("Using CMA-ES sampler (seed=%d)", seed)
+            selected_sampler = CmaEsSampler(
+                seed=worker_seed, warn_independent_sampling=False
+            )
+            logger.info("Using CMA-ES sampler (seed=%d)", worker_seed)
         except ImportError:
             logger.warning("CMA-ES not available, falling back to TPE sampler")
-            selected_sampler = optuna.samplers.TPESampler(multivariate=True, seed=seed)
+            selected_sampler = optuna.samplers.TPESampler(
+                multivariate=True, seed=worker_seed
+            )
     elif sampler == "tpe":
         # Use multivariate=True for better handling of parameter correlations
-        selected_sampler = optuna.samplers.TPESampler(multivariate=True, seed=seed)
-        logger.info("Using TPE sampler with multivariate=True (seed=%d)", seed)
+        selected_sampler = optuna.samplers.TPESampler(
+            multivariate=True, seed=worker_seed
+        )
+        logger.info("Using TPE sampler with multivariate=True (seed=%d)", worker_seed)
     else:  # random
-        selected_sampler = optuna.samplers.RandomSampler(seed=seed)
-        logger.info("Using Random sampler (seed=%d)", seed)
+        selected_sampler = optuna.samplers.RandomSampler(seed=worker_seed)
+        logger.info("Using Random sampler (seed=%d)", worker_seed)
 
     storage = JournalStorage(JournalFileBackend(str(journal_file)))
     # Use PercentilePruner to enable early pruning even with few workers
