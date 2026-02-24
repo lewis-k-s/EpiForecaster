@@ -160,7 +160,7 @@ def plot_age_heatmap(
     da_age: np.ndarray,
     region_ids: np.ndarray,
     observed_mask: np.ndarray | None = None,
-    history_length: int | None = None,
+    input_window_length: int | None = None,
     age_max: int = 14,
     title: str = "Data",
 ) -> None:
@@ -171,7 +171,7 @@ def plot_age_heatmap(
         da_values: 2D array (time, region) of values
         da_age: 2D array (time, region) of age in days
         region_ids: Array of region IDs
-        history_length: Optional separator line position
+        input_window_length: Optional separator line position
         age_max: Maximum age for normalization
         title: Plot title
     """
@@ -202,8 +202,8 @@ def plot_age_heatmap(
     )
 
     # Add history/horizon separator
-    if history_length is not None:
-        ax.axvline(history_length, color="blue", linestyle="--", linewidth=2, alpha=0.7)
+    if input_window_length is not None:
+        ax.axvline(input_window_length, color="blue", linestyle="--", linewidth=2, alpha=0.7)
 
     ax.set_title(f"{title} - Data Age/Staleness", fontsize=10, fontweight="semibold")
     ax.set_xlabel("Time")
@@ -214,7 +214,7 @@ def make_age_sparsity_figure(
     da_values: xr.DataArray,
     da_age: xr.DataArray,
     da_mask: xr.DataArray | None = None,
-    history_length: int | None = None,
+    input_window_length: int | None = None,
     age_max: int = 14,
     title: str = "Data",
 ) -> Figure | None:
@@ -223,7 +223,7 @@ def make_age_sparsity_figure(
     Args:
         da_values: DataArray with values (2D: date, region)
         da_age: DataArray with age in days (2D: date, region)
-        history_length: Optional separator position
+        input_window_length: Optional separator position
         age_max: Maximum age for normalization
         title: Figure title
 
@@ -259,7 +259,7 @@ def make_age_sparsity_figure(
         da_age=age_values,
         region_ids=da_values[REGION_COORD].values,
         observed_mask=observed_mask,
-        history_length=history_length,
+        input_window_length=input_window_length,
         age_max=age_max,
         title=title,
     )
@@ -370,7 +370,7 @@ def generate_age_mask_plots(
                 da_values=da_values,
                 da_age=da_age,
                 da_mask=da_mask,
-                history_length=config.model.history_length,
+                input_window_length=config.model.input_window_length,
                 title=title,
             )
 
@@ -472,7 +472,7 @@ def generate_age_mask_plots(
                 da_values=da_combined_values,
                 da_age=da_combined_age,
                 da_mask=da_combined_values,
-                history_length=config.model.history_length,
+                input_window_length=config.model.input_window_length,
                 title="Biomarkers (combined)",
             )
 

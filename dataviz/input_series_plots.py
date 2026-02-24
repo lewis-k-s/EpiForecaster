@@ -66,7 +66,7 @@ def collect_window_samples(
 
     ww_positive_indices: list[int] = []
     if prefer_ww_horizon and hasattr(dataset, "_index_map"):
-        L = int(dataset.config.model.history_length)
+        L = int(dataset.config.model.input_window_length)
         H = int(dataset.config.model.forecast_horizon)
         for sample_idx, (target_idx, start_idx) in enumerate(dataset._index_map):
             ww_slice = dataset.precomputed_ww_mask[
@@ -245,7 +245,7 @@ def collect_window_samples(
 
 def make_input_series_figure(
     samples: list[dict[str, Any]],
-    history_length: int,
+    input_window_length: int,
 ) -> Any:
     """Build figure with 4 subplots per window (cases, biomarkers, hosp, deaths).
 
@@ -256,7 +256,7 @@ def make_input_series_figure(
 
     Args:
         samples: List of window samples from collect_window_samples
-        history_length: Length of history window (for separator line)
+        input_window_length: Length of history window (for separator line)
 
     Returns:
         Matplotlib Figure
@@ -290,7 +290,7 @@ def make_input_series_figure(
         # Get series lengths
         cases_series = sample["cases_series"]
         total_len = len(cases_series)
-        horizon_length = total_len - history_length
+        horizon_length = total_len - input_window_length
         t = np.arange(total_len)
 
         # Column 0: Cases
@@ -300,7 +300,7 @@ def make_input_series_figure(
             series=sample["cases_series"],
             age=sample["cases_age"],
             observed_mask_full=sample["cases_obs_mask_full"],
-            history_length=history_length,
+            input_window_length=input_window_length,
             horizon_length=horizon_length,
             t=t,
             color=colors["cases"],
@@ -316,7 +316,7 @@ def make_input_series_figure(
             biomarkers=biomarkers,
             ww_series=sample.get("ww_series"),
             ww_obs_mask_full=sample.get("ww_obs_mask_full"),
-            history_length=history_length,
+            input_window_length=input_window_length,
             horizon_length=horizon_length,
             t=t,
         )
@@ -329,7 +329,7 @@ def make_input_series_figure(
             series=sample["hosp_series"],
             age=sample["hosp_age"],
             observed_mask_full=sample["hosp_obs_mask_full"],
-            history_length=history_length,
+            input_window_length=input_window_length,
             horizon_length=horizon_length,
             t=t,
             color=colors["hosp"],
@@ -344,7 +344,7 @@ def make_input_series_figure(
             series=sample["deaths_series"],
             age=sample["deaths_age"],
             observed_mask_full=sample["deaths_obs_mask_full"],
-            history_length=history_length,
+            input_window_length=input_window_length,
             horizon_length=horizon_length,
             t=t,
             color=colors["deaths"],
@@ -387,7 +387,7 @@ def _plot_single_series(
     series: np.ndarray,
     age: np.ndarray,
     observed_mask_full: np.ndarray,
-    history_length: int,
+    input_window_length: int,
     horizon_length: int,
     t: np.ndarray,
     color: str,
@@ -448,7 +448,7 @@ def _plot_single_series(
         )
 
     # Draw history/horizon separator
-    ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
+    ax.axvline(input_window_length - 0.5, color="black", linestyle="--", alpha=0.5)
 
     # Set y-limits with padding for ribbon
     if np.all(np.isnan(series)):
@@ -464,7 +464,7 @@ def _plot_biomarkers(
     biomarkers: dict[str, dict[str, np.ndarray]],
     ww_series: np.ndarray | None,
     ww_obs_mask_full: np.ndarray | None,
-    history_length: int,
+    input_window_length: int,
     horizon_length: int,
     t: np.ndarray,
 ) -> None:
@@ -543,7 +543,7 @@ def _plot_biomarkers(
             )
 
     # Draw history/horizon separator
-    ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
+    ax.axvline(input_window_length - 0.5, color="black", linestyle="--", alpha=0.5)
 
     # Overlay WW target/trajectory as the biomarker aggregate used in loss.
     if ww_series is not None and ww_obs_mask_full is not None:
@@ -731,7 +731,7 @@ def generate_input_series_plots(
     logger.info("Generating ordered window figure...")
     fig_ordered = make_input_series_figure(
         ordered_samples,
-        history_length=config.model.history_length,
+        input_window_length=config.model.input_window_length,
     )
     if fig_ordered:
         ordered_path = output_dir / "input_series_ordered.png"
@@ -744,7 +744,7 @@ def generate_input_series_plots(
     logger.info("Generating shuffled window figure...")
     fig_shuffled = make_input_series_figure(
         shuffled_samples,
-        history_length=config.model.history_length,
+        input_window_length=config.model.input_window_length,
     )
     if fig_shuffled:
         shuffled_path = output_dir / "input_series_shuffled.png"

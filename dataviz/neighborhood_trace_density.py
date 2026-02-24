@@ -55,7 +55,7 @@ def resolve_mobility_array(mobility_da: xr.DataArray | xr.Dataset) -> np.ndarray
 
 def compute_valid_window_mask(
     cases_da: xr.DataArray,
-    history_length: int,
+    input_window_length: int,
     horizon: int,
     window_stride: int,
     missing_permit: int,
@@ -78,7 +78,7 @@ def compute_valid_window_mask(
         raise ValueError(f"Expected cases array with 2 or 3 dims, got {cases_np.shape}")
 
     T = cases_np.shape[0]
-    seg = history_length + horizon
+    seg = input_window_length + horizon
     if T < seg:
         starts = np.array([], dtype=np.int64)
         valid_mask = np.zeros((0, cases_np.shape[1]), dtype=bool)
@@ -95,12 +95,12 @@ def compute_valid_window_mask(
         axis=0,
     )
 
-    history_counts = cumsum[history_length:] - cumsum[:-history_length]
+    history_counts = cumsum[input_window_length:] - cumsum[:-input_window_length]
 
     starts = np.arange(0, T - seg + 1, window_stride, dtype=np.int64)
     history_counts = history_counts[starts]
 
-    history_threshold = max(0, history_length - missing_permit)
+    history_threshold = max(0, input_window_length - missing_permit)
     history_ok = history_counts >= history_threshold
     valid_mask = history_ok
 
@@ -193,7 +193,7 @@ def compute_neighbor_sparsity(
     mobility: np.ndarray,
     starts: np.ndarray,
     valid_mask: np.ndarray,
-    history_length: int,
+    input_window_length: int,
     mobility_threshold: float,
     neighbor_timestep: str,
     include_self: bool,
@@ -212,7 +212,7 @@ def compute_neighbor_sparsity(
             f"Expected mobility (time, origin, dest), got {mobility.shape}"
         )
 
-    offset = 0 if neighbor_timestep == "start" else max(0, history_length - 1)
+    offset = 0 if neighbor_timestep == "start" else max(0, input_window_length - 1)
     times = starts + offset
     time_mask = times < mobility.shape[0]
     times = times[time_mask]
@@ -333,7 +333,7 @@ def main() -> None:
     else:
         target_nodes = list(range(num_nodes))
 
-    history_len = int(config.model.history_length)
+    history_len = int(config.model.input_window_length)
     horizon = int(config.model.forecast_horizon)
     window_stride = int(config.data.window_stride)
     missing_permit = int(config.data.missing_permit)
@@ -427,7 +427,7 @@ def main() -> None:
         mobility,
         starts_orig,
         valid_mask_orig,
-        history_length=history_len,
+        input_window_length=history_len,
         mobility_threshold=mobility_threshold,
         neighbor_timestep=args.neighbor_timestep,
         include_self=args.include_self,

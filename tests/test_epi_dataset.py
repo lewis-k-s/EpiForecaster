@@ -63,7 +63,7 @@ class TestEpiDataset:
             ),
             model=ModelConfig(
                 type=ModelVariant(cases=True, mobility=True),
-                history_length=5,
+                input_window_length=5,
                 forecast_horizon=3,
                 mobility_embedding_dim=8,
                 region_embedding_dim=8,
@@ -97,7 +97,7 @@ class TestEpiDataset:
 
             item = ds[0]
 
-            L = config.model.history_length
+            L = config.model.input_window_length
 
             assert item["hosp_hist"].shape == (L, 3)
             assert item["mob_x"].shape[2] >= 9

@@ -75,11 +75,11 @@ def _history_window(
     series_tensor: torch.Tensor,
     *,
     start_idx: int,
-    history_length: int,
+    input_window_length: int,
     node_idx: int,
 ) -> np.ndarray:
     return (
-        series_tensor[start_idx : start_idx + history_length, node_idx]
+        series_tensor[start_idx : start_idx + input_window_length, node_idx]
         .detach()
         .cpu()
         .numpy()
@@ -257,7 +257,7 @@ def collect_forecast_samples_for_target_nodes(
                 )
 
         samples: list[dict[str, Any]] = []
-        L = dataset.config.model.history_length
+        L = dataset.config.model.input_window_length
         H = dataset.config.model.forecast_horizon
         T_total = dataset.precomputed_cases_hist.shape[0]
 
@@ -296,7 +296,7 @@ def collect_forecast_samples_for_target_nodes(
                 history_series = _history_window(
                     dataset_tensor,
                     start_idx=start_idx,
-                    history_length=L,
+                    input_window_length=L,
                     node_idx=node_idx,
                 ).astype(np.float32)
 
@@ -344,7 +344,7 @@ def collect_forecast_samples_for_target_nodes(
 def make_forecast_figure(
     *,
     samples: list[dict[str, Any]] | dict[str, list[dict[str, Any]]],
-    history_length: int,
+    input_window_length: int,
     forecast_horizon: int,
     context_pre: int = 30,
     context_post: int = 30,
@@ -360,7 +360,7 @@ def make_forecast_figure(
     The plot shows:
     - Actual: Extended time series from dataset (wider than just history+horizon)
     - Forecast: Only over the forecast horizon [0, H)
-    - Receptive field: Shaded region [-history_length, 0]
+    - Receptive field: Shaded region [-input_window_length, 0]
     - Forecast boundary: Vertical line at t=0
     """
     if not samples:
@@ -433,7 +433,7 @@ def make_forecast_figure(
             )
 
             ax.axvline(0, color="black", linestyle="--", alpha=0.5)
-            ax.axvspan(-history_length, 0, color="gray", alpha=0.15)
+            ax.axvspan(-input_window_length, 0, color="gray", alpha=0.15)
 
             node_label = sample.get("node_label", "")
             start_time = sample.get("start_time", "")
@@ -469,7 +469,7 @@ def make_forecast_figure(
 def make_joint_forecast_figure(
     *,
     samples: list[dict[str, Any]] | dict[str, list[dict[str, Any]]],
-    history_length: int,
+    input_window_length: int,
     forecast_horizon: int,
     context_pre: int = 30,
     context_post: int = 30,
@@ -510,7 +510,7 @@ def make_joint_forecast_figure(
 
     return make_forecast_figure(
         samples=expanded_groups,
-        history_length=history_length,
+        input_window_length=input_window_length,
         forecast_horizon=forecast_horizon,
         context_pre=context_pre,
         context_post=context_post,

@@ -123,7 +123,7 @@ def get_temporal_boundaries(
 
 def validate_temporal_range(
     time_range: tuple[int, int],
-    history_length: int,
+    input_window_length: int,
     forecast_horizon: int,
     total_time_steps: int,
 ) -> None:
@@ -131,7 +131,7 @@ def validate_temporal_range(
 
     Args:
         time_range: (start_idx, end_idx) tuple, end_idx is exclusive.
-        history_length: Required history window size (L).
+        input_window_length: Required history window size (L).
         forecast_horizon: Required forecast horizon (H).
         total_time_steps: Total number of time steps in dataset.
 
@@ -139,7 +139,7 @@ def validate_temporal_range(
         ValueError: If the range is too small or out of bounds.
     """
     start_idx, end_idx = time_range
-    window_size = history_length + forecast_horizon
+    window_size = input_window_length + forecast_horizon
 
     if start_idx < 0 or end_idx > total_time_steps:
         raise ValueError(
@@ -157,7 +157,7 @@ def validate_temporal_range(
         raise ValueError(
             f"Time range [{start_idx}, {end_idx}) has {available_steps} steps, "
             f"but requires at least {window_size} steps "
-            f"(L={history_length} + H={forecast_horizon})"
+            f"(L={input_window_length} + H={forecast_horizon})"
         )
 
 

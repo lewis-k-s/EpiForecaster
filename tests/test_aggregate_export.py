@@ -211,15 +211,14 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
     trainer.test_loader = object()
     trainer.metric_artifacts = {}
     trainer.model = torch.nn.Linear(1, 1)
+    trainer.device = torch.device("cpu")
     trainer.cleanup_dataloaders = lambda: None
     trainer._train_epoch = lambda: 0.0
     trainer._log_epoch = lambda **_kwargs: None
-    trainer._evaluate_split = (
-        lambda *_args, **_kwargs: (
-            0.5,
-            {"mae": 1.0, "rmse": 2.0, "smape": 0.1, "r2": 0.2},
-            {},
-        )
+    trainer._evaluate_split = lambda *_args, **_kwargs: (
+        0.5,
+        {"mae": 1.0, "rmse": 2.0, "smape": 0.1, "r2": 0.2},
+        {},
     )
     trainer.test_epoch = lambda: (
         0.6,
@@ -229,16 +228,20 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
 
     called_splits: list[str] = []
 
-    def _fake_writer(split_name: str, eval_metrics: dict[str, float]) -> dict[str, Path]:
+    def _fake_writer(
+        split_name: str, eval_metrics: dict[str, float]
+    ) -> dict[str, Path]:
         del eval_metrics
         split_key = split_name.lower()
         called_splits.append(split_key)
         target_path = tmp_path / f"{split_key}_main_model_aggregate_metrics.csv"
         joint_path = tmp_path / f"{split_key}_main_model_joint_loss_aggregate.csv"
-        trainer.metric_artifacts[f"{split_key}_main_model_aggregate_metrics"] = target_path
-        trainer.metric_artifacts[
-            f"{split_key}_main_model_joint_loss_aggregate"
-        ] = joint_path
+        trainer.metric_artifacts[f"{split_key}_main_model_aggregate_metrics"] = (
+            target_path
+        )
+        trainer.metric_artifacts[f"{split_key}_main_model_joint_loss_aggregate"] = (
+            joint_path
+        )
         return {
             f"{split_key}_main_model_aggregate_metrics": target_path,
             f"{split_key}_main_model_joint_loss_aggregate": joint_path,

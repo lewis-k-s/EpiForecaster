@@ -26,7 +26,7 @@ class TestEpiForecasterTrainer:
                 type=ModelVariant(cases=True),
                 mobility_embedding_dim=8,
                 region_embedding_dim=8,
-                history_length=14,
+                input_window_length=14,
                 forecast_horizon=7,
                 max_neighbors=5,
                 sir_physics=SIRPhysicsConfig(),

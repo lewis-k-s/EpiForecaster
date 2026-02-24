@@ -26,17 +26,25 @@ class _DummyDataConfig:
     run_id = "real"
 
     @staticmethod
-    def resolve_missing_permit_map() -> dict[str, int]:
+    def resolve_missing_permit_map() -> dict[str, dict[str, int]]:
         return {
-            "cases": 0,
-            "hospitalizations": 0,
-            "deaths": 0,
-            "wastewater": 0,
+            "input": {
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+                "wastewater": 0,
+            },
+            "horizon": {
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+                "wastewater": 0,
+            },
         }
 
 
 class _DummyModelConfig:
-    history_length = 4
+    input_window_length = 4
     forecast_horizon = 3
 
 

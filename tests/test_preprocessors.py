@@ -104,7 +104,7 @@ class TestCasesPreprocessor:
 
     def test_preprocess_dataset(self, mock_cases_dataset):
         config = CasesPreprocessorConfig(
-            history_length=7, per_100k=True, log_scale=True
+            input_window_length=7, per_100k=True, log_scale=True
         )
         processor = CasesPreprocessor(config)
 
@@ -123,12 +123,12 @@ class TestCasesPreprocessor:
         assert torch.all(processed[..., 1] == 1.0)
 
     def test_make_normalized_window(self, mock_cases_dataset):
-        config = CasesPreprocessorConfig(history_length=5)
+        config = CasesPreprocessorConfig(input_window_length=5)
         processor = CasesPreprocessor(config)
         processor.preprocess_dataset(mock_cases_dataset)
 
         norm_window, mean, std = processor.make_normalized_window(
-            range_start=0, history_length=5, forecast_horizon=3
+            range_start=0, input_window_length=5, forecast_horizon=3
         )
 
         # Window size = L + H = 5 + 3 = 8

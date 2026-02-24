@@ -10,7 +10,7 @@ from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 
 def _make_config(
     dataset_path: str,
-    missing_permit: dict[str, int] | None = None,
+    missing_permit: dict[str, dict[str, int]] | None = None,
 ) -> EpiForecasterConfig:
     model = ModelConfig(
         type={"cases": True, "regions": False, "biomarkers": True, "mobility": False},
@@ -18,7 +18,7 @@ def _make_config(
         # that match the dataset output dimensions
         mobility_embedding_dim=1,
         region_embedding_dim=1,
-        history_length=3,
+        input_window_length=3,
         forecast_horizon=2,
         max_neighbors=1,
         gnn_depth=1,
@@ -28,16 +28,24 @@ def _make_config(
         forecaster_head="transformer",
         region2vec_path="",
     )
-    data_cfg = DataConfig(
-        dataset_path=str(dataset_path),
-        mobility_threshold=0.1,
-        missing_permit=missing_permit
-        or {
+    default_permit = {
+        "input": {
             "biomarkers_joint": 0,
             "cases": 0,
             "hospitalizations": 0,
             "deaths": 0,
         },
+        "horizon": {
+            "biomarkers_joint": 0,
+            "cases": 0,
+            "hospitalizations": 0,
+            "deaths": 0,
+        },
+    }
+    data_cfg = DataConfig(
+        dataset_path=str(dataset_path),
+        mobility_threshold=0.1,
+        missing_permit=missing_permit or default_permit,
         window_stride=1,
     )
     return EpiForecasterConfig(model=model, data=data_cfg)
@@ -288,10 +296,18 @@ def test_missing_permit_allows_history_nan_but_excludes_target_nan(tmp_path):
     config = _make_config(
         str(zarr_path),
         missing_permit={
-            "biomarkers_joint": 1,
-            "cases": 1,
-            "hospitalizations": 1,
-            "deaths": 1,
+            "input": {
+                "biomarkers_joint": 1,
+                "cases": 1,
+                "hospitalizations": 1,
+                "deaths": 1,
+            },
+            "horizon": {
+                "biomarkers_joint": 1,
+                "cases": 1,
+                "hospitalizations": 1,
+                "deaths": 1,
+            },
         },
     )
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
@@ -324,10 +340,18 @@ def test_window_filtering_uses_cases_mask_not_interpolated_values(tmp_path):
     config = _make_config(
         str(zarr_path),
         missing_permit={
-            "biomarkers_joint": 0,
-            "cases": 0,
-            "hospitalizations": 0,
-            "deaths": 0,
+            "input": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
+            "horizon": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
         },
     )
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0])
@@ -341,10 +365,18 @@ def test_window_filtering_uses_cases_mask_not_interpolated_values(tmp_path):
     relaxed = _make_config(
         str(zarr_path),
         missing_permit={
-            "biomarkers_joint": 1,
-            "cases": 1,
-            "hospitalizations": 1,
-            "deaths": 1,
+            "input": {
+                "biomarkers_joint": 1,
+                "cases": 1,
+                "hospitalizations": 1,
+                "deaths": 1,
+            },
+            "horizon": {
+                "biomarkers_joint": 1,
+                "cases": 1,
+                "hospitalizations": 1,
+                "deaths": 1,
+            },
         },
     )
     relaxed_ds = EpiDataset(config=relaxed, target_nodes=[0], context_nodes=[0])
@@ -360,10 +392,18 @@ def test_per_target_missing_permit_can_filter_deaths(tmp_path):
     base = _make_config(
         str(zarr_path),
         missing_permit={
-            "biomarkers_joint": 0,
-            "cases": 0,
-            "hospitalizations": 0,
-            "deaths": 2,
+            "input": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 2,
+            },
+            "horizon": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 2,
+            },
         },
     )
     base_ds = EpiDataset(config=base, target_nodes=[0], context_nodes=[0])
@@ -373,10 +413,18 @@ def test_per_target_missing_permit_can_filter_deaths(tmp_path):
     strict_deaths = _make_config(
         str(zarr_path),
         missing_permit={
-            "biomarkers_joint": 0,
-            "cases": 0,
-            "hospitalizations": 0,
-            "deaths": 0,
+            "input": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
+            "horizon": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
         },
     )
     strict_ds = EpiDataset(config=strict_deaths, target_nodes=[0], context_nodes=[0])
@@ -498,10 +546,18 @@ def test_ww_target_uses_biomarker_masked_mean_and_any_variant_mask(tmp_path):
     config = _make_config(
         str(zarr_path),
         missing_permit={
-            "biomarkers_joint": 4,
-            "cases": 4,
-            "hospitalizations": 4,
-            "deaths": 4,
+            "input": {
+                "biomarkers_joint": 4,
+                "cases": 4,
+                "hospitalizations": 4,
+                "deaths": 4,
+            },
+            "horizon": {
+                "biomarkers_joint": 4,
+                "cases": 4,
+                "hospitalizations": 4,
+                "deaths": 4,
+            },
         },
     )
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0])

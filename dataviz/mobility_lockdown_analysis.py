@@ -172,7 +172,7 @@ def load_or_compute_regression_results(
 
     cases_da = dataset["cases"]
 
-    history_len = int(config.model.history_length)
+    history_len = int(config.model.input_window_length)
     horizon = int(config.model.forecast_horizon)
     window_len = history_len + horizon
     missing_permit = int(config.data.missing_permit)
@@ -793,7 +793,7 @@ def main() -> None:
         logger.info("Saved regression results to %s", regression_path)
 
     # Aggregate regression statistics by window
-    window_len = int(config.model.history_length) + int(config.model.forecast_horizon)
+    window_len = int(config.model.input_window_length) + int(config.model.forecast_horizon)
     agg_df = aggregate_regression_by_window(results_df, window_len)
 
     # Save aggregated results

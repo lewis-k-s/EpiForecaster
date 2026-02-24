@@ -104,7 +104,7 @@ def _generate_rolling_folds(
     dataset: EpiDataset,
     rolling_folds: int,
 ) -> list[RollingFold]:
-    L = int(dataset.config.model.history_length)
+    L = int(dataset.config.model.input_window_length)
     H = int(dataset.config.model.forecast_horizon)
     split_start, split_end = _resolve_split_bounds(dataset)
 
@@ -158,15 +158,15 @@ def _compute_valid_node_mask_for_target(
     *,
     target_mask: np.ndarray,
     forecast_start: int,
-    history_length: int,
+    input_window_length: int,
     horizon: int,
     permit: int,
 ) -> np.ndarray:
-    history_slice = target_mask[forecast_start - history_length : forecast_start]
+    history_slice = target_mask[forecast_start - input_window_length : forecast_start]
     target_slice = target_mask[forecast_start : forecast_start + horizon]
     history_counts = history_slice.sum(axis=0)
     target_counts = target_slice.sum(axis=0)
-    history_threshold = max(0, history_length - permit)
+    history_threshold = max(0, input_window_length - permit)
     target_threshold = max(0, horizon - permit)
     return (history_counts >= history_threshold) & (target_counts >= target_threshold)
 
@@ -356,7 +356,9 @@ def _joint_weighted_masked_mse_numpy(
         posinf=_JOINT_LOSS_VALUE_CLAMP,
         neginf=-_JOINT_LOSS_VALUE_CLAMP,
     ).clamp(min=-_JOINT_LOSS_VALUE_CLAMP, max=_JOINT_LOSS_VALUE_CLAMP)
-    prediction_safe = torch.where(active, prediction_clean, torch.zeros_like(prediction_clean))
+    prediction_safe = torch.where(
+        active, prediction_clean, torch.zeros_like(prediction_clean)
+    )
     target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
 
     sq = (prediction_safe - target_safe) ** 2
@@ -400,7 +402,11 @@ def _compute_joint_observation_loss_for_fold(
     for target_name, alias in target_aliases.items():
         pred, target, mask = fold_target_data.get(
             target_name,
-            (_empty_metric_matrix(horizon), _empty_metric_matrix(horizon), _empty_metric_matrix(horizon)),
+            (
+                _empty_metric_matrix(horizon),
+                _empty_metric_matrix(horizon),
+                _empty_metric_matrix(horizon),
+            ),
         )
         loss_value = _joint_weighted_masked_mse_numpy(
             prediction=pred,
@@ -456,8 +462,8 @@ def _evaluate_univariate_baseline_model(
     target_views: dict[str, TargetSeriesView],
     folds: list[RollingFold],
     target_nodes: list[int],
-    permit_map: dict[str, int],
-    history_length: int,
+    permit_map: dict[str, dict[str, int]],
+    input_window_length: int,
     horizon: int,
     seasonal_period: int,
     calendar_exog: np.ndarray | None,
@@ -470,7 +476,9 @@ def _evaluate_univariate_baseline_model(
     joint_spec: JointObservationLossSpec | None,
     joint_rows: list[dict[str, Any]],
 ) -> None:
-    joint_target_buffers: dict[int, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    joint_target_buffers: dict[
+        int, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
+    ] = {}
 
     for target_name, target_view in target_views.items():
         values = target_view.values
@@ -481,9 +489,9 @@ def _evaluate_univariate_baseline_model(
             valid_nodes_mask = _compute_valid_node_mask_for_target(
                 target_mask=mask,
                 forecast_start=fold.forecast_start,
-                history_length=history_length,
+                input_window_length=input_window_length,
                 horizon=horizon,
-                permit=int(permit_map[target_name]),
+                permit=int(permit_map["horizon"][target_name]),
             )
 
             global_median = _global_median_for_target(
@@ -695,8 +703,8 @@ def _evaluate_var_cross_target_model(
     target_views: dict[str, TargetSeriesView],
     folds: list[RollingFold],
     target_nodes: list[int],
-    permit_map: dict[str, int],
-    history_length: int,
+    permit_map: dict[str, dict[str, int]],
+    input_window_length: int,
     horizon: int,
     seasonal_period: int,
     include_sparsity_bins: bool,
@@ -721,9 +729,9 @@ def _evaluate_var_cross_target_model(
             valid_nodes_by_target[target_name] = _compute_valid_node_mask_for_target(
                 target_mask=target_view.mask,
                 forecast_start=fold.forecast_start,
-                history_length=history_length,
+                input_window_length=input_window_length,
                 horizon=horizon,
-                permit=int(permit_map[target_name]),
+                permit=int(permit_map["horizon"][target_name]),
             )
             global_medians_by_target[target_name] = _global_median_for_target(
                 values=target_view.values,
@@ -827,12 +835,8 @@ def _evaluate_var_cross_target_model(
                         }
                     )
 
-                pred_rows_by_target[target_name].append(
-                    cleaned_pred
-                )
-                target_rows_by_target[target_name].append(
-                    cleaned_target
-                )
+                pred_rows_by_target[target_name].append(cleaned_pred)
+                target_rows_by_target[target_name].append(cleaned_target)
                 score_mask_by_target[target_name].append(cleaned_mask)
                 pair_rows.append(
                     {
@@ -1009,7 +1013,7 @@ def run_baseline_evaluation(
     temporal_coords = list(dataset._temporal_coords)
     target_nodes = list(dataset.target_nodes)
     horizon = int(config.model.forecast_horizon)
-    history_length = int(config.model.history_length)
+    input_window_length = int(config.model.input_window_length)
     permit_map = config.data.resolve_missing_permit_map()
     calendar_exog = _resolve_calendar_exog(dataset)
     joint_spec = _resolve_joint_observation_loss_spec(config=config, horizon=horizon)
@@ -1036,7 +1040,7 @@ def run_baseline_evaluation(
                 folds=folds,
                 target_nodes=target_nodes,
                 permit_map=permit_map,
-                history_length=history_length,
+                input_window_length=input_window_length,
                 horizon=horizon,
                 seasonal_period=seasonal_period,
                 calendar_exog=calendar_exog,
@@ -1055,7 +1059,7 @@ def run_baseline_evaluation(
                 folds=folds,
                 target_nodes=target_nodes,
                 permit_map=permit_map,
-                history_length=history_length,
+                input_window_length=input_window_length,
                 horizon=horizon,
                 seasonal_period=seasonal_period,
                 include_sparsity_bins=include_sparsity_bins,
@@ -1091,9 +1095,7 @@ def run_baseline_evaluation(
         "joint_observed_count_deaths",
     ]
     joint_fold_df = (
-        pd.DataFrame(joint_rows)
-        if joint_rows
-        else pd.DataFrame(columns=joint_cols)
+        pd.DataFrame(joint_rows) if joint_rows else pd.DataFrame(columns=joint_cols)
     )
 
     aggregate_rows: list[dict[str, Any]] = []
@@ -1186,7 +1188,7 @@ def run_baseline_evaluation(
         "split": split,
         "rolling_folds_requested": rolling_folds,
         "rolling_folds_used": len(folds),
-        "history_length": history_length,
+        "input_window_length": input_window_length,
         "forecast_horizon": horizon,
         "seasonal_period": seasonal_period,
         "var_maxlags": var_maxlags,
@@ -1301,7 +1303,9 @@ def compare_model_metrics_against_baselines(
         for model_name, group in baseline_df.groupby("model"):
             row: dict[str, Any] = {"model": model_name}
             for col in joint_value_cols:
-                row[f"{col}_median"] = pd.to_numeric(group[col], errors="coerce").median()
+                row[f"{col}_median"] = pd.to_numeric(
+                    group[col], errors="coerce"
+                ).median()
             agg_rows.append(row)
         baseline_df = pd.DataFrame(agg_rows)
 
@@ -1406,8 +1410,7 @@ def compare_model_metrics_against_baselines(
                     "metric": baseline_key,
                     "model_value": metric_value,
                     "baseline_value": float(baseline_value),
-                    "delta_model_minus_baseline": metric_value
-                    - float(baseline_value),
+                    "delta_model_minus_baseline": metric_value - float(baseline_value),
                 }
             )
             joint_component_recorded.add((model_name, baseline_key))

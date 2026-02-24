@@ -189,17 +189,17 @@ class TestTemporal:
     def test_validate_temporal_range(self):
         # Valid
         validate_temporal_range(
-            (0, 10), history_length=5, forecast_horizon=2, total_time_steps=20
+            (0, 10), input_window_length=5, forecast_horizon=2, total_time_steps=20
         )
 
         # Invalid: range too small
         with pytest.raises(ValueError, match="requires at least"):
             validate_temporal_range(
-                (0, 5), history_length=5, forecast_horizon=2, total_time_steps=20
+                (0, 5), input_window_length=5, forecast_horizon=2, total_time_steps=20
             )
 
         # Invalid: out of bounds
         with pytest.raises(ValueError, match="out of bounds"):
             validate_temporal_range(
-                (0, 25), history_length=5, forecast_horizon=2, total_time_steps=20
+                (0, 25), input_window_length=5, forecast_horizon=2, total_time_steps=20
             )

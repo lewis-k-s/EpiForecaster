@@ -63,7 +63,7 @@ def resolve_mobility_array(mobility_da: xr.DataArray | xr.Dataset) -> np.ndarray
 
 def compute_valid_window_mask(
     cases_da: xr.DataArray,
-    history_length: int,
+    input_window_length: int,
     horizon: int,
     window_stride: int,
     missing_permit: int,
@@ -86,7 +86,7 @@ def compute_valid_window_mask(
         raise ValueError(f"Expected cases array with 2 or 3 dims, got {cases_np.shape}")
 
     T = cases_np.shape[0]
-    seg = history_length + horizon
+    seg = input_window_length + horizon
     if T < seg:
         starts = np.array([], dtype=np.int64)
         valid_mask = np.zeros((0, cases_np.shape[1]), dtype=bool)
@@ -103,14 +103,14 @@ def compute_valid_window_mask(
         axis=0,
     )
 
-    history_counts = cumsum[history_length:] - cumsum[:-history_length]
-    target_counts = cumsum[history_length + horizon :] - cumsum[history_length:-horizon]
+    history_counts = cumsum[input_window_length:] - cumsum[:-input_window_length]
+    target_counts = cumsum[input_window_length + horizon :] - cumsum[input_window_length:-horizon]
 
     starts = np.arange(0, T - seg + 1, window_stride, dtype=np.int64)
     history_counts = history_counts[starts]
     target_counts = target_counts[starts]
 
-    history_threshold = max(0, history_length - missing_permit)
+    history_threshold = max(0, input_window_length - missing_permit)
     history_ok = history_counts >= history_threshold
     target_ok = target_counts >= horizon
     valid_mask = history_ok & target_ok
@@ -626,7 +626,7 @@ def main() -> None:
     population = dataset["population"].values
 
     # Compute window parameters
-    history_len = int(config.model.history_length)
+    history_len = int(config.model.input_window_length)
     horizon = int(config.model.forecast_horizon)
     window_len = history_len + horizon
     window_stride = int(args.window_stride)

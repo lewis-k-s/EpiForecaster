@@ -27,7 +27,7 @@ def test_cases_preprocessor_basic():
         coords={"date": dates, "region_id": regions},
     )
 
-    config = CasesPreprocessorConfig(history_length=3, log_scale=True, per_100k=True)
+    config = CasesPreprocessorConfig(input_window_length=3, log_scale=True, per_100k=True)
 
     processor = CasesPreprocessor(config)
 

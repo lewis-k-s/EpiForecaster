@@ -22,7 +22,7 @@ def _make_config(
         # that match the dataset output dimensions
         mobility_embedding_dim=1,
         region_embedding_dim=1,
-        history_length=3,
+        input_window_length=3,
         forecast_horizon=2,
         max_neighbors=1,
         gnn_depth=1,
@@ -32,10 +32,18 @@ def _make_config(
         dataset_path=str(dataset_path),
         mobility_threshold=0.0,
         missing_permit={
-            "biomarkers_joint": 0,
-            "cases": 0,
-            "hospitalizations": 0,
-            "deaths": 0,
+            "input": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
+            "horizon": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
         },
         log_scale=log_scale,
         sample_ordering=sample_ordering,

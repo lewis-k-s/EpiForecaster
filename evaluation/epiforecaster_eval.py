@@ -519,14 +519,17 @@ def get_loss_from_config(
         min_obs = {"cases": 0, "hospitalizations": 0, "deaths": 0, "wastewater": 0}
         if data_config is not None and forecast_horizon is not None:
             permits = data_config.resolve_missing_permit_map()
+            horizon_permits = permits["horizon"]
             min_obs = {
-                "cases": max(0, int(forecast_horizon) - int(permits["cases"])),
+                "cases": max(0, int(forecast_horizon) - int(horizon_permits["cases"])),
                 "hospitalizations": max(
-                    0, int(forecast_horizon) - int(permits["hospitalizations"])
+                    0, int(forecast_horizon) - int(horizon_permits["hospitalizations"])
                 ),
-                "deaths": max(0, int(forecast_horizon) - int(permits["deaths"])),
+                "deaths": max(
+                    0, int(forecast_horizon) - int(horizon_permits["deaths"])
+                ),
                 "wastewater": max(
-                    0, int(forecast_horizon) - int(permits["wastewater"])
+                    0, int(forecast_horizon) - int(horizon_permits["wastewater"])
                 ),
             }
         return JointInferenceLoss(
@@ -637,7 +640,7 @@ def load_model_from_checkpoint(
         region_embedding_dim=config.model.region_embedding_dim,
         mobility_embedding_dim=config.model.mobility_embedding_dim,
         gnn_depth=config.model.gnn_depth,
-        sequence_length=config.model.history_length,
+        sequence_length=config.model.input_window_length,
         forecast_horizon=config.model.forecast_horizon,
         use_population=config.model.use_population,
         population_dim=config.model.population_dim,
@@ -986,7 +989,7 @@ def evaluate_checkpoint_topk_forecasts(
 
     fig = make_forecast_figure(
         samples=samples,
-        history_length=int(config.model.history_length),
+        input_window_length=int(config.model.input_window_length),
         forecast_horizon=int(config.model.forecast_horizon),
         context_pre=30,
         context_post=30,
@@ -1390,7 +1393,7 @@ def generate_forecast_plots(
     config = dataset.config
     fig = make_joint_forecast_figure(
         samples=grouped_samples,
-        history_length=int(config.model.history_length),
+        input_window_length=int(config.model.input_window_length),
         forecast_horizon=int(config.model.forecast_horizon),
         context_pre=context_pre,
         context_post=context_post,
@@ -1406,7 +1409,7 @@ def generate_forecast_plots(
     for target_name in resolved_targets:
         target_fig = make_forecast_figure(
             samples=grouped_samples,
-            history_length=int(config.model.history_length),
+            input_window_length=int(config.model.input_window_length),
             forecast_horizon=int(config.model.forecast_horizon),
             context_pre=context_pre,
             context_post=context_post,
@@ -1709,7 +1712,7 @@ def plot_forecasts_from_csv(
 
     fig = make_forecast_figure(
         samples=quartile_samples,
-        history_length=int(config.model.history_length),
+        input_window_length=int(config.model.input_window_length),
         forecast_horizon=int(config.model.forecast_horizon),
         context_pre=30,
         context_post=30,

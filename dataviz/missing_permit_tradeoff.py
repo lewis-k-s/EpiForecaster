@@ -147,7 +147,7 @@ def analyze_series(
     values: np.ndarray,
     mask: np.ndarray,
     valid_range: np.ndarray,
-    history_length: int,
+    input_window_length: int,
     forecast_horizon: int,
     hist_permits: list[int],
     target_permits: list[int],
@@ -155,7 +155,7 @@ def analyze_series(
 ) -> pd.DataFrame:
     """Build permit grid with pass rate and zero-variation incidence."""
     t, _ = mask.shape
-    segment = history_length + forecast_horizon
+    segment = input_window_length + forecast_horizon
     if t < segment:
         return pd.DataFrame()
 
@@ -171,15 +171,15 @@ def analyze_series(
     )
     valid_counts = (vr_csum[segment:] - vr_csum[:-segment])[starts]
     eligible = valid_counts >= segment
-    hist_obs = _window_counts(mask, history_length, starts)
-    target_obs_counts = _window_counts(mask[history_length:], forecast_horizon, starts)
+    hist_obs = _window_counts(mask, input_window_length, starts)
+    target_obs_counts = _window_counts(mask[input_window_length:], forecast_horizon, starts)
 
-    hist_missing = history_length - hist_obs
+    hist_missing = input_window_length - hist_obs
     target_missing = forecast_horizon - target_obs_counts
 
-    z_hist = _window_zero_variation_flags(values, starts, history_length, epsilon)
+    z_hist = _window_zero_variation_flags(values, starts, input_window_length, epsilon)
     z_target = _window_zero_variation_flags(
-        values[history_length:], starts, forecast_horizon, epsilon
+        values[input_window_length:], starts, forecast_horizon, epsilon
     )
     z_full = _window_zero_variation_flags(values, starts, segment, epsilon)
 
@@ -187,7 +187,7 @@ def analyze_series(
     n_eligible = int(eligible.sum())
     rows: list[dict[str, float | int]] = []
     for hp in hist_permits:
-        if hp > history_length:
+        if hp > input_window_length:
             continue
         hist_ok = hist_missing <= hp
         for tp in target_permits:
@@ -330,7 +330,7 @@ def main() -> None:
     ds = xr.open_zarr(dataset_path)
     series = _load_series(ds)
 
-    history_length = int(cfg.model.history_length)
+    input_window_length = int(cfg.model.input_window_length)
     forecast_horizon = int(cfg.model.forecast_horizon)
     hist_permits = [int(x) for x in args.history_permits.split(",") if x.strip()]
     target_permits = [int(x) for x in args.target_permits.split(",") if x.strip()]
@@ -352,7 +352,7 @@ def main() -> None:
             values=values,
             mask=mask,
             valid_range=valid_range,
-            history_length=history_length,
+            input_window_length=input_window_length,
             forecast_horizon=forecast_horizon,
             hist_permits=hist_permits,
             target_permits=target_permits,

@@ -111,7 +111,8 @@ def test_manual_batching_equivalence():
         edge_attr=old_result.edge_weight,
         max_num_nodes=num_nodes,
     )
-    assert torch.allclose(old_adj_dense, new_result.adj_dense)
+    # Compare with appropriate dtype tolerance - new_result uses float16 for memory efficiency
+    assert torch.allclose(old_adj_dense, new_result.adj_dense.float(), atol=1e-3)
 
     # Check target_node reconstruction
     # Old result has target_node from Batch.from_data_list (concatenated list of tensors)

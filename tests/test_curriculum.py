@@ -29,7 +29,7 @@ def create_mock_config(dataset_path: str) -> EpiForecasterConfig:
             type=ModelVariant(),
             mobility_embedding_dim=0,
             region_embedding_dim=0,
-            history_length=4,
+            input_window_length=4,
             forecast_horizon=4,
             max_neighbors=0,
         ),

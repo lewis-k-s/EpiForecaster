@@ -196,7 +196,7 @@ def collect_case_window_samples(
     return samples
 
 
-def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int):
+def make_cases_window_figure(samples: list[dict[str, Any]], input_window_length: int):
     """
     Build a seaborn figure to visualize case windows (history + horizon).
 
@@ -232,7 +232,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         # Series already includes history + horizon
         series = np.asarray(sample["series"], dtype=np.float32).reshape(-1)
         total_len = series.shape[0]
-        horizon_length = total_len - history_length
+        horizon_length = total_len - input_window_length
 
         cases_age = sample.get("cases_age")
         biomarker_series = sample.get("biomarkers") or {}
@@ -251,8 +251,8 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         if biomarker_series:
             for name, series_values in biomarker_series.items():
                 series_values = np.asarray(series_values, dtype=np.float32).reshape(-1)
-                assert series_values.shape[0] == history_length, (
-                    f"Biomarker length {series_values.shape[0]} != history_length {history_length}"
+                assert series_values.shape[0] == input_window_length, (
+                    f"Biomarker length {series_values.shape[0]} != input_window_length {input_window_length}"
                 )
                 padded = np.concatenate(
                     [series_values, np.full(horizon_length, np.nan)]
@@ -265,7 +265,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                 age_values = biomarker_age.get(name)
                 if age_values is not None:
                     age_values = np.asarray(age_values, dtype=np.float32).reshape(-1)
-                    assert age_values.shape[0] == history_length
+                    assert age_values.shape[0] == input_window_length
                     biomarker_age_padded[label] = np.concatenate(
                         [age_values, np.full(horizon_length, np.nan)]
                     )
@@ -273,7 +273,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                 mask_values = biomarker_mask.get(name)
                 if mask_values is not None:
                     mask_values = np.asarray(mask_values, dtype=np.float32).reshape(-1)
-                    assert mask_values.shape[0] == history_length
+                    assert mask_values.shape[0] == input_window_length
                     biomarker_mask_padded[label] = np.concatenate(
                         [mask_values, np.full(horizon_length, np.nan)]
                     )
@@ -285,10 +285,10 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
         if mobility_mean is not None:
             mobility_mean = np.asarray(mobility_mean, dtype=np.float32).reshape(-1)
             mobility_std = np.asarray(mobility_std, dtype=np.float32).reshape(-1)
-            assert mobility_mean.shape[0] == history_length, (
-                f"Mobility length {mobility_mean.shape[0]} != history_length {history_length}"
+            assert mobility_mean.shape[0] == input_window_length, (
+                f"Mobility length {mobility_mean.shape[0]} != input_window_length {input_window_length}"
             )
-            assert mobility_std.shape[0] == history_length
+            assert mobility_std.shape[0] == input_window_length
             # Pad with NaNs for horizon portion
             mobility_mean_padded = np.concatenate(
                 [mobility_mean, np.full(horizon_length, np.nan)]
@@ -343,7 +343,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
 
                 # Add label to the right of the ribbon, aligned with history/horizon line
                 ax.text(
-                    history_length - 0.5,
+                    input_window_length - 0.5,
                     0.975,  # Center of the ribbon (ymin=0.95, ymax=1.0)
                     " cases age",
                     transform=ax.get_xaxis_transform(),
@@ -425,7 +425,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
                         )
 
                     ax.text(
-                        history_length - 0.5,
+                        input_window_length - 0.5,
                         0.025,
                         " biomarker age (min)",
                         transform=ax.get_xaxis_transform(),
@@ -464,7 +464,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
 
                 if biomarker_censor:
                     ax.text(
-                        history_length - 0.5,
+                        input_window_length - 0.5,
                         0.075,
                         " LD censored",
                         transform=ax.get_xaxis_transform(),
@@ -505,7 +505,7 @@ def make_cases_window_figure(samples: list[dict[str, Any]], history_length: int)
             )
 
         # Draw history/horizon separator
-        ax.axvline(history_length - 0.5, color="black", linestyle="--", alpha=0.5)
+        ax.axvline(input_window_length - 0.5, color="black", linestyle="--", alpha=0.5)
 
         # Title
         node_label = sample.get("node_label", "")
@@ -890,7 +890,7 @@ def plot_biomarker_age_heatmap_from_precomputed(
     ax,
     precomputed_biomarkers: torch.Tensor,
     biomarker_available_mask: torch.Tensor,
-    history_length: int | None = None,
+    input_window_length: int | None = None,
     age_max: int = 14,
     variant_names: list[str] | None = None,
 ) -> None:
@@ -900,7 +900,7 @@ def plot_biomarker_age_heatmap_from_precomputed(
         ax: Matplotlib axes to plot on
         precomputed_biomarkers: (T, N, 3 * V) tensor with [value, mask, age] blocks
         biomarker_available_mask: (N, B) tensor indicating region-level availability
-        history_length: Optional history/horizon separator position
+        input_window_length: Optional history/horizon separator position
         age_max: Maximum age in days (for normalization label only)
         variant_names: Optional list of biomarker variant names
     """
@@ -927,9 +927,9 @@ def plot_biomarker_age_heatmap_from_precomputed(
     )
 
     # Draw history/horizon separator if provided
-    if history_length is not None:
+    if input_window_length is not None:
         ax.axvline(
-            history_length - 0.5, color="black", linestyle="--", alpha=0.5, linewidth=2
+            input_window_length - 0.5, color="black", linestyle="--", alpha=0.5, linewidth=2
         )
 
     n_regions = age_filtered.shape[0]
@@ -994,7 +994,7 @@ def make_biomarker_sparsity_figure_all_from_precomputed(
     precomputed_biomarkers: torch.Tensor,
     biomarker_available_mask: torch.Tensor,
     region_ids: np.ndarray,
-    history_length: int | None = None,
+    input_window_length: int | None = None,
     age_max: int = 14,
     variant_names: list[str] | None = None,
 ):
@@ -1009,7 +1009,7 @@ def make_biomarker_sparsity_figure_all_from_precomputed(
         ax1,
         precomputed_biomarkers,
         biomarker_available_mask,
-        history_length,
+        input_window_length,
         age_max,
         variant_names=variant_names,
     )

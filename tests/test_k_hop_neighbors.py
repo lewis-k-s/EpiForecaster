@@ -33,7 +33,7 @@ def _make_config(
         },
         mobility_embedding_dim=1,
         region_embedding_dim=1,
-        history_length=3,
+        input_window_length=3,
         forecast_horizon=1,
         max_neighbors=1,
         gnn_depth=gnn_depth,
@@ -45,10 +45,18 @@ def _make_config(
         dataset_path=str(dataset_path),
         mobility_threshold=0.0,
         missing_permit={
-            "biomarkers_joint": 0,
-            "cases": 0,
-            "hospitalizations": 0,
-            "deaths": 0,
+            "input": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
+            "horizon": {
+                "biomarkers_joint": 0,
+                "cases": 0,
+                "hospitalizations": 0,
+                "deaths": 0,
+            },
         },
         log_scale=log_scale,
         sample_ordering=sample_ordering,
@@ -257,7 +265,7 @@ def test_k_hop_masking_gnn_depth_1(tmp_path):
     item = dataset[0]
 
     # Verify for each time step in the history window
-    L = dataset.config.model.history_length
+    L = dataset.config.model.input_window_length
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
@@ -307,7 +315,7 @@ def test_k_hop_masking_gnn_depth_2(tmp_path):
 
     item = dataset[0]
 
-    L = dataset.config.model.history_length
+    L = dataset.config.model.input_window_length
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
@@ -356,7 +364,7 @@ def test_k_hop_masking_middle_node(tmp_path):
 
     item = dataset[0]
 
-    L = dataset.config.model.history_length
+    L = dataset.config.model.input_window_length
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
@@ -402,7 +410,7 @@ def test_k_hop_masking_time_ordering(tmp_path):
     # Get the first sample for target node 0
     item = dataset[0]
 
-    L = dataset.config.model.history_length
+    L = dataset.config.model.input_window_length
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
@@ -440,7 +448,7 @@ def test_k_hop_masking_node_ordering(tmp_path):
 
     item = dataset[0]
 
-    L = dataset.config.model.history_length
+    L = dataset.config.model.input_window_length
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 

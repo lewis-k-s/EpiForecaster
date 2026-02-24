@@ -125,7 +125,7 @@ def ensure_3d(arr: np.ndarray) -> np.ndarray:
 
 def compute_valid_window_mask(
     cases: np.ndarray,
-    history_length: int,
+    input_window_length: int,
     horizon: int,
     window_stride: int,
     missing_permit: float,
@@ -137,12 +137,12 @@ def compute_valid_window_mask(
         n_windows: Total number of windows
     """
     n_time = cases.shape[0]
-    n_windows = (n_time - history_length - horizon) // window_stride + 1
+    n_windows = (n_time - input_window_length - horizon) // window_stride + 1
 
     valid_starts = []
     for w in range(n_windows):
         start = w * window_stride
-        window_end = start + history_length + horizon
+        window_end = start + input_window_length + horizon
         window_data = cases[start:window_end]
 
         if np.isnan(window_data).mean() <= missing_permit:
