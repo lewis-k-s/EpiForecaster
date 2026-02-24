@@ -102,7 +102,7 @@ class TestEpiDataset:
             assert item["hosp_hist"].shape == (L, 3)
             assert item["mob_x"].shape[2] >= 9
 
-            assert len(item["mob_edge_index"]) == L
+            assert item["mob_adj"].shape == (L, 2, 2)
 
     def test_feature_masking(self, config, mock_xarray_dataset):
         with patch.object(
@@ -182,7 +182,7 @@ class TestEpiDataset:
             item_a["bio_node"][0, 0] = float("nan")
             item_a["temporal_covariates"][0, 0] = float("nan")
             item_a["mob_x"][0, 0, 0] = float("inf")
-            item_a["mob_edge_weight"][0][0] = float("nan")
+            item_a["mob_adj"][0, 0, 0] = float("nan")
 
             batch = collate_epiforecaster_batch(
                 [item_a, item_b], require_region_index=False
@@ -195,161 +195,3 @@ class TestEpiDataset:
             assert torch.isfinite(batch["TemporalCovariates"]).all()
             assert torch.isfinite(batch["MobBatch"].x_dense).all()
             assert torch.isfinite(batch["MobBatch"].adj_dense).all()
-
-    def test_sparse_graphs_precomputed_at_init(self, config, mock_xarray_dataset):
-        """Verify that sparse graphs are eagerly precomputed during initialization."""
-        with patch.object(
-            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
-        ):
-            ds = EpiDataset(
-                config=config,
-                target_nodes=[0, 1],
-                context_nodes=[0, 1, 2],
-            )
-
-            # Check that all timesteps have precomputed graphs
-            T = len(mock_xarray_dataset.date)
-            assert len(ds._full_graph_cache) == T, (
-                f"Expected {T} precomputed graphs, got {len(ds._full_graph_cache)}"
-            )
-
-            # Verify each graph has valid structure
-            for time_step, graph in ds._full_graph_cache.items():
-                assert graph.edge_index is not None
-                assert graph.edge_weight is not None
-                assert graph.num_nodes > 0
-                assert graph.node_ids is not None
-                # edge_index should be (2, E)
-                assert graph.edge_index.shape[0] == 2
-                # edge_weight should match number of edges
-                assert graph.edge_weight.shape[0] == graph.edge_index.shape[1]
-
-    def test_full_sparse_prune_matches_direct_dense_mask(
-        self, config, mock_xarray_dataset
-    ):
-        """Pruned shared sparse topology should match direct dense masking output."""
-        with patch.object(
-            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
-        ):
-            ds = EpiDataset(
-                config=config,
-                target_nodes=[0],
-                context_nodes=[0, 1, 2],
-            )
-
-            node_mask = ds._get_graph_node_mask()
-            node_ids = torch.where(node_mask)[0]
-
-            for time_step, graph in ds._full_graph_cache.items():
-                dense = ds.preloaded_mobility[time_step].clone()
-                dense[~node_mask] = 0
-                dense[:, ~node_mask] = 0
-
-                # Topology now injects missing self-loops with unit weight once at init.
-                local_n = node_ids.numel()
-                expected_dense = dense[node_ids][:, node_ids]
-                expected_dense = torch.where(
-                    expected_dense > 0,
-                    expected_dense,
-                    torch.zeros_like(expected_dense),
-                )
-                diag_idx = torch.arange(local_n)
-                expected_dense[diag_idx, diag_idx] = torch.where(
-                    expected_dense[diag_idx, diag_idx] > 0,
-                    expected_dense[diag_idx, diag_idx],
-                    torch.ones_like(expected_dense[diag_idx, diag_idx]),
-                )
-
-                actual_dense = torch.zeros_like(expected_dense)
-                actual_dense.index_put_(
-                    (graph.edge_index[0], graph.edge_index[1]),
-                    graph.edge_weight,
-                    accumulate=True,
-                )
-
-                assert torch.equal(graph.node_ids, node_ids)
-                assert torch.allclose(actual_dense, expected_dense)
-
-    def test_shared_sparse_topology_built_once_when_reused(
-        self, config, mock_xarray_dataset
-    ):
-        """Dense->sparse full topology conversion should happen once with reuse."""
-
-        def _dataset_factory(*_args, **_kwargs):
-            return mock_xarray_dataset.copy(deep=True)
-
-        builder = EpiDataset._build_full_sparse_topology
-        with patch.object(EpiDataset, "load_canonical_dataset", side_effect=_dataset_factory):
-            with patch.object(
-                EpiDataset,
-                "_build_full_sparse_topology",
-                autospec=True,
-                side_effect=builder,
-            ) as build_spy:
-                train_ds = EpiDataset(
-                    config=config,
-                    target_nodes=[0, 1],
-                    context_nodes=[0, 1],
-                )
-                val_ds = EpiDataset(
-                    config=config,
-                    target_nodes=[2],
-                    context_nodes=[0, 1, 2],
-                    biomarker_preprocessor=train_ds.biomarker_preprocessor,
-                    mobility_preprocessor=train_ds.mobility_preprocessor,
-                    preloaded_mobility=train_ds.preloaded_mobility,
-                    mobility_mask=train_ds.mobility_mask,
-                    shared_sparse_topology=train_ds.shared_sparse_topology,
-                )
-                _ = EpiDataset(
-                    config=config,
-                    target_nodes=[3],
-                    context_nodes=[0, 1, 2, 3],
-                    biomarker_preprocessor=train_ds.biomarker_preprocessor,
-                    mobility_preprocessor=train_ds.mobility_preprocessor,
-                    preloaded_mobility=train_ds.preloaded_mobility,
-                    mobility_mask=train_ds.mobility_mask,
-                    shared_sparse_topology=train_ds.shared_sparse_topology,
-                )
-
-                # Full dense->sparse build happens once on the train dataset only.
-                assert build_spy.call_count == 1
-                assert train_ds.shared_sparse_topology is not None
-                assert val_ds.shared_sparse_topology is train_ds.shared_sparse_topology
-
-    def test_create_temporal_splits_reuses_full_sparse_topology(
-        self, config, mock_xarray_dataset
-    ):
-        """Temporal split creation should build full sparse once and prune per split."""
-
-        def _dataset_factory(*_args, **_kwargs):
-            return mock_xarray_dataset.copy(deep=True)
-
-        builder = EpiDataset._build_full_sparse_topology
-        with patch.object(EpiDataset, "load_canonical_dataset", side_effect=_dataset_factory):
-            with patch("utils.temporal.get_temporal_boundaries", return_value=(0, 20, 25, 30)):
-                with patch("utils.temporal.validate_temporal_range", return_value=None):
-                    with patch(
-                        "utils.temporal.format_date_range",
-                        return_value="dummy-range",
-                    ):
-                        with patch.object(
-                            EpiDataset,
-                            "_build_full_sparse_topology",
-                            autospec=True,
-                            side_effect=builder,
-                        ) as build_spy:
-                            train_ds, val_ds, test_ds = EpiDataset.create_temporal_splits(
-                                config=config,
-                                train_end_date="2020-01-15",
-                                val_end_date="2020-01-25",
-                                test_end_date="2020-01-30",
-                            )
-
-        assert build_spy.call_count == 1
-        assert train_ds.shared_sparse_topology is None
-        assert val_ds.shared_sparse_topology is None
-        assert test_ds.shared_sparse_topology is None
-        assert len(train_ds._full_graph_cache) > 0
-        assert len(val_ds._full_graph_cache) > 0
-        assert len(test_ds._full_graph_cache) > 0
