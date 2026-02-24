@@ -36,6 +36,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -259,12 +260,53 @@ def suggest_epiforecaster_params(
         _categorical_choices((0.0, 1.0, 5.0, 10.0, 20.0, 50.0)),
     )
 
-    # Missingness filters dataset windows; can help robustness.
-    missing_permit_val = trial.suggest_int("data.missing_permit", 0, 3)
-    overrides["data.missing_permit.cases"] = missing_permit_val
-    overrides["data.missing_permit.hospitalizations"] = missing_permit_val
-    overrides["data.missing_permit.deaths"] = missing_permit_val
-    overrides["data.missing_permit.biomarkers_joint"] = missing_permit_val
+    # Missingness filters dataset windows; computed from window sizes.
+    # Daily series (cases, deaths): allow up to 50% missing days
+    # Weekly series (hospitalizations, biomarkers_joint): range based on expected measurements
+    input_len = base_cfg.model.input_window_length
+    horizon_len = base_cfg.model.forecast_horizon
+
+    # Daily series - input window: 0-50% of input_window_length
+    max_missing_input_daily = int(input_len * 0.5)
+    missing_input_daily = trial.suggest_int(
+        "data.missing_permit_input_daily", 0, max_missing_input_daily
+    )
+    overrides["data.missing_permit.input.cases"] = missing_input_daily
+    overrides["data.missing_permit.input.deaths"] = missing_input_daily
+
+    # Daily series - horizon window: 0-50% of forecast_horizon
+    max_missing_horizon_daily = int(horizon_len * 0.5)
+    missing_horizon_daily = trial.suggest_int(
+        "data.missing_permit_horizon_daily", 0, max_missing_horizon_daily
+    )
+    overrides["data.missing_permit.horizon.cases"] = missing_horizon_daily
+    overrides["data.missing_permit.horizon.deaths"] = missing_horizon_daily
+
+    # Weekly series - input window: range from "all present" to "at least 1 measurement"
+    # min_missing = window_length - ceil(window_length / 7)  (all weekly measurements present)
+    # max_missing = window_length - 1  (only 1 day has data)
+    expected_input_weekly = math.ceil(input_len / 7)
+    min_missing_input_weekly = input_len - expected_input_weekly
+    max_missing_input_weekly = input_len - 1
+    missing_input_weekly = trial.suggest_int(
+        "data.missing_permit_input_weekly",
+        min_missing_input_weekly,
+        max_missing_input_weekly,
+    )
+    overrides["data.missing_permit.input.hospitalizations"] = missing_input_weekly
+    overrides["data.missing_permit.input.biomarkers_joint"] = missing_input_weekly
+
+    # Weekly series - horizon window: same logic
+    expected_horizon_weekly = math.ceil(horizon_len / 7)
+    min_missing_horizon_weekly = horizon_len - expected_horizon_weekly
+    max_missing_horizon_weekly = horizon_len - 1
+    missing_horizon_weekly = trial.suggest_int(
+        "data.missing_permit_horizon_weekly",
+        min_missing_horizon_weekly,
+        max_missing_horizon_weekly,
+    )
+    overrides["data.missing_permit.horizon.hospitalizations"] = missing_horizon_weekly
+    overrides["data.missing_permit.horizon.biomarkers_joint"] = missing_horizon_weekly
 
     # --- model knobs (conditional) ---
     if base_cfg.model.type.mobility:

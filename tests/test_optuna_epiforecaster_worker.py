@@ -40,6 +40,8 @@ def _base_cfg_stub() -> SimpleNamespace:
             temporal_covariates_dim=0,
             include_day_of_week=True,
             include_holidays=True,
+            input_window_length=60,
+            forecast_horizon=28,
         ),
         training=SimpleNamespace(loss=SimpleNamespace(name="mse")),
     )
@@ -50,7 +52,9 @@ def test_batch_grad_combo_json_string_decodes_and_parses() -> None:
 
 
 @pytest.mark.parametrize("combo", [(64, 2), [64, 2]])
-def test_batch_grad_combo_native_sequence_parses(combo: tuple[int, int] | list[int]) -> None:
+def test_batch_grad_combo_native_sequence_parses(
+    combo: tuple[int, int] | list[int],
+) -> None:
     assert _parse_batch_grad_combo(combo) == (64, 2)
 
 
