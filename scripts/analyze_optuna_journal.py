@@ -202,9 +202,10 @@ def analyze_param_importance(summary: StudySummary) -> dict[str, float]:
             # Convert to numeric if possible
             if isinstance(val, (int, float)):
                 values.append(float(val))
-            elif isinstance(val, str):
-                # Use string hash for categorical
-                values.append(hash(val))
+            elif isinstance(val, str | list | tuple):
+                # Use hash for categorical (strings, lists, tuples)
+                hashable = tuple(val) if isinstance(val, list) else val
+                values.append(hash(hashable))
             else:
                 continue
 
@@ -338,17 +339,25 @@ def format_param_distributions(summary: StudySummary) -> dict[str, dict[str, Any
     distributions = {}
 
     for param, values in sorted(param_values.items()):
+        first_val = values[0]
+        is_categorical = isinstance(first_val, str | list | tuple)
         dist: dict[str, Any] = {
             "param": param,
-            "type": "categorical" if isinstance(values[0], str) else "numeric",
+            "type": "categorical" if is_categorical else "numeric",
         }
 
-        # Count categorical values
-        if isinstance(values[0], str):
-            counts = Counter(values)
+        # Count categorical values (strings, lists, tuples)
+        if is_categorical:
+            # Convert lists to tuples for hashing, then to string for display
+            hashable_values = [tuple(v) if isinstance(v, list) else v for v in values]
+            counts = Counter(hashable_values)
             total = len(values)
             dist["values"] = [
-                {"value": val, "count": count, "percentage": 100 * count / total}
+                {
+                    "value": list(val) if isinstance(val, tuple) else val,
+                    "count": count,
+                    "percentage": 100 * count / total,
+                }
                 for val, count in sorted(
                     counts.items(), key=lambda x: x[1], reverse=True
                 )
@@ -413,7 +422,12 @@ def format_recommendations(summary: StudySummary) -> list[dict[str, Any]]:
 
     # Separate numeric and categorical
     for param, values in sorted(param_values.items()):
-        if isinstance(values[0], (int, float)) and not isinstance(values[0], bool):
+        first_val = values[0]
+        is_numeric = isinstance(first_val, (int, float)) and not isinstance(
+            first_val, bool
+        )
+
+        if is_numeric:
             vals = [float(v) for v in values]
             p10, p90 = np.percentile(vals, [10, 90])
 
@@ -431,9 +445,10 @@ def format_recommendations(summary: StudySummary) -> list[dict[str, Any]]:
 
             recommendations.append(rec)
 
-        # For categorical, check if any values are unused
-        elif isinstance(values[0], str):
-            counts = Counter(values)
+        # For categorical (strings, lists, tuples), check if any values are unused
+        else:
+            hashable_values = [tuple(v) if isinstance(v, list) else v for v in values]
+            counts = Counter(hashable_values)
             total = len(values)
             unused = [k for k, v in counts.items() if v / total < 0.05]
 
@@ -445,7 +460,9 @@ def format_recommendations(summary: StudySummary) -> list[dict[str, Any]]:
 
             if unused:
                 rec["suggestion"] = "remove_unused"
-                rec["unused_values"] = unused
+                rec["unused_values"] = [
+                    list(u) if isinstance(u, tuple) else u for u in unused
+                ]
 
             recommendations.append(rec)
 
