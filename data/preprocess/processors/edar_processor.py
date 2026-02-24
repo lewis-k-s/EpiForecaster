@@ -10,7 +10,6 @@ creates temporal tensors for downstream aggregation to target regions.
 import numpy as np
 import pandas as pd
 import xarray as xr
-from scipy.stats import norm
 
 from ..config import REGION_COORD, PreprocessingConfig
 from ..smoothing import TobitKalmanSmoother, fit_kalman_params

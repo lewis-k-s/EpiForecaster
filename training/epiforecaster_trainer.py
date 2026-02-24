@@ -386,7 +386,7 @@ class EpiForecasterTrainer:
             region_embedding_dim=self.config.model.region_embedding_dim,
             mobility_embedding_dim=self.config.model.mobility_embedding_dim,
             gnn_depth=self.config.model.gnn_depth,
-            sequence_length=self.config.model.history_length,
+            sequence_length=self.config.model.input_window_length,
             forecast_horizon=self.config.model.forecast_horizon,
             use_population=self.config.model.use_population,
             population_dim=self.config.model.population_dim,
@@ -1392,7 +1392,7 @@ class EpiForecasterTrainer:
             "use_region_embeddings": self.config.model.type.regions,
             "use_biomarkers": self.config.model.type.biomarkers,
             "use_mobility": self.config.model.type.mobility,
-            "history_length": self.config.model.history_length,
+            "input_window_length": self.config.model.input_window_length,
             "forecast_horizon": self.config.model.forecast_horizon,
             "mobility_embedding_dim": self.config.model.mobility_embedding_dim,
             "region_embedding_dim": self.config.model.region_embedding_dim,
@@ -1468,7 +1468,7 @@ class EpiForecasterTrainer:
                 repeat=self.config.training.profiler.repeat,
             ),
             on_trace_ready=tb_handler,
-            record_shapes=True,
+            record_shapes=False,
             profile_memory=self.config.training.profiler.record_memory,
             with_stack=self.config.training.profiler.with_stack,
         )
@@ -1595,7 +1595,19 @@ class EpiForecasterTrainer:
         for epoch in range(self.current_epoch, epochs_todo):
             self.current_epoch = epoch
 
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+
             _train_loss = self._train_epoch()
+
+            if self.device.type == "cuda" and self.wandb_run is not None:
+                max_mem_mb = torch.cuda.max_memory_allocated(self.device) / (
+                    1024 * 1024
+                )
+                wandb.log(
+                    {"epoch/max_gpu_memory_mb": max_mem_mb}, step=self.global_step
+                )
+
             if self.nan_loss_triggered:
                 self._status("Stopping training due to persistent non-finite loss.")
                 break
@@ -1834,12 +1846,13 @@ class EpiForecasterTrainer:
                     dtype=self.precision_policy.autocast_dtype,
                     enabled=self.precision_policy.autocast_enabled,
                 ):
-                    model_outputs, targets_dict = self.model.forward_batch(
-                        batch_data=batch_data,
-                        region_embeddings=self.region_embeddings,
-                    )
+                    with torch.profiler.record_function("forward"):
+                        model_outputs, targets_dict = self.model.forward_batch(
+                            batch_data=batch_data,
+                            region_embeddings=self.region_embeddings,
+                        )
 
-                    loss = self.criterion(model_outputs, targets_dict, batch_data)
+                        loss = self.criterion(model_outputs, targets_dict, batch_data)
 
                 # Guard against non-finite losses to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -1874,7 +1887,8 @@ class EpiForecasterTrainer:
                 # Scale loss for gradient accumulation
                 scaled_loss = loss / accum_steps
 
-                scaled_loss.backward()
+                with torch.profiler.record_function("backward"):
+                    scaled_loss.backward()
 
                 # Only step optimizer every N batches (gradient accumulation)
                 should_step = (batch_idx + 1) % accum_steps == 0
@@ -1928,7 +1942,8 @@ class EpiForecasterTrainer:
                         self.global_step += 1
                         continue
                     last_gradnorm = grad_norm  # Update for progress logging
-                    self.optimizer.step()
+                    with torch.profiler.record_function("optimizer_step"):
+                        self.optimizer.step()
 
                     # LR warmup restore: after curriculum transition, gradually
                     # restore learning rate over 100 steps
@@ -2320,12 +2335,39 @@ class EpiForecasterTrainer:
                 "loss_sir_weighted"
             ]
 
-        # Add per-horizon metrics
-        for idx, (mae_h, rmse_h) in enumerate(
-            zip(metrics["mae_per_h"], metrics["rmse_per_h"], strict=False)
-        ):
-            log_data[f"mae_{prefix.lower()}_h{idx + 1}"] = mae_h
-            log_data[f"rmse_{prefix.lower()}_h{idx + 1}"] = rmse_h
+        # Add per-horizon metrics (batched by week or individual)
+        aggregation = getattr(
+            self.config.training, "horizon_metric_aggregation", "weekly"
+        )
+        mae_per_h = metrics.get("mae_per_h", [])
+        rmse_per_h = metrics.get("rmse_per_h", [])
+
+        if aggregation == "weekly" and len(mae_per_h) > 0:
+            # Aggregate into weekly buckets (7 days per week)
+            # Report median of each week to reduce dashboard clutter
+            import statistics
+
+            week_num = 1
+            for start_idx in range(0, len(mae_per_h), 7):
+                end_idx = min(start_idx + 7, len(mae_per_h))
+                week_mae_values = mae_per_h[start_idx:end_idx]
+                week_rmse_values = rmse_per_h[start_idx:end_idx]
+
+                # Use median for robust aggregation
+                log_data[f"mae_{prefix.lower()}_w{week_num}"] = statistics.median(
+                    week_mae_values
+                )
+                log_data[f"rmse_{prefix.lower()}_w{week_num}"] = statistics.median(
+                    week_rmse_values
+                )
+                week_num += 1
+        else:
+            # Individual per-timestep metrics (legacy behavior)
+            for idx, (mae_h, rmse_h) in enumerate(
+                zip(mae_per_h, rmse_per_h, strict=False)
+            ):
+                log_data[f"mae_{prefix.lower()}_h{idx + 1}"] = mae_h
+                log_data[f"rmse_{prefix.lower()}_h{idx + 1}"] = rmse_h
 
         # Log to WandB
         if self.wandb_run is not None:
@@ -2366,12 +2408,34 @@ class EpiForecasterTrainer:
             if "loss_deaths" in metrics:
                 components_str += f" | Deaths={metrics['loss_deaths']:.4g} (w={metrics.get('loss_deaths_weighted', 0):.4g})"
             self._status(f"{prefix} loss components: {components_str}")
-        for idx, (mae_h, rmse_h) in enumerate(
-            zip(metrics["mae_per_h"], metrics["rmse_per_h"], strict=False)
-        ):
-            self._status(
-                f"{prefix} MAE_h{idx + 1}: {mae_h:.6f} | RMSE_h{idx + 1}: {rmse_h:.6f}"
-            )
+        # Log per-horizon metrics to console (respecting aggregation setting)
+        aggregation = getattr(
+            self.config.training, "horizon_metric_aggregation", "weekly"
+        )
+        mae_per_h = metrics.get("mae_per_h", [])
+        rmse_per_h = metrics.get("rmse_per_h", [])
+
+        if aggregation == "weekly" and len(mae_per_h) > 0:
+            import statistics
+
+            week_num = 1
+            for start_idx in range(0, len(mae_per_h), 7):
+                end_idx = min(start_idx + 7, len(mae_per_h))
+                week_mae_values = mae_per_h[start_idx:end_idx]
+                week_rmse_values = rmse_per_h[start_idx:end_idx]
+                mae_median = statistics.median(week_mae_values)
+                rmse_median = statistics.median(week_rmse_values)
+                self._status(
+                    f"{prefix} MAE_w{week_num}: {mae_median:.6f} | RMSE_w{week_num}: {rmse_median:.6f}"
+                )
+                week_num += 1
+        else:
+            for idx, (mae_h, rmse_h) in enumerate(
+                zip(mae_per_h, rmse_per_h, strict=False)
+            ):
+                self._status(
+                    f"{prefix} MAE_h{idx + 1}: {mae_h:.6f} | RMSE_h{idx + 1}: {rmse_h:.6f}"
+                )
 
     def _save_checkpoint(
         self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False

@@ -11,7 +11,7 @@ from utils import dtypes as dtype_utils
 
 @dataclass
 class CasesPreprocessorConfig:
-    history_length: int
+    input_window_length: int
     log_scale: bool = False
     scale_epsilon: float = 1e-6
     per_100k: bool = True
@@ -65,7 +65,7 @@ class CasesPreprocessor:
         if self.config.log_scale:
             values = np.log1p(values)
 
-        window = int(self.config.history_length)
+        window = int(self.config.input_window_length)
         rolling_mean = bn.move_mean(values, window=window, min_count=1, axis=0)
         rolling_std = bn.move_std(values, window=window, min_count=1, axis=0)
 
@@ -148,7 +148,7 @@ class CasesPreprocessor:
         return torch.cat([norm_value, mask_channel, age_channel], dim=-1)
 
     def make_normalized_window(
-        self, *, range_start: int, history_length: int, forecast_horizon: int
+        self, *, range_start: int, input_window_length: int, forecast_horizon: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return normalized (L+H) window and anchor mean/std.
 
@@ -163,7 +163,7 @@ class CasesPreprocessor:
         """
         processed_cases, rolling_mean, rolling_std = self._require_fitted()
 
-        L = int(history_length)
+        L = int(input_window_length)
         H = int(forecast_horizon)
         range_end = int(range_start) + L
         forecast_end = range_end + H

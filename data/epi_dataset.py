@@ -425,7 +425,9 @@ class EpiDataset(Dataset):
         self._target_khop_mask: torch.Tensor | None = None
 
         # Set dimensions
-        self.time_dim_size = config.model.history_length + config.model.forecast_horizon
+        self.time_dim_size = (
+            config.model.input_window_length + config.model.forecast_horizon
+        )
         self.window_stride = int(config.data.window_stride)
         self.missing_permit_map = config.data.resolve_missing_permit_map()
         self.window_starts = self._compute_window_starts()
@@ -651,7 +653,7 @@ class EpiDataset(Dataset):
         and its incoming neighbors.
         """
 
-        L = self.config.model.history_length
+        L = self.config.model.input_window_length
         H = self.config.model.forecast_horizon
 
         try:
@@ -1046,7 +1048,7 @@ class EpiDataset(Dataset):
         For multi-run datasets, also filters out windows that cross run boundaries
         to prevent context leakage between simulation runs.
         """
-        L = self.config.model.history_length
+        L = self.config.model.input_window_length
         H = self.config.model.forecast_horizon
         T = len(self.dataset[TEMPORAL_COORD].values)
         seg = L + H
@@ -1080,7 +1082,7 @@ class EpiDataset(Dataset):
         if not self.window_starts:
             return {target_idx: [] for target_idx in self.target_nodes}
 
-        L = self.config.model.history_length
+        L = self.config.model.input_window_length
         H = self.config.model.forecast_horizon
         starts = np.asarray(self.window_starts, dtype=np.int64)
 
@@ -1113,9 +1115,10 @@ class EpiDataset(Dataset):
             history_counts = history_counts[starts]
             target_counts = target_counts[starts]
 
-            permit = int(self.missing_permit_map.get(target_name, 0))
-            history_threshold = max(0, L - permit)
-            target_threshold = max(0, H - permit)
+            input_permit = int(self.missing_permit_map["input"].get(target_name, 0))
+            horizon_permit = int(self.missing_permit_map["horizon"].get(target_name, 0))
+            history_threshold = max(0, L - input_permit)
+            target_threshold = max(0, H - horizon_permit)
             target_valid = (history_counts >= history_threshold) & (
                 target_counts >= target_threshold
             )
@@ -1733,7 +1736,7 @@ class EpiDataset(Dataset):
             test_end_date=test_end_date,
         )
 
-        L = config.model.history_length
+        L = config.model.input_window_length
         H = config.model.forecast_horizon
         total_time_steps = len(aligned_dataset[TEMPORAL_COORD])
 
@@ -1836,8 +1839,11 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     # 1) Dense node features [B*T, N, F]
     x_dense = torch.cat([item["mob_x"] for item in batch], dim=0)
 
-    # 2) Dense adjacency [B*T, N, N]
-    adj_dense = x_dense.new_zeros((num_graphs, num_nodes, num_nodes))
+    # 2) Dense adjacency [B*T, N, N] - use float16 for memory efficiency
+    # Edge weights are stored as float16, so adjacency should match
+    adj_dense = x_dense.new_zeros(
+        (num_graphs, num_nodes, num_nodes), dtype=torch.float16
+    )
 
     # 3) Target node index per graph [B*T]
     target_nodes_stacked = torch.stack(
