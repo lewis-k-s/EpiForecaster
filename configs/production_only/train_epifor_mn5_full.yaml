@@ -6,10 +6,16 @@ data:
   use_valid_targets: true
   mobility_threshold: 10
   missing_permit:
-    biomarkers_joint: 53
-    cases: 20
-    hospitalizations: 53
-    deaths: 20
+    input:
+      biomarkers_joint: 53
+      cases: 20
+      hospitalizations: 53
+      deaths: 20
+    horizon:
+      biomarkers_joint: 26
+      cases: 10
+      hospitalizations: 26
+      deaths: 10
   window_stride: 7
   sample_ordering: "time"
   log_scale: true
@@ -24,8 +30,8 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    history_length: 60
-    forecast_horizon: 60
+    input_window_length: 60
+    forecast_horizon: 28
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
@@ -49,20 +55,20 @@ output:
 training:
   seed: 42
   device: "cuda"
-  batch_size: 16
+  batch_size: 32
   shuffle_train_batches: true
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   gradient_clip_value: 5.0
   early_stopping_patience: 5
   nan_loss_patience: 5
   epochs: 10
   learning_rate: 0.001
   weight_decay: 1.0e-05
-  warmup_steps: 3000
+  warmup_steps: 100
   # Worker config for 1 GPU + 20 CPUs
-  num_workers: 14
-  val_workers: 4
-  prefetch_factor: 1
+  num_workers: 8
+  val_workers: 2
+  prefetch_factor: 2
   pin_memory: true
 
   # Temporal split configuration
@@ -77,7 +83,7 @@ training:
 
   profiler:
     enabled: true
-    profile_batches: 20
+    profile_batches: 3
     log_dir: auto
     profile_epochs: [1, 2]
   plot_forecasts: true

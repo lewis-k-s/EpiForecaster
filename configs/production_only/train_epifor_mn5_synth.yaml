@@ -22,10 +22,16 @@ data:
   use_valid_targets: true
   mobility_threshold: 10
   missing_permit:
-    biomarkers_joint: 26
-    cases: 10
-    hospitalizations: 26
-    deaths: 10
+    input:
+      biomarkers_joint: 26
+      cases: 10
+      hospitalizations: 26
+      deaths: 10
+    horizon:
+      biomarkers_joint: 26
+      cases: 10
+      hospitalizations: 26
+      deaths: 10
   window_stride: 1
   sample_ordering: "time"
   log_scale: true
@@ -43,7 +49,7 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    history_length: 30
+    input_window_length: 30
     forecast_horizon: 30
     #-- graph params --#
     max_neighbors: 20

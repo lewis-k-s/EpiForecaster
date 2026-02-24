@@ -6,7 +6,7 @@ model:
     mobility: true
   mobility_embedding_dim: 32
   region_embedding_dim: 64
-  history_length: 14
+  input_window_length: 14
   forecast_horizon: 14
   max_neighbors: 30
   gnn_module: "gcn"
@@ -23,10 +23,16 @@ data:
   region2vec_path: "checkpoints/region_embedding/region_embeddings.pt"
   window_stride: 1
   missing_permit:
-    biomarkers_joint: 4
-    cases: 4
-    hospitalizations: 4
-    deaths: 4
+    input:
+      biomarkers_joint: 4
+      cases: 4
+      hospitalizations: 4
+      deaths: 4
+    horizon:
+      biomarkers_joint: 4
+      cases: 4
+      hospitalizations: 4
+      deaths: 4
   log_scale: true
   run_id: "real" # Default/Real run ID
 

@@ -7,10 +7,16 @@ data:
   use_valid_targets: true
   mobility_threshold: 10
   missing_permit:
-    biomarkers_joint: 24
-    cases: 24
-    hospitalizations: 24
-    deaths: 24
+    input:
+      biomarkers_joint: 53
+      cases: 20
+      hospitalizations: 53
+      deaths: 20
+    horizon:
+      biomarkers_joint: 26
+      cases: 10
+      hospitalizations: 26
+      deaths: 10
   window_stride: 1
   sample_ordering: "time"
   log_scale: true
@@ -27,7 +33,7 @@ model:
     include_day_of_week: true
     include_holidays: true
     gnn_module: "gcn"
-    history_length: 28
+    input_window_length: 60
     forecast_horizon: 28
     max_neighbors: 20
     gnn_depth: 2
@@ -51,14 +57,13 @@ output:
 training:
   seed: 42
   device: "cpu"
-  batch_size: 16
-  gradient_accumulation_steps: 2
+  batch_size: 8
+  gradient_accumulation_steps: 1
   gradient_clip_value: 5.0
   warmup_steps: 50
   early_stopping_patience: 3
   nan_loss_patience: 3
   epochs: 1
-  max_batches: 10
   learning_rate: 0.0001
   weight_decay: 1.0e-05
   num_workers: 0

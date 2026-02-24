@@ -28,7 +28,7 @@ class ProfilerConfig:
     # Where to write profiler traces. Use "auto" to place traces inside the
     # experiment log directory so they appear alongside other artifacts.
     log_dir: str = "auto"
-    record_memory: bool = True
+    record_memory: bool = False
     with_stack: bool = False
 
 
@@ -303,6 +303,38 @@ class ObservationHeadConfig:
 
 
 @dataclass
+class MissingPermitConfig:
+    """Missing value permit configuration for input and horizon windows."""
+
+    # Maximum allowed missing values in input window (by target)
+    # Each value must be in [0, input_window_length)
+    input: dict[str, int] = field(default_factory=dict)
+    # Maximum allowed missing values in forecast horizon (by target)
+    # Each value must be in [0, forecast_horizon)
+    horizon: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        valid_targets = {
+            "biomarkers_joint",
+            "cases",
+            "hospitalizations",
+            "deaths",
+        }
+
+        for window_type, permits in [("input", self.input), ("horizon", self.horizon)]:
+            for name, permit in permits.items():
+                if name not in valid_targets:
+                    raise ValueError(
+                        f"missing_permit.{window_type} has unsupported key '{name}'. "
+                        f"Expected one of: {sorted(valid_targets)}"
+                    )
+                if int(permit) < 0:
+                    raise ValueError(
+                        f"missing_permit.{window_type}['{name}'] must be non-negative"
+                    )
+
+
+@dataclass
 class DataConfig:
     """Dataset configuration loaded from ``data`` YAML block."""
 
@@ -318,15 +350,20 @@ class DataConfig:
     use_valid_targets: bool = False
     # Sliding window stride for training samples
     window_stride: int = 1
-    # Maximum allowed missing values by target for both history and horizon windows.
-    # Preferred schema:
+    # Maximum allowed missing values by target for input and horizon windows.
+    # Schema:
     #   missing_permit:
-    #     biomarkers_joint: 24
-    #     cases: 24
-    #     hospitalizations: 24
-    #     deaths: 24
-    #
-    missing_permit: dict[str, int] = field(default_factory=dict)
+    #     input:
+    #       biomarkers_joint: 53
+    #       cases: 20
+    #       hospitalizations: 53
+    #       deaths: 20
+    #     horizon:
+    #       biomarkers_joint: 26
+    #       cases: 10
+    #       hospitalizations: 26
+    #       deaths: 10
+    missing_permit: MissingPermitConfig = field(default_factory=MissingPermitConfig)
     # Dataset sample ordering: "node" (node-major) or "time" (time-major)
     sample_ordering: str = "node"
     # Log transformation for cases (used by legacy CasesPreprocessor only)
@@ -359,20 +396,13 @@ class DataConfig:
                 "Specify at least one lag value (e.g., [1, 7, 14])."
             )
 
-        valid_targets = {
-            "biomarkers_joint",
-            "cases",
-            "hospitalizations",
-            "deaths",
-        }
-        for name, permit in self.missing_permit.items():
-            if name not in valid_targets:
-                raise ValueError(
-                    f"missing_permit has unsupported key '{name}'. "
-                    f"Expected one of: {sorted(valid_targets)}"
-                )
-            if int(permit) < 0:
-                raise ValueError(f"missing_permit['{name}'] must be non-negative")
+        # Convert dict to MissingPermitConfig if needed
+        if isinstance(self.missing_permit, dict):
+            input_permits = self.missing_permit.get("input", {})
+            horizon_permits = self.missing_permit.get("horizon", {})
+            self.missing_permit = MissingPermitConfig(
+                input=input_permits, horizon=horizon_permits
+            )
 
         if len(self.mobility_clip_range) != 2:
             raise ValueError("mobility_clip_range must be a tuple of (min, max)")
@@ -397,20 +427,34 @@ class DataConfig:
                 "This is required for valid_targets filtering with multi-run datasets."
             )
 
-    def resolve_missing_permit_map(self) -> dict[str, int]:
-        """Resolve per-target missing permits used for window inclusion and loss gating.
+    def resolve_missing_permit_map(self) -> dict[str, dict[str, int]]:
+        """Resolve per-target missing permits for input and horizon windows.
 
-        Returns keys in dataset/loss naming:
+        Returns dict with 'input' and 'horizon' keys, each mapping to:
         - cases
         - hospitalizations
         - deaths
         - wastewater
         """
         return {
-            "cases": int(self.missing_permit.get("cases", 0)),
-            "hospitalizations": int(self.missing_permit.get("hospitalizations", 0)),
-            "deaths": int(self.missing_permit.get("deaths", 0)),
-            "wastewater": int(self.missing_permit.get("biomarkers_joint", 0)),
+            "input": {
+                "cases": int(self.missing_permit.input.get("cases", 0)),
+                "hospitalizations": int(
+                    self.missing_permit.input.get("hospitalizations", 0)
+                ),
+                "deaths": int(self.missing_permit.input.get("deaths", 0)),
+                "wastewater": int(self.missing_permit.input.get("biomarkers_joint", 0)),
+            },
+            "horizon": {
+                "cases": int(self.missing_permit.horizon.get("cases", 0)),
+                "hospitalizations": int(
+                    self.missing_permit.horizon.get("hospitalizations", 0)
+                ),
+                "deaths": int(self.missing_permit.horizon.get("deaths", 0)),
+                "wastewater": int(
+                    self.missing_permit.horizon.get("biomarkers_joint", 0)
+                ),
+            },
         }
 
 
@@ -424,7 +468,7 @@ class ModelConfig:
     region_embedding_dim: int
 
     # -- seq sizes --#
-    history_length: int
+    input_window_length: int
     forecast_horizon: int
 
     # -- graph params --#
@@ -577,6 +621,11 @@ class TrainingParams:
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    # Horizon metric aggregation strategy for W&B logging.
+    # - "individual": Log per-timestep metrics (H1, H2, H3, ...)
+    # - "weekly": Aggregate into weekly buckets (week1, week2, week3, ...)
+    #   where each week reports the median of all timesteps in that week.
+    horizon_metric_aggregation: str = "weekly"
     # Precision settings for Tensor Core optimization
     enable_tf32: bool = True
     enable_mixed_precision: bool = True
@@ -730,6 +779,14 @@ class TrainingParams:
         if self.optimizer_eps is not None and self.optimizer_eps <= 0:
             raise ValueError(
                 f"optimizer_eps must be positive, got {self.optimizer_eps}"
+            )
+
+        # Validate horizon metric aggregation strategy
+        valid_aggregation_strategies = {"individual", "weekly"}
+        if self.horizon_metric_aggregation not in valid_aggregation_strategies:
+            raise ValueError(
+                f"Invalid horizon_metric_aggregation: '{self.horizon_metric_aggregation}'. "
+                f"Valid options: {sorted(valid_aggregation_strategies)}"
             )
 
 
