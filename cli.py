@@ -441,20 +441,23 @@ def eval_epiforecaster(
         )
 
         # Step 3: Generate plots (use "last" window by default)
-        plot_result = generate_forecast_plots(
-            model=eval_result["model"],
-            loader=eval_result["loader"],
-            node_groups=node_groups,
-            window="last",
-            output_path=output,
-            log_dir=log_dir,
-        )
+        try:
+            plot_result = generate_forecast_plots(
+                model=eval_result["model"],
+                loader=eval_result["loader"],
+                node_groups=node_groups,
+                window="last",
+                output_path=output,
+                log_dir=log_dir,
+            )
 
-        # Step 4: Show results
-        total_nodes = len(plot_result["selected_nodes"])
-        click.echo(f"Selected {total_nodes} nodes from quartiles:")
-        for group_name, nodes in plot_result["node_groups"].items():
-            click.echo(f"  {group_name}: {len(nodes)} nodes")
+            # Step 4: Show results
+            total_nodes = len(plot_result["selected_nodes"])
+            click.echo(f"Selected {total_nodes} nodes from quartiles:")
+            for group_name, nodes in plot_result["node_groups"].items():
+                click.echo(f"  {group_name}: {len(nodes)} nodes")
+        except Exception as e:
+            click.echo(f"Warning: Plotting failed: {e}")
 
         # Show eval metrics
         loss = eval_result["eval_loss"]

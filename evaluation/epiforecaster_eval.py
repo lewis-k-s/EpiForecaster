@@ -655,7 +655,11 @@ def load_model_from_checkpoint(
         observation_heads=config.model.observation_heads,
         temporal_covariates_dim=config.model.temporal_covariates_dim,
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Strip _orig_mod. prefix from compiled model checkpoints
+    state_dict = checkpoint["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.to(resolve_device(device))
     return model, config, checkpoint
 
