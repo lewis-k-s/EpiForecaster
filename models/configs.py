@@ -511,6 +511,10 @@ class ModelConfig:
     gnn_module: str = ""
     forecaster_head: str = "transformer"
 
+    # Enable strict mode for tensor shape and value validation
+    # If False, bypasses data-dependent control flow (torch.any, etc) for Dynamo compilation
+    strict: bool = True
+
     # -- forecaster head params --#
     head_d_model: int = 128
     head_n_heads: int = 4
@@ -577,8 +581,7 @@ class TrainingParams:
     learning_rate: float = 1.0e-3
     optimizer: str = "adamw"
     weight_decay: float = 1.0e-5
-    model_id: str = ""
-    resume: bool = False
+    resume_checkpoint_path: str | None = None
     scheduler_type: str = "cosine"
     warmup_steps: int = 0
     gradient_clip_value: float = 5.0
@@ -637,13 +640,18 @@ class TrainingParams:
     # Gradient debugging (toggleable, disabled by default for zero overhead)
     enable_gradient_debug: bool = False
     gradient_debug_log_dir: str | None = None  # Auto-set if None and enabled
+    # Apply torch.compile to the model for performance
+    compile: bool = False
+    # torch.compile mode. "reduce-overhead" can improve GPU utilization by reducing
+    # kernel launch overhead when shapes are stable.
+    compile_mode: str = "default"
+    # Whether to require single-graph capture. Keep false unless model is known to
+    # be graph-break free.
+    compile_fullgraph: bool = False
+    # Static-shape preference for compile. None defers to PyTorch default.
+    compile_dynamic: bool | None = None
 
     def __post_init__(self) -> None:
-        if self.resume and not self.model_id:
-            raise ValueError(
-                "model_id must be provided when resume is True. If you are not resuming, leave model_id empty."
-            )
-
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
@@ -740,6 +748,18 @@ class TrainingParams:
                 f"Valid options: {sorted(valid_optimizers)}"
             )
         self.optimizer = optimizer_name
+
+        valid_compile_modes = {
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }
+        if self.compile_mode not in valid_compile_modes:
+            raise ValueError(
+                f"Invalid compile_mode: {self.compile_mode}. "
+                f"Valid options: {sorted(valid_compile_modes)}"
+            )
 
         # Validate curriculum configuration
         if self.curriculum.enabled:

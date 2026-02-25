@@ -266,11 +266,13 @@ class SheddingConvolution(nn.Module):
         sensitivity_scale: float = 1.0,
         learnable_kernel: bool = True,
         learnable_scale: bool = True,
+        strict: bool = True,
     ):
         super().__init__()
         self.kernel_length = kernel_length
         self.learnable_kernel = learnable_kernel
         self.learnable_scale = learnable_scale
+        self.strict = strict
 
         # Initialize shedding kernel with biologically-informed profile
         kernel_weights = self._init_shedding_kernel(kernel_length)
@@ -353,17 +355,21 @@ class SheddingConvolution(nn.Module):
         """
         batch_size, time_steps = I_trajectory.shape
 
-        if population.shape == (batch_size,):
-            population = population.unsqueeze(1).expand(-1, time_steps)
-        elif population.shape != (batch_size, time_steps):
-            raise ValueError(
-                "population must be [batch_size, time_steps] or [batch_size]"
-            )
+        if self.strict:
+            if population.shape == (batch_size,):
+                population = population.unsqueeze(1).expand(-1, time_steps)
+            elif population.shape != (batch_size, time_steps):
+                raise ValueError(
+                    "population must be [batch_size, time_steps] or [batch_size]"
+                )
 
-        if not torch.all(torch.isfinite(population)):
-            raise ValueError("population must be finite and positive")
-        if torch.any(population <= 0):
-            raise ValueError("population must be positive")
+            if not torch.all(torch.isfinite(population)):
+                raise ValueError("population must be finite and positive")
+            if torch.any(population <= 0):
+                raise ValueError("population must be positive")
+        else:
+            if population.shape == (batch_size,):
+                population = population.unsqueeze(1).expand(-1, time_steps)
 
         with _autocast_disabled_for(I_trajectory):
             if self.learnable_kernel:
@@ -526,10 +532,13 @@ class ClinicalObservationHead(nn.Module):
         Formula:
             pred = log1p(I_delayed × 100,000 × scale) + alpha × residual(obs_context)
         """
+        out_dtype = I_trajectory.dtype
         with _autocast_disabled_for(I_trajectory):
-            delayed_infections = self.delay_kernel(I_trajectory.float())
+            delayed_infections = self.delay_kernel(I_trajectory.to(torch.float32))
             per_100k = delayed_infections * 100_000.0
-            scale = self.get_scale().float()
+            scale = self.get_scale()
+            if scale.dtype != per_100k.dtype:
+                scale = scale.to(per_100k.dtype)
             scaled = per_100k * scale
             scaled = torch.nan_to_num(
                 scaled,
@@ -546,16 +555,20 @@ class ClinicalObservationHead(nn.Module):
             and self.residual_proj is not None
         ):
             residual = self.residual_proj(obs_context).squeeze(-1)
+            if residual.dtype != pred_log.dtype:
+                residual = residual.to(pred_log.dtype)
             alpha = self.get_alpha()
             if alpha is not None:
-                pred_log = pred_log + alpha.float() * residual.float()
+                if alpha.dtype != pred_log.dtype:
+                    alpha = alpha.to(pred_log.dtype)
+                pred_log = pred_log + alpha * residual
 
-        return pred_log.to(I_trajectory.dtype)
+        return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
-            return _safe_exp_from_log(self.scale).to(self.scale.dtype)
+            return _safe_exp_from_log(self.scale)
         return self.scale.clamp_min(_KERNEL_EPS)
 
     def get_alpha(self) -> torch.Tensor | None:
@@ -606,6 +619,7 @@ class WastewaterObservationHead(nn.Module):
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
+        strict: bool = True,
     ):
         super().__init__()
 
@@ -614,6 +628,7 @@ class WastewaterObservationHead(nn.Module):
             sensitivity_scale=1.0,  # Fixed, we'll handle scaling separately
             learnable_kernel=learnable_kernel,
             learnable_scale=False,  # We handle scale separately
+            strict=strict,
         )
 
         # Learnable scale for per-100k conversion (constrained positive)
@@ -663,11 +678,14 @@ class WastewaterObservationHead(nn.Module):
             viral_load = conv(I, shedding_kernel) / population
             pred = log1p(viral_load × 100,000 × scale) + alpha × residual(obs_context)
         """
-        viral_load = self.shedding_conv(I_trajectory, population)
+        out_dtype = I_trajectory.dtype
+        viral_load = self.shedding_conv(I_trajectory.to(torch.float32), population)
 
         with _autocast_disabled_for(I_trajectory):
-            per_100k = viral_load.float() * 100_000.0
-            scale = self.get_scale().float()
+            per_100k = viral_load * 100_000.0
+            scale = self.get_scale()
+            if scale.dtype != per_100k.dtype:
+                scale = scale.to(per_100k.dtype)
             scaled = per_100k * scale
             scaled = torch.nan_to_num(
                 scaled,
@@ -684,16 +702,20 @@ class WastewaterObservationHead(nn.Module):
             and self.residual_proj is not None
         ):
             residual = self.residual_proj(obs_context).squeeze(-1)
+            if residual.dtype != pred_log.dtype:
+                residual = residual.to(pred_log.dtype)
             alpha = self.get_alpha()
             if alpha is not None:
-                pred_log = pred_log + alpha.float() * residual.float()
+                if alpha.dtype != pred_log.dtype:
+                    alpha = alpha.to(pred_log.dtype)
+                pred_log = pred_log + alpha * residual
 
-        return pred_log.to(I_trajectory.dtype)
+        return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
-            return _safe_exp_from_log(self.scale).to(self.scale.dtype)
+            return _safe_exp_from_log(self.scale)
         return self.scale.clamp_min(_KERNEL_EPS)
 
     def get_alpha(self) -> torch.Tensor | None:

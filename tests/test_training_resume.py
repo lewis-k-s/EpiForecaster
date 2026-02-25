@@ -16,20 +16,9 @@ def _make_trainer_stub(config) -> EpiForecasterTrainer:
 
 
 @pytest.mark.epiforecaster
-def test_resolve_model_id_prefers_config(monkeypatch) -> None:
-    config = SimpleNamespace(
-        training=SimpleNamespace(model_id="explicit"),
-        output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
-    )
-    trainer = _make_trainer_stub(config)
-    monkeypatch.setenv("SLURM_JOB_ID", "123")
-    assert trainer._resolve_model_id() == "explicit"
-
-
-@pytest.mark.epiforecaster
 def test_resolve_model_id_falls_back_to_slurm(monkeypatch) -> None:
     config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
+        training=SimpleNamespace(),
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
@@ -41,7 +30,7 @@ def test_resolve_model_id_falls_back_to_slurm(monkeypatch) -> None:
 def test_resolve_model_id_interactive_slurm_uses_datetime(monkeypatch) -> None:
     """Interactive SLURM sessions should use datetime ID, not SLURM_JOB_ID."""
     config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
+        training=SimpleNamespace(),
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
@@ -57,7 +46,7 @@ def test_resolve_model_id_interactive_slurm_uses_datetime(monkeypatch) -> None:
 def test_resolve_model_id_interactive_qos_detection(monkeypatch) -> None:
     """Detect interactive sessions via _interactive in QOS."""
     config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
+        training=SimpleNamespace(),
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
@@ -73,7 +62,7 @@ def test_resolve_model_id_interactive_qos_detection(monkeypatch) -> None:
 def test_resolve_model_id_batch_job_uses_slurm_id(monkeypatch) -> None:
     """Batch jobs should still use SLURM_JOB_ID."""
     config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
+        training=SimpleNamespace(),
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
@@ -85,53 +74,13 @@ def test_resolve_model_id_batch_job_uses_slurm_id(monkeypatch) -> None:
 
 
 @pytest.mark.epiforecaster
-def test_find_checkpoint_for_model_id_prefers_best(tmp_path) -> None:
-    config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
-        output=SimpleNamespace(
-            log_dir=str(tmp_path),
-            experiment_name="exp",
-            save_checkpoints=True,
-        ),
-    )
-    trainer = _make_trainer_stub(config)
-    trainer.model_id = "run_001"
-    checkpoint_dir = tmp_path / "exp" / trainer.model_id / "checkpoints"
-    checkpoint_dir.mkdir(parents=True)
-    best_path = checkpoint_dir / "best_model.pt"
-    best_path.touch()
-    (checkpoint_dir / "final_model.pt").touch()
-    (checkpoint_dir / "checkpoint_epoch_0005.pt").touch()
-    assert trainer._find_checkpoint_for_model_id() == best_path
-
-
-@pytest.mark.epiforecaster
-def test_find_checkpoint_for_model_id_falls_back_to_latest(tmp_path) -> None:
-    config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
-        output=SimpleNamespace(
-            log_dir=str(tmp_path),
-            experiment_name="exp",
-            save_checkpoints=True,
-        ),
-    )
-    trainer = _make_trainer_stub(config)
-    trainer.model_id = "run_002"
-    checkpoint_dir = tmp_path / "exp" / trainer.model_id / "checkpoints"
-    checkpoint_dir.mkdir(parents=True)
-    first = checkpoint_dir / "checkpoint_epoch_0001.pt"
-    last = checkpoint_dir / "checkpoint_epoch_0003.pt"
-    first.touch()
-    last.touch()
-    assert trainer._find_checkpoint_for_model_id() == last
-
-
-@pytest.mark.epiforecaster
 def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     from utils.precision_policy import PrecisionPolicy
 
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
     config = SimpleNamespace(
-        training=SimpleNamespace(model_id=""),
+        training=SimpleNamespace(resume_checkpoint_path=checkpoint_path),
         output=SimpleNamespace(
             log_dir=str(tmp_path),
             experiment_name="exp",
@@ -153,10 +102,6 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
         optimizer_eps=1e-8,
         device_type="cpu",
     )
-
-    checkpoint_dir = tmp_path / "exp" / trainer.model_id / "checkpoints"
-    checkpoint_dir.mkdir(parents=True)
-    checkpoint_path = checkpoint_dir / "best_model.pt"
 
     for param in trainer.model.parameters():
         torch.nn.init.constant_(param, 0.0)

@@ -1,7 +1,6 @@
 import torch
 import pytest
 from torch_geometric.data import Data, Batch
-from torch_geometric.utils import to_dense_adj
 
 from data.epi_dataset import optimized_collate_graphs
 
@@ -93,6 +92,7 @@ def test_manual_batching_equivalence():
             "mob_x": torch.stack(mob_x_list),  # (L, N, F)
             "mob_edge_index": mob_ei_list,
             "mob_edge_weight": mob_ew_list,
+            "mob_t": torch.arange(L),
             "mob_target_node_idx": 0,  # Dummy
         }
         new_batch_input.append(item)
@@ -105,14 +105,9 @@ def test_manual_batching_equivalence():
     old_x_dense = old_result.x.view(B * L, num_nodes, F)
     assert torch.allclose(old_x_dense, new_result.x_dense)
 
-    old_adj_dense = to_dense_adj(
-        old_result.edge_index,
-        old_result.batch,
-        edge_attr=old_result.edge_weight,
-        max_num_nodes=num_nodes,
-    )
-    # Compare with appropriate dtype tolerance - new_result uses float16 for memory efficiency
-    assert torch.allclose(old_adj_dense, new_result.adj_dense.float(), atol=1e-3)
+    # The new result no longer computes adj_dense here, it just passes mob_t
+    assert hasattr(new_result, "global_t")
+    assert new_result.global_t.shape == (B * L,)
 
     # Check target_node reconstruction
     # Old result has target_node from Batch.from_data_list (concatenated list of tensors)

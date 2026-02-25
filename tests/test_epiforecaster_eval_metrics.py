@@ -8,6 +8,7 @@ from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 class _DummyLoader:
     def __init__(self, batches: list[dict]):
         self._batches = batches
+        self.dataset = None
 
     def __iter__(self):
         return iter(self._batches)

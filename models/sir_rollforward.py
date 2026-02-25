@@ -46,12 +46,14 @@ class SIRRollForward(nn.Module):
         enforce_nonnegativity: bool = True,
         enforce_mass_conservation: bool = True,
         residual_clip: float = 1e4,
+        strict: bool = True,
     ):
         super().__init__()
         self.dt = dt
         self.enforce_nonnegativity = enforce_nonnegativity
         self.enforce_mass_conservation = enforce_mass_conservation
         self.residual_clip = residual_clip
+        self.strict = strict
 
         logger.info(
             f"Initialized SIRRollForward: dt={dt}, "
@@ -106,18 +108,22 @@ class SIRRollForward(nn.Module):
 
         batch_size, horizon = beta_t.shape
 
-        # Validate shapes
-        if S0.shape != (batch_size,):
-            raise ValueError(f"S0 shape {S0.shape} != ({batch_size},)")
-        if I0.shape != (batch_size,):
-            raise ValueError(f"I0 shape {I0.shape} != ({batch_size},)")
-        if R0.shape != (batch_size,):
-            raise ValueError(f"R0 shape {R0.shape} != ({batch_size},)")
-        if population.shape != (batch_size,):
-            raise ValueError(f"population shape {population.shape} != ({batch_size},)")
+        # Validate shapes (always safe in Dynamo relative to static shapes if trace permits,
+        # but best to skip if not strict to avoid runtime checks during execute)
+        if self.strict:
+            if S0.shape != (batch_size,):
+                raise ValueError(f"S0 shape {S0.shape} != ({batch_size},)")
+            if I0.shape != (batch_size,):
+                raise ValueError(f"I0 shape {I0.shape} != ({batch_size},)")
+            if R0.shape != (batch_size,):
+                raise ValueError(f"R0 shape {R0.shape} != ({batch_size},)")
+            if population.shape != (batch_size,):
+                raise ValueError(
+                    f"population shape {population.shape} != ({batch_size},)"
+                )
 
-        if torch.any(population <= 0):
-            raise ValueError("Population must be positive for all batch elements")
+            if torch.any(population <= 0):
+                raise ValueError("Population must be positive for all batch elements")
 
         # Validate and normalize initial states
         S0, I0, R0 = self._sanitize_initial_states(S0, I0, R0, population)
@@ -240,22 +246,30 @@ class SIRRollForward(nn.Module):
         # Note: D0 is assumed 0 for the start of the window, so we check S+I+R against N.
         # If we start tracking accumulated D, we'd need D0 input.
 
-        # Check non-negativity
-        if torch.any(S0 < 0) or torch.any(I0 < 0) or torch.any(R0 < 0):
-            raise ValueError("Initial states must be non-negative")
+        if self.strict:
+            # Check non-negativity
+            if torch.any(S0 < 0) or torch.any(I0 < 0) or torch.any(R0 < 0):
+                raise ValueError("Initial states must be non-negative")
 
-        # Check mass conservation (with small tolerance)
-        if not torch.allclose(total, population, rtol=1e-3, atol=1e-3):
-            if not self.enforce_mass_conservation:
-                logger.warning(
-                    "Initial states do not sum to population; proceeding without normalization."
-                )
-                return S0, I0, R0
+            # Check mass conservation (with small tolerance)
+            if not torch.allclose(total, population, rtol=1e-3, atol=1e-3):
+                if not self.enforce_mass_conservation:
+                    logger.warning(
+                        "Initial states do not sum to population; proceeding without normalization."
+                    )
+                    return S0, I0, R0
 
-            scale = population / (total + 1e-8)
-            S0 = S0 * scale
-            I0 = I0 * scale
-            R0 = R0 * scale
+                scale = population / (total + 1e-8)
+                S0 = S0 * scale
+                I0 = I0 * scale
+                R0 = R0 * scale
+        else:
+            if self.enforce_mass_conservation:
+                # Branchless scaling for Dynamo
+                scale = population / (total + 1e-8)
+                S0 = S0 * scale
+                I0 = I0 * scale
+                R0 = R0 * scale
 
         return S0, I0, R0
 

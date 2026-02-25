@@ -165,17 +165,25 @@ def _reconstruct_mob_graph(item, t: int, dataset):
 
     # Get components for time step t
     mob_x_t = item["mob_x"][t]  # (N_ctx, F)
-    edge_index = item["mob_edge_index"][t]  # (2, E)
-    edge_weight = item["mob_edge_weight"][t]  # (E)
 
     # Get node_ids from dataset's global_to_local mapping
-    window_start = item["window_start"]
-    global_t = window_start + t
+    window_start = item.get("window_start", 0)
+    global_t = item["mob_t"][t] if "mob_t" in item else window_start + t
     global_to_local = dataset._get_global_to_local_at_time(global_t)
 
     # Get all context node_ids (those with valid local indices)
     node_mask = global_to_local >= 0
     node_ids = torch.where(node_mask)[0]
+
+    if dataset.preloaded_mobility is not None:
+        adj = dataset.preloaded_mobility[global_t, node_ids.unsqueeze(-1), node_ids]
+        eye = torch.eye(len(node_ids), dtype=torch.float32)
+        adj = torch.maximum(adj.float(), eye)
+        edge_index = adj.nonzero(as_tuple=False).t().contiguous()
+        edge_weight = adj[edge_index[0], edge_index[1]]
+    else:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_weight = torch.empty((0,), dtype=torch.float32)
 
     # Create Data object
     g = Data(

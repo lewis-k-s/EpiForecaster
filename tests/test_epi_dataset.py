@@ -102,7 +102,8 @@ class TestEpiDataset:
             assert item["hosp_hist"].shape == (L, 3)
             assert item["mob_x"].shape[2] >= 9
 
-            assert item["mob_adj"].shape == (L, 2, 2)
+            assert "mob_t" in item
+            assert item["mob_t"].shape == (L,)
 
     def test_feature_masking(self, config, mock_xarray_dataset):
         with patch.object(
@@ -182,7 +183,6 @@ class TestEpiDataset:
             item_a["bio_node"][0, 0] = float("nan")
             item_a["temporal_covariates"][0, 0] = float("nan")
             item_a["mob_x"][0, 0, 0] = float("inf")
-            item_a["mob_adj"][0, 0, 0] = float("nan")
 
             batch = collate_epiforecaster_batch(
                 [item_a, item_b], require_region_index=False
@@ -194,4 +194,3 @@ class TestEpiDataset:
             assert torch.isfinite(batch["BioNode"]).all()
             assert torch.isfinite(batch["TemporalCovariates"]).all()
             assert torch.isfinite(batch["MobBatch"].x_dense).all()
-            assert torch.isfinite(batch["MobBatch"].adj_dense).all()

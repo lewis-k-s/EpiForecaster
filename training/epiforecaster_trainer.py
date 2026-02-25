@@ -100,7 +100,6 @@ class EpiForecasterTrainer:
                 torch.backends.cudnn.deterministic = True
                 torch.backends.cudnn.benchmark = False
         self.model_id = self._resolve_model_id()
-        self.resume = self.config.training.resume
         self.experiment_dir: Path | None = None
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
 
@@ -399,6 +398,7 @@ class EpiForecasterTrainer:
             head_dropout=self.config.model.head_dropout,
             head_positional_encoding=self.config.model.head_positional_encoding,
             temporal_covariates_dim=temporal_covariates_dim,
+            strict=self.config.model.strict,
         )
 
         # Setup data loaders before CUDA initialization when using fork
@@ -445,6 +445,31 @@ class EpiForecasterTrainer:
                 logging.INFO,
             )
             self.model = self.model.to(torch.float32)
+
+        # Apply torch.compile if enabled
+        if getattr(self.config.training, "compile", False):
+            compile_kwargs: dict[str, Any] = {}
+            compile_mode = getattr(self.config.training, "compile_mode", "default")
+            if compile_mode != "default":
+                compile_kwargs["mode"] = compile_mode
+
+            compile_dynamic = getattr(self.config.training, "compile_dynamic", None)
+            if compile_dynamic is not None:
+                compile_kwargs["dynamic"] = compile_dynamic
+
+            if getattr(self.config.training, "compile_fullgraph", False):
+                compile_kwargs["fullgraph"] = True
+
+            compile_desc = (
+                ", ".join(f"{k}={v}" for k, v in compile_kwargs.items())
+                if compile_kwargs
+                else "default settings"
+            )
+            self._status(
+                f"Applying torch.compile to model for performance ({compile_desc})",
+                logging.INFO,
+            )
+            self.model = torch.compile(self.model, **compile_kwargs)
 
         # Enable TF32 for better performance on Ampere+ GPUs
         self._setup_tensor_core_optimizations()
@@ -517,7 +542,7 @@ class EpiForecasterTrainer:
             )
 
         # Resume from checkpoint after all state is initialized
-        if self.resume:
+        if self.config.training.resume_checkpoint_path:
             self._resume_from_checkpoint()
 
         self._status("=" * 60)
@@ -616,7 +641,12 @@ class EpiForecasterTrainer:
                 f"({effective_warmup} scheduler steps, accum={accum})"
             )
         self._status(f"  Gradient clip: {self.config.training.gradient_clip_value}")
-        self._status(f"  Resume: {'enabled' if self.resume else 'disabled'}")
+        resume_status = (
+            f"enabled from {self.config.training.resume_checkpoint_path}"
+            if self.config.training.resume_checkpoint_path
+            else "disabled"
+        )
+        self._status(f"  Resume: {resume_status}")
         self._status("=" * 60)
 
     def __del__(self) -> None:
@@ -1141,11 +1171,27 @@ class EpiForecasterTrainer:
                 f"Unknown optimizer type: {self.config.training.optimizer}"
             )
 
-        return optimizer_cls(
-            param_groups,
-            lr=self.config.training.learning_rate,
-            eps=self.precision_policy.optimizer_eps,
-        )
+        optimizer_kwargs: dict[str, Any] = {
+            "lr": self.config.training.learning_rate,
+            "eps": self.precision_policy.optimizer_eps,
+        }
+
+        # CUDA fast path: fused AdamW reduces optimizer kernel launch overhead.
+        if optimizer_name == "adamw" and self.device.type == "cuda":
+            try:
+                return optimizer_cls(
+                    param_groups,
+                    fused=True,
+                    capturable=True,
+                    **optimizer_kwargs,
+                )
+            except (TypeError, ValueError, RuntimeError) as exc:
+                self._status(
+                    f"Fused AdamW unavailable, falling back to standard AdamW ({exc})",
+                    logging.WARNING,
+                )
+
+        return optimizer_cls(param_groups, **optimizer_kwargs)
 
     def _create_scheduler(
         self, total_steps: int, warmup_steps: int = 0
@@ -1245,7 +1291,7 @@ class EpiForecasterTrainer:
                 dataset=self.train_dataset,
                 batch_size=self.config.training.batch_size,
                 config=self.config.training.curriculum,
-                drop_last=False,
+                drop_last=True,
                 real_run_id=getattr(self, "real_run_id", "real"),
             )
             # When using batch_sampler, batch_size and shuffle must be omitted
@@ -1258,12 +1304,13 @@ class EpiForecasterTrainer:
                 train_loader_kwargs["batch_sampler"] = ShuffledBatchSampler(
                     dataset_size=len(self.train_dataset),
                     batch_size=self.config.training.batch_size,
-                    drop_last=False,
+                    drop_last=True,
                     seed=self.config.training.seed,
                 )
             else:
                 train_loader_kwargs["batch_size"] = self.config.training.batch_size
                 train_loader_kwargs["shuffle"] = False
+                train_loader_kwargs["drop_last"] = True
             train_loader_kwargs["collate_fn"] = shared_collate
 
         if persistent_workers:
@@ -1488,10 +1535,6 @@ class EpiForecasterTrainer:
         return Path(configured)
 
     def _resolve_model_id(self) -> str:
-        configured = self.config.training.model_id
-        if configured:
-            return configured
-
         sjid = os.getenv("SLURM_JOB_ID", "")
         if sjid:
             # Detect interactive SLURM session - use datetime ID instead
@@ -1504,44 +1547,12 @@ class EpiForecasterTrainer:
 
         return f"run_{time.time_ns()}"
 
-    def _find_checkpoint_for_model_id(self) -> Path:
-        if not self.config.output.save_checkpoints:
-            raise ValueError(
-                "Resume requested but checkpointing is disabled in the output config."
-            )
-
-        checkpoint_dir = (
-            Path(self.config.output.log_dir)
-            / self.config.output.experiment_name
-            / self.model_id
-            / "checkpoints"
-        )
-        if not checkpoint_dir.exists():
-            raise FileNotFoundError(
-                f"No checkpoint directory found for model_id '{self.model_id}': "
-                f"{checkpoint_dir}"
-            )
-
-        best_checkpoint = checkpoint_dir / "best_model.pt"
-        if best_checkpoint.exists():
-            return best_checkpoint
-
-        final_checkpoint = checkpoint_dir / "final_model.pt"
-        if final_checkpoint.exists():
-            return final_checkpoint
-
-        epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
-        if epoch_checkpoints:
-            return epoch_checkpoints[-1]
-
-        raise FileNotFoundError(
-            f"No checkpoints found for model_id '{self.model_id}' in {checkpoint_dir}"
-        )
-
     def _resume_from_checkpoint(self) -> None:
         from utils.precision_policy import validate_old_checkpoint_compatible
 
-        checkpoint_path = self._find_checkpoint_for_model_id()
+        checkpoint_path = self.config.training.resume_checkpoint_path
+        if checkpoint_path is None:
+            raise ValueError("resume_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
@@ -1847,6 +1858,12 @@ class EpiForecasterTrainer:
                     enabled=self.precision_policy.autocast_enabled,
                 ):
                     with torch.profiler.record_function("forward"):
+                        # Reconstruct massive dense graph tensors on the GPU directly
+                        # bypassing dataloader worker IPC queue.
+                        from utils.training_utils import inject_gpu_mobility
+
+                        inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
+
                         model_outputs, targets_dict = self.model.forward_batch(
                             batch_data=batch_data,
                             region_embeddings=self.region_embeddings,

@@ -1,6 +1,6 @@
 import pytest
 import torch
-from torch_geometric.data import Batch, Data
+from torch_geometric.data import Batch
 
 from models.configs import (
     ModelVariant,
@@ -150,20 +150,16 @@ class TestEpiForecaster:
 
         model = EpiForecaster(**config)
 
-        # Create dummy mobility graphs
+        # Create dummy dense mobility batch
         B, T = dummy_batch["hosp_hist"].shape[:2]
         num_graphs = B * T
-        # Create a list of dummy graphs
-        graphs = []
-        for _ in range(num_graphs):
-            # 5 nodes, random edges
-            x = _rand_tensor(5, model.temporal_node_dim)
-            edge_index = torch.randint(0, 5, (2, 10))
-            graphs.append(
-                Data(x=x, edge_index=edge_index, target_node=torch.tensor([0]))
-            )
-
-        mob_batch = Batch.from_data_list(graphs)
+        num_nodes = 5
+        mob_batch = Batch()
+        mob_batch.x_dense = _rand_tensor(num_graphs, num_nodes, model.temporal_node_dim)
+        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes)
+        eye = torch.eye(num_nodes, dtype=dense_adj.dtype).unsqueeze(0)
+        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
 
         out = model(
             hosp_hist=dummy_batch["hosp_hist"],
@@ -278,19 +274,17 @@ class TestEpiForecaster:
         B, T = 1, config["sequence_length"]
         horizon = config["forecast_horizon"]
 
-        # Build B*T mobility graphs with MODEL_DTYPE node/edge weights.
-        graphs: list[Data] = []
-        edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]], dtype=torch.long)
-        for _ in range(B * T):
-            graphs.append(
-                Data(
-                    x=_rand_tensor(4, model.temporal_node_dim),
-                    edge_index=edge_index,
-                    edge_weight=torch.ones(edge_index.shape[1], dtype=torch.float32),
-                    target_node=torch.tensor([0], dtype=torch.long),
-                )
-            )
-        mob_batch = Batch.from_data_list(graphs)
+        # Build B*T dense mobility tensors with non-default dtype.
+        num_graphs = B * T
+        num_nodes = 4
+        mob_batch = Batch()
+        mob_batch.x_dense = _rand_tensor(
+            num_graphs, num_nodes, model.temporal_node_dim, dtype=torch.float64
+        )
+        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes, dtype=torch.float64)
+        eye = torch.eye(num_nodes, dtype=torch.float64).unsqueeze(0)
+        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
 
         batch_data = {
             "HospHist": _rand_tensor(B, T, 3),
@@ -312,7 +306,8 @@ class TestEpiForecaster:
         assert outputs["pred_hosp"].dtype == expected_dtype
         assert targets["cases"] is not None
         assert targets["cases"].dtype == expected_dtype
-        assert mob_batch.edge_weight.dtype == expected_dtype
+        assert mob_batch.x_dense.dtype == expected_dtype
+        assert mob_batch.adj_dense.dtype == expected_dtype
 
     @pytest.mark.device
     def test_forward_batch_cross_device(self, basic_config, accelerator_device):

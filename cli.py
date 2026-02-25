@@ -936,8 +936,12 @@ def train_regions(
 
 @train_cli.command("epiforecaster")
 @click.option("--config", required=True, help="Path to training configuration file")
-@click.option("--model-id", default="", help="Model id for logging/checkpoints")
-@click.option("--resume", is_flag=True, help="Resume training from a saved checkpoint")
+@click.option(
+    "--resume",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Path to checkpoint to resume training from",
+)
 @click.option(
     "--max-batches",
     type=int,
@@ -951,19 +955,17 @@ def train_regions(
 )
 def train_epiforecaster(
     config: str,
-    model_id: str,
-    resume: bool,
+    resume: Path | None,
     max_batches: int | None,
     override: tuple[str, ...],
 ):
     """Train EpiForecaster model."""
-    _run_forecaster_training(config, model_id, resume, max_batches, override)
+    _run_forecaster_training(config, resume, max_batches, override)
 
 
 def _run_forecaster_training(
     config: str,
-    model_id: str,
-    resume: bool,
+    resume: Path | None,
     max_batches: int | None,
     overrides: tuple[str, ...] = (),
 ) -> None:
@@ -971,10 +973,8 @@ def _run_forecaster_training(
     try:
         override_list = list(overrides)
 
-        if model_id:
-            override_list.append(f"training.model_id={model_id}")
-        if resume:
-            override_list.append("training.resume=true")
+        if resume is not None:
+            override_list.append(f"training.resume_checkpoint_path={resume}")
         if max_batches is not None:
             override_list.append(f"training.max_batches={max_batches}")
 
@@ -995,10 +995,10 @@ def _run_forecaster_training(
             logger.debug(f"  - Epochs: {trainer_config.training.epochs}")
             logger.debug(f"  - Batch size: {trainer_config.training.batch_size}")
             logger.debug(f"  - Learning rate: {trainer_config.training.learning_rate}")
-            if trainer_config.training.model_id:
-                logger.debug(f"  - Model ID: {trainer_config.training.model_id}")
-            if trainer_config.training.resume:
-                logger.debug("  - Resume: enabled")
+            if trainer_config.training.resume_checkpoint_path:
+                logger.debug(
+                    f"  - Resume from: {trainer_config.training.resume_checkpoint_path}"
+                )
 
         trainer = EpiForecasterTrainer(trainer_config)
         results = trainer.run()

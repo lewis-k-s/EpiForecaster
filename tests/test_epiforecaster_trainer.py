@@ -164,7 +164,7 @@ class TestEpiForecasterTrainer:
     def test_checkpoint_logic(
         self, mock_wandb, mock_model_cls, mock_dataset, minimal_config, tmp_path
     ):
-        """Test checkpoint discovery/resume logic."""
+        """Test checkpoint resume logic with explicit checkpoint path."""
         # Mock model
         mock_model_instance = MagicMock()
         # Use float32 dtype (only supported dtype)
@@ -183,25 +183,18 @@ class TestEpiForecasterTrainer:
         # Setup fake checkpoint
         minimal_config.output.log_dir = str(tmp_path)
         minimal_config.output.experiment_name = "test_exp"
-        model_id = "test_model_id"
-        minimal_config.training.model_id = model_id
-
-        checkpoint_dir = tmp_path / "test_exp" / model_id / "checkpoints"
-        checkpoint_dir.mkdir(parents=True)
 
         # Create a dummy checkpoint file
-        ckpt_path = checkpoint_dir / "checkpoint_epoch_5.pt"
+        ckpt_path = tmp_path / "checkpoint_epoch_5.pt"
         torch.save({"epoch": 5, "model_state_dict": {}}, ckpt_path)
 
-        # Enable resume
-        minimal_config.training.resume = True
+        # Enable resume with explicit path (as string for YAML serialization)
+        minimal_config.training.resume_checkpoint_path = str(ckpt_path)
 
         trainer = EpiForecasterTrainer(minimal_config)
 
-        # Should have found the checkpoint
-        assert trainer.resume is True
-        # Since we mocked everything, actual load might not happen or fail on key mismatch,
-        # but initialization passed meaning it didn't crash on finding path.
+        # Should have the checkpoint path set
+        assert trainer.config.training.resume_checkpoint_path == str(ckpt_path)
 
     @patch("training.epiforecaster_trainer.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
@@ -295,7 +288,9 @@ class TestEpiForecasterTrainer:
         mock_dataset_cls.side_effect = [train_ds, val_ds, test_ds]
 
         with patch.object(
-            EpiForecasterTrainer, "_split_dataset_by_nodes", return_value=([0, 1], [2], [3])
+            EpiForecasterTrainer,
+            "_split_dataset_by_nodes",
+            return_value=([0, 1], [2], [3]),
         ):
             _ = EpiForecasterTrainer(minimal_config)
 

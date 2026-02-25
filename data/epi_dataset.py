@@ -782,7 +782,6 @@ class EpiDataset(Dataset):
         )
 
         mob_x_list: list[torch.Tensor] = []
-        mob_adj_list: list[torch.Tensor] = []
 
         # Find local index of target node (constant across window)
         # Use tensor to defer GPU->CPU sync until actually needed
@@ -843,21 +842,6 @@ class EpiDataset(Dataset):
             # --- OPTIMIZED BATCHING CHANGE ---
             mob_x_list.append(x_masked)
 
-            # Slice the dense adjacency matrix to the context nodes
-            if self.preloaded_mobility is not None:
-                adj_t = self.preloaded_mobility[global_t]
-                # Slice and enforce float16 for efficiency
-                adj_t_local = adj_t[node_ids][:, node_ids].to(torch.float16)
-                mob_adj_list.append(adj_t_local)
-
-        if self.preloaded_mobility is None:
-            # Fallback if somehow requested without mobility, though mobility flag protects this
-            mob_adj = torch.empty(
-                (L, len(node_ids), len(node_ids)), dtype=torch.float16
-            )
-        else:
-            mob_adj = torch.stack(mob_adj_list)
-
         population = self.node_static_covariates["Pop"][target_idx]
 
         # Extract temporal covariates for the history window
@@ -873,7 +857,7 @@ class EpiDataset(Dataset):
             "cases_hist": cases_history[:, target_idx, :],  # (L, 3)
             "bio_node": biomarker_history[:, target_idx, :],
             "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
-            "mob_adj": mob_adj,  # (L, N_ctx, N_ctx)
+            "mob_t": torch.arange(range_start, range_start + L, dtype=torch.long),
             "mob_target_node_idx": local_target_idx_tensor,
             "population": population,
             "run_id": run_id,
@@ -1615,14 +1599,13 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     Optimized dense batch construction for dynamic mobility graphs.
 
     Args:
-        batch: List of EpiDatasetItem (must contain mob_x, mob_edge_index, mob_edge_weight)
+        batch: List of EpiDatasetItem (must contain mob_x, mob_t, mob_target_node_idx)
 
     Returns:
         A PyG Batch-like container with:
         - x_dense: [B*T, N, F]
-        - adj_dense: [B*T, N, N]
+        - global_t: [B*T]
         - target_node: [B*T]
-        - target_index: [B*T] flattened index into x_dense.view(B*T*N, F)
     """
     B = len(batch)
     if B == 0:
@@ -1630,26 +1613,12 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
 
     # Fixed-size dense contract per item: mob_x is (L, N, F)
     L, num_nodes, _ = batch[0]["mob_x"].shape
-    num_graphs = B * L
 
     # 1) Dense node features [B*T, N, F]
     x_dense = torch.cat([item["mob_x"] for item in batch], dim=0)
 
-    # 2) Dense adjacency [B*T, N, N]
-    # We can just concatenate the L-length sequence of matrices per sample
-    # `mob_adj` is already guaranteed float16 and shape [L, N, N]
-    adj_dense = torch.cat([item["mob_adj"] for item in batch], dim=0)
-
-    # Make sure diag is at least 1.0 since we removed build_full_sparse_topology self-loops.
-    # We can just add self loops dynamically but only up to 1 for the diagonal:
-    adj_dense = adj_dense.to(
-        torch.float32
-    )  # to avoid float16 precision issues during sum
-    eye = torch.eye(
-        num_nodes, device=adj_dense.device, dtype=adj_dense.dtype
-    ).unsqueeze(0)
-    adj_dense = torch.maximum(adj_dense, eye)  # Ensure diagonal is at least 1
-    adj_dense = adj_dense.to(torch.float16)
+    # 2) Global T indices [B*T]
+    global_t_dense = torch.cat([item["mob_t"] for item in batch], dim=0)
 
     # 3) Target node index per graph [B*T]
     target_nodes_stacked = torch.stack(
@@ -1665,16 +1634,8 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     # 5) Batch-like container
     mob_batch = Batch()
     mob_batch.x_dense = x_dense
-    mob_batch.adj_dense = adj_dense
+    mob_batch.global_t = global_t_dense
     mob_batch.target_node = target_node_tensor
-
-    # target_index[i] = start[i] + target_node[i] on flattened [B*T*N, F]
-    graph_starts = torch.arange(num_graphs, device=x_dense.device) * num_nodes
-    mob_batch["target_index"] = graph_starts + target_node_tensor
-
-    # Keep ptr for compatibility checks in model code paths.
-    ptr = torch.arange(num_graphs + 1, device=x_dense.device) * num_nodes
-    mob_batch.ptr = ptr
 
     return mob_batch
 
@@ -1734,8 +1695,6 @@ def collate_epiforecaster_batch(
     mob_batch = optimized_collate_graphs(batch)
     if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
         mob_batch.x_dense = _replace_non_finite(mob_batch.x_dense)
-    if hasattr(mob_batch, "adj_dense") and mob_batch.adj_dense is not None:
-        mob_batch.adj_dense = _replace_non_finite(mob_batch.adj_dense)
 
     hosp_hist = _replace_non_finite(hosp_hist)
     deaths_hist = _replace_non_finite(deaths_hist)
