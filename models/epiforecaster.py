@@ -108,9 +108,13 @@ class EpiForecaster(nn.Module):
             assert self.temporal_node_dim > 0, (
                 "Mobility GNN requires temporal node features (cases/biomarkers)."
             )
+            gnn_in_dim = self.temporal_node_dim
+            if self.variant_type.regions:
+                gnn_in_dim += self.region_embedding_dim
+
             if gnn_module in {"gcn", "gat"}:
                 self.mobility_gnn = MobilityDenseEncoder(
-                    in_dim=self.temporal_node_dim,
+                    in_dim=gnn_in_dim,
                     hidden_dim=gnn_hidden_dim,
                     out_dim=self.mobility_embedding_dim,
                     module_type=gnn_module,
@@ -268,7 +272,9 @@ class EpiForecaster(nn.Module):
                 raise TypeError(
                     f"Expected mob_graphs to be PyG Batch, got {type(mob_graphs)}"
                 )
-            mobility_embeddings = self._process_mobility_sequence_pyg(mob_graphs, B, T)
+            mobility_embeddings = self._process_mobility_sequence_pyg(
+                mob_graphs, B, T, region_embeddings
+            )
             features.append(mobility_embeddings)
 
         if self.variant_type.regions:
@@ -476,7 +482,11 @@ class EpiForecaster(nn.Module):
         return model_outputs, targets_dict
 
     def _process_mobility_sequence_pyg(
-        self, mob_batch: Batch, B: int, T: int
+        self,
+        mob_batch: Batch,
+        B: int,
+        T: int,
+        region_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Process mobility graphs (batched) with MobilityGNN."""
         if not self.variant_type.mobility or self.mobility_gnn is None:
@@ -484,7 +494,7 @@ class EpiForecaster(nn.Module):
                 "Mobility processing requested but MobilityGNN is not enabled."
             )
 
-        node_emb = self._get_mobility_node_embeddings(mob_batch)
+        node_emb = self._get_mobility_node_embeddings(mob_batch, region_embeddings)
         mobility_embeddings = self._gather_target_mobility_embeddings(
             node_emb, mob_batch, B, T
         )
@@ -523,7 +533,9 @@ class EpiForecaster(nn.Module):
             return prediction[:, 1 : 1 + self.forecast_horizon]
         return prediction
 
-    def _get_mobility_node_embeddings(self, mob_batch: Batch) -> torch.Tensor:
+    def _get_mobility_node_embeddings(
+        self, mob_batch: Batch, region_embeddings: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Run dense GNN encoder on mobility batch."""
         if not hasattr(mob_batch, "x_dense") or not hasattr(mob_batch, "adj_dense"):
             raise ValueError(
@@ -536,11 +548,38 @@ class EpiForecaster(nn.Module):
             raise ValueError(
                 "Mobility batch has null dense graph tensors x_dense/adj_dense."
             )
-        if self.strict and x_dense.size(-1) != self.temporal_node_dim:
+
+        # Optional: Inject region embeddings into GNN node features
+        if self.variant_type.regions and region_embeddings is not None:
+            # x_dense is [G, N_ctx, F]
+            G, N_ctx, F = x_dense.shape
+
+            # mob_batch.mob_real_node_idx contains the global indices of the context nodes.
+            # Its shape should be [N_ctx] (constant across the batch as built by EpiDataset)
+            if (
+                hasattr(mob_batch, "mob_real_node_idx")
+                and mob_batch.mob_real_node_idx is not None
+            ):
+                real_nodes = mob_batch.mob_real_node_idx  # [N_ctx]
+            else:
+                raise ValueError(
+                    "Mobility batch missing 'mob_real_node_idx' required for region embeddings in GNN."
+                )
+
+            # Gather region embeddings: [N_ctx, region_dim]
+            gathered_regions = region_embeddings[real_nodes]
+            # Broadcast to [G, N_ctx, region_dim]
+            gathered_regions = gathered_regions.unsqueeze(0).expand(G, -1, -1)
+
+            # Concatenate to features
+            x_dense = torch.cat([x_dense, gathered_regions], dim=-1)
+
+        if self.strict and x_dense.size(-1) != self.mobility_gnn.layers[0].in_channels:
             raise ValueError(
                 f"Mobility graph feature dim {x_dense.size(-1)} != expected "
-                f"{self.temporal_node_dim}"
+                f"{self.mobility_gnn.layers[0].in_channels}"
             )
+
         return self.mobility_gnn(x_dense, adj_dense)
 
     def _gather_target_mobility_embeddings(

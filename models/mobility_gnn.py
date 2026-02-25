@@ -122,8 +122,8 @@ class MobilityDenseEncoder(nn.Module):
                 h = self.activation(h)
                 h = F.dropout(h, p=self.dropout_val, training=self.training)
 
-                if i < len(self.skips):
-                    skip = self.skips[i](h_in)
-                    h = h + skip
+            if i < len(self.skips):
+                skip = self.skips[i](h_in)
+                h = h + skip
 
         return h
