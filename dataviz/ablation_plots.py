@@ -34,22 +34,22 @@ TARGET_LABELS = {
     "deaths": "Deaths",
 }
 METRIC_LABELS = {
-    "mae_median": "MAE",
-    "rmse_median": "RMSE",
-    "smape_median": "sMAPE",
-    "r2_median": "R²",
+    "mae": "MAE",
+    "rmse": "RMSE",
+    "smape": "sMAPE",
+    "r2": "R²",
 }
 
 
-def _prepare_ablation_order(
+def _prepare_model_order(
     df: pd.DataFrame, baseline_name: str = "baseline"
 ) -> list[str]:
-    """Prepare ablation order with baseline first, then alphabetical."""
-    ablations = sorted(df["ablation"].unique())
-    if baseline_name in ablations:
-        ablations.remove(baseline_name)
-        ablations.insert(0, baseline_name)
-    return ablations
+    """Prepare model order with baseline first, then alphabetical."""
+    models = sorted(df["model"].unique())
+    if baseline_name in models:
+        models.remove(baseline_name)
+        models.insert(0, baseline_name)
+    return models
 
 
 def _prepare_target_order(df: pd.DataFrame) -> list[str]:
@@ -78,7 +78,7 @@ def plot_ablation_comparison(
     Args:
         csv_path: Path to ablation_metrics_aggregated.csv
         output_dir: Directory to save plots (default: same as csv_path parent)
-        metrics: List of metrics to plot (default: ["mae_median", "rmse_median", "smape_median", "r2_median"])
+        metrics: List of metrics to plot (default: ["mae", "rmse", "smape", "r2"])
         baseline_name: Name of baseline ablation
         figsize: Figure size (width, height)
         show: Whether to display plots interactively
@@ -99,10 +99,10 @@ def plot_ablation_comparison(
     df = pd.read_csv(csv_path)
 
     if metrics is None:
-        metrics = ["mae_median", "rmse_median", "smape_median", "r2_median"]
+        metrics = ["mae", "rmse", "smape", "r2"]
 
     # Prepare ordering
-    ablation_order = _prepare_ablation_order(df, baseline_name)
+    model_order = _prepare_model_order(df, baseline_name)
     target_order = _prepare_target_order(df)
 
     saved_paths = {}
@@ -117,19 +117,19 @@ def plot_ablation_comparison(
 
         # Create pivot for plotting
         pivot_mean = df.pivot_table(
-            index="ablation",
+            index="model",
             columns="target",
             values=mean_col,
-        ).reindex(ablation_order)[target_order]
+        ).reindex(model_order)[target_order]
 
         pivot_std = df.pivot_table(
-            index="ablation",
+            index="model",
             columns="target",
             values=std_col,
-        ).reindex(ablation_order)[target_order]
+        ).reindex(model_order)[target_order]
 
         # Create plot
-        n_ablations = len(ablation_order)
+        n_ablations = len(model_order)
         n_targets = len(target_order)
 
         if figsize is None:
@@ -162,14 +162,14 @@ def plot_ablation_comparison(
 
         # Styling
         ax.set_yticks(y_positions)
-        ax.set_yticklabels(ablation_order)
+        ax.set_yticklabels(model_order)
         ax.set_xlabel(METRIC_LABELS.get(metric, metric))
         ax.set_title(f"Ablation Study: {METRIC_LABELS.get(metric, metric)} by Target")
         ax.legend(title="Target", loc="lower right")
         ax.grid(axis="x", alpha=0.3)
 
         # Add vertical reference lines at baseline values for each target
-        if baseline_name in ablation_order:
+        if baseline_name in model_order:
             baseline_row = pivot_mean.loc[baseline_name]
             for i, target in enumerate(target_order):
                 baseline_val = baseline_row[target]
@@ -203,7 +203,7 @@ def plot_ablation_comparison(
 def plot_ablation_deltas_heatmap(
     csv_path: str | Path,
     output_dir: str | Path | None = None,
-    metric: str = "mae_median",
+    metric: str = "mae",
     baseline_name: str = "baseline",
     figsize: tuple[float, float] | None = None,
     show: bool = False,
@@ -213,7 +213,7 @@ def plot_ablation_deltas_heatmap(
     Args:
         csv_path: Path to ablation_metrics_deltas.csv
         output_dir: Directory to save plot
-        metric: Metric to visualize (default: "mae_median")
+        metric: Metric to visualize (default: "mae")
         baseline_name: Name of baseline ablation (not shown, used for ordering)
         figsize: Figure size (width, height)
         show: Whether to display plot interactively
@@ -245,18 +245,18 @@ def plot_ablation_deltas_heatmap(
 
     # Prepare ordering
     target_order = _prepare_target_order(df)
-    ablation_order = sorted(df["ablation"].unique())
+    model_order = sorted(df["model"].unique())
 
     # Create pivot
     pivot = df.pivot_table(
-        index="ablation",
+        index="model",
         columns="target",
         values=delta_col,
-    ).reindex(ablation_order)[target_order]
+    ).reindex(model_order)[target_order]
 
     # Create plot
     if figsize is None:
-        figsize = (max(8, len(target_order) * 1.5), max(6, len(ablation_order) * 0.5))
+        figsize = (max(8, len(target_order) * 1.5), max(6, len(model_order) * 0.5))
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -335,14 +335,14 @@ def plot_ablation_summary_grid(
     df = pd.read_csv(aggregated_csv)
 
     # Prepare ordering
-    ablation_order = _prepare_ablation_order(df, baseline_name)
+    model_order = _prepare_model_order(df, baseline_name)
     target_order = _prepare_target_order(df)
 
     # Create 2x2 grid
-    metrics = ["mae_median", "rmse_median", "smape_median", "r2_median"]
+    metrics = ["mae", "rmse", "smape", "r2"]
 
     if figsize is None:
-        figsize = (16, max(10, len(ablation_order) * 0.3))
+        figsize = (16, max(10, len(model_order) * 0.3))
 
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     axes = axes.flatten()
@@ -359,19 +359,19 @@ def plot_ablation_summary_grid(
 
         # Create pivot
         pivot_mean = df.pivot_table(
-            index="ablation",
+            index="model",
             columns="target",
             values=mean_col,
-        ).reindex(ablation_order)[target_order]
+        ).reindex(model_order)[target_order]
 
         pivot_std = df.pivot_table(
-            index="ablation",
+            index="model",
             columns="target",
             values=std_col,
-        ).reindex(ablation_order)[target_order]
+        ).reindex(model_order)[target_order]
 
         # Plot
-        n_ablations = len(ablation_order)
+        n_ablations = len(model_order)
         n_targets = len(target_order)
         y_positions = np.arange(n_ablations)
         bar_height = 0.18
@@ -398,7 +398,7 @@ def plot_ablation_summary_grid(
         # Styling
         ax.set_yticks(y_positions)
         if idx % 2 == 0:  # Left column
-            ax.set_yticklabels(ablation_order)
+            ax.set_yticklabels(model_order)
         else:
             ax.set_yticklabels([])
 
@@ -407,7 +407,7 @@ def plot_ablation_summary_grid(
         ax.grid(axis="x", alpha=0.3)
 
         # Add vertical reference lines at baseline values for each target
-        if baseline_name in ablation_order:
+        if baseline_name in model_order:
             baseline_row = pivot_mean.loc[baseline_name]
             for i, target in enumerate(target_order):
                 baseline_val = baseline_row[target]
@@ -522,7 +522,7 @@ Examples:
         plot_ablation_deltas_heatmap(
             args.deltas_csv,
             output_dir=args.output_dir,
-            metric="mae_median",
+            metric="mae",
             baseline_name=args.baseline,
             show=args.show,
         )
