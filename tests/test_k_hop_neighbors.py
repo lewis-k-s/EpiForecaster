@@ -14,7 +14,7 @@ import xarray as xr
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
-from models.mobility_gnn import MobilityPyGEncoder
+from models.mobility_gnn import MobilityDenseEncoder
 
 
 def _make_config(
@@ -151,27 +151,27 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
 
 
 def _reconstruct_mob_graph(item, t: int, dataset):
-    """Reconstruct PyG Data object from new EpiDatasetItem components.
+    """Reconstruct mobility graph with dense adjacency.
 
     Args:
-        item: EpiDatasetItem with mob_x, mob_edge_index, mob_edge_weight, etc.
+        item: EpiDatasetItem with mob_x, mob_t, etc.
         t: Time step index within the history window
         dataset: EpiDataset instance to get node_ids mapping
 
     Returns:
-        PyG Data object with node features, edges, and node_ids
+        Dict with:
+            - x: Node features (N, F)
+            - adj: Dense adjacency (N, N)
+            - node_ids: Tensor of global node IDs
+            - target_node: Local index of target node
+            - num_nodes: Number of nodes
     """
-    from torch_geometric.data import Data
-
-    # Get components for time step t
     mob_x_t = item["mob_x"][t]  # (N_ctx, F)
 
-    # Get node_ids from dataset's global_to_local mapping
     window_start = item.get("window_start", 0)
     global_t = item["mob_t"][t] if "mob_t" in item else window_start + t
     global_to_local = dataset._get_global_to_local_at_time(global_t)
 
-    # Get all context node_ids (those with valid local indices)
     node_mask = global_to_local >= 0
     node_ids = torch.where(node_mask)[0]
 
@@ -179,32 +179,25 @@ def _reconstruct_mob_graph(item, t: int, dataset):
         adj = dataset.preloaded_mobility[global_t, node_ids.unsqueeze(-1), node_ids]
         eye = torch.eye(len(node_ids), dtype=torch.float32)
         adj = torch.maximum(adj.float(), eye)
-        edge_index = adj.nonzero(as_tuple=False).t().contiguous()
-        edge_weight = adj[edge_index[0], edge_index[1]]
     else:
-        edge_index = torch.empty((2, 0), dtype=torch.long)
-        edge_weight = torch.empty((0,), dtype=torch.float32)
+        adj = torch.zeros(len(node_ids), len(node_ids), dtype=torch.float32)
 
-    # Create Data object
-    g = Data(
-        x=mob_x_t,
-        edge_index=edge_index,
-        edge_weight=edge_weight,
-    )
-    g.num_nodes = mob_x_t.size(0)
-    g.node_ids = node_ids
-    g.target_node = item["mob_target_node_idx"]
-
-    return g
+    return {
+        "x": mob_x_t,
+        "adj": adj,
+        "node_ids": node_ids,
+        "target_node": item["mob_target_node_idx"],
+        "num_nodes": mob_x_t.size(0),
+    }
 
 
 def _verify_node_features_masked(
-    mob_graph, node_idx: int, expected_masked: bool
+    mob_graph: dict, node_idx: int, expected_masked: bool
 ) -> bool:
     """Verify that node at local_idx has features matching expected_masked.
 
     Args:
-        mob_graph: PyG Data object with node features
+        mob_graph: Dict with 'x' tensor of node features
         node_idx: Local node index in the graph
         expected_masked: If True, verify all features are zero. If False, verify
             at least one feature is non-zero.
@@ -212,27 +205,20 @@ def _verify_node_features_masked(
     Returns:
         True if verification passes
     """
-    from torch_geometric.data import Data
-
-    if not isinstance(mob_graph, Data):
-        raise TypeError(f"Expected PyG Data object, got {type(mob_graph)}")
-
-    x = mob_graph.x  # (num_nodes, feat_dim)
+    x = mob_graph["x"]  # (num_nodes, feat_dim)
     node_features = x[node_idx]
 
     if expected_masked:
-        # All features should be zero (or very close)
         return torch.allclose(node_features, torch.zeros_like(node_features), atol=1e-5)
     else:
-        # At least some features should be non-zero
         return not torch.allclose(
             node_features, torch.zeros_like(node_features), atol=1e-5
         )
 
 
-def _global_to_local_map(mob_graph) -> dict[int, int]:
+def _global_to_local_map(mob_graph: dict) -> dict[int, int]:
     """Build a global->local node index map for a reconstructed graph."""
-    return {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
+    return {int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())}
 
 
 @pytest.mark.epiforecaster
@@ -248,9 +234,9 @@ def test_k_hop_masking_gnn_depth_0(tmp_path):
     mob_graph = _reconstruct_mob_graph(item, 0, dataset)
 
     # With gnn_depth=0, all nodes should have non-zero features
-    assert mob_graph.num_nodes == 4, "All context nodes should be in graph"
+    assert mob_graph["num_nodes"] == 4, "All context nodes should be in graph"
 
-    for local_idx in range(mob_graph.num_nodes):
+    for local_idx in range(mob_graph["num_nodes"]):
         assert _verify_node_features_masked(
             mob_graph, local_idx, expected_masked=False
         ), f"Node {local_idx} should have non-zero features with gnn_depth=0"
@@ -278,7 +264,9 @@ def test_k_hop_masking_gnn_depth_1(tmp_path):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
         # Map local indices to global indices using node_ids
-        global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
+        global_to_local = {
+            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
+        }
 
         # Node 0 (target): should have non-zero features
         local_0 = global_to_local[0]
@@ -327,7 +315,9 @@ def test_k_hop_masking_gnn_depth_2(tmp_path):
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
-        global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
+        global_to_local = {
+            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
+        }
 
         # Node 0 (target): non-zero
         local_0 = global_to_local[0]
@@ -376,7 +366,9 @@ def test_k_hop_masking_middle_node(tmp_path):
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
-        global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
+        global_to_local = {
+            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
+        }
 
         # Node 1 (target): non-zero
         local_1 = global_to_local[1]
@@ -422,7 +414,9 @@ def test_k_hop_masking_time_ordering(tmp_path):
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
-        global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
+        global_to_local = {
+            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
+        }
 
         # Node 0 (target): non-zero
         local_0 = global_to_local[0]
@@ -460,7 +454,9 @@ def test_k_hop_masking_node_ordering(tmp_path):
     for t in range(L):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
 
-        global_to_local = {int(g): i for i, g in enumerate(mob_graph.node_ids.tolist())}
+        global_to_local = {
+            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
+        }
 
         # Node 0 (target): non-zero
         local_0 = global_to_local[0]
@@ -543,9 +539,9 @@ def test_k_hop_reachability_cache(tmp_path):
 # ============================================================================
 
 
-def _create_gnn_model(gnn_depth: int, in_dim: int = 8) -> MobilityPyGEncoder:
+def _create_gnn_model(gnn_depth: int, in_dim: int = 8) -> MobilityDenseEncoder:
     """Create a GNN model for testing receptive field."""
-    return MobilityPyGEncoder(
+    return MobilityDenseEncoder(
         in_dim=in_dim,
         hidden_dim=16,
         out_dim=8,
@@ -571,34 +567,28 @@ def test_gnn_receptive_field_depth_1_chain(tmp_path):
     item = dataset[0]
     mob_graph = _reconstruct_mob_graph(item, 0, dataset)
 
-    # Get feature dimension
-    feat_dim = mob_graph.x.shape[1]
-
-    # Create model
+    feat_dim = mob_graph["x"].shape[1]
     model = _create_gnn_model(gnn_depth=1, in_dim=feat_dim)
     global_to_local = _global_to_local_map(mob_graph)
 
+    adj = mob_graph["adj"].unsqueeze(0)
+
     # Test 1: All nodes zero except 1-hop neighbor (node 1)
     # Node 0 SHOULD be influenced
-    x_test1 = torch.zeros_like(mob_graph.x, dtype=torch.float32)
-    x_test1[global_to_local[1]] = 1.0  # Node 1 (1-hop) has signal
-    out1 = model(x_test1, mob_graph.edge_index, mob_graph.edge_weight)
-    target_out1 = out1[mob_graph.target_node]
+    x_test1 = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
+    x_test1[global_to_local[1]] = 1.0
+    out1 = model(x_test1.unsqueeze(0), adj)
+    target_out1 = out1[0, mob_graph["target_node"]]
 
     # Test 2: All nodes zero except 2-hop neighbor (node 2)
     # Node 0 should NOT be influenced (if receptive field is correct)
-    x_test2 = torch.zeros_like(mob_graph.x, dtype=torch.float32)
+    x_test2 = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
     if 2 in global_to_local:
-        x_test2[global_to_local[2]] = 1.0  # Node 2 (2-hop) has signal
-    out2 = model(x_test2, mob_graph.edge_index, mob_graph.edge_weight)
-    target_out2 = out2[mob_graph.target_node]
+        x_test2[global_to_local[2]] = 1.0
+    out2 = model(x_test2.unsqueeze(0), adj)
+    target_out2 = out2[0, mob_graph["target_node"]]
 
-    # With depth=1, node 0 should get signal from node 1 but NOT from node 2
-    # Note: This test will FAIL with the current implementation because
-    # the full graph is used, allowing information to flow beyond k-hops
     assert torch.norm(target_out1) > 0, "Target should be influenced by 1-hop neighbor"
-    # This assertion captures the bug: with full graph, 2-hop influences 1-hop
-    # which then influences target
     assert torch.norm(target_out2) == 0, (
         "Target should NOT be influenced by 2-hop neighbor with depth=1. "
         "If this fails, the GNN is using full graph topology, allowing "
@@ -621,18 +611,17 @@ def test_gnn_receptive_field_depth_2_chain(tmp_path):
 
     item = dataset[0]
     mob_graph = _reconstruct_mob_graph(item, 0, dataset)
-    feat_dim = mob_graph.x.shape[1]
+    feat_dim = mob_graph["x"].shape[1]
 
     model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
     global_to_local = _global_to_local_map(mob_graph)
 
-    # Test: Only node 2 (2-hop) has signal
-    x_test = torch.zeros_like(mob_graph.x, dtype=torch.float32)
+    adj = mob_graph["adj"].unsqueeze(0)
+    x_test = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
     x_test[global_to_local[2]] = 1.0
-    out = model(x_test, mob_graph.edge_index, mob_graph.edge_weight)
-    target_out = out[mob_graph.target_node]
+    out = model(x_test.unsqueeze(0), adj)
+    target_out = out[0, mob_graph["target_node"]]
 
-    # With depth=2, node 0 should get signal from node 2
     assert torch.norm(target_out) > 0, (
         "Target should be influenced by 2-hop neighbor with depth=2"
     )
@@ -654,40 +643,18 @@ def test_gnn_receptive_field_full_graph_issue(tmp_path):
 
     item = dataset[0]
     mob_graph = _reconstruct_mob_graph(item, 0, dataset)
-    feat_dim = mob_graph.x.shape[1]
+    feat_dim = mob_graph["x"].shape[1]
 
     model = _create_gnn_model(gnn_depth=1, in_dim=feat_dim)
     global_to_local = _global_to_local_map(mob_graph)
 
-    # Only node 4 (4-hop away) has signal
-    x_test = torch.zeros_like(mob_graph.x, dtype=torch.float32)
+    adj = mob_graph["adj"].unsqueeze(0)
+    x_test = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
     if 4 in global_to_local:
         x_test[global_to_local[4]] = 1.0
 
-    out = model(x_test, mob_graph.edge_index, mob_graph.edge_weight)
-    target_out = out[mob_graph.target_node]
-
-    # With depth=1 and CORRECT k-hop subgraph, this should be 0
-    # But with full graph, node 4 influences node 3, which influences node 2,
-    # which influences node 1, which influences node 0
-    # All in ONE layer because edges exist between all adjacent pairs
-
-    # Actually, with depth=1 on a chain:
-    # Node 4 can only reach node 3 in one hop
-    # So target_out should be 0 even with full graph
-    # Let me reconsider...
-
-    # The issue is more subtle. After Layer 1:
-    # - Node 3 has representation from [3, 4]
-    # - Node 2 has representation from [2, 3']
-    # - Node 1 has representation from [1, 2']
-    # - Node 0 has representation from [0, 1']
-
-    # For depth=1, node 0 only sees direct neighbors [0, 1], not 1'
-    # So node 4 shouldn't influence node 0 with depth=1
-
-    # The real issue is with depth > 1:
-    # With depth=2, node 0 sees [0, 1], but 1' contains info from 2, which contains info from 3...
+    out = model(x_test.unsqueeze(0), adj)
+    target_out = out[0, mob_graph["target_node"]]
 
     assert torch.norm(target_out) == 0, (
         "With depth=1, 4-hop neighbor shouldn't influence target directly"
@@ -709,21 +676,19 @@ def test_gnn_receptive_field_depth_2_khop_masking_prevents_propagation(tmp_path)
 
     item = dataset[0]
     mob_graph = _reconstruct_mob_graph(item, 0, dataset)
-    feat_dim = mob_graph.x.shape[1]
+    feat_dim = mob_graph["x"].shape[1]
 
     model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
     global_to_local = _global_to_local_map(mob_graph)
 
-    # Only node 4 (4-hop away) has signal
-    x_test = torch.zeros_like(mob_graph.x, dtype=torch.float32)
+    adj = mob_graph["adj"].unsqueeze(0)
+    x_test = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
     if 4 in global_to_local:
         x_test[global_to_local[4]] = 1.0
 
-    out = model(x_test, mob_graph.edge_index, mob_graph.edge_weight)
-    target_out = out[mob_graph.target_node]
+    out = model(x_test.unsqueeze(0), adj)
+    target_out = out[0, mob_graph["target_node"]]
 
-    # With k-hop feature masking, node 4's features are masked to 0 for target node 0
-    # So the target should NOT be influenced by the 4-hop neighbor
     assert torch.norm(target_out) == 0, (
         "With k-hop feature masking, 4-hop neighbor should NOT influence target"
     )

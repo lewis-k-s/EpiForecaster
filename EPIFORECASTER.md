@@ -68,7 +68,7 @@ $$ L_{total} = w_{ww} L_{WW} + w_{hosp} L_{Hosp} + w_{cases} L_{Cases} + w_{deat
 The architecture supports ablation studies via `ModelVariant` flags:
 
 *   **Regions**: Enables static `region_embeddings` inputs.
-*   **Mobility**: Enables `MobilityPyGEncoder` to process dynamic mobility graphs.
+*   **Mobility**: Enables `MobilityDenseEncoder` to process dynamic mobility graphs.
 *   **Biomarkers**: Enables wastewater inputs.
 *   **Cases**: Enables clinical history inputs.
 
