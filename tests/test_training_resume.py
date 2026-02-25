@@ -22,6 +22,7 @@ def test_resolve_model_id_falls_back_to_slurm(monkeypatch) -> None:
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
+    monkeypatch.delenv("EPIFORECASTER_MODEL_ID", raising=False)
     monkeypatch.setenv("SLURM_JOB_ID", "456")
     assert trainer._resolve_model_id() == "456"
 
@@ -34,6 +35,7 @@ def test_resolve_model_id_interactive_slurm_uses_datetime(monkeypatch) -> None:
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
+    monkeypatch.delenv("EPIFORECASTER_MODEL_ID", raising=False)
     # Simulate interactive SLURM session
     monkeypatch.setenv("SLURM_JOB_ID", "35320487")
     monkeypatch.setenv("SLURM_JOB_NAME", "interactive")
@@ -50,6 +52,7 @@ def test_resolve_model_id_interactive_qos_detection(monkeypatch) -> None:
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
+    monkeypatch.delenv("EPIFORECASTER_MODEL_ID", raising=False)
     # Simulate interactive SLURM via QOS
     monkeypatch.setenv("SLURM_JOB_ID", "35320487")
     monkeypatch.setenv("SLURM_JOB_QOS", "acc_interactive")
@@ -66,11 +69,26 @@ def test_resolve_model_id_batch_job_uses_slurm_id(monkeypatch) -> None:
         output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
     )
     trainer = _make_trainer_stub(config)
+    monkeypatch.delenv("EPIFORECASTER_MODEL_ID", raising=False)
     # Simulate batch job (no interactive markers)
     monkeypatch.setenv("SLURM_JOB_ID", "35320487")
     monkeypatch.setenv("SLURM_JOB_NAME", "train_epoch")
     monkeypatch.setenv("SLURM_JOB_QOS", "normal")
     assert trainer._resolve_model_id() == "35320487"
+
+
+@pytest.mark.epiforecaster
+def test_resolve_model_id_env_override_has_priority(monkeypatch) -> None:
+    config = SimpleNamespace(
+        training=SimpleNamespace(),
+        output=SimpleNamespace(log_dir="unused", experiment_name="exp"),
+    )
+    trainer = _make_trainer_stub(config)
+    monkeypatch.setenv("EPIFORECASTER_MODEL_ID", "override_123")
+    monkeypatch.setenv("SLURM_JOB_ID", "35320487")
+    monkeypatch.setenv("SLURM_JOB_NAME", "train_epoch")
+    monkeypatch.setenv("SLURM_JOB_QOS", "normal")
+    assert trainer._resolve_model_id() == "override_123"
 
 
 @pytest.mark.epiforecaster

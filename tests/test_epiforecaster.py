@@ -195,6 +195,42 @@ class TestEpiForecaster:
         # Predictions include t=0 (nowcast) so they are H+1 shaped
         assert out["pred_cases"].shape == (2, config["forecast_horizon"] + 1)
 
+    def test_forward_with_mobility_and_regions(self, basic_config, dummy_batch):
+        """Test forward pass where region embeddings are injected into the mobility GNN."""
+        config = basic_config.copy()
+        config["variant_type"] = ModelVariant(cases=True, mobility=True, regions=True)
+        config["gnn_hidden_dim"] = 8
+        config["mobility_embedding_dim"] = 8
+        config["region_embedding_dim"] = 8
+
+        model = EpiForecaster(**config)
+
+        B, T = dummy_batch["hosp_hist"].shape[:2]
+        num_graphs = B * T
+        num_nodes = 5
+        mob_batch = Batch()
+
+        # In this config, the GNN input capacity is temporal_dim + region_dim
+        mob_batch.x_dense = _rand_tensor(num_graphs, num_nodes, model.temporal_node_dim)
+        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes)
+        eye = torch.eye(num_nodes, dtype=dense_adj.dtype).unsqueeze(0)
+        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
+        mob_batch.mob_real_node_idx = torch.arange(num_nodes, dtype=torch.long)
+
+        out = model(
+            hosp_hist=dummy_batch["hosp_hist"],
+            deaths_hist=dummy_batch["deaths_hist"],
+            cases_hist=dummy_batch["cases_hist"],
+            biomarkers_hist=dummy_batch["biomarkers_hist"],
+            mob_graphs=mob_batch,
+            target_nodes=dummy_batch["target_nodes"],
+            region_embeddings=torch.randn(10, 8),  # num_regions = 10
+            population=dummy_batch["population"],
+        )
+
+        assert out["beta_t"].shape == (B, config["forecast_horizon"])
+
     def test_gradient_flow(self, basic_config, dummy_batch):
         """Smoke test for parameter gradient flow under conservative initialization."""
         model = EpiForecaster(**basic_config)

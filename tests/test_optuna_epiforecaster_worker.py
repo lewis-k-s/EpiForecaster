@@ -13,7 +13,6 @@ from scripts.optuna_epiforecaster_worker import (
     _compute_worker_seed,
     _decode_categorical_value,
     _overrides_to_dotlist,
-    _parse_batch_grad_combo,
     suggest_epiforecaster_params,
 )
 
@@ -217,25 +216,6 @@ class TestOverridesToDotlist:
         assert result == ["lr=0.001"]
 
 
-class TestParseBatchGradCombo:
-    def test_json_string_decodes_and_parses(self) -> None:
-        assert _parse_batch_grad_combo("[32, 4]") == (32, 4)
-
-    @pytest.mark.parametrize("combo", [(64, 2), [64, 2]])
-    def test_native_sequence_parses(self, combo: tuple[int, int] | list[int]) -> None:
-        assert _parse_batch_grad_combo(combo) == (64, 2)
-
-    @pytest.mark.parametrize("combo", ["[32, 4, 8]", "[]"])
-    def test_invalid_shape_raises(self, combo: str) -> None:
-        with pytest.raises(ValueError, match="training.batch_grad_combo"):
-            _parse_batch_grad_combo(combo)
-
-    @pytest.mark.parametrize("combo", ['["32", 4]', ["32", 4], [0, 4], [-1, 2]])
-    def test_invalid_types_raises(self, combo: object) -> None:
-        with pytest.raises(ValueError, match="training.batch_grad_combo"):
-            _parse_batch_grad_combo(combo)
-
-
 class TestBoundedJointLossWeightOverrides:
     def test_returns_all_weight_keys(self) -> None:
         trial = _StubTrial()
@@ -311,16 +291,8 @@ class TestBoundedJointLossWeightOverrides:
 
 
 class TestSuggestEpiforecasterParams:
-    def test_sets_batch_and_grad_from_encoded_combo(self) -> None:
-        trial = _StubTrial(categorical_values={"training.batch_grad_combo": "[32, 4]"})
-        overrides = suggest_epiforecaster_params(
-            trial=trial,
-            base_cfg=_base_cfg_stub(),
-        )
-        assert overrides["training.batch_size"] == 32
-        assert overrides["training.gradient_accumulation_steps"] == 4
-        assert isinstance(overrides["training.batch_size"], int)
-        assert isinstance(overrides["training.gradient_accumulation_steps"], int)
+    # NOTE: batch_size/gradient_accumulation_steps are no longer swept.
+    # They were fixed at 32/1 based on production config. Test removed.
 
     def test_training_knobs_learning_rate(self) -> None:
         trial = _StubTrial()
@@ -349,69 +321,15 @@ class TestSuggestEpiforecasterParams:
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
         assert "data.mobility_threshold" in overrides
 
-    def test_missing_permit_daily_bounds(self) -> None:
+    def test_full_worker_does_not_suggest_missing_permit(self) -> None:
         trial = _StubTrial()
-        cfg = _base_cfg_stub(model={"input_window_length": 60, "forecast_horizon": 28})
-        suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-
-        input_call = next(
-            c for c in trial.suggest_calls if c[1] == "data.missing_permit_input_daily"
-        )
-        assert input_call[0] == "int"
-        assert input_call[2] == (0, 30)
-
-        horizon_call = next(
-            c
-            for c in trial.suggest_calls
-            if c[1] == "data.missing_permit_horizon_daily"
-        )
-        assert horizon_call[0] == "int"
-        assert horizon_call[2] == (0, 14)
-
-    def test_missing_permit_weekly_bounds(self) -> None:
-        trial = _StubTrial()
-        cfg = _base_cfg_stub(model={"input_window_length": 14, "forecast_horizon": 7})
-        suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-
-        input_call = next(
-            c for c in trial.suggest_calls if c[1] == "data.missing_permit_input_weekly"
-        )
-        assert input_call[0] == "int"
-        assert input_call[2] == (12, 13)
-
-        horizon_call = next(
-            c
-            for c in trial.suggest_calls
-            if c[1] == "data.missing_permit_horizon_weekly"
-        )
-        assert horizon_call[0] == "int"
-        assert horizon_call[2] == (6, 6)
-
-    def test_missing_permit_sets_all_daily_overrides(self) -> None:
-        trial = _StubTrial(
-            int_values={
-                "data.missing_permit_input_daily": 5,
-                "data.missing_permit_horizon_daily": 3,
-            }
-        )
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        assert overrides["data.missing_permit.input.cases"] == 5
-        assert overrides["data.missing_permit.input.deaths"] == 5
-        assert overrides["data.missing_permit.horizon.cases"] == 3
-        assert overrides["data.missing_permit.horizon.deaths"] == 3
-
-    def test_missing_permit_sets_all_weekly_overrides(self) -> None:
-        trial = _StubTrial(
-            int_values={
-                "data.missing_permit_input_weekly": 50,
-                "data.missing_permit_horizon_weekly": 20,
-            }
-        )
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        assert overrides["data.missing_permit.input.hospitalizations"] == 50
-        assert overrides["data.missing_permit.input.biomarkers_joint"] == 50
-        assert overrides["data.missing_permit.horizon.hospitalizations"] == 20
-        assert overrides["data.missing_permit.horizon.biomarkers_joint"] == 20
+        missing_calls = [c for c in trial.suggest_calls if "missing_permit" in c[1]]
+        assert missing_calls == []
+        missing_override_keys = [
+            k for k in overrides if k.startswith("data.missing_permit.")
+        ]
+        assert missing_override_keys == []
 
     def test_mobility_model_knobs_gnn_depth(self) -> None:
         trial = _StubTrial()
