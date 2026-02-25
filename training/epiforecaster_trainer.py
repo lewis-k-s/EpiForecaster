@@ -1860,19 +1860,18 @@ class EpiForecasterTrainer:
                     dtype=self.precision_policy.autocast_dtype,
                     enabled=self.precision_policy.autocast_enabled,
                 ):
-                    with torch.profiler.record_function("forward"):
-                        # Reconstruct massive dense graph tensors on the GPU directly
-                        # bypassing dataloader worker IPC queue.
-                        from utils.training_utils import inject_gpu_mobility
+                    # Reconstruct massive dense graph tensors on the GPU directly
+                    # bypassing dataloader worker IPC queue.
+                    from utils.training_utils import inject_gpu_mobility
 
-                        inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
+                    inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
 
-                        model_outputs, targets_dict = self.model.forward_batch(
-                            batch_data=batch_data,
-                            region_embeddings=self.region_embeddings,
-                        )
+                    model_outputs, targets_dict = self.model.forward_batch(
+                        batch_data=batch_data,
+                        region_embeddings=self.region_embeddings,
+                    )
 
-                        loss = self.criterion(model_outputs, targets_dict, batch_data)
+                    loss = self.criterion(model_outputs, targets_dict, batch_data)
 
                 # Guard against non-finite losses to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -1907,8 +1906,7 @@ class EpiForecasterTrainer:
                 # Scale loss for gradient accumulation
                 scaled_loss = loss / accum_steps
 
-                with torch.profiler.record_function("backward"):
-                    scaled_loss.backward()
+                scaled_loss.backward()
 
                 # Only step optimizer every N batches (gradient accumulation)
                 should_step = (batch_idx + 1) % accum_steps == 0
@@ -1959,8 +1957,7 @@ class EpiForecasterTrainer:
                         self.global_step += 1
                         continue
                     last_gradnorm = grad_norm  # Update for progress logging
-                    with torch.profiler.record_function("optimizer_step"):
-                        self.optimizer.step()
+                    self.optimizer.step()
 
                     # LR warmup restore: after curriculum transition, gradually
                     # restore learning rate over 100 steps

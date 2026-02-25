@@ -28,6 +28,7 @@ class ProfilerConfig:
     # Where to write profiler traces. Use "auto" to place traces inside the
     # experiment log directory so they appear alongside other artifacts.
     log_dir: str = "auto"
+    # Memory profiling adds ~15-20% overhead to profiler. Disable for production runs.
     record_memory: bool = False
     with_stack: bool = False
 
