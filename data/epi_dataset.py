@@ -859,6 +859,7 @@ class EpiDataset(Dataset):
             "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
             "mob_t": torch.arange(range_start, range_start + L, dtype=torch.long),
             "mob_target_node_idx": local_target_idx_tensor,
+            "mob_real_node_idx": node_ids,
             "population": population,
             "run_id": run_id,
             "temporal_covariates": temporal_covariates_hist,  # (L, cov_dim)
@@ -1631,11 +1632,28 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     ).long()
     target_node_tensor = target_nodes_stacked.repeat_interleave(L).to(x_dense.device)
 
+    # Extract run_id provenance if the batch is homogeneous (expected with chunked samplers).
+    run_ids = [item.get("run_id") for item in batch]
+    non_none_run_ids = [run_id for run_id in run_ids if run_id is not None]
+    normalized_run_ids = {str(run_id).strip() for run_id in non_none_run_ids}
+    batch_run_id = None
+    if len(non_none_run_ids) == len(run_ids) and len(normalized_run_ids) == 1:
+        batch_run_id = next(iter(normalized_run_ids))
+
+    # Context node mapping (constant across batch, so we can take from the first item)
+    if "mob_real_node_idx" in batch[0]:
+        mob_real_node_idx = batch[0]["mob_real_node_idx"]
+    else:
+        mob_real_node_idx = None
+
     # 5) Batch-like container
     mob_batch = Batch()
     mob_batch.x_dense = x_dense
     mob_batch.global_t = global_t_dense
     mob_batch.target_node = target_node_tensor
+    if mob_real_node_idx is not None:
+        mob_batch.mob_real_node_idx = mob_real_node_idx
+    mob_batch.run_id = batch_run_id
 
     return mob_batch
 
