@@ -56,6 +56,14 @@ uv run pyright .           # type checking (best-effort; excludes dataviz/plotti
 - Use fixtures for sample data; keep tests deterministic (seed RNGs).
 - Quick examples: `uv run pytest -k graph tests/`, `uv run pytest -q tests/`.
 
+## Configuration Files
+
+> **WARNING: Production Configs**
+>
+> Do not run configs in `configs/production_only/` locally. They require 100GB+ memory and GPU cluster resources, and will cause out-of-memory crashes on typical development machines. See `configs/production_only/README.md` for details.
+>
+> For local development, use configs in the main `configs/` directory instead.
+
 ### Pytest Markers
 
 Tests are organized with markers for selective execution:
@@ -94,7 +102,7 @@ This project uses YAML configuration files for reproducible experiments:
 The canonical data pipeline follows: raw data → preprocessing → Zarr datasets → training
 
 - Use `uv run preprocess (regions|epiforecaster)` to convert raw data to canonical format
-- Manage datasets with `epiforecaster list-datasets` and `epiforecaster info`
+
 - Use `uv run train (regions|epiforecaster)` to train on the prepared dataset.
 
 ## Commit & Pull Request Guidelines

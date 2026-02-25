@@ -7,52 +7,87 @@ For information on the region embedding model design see REGION2VEC.md
 
 ## Model Architecture
 
-The `EpiForecaster` assembly in `models/epiforecaster.py` orchestrates three cooperating modules: the inductive region embedder defined in `graph/node_encoder.py`, the per-time-step mobility GNN in `models/mobility_gnn.py`, and the Transformer forecasting head in `models/forecaster_head.py`. The diagram below shows how static, mobility, and temporal signals move through the complete model.
+The `EpiForecaster` implements a **Joint Inference-Observation** framework with a three-stage differentiable pipeline. See [EPIFORECASTER.md](EPIFORECASTER.md) for full details.
 
 ```mermaid
 flowchart TD
     subgraph Inputs
-        cases[["covid case incidence
-        (T,N,1)"]]
-        biomarkers[["biomarkers
-        (T,N,F_bio)"]]
-        mobility[["mobility
-        (T,N,N,1)"]]
-        regions[["region geometries, spatial metadata
-        (N,F_regions)"]]
-        temporal[["temporal covariates
-        (T,3) optional"]]
+        cases_hist[["Cases History
+        (B,T,3)"]]
+        hosp_hist[["Hospitalizations History
+        (B,T,3)"]]
+        deaths_hist[["Deaths History
+        (B,T,3)"]]
+        biomarkers[["Biomarkers (Wastewater)
+        (B,T,D_bio)"]]
+        mobility[["Mobility Graphs
+        (B*T graphs)"]]
+        regions[["Region Embeddings
+        (N,F_regions) optional"]]
+        population[["Population
+        (B) optional"]]
+        temporal[["Temporal Covariates
+        (B,T,3) optional"]]
     end
 
-    subgraph Region2Vec
-        regionEmbedder["Region Embedder
-        (graph/node_encoder.py)"]
+    subgraph Stage1_Encoder["Stage 1: Encoder (TransformerBackbone)"]
+        encoder["Amortized Inference Engine
+(models/epiforecaster.py)"]
+        rates["Output: βt, γt, μt, (S₀,I₀,R₀),
+Observation Context"]
     end
 
-    subgraph TimeStepProcessing
-        featureBuilder["Local feature builder
-        (models/epiforecaster.py)"]
-        mobilityGNN["Mobility GNN
-        (models/mobility_gnn.py)"]
+    subgraph Stage2_Physics["Stage 2: Physics Core (SIRRollForward)"]
+        sir["Differentiable SIRD Roll-forward"]
+        latent["Latent Trajectories:
+S(t), I(t), R(t), death_flow(t)"]
     end
 
-    subgraph TemporalHead
-        transformerHead["Transformer Forecaster Head
-        (models/forecaster_head.py)"]
+    subgraph Stage3_Observation["Stage 3: Observation Heads"]
+        ww_head["Wastewater Head
+I(t-k:t) → Viral Load"]
+        hosp_head["Hospitalization Head
+I(t-k:t) → Admissions"]
+        cases_head["Cases Head
+I(t-k:t) → Reported Cases"]
+        deaths_head["Deaths Head
+death_flow → Observed Deaths"]
     end
 
-    cases --> featureBuilder
-    biomarkers --> featureBuilder
-    regions --> regionEmbedder --> featureBuilder
-    temporal --> featureBuilder
-    featureBuilder --> mobilityGNN
-    mobility --> mobilityGNN
-    regionEmbedder --> mobilityGNN
-    mobilityGNN --> transformerHead
-    featureBuilder --> transformerHead
-    transformerHead --> forecasts[["- H-step forecasts
-    - Outbreak classification"]]
+    subgraph Outputs
+        pred_ww[["pred_ww"]]
+        pred_hosp[["pred_hosp"]]
+        pred_cases[["pred_cases"]]
+        pred_deaths[["pred_deaths"]]
+        latent_out[["S,I,R Trajectories
+βt, γt, μt"]]
+    end
+
+    cases_hist --> encoder
+    hosp_hist --> encoder
+    deaths_hist --> encoder
+    biomarkers --> encoder
+    mobility --> encoder
+    regions --> encoder
+    population --> encoder
+    temporal --> encoder
+
+    encoder --> rates --> sir
+    sir --> latent
+
+    latent --> ww_head --> pred_ww
+    latent --> hosp_head --> pred_hosp
+    latent --> cases_head --> pred_cases
+    latent --> deaths_head --> pred_deaths
+
+    rates --> latent_out
+    latent --> latent_out
 ```
+
+**Key Design Principles:**
+- **Physics constrains the Latent State**: SIRD dynamics enforce epidemiological consistency
+- **Observations constrain the Physics**: Multiple observation heads anchor latent states to real-world signals
+- **End-to-end Differentiable**: All three stages are jointly optimized via composite loss
 
 ## Installation
 
@@ -68,16 +103,6 @@ pip install -e .
 ```
 
 The installation provides access to the `epiforecaster` command-line interface:
-- After `pip install -e .`: Use `epiforecaster` directly
-- With `uv`: Use `uv run python -m cli` (recommended for development)
-
-## Configuration Files
-
-> **WARNING: Production Configs**
->
-> Do not run configs in `configs/production_only/` locally. They require 100GB+ memory and GPU cluster resources, and will cause out-of-memory crashes on typical development machines. See `configs/production_only/README.md` for details.
->
-> For local development, use configs in the main `configs/` directory instead.
 
 ## Usage
 
@@ -86,19 +111,9 @@ EpiForecaster follows a two-step workflow: data preprocessing followed by model 
 ### Quick Start
 
 ```bash
-uv run python -m cli preprocess epiforecaster --config preprocess_config.yaml
+uv run preprocess epiforecaster --config preprocess_config.yaml
 
-uv run python -m cli train epiforecaster --config train_config.yaml
-```
-
-### Dataset Management
-
-```bash
-# List available preprocessed datasets
-uv run python -m cli list-datasets --data-dir data/processed
-
-# Get detailed information about a dataset
-uv run python -m cli info --dataset data/processed/dataset.zarr --validate
+uv run train epiforecaster --config train_config.yaml
 ```
 
 ### Development & Testing
@@ -118,6 +133,7 @@ uv run ruff format .
 ```
 
 Tests are organized with pytest markers:
+
 - `@pytest.mark.region`: Tests for region2vec, region losses, spatial autocorrelation
 - `@pytest.mark.epiforecaster`: Tests for the main epidemiological forecaster model
 
@@ -134,6 +150,7 @@ Run `uv run pytest --markers` to see all available markers.
 [4] Fey, M., & Lenssen, J. E. (2019). **Fast Graph Representation Learning with PyTorch Geometric**. *ICLR Workshop on Representation Learning on Graphs and Manifolds*. [arXiv:1903.02428](https://arxiv.org/abs/1903.02428)
 
 [5] Zhang, J., et al. (2023). **Heterogeneous Graph Neural Networks for Origin-Destination Demand Prediction**. *Transportation Research Part C*, 147, 103995. [doi:10.1016/j.trc.2022.103995](https://doi.org/10.1016/j.trc.2022.103995)
+[6] Liang, Y., et al. (2022) Region2Vec: community detection on spatial networks using graph embedding with node attributes and spatial interactions. *Proceedings of the 30th International Conference on Advances in Geographic Information Systems (pp. 1-4)* [doi.org/10.1145/3557915.3560974](https://doi.org/10.1145/3557915.3560974)
 
 ## License
 

@@ -133,7 +133,7 @@ uv run python -m data.preprocess.pipeline --config configs/preprocess/<your_conf
 
 * Use a single configuration file to describe the desired dataset. Variant-specific switches should live in the training/model configs, not here.
 * The pipeline infers the output path via `PreprocessingConfig.get_output_dataset_path()` and overwrites previous artifacts if they share the same dataset name—copy/rename if you need historical snapshots.
-* To inspect the result, point `DatasetStorage.validate_dataset(<zarr_path>)` or load via the CLI commands defined in `cli.py`.
+* To inspect the result, point `DatasetStorage.validate_dataset(<zarr_path>)`.
 
 ## Practical Notes
 

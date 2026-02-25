@@ -474,6 +474,9 @@ class EpiForecasterTrainer:
         # Enable TF32 for better performance on Ampere+ GPUs
         self._setup_tensor_core_optimizations()
 
+        # Pre-compute parameter groups for efficient gradient norm logging
+        self._init_gradient_norm_groups()
+
         # Setup training components (optimizer, scheduler, criterion)
         self.optimizer = self._create_optimizer()
 
@@ -1913,12 +1916,9 @@ class EpiForecasterTrainer:
 
                 grad_norm = torch.tensor(0.0)
                 if should_step or is_last_batch:
-                    self._log_gradient_norms(step=self.global_step)
-                    # Clip gradients without error_if_nonfinite to avoid GPU-CPU sync
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.training.gradient_clip_value,
-                        error_if_nonfinite=False,
+                    # Compute gradient norms and clip in single pass
+                    grad_norm, _grad_norms_dict = self._compute_gradient_norms_and_clip(
+                        step=self.global_step
                     )
                     # Check for non-finite grad norm on CPU to avoid sync
                     grad_norm_cpu = grad_norm.detach().cpu()
@@ -2144,36 +2144,12 @@ class EpiForecasterTrainer:
         )
         return test_loss, test_metrics, test_node_mae
 
-    def _log_gradient_norms(self, step: int):
-        """Calculates and logs the gradient norms for model components.
+    def _init_gradient_norm_groups(self):
+        """Pre-compute parameter groups for efficient gradient norm computation.
 
-        Groups parameters into semantically meaningful categories:
-        - SIRD physics: beta/gamma/mortality/initial_states projections
-        - Observation heads: ww_head, hosp_head, cases_head, deaths_head (per-head + total)
-        - Backbone encoder: remaining backbone params (transformer, embeddings)
-        - Mobility GNN: graph neural network parameters
-        - Other: catch-all for any remaining parameters
+        Categorizes parameters by component once at init to avoid string matching
+        in the hot training loop.
         """
-        frequency = self.config.training.grad_norm_log_frequency
-        accum_steps = self.config.training.gradient_accumulation_steps
-        effective_step = get_effective_optimizer_step(step, accum_steps)
-
-        if frequency <= 0 or (effective_step % frequency != 0 and effective_step != 0):
-            return
-
-        if not any(p.requires_grad for p in self.model.parameters()):
-            return
-
-        sird_sq_sum = torch.tensor(0.0, device=self.device)
-        encoder_sq_sum = torch.tensor(0.0, device=self.device)
-        gnn_sq_sum = torch.tensor(0.0, device=self.device)
-        other_sq_sum = torch.tensor(0.0, device=self.device)
-
-        ww_sq_sum = torch.tensor(0.0, device=self.device)
-        hosp_sq_sum = torch.tensor(0.0, device=self.device)
-        cases_sq_sum = torch.tensor(0.0, device=self.device)
-        deaths_sq_sum = torch.tensor(0.0, device=self.device)
-
         sird_projections = {
             "beta_projection",
             "gamma_projection",
@@ -2181,90 +2157,155 @@ class EpiForecasterTrainer:
             "initial_states_projection",
         }
 
+        self._grad_norm_groups: dict[str, list[torch.nn.Parameter]] = {
+            "mobility_gnn": [],
+            "ww_head": [],
+            "hosp_head": [],
+            "cases_head": [],
+            "deaths_head": [],
+            "sird": [],
+            "backbone": [],
+            "other": [],
+        }
+
         for name, param in self.model.named_parameters():
-            if param.grad is not None and param.requires_grad:
-                grad_sq_sum = param.grad.detach().pow(2).sum()
+            if not param.requires_grad:
+                continue
 
-                if "mobility_gnn" in name:
-                    gnn_sq_sum += grad_sq_sum
-                elif "ww_head" in name:
-                    ww_sq_sum += grad_sq_sum
-                elif "hosp_head" in name:
-                    hosp_sq_sum += grad_sq_sum
-                elif "cases_head" in name:
-                    cases_sq_sum += grad_sq_sum
-                elif "deaths_head" in name:
-                    deaths_sq_sum += grad_sq_sum
-                elif any(proj in name for proj in sird_projections):
-                    sird_sq_sum += grad_sq_sum
-                elif "backbone" in name:
-                    encoder_sq_sum += grad_sq_sum
-                else:
-                    other_sq_sum += grad_sq_sum
+            if "mobility_gnn" in name:
+                self._grad_norm_groups["mobility_gnn"].append(param)
+            elif "ww_head" in name:
+                self._grad_norm_groups["ww_head"].append(param)
+            elif "hosp_head" in name:
+                self._grad_norm_groups["hosp_head"].append(param)
+            elif "cases_head" in name:
+                self._grad_norm_groups["cases_head"].append(param)
+            elif "deaths_head" in name:
+                self._grad_norm_groups["deaths_head"].append(param)
+            elif any(proj in name for proj in sird_projections):
+                self._grad_norm_groups["sird"].append(param)
+            elif "backbone" in name:
+                self._grad_norm_groups["backbone"].append(param)
+            else:
+                self._grad_norm_groups["other"].append(param)
 
-        obs_heads_sq_sum = ww_sq_sum + hosp_sq_sum + cases_sq_sum + deaths_sq_sum
+    def _compute_gradient_norms_and_clip(
+        self, step: int
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute gradient norms by component and apply clipping in a single pass.
 
-        component_sq_sums = torch.stack(
-            [
-                sird_sq_sum,
-                encoder_sq_sum,
-                gnn_sq_sum,
-                obs_heads_sq_sum,
-                other_sq_sum,
-            ]
+        Combines gradient norm computation and clipping to avoid iterating
+        parameters twice.
+
+        Returns:
+            Tuple of (global_grad_norm, component_norms_dict)
+        """
+        frequency = self.config.training.grad_norm_log_frequency
+        accum_steps = self.config.training.gradient_accumulation_steps
+        effective_step = get_effective_optimizer_step(step, accum_steps)
+        should_log = frequency > 0 and (
+            effective_step % frequency == 0 or effective_step == 0
         )
-        total_sq_sum = component_sq_sums.sum()
 
-        per_head_sq_sums = torch.stack(
-            [ww_sq_sum, hosp_sq_sum, cases_sq_sum, deaths_sq_sum]
-        )
+        # Compute squared norms by group
+        gnn_sq_sum = torch.tensor(0.0, device=self.device)
+        ww_sq_sum = torch.tensor(0.0, device=self.device)
+        hosp_sq_sum = torch.tensor(0.0, device=self.device)
+        cases_sq_sum = torch.tensor(0.0, device=self.device)
+        deaths_sq_sum = torch.tensor(0.0, device=self.device)
+        sird_sq_sum = torch.tensor(0.0, device=self.device)
+        encoder_sq_sum = torch.tensor(0.0, device=self.device)
+        other_sq_sum = torch.tensor(0.0, device=self.device)
 
-        all_sq_sums = torch.cat(
-            [
-                total_sq_sum.unsqueeze(0),
-                component_sq_sums,
-                per_head_sq_sums,
-            ]
-        )
-        all_norms = all_sq_sums.sqrt().cpu().numpy()
+        # Collect all gradients for global norm computation
+        all_grads = []
 
-        (
-            total_norm,
-            sird_norm,
-            encoder_norm,
-            gnn_norm,
-            obs_heads_norm,
-            other_norm,
-            ww_norm,
-            hosp_norm,
-            cases_norm,
-            deaths_norm,
-        ) = all_norms
+        for group_name, params in self._grad_norm_groups.items():
+            for param in params:
+                if param.grad is not None:
+                    grad = param.grad.detach()
+                    all_grads.append(grad)
+                    sq_norm = grad.pow(2).sum()
 
-        if self.wandb_run is not None:
-            wandb.log(
-                {
-                    "gradnorm_total_preclip": total_norm,
-                    "gradnorm_sird_physics": sird_norm,
-                    "gradnorm_backbone_encoder": encoder_norm,
-                    "gradnorm_mobility_gnn": gnn_norm,
-                    "gradnorm_observation_heads": obs_heads_norm,
-                    "gradnorm_obs_ww": ww_norm,
-                    "gradnorm_obs_hosp": hosp_norm,
-                    "gradnorm_obs_cases": cases_norm,
-                    "gradnorm_obs_deaths": deaths_norm,
-                    "gradnorm_other": other_norm,
-                    "gradnorm_backbone": encoder_norm + sird_norm,
-                },
-                step=effective_step,
+                    if should_log:
+                        if group_name == "mobility_gnn":
+                            gnn_sq_sum += sq_norm
+                        elif group_name == "ww_head":
+                            ww_sq_sum += sq_norm
+                        elif group_name == "hosp_head":
+                            hosp_sq_sum += sq_norm
+                        elif group_name == "cases_head":
+                            cases_sq_sum += sq_norm
+                        elif group_name == "deaths_head":
+                            deaths_sq_sum += sq_norm
+                        elif group_name == "sird":
+                            sird_sq_sum += sq_norm
+                        elif group_name == "backbone":
+                            encoder_sq_sum += sq_norm
+                        else:
+                            other_sq_sum += sq_norm
+
+        # Compute global norm
+        if all_grads:
+            global_norm = torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
+        else:
+            global_norm = torch.tensor(0.0, device=self.device)
+
+        # Apply gradient clipping
+        clip_value = self.config.training.gradient_clip_value
+        if global_norm > clip_value:
+            scale = clip_value / (global_norm + 1e-6)
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(scale)
+
+        # Build norms dict for logging
+        norms_dict: dict[str, float] = {}
+        if should_log:
+            obs_heads_sq_sum = ww_sq_sum + hosp_sq_sum + cases_sq_sum + deaths_sq_sum
+            component_sq_sums = torch.stack(
+                [
+                    sird_sq_sum,
+                    encoder_sq_sum,
+                    gnn_sq_sum,
+                    obs_heads_sq_sum,
+                    other_sq_sum,
+                ]
+            )
+            total_sq_sum = component_sq_sums.sum()
+            per_head_sq_sums = torch.stack(
+                [ww_sq_sum, hosp_sq_sum, cases_sq_sum, deaths_sq_sum]
+            )
+            all_sq_sums = torch.cat(
+                [total_sq_sum.unsqueeze(0), component_sq_sums, per_head_sq_sums]
+            )
+            all_norms = all_sq_sums.sqrt().cpu().numpy()
+
+            norms_dict = {
+                "gradnorm_total_preclip": float(all_norms[0]),
+                "gradnorm_sird_physics": float(all_norms[1]),
+                "gradnorm_backbone_encoder": float(all_norms[2]),
+                "gradnorm_mobility_gnn": float(all_norms[3]),
+                "gradnorm_observation_heads": float(all_norms[4]),
+                "gradnorm_other": float(all_norms[5]),
+                "gradnorm_obs_ww": float(all_norms[6]),
+                "gradnorm_obs_hosp": float(all_norms[7]),
+                "gradnorm_obs_cases": float(all_norms[8]),
+                "gradnorm_obs_deaths": float(all_norms[9]),
+                "gradnorm_backbone": float(all_norms[1] + all_norms[2]),
+            }
+
+            if self.wandb_run is not None:
+                wandb.log(norms_dict, step=effective_step)
+
+            self._status(
+                f"Grad norms @ step {step}: Total={all_norms[0]:.4f} | "
+                f"SIRD={all_norms[1]:.4f} | Enc={all_norms[2]:.4f} | "
+                f"GNN={all_norms[3]:.4f} | Obs={all_norms[4]:.4f} | Other={all_norms[5]:.4f}",
+                logging.DEBUG,
             )
 
-        self._status(
-            f"Grad norms @ step {step}: Total={total_norm:.4f} | "
-            f"SIRD={sird_norm:.4f} | Enc={encoder_norm:.4f} | "
-            f"GNN={gnn_norm:.4f} | Obs={obs_heads_norm:.4f} | Other={other_norm:.4f}",
-            logging.DEBUG,
-        )
+        return global_norm, norms_dict
 
     def _persist_run_config(self, run_dir: Path) -> None:
         """Copy the input configuration to the run directory.
