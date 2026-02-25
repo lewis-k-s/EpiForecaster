@@ -36,7 +36,6 @@ from __future__ import annotations
 import importlib
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -93,33 +92,6 @@ def _decode_categorical_value(value: Any) -> Any:
             except json.JSONDecodeError as exc:
                 raise ValueError(f"Invalid JSON categorical value: {value!r}") from exc
     return value
-
-
-def _parse_batch_grad_combo(value: Any) -> tuple[int, int]:
-    """Validate and parse (batch_size, grad_accum) from categorical value."""
-    decoded = _decode_categorical_value(value)
-    if not isinstance(decoded, (list, tuple)):
-        raise ValueError(
-            "training.batch_grad_combo must be a 2-item list/tuple like [32, 4]"
-        )
-    if len(decoded) != 2:
-        raise ValueError(
-            "training.batch_grad_combo must have exactly 2 values: "
-            "[batch_size, gradient_accumulation_steps]"
-        )
-
-    batch_size, grad_accum = decoded
-    if not isinstance(batch_size, int) or not isinstance(grad_accum, int):
-        raise ValueError(
-            "training.batch_grad_combo values must be positive integers: "
-            "[batch_size, gradient_accumulation_steps]"
-        )
-    if batch_size <= 0 or grad_accum <= 0:
-        raise ValueError(
-            "training.batch_grad_combo values must be > 0: "
-            "[batch_size, gradient_accumulation_steps]"
-        )
-    return batch_size, grad_accum
 
 
 def _slurm_identity() -> dict[str, str]:
@@ -238,24 +210,25 @@ def suggest_epiforecaster_params(
     overrides["training.weight_decay"] = trial.suggest_float(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
-    # Jointly sample batch_size and grad_accum to guarantee constraints:
-    # - batch_size * grad_accum >= 8 (minimum effective batch)
-    # - batch_size * grad_accum <= 32 (maximum effective batch, reduced for OOM safety)
-    valid_batch_grad_combos: list[tuple[int, int]] = [
-        (8, 1),  # effective 8
-        (8, 2),  # effective 16
-        (8, 4),  # effective 32
-        (16, 1),  # effective 16
-        (16, 2),  # effective 32
-        (32, 1),  # effective 32
-    ]
-    combo = trial.suggest_categorical(
-        "training.batch_grad_combo",
-        _categorical_choices(valid_batch_grad_combos),
-    )
-    batch_size, grad_accum = _parse_batch_grad_combo(combo)
-    overrides["training.batch_size"] = batch_size
-    overrides["training.gradient_accumulation_steps"] = grad_accum
+    # NOTE: batch_size is NOT swept - fixed at base config value (32 works well).
+    # Previously we swept batch/grad_accum combos, but gradient_accumulation_steps
+    # is now hardcoded to 1 in the trainer and batch_size 32 has proven optimal.
+    # Leaving commented for reference:
+    # valid_batch_grad_combos: list[tuple[int, int]] = [
+    #     (8, 1),  # effective 8
+    #     (8, 2),  # effective 16
+    #     (8, 4),  # effective 32
+    #     (16, 1),  # effective 16
+    #     (16, 2),  # effective 32
+    #     (32, 1),  # effective 32
+    # ]
+    # combo = trial.suggest_categorical(
+    #     "training.batch_grad_combo",
+    #     _categorical_choices(valid_batch_grad_combos),
+    # )
+    # batch_size, grad_accum = _parse_batch_grad_combo(combo)
+    # overrides["training.batch_size"] = batch_size
+    # overrides["training.gradient_accumulation_steps"] = grad_accum
     # # Early stopping affects compute/overfit tradeoff; keep it moderate.
     # overrides["training.early_stopping_patience"] = trial.suggest_int(
     #     "training.early_stopping_patience", 5, 20
@@ -278,54 +251,6 @@ def suggest_epiforecaster_params(
         "data.mobility_threshold",
         _categorical_choices((0.0, 1.0, 5.0, 10.0, 20.0, 50.0)),
     )
-
-    # Missingness filters dataset windows; computed from window sizes.
-    # Daily series (cases, deaths): allow up to 50% missing days
-    # Weekly series (hospitalizations, biomarkers_joint): range based on expected measurements
-    input_len = base_cfg.model.input_window_length
-    horizon_len = base_cfg.model.forecast_horizon
-
-    # Daily series - input window: 0-50% of input_window_length
-    max_missing_input_daily = int(input_len * 0.5)
-    missing_input_daily = trial.suggest_int(
-        "data.missing_permit_input_daily", 0, max_missing_input_daily
-    )
-    overrides["data.missing_permit.input.cases"] = missing_input_daily
-    overrides["data.missing_permit.input.deaths"] = missing_input_daily
-
-    # Daily series - horizon window: 0-50% of forecast_horizon
-    max_missing_horizon_daily = int(horizon_len * 0.5)
-    missing_horizon_daily = trial.suggest_int(
-        "data.missing_permit_horizon_daily", 0, max_missing_horizon_daily
-    )
-    overrides["data.missing_permit.horizon.cases"] = missing_horizon_daily
-    overrides["data.missing_permit.horizon.deaths"] = missing_horizon_daily
-
-    # Weekly series - input window: range from "all present" to "at least 1 measurement"
-    # min_missing = window_length - ceil(window_length / 7)  (all weekly measurements present)
-    # max_missing = window_length - 1  (only 1 day has data)
-    expected_input_weekly = math.ceil(input_len / 7)
-    min_missing_input_weekly = input_len - expected_input_weekly
-    max_missing_input_weekly = input_len - 1
-    missing_input_weekly = trial.suggest_int(
-        "data.missing_permit_input_weekly",
-        min_missing_input_weekly,
-        max_missing_input_weekly,
-    )
-    overrides["data.missing_permit.input.hospitalizations"] = missing_input_weekly
-    overrides["data.missing_permit.input.biomarkers_joint"] = missing_input_weekly
-
-    # Weekly series - horizon window: same logic
-    expected_horizon_weekly = math.ceil(horizon_len / 7)
-    min_missing_horizon_weekly = horizon_len - expected_horizon_weekly
-    max_missing_horizon_weekly = horizon_len - 1
-    missing_horizon_weekly = trial.suggest_int(
-        "data.missing_permit_horizon_weekly",
-        min_missing_horizon_weekly,
-        max_missing_horizon_weekly,
-    )
-    overrides["data.missing_permit.horizon.hospitalizations"] = missing_horizon_weekly
-    overrides["data.missing_permit.horizon.biomarkers_joint"] = missing_horizon_weekly
 
     # --- model knobs (conditional) ---
     if base_cfg.model.type.mobility:

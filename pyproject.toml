@@ -93,6 +93,8 @@ remote-preprocess = "scripts.remote_preprocess:main"
 dataviz = "scripts.dataviz_runner:main"
 # Optuna HPO worker for manual SLURM array jobs
 optuna-worker = "scripts.optuna_epiforecaster_worker:main"
+optuna-missing-permit-worker = "scripts.optuna_epiforecaster_missing_permit_worker:main"
+optuna-pareto-plot = "scripts.plot_optuna_pareto:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
