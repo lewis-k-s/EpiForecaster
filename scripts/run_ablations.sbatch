@@ -100,3 +100,43 @@ else
   # shellcheck disable=SC2086
   python -m cli train epiforecaster --config "$CONFIG" $OVERRIDE_ARGS
 fi
+
+# Post-processing: Run analysis on the last array task (task 10, which is index 10)
+if [ "$SLURM_ARRAY_TASK_ID" -eq 10 ]; then
+  echo ""
+  echo "========================================"
+  echo "Running ablation analysis on last task..."
+  echo "========================================"
+  
+  ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-outputs/reports/ablation_analysis}"
+  
+  if command -v uv >/dev/null 2>&1; then
+    uv run python scripts/analyze_ablations.py \
+      --training-dir outputs/training \
+      --output-dir "$ANALYSIS_OUTPUT_DIR" \
+      --baseline baseline
+    
+    uv run python -m dataviz.ablation_plots \
+      "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
+      --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
+      --output-dir "$ANALYSIS_OUTPUT_DIR" \
+      --baseline baseline
+  else
+    python scripts/analyze_ablations.py \
+      --training-dir outputs/training \
+      --output-dir "$ANALYSIS_OUTPUT_DIR" \
+      --baseline baseline
+    
+    python -m dataviz.ablation_plots \
+      "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
+      --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
+      --output-dir "$ANALYSIS_OUTPUT_DIR" \
+      --baseline baseline
+  fi
+  
+  echo ""
+  echo "========================================"
+  echo "Ablation analysis complete!"
+  echo "Results saved to: $ANALYSIS_OUTPUT_DIR"
+  echo "========================================"
+fi
