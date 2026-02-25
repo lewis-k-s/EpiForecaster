@@ -483,8 +483,6 @@ def objective(
     if run_root is not None:
         cfg.output.log_dir = str(run_root)
 
-    cfg.training.model_id = f"{worker_tag}_trial{trial.number}_{time.time_ns()}"
-
     # Basic reproducibility hook.
     if seed is not None:
         import numpy as np
@@ -541,9 +539,7 @@ def objective(
     # Persist a small JSON summary next to the run logs if desired.
     try:
         log_dir = (
-            Path(cfg.output.log_dir)
-            / cfg.output.experiment_name
-            / cfg.training.model_id
+            Path(cfg.output.log_dir) / cfg.output.experiment_name / trainer.model_id
         )
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "optuna_trial.json").write_text(
@@ -558,7 +554,7 @@ def objective(
                     "config_effective": {
                         "output.log_dir": cfg.output.log_dir,
                         "output.experiment_name": cfg.output.experiment_name,
-                        "training.model_id": cfg.training.model_id,
+                        "trainer.model_id": trainer.model_id,
                     },
                 },
                 indent=2,

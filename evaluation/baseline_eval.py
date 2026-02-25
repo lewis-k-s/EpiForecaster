@@ -603,31 +603,37 @@ def _evaluate_univariate_baseline_model(
                     predictions=np.zeros((1, horizon), dtype=np.float64),
                     targets=np.zeros((1, horizon), dtype=np.float64),
                     observed_mask=np.zeros((1, horizon), dtype=np.float64),
+                    horizon=horizon,
                 )
             else:
                 metric = compute_masked_metrics_numpy(
                     predictions=np.vstack(pred_rows),
                     targets=np.vstack(target_rows),
                     observed_mask=np.vstack(score_mask_rows),
+                    horizon=horizon,
                 )
 
-            fold_rows.append(
-                {
-                    "model": baseline_model,
-                    "target": target_name,
-                    "fold": fold.fold,
-                    "mae": metric.mae,
-                    "rmse": metric.rmse,
-                    "smape": metric.smape,
-                    "r2": metric.r2,
-                    "observed_count": metric.observed_count,
-                    "node_target_pairs": node_pairs,
-                    "train_start": fold.train_start,
-                    "train_end": fold.train_end,
-                    "forecast_start": fold.forecast_start,
-                    "forecast_end": fold.forecast_end,
-                }
-            )
+            fold_row: dict[str, Any] = {
+                "model": baseline_model,
+                "target": target_name,
+                "fold": fold.fold,
+                "mae": metric.mae,
+                "rmse": metric.rmse,
+                "smape": metric.smape,
+                "r2": metric.r2,
+                "observed_count": metric.observed_count,
+                "node_target_pairs": node_pairs,
+                "train_start": fold.train_start,
+                "train_end": fold.train_end,
+                "forecast_start": fold.forecast_start,
+                "forecast_end": fold.forecast_end,
+            }
+            for h_idx, (mae_h, rmse_h) in enumerate(
+                zip(metric.mae_per_h, metric.rmse_per_h, strict=False)
+            ):
+                fold_row[f"mae_h{h_idx + 1}"] = mae_h
+                fold_row[f"rmse_h{h_idx + 1}"] = rmse_h
+            fold_rows.append(fold_row)
 
             coverage_row = {
                 "model": baseline_model,
@@ -651,6 +657,7 @@ def _evaluate_univariate_baseline_model(
                         predictions=np.vstack(per_bin_preds[bin_idx]),
                         targets=np.vstack(per_bin_targets[bin_idx]),
                         observed_mask=np.vstack(per_bin_masks[bin_idx]),
+                        horizon=horizon,
                     )
                     sparsity_rows.append(
                         {
@@ -880,31 +887,37 @@ def _evaluate_var_cross_target_model(
                     predictions=np.zeros((1, horizon), dtype=np.float64),
                     targets=np.zeros((1, horizon), dtype=np.float64),
                     observed_mask=np.zeros((1, horizon), dtype=np.float64),
+                    horizon=horizon,
                 )
             else:
                 metric = compute_masked_metrics_numpy(
                     predictions=np.vstack(pred_rows_by_target[target_name]),
                     targets=np.vstack(target_rows_by_target[target_name]),
                     observed_mask=np.vstack(score_mask_by_target[target_name]),
+                    horizon=horizon,
                 )
 
-            fold_rows.append(
-                {
-                    "model": "var_cross_target",
-                    "target": target_name,
-                    "fold": fold.fold,
-                    "mae": metric.mae,
-                    "rmse": metric.rmse,
-                    "smape": metric.smape,
-                    "r2": metric.r2,
-                    "observed_count": metric.observed_count,
-                    "node_target_pairs": node_pairs,
-                    "train_start": fold.train_start,
-                    "train_end": fold.train_end,
-                    "forecast_start": fold.forecast_start,
-                    "forecast_end": fold.forecast_end,
-                }
-            )
+            fold_row: dict[str, Any] = {
+                "model": "var_cross_target",
+                "target": target_name,
+                "fold": fold.fold,
+                "mae": metric.mae,
+                "rmse": metric.rmse,
+                "smape": metric.smape,
+                "r2": metric.r2,
+                "observed_count": metric.observed_count,
+                "node_target_pairs": node_pairs,
+                "train_start": fold.train_start,
+                "train_end": fold.train_end,
+                "forecast_start": fold.forecast_start,
+                "forecast_end": fold.forecast_end,
+            }
+            for h_idx, (mae_h, rmse_h) in enumerate(
+                zip(metric.mae_per_h, metric.rmse_per_h, strict=False)
+            ):
+                fold_row[f"mae_h{h_idx + 1}"] = mae_h
+                fold_row[f"rmse_h{h_idx + 1}"] = rmse_h
+            fold_rows.append(fold_row)
 
             scored_points = scored_points_by_target[target_name]
             coverage_row = {
@@ -931,6 +944,7 @@ def _evaluate_var_cross_target_model(
                         predictions=np.vstack(per_bin_preds[target_name][bin_idx]),
                         targets=np.vstack(per_bin_targets[target_name][bin_idx]),
                         observed_mask=np.vstack(per_bin_masks[target_name][bin_idx]),
+                        horizon=horizon,
                     )
                     sparsity_rows.append(
                         {
@@ -1115,6 +1129,51 @@ def run_baseline_evaluation(
                 row[f"{metric_name}_iqr"] = float(
                     values.quantile(0.75) - values.quantile(0.25)
                 )
+
+        per_h_cols = [
+            c for c in group.columns if c.startswith("mae_h") or c.startswith("rmse_h")
+        ]
+        if per_h_cols:
+            max_h = max(int(c.split("_h")[1]) for c in per_h_cols if "_h" in c)
+            for start_idx in range(0, max_h, 7):
+                end_idx = min(start_idx + 7, max_h)
+                week_num = (start_idx // 7) + 1
+                week_mae_cols = [f"mae_h{h}" for h in range(start_idx + 1, end_idx + 1)]
+                week_rmse_cols = [
+                    f"rmse_h{h}" for h in range(start_idx + 1, end_idx + 1)
+                ]
+
+                week_mae_values: list[float] = []
+                week_rmse_values: list[float] = []
+                for col in week_mae_cols:
+                    if col in group.columns:
+                        vals = pd.to_numeric(group[col], errors="coerce").dropna()
+                        week_mae_values.extend(vals.tolist())
+                for col in week_rmse_cols:
+                    if col in group.columns:
+                        vals = pd.to_numeric(group[col], errors="coerce").dropna()
+                        week_rmse_values.extend(vals.tolist())
+
+                if week_mae_values:
+                    week_mae_arr = np.array(week_mae_values)
+                    row[f"mae_w{week_num}_mean"] = float(np.nanmean(week_mae_arr))
+                    row[f"mae_w{week_num}_median"] = float(np.nanmedian(week_mae_arr))
+                    row[f"mae_w{week_num}_std"] = float(np.nanstd(week_mae_arr))
+                else:
+                    row[f"mae_w{week_num}_mean"] = float("nan")
+                    row[f"mae_w{week_num}_median"] = float("nan")
+                    row[f"mae_w{week_num}_std"] = float("nan")
+
+                if week_rmse_values:
+                    week_rmse_arr = np.array(week_rmse_values)
+                    row[f"rmse_w{week_num}_mean"] = float(np.nanmean(week_rmse_arr))
+                    row[f"rmse_w{week_num}_median"] = float(np.nanmedian(week_rmse_arr))
+                    row[f"rmse_w{week_num}_std"] = float(np.nanstd(week_rmse_arr))
+                else:
+                    row[f"rmse_w{week_num}_mean"] = float("nan")
+                    row[f"rmse_w{week_num}_median"] = float("nan")
+                    row[f"rmse_w{week_num}_std"] = float("nan")
+
         aggregate_rows.append(row)
     aggregate_df = pd.DataFrame(aggregate_rows)
     joint_aggregate_rows: list[dict[str, Any]] = []
@@ -1193,6 +1252,12 @@ def run_baseline_evaluation(
         "seasonal_period": seasonal_period,
         "var_maxlags": var_maxlags,
         "models": resolved_models,
+        "weekly_horizon_aggregation": {
+            "enabled": True,
+            "days_per_week": 7,
+            "metrics": ["mae", "rmse"],
+            "statistics": ["mean", "median", "std"],
+        },
         "joint_observation_loss_enabled": joint_spec is not None,
         "joint_observation_loss_spec": None
         if joint_spec is None

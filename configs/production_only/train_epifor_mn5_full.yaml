@@ -20,6 +20,7 @@ data:
   sample_ordering: "time"
   log_scale: true
 model:
+  strict: false
   type:
     cases: true
     regions: true
@@ -53,6 +54,10 @@ output:
   wandb_mode: offline
   wandb_tags: [mn5]
 training:
+  compile: true
+  compile_mode: "reduce-overhead"
+  compile_dynamic: false
+  compile_fullgraph: false
   seed: 42
   device: "cuda"
   batch_size: 32
@@ -61,7 +66,7 @@ training:
   gradient_clip_value: 5.0
   early_stopping_patience: 5
   nan_loss_patience: 5
-  epochs: 10
+  epochs: 50
   learning_rate: 0.001
   weight_decay: 1.0e-05
   warmup_steps: 100
@@ -83,7 +88,11 @@ training:
 
   profiler:
     enabled: true
-    profile_batches: 3
+    wait_steps: 50
+    warmup_steps: 5
+    active_steps: 5
+    record_memory: true
+    profile_batches: 60
     log_dir: auto
     profile_epochs: [1, 2]
   plot_forecasts: true

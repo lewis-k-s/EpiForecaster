@@ -4,9 +4,9 @@
 #SBATCH --qos=acc_bscls
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=20
-#SBATCH --time=05:00:00 # 5 hours for 50-epoch trials with pruning
+#SBATCH --time=05:00:00
 #SBATCH --array=0-3 # saturate the node with parallel tasks on each GPU
-#SBATCH --output=slurm-%x-%A_%a.out
+#SBATCH --output=logs/slurm-%x-%A_%a.out
 #SBATCH --error=logs/slurm-%x-%A_%a.err
 
 # Fail fast on errors; print commands for easier debugging.

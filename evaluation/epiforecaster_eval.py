@@ -890,6 +890,10 @@ def topk_target_nodes_by_mae(
         with torch.no_grad():
             eval_iter = loader
             for batch in eval_iter:
+                from utils.training_utils import inject_gpu_mobility
+
+                inject_gpu_mobility(batch, eval_iter.dataset, device)
+
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch,
                     region_embeddings=region_embeddings,
@@ -1133,6 +1137,10 @@ def evaluate_loader(
                     break
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
+
+                from utils.training_utils import inject_gpu_mobility
+
+                inject_gpu_mobility(batch_data, eval_iter.dataset, device)
 
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch_data,

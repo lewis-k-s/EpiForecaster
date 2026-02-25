@@ -147,6 +147,7 @@ def compute_masked_metrics_numpy(
     predictions: np.ndarray,
     targets: np.ndarray,
     observed_mask: np.ndarray | None,
+    horizon: int | None = None,
 ) -> MaskedMetricResult:
     # Detect overflow issues early
     if not np.all(np.isfinite(predictions)):
@@ -202,12 +203,22 @@ def compute_masked_metrics_numpy(
         ss_tot = float((centered**2).sum())
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
+    mae_per_h: list[float] = []
+    rmse_per_h: list[float] = []
+    if horizon is not None and pred.ndim == 2 and pred.shape[1] == horizon:
+        per_h_abs_sum = (abs_diff * mask).sum(axis=0)
+        per_h_sq_sum = ((diff**2) * mask).sum(axis=0)
+        per_h_count = mask.sum(axis=0)
+        per_h_count = np.maximum(per_h_count, 1.0)
+        mae_per_h = (per_h_abs_sum / per_h_count).tolist()
+        rmse_per_h = np.sqrt(per_h_sq_sum / per_h_count).tolist()
+
     return MaskedMetricResult(
         mae=mae,
         rmse=rmse,
         smape=smape,
         r2=r2,
         observed_count=observed_count,
-        mae_per_h=[],
-        rmse_per_h=[],
+        mae_per_h=mae_per_h,
+        rmse_per_h=rmse_per_h,
     )
