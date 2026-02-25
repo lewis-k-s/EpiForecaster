@@ -651,6 +651,9 @@ class TrainingParams:
     compile_fullgraph: bool = False
     # Static-shape preference for compile. None defers to PyTorch default.
     compile_dynamic: bool | None = None
+    # Compile the full training step (forward + backward + optimizer) for 10-20% speedup.
+    # This is experimental and may cause issues with some models.
+    compile_backward: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.loss, (dict, DictConfig)):

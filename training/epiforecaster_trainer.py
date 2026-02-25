@@ -42,7 +42,7 @@ from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from utils import setup_tensor_core_optimizations
 from utils.gradient_debug import GradientDebugger
 
-from utils.training_utils import get_effective_optimizer_step, should_log_step
+from utils.training_utils import should_log_step
 from utils.platform import (
     cleanup_nvme_staging,
     get_nvme_path,
@@ -496,6 +496,29 @@ class EpiForecasterTrainer:
             raise ValueError(
                 "EpiForecasterTrainer now requires JointInferenceLoss. "
                 "Set training.loss.name=joint_inference in the config."
+            )
+
+        # Compile full training step (forward + backward + optimizer) if enabled
+        self._compiled_training_step = None
+        if getattr(self.config.training, "compile_backward", False):
+            compile_kwargs: dict[str, Any] = {}
+            compile_mode = getattr(self.config.training, "compile_mode", "default")
+            if compile_mode != "default":
+                compile_kwargs["mode"] = compile_mode
+
+            compile_dynamic = getattr(self.config.training, "compile_dynamic", None)
+            if compile_dynamic is not None:
+                compile_kwargs["dynamic"] = compile_dynamic
+
+            # Use fullgraph=False to allow data-dependent control flow if needed
+            compile_kwargs["fullgraph"] = False
+
+            self._status(
+                f"Compiling full training step (forward+backward+optimizer) with mode={compile_mode}",
+                logging.INFO,
+            )
+            self._compiled_training_step = torch.compile(
+                self._training_step_impl, **compile_kwargs
             )
 
         # Setup logging and checkpointing
@@ -1786,6 +1809,97 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx = current_idx
         return transition
 
+    def _move_batch_to_device(
+        self, batch_data: dict[str, Any], dtype: torch.dtype
+    ) -> dict[str, Any]:
+        """Move all tensors in batch_data to the trainer's device.
+
+        This is called before the compiled training step to ensure all tensors
+        are already on device, avoiding DeviceCopy ops that break CUDA graphs.
+
+        Args:
+            batch_data: Dictionary containing batch tensors (may be on CPU)
+            dtype: Target dtype for floating point tensors
+
+        Returns:
+            Dictionary with all tensors moved to device
+        """
+        device = self.device
+        result = {}
+        for k, v in batch_data.items():
+            if isinstance(v, torch.Tensor):
+                if v.device != device:
+                    if torch.is_floating_point(v):
+                        v = v.to(device=device, dtype=dtype, non_blocking=True)
+                    else:
+                        v = v.to(device=device, non_blocking=True)
+                elif torch.is_floating_point(v) and v.dtype != dtype:
+                    v = v.to(dtype=dtype)
+                result[k] = v
+            elif hasattr(v, "to"):  # PyG Data/Batch objects
+                v = v.to(device, non_blocking=True)
+                result[k] = v
+            else:
+                result[k] = v
+        return result
+
+    def _training_step_impl(
+        self, batch_data: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pure training step: forward + backward + optimizer.
+
+        This method is designed to be compiled with torch.compile for performance.
+        It excludes graph-breaking operations like CPU syncs, logging, and I/O.
+
+        Args:
+            batch_data: Dictionary containing batch tensors (already on device)
+
+        Returns:
+            Tuple of (loss, grad_norm) - both detached but still on GPU
+        """
+        # Forward with autocast
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.precision_policy.autocast_dtype,
+            enabled=self.precision_policy.autocast_enabled,
+        ):
+            model_outputs, targets_dict = self.model.forward_batch(
+                batch_data=batch_data,
+                region_embeddings=self.region_embeddings,
+                skip_device_transfer=True,  # Tensors already moved by _move_batch_to_device
+            )
+            loss = self.criterion(model_outputs, targets_dict, batch_data)
+
+        # Backward
+        loss.backward()
+
+        # Compute gradient norm and clip with STATIC shapes to prevent recompilation.
+        # Always iterate over ALL model parameters in consistent order, using zeros
+        # for missing grads. This ensures torch.compile sees the same graph every step.
+        all_grads: list[torch.Tensor] = []
+        for p in self.model.parameters():
+            if p.grad is not None:
+                all_grads.append(p.grad)
+            else:
+                # Use zeros_like to maintain consistent tensor count (prevents recompilation)
+                all_grads.append(torch.zeros_like(p))
+
+        # Compute global norm (always has grads now)
+        global_norm = torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
+
+        # Apply gradient clipping using foreach=True
+        clip_value = self.config.training.gradient_clip_value
+        if global_norm > clip_value:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=clip_value, foreach=True
+            )
+
+        # Optimizer step
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        return loss.detach(), global_norm.detach()
+
     def _train_epoch(self) -> float:
         """Train for one epoch."""
         self.model.train()
@@ -1857,24 +1971,40 @@ class EpiForecasterTrainer:
                 data_time_s = time.time() - fetch_start_time
                 batch_start_time = time.time()
 
-                # Use precision policy for autocast settings
-                with torch.autocast(
-                    device_type=self.device.type,
-                    dtype=self.precision_policy.autocast_dtype,
-                    enabled=self.precision_policy.autocast_enabled,
-                ):
-                    # Reconstruct massive dense graph tensors on the GPU directly
-                    # bypassing dataloader worker IPC queue.
-                    from utils.training_utils import inject_gpu_mobility
+                # Reconstruct massive dense graph tensors on the GPU directly
+                # bypassing dataloader worker IPC queue.
+                from utils.training_utils import inject_gpu_mobility
 
-                    inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
+                inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
 
-                    model_outputs, targets_dict = self.model.forward_batch(
-                        batch_data=batch_data,
-                        region_embeddings=self.region_embeddings,
+                # Execute training step: either compiled (fast) or eager (debuggable)
+                if self._compiled_training_step is not None:
+                    # Move all tensors to device BEFORE compiled step to avoid
+                    # DeviceCopy ops that break CUDA graphs
+                    batch_data = self._move_batch_to_device(
+                        batch_data, self.precision_policy.param_dtype
                     )
+                    # Compiled path: forward + backward + optimizer in one compiled function
+                    loss, grad_norm = self._compiled_training_step(batch_data)
+                else:
+                    # Eager path: manual execution for debugging and flexibility
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        dtype=self.precision_policy.autocast_dtype,
+                        enabled=self.precision_policy.autocast_enabled,
+                    ):
+                        model_outputs, targets_dict = self.model.forward_batch(
+                            batch_data=batch_data,
+                            region_embeddings=self.region_embeddings,
+                        )
+                        loss = self.criterion(model_outputs, targets_dict, batch_data)
 
-                    loss = self.criterion(model_outputs, targets_dict, batch_data)
+                    loss.backward()
+                    grad_norm, _ = self._compute_gradient_norms_and_clip(
+                        step=self.global_step
+                    )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 # Guard against non-finite losses to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -1906,12 +2036,6 @@ class EpiForecasterTrainer:
                 # Reset counter once we see a valid loss.
                 self.nan_loss_counter = 0
 
-                loss.backward()
-
-                # Compute gradient norms and clip in single pass
-                grad_norm, _grad_norms_dict = self._compute_gradient_norms_and_clip(
-                    step=self.global_step
-                )
                 # Check for non-finite grad norm on CPU to avoid sync
                 grad_norm_cpu = grad_norm.detach().cpu()
                 if not torch.isfinite(grad_norm_cpu):
@@ -1951,7 +2075,6 @@ class EpiForecasterTrainer:
                     self.global_step += 1
                     continue
                 last_gradnorm = grad_norm  # Update for progress logging
-                self.optimizer.step()
 
                 # LR warmup restore: after curriculum transition, gradually
                 # restore learning rate over 100 steps
@@ -1969,8 +2092,6 @@ class EpiForecasterTrainer:
                 # Per-step scheduler update (e.g., for CosineAnnealingLR)
                 if self.scheduler and self.config.training.scheduler_type == "cosine":
                     self.scheduler.step()
-
-                self.optimizer.zero_grad(set_to_none=True)
 
                 total_loss += loss.detach()
                 counted_batches += 1

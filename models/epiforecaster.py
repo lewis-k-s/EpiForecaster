@@ -389,6 +389,7 @@ class EpiForecaster(nn.Module):
         *,
         batch_data: dict[str, Any],
         region_embeddings: torch.Tensor | None = None,
+        skip_device_transfer: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
         """
         Forward pass with automatic device transfers and non-blocking I/O.
@@ -401,6 +402,9 @@ class EpiForecaster(nn.Module):
             batch_data: Dict containing batch tensors (HospHist, DeathsHist, CasesHist,
                         BioNode, MobBatch, Population, TargetNode, WindowStart, B, T)
             region_embeddings: Optional static region embeddings [num_regions, region_dim]
+            skip_device_transfer: If True, assume all tensors are already on the correct
+                                 device and dtype. Used with compiled training to avoid
+                                 DeviceCopy ops that break CUDA graphs.
 
         Returns:
             Tuple of (model_outputs, targets_dict) where:
@@ -409,22 +413,27 @@ class EpiForecaster(nn.Module):
         """
         # Non-blocking transfer for all PyTorch tensors
         # Convert float tensors to model dtype, keep integer tensors as-is
-        batch = {}
-        for k, v in batch_data.items():
-            if not isinstance(v, torch.Tensor):
-                continue
+        if skip_device_transfer:
+            # Fast path: assume tensors already on device (for compiled training)
+            batch = {k: v for k, v in batch_data.items() if isinstance(v, torch.Tensor)}
+            mob_batch = batch_data["MobBatch"]
+        else:
+            batch = {}
+            for k, v in batch_data.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
 
-            if torch.is_floating_point(v):
-                if v.device != self.device or v.dtype != self.dtype:
-                    v = v.to(
-                        device=self.device, dtype=self.dtype, non_blocking=True
-                    )
-            elif v.device != self.device:
-                v = v.to(device=self.device, non_blocking=True)
-            batch[k] = v
+                if torch.is_floating_point(v):
+                    if v.device != self.device or v.dtype != self.dtype:
+                        v = v.to(
+                            device=self.device, dtype=self.dtype, non_blocking=True
+                        )
+                elif v.device != self.device:
+                    v = v.to(device=self.device, non_blocking=True)
+                batch[k] = v
 
-        # PyG Batch handles its own device transfer
-        mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
+            # PyG Batch handles its own device transfer
+            mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
         # Convert graph tensors to model dtype.
         if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
             if mob_batch.x_dense.dtype != self.dtype:
@@ -517,12 +526,16 @@ class EpiForecaster(nn.Module):
     def _get_mobility_node_embeddings(self, mob_batch: Batch) -> torch.Tensor:
         """Run dense GNN encoder on mobility batch."""
         if not hasattr(mob_batch, "x_dense") or not hasattr(mob_batch, "adj_dense"):
-            raise ValueError("Mobility batch missing dense graph tensors x_dense/adj_dense.")
+            raise ValueError(
+                "Mobility batch missing dense graph tensors x_dense/adj_dense."
+            )
 
         x_dense = mob_batch.x_dense  # type: ignore[attr-defined]
         adj_dense = mob_batch.adj_dense  # type: ignore[attr-defined]
         if x_dense is None or adj_dense is None:
-            raise ValueError("Mobility batch has null dense graph tensors x_dense/adj_dense.")
+            raise ValueError(
+                "Mobility batch has null dense graph tensors x_dense/adj_dense."
+            )
         if self.strict and x_dense.size(-1) != self.temporal_node_dim:
             raise ValueError(
                 f"Mobility graph feature dim {x_dense.size(-1)} != expected "
