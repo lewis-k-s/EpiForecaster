@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
+from utils.training_utils import inject_gpu_mobility
 
 logger = logging.getLogger(__name__)
 
@@ -226,7 +227,9 @@ def collect_forecast_samples_for_target_nodes(
     model_was_training = model.training
     model.eval()
     try:
-        mob_batch = batch["MobBatch"].to(device)
+        # Inject GPU mobility (adj_dense) into the batch for mobility-enabled models
+        inject_gpu_mobility(batch, dataset, device)
+
         region_embeddings = getattr(dataset, "region_embeddings", None)
         if region_embeddings is not None:
             region_embeddings = region_embeddings.to(device)
@@ -246,7 +249,7 @@ def collect_forecast_samples_for_target_nodes(
                     deaths_hist=batch["DeathsHist"].to(device),
                     cases_hist=batch["CasesHist"].to(device),
                     biomarkers_hist=batch["BioNode"].to(device),
-                    mob_graphs=mob_batch,
+                    mob_graphs=batch["MobBatch"].to(device),
                     target_nodes=target_nodes,
                     region_embeddings=region_embeddings,
                     population=batch["Population"].to(device),

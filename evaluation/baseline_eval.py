@@ -1122,13 +1122,11 @@ def run_baseline_evaluation(
         for metric_name in ["mae", "rmse", "smape", "r2", "observed_count"]:
             values = pd.to_numeric(group[metric_name], errors="coerce").dropna()
             if values.empty:
-                row[f"{metric_name}_median"] = float("nan")
-                row[f"{metric_name}_iqr"] = float("nan")
+                row[f"{metric_name}_mean"] = float("nan")
+                row[f"{metric_name}_std"] = float("nan")
             else:
-                row[f"{metric_name}_median"] = float(values.median())
-                row[f"{metric_name}_iqr"] = float(
-                    values.quantile(0.75) - values.quantile(0.25)
-                )
+                row[f"{metric_name}_mean"] = float(values.mean())
+                row[f"{metric_name}_std"] = float(values.std(ddof=1))
 
         per_h_cols = [
             c for c in group.columns if c.startswith("mae_h") or c.startswith("rmse_h")
@@ -1189,13 +1187,11 @@ def run_baseline_evaluation(
             for value_col in value_cols:
                 values = pd.to_numeric(group[value_col], errors="coerce").dropna()
                 if values.empty:
-                    row[f"{value_col}_median"] = float("nan")
-                    row[f"{value_col}_iqr"] = float("nan")
+                    row[f"{value_col}_mean"] = float("nan")
+                    row[f"{value_col}_std"] = float("nan")
                 else:
-                    row[f"{value_col}_median"] = float(values.median())
-                    row[f"{value_col}_iqr"] = float(
-                        values.quantile(0.75) - values.quantile(0.25)
-                    )
+                    row[f"{value_col}_mean"] = float(values.mean())
+                    row[f"{value_col}_std"] = float(values.std(ddof=1))
             joint_aggregate_rows.append(row)
     joint_aggregate_df = pd.DataFrame(joint_aggregate_rows)
     if joint_aggregate_df.empty:
@@ -1368,9 +1364,7 @@ def compare_model_metrics_against_baselines(
         for model_name, group in baseline_df.groupby("model"):
             row: dict[str, Any] = {"model": model_name}
             for col in joint_value_cols:
-                row[f"{col}_median"] = pd.to_numeric(
-                    group[col], errors="coerce"
-                ).median()
+                row[f"{col}_mean"] = pd.to_numeric(group[col], errors="coerce").mean()
             agg_rows.append(row)
         baseline_df = pd.DataFrame(agg_rows)
 
@@ -1425,7 +1419,7 @@ def compare_model_metrics_against_baselines(
         model_name = str(baseline_row["model"])
         if target in model_target_metrics:
             for metric_name in ["mae", "rmse", "smape", "r2"]:
-                baseline_value = baseline_row.get(f"{metric_name}_median")
+                baseline_value = baseline_row.get(f"{metric_name}_mean")
                 model_value = model_target_metrics[target].get(metric_name)
                 if baseline_value is None or model_value is None:
                     continue
@@ -1442,7 +1436,7 @@ def compare_model_metrics_against_baselines(
                 )
 
         if has_joint_obs_component and model_name not in joint_total_recorded:
-            baseline_joint_total = baseline_row.get("joint_obs_loss_total_median")
+            baseline_joint_total = baseline_row.get("joint_obs_loss_total_mean")
             if baseline_joint_total is not None and pd.notna(baseline_joint_total):
                 rows.append(
                     {
@@ -1465,7 +1459,7 @@ def compare_model_metrics_against_baselines(
             metric_value = float(model_metric)
             if not np.isfinite(metric_value):
                 continue
-            baseline_value = baseline_row.get(f"{baseline_key}_median")
+            baseline_value = baseline_row.get(f"{baseline_key}_mean")
             if baseline_value is None or not pd.notna(baseline_value):
                 continue
             rows.append(
