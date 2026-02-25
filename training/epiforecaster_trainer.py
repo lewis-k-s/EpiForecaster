@@ -485,7 +485,7 @@ class EpiForecasterTrainer:
         total_steps, warmup_steps = compute_scheduler_steps(
             epochs=self.config.training.epochs,
             batches_per_epoch=len(self.train_loader),
-            gradient_accumulation_steps=self.config.training.gradient_accumulation_steps,
+            gradient_accumulation_steps=1,
             warmup_batches=self.config.training.warmup_steps,
         )
         self.scheduler = self._create_scheduler(
@@ -1538,6 +1538,10 @@ class EpiForecasterTrainer:
         return Path(configured)
 
     def _resolve_model_id(self) -> str:
+        model_id_override = os.getenv("EPIFORECASTER_MODEL_ID", "").strip()
+        if model_id_override:
+            return model_id_override
+
         sjid = os.getenv("SLURM_JOB_ID", "")
         if sjid:
             # Detect interactive SLURM session - use datetime ID instead
@@ -1820,8 +1824,7 @@ class EpiForecasterTrainer:
         max_batches = getattr(self.config.training, "max_batches", None)
         first_iteration_done = False
 
-        # Gradient accumulation setup
-        accum_steps = self.config.training.gradient_accumulation_steps
+        # Initialize optimizer state
         self.optimizer.zero_grad(set_to_none=True)
         # NaN check frequency matches progress log frequency to reduce GPU-CPU syncs
         nan_check_frequency = self.config.training.progress_log_frequency
@@ -1903,83 +1906,71 @@ class EpiForecasterTrainer:
                 # Reset counter once we see a valid loss.
                 self.nan_loss_counter = 0
 
-                # Scale loss for gradient accumulation
-                scaled_loss = loss / accum_steps
+                loss.backward()
 
-                scaled_loss.backward()
-
-                # Only step optimizer every N batches (gradient accumulation)
-                should_step = (batch_idx + 1) % accum_steps == 0
-                is_last_batch = batch_idx == len(self.train_loader) - 1
-
-                grad_norm = torch.tensor(0.0)
-                if should_step or is_last_batch:
-                    # Compute gradient norms and clip in single pass
-                    grad_norm, _grad_norms_dict = self._compute_gradient_norms_and_clip(
-                        step=self.global_step
+                # Compute gradient norms and clip in single pass
+                grad_norm, _grad_norms_dict = self._compute_gradient_norms_and_clip(
+                    step=self.global_step
+                )
+                # Check for non-finite grad norm on CPU to avoid sync
+                grad_norm_cpu = grad_norm.detach().cpu()
+                if not torch.isfinite(grad_norm_cpu):
+                    self.nan_loss_counter += 1
+                    self._status(
+                        "Non-finite gradient norm detected during clipping at "
+                        f"epoch={self.current_epoch}, step={self.global_step}, "
+                        f"batch={batch_idx} (counter={self.nan_loss_counter}). "
+                        "Skipping optimizer step.",
+                        logging.WARNING,
                     )
-                    # Check for non-finite grad norm on CPU to avoid sync
-                    grad_norm_cpu = grad_norm.detach().cpu()
-                    if not torch.isfinite(grad_norm_cpu):
-                        self.nan_loss_counter += 1
-                        self._status(
-                            "Non-finite gradient norm detected during clipping at "
-                            f"epoch={self.current_epoch}, step={self.global_step}, "
-                            f"batch={batch_idx} (counter={self.nan_loss_counter}). "
-                            "Skipping optimizer step.",
-                            logging.WARNING,
+
+                    # Capture gradient diagnostics if debugging is enabled
+                    if self.gradient_debugger.enabled:
+                        snapshot = self.gradient_debugger.capture_snapshot(
+                            self.model,
+                            loss=loss,
+                            step_info={
+                                "step": self.global_step,
+                                "epoch": self.current_epoch,
+                                "batch_idx": batch_idx,
+                            },
                         )
-
-                        # Capture gradient diagnostics if debugging is enabled
-                        if self.gradient_debugger.enabled:
-                            snapshot = self.gradient_debugger.capture_snapshot(
-                                self.model,
-                                loss=loss,
-                                step_info={
-                                    "step": self.global_step,
-                                    "epoch": self.current_epoch,
-                                    "batch_idx": batch_idx,
-                                },
-                            )
-                            self.gradient_debugger.log_summary(snapshot)
-                            self.gradient_debugger.save_report(snapshot)
-
-                        self.optimizer.zero_grad(set_to_none=True)
-                        patience = self.config.training.nan_loss_patience
-                        if (
-                            patience is not None
-                            and patience > 0
-                            and self.nan_loss_counter >= patience
-                        ):
-                            self.nan_loss_triggered = True
-                            break
-                        fetch_start_time = time.time()
-                        self.global_step += 1
-                        continue
-                    last_gradnorm = grad_norm  # Update for progress logging
-                    self.optimizer.step()
-
-                    # LR warmup restore: after curriculum transition, gradually
-                    # restore learning rate over 100 steps
-                    if self._lr_warmup_remaining > 0:
-                        self._lr_warmup_remaining -= 1
-                        if self._lr_warmup_remaining == 0:
-                            # Restore to the LR we saved before reducing
-                            for param_group in self.optimizer.param_groups:
-                                param_group["lr"] = self._lr_warmup_target_lr
-                            self._status(
-                                f"LR warmup complete - restored to {self._lr_warmup_target_lr:.2e}",
-                                logging.INFO,
-                            )
-
-                    # Per-step scheduler update (e.g., for CosineAnnealingLR)
-                    if (
-                        self.scheduler
-                        and self.config.training.scheduler_type == "cosine"
-                    ):
-                        self.scheduler.step()
+                        self.gradient_debugger.log_summary(snapshot)
+                        self.gradient_debugger.save_report(snapshot)
 
                     self.optimizer.zero_grad(set_to_none=True)
+                    patience = self.config.training.nan_loss_patience
+                    if (
+                        patience is not None
+                        and patience > 0
+                        and self.nan_loss_counter >= patience
+                    ):
+                        self.nan_loss_triggered = True
+                        break
+                    fetch_start_time = time.time()
+                    self.global_step += 1
+                    continue
+                last_gradnorm = grad_norm  # Update for progress logging
+                self.optimizer.step()
+
+                # LR warmup restore: after curriculum transition, gradually
+                # restore learning rate over 100 steps
+                if self._lr_warmup_remaining > 0:
+                    self._lr_warmup_remaining -= 1
+                    if self._lr_warmup_remaining == 0:
+                        # Restore to the LR we saved before reducing
+                        for param_group in self.optimizer.param_groups:
+                            param_group["lr"] = self._lr_warmup_target_lr
+                        self._status(
+                            f"LR warmup complete - restored to {self._lr_warmup_target_lr:.2e}",
+                            logging.INFO,
+                        )
+
+                # Per-step scheduler update (e.g., for CosineAnnealingLR)
+                if self.scheduler and self.config.training.scheduler_type == "cosine":
+                    self.scheduler.step()
+
+                self.optimizer.zero_grad(set_to_none=True)
 
                 total_loss += loss.detach()
                 counted_batches += 1
@@ -1993,13 +1984,7 @@ class EpiForecasterTrainer:
                     (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
-                accum_steps = self.config.training.gradient_accumulation_steps
-                effective_step = get_effective_optimizer_step(
-                    self.global_step, accum_steps
-                )
-                log_this_step = should_log_step(
-                    self.global_step, accum_steps, log_frequency
-                )
+                log_this_step = should_log_step(self.global_step, 1, log_frequency)
 
                 log_data = {
                     "learning_rate_step": lr,
@@ -2017,7 +2002,7 @@ class EpiForecasterTrainer:
                     # Convert to scalar only for console logging
                     loss_value = float(loss_detached)
                     self._status(
-                        f"Epoch {self.current_epoch} | Step {effective_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
+                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
                     )
 
                     # Keep as tensor - wandb handles CPU tensor conversion
@@ -2033,7 +2018,7 @@ class EpiForecasterTrainer:
                         )
 
                     if self.wandb_run is not None:
-                        wandb.log(log_data, step=effective_step)
+                        wandb.log(log_data, step=self.global_step)
 
                 self.global_step += 1
 
@@ -2198,11 +2183,7 @@ class EpiForecasterTrainer:
             Tuple of (global_grad_norm, component_norms_dict)
         """
         frequency = self.config.training.grad_norm_log_frequency
-        accum_steps = self.config.training.gradient_accumulation_steps
-        effective_step = get_effective_optimizer_step(step, accum_steps)
-        should_log = frequency > 0 and (
-            effective_step % frequency == 0 or effective_step == 0
-        )
+        should_log = frequency > 0 and (step % frequency == 0 or step == 0)
 
         # Compute squared norms by group
         gnn_sq_sum = torch.tensor(0.0, device=self.device)
@@ -2242,19 +2223,22 @@ class EpiForecasterTrainer:
                         else:
                             other_sq_sum += sq_norm
 
-        # Compute global norm
+        # Compute global norm using foreach operations for efficiency
         if all_grads:
-            global_norm = torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
+            # Use torch.linalg.vector_norm with foreach for faster multi-tensor computation
+            global_norm = torch.linalg.vector_norm(
+                torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
+            )
         else:
             global_norm = torch.tensor(0.0, device=self.device)
 
-        # Apply gradient clipping
+        # Apply gradient clipping using foreach=True for multi-tensor parallelism
         clip_value = self.config.training.gradient_clip_value
         if global_norm > clip_value:
-            scale = clip_value / (global_norm + 1e-6)
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.mul_(scale)
+            # foreach=True uses faster multi-tensor kernels on CUDA
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=clip_value, foreach=True
+            )
 
         # Build norms dict for logging
         norms_dict: dict[str, float] = {}
@@ -2293,7 +2277,7 @@ class EpiForecasterTrainer:
             }
 
             if self.wandb_run is not None:
-                wandb.log(norms_dict, step=effective_step)
+                wandb.log(norms_dict, step=step)
 
             self._status(
                 f"Grad norms @ step {step}: Total={all_norms[0]:.4f} | "
@@ -2345,8 +2329,6 @@ class EpiForecasterTrainer:
         if epoch is None:
             return
         prefix = split_name.capitalize()
-        accum_steps = self.config.training.gradient_accumulation_steps
-        effective_step = get_effective_optimizer_step(self.global_step, accum_steps)
         # Initial standard metrics
         log_data = {
             "epoch": epoch,
@@ -2439,7 +2421,7 @@ class EpiForecasterTrainer:
                 self.curriculum_sampler.state.synth_ratio
             )
         if self.wandb_run is not None:
-            wandb.log(log_data, step=effective_step)
+            wandb.log(log_data, step=self.global_step)
 
         self._status(
             f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"
