@@ -39,10 +39,10 @@ from data.preprocess.config import REGION_COORD
 from data.samplers import EpidemicCurriculumSampler, ShuffledBatchSampler
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
+from models.configs import EpiForecasterConfig
+from models.epiforecaster import EpiForecaster
 from utils import setup_tensor_core_optimizations
 from utils.gradient_debug import GradientDebugger
-
-from utils.training_utils import should_log_step
 from utils.platform import (
     cleanup_nvme_staging,
     get_nvme_path,
@@ -50,8 +50,7 @@ from utils.platform import (
     select_multiprocessing_context,
     stage_dataset_to_nvme,
 )
-from models.configs import EpiForecasterConfig
-from models.epiforecaster import EpiForecaster
+from utils.training_utils import should_log_step
 
 logger = logging.getLogger(__name__)
 
@@ -447,17 +446,15 @@ class EpiForecasterTrainer:
             self.model = self.model.to(torch.float32)
 
         # Apply torch.compile if enabled
-        if getattr(self.config.training, "compile", False):
+        if self.config.training.compile:
             compile_kwargs: dict[str, Any] = {}
-            compile_mode = getattr(self.config.training, "compile_mode", "default")
-            if compile_mode != "default":
-                compile_kwargs["mode"] = compile_mode
+            if self.config.training.compile_mode != "default":
+                compile_kwargs["mode"] = self.config.training.compile_mode
 
-            compile_dynamic = getattr(self.config.training, "compile_dynamic", None)
-            if compile_dynamic is not None:
-                compile_kwargs["dynamic"] = compile_dynamic
+            if self.config.training.compile_dynamic is not None:
+                compile_kwargs["dynamic"] = self.config.training.compile_dynamic
 
-            if getattr(self.config.training, "compile_fullgraph", False):
+            if self.config.training.compile_fullgraph:
                 compile_kwargs["fullgraph"] = True
 
             compile_desc = (
@@ -498,23 +495,21 @@ class EpiForecasterTrainer:
                 "Set training.loss.name=joint_inference in the config."
             )
 
-        # Compile full training step (forward + backward + optimizer) if enabled
+        # Compile training step (forward + backward + gradient clip) if enabled
         self._compiled_training_step = None
-        if getattr(self.config.training, "compile_backward", False):
+        if self.config.training.compile_backward:
             compile_kwargs: dict[str, Any] = {}
-            compile_mode = getattr(self.config.training, "compile_mode", "default")
-            if compile_mode != "default":
-                compile_kwargs["mode"] = compile_mode
+            if self.config.training.compile_mode != "default":
+                compile_kwargs["mode"] = self.config.training.compile_mode
 
-            compile_dynamic = getattr(self.config.training, "compile_dynamic", None)
-            if compile_dynamic is not None:
-                compile_kwargs["dynamic"] = compile_dynamic
+            if self.config.training.compile_dynamic is not None:
+                compile_kwargs["dynamic"] = self.config.training.compile_dynamic
 
             # Use fullgraph=False to allow data-dependent control flow if needed
             compile_kwargs["fullgraph"] = False
 
             self._status(
-                f"Compiling full training step (forward+backward+optimizer) with mode={compile_mode}",
+                f"Compiling training step (forward+backward+clip) with mode={self.config.training.compile_mode}",
                 logging.INFO,
             )
             self._compiled_training_step = torch.compile(
@@ -1368,7 +1363,7 @@ class EpiForecasterTrainer:
         val_loader = DataLoader(**val_loader_kwargs)
 
         # Compute test_workers (default to 0 since test runs once at end)
-        cfg_test_workers = getattr(self.config.training, "test_workers", 0)
+        cfg_test_workers = self.config.training.test_workers
         if cfg_test_workers == -1:
             test_num_workers = max(0, avail_cores)
         else:
@@ -1547,7 +1542,7 @@ class EpiForecasterTrainer:
         )
 
     def _resolve_profiler_log_dir(self) -> Path:
-        configured = getattr(self.config.training.profiler, "log_dir", "auto")
+        configured = self.config.training.profiler.log_dir
         if configured == "auto":
             if self.experiment_dir is not None:
                 return self.experiment_dir
@@ -1846,10 +1841,12 @@ class EpiForecasterTrainer:
     def _training_step_impl(
         self, batch_data: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pure training step: forward + backward + optimizer.
+        """Pure training step: forward + backward + gradient clipping.
 
-        This method is designed to be compiled with torch.compile for performance.
-        It excludes graph-breaking operations like CPU syncs, logging, and I/O.
+        This method computes the forward pass, loss, backward pass, and gradient
+        clipping. It is designed to be compiled with torch.compile for performance.
+        It excludes graph-breaking operations like CPU syncs, logging, I/O, and
+        optimizer.step() / zero_grad() which are handled in the main loop.
 
         Args:
             batch_data: Dictionary containing batch tensors (already on device)
@@ -1894,9 +1891,8 @@ class EpiForecasterTrainer:
                 self.model.parameters(), max_norm=clip_value, foreach=True
             )
 
-        # Optimizer step
-        self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
+        # Note: optimizer.step() and zero_grad() are called in the main loop
+        # to allow component-wise gradient norm logging
 
         return loss.detach(), global_norm.detach()
 
@@ -1935,7 +1931,7 @@ class EpiForecasterTrainer:
         # to avoid CUDA context deadlock with multiprocessing workers
 
         fetch_start_time = time.time()
-        max_batches = getattr(self.config.training, "max_batches", None)
+        max_batches = self.config.training.max_batches
         first_iteration_done = False
 
         # Initialize optimizer state
@@ -1973,40 +1969,42 @@ class EpiForecasterTrainer:
 
                 # Reconstruct massive dense graph tensors on the GPU directly
                 # bypassing dataloader worker IPC queue.
-                from utils.training_utils import inject_gpu_mobility
+                from utils.training_utils import (
+                    ensure_mobility_adj_dense_ready,
+                    inject_gpu_mobility,
+                )
 
                 inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
 
                 # Execute training step: either compiled (fast) or eager (debuggable)
+                # Move all tensors to device before training step to avoid DeviceCopy ops
+                batch_data = self._move_batch_to_device(
+                    batch_data, self.precision_policy.param_dtype
+                )
+
+                # Call either compiled or eager version of the same step implementation
                 if self._compiled_training_step is not None:
-                    # Move all tensors to device BEFORE compiled step to avoid
-                    # DeviceCopy ops that break CUDA graphs
-                    batch_data = self._move_batch_to_device(
-                        batch_data, self.precision_policy.param_dtype
+                    ensure_mobility_adj_dense_ready(
+                        batch_data,
+                        required=bool(self.config.model.type.mobility),
+                        context="compiled training",
                     )
-                    # Compiled path: forward + backward + optimizer in one compiled function
                     loss, grad_norm = self._compiled_training_step(batch_data)
                 else:
-                    # Eager path: manual execution for debugging and flexibility
-                    with torch.autocast(
-                        device_type=self.device.type,
-                        dtype=self.precision_policy.autocast_dtype,
-                        enabled=self.precision_policy.autocast_enabled,
-                    ):
-                        model_outputs, targets_dict = self.model.forward_batch(
-                            batch_data=batch_data,
-                            region_embeddings=self.region_embeddings,
-                        )
-                        loss = self.criterion(model_outputs, targets_dict, batch_data)
+                    loss, grad_norm = self._training_step_impl(batch_data)
 
-                    loss.backward()
-                    grad_norm, _ = self._compute_gradient_norms_and_clip(
-                        step=self.global_step
-                    )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
+                # Log component-wise gradnorms at frequency intervals (gradients still available)
+                frequency = self.config.training.grad_norm_log_frequency
+                if frequency > 0 and (
+                    self.global_step % frequency == 0 or self.global_step == 0
+                ):
+                    _, _ = self._compute_gradient_norms_and_clip(step=self.global_step)
 
-                # Guard against non-finite losses to prevent corrupt optimizer state.
+                # Optimizer step and gradient zeroing (common to both paths)
+                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                # Guard against non-finite losses/gradients to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
                 should_check_nan = self.global_step % nan_check_frequency == 0
                 if should_check_nan:
@@ -2033,47 +2031,48 @@ class EpiForecasterTrainer:
                         self.global_step += 1
                         continue
 
-                # Reset counter once we see a valid loss.
+                    # Check for non-finite grad norm on CPU (same frequency as loss check)
+                    grad_norm_cpu = grad_norm.detach().cpu()
+                    if not torch.isfinite(grad_norm_cpu):
+                        self.nan_loss_counter += 1
+                        self._status(
+                            "Non-finite gradient norm detected during clipping at "
+                            f"epoch={self.current_epoch}, step={self.global_step}, "
+                            f"batch={batch_idx} (counter={self.nan_loss_counter}). "
+                            "Skipping optimizer step.",
+                            logging.WARNING,
+                        )
+
+                        # Capture gradient diagnostics if debugging is enabled
+                        if self.gradient_debugger.enabled:
+                            snapshot = self.gradient_debugger.capture_snapshot(
+                                self.model,
+                                loss=loss,
+                                step_info={
+                                    "step": self.global_step,
+                                    "epoch": self.current_epoch,
+                                    "batch_idx": batch_idx,
+                                },
+                            )
+                            self.gradient_debugger.log_summary(snapshot)
+                            self.gradient_debugger.save_report(snapshot)
+
+                        self.optimizer.zero_grad(set_to_none=True)
+                        patience = self.config.training.nan_loss_patience
+                        if (
+                            patience is not None
+                            and patience > 0
+                            and self.nan_loss_counter >= patience
+                        ):
+                            self.nan_loss_triggered = True
+                            break
+                        fetch_start_time = time.time()
+                        self.global_step += 1
+                        continue
+
+                # Reset counter once we see valid loss and grad_norm.
                 self.nan_loss_counter = 0
 
-                # Check for non-finite grad norm on CPU to avoid sync
-                grad_norm_cpu = grad_norm.detach().cpu()
-                if not torch.isfinite(grad_norm_cpu):
-                    self.nan_loss_counter += 1
-                    self._status(
-                        "Non-finite gradient norm detected during clipping at "
-                        f"epoch={self.current_epoch}, step={self.global_step}, "
-                        f"batch={batch_idx} (counter={self.nan_loss_counter}). "
-                        "Skipping optimizer step.",
-                        logging.WARNING,
-                    )
-
-                    # Capture gradient diagnostics if debugging is enabled
-                    if self.gradient_debugger.enabled:
-                        snapshot = self.gradient_debugger.capture_snapshot(
-                            self.model,
-                            loss=loss,
-                            step_info={
-                                "step": self.global_step,
-                                "epoch": self.current_epoch,
-                                "batch_idx": batch_idx,
-                            },
-                        )
-                        self.gradient_debugger.log_summary(snapshot)
-                        self.gradient_debugger.save_report(snapshot)
-
-                    self.optimizer.zero_grad(set_to_none=True)
-                    patience = self.config.training.nan_loss_patience
-                    if (
-                        patience is not None
-                        and patience > 0
-                        and self.nan_loss_counter >= patience
-                    ):
-                        self.nan_loss_triggered = True
-                        break
-                    fetch_start_time = time.time()
-                    self.global_step += 1
-                    continue
                 last_gradnorm = grad_norm  # Update for progress logging
 
                 # LR warmup restore: after curriculum transition, gradually
@@ -2226,7 +2225,7 @@ class EpiForecasterTrainer:
             device=self.device,
             region_embeddings=self.region_embeddings,
             split_name=split_name,
-            max_batches=getattr(self.config.training, "max_batches", None),
+            max_batches=self.config.training.max_batches,
         )
 
         # Store node MAE for forecast plotting

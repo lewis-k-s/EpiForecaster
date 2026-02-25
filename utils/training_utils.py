@@ -2,6 +2,8 @@
 Training utilities for the EpiForecaster project.
 """
 
+from typing import Any
+
 import torch
 
 
@@ -86,7 +88,7 @@ def should_log_step(
 
 
 def inject_gpu_mobility(
-    batch_data: dict[str, torch.Tensor],
+    batch_data: dict[str, Any],
     dataset: torch.utils.data.Dataset,
     device: torch.device,
 ) -> None:
@@ -105,10 +107,30 @@ def inject_gpu_mobility(
     if mob_batch is None or not hasattr(mob_batch, "global_t"):
         return
 
-    # Handle ConcatDataset wrappers safely
+    # Handle ConcatDataset wrappers safely: resolve the active sub-dataset
+    # from batch run_id provenance when available.
     base_ds = dataset
     if hasattr(dataset, "datasets") and hasattr(dataset, "cumulative_sizes"):
         base_ds = dataset.datasets[0]
+
+        batch_run_id = getattr(mob_batch, "run_id", None)
+        if batch_run_id is not None:
+            run_id = str(batch_run_id).strip()
+            if run_id:
+                if not hasattr(dataset, "_run_id_to_dataset_index"):
+                    run_id_to_dataset_index = {}
+                    for i, sub_dataset in enumerate(dataset.datasets):
+                        sub_run_id = getattr(sub_dataset, "run_id", None)
+                        if sub_run_id is None:
+                            continue
+                        sub_run_id = str(sub_run_id).strip()
+                        if sub_run_id and sub_run_id not in run_id_to_dataset_index:
+                            run_id_to_dataset_index[sub_run_id] = i
+                    dataset._run_id_to_dataset_index = run_id_to_dataset_index
+
+                dataset_index = dataset._run_id_to_dataset_index.get(run_id)
+                if dataset_index is not None:
+                    base_ds = dataset.datasets[dataset_index]
 
     if not hasattr(base_ds, "preloaded_mobility") or base_ds.preloaded_mobility is None:
         return
@@ -133,10 +155,40 @@ def inject_gpu_mobility(
         gpu_mob = torch.maximum(gpu_mob.float(), eye).to(torch.float16)
 
         base_ds._gpu_mobility_cache[device] = gpu_mob
+    else:
+        gpu_mob = base_ds._gpu_mobility_cache[device]
 
-    gpu_mob = base_ds._gpu_mobility_cache[device]
-    # global_t was populated by epi_dataset.py and stack flattened in collate
+    # Extract base global_t for this chunk (global_t_gpu is shape [B*T])
     global_t_gpu = mob_batch.global_t.to(device, non_blocking=True)
 
     # Reconstruct adj_dense inside the batch!
     mob_batch.adj_dense = gpu_mob[global_t_gpu]
+
+
+def ensure_mobility_adj_dense_ready(
+    batch_data: dict[str, Any], *, required: bool, context: str = ""
+) -> None:
+    """
+    Validate that dense mobility adjacency exists when required.
+
+    This guard is intended for pre-compiled call sites (e.g., trainer loop) so
+    we can fail fast before entering a compiled graph.
+
+    Args:
+        batch_data: Batch dictionary expected to contain ``MobBatch``.
+        required: Whether mobility adjacency is required for the current path.
+        context: Optional context label included in error messages.
+    """
+    if not required:
+        return
+
+    suffix = f" ({context})" if context else ""
+    mob_batch = batch_data.get("MobBatch")
+    if mob_batch is None:
+        raise ValueError(f"Missing 'MobBatch' in batch data{suffix}.")
+
+    if not hasattr(mob_batch, "adj_dense") or mob_batch.adj_dense is None:
+        raise ValueError(
+            "Missing 'MobBatch.adj_dense' before compiled forward"
+            f"{suffix}. Ensure inject_gpu_mobility() (or equivalent prep) runs first."
+        )
