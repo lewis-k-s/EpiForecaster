@@ -75,4 +75,9 @@ training:
     # Joint inference loss configuration
     loss:
         name: "joint_inference"
-        joint: {}
+        joint:
+            adaptive_scheme: "gradnorm"
+            gradnorm_obs_weight_sum: 0.95
+            gradnorm_update_every: 16
+            gradnorm_ema_decay: 0.9
+            gradnorm_probe: "obs_context"
