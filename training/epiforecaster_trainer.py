@@ -41,7 +41,16 @@ from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
+from training.gradnorm import GradNormController
 from utils import setup_tensor_core_optimizations
+from utils.compiled_batch import build_compiled_batch_view
+from utils.gradnorm_logging import (
+    append_gradnorm_sidecar_metrics,
+    did_gradnorm_sidecar_run,
+    format_gradnorm_controller_status,
+    init_gradnorm_sidecar_log_data,
+    mark_gradnorm_sidecar_complete,
+)
 from utils.gradient_debug import GradientDebugger
 from utils.platform import (
     cleanup_nvme_staging,
@@ -49,6 +58,16 @@ from utils.platform import (
     is_slurm_cluster,
     select_multiprocessing_context,
     stage_dataset_to_nvme,
+)
+from utils.train_logging import (
+    add_curriculum_metrics,
+    build_epoch_logging_bundle,
+    build_train_step_log_data,
+    compute_gradient_norms_and_clip,
+    format_component_gradnorm_status,
+    format_train_progress_status,
+    get_wandb_step_payload,
+    should_log_gradnorm_components,
 )
 from utils.training_utils import should_log_step
 
@@ -495,9 +514,58 @@ class EpiForecasterTrainer:
                 "Set training.loss.name=joint_inference in the config."
             )
 
-        # Compile training step (forward + backward + gradient clip) if enabled
+        joint_cfg = self.config.training.loss.joint
+        self._adaptive_scheme = joint_cfg.adaptive_scheme
+        self._gradnorm_enabled = self._adaptive_scheme == "gradnorm"
+        self.gradnorm_controller: GradNormController | None = None
+        self.gradnorm_optimizer: torch.optim.Optimizer | None = None
+        self._gradnorm_probe = joint_cfg.gradnorm_probe
+        self._gradnorm_cached_weights = torch.full(
+            (len(GradNormController.task_names),),
+            joint_cfg.gradnorm_obs_weight_sum / len(GradNormController.task_names),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._gradnorm_last_active_mask = torch.ones(
+            len(GradNormController.task_names),
+            device=self.device,
+            dtype=torch.bool,
+        )
+
+        if self._gradnorm_enabled:
+            self.gradnorm_controller = GradNormController(
+                alpha=joint_cfg.gradnorm_alpha,
+                obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
+                min_weight=joint_cfg.gradnorm_min_weight,
+                warmup_steps=joint_cfg.gradnorm_warmup_steps,
+                update_every=joint_cfg.gradnorm_update_every,
+                ema_decay=joint_cfg.gradnorm_ema_decay,
+                probe=joint_cfg.gradnorm_probe,
+            ).to(self.device)
+            self.gradnorm_optimizer = torch.optim.Adam(
+                self.gradnorm_controller.parameters(),
+                lr=joint_cfg.gradnorm_weight_lr,
+            )
+            self._gradnorm_cached_weights = self.gradnorm_controller.weights(
+                self._gradnorm_last_active_mask
+            ).detach()
+
+        # Compile training step (forward + backward) if enabled
         self._compiled_training_step = None
         if self.config.training.compile_backward:
+            compile_target = self._training_step_impl
+            if self._gradnorm_enabled:
+                compile_target = self._training_step_impl_adaptive
+                self._status(
+                    "Compiling adaptive training step for GradNorm hybrid mode",
+                    logging.INFO,
+                )
+            else:
+                self._status(
+                    "Compiling training step (forward+backward)",
+                    logging.INFO,
+                )
+
             compile_kwargs: dict[str, Any] = {}
             if self.config.training.compile_mode != "default":
                 compile_kwargs["mode"] = self.config.training.compile_mode
@@ -509,11 +577,11 @@ class EpiForecasterTrainer:
             compile_kwargs["fullgraph"] = False
 
             self._status(
-                f"Compiling training step (forward+backward+clip) with mode={self.config.training.compile_mode}",
+                f"Compile mode={self.config.training.compile_mode}",
                 logging.INFO,
             )
             self._compiled_training_step = torch.compile(
-                self._training_step_impl, **compile_kwargs
+                compile_target, **compile_kwargs
             )
 
         # Setup logging and checkpointing
@@ -614,13 +682,25 @@ class EpiForecasterTrainer:
 
         # Log Loss configuration
         if self.config.training.loss.name == "joint_inference":
-            self._status("  Joint Inference Loss Weights:")
-            weights = self.config.training.loss.joint
-            self._status(f"    - WW:    {weights.w_ww}")
-            self._status(f"    - Hosp:  {weights.w_hosp}")
-            self._status(f"    - Cases: {weights.w_cases}")
-            self._status(f"    - Deaths: {weights.w_deaths}")
-            self._status(f"    - SIR:   {weights.w_sir}")
+            loss_cfg = self.config.training.loss.joint
+            self._status("  Joint Inference Loss:")
+            self._status(f"    - Adaptive scheme: {loss_cfg.adaptive_scheme}")
+            self._status(
+                f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
+            )
+            self._status(f"    - SIR weight: {loss_cfg.w_sir}")
+            self._status(f"    - Continuity weight: {loss_cfg.w_continuity}")
+            if self._gradnorm_enabled:
+                self._status(
+                    "    - GradNorm settings: "
+                    f"alpha={loss_cfg.gradnorm_alpha}, "
+                    f"weight_lr={loss_cfg.gradnorm_weight_lr}, "
+                    f"warmup_steps={loss_cfg.gradnorm_warmup_steps}, "
+                    f"update_every={loss_cfg.gradnorm_update_every}, "
+                    f"ema_decay={loss_cfg.gradnorm_ema_decay}, "
+                    f"probe={loss_cfg.gradnorm_probe}, "
+                    f"min_weight={loss_cfg.gradnorm_min_weight}"
+                )
 
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
@@ -1601,6 +1681,33 @@ class EpiForecasterTrainer:
 
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        gradnorm_controller = getattr(self, "gradnorm_controller", None)
+        gradnorm_optimizer = getattr(self, "gradnorm_optimizer", None)
+        if (
+            gradnorm_controller is not None
+            and "gradnorm_controller_state_dict" in checkpoint
+        ):
+            gradnorm_controller.load_state_dict(
+                checkpoint["gradnorm_controller_state_dict"]
+            )
+            active_mask = getattr(
+                self,
+                "_gradnorm_last_active_mask",
+                torch.ones(
+                    len(GradNormController.task_names),
+                    dtype=torch.bool,
+                ),
+            )
+            self._gradnorm_cached_weights = gradnorm_controller.weights(
+                active_mask
+            ).detach()
+        if (
+            gradnorm_optimizer is not None
+            and "gradnorm_optimizer_state_dict" in checkpoint
+        ):
+            gradnorm_optimizer.load_state_dict(
+                checkpoint["gradnorm_optimizer_state_dict"]
+            )
         if self.scheduler and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
@@ -1843,13 +1950,17 @@ class EpiForecasterTrainer:
                 result[k] = v
         return result
 
+    def _build_compiled_batch(self, batch_data: dict[str, Any]) -> dict[str, Any]:
+        """Build a shape-stable, tensor-only view for compiled training steps."""
+        return build_compiled_batch_view(batch_data)
+
     def _training_step_impl(
         self, batch_data: dict[str, Any]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pure training step: forward + backward + gradient clipping.
+    ) -> torch.Tensor:
+        """Pure training step: forward + backward only.
 
-        This method computes the forward pass, loss, backward pass, and gradient
-        clipping. It is designed to be compiled with torch.compile for performance.
+        This method computes the forward pass, loss, and backward pass.
+        It is designed to be compiled with torch.compile for performance.
         It excludes graph-breaking operations like CPU syncs, logging, I/O, and
         optimizer.step() / zero_grad() which are handled in the main loop.
 
@@ -1857,7 +1968,7 @@ class EpiForecasterTrainer:
             batch_data: Dictionary containing batch tensors (already on device)
 
         Returns:
-            Tuple of (loss, grad_norm) - both detached but still on GPU
+            Detached loss tensor on device
         """
         # Forward with autocast
         with torch.autocast(
@@ -1874,32 +1985,165 @@ class EpiForecasterTrainer:
 
         # Backward
         loss.backward()
+        return loss.detach()
 
-        # Compute gradient norm and clip with STATIC shapes to prevent recompilation.
-        # Always iterate over ALL model parameters in consistent order, using zeros
-        # for missing grads. This ensures torch.compile sees the same graph every step.
-        all_grads: list[torch.Tensor] = []
-        for p in self.model.parameters():
-            if p.grad is not None:
-                all_grads.append(p.grad)
-            else:
-                # Use zeros_like to maintain consistent tensor count (prevents recompilation)
-                all_grads.append(torch.zeros_like(p))
+    def _training_step_impl_adaptive(
+        self,
+        batch_data: dict[str, Any],
+        obs_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compiled-friendly adaptive training step using cached observation weights."""
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.precision_policy.autocast_dtype,
+            enabled=self.precision_policy.autocast_enabled,
+        ):
+            model_outputs, targets_dict = self.model.forward_batch(
+                batch_data=batch_data,
+                region_embeddings=self.region_embeddings,
+                skip_device_transfer=True,
+            )
+            components = self.criterion.compute_components_train(
+                model_outputs, targets_dict, batch_data
+            )
+            obs_active_mask = components["obs_active_mask"].to(
+                device=obs_weights.device, dtype=torch.bool
+            )
+            active_weights = torch.where(
+                obs_active_mask,
+                obs_weights.to(torch.float32),
+                torch.zeros_like(obs_weights, dtype=torch.float32),
+            )
+            active_sum = active_weights.sum().clamp_min(1e-8)
+            normalized_weights = torch.where(
+                obs_active_mask,
+                active_weights * (self.criterion.obs_weight_sum / active_sum),
+                torch.zeros_like(active_weights),
+            )
+            totals = self.criterion.compose_total_loss(
+                components=components,
+                obs_active_mask=obs_active_mask,
+                obs_weights=normalized_weights.detach(),
+            )
+            loss = totals["total"]
 
-        # Compute global norm (always has grads now)
-        global_norm = torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
+        loss.backward()
+        return loss.detach()
 
-        # Apply gradient clipping using foreach=True
-        clip_value = self.config.training.gradient_clip_value
-        if global_norm > clip_value:
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=clip_value, foreach=True
+    def _gradnorm_sidecar_update(
+        self, batch_data: dict[str, Any]
+    ) -> dict[str, torch.Tensor]:
+        """Periodic eager GradNorm controller update on obs_context probe."""
+        if self.gradnorm_controller is None or self.gradnorm_optimizer is None:
+            return {}
+
+        log_data = init_gradnorm_sidecar_log_data(self.device)
+
+        if self.global_step % self.gradnorm_controller.update_every != 0:
+            return log_data
+
+        sidecar_start_time = time.time()
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.precision_policy.autocast_dtype,
+            enabled=self.precision_policy.autocast_enabled,
+        ):
+            model_outputs, targets_dict = self.model.forward_batch(
+                batch_data=batch_data,
+                region_embeddings=self.region_embeddings,
+                skip_device_transfer=True,
+            )
+            components = self.criterion.compute_components_train(
+                model_outputs, targets_dict, batch_data
             )
 
-        # Note: optimizer.step() and zero_grad() are called in the main loop
-        # to allow component-wise gradient norm logging
+        obs_losses = torch.stack(
+            [
+                components["ww"].float(),
+                components["hosp"].float(),
+                components["cases"].float(),
+                components["deaths"].float(),
+            ]
+        )
+        obs_active_mask = components["obs_active_mask"].to(
+            device=obs_losses.device,
+            dtype=torch.bool,
+        )
+        self._gradnorm_last_active_mask = obs_active_mask.detach()
 
-        return loss.detach(), global_norm.detach()
+        self.gradnorm_controller.maybe_init_l0(
+            obs_losses,
+            step=self.global_step,
+            active_mask=obs_active_mask,
+        )
+
+        # Keep cached weights current even before warmup/GradNorm loss activation.
+        self._gradnorm_cached_weights = self.gradnorm_controller.weights(
+            obs_active_mask
+        ).detach()
+
+        if not bool(obs_active_mask.any()):
+            mark_gradnorm_sidecar_complete(
+                log_data,
+                started_at=sidecar_start_time,
+                device=self.device,
+            )
+            return log_data
+
+        if not bool(
+            self.gradnorm_controller.l0_initialized[obs_active_mask].all().item()
+        ):
+            mark_gradnorm_sidecar_complete(
+                log_data,
+                started_at=sidecar_start_time,
+                device=self.device,
+            )
+            return log_data
+
+        if self._gradnorm_probe != "obs_context":
+            raise ValueError(f"Unsupported gradnorm probe: {self._gradnorm_probe!r}")
+        probe = model_outputs["obs_context"]
+
+        self.gradnorm_optimizer.zero_grad(set_to_none=True)
+        gradnorm_terms = self.gradnorm_controller.compute_gradnorm_terms(
+            obs_losses,
+            probe=probe,
+            active_mask=obs_active_mask,
+        )
+        gradnorm_loss = gradnorm_terms["gradnorm_loss"]
+        gradnorm_loss.backward()
+        self.gradnorm_optimizer.step()
+
+        self._gradnorm_cached_weights = self.gradnorm_controller.weights(
+            obs_active_mask
+        ).detach()
+        self.model.zero_grad(set_to_none=True)
+
+        mark_gradnorm_sidecar_complete(
+            log_data,
+            started_at=sidecar_start_time,
+            device=self.device,
+            gradnorm_loss=gradnorm_loss,
+        )
+        append_gradnorm_sidecar_metrics(
+            log_data,
+            cached_weights=self._gradnorm_cached_weights,
+            gradnorm_terms=gradnorm_terms,
+            task_names=GradNormController.task_names,
+        )
+        return log_data
+
+    def _format_gradnorm_controller_status(
+        self, gradnorm_step_log_data: dict[str, torch.Tensor]
+    ) -> tuple[str, dict[str, float]]:
+        """Build a concise, interpretable GradNorm controller progress summary."""
+        return format_gradnorm_controller_status(
+            gradnorm_enabled=self._gradnorm_enabled,
+            gradnorm_step_log_data=gradnorm_step_log_data,
+            cached_weights=self._gradnorm_cached_weights,
+            last_active_mask=self._gradnorm_last_active_mask,
+            task_names=GradNormController.task_names,
+        )
 
     def _train_epoch(self) -> float:
         """Train for one epoch."""
@@ -1986,28 +2230,73 @@ class EpiForecasterTrainer:
                 batch_data = self._move_batch_to_device(
                     batch_data, self.precision_policy.param_dtype
                 )
+                compiled_batch = self._build_compiled_batch(batch_data)
 
+                model_step_start_time = time.time()
+                if self._gradnorm_enabled:
+                    if self._compiled_training_step is not None:
+                        ensure_mobility_adj_dense_ready(
+                            compiled_batch,
+                            required=bool(self.config.model.type.mobility),
+                            context="compiled adaptive training",
+                        )
+                        loss = self._compiled_training_step(
+                            compiled_batch,
+                            self._gradnorm_cached_weights,
+                        )
+                    else:
+                        loss = self._training_step_impl_adaptive(
+                            compiled_batch,
+                            self._gradnorm_cached_weights,
+                        )
                 # Call either compiled or eager version of the same step implementation
-                if self._compiled_training_step is not None:
+                elif self._compiled_training_step is not None:
                     ensure_mobility_adj_dense_ready(
-                        batch_data,
+                        compiled_batch,
                         required=bool(self.config.model.type.mobility),
                         context="compiled training",
                     )
-                    loss, grad_norm = self._compiled_training_step(batch_data)
+                    loss = self._compiled_training_step(compiled_batch)
                 else:
-                    loss, grad_norm = self._training_step_impl(batch_data)
+                    loss = self._training_step_impl(compiled_batch)
+                model_step_time_s = time.time() - model_step_start_time
 
-                # Log component-wise gradnorms at frequency intervals (gradients still available)
                 frequency = self.config.training.grad_norm_log_frequency
-                if frequency > 0 and (
-                    self.global_step % frequency == 0 or self.global_step == 0
-                ):
-                    _, _ = self._compute_gradient_norms_and_clip(step=self.global_step)
+                component_gradnorm_log_data: dict[str, float] = {}
+                if should_log_gradnorm_components(self.global_step, frequency):
+                    grad_norm, component_gradnorm_log_data = (
+                        self._compute_gradient_norms_and_clip(
+                            step=self.global_step
+                        )
+                    )
+                    self._status(
+                        format_component_gradnorm_status(
+                            self.global_step,
+                            component_gradnorm_log_data,
+                        ),
+                        logging.DEBUG,
+                    )
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.config.training.gradient_clip_value,
+                        foreach=True,
+                    )
 
                 # Optimizer step and gradient zeroing (common to both paths)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
+
+                gradnorm_step_log_data: dict[str, torch.Tensor] = {}
+                if self._gradnorm_enabled:
+                    gradnorm_step_log_data = self._gradnorm_sidecar_update(
+                        compiled_batch
+                    )
+                    for idx, task in enumerate(GradNormController.task_names):
+                        if f"gradnorm_w_{task}" not in gradnorm_step_log_data:
+                            gradnorm_step_log_data[f"gradnorm_w_{task}"] = (
+                                self._gradnorm_cached_weights[idx]
+                            )
 
                 # Guard against non-finite losses/gradients to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -2111,14 +2400,16 @@ class EpiForecasterTrainer:
                 log_frequency = self.config.training.progress_log_frequency
                 log_this_step = should_log_step(self.global_step, 1, log_frequency)
 
-                log_data = {
-                    "learning_rate_step": lr,
-                    "gradnorm_clipped_total": grad_norm,
-                    "time_batch_s": batch_time_s,
-                    "time_dataload_s": data_time_s,
-                    "time_step_s": batch_time_s,
-                    "epoch": self.current_epoch,
-                }
+                log_data = build_train_step_log_data(
+                    lr=lr,
+                    grad_norm=grad_norm,
+                    batch_time_s=batch_time_s,
+                    data_time_s=data_time_s,
+                    model_step_time_s=model_step_time_s,
+                    epoch=self.current_epoch,
+                    component_gradnorm_log_data=component_gradnorm_log_data,
+                    gradnorm_step_log_data=gradnorm_step_log_data,
+                )
 
                 if log_this_step:
                     # Use detach() instead of item() - wandb handles tensor conversion
@@ -2126,24 +2417,47 @@ class EpiForecasterTrainer:
                     log_data["loss_train_step"] = loss_detached
                     # Convert to scalar only for console logging
                     loss_value = float(loss_detached)
+                    gradnorm_status_line = ""
+                    if self._gradnorm_enabled:
+                        if did_gradnorm_sidecar_run(gradnorm_step_log_data):
+                            gradnorm_status_line, gradnorm_controller_metrics = (
+                                self._format_gradnorm_controller_status(
+                                    gradnorm_step_log_data
+                                )
+                            )
+                            log_data.update(gradnorm_controller_metrics)
                     self._status(
-                        f"Epoch {self.current_epoch} | Step {self.global_step} | Loss: {loss_value:.4g} | Lr: {lr:.2e} | Grad: {float(last_gradnorm):.3f} | SPS: {samples_per_s:7.1f}",
+                        format_train_progress_status(
+                            epoch=self.current_epoch,
+                            step=self.global_step,
+                            loss_value=loss_value,
+                            lr=lr,
+                            grad_norm=last_gradnorm,
+                            samples_per_s=samples_per_s,
+                            gradnorm_status_suffix="",
+                        ),
                     )
+                    if gradnorm_status_line:
+                        self._status(f"  {gradnorm_status_line}")
 
                     # Keep as tensor - wandb handles CPU tensor conversion
                     window_start_mean = batch_data["WindowStart"].float().mean()
                     log_data["time_window_start"] = window_start_mean
 
                     # Log curriculum metrics for loss-curve-critic analysis
-                    if self.curriculum_sampler is not None and hasattr(
-                        self.curriculum_sampler, "state"
-                    ):
-                        log_data["train_sparsity_step"] = (
-                            self.curriculum_sampler.state.max_sparsity or 0.0
-                        )
-
-                    if self.wandb_run is not None:
-                        wandb.log(log_data, step=self.global_step)
+                    add_curriculum_metrics(
+                        log_data=log_data,
+                        curriculum_sampler=self.curriculum_sampler,
+                        key_suffix="step",
+                        include_synth_ratio=False,
+                    )
+                wandb_payload = get_wandb_step_payload(
+                    log_this_step=log_this_step,
+                    log_data=log_data,
+                    component_gradnorm_log_data=component_gradnorm_log_data,
+                )
+                if self.wandb_run is not None and wandb_payload is not None:
+                    wandb.log(wandb_payload, step=self.global_step)
 
                 self.global_step += 1
 
@@ -2307,111 +2621,14 @@ class EpiForecasterTrainer:
         Returns:
             Tuple of (global_grad_norm, component_norms_dict)
         """
-        frequency = self.config.training.grad_norm_log_frequency
-        should_log = frequency > 0 and (step % frequency == 0 or step == 0)
-
-        # Compute squared norms by group
-        gnn_sq_sum = torch.tensor(0.0, device=self.device)
-        ww_sq_sum = torch.tensor(0.0, device=self.device)
-        hosp_sq_sum = torch.tensor(0.0, device=self.device)
-        cases_sq_sum = torch.tensor(0.0, device=self.device)
-        deaths_sq_sum = torch.tensor(0.0, device=self.device)
-        sird_sq_sum = torch.tensor(0.0, device=self.device)
-        encoder_sq_sum = torch.tensor(0.0, device=self.device)
-        other_sq_sum = torch.tensor(0.0, device=self.device)
-
-        # Collect all gradients for global norm computation
-        all_grads = []
-
-        for group_name, params in self._grad_norm_groups.items():
-            for param in params:
-                if param.grad is not None:
-                    grad = param.grad.detach()
-                    all_grads.append(grad)
-                    sq_norm = grad.pow(2).sum()
-
-                    if should_log:
-                        if group_name == "mobility_gnn":
-                            gnn_sq_sum += sq_norm
-                        elif group_name == "ww_head":
-                            ww_sq_sum += sq_norm
-                        elif group_name == "hosp_head":
-                            hosp_sq_sum += sq_norm
-                        elif group_name == "cases_head":
-                            cases_sq_sum += sq_norm
-                        elif group_name == "deaths_head":
-                            deaths_sq_sum += sq_norm
-                        elif group_name == "sird":
-                            sird_sq_sum += sq_norm
-                        elif group_name == "backbone":
-                            encoder_sq_sum += sq_norm
-                        else:
-                            other_sq_sum += sq_norm
-
-        # Compute global norm using foreach operations for efficiency
-        if all_grads:
-            # Use torch.linalg.vector_norm with foreach for faster multi-tensor computation
-            global_norm = torch.linalg.vector_norm(
-                torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
-            )
-        else:
-            global_norm = torch.tensor(0.0, device=self.device)
-
-        # Apply gradient clipping using foreach=True for multi-tensor parallelism
-        clip_value = self.config.training.gradient_clip_value
-        if global_norm > clip_value:
-            # foreach=True uses faster multi-tensor kernels on CUDA
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_norm=clip_value, foreach=True
-            )
-
-        # Build norms dict for logging
-        norms_dict: dict[str, float] = {}
-        if should_log:
-            obs_heads_sq_sum = ww_sq_sum + hosp_sq_sum + cases_sq_sum + deaths_sq_sum
-            component_sq_sums = torch.stack(
-                [
-                    sird_sq_sum,
-                    encoder_sq_sum,
-                    gnn_sq_sum,
-                    obs_heads_sq_sum,
-                    other_sq_sum,
-                ]
-            )
-            total_sq_sum = component_sq_sums.sum()
-            per_head_sq_sums = torch.stack(
-                [ww_sq_sum, hosp_sq_sum, cases_sq_sum, deaths_sq_sum]
-            )
-            all_sq_sums = torch.cat(
-                [total_sq_sum.unsqueeze(0), component_sq_sums, per_head_sq_sums]
-            )
-            all_norms = all_sq_sums.sqrt().cpu().numpy()
-
-            norms_dict = {
-                "gradnorm_total_preclip": float(all_norms[0]),
-                "gradnorm_sird_physics": float(all_norms[1]),
-                "gradnorm_backbone_encoder": float(all_norms[2]),
-                "gradnorm_mobility_gnn": float(all_norms[3]),
-                "gradnorm_observation_heads": float(all_norms[4]),
-                "gradnorm_other": float(all_norms[5]),
-                "gradnorm_obs_ww": float(all_norms[6]),
-                "gradnorm_obs_hosp": float(all_norms[7]),
-                "gradnorm_obs_cases": float(all_norms[8]),
-                "gradnorm_obs_deaths": float(all_norms[9]),
-                "gradnorm_backbone": float(all_norms[1] + all_norms[2]),
-            }
-
-            if self.wandb_run is not None:
-                wandb.log(norms_dict, step=step)
-
-            self._status(
-                f"Grad norms @ step {step}: Total={all_norms[0]:.4f} | "
-                f"SIRD={all_norms[1]:.4f} | Enc={all_norms[2]:.4f} | "
-                f"GNN={all_norms[3]:.4f} | Obs={all_norms[4]:.4f} | Other={all_norms[5]:.4f}",
-                logging.DEBUG,
-            )
-
-        return global_norm, norms_dict
+        return compute_gradient_norms_and_clip(
+            grad_norm_groups=self._grad_norm_groups,
+            model=self.model,
+            device=self.device,
+            step=step,
+            frequency=self.config.training.grad_norm_log_frequency,
+            clip_value=self.config.training.gradient_clip_value,
+        )
 
     def _persist_run_config(self, run_dir: Path) -> None:
         """Copy the input configuration to the run directory.
@@ -2453,151 +2670,21 @@ class EpiForecasterTrainer:
         """Log metrics for a specific split."""
         if epoch is None:
             return
-        prefix = split_name.capitalize()
-        # Initial standard metrics
-        log_data = {
-            "epoch": epoch,
-            f"loss_{prefix.lower()}": loss,
-            f"mae_{prefix.lower()}": metrics["mae"],
-            f"rmse_{prefix.lower()}": metrics["rmse"],
-            f"smape_{prefix.lower()}": metrics["smape"],
-            f"r2_{prefix.lower()}": metrics["r2"],
-        }
-
-        # Add Joint Inference specific metrics
-        # Raw losses
-        if "loss_ww" in metrics:
-            log_data[f"loss_{prefix.lower()}_ww"] = metrics["loss_ww"]
-        if "loss_hosp" in metrics:
-            log_data[f"loss_{prefix.lower()}_hosp"] = metrics["loss_hosp"]
-        if "loss_cases" in metrics:
-            log_data[f"loss_{prefix.lower()}_cases"] = metrics["loss_cases"]
-        if "loss_deaths" in metrics:
-            log_data[f"loss_{prefix.lower()}_deaths"] = metrics["loss_deaths"]
-        if "loss_sir" in metrics:
-            log_data[f"loss_{prefix.lower()}_sir"] = metrics["loss_sir"]
-
-        # Weighted losses
-        if "loss_ww_weighted" in metrics:
-            log_data[f"loss_{prefix.lower()}_ww_weighted"] = metrics["loss_ww_weighted"]
-        if "loss_hosp_weighted" in metrics:
-            log_data[f"loss_{prefix.lower()}_hosp_weighted"] = metrics[
-                "loss_hosp_weighted"
-            ]
-        if "loss_cases_weighted" in metrics:
-            log_data[f"loss_{prefix.lower()}_cases_weighted"] = metrics[
-                "loss_cases_weighted"
-            ]
-        if "loss_deaths_weighted" in metrics:
-            log_data[f"loss_{prefix.lower()}_deaths_weighted"] = metrics[
-                "loss_deaths_weighted"
-            ]
-        if "loss_sir_weighted" in metrics:
-            log_data[f"loss_{prefix.lower()}_sir_weighted"] = metrics[
-                "loss_sir_weighted"
-            ]
-
-        # Add per-horizon metrics (batched by week or individual)
-        aggregation = getattr(
-            self.config.training, "horizon_metric_aggregation", "weekly"
+        aggregation = getattr(self.config.training, "horizon_metric_aggregation", "weekly")
+        log_data, status_lines = build_epoch_logging_bundle(
+            split_name=split_name,
+            loss=loss,
+            metrics=metrics,
+            epoch=epoch,
+            aggregation=aggregation,
+            curriculum_sampler=self.curriculum_sampler,
         )
-        mae_per_h = metrics.get("mae_per_h", [])
-        rmse_per_h = metrics.get("rmse_per_h", [])
 
-        if aggregation == "weekly" and len(mae_per_h) > 0:
-            # Aggregate into weekly buckets (7 days per week)
-            # Report median of each week to reduce dashboard clutter
-            import statistics
-
-            week_num = 1
-            for start_idx in range(0, len(mae_per_h), 7):
-                end_idx = min(start_idx + 7, len(mae_per_h))
-                week_mae_values = mae_per_h[start_idx:end_idx]
-                week_rmse_values = rmse_per_h[start_idx:end_idx]
-
-                # Use median for robust aggregation
-                log_data[f"mae_{prefix.lower()}_w{week_num}"] = statistics.median(
-                    week_mae_values
-                )
-                log_data[f"rmse_{prefix.lower()}_w{week_num}"] = statistics.median(
-                    week_rmse_values
-                )
-                week_num += 1
-        else:
-            # Individual per-timestep metrics (legacy behavior)
-            for idx, (mae_h, rmse_h) in enumerate(
-                zip(mae_per_h, rmse_per_h, strict=False)
-            ):
-                log_data[f"mae_{prefix.lower()}_h{idx + 1}"] = mae_h
-                log_data[f"rmse_{prefix.lower()}_h{idx + 1}"] = rmse_h
-
-        # Log to WandB
-        if self.wandb_run is not None:
-            wandb.log(log_data)
-
-        # Log curriculum metrics for loss-curve-critic analysis
-        if self.curriculum_sampler is not None and hasattr(
-            self.curriculum_sampler, "state"
-        ):
-            log_data["train_sparsity_epoch"] = (
-                self.curriculum_sampler.state.max_sparsity or 0.0
-            )
-            log_data["train_synth_ratio_epoch"] = (
-                self.curriculum_sampler.state.synth_ratio
-            )
         if self.wandb_run is not None:
             wandb.log(log_data, step=self.global_step)
 
-        self._status(
-            f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | R2: {metrics['r2']:.4g}"
-        )
-        if (
-            "loss_ww" in metrics
-            and "loss_hosp" in metrics
-            and "loss_sir" in metrics
-            and "loss_ww_weighted" in metrics
-            and "loss_hosp_weighted" in metrics
-            and "loss_sir_weighted" in metrics
-        ):
-            # Build component strings, only including non-zero cases/deaths
-            components_str = (
-                f"WW={metrics['loss_ww']:.4g} (w={metrics['loss_ww_weighted']:.4g}) | "
-                f"Hosp={metrics['loss_hosp']:.4g} (w={metrics['loss_hosp_weighted']:.4g}) | "
-                f"SIR={metrics['loss_sir']:.4g} (w={metrics['loss_sir_weighted']:.4g})"
-            )
-            if "loss_cases" in metrics:
-                components_str += f" | Cases={metrics['loss_cases']:.4g} (w={metrics.get('loss_cases_weighted', 0):.4g})"
-            if "loss_deaths" in metrics:
-                components_str += f" | Deaths={metrics['loss_deaths']:.4g} (w={metrics.get('loss_deaths_weighted', 0):.4g})"
-            self._status(f"{prefix} loss components: {components_str}")
-        # Log per-horizon metrics to console (respecting aggregation setting)
-        aggregation = getattr(
-            self.config.training, "horizon_metric_aggregation", "weekly"
-        )
-        mae_per_h = metrics.get("mae_per_h", [])
-        rmse_per_h = metrics.get("rmse_per_h", [])
-
-        if aggregation == "weekly" and len(mae_per_h) > 0:
-            import statistics
-
-            week_num = 1
-            for start_idx in range(0, len(mae_per_h), 7):
-                end_idx = min(start_idx + 7, len(mae_per_h))
-                week_mae_values = mae_per_h[start_idx:end_idx]
-                week_rmse_values = rmse_per_h[start_idx:end_idx]
-                mae_median = statistics.median(week_mae_values)
-                rmse_median = statistics.median(week_rmse_values)
-                self._status(
-                    f"{prefix} MAE_w{week_num}: {mae_median:.6f} | RMSE_w{week_num}: {rmse_median:.6f}"
-                )
-                week_num += 1
-        else:
-            for idx, (mae_h, rmse_h) in enumerate(
-                zip(mae_per_h, rmse_per_h, strict=False)
-            ):
-                self._status(
-                    f"{prefix} MAE_h{idx + 1}: {mae_h:.6f} | RMSE_h{idx + 1}: {rmse_h:.6f}"
-                )
+        for status_line in status_lines:
+            self._status(status_line)
 
     def _get_config_for_save(self) -> dict:
         """Get config dict with original dataset paths (not staged NVMe paths).
@@ -2639,6 +2726,16 @@ class EpiForecasterTrainer:
 
         if self.scheduler:
             checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+        gradnorm_controller = getattr(self, "gradnorm_controller", None)
+        gradnorm_optimizer = getattr(self, "gradnorm_optimizer", None)
+        if gradnorm_controller is not None:
+            checkpoint["gradnorm_controller_state_dict"] = (
+                gradnorm_controller.state_dict()
+            )
+        if gradnorm_optimizer is not None:
+            checkpoint["gradnorm_optimizer_state_dict"] = (
+                gradnorm_optimizer.state_dict()
+            )
 
         if is_best or is_final:
             filename = "best_model.pt" if is_best else "final_model.pt"
