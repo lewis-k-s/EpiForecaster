@@ -301,24 +301,47 @@ def test_run_baseline_evaluation_multiple_models_writes_artifacts(
 
 
 def test_compare_model_metrics_against_baselines(tmp_path: Path):
-    baseline_csv = tmp_path / "baseline_aggregate_metrics.csv"
+    baseline_csv = tmp_path / "baseline_fold_metrics.csv"
+    # Provide fold-level data that the function aggregates
     pd.DataFrame(
         [
+            # Fold 0
             {
                 "model": "tiered",
                 "target": "hospitalizations",
-                "mae_median": 1.0,
-                "rmse_median": 2.0,
-                "smape_median": 0.5,
-                "r2_median": 0.1,
+                "fold": 0,
+                "mae": 0.9,
+                "rmse": 1.9,
+                "smape": 0.4,
+                "r2": 0.2,
             },
             {
                 "model": "tiered",
                 "target": "cases",
-                "mae_median": 1.5,
-                "rmse_median": 2.5,
-                "smape_median": 0.6,
-                "r2_median": 0.2,
+                "fold": 0,
+                "mae": 1.4,
+                "rmse": 2.4,
+                "smape": 0.55,
+                "r2": 0.25,
+            },
+            # Fold 1
+            {
+                "model": "tiered",
+                "target": "hospitalizations",
+                "fold": 1,
+                "mae": 1.1,
+                "rmse": 2.1,
+                "smape": 0.6,
+                "r2": 0.0,
+            },
+            {
+                "model": "tiered",
+                "target": "cases",
+                "fold": 1,
+                "mae": 1.6,
+                "rmse": 2.6,
+                "smape": 0.65,
+                "r2": 0.15,
             },
         ]
     ).to_csv(baseline_csv, index=False)
@@ -356,18 +379,30 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
 
 
 def test_compare_model_metrics_against_joint_baseline_aggregate(tmp_path: Path):
-    baseline_csv = tmp_path / "baseline_joint_loss_aggregate.csv"
+    baseline_csv = tmp_path / "baseline_joint_loss_fold.csv"
+    # Provide fold-level data that the function aggregates
     pd.DataFrame(
         [
+            # Fold 0
             {
                 "model": "tiered",
-                "folds": 2,
-                "joint_obs_loss_total_median": 1.4,
-                "joint_loss_ww_weighted_median": 0.3,
-                "joint_loss_hosp_weighted_median": 0.4,
-                "joint_loss_cases_weighted_median": 0.5,
-                "joint_loss_deaths_weighted_median": 0.2,
-            }
+                "fold": 0,
+                "joint_obs_loss_total": 1.3,
+                "joint_loss_ww_weighted": 0.25,
+                "joint_loss_hosp_weighted": 0.35,
+                "joint_loss_cases_weighted": 0.45,
+                "joint_loss_deaths_weighted": 0.25,
+            },
+            # Fold 1
+            {
+                "model": "tiered",
+                "fold": 1,
+                "joint_obs_loss_total": 1.5,
+                "joint_loss_ww_weighted": 0.35,
+                "joint_loss_hosp_weighted": 0.45,
+                "joint_loss_cases_weighted": 0.55,
+                "joint_loss_deaths_weighted": 0.15,
+            },
         ]
     ).to_csv(baseline_csv, index=False)
 

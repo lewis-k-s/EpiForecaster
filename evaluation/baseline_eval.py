@@ -1345,14 +1345,10 @@ def compare_model_metrics_against_baselines(
                 {
                     "model": model_name,
                     "target": target_name,
-                    "mae_median": pd.to_numeric(group["mae"], errors="coerce").median(),
-                    "rmse_median": pd.to_numeric(
-                        group["rmse"], errors="coerce"
-                    ).median(),
-                    "smape_median": pd.to_numeric(
-                        group["smape"], errors="coerce"
-                    ).median(),
-                    "r2_median": pd.to_numeric(group["r2"], errors="coerce").median(),
+                    "mae_mean": pd.to_numeric(group["mae"], errors="coerce").mean(),
+                    "rmse_mean": pd.to_numeric(group["rmse"], errors="coerce").mean(),
+                    "smape_mean": pd.to_numeric(group["smape"], errors="coerce").mean(),
+                    "r2_mean": pd.to_numeric(group["r2"], errors="coerce").mean(),
                 }
             )
         baseline_df = pd.DataFrame(agg_rows)
