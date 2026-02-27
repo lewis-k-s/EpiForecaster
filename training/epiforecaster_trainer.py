@@ -692,6 +692,7 @@ class EpiForecasterTrainer:
         """Stage dataset(s) to node-local NVMe storage for improved I/O.
 
         Updates config paths to point to staged locations on NVMe.
+        Stores original paths for config export/checkpointing.
         Only runs when on a SLURM cluster with NVMe available.
         """
         enable_staging = os.getenv("EPFORECASTER_STAGE_TO_NVME", "1") != "0"
@@ -701,6 +702,10 @@ class EpiForecasterTrainer:
 
         logger.info("Detected SLURM cluster - staging data to NVMe")
         self._nvme_staging_path = get_nvme_path()
+
+        # Store original paths before staging for config export
+        self._original_dataset_path = self.config.data.dataset_path
+        self._original_real_dataset_path = self.config.data.real_dataset_path
 
         # Stage main dataset
         main_path = Path(self.config.data.dataset_path)
@@ -1438,7 +1443,7 @@ class EpiForecasterTrainer:
                 group=group,
                 name=self.model_id,
                 dir=str(experiment_dir),
-                config=self.config.to_dict(),
+                config=self._get_config_for_save(),
                 tags=self.config.output.wandb_tags or None,
                 job_type="train",
                 mode=self.config.output.wandb_mode,
@@ -2413,7 +2418,7 @@ class EpiForecasterTrainer:
         Note that the config is saved in the model snapshots eg. best_model.pt
         So this is purely a convenience method for easier readability
         """
-        config_dict = self.config.to_dict()
+        config_dict = self._get_config_for_save()
         config_path = run_dir / "config.yaml"
 
         with open(config_path, "w") as f:
@@ -2594,6 +2599,27 @@ class EpiForecasterTrainer:
                     f"{prefix} MAE_h{idx + 1}: {mae_h:.6f} | RMSE_h{idx + 1}: {rmse_h:.6f}"
                 )
 
+    def _get_config_for_save(self) -> dict:
+        """Get config dict with original dataset paths (not staged NVMe paths).
+
+        When running on SLURM, datasets are staged to NVMe and config paths are
+        updated to point to the staged locations. This method returns a config
+        dict with the original paths preserved for checkpoint/export.
+
+        Returns:
+            Config dict with original dataset paths.
+        """
+        config_dict = self.config.to_dict()
+
+        # Restore original paths if they were stored during staging
+        if hasattr(self, "_original_dataset_path"):
+            config_dict["data"]["dataset_path"] = self._original_dataset_path
+        if hasattr(self, "_original_real_dataset_path"):
+            original_real = self._original_real_dataset_path
+            config_dict["data"]["real_dataset_path"] = original_real
+
+        return config_dict
+
     def _save_checkpoint(
         self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False
     ):
@@ -2606,7 +2632,7 @@ class EpiForecasterTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
             "best_val_loss": self.best_val_loss,
-            "config": self.config.to_dict(),
+            "config": self._get_config_for_save(),
             "training_history": self.training_history,
             "precision_signature": create_precision_signature(self.precision_policy),
         }
