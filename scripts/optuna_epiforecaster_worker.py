@@ -25,7 +25,6 @@ Notes:
 - Uses CMA-ES sampler by default for better convergence on high-dimensional spaces.
 - Implements early pruning to kill unpromising trials and save compute.
 - Default: 50 epochs per trial with pruning after epoch 10.
-- Joint loss weights are fixed by default to avoid objective drift across trials.
 - We force `training.plot_forecasts=False` by default to avoid workers clobbering
   shared forecast images (trainer writes `{split}_forecasts.png` at the
   experiment root).
@@ -57,7 +56,6 @@ logger = logging.getLogger(__name__)
 
 # Global flag for signal handling
 _shutdown_requested = False
-_JOINT_WEIGHT_KEYS = ("w_ww", "w_hosp", "w_cases", "w_deaths", "w_sir")
 
 
 def _handle_shutdown(signum: int, frame: Any) -> None:
@@ -148,49 +146,10 @@ def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
     return dotlist
 
 
-def _bounded_joint_loss_weight_overrides(
-    *,
-    trial: Any,
-    base_cfg: EpiForecasterConfig,
-    max_ratio: float,
-) -> dict[str, float]:
-    """Tune joint loss weights in a bounded simplex around base config values.
-
-    Keeps the total joint weight sum fixed to the base config and limits each
-    component's relative movement by `max_ratio`.
-    """
-    if max_ratio < 1.0:
-        raise ValueError("loss_weight_max_ratio must be >= 1.0")
-
-    base_joint = base_cfg.training.loss.joint
-    base_weights = {key: float(getattr(base_joint, key)) for key in _JOINT_WEIGHT_KEYS}
-    total = sum(base_weights.values())
-    if total <= 0:
-        raise ValueError("Sum of joint loss weights must be > 0 for bounded tuning")
-
-    lower = 1.0 / max_ratio
-    upper = max_ratio
-    scaled = {}
-    for key, base in base_weights.items():
-        mult = trial.suggest_float(
-            f"training.loss.joint.mult_{key}",
-            lower,
-            upper,
-            log=True,
-        )
-        scaled[key] = max(base, 1e-12) * mult
-
-    scaled_sum = sum(scaled.values())
-    normalized = {key: total * (value / scaled_sum) for key, value in scaled.items()}
-    return {f"training.loss.joint.{key}": value for key, value in normalized.items()}
-
-
 def suggest_epiforecaster_params(
     *,
     trial: Any,
     base_cfg: EpiForecasterConfig,
-    loss_weight_mode: str = "fixed",
-    loss_weight_max_ratio: float = 2.0,
 ) -> dict[str, Any]:
     """Define the search space and return dotted-key overrides.
 
@@ -288,22 +247,6 @@ def suggest_epiforecaster_params(
     # --- SIR joint inference knobs (high leverage for observation heads) ---
     # Only tune if using joint_inference loss
     if base_cfg.training.loss.name == "joint_inference":
-        # Loss-weight policy:
-        # - fixed: keep base config objective unchanged across trials.
-        # - bounded: small relative re-balancing around base config proportions.
-        if loss_weight_mode == "bounded":
-            overrides.update(
-                _bounded_joint_loss_weight_overrides(
-                    trial=trial,
-                    base_cfg=base_cfg,
-                    max_ratio=loss_weight_max_ratio,
-                )
-            )
-        elif loss_weight_mode != "fixed":
-            raise ValueError(
-                f"Unknown loss_weight_mode={loss_weight_mode!r}; expected fixed|bounded"
-            )
-
         # Residual connection params - affects model capacity for observation heads
         overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
             "model.observation_heads.residual_scale", 0.05, 0.5
@@ -335,6 +278,58 @@ def suggest_epiforecaster_params(
             _categorical_choices(("additive", "modulation")),
         )
 
+        # Weekly-observed heads default to frozen kernels in base config; allow HPO to
+        # opt into learnable kernels explicitly.
+        overrides["model.observation_heads.learnable_kernel_ww"] = (
+            trial.suggest_categorical(
+                "model.observation_heads.learnable_kernel_ww",
+                _categorical_choices((False, True)),
+            )
+        )
+        overrides["model.observation_heads.learnable_kernel_hosp"] = (
+            trial.suggest_categorical(
+                "model.observation_heads.learnable_kernel_hosp",
+                _categorical_choices((False, True)),
+            )
+        )
+
+        # GradNorm controller knobs (only relevant when adaptive weighting is enabled).
+        adaptive_scheme = getattr(
+            base_cfg.training.loss.joint, "adaptive_scheme", "none"
+        ).lower()
+        if adaptive_scheme == "gradnorm":
+            overrides["training.loss.joint.gradnorm_alpha"] = trial.suggest_float(
+                "training.loss.joint.gradnorm_alpha", 0.5, 2.5
+            )
+            overrides["training.loss.joint.gradnorm_weight_lr"] = trial.suggest_float(
+                "training.loss.joint.gradnorm_weight_lr",
+                1.0e-4,
+                5.0e-3,
+                log=True,
+            )
+            overrides["training.loss.joint.gradnorm_warmup_steps"] = trial.suggest_int(
+                "training.loss.joint.gradnorm_warmup_steps",
+                0,
+                100,
+            )
+            overrides["training.loss.joint.gradnorm_update_every"] = (
+                trial.suggest_categorical(
+                    "training.loss.joint.gradnorm_update_every",
+                    _categorical_choices((8, 16, 32)),
+                )
+            )
+            overrides["training.loss.joint.gradnorm_ema_decay"] = trial.suggest_float(
+                "training.loss.joint.gradnorm_ema_decay",
+                0.85,
+                0.99,
+            )
+            overrides["training.loss.joint.gradnorm_min_weight"] = (
+                trial.suggest_categorical(
+                    "training.loss.joint.gradnorm_min_weight",
+                    _categorical_choices((5.0e-4, 1.0e-3, 2.0e-3)),
+                )
+            )
+
     return overrides
 
 
@@ -349,8 +344,6 @@ def objective(
     seed: int | None,
     cli_overrides: list[str],
     pruning_start_epoch: int = 10,
-    loss_weight_mode: str = "fixed",
-    loss_weight_max_ratio: float = 2.0,
 ) -> float:
     start_time = time.time()
     logger.info("=== Trial %d started ===", trial.number)
@@ -364,8 +357,6 @@ def objective(
     overrides = suggest_epiforecaster_params(
         trial=trial,
         base_cfg=cfg,
-        loss_weight_mode=loss_weight_mode,
-        loss_weight_max_ratio=loss_weight_max_ratio,
     )
 
     override_list = _overrides_to_dotlist(overrides)
@@ -558,26 +549,6 @@ def objective(
     help="Epoch to start checking for pruning (default: 10).",
 )
 @click.option(
-    "--loss-weight-mode",
-    type=click.Choice(["fixed", "bounded"], case_sensitive=False),
-    default="fixed",
-    show_default=True,
-    help=(
-        "Joint loss weight search mode: fixed (recommended), "
-        "bounded (re-balance around config)"
-    ),
-)
-@click.option(
-    "--loss-weight-max-ratio",
-    type=float,
-    default=2.0,
-    show_default=True,
-    help=(
-        "Max multiplicative deviation for --loss-weight-mode=bounded. "
-        "Example: 2.0 means each weight multiplier is in [0.5, 2.0]."
-    ),
-)
-@click.option(
     "--override",
     "cli_overrides",
     type=str,
@@ -597,8 +568,6 @@ def main(
     seed: int,
     sampler: str,
     pruning_start_epoch: int,
-    loss_weight_mode: str,
-    loss_weight_max_ratio: float,
     cli_overrides: tuple[str, ...],
 ) -> None:
     """Run one Optuna worker process."""
@@ -681,13 +650,10 @@ def main(
     logger.info("Run root: %s", run_root)
     logger.info(
         "Settings: epochs=%d, pruning_start_epoch=%d, seed=%d, "
-        "loss_weight_mode=%s, loss_weight_max_ratio=%.3f, "
         "pruner=PercentilePruner(25%%)",
         epochs,
         pruning_start_epoch,
         seed,
-        loss_weight_mode,
-        loss_weight_max_ratio,
     )
     slurm = _slurm_identity()
     if any(slurm.values()):
@@ -718,8 +684,6 @@ def main(
             seed=seed,
             cli_overrides=base_overrides,
             pruning_start_epoch=pruning_start_epoch,
-            loss_weight_mode=loss_weight_mode,
-            loss_weight_max_ratio=loss_weight_max_ratio,
         ),
         n_trials=n_trials,
         timeout=timeout_s,
