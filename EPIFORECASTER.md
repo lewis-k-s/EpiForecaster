@@ -58,10 +58,24 @@ Differentiable layers mapping latent states to observable metrics.
 
 The model is trained end-to-end using a composite loss function:
 
-$$ L_{total} = w_{ww} L_{WW} + w_{hosp} L_{Hosp} + w_{cases} L_{Cases} + w_{deaths} L_{Deaths} + w_{sir} L_{SIR} $$
+$$ L_{total} = L_{obs} + w_{sir} L_{SIR} + w_{continuity} L_{continuity} $$
+
+where:
+
+*   **Training observation term (`L_obs`)**: adaptive GradNorm weighting over
+    `L_WW`, `L_Hosp`, `L_Cases`, `L_Deaths` (or fixed equal split when
+    `adaptive_scheme=none`).
+    GradNorm uses the shared observation context probe (`obs_context`) and updates
+    controller weights periodically (`gradnorm_update_every`, default 16) with EMA
+    smoothing (`gradnorm_ema_decay`, default 0.9) to preserve training throughput.
+*   **Evaluation observation term**: fixed equal-split weighting over active
+    observation targets with sum `gradnorm_obs_weight_sum` for stable
+    early-stopping comparisons.
 
 *   **Observation Losses ($L_{WW}, L_{Hosp}, \dots$)**: Minimize error between predictions and ground truth data. Per-target masks allow training even when some signals are missing (e.g., missing wastewater data).
 *   **SIR Physics Loss ($L_{SIR}$)**: A regularization term that enforces consistency between the unconstrained updates and the strict SIRD equations, preventing the model from "breaking physics" to fit noise.
+*   **Continuity Loss ($L_{continuity}$)**: Optional nowcast continuity penalty that
+    discourages discontinuity between the last observed point and first forecast step.
 
 ## 4. Model Variants
 
