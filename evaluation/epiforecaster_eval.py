@@ -21,6 +21,7 @@ from evaluation.metrics import TorchMaskedMetricAccumulator
 from utils.sparsity_logging import log_sparsity_loss_correlation
 from utils.normalization import unscale_forecasts
 from utils.dtypes import sync_to_device
+from utils.training_utils import drop_nowcast
 from models.configs import DataConfig, EpiForecasterConfig, LossConfig
 from models.epiforecaster import EpiForecaster
 from plotting.forecast_plots import (
@@ -163,10 +164,7 @@ class JointInferenceLoss(nn.Module):
 
     def __init__(
         self,
-        w_ww: float = 1.0,
-        w_hosp: float = 1.0,
-        w_cases: float = 1.0,
-        w_deaths: float = 1.0,
+        obs_weight_sum: float = 0.95,
         w_sir: float = 0.1,
         w_continuity: float = 0.0,
         ww_imputed_weight: float = 0.0,
@@ -174,16 +172,17 @@ class JointInferenceLoss(nn.Module):
         cases_imputed_weight: float = 0.0,
         deaths_imputed_weight: float = 0.0,
         sir_residual_clip: float = 1.0e3,
+        disable_ww: bool = False,
+        disable_hosp: bool = False,
+        disable_cases: bool = False,
+        disable_deaths: bool = False,
         ww_min_observed: int = 0,
         hosp_min_observed: int = 0,
         cases_min_observed: int = 0,
         deaths_min_observed: int = 0,
     ):
         super().__init__()
-        self.w_ww = w_ww
-        self.w_hosp = w_hosp
-        self.w_cases = w_cases
-        self.w_deaths = w_deaths
+        self.obs_weight_sum = float(obs_weight_sum)
         self.w_sir = w_sir
         self.w_continuity = w_continuity
         self.ww_imputed_weight = ww_imputed_weight
@@ -191,10 +190,77 @@ class JointInferenceLoss(nn.Module):
         self.cases_imputed_weight = cases_imputed_weight
         self.deaths_imputed_weight = deaths_imputed_weight
         self.sir_residual_clip = float(sir_residual_clip)
+        self.disable_ww = bool(disable_ww)
+        self.disable_hosp = bool(disable_hosp)
+        self.disable_cases = bool(disable_cases)
+        self.disable_deaths = bool(disable_deaths)
         self.ww_min_observed = int(ww_min_observed)
         self.hosp_min_observed = int(hosp_min_observed)
         self.cases_min_observed = int(cases_min_observed)
         self.deaths_min_observed = int(deaths_min_observed)
+        if self.obs_weight_sum <= 0:
+            raise ValueError(
+                f"obs_weight_sum must be positive, got {self.obs_weight_sum}"
+            )
+
+    @staticmethod
+    def fixed_obs_weights(
+        *,
+        active_mask: torch.Tensor,
+        obs_weight_sum: float,
+    ) -> torch.Tensor:
+        active_mask = active_mask.to(dtype=torch.bool)
+        active_f32 = active_mask.to(dtype=torch.float32)
+        num_active = active_f32.sum()
+        safe_num_active = num_active.clamp_min(1.0)
+        equal_weight = torch.as_tensor(
+            float(obs_weight_sum),
+            dtype=torch.float32,
+            device=active_mask.device,
+        ) / safe_num_active
+        weights = active_f32 * equal_weight
+        return torch.where(num_active > 0, weights, torch.zeros_like(weights))
+
+    def compose_total_loss(
+        self,
+        *,
+        components: dict[str, torch.Tensor],
+        obs_active_mask: torch.Tensor,
+        obs_weights: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compose total loss from raw components with fixed or provided obs weights."""
+        obs_losses = torch.stack(
+            [
+                components["ww"].float(),
+                components["hosp"].float(),
+                components["cases"].float(),
+                components["deaths"].float(),
+            ]
+        )
+
+        if obs_weights is None:
+            obs_weights = self.fixed_obs_weights(
+                active_mask=obs_active_mask, obs_weight_sum=self.obs_weight_sum
+            ).to(obs_losses.device)
+        else:
+            obs_weights = obs_weights.float().to(obs_losses.device)
+
+        obs_weighted = obs_weights * obs_losses
+        obs_total = obs_weighted.sum()
+        sir_weighted = self.w_sir * components["sir"]
+        continuity_weighted = self.w_continuity * components["continuity"]
+        total = obs_total + sir_weighted + continuity_weighted
+        return {
+            "obs_weights": obs_weights,
+            "obs_total": obs_total,
+            "total": total,
+            "ww_weighted": obs_weighted[0],
+            "hosp_weighted": obs_weighted[1],
+            "cases_weighted": obs_weighted[2],
+            "deaths_weighted": obs_weighted[3],
+            "sir_weighted": sir_weighted,
+            "continuity_weighted": continuity_weighted,
+        }
 
     @staticmethod
     def _weighted_masked_mse(
@@ -300,7 +366,6 @@ class JointInferenceLoss(nn.Module):
             ).sum()
             * 0.0
         )
-        total_loss = zero_anchor
         ww_loss = zero_anchor
         hosp_loss = zero_anchor
         cases_loss = zero_anchor
@@ -308,11 +373,34 @@ class JointInferenceLoss(nn.Module):
         sir_loss = zero_anchor
         continuity_loss = zero_anchor
 
-        # Helper to slice predictions: remove t=0 (nowcast) for forecast loss
-        from utils.training_utils import drop_nowcast
+        def _is_active(target_key: str, mask_key: str, disabled: bool) -> torch.Tensor:
+            if disabled:
+                return torch.zeros((), device=zero_anchor.device, dtype=torch.bool)
+            target = targets.get(target_key)
+            if target is None:
+                return torch.zeros((), device=zero_anchor.device, dtype=torch.bool)
+            mask = targets.get(mask_key)
+            if mask is None:
+                return torch.ones((), device=zero_anchor.device, dtype=torch.bool)
+            mask_clean = torch.nan_to_num(
+                mask.float().to(zero_anchor.device),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(min=0.0, max=1.0)
+            return mask_clean.sum() > 0
+
+        obs_active_mask = torch.stack(
+            [
+                _is_active("ww", "ww_mask", self.disable_ww),
+                _is_active("hosp", "hosp_mask", self.disable_hosp),
+                _is_active("cases", "cases_mask", self.disable_cases),
+                _is_active("deaths", "deaths_mask", self.disable_deaths),
+            ]
+        )
 
         # Wastewater loss
-        if self.w_ww > 0 and targets.get("ww") is not None:
+        if not self.disable_ww and targets.get("ww") is not None:
             ww_target = targets["ww"]
             assert ww_target is not None
             ww_loss = self._weighted_masked_mse(
@@ -322,10 +410,9 @@ class JointInferenceLoss(nn.Module):
                 self.ww_imputed_weight,
                 self.ww_min_observed,
             )
-            total_loss = total_loss + self.w_ww * ww_loss
 
         # Hospitalization loss
-        if self.w_hosp > 0 and targets.get("hosp") is not None:
+        if not self.disable_hosp and targets.get("hosp") is not None:
             hosp_target = targets["hosp"]
             assert hosp_target is not None
             hosp_loss = self._weighted_masked_mse(
@@ -335,10 +422,9 @@ class JointInferenceLoss(nn.Module):
                 self.hosp_imputed_weight,
                 self.hosp_min_observed,
             )
-            total_loss = total_loss + self.w_hosp * hosp_loss
 
         # Cases loss (reported cases observation)
-        if targets.get("cases") is not None:
+        if not self.disable_cases and targets.get("cases") is not None:
             cases_target = targets["cases"]
             assert cases_target is not None
             cases_loss = self._weighted_masked_mse(
@@ -348,11 +434,9 @@ class JointInferenceLoss(nn.Module):
                 self.cases_imputed_weight,
                 self.cases_min_observed,
             )
-            if self.w_cases > 0:
-                total_loss = total_loss + self.w_cases * cases_loss
 
         # Deaths loss (mortality observation)
-        if targets.get("deaths") is not None:
+        if not self.disable_deaths and targets.get("deaths") is not None:
             deaths_loss = self._weighted_masked_mse(
                 model_outputs["pred_deaths"],
                 targets["deaths"],
@@ -360,8 +444,6 @@ class JointInferenceLoss(nn.Module):
                 self.deaths_imputed_weight,
                 self.deaths_min_observed,
             )
-            if self.w_deaths > 0:
-                total_loss = total_loss + self.w_deaths * deaths_loss
 
         # SIR physics loss (always computed from residual)
         if self.w_sir > 0:
@@ -397,19 +479,23 @@ class JointInferenceLoss(nn.Module):
                     combined_mask,
                     0.0,
                 )
-            total_loss = total_loss + self.w_sir * sir_loss
 
         # Nowcast continuity penalty
         if self.w_continuity > 0 and batch_data is not None:
             continuity_loss = self._compute_continuity_loss(model_outputs, batch_data)
-            total_loss = total_loss + self.w_continuity * continuity_loss
 
-        ww_weighted = self.w_ww * ww_loss
-        hosp_weighted = self.w_hosp * hosp_loss
-        cases_weighted = self.w_cases * cases_loss
-        deaths_weighted = self.w_deaths * deaths_loss
-        sir_weighted = self.w_sir * sir_loss
-        continuity_weighted = self.w_continuity * continuity_loss
+        components = {
+            "ww": ww_loss,
+            "hosp": hosp_loss,
+            "cases": cases_loss,
+            "deaths": deaths_loss,
+            "sir": sir_loss,
+            "continuity": continuity_loss,
+        }
+        totals = self.compose_total_loss(
+            components=components,
+            obs_active_mask=obs_active_mask,
+        )
 
         return {
             "ww": ww_loss,
@@ -418,14 +504,26 @@ class JointInferenceLoss(nn.Module):
             "deaths": deaths_loss,
             "sir": sir_loss,
             "continuity": continuity_loss,
-            "ww_weighted": ww_weighted,
-            "hosp_weighted": hosp_weighted,
-            "cases_weighted": cases_weighted,
-            "deaths_weighted": deaths_weighted,
-            "sir_weighted": sir_weighted,
-            "continuity_weighted": continuity_weighted,
-            "total": total_loss,
+            "ww_weighted": totals["ww_weighted"],
+            "hosp_weighted": totals["hosp_weighted"],
+            "cases_weighted": totals["cases_weighted"],
+            "deaths_weighted": totals["deaths_weighted"],
+            "sir_weighted": totals["sir_weighted"],
+            "continuity_weighted": totals["continuity_weighted"],
+            "obs_weights": totals["obs_weights"],
+            "obs_active_mask": obs_active_mask,
+            "obs_total": totals["obs_total"],
+            "total": totals["total"],
         }
+
+    def compute_components_train(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        targets: dict[str, torch.Tensor | None],
+        batch_data: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compile-safe train path (kept separate to avoid eval-path regressions)."""
+        return self.compute_components(model_outputs, targets, batch_data)
 
     def _compute_continuity_loss(
         self,
@@ -451,42 +549,38 @@ class JointInferenceLoss(nn.Module):
             ).sum()
             * 0.0
         )
-        total_continuity_loss = zero_anchor
-        num_components = 0
+        component_losses: list[torch.Tensor] = []
 
-        # Hospitalization continuity: compare pred_hosp[:, 0] with HospHist[:, -1, 0]
+        def _masked_mse(nowcast_pred: torch.Tensor, last_observed: torch.Tensor) -> torch.Tensor:
+            valid_mask = torch.isfinite(last_observed)
+            valid_f = valid_mask.to(dtype=nowcast_pred.dtype)
+            last_observed_safe = torch.nan_to_num(
+                last_observed.float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).to(nowcast_pred.dtype)
+            sq = (nowcast_pred - last_observed_safe) ** 2
+            numerator = (sq * valid_f).sum()
+            denominator = valid_f.sum().clamp_min(1.0)
+            return numerator / denominator
+
         if "HospHist" in batch_data and model_outputs["pred_hosp"].shape[1] > 0:
-            last_observed = batch_data["HospHist"][:, -1, 0]  # value channel
-            nowcast_pred = model_outputs["pred_hosp"][:, 0]
-            # Only compute where observed value is finite
-            valid_mask = torch.isfinite(last_observed)
-            if valid_mask.any():
-                diff = (nowcast_pred[valid_mask] - last_observed[valid_mask]) ** 2
-                total_continuity_loss = total_continuity_loss + diff.mean()
-                num_components += 1
+            component_losses.append(
+                _masked_mse(model_outputs["pred_hosp"][:, 0], batch_data["HospHist"][:, -1, 0])
+            )
 
-        # Cases continuity: compare pred_cases[:, 0] with CasesHist[:, -1, 0]
         if "CasesHist" in batch_data and model_outputs["pred_cases"].shape[1] > 0:
-            last_observed = batch_data["CasesHist"][:, -1, 0]
-            nowcast_pred = model_outputs["pred_cases"][:, 0]
-            valid_mask = torch.isfinite(last_observed)
-            if valid_mask.any():
-                diff = (nowcast_pred[valid_mask] - last_observed[valid_mask]) ** 2
-                total_continuity_loss = total_continuity_loss + diff.mean()
-                num_components += 1
+            component_losses.append(
+                _masked_mse(model_outputs["pred_cases"][:, 0], batch_data["CasesHist"][:, -1, 0])
+            )
 
-        # Deaths continuity: compare pred_deaths[:, 0] with DeathsHist[:, -1, 0]
         if "DeathsHist" in batch_data and model_outputs["pred_deaths"].shape[1] > 0:
-            last_observed = batch_data["DeathsHist"][:, -1, 0]
-            nowcast_pred = model_outputs["pred_deaths"][:, 0]
-            valid_mask = torch.isfinite(last_observed)
-            if valid_mask.any():
-                diff = (nowcast_pred[valid_mask] - last_observed[valid_mask]) ** 2
-                total_continuity_loss = total_continuity_loss + diff.mean()
-                num_components += 1
+            component_losses.append(
+                _masked_mse(
+                    model_outputs["pred_deaths"][:, 0], batch_data["DeathsHist"][:, -1, 0]
+                )
+            )
 
-        if num_components > 0:
-            return total_continuity_loss / num_components
+        if component_losses:
+            return torch.stack(component_losses).mean()
         return zero_anchor
 
 
@@ -516,34 +610,25 @@ def get_loss_from_config(
     if name_lower == "joint_inference":
         # Joint inference loss for SIR + observation heads
         joint_cfg = loss_config.joint
+        imputed_weights = joint_cfg.resolve_imputed_weight_map()
         min_obs = {"cases": 0, "hospitalizations": 0, "deaths": 0, "wastewater": 0}
         if data_config is not None and forecast_horizon is not None:
-            permits = data_config.resolve_missing_permit_map()
-            horizon_permits = permits["horizon"]
-            min_obs = {
-                "cases": max(0, int(forecast_horizon) - int(horizon_permits["cases"])),
-                "hospitalizations": max(
-                    0, int(forecast_horizon) - int(horizon_permits["hospitalizations"])
-                ),
-                "deaths": max(
-                    0, int(forecast_horizon) - int(horizon_permits["deaths"])
-                ),
-                "wastewater": max(
-                    0, int(forecast_horizon) - int(horizon_permits["wastewater"])
-                ),
-            }
+            min_obs = data_config.resolve_min_observed_map(
+                forecast_horizon=int(forecast_horizon)
+            )
         return JointInferenceLoss(
-            w_ww=joint_cfg.w_ww,
-            w_hosp=joint_cfg.w_hosp,
-            w_cases=joint_cfg.w_cases,
-            w_deaths=joint_cfg.w_deaths,
+            obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
             w_sir=joint_cfg.w_sir,
             w_continuity=joint_cfg.w_continuity,
-            ww_imputed_weight=joint_cfg.ww_imputed_weight,
-            hosp_imputed_weight=joint_cfg.hosp_imputed_weight,
-            cases_imputed_weight=joint_cfg.cases_imputed_weight,
-            deaths_imputed_weight=joint_cfg.deaths_imputed_weight,
+            ww_imputed_weight=imputed_weights["wastewater"],
+            hosp_imputed_weight=imputed_weights["hospitalizations"],
+            cases_imputed_weight=imputed_weights["cases"],
+            deaths_imputed_weight=imputed_weights["deaths"],
             sir_residual_clip=joint_cfg.sir_residual_clip,
+            disable_ww=joint_cfg.disable_ww,
+            disable_hosp=joint_cfg.disable_hosp,
+            disable_cases=joint_cfg.disable_cases,
+            disable_deaths=joint_cfg.disable_deaths,
             ww_min_observed=min_obs["wastewater"],
             hosp_min_observed=min_obs["hospitalizations"],
             cases_min_observed=min_obs["cases"],
