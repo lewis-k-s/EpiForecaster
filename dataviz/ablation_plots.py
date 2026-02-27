@@ -446,6 +446,144 @@ def plot_ablation_summary_grid(
     return output_path
 
 
+# Cross-head impact heatmap labels
+CROSS_HEAD_LABELS = {
+    "ww": "Wastewater",
+    "cases": "Cases",
+    "hosp": "Hosp.",
+    "deaths": "Deaths",
+}
+
+
+def plot_cross_head_impact_heatmap(
+    mean_csv: str | Path,
+    std_csv: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    figsize: tuple[float, float] | None = None,
+    show: bool = False,
+) -> Path:
+    """Create heatmap showing cross-head impact from ablation study.
+
+    Shows how ablating each observation head (rows) affects losses on
+    all other heads (columns). Values are percentage change from baseline.
+
+    Args:
+        mean_csv: Path to cross_head_mean_matrix.csv
+        std_csv: Path to cross_head_std_matrix.csv (optional, for annotations)
+        output_dir: Directory to save plot (default: same as mean_csv parent)
+        figsize: Figure size (width, height)
+        show: Whether to display plot interactively
+
+    Returns:
+        Path to saved figure
+    """
+    mean_csv = Path(mean_csv)
+
+    if output_dir is None:
+        output_dir = mean_csv.parent
+    else:
+        output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load mean matrix
+    mean_df = pd.read_csv(mean_csv, index_col=0)
+
+    # Load std matrix if available
+    std_df = None
+    if std_csv is not None:
+        std_path = Path(std_csv)
+        if std_path.exists():
+            std_df = pd.read_csv(std_path, index_col=0)
+
+    # Create plot
+    if figsize is None:
+        figsize = (8, 6)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Determine color scale (symmetric around 0)
+    vmax = max(abs(mean_df.min().min()), abs(mean_df.max().max()))
+    if np.isnan(vmax) or vmax == 0:
+        vmax = 1.0
+    vmin = -vmax
+
+    # Create annotations with std if available
+    if std_df is not None:
+        annotations = mean_df.copy().astype(str)
+        for i in annotations.index:
+            for c in annotations.columns:
+                mean_val = mean_df.loc[i, c]
+                std_val = std_df.loc[i, c]
+                if pd.notna(mean_val) and pd.notna(std_val):
+                    annotations.loc[i, c] = f"{mean_val:+.1f}\n±{std_val:.1f}"
+                elif pd.notna(mean_val):
+                    annotations.loc[i, c] = f"{mean_val:+.1f}"
+                else:
+                    annotations.loc[i, c] = ""
+        annot_fmt = ""
+    else:
+        annotations = True
+        annot_fmt = ".1f"
+
+    # Plot heatmap
+    sns.heatmap(
+        mean_df,
+        annot=annotations,
+        fmt=annot_fmt,
+        cmap="RdBu_r",  # Red = worse (positive delta), Blue = better (negative delta)
+        center=0,
+        vmin=vmin,
+        vmax=vmax,
+        cbar_kws={"label": "% change in loss\n(ablated - baseline) / baseline × 100"},
+        ax=ax,
+        square=True,
+        linewidths=0.5,
+    )
+
+    # Labels
+    ax.set_xlabel("Measured Head (Loss)", fontweight="bold")
+    ax.set_ylabel("Ablated Head (Removed)", fontweight="bold")
+    ax.set_title(
+        "Cross-Head Impact Analysis\nEffect of Ablating Each Head on Other Head Losses",
+        fontweight="bold",
+        pad=20,
+    )
+
+    # Improve tick labels
+    x_labels = [CROSS_HEAD_LABELS.get(col, col) for col in mean_df.columns]
+    y_labels = [CROSS_HEAD_LABELS.get(idx, idx) for idx in mean_df.index]
+    ax.set_xticklabels(x_labels, rotation=45, ha="right")
+    ax.set_yticklabels(y_labels, rotation=0)
+
+    # Add diagonal mask or annotation for N/A (same head)
+    for i, idx in enumerate(mean_df.index):
+        for j, col in enumerate(mean_df.columns):
+            if idx == col:
+                ax.add_patch(
+                    plt.Rectangle(
+                        (j, i), 1, 1, fill=True, facecolor="lightgray", edgecolor="gray"
+                    )
+                )
+                ax.text(
+                    j + 0.5, i + 0.5, "N/A", ha="center", va="center", fontweight="bold"
+                )
+
+    plt.tight_layout()
+
+    # Save
+    output_path = output_dir / "cross_head_impact_heatmap.png"
+    fig.savefig(output_path, bbox_inches="tight", dpi=150)
+    logger.info(f"Saved cross-head impact heatmap to {output_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return output_path
+
+
 def main():
     """CLI entry point for generating ablation plots."""
     import argparse
@@ -481,6 +619,18 @@ Examples:
         type=str,
         default="baseline",
         help="Name of baseline ablation (default: baseline)",
+    )
+    parser.add_argument(
+        "--cross-head-mean-csv",
+        type=Path,
+        default=None,
+        help="Path to cross_head_mean_matrix.csv for cross-head impact heatmap (optional)",
+    )
+    parser.add_argument(
+        "--cross-head-std-csv",
+        type=Path,
+        default=None,
+        help="Path to cross_head_std_matrix.csv for cross-head impact heatmap (optional)",
     )
     parser.add_argument(
         "--show",
@@ -524,6 +674,16 @@ Examples:
             output_dir=args.output_dir,
             metric="mae",
             baseline_name=args.baseline,
+            show=args.show,
+        )
+
+    # Cross-head impact heatmap
+    if args.cross_head_mean_csv and args.cross_head_mean_csv.exists():
+        logger.info("Generating cross-head impact heatmap...")
+        plot_cross_head_impact_heatmap(
+            args.cross_head_mean_csv,
+            std_csv=args.cross_head_std_csv,
+            output_dir=args.output_dir,
             show=args.show,
         )
 
