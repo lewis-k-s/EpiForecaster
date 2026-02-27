@@ -57,6 +57,7 @@ class TestEpiForecasterTrainer:
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))
         mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
         # Trainer calls .to() for device/dtype conversion
         mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
         mock_model_instance.dtype = torch.float32
@@ -102,6 +103,7 @@ class TestEpiForecasterTrainer:
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))
         mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
         mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
         mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
@@ -133,6 +135,7 @@ class TestEpiForecasterTrainer:
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))
         mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
         mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
         mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
@@ -170,6 +173,7 @@ class TestEpiForecasterTrainer:
         # Use float32 dtype (only supported dtype)
         param = torch.nn.Parameter(torch.randn(1, dtype=torch.float32))
         mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
         # Track the parameter through dtype conversion
         mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
         mock_model_instance.dtype = torch.float32
@@ -207,6 +211,7 @@ class TestEpiForecasterTrainer:
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))
         mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
         mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
         mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
@@ -252,6 +257,7 @@ class TestEpiForecasterTrainer:
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))
         mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
         mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
         mock_model_instance.dtype = torch.float32
         mock_model_cls.return_value = mock_model_instance
@@ -303,3 +309,101 @@ class TestEpiForecasterTrainer:
         train_ds.release_shared_sparse_topology.assert_called_once()
         val_ds.release_shared_sparse_topology.assert_called_once()
         test_ds.release_shared_sparse_topology.assert_called_once()
+
+    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("training.epiforecaster_trainer.EpiForecaster")
+    @patch("training.epiforecaster_trainer.wandb")
+    def test_gradnorm_compiles_adaptive_backward_step(
+        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config
+    ):
+        mock_model_instance = MagicMock()
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.dtype = torch.float32
+        mock_model_cls.return_value = mock_model_instance
+
+        mock_dataset_instance = MagicMock()
+        mock_dataset_instance.cases_output_dim = 1
+        mock_dataset_instance.biomarkers_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
+        mock_dataset_instance.__len__.return_value = 16
+        mock_dataset_instance.target_nodes = [0, 1]
+        mock_dataset.return_value = mock_dataset_instance
+        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+
+        minimal_config.training.compile_backward = True
+        trainer = EpiForecasterTrainer(minimal_config)
+        assert trainer._compiled_training_step is not None
+        assert trainer.gradnorm_controller is not None
+        assert trainer.gradnorm_optimizer is not None
+
+    def test_build_compiled_batch_strips_non_tensor_metadata(self):
+        trainer = object.__new__(EpiForecasterTrainer)
+        batch_data = {
+            "HospHist": torch.randn(2, 4, 3),
+            "DeathsHist": torch.randn(2, 4, 3),
+            "CasesHist": torch.randn(2, 4, 3),
+            "BioNode": torch.randn(2, 4, 1),
+            "MobBatch": MagicMock(),
+            "Population": torch.ones(2),
+            "TargetNode": torch.tensor([0, 1]),
+            "TargetRegionIndex": torch.tensor([0, 1]),
+            "TemporalCovariates": torch.randn(2, 4, 3),
+            "WWTarget": torch.randn(2, 2),
+            "HospTarget": torch.randn(2, 2),
+            "CasesTarget": torch.randn(2, 2),
+            "DeathsTarget": torch.randn(2, 2),
+            "WWTargetMask": torch.ones(2, 2),
+            "HospTargetMask": torch.ones(2, 2),
+            "CasesTargetMask": torch.ones(2, 2),
+            "DeathsTargetMask": torch.ones(2, 2),
+            "NodeLabels": ["a", "b"],
+            "WindowStart": torch.tensor([1, 2]),
+            "B": 2,
+            "T": 4,
+        }
+        compiled_batch = EpiForecasterTrainer._build_compiled_batch(trainer, batch_data)
+
+        assert "NodeLabels" not in compiled_batch
+        assert "WindowStart" not in compiled_batch
+        assert "B" not in compiled_batch
+        assert "T" not in compiled_batch
+        assert compiled_batch["HospHist"].shape == (2, 4, 3)
+        assert "MobBatch" in compiled_batch
+
+    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("training.epiforecaster_trainer.EpiForecaster")
+    @patch("training.epiforecaster_trainer.wandb")
+    def test_checkpoint_includes_gradnorm_state(
+        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config, tmp_path
+    ):
+        mock_model_instance = MagicMock()
+        param = torch.nn.Parameter(torch.randn(1))
+        mock_model_instance.parameters.return_value = [param]
+        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
+        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
+        mock_model_instance.state_dict.return_value = {"backbone.mock": param.detach()}
+        mock_model_instance.dtype = torch.float32
+        mock_model_cls.return_value = mock_model_instance
+
+        mock_dataset_instance = MagicMock()
+        mock_dataset_instance.cases_output_dim = 1
+        mock_dataset_instance.biomarkers_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
+        mock_dataset_instance.__len__.return_value = 16
+        mock_dataset_instance.target_nodes = [0, 1]
+        mock_dataset.return_value = mock_dataset_instance
+        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+
+        minimal_config.output.log_dir = str(tmp_path)
+        minimal_config.output.experiment_name = "gradnorm_ckpt"
+        trainer = EpiForecasterTrainer(minimal_config)
+        trainer._save_checkpoint(epoch=0, val_loss=1.0, is_best=False, is_final=False)
+
+        ckpt_files = list((trainer.checkpoint_dir).glob("checkpoint_epoch_*.pt"))
+        assert ckpt_files
+        checkpoint = torch.load(ckpt_files[0], map_location="cpu", weights_only=False)
+        assert "gradnorm_controller_state_dict" in checkpoint
+        assert "gradnorm_optimizer_state_dict" in checkpoint

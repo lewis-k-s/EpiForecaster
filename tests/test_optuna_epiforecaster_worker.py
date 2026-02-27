@@ -8,7 +8,6 @@ from unittest.mock import patch
 import pytest
 
 from scripts.optuna_epiforecaster_worker import (
-    _bounded_joint_loss_weight_overrides,
     _categorical_choices,
     _compute_worker_seed,
     _decode_categorical_value,
@@ -92,21 +91,19 @@ def _temporal_covariates_cfg_stub(**overrides: Any) -> SimpleNamespace:
     return _base_cfg_stub(**overrides)
 
 
-def _joint_loss_cfg_stub(
-    joint_weights: dict[str, float] | None = None, **overrides: Any
-) -> SimpleNamespace:
-    """Config stub with joint_inference loss for bounded weight tests."""
-    weights = joint_weights or {
-        "w_ww": 1.0,
-        "w_hosp": 1.0,
-        "w_cases": 1.0,
-        "w_deaths": 1.0,
+def _joint_loss_cfg_stub(**overrides: Any) -> SimpleNamespace:
+    """Config stub with joint_inference loss."""
+    joint_overrides = overrides.pop("joint", {})
+    joint_defaults = {
+        "adaptive_scheme": "gradnorm",
         "w_sir": 1.0,
+        "gradnorm_obs_weight_sum": 0.95,
     }
+    joint_defaults.update(joint_overrides)
     training_overrides = overrides.setdefault("training", {})
     training_overrides["loss"] = SimpleNamespace(
         name="joint_inference",
-        joint=SimpleNamespace(**weights),
+        joint=SimpleNamespace(**joint_defaults),
     )
     return _base_cfg_stub(**overrides)
 
@@ -216,80 +213,6 @@ class TestOverridesToDotlist:
         assert result == ["lr=0.001"]
 
 
-class TestBoundedJointLossWeightOverrides:
-    def test_returns_all_weight_keys(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        overrides = _bounded_joint_loss_weight_overrides(
-            trial=trial, base_cfg=cfg, max_ratio=2.0
-        )
-        expected_keys = {
-            "training.loss.joint.w_ww",
-            "training.loss.joint.w_hosp",
-            "training.loss.joint.w_cases",
-            "training.loss.joint.w_deaths",
-            "training.loss.joint.w_sir",
-        }
-        assert set(overrides.keys()) == expected_keys
-
-    def test_preserves_total_weight_sum(self) -> None:
-        trial = _StubTrial(
-            float_values={
-                "training.loss.joint.mult_w_ww": 2.0,
-                "training.loss.joint.mult_w_hosp": 0.5,
-            }
-        )
-        cfg = _joint_loss_cfg_stub(
-            joint_weights={
-                "w_ww": 1.0,
-                "w_hosp": 1.0,
-                "w_cases": 1.0,
-                "w_deaths": 1.0,
-                "w_sir": 1.0,
-            }
-        )
-        overrides = _bounded_joint_loss_weight_overrides(
-            trial=trial, base_cfg=cfg, max_ratio=2.0
-        )
-        weight_sum = sum(overrides.values())
-        assert abs(weight_sum - 5.0) < 1e-6
-
-    def test_multiplier_bounds_are_correct(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        _bounded_joint_loss_weight_overrides(trial=trial, base_cfg=cfg, max_ratio=3.0)
-
-        for call_type, name, args in trial.suggest_calls:
-            if call_type == "float" and "mult_" in name:
-                low, high, _ = args
-                assert low == pytest.approx(1.0 / 3.0)
-                assert high == 3.0
-
-    def test_raises_on_max_ratio_less_than_one(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        with pytest.raises(ValueError, match="loss_weight_max_ratio must be >= 1.0"):
-            _bounded_joint_loss_weight_overrides(
-                trial=trial, base_cfg=cfg, max_ratio=0.5
-            )
-
-    def test_raises_on_zero_total_weight(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub(
-            joint_weights={
-                "w_ww": 0.0,
-                "w_hosp": 0.0,
-                "w_cases": 0.0,
-                "w_deaths": 0.0,
-                "w_sir": 0.0,
-            }
-        )
-        with pytest.raises(ValueError, match="Sum of joint loss weights must be > 0"):
-            _bounded_joint_loss_weight_overrides(
-                trial=trial, base_cfg=cfg, max_ratio=2.0
-            )
-
-
 class TestSuggestEpiforecasterParams:
     # NOTE: batch_size/gradient_accumulation_steps are no longer swept.
     # They were fixed at 32/1 based on production config. Test removed.
@@ -389,31 +312,14 @@ class TestSuggestEpiforecasterParams:
         assert "model.head_positional_encoding" in overrides
         assert overrides["model.head_positional_encoding"] in ("sinusoidal", "learned")
 
-    def test_joint_inference_fixed_mode_no_loss_weight_overrides(self) -> None:
+    def test_joint_inference_no_static_loss_weight_overrides(self) -> None:
         trial = _StubTrial()
         cfg = _joint_loss_cfg_stub()
-        overrides = suggest_epiforecaster_params(
-            trial=trial,
-            base_cfg=cfg,
-            loss_weight_mode="fixed",
-        )
+        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
         loss_weight_overrides = [
             k for k in overrides if k.startswith("training.loss.joint.w_")
         ]
         assert loss_weight_overrides == []
-
-    def test_joint_inference_bounded_mode_adds_loss_weight_overrides(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        overrides = suggest_epiforecaster_params(
-            trial=trial,
-            base_cfg=cfg,
-            loss_weight_mode="bounded",
-        )
-        loss_weight_overrides = [
-            k for k in overrides if k.startswith("training.loss.joint.w_")
-        ]
-        assert len(loss_weight_overrides) == 5
 
     def test_joint_inference_observation_heads_params(self) -> None:
         trial = _StubTrial()
@@ -426,6 +332,37 @@ class TestSuggestEpiforecasterParams:
         assert "model.observation_heads.residual_dropout" in overrides
         assert "model.observation_heads.obs_context_dim" in overrides
         assert "model.observation_heads.residual_mode" in overrides
+        assert "model.observation_heads.learnable_kernel_ww" in overrides
+        assert "model.observation_heads.learnable_kernel_hosp" in overrides
+        assert overrides["model.observation_heads.learnable_kernel_ww"] in (
+            False,
+            True,
+        )
+        assert overrides["model.observation_heads.learnable_kernel_hosp"] in (
+            False,
+            True,
+        )
+
+    def test_joint_inference_gradnorm_params_when_enabled(self) -> None:
+        trial = _StubTrial()
+        cfg = _joint_loss_cfg_stub(joint={"adaptive_scheme": "gradnorm"})
+        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
+
+        assert "training.loss.joint.gradnorm_alpha" in overrides
+        assert "training.loss.joint.gradnorm_weight_lr" in overrides
+        assert "training.loss.joint.gradnorm_warmup_steps" in overrides
+        assert "training.loss.joint.gradnorm_update_every" in overrides
+        assert "training.loss.joint.gradnorm_ema_decay" in overrides
+        assert "training.loss.joint.gradnorm_min_weight" in overrides
+
+    def test_joint_inference_skips_gradnorm_params_when_disabled(self) -> None:
+        trial = _StubTrial()
+        cfg = _joint_loss_cfg_stub(joint={"adaptive_scheme": "none"})
+        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
+        gradnorm_overrides = [
+            k for k in overrides if k.startswith("training.loss.joint.gradnorm_")
+        ]
+        assert gradnorm_overrides == []
 
     def test_joint_inference_residual_scale_bounds(self) -> None:
         trial = _StubTrial()
@@ -466,13 +403,3 @@ class TestSuggestEpiforecasterParams:
         suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
         obs_calls = [c for c in trial.suggest_calls if "observation_heads" in c[1]]
         assert obs_calls == []
-
-    def test_invalid_loss_weight_mode_raises(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        with pytest.raises(ValueError, match="Unknown loss_weight_mode"):
-            suggest_epiforecaster_params(
-                trial=trial,
-                base_cfg=cfg,
-                loss_weight_mode="invalid",
-            )

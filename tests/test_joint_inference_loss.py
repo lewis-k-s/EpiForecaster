@@ -28,9 +28,7 @@ def test_physics_residual_not_trivially_zero_when_constraints_bind():
 
 def test_joint_inference_sir_loss_zero_when_all_observation_masks_missing():
     """Regression test: SIR loss must not apply where no observations exist."""
-    loss_fn = JointInferenceLoss(
-        w_ww=0.0, w_hosp=0.0, w_cases=0.0, w_deaths=0.0, w_sir=1.0
-    )
+    loss_fn = JointInferenceLoss(w_sir=1.0)
 
     model_outputs = {
         "pred_ww": torch.zeros(2, 3),
@@ -56,9 +54,7 @@ def test_joint_inference_sir_loss_zero_when_all_observation_masks_missing():
 
 def test_joint_inference_sir_loss_respects_observation_mask():
     """Regression test: SIR loss should average only masked-in timesteps."""
-    loss_fn = JointInferenceLoss(
-        w_ww=0.0, w_hosp=0.0, w_cases=0.0, w_deaths=0.0, w_sir=1.0
-    )
+    loss_fn = JointInferenceLoss(w_sir=1.0)
 
     residual = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     model_outputs = {
@@ -87,9 +83,7 @@ def test_joint_inference_sir_loss_respects_observation_mask():
 
 def test_joint_inference_loss_all_masked_keeps_grad_graph():
     """Regression test: all-masked batches must still allow backward()."""
-    loss_fn = JointInferenceLoss(
-        w_ww=1.0, w_hosp=1.0, w_cases=1.0, w_deaths=1.0, w_sir=0.0
-    )
+    loss_fn = JointInferenceLoss(w_sir=0.0)
 
     pred_ww = torch.randn(2, 3, requires_grad=True)
     pred_hosp = torch.randn(2, 3, requires_grad=True)
@@ -128,9 +122,7 @@ def test_joint_inference_loss_all_masked_keeps_grad_graph():
 
 def test_joint_inference_loss_ignores_nonfinite_targets_under_mask():
     """Regression test: NaN/Inf targets outside valid mask must not contaminate loss."""
-    loss_fn = JointInferenceLoss(
-        w_ww=1.0, w_hosp=0.0, w_cases=0.0, w_deaths=0.0, w_sir=0.0
-    )
+    loss_fn = JointInferenceLoss(w_sir=0.0)
 
     pred_ww = torch.tensor([[1.0, 2.0, 3.0]], requires_grad=True)
     model_outputs = {
@@ -168,10 +160,7 @@ def test_joint_inference_loss_cross_device(accelerator_device):
     Regression test for device mismatch bugs in loss computation.
     """
     loss_fn = JointInferenceLoss(
-        w_ww=1.0,
-        w_hosp=1.0,
-        w_cases=1.0,
-        w_deaths=0.0,
+        obs_weight_sum=3.0,
         w_sir=0.0,
     )
 
@@ -201,16 +190,13 @@ def test_joint_inference_loss_cross_device(accelerator_device):
 
     # Verify loss is computed correctly (3 heads × MSE of 1.0 each)
     assert torch.isfinite(loss)
-    assert loss.item() == 3.0  # w_ww=1.0 + w_hosp=1.0 + w_cases=1.0, each MSE=1.0
+    assert loss.item() == 3.0
 
 
 def test_joint_inference_loss_zero_weight_head_not_poisoned_by_nonfinite_output():
     """Disabled heads should not poison total loss through zero-initialization anchors."""
     loss_fn = JointInferenceLoss(
-        w_ww=0.0,
-        w_hosp=1.0,
-        w_cases=0.0,
-        w_deaths=0.0,
+        obs_weight_sum=1.0,
         w_sir=0.0,
     )
 
@@ -235,3 +221,58 @@ def test_joint_inference_loss_zero_weight_head_not_poisoned_by_nonfinite_output(
     loss = loss_fn(model_outputs, targets)
     assert torch.isfinite(loss)
     assert torch.isclose(loss, torch.tensor(1.0))
+
+
+def test_joint_inference_obs_active_mask_from_masks() -> None:
+    loss_fn = JointInferenceLoss(w_sir=0.0)
+    model_outputs = {
+        "pred_ww": torch.zeros(1, 2),
+        "pred_hosp": torch.zeros(1, 2),
+        "pred_cases": torch.zeros(1, 2),
+        "pred_deaths": torch.zeros(1, 2),
+        "physics_residual": torch.zeros(1, 2),
+    }
+    targets = {
+        "ww": torch.zeros(1, 1),
+        "hosp": torch.zeros(1, 1),
+        "cases": torch.zeros(1, 1),
+        "deaths": torch.zeros(1, 1),
+        "ww_mask": torch.tensor([[1.0]]),
+        "hosp_mask": torch.tensor([[0.0]]),
+        "cases_mask": torch.tensor([[1.0]]),
+        "deaths_mask": torch.tensor([[0.0]]),
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+    assert components["obs_active_mask"].dtype == torch.bool
+    assert components["obs_active_mask"].tolist() == [True, False, True, False]
+
+
+def test_joint_inference_compute_components_train_matches_default() -> None:
+    loss_fn = JointInferenceLoss(w_sir=0.2, w_continuity=0.0)
+    model_outputs = {
+        "pred_ww": torch.tensor([[0.2, 0.4]]),
+        "pred_hosp": torch.tensor([[0.1, 0.3]]),
+        "pred_cases": torch.tensor([[0.5, 0.7]]),
+        "pred_deaths": torch.tensor([[0.6]]),
+        "physics_residual": torch.tensor([[0.25]]),
+    }
+    targets = {
+        "ww": torch.tensor([[0.4]]),
+        "hosp": torch.tensor([[0.3]]),
+        "cases": torch.tensor([[0.7]]),
+        "deaths": torch.tensor([[0.6]]),
+        "ww_mask": torch.tensor([[1.0]]),
+        "hosp_mask": torch.tensor([[1.0]]),
+        "cases_mask": torch.tensor([[1.0]]),
+        "deaths_mask": torch.tensor([[1.0]]),
+    }
+
+    components_default = loss_fn.compute_components(model_outputs, targets)
+    components_train = loss_fn.compute_components_train(model_outputs, targets)
+
+    assert torch.allclose(
+        components_default["obs_active_mask"].float(),
+        components_train["obs_active_mask"].float(),
+    )
+    assert torch.allclose(components_default["total"], components_train["total"])

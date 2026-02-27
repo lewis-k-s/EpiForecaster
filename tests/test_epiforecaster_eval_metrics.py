@@ -50,10 +50,7 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
     }
     loader = _DummyLoader([batch])
     criterion = JointInferenceLoss(
-        w_ww=1.0,
-        w_hosp=1.0,
-        w_cases=1.0,
-        w_deaths=1.0,
+        obs_weight_sum=4.0,
         w_sir=0.0,
     )
     _loss, metrics, _node_mae = evaluate_loader(
