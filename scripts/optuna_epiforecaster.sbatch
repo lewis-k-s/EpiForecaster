@@ -23,8 +23,8 @@ JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal
 # Trial outputs root (log_dir override).
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
 # Optional speed knobs (set to empty to disable).
-EPOCHS="${EPOCHS:-20}"
-MAX_BATCHES="${MAX_BATCHES:-}"
+MAX_EPOCHS="${MAX_EPOCHS:-20}"
+N_TRIALS="${N_TRIALS:-}"
 SEED="${SEED:-42}"                                    # Reproducibility seed
 SAMPLER="${SAMPLER:-tpe}"                             # tpe (default), cmaes, or random
 PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N epochs
@@ -32,6 +32,12 @@ LOSS_WEIGHT_MODE="${LOSS_WEIGHT_MODE:-fixed}"         # fixed (recommended), bou
 LOSS_WEIGHT_MAX_RATIO="${LOSS_WEIGHT_MAX_RATIO:-2.0}" # for bounded mode
 # Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
 OVERRIDES="${OVERRIDES:-}"
+# Smoke-test mode:
+#   DRY_RUN=1 sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/optuna_epiforecaster.sbatch
+DRY_RUN="${DRY_RUN:-0}"
+DRY_RUN_MAX_EPOCHS="${DRY_RUN_MAX_EPOCHS:-1}"
+DRY_RUN_TIMEOUT_SECS="${DRY_RUN_TIMEOUT_SECS:-600}"
+DRY_RUN_N_TRIALS="${DRY_RUN_N_TRIALS:-1}"
 # Worker timeout in seconds (auto-calculated from SLURM time limit minus 15min buffer).
 # Falls back to 5 hours - 15 minutes if SLURM_TIME_LIMIT is not set.
 if [ -n "${SLURM_TIME_LIMIT:-}" ]; then
@@ -56,6 +62,14 @@ fi
 # Keep thread counts aligned with allocation.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
+if [ "$DRY_RUN" = "1" ]; then
+  MAX_EPOCHS="$DRY_RUN_MAX_EPOCHS"
+  N_TRIALS="${N_TRIALS:-$DRY_RUN_N_TRIALS}"
+  TIMEOUT_SECS="$DRY_RUN_TIMEOUT_SECS"
+  echo "DRY_RUN enabled: max_epochs=${MAX_EPOCHS}, n_trials=${N_TRIALS}, timeout_s=${TIMEOUT_SECS}"
+  echo "Tip: submit with short walltime and single worker, e.g. sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/optuna_epiforecaster.sbatch"
+fi
+
 ARGS=(
   --config "$CONFIG"
   --study-name "$STUDY_NAME"
@@ -63,16 +77,11 @@ ARGS=(
   --run-root "$RUN_ROOT"
 )
 
-# Optional dotted-key overrides are supported by repeating:
-#   --override key=value
-# In this sbatch script, OVERRIDES is currently not expanded into repeated args.
-# Use a custom base config for bulk overrides.
-
-if [ -n "$EPOCHS" ]; then
-  ARGS+=(--epochs "$EPOCHS")
+if [ -n "$MAX_EPOCHS" ]; then
+  ARGS+=(--epochs "$MAX_EPOCHS")
 fi
-if [ -n "$MAX_BATCHES" ]; then
-  ARGS+=(--max-batches "$MAX_BATCHES")
+if [ -n "$N_TRIALS" ]; then
+  ARGS+=(--n-trials "$N_TRIALS")
 fi
 if [ -n "$SEED" ]; then
   ARGS+=(--seed "$SEED")
@@ -91,6 +100,11 @@ if [ -n "$LOSS_WEIGHT_MAX_RATIO" ]; then
 fi
 if [ -n "$TIMEOUT_SECS" ]; then
   ARGS+=(--timeout-s "$TIMEOUT_SECS")
+fi
+if [ -n "$OVERRIDES" ]; then
+  for override in $OVERRIDES; do
+    ARGS+=(--override "$override")
+  done
 fi
 
 # Prefer uv runner if available; fall back to plain python.

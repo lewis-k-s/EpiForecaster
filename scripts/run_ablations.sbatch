@@ -8,6 +8,15 @@
 #SBATCH --array=0-10                # One task per ablation
 #SBATCH --output=logs/slurm-%x-%A_%a.out    # stdout/stderr log per array task
 #SBATCH --error=logs/slurm-%x-%A_%a.err    # stdout/stderr log per array task
+#
+#
+# Usage example with external sbatch arguments:
+#   sbatch --job-name=epi-ablations --account=bsc08 --qos=acc_bscls \
+#          --gres=gpu:1 --cpus-per-task=20 --time=04:00:00 --array=0-10 \
+#          --output=logs/slurm-%x-%A_%a.out --error=logs/slurm-%x-%A_%a.err \
+#          scripts/run_ablations.sbatch
+#
+# All SBATCH directives can be overridden at submission time.
 
 # Fail fast on errors; print commands for easier debugging.
 set -euo pipefail
@@ -18,12 +27,16 @@ PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
-# Campaign and repeat controls.
+# Campaign and run controls.
 CAMPAIGN_ID="${CAMPAIGN_ID:-ablation_${SLURM_ARRAY_JOB_ID:-local}}"
-ABLATION_REPEATS="${ABLATION_REPEATS:-3}"
-SEED_BASE="${SEED_BASE:-42}"
-TIME_BUFFER_SECONDS="${TIME_BUFFER_SECONDS:-900}"
-RUN_ANALYSIS="${RUN_ANALYSIS:-1}"
+MAX_EPOCHS="${MAX_EPOCHS:-}"
+SEED="${SEED:-42}"
+RUN_ANALYSIS="${RUN_ANALYSIS:-0}"
+# Smoke-test mode:
+#   DRY_RUN=1 sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/run_ablations.sbatch
+DRY_RUN="${DRY_RUN:-0}"
+DRY_RUN_MAX_EPOCHS="${DRY_RUN_MAX_EPOCHS:-1}"
+DRY_RUN_RUN_ANALYSIS="${DRY_RUN_RUN_ANALYSIS:-0}"
 
 module load EB/apps EB/install CUDA/12.1.1 || (echo "CUDA module not found" && exit 1)
 
@@ -37,109 +50,6 @@ fi
 
 # Keep thread counts aligned with allocation.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
-
-time_to_seconds() {
-  local t="$1"
-  local days=0
-  local hours=0
-  local mins=0
-  local secs=0
-
-  if [ -z "$t" ]; then
-    echo "-1"
-    return
-  fi
-
-  if [ "$t" = "UNLIMITED" ]; then
-    echo "2147483647"
-    return
-  fi
-
-  if [[ "$t" =~ ^([0-9]+)-([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
-    days="${BASH_REMATCH[1]}"
-    hours="${BASH_REMATCH[2]}"
-    mins="${BASH_REMATCH[3]}"
-    secs="${BASH_REMATCH[4]}"
-    echo $((days * 86400 + hours * 3600 + mins * 60 + secs))
-    return
-  fi
-
-  if [[ "$t" =~ ^([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
-    hours="${BASH_REMATCH[1]}"
-    mins="${BASH_REMATCH[2]}"
-    secs="${BASH_REMATCH[3]}"
-    echo $((hours * 3600 + mins * 60 + secs))
-    return
-  fi
-
-  if [[ "$t" =~ ^([0-9]+):([0-9]{2})$ ]]; then
-    mins="${BASH_REMATCH[1]}"
-    secs="${BASH_REMATCH[2]}"
-    echo $((mins * 60 + secs))
-    return
-  fi
-
-  echo "-1"
-}
-
-get_remaining_seconds() {
-  if ! command -v squeue >/dev/null 2>&1; then
-    echo "-1"
-    return
-  fi
-
-  if [ -z "${SLURM_JOB_ID:-}" ]; then
-    echo "-1"
-    return
-  fi
-
-  local remaining_raw
-  remaining_raw="$(squeue -h -j "$SLURM_JOB_ID" -o "%L" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
-  time_to_seconds "$remaining_raw"
-}
-
-should_stop_for_time() {
-  local remaining
-  remaining="$(get_remaining_seconds)"
-
-  if [ "$remaining" -lt 0 ]; then
-    return 1
-  fi
-
-  if [ "$remaining" -le "$TIME_BUFFER_SECONDS" ]; then
-    echo "Remaining walltime (${remaining}s) <= TIME_BUFFER_SECONDS (${TIME_BUFFER_SECONDS}s). Stopping repeats."
-    return 0
-  fi
-
-  return 1
-}
-
-wait_for_array_completion() {
-  if ! command -v squeue >/dev/null 2>&1; then
-    echo "squeue unavailable; skipping array wait gate."
-    return
-  fi
-
-  if [ -z "${SLURM_ARRAY_JOB_ID:-}" ] || [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
-    return
-  fi
-
-  while true; do
-    local pending_count
-    pending_count="$(
-      squeue -h -j "$SLURM_ARRAY_JOB_ID" -o "%a %T" 2>/dev/null \
-        | awk -v self="$SLURM_ARRAY_TASK_ID" '$1 != self {count++} END {print count + 0}'
-    )"
-
-    if [ "$pending_count" -eq 0 ]; then
-      echo "All sibling array tasks have finished."
-      break
-    fi
-
-    echo "Waiting for ${pending_count} sibling array tasks before running analysis..."
-    sleep 30
-  done
-}
 
 # Define the ablations. These correspond to Study 4, 5, and 6 in todo/STUDIES.md
 declare -a ABLATION_NAMES=(
@@ -170,24 +80,18 @@ declare -a ABLATION_OVERRIDES=(
   "model.observation_heads.learnable_kernel_hosp=false model.observation_heads.learnable_kernel_cases=false model.observation_heads.learnable_kernel_deaths=false" # 10: mlp_clinical_heads
 )
 
-# Check if SLURM_ARRAY_TASK_ID is beyond our defined ablations
-if [ "$SLURM_ARRAY_TASK_ID" -ge "${#ABLATION_NAMES[@]}" ]; then
-  echo "Error: SLURM_ARRAY_TASK_ID $SLURM_ARRAY_TASK_ID is out of bounds."
+# Default to task 0 when running locally (outside sbatch array).
+TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+
+# Check if task index is beyond our defined ablations.
+if [ "$TASK_ID" -ge "${#ABLATION_NAMES[@]}" ]; then
+  echo "Error: task index $TASK_ID is out of bounds."
   exit 1
 fi
 
-ABLATION_NAME="${ABLATION_NAMES[$SLURM_ARRAY_TASK_ID]}"
-OVERRIDES="${ABLATION_OVERRIDES[$SLURM_ARRAY_TASK_ID]}"
+ABLATION_NAME="${ABLATION_NAMES[$TASK_ID]}"
+OVERRIDES="${ABLATION_OVERRIDES[$TASK_ID]}"
 LAST_TASK_INDEX=$(( ${#ABLATION_NAMES[@]} - 1 ))
-
-echo "Running ablation: $ABLATION_NAME (Task ID: $SLURM_ARRAY_TASK_ID)"
-echo "Base config: $CONFIG"
-echo "Overrides: $OVERRIDES"
-echo "Campaign ID: $CAMPAIGN_ID"
-echo "Ablation repeats: $ABLATION_REPEATS"
-echo "Seed base: $SEED_BASE"
-echo "Time buffer (s): $TIME_BUFFER_SECONDS"
-echo "Run analysis: $RUN_ANALYSIS"
 
 # Build override arguments.
 OVERRIDE_ARGS=()
@@ -196,6 +100,25 @@ if [ -n "$OVERRIDES" ]; then
     OVERRIDE_ARGS+=(--override "$override")
   done
 fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  MAX_EPOCHS="${MAX_EPOCHS:-$DRY_RUN_MAX_EPOCHS}"
+  RUN_ANALYSIS="${DRY_RUN_RUN_ANALYSIS}"
+  echo "DRY_RUN enabled: max_epochs=${MAX_EPOCHS}, run_analysis=${RUN_ANALYSIS}"
+  echo "Tip: submit with single array task and short walltime, e.g. sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/run_ablations.sbatch"
+fi
+
+if [ -n "$MAX_EPOCHS" ]; then
+  OVERRIDE_ARGS+=(--override "training.epochs=${MAX_EPOCHS}")
+fi
+
+echo "Running ablation: $ABLATION_NAME (Task ID: $TASK_ID)"
+echo "Base config: $CONFIG"
+echo "Overrides: $OVERRIDES"
+echo "Campaign ID: $CAMPAIGN_ID"
+echo "Max epochs override: ${MAX_EPOCHS:-<config default>}"
+echo "Seed: $SEED"
+echo "Run analysis: $RUN_ANALYSIS"
 
 # Override experiment name so logs don't overwrite
 # e.g., mn5_ablation__ablation_12345__no_sir_loss
@@ -206,46 +129,29 @@ GROUP_OVERRIDE="output.wandb_group=ablation_campaign_${CAMPAIGN_ID}"
 
 OVERRIDE_ARGS+=(--override "$EXPERIMENT_NAME_OVERRIDE" --override "$GROUP_OVERRIDE")
 
-completed_runs=0
+model_id_override="${SLURM_JOB_ID:-local}_a${TASK_ID}_s${SEED}"
+tags_override="output.wandb_tags=[mn5,ablation,${ABLATION_NAME},campaign_${CAMPAIGN_ID},seed_${SEED}]"
+RUN_ARGS=(
+  "${OVERRIDE_ARGS[@]}"
+  --override "training.seed=${SEED}"
+  --override "$tags_override"
+)
 
-for ((i = 0; i < ABLATION_REPEATS; i++)); do
-  if should_stop_for_time; then
-    break
-  fi
+echo "Model ID override: $model_id_override"
 
-  seed=$((SEED_BASE + i))
-  model_id_override="${SLURM_JOB_ID:-local}_a${SLURM_ARRAY_TASK_ID}_s${seed}"
-  tags_override="output.wandb_tags=[mn5,ablation,${ABLATION_NAME},campaign_${CAMPAIGN_ID},seed_${seed}]"
+# Prefer uv runner if available; fall back to plain python.
+if command -v uv >/dev/null 2>&1; then
+  EPIFORECASTER_MODEL_ID="$model_id_override" \
+    uv run main train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
+else
+  EPIFORECASTER_MODEL_ID="$model_id_override" \
+    python -m cli train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
+fi
 
-  RUN_ARGS=(
-    "${OVERRIDE_ARGS[@]}"
-    --override "training.seed=${seed}"
-    --override "$tags_override"
-  )
+echo "Completed 1 run for ablation '${ABLATION_NAME}'."
 
-  echo "----------------------------------------"
-  echo "Repeat $((i + 1))/${ABLATION_REPEATS} for $ABLATION_NAME"
-  echo "Seed: $seed"
-  echo "Model ID override: $model_id_override"
-  echo "----------------------------------------"
-
-  # Prefer uv runner if available; fall back to plain python.
-  if command -v uv >/dev/null 2>&1; then
-    EPIFORECASTER_MODEL_ID="$model_id_override" \
-      uv run main train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
-  else
-    EPIFORECASTER_MODEL_ID="$model_id_override" \
-      python -m cli train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
-  fi
-
-  completed_runs=$((completed_runs + 1))
-done
-
-echo "Completed ${completed_runs} run(s) for ablation '${ABLATION_NAME}'."
-
-# Post-processing: Run analysis on the last array task after siblings finish.
-if [ "$RUN_ANALYSIS" = "1" ] && [ "$SLURM_ARRAY_TASK_ID" -eq "$LAST_TASK_INDEX" ]; then
-  wait_for_array_completion
+# Optional post-processing on the last array task.
+if [ "$RUN_ANALYSIS" = "1" ] && [ "$TASK_ID" -eq "$LAST_TASK_INDEX" ]; then
 
   echo ""
   echo "========================================"
@@ -264,6 +170,8 @@ if [ "$RUN_ANALYSIS" = "1" ] && [ "$SLURM_ARRAY_TASK_ID" -eq "$LAST_TASK_INDEX" 
     uv run python -m dataviz.ablation_plots \
       "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
       --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
+      --cross-head-mean-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_mean_matrix.csv" \
+      --cross-head-std-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_std_matrix.csv" \
       --output-dir "$ANALYSIS_OUTPUT_DIR" \
       --baseline baseline
   else
@@ -276,6 +184,8 @@ if [ "$RUN_ANALYSIS" = "1" ] && [ "$SLURM_ARRAY_TASK_ID" -eq "$LAST_TASK_INDEX" 
     python -m dataviz.ablation_plots \
       "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
       --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
+      --cross-head-mean-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_mean_matrix.csv" \
+      --cross-head-std-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_std_matrix.csv" \
       --output-dir "$ANALYSIS_OUTPUT_DIR" \
       --baseline baseline
   fi
