@@ -39,6 +39,7 @@ class AblationRun:
     campaign_id: str | None
     experiment_dir: Path
     run_dir: Path
+    seed: int | None
 
 
 def parse_experiment_name(experiment_name: str) -> tuple[str | None, str] | None:
@@ -92,6 +93,22 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
     return parsed
 
 
+def get_run_seed(run_dir: Path) -> int | None:
+    """Extract training seed from run config if available."""
+    try:
+        config = load_run_config(run_dir)
+    except ValueError:
+        return None
+
+    seed = _nested_get(config, ("training", "seed"))
+    if seed is None:
+        return None
+    try:
+        return int(seed)
+    except (TypeError, ValueError):
+        return None
+
+
 def build_config_fingerprint(config: dict[str, Any]) -> str:
     """Build a deterministic comparability fingerprint from run config."""
     normalized = copy.deepcopy(config)
@@ -136,12 +153,14 @@ def collect_ablation_runs(
 
         existing = ablation_runs.setdefault(ablation, [])
         for run_dir in run_dirs:
+            seed = get_run_seed(run_dir)
             existing.append(
                 AblationRun(
                     ablation=ablation,
                     campaign_id=experiment_campaign_id,
                     experiment_dir=experiment_dir,
                     run_dir=run_dir,
+                    seed=seed,
                 )
             )
 
@@ -307,6 +326,137 @@ def compute_baseline_deltas(
     return pd.DataFrame(delta_records)
 
 
+def compute_seed_matched_baseline_deltas(
+    ablation_runs: dict[str, list[AblationRun]],
+    baseline_name: str = "baseline",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute baseline deltas using only seed-matched run pairs.
+
+    Returns:
+        pairwise_df: one record per (ablation run, baseline run, target, seed)
+        summary_df: aggregated mean/std deltas per (ablation, target)
+    """
+    baseline_runs = ablation_runs.get(baseline_name, [])
+    if not baseline_runs:
+        logger.warning(
+            "Cannot compute seed-matched deltas: baseline '%s' not found",
+            baseline_name,
+        )
+        return pd.DataFrame(), pd.DataFrame()
+
+    baseline_by_seed: dict[int, AblationRun] = {}
+    for run in baseline_runs:
+        if run.seed is None:
+            continue
+        if run.seed in baseline_by_seed:
+            logger.warning(
+                "Multiple baseline runs for seed=%s; keeping %s/%s",
+                run.seed,
+                baseline_by_seed[run.seed].experiment_dir.name,
+                baseline_by_seed[run.seed].run_dir.name,
+            )
+            continue
+        baseline_by_seed[run.seed] = run
+
+    if not baseline_by_seed:
+        logger.warning("No baseline runs with extractable seed found")
+        return pd.DataFrame(), pd.DataFrame()
+
+    pairwise_records: list[dict[str, Any]] = []
+    for ablation, runs in sorted(ablation_runs.items()):
+        if ablation == baseline_name:
+            continue
+
+        for run in runs:
+            if run.seed is None:
+                continue
+            baseline_run = baseline_by_seed.get(run.seed)
+            if baseline_run is None:
+                continue
+
+            baseline_df = load_test_metrics(baseline_run.run_dir)
+            ablation_df = load_test_metrics(run.run_dir)
+            if baseline_df is None or ablation_df is None:
+                continue
+
+            common_targets = sorted(
+                set(baseline_df["target"]).intersection(set(ablation_df["target"]))
+            )
+            for target in common_targets:
+                baseline_row_df = baseline_df[baseline_df["target"] == target]
+                ablation_row_df = ablation_df[ablation_df["target"] == target]
+                if baseline_row_df.empty or ablation_row_df.empty:
+                    continue
+
+                baseline_row = baseline_row_df.iloc[0]
+                ablation_row = ablation_row_df.iloc[0]
+
+                record: dict[str, Any] = {
+                    "model": ablation,
+                    "target": target,
+                    "seed": run.seed,
+                    "baseline_run": f"{baseline_run.experiment_dir.name}/{baseline_run.run_dir.name}",
+                    "ablation_run": f"{run.experiment_dir.name}/{run.run_dir.name}",
+                }
+
+                for metric in METRICS:
+                    if metric not in baseline_row or metric not in ablation_row:
+                        continue
+
+                    baseline_val = baseline_row[metric]
+                    ablation_val = ablation_row[metric]
+                    if pd.isna(baseline_val) or pd.isna(ablation_val):
+                        continue
+
+                    clean_metric = metric.replace("_median", "")
+                    record[f"{clean_metric}_delta_abs"] = ablation_val - baseline_val
+
+                    if clean_metric == "r2":
+                        if abs(baseline_val) > 0.01:
+                            record[f"{clean_metric}_delta_pct"] = (
+                                (ablation_val - baseline_val) / abs(baseline_val)
+                            ) * 100
+                    elif baseline_val != 0:
+                        record[f"{clean_metric}_delta_pct"] = (
+                            (ablation_val - baseline_val) / baseline_val
+                        ) * 100
+
+                pairwise_records.append(record)
+
+    pairwise_df = pd.DataFrame(pairwise_records)
+    if pairwise_df.empty:
+        return pairwise_df, pd.DataFrame()
+
+    summary_records: list[dict[str, Any]] = []
+    grouped = pairwise_df.groupby(["model", "target"], sort=True)
+    for (model, target), group in grouped:
+        record: dict[str, Any] = {
+            "model": model,
+            "target": target,
+            "paired_seeds": int(group["seed"].nunique()),
+            "pairs": int(len(group)),
+        }
+
+        for metric in METRICS:
+            clean_metric = metric.replace("_median", "")
+            for suffix in ["delta_abs", "delta_pct"]:
+                col = f"{clean_metric}_{suffix}"
+                if col not in group:
+                    continue
+                values = group[col].dropna()
+                if values.empty:
+                    continue
+                record[f"{clean_metric}_{suffix}_mean"] = float(values.mean())
+                record[f"{clean_metric}_{suffix}_std"] = (
+                    float(values.std(ddof=1)) if len(values) > 1 else 0.0
+                )
+
+        summary_records.append(record)
+
+    summary_df = pd.DataFrame(summary_records)
+    return pairwise_df, summary_df
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Aggregate ablation study results",
@@ -408,6 +558,58 @@ def main() -> int:
         deltas_df.to_csv(deltas_path, index=False)
         logger.info(f"Saved delta metrics to {deltas_path}")
 
+    logger.info("Computing seed-matched deltas from baseline...")
+    seed_pairwise_df, seed_matched_df = compute_seed_matched_baseline_deltas(
+        ablation_runs,
+        baseline_name=args.baseline,
+    )
+    if not seed_pairwise_df.empty:
+        seed_pairwise_path = (
+            args.output_dir / "ablation_metrics_deltas_seed_pairwise.csv"
+        )
+        seed_pairwise_df.to_csv(seed_pairwise_path, index=False)
+        logger.info(f"Saved seed-paired deltas to {seed_pairwise_path}")
+
+    if not seed_matched_df.empty:
+        seed_matched_path = args.output_dir / "ablation_metrics_deltas_seed_matched.csv"
+        seed_matched_df.to_csv(seed_matched_path, index=False)
+        logger.info(f"Saved seed-matched summary deltas to {seed_matched_path}")
+
+    # Cross-head impact analysis
+    logger.info("Computing cross-head impact analysis...")
+    try:
+        from analyze_cross_head_impact import compute_cross_head_impact
+
+        cross_head_result = compute_cross_head_impact(
+            args.training_dir,
+            args.campaign_id,
+            split="test",
+        )
+
+        if cross_head_result is not None:
+            pairwise_df, mean_matrix, (std_matrix, count_matrix) = cross_head_result
+
+            # Save cross-head matrices
+            cross_head_dir = args.output_dir / "cross_head"
+            cross_head_dir.mkdir(exist_ok=True)
+
+            pairwise_path = cross_head_dir / "cross_head_pairwise.csv"
+            pairwise_df.to_csv(pairwise_path, index=False)
+
+            mean_matrix.to_csv(cross_head_dir / "cross_head_mean_matrix.csv")
+            std_matrix.to_csv(cross_head_dir / "cross_head_std_matrix.csv")
+            count_matrix.to_csv(cross_head_dir / "cross_head_count_matrix.csv")
+
+            logger.info(f"Saved cross-head analysis to {cross_head_dir}")
+
+            cross_head_success = True
+        else:
+            logger.warning("Cross-head impact analysis returned no data")
+            cross_head_success = False
+    except Exception as exc:
+        logger.warning(f"Cross-head impact analysis failed: {exc}")
+        cross_head_success = False
+
     print("\n" + "=" * 80)
     print("ABLATION STUDY SUMMARY")
     print("=" * 80)
@@ -419,6 +621,14 @@ def main() -> int:
     print(f"  - {aggregated_path.name}")
     if not deltas_df.empty:
         print(f"  - {deltas_path.name}")
+    if not seed_pairwise_df.empty:
+        print(f"  - {seed_pairwise_path.name}")
+    if not seed_matched_df.empty:
+        print(f"  - {seed_matched_path.name}")
+    if cross_head_success:
+        print("  - cross_head/")
+        print("    - cross_head_mean_matrix.csv")
+        print("    - cross_head_pairwise.csv")
 
     print("\n" + "-" * 80)
     print("Sample of aggregated metrics (MAE means):")
@@ -440,6 +650,17 @@ def main() -> int:
             values="mae_delta_pct",
         )
         print(pivot_delta.to_string())
+
+    if not seed_matched_df.empty:
+        print("\n" + "-" * 80)
+        print("Seed-matched deltas from baseline (MAE % change, mean across pairs):")
+        print("-" * 80)
+        pivot_seed = seed_matched_df.pivot_table(
+            index="model",
+            columns="target",
+            values="mae_delta_pct_mean",
+        )
+        print(pivot_seed.to_string())
 
     print("\n" + "=" * 80)
     return 0

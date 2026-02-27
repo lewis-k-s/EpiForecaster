@@ -133,27 +133,27 @@ def test_aggregate_accepts_seed_only_variation(tmp_path: Path) -> None:
     df = aggregate_ablation_metrics(ablation_runs, assert_consistent_config=True)
 
     assert len(df) == 1
-    assert df.iloc[0]["n_runs"] == 2
+    assert df.iloc[0]["folds"] == 2
 
 
 def test_compute_baseline_deltas_includes_absolute_columns() -> None:
     df = pd.DataFrame(
         [
             {
-                "ablation": "baseline",
+                "model": "baseline",
                 "target": "cases",
-                "mae_median_mean": 2.0,
-                "rmse_median_mean": 4.0,
-                "smape_median_mean": 10.0,
-                "r2_median_mean": 0.0,
+                "mae_mean": 2.0,
+                "rmse_mean": 4.0,
+                "smape_mean": 10.0,
+                "r2_mean": 0.0,
             },
             {
-                "ablation": "no_sir_loss",
+                "model": "no_sir_loss",
                 "target": "cases",
-                "mae_median_mean": 3.0,
-                "rmse_median_mean": 5.0,
-                "smape_median_mean": 12.0,
-                "r2_median_mean": 0.2,
+                "mae_mean": 3.0,
+                "rmse_mean": 5.0,
+                "smape_mean": 12.0,
+                "r2_mean": 0.2,
             },
         ]
     )
@@ -161,15 +161,15 @@ def test_compute_baseline_deltas_includes_absolute_columns() -> None:
     deltas = compute_baseline_deltas(df, baseline_name="baseline")
     row = deltas.iloc[0]
 
-    assert row["mae_median_delta_abs"] == pytest.approx(1.0)
-    assert row["rmse_median_delta_abs"] == pytest.approx(1.0)
-    assert row["smape_median_delta_abs"] == pytest.approx(2.0)
-    assert row["r2_median_delta_abs"] == pytest.approx(0.2)
+    assert row["mae_delta_abs"] == pytest.approx(1.0)
+    assert row["rmse_delta_abs"] == pytest.approx(1.0)
+    assert row["smape_delta_abs"] == pytest.approx(2.0)
+    assert row["r2_delta_abs"] == pytest.approx(0.2)
 
-    assert row["mae_median_delta_pct"] == pytest.approx(50.0)
-    assert row["rmse_median_delta_pct"] == pytest.approx(25.0)
-    assert row["smape_median_delta_pct"] == pytest.approx(20.0)
-    assert "r2_median_delta_pct" not in deltas.columns
+    assert row["mae_delta_pct"] == pytest.approx(50.0)
+    assert row["rmse_delta_pct"] == pytest.approx(25.0)
+    assert row["smape_delta_pct"] == pytest.approx(20.0)
+    assert "r2_delta_pct" not in deltas.columns
 
 
 def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:
@@ -224,7 +224,7 @@ def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:
     )
     deltas = compute_baseline_deltas(aggregated, baseline_name="baseline")
 
-    assert set(aggregated["ablation"]) == {"baseline", "no_sir_loss"}
-    assert (aggregated["n_runs"] == 2).all()
+    assert set(aggregated["model"]) == {"baseline", "no_sir_loss"}
+    assert (aggregated["folds"] == 2).all()
     assert len(deltas) == 1
-    assert deltas.iloc[0]["ablation"] == "no_sir_loss"
+    assert deltas.iloc[0]["model"] == "no_sir_loss"
