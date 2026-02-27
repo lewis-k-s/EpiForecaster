@@ -49,32 +49,57 @@ class LossComponentConfig:
 class JointLossConfig:
     """Loss weights for joint inference training."""
 
-    # Default balance with higher weight on low-noise signals
-    w_hosp: float = 0.4
-    w_deaths: float = 0.25
-    w_cases: float = 0.15
-    w_ww: float = 0.15
+    # Observation loss weighting policy:
+    # - "gradnorm": adaptive weights for ww/hosp/cases/deaths (default cutover path)
+    # - "none": fixed equal-split weighting across active observation targets
+    adaptive_scheme: str = "gradnorm"
+    gradnorm_alpha: float = 1.5
+    gradnorm_weight_lr: float = 1.0e-3
+    gradnorm_warmup_steps: int = 50
+    gradnorm_update_every: int = 16
+    gradnorm_ema_decay: float = 0.9
+    # GradNorm probe used for per-task gradient norms.
+    # "obs_context" measures tug-of-war on the shared representation.
+    gradnorm_probe: str = "obs_context"
+    gradnorm_min_weight: float = 1.0e-3
+    gradnorm_obs_weight_sum: float = 0.95
     w_sir: float = 0.05
     # Relative per-timestep weights for imputed (mask=0) supervision.
     # 0.0 disables imputed supervision; observed (mask=1) always has weight 1.0.
-    ww_imputed_weight: float = 0.25
-    hosp_imputed_weight: float = 0.25
-    cases_imputed_weight: float = 0.25
-    deaths_imputed_weight: float = 0.25
+    ww_imputed_weight: float = 0.01
+    hosp_imputed_weight: float = 0.01
+    cases_imputed_weight: float = 0.01
+    deaths_imputed_weight: float = 0.01
     # Cap on absolute physics residual before squaring in SIR loss.
     # Prevents occasional residual spikes from dominating gradients.
     sir_residual_clip: float = 1.0e3
+    # Optional target-level ablation toggles for observation losses.
+    disable_ww: bool = False
+    disable_hosp: bool = False
+    disable_cases: bool = False
+    disable_deaths: bool = False
     # Nowcast continuity penalty weight.
     # Penalizes discontinuity between last observed value and first forecast prediction.
     # 0.0 disables the penalty.
     w_continuity: float = 0.0
 
     def __post_init__(self) -> None:
+        valid_schemes = {"none", "gradnorm"}
+        valid_probes = {"obs_context"}
+        self.adaptive_scheme = self.adaptive_scheme.lower()
+        self.gradnorm_probe = self.gradnorm_probe.lower()
+        if self.adaptive_scheme not in valid_schemes:
+            raise ValueError(
+                f"adaptive_scheme must be one of {sorted(valid_schemes)}, "
+                f"got {self.adaptive_scheme!r}"
+            )
+        if self.gradnorm_probe not in valid_probes:
+            raise ValueError(
+                f"gradnorm_probe must be one of {sorted(valid_probes)}, "
+                f"got {self.gradnorm_probe!r}"
+            )
+
         for name, value in [
-            ("w_ww", self.w_ww),
-            ("w_hosp", self.w_hosp),
-            ("w_cases", self.w_cases),
-            ("w_deaths", self.w_deaths),
             ("w_sir", self.w_sir),
             ("ww_imputed_weight", self.ww_imputed_weight),
             ("hosp_imputed_weight", self.hosp_imputed_weight),
@@ -82,13 +107,49 @@ class JointLossConfig:
             ("deaths_imputed_weight", self.deaths_imputed_weight),
             ("sir_residual_clip", self.sir_residual_clip),
             ("w_continuity", self.w_continuity),
+            ("gradnorm_alpha", self.gradnorm_alpha),
+            ("gradnorm_weight_lr", self.gradnorm_weight_lr),
+            ("gradnorm_ema_decay", self.gradnorm_ema_decay),
+            ("gradnorm_min_weight", self.gradnorm_min_weight),
+            ("gradnorm_obs_weight_sum", self.gradnorm_obs_weight_sum),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
 
-        lsum = sum([self.w_deaths, self.w_hosp, self.w_cases, self.w_ww, self.w_sir])
-        if lsum > 1:
-            print(f"WARNING: composite loss sum {lsum} > 1")
+        if self.gradnorm_warmup_steps < 0:
+            raise ValueError(
+                "gradnorm_warmup_steps must be non-negative, "
+                f"got {self.gradnorm_warmup_steps}"
+            )
+        if self.gradnorm_update_every < 1:
+            raise ValueError(
+                "gradnorm_update_every must be >= 1, "
+                f"got {self.gradnorm_update_every}"
+            )
+        if self.gradnorm_ema_decay >= 1:
+            raise ValueError(
+                "gradnorm_ema_decay must be in [0, 1), "
+                f"got {self.gradnorm_ema_decay}"
+            )
+        if self.gradnorm_obs_weight_sum <= 0:
+            raise ValueError(
+                "gradnorm_obs_weight_sum must be positive, "
+                f"got {self.gradnorm_obs_weight_sum}"
+            )
+        if self.gradnorm_min_weight * 4 > self.gradnorm_obs_weight_sum:
+            raise ValueError(
+                "gradnorm_min_weight is too large for gradnorm_obs_weight_sum "
+                "with four observation tasks"
+            )
+
+    def resolve_imputed_weight_map(self) -> dict[str, float]:
+        """Resolve per-target imputed supervision weights used by JointInferenceLoss."""
+        return {
+            "wastewater": float(self.ww_imputed_weight),
+            "hospitalizations": float(self.hosp_imputed_weight),
+            "cases": float(self.cases_imputed_weight),
+            "deaths": float(self.deaths_imputed_weight),
+        }
 
 
 @dataclass
@@ -247,8 +308,8 @@ class ObservationHeadConfig:
     kernel_length_deaths: int = 21
 
     # Learnable parameters
-    learnable_kernel_ww: bool = True
-    learnable_kernel_hosp: bool = True
+    learnable_kernel_ww: bool = False
+    learnable_kernel_hosp: bool = False
     learnable_kernel_cases: bool = True
     learnable_kernel_deaths: bool = True
     learnable_scale_ww: bool = True
@@ -456,6 +517,21 @@ class DataConfig:
                     self.missing_permit.horizon.get("biomarkers_joint", 0)
                 ),
             },
+        }
+
+    def resolve_min_observed_map(self, forecast_horizon: int) -> dict[str, int]:
+        """Resolve per-target minimum observed horizon steps for active supervision."""
+        if forecast_horizon <= 0:
+            raise ValueError(
+                f"forecast_horizon must be positive, got {forecast_horizon}"
+            )
+        horizon = int(forecast_horizon)
+        permits = self.resolve_missing_permit_map()["horizon"]
+        return {
+            "cases": max(0, horizon - int(permits["cases"])),
+            "hospitalizations": max(0, horizon - int(permits["hospitalizations"])),
+            "deaths": max(0, horizon - int(permits["deaths"])),
+            "wastewater": max(0, horizon - int(permits["wastewater"])),
         }
 
 
