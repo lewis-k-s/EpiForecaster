@@ -91,6 +91,12 @@ def _zero_linear(layer: nn.Linear) -> None:
     nn.init.zeros_(layer.bias)
 
 
+def _small_xavier_linear(layer: nn.Linear, gain: float = 0.1) -> None:
+    """Initialize a linear layer with small non-zero Xavier weights."""
+    nn.init.xavier_normal_(layer.weight, gain=gain)
+    nn.init.zeros_(layer.bias)
+
+
 class DelayKernel(nn.Module):
     """
     Causal delay kernel for clinical observations (cases, hospitalizations, deaths).
@@ -499,7 +505,7 @@ class ClinicalObservationHead(nn.Module):
         self.use_residual = residual_dim > 0
         if self.use_residual:
             self.residual_proj = nn.Linear(residual_dim, 1)
-            _zero_linear(self.residual_proj)
+            _small_xavier_linear(self.residual_proj, gain=0.1)
             if learnable_scale:
                 self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
             else:
@@ -642,7 +648,7 @@ class WastewaterObservationHead(nn.Module):
         self.use_residual = residual_dim > 0
         if self.use_residual:
             self.residual_proj = nn.Linear(residual_dim, 1)
-            _zero_linear(self.residual_proj)
+            _small_xavier_linear(self.residual_proj, gain=0.1)
             if learnable_scale:
                 self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
             else:

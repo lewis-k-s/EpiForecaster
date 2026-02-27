@@ -373,7 +373,9 @@ class TransformerBackbone(nn.Module):
             self.initial_states_projection[2], initial_bias.tolist()
         )
 
-        self._init_linear_with_bias(self.obs_context_projection[2], 0.0)
+        # Keep bias anchored at zero while giving GradNorm's obs_context probe
+        # a non-degenerate path from step 0.
+        self._init_linear_xavier_normal(self.obs_context_projection[2], gain=0.5)
 
         if isinstance(self.pos_encoding, LearnedPositionalEncoding):
             nn.init.normal_(self.pos_encoding.pos_embedding.weight, mean=0.0, std=0.02)
@@ -392,6 +394,10 @@ class TransformerBackbone(nn.Module):
 
     def _init_linear_xavier(self, layer: nn.Linear) -> None:
         nn.init.xavier_uniform_(layer.weight)
+        nn.init.zeros_(layer.bias)
+
+    def _init_linear_xavier_normal(self, layer: nn.Linear, gain: float = 1.0) -> None:
+        nn.init.xavier_normal_(layer.weight, gain=gain)
         nn.init.zeros_(layer.bias)
 
     def _init_linear_with_bias(

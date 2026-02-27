@@ -8,6 +8,7 @@ import torch.nn.functional as F
 # type: ignore[import-not-found] (PyTorch Geometric has incomplete type stubs)
 from torch_geometric.data import Batch
 
+from utils.compiled_batch import COMPILED_BATCH_TENSOR_KEYS
 from .configs import ModelVariant, ObservationHeadConfig, SIRPhysicsConfig
 from .mobility_gnn import MobilityDenseEncoder
 from .observation_heads import ClinicalObservationHead, WastewaterObservationHead
@@ -421,22 +422,27 @@ class EpiForecaster(nn.Module):
         # Convert float tensors to model dtype, keep integer tensors as-is
         if skip_device_transfer:
             # Fast path: assume tensors already on device (for compiled training)
-            batch = {k: v for k, v in batch_data.items() if isinstance(v, torch.Tensor)}
+            batch: dict[str, torch.Tensor] = {}
+            for key in COMPILED_BATCH_TENSOR_KEYS:
+                value = batch_data.get(key)
+                if isinstance(value, torch.Tensor):
+                    batch[key] = value
             mob_batch = batch_data["MobBatch"]
         else:
             batch = {}
-            for k, v in batch_data.items():
-                if not isinstance(v, torch.Tensor):
+            for key in COMPILED_BATCH_TENSOR_KEYS:
+                value = batch_data.get(key)
+                if not isinstance(value, torch.Tensor):
                     continue
 
-                if torch.is_floating_point(v):
-                    if v.device != self.device or v.dtype != self.dtype:
-                        v = v.to(
+                if torch.is_floating_point(value):
+                    if value.device != self.device or value.dtype != self.dtype:
+                        value = value.to(
                             device=self.device, dtype=self.dtype, non_blocking=True
                         )
-                elif v.device != self.device:
-                    v = v.to(device=self.device, non_blocking=True)
-                batch[k] = v
+                elif value.device != self.device:
+                    value = value.to(device=self.device, non_blocking=True)
+                batch[key] = value
 
             # PyG Batch handles its own device transfer
             mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
