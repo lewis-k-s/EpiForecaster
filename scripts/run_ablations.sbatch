@@ -69,10 +69,10 @@ declare -a ABLATION_NAMES=(
 declare -a ABLATION_OVERRIDES=(
   ""                                                                                # 0: baseline
   "training.loss.joint.w_sir=0.0"                                                   # 1: no_sir_loss
-  "training.loss.joint.w_ww=0.0 training.loss.joint.ww_imputed_weight=0.0"          # 2: no_ww_loss
-  "training.loss.joint.w_cases=0.0 training.loss.joint.cases_imputed_weight=0.0"    # 3: no_cases_loss
-  "training.loss.joint.w_hosp=0.0 training.loss.joint.hosp_imputed_weight=0.0"      # 4: no_hosp_loss
-  "training.loss.joint.w_deaths=0.0 training.loss.joint.deaths_imputed_weight=0.0"  # 5: no_deaths_loss
+  "training.loss.joint.disable_ww=true"                                              # 2: no_ww_loss
+  "training.loss.joint.disable_cases=true"                                           # 3: no_cases_loss
+  "training.loss.joint.disable_hosp=true"                                            # 4: no_hosp_loss
+  "training.loss.joint.disable_deaths=true"                                          # 5: no_deaths_loss
   "model.observation_heads.residual_scale=0.0"                                      # 6: no_residual_context
   "model.type.mobility=false"                                                       # 7: no_mobility
   "model.type.regions=false"                                                        # 8: no_regions
