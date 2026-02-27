@@ -69,10 +69,7 @@ class TargetSeriesView:
 
 @dataclass
 class JointObservationLossSpec:
-    w_ww: float
-    w_hosp: float
-    w_cases: float
-    w_deaths: float
+    obs_weight_sum: float
     ww_imputed_weight: float
     hosp_imputed_weight: float
     cases_imputed_weight: float
@@ -300,10 +297,7 @@ def _resolve_joint_observation_loss_spec(
         return None
 
     return JointObservationLossSpec(
-        w_ww=float(criterion.w_ww),
-        w_hosp=float(criterion.w_hosp),
-        w_cases=float(criterion.w_cases),
-        w_deaths=float(criterion.w_deaths),
+        obs_weight_sum=float(criterion.obs_weight_sum),
         ww_imputed_weight=float(criterion.ww_imputed_weight),
         hosp_imputed_weight=float(criterion.hosp_imputed_weight),
         cases_imputed_weight=float(criterion.cases_imputed_weight),
@@ -379,12 +373,6 @@ def _compute_joint_observation_loss_for_fold(
         "cases": "cases",
         "deaths": "deaths",
     }
-    target_weights = {
-        "wastewater": joint_spec.w_ww,
-        "hospitalizations": joint_spec.w_hosp,
-        "cases": joint_spec.w_cases,
-        "deaths": joint_spec.w_deaths,
-    }
     target_imputed_weights = {
         "wastewater": joint_spec.ww_imputed_weight,
         "hospitalizations": joint_spec.hosp_imputed_weight,
@@ -399,6 +387,8 @@ def _compute_joint_observation_loss_for_fold(
     }
 
     components: dict[str, Any] = {"joint_obs_loss_total": 0.0}
+    raw_losses: dict[str, float] = {}
+    observed_counts: dict[str, int] = {}
     for target_name, alias in target_aliases.items():
         pred, target, mask = fold_target_data.get(
             target_name,
@@ -415,10 +405,22 @@ def _compute_joint_observation_loss_for_fold(
             imputed_weight=target_imputed_weights[target_name],
             min_observed=target_min_observed[target_name],
         )
-        weighted_value = target_weights[target_name] * loss_value
+        observed_count = int((mask > 0).sum())
+        raw_losses[target_name] = loss_value
+        observed_counts[target_name] = observed_count
         components[f"joint_loss_{alias}"] = loss_value
+        components[f"joint_observed_count_{alias}"] = observed_count
+
+    active_targets = [
+        target_name for target_name, count in observed_counts.items() if count > 0
+    ]
+    num_active = len(active_targets)
+    equal_weight = (joint_spec.obs_weight_sum / num_active) if num_active > 0 else 0.0
+
+    for target_name, alias in target_aliases.items():
+        weight = equal_weight if target_name in active_targets else 0.0
+        weighted_value = weight * raw_losses[target_name]
         components[f"joint_loss_{alias}_weighted"] = weighted_value
-        components[f"joint_observed_count_{alias}"] = int((mask > 0).sum())
         components["joint_obs_loss_total"] += weighted_value
 
     return components
@@ -1258,10 +1260,7 @@ def run_baseline_evaluation(
         "joint_observation_loss_spec": None
         if joint_spec is None
         else {
-            "w_ww": joint_spec.w_ww,
-            "w_hosp": joint_spec.w_hosp,
-            "w_cases": joint_spec.w_cases,
-            "w_deaths": joint_spec.w_deaths,
+            "obs_weight_sum": joint_spec.obs_weight_sum,
             "ww_imputed_weight": joint_spec.ww_imputed_weight,
             "hosp_imputed_weight": joint_spec.hosp_imputed_weight,
             "cases_imputed_weight": joint_spec.cases_imputed_weight,
