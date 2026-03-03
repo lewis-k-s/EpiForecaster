@@ -547,9 +547,9 @@ class EpiForecasterTrainer:
                 self.gradnorm_controller.parameters(),
                 lr=joint_cfg.gradnorm_weight_lr,
             )
-            self._gradnorm_cached_weights = self.gradnorm_controller.weights(
-                self._gradnorm_last_active_mask
-            ).detach()
+            self._gradnorm_cached_weights = (
+                self.gradnorm_controller.weights().detach()
+            )
 
         # Compile training step (forward + backward) if enabled
         self._compiled_training_step = None
@@ -691,6 +691,15 @@ class EpiForecasterTrainer:
             )
             self._status(f"    - SIR weight: {loss_cfg.w_sir}")
             self._status(f"    - Continuity weight: {loss_cfg.w_continuity}")
+            self._status(
+                "    - n_eff scaling: "
+                f"power={loss_cfg.obs_n_eff_power}, "
+                f"reference={loss_cfg.obs_n_eff_reference}, "
+                f"per_head=(ww:{loss_cfg.ww_n_eff_reference}, "
+                f"hosp:{loss_cfg.hosp_n_eff_reference}, "
+                f"cases:{loss_cfg.cases_n_eff_reference}, "
+                f"deaths:{loss_cfg.deaths_n_eff_reference})"
+            )
             if self._gradnorm_enabled:
                 self._status(
                     "    - GradNorm settings: "
@@ -1691,17 +1700,7 @@ class EpiForecasterTrainer:
             gradnorm_controller.load_state_dict(
                 checkpoint["gradnorm_controller_state_dict"]
             )
-            active_mask = getattr(
-                self,
-                "_gradnorm_last_active_mask",
-                torch.ones(
-                    len(GradNormController.task_names),
-                    dtype=torch.bool,
-                ),
-            )
-            self._gradnorm_cached_weights = gradnorm_controller.weights(
-                active_mask
-            ).detach()
+            self._gradnorm_cached_weights = gradnorm_controller.weights().detach()
         if (
             gradnorm_optimizer is not None
             and "gradnorm_optimizer_state_dict" in checkpoint
@@ -2085,9 +2084,7 @@ class EpiForecasterTrainer:
         )
 
         # Keep cached weights current even before warmup/GradNorm loss activation.
-        self._gradnorm_cached_weights = self.gradnorm_controller.weights(
-            obs_active_mask
-        ).detach()
+        self._gradnorm_cached_weights = self.gradnorm_controller.weights().detach()
 
         if not bool(obs_active_mask.any()):
             mark_gradnorm_sidecar_complete(
@@ -2121,9 +2118,7 @@ class EpiForecasterTrainer:
         gradnorm_loss.backward()
         self.gradnorm_optimizer.step()
 
-        self._gradnorm_cached_weights = self.gradnorm_controller.weights(
-            obs_active_mask
-        ).detach()
+        self._gradnorm_cached_weights = self.gradnorm_controller.weights().detach()
         self.model.zero_grad(set_to_none=True)
 
         mark_gradnorm_sidecar_complete(
