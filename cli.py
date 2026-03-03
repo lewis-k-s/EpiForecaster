@@ -232,24 +232,48 @@ def train_cli(debug: bool):
     setup_logging(level=level)
 
 
-# Backward compatibility: add preprocess and train as subgroups of main
+@click.group()
+@click.version_option()
+@click.option(
+    "--debug/--no-debug",
+    default=False,
+    help="Enable debug logging (includes model forward-pass debug logs).",
+)
+def eval_cli(debug: bool):
+    """Evaluate trained checkpoints and generate plots.
+
+    Direct usage: uv run eval <command>
+    Via main:     uv run main eval <command>
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    setup_logging(level=level)
+
+
+@click.group()
+@click.version_option()
+@click.option(
+    "--debug/--no-debug",
+    default=False,
+    help="Enable debug logging (includes model forward-pass debug logs).",
+)
+def plot_cli(debug: bool):
+    """Generate forecast plots from evaluation results.
+
+    Direct usage: uv run plot <command>
+    Via main:     uv run main plot <command>
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    setup_logging(level=level)
+
+
+# Backward compatibility: add preprocess, train, eval, plot as subgroups of main
 cli.add_command(preprocess_cli, name="preprocess")
 cli.add_command(train_cli, name="train")
+cli.add_command(eval_cli, name="eval")
+cli.add_command(plot_cli, name="plot")
 
 
-@cli.group("eval")
-def eval_group():
-    """Evaluate trained checkpoints and generate plots."""
-    pass
-
-
-@cli.group("plot")
-def plot_group():
-    """Generate forecast plots from evaluation results."""
-    pass
-
-
-@eval_group.command("epiforecaster")
+@eval_cli.command("epiforecaster")
 @click.option(
     "--experiment",
     type=str,
@@ -496,7 +520,7 @@ def eval_epiforecaster(
         raise click.ClickException(str(exc)) from exc
 
 
-@eval_group.command("baselines")
+@eval_cli.command("baselines")
 @click.option("--config", required=True, help="Path to training configuration file.")
 @click.option(
     "--models",
@@ -603,7 +627,7 @@ def eval_baselines(
         raise click.ClickException(str(exc)) from exc
 
 
-@plot_group.command("forecasts")
+@plot_cli.command("forecasts")
 @click.option(
     "--experiment",
     type=str,
