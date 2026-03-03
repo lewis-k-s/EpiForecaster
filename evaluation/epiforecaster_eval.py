@@ -176,6 +176,10 @@ class JointInferenceLoss(nn.Module):
         disable_hosp: bool = False,
         disable_cases: bool = False,
         disable_deaths: bool = False,
+        mask_input_ww: bool = False,
+        mask_input_hosp: bool = False,
+        mask_input_cases: bool = False,
+        mask_input_deaths: bool = False,
         ww_min_observed: int = 0,
         hosp_min_observed: int = 0,
         cases_min_observed: int = 0,
@@ -194,6 +198,10 @@ class JointInferenceLoss(nn.Module):
         self.disable_hosp = bool(disable_hosp)
         self.disable_cases = bool(disable_cases)
         self.disable_deaths = bool(disable_deaths)
+        self.mask_input_ww = bool(mask_input_ww)
+        self.mask_input_hosp = bool(mask_input_hosp)
+        self.mask_input_cases = bool(mask_input_cases)
+        self.mask_input_deaths = bool(mask_input_deaths)
         self.ww_min_observed = int(ww_min_observed)
         self.hosp_min_observed = int(hosp_min_observed)
         self.cases_min_observed = int(cases_min_observed)
@@ -213,11 +221,14 @@ class JointInferenceLoss(nn.Module):
         active_f32 = active_mask.to(dtype=torch.float32)
         num_active = active_f32.sum()
         safe_num_active = num_active.clamp_min(1.0)
-        equal_weight = torch.as_tensor(
-            float(obs_weight_sum),
-            dtype=torch.float32,
-            device=active_mask.device,
-        ) / safe_num_active
+        equal_weight = (
+            torch.as_tensor(
+                float(obs_weight_sum),
+                dtype=torch.float32,
+                device=active_mask.device,
+            )
+            / safe_num_active
+        )
         weights = active_f32 * equal_weight
         return torch.where(num_active > 0, weights, torch.zeros_like(weights))
 
@@ -551,7 +562,9 @@ class JointInferenceLoss(nn.Module):
         )
         component_losses: list[torch.Tensor] = []
 
-        def _masked_mse(nowcast_pred: torch.Tensor, last_observed: torch.Tensor) -> torch.Tensor:
+        def _masked_mse(
+            nowcast_pred: torch.Tensor, last_observed: torch.Tensor
+        ) -> torch.Tensor:
             valid_mask = torch.isfinite(last_observed)
             valid_f = valid_mask.to(dtype=nowcast_pred.dtype)
             last_observed_safe = torch.nan_to_num(
@@ -564,18 +577,23 @@ class JointInferenceLoss(nn.Module):
 
         if "HospHist" in batch_data and model_outputs["pred_hosp"].shape[1] > 0:
             component_losses.append(
-                _masked_mse(model_outputs["pred_hosp"][:, 0], batch_data["HospHist"][:, -1, 0])
+                _masked_mse(
+                    model_outputs["pred_hosp"][:, 0], batch_data["HospHist"][:, -1, 0]
+                )
             )
 
         if "CasesHist" in batch_data and model_outputs["pred_cases"].shape[1] > 0:
             component_losses.append(
-                _masked_mse(model_outputs["pred_cases"][:, 0], batch_data["CasesHist"][:, -1, 0])
+                _masked_mse(
+                    model_outputs["pred_cases"][:, 0], batch_data["CasesHist"][:, -1, 0]
+                )
             )
 
         if "DeathsHist" in batch_data and model_outputs["pred_deaths"].shape[1] > 0:
             component_losses.append(
                 _masked_mse(
-                    model_outputs["pred_deaths"][:, 0], batch_data["DeathsHist"][:, -1, 0]
+                    model_outputs["pred_deaths"][:, 0],
+                    batch_data["DeathsHist"][:, -1, 0],
                 )
             )
 
@@ -629,6 +647,10 @@ def get_loss_from_config(
             disable_hosp=joint_cfg.disable_hosp,
             disable_cases=joint_cfg.disable_cases,
             disable_deaths=joint_cfg.disable_deaths,
+            mask_input_ww=joint_cfg.mask_input_ww,
+            mask_input_hosp=joint_cfg.mask_input_hosp,
+            mask_input_cases=joint_cfg.mask_input_cases,
+            mask_input_deaths=joint_cfg.mask_input_deaths,
             ww_min_observed=min_obs["wastewater"],
             hosp_min_observed=min_obs["hospitalizations"],
             cases_min_observed=min_obs["cases"],
@@ -1234,6 +1256,10 @@ def evaluate_loader(
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
+                    mask_cases=criterion.mask_input_cases,
+                    mask_ww=criterion.mask_input_ww,
+                    mask_hosp=criterion.mask_input_hosp,
+                    mask_deaths=criterion.mask_input_deaths,
                 )
 
                 # Slice predictions to match target horizon (remove t=0 nowcast)

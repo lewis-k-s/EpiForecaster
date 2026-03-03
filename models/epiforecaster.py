@@ -409,6 +409,10 @@ class EpiForecaster(nn.Module):
         batch_data: dict[str, Any],
         region_embeddings: torch.Tensor | None = None,
         skip_device_transfer: bool = False,
+        mask_cases: bool = False,
+        mask_ww: bool = False,
+        mask_hosp: bool = False,
+        mask_deaths: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
         """
         Forward pass with automatic device transfers and non-blocking I/O.
@@ -458,6 +462,16 @@ class EpiForecaster(nn.Module):
 
             # PyG Batch handles its own device transfer
             mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
+
+        from utils.training_utils import mask_ablated_inputs
+
+        mask_ablated_inputs(
+            batch,
+            mask_cases=mask_cases,
+            mask_ww=mask_ww,
+            mask_hosp=mask_hosp,
+            mask_deaths=mask_deaths,
+        )
         # Convert graph tensors to model dtype.
         if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
             if mob_batch.x_dense.dtype != self.dtype:

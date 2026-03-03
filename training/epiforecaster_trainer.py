@@ -397,6 +397,7 @@ class EpiForecasterTrainer:
         self.model = EpiForecaster(
             variant_type=self.config.model.type,
             sir_physics=self.config.model.sir_physics,
+            init_weights=self.config.model.init_weights,
             observation_heads=self.config.model.observation_heads,
             temporal_input_dim=train_example_ds.cases_output_dim,
             biomarkers_dim=train_example_ds.biomarkers_output_dim,
@@ -1954,9 +1955,7 @@ class EpiForecasterTrainer:
         """Build a shape-stable, tensor-only view for compiled training steps."""
         return build_compiled_batch_view(batch_data)
 
-    def _training_step_impl(
-        self, batch_data: dict[str, Any]
-    ) -> torch.Tensor:
+    def _training_step_impl(self, batch_data: dict[str, Any]) -> torch.Tensor:
         """Pure training step: forward + backward only.
 
         This method computes the forward pass, loss, and backward pass.
@@ -1980,6 +1979,10 @@ class EpiForecasterTrainer:
                 batch_data=batch_data,
                 region_embeddings=self.region_embeddings,
                 skip_device_transfer=True,  # Tensors already moved by _move_batch_to_device
+                mask_cases=self.criterion.mask_input_cases,
+                mask_ww=self.criterion.mask_input_ww,
+                mask_hosp=self.criterion.mask_input_hosp,
+                mask_deaths=self.criterion.mask_input_deaths,
             )
             loss = self.criterion(model_outputs, targets_dict, batch_data)
 
@@ -2002,6 +2005,10 @@ class EpiForecasterTrainer:
                 batch_data=batch_data,
                 region_embeddings=self.region_embeddings,
                 skip_device_transfer=True,
+                mask_cases=self.criterion.mask_input_cases,
+                mask_ww=self.criterion.mask_input_ww,
+                mask_hosp=self.criterion.mask_input_hosp,
+                mask_deaths=self.criterion.mask_input_deaths,
             )
             components = self.criterion.compute_components_train(
                 model_outputs, targets_dict, batch_data
@@ -2265,9 +2272,7 @@ class EpiForecasterTrainer:
                 component_gradnorm_log_data: dict[str, float] = {}
                 if should_log_gradnorm_components(self.global_step, frequency):
                     grad_norm, component_gradnorm_log_data = (
-                        self._compute_gradient_norms_and_clip(
-                            step=self.global_step
-                        )
+                        self._compute_gradient_norms_and_clip(step=self.global_step)
                     )
                     self._status(
                         format_component_gradnorm_status(
@@ -2670,7 +2675,9 @@ class EpiForecasterTrainer:
         """Log metrics for a specific split."""
         if epoch is None:
             return
-        aggregation = getattr(self.config.training, "horizon_metric_aggregation", "weekly")
+        aggregation = getattr(
+            self.config.training, "horizon_metric_aggregation", "weekly"
+        )
         log_data, status_lines = build_epoch_logging_bundle(
             split_name=split_name,
             loss=loss,
