@@ -77,6 +77,35 @@ where:
 *   **Continuity Loss ($L_{continuity}$)**: Optional nowcast continuity penalty that
     discourages discontinuity between the last observed point and first forecast step.
 
+### Observation Supervision and `n_eff`
+
+Observation heads use weighted masked reductions with three distinct controls:
+
+1.  **Hard eligibility (`missing_permit` -> `min_observed`)**: windows with too few observed
+    points for a head are excluded from supervision for that head.
+2.  **Per-head weighted mean reduction**:
+    $$ L_h = \frac{\sum_t w_t ( \hat{y}_t - y_t )^2}{\sum_t w_t + \epsilon} $$
+3.  **Optional confidence scaling by effective support (`n_eff`)**:
+    $$ n_{eff,h} = \sum_t w_t,\quad
+    s_h = \min(1, n_{eff,h}/r_h)^{p},\quad
+    L_h^{scaled} = s_h \cdot L_h $$
+    where `p = obs_n_eff_power`, `r_h` is head-specific reference
+    (`*_n_eff_reference`, then `obs_n_eff_reference`, then 1.0 fallback).
+
+Current production policy is to **fully mask imputed points out of loss**:
+
+*   `w_t = 1.0` for observed points
+*   `w_t = 0.0` for imputed/missing points
+
+With this policy, `n_eff` is effectively the count of truly observed supervised points
+(after gating), and the `power` term controls how aggressively low-support batches are
+down-weighted:
+
+*   `p = 0`: disabled
+*   `p = 1`: linear count-based scaling
+*   `0 < p < 1`: gentler than linear
+*   `p > 1`: harsher than linear
+
 ## 4. Model Variants
 
 The architecture supports ablation studies via `ModelVariant` flags:
@@ -147,7 +176,7 @@ def forward(
 
 The model uses a conservative startup policy to keep early training dynamics stable:
 
-*   **Prior-biased SIR heads**: Final layers for $\beta_t$, $\gamma_t$, and $\mu_t$ are initialized with zero weights and biases set via inverse-softplus to epidemiologically plausible priors (`0.25`, `0.14`, `0.002`).
-*   **Initial state prior**: The initial-state logits head starts from $\log([0.995, 0.004, 0.001])$, so `softmax` begins near a susceptible-dominant population.
+*   **Prior-biased SIR heads**: Final layers for $\beta_t$, $\gamma_t$, and $\mu_t$ use small Xavier weights plus inverse-softplus prior biases (`0.25`, `0.14`, `0.002`), keeping outputs near conservative priors while preserving immediate gradient flow through projection stems.
+*   **Initial state prior**: The initial-state logits head uses small Xavier weights plus $\log([0.995, 0.004, 0.001])$ bias, so `softmax` starts near a susceptible-dominant population without a step-1 gradient blind spot.
 *   **Neutral observation residual path**: Observation residual projections are initialized to exact zeros, so residual corrections start inactive and become data-driven during training.
 *   **Population feature stabilization**: Population inputs are transformed with `log1p(population)` before concatenation into the backbone input to avoid projection instability from large raw counts.

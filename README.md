@@ -111,10 +111,36 @@ EpiForecaster follows a two-step workflow: data preprocessing followed by model 
 ### Quick Start
 
 ```bash
+# Step 1: Preprocess data
 uv run preprocess epiforecaster --config preprocess_config.yaml
 
+# Step 2: Train model
 uv run train epiforecaster --config train_config.yaml
+
+# Step 3: Evaluate checkpoint and generate plots
+uv run eval epiforecaster --experiment <name> --run <run_id> --split val
+
+# Step 4: (Optional) Generate custom forecast plots
+uv run plot forecasts --experiment <name> --run <run_id> --nodes quartile:3
 ```
+
+### CLI Commands
+
+All commands can be run via their standalone entrypoints or through the main CLI:
+
+| Standalone | Via main | Description |
+|------------|----------|-------------|
+| `uv run preprocess` | `uv run main preprocess` | Run preprocessing pipelines |
+| `uv run train` | `uv run main train` | Train forecasting models |
+| `uv run eval` | `uv run main eval` | Evaluate checkpoints and compute metrics |
+| `uv run plot` | `uv run main plot` | Generate forecast visualization plots |
+
+**Evaluation commands:**
+- `eval epiforecaster`: Evaluate checkpoint, compute metrics, generate quartile-based plots
+- `eval baselines`: Run rolling-origin baseline benchmarks (tiered, exp_smoothing, var_cross_target)
+
+**Plotting commands:**
+- `plot forecasts`: Generate forecast plots with flexible node selection (random, quartile, best, worst)
 
 ### Development & Testing
 
