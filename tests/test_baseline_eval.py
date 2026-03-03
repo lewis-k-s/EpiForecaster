@@ -217,6 +217,7 @@ def test_masked_metrics_ignore_unobserved_points():
     mask = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.float64)
     metrics = compute_masked_metrics_numpy(pred, target, mask)
     assert metrics.observed_count == 1
+    assert metrics.effective_count == 1.0
     assert metrics.mae == 0.0
     assert metrics.rmse == 0.0
 

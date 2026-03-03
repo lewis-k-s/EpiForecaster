@@ -276,3 +276,105 @@ def test_joint_inference_compute_components_train_matches_default() -> None:
         components_train["obs_active_mask"].float(),
     )
     assert torch.allclose(components_default["total"], components_train["total"])
+
+
+def test_joint_inference_obs_active_mask_respects_min_observed() -> None:
+    loss_fn = JointInferenceLoss(
+        w_sir=0.0,
+        ww_min_observed=2,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.zeros(1, 3),
+        "pred_hosp": torch.zeros(1, 2),
+        "pred_cases": torch.zeros(1, 2),
+        "pred_deaths": torch.zeros(1, 2),
+        "physics_residual": torch.zeros(1, 2),
+    }
+    targets = {
+        "ww": torch.zeros(1, 2),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.tensor([[1.0, 0.0]]),  # only one observed point (< min_observed)
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+    components = loss_fn.compute_components(model_outputs, targets)
+    assert components["obs_active_mask"].tolist() == [False, False, False, False]
+    assert torch.isclose(components["ww"], torch.tensor(0.0))
+
+
+def test_joint_inference_n_eff_scaling_applies_to_head_loss() -> None:
+    loss_fn = JointInferenceLoss(
+        obs_weight_sum=1.0,
+        w_sir=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+        obs_n_eff_power=1.0,
+        ww_n_eff_reference=4.0,
+    )
+    model_outputs = {
+        # Includes nowcast at t=0; supervised horizon has 4 points of value 1.0
+        "pred_ww": torch.tensor([[0.0, 1.0, 1.0, 1.0, 1.0]]),
+        "pred_hosp": torch.zeros(1, 2),
+        "pred_cases": torch.zeros(1, 2),
+        "pred_deaths": torch.zeros(1, 2),
+        "physics_residual": torch.zeros(1, 2),
+    }
+    targets = {
+        "ww": torch.zeros(1, 4),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        # n_eff = 2.0 (two contributing points), base MSE=1.0, scale=(2/4)^1=0.5
+        "ww_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+    components = loss_fn.compute_components(model_outputs, targets)
+    assert components["obs_active_mask"].tolist() == [True, False, False, False]
+    assert torch.isclose(components["ww_n_eff"], torch.tensor(2.0))
+    assert torch.isclose(components["ww"], torch.tensor(0.5))
+    assert torch.isclose(components["total"], torch.tensor(0.5))
+
+
+def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:
+    loss_fn = JointInferenceLoss(w_sir=0.0, hosp_min_observed=2)
+    model_outputs = {
+        "pred_ww": torch.zeros(1, 3),
+        "pred_hosp": torch.zeros(1, 3),
+        "pred_cases": torch.zeros(1, 3),
+        "pred_deaths": torch.zeros(1, 2),
+        "physics_residual": torch.zeros(1, 2),
+    }
+    targets = {
+        "ww": torch.zeros(1, 2),
+        "hosp": torch.zeros(1, 2),
+        "cases": torch.zeros(1, 2),
+        "deaths": torch.zeros(1, 2),
+        "ww_mask": torch.tensor([[1.0, 0.0]]),
+        "hosp_mask": torch.tensor([[1.0, 0.0]]),  # below hosp_min_observed
+        "cases_mask": torch.tensor([[1.0, 1.0]]),
+        "deaths_mask": torch.tensor([[0.0, 0.0]]),
+    }
+
+    supervision = loss_fn.compute_observation_supervision(
+        targets,
+        device=torch.device("cpu"),
+    )
+    expected_active = torch.stack(
+        [
+            supervision["ww"]["active"],
+            supervision["hosp"]["active"],
+            supervision["cases"]["active"],
+            supervision["deaths"]["active"],
+        ]
+    ).to(dtype=torch.bool)
+    components = loss_fn.compute_components(model_outputs, targets)
+    assert torch.equal(components["obs_active_mask"], expected_active)

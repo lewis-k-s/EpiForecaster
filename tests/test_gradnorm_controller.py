@@ -73,6 +73,7 @@ class _StepModel(torch.nn.Module):
         batch_data,
         region_embeddings=None,
         skip_device_transfer=False,
+        **kwargs,
     ):
         s = self.shared
         obs_context = torch.stack([s, s * 2.0]).reshape(1, 1, 2)
@@ -181,6 +182,51 @@ def test_gradnorm_sidecar_keeps_model_grads_cleared() -> None:
 
     for param in trainer.model.parameters():
         assert param.grad is None
+
+
+def test_gradnorm_sidecar_keeps_global_cached_weights_when_head_inactive() -> None:
+    trainer = _make_gradnorm_stub_trainer(update_every=1)
+    trainer.global_step = 0
+
+    def forward_batch_with_missing_ww(  # noqa: ANN001
+        *,
+        batch_data,
+        region_embeddings=None,
+        skip_device_transfer=False,
+        **kwargs,
+    ):
+        s = trainer.model.shared
+        obs_context = torch.stack([s, s * 2.0]).reshape(1, 1, 2)
+        c0 = obs_context[..., 0].reshape(())
+        c1 = obs_context[..., 1].reshape(())
+        model_outputs = {
+            "pred_ww": torch.stack([c0, c0 + 0.1]).reshape(1, 2),
+            "pred_hosp": torch.stack([c1 + 0.2, c1 + 0.4]).reshape(1, 2),
+            "pred_cases": torch.stack([c0 + 0.3, c0 + 0.7]).reshape(1, 2),
+            "pred_deaths": torch.stack([c1 + 0.5]).reshape(1, 1),
+            "physics_residual": torch.stack([s * 0.1]).reshape(1, 1),
+            "obs_context": obs_context,
+        }
+        targets = {
+            "ww": torch.tensor([[0.1]], dtype=torch.float32),
+            "hosp": torch.tensor([[0.2]], dtype=torch.float32),
+            "cases": torch.tensor([[0.3]], dtype=torch.float32),
+            "deaths": torch.tensor([[0.4]], dtype=torch.float32),
+            "ww_mask": torch.zeros((1, 1), dtype=torch.float32),
+            "hosp_mask": torch.ones((1, 1), dtype=torch.float32),
+            "cases_mask": torch.ones((1, 1), dtype=torch.float32),
+            "deaths_mask": torch.ones((1, 1), dtype=torch.float32),
+        }
+        return model_outputs, targets
+
+    trainer.model.forward_batch = forward_batch_with_missing_ww  # type: ignore[method-assign]
+
+    sidecar = EpiForecasterTrainer._gradnorm_sidecar_update(trainer, {})
+
+    assert sidecar["gradnorm_sidecar_ran"] > 0
+    assert trainer._gradnorm_last_active_mask.tolist() == [False, True, True, True]
+    assert sidecar["gradnorm_w_ww"] > 0
+    assert trainer._gradnorm_cached_weights[0] > 0
 
 
 def test_build_compiled_batch_excludes_metadata() -> None:

@@ -22,7 +22,7 @@ class _DummyModel(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
 
-    def forward_batch(self, batch_data, region_embeddings=None):  # noqa: ANN001
+    def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         return batch_data["model_outputs"], batch_data["targets_dict"]
 
 

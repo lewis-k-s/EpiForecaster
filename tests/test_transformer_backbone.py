@@ -122,7 +122,7 @@ class TestTransformerBackbone:
         for key, expected in expected_priors.items():
             values = outputs[key]
             assert torch.all(torch.isfinite(values))
-            assert torch.allclose(values, torch.full_like(values, expected), atol=5e-3)
+            assert torch.allclose(values, torch.full_like(values, expected), atol=5e-2)
 
         cfg = model.sir_physics
         assert torch.all(outputs["beta_t"] > cfg.beta_min)

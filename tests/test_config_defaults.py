@@ -4,17 +4,6 @@ from models.configs import DataConfig, JointLossConfig, ObservationHeadConfig
 
 
 @pytest.mark.epiforecaster
-def test_joint_loss_imputed_weights_default_to_point_zero_one() -> None:
-    cfg = JointLossConfig()
-    assert cfg.resolve_imputed_weight_map() == {
-        "wastewater": 0.01,
-        "hospitalizations": 0.01,
-        "cases": 0.01,
-        "deaths": 0.01,
-    }
-
-
-@pytest.mark.epiforecaster
 def test_observation_heads_default_weekly_kernels_frozen() -> None:
     cfg = ObservationHeadConfig()
     assert cfg.learnable_kernel_ww is False
@@ -45,3 +34,14 @@ def test_data_config_resolves_min_observed_from_missing_permit() -> None:
         "deaths": 18,
         "wastewater": 2,
     }
+
+
+@pytest.mark.epiforecaster
+def test_joint_loss_defaults_use_balanced_n_eff_scaling() -> None:
+    cfg = JointLossConfig()
+    assert cfg.obs_n_eff_power == 0.5
+    assert cfg.obs_n_eff_reference == 28.0
+    assert cfg.ww_n_eff_reference == 0.0
+    assert cfg.hosp_n_eff_reference == 0.0
+    assert cfg.cases_n_eff_reference == 0.0
+    assert cfg.deaths_n_eff_reference == 0.0
