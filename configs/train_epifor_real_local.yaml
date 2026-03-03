@@ -87,3 +87,4 @@ training:
       gradnorm_probe: "obs_context"
       w_sir: 0.005
       sir_residual_clip: 100
+      w_continuity: 0.01

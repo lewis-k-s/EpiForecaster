@@ -89,14 +89,13 @@ training:
 
   profiler:
     # Optimized for minimal overhead (~10% vs 234% with defaults)
-    # Reduces ProfilerStep annotation overhead from 70ms to <5ms per step
     # Duration controlled by: wait_steps + warmup_steps + active_steps = 5+1+2 = 8 batches
     enabled: true
-    wait_steps: 5          # Reduced from 50 - start profiling sooner
-    warmup_steps: 1        # Reduced from 5 - less warmup overhead
-    active_steps: 2        # Reduced from 5 - profile fewer steps
-    profile_epochs: [1]    # Profile only epoch 1 (was [1, 2])
-    record_memory: false   # Disabled - saves ~15-20% profiler overhead
+    wait_steps: 5
+    warmup_steps: 1
+    active_steps: 2
+    profile_epochs: [1]
+    record_memory: false # Disabled - saves ~15-20% profiler overhead
     log_dir: auto
   plot_forecasts: true
   num_forecast_samples: 3

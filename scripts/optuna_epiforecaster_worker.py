@@ -259,11 +259,9 @@ def suggest_epiforecaster_params(
             _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
         )
     )
-    overrides["model.init_weights.obs_context_final_gain"] = (
-        trial.suggest_categorical(
-            "init_weights.obs_context_final_gain",
-            _categorical_choices((0.25, 0.5, 1.0)),
-        )
+    overrides["model.init_weights.obs_context_final_gain"] = trial.suggest_categorical(
+        "init_weights.obs_context_final_gain",
+        _categorical_choices((0.25, 0.5, 1.0)),
     )
 
     # --- SIR joint inference knobs (high leverage for observation heads) ---
@@ -315,6 +313,12 @@ def suggest_epiforecaster_params(
                 "model.observation_heads.learnable_kernel_hosp",
                 _categorical_choices((False, True)),
             )
+        )
+
+        # Nowcast continuity penalty weight
+        overrides["training.loss.joint.w_continuity"] = trial.suggest_categorical(
+            "training.loss.joint.w_continuity",
+            _categorical_choices((0.0, 0.01, 0.05, 0.1, 0.2)),
         )
 
         # GradNorm controller knobs (only relevant when adaptive weighting is enabled).

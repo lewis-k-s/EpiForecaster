@@ -5,14 +5,14 @@
 #SBATCH --gres=gpu:1                # one CUDA-capable GPU
 #SBATCH --cpus-per-task=20          # must be full node
 #SBATCH --time=04:00:00             # wall-clock limit
-#SBATCH --array=0-10                # One task per ablation
+#SBATCH --array=0-19                # One task per ablation
 #SBATCH --output=logs/slurm-%x-%A_%a.out    # stdout/stderr log per array task
 #SBATCH --error=logs/slurm-%x-%A_%a.err    # stdout/stderr log per array task
 #
 #
 # Usage example with external sbatch arguments:
 #   sbatch --job-name=epi-ablations --account=bsc08 --qos=acc_bscls \
-#          --gres=gpu:1 --cpus-per-task=20 --time=04:00:00 --array=0-10 \
+#          --gres=gpu:1 --cpus-per-task=20 --time=04:00:00 --array=0-19 \
 #          --output=logs/slurm-%x-%A_%a.out --error=logs/slurm-%x-%A_%a.err \
 #          scripts/run_ablations.sbatch
 #
@@ -52,32 +52,56 @@ fi
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 # Define the ablations. These correspond to Study 4, 5, and 6 in todo/STUDIES.md
+# #SBATCH --array=0-19                # One task per ablation
+# #SBATCH --output=logs/slurm-%x-%A_%a.out    # stdout/stderr log per array task
+# #SBATCH --error=logs/slurm-%x-%A_%a.err    # stdout/stderr log per array task
+
+# ...
+
 declare -a ABLATION_NAMES=(
   "baseline"                             # 0: Full model (baseline)
   "no_sir_loss"                          # 1: Study 4: -L_sir
-  "no_ww_loss"                           # 2: Study 4: -L_ww
-  "no_cases_loss"                        # 3: Study 4: -L_cases
-  "no_hosp_loss"                         # 4: Study 4: -L_hosp
-  "no_deaths_loss"                       # 5: Study 4: -L_deaths
-  "no_residual_context"                  # 6: Study 5: w/o residual context from encoder (assuming residual_scale=0.0 means off)
-  "no_mobility"                          # 7: Study 6: Remove mobility edges/features
-  "no_regions"                           # 8: Study 6: Remove static regional embeddings
-  "no_mobility_and_regions"              # 9: Study 6: Remove both (local-only)
-  "mlp_clinical_heads"                   # 10: Study 5: delay-kernel vs direct MLP mapping (assuming learnable_kernel=false defaults to direct mapping)
+  "no_ww_loss"                           # 2: Loss OFF, Input ON
+  "mask_ww_input"                        # 3: Loss ON, Input OFF
+  "no_ww"                                # 4: Loss OFF, Input OFF
+  "no_cases_loss"                        # 5: Loss OFF, Input ON
+  "mask_cases_input"                     # 6: Loss ON, Input OFF
+  "no_cases"                             # 7: Loss OFF, Input OFF
+  "no_hosp_loss"                         # 8: Loss OFF, Input ON
+  "mask_hosp_input"                      # 9: Loss ON, Input OFF
+  "no_hosp"                              # 10: Loss OFF, Input OFF
+  "no_deaths_loss"                       # 11: Loss OFF, Input ON
+  "mask_deaths_input"                    # 12: Loss ON, Input OFF
+  "no_deaths"                            # 13: Loss OFF, Input OFF
+  "no_residual_context"                  # 14: Study 5: w/o residual context from encoder (assuming residual_scale=0.0 means off)
+  "no_mobility"                          # 15: Study 6: Remove mobility edges/features
+  "no_regions"                           # 16: Study 6: Remove static regional embeddings
+  "no_mobility_and_regions"              # 17: Study 6: Remove both (local-only)
+  "mlp_clinical_heads"                   # 18: Study 5: delay-kernel vs direct MLP mapping (assuming learnable_kernel=false defaults to direct mapping)
+  "fixed_obs_weights"                    # 19: Disable adaptive GradNorm weighting
 )
 
 declare -a ABLATION_OVERRIDES=(
   ""                                                                                # 0: baseline
   "training.loss.joint.w_sir=0.0"                                                   # 1: no_sir_loss
-  "training.loss.joint.disable_ww=true"                                              # 2: no_ww_loss
-  "training.loss.joint.disable_cases=true"                                           # 3: no_cases_loss
-  "training.loss.joint.disable_hosp=true"                                            # 4: no_hosp_loss
-  "training.loss.joint.disable_deaths=true"                                          # 5: no_deaths_loss
-  "model.observation_heads.residual_scale=0.0"                                      # 6: no_residual_context
-  "model.type.mobility=false"                                                       # 7: no_mobility
-  "model.type.regions=false"                                                        # 8: no_regions
-  "model.type.mobility=false model.type.regions=false"                              # 9: no_mobility_and_regions
-  "model.observation_heads.learnable_kernel_hosp=false model.observation_heads.learnable_kernel_cases=false model.observation_heads.learnable_kernel_deaths=false" # 10: mlp_clinical_heads
+  "training.loss.joint.disable_ww=true"                                             # 2: no_ww_loss
+  "training.loss.joint.mask_input_ww=true"                                          # 3: mask_ww_input
+  "training.loss.joint.disable_ww=true training.loss.joint.mask_input_ww=true"      # 4: no_ww
+  "training.loss.joint.disable_cases=true"                                          # 5: no_cases_loss
+  "training.loss.joint.mask_input_cases=true"                                       # 6: mask_cases_input
+  "training.loss.joint.disable_cases=true training.loss.joint.mask_input_cases=true" # 7: no_cases
+  "training.loss.joint.disable_hosp=true"                                           # 8: no_hosp_loss
+  "training.loss.joint.mask_input_hosp=true"                                        # 9: mask_hosp_input
+  "training.loss.joint.disable_hosp=true training.loss.joint.mask_input_hosp=true"  # 10: no_hosp
+  "training.loss.joint.disable_deaths=true"                                         # 11: no_deaths_loss
+  "training.loss.joint.mask_input_deaths=true"                                      # 12: mask_deaths_input
+  "training.loss.joint.disable_deaths=true training.loss.joint.mask_input_deaths=true" # 13: no_deaths
+  "model.observation_heads.residual_scale=0.0"                                      # 14: no_residual_context
+  "model.type.mobility=false"                                                       # 15: no_mobility
+  "model.type.regions=false"                                                        # 16: no_regions
+  "model.type.mobility=false model.type.regions=false"                              # 17: no_mobility_and_regions
+  "model.observation_heads.learnable_kernel_hosp=false model.observation_heads.learnable_kernel_cases=false model.observation_heads.learnable_kernel_deaths=false" # 18: mlp_clinical_heads
+  "training.loss.joint.adaptive_scheme=none"                                        # 19: fixed_obs_weights
 )
 
 # Default to task 0 when running locally (outside sbatch array).
