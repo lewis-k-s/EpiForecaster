@@ -221,6 +221,10 @@ class TransformerBackbone(nn.Module):
         positional_encoding: str = "sinusoidal",
         max_seq_len: int = 1000,
         use_layer_norm: bool = True,
+        rezero_init: float = 1.0e-3,
+        rate_head_final_gain: float = 1.0e-2,
+        initial_state_final_gain: float = 1.0e-2,
+        obs_context_final_gain: float = 0.5,
         device=None,
         obs_context_dim: int = 96,
         sir_physics: SIRPhysicsConfig | None = None,
@@ -239,6 +243,10 @@ class TransformerBackbone(nn.Module):
             positional_encoding: Type of positional encoding ('sinusoidal', 'learned')
             max_seq_len: Maximum sequence length for positional encoding
             use_layer_norm: Whether to use layer normalization in encoder
+            rezero_init: Initial ReZero gate value for attention/FFN residuals
+            rate_head_final_gain: Xavier gain for rate-head final linear layers
+            initial_state_final_gain: Xavier gain for initial-state final linear layer
+            obs_context_final_gain: Xavier gain for obs-context final linear layer
             obs_context_dim: Dimension of observation context output
             sir_physics: SIR physics config for parameter bounds
         """
@@ -256,6 +264,27 @@ class TransformerBackbone(nn.Module):
         self.max_seq_len = max_seq_len
         self.obs_context_dim = obs_context_dim
         self.sir_physics = sir_physics or SIRPhysicsConfig()
+        if rezero_init <= 0:
+            raise ValueError(f"rezero_init must be positive, got {rezero_init}")
+        if rate_head_final_gain <= 0:
+            raise ValueError(
+                "rate_head_final_gain must be positive, "
+                f"got {rate_head_final_gain}"
+            )
+        if initial_state_final_gain <= 0:
+            raise ValueError(
+                "initial_state_final_gain must be positive, "
+                f"got {initial_state_final_gain}"
+            )
+        if obs_context_final_gain <= 0:
+            raise ValueError(
+                "obs_context_final_gain must be positive, "
+                f"got {obs_context_final_gain}"
+            )
+        self.rezero_init = rezero_init
+        self.rate_head_final_gain = rate_head_final_gain
+        self.initial_state_final_gain = initial_state_final_gain
+        self.obs_context_final_gain = obs_context_final_gain
 
         # Input projection layer
         self.input_projection = nn.Linear(in_dim, d_model)
@@ -278,7 +307,7 @@ class TransformerBackbone(nn.Module):
                     n_heads=n_heads,
                     ffn_dim=4 * d_model,
                     dropout=dropout,
-                    rezero_init=1.0e-3,
+                    rezero_init=self.rezero_init,
                     use_norm=use_layer_norm,
                 )
                 for _ in range(num_layers)
@@ -369,13 +398,17 @@ class TransformerBackbone(nn.Module):
         # Use default dtype (float32) for initial prior
         initial_prior = torch.tensor([0.995, 0.004, 0.001])
         initial_bias = torch.log(initial_prior)
-        self._init_linear_with_bias(
-            self.initial_states_projection[2], initial_bias.tolist()
+        self._init_linear_small_xavier_with_bias(
+            self.initial_states_projection[2],
+            initial_bias.tolist(),
+            gain=self.initial_state_final_gain,
         )
 
         # Keep bias anchored at zero while giving GradNorm's obs_context probe
         # a non-degenerate path from step 0.
-        self._init_linear_xavier_normal(self.obs_context_projection[2], gain=0.5)
+        self._init_linear_xavier_normal(
+            self.obs_context_projection[2], gain=self.obs_context_final_gain
+        )
 
         if isinstance(self.pos_encoding, LearnedPositionalEncoding):
             nn.init.normal_(self.pos_encoding.pos_embedding.weight, mean=0.0, std=0.02)
@@ -390,7 +423,9 @@ class TransformerBackbone(nn.Module):
     ) -> None:
         clipped_prior = min(max(prior, min_value), max_value)
         bias_value = _inverse_softplus(clipped_prior)
-        self._init_linear_with_bias(layer, bias_value)
+        self._init_linear_small_xavier_with_bias(
+            layer, bias_value, gain=self.rate_head_final_gain
+        )
 
     def _init_linear_xavier(self, layer: nn.Linear) -> None:
         nn.init.xavier_uniform_(layer.weight)
@@ -400,10 +435,10 @@ class TransformerBackbone(nn.Module):
         nn.init.xavier_normal_(layer.weight, gain=gain)
         nn.init.zeros_(layer.bias)
 
-    def _init_linear_with_bias(
-        self, layer: nn.Linear, bias: float | list[float]
+    def _init_linear_small_xavier_with_bias(
+        self, layer: nn.Linear, bias: float | list[float], gain: float = 1.0e-2
     ) -> None:
-        nn.init.zeros_(layer.weight)
+        nn.init.xavier_normal_(layer.weight, gain=gain)
         with torch.no_grad():
             if isinstance(bias, list):
                 bias_tensor = torch.tensor(

@@ -28,8 +28,6 @@ N_TRIALS="${N_TRIALS:-}"
 SEED="${SEED:-42}"                                    # Reproducibility seed
 SAMPLER="${SAMPLER:-tpe}"                             # tpe (default), cmaes, or random
 PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N epochs
-LOSS_WEIGHT_MODE="${LOSS_WEIGHT_MODE:-fixed}"         # fixed (recommended), bounded
-LOSS_WEIGHT_MAX_RATIO="${LOSS_WEIGHT_MAX_RATIO:-2.0}" # for bounded mode
 # Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
 OVERRIDES="${OVERRIDES:-}"
 # Smoke-test mode:
@@ -91,12 +89,6 @@ if [ -n "$SAMPLER" ]; then
 fi
 if [ -n "$PRUNING_START_EPOCH" ]; then
   ARGS+=(--pruning-start-epoch "$PRUNING_START_EPOCH")
-fi
-if [ -n "$LOSS_WEIGHT_MODE" ]; then
-  ARGS+=(--loss-weight-mode "$LOSS_WEIGHT_MODE")
-fi
-if [ -n "$LOSS_WEIGHT_MAX_RATIO" ]; then
-  ARGS+=(--loss-weight-max-ratio "$LOSS_WEIGHT_MAX_RATIO")
 fi
 if [ -n "$TIMEOUT_SECS" ]; then
   ARGS+=(--timeout-s "$TIMEOUT_SECS")

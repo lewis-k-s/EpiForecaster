@@ -312,6 +312,32 @@ class TestSuggestEpiforecasterParams:
         assert "model.head_positional_encoding" in overrides
         assert overrides["model.head_positional_encoding"] in ("sinusoidal", "learned")
 
+    def test_init_weights_group_params(self) -> None:
+        trial = _StubTrial()
+        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
+
+        assert "model.init_weights.rezero_init" in overrides
+        assert "model.init_weights.rate_head_final_gain" in overrides
+        assert "model.init_weights.initial_state_final_gain" in overrides
+        assert "model.init_weights.obs_context_final_gain" in overrides
+
+        assert overrides["model.init_weights.rezero_init"] in (1.0e-3, 3.0e-3, 1.0e-2)
+        assert overrides["model.init_weights.rate_head_final_gain"] in (
+            5.0e-3,
+            1.0e-2,
+            2.0e-2,
+        )
+        assert overrides["model.init_weights.initial_state_final_gain"] in (
+            5.0e-3,
+            1.0e-2,
+            2.0e-2,
+        )
+        assert overrides["model.init_weights.obs_context_final_gain"] in (
+            0.25,
+            0.5,
+            1.0,
+        )
+
     def test_joint_inference_no_static_loss_weight_overrides(self) -> None:
         trial = _StubTrial()
         cfg = _joint_loss_cfg_stub()
@@ -371,11 +397,11 @@ class TestSuggestEpiforecasterParams:
         call = next(
             c
             for c in trial.suggest_calls
-            if c[1] == "model.observation_heads.residual_scale"
+            if c[1] == "init_weights.observation_residual_scale"
         )
         assert call[0] == "float"
-        assert call[2][0] == pytest.approx(0.05)
-        assert call[2][1] == pytest.approx(0.5)
+        assert call[2][0] == pytest.approx(0.03)
+        assert call[2][1] == pytest.approx(0.2)
 
     def test_joint_inference_residual_layers_bounds(self) -> None:
         trial = _StubTrial()

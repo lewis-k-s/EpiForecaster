@@ -85,12 +85,6 @@ def _inverse_softplus(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.log(torch.expm1(x).clamp_min(eps))
 
 
-def _zero_linear(layer: nn.Linear) -> None:
-    """Set a linear layer to an exact zero map."""
-    nn.init.zeros_(layer.weight)
-    nn.init.zeros_(layer.bias)
-
-
 def _small_xavier_linear(layer: nn.Linear, gain: float = 0.1) -> None:
     """Initialize a linear layer with small non-zero Xavier weights."""
     nn.init.xavier_normal_(layer.weight, gain=gain)

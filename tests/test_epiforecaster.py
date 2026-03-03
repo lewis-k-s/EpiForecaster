@@ -245,10 +245,15 @@ class TestEpiForecaster:
             population=dummy_batch["population"],
         )
 
-        # Conservative init keeps backbone outputs prior-centered constants, but
-        # the final rate-head weights should still receive gradient.
+        # Conservative init keeps backbone outputs near prior-centered values.
+        # Step 1 should propagate gradient through both final rate heads and
+        # their projection stems.
         loss_beta = out["beta_t"].sum()
         loss_beta.backward(retain_graph=True)
+
+        beta_stem_weight_grad = model.backbone.beta_projection[0].weight.grad
+        assert beta_stem_weight_grad is not None
+        assert beta_stem_weight_grad.abs().sum() > 0
 
         beta_head_weight_grad = model.backbone.beta_projection[2].weight.grad
         assert beta_head_weight_grad is not None

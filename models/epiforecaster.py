@@ -9,7 +9,12 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch
 
 from utils.compiled_batch import COMPILED_BATCH_TENSOR_KEYS
-from .configs import ModelVariant, ObservationHeadConfig, SIRPhysicsConfig
+from .configs import (
+    InitWeightsConfig,
+    ModelVariant,
+    ObservationHeadConfig,
+    SIRPhysicsConfig,
+)
 from .mobility_gnn import MobilityDenseEncoder
 from .observation_heads import ClinicalObservationHead, WastewaterObservationHead
 from .sir_rollforward import SIRRollForward
@@ -33,6 +38,7 @@ class EpiForecaster(nn.Module):
         variant_type: ModelVariant,
         sir_physics: SIRPhysicsConfig,
         observation_heads: ObservationHeadConfig,
+        init_weights: InitWeightsConfig | None = None,
         temporal_input_dim: int = 1,
         biomarkers_dim: int = 1,
         region_embedding_dim: int = 64,
@@ -60,6 +66,7 @@ class EpiForecaster(nn.Module):
         Args:
             variant_type: ModelVariant with flags for cases/regions/biomarkers/mobility
             sir_physics: SIR physics configuration
+            init_weights: Initialization controls for startup dynamics
             observation_heads: Observation head configuration
             temporal_input_dim: Dimension of temporal input features (cases)
             biomarkers_dim: Dimension of biomarker features
@@ -84,6 +91,7 @@ class EpiForecaster(nn.Module):
 
         self.variant_type = variant_type
         self.sir_physics = sir_physics
+        self.init_weights = init_weights or InitWeightsConfig()
         self.observation_heads_config = observation_heads
         self.temporal_input_dim = temporal_input_dim
         self.biomarkers_dim = biomarkers_dim
@@ -136,6 +144,10 @@ class EpiForecaster(nn.Module):
             horizon=forecast_horizon,
             dropout=head_dropout,
             positional_encoding=head_positional_encoding,
+            rezero_init=self.init_weights.rezero_init,
+            rate_head_final_gain=self.init_weights.rate_head_final_gain,
+            initial_state_final_gain=self.init_weights.initial_state_final_gain,
+            obs_context_final_gain=self.init_weights.obs_context_final_gain,
             device=device,
             obs_context_dim=observation_heads.obs_context_dim,
             sir_physics=sir_physics,

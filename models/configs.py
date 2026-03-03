@@ -66,7 +66,7 @@ class JointLossConfig:
     w_sir: float = 0.05
     # Relative per-timestep weights for imputed (mask=0) supervision.
     # 0.0 disables imputed supervision; observed (mask=1) always has weight 1.0.
-    ww_imputed_weight: float = 0.01
+    ww_imputed_weight: float = 0.0
     hosp_imputed_weight: float = 0.01
     cases_imputed_weight: float = 0.01
     deaths_imputed_weight: float = 0.01
@@ -78,6 +78,11 @@ class JointLossConfig:
     disable_hosp: bool = False
     disable_cases: bool = False
     disable_deaths: bool = False
+    # Optional target-level ablation toggles for input data masking.
+    mask_input_ww: bool = False
+    mask_input_hosp: bool = False
+    mask_input_cases: bool = False
+    mask_input_deaths: bool = False
     # Nowcast continuity penalty weight.
     # Penalizes discontinuity between last observed value and first forecast prediction.
     # 0.0 disables the penalty.
@@ -123,13 +128,11 @@ class JointLossConfig:
             )
         if self.gradnorm_update_every < 1:
             raise ValueError(
-                "gradnorm_update_every must be >= 1, "
-                f"got {self.gradnorm_update_every}"
+                f"gradnorm_update_every must be >= 1, got {self.gradnorm_update_every}"
             )
         if self.gradnorm_ema_decay >= 1:
             raise ValueError(
-                "gradnorm_ema_decay must be in [0, 1), "
-                f"got {self.gradnorm_ema_decay}"
+                f"gradnorm_ema_decay must be in [0, 1), got {self.gradnorm_ema_decay}"
             )
         if self.gradnorm_obs_weight_sum <= 0:
             raise ValueError(
@@ -294,6 +297,39 @@ class SIRPhysicsConfig:
         if self.residual_clip <= 0:
             raise ValueError(
                 f"residual_clip must be positive, got {self.residual_clip}"
+            )
+
+
+@dataclass
+class InitWeightsConfig:
+    """Initialization controls for startup dynamics and gradient transport."""
+
+    # ReZero gate scalar in transformer encoder blocks.
+    rezero_init: float = 1.0e-3
+    # Gain for small-Xavier init on final beta/gamma/mortality projection layers.
+    rate_head_final_gain: float = 1.0e-2
+    # Gain for small-Xavier init on final initial-state projection layer.
+    initial_state_final_gain: float = 1.0e-2
+    # Gain for obs_context projection final layer.
+    obs_context_final_gain: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.rezero_init <= 0:
+            raise ValueError(f"rezero_init must be positive, got {self.rezero_init}")
+        if self.rate_head_final_gain <= 0:
+            raise ValueError(
+                "rate_head_final_gain must be positive, "
+                f"got {self.rate_head_final_gain}"
+            )
+        if self.initial_state_final_gain <= 0:
+            raise ValueError(
+                "initial_state_final_gain must be positive, "
+                f"got {self.initial_state_final_gain}"
+            )
+        if self.obs_context_final_gain <= 0:
+            raise ValueError(
+                "obs_context_final_gain must be positive, "
+                f"got {self.obs_context_final_gain}"
             )
 
 
@@ -601,6 +637,7 @@ class ModelConfig:
 
     # -- SIR physics and observation heads --#
     sir_physics: SIRPhysicsConfig = field(default_factory=SIRPhysicsConfig)
+    init_weights: InitWeightsConfig = field(default_factory=InitWeightsConfig)
     observation_heads: ObservationHeadConfig = field(
         default_factory=ObservationHeadConfig
     )
@@ -618,6 +655,9 @@ class ModelConfig:
 
         if isinstance(self.sir_physics, (dict, DictConfig)):
             self.sir_physics = SIRPhysicsConfig(**self.sir_physics)
+
+        if isinstance(self.init_weights, (dict, DictConfig)):
+            self.init_weights = InitWeightsConfig(**self.init_weights)
 
         if isinstance(self.observation_heads, (dict, DictConfig)):
             self.observation_heads = ObservationHeadConfig(**self.observation_heads)

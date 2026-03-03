@@ -244,13 +244,37 @@ def suggest_epiforecaster_params(
         _categorical_choices(("sinusoidal", "learned")),
     )
 
+    # --- init_weights knobs (startup dynamics / gradient transport) ---
+    overrides["model.init_weights.rezero_init"] = trial.suggest_categorical(
+        "init_weights.rezero_init",
+        _categorical_choices((1.0e-3, 3.0e-3, 1.0e-2)),
+    )
+    overrides["model.init_weights.rate_head_final_gain"] = trial.suggest_categorical(
+        "init_weights.rate_head_final_gain",
+        _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
+    )
+    overrides["model.init_weights.initial_state_final_gain"] = (
+        trial.suggest_categorical(
+            "init_weights.initial_state_final_gain",
+            _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
+        )
+    )
+    overrides["model.init_weights.obs_context_final_gain"] = (
+        trial.suggest_categorical(
+            "init_weights.obs_context_final_gain",
+            _categorical_choices((0.25, 0.5, 1.0)),
+        )
+    )
+
     # --- SIR joint inference knobs (high leverage for observation heads) ---
     # Only tune if using joint_inference loss
     if base_cfg.training.loss.name == "joint_inference":
-        # Residual connection params - affects model capacity for observation heads
+        # Residual alpha is an init-sensitive knob for startup stability.
         overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
-            "model.observation_heads.residual_scale", 0.05, 0.5
+            "init_weights.observation_residual_scale", 0.03, 0.2
         )
+
+        # Residual connection params - affects model capacity for observation heads
         overrides["model.observation_heads.residual_hidden_dim"] = (
             trial.suggest_categorical(
                 "model.observation_heads.residual_hidden_dim",
