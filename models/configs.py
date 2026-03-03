@@ -63,13 +63,21 @@ class JointLossConfig:
     gradnorm_probe: str = "obs_context"
     gradnorm_min_weight: float = 1.0e-3
     gradnorm_obs_weight_sum: float = 0.95
+    # Confidence scaling based on effective supervised points (n_eff).
+    # Per-head factor: min(1, n_eff / reference) ** obs_n_eff_power.
+    # Reference resolution order per head:
+    #   1) <head>_n_eff_reference when > 0
+    #   2) obs_n_eff_reference when > 0
+    #   3) 1.0 fallback
+    # Defaults use a balanced shared reference across heads.
+    # Set obs_n_eff_power=0.0 to disable scaling.
+    obs_n_eff_power: float = 0.5
+    obs_n_eff_reference: float = 28.0
+    ww_n_eff_reference: float = 0.0
+    hosp_n_eff_reference: float = 0.0
+    cases_n_eff_reference: float = 0.0
+    deaths_n_eff_reference: float = 0.0
     w_sir: float = 0.05
-    # Relative per-timestep weights for imputed (mask=0) supervision.
-    # 0.0 disables imputed supervision; observed (mask=1) always has weight 1.0.
-    ww_imputed_weight: float = 0.0
-    hosp_imputed_weight: float = 0.01
-    cases_imputed_weight: float = 0.01
-    deaths_imputed_weight: float = 0.01
     # Cap on absolute physics residual before squaring in SIR loss.
     # Prevents occasional residual spikes from dominating gradients.
     sir_residual_clip: float = 1.0e3
@@ -106,10 +114,6 @@ class JointLossConfig:
 
         for name, value in [
             ("w_sir", self.w_sir),
-            ("ww_imputed_weight", self.ww_imputed_weight),
-            ("hosp_imputed_weight", self.hosp_imputed_weight),
-            ("cases_imputed_weight", self.cases_imputed_weight),
-            ("deaths_imputed_weight", self.deaths_imputed_weight),
             ("sir_residual_clip", self.sir_residual_clip),
             ("w_continuity", self.w_continuity),
             ("gradnorm_alpha", self.gradnorm_alpha),
@@ -117,6 +121,12 @@ class JointLossConfig:
             ("gradnorm_ema_decay", self.gradnorm_ema_decay),
             ("gradnorm_min_weight", self.gradnorm_min_weight),
             ("gradnorm_obs_weight_sum", self.gradnorm_obs_weight_sum),
+            ("obs_n_eff_power", self.obs_n_eff_power),
+            ("obs_n_eff_reference", self.obs_n_eff_reference),
+            ("ww_n_eff_reference", self.ww_n_eff_reference),
+            ("hosp_n_eff_reference", self.hosp_n_eff_reference),
+            ("cases_n_eff_reference", self.cases_n_eff_reference),
+            ("deaths_n_eff_reference", self.deaths_n_eff_reference),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
@@ -144,15 +154,6 @@ class JointLossConfig:
                 "gradnorm_min_weight is too large for gradnorm_obs_weight_sum "
                 "with four observation tasks"
             )
-
-    def resolve_imputed_weight_map(self) -> dict[str, float]:
-        """Resolve per-target imputed supervision weights used by JointInferenceLoss."""
-        return {
-            "wastewater": float(self.ww_imputed_weight),
-            "hospitalizations": float(self.hosp_imputed_weight),
-            "cases": float(self.cases_imputed_weight),
-            "deaths": float(self.deaths_imputed_weight),
-        }
 
 
 @dataclass

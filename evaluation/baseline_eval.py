@@ -4,7 +4,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -35,7 +35,6 @@ _TARGET_SPECS = {
 }
 _SUPPORTED_BASELINE_MODELS = ["tiered", "exp_smoothing", "var_cross_target"]
 _VAR_TARGET_ORDER = ["hospitalizations", "wastewater", "cases", "deaths"]
-_JOINT_LOSS_VALUE_CLAMP = 1.0e6
 
 
 @dataclass
@@ -70,10 +69,12 @@ class TargetSeriesView:
 @dataclass
 class JointObservationLossSpec:
     obs_weight_sum: float
-    ww_imputed_weight: float
-    hosp_imputed_weight: float
-    cases_imputed_weight: float
-    deaths_imputed_weight: float
+    obs_n_eff_power: float
+    obs_n_eff_reference: float
+    ww_n_eff_reference: float
+    hosp_n_eff_reference: float
+    cases_n_eff_reference: float
+    deaths_n_eff_reference: float
     ww_min_observed: int
     hosp_min_observed: int
     cases_min_observed: int
@@ -298,10 +299,12 @@ def _resolve_joint_observation_loss_spec(
 
     return JointObservationLossSpec(
         obs_weight_sum=float(criterion.obs_weight_sum),
-        ww_imputed_weight=float(criterion.ww_imputed_weight),
-        hosp_imputed_weight=float(criterion.hosp_imputed_weight),
-        cases_imputed_weight=float(criterion.cases_imputed_weight),
-        deaths_imputed_weight=float(criterion.deaths_imputed_weight),
+        obs_n_eff_power=float(criterion.obs_n_eff_power),
+        obs_n_eff_reference=float(criterion.obs_n_eff_reference),
+        ww_n_eff_reference=float(criterion.ww_n_eff_reference),
+        hosp_n_eff_reference=float(criterion.hosp_n_eff_reference),
+        cases_n_eff_reference=float(criterion.cases_n_eff_reference),
+        deaths_n_eff_reference=float(criterion.deaths_n_eff_reference),
         ww_min_observed=int(criterion.ww_min_observed),
         hosp_min_observed=int(criterion.hosp_min_observed),
         cases_min_observed=int(criterion.cases_min_observed),
@@ -318,47 +321,48 @@ def _joint_weighted_masked_mse_numpy(
     prediction: np.ndarray,
     target: np.ndarray,
     observed_mask: np.ndarray,
-    imputed_weight: float,
     min_observed: int,
-) -> float:
+) -> tuple[float, float]:
     pred_t = torch.as_tensor(prediction, dtype=torch.float32)
     target_t = torch.as_tensor(target, dtype=torch.float32)
     observed_t = torch.as_tensor(observed_mask, dtype=torch.float32)
-
-    finite_mask = torch.isfinite(target_t).to(pred_t.dtype)
-    observed = torch.nan_to_num(observed_t, nan=0.0, posinf=1.0, neginf=0.0).clamp(
-        min=0.0, max=1.0
+    supervision = JointInferenceLoss._build_supervision_weights(
+        target=target_t,
+        observed_mask=observed_t,
+        min_observed=min_observed,
+        device=pred_t.device,
     )
-    weights = (observed + (1.0 - observed) * float(imputed_weight)) * finite_mask
-    observed_binary = (observed > 0.5).to(pred_t.dtype) * finite_mask
-
-    if min_observed > 0:
-        observed_counts = observed_binary.sum(dim=1, keepdim=True)
-        eligible = (observed_counts >= float(min_observed)).to(pred_t.dtype)
-        weights = weights * eligible
-
-    active = weights > 0
-    prediction_clean = torch.nan_to_num(
-        pred_t,
-        nan=0.0,
-        posinf=_JOINT_LOSS_VALUE_CLAMP,
-        neginf=-_JOINT_LOSS_VALUE_CLAMP,
-    ).clamp(min=-_JOINT_LOSS_VALUE_CLAMP, max=_JOINT_LOSS_VALUE_CLAMP)
-    target_clean = torch.nan_to_num(
-        target_t,
-        nan=0.0,
-        posinf=_JOINT_LOSS_VALUE_CLAMP,
-        neginf=-_JOINT_LOSS_VALUE_CLAMP,
-    ).clamp(min=-_JOINT_LOSS_VALUE_CLAMP, max=_JOINT_LOSS_VALUE_CLAMP)
-    prediction_safe = torch.where(
-        active, prediction_clean, torch.zeros_like(prediction_clean)
+    loss = JointInferenceLoss._weighted_masked_mse_from_weights(
+        prediction=pred_t,
+        target=cast(torch.Tensor, supervision["target"]),
+        weights=cast(torch.Tensor, supervision["weights"]),
     )
-    target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
+    n_eff = cast(torch.Tensor, supervision["n_eff"])
+    return float(loss.item()), float(n_eff.item())
 
-    sq = (prediction_safe - target_safe) ** 2
-    numerator = (sq * weights).sum()
-    denominator = weights.sum().clamp_min(1e-8)
-    return float((numerator / denominator).item())
+
+def _joint_head_n_eff_scale_numpy(
+    *,
+    target_name: str,
+    n_eff: float,
+    joint_spec: JointObservationLossSpec,
+) -> float:
+    power = float(joint_spec.obs_n_eff_power)
+    if power <= 0:
+        return 1.0
+    head_specific = {
+        "wastewater": joint_spec.ww_n_eff_reference,
+        "hospitalizations": joint_spec.hosp_n_eff_reference,
+        "cases": joint_spec.cases_n_eff_reference,
+        "deaths": joint_spec.deaths_n_eff_reference,
+    }
+    reference = float(head_specific.get(target_name, 0.0))
+    if reference <= 0:
+        reference = float(joint_spec.obs_n_eff_reference)
+    if reference <= 0:
+        reference = 1.0
+    ratio = min(1.0, max(0.0, float(n_eff) / reference))
+    return float(ratio**power)
 
 
 def _compute_joint_observation_loss_for_fold(
@@ -373,12 +377,6 @@ def _compute_joint_observation_loss_for_fold(
         "cases": "cases",
         "deaths": "deaths",
     }
-    target_imputed_weights = {
-        "wastewater": joint_spec.ww_imputed_weight,
-        "hospitalizations": joint_spec.hosp_imputed_weight,
-        "cases": joint_spec.cases_imputed_weight,
-        "deaths": joint_spec.deaths_imputed_weight,
-    }
     target_min_observed = {
         "wastewater": joint_spec.ww_min_observed,
         "hospitalizations": joint_spec.hosp_min_observed,
@@ -389,6 +387,7 @@ def _compute_joint_observation_loss_for_fold(
     components: dict[str, Any] = {"joint_obs_loss_total": 0.0}
     raw_losses: dict[str, float] = {}
     observed_counts: dict[str, int] = {}
+    effective_counts: dict[str, float] = {}
     for target_name, alias in target_aliases.items():
         pred, target, mask = fold_target_data.get(
             target_name,
@@ -398,21 +397,30 @@ def _compute_joint_observation_loss_for_fold(
                 _empty_metric_matrix(horizon),
             ),
         )
-        loss_value = _joint_weighted_masked_mse_numpy(
+        min_observed = target_min_observed[target_name]
+        loss_value, n_eff = _joint_weighted_masked_mse_numpy(
             prediction=pred,
             target=target,
             observed_mask=mask,
-            imputed_weight=target_imputed_weights[target_name],
-            min_observed=target_min_observed[target_name],
+            min_observed=min_observed,
+        )
+        loss_value *= _joint_head_n_eff_scale_numpy(
+            target_name=target_name,
+            n_eff=n_eff,
+            joint_spec=joint_spec,
         )
         observed_count = int((mask > 0).sum())
         raw_losses[target_name] = loss_value
         observed_counts[target_name] = observed_count
+        effective_counts[target_name] = n_eff
         components[f"joint_loss_{alias}"] = loss_value
         components[f"joint_observed_count_{alias}"] = observed_count
+        components[f"joint_effective_count_{alias}"] = n_eff
 
     active_targets = [
-        target_name for target_name, count in observed_counts.items() if count > 0
+        target_name
+        for target_name, effective_count in effective_counts.items()
+        if effective_count > 0
     ]
     num_active = len(active_targets)
     equal_weight = (joint_spec.obs_weight_sum / num_active) if num_active > 0 else 0.0
@@ -1261,10 +1269,12 @@ def run_baseline_evaluation(
         if joint_spec is None
         else {
             "obs_weight_sum": joint_spec.obs_weight_sum,
-            "ww_imputed_weight": joint_spec.ww_imputed_weight,
-            "hosp_imputed_weight": joint_spec.hosp_imputed_weight,
-            "cases_imputed_weight": joint_spec.cases_imputed_weight,
-            "deaths_imputed_weight": joint_spec.deaths_imputed_weight,
+            "obs_n_eff_power": joint_spec.obs_n_eff_power,
+            "obs_n_eff_reference": joint_spec.obs_n_eff_reference,
+            "ww_n_eff_reference": joint_spec.ww_n_eff_reference,
+            "hosp_n_eff_reference": joint_spec.hosp_n_eff_reference,
+            "cases_n_eff_reference": joint_spec.cases_n_eff_reference,
+            "deaths_n_eff_reference": joint_spec.deaths_n_eff_reference,
             "ww_min_observed": joint_spec.ww_min_observed,
             "hosp_min_observed": joint_spec.hosp_min_observed,
             "cases_min_observed": joint_spec.cases_min_observed,

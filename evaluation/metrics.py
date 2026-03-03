@@ -17,6 +17,7 @@ class MaskedMetricResult:
     smape: float
     r2: float
     observed_count: int
+    effective_count: float
     mae_per_h: list[float]
     rmse_per_h: list[float]
 
@@ -30,9 +31,10 @@ class TorchMaskedMetricAccumulator:
         self.mae_sum = torch.tensor(0.0, device=device)
         self.mse_sum = torch.tensor(0.0, device=device)
         self.smape_sum = torch.tensor(0.0, device=device)
-        self.target_mean_acc = torch.tensor(0.0, device=device)
-        self.target_m2 = torch.tensor(0.0, device=device)
-        self.total_count = 0
+        self.weight_sum = torch.tensor(0.0, device=device)
+        self.target_weighted_sum = torch.tensor(0.0, device=device)
+        self.target_weighted_sq_sum = torch.tensor(0.0, device=device)
+        self.observed_count = 0
         self.per_h_mae_sum = (
             torch.zeros(horizon, device=device) if horizon is not None else None
         )
@@ -48,6 +50,7 @@ class TorchMaskedMetricAccumulator:
         predictions: torch.Tensor,
         targets: torch.Tensor,
         observed_mask: torch.Tensor | None,
+        sample_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update accumulators and return cleaned (diff, abs_diff, effective_mask)."""
         pred = torch.nan_to_num(
@@ -64,7 +67,17 @@ class TorchMaskedMetricAccumulator:
         ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
 
         finite_target = torch.isfinite(targets.float()).to(pred.dtype)
-        if observed_mask is None:
+        if sample_weights is not None:
+            mask = (
+                torch.nan_to_num(
+                    sample_weights.float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).clamp(min=0.0)
+                * finite_target
+            )
+        elif observed_mask is None:
             mask = finite_target
         else:
             mask = (
@@ -84,20 +97,10 @@ class TorchMaskedMetricAccumulator:
         self.smape_sum += (
             2 * abs_diff / (pred.abs() + target.abs() + _EPSILON) * mask
         ).sum()
-
-        flat_targets = target[mask > 0].detach().float().reshape(-1)
-        batch_count = flat_targets.numel()
-        if batch_count > 0:
-            batch_mean = flat_targets.mean()
-            batch_m2 = ((flat_targets - batch_mean) ** 2).sum()
-
-            delta = batch_mean - self.target_mean_acc
-            new_count = self.total_count + batch_count
-            self.target_mean_acc += delta * batch_count / new_count
-            self.target_m2 += (
-                batch_m2 + (delta**2) * (self.total_count * batch_count) / new_count
-            )
-            self.total_count = new_count
+        self.weight_sum += mask.sum()
+        self.target_weighted_sum += (target * mask).sum()
+        self.target_weighted_sq_sum += ((target**2) * mask).sum()
+        self.observed_count += int((mask > 0).sum().item())
 
         if self.horizon is not None and self.per_h_mae_sum is not None:
             self.per_h_mae_sum += (abs_diff * mask).sum(dim=0)
@@ -107,22 +110,27 @@ class TorchMaskedMetricAccumulator:
         return diff, abs_diff, mask
 
     def finalize(self) -> MaskedMetricResult:
-        if self.total_count <= 0:
+        if float(self.weight_sum.item()) <= 0:
             return MaskedMetricResult(
                 mae=float("nan"),
                 rmse=float("nan"),
                 smape=float("nan"),
                 r2=float("nan"),
                 observed_count=0,
+                effective_count=0.0,
                 mae_per_h=[],
                 rmse_per_h=[],
             )
 
-        mae = (self.mae_sum / max(1, self.total_count)).item()
-        rmse = math.sqrt((self.mse_sum / max(1, self.total_count)).item())
-        smape = (self.smape_sum / max(1, self.total_count)).item()
+        weight_sum = self.weight_sum.clamp_min(1e-8)
+        mae = (self.mae_sum / weight_sum).item()
+        rmse = math.sqrt((self.mse_sum / weight_sum).item())
+        smape = (self.smape_sum / weight_sum).item()
         ss_res = self.mse_sum.item()
-        ss_tot = self.target_m2.item()
+        ss_tot = (
+            self.target_weighted_sq_sum
+            - (self.target_weighted_sum**2) / weight_sum
+        ).item()
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
         mae_per_h: list[float] = []
@@ -137,7 +145,8 @@ class TorchMaskedMetricAccumulator:
             rmse=rmse,
             smape=smape,
             r2=r2,
-            observed_count=int(self.total_count),
+            observed_count=int(self.observed_count),
+            effective_count=float(self.weight_sum.item()),
             mae_per_h=mae_per_h,
             rmse_per_h=rmse_per_h,
         )
@@ -147,6 +156,7 @@ def compute_masked_metrics_numpy(
     predictions: np.ndarray,
     targets: np.ndarray,
     observed_mask: np.ndarray | None,
+    sample_weights: np.ndarray | None = None,
     horizon: int | None = None,
 ) -> MaskedMetricResult:
     # Detect overflow issues early
@@ -166,7 +176,14 @@ def compute_masked_metrics_numpy(
     pred = np.nan_to_num(predictions.astype(np.float64), nan=0.0)
     target = np.nan_to_num(targets.astype(np.float64), nan=0.0)
     finite_target = np.isfinite(targets).astype(np.float64)
-    if observed_mask is None:
+    if sample_weights is not None:
+        mask = np.clip(
+            np.nan_to_num(sample_weights.astype(np.float64), nan=0.0),
+            0.0,
+            np.inf,
+        )
+        mask = mask * finite_target
+    elif observed_mask is None:
         mask = finite_target
     else:
         mask = np.clip(
@@ -174,34 +191,35 @@ def compute_masked_metrics_numpy(
         )
         mask = mask * finite_target
 
-    observed_count = int(mask.sum())
-    if observed_count <= 0:
+    observed_count = int((mask > 0).sum())
+    effective_count = float(mask.sum())
+    if effective_count <= 0:
         return MaskedMetricResult(
             mae=float("nan"),
             rmse=float("nan"),
             smape=float("nan"),
             r2=float("nan"),
             observed_count=0,
+            effective_count=0.0,
             mae_per_h=[],
             rmse_per_h=[],
         )
 
     diff = pred - target
     abs_diff = np.abs(diff)
-    mae = float((abs_diff * mask).sum() / max(1, observed_count))
-    rmse = float(np.sqrt(((diff**2) * mask).sum() / max(1, observed_count)))
+    mae = float((abs_diff * mask).sum() / max(_EPSILON, effective_count))
+    rmse = float(np.sqrt(((diff**2) * mask).sum() / max(_EPSILON, effective_count)))
     smape = float(
         (2 * abs_diff / (np.abs(pred) + np.abs(target) + _EPSILON) * mask).sum()
-        / max(1, observed_count)
+        / max(_EPSILON, effective_count)
     )
-    observed_targets = target[mask > 0]
-    if observed_targets.size == 0:
-        r2 = float("nan")
-    else:
-        ss_res = float(((diff**2) * mask).sum())
-        centered = observed_targets - observed_targets.mean()
-        ss_tot = float((centered**2).sum())
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    ss_res = float(((diff**2) * mask).sum())
+    weighted_target_sum = float((target * mask).sum())
+    weighted_target_sq_sum = float(((target**2) * mask).sum())
+    ss_tot = weighted_target_sq_sum - (weighted_target_sum**2) / max(
+        _EPSILON, effective_count
+    )
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
     mae_per_h: list[float] = []
     rmse_per_h: list[float] = []
@@ -219,6 +237,7 @@ def compute_masked_metrics_numpy(
         smape=smape,
         r2=r2,
         observed_count=observed_count,
+        effective_count=effective_count,
         mae_per_h=mae_per_h,
         rmse_per_h=rmse_per_h,
     )
