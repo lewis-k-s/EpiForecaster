@@ -505,6 +505,16 @@ def test_joint_inference_horizon_weights_are_normalized_and_monotonic() -> None:
     assert torch.isclose(exp_decay.horizon_weights.sum(), torch.tensor(1.0))
     assert bool(torch.all(exp_decay.horizon_weights[:-1] > exp_decay.horizon_weights[1:]))
 
+    exp_growth = JointInferenceLoss(
+        forecast_horizon=4,
+        horizon_weight_mode="exp_growth",
+        horizon_weight_gamma=0.8,
+    )
+    assert torch.isclose(exp_growth.horizon_weights.sum(), torch.tensor(1.0))
+    assert bool(
+        torch.all(exp_growth.horizon_weights[:-1] < exp_growth.horizon_weights[1:])
+    )
+
     linear_decay = JointInferenceLoss(
         forecast_horizon=4,
         horizon_weight_mode="linear_decay",

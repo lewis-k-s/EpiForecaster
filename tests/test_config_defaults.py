@@ -56,5 +56,7 @@ def test_joint_loss_defaults_use_balanced_n_eff_scaling() -> None:
 
 @pytest.mark.epiforecaster
 def test_joint_loss_horizon_weight_mode_validation() -> None:
+    cfg = JointLossConfig(horizon_weight_mode="exp_growth")
+    assert cfg.horizon_weight_mode == "exp_growth"
     with pytest.raises(ValueError):
         JointLossConfig(horizon_weight_mode="bad_mode")

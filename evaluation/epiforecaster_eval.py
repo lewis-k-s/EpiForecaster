@@ -289,10 +289,15 @@ class JointInferenceLoss(nn.Module):
                 "horizon_norm_scale_floor must be positive, "
                 f"got {self.horizon_norm_scale_floor}"
             )
-        if self.horizon_weight_mode not in {"uniform", "exp_decay", "linear_decay"}:
+        if self.horizon_weight_mode not in {
+            "uniform",
+            "exp_decay",
+            "exp_growth",
+            "linear_decay",
+        }:
             raise ValueError(
                 "horizon_weight_mode must be one of "
-                "['uniform', 'exp_decay', 'linear_decay'], "
+                "['uniform', 'exp_decay', 'exp_growth', 'linear_decay'], "
                 f"got {self.horizon_weight_mode!r}"
             )
         if not (0 < self.horizon_weight_gamma <= 1):
@@ -332,6 +337,11 @@ class JointInferenceLoss(nn.Module):
             raw = torch.pow(
                 torch.as_tensor(self.horizon_weight_gamma, dtype=torch.float32),
                 torch.arange(horizon, dtype=torch.float32),
+            )
+        elif self.horizon_weight_mode == "exp_growth":
+            raw = torch.pow(
+                torch.as_tensor(self.horizon_weight_gamma, dtype=torch.float32),
+                torch.arange(horizon - 1, -1, -1, dtype=torch.float32),
             )
         else:
             raw = torch.pow(

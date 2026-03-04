@@ -72,8 +72,9 @@ class JointLossConfig:
     # Horizon weighting schedule (after normalization).
     # - uniform: w_h = 1/H
     # - exp_decay: w_h ∝ gamma^h
+    # - exp_growth: w_h ∝ gamma^(H-1-h), favoring farther horizons when gamma<1
     # - linear_decay: w_h ∝ (H - h)^power
-    horizon_weight_mode: str = "exp_decay"
+    horizon_weight_mode: str = "uniform"
     horizon_weight_gamma: float = 0.85
     horizon_weight_power: float = 1.0
     # Confidence scaling based on effective supervised points (n_eff).
@@ -112,7 +113,12 @@ class JointLossConfig:
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
         valid_probes = {"obs_context"}
-        valid_horizon_weight_modes = {"uniform", "exp_decay", "linear_decay"}
+        valid_horizon_weight_modes = {
+            "uniform",
+            "exp_decay",
+            "exp_growth",
+            "linear_decay",
+        }
         self.adaptive_scheme = self.adaptive_scheme.lower()
         self.gradnorm_probe = self.gradnorm_probe.lower()
         self.horizon_weight_mode = self.horizon_weight_mode.lower()
