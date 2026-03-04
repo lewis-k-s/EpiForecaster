@@ -514,6 +514,7 @@ class EpiForecasterTrainer:
                 "EpiForecasterTrainer now requires JointInferenceLoss. "
                 "Set training.loss.name=joint_inference in the config."
             )
+        self.criterion = self.criterion.to(self.device)
 
         joint_cfg = self.config.training.loss.joint
         self._adaptive_scheme = joint_cfg.adaptive_scheme
@@ -1710,6 +1711,20 @@ class EpiForecasterTrainer:
             )
         if self.scheduler and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        criterion_state_dict = checkpoint.get("criterion_state_dict")
+        if criterion_state_dict is not None:
+            criterion = getattr(self, "criterion", None)
+            if isinstance(criterion, nn.Module):
+                missing, unexpected = criterion.load_state_dict(
+                    criterion_state_dict,
+                    strict=False,
+                )
+                if missing or unexpected:
+                    self._status(
+                        "Loaded criterion_state_dict with mismatch "
+                        f"(missing={missing}, unexpected={unexpected})",
+                        logging.WARNING,
+                    )
 
         self.current_epoch = int(checkpoint.get("epoch", -1)) + 1
         self.best_val_loss = checkpoint.get("best_val_loss", self.best_val_loss)
@@ -2724,6 +2739,7 @@ class EpiForecasterTrainer:
             "config": self._get_config_for_save(),
             "training_history": self.training_history,
             "precision_signature": create_precision_signature(self.precision_policy),
+            "criterion_state_dict": self.criterion.state_dict(),
         }
 
         if self.scheduler:

@@ -45,3 +45,16 @@ def test_joint_loss_defaults_use_balanced_n_eff_scaling() -> None:
     assert cfg.hosp_n_eff_reference == 0.0
     assert cfg.cases_n_eff_reference == 0.0
     assert cfg.deaths_n_eff_reference == 0.0
+    assert cfg.horizon_norm_enabled is True
+    assert cfg.horizon_norm_ema_decay == 0.9
+    assert cfg.horizon_norm_eps == 1.0e-6
+    assert cfg.horizon_norm_scale_floor == 1.0e-3
+    assert cfg.horizon_weight_mode == "exp_decay"
+    assert cfg.horizon_weight_gamma == 0.85
+    assert cfg.horizon_weight_power == 1.0
+
+
+@pytest.mark.epiforecaster
+def test_joint_loss_horizon_weight_mode_validation() -> None:
+    with pytest.raises(ValueError):
+        JointLossConfig(horizon_weight_mode="bad_mode")

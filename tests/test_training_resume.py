@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from evaluation.epiforecaster_eval import JointInferenceLoss
 from training.epiforecaster_trainer import EpiForecasterTrainer
 
 
@@ -110,6 +111,7 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     trainer.model = torch.nn.Linear(2, 2, dtype=torch.float32)
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
     trainer.scheduler = None
+    trainer.criterion = JointInferenceLoss(forecast_horizon=2)
     trainer.best_val_loss = float("inf")
     trainer.training_history = {"train_loss": []}
     trainer.current_epoch = 0
@@ -125,12 +127,21 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
         torch.nn.init.constant_(param, 0.0)
     original_state = {k: v.clone() for k, v in trainer.model.state_dict().items()}
     updated_state = {k: v + 1.0 for k, v in original_state.items()}
+    criterion_state = trainer.criterion.state_dict()
+    criterion_state["horizon_rms_scales"] = torch.full_like(
+        criterion_state["horizon_rms_scales"],
+        3.0,
+    )
+    criterion_state["horizon_scale_initialized"] = torch.ones_like(
+        criterion_state["horizon_scale_initialized"]
+    )
 
     torch.save(
         {
             "epoch": 4,
             "model_state_dict": updated_state,
             "optimizer_state_dict": trainer.optimizer.state_dict(),
+            "criterion_state_dict": criterion_state,
             "best_val_loss": 0.123,
             "training_history": {"train_loss": [1.0]},
         },
@@ -141,5 +152,13 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     assert trainer.current_epoch == 5
     assert trainer.best_val_loss == 0.123
     assert trainer.training_history["train_loss"] == [1.0]
+    assert torch.allclose(
+        trainer.criterion.horizon_rms_scales,
+        torch.full_like(trainer.criterion.horizon_rms_scales, 3.0),
+    )
+    assert torch.equal(
+        trainer.criterion.horizon_scale_initialized,
+        torch.ones_like(trainer.criterion.horizon_scale_initialized),
+    )
     for key, value in trainer.model.state_dict().items():
         assert torch.allclose(value, updated_state[key])

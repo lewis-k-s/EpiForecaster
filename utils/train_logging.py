@@ -98,9 +98,12 @@ def add_joint_loss_metrics(
     """Append optional joint-loss metrics (raw + weighted) to epoch payload."""
     for component in JOINT_LOSS_COMPONENTS:
         raw_key = f"loss_{component}"
+        objective_raw_key = f"{raw_key}_raw"
         weighted_key = f"{raw_key}_weighted"
         if raw_key in metrics:
             log_data[f"loss_{split_prefix}_{component}"] = metrics[raw_key]
+        if objective_raw_key in metrics:
+            log_data[f"loss_{split_prefix}_{component}_raw"] = metrics[objective_raw_key]
         if weighted_key in metrics:
             log_data[f"loss_{split_prefix}_{component}_weighted"] = metrics[
                 weighted_key
@@ -248,6 +251,13 @@ def build_epoch_logging_bundle(
         split_prefix=prefix_lower,
         horizon_metrics=horizon_metrics,
     )
+    if horizon_metrics:
+        mixed_mae = float(statistics.mean(mae for _label, mae, _rmse in horizon_metrics))
+        mixed_rmse = float(
+            statistics.mean(rmse for _label, _mae, rmse in horizon_metrics)
+        )
+        log_data[f"mae_{prefix_lower}_mixed_horizon"] = mixed_mae
+        log_data[f"rmse_{prefix_lower}_mixed_horizon"] = mixed_rmse
     add_curriculum_metrics(
         log_data=log_data,
         curriculum_sampler=curriculum_sampler,
@@ -271,6 +281,10 @@ def build_epoch_logging_bundle(
             horizon_metrics=horizon_metrics,
         )
     )
+    if horizon_metrics:
+        status_lines.append(
+            f"{prefix} MAE_mixed: {mixed_mae:.6f} | RMSE_mixed: {mixed_rmse:.6f}"
+        )
 
     return log_data, status_lines
 

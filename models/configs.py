@@ -63,6 +63,19 @@ class JointLossConfig:
     gradnorm_probe: str = "obs_context"
     gradnorm_min_weight: float = 1.0e-3
     gradnorm_obs_weight_sum: float = 0.95
+    # Per-(head, horizon) loss normalization using EMA RMS scales.
+    # Normalized per-horizon MSE: mse_h / (scale_h^2 + eps)
+    horizon_norm_enabled: bool = True
+    horizon_norm_ema_decay: float = 0.9
+    horizon_norm_eps: float = 1.0e-6
+    horizon_norm_scale_floor: float = 1.0e-3
+    # Horizon weighting schedule (after normalization).
+    # - uniform: w_h = 1/H
+    # - exp_decay: w_h ∝ gamma^h
+    # - linear_decay: w_h ∝ (H - h)^power
+    horizon_weight_mode: str = "exp_decay"
+    horizon_weight_gamma: float = 0.85
+    horizon_weight_power: float = 1.0
     # Confidence scaling based on effective supervised points (n_eff).
     # Per-head factor: min(1, n_eff / reference) ** obs_n_eff_power.
     # Reference resolution order per head:
@@ -99,8 +112,10 @@ class JointLossConfig:
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
         valid_probes = {"obs_context"}
+        valid_horizon_weight_modes = {"uniform", "exp_decay", "linear_decay"}
         self.adaptive_scheme = self.adaptive_scheme.lower()
         self.gradnorm_probe = self.gradnorm_probe.lower()
+        self.horizon_weight_mode = self.horizon_weight_mode.lower()
         if self.adaptive_scheme not in valid_schemes:
             raise ValueError(
                 f"adaptive_scheme must be one of {sorted(valid_schemes)}, "
@@ -110,6 +125,12 @@ class JointLossConfig:
             raise ValueError(
                 f"gradnorm_probe must be one of {sorted(valid_probes)}, "
                 f"got {self.gradnorm_probe!r}"
+            )
+        if self.horizon_weight_mode not in valid_horizon_weight_modes:
+            raise ValueError(
+                "horizon_weight_mode must be one of "
+                f"{sorted(valid_horizon_weight_modes)}, "
+                f"got {self.horizon_weight_mode!r}"
             )
 
         for name, value in [
@@ -127,6 +148,11 @@ class JointLossConfig:
             ("hosp_n_eff_reference", self.hosp_n_eff_reference),
             ("cases_n_eff_reference", self.cases_n_eff_reference),
             ("deaths_n_eff_reference", self.deaths_n_eff_reference),
+            ("horizon_norm_ema_decay", self.horizon_norm_ema_decay),
+            ("horizon_norm_eps", self.horizon_norm_eps),
+            ("horizon_norm_scale_floor", self.horizon_norm_scale_floor),
+            ("horizon_weight_gamma", self.horizon_weight_gamma),
+            ("horizon_weight_power", self.horizon_weight_power),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
@@ -143,6 +169,29 @@ class JointLossConfig:
         if self.gradnorm_ema_decay >= 1:
             raise ValueError(
                 f"gradnorm_ema_decay must be in [0, 1), got {self.gradnorm_ema_decay}"
+            )
+        if self.horizon_norm_ema_decay >= 1:
+            raise ValueError(
+                "horizon_norm_ema_decay must be in [0, 1), "
+                f"got {self.horizon_norm_ema_decay}"
+            )
+        if self.horizon_norm_eps <= 0:
+            raise ValueError(
+                f"horizon_norm_eps must be positive, got {self.horizon_norm_eps}"
+            )
+        if self.horizon_norm_scale_floor <= 0:
+            raise ValueError(
+                "horizon_norm_scale_floor must be positive, "
+                f"got {self.horizon_norm_scale_floor}"
+            )
+        if not (0 < self.horizon_weight_gamma <= 1):
+            raise ValueError(
+                "horizon_weight_gamma must be in (0, 1], "
+                f"got {self.horizon_weight_gamma}"
+            )
+        if self.horizon_weight_power <= 0:
+            raise ValueError(
+                f"horizon_weight_power must be positive, got {self.horizon_weight_power}"
             )
         if self.gradnorm_obs_weight_sum <= 0:
             raise ValueError(

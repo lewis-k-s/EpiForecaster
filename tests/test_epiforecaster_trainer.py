@@ -407,3 +407,4 @@ class TestEpiForecasterTrainer:
         checkpoint = torch.load(ckpt_files[0], map_location="cpu", weights_only=False)
         assert "gradnorm_controller_state_dict" in checkpoint
         assert "gradnorm_optimizer_state_dict" in checkpoint
+        assert "criterion_state_dict" in checkpoint

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from utils.train_logging import (
     add_curriculum_metrics,
     add_horizon_metrics_to_log_data,
@@ -17,6 +19,7 @@ def test_add_joint_loss_metrics_only_adds_present_keys() -> None:
     log_data: dict[str, float] = {}
     metrics = {
         "loss_ww": 1.0,
+        "loss_ww_raw": 0.9,
         "loss_ww_weighted": 0.1,
         "loss_sir": 2.0,
     }
@@ -25,6 +28,7 @@ def test_add_joint_loss_metrics_only_adds_present_keys() -> None:
 
     assert log_data == {
         "loss_val_ww": 1.0,
+        "loss_val_ww_raw": 0.9,
         "loss_val_ww_weighted": 0.1,
         "loss_val_sir": 2.0,
     }
@@ -142,9 +146,12 @@ def test_build_epoch_logging_bundle_includes_payload_and_status_lines() -> None:
     assert log_data["loss_val"] == 1.23
     assert log_data["mae_val_h1"] == 0.11
     assert log_data["rmse_val_h2"] == 0.22
+    assert log_data["mae_val_mixed_horizon"] == pytest.approx(0.115)
+    assert log_data["rmse_val_mixed_horizon"] == pytest.approx(0.215)
     assert log_data["train_sparsity_epoch"] == 0.2
     assert log_data["train_synth_ratio_epoch"] == 0.4
 
     assert status_lines[0].startswith("Val loss:")
     assert any("Val loss components:" in line for line in status_lines)
     assert any("Val MAE_h1" in line for line in status_lines)
+    assert any("Val MAE_mixed" in line for line in status_lines)

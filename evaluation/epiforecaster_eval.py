@@ -193,6 +193,7 @@ class JointInferenceLoss(nn.Module):
         "cases": "cases_n_eff_reference",
         "deaths": "deaths_n_eff_reference",
     }
+    _HEAD_INDEX = {head_name: idx for idx, head_name in enumerate(_OBS_HEADS)}
 
     def __init__(
         self,
@@ -218,6 +219,14 @@ class JointInferenceLoss(nn.Module):
         hosp_n_eff_reference: float = 0.0,
         cases_n_eff_reference: float = 0.0,
         deaths_n_eff_reference: float = 0.0,
+        forecast_horizon: int | None = None,
+        horizon_norm_enabled: bool = True,
+        horizon_norm_ema_decay: float = 0.9,
+        horizon_norm_eps: float = 1.0e-6,
+        horizon_norm_scale_floor: float = 1.0e-3,
+        horizon_weight_mode: str = "exp_decay",
+        horizon_weight_gamma: float = 0.85,
+        horizon_weight_power: float = 1.0,
     ):
         super().__init__()
         self.obs_weight_sum = float(obs_weight_sum)
@@ -242,6 +251,13 @@ class JointInferenceLoss(nn.Module):
         self.hosp_n_eff_reference = float(hosp_n_eff_reference)
         self.cases_n_eff_reference = float(cases_n_eff_reference)
         self.deaths_n_eff_reference = float(deaths_n_eff_reference)
+        self.horizon_norm_enabled = bool(horizon_norm_enabled)
+        self.horizon_norm_ema_decay = float(horizon_norm_ema_decay)
+        self.horizon_norm_eps = float(horizon_norm_eps)
+        self.horizon_norm_scale_floor = float(horizon_norm_scale_floor)
+        self.horizon_weight_mode = str(horizon_weight_mode).lower()
+        self.horizon_weight_gamma = float(horizon_weight_gamma)
+        self.horizon_weight_power = float(horizon_weight_power)
         if self.obs_weight_sum <= 0:
             raise ValueError(
                 f"obs_weight_sum must be positive, got {self.obs_weight_sum}"
@@ -259,6 +275,133 @@ class JointInferenceLoss(nn.Module):
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
+        if not (0 <= self.horizon_norm_ema_decay < 1):
+            raise ValueError(
+                "horizon_norm_ema_decay must be in [0, 1), "
+                f"got {self.horizon_norm_ema_decay}"
+            )
+        if self.horizon_norm_eps <= 0:
+            raise ValueError(
+                f"horizon_norm_eps must be positive, got {self.horizon_norm_eps}"
+            )
+        if self.horizon_norm_scale_floor <= 0:
+            raise ValueError(
+                "horizon_norm_scale_floor must be positive, "
+                f"got {self.horizon_norm_scale_floor}"
+            )
+        if self.horizon_weight_mode not in {"uniform", "exp_decay", "linear_decay"}:
+            raise ValueError(
+                "horizon_weight_mode must be one of "
+                "['uniform', 'exp_decay', 'linear_decay'], "
+                f"got {self.horizon_weight_mode!r}"
+            )
+        if not (0 < self.horizon_weight_gamma <= 1):
+            raise ValueError(
+                "horizon_weight_gamma must be in (0, 1], "
+                f"got {self.horizon_weight_gamma}"
+            )
+        if self.horizon_weight_power <= 0:
+            raise ValueError(
+                f"horizon_weight_power must be positive, got {self.horizon_weight_power}"
+            )
+        if forecast_horizon is not None and int(forecast_horizon) < 1:
+            raise ValueError(
+                f"forecast_horizon must be >= 1 when provided, got {forecast_horizon}"
+            )
+
+        initial_horizon = int(forecast_horizon) if forecast_horizon is not None else 0
+        self.register_buffer(
+            "horizon_rms_scales",
+            torch.ones((len(self._OBS_HEADS), initial_horizon), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "horizon_scale_initialized",
+            torch.zeros((len(self._OBS_HEADS), initial_horizon), dtype=torch.bool),
+        )
+        self.register_buffer(
+            "horizon_weights",
+            self._build_horizon_weights(initial_horizon),
+        )
+
+    def _build_horizon_weights(self, horizon: int) -> torch.Tensor:
+        if horizon <= 0:
+            return torch.zeros(0, dtype=torch.float32)
+        if self.horizon_weight_mode == "uniform":
+            raw = torch.ones(horizon, dtype=torch.float32)
+        elif self.horizon_weight_mode == "exp_decay":
+            raw = torch.pow(
+                torch.as_tensor(self.horizon_weight_gamma, dtype=torch.float32),
+                torch.arange(horizon, dtype=torch.float32),
+            )
+        else:
+            raw = torch.pow(
+                torch.arange(horizon, 0, -1, dtype=torch.float32),
+                self.horizon_weight_power,
+            )
+        return raw / raw.sum().clamp_min(1e-8)
+
+    def _ensure_horizon_state(self, horizon: int) -> None:
+        if horizon < 1:
+            raise ValueError(f"horizon must be >= 1, got {horizon}")
+        current_horizon = int(self.horizon_weights.numel())
+        if current_horizon == horizon:
+            return
+
+        target_device = self.horizon_rms_scales.device
+        new_scales = torch.ones(
+            (len(self._OBS_HEADS), horizon),
+            dtype=torch.float32,
+            device=target_device,
+        )
+        new_initialized = torch.zeros(
+            (len(self._OBS_HEADS), horizon),
+            dtype=torch.bool,
+            device=target_device,
+        )
+        overlap = min(current_horizon, horizon)
+        if overlap > 0:
+            new_scales[:, :overlap] = self.horizon_rms_scales[:, :overlap]
+            new_initialized[:, :overlap] = self.horizon_scale_initialized[:, :overlap]
+        self.horizon_rms_scales = new_scales
+        self.horizon_scale_initialized = new_initialized
+        self.horizon_weights = self._build_horizon_weights(horizon).to(target_device)
+
+    def _ensure_horizon_state_device(self, device: torch.device) -> None:
+        if self.horizon_rms_scales.device == device:
+            return
+        self.horizon_rms_scales = self.horizon_rms_scales.to(device)
+        self.horizon_scale_initialized = self.horizon_scale_initialized.to(device)
+        self.horizon_weights = self.horizon_weights.to(device)
+
+    @staticmethod
+    def _align_prediction_to_target_horizon(
+        prediction: torch.Tensor,
+        target_horizon: int,
+    ) -> torch.Tensor:
+        if prediction.ndim < 2:
+            return prediction
+        if target_horizon < 1:
+            return prediction
+        current_horizon = int(prediction.shape[1])
+        if current_horizon <= target_horizon:
+            return prediction
+        return prediction[:, :target_horizon]
+
+    def _resolve_batch_horizon(
+        self,
+        *,
+        obs_supervision: dict[str, dict[str, torch.Tensor | None]],
+        model_outputs: dict[str, torch.Tensor],
+    ) -> int | None:
+        for head_name in self._OBS_HEADS:
+            target = obs_supervision[head_name]["target"]
+            if target is not None:
+                return int(target.shape[1])
+        for key in ("pred_deaths", "physics_residual"):
+            value = model_outputs.get(key)
+            if isinstance(value, torch.Tensor) and value.ndim >= 2:
+                return int(value.shape[1])
+        return None
 
     @staticmethod
     def fixed_obs_weights(
@@ -412,6 +555,161 @@ class JointInferenceLoss(nn.Module):
             1e-8
         )
 
+    @staticmethod
+    def _compute_per_h_mse(
+        *,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        prediction_f32 = prediction.float()
+        target_f32 = target.float()
+        weights_f32 = weights.float()
+        active = weights_f32 > 0
+
+        prediction_clean = torch.nan_to_num(
+            prediction_f32,
+            nan=0.0,
+            posinf=_LOSS_VALUE_CLAMP,
+            neginf=-_LOSS_VALUE_CLAMP,
+        ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+        target_clean = torch.nan_to_num(
+            target_f32,
+            nan=0.0,
+            posinf=_LOSS_VALUE_CLAMP,
+            neginf=-_LOSS_VALUE_CLAMP,
+        ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+        prediction_safe = torch.where(
+            active, prediction_clean, torch.zeros_like(prediction_clean)
+        )
+        target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
+
+        sq = (prediction_safe - target_safe) ** 2
+        sq_sum_h = (sq * weights_f32).sum(dim=0)
+        count_h = weights_f32.sum(dim=0)
+        mse_h = sq_sum_h / count_h.clamp_min(1.0)
+        return mse_h, count_h
+
+    def _maybe_update_horizon_scales(
+        self,
+        *,
+        head_idx: int,
+        mse_h: torch.Tensor,
+        active_h: torch.Tensor,
+    ) -> None:
+        if not self.horizon_norm_enabled:
+            return
+        with torch.no_grad():
+            rms_h = torch.sqrt(mse_h.detach().clamp_min(0.0))
+            active_h_bool = active_h
+            scale_row = self.horizon_rms_scales[head_idx]
+            initialized_row = self.horizon_scale_initialized[head_idx]
+
+            newly_active = active_h_bool & (~initialized_row)
+            scale_row_next = torch.where(newly_active, rms_h, scale_row)
+            initialized_next = initialized_row | newly_active
+
+            steady = active_h_bool & initialized_next
+            d = self.horizon_norm_ema_decay
+            ema_value = d * scale_row_next + (1.0 - d) * rms_h
+            scale_row_next = torch.where(steady, ema_value, scale_row_next)
+
+            clamped = scale_row_next.clamp_min(self.horizon_norm_scale_floor)
+            scale_row_next = torch.where(
+                active_h_bool,
+                clamped,
+                scale_row_next,
+            )
+            scale_row.copy_(scale_row_next)
+            initialized_row.copy_(initialized_next)
+
+    def _use_legacy_observation_objective(self) -> bool:
+        """Preserve historical loss behavior when horizon weighting is effectively off."""
+        return (not self.horizon_norm_enabled) and self.horizon_weight_mode == "uniform"
+
+    def _head_horizon_normalized_mse_loss(
+        self,
+        *,
+        head_name: str,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        head_idx = self._HEAD_INDEX[head_name]
+        mse_h, count_h = self._compute_per_h_mse(
+            prediction=prediction,
+            target=target,
+            weights=weights,
+        )
+        active_h = count_h > 0
+        scale_h = self.horizon_rms_scales[head_idx]
+        if self._use_legacy_observation_objective():
+            legacy_loss = self._weighted_masked_mse_from_weights(
+                prediction=prediction,
+                target=target,
+                weights=weights,
+            )
+            horizon_weights = self.horizon_weights
+            weighted_active = horizon_weights * active_h.to(dtype=mse_h.dtype)
+            denom = weighted_active.sum()
+            raw_loss = torch.where(
+                denom > 0,
+                (weighted_active * mse_h).sum() / denom.clamp_min(self.horizon_norm_eps),
+                mse_h.new_zeros(()),
+            )
+            contrib = torch.where(
+                denom > 0,
+                (weighted_active * mse_h) / denom.clamp_min(self.horizon_norm_eps),
+                torch.zeros_like(mse_h),
+            )
+            return legacy_loss, {
+                "raw": mse_h.detach(),
+                "norm": mse_h.detach(),
+                "contrib": contrib.detach(),
+                "scale": scale_h.detach(),
+                "raw_loss": raw_loss.detach(),
+            }
+
+        if self.horizon_norm_enabled:
+            mse_norm_h = mse_h / (scale_h.detach().pow(2) + self.horizon_norm_eps)
+        else:
+            mse_norm_h = mse_h
+
+        horizon_weights = self.horizon_weights
+        weighted_active = horizon_weights * active_h.to(dtype=mse_h.dtype)
+        denom = weighted_active.sum()
+        raw_loss = torch.where(
+            denom > 0,
+            (weighted_active * mse_h).sum() / denom.clamp_min(self.horizon_norm_eps),
+            mse_h.new_zeros(()),
+        )
+        numerator = (weighted_active * mse_norm_h).sum()
+        loss = torch.where(
+            denom > 0,
+            numerator / denom.clamp_min(self.horizon_norm_eps),
+            mse_h.new_zeros(()),
+        )
+        contrib = torch.where(
+            denom > 0,
+            (weighted_active * mse_norm_h) / denom.clamp_min(self.horizon_norm_eps),
+            torch.zeros_like(mse_h),
+        )
+
+        if self.training and self.horizon_norm_enabled:
+            self._maybe_update_horizon_scales(
+                head_idx=head_idx,
+                mse_h=mse_h,
+                active_h=active_h,
+            )
+
+        return loss, {
+            "raw": mse_h.detach(),
+            "norm": mse_norm_h.detach(),
+            "contrib": contrib.detach(),
+            "scale": scale_h.detach(),
+            "raw_loss": raw_loss.detach(),
+        }
+
     def _head_n_eff_scale(self, *, head_name: str, n_eff: torch.Tensor) -> torch.Tensor:
         if self.obs_n_eff_power <= 0:
             return torch.as_tensor(1.0, device=n_eff.device, dtype=torch.float32)
@@ -475,6 +773,8 @@ class JointInferenceLoss(nn.Module):
         model_outputs: dict[str, torch.Tensor],
         targets: dict[str, torch.Tensor | None],
         batch_data: dict[str, torch.Tensor] | None = None,
+        *,
+        emit_horizon_diagnostics: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Compute joint inference loss components.
@@ -510,15 +810,26 @@ class JointInferenceLoss(nn.Module):
             * 0.0
         )
         ww_loss = zero_anchor
+        ww_raw_loss = zero_anchor
         hosp_loss = zero_anchor
+        hosp_raw_loss = zero_anchor
         cases_loss = zero_anchor
+        cases_raw_loss = zero_anchor
         deaths_loss = zero_anchor
+        deaths_raw_loss = zero_anchor
         sir_loss = zero_anchor
         continuity_loss = zero_anchor
         obs_supervision = self.compute_observation_supervision(
             targets,
             device=zero_anchor.device,
         )
+        batch_horizon = self._resolve_batch_horizon(
+            obs_supervision=obs_supervision,
+            model_outputs=model_outputs,
+        )
+        if batch_horizon is not None:
+            self._ensure_horizon_state(batch_horizon)
+        self._ensure_horizon_state_device(zero_anchor.device)
         obs_active_mask = torch.stack(
             [
                 cast(torch.Tensor, obs_supervision["ww"]["active"]),
@@ -532,59 +843,80 @@ class JointInferenceLoss(nn.Module):
         hosp_n_eff = cast(torch.Tensor, obs_supervision["hosp"]["n_eff"]).float()
         cases_n_eff = cast(torch.Tensor, obs_supervision["cases"]["n_eff"]).float()
         deaths_n_eff = cast(torch.Tensor, obs_supervision["deaths"]["n_eff"]).float()
+        horizon_diagnostics: dict[str, dict[str, torch.Tensor]] = {}
 
         ww_target = obs_supervision["ww"]["target"]
         ww_weights = obs_supervision["ww"]["weights"]
         if ww_target is not None and ww_weights is not None:
-            ww_base = self._weighted_masked_mse_from_weights(
+            ww_base, ww_diag = self._head_horizon_normalized_mse_loss(
+                head_name="ww",
                 prediction=drop_nowcast(model_outputs["pred_ww"], ww_target.shape[1]),
                 target=ww_target,
                 weights=ww_weights,
             )
-            ww_loss = ww_base * self._head_n_eff_scale(head_name="ww", n_eff=ww_n_eff)
+            horizon_diagnostics["ww"] = ww_diag
+            ww_scale = self._head_n_eff_scale(head_name="ww", n_eff=ww_n_eff)
+            ww_loss = ww_base * ww_scale
+            ww_raw_loss = cast(torch.Tensor, ww_diag["raw_loss"]) * ww_scale
 
         hosp_target = obs_supervision["hosp"]["target"]
         hosp_weights = obs_supervision["hosp"]["weights"]
         if hosp_target is not None and hosp_weights is not None:
-            hosp_base = self._weighted_masked_mse_from_weights(
+            hosp_base, hosp_diag = self._head_horizon_normalized_mse_loss(
+                head_name="hosp",
                 prediction=drop_nowcast(
                     model_outputs["pred_hosp"], hosp_target.shape[1]
                 ),
                 target=hosp_target,
                 weights=hosp_weights,
             )
-            hosp_loss = hosp_base * self._head_n_eff_scale(
+            horizon_diagnostics["hosp"] = hosp_diag
+            hosp_scale = self._head_n_eff_scale(
                 head_name="hosp",
                 n_eff=hosp_n_eff,
             )
+            hosp_loss = hosp_base * hosp_scale
+            hosp_raw_loss = cast(torch.Tensor, hosp_diag["raw_loss"]) * hosp_scale
 
         cases_target = obs_supervision["cases"]["target"]
         cases_weights = obs_supervision["cases"]["weights"]
         if cases_target is not None and cases_weights is not None:
-            cases_base = self._weighted_masked_mse_from_weights(
+            cases_base, cases_diag = self._head_horizon_normalized_mse_loss(
+                head_name="cases",
                 prediction=drop_nowcast(
                     model_outputs["pred_cases"], cases_target.shape[1]
                 ),
                 target=cases_target,
                 weights=cases_weights,
             )
-            cases_loss = cases_base * self._head_n_eff_scale(
+            horizon_diagnostics["cases"] = cases_diag
+            cases_scale = self._head_n_eff_scale(
                 head_name="cases",
                 n_eff=cases_n_eff,
             )
+            cases_loss = cases_base * cases_scale
+            cases_raw_loss = cast(torch.Tensor, cases_diag["raw_loss"]) * cases_scale
 
         deaths_target = obs_supervision["deaths"]["target"]
         deaths_weights = obs_supervision["deaths"]["weights"]
         if deaths_target is not None and deaths_weights is not None:
-            deaths_base = self._weighted_masked_mse_from_weights(
-                prediction=model_outputs["pred_deaths"],
+            deaths_prediction = self._align_prediction_to_target_horizon(
+                model_outputs["pred_deaths"],
+                deaths_target.shape[1],
+            )
+            deaths_base, deaths_diag = self._head_horizon_normalized_mse_loss(
+                head_name="deaths",
+                prediction=deaths_prediction,
                 target=deaths_target,
                 weights=deaths_weights,
             )
-            deaths_loss = deaths_base * self._head_n_eff_scale(
+            horizon_diagnostics["deaths"] = deaths_diag
+            deaths_scale = self._head_n_eff_scale(
                 head_name="deaths",
                 n_eff=deaths_n_eff,
             )
+            deaths_loss = deaths_base * deaths_scale
+            deaths_raw_loss = cast(torch.Tensor, deaths_diag["raw_loss"]) * deaths_scale
 
         # SIR physics loss (always computed from residual)
         if self.w_sir > 0:
@@ -648,6 +980,34 @@ class JointInferenceLoss(nn.Module):
             obs_active_mask=obs_active_mask,
         )
 
+        horizon_terms: dict[str, torch.Tensor] = {}
+        if emit_horizon_diagnostics:
+            horizon_count = int(self.horizon_weights.numel())
+            for head_name in self._OBS_HEADS:
+                head_diag = horizon_diagnostics.get(head_name)
+                if head_diag is None:
+                    zeros = zero_anchor.new_zeros((horizon_count,))
+                    scale_h = self.horizon_rms_scales[self._HEAD_INDEX[head_name]]
+                    head_diag = {
+                        "raw": zeros,
+                        "norm": zeros,
+                        "contrib": zeros,
+                        "scale": scale_h.detach(),
+                    }
+                for h_idx in range(horizon_count):
+                    horizon_terms[f"loss_{head_name}_h{h_idx + 1}_raw"] = head_diag[
+                        "raw"
+                    ][h_idx]
+                    horizon_terms[f"loss_{head_name}_h{h_idx + 1}_norm"] = head_diag[
+                        "norm"
+                    ][h_idx]
+                    horizon_terms[f"loss_{head_name}_h{h_idx + 1}_contrib"] = head_diag[
+                        "contrib"
+                    ][h_idx]
+                    horizon_terms[f"horizon_scale_{head_name}_h{h_idx + 1}"] = head_diag[
+                        "scale"
+                    ][h_idx]
+
         return {
             "ww": ww_loss,
             "hosp": hosp_loss,
@@ -659,6 +1019,10 @@ class JointInferenceLoss(nn.Module):
             "hosp_weighted": totals["hosp_weighted"],
             "cases_weighted": totals["cases_weighted"],
             "deaths_weighted": totals["deaths_weighted"],
+            "ww_raw": ww_raw_loss,
+            "hosp_raw": hosp_raw_loss,
+            "cases_raw": cases_raw_loss,
+            "deaths_raw": deaths_raw_loss,
             "sir_weighted": totals["sir_weighted"],
             "continuity_weighted": totals["continuity_weighted"],
             "ww_n_eff": ww_n_eff,
@@ -669,6 +1033,7 @@ class JointInferenceLoss(nn.Module):
             "obs_active_mask": obs_active_mask,
             "obs_total": totals["obs_total"],
             "total": totals["total"],
+            **horizon_terms,
         }
 
     def compute_components_train(
@@ -678,7 +1043,12 @@ class JointInferenceLoss(nn.Module):
         batch_data: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compile-safe train path (kept separate to avoid eval-path regressions)."""
-        return self.compute_components(model_outputs, targets, batch_data)
+        return self.compute_components(
+            model_outputs,
+            targets,
+            batch_data,
+            emit_horizon_diagnostics=False,
+        )
 
     def _compute_continuity_loss(
         self,
@@ -710,10 +1080,12 @@ class JointInferenceLoss(nn.Module):
             nowcast_pred: torch.Tensor, last_observed: torch.Tensor
         ) -> torch.Tensor:
             valid_mask = torch.isfinite(last_observed)
-            valid_f = valid_mask.to(dtype=nowcast_pred.dtype)
+            valid_f = valid_mask.to(
+                device=nowcast_pred.device, dtype=nowcast_pred.dtype
+            )
             last_observed_safe = torch.nan_to_num(
                 last_observed.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).to(nowcast_pred.dtype)
+            ).to(device=nowcast_pred.device, dtype=nowcast_pred.dtype)
             sq = (nowcast_pred - last_observed_safe) ** 2
             numerator = (sq * valid_f).sum()
             denominator = valid_f.sum().clamp_min(1.0)
@@ -800,6 +1172,14 @@ def get_loss_from_config(
             hosp_n_eff_reference=joint_cfg.hosp_n_eff_reference,
             cases_n_eff_reference=joint_cfg.cases_n_eff_reference,
             deaths_n_eff_reference=joint_cfg.deaths_n_eff_reference,
+            forecast_horizon=int(forecast_horizon) if forecast_horizon is not None else None,
+            horizon_norm_enabled=joint_cfg.horizon_norm_enabled,
+            horizon_norm_ema_decay=joint_cfg.horizon_norm_ema_decay,
+            horizon_norm_eps=joint_cfg.horizon_norm_eps,
+            horizon_norm_scale_floor=joint_cfg.horizon_norm_scale_floor,
+            horizon_weight_mode=joint_cfg.horizon_weight_mode,
+            horizon_weight_gamma=joint_cfg.horizon_weight_gamma,
+            horizon_weight_power=joint_cfg.horizon_weight_power,
         )
     if name_lower == "composite":
         if not loss_config.components:
@@ -914,6 +1294,33 @@ def load_model_from_checkpoint(
     model.load_state_dict(state_dict)
     model.to(resolve_device(device))
     return model, config, checkpoint
+
+
+def _maybe_load_criterion_state_from_checkpoint(
+    *,
+    criterion: JointInferenceLoss,
+    checkpoint: dict[str, Any],
+) -> None:
+    state_dict = checkpoint.get("criterion_state_dict")
+    if state_dict is None:
+        logger.info(
+            "[eval] Checkpoint missing criterion_state_dict; "
+            "using freshly initialized loss state."
+        )
+        return
+    try:
+        missing, unexpected = criterion.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            logger.warning(
+                "[eval] Loaded criterion_state_dict with mismatch "
+                f"(missing={missing}, unexpected={unexpected})."
+            )
+    except RuntimeError as exc:
+        logger.warning(
+            "[eval] Failed to load criterion_state_dict (%s). "
+            "Using freshly initialized loss state.",
+            exc,
+        )
 
 
 def split_nodes(config: EpiForecasterConfig) -> tuple[list[int], list[int], list[int]]:
@@ -1272,6 +1679,10 @@ def evaluate_checkpoint_topk_forecasts(
                 "Evaluation now requires JointInferenceLoss. "
                 "Set training.loss.name=joint_inference in the config."
             )
+        _maybe_load_criterion_state_from_checkpoint(
+            criterion=criterion,
+            checkpoint=checkpoint,
+        )
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
             loader=loader,
@@ -1353,6 +1764,7 @@ def evaluate_loader(
     Uses device-local metric accumulation to minimize CPU-GPU synchronization.
     """
     logger.info(f"{split_name} evaluation started...")
+    criterion = criterion.to(device)
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
     hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
@@ -1364,11 +1776,23 @@ def evaluate_loader(
     loss_cases_sum = torch.tensor(0.0, device=device)
     loss_deaths_sum = torch.tensor(0.0, device=device)
     loss_sir_sum = torch.tensor(0.0, device=device)
+    loss_ww_raw_sum = torch.tensor(0.0, device=device)
+    loss_hosp_raw_sum = torch.tensor(0.0, device=device)
+    loss_cases_raw_sum = torch.tensor(0.0, device=device)
+    loss_deaths_raw_sum = torch.tensor(0.0, device=device)
     loss_ww_weighted_sum = torch.tensor(0.0, device=device)
     loss_hosp_weighted_sum = torch.tensor(0.0, device=device)
     loss_cases_weighted_sum = torch.tensor(0.0, device=device)
     loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
     loss_sir_weighted_sum = torch.tensor(0.0, device=device)
+    horizon_metric_sums: dict[str, torch.Tensor] = {}
+    horizon_metric_prefixes = (
+        "loss_ww_h",
+        "loss_hosp_h",
+        "loss_cases_h",
+        "loss_deaths_h",
+        "horizon_scale_",
+    )
 
     # For node-level MAE, accumulate in dict but defer item() calls
     node_mae_sum: dict[int, torch.Tensor] = {}
@@ -1379,7 +1803,9 @@ def evaluate_loader(
     log_every = 10
 
     model_was_training = model.training
+    criterion_was_training = criterion.training
     model.eval()
+    criterion.eval()
     forward_model = cast(EpiForecaster, model)
     try:
         with (
@@ -1420,7 +1846,10 @@ def evaluate_loader(
 
                 # Compute loss with batch_data for continuity penalty
                 components = criterion.compute_components(
-                    model_outputs, targets_dict, batch_data
+                    model_outputs,
+                    targets_dict,
+                    batch_data,
+                    emit_horizon_diagnostics=True,
                 )
                 metric_supervision = criterion.compute_observation_supervision(
                     targets_dict,
@@ -1433,6 +1862,10 @@ def evaluate_loader(
                 loss_cases_sum += components["cases"].detach()
                 loss_deaths_sum += components["deaths"].detach()
                 loss_sir_sum += components["sir"].detach()
+                loss_ww_raw_sum += components["ww_raw"].detach()
+                loss_hosp_raw_sum += components["hosp_raw"].detach()
+                loss_cases_raw_sum += components["cases_raw"].detach()
+                loss_deaths_raw_sum += components["deaths_raw"].detach()
                 if "continuity" in components:
                     pass  # Don't accumulate continuity loss in metrics
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
@@ -1440,6 +1873,14 @@ def evaluate_loader(
                 loss_cases_weighted_sum += components["cases_weighted"].detach()
                 loss_deaths_weighted_sum += components["deaths_weighted"].detach()
                 loss_sir_weighted_sum += components["sir_weighted"].detach()
+                for key, value in components.items():
+                    if not isinstance(value, torch.Tensor) or value.ndim != 0:
+                        continue
+                    if not key.startswith(horizon_metric_prefixes):
+                        continue
+                    if key not in horizon_metric_sums:
+                        horizon_metric_sums[key] = torch.tensor(0.0, device=device)
+                    horizon_metric_sums[key] += value.detach()
 
                 # Log sparsity-loss correlation during evaluation (moved from training)
                 if batch_idx % 10 == 0:
@@ -1535,6 +1976,8 @@ def evaluate_loader(
     finally:
         if model_was_training:
             model.train()
+        if criterion_was_training:
+            criterion.train()
 
     # Final sync - transfer metrics to CPU once
     mean_loss = (total_loss / max(1, num_batches)).item()
@@ -1600,6 +2043,10 @@ def evaluate_loader(
         "loss_hosp": (loss_hosp_sum / max(1, num_batches)).item(),
         "loss_cases": (loss_cases_sum / max(1, num_batches)).item(),
         "loss_deaths": (loss_deaths_sum / max(1, num_batches)).item(),
+        "loss_ww_raw": (loss_ww_raw_sum / max(1, num_batches)).item(),
+        "loss_hosp_raw": (loss_hosp_raw_sum / max(1, num_batches)).item(),
+        "loss_cases_raw": (loss_cases_raw_sum / max(1, num_batches)).item(),
+        "loss_deaths_raw": (loss_deaths_raw_sum / max(1, num_batches)).item(),
         "loss_sir": (loss_sir_sum / max(1, num_batches)).item(),
         "loss_ww_weighted": (loss_ww_weighted_sum / max(1, num_batches)).item(),
         "loss_hosp_weighted": (loss_hosp_weighted_sum / max(1, num_batches)).item(),
@@ -1607,6 +2054,8 @@ def evaluate_loader(
         "loss_deaths_weighted": (loss_deaths_weighted_sum / max(1, num_batches)).item(),
         "loss_sir_weighted": (loss_sir_weighted_sum / max(1, num_batches)).item(),
     }
+    for key, value in horizon_metric_sums.items():
+        metrics[key] = (value / max(1, num_batches)).item()
 
     logger.info("EVAL COMPLETE")
     return mean_loss, metrics, node_mae
@@ -1813,6 +2262,15 @@ def eval_checkpoint(
             config.training.loss,
             data_config=config.data,
             forecast_horizon=config.model.forecast_horizon,
+        )
+        if not isinstance(criterion, JointInferenceLoss):
+            raise ValueError(
+                "Evaluation now requires JointInferenceLoss. "
+                "Set training.loss.name=joint_inference in the config."
+            )
+        _maybe_load_criterion_state_from_checkpoint(
+            criterion=criterion,
+            checkpoint=checkpoint,
         )
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
