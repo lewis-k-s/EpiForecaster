@@ -440,6 +440,7 @@ def objective(
 
     trial.set_user_attr("slurm", slurm)
     trial.set_user_attr("overrides", overrides)
+    trial.set_user_attr("base_config_path", str(base_config_path))
 
     # Run training and return objective.
     # Pass trial to trainer for intermediate pruning support.
