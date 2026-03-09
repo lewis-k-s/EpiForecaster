@@ -1,7 +1,9 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
-from evaluation.epiforecaster_eval import JointInferenceLoss
+from evaluation.losses import JointInferenceLoss, get_loss_from_config
+from models.configs import LossConfig
 from models.sir_rollforward import SIRRollForward
 
 
@@ -50,6 +52,18 @@ def test_joint_inference_sir_loss_zero_when_all_observation_masks_missing():
 
     loss = loss_fn(model_outputs, targets)
     assert loss.item() == 0.0
+
+
+def test_get_loss_from_config_default_is_joint_inference() -> None:
+    criterion = get_loss_from_config(None)
+    assert isinstance(criterion, JointInferenceLoss)
+
+
+def test_get_loss_from_config_rejects_non_joint_name() -> None:
+    loss_cfg = LossConfig(name="joint_inference")
+    loss_cfg.name = "mse"
+    with pytest.raises(ValueError, match="Only training.loss.name='joint_inference'"):
+        _ = get_loss_from_config(loss_cfg)
 
 
 def test_joint_inference_sir_loss_respects_observation_mask():
@@ -378,3 +392,42 @@ def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:
     ).to(dtype=torch.bool)
     components = loss_fn.compute_components(model_outputs, targets)
     assert torch.equal(components["obs_active_mask"], expected_active)
+
+
+def test_continuity_uses_only_active_heads() -> None:
+    loss_fn = JointInferenceLoss(
+        w_sir=0.0,
+        w_continuity=1.0,
+        disable_ww=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.zeros(1, 2),
+        "pred_hosp": torch.tensor([[1.0, 0.0]]),
+        "pred_cases": torch.tensor([[10.0, 0.0]]),
+        "pred_deaths": torch.tensor([[20.0]]),
+        "physics_residual": torch.zeros(1, 1),
+    }
+    targets = {
+        "ww": None,
+        "hosp": torch.tensor([[0.0]]),
+        "cases": torch.tensor([[0.0]]),
+        "deaths": torch.tensor([[0.0]]),
+        "ww_mask": None,
+        "hosp_mask": torch.tensor([[1.0]]),
+        "cases_mask": torch.tensor([[0.0]]),
+        "deaths_mask": torch.tensor([[0.0]]),
+    }
+    batch_data = SimpleNamespace(
+        hosp_hist=torch.tensor([[[0.0, 0.0, 0.0], [3.0, 1.0, 0.0]]]),
+        cases_hist=torch.tensor([[[0.0, 0.0, 0.0], [1000.0, 1.0, 0.0]]]),
+        deaths_hist=torch.tensor([[[0.0, 0.0, 0.0], [2000.0, 1.0, 0.0]]]),
+    )
+
+    components = loss_fn.compute_components(
+        model_outputs=model_outputs,
+        targets=targets,
+        batch_data=batch_data,
+    )
+
+    assert components["obs_active_mask"].tolist() == [False, True, False, False]
+    assert torch.isclose(components["continuity"], torch.tensor(4.0))

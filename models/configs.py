@@ -34,18 +34,6 @@ class ProfilerConfig:
 
 
 @dataclass
-class LossComponentConfig:
-    """Single loss component for composite objectives."""
-
-    name: str
-    weight: float = 1.0
-
-    def __post_init__(self) -> None:
-        if self.weight < 0:
-            raise ValueError("loss component weight must be non-negative")
-
-
-@dataclass
 class JointLossConfig:
     """Loss weights for joint inference training."""
 
@@ -161,24 +149,10 @@ class LossConfig:
     """Loss configuration from ``training.loss`` YAML block."""
 
     name: str = "joint_inference"
-    components: list[LossComponentConfig] = field(default_factory=list)
     # Joint inference loss weights (used when training with SIR + observation heads)
     joint: JointLossConfig = field(default_factory=JointLossConfig)
 
     def __post_init__(self) -> None:
-        if isinstance(self.components, list):
-            normalized: list[LossComponentConfig] = []
-            for component in self.components:
-                if isinstance(component, LossComponentConfig):
-                    normalized.append(component)
-                elif isinstance(component, (dict, DictConfig)):
-                    normalized.append(LossComponentConfig(**component))
-                else:
-                    raise ValueError(
-                        "loss.components must be LossComponentConfig or dict entries"
-                    )
-            self.components = normalized
-
         if isinstance(self.joint, (dict, DictConfig)):
             self.joint = JointLossConfig(**self.joint)
 
@@ -758,6 +732,12 @@ class TrainingParams:
     # Gradient debugging (toggleable, disabled by default for zero overhead)
     enable_gradient_debug: bool = False
     gradient_debug_log_dir: str | None = None  # Auto-set if None and enabled
+    # Periodic layer-wise gradient snapshots for interpretability/visualization.
+    # 0 disables periodic capture; snapshots are always pre-clip.
+    gradient_snapshot_frequency: int = 0
+    gradient_snapshot_top_k: int = 5
+    gradient_vanishing_threshold: float = 1.0e-8
+    gradient_exploding_threshold: float = 1.0e2
     # Apply torch.compile to the model for performance
     compile: bool = False
     # torch.compile mode. "reduce-overhead" can improve GPU utilization by reducing
@@ -783,33 +763,11 @@ class TrainingParams:
             profiler_dict = cast(dict[str, Any], self.profiler)
             self.profiler = ProfilerConfig(**profiler_dict)
 
-        valid_loss_names = {
-            "smape",
-            "mse",
-            "mae",
-            "l1",
-            "mse_unscaled",
-            "composite",
-            "joint_inference",
-        }
         loss_name = (self.loss.name or "").lower()
-        if loss_name not in valid_loss_names:
+        if loss_name != "joint_inference":
             raise ValueError(
-                f"Invalid loss.name: {self.loss.name}. Valid options: {sorted(valid_loss_names)}"
-            )
-        if loss_name == "composite":
-            if not self.loss.components:
-                raise ValueError("loss.components must be provided for composite loss")
-            for component in self.loss.components:
-                comp_name = (component.name or "").lower()
-                if comp_name not in valid_loss_names - {"composite"}:
-                    raise ValueError(
-                        f"Invalid loss component: {component.name}. "
-                        f"Valid options: {sorted(valid_loss_names - {'composite'})}"
-                    )
-        elif self.loss.components:
-            raise ValueError(
-                "loss.components is only valid when loss.name is 'composite'"
+                "EpiForecaster only supports training.loss.name='joint_inference', "
+                f"got {self.loss.name!r}."
             )
 
         # Validate split_strategy

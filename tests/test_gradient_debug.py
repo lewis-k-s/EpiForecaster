@@ -157,6 +157,52 @@ class TestGradientDebugger:
         assert snapshot.summary["non_finite_layers_count"] == 2
         assert len(snapshot.summary["most_problematic_layers"]) == 2
 
+    def test_snapshot_tracks_vanishing_and_exploding_layers(self, tmp_path):
+        """Snapshot summary should flag very small and very large layer norms."""
+        debugger = GradientDebugger(
+            enabled=True,
+            log_dir=tmp_path,
+            vanishing_threshold=1.0e-6,
+            exploding_threshold=10.0,
+            snapshot_top_k=2,
+        )
+        model = SimpleModel()
+
+        x = torch.randn(2, 10)
+        y = model(x).sum()
+        y.backward()
+
+        model.fc1.bias.grad.zero_()
+        model.fc2.weight.grad.fill_(50.0)
+
+        snapshot = debugger.capture_snapshot(model, step_info={"step": 9})
+
+        assert "fc1.bias" in snapshot.vanishing_layers
+        assert "fc2.weight" in snapshot.exploding_layers
+        assert snapshot.summary["vanishing_layers_count"] == 1
+        assert snapshot.summary["exploding_layers_count"] == 1
+        assert snapshot.summary["highest_norm_layers"][0]["name"] == "fc2.weight"
+        assert snapshot.summary["lowest_norm_layers"][0]["name"] == "fc1.bias"
+
+    def test_snapshot_log_data_and_status_are_compact_and_numeric(self, tmp_path):
+        """Snapshot helpers should expose metrics for logging surfaces."""
+        debugger = GradientDebugger(enabled=True, log_dir=tmp_path)
+        model = SimpleModel()
+
+        x = torch.randn(2, 10)
+        y = model(x).sum()
+        y.backward()
+
+        snapshot = debugger.capture_snapshot(model, step_info={"step": 11})
+        log_data = debugger.build_snapshot_log_data(snapshot)
+        status = debugger.format_snapshot_status(snapshot)
+
+        assert log_data["grad_snapshot_layers_with_grads"] == 4
+        assert "grad_snapshot_max_layer_norm" in log_data
+        assert "Gradient snapshot @ step 11" in status
+        assert "vanishing=" in status
+        assert "exploding=" in status
+
 
 class TestHelperFunctions:
     """Test utility helper functions."""
@@ -193,11 +239,17 @@ class TestHelperFunctions:
         config = SimpleNamespace(
             enable_gradient_debug=True,
             gradient_debug_log_dir=str(tmp_path),
+            gradient_vanishing_threshold=1.0e-7,
+            gradient_exploding_threshold=50.0,
+            gradient_snapshot_top_k=3,
         )
 
         debugger = create_gradient_debugger(config)
         assert debugger.enabled
         assert debugger.log_dir == tmp_path
+        assert debugger.vanishing_threshold == pytest.approx(1.0e-7)
+        assert debugger.exploding_threshold == pytest.approx(50.0)
+        assert debugger.snapshot_top_k == 3
 
     def test_create_gradient_debugger_disabled_by_default(self):
         """Factory should create disabled debugger with None config."""
@@ -224,3 +276,5 @@ class TestGradientDataClasses:
         assert not snapshot.has_non_finite
         assert snapshot.layer_stats == []
         assert snapshot.non_finite_layers == []
+        assert snapshot.vanishing_layers == []
+        assert snapshot.exploding_layers == []

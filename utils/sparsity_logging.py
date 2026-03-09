@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from utils.dtypes import sync_to_device
+from utils.device import sync_to_device
 
 logger = logging.getLogger(__name__)
 
@@ -58,25 +58,25 @@ def compute_batch_sparsity(batch: dict[str, Any]) -> dict[str, torch.Tensor]:
     # Mask is at index 1 for each variant, plus index 4 for has_data
     if "BioNode" in batch and batch["BioNode"] is not None:
         bio = batch["BioNode"]
-        B = batch.get("B", bio.shape[0])
-        if bio.dim() == 3 and bio.shape[-1] >= 4:
-            # Channels are [value, mask, censor, age] per variant + has_data
-            # Use mask channels (indices 1, 5, 9, ...) for sparsity
-            num_channels = bio.shape[-1]
-            mask_indices = list(range(1, num_channels, 4))
-            if mask_indices:
-                masks = bio[:, :, mask_indices].float()
-                bio_sparsity = 1.0 - masks.mean(dim=[1, 2])
-                sparsity["bio_hist"] = bio_sparsity
+        if bio.dim() == 3 and bio.shape[-1] >= 2:
+            # Mask channels are at indices 1, 5, 9, ... (every 4th starting from 1)
+            # Plus index 4 for has_data (last channel after all variants)
+            mask_indices = list(range(1, bio.shape[-1], 4))  # [1, 5, 9, ...]
+            if bio.shape[-1] > max(mask_indices, default=0):
+                mask_channels = bio[:, :, mask_indices]  # (B, L, num_variants)
+                mask = mask_channels.mean(dim=-1).float()  # Average across variants
+                sparsity["bio_hist"] = 1.0 - mask.mean(dim=1)
             else:
+                B = batch.get("B", bio.shape[0])
                 sparsity["bio_hist"] = torch.zeros(B, device=bio.device)
         else:
+            B = batch.get("B", bio.shape[0])
             sparsity["bio_hist"] = torch.zeros(B, device=bio.device)
 
     # Mobility sparsity from edge weights
     # Count edges per sample in the batched graph
     if "MobBatch" in batch:
-        mob_batch = batch["MobBatch"]
+        mob_batch = batch.mob_batch
         B = batch.get("B", 1)
         T = batch.get("T", 1)
         device = (

@@ -2,7 +2,7 @@
 
 import torch
 
-from utils.dtypes import (
+from utils.device import (
     get_dtype_safe_eps,
     get_model_eps,
 )

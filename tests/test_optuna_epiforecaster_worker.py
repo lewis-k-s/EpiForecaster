@@ -66,7 +66,10 @@ def _base_cfg_stub(**overrides: Any) -> SimpleNamespace:
     model_defaults.update(model_overrides)
 
     training_defaults = dict(
-        loss=SimpleNamespace(name="mse"),
+        loss=SimpleNamespace(
+            name="joint_inference",
+            joint=SimpleNamespace(adaptive_scheme="gradnorm"),
+        ),
     )
     training_overrides = overrides.pop("training", {})
     training_defaults.update(training_overrides)
@@ -344,6 +347,7 @@ class TestSuggestEpiforecasterParams:
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
         loss_weight_overrides = [
             k for k in overrides if k.startswith("training.loss.joint.w_")
+            and k not in ("training.loss.joint.w_sir", "training.loss.joint.w_continuity")
         ]
         assert loss_weight_overrides == []
 
@@ -424,8 +428,8 @@ class TestSuggestEpiforecasterParams:
             "modulation",
         )
 
-    def test_non_joint_inference_skips_observation_heads(self) -> None:
+    def test_base_stub_also_suggests_observation_heads(self) -> None:
         trial = _StubTrial()
-        suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        obs_calls = [c for c in trial.suggest_calls if "observation_heads" in c[1]]
-        assert obs_calls == []
+        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
+        assert "model.observation_heads.residual_hidden_dim" in overrides
+        assert "training.loss.joint.w_continuity" in overrides

@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 import torch
 
 from training.epiforecaster_trainer import EpiForecasterTrainer
@@ -15,7 +16,7 @@ from models.configs import (
     LossConfig,
     CurriculumConfig,
 )
-from evaluation.epiforecaster_eval import JointInferenceLoss
+from evaluation.losses import JointInferenceLoss
 
 
 class TestEpiForecasterTrainer:
@@ -34,23 +35,30 @@ class TestEpiForecasterTrainer:
             ),
             data=DataConfig(
                 dataset_path="dummy_dataset.zarr",
-                run_id="test_run",
+                run_id="real",
+                run_id_chunk_size=1,
             ),
             training=TrainingParams(
                 epochs=1,
                 batch_size=4,
                 loss=LossConfig(name="joint_inference"),
                 curriculum=CurriculumConfig(enabled=False),
-                enable_mixed_precision=False,  # Disable for tests on non-CUDA devices
+                enable_mixed_precision=False,
             ),
             output=OutputConfig(log_dir="test_outputs", experiment_name="test_exp"),
         )
 
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_initialization(
-        self, mock_wandb, mock_model_cls, mock_dataset_cls, minimal_config
+        self,
+        mock_dataloader,
+        mock_wandb,
+        mock_model_cls,
+        mock_dataset_cls,
+        minimal_config,
     ):
         """Test trainer initialization and component creation."""
         # Mock model parameters for optimizer
@@ -92,11 +100,12 @@ class TestEpiForecasterTrainer:
         assert kwargs["forecast_horizon"] == 7
         assert kwargs["sequence_length"] == 14
 
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_loss_criterion_creation(
-        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config
+        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
     ):
         """Test correct loss function is created."""
         # Mock model
@@ -119,16 +128,12 @@ class TestEpiForecasterTrainer:
         trainer = EpiForecasterTrainer(minimal_config)
         assert isinstance(trainer.criterion, JointInferenceLoss)
 
-        # Test validation for wrong loss type
-        minimal_config.training.loss.name = "mse"
-        with pytest.raises(ValueError, match="requires JointInferenceLoss"):
-            EpiForecasterTrainer(minimal_config)
-
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_scheduler_creation(
-        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config
+        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
     ):
         """Test scheduler creation options."""
         # Mock model
@@ -161,11 +166,18 @@ class TestEpiForecasterTrainer:
         trainer = EpiForecasterTrainer(minimal_config)
         assert trainer.scheduler is None
 
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_checkpoint_logic(
-        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config, tmp_path
+        self,
+        mock_dataloader,
+        mock_wandb,
+        mock_model_cls,
+        mock_dataset,
+        minimal_config,
+        tmp_path,
     ):
         """Test checkpoint resume logic with explicit checkpoint path."""
         # Mock model
@@ -200,11 +212,12 @@ class TestEpiForecasterTrainer:
         # Should have the checkpoint path set
         assert trainer.config.training.resume_checkpoint_path == str(ckpt_path)
 
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_curriculum_config_validation(
-        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config
+        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
     ):
         """Test curriculum config validation."""
         # Mock model
@@ -227,31 +240,44 @@ class TestEpiForecasterTrainer:
         minimal_config.data.real_dataset_path = "real.zarr"
 
         # Should initialize (mocks handles actual data loading calls)
-        with patch.object(
-            EpiForecasterTrainer, "_discover_runs", return_value=("real", ["synth1"])
-        ):
-            with patch.object(
-                EpiForecasterTrainer,
-                "_split_dataset_by_nodes",
-                return_value=([], [], []),
+        mock_dataset_instance.biomarkers_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
+        mock_dataset_instance.target_nodes = [0]
+        mock_dataset_instance.__len__.return_value = 10
+        mock_dataset_instance.region_embeddings = None
+        mock_loader_bundle = SimpleNamespace(
+            train=MagicMock(),
+            val=MagicMock(),
+            test=MagicMock(),
+            curriculum_sampler=None,
+            multiprocessing_context=None,
+        )
+        mock_splits = SimpleNamespace(
+            train=mock_dataset_instance,
+            val=mock_dataset_instance,
+            test=mock_dataset_instance,
+            real_run_id="real",
+            synth_run_ids=["synth1"],
+        )
+        with patch("training.epiforecaster_trainer.build_datasets", return_value=mock_splits):
+            with patch(
+                "training.epiforecaster_trainer.build_dataloaders",
+                return_value=mock_loader_bundle,
             ):
-                with patch.object(
-                    EpiForecasterTrainer, "_load_region_ids", return_value=["r1"]
-                ):
-                    # Mock _map_region_ids_to_nodes to return list
-                    with patch.object(
-                        EpiForecasterTrainer,
-                        "_map_region_ids_to_nodes",
-                        return_value=[0],
-                    ):
-                        trainer = EpiForecasterTrainer(minimal_config)
-                        assert trainer.config.training.curriculum.enabled is True
+                trainer = EpiForecasterTrainer(minimal_config)
+                assert trainer.config.training.curriculum.enabled is True
 
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_standard_split_reuses_sparse_topology_and_releases(
-        self, mock_wandb, mock_model_cls, mock_dataset_cls, minimal_config
+        self,
+        mock_dataloader,
+        mock_wandb,
+        mock_model_cls,
+        mock_dataset_cls,
+        minimal_config,
     ):
         """Val/test should reuse train full sparse topology and release references."""
         mock_model_instance = MagicMock()
@@ -293,9 +319,8 @@ class TestEpiForecasterTrainer:
 
         mock_dataset_cls.side_effect = [train_ds, val_ds, test_ds]
 
-        with patch.object(
-            EpiForecasterTrainer,
-            "_split_dataset_by_nodes",
+        with patch(
+            "data.dataset_factory.split_nodes_by_ratio",
             return_value=([0, 1], [2], [3]),
         ):
             _ = EpiForecasterTrainer(minimal_config)
@@ -310,11 +335,12 @@ class TestEpiForecasterTrainer:
         val_ds.release_shared_sparse_topology.assert_called_once()
         test_ds.release_shared_sparse_topology.assert_called_once()
 
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_gradnorm_compiles_adaptive_backward_step(
-        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config
+        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
     ):
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))
@@ -339,45 +365,18 @@ class TestEpiForecasterTrainer:
         assert trainer.gradnorm_controller is not None
         assert trainer.gradnorm_optimizer is not None
 
-    def test_build_compiled_batch_strips_non_tensor_metadata(self):
-        trainer = object.__new__(EpiForecasterTrainer)
-        batch_data = {
-            "HospHist": torch.randn(2, 4, 3),
-            "DeathsHist": torch.randn(2, 4, 3),
-            "CasesHist": torch.randn(2, 4, 3),
-            "BioNode": torch.randn(2, 4, 1),
-            "MobBatch": MagicMock(),
-            "Population": torch.ones(2),
-            "TargetNode": torch.tensor([0, 1]),
-            "TargetRegionIndex": torch.tensor([0, 1]),
-            "TemporalCovariates": torch.randn(2, 4, 3),
-            "WWTarget": torch.randn(2, 2),
-            "HospTarget": torch.randn(2, 2),
-            "CasesTarget": torch.randn(2, 2),
-            "DeathsTarget": torch.randn(2, 2),
-            "WWTargetMask": torch.ones(2, 2),
-            "HospTargetMask": torch.ones(2, 2),
-            "CasesTargetMask": torch.ones(2, 2),
-            "DeathsTargetMask": torch.ones(2, 2),
-            "NodeLabels": ["a", "b"],
-            "WindowStart": torch.tensor([1, 2]),
-            "B": 2,
-            "T": 4,
-        }
-        compiled_batch = EpiForecasterTrainer._build_compiled_batch(trainer, batch_data)
-
-        assert "NodeLabels" not in compiled_batch
-        assert "WindowStart" not in compiled_batch
-        assert "B" not in compiled_batch
-        assert "T" not in compiled_batch
-        assert compiled_batch["HospHist"].shape == (2, 4, 3)
-        assert "MobBatch" in compiled_batch
-
-    @patch("training.epiforecaster_trainer.EpiDataset")
+    @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")
+    @patch("training.dataloader_factory.DataLoader")
     def test_checkpoint_includes_gradnorm_state(
-        self, mock_wandb, mock_model_cls, mock_dataset, minimal_config, tmp_path
+        self,
+        mock_dataloader,
+        mock_wandb,
+        mock_model_cls,
+        mock_dataset,
+        minimal_config,
+        tmp_path,
     ):
         mock_model_instance = MagicMock()
         param = torch.nn.Parameter(torch.randn(1))

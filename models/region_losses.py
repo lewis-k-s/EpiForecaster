@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.dtypes import sync_to_device
+from utils.device import sync_to_device
 
 # PySAL imports for spatial autocorrelation
 from libpysal import weights

@@ -2,9 +2,8 @@
 Training utilities for the EpiForecaster project.
 """
 
-from typing import Any
-
 import torch
+from data.epi_batch import EpiBatch
 
 
 def drop_nowcast(prediction: torch.Tensor, horizon: int | None = None) -> torch.Tensor:
@@ -88,7 +87,7 @@ def should_log_step(
 
 
 def inject_gpu_mobility(
-    batch_data: dict[str, Any],
+    batch_data: EpiBatch,
     dataset: torch.utils.data.Dataset,
     device: torch.device,
 ) -> None:
@@ -99,11 +98,11 @@ def inject_gpu_mobility(
     multiprocessing queue, preventing severe worker OOMs on Linux systems.
 
     Args:
-        batch_data: The batch dictionary containing 'MobBatch'.
+        batch_data: The batch data containing 'mob_batch'.
         dataset: The Dataset yielding the batches (contains preloaded_mobility).
         device: The target GPU device.
     """
-    mob_batch = batch_data.get("MobBatch")
+    mob_batch = batch_data.mob_batch
     if mob_batch is None or not hasattr(mob_batch, "global_t"):
         return
 
@@ -166,7 +165,7 @@ def inject_gpu_mobility(
 
 
 def ensure_mobility_adj_dense_ready(
-    batch_data: dict[str, Any], *, required: bool, context: str = ""
+    batch_data: EpiBatch, *, required: bool, context: str = ""
 ) -> None:
     """
     Validate that dense mobility adjacency exists when required.
@@ -175,7 +174,7 @@ def ensure_mobility_adj_dense_ready(
     we can fail fast before entering a compiled graph.
 
     Args:
-        batch_data: Batch dictionary expected to contain ``MobBatch``.
+        batch_data: Batch data expected to contain ``mob_batch``.
         required: Whether mobility adjacency is required for the current path.
         context: Optional context label included in error messages.
     """
@@ -183,48 +182,12 @@ def ensure_mobility_adj_dense_ready(
         return
 
     suffix = f" ({context})" if context else ""
-    mob_batch = batch_data.get("MobBatch")
+    mob_batch = batch_data.mob_batch
     if mob_batch is None:
-        raise ValueError(f"Missing 'MobBatch' in batch data{suffix}.")
+        raise ValueError(f"Missing 'mob_batch' in batch data{suffix}.")
 
     if not hasattr(mob_batch, "adj_dense") or mob_batch.adj_dense is None:
         raise ValueError(
-            "Missing 'MobBatch.adj_dense' before compiled forward"
+            "Missing 'mob_batch.adj_dense' before compiled forward"
             f"{suffix}. Ensure inject_gpu_mobility() (or equivalent prep) runs first."
         )
-
-
-def mask_ablated_inputs(
-    batch_data: dict[str, Any],
-    *,
-    mask_cases: bool = False,
-    mask_ww: bool = False,
-    mask_hosp: bool = False,
-    mask_deaths: bool = False,
-) -> None:
-    """
-    Apply zero-masking to input data series corresponding to disabled clinical heads.
-
-    This ensures that when an observation head's loss is ablated, its input data
-    is also zeroed out in the batch so it does not leak information to other heads
-    through the backbone representation.
-
-    Args:
-        batch_data: The batch data dictionary. Modified in-place.
-        mask_cases: If True, zero out 'CasesHist'.
-        mask_ww: If True, zero out 'BioNode'.
-        mask_hosp: If True, zero out 'HospHist'.
-        mask_deaths: If True, zero out 'DeathsHist'.
-    """
-    if mask_ww and "BioNode" in batch_data and batch_data["BioNode"] is not None:
-        batch_data["BioNode"] = torch.zeros_like(batch_data["BioNode"])
-    if mask_hosp and "HospHist" in batch_data and batch_data["HospHist"] is not None:
-        batch_data["HospHist"] = torch.zeros_like(batch_data["HospHist"])
-    if mask_cases and "CasesHist" in batch_data and batch_data["CasesHist"] is not None:
-        batch_data["CasesHist"] = torch.zeros_like(batch_data["CasesHist"])
-    if (
-        mask_deaths
-        and "DeathsHist" in batch_data
-        and batch_data["DeathsHist"] is not None
-    ):
-        batch_data["DeathsHist"] = torch.zeros_like(batch_data["DeathsHist"])

@@ -3,6 +3,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+
+from data.epi_batch import EpiBatch
 import torch.nn.functional as F
 
 # type: ignore[import-not-found] (PyTorch Geometric has incomplete type stubs)
@@ -406,7 +408,7 @@ class EpiForecaster(nn.Module):
     def forward_batch(
         self,
         *,
-        batch_data: dict[str, Any],
+        batch_data: EpiBatch,
         region_embeddings: torch.Tensor | None = None,
         skip_device_transfer: bool = False,
         mask_cases: bool = False,
@@ -422,8 +424,7 @@ class EpiForecaster(nn.Module):
         CPU-GPU sync time.
 
         Args:
-            batch_data: Dict containing batch tensors (HospHist, DeathsHist, CasesHist,
-                        BioNode, MobBatch, Population, TargetNode, WindowStart, B, T)
+            batch_data: EpiBatch containing batch tensors
             region_embeddings: Optional static region embeddings [num_regions, region_dim]
             skip_device_transfer: If True, assume all tensors are already on the correct
                                  device and dtype. Used with compiled training to avoid
@@ -434,44 +435,21 @@ class EpiForecaster(nn.Module):
                 - model_outputs: Dict from forward() with predictions and latents
                 - targets_dict: Dict with target tensors for loss computation
         """
-        # Non-blocking transfer for all PyTorch tensors
-        # Convert float tensors to model dtype, keep integer tensors as-is
-        if skip_device_transfer:
-            # Fast path: assume tensors already on device (for compiled training)
-            batch: dict[str, torch.Tensor] = {}
-            for key in COMPILED_BATCH_TENSOR_KEYS:
-                value = batch_data.get(key)
-                if isinstance(value, torch.Tensor):
-                    batch[key] = value
-            mob_batch = batch_data["MobBatch"]
-        else:
-            batch = {}
-            for key in COMPILED_BATCH_TENSOR_KEYS:
-                value = batch_data.get(key)
-                if not isinstance(value, torch.Tensor):
-                    continue
+        if not skip_device_transfer:
+            batch_data = batch_data.to(device=self.device, dtype=self.dtype, non_blocking=True)
 
-                if torch.is_floating_point(value):
-                    if value.device != self.device or value.dtype != self.dtype:
-                        value = value.to(
-                            device=self.device, dtype=self.dtype, non_blocking=True
-                        )
-                elif value.device != self.device:
-                    value = value.to(device=self.device, non_blocking=True)
-                batch[key] = value
+        # Mask ablated inputs directly on the batch object
+        if mask_ww and batch_data.bio_node is not None:
+            batch_data.bio_node = torch.zeros_like(batch_data.bio_node)
+        if mask_hosp and batch_data.hosp_hist is not None:
+            batch_data.hosp_hist = torch.zeros_like(batch_data.hosp_hist)
+        if mask_cases and batch_data.cases_hist is not None:
+            batch_data.cases_hist = torch.zeros_like(batch_data.cases_hist)
+        if mask_deaths and batch_data.deaths_hist is not None:
+            batch_data.deaths_hist = torch.zeros_like(batch_data.deaths_hist)
 
-            # PyG Batch handles its own device transfer
-            mob_batch = batch_data["MobBatch"].to(self.device, non_blocking=True)
+        mob_batch = batch_data.mob_batch
 
-        from utils.training_utils import mask_ablated_inputs
-
-        mask_ablated_inputs(
-            batch,
-            mask_cases=mask_cases,
-            mask_ww=mask_ww,
-            mask_hosp=mask_hosp,
-            mask_deaths=mask_deaths,
-        )
         # Convert graph tensors to model dtype.
         if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
             if mob_batch.x_dense.dtype != self.dtype:
@@ -480,35 +458,35 @@ class EpiForecaster(nn.Module):
             if mob_batch.adj_dense.dtype != self.dtype:
                 mob_batch.adj_dense = mob_batch.adj_dense.to(self.dtype)
 
-        target_nodes = batch.get("TargetRegionIndex", batch["TargetNode"])
+        target_nodes = batch_data.target_region_index if batch_data.target_region_index is not None else batch_data.target_node
 
         # Extract temporal covariates if present
-        temporal_covariates = batch.get("TemporalCovariates")
+        temporal_covariates = batch_data.temporal_covariates
 
         # Forward pass
         model_outputs = self.forward(
-            hosp_hist=batch["HospHist"],
-            deaths_hist=batch["DeathsHist"],
-            cases_hist=batch["CasesHist"],
-            biomarkers_hist=batch["BioNode"],
+            hosp_hist=batch_data.hosp_hist,
+            deaths_hist=batch_data.deaths_hist,
+            cases_hist=batch_data.cases_hist,
+            biomarkers_hist=batch_data.bio_node,
             mob_graphs=mob_batch,
             target_nodes=target_nodes,
             region_embeddings=region_embeddings,
-            population=batch["Population"],
+            population=batch_data.population,
             temporal_covariates=temporal_covariates,
         )
 
         # Prepare targets dict
         # Joint inference targets: WW, Hosp, Cases, Deaths with per-target masks
         targets_dict = {
-            "ww": batch.get("WWTarget"),
-            "hosp": batch.get("HospTarget"),
-            "cases": batch.get("CasesTarget"),
-            "deaths": batch.get("DeathsTarget"),
-            "ww_mask": batch.get("WWTargetMask"),
-            "hosp_mask": batch.get("HospTargetMask"),
-            "cases_mask": batch.get("CasesTargetMask"),
-            "deaths_mask": batch.get("DeathsTargetMask"),
+            "ww": batch_data.ww_target,
+            "hosp": batch_data.hosp_target,
+            "cases": batch_data.cases_target,
+            "deaths": batch_data.deaths_target,
+            "ww_mask": batch_data.ww_target_mask,
+            "hosp_mask": batch_data.hosp_target_mask,
+            "cases_mask": batch_data.cases_target_mask,
+            "deaths_mask": batch_data.deaths_target_mask,
         }
 
         return model_outputs, targets_dict

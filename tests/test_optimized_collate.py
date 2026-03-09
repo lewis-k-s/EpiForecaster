@@ -2,7 +2,7 @@ import torch
 import pytest
 from torch_geometric.data import Data, Batch
 
-from data.epi_dataset import optimized_collate_graphs
+from data.epi_batch import optimized_collate_graphs
 
 # Mocking the structures for the test
 # We want to simulate the BEFORE and AFTER states of the refactor

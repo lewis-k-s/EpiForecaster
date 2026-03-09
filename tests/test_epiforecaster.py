@@ -2,6 +2,7 @@ import pytest
 import torch
 from torch_geometric.data import Batch
 
+from data.epi_batch import EpiBatch
 from models.configs import (
     ModelVariant,
     ObservationHeadConfig,
@@ -271,28 +272,32 @@ class TestEpiForecaster:
         """Test the forward_batch helper method."""
         model = EpiForecaster(**basic_config)
 
-        # Construct batch_data dict expected by forward_batch
-        # Note: forward_batch expects "BioNode", "MobBatch", "TargetNode" etc.
-        # It also handles .to(device)
+        B, T = 2, 14
+        H = basic_config["forecast_horizon"]
 
-        batch_data = {
-            "HospHist": dummy_batch["hosp_hist"],
-            "DeathsHist": dummy_batch["deaths_hist"],
-            "CasesHist": dummy_batch["cases_hist"],
-            "BioNode": dummy_batch["biomarkers_hist"],
-            "MobBatch": torch.zeros(1),  # Placeholder, will fail if mobility=True
-            "Population": dummy_batch["population"],
-            "TargetNode": dummy_batch["target_nodes"],
-            # Targets for loss dict
-            "WWTarget": _rand_tensor(2, 7),
-            "HospTarget": _rand_tensor(2, 7),
-            "CasesTarget": _rand_tensor(2, 7),
-            "DeathsTarget": _rand_tensor(2, 7),
-        }
-
-        # Test with mobility=False (so MobBatch doesn't matter much unless checked)
-        # The code does: mob_batch = batch_data["MobBatch"].to(...)
-        # So we need a dummy tensor at least.
+        batch_data = EpiBatch(
+            hosp_hist=dummy_batch["hosp_hist"],
+            deaths_hist=dummy_batch["deaths_hist"],
+            cases_hist=dummy_batch["cases_hist"],
+            bio_node=dummy_batch["biomarkers_hist"],
+            mob_batch=torch.zeros(1),
+            population=dummy_batch["population"],
+            b=B,
+            t=T,
+            target_node=dummy_batch["target_nodes"],
+            target_region_index=None,
+            window_start=torch.zeros(B, dtype=torch.long),
+            node_labels=["node_0", "node_1"],
+            temporal_covariates=torch.zeros(B, T, 0),
+            hosp_target=_rand_tensor(B, H),
+            ww_target=_rand_tensor(B, H),
+            cases_target=_rand_tensor(B, H),
+            deaths_target=_rand_tensor(B, H),
+            hosp_target_mask=torch.ones(B, H),
+            ww_target_mask=torch.ones(B, H),
+            cases_target_mask=torch.ones(B, H),
+            deaths_target_mask=torch.ones(B, H),
+        )
 
         outputs, targets = model.forward_batch(
             batch_data=batch_data, region_embeddings=dummy_batch["region_embeddings"]
@@ -309,13 +314,11 @@ class TestEpiForecaster:
         config["gnn_hidden_dim"] = 8
         config["mobility_embedding_dim"] = 8
         model = EpiForecaster(**config)
-        # Use centralized dtype constant as the source of truth
         expected_dtype = torch.float32
 
         B, T = 1, config["sequence_length"]
         horizon = config["forecast_horizon"]
 
-        # Build B*T dense mobility tensors with non-default dtype.
         num_graphs = B * T
         num_nodes = 4
         mob_batch = Batch()
@@ -327,19 +330,29 @@ class TestEpiForecaster:
         mob_batch.adj_dense = torch.maximum(dense_adj, eye)
         mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
 
-        batch_data = {
-            "HospHist": _rand_tensor(B, T, 3),
-            "DeathsHist": _rand_tensor(B, T, 3),
-            "CasesHist": _rand_tensor(B, T, 3),
-            "BioNode": torch.zeros(B, T, 1, dtype=torch.float32),
-            "MobBatch": mob_batch,
-            "Population": torch.full((B,), 1000.0, dtype=torch.float32),
-            "TargetNode": torch.zeros(B, dtype=torch.long),
-            "WWTarget": _rand_tensor(B, horizon),
-            "HospTarget": _rand_tensor(B, horizon),
-            "CasesTarget": _rand_tensor(B, horizon),
-            "DeathsTarget": _rand_tensor(B, horizon),
-        }
+        batch_data = EpiBatch(
+            hosp_hist=_rand_tensor(B, T, 3),
+            deaths_hist=_rand_tensor(B, T, 3),
+            cases_hist=_rand_tensor(B, T, 3),
+            bio_node=torch.zeros(B, T, 1, dtype=torch.float32),
+            mob_batch=mob_batch,
+            population=torch.full((B,), 1000.0, dtype=torch.float32),
+            b=B,
+            t=T,
+            target_node=torch.zeros(B, dtype=torch.long),
+            target_region_index=None,
+            window_start=torch.zeros(B, dtype=torch.long),
+            node_labels=["node_0"],
+            temporal_covariates=torch.zeros(B, T, 0),
+            hosp_target=_rand_tensor(B, horizon),
+            ww_target=_rand_tensor(B, horizon),
+            cases_target=_rand_tensor(B, horizon),
+            deaths_target=_rand_tensor(B, horizon),
+            hosp_target_mask=torch.ones(B, horizon),
+            ww_target_mask=torch.ones(B, horizon),
+            cases_target_mask=torch.ones(B, horizon),
+            deaths_target_mask=torch.ones(B, horizon),
+        )
 
         outputs, targets = model.forward_batch(batch_data=batch_data)
 
@@ -366,27 +379,32 @@ class TestEpiForecaster:
         B, T = 2, config["sequence_length"]
         horizon = config["forecast_horizon"]
 
-        # Batch data on CPU (simulates DataLoader output)
-        batch_data = {
-            "HospHist": _rand_tensor(B, T, 3),  # CPU
-            "DeathsHist": _rand_tensor(B, T, 3),  # CPU
-            "CasesHist": _rand_tensor(B, T, 3),  # CPU
-            "BioNode": torch.zeros(B, T, 1, dtype=torch.float32),  # CPU
-            "MobBatch": torch.zeros(1),  # Placeholder, mobility disabled
-            "Population": torch.full((B,), 1000.0, dtype=torch.float32),  # CPU
-            "TargetNode": torch.zeros(B, dtype=torch.long),  # CPU
-            "WWTarget": _rand_tensor(B, horizon),  # CPU
-            "HospTarget": _rand_tensor(B, horizon),  # CPU
-            "CasesTarget": _rand_tensor(B, horizon),  # CPU
-            "DeathsTarget": _rand_tensor(B, horizon),  # CPU
-        }
+        batch_data = EpiBatch(
+            hosp_hist=_rand_tensor(B, T, 3),
+            deaths_hist=_rand_tensor(B, T, 3),
+            cases_hist=_rand_tensor(B, T, 3),
+            bio_node=torch.zeros(B, T, 1, dtype=torch.float32),
+            mob_batch=torch.zeros(1),
+            population=torch.full((B,), 1000.0, dtype=torch.float32),
+            b=B,
+            t=T,
+            target_node=torch.zeros(B, dtype=torch.long),
+            target_region_index=None,
+            window_start=torch.zeros(B, dtype=torch.long),
+            node_labels=["node_0", "node_1"],
+            temporal_covariates=torch.zeros(B, T, 0),
+            hosp_target=_rand_tensor(B, horizon),
+            ww_target=_rand_tensor(B, horizon),
+            cases_target=_rand_tensor(B, horizon),
+            deaths_target=_rand_tensor(B, horizon),
+            hosp_target_mask=torch.ones(B, horizon),
+            ww_target_mask=torch.ones(B, horizon),
+            cases_target_mask=torch.ones(B, horizon),
+            deaths_target_mask=torch.ones(B, horizon),
+        )
 
-        # This should NOT raise RuntimeError about device mismatch
         outputs, targets = model.forward_batch(batch_data=batch_data)
 
-        # Verify outputs are on the correct device
         assert outputs["pred_cases"].device.type == accelerator_device.type
         assert outputs["pred_hosp"].device.type == accelerator_device.type
-
-        # Verify targets are also on accelerator (forward_batch moves them)
         assert targets["cases"].device.type == accelerator_device.type

@@ -7,6 +7,11 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from data.curriculum_builder import (
+    _select_synthetic_scaler_run,
+    load_sparsity_mapping,
+    select_runs_by_sparsity,
+)
 from models.configs import (
     CurriculumConfig,
     DataConfig,
@@ -47,13 +52,10 @@ def create_mock_config(dataset_path: str) -> EpiForecasterConfig:
 
 
 class TestLoadSparsityMapping:
-    """Tests for _load_sparsity_mapping method."""
+    """Tests for load_sparsity_mapping function."""
 
     def test_load_sparsity_mapping_from_processed_dataset(self, tmp_path: Path):
         """Test that sparsity is correctly loaded from the processed dataset."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        # Create a sample zarr dataset with sparsity data
         dataset_path = tmp_path / "test_dataset.zarr"
         run_ids = np.array(["real_run", "synth_0.05", "synth_0.20", "synth_0.80"])
         sparsity_levels = np.array([0.0, 0.05, 0.20, 0.80])
@@ -70,14 +72,7 @@ class TestLoadSparsityMapping:
         )
         ds.to_zarr(str(dataset_path), mode="w")
 
-        mock_config = create_mock_config(str(dataset_path))
-
-        # Mock the __init__ to skip dataset loading
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
-        mapping = trainer._load_sparsity_mapping()
+        mapping = load_sparsity_mapping(dataset_path)
 
         assert mapping == {
             "real_run": 0.0,
@@ -88,8 +83,6 @@ class TestLoadSparsityMapping:
 
     def test_load_sparsity_mapping_missing_variable(self, tmp_path: Path):
         """Test graceful handling when synthetic_sparsity_level is missing."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
         dataset_path = tmp_path / "test_dataset_no_sparsity.zarr"
         run_ids = np.array(["real_run", "synth_1"])
 
@@ -104,45 +97,22 @@ class TestLoadSparsityMapping:
         )
         ds.to_zarr(str(dataset_path), mode="w")
 
-        mock_config = create_mock_config(str(dataset_path))
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
-        mapping = trainer._load_sparsity_mapping()
+        mapping = load_sparsity_mapping(dataset_path)
 
         assert mapping == {}
 
     def test_load_sparsity_mapping_nonexistent_dataset(self):
         """Test handling of non-existent dataset paths."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = create_mock_config("/nonexistent/path/to/dataset.zarr")
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
-        mapping = trainer._load_sparsity_mapping()
+        mapping = load_sparsity_mapping(Path("/nonexistent/path/to/dataset.zarr"))
 
         assert mapping == {}
 
 
 class TestSelectRunsForCurriculum:
-    """Tests for _select_runs_for_curriculum method."""
+    """Tests for select_runs_by_sparsity function."""
 
     def test_select_runs_for_curriculum_with_sparsity(self):
         """Test run selection for sparsity diversity."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = MagicMock()
-        mock_config.training.curriculum.enabled = False
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
         synth_runs = [
             "synth_0.05",
             "synth_0.20",
@@ -160,154 +130,70 @@ class TestSelectRunsForCurriculum:
             "synth_0.81": 0.81,
         }
 
-        # Set seed for reproducibility
         import random
 
         random.seed(42)
         np.random.seed(42)
 
-        selected = trainer._select_runs_for_curriculum(synth_runs, sparsity_map)
+        selected = select_runs_by_sparsity(synth_runs, sparsity_map, max_runs=5)
 
-        # Should select at least one from each bucket
         assert len(selected) <= 5
         assert all(run in synth_runs for run in selected)
 
     def test_select_runs_for_curriculum_without_sparsity(self):
         """Test fallback to random selection when no sparsity data."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = MagicMock()
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
         synth_runs = ["synth_1", "synth_2", "synth_3", "synth_4", "synth_5"]
         sparsity_map: dict[str, float] = {}
 
-        # Set seed for reproducibility
         import random
 
         random.seed(42)
         np.random.seed(42)
 
-        selected = trainer._select_runs_for_curriculum(synth_runs, sparsity_map)
+        selected = select_runs_by_sparsity(synth_runs, sparsity_map, max_runs=5)
 
-        # Should return first max_runs (default 5) when no sparsity data
-        assert len(selected) == min(5, len(synth_runs))
+        assert selected == synth_runs[:5]
 
-    def test_select_runs_for_curriculum_partial_sparsity(self):
-        """Test with some runs having sparsity data."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
+    def test_select_runs_for_curriculum_max_runs(self):
+        """Test that max_runs is respected."""
+        synth_runs = ["synth_1", "synth_2", "synth_3", "synth_4", "synth_5", "synth_6"]
+        sparsity_map: dict[str, float] = {}
 
-        mock_config = MagicMock()
+        selected = select_runs_by_sparsity(synth_runs, sparsity_map, max_runs=3)
 
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
-        synth_runs = ["synth_0.05", "synth_0.80", "no_sparsity_1", "no_sparsity_2"]
-        sparsity_map = {
-            "synth_0.05": 0.05,
-            "synth_0.80": 0.80,
-        }
-
-        # Set seed for reproducibility
-        import random
-
-        random.seed(42)
-        np.random.seed(42)
-
-        selected = trainer._select_runs_for_curriculum(
-            synth_runs, sparsity_map, max_runs=3
-        )
-
-        assert len(selected) <= 3
-        assert all(run in synth_runs for run in selected)
-
-    def test_select_runs_for_curriculum_max_runs_limit(self):
-        """Test that max_runs limit is respected."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = MagicMock()
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
-        synth_runs = [
-            "synth_0.05",
-            "synth_0.20",
-            "synth_0.40",
-            "synth_0.60",
-            "synth_0.80",
-        ]
-        sparsity_map = {
-            "synth_0.05": 0.05,
-            "synth_0.20": 0.20,
-            "synth_0.40": 0.40,
-            "synth_0.60": 0.60,
-            "synth_0.80": 0.80,
-        }
-
-        selected = trainer._select_runs_for_curriculum(
-            synth_runs, sparsity_map, max_runs=2
-        )
-
-        assert len(selected) <= 2
+        assert len(selected) == 3
+        assert selected == synth_runs[:3]
 
 
 class TestSelectSyntheticScalerRun:
-    """Tests for _select_synthetic_scaler_run method."""
+    """Tests for _select_synthetic_scaler_run function."""
 
     def test_select_scaler_run_with_sparsity(self):
-        """Test selecting lowest sparsity run for scaler fitting."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = MagicMock()
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
-        synth_runs = ["synth_0.05", "synth_0.20", "synth_0.80"]
-        trainer._load_sparsity_mapping = lambda: {
+        """Test that lowest sparsity run is selected for scaler fitting."""
+        synth_runs = ["synth_0.80", "synth_0.05", "synth_0.20"]
+        sparsity_map = {
+            "synth_0.80": 0.80,
             "synth_0.05": 0.05,
             "synth_0.20": 0.20,
-            "synth_0.80": 0.80,
         }
 
-        selected = trainer._select_synthetic_scaler_run(synth_runs)
+        with patch(
+            "data.curriculum_builder.load_sparsity_mapping", return_value=sparsity_map
+        ):
+            selected = _select_synthetic_scaler_run(synth_runs, Path("/fake/path"))
 
         assert selected == "synth_0.05"
 
     def test_select_scaler_run_without_sparsity(self):
-        """Test fallback when no sparsity metadata available."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = MagicMock()
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
+        """Test fallback when no sparsity metadata is available."""
         synth_runs = ["synth_1", "synth_2", "synth_3"]
-        trainer._load_sparsity_mapping = lambda: {}
 
-        selected = trainer._select_synthetic_scaler_run(synth_runs)
+        with patch("data.curriculum_builder.load_sparsity_mapping", return_value={}):
+            selected = _select_synthetic_scaler_run(synth_runs, Path("/fake/path"))
 
-        # Should return the last run as fallback
         assert selected == "synth_3"
 
     def test_select_scaler_run_empty_list(self):
-        """Test error handling when no synthetic runs available."""
-        from training.epiforecaster_trainer import EpiForecasterTrainer
-
-        mock_config = MagicMock()
-
-        with patch.object(EpiForecasterTrainer, "__init__", return_value=None):
-            trainer = EpiForecasterTrainer(mock_config)
-            trainer.config = mock_config
-
+        """Test error handling for empty run list."""
         with pytest.raises(ValueError, match="No synthetic runs available"):
-            trainer._select_synthetic_scaler_run([])
+            _select_synthetic_scaler_run([], Path("/fake/path"))

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
-from evaluation.epiforecaster_eval import JointInferenceLoss
+from evaluation.losses import JointInferenceLoss
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from training.gradnorm import GradNormController
 
@@ -229,50 +229,4 @@ def test_gradnorm_sidecar_keeps_global_cached_weights_when_head_inactive() -> No
     assert trainer._gradnorm_cached_weights[0] > 0
 
 
-def test_build_compiled_batch_excludes_metadata() -> None:
-    trainer = _make_gradnorm_stub_trainer(update_every=1)
-    batch = {
-        "HospHist": torch.ones((1, 2, 3)),
-        "DeathsHist": torch.ones((1, 2, 3)),
-        "CasesHist": torch.ones((1, 2, 3)),
-        "BioNode": torch.ones((1, 2, 1)),
-        "MobBatch": SimpleNamespace(x_dense=torch.ones((2, 1, 1))),
-        "Population": torch.ones((1,)),
-        "TargetNode": torch.zeros((1,), dtype=torch.long),
-        "TargetRegionIndex": torch.zeros((1,), dtype=torch.long),
-        "TemporalCovariates": torch.ones((1, 2, 0)),
-        "WWTarget": torch.ones((1, 1)),
-        "HospTarget": torch.ones((1, 1)),
-        "CasesTarget": torch.ones((1, 1)),
-        "DeathsTarget": torch.ones((1, 1)),
-        "WWTargetMask": torch.ones((1, 1)),
-        "HospTargetMask": torch.ones((1, 1)),
-        "CasesTargetMask": torch.ones((1, 1)),
-        "DeathsTargetMask": torch.ones((1, 1)),
-        "NodeLabels": ["A"],
-        "ExtraMetadata": "ignore-me",
-    }
 
-    compiled_batch = EpiForecasterTrainer._build_compiled_batch(trainer, batch)
-
-    assert "NodeLabels" not in compiled_batch
-    assert "ExtraMetadata" not in compiled_batch
-    assert set(compiled_batch.keys()) == {
-        "HospHist",
-        "DeathsHist",
-        "CasesHist",
-        "BioNode",
-        "MobBatch",
-        "Population",
-        "TargetNode",
-        "TargetRegionIndex",
-        "TemporalCovariates",
-        "WWTarget",
-        "HospTarget",
-        "CasesTarget",
-        "DeathsTarget",
-        "WWTargetMask",
-        "HospTargetMask",
-        "CasesTargetMask",
-        "DeathsTargetMask",
-    }

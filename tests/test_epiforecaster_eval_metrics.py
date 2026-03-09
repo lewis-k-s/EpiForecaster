@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import torch
+from types import SimpleNamespace
 
-from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
+from evaluation.losses import JointInferenceLoss
+from evaluation.epiforecaster_eval import evaluate_loader
 
 
 class _DummyLoader:
-    def __init__(self, batches: list[dict]):
+    def __init__(self, batches: list):
         self._batches = batches
         self.dataset = None
 
@@ -23,21 +25,22 @@ class _DummyModel(torch.nn.Module):
         self.anchor = torch.nn.Parameter(torch.zeros(()))
 
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
-        return batch_data["model_outputs"], batch_data["targets_dict"]
+        return batch_data.model_outputs, batch_data.targets_dict
 
 
 def test_evaluate_loader_emits_cases_and_deaths_metrics():
     model = _DummyModel()
-    batch = {
-        "TargetNode": torch.tensor([0, 1], dtype=torch.long),
-        "model_outputs": {
+
+    batch = SimpleNamespace(
+        target_node=torch.tensor([0, 1], dtype=torch.long),
+        model_outputs={
             "pred_hosp": torch.tensor([[1.0, 2.0], [2.0, 3.0]], dtype=torch.float32),
             "pred_ww": torch.tensor([[0.5, 0.5], [0.5, 0.5]], dtype=torch.float32),
             "pred_cases": torch.tensor([[3.0, 4.0], [5.0, 6.0]], dtype=torch.float32),
             "pred_deaths": torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
             "physics_residual": torch.zeros((2, 2), dtype=torch.float32),
         },
-        "targets_dict": {
+        targets_dict={
             "hosp": torch.tensor([[1.0, 2.0], [2.0, 3.0]], dtype=torch.float32),
             "ww": torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.float32),
             "cases": torch.tensor([[2.0, 4.0], [8.0, 6.0]], dtype=torch.float32),
@@ -47,7 +50,9 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
             "cases_mask": torch.tensor([[1.0, 0.0], [1.0, 1.0]], dtype=torch.float32),
             "deaths_mask": torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32),
         },
-    }
+        mob_batch=None,
+    )
+
     loader = _DummyLoader([batch])
     criterion = JointInferenceLoss(
         obs_weight_sum=4.0,

@@ -50,7 +50,6 @@ class TestComputeBatchSparsity:
             "WWTargetMask": torch.zeros(B, H),
         }
 
-        # Sample 0: fully observed, sample 1: half, sample 2: quarter, sample 3: none
         batch["HospTargetMask"][0, :] = 1.0
         batch["HospTargetMask"][1, : H // 2] = 1.0
         batch["HospTargetMask"][2, : H // 4] = 1.0
@@ -66,7 +65,6 @@ class TestComputeBatchSparsity:
         hosp = sparsity["hosp_target"]
         assert torch.isclose(hosp[0], torch.tensor(0.0), atol=1e-5)
         assert torch.isclose(hosp[1], torch.tensor(0.5), atol=1e-5)
-        # 14 // 4 = 3, so 11/14 = 0.7857 (integer division rounding)
         assert torch.isclose(hosp[2], torch.tensor(11 / 14), atol=1e-5)
         assert torch.isclose(hosp[3], torch.tensor(1.0), atol=1e-5)
 
@@ -218,7 +216,6 @@ class TestLogSparsityLossCorrelation:
             epoch=1,
         )
 
-        # Check that summary statistics are logged for each head
         assert "sparsity_loss_hosp_mean" in logged_data
         assert "sparsity_loss_hosp_std" in logged_data
         assert "sparsity_loss_hosp_p25" in logged_data
@@ -228,10 +225,6 @@ class TestLogSparsityLossCorrelation:
         assert "sparsity_loss_ww_mean" in logged_data
         assert logged_data["_step"] == 42
 
-        # Verify values are reasonable (loss=1.0, sparsity varies between 0-0.5)
-        # Sample 1: sparsity = 0 (fully observed), loss = 1.0, product = 0.0
-        # Sample 2: sparsity = 0.5 (half observed), loss = 1.0, product = 0.5
-        # Mean should be 0.25
         assert logged_data["sparsity_loss_hosp_mean"] == 0.25
         assert logged_data["sparsity_loss_hosp_max"] == 0.5
 
@@ -271,16 +264,14 @@ class TestLogSparsityLossCorrelation:
 
         B, L, H = 2, 28, 14
 
-        # Batch data on CPU (simulates DataLoader output)
         batch = {
             "B": B,
-            "HospHist": torch.zeros(B, L, 3),  # CPU
-            "BioNode": torch.zeros(B, L, 13),  # CPU
+            "HospHist": torch.zeros(B, L, 3),
+            "BioNode": torch.zeros(B, L, 13),
         }
-        batch["HospHist"][:, :, 1] = 1.0  # mask channel: fully observed
+        batch["HospHist"][:, :, 1] = 1.0
         batch["BioNode"][:, :, 1] = 1.0
 
-        # Model outputs and targets on accelerator (simulates GPU forward pass)
         model_outputs = {
             "pred_hosp": torch.ones(B, H).to(accelerator_device),
             "pred_ww": torch.ones(B, H).to(accelerator_device),
@@ -292,7 +283,6 @@ class TestLogSparsityLossCorrelation:
             "ww_mask": torch.ones(B, H).to(accelerator_device),
         }
 
-        # This should NOT raise RuntimeError about device mismatch
         log_sparsity_loss_correlation(
             batch=batch,
             model_outputs=model_outputs,
@@ -302,5 +292,4 @@ class TestLogSparsityLossCorrelation:
             epoch=1,
         )
 
-        # Verify logging happened
         assert "sparsity_loss_hosp_mean" in logged_data

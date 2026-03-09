@@ -7,9 +7,11 @@ from utils.train_logging import (
     add_horizon_metrics_to_log_data,
     add_joint_loss_metrics,
     build_epoch_logging_bundle,
+    build_train_step_log_data,
     compute_horizon_metric_series,
     format_horizon_status_lines,
     format_joint_loss_components_status,
+    get_wandb_step_payload,
 )
 
 
@@ -148,3 +150,34 @@ def test_build_epoch_logging_bundle_includes_payload_and_status_lines() -> None:
     assert status_lines[0].startswith("Val loss:")
     assert any("Val loss components:" in line for line in status_lines)
     assert any("Val MAE_h1" in line for line in status_lines)
+
+
+def test_train_step_logging_includes_gradient_snapshot_metrics() -> None:
+    log_data = build_train_step_log_data(
+        lr=1.0e-3,
+        grad_norm=1.5,
+        batch_time_s=0.2,
+        data_time_s=0.05,
+        model_step_time_s=0.1,
+        epoch=2,
+        component_gradnorm_log_data={"gradnorm_total_preclip": 3.0},
+        gradnorm_step_log_data={},
+        gradient_snapshot_log_data={"grad_snapshot_max_layer_norm": 9.0},
+    )
+
+    assert log_data["gradnorm_total_preclip"] == 3.0
+    assert log_data["grad_snapshot_max_layer_norm"] == 9.0
+
+
+def test_wandb_step_payload_merges_sparse_gradient_metrics() -> None:
+    payload = get_wandb_step_payload(
+        log_this_step=False,
+        log_data={"loss_train_step": 1.0},
+        component_gradnorm_log_data={"gradnorm_total_preclip": 3.0},
+        gradient_snapshot_log_data={"grad_snapshot_max_layer_norm": 9.0},
+    )
+
+    assert payload == {
+        "gradnorm_total_preclip": 3.0,
+        "grad_snapshot_max_layer_norm": 9.0,
+    }

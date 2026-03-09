@@ -44,6 +44,15 @@ def test_epiforecaster_training_configs_parse(config_path):
     assert cfg.training.loss.name == "joint_inference"
 
 
+@pytest.mark.epiforecaster
+def test_epiforecaster_rejects_non_joint_loss_name():
+    with pytest.raises(ValueError, match="only supports training.loss.name='joint_inference'"):
+        EpiForecasterConfig.load(
+            "configs/train_epifor_real_local.yaml",
+            overrides=["training.loss.name=mse"],
+        )
+
+
 @pytest.mark.region
 @pytest.mark.parametrize("config_path", REGION2VEC_CONFIGS)
 def test_region2vec_configs_parse(config_path):

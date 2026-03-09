@@ -5,62 +5,18 @@ import xarray as xr
 import pandas as pd
 from unittest.mock import MagicMock, patch
 
-from utils.remote_runner import (
-    SlurmJobSpec,
-    submit_job_with_script,
-    generate_training_script,
-)
 from utils.platform import (
     is_slurm_cluster,
     stage_dataset_to_nvme,
     select_multiprocessing_context,
 )
-from utils.tensor_core import setup_tensor_core_optimizations
+from utils.device import setup_tensor_core_optimizations
 from utils.temporal import (
     parse_date_string,
     date_to_index,
     get_temporal_boundaries,
     validate_temporal_range,
 )
-
-# --- Test Remote Runner ---
-
-
-class TestRemoteRunner:
-    def test_slurm_job_spec_script_generation(self):
-        spec = SlurmJobSpec(
-            job_name="test_job", time="01:00:00", gres="gpu:1", partition="debug"
-        )
-        script = spec.to_sbatch_script("echo 'hello'")
-
-        assert "#SBATCH --job-name=test_job" in script
-        assert "#SBATCH --time=01:00:00" in script
-        assert "#SBATCH --gres=gpu:1" in script
-        assert "#SBATCH --partition=debug" in script
-        assert "echo 'hello'" in script
-
-    @patch("utils.remote_runner.subprocess.run")
-    def test_submit_job_with_script(self, mock_run):
-        # Mock successful submission
-        mock_result = MagicMock()
-        mock_result.stdout = "Submitted batch job 12345"
-        mock_run.return_value = mock_result
-
-        spec = SlurmJobSpec(job_name="test")
-        job_id = submit_job_with_script(spec, "cmd", remote_host="host")
-
-        assert job_id == "12345"
-        assert mock_run.call_count == 2  # 1 for cat (copy), 1 for sbatch
-
-    def test_generate_training_script(self):
-        script = generate_training_script(
-            config_path="config.yaml", overrides=["a=1", "b=2"]
-        )
-        assert "uv run main train epiforecaster" in script
-        assert '--config "config.yaml"' in script
-        assert "--override a=1" in script
-        assert "--override b=2" in script
-
 
 # --- Test Platform ---
 
