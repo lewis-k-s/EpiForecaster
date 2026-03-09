@@ -26,6 +26,7 @@ from .preprocess import (
     PreprocessingConfig,
     RegionGraphPreprocessor,
 )
+from .region_embedding_store import RegionEmbeddingStore
 
 __all__ = [
     "CasesPreprocessor",
@@ -36,6 +37,7 @@ __all__ = [
     "FittedPreprocessors",
     "OfflinePreprocessingPipeline",
     "PreprocessingConfig",
+    "RegionEmbeddingStore",
     "RegionGraphPreprocessor",
     "build_curriculum_datasets",
     "build_datasets",

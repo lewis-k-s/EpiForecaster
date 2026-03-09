@@ -15,7 +15,6 @@ from constants import (
 )
 from data import dtypes as dtype_utils
 from data.epi_batch import _replace_non_finite
-from graph.node_encoder import Region2Vec
 from models.configs import EpiForecasterConfig
 from utils.logging import suppress_zarr_warnings
 
@@ -31,6 +30,7 @@ from .mobility_preprocessor import (  # noqa: E402
     MobilityPreprocessorConfig,
 )
 from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
+from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,6 @@ class SharedSparseTopology:
     edge_weight_by_time: list[torch.Tensor]
     num_nodes: int
     num_timesteps: int
-
-
-def _ensure_3d(arr: np.ndarray) -> np.ndarray:
-    """Ensure array is 3D (time, region, feature), adding trailing dim if needed."""
-    if arr.ndim == 2:
-        return arr[..., None]
-    return arr
 
 
 class EpiDatasetItem(TypedDict):
@@ -107,7 +100,7 @@ class EpiDataset(Dataset):
         shared_sparse_topology: SharedSparseTopology | None = None,
         time_range: tuple[int, int] | None = None,
         run_id: str | None = None,
-        region_id_index: dict[str, int] | None = None,
+        region_embedding_store: RegionEmbeddingStore | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
@@ -124,7 +117,8 @@ class EpiDataset(Dataset):
 
         # Store run_id for curriculum sampler to identify real vs synthetic datasets
         self.run_id = effective_run_id
-        self._region_id_index = region_id_index
+        self._region_embedding_store = region_embedding_store
+        self._local_to_global_region_index: torch.Tensor | None = None
 
         # Load dataset with run_id filtering for memory efficiency
         # This ensures only the required run is loaded, not all runs
@@ -378,36 +372,11 @@ class EpiDataset(Dataset):
                 (T_total, 0), dtype=dtype_utils.STORAGE_DTYPES["continuous"]
             )
             self.temporal_covariates_dim = 0
-            logger.info("No temporal covariates found in dataset")
+            logger.warn("No temporal covariates found in dataset")
 
-        self.region_embeddings = None
-        if config.data.region2vec_path:
-            # use pre-trained region2vec embeddings and lookup by labeled regions
-            # TODO: actually run forward pass region2vec in EpiForecaster
-            _, art = Region2Vec.from_weights(config.data.region2vec_path)
-
-            # Filter region embeddings using numpy instead of xarray to avoid requiring a named dimension
-            # for the embedding size (since xarray expects all dims to be named).
-            region_ids = list(art.get("region_ids", []))  # type: ignore[typeddict-item]
-            selected_ids = list(self._dataset[REGION_COORD].values)
-            region_id_index = {rid: i for i, rid in enumerate(region_ids)}
-            indices = [
-                region_id_index[rid] for rid in selected_ids if rid in region_id_index
-            ]
-            embeddings = art.get("embeddings")  # type: ignore[typeddict-item]
-            if embeddings is None:
-                raise ValueError("Region embeddings not found in artifact")
-            region_embeddings = embeddings[indices]
-
-            assert region_embeddings.shape == (
-                self.num_nodes,
-                self.config.model.region_embedding_dim,
-            ), "Static embeddings shape mismatch"
-
-            self.region_embeddings = torch.as_tensor(
-                region_embeddings, dtype=dtype_utils.STORAGE_DTYPES["continuous"]
-            )
-            self.region_embeddings = _replace_non_finite(self.region_embeddings)
+        self.region_embeddings = (
+            region_embedding_store.embeddings if region_embedding_store is not None else None
+        )
 
         self.target_nodes = target_nodes
         self.context_mask = torch.zeros(
@@ -459,6 +428,12 @@ class EpiDataset(Dataset):
         # This prevents hangs when workers try to reopen zarr files
         self._region_labels = list(self._dataset[REGION_COORD].values)
         self._temporal_coords = list(self._dataset[TEMPORAL_COORD].values)
+        if self._region_embedding_store is not None:
+            self._local_to_global_region_index = (
+                self._region_embedding_store.build_local_to_global_index(
+                    [str(region_id) for region_id in self._region_labels]
+                )
+            )
 
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
         # This moves expensive matrix operations from per-sample to startup time
@@ -653,11 +628,10 @@ class EpiDataset(Dataset):
         # Use pre-extracted metadata to avoid zarr access in workers
         node_label = self._region_labels[target_idx]
         target_region_index = target_idx
-        if self._region_id_index is not None:
-            key = str(node_label)
-            if key not in self._region_id_index:
-                raise ValueError(f"Region ID '{key}' missing from embedding index.")
-            target_region_index = self._region_id_index[key]
+        if self._local_to_global_region_index is not None:
+            target_region_index = int(
+                self._local_to_global_region_index[target_idx].item()
+            )
 
         range_end = range_start + L
         forecast_targets = range_end + H
@@ -786,6 +760,9 @@ class EpiDataset(Dataset):
         # Determine node IDs in the context mask
         node_mask = self._get_graph_node_mask()
         node_ids = torch.where(node_mask)[0]
+        mob_real_node_idx = node_ids
+        if self._local_to_global_region_index is not None:
+            mob_real_node_idx = self._local_to_global_region_index[node_ids]
 
         for t in range(L):
             global_t = range_start + t
@@ -852,7 +829,7 @@ class EpiDataset(Dataset):
             "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
             "mob_t": torch.arange(range_start, range_start + L, dtype=torch.long),
             "mob_target_node_idx": local_target_idx_tensor,
-            "mob_real_node_idx": node_ids,
+            "mob_real_node_idx": mob_real_node_idx,
             "population": population,
             "run_id": run_id,
             "temporal_covariates": temporal_covariates_hist,  # (L, cov_dim)
@@ -1484,136 +1461,3 @@ class EpiDataset(Dataset):
                 dataset = dataset.load()
 
         return dataset
-
-    @classmethod
-    def create_temporal_splits(
-        cls,
-        config: EpiForecasterConfig,
-        train_end_date: str,
-        val_end_date: str,
-        test_end_date: str | None = None,
-    ) -> tuple["EpiDataset", "EpiDataset", "EpiDataset"]:
-        """Create train/val/test datasets with the same nodes but different time ranges.
-
-        All splits use all available nodes as targets, but data is divided by date ranges.
-        Preprocessors are fitted on the train data only and shared across splits.
-
-        Args:
-            config: EpiForecasterConfig with dataset path and model parameters.
-            train_end_date: Train split end date (YYYY-MM-DD). Exclusive.
-            val_end_date: Validation split end date (YYYY-MM-DD). Exclusive.
-            test_end_date: Optional test split end date. If None, uses end of dataset.
-
-        Returns:
-            Tuple of (train_dataset, val_dataset, test_dataset).
-
-        Raises:
-            ValueError: If temporal boundaries are invalid or out of range.
-        """
-        from utils.temporal import (
-            format_date_range,
-            get_temporal_boundaries,
-            validate_temporal_range,
-        )
-
-        # Load canonical dataset to get node list and temporal boundaries
-        if not config.data.run_id:
-            raise ValueError("run_id must be specified in config for temporal splits")
-        aligned_dataset = cls.load_canonical_dataset(
-            Path(config.data.dataset_path),
-            run_id=config.data.run_id,
-            run_id_chunk_size=config.data.run_id_chunk_size,
-        )
-
-        num_nodes = aligned_dataset[REGION_COORD].size
-        all_nodes = list(range(num_nodes))
-
-        # Check for valid_targets filter
-        if config.data.use_valid_targets and "valid_targets" in aligned_dataset:
-            valid_targets = aligned_dataset.valid_targets
-
-            # Aggregate across run_id dimension (always present)
-            if "run_id" in valid_targets.dims:
-                valid_targets = valid_targets.any(dim="run_id")
-
-            valid_mask = valid_targets.values.astype(bool)
-            all_nodes = [i for i in all_nodes if valid_mask[i]]
-            logger.info(
-                f"Using valid_targets filter: {len(all_nodes)}/{num_nodes} training regions"
-            )
-
-        # Get temporal boundaries
-        train_start, train_end, val_end, test_end = get_temporal_boundaries(
-            aligned_dataset,
-            train_end_date=train_end_date,
-            val_end_date=val_end_date,
-            test_end_date=test_end_date,
-        )
-
-        L = config.model.input_window_length
-        H = config.model.forecast_horizon
-        total_time_steps = len(aligned_dataset[TEMPORAL_COORD])
-
-        # Validate each temporal range
-        for name, time_range in [
-            ("train", (train_start, train_end)),
-            ("val", (train_end, val_end)),
-            ("test", (val_end, test_end)),
-        ]:
-            try:
-                validate_temporal_range(time_range, L, H, total_time_steps)
-            except ValueError as e:
-                raise ValueError(
-                    f"{name.upper()} split temporal range invalid: {e}"
-                ) from e
-
-        # Log date ranges
-        logger.info("Temporal split boundaries:")
-        logger.info(
-            f"  TRAIN: {format_date_range(aligned_dataset, (train_start, train_end))}"
-        )
-        logger.info(
-            f"  VAL:   {format_date_range(aligned_dataset, (train_end, val_end))}"
-        )
-        logger.info(
-            f"  TEST:  {format_date_range(aligned_dataset, (val_end, test_end))}"
-        )
-
-        # Create train dataset with time range - preprocessors fitted internally
-        train_dataset = cls(
-            config=config,
-            target_nodes=all_nodes,
-            context_nodes=all_nodes,
-            biomarker_preprocessor=None,
-            mobility_preprocessor=None,
-            time_range=(train_start, train_end),
-        )
-
-        # Reuse train dataset's fitted preprocessors for val/test
-        fitted_bio_preprocessor = train_dataset.biomarker_preprocessor
-        fitted_mobility_preprocessor = train_dataset.mobility_preprocessor
-        shared_mobility = train_dataset.preloaded_mobility
-        shared_mobility_mask = train_dataset.mobility_mask
-        val_dataset = cls(
-            config=config,
-            target_nodes=all_nodes,
-            context_nodes=all_nodes,
-            biomarker_preprocessor=fitted_bio_preprocessor,
-            mobility_preprocessor=fitted_mobility_preprocessor,
-            preloaded_mobility=shared_mobility,
-            mobility_mask=shared_mobility_mask,
-            time_range=(train_end, val_end),
-        )
-
-        test_dataset = cls(
-            config=config,
-            target_nodes=all_nodes,
-            context_nodes=all_nodes,
-            biomarker_preprocessor=fitted_bio_preprocessor,
-            mobility_preprocessor=fitted_mobility_preprocessor,
-            preloaded_mobility=shared_mobility,
-            mobility_mask=shared_mobility_mask,
-            time_range=(val_end, test_end),
-        )
-
-        return train_dataset, val_dataset, test_dataset

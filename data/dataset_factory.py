@@ -17,8 +17,14 @@ from data.curriculum_builder import (
     discover_runs,
 )
 from data.epi_dataset import EpiDataset
-from data.preprocess.config import REGION_COORD
+from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.region_embedding_store import RegionEmbeddingStore
 from models.configs import EpiForecasterConfig
+from utils.temporal import (
+    format_date_range,
+    get_temporal_boundaries,
+    validate_temporal_range,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,18 @@ class DatasetSplits:
     test: EpiDataset
     real_run_id: str | None = None
     synth_run_ids: list[str] | None = None
+    region_embedding_store: RegionEmbeddingStore | None = None
+
+
+def _build_region_embedding_store(
+    config: EpiForecasterConfig,
+) -> RegionEmbeddingStore | None:
+    if not config.data.region2vec_path:
+        return None
+    return RegionEmbeddingStore.from_weights(
+        config.data.region2vec_path,
+        expected_dim=config.model.region_embedding_dim,
+    )
 
 
 def split_nodes_by_ratio(
@@ -102,6 +120,7 @@ def _build_standard_splits(
     train_nodes: list[int],
     val_nodes: list[int],
     test_nodes: list[int],
+    region_embedding_store: RegionEmbeddingStore | None,
 ) -> DatasetSplits:
     """Build standard (non-curriculum) train/val/test splits with shared preprocessors."""
     train_dataset = EpiDataset(
@@ -110,6 +129,7 @@ def _build_standard_splits(
         context_nodes=train_nodes,
         biomarker_preprocessor=None,
         mobility_preprocessor=None,
+        region_embedding_store=region_embedding_store,
     )
 
     fitted_bio_preprocessor = train_dataset.biomarker_preprocessor
@@ -127,6 +147,7 @@ def _build_standard_splits(
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
         shared_sparse_topology=shared_sparse_topology,
+        region_embedding_store=region_embedding_store,
     )
 
     test_dataset = EpiDataset(
@@ -138,6 +159,7 @@ def _build_standard_splits(
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
         shared_sparse_topology=shared_sparse_topology,
+        region_embedding_store=region_embedding_store,
     )
 
     train_dataset.release_shared_sparse_topology()
@@ -148,6 +170,123 @@ def _build_standard_splits(
         train=train_dataset,
         val=val_dataset,
         test=test_dataset,
+        region_embedding_store=region_embedding_store,
+    )
+
+
+def _build_temporal_splits(
+    config: EpiForecasterConfig,
+    train_end_date: str,
+    val_end_date: str,
+    test_end_date: str | None,
+    region_embedding_store: RegionEmbeddingStore | None,
+) -> DatasetSplits:
+    """Build temporal train/val/test splits with shared preprocessors."""
+    if not config.data.run_id:
+        raise ValueError("run_id must be specified in config for temporal splits")
+
+    aligned_dataset = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+        run_id_chunk_size=config.data.run_id_chunk_size,
+    )
+
+    num_nodes = aligned_dataset[REGION_COORD].size
+    all_nodes = list(range(num_nodes))
+
+    if config.data.use_valid_targets and "valid_targets" in aligned_dataset:
+        valid_targets = aligned_dataset.valid_targets
+        if "run_id" in valid_targets.dims:
+            valid_targets = valid_targets.any(dim="run_id")
+
+        valid_mask = valid_targets.values.astype(bool)
+        all_nodes = [i for i in all_nodes if valid_mask[i]]
+        logger.info(
+            "Using valid_targets filter: %d/%d training regions",
+            len(all_nodes),
+            num_nodes,
+        )
+
+    train_start, train_end, val_end, test_end = get_temporal_boundaries(
+        aligned_dataset,
+        train_end_date=train_end_date,
+        val_end_date=val_end_date,
+        test_end_date=test_end_date,
+    )
+
+    input_window = config.model.input_window_length
+    forecast_horizon = config.model.forecast_horizon
+    total_time_steps = len(aligned_dataset[TEMPORAL_COORD])
+
+    for name, time_range in [
+        ("train", (train_start, train_end)),
+        ("val", (train_end, val_end)),
+        ("test", (val_end, test_end)),
+    ]:
+        try:
+            validate_temporal_range(
+                time_range, input_window, forecast_horizon, total_time_steps
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{name.upper()} split temporal range invalid: {exc}"
+            ) from exc
+
+    logger.info("Temporal split boundaries:")
+    logger.info(
+        "  TRAIN: %s", format_date_range(aligned_dataset, (train_start, train_end))
+    )
+    logger.info(
+        "  VAL:   %s", format_date_range(aligned_dataset, (train_end, val_end))
+    )
+    logger.info(
+        "  TEST:  %s", format_date_range(aligned_dataset, (val_end, test_end))
+    )
+
+    train_dataset = EpiDataset(
+        config=config,
+        target_nodes=all_nodes,
+        context_nodes=all_nodes,
+        biomarker_preprocessor=None,
+        mobility_preprocessor=None,
+        time_range=(train_start, train_end),
+        region_embedding_store=region_embedding_store,
+    )
+
+    fitted_bio_preprocessor = train_dataset.biomarker_preprocessor
+    fitted_mobility_preprocessor = train_dataset.mobility_preprocessor
+    shared_mobility = train_dataset.preloaded_mobility
+    shared_mobility_mask = train_dataset.mobility_mask
+
+    val_dataset = EpiDataset(
+        config=config,
+        target_nodes=all_nodes,
+        context_nodes=all_nodes,
+        biomarker_preprocessor=fitted_bio_preprocessor,
+        mobility_preprocessor=fitted_mobility_preprocessor,
+        preloaded_mobility=shared_mobility,
+        mobility_mask=shared_mobility_mask,
+        time_range=(train_end, val_end),
+        region_embedding_store=region_embedding_store,
+    )
+
+    test_dataset = EpiDataset(
+        config=config,
+        target_nodes=all_nodes,
+        context_nodes=all_nodes,
+        biomarker_preprocessor=fitted_bio_preprocessor,
+        mobility_preprocessor=fitted_mobility_preprocessor,
+        preloaded_mobility=shared_mobility,
+        mobility_mask=shared_mobility_mask,
+        time_range=(val_end, test_end),
+        region_embedding_store=region_embedding_store,
+    )
+
+    return DatasetSplits(
+        train=train_dataset,
+        val=val_dataset,
+        test=test_dataset,
+        region_embedding_store=region_embedding_store,
     )
 
 
@@ -165,22 +304,19 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
     Returns:
         DatasetSplits with train/val/test datasets and optional curriculum metadata
     """
+    region_embedding_store = _build_region_embedding_store(config)
+
     if config.training.split_strategy == "time":
         train_end: str = config.training.train_end_date or ""
         val_end: str = config.training.val_end_date or ""
         test_end: str | None = config.training.test_end_date
 
-        train_dataset, val_dataset, test_dataset = EpiDataset.create_temporal_splits(
+        return _build_temporal_splits(
             config=config,
             train_end_date=train_end,
             val_end_date=val_end,
             test_end_date=test_end,
-        )
-
-        return DatasetSplits(
-            train=train_dataset,
-            val=val_dataset,
-            test=test_dataset,
+            region_embedding_store=region_embedding_store,
         )
 
     real_run_for_split: str | None = None
@@ -211,6 +347,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             test_nodes=list(test_nodes),
             real_run=real_run,
             synth_runs=synth_runs,
+            region_embedding_store=region_embedding_store,
         )
 
         return DatasetSplits(
@@ -219,6 +356,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             test=result.test_dataset,
             real_run_id=result.real_run_id,
             synth_run_ids=result.synth_run_ids,
+            region_embedding_store=result.region_embedding_store,
         )
     else:
         if not config.data.run_id:
@@ -230,4 +368,5 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             train_nodes=list(train_nodes),
             val_nodes=list(val_nodes),
             test_nodes=list(test_nodes),
+            region_embedding_store=region_embedding_store,
         )

@@ -7,6 +7,7 @@ import xarray as xr
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.region_embedding_store import RegionEmbeddingStore
 from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 
 
@@ -221,7 +222,6 @@ def test_getitem_values(tmp_path):
             torch.full_like(cases_hist[..., 2], expected_age),
             atol=1e-3,
         )
-
     elif item["node_label"] == 1:
         # Node 1: 50 cases.
         cases_hist = item["cases_hist"]
@@ -243,6 +243,32 @@ def test_getitem_values(tmp_path):
             torch.full_like(cases_hist[..., 2], expected_age),
             atol=1e-3,
         )
+
+
+@pytest.mark.epiforecaster
+def test_getitem_maps_target_and_context_nodes_to_canonical_region_indices(tmp_path):
+    zarr_path = tmp_path / "region_mapping.zarr"
+    _write_tiny_dataset(str(zarr_path), periods=8)
+
+    config = _make_config(str(zarr_path), log_scale=False)
+    store = RegionEmbeddingStore(
+        embeddings=torch.randn(2, 1),
+        region_id_to_index={"0": 1, "1": 0},
+    )
+    dataset = EpiDataset(
+        config=config,
+        target_nodes=[0, 1],
+        context_nodes=[0, 1],
+        region_embedding_store=store,
+    )
+
+    item = dataset[0]
+    if item["node_label"] == 0:
+        assert item["target_region_index"] == 1
+    else:
+        assert item["target_region_index"] == 0
+
+    assert torch.equal(item["mob_real_node_idx"], torch.tensor([1, 0]))
 
 
 @pytest.mark.epiforecaster
