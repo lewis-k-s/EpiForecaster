@@ -258,6 +258,7 @@ class TestEpiForecasterTrainer:
             test=mock_dataset_instance,
             real_run_id="real",
             synth_run_ids=["synth1"],
+            region_embedding_store=None,
         )
         with patch("training.epiforecaster_trainer.build_datasets", return_value=mock_splits):
             with patch(

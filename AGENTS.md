@@ -36,8 +36,7 @@ uv run ruff format .       # formatting
 uv run pyright .           # type checking (best-effort; excludes dataviz/plotting)
 
 # CLI usage
-.venv/bin/python -m cli --help  # access CLI commands
-# or after installation: epiforecaster --help
+uv run main --help  # entrypoint cli.py
 ```
 
 ## Coding Style & Naming Conventions
@@ -48,6 +47,7 @@ uv run pyright .           # type checking (best-effort; excludes dataviz/plotti
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.
 - Tensor ops: prefer `einops` (`rearrange`, `reduce`, `repeat`) for matrix/tensor manipulation over manual `view/reshape/permute` for clarity.
 - For Python types, prefer native list, dict, tuple instead of the typing library. Prefer the `x | None` notation over Optional
+- With our model and training config, use direct class attribute access instead of getattr. Config value defaults are defined on startup during yaml parsing, so runtime fallbacks are undesirable in most cases.
 
 ## Testing Guidelines
 
@@ -117,6 +117,5 @@ The canonical data pipeline follows: raw data → preprocessing → Zarr dataset
 - Prefer `uv run` for execution and CLI commands over ad-hoc commands; update `pyproject.toml` if adding deps.
 - Do not modify `data/` inputs or commit large `outputs/`. Place generated artifacts in `outputs/` and ignore by default.
 - Keep patches minimal and consistent with existing style; avoid unrelated refactors. If heavy compute is required, add flags and default to lightweight settings.
-- This project is a work in progress. It is ok to make breaking changes as the interface evolves.
-- Use configuration-driven development: copy and modify templates from the `configs/` directory rather than hardcoding parameters.
+- Use configuration-driven development: copy and modify templates from the `configs/` directory or provide CLI level overrides with dot-path syntax like `--override model.strict=true` rather than hardcoding parameters.
 - **Zarr Data Access**: Always use `xarray.open_zarr()` instead of `zarr.open()` for inspecting or loading zarr datasets. Xarray provides labeled dimensions, coordinates, and better integration with the data pipeline.
