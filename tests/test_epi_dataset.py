@@ -4,7 +4,8 @@ import numpy as np
 import xarray as xr
 from unittest.mock import patch
 from models.configs import EpiForecasterConfig, DataConfig, ModelConfig, ModelVariant
-from data.epi_dataset import EpiDataset, collate_epiforecaster_batch
+from data.epi_dataset import EpiDataset
+from data.epi_batch import collate_epiforecaster_batch
 
 
 class TestEpiDataset:
@@ -188,9 +189,9 @@ class TestEpiDataset:
                 [item_a, item_b], require_region_index=False
             )
 
-            assert torch.isfinite(batch["HospHist"]).all()
-            assert torch.isfinite(batch["DeathsHist"]).all()
-            assert torch.isfinite(batch["CasesHist"]).all()
-            assert torch.isfinite(batch["BioNode"]).all()
-            assert torch.isfinite(batch["TemporalCovariates"]).all()
-            assert torch.isfinite(batch["MobBatch"].x_dense).all()
+            assert torch.isfinite(batch.hosp_hist).all()
+            assert torch.isfinite(batch.deaths_hist).all()
+            assert torch.isfinite(batch.cases_hist).all()
+            assert torch.isfinite(batch.bio_node).all()
+            assert torch.isfinite(batch.temporal_covariates).all()
+            assert torch.isfinite(batch.mob_batch.x_dense).all()
