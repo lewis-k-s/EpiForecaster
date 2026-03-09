@@ -20,7 +20,7 @@ from torch import nn
 from graph.node_encoder import Region2Vec
 from utils import setup_tensor_core_optimizations
 from utils import device as dtype_utils
-from models.region_losses import (
+from evaluation.region_losses import (
     CommunityOrientedLoss,
     SpatialContiguityPrior,
     SpatialOnlyLoss,

@@ -4,7 +4,7 @@ import torch
 from pathlib import Path
 
 from training.region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
-from models.region_losses import CommunityOrientedLoss
+from evaluation.region_losses import CommunityOrientedLoss
 
 
 class TestRegion2VecTrainer:

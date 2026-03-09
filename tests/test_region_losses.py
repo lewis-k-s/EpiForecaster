@@ -1,6 +1,6 @@
 import pytest
 import torch
-from models.region_losses import (
+from evaluation.region_losses import (
     FlowWeightedContrastiveLoss,
     SpatialAutocorrelationLoss,
     CommunityOrientedLoss,

@@ -6,7 +6,7 @@ import pytest
 import torch
 from libpysal import weights
 
-from models.region_losses import (
+from evaluation.region_losses import (
     SpatialAutocorrelationLoss,
     _create_spatial_weights_from_edge_index,
 )
