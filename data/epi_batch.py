@@ -218,7 +218,7 @@ def collate_epiforecaster_batch(
     if require_region_index and any(idx is None for idx in target_region_indices):
         raise ValueError(
             "TargetRegionIndex missing for batch while region matching is required. "
-            "Ensure region_id_index is provided when model.type.regions is enabled."
+            "Ensure region_embedding_store is provided when model.type.regions is enabled."
         )
 
     return EpiBatch(

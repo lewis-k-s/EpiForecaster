@@ -21,6 +21,7 @@ from torch.utils.data import ConcatDataset
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD
+from data.region_embedding_store import RegionEmbeddingStore
 from models.configs import EpiForecasterConfig
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class CurriculumBuildResult:
     test_dataset: EpiDataset
     real_run_id: str
     synth_run_ids: list[str]
+    region_embedding_store: RegionEmbeddingStore | None
 
 
 def load_sparsity_mapping(dataset_path: Path) -> dict[str, float]:
@@ -358,6 +360,7 @@ def build_curriculum_datasets(
     test_nodes: list[int],
     real_run: str,
     synth_runs: list[str],
+    region_embedding_store: RegionEmbeddingStore | None = None,
 ) -> CurriculumBuildResult:
     """Build curriculum training datasets with real + synthetic runs.
 
@@ -384,8 +387,6 @@ def build_curriculum_datasets(
 
     real_region_ids = _load_region_ids(split_dataset_path, real_run)
     train_region_ids = [real_region_ids[n] for n in train_nodes]
-    region_id_index = {region_id: idx for idx, region_id in enumerate(real_region_ids)}
-
     real_train_ds = EpiDataset(
         config=real_config,
         target_nodes=train_nodes,
@@ -393,7 +394,7 @@ def build_curriculum_datasets(
         biomarker_preprocessor=None,
         mobility_preprocessor=None,
         run_id=real_run,
-        region_id_index=region_id_index,
+        region_embedding_store=region_embedding_store,
     )
 
     fitted_bio_preprocessor = real_train_ds.biomarker_preprocessor
@@ -423,7 +424,7 @@ def build_curriculum_datasets(
         biomarker_preprocessor=None,
         mobility_preprocessor=None,
         run_id=synth_scaler_run,
-        region_id_index=region_id_index,
+        region_embedding_store=region_embedding_store,
     )
 
     synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
@@ -455,7 +456,7 @@ def build_curriculum_datasets(
             biomarker_preprocessor=synth_bio_preprocessor,
             mobility_preprocessor=synth_mobility_preprocessor,
             run_id=s_run,
-            region_id_index=region_id_index,
+            region_embedding_store=region_embedding_store,
         )
         synth_datasets.append(s_ds)
 
@@ -471,7 +472,7 @@ def build_curriculum_datasets(
         mobility_mask=shared_real_mobility_mask,
         shared_sparse_topology=shared_real_sparse_topology,
         run_id=real_run,
-        region_id_index=region_id_index,
+        region_embedding_store=region_embedding_store,
     )
 
     test_dataset = EpiDataset(
@@ -484,7 +485,7 @@ def build_curriculum_datasets(
         mobility_mask=shared_real_mobility_mask,
         shared_sparse_topology=shared_real_sparse_topology,
         run_id=real_run,
-        region_id_index=region_id_index,
+        region_embedding_store=region_embedding_store,
     )
 
     real_train_ds.release_shared_sparse_topology()
@@ -501,4 +502,5 @@ def build_curriculum_datasets(
         test_dataset=test_dataset,
         real_run_id=real_run,
         synth_run_ids=synth_runs,
+        region_embedding_store=region_embedding_store,
     )
