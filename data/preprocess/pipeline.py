@@ -15,7 +15,7 @@ import numpy as np
 import xarray as xr
 import yaml
 
-from utils import dtypes as dtype_utils
+from data import dtypes as dtype_utils
 from .config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 from .utils import load_csv_with_string_ids
 from .processors.alignment_processor import AlignmentProcessor

@@ -1,36 +1,16 @@
 """
-Centralized dtype constants and conversion utilities for EpiForecaster.
+Centralized device and computation dtype utilities for EpiForecaster.
 
-This module provides a single source of truth for dtype handling across the codebase.
-Input data is stored as bool/int/float16, while model computation uses float16.
-Only bool and int types need coercion to the model dtype.
+This module isolates model execution, dtype coercion, and numerical stability
+from the raw data schemas.
 """
+
+import logging
+from typing import Literal
 
 import torch
 
-# =============================================================================
-# STORAGE DTYPES (used in preprocessing and dataset loading)
-# =============================================================================
-
-# Input data dtypes - matches preprocessing output schema from data/preprocess/README.md
-STORAGE_DTYPES = {
-    "continuous": torch.float16,  # All continuous series (clinical, biomarkers, mobility)
-    "mask": torch.bool,  # Binary masks (observed vs missing)
-    "age": torch.uint8,  # Days since last observation (0-14)
-    "censor": torch.uint8,  # Censor flags (0=uncensored, 1=censored, 2=imputed)
-    "index": torch.int16,  # Data start indices (-1 sentinel)
-    "population": torch.int32,  # Population counts
-}
-
-# Numpy equivalents for preprocessing
-NUMPY_STORAGE_DTYPES = {
-    "continuous": "float16",
-    "mask": "bool",
-    "age": "uint8",
-    "censor": "uint8",
-    "index": "int16",
-    "population": "int32",
-}
+PrecisionMode = Literal["tf32", "ieee"]
 
 # =============================================================================
 # MODEL DTYPES (used for computation)
@@ -143,24 +123,6 @@ def get_model_dtype() -> torch.dtype:
     return MODEL_DTYPE
 
 
-def get_storage_dtype(dtype_key: str) -> torch.dtype:
-    """
-    Get the storage dtype for a given key.
-
-    Args:
-        dtype_key: One of 'continuous', 'mask', 'age', 'censor', 'index', 'population'
-
-    Returns:
-        torch dtype for storage
-    """
-    return STORAGE_DTYPES[dtype_key]
-
-
-def is_storage_dtype(tensor: torch.Tensor, dtype_key: str) -> bool:
-    """Check if tensor matches the expected storage dtype."""
-    return tensor.dtype == STORAGE_DTYPES[dtype_key]
-
-
 # =============================================================================
 # NUMERICAL STABILITY UTILITIES
 # =============================================================================
@@ -238,3 +200,67 @@ def sync_to_device(
         else:
             result.append(t)
     return tuple(result)
+
+
+def resolve_device(device: str) -> torch.device:
+    """Resolve the torch device string using the same priority as training."""
+    if device == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    if resolved.type == "mps" and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        return torch.device("cpu")
+    return resolved
+
+
+def _log(logger: logging.Logger | None, message: str) -> None:
+    if logger:
+        logger.info(message)
+
+
+def setup_tensor_core_optimizations(
+    device: torch.device,
+    enable_tf32: bool = True,
+    enable_mixed_precision: bool = True,
+    mixed_precision_dtype: str = "bfloat16",
+    logger: logging.Logger | None = None,
+) -> None:
+    """Configure TF32 and mixed precision settings for CUDA devices.
+
+    Args:
+        device: The torch device being used for training.
+        enable_tf32: Whether to enable TF32 precision on Ampere+ GPUs.
+        enable_mixed_precision: Whether mixed precision (AMP) is enabled.
+        mixed_precision_dtype: The dtype for mixed precision ('bfloat16' or 'float16').
+        logger: Optional logger instance for status messages.
+    """
+    if device.type != "cuda":
+        _log(logger, "Tensor Core optimizations skipped (non-CUDA device)")
+        return
+
+    # Use new PyTorch 2.9+ API for TF32 control
+    # See: https://docs.pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices
+    precision_mode: PrecisionMode = "tf32" if enable_tf32 else "ieee"
+
+    torch.backends.cuda.matmul.fp32_precision = precision_mode  # type: ignore[attr-defined]
+    torch.backends.cudnn.conv.fp32_precision = precision_mode  # type: ignore[attr-defined]
+
+    if enable_tf32:
+        _log(logger, "TF32 optimizations enabled")
+    else:
+        _log(logger, "TF32 optimizations disabled")
+
+    if enable_mixed_precision:
+        _log(
+            logger,
+            f"Mixed precision ({mixed_precision_dtype}): will be used in forward pass",
+        )
+    else:
+        _log(logger, "Mixed precision disabled")

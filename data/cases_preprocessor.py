@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 import xarray as xr
 
-from utils import dtypes as dtype_utils
+from data import dtypes as dtype_utils
 
 
 @dataclass

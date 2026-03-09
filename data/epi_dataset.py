@@ -1,22 +1,22 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict, Any
+from typing import TypedDict
 
 import numpy as np
 import torch
 import xarray as xr
 from torch.utils.data import Dataset
-from torch_geometric.data import Batch, Data
-
-from graph.node_encoder import Region2Vec
-from models.configs import EpiForecasterConfig
+from torch_geometric.data import Data
 
 from constants import (
     EDAR_BIOMARKER_PREFIX,
     EDAR_BIOMARKER_VARIANTS,
 )
-from utils import dtypes as dtype_utils
+from data import dtypes as dtype_utils
+from data.epi_batch import _replace_non_finite
+from graph.node_encoder import Region2Vec
+from models.configs import EpiForecasterConfig
 from utils.logging import suppress_zarr_warnings
 
 suppress_zarr_warnings()
@@ -52,13 +52,6 @@ def _ensure_3d(arr: np.ndarray) -> np.ndarray:
     if arr.ndim == 2:
         return arr[..., None]
     return arr
-
-
-def _replace_non_finite(tensor: torch.Tensor) -> torch.Tensor:
-    """Replace NaN/Inf values in floating tensors with finite zeros."""
-    if not torch.is_floating_point(tensor):
-        return tensor
-    return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class EpiDatasetItem(TypedDict):
@@ -1066,9 +1059,22 @@ class EpiDataset(Dataset):
         return all_starts
 
     def _compute_valid_window_starts(self) -> dict[int, list[int]]:
-        """Compute valid window starts per target node using mask-based permits."""
+        return self.get_valid_window_starts_dict(mode="any")
+
+    def get_valid_window_starts_dict(
+        self, mode: str = "any", required_targets: list[str] | None = None
+    ) -> dict[int, list[int]]:
+        """Compute valid window starts per target node using mask-based permits.
+
+        Args:
+            mode: "any" (valid if any target meets threshold) or "all" (valid only if all required targets meet threshold)
+            required_targets: list of target names that must pass if mode="all". If None, defaults to all available targets.
+        """
         if not self.window_starts:
             return {target_idx: [] for target_idx in self.target_nodes}
+
+        if mode not in ("any", "all"):
+            raise ValueError(f"Unknown mode: {mode}")
 
         L = self.config.model.input_window_length
         H = self.config.model.forecast_horizon
@@ -1081,10 +1087,24 @@ class EpiDataset(Dataset):
             "wastewater": self.precomputed_ww_mask,
         }
 
+        if required_targets is not None:
+            mask_by_target = {
+                k: v for k, v in mask_by_target.items() if k in required_targets
+            }
+
         # Presentation logic:
-        # Include a window for a node if ANY target has enough observed values
-        # in both history and forecast horizon for that target.
-        valid_mask = np.zeros((len(starts), self.num_nodes), dtype=bool)
+        # mode="any": Include a window for a node if ANY target has enough observed values
+        # mode="all": Include a window for a node if ALL required targets have enough observed values
+        valid_mask = (
+            np.zeros((len(starts), self.num_nodes), dtype=bool)
+            if mode == "any"
+            else np.ones((len(starts), self.num_nodes), dtype=bool)
+        )
+
+        # If no targets required, valid_mask will just stay all ones
+        if mode == "all" and not mask_by_target:
+            valid_mask = np.zeros((len(starts), self.num_nodes), dtype=bool)
+
         for target_name, target_mask_t in mask_by_target.items():
             target_mask = target_mask_t.detach().cpu().numpy()
             observed = (target_mask > 0).astype(np.int32)
@@ -1110,7 +1130,11 @@ class EpiDataset(Dataset):
             target_valid = (history_counts >= history_threshold) & (
                 target_counts >= target_threshold
             )
-            valid_mask |= target_valid
+
+            if mode == "any":
+                valid_mask |= target_valid
+            else:
+                valid_mask &= target_valid
 
         starts_by_node: dict[int, list[int]] = {}
         for target_idx in self.target_nodes:
@@ -1593,172 +1617,3 @@ class EpiDataset(Dataset):
         )
 
         return train_dataset, val_dataset, test_dataset
-
-
-def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
-    """
-    Optimized dense batch construction for dynamic mobility graphs.
-
-    Args:
-        batch: List of EpiDatasetItem (must contain mob_x, mob_t, mob_target_node_idx)
-
-    Returns:
-        A PyG Batch-like container with:
-        - x_dense: [B*T, N, F]
-        - global_t: [B*T]
-        - target_node: [B*T]
-    """
-    B = len(batch)
-    if B == 0:
-        return Batch()
-
-    # Fixed-size dense contract per item: mob_x is (L, N, F)
-    L, num_nodes, _ = batch[0]["mob_x"].shape
-
-    # 1) Dense node features [B*T, N, F]
-    x_dense = torch.cat([item["mob_x"] for item in batch], dim=0)
-
-    # 2) Global T indices [B*T]
-    global_t_dense = torch.cat([item["mob_t"] for item in batch], dim=0)
-
-    # 3) Target node index per graph [B*T]
-    target_nodes_stacked = torch.stack(
-        [
-            item["mob_target_node_idx"]
-            if isinstance(item["mob_target_node_idx"], torch.Tensor)
-            else torch.tensor(item["mob_target_node_idx"], dtype=torch.long)
-            for item in batch
-        ]
-    ).long()
-    target_node_tensor = target_nodes_stacked.repeat_interleave(L).to(x_dense.device)
-
-    # Extract run_id provenance if the batch is homogeneous (expected with chunked samplers).
-    run_ids = [item.get("run_id") for item in batch]
-    non_none_run_ids = [run_id for run_id in run_ids if run_id is not None]
-    normalized_run_ids = {str(run_id).strip() for run_id in non_none_run_ids}
-    batch_run_id = None
-    if len(non_none_run_ids) == len(run_ids) and len(normalized_run_ids) == 1:
-        batch_run_id = next(iter(normalized_run_ids))
-
-    # Context node mapping (constant across batch, so we can take from the first item)
-    if "mob_real_node_idx" in batch[0]:
-        mob_real_node_idx = batch[0]["mob_real_node_idx"]
-    else:
-        mob_real_node_idx = None
-
-    # 5) Batch-like container
-    mob_batch = Batch()
-    mob_batch.x_dense = x_dense
-    mob_batch.global_t = global_t_dense
-    mob_batch.target_node = target_node_tensor
-    if mob_real_node_idx is not None:
-        mob_batch.mob_real_node_idx = mob_real_node_idx
-    mob_batch.run_id = batch_run_id
-
-    return mob_batch
-
-
-def collate_epiforecaster_batch(
-    batch: list[EpiDatasetItem],
-    *,
-    require_region_index: bool = True,
-) -> dict[str, Any]:
-    """
-    Collate function for EpiForecaster batches.
-
-    This function is shared by curriculum and standard training/evaluation paths.
-    It flattens per-time-step graphs into a single PyG Batch for a consistent model
-    contract and can enforce region-index availability when region embeddings are used.
-    """
-    B = len(batch)
-    if B == 0:
-        return {}
-
-    # 1. Stack standard tensors
-    # Clinical series (3-channel: value, mask, age)
-    hosp_hist = torch.stack([item["hosp_hist"] for item in batch], dim=0)  # (B, L, 3)
-    deaths_hist = torch.stack(
-        [item["deaths_hist"] for item in batch], dim=0
-    )  # (B, L, 3)
-    cases_hist = torch.stack([item["cases_hist"] for item in batch], dim=0)  # (B, L, 3)
-    bio_node = torch.stack([item["bio_node"] for item in batch], dim=0)
-    target_nodes = torch.tensor(
-        [item["target_node"] for item in batch], dtype=torch.long
-    )
-    window_starts = torch.tensor(
-        [item["window_start"] for item in batch], dtype=torch.long
-    )
-    population = torch.stack([item["population"] for item in batch], dim=0)
-
-    # Stack joint inference targets (log1p per-100k)
-    hosp_targets = torch.stack([item["hosp_target"] for item in batch], dim=0)
-    ww_targets = torch.stack([item["ww_target"] for item in batch], dim=0)
-    cases_targets = torch.stack([item["cases_target"] for item in batch], dim=0)
-    deaths_targets = torch.stack([item["deaths_target"] for item in batch], dim=0)
-    hosp_target_masks = torch.stack([item["hosp_target_mask"] for item in batch], dim=0)
-    ww_target_masks = torch.stack([item["ww_target_mask"] for item in batch], dim=0)
-    cases_target_masks = torch.stack(
-        [item["cases_target_mask"] for item in batch], dim=0
-    )
-    deaths_target_masks = torch.stack(
-        [item["deaths_target_mask"] for item in batch], dim=0
-    )
-
-    # Stack temporal covariates
-    temporal_covariates = torch.stack(
-        [item["temporal_covariates"] for item in batch], dim=0
-    )  # (B, L, cov_dim)
-
-    # 2. Batch Temporal Graphs (Optimized Manual Batching)
-    mob_batch = optimized_collate_graphs(batch)
-    if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
-        mob_batch.x_dense = _replace_non_finite(mob_batch.x_dense)
-
-    hosp_hist = _replace_non_finite(hosp_hist)
-    deaths_hist = _replace_non_finite(deaths_hist)
-    cases_hist = _replace_non_finite(cases_hist)
-    bio_node = _replace_non_finite(bio_node)
-    temporal_covariates = _replace_non_finite(temporal_covariates)
-
-    # Store B and T on the batch for downstream reshaping
-    T = batch[0]["mob_x"].shape[0] if B > 0 else 0
-    mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
-    mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
-
-    target_region_indices = [item["target_region_index"] for item in batch]
-    if require_region_index and any(idx is None for idx in target_region_indices):
-        raise ValueError(
-            "TargetRegionIndex missing for batch while region matching is required. "
-            "Ensure region_id_index is provided when model.type.regions is enabled."
-        )
-
-    out = {
-        # Clinical series inputs (3-channel: value, mask, age)
-        "HospHist": hosp_hist,  # (B, L, 3)
-        "DeathsHist": deaths_hist,  # (B, L, 3)
-        "CasesHist": cases_hist,  # (B, L, 3)
-        "BioNode": bio_node,  # (B, L, B)
-        "MobBatch": mob_batch,  # Batched PyG graphs
-        "Population": population,  # (B,)
-        "B": B,
-        "T": T,
-        "TargetNode": target_nodes,  # (B,)
-        "TargetRegionIndex": torch.tensor(target_region_indices, dtype=torch.long),
-        "WindowStart": window_starts,  # (B,)
-        "NodeLabels": [item["node_label"] for item in batch],
-        # Temporal covariates
-        "TemporalCovariates": temporal_covariates,  # (B, L, cov_dim)
-        # Joint inference targets (log1p per-100k)
-        "HospTarget": hosp_targets,  # (B, H)
-        "WWTarget": ww_targets,  # (B, H)
-        "CasesTarget": cases_targets,  # (B, H)
-        "DeathsTarget": deaths_targets,  # (B, H)
-        "HospTargetMask": hosp_target_masks,  # (B, H)
-        "WWTargetMask": ww_target_masks,  # (B, H)
-        "CasesTargetMask": cases_target_masks,  # (B, H)
-        "DeathsTargetMask": deaths_target_masks,  # (B, H)
-    }
-    if all(idx is not None for idx in target_region_indices):
-        out["TargetRegionIndex"] = torch.tensor(target_region_indices, dtype=torch.long)
-
-    return out
