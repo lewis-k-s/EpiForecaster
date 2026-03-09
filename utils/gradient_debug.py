@@ -65,6 +65,13 @@ class GradientSnapshot:
     non_finite_layers: list[str] = field(default_factory=list)
     vanishing_layers: list[str] = field(default_factory=list)
     exploding_layers: list[str] = field(default_factory=list)
+    head_supervision: dict[str, dict[str, float | int | bool]] = field(
+        default_factory=dict
+    )
+    head_gradient_health: dict[str, dict[str, float | int | bool]] = field(
+        default_factory=dict
+    )
+    head_coverage: dict[str, dict[str, float | int]] = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
 
 
@@ -79,6 +86,8 @@ class GradientDebugger:
         log_dir: Directory to save diagnostic reports
         logger: Logger instance for output
     """
+
+    _OBS_HEAD_MARKERS = ("ww", "hosp", "cases", "deaths")
 
     def __init__(
         self,
@@ -196,6 +205,8 @@ class GradientDebugger:
         model: nn.Module,
         loss: torch.Tensor | None = None,
         step_info: dict | None = None,
+        head_supervision: dict[str, dict[str, float | int | bool]] | None = None,
+        head_coverage: dict[str, dict[str, float | int]] | None = None,
     ) -> GradientSnapshot:
         """Capture a complete snapshot of gradient state.
 
@@ -218,6 +229,8 @@ class GradientDebugger:
             batch_idx=step_info.get("batch_idx", -1),
             loss=float(loss.item()) if loss is not None else None,
             loss_finite=bool(torch.isfinite(loss).item()) if loss is not None else True,
+            head_supervision=head_supervision or {},
+            head_coverage=head_coverage or {},
         )
 
         # Compute stats for all parameters with gradients
@@ -250,6 +263,7 @@ class GradientDebugger:
         snapshot.non_finite_layers = non_finite_layers
         snapshot.vanishing_layers = vanishing_layers
         snapshot.exploding_layers = exploding_layers
+        snapshot.head_gradient_health = self._build_head_gradient_health(snapshot)
         snapshot.global_grad_norm = float(total_norm_sq**0.5)
 
         # Generate summary statistics
@@ -312,15 +326,59 @@ class GradientDebugger:
             "max_finite_layer_norm": max(finite_norms) if finite_norms else 0.0,
             "lowest_norm_layers": bottom_k,
             "highest_norm_layers": top_k,
+            "head_supervision": snapshot.head_supervision,
+            "head_gradient_health": snapshot.head_gradient_health,
+            "head_coverage": snapshot.head_coverage,
             "most_problematic_layers": problematic_layers[:10],  # Top 10
         }
+
+    def refresh_snapshot_summary(self, snapshot: GradientSnapshot) -> GradientSnapshot:
+        """Recompute the derived summary after caller-side metadata updates."""
+        snapshot.summary = self._generate_summary(snapshot)
+        return snapshot
+
+    @classmethod
+    def infer_observation_head(cls, layer_name: str) -> str | None:
+        """Map parameter names to observation head names when applicable."""
+        for head in cls._OBS_HEAD_MARKERS:
+            if f".{head}_head." in layer_name or layer_name.startswith(f"{head}_head."):
+                return head
+        return None
+
+    def _build_head_gradient_health(
+        self, snapshot: GradientSnapshot
+    ) -> dict[str, dict[str, float | int | bool]]:
+        """Summarize expected vs unexpected zero-gradient head behavior."""
+        if not snapshot.head_supervision:
+            return {}
+
+        vanishing_by_head: dict[str, list[str]] = {head: [] for head in self._OBS_HEAD_MARKERS}
+        for layer_name in snapshot.vanishing_layers:
+            head = self.infer_observation_head(layer_name)
+            if head is not None:
+                vanishing_by_head[head].append(layer_name)
+
+        head_health: dict[str, dict[str, float | int | bool]] = {}
+        for head, supervision in snapshot.head_supervision.items():
+            active = bool(supervision.get("active", False))
+            vanishing_layers = vanishing_by_head.get(head, [])
+            head_health[head] = {
+                "active": active,
+                "vanishing_layer_count": len(vanishing_layers),
+                "has_vanishing_layers": bool(vanishing_layers),
+                "expected_zero": (not active) and bool(vanishing_layers),
+                "unexpected_zero": active and bool(vanishing_layers),
+                "vanishing_layers": vanishing_layers,
+            }
+
+        return head_health
 
     def build_snapshot_log_data(
         self, snapshot: GradientSnapshot
     ) -> dict[str, float | int]:
         """Build compact numeric metrics suitable for console/W&B logging."""
         summary = snapshot.summary
-        return {
+        log_data: dict[str, float | int] = {
             "grad_snapshot_global_norm": snapshot.global_grad_norm,
             "grad_snapshot_layers_with_grads": int(
                 summary.get("total_layers_with_grads", 0)
@@ -344,6 +402,40 @@ class GradientDebugger:
                 summary.get("max_finite_layer_norm", 0.0)
             ),
         }
+        for head, supervision in snapshot.head_supervision.items():
+            log_data[f"grad_snapshot_head_{head}_active"] = int(
+                bool(supervision.get("active", False))
+            )
+            log_data[f"grad_snapshot_head_{head}_n_eff"] = float(
+                supervision.get("n_eff", 0.0)
+            )
+            log_data[f"grad_snapshot_head_{head}_valid_points"] = int(
+                supervision.get("valid_points", 0)
+            )
+            log_data[f"grad_snapshot_head_{head}_valid_series"] = int(
+                supervision.get("valid_series", 0)
+            )
+        for head, health in snapshot.head_gradient_health.items():
+            log_data[f"grad_snapshot_head_{head}_expected_zero"] = int(
+                bool(health.get("expected_zero", False))
+            )
+            log_data[f"grad_snapshot_head_{head}_unexpected_zero"] = int(
+                bool(health.get("unexpected_zero", False))
+            )
+            log_data[f"grad_snapshot_head_{head}_vanishing_layers"] = int(
+                health.get("vanishing_layer_count", 0)
+            )
+        for head, coverage in snapshot.head_coverage.items():
+            log_data[f"grad_snapshot_head_{head}_pass_rate"] = float(
+                coverage.get("pass_rate", 0.0)
+            )
+            log_data[f"grad_snapshot_head_{head}_zero_when_active_rate"] = float(
+                coverage.get("zero_when_active_rate", 0.0)
+            )
+            log_data[f"grad_snapshot_head_{head}_zero_when_inactive_rate"] = float(
+                coverage.get("zero_when_inactive_rate", 0.0)
+            )
+        return log_data
 
     def format_snapshot_status(self, snapshot: GradientSnapshot) -> str:
         """Build a concise status line for periodic snapshot captures."""
@@ -363,7 +455,7 @@ class GradientDebugger:
             if bottom_layer is not None
             else "n/a"
         )
-        return (
+        status = (
             f"Gradient snapshot @ step {snapshot.step}: "
             f"median={summary.get('median_finite_layer_norm', 0.0):.2e} | "
             f"max={summary.get('max_finite_layer_norm', 0.0):.2e} | "
@@ -371,6 +463,25 @@ class GradientDebugger:
             f"exploding={summary.get('exploding_layers_count', 0)} | "
             f"low={bottom_desc} | high={top_desc}"
         )
+        if snapshot.head_gradient_health:
+            head_terms = []
+            for head in self._OBS_HEAD_MARKERS:
+                if head not in snapshot.head_gradient_health:
+                    continue
+                health = snapshot.head_gradient_health[head]
+                supervision = snapshot.head_supervision.get(head, {})
+                active = "on" if bool(health.get("active", False)) else "off"
+                zero_tag = ""
+                if bool(health.get("unexpected_zero", False)):
+                    zero_tag = " unexpected-zero"
+                elif bool(health.get("expected_zero", False)):
+                    zero_tag = " expected-zero"
+                head_terms.append(
+                    f"{head}={active}/n={float(supervision.get('n_eff', 0.0)):.0f}{zero_tag}"
+                )
+            if head_terms:
+                status = f"{status} | " + ", ".join(head_terms)
+        return status
 
     def save_report(self, snapshot: GradientSnapshot, step: int | None = None) -> Path:
         """Save snapshot report to JSON file.
@@ -486,3 +597,4 @@ def has_non_finite_gradients(model: nn.Module) -> bool:
         if param.grad is not None and not torch.isfinite(param.grad).all():
             return True
     return False
+    _OBS_HEAD_MARKERS = ("ww", "hosp", "cases", "deaths")

@@ -27,6 +27,18 @@ class SimpleModel(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
+class HeadModel(nn.Module):
+    """Small model with observation-head style names for snapshot tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.ww_head = nn.Linear(4, 2)
+        self.deaths_head = nn.Linear(2, 1)
+
+    def forward(self, x):
+        return self.deaths_head(torch.relu(self.ww_head(x)))
+
+
 class TestGradientDebugger:
     """Test suite for GradientDebugger."""
 
@@ -202,6 +214,53 @@ class TestGradientDebugger:
         assert "Gradient snapshot @ step 11" in status
         assert "vanishing=" in status
         assert "exploding=" in status
+
+    def test_snapshot_marks_expected_vs_unexpected_zero_heads(self, tmp_path):
+        """Vanishing head layers should be contextualized by supervision activity."""
+        debugger = GradientDebugger(enabled=True, log_dir=tmp_path)
+        model = HeadModel()
+
+        x = torch.randn(2, 4)
+        y = model(x).sum()
+        y.backward()
+
+        model.ww_head.weight.grad.zero_()
+        model.ww_head.bias.grad.zero_()
+
+        snapshot = debugger.capture_snapshot(
+            model,
+            step_info={"step": 21},
+            head_supervision={
+                "ww": {
+                    "active": False,
+                    "n_eff": 0.0,
+                    "valid_points": 0,
+                    "valid_series": 0,
+                },
+                "deaths": {
+                    "active": True,
+                    "n_eff": 6.0,
+                    "valid_points": 6,
+                    "valid_series": 2,
+                },
+            },
+            head_coverage={
+                "ww": {"pass_rate": 0.2, "zero_when_active_rate": 0.0, "zero_when_inactive_rate": 1.0},
+                "deaths": {"pass_rate": 0.8, "zero_when_active_rate": 0.0, "zero_when_inactive_rate": 0.0},
+            },
+        )
+
+        ww_health = snapshot.head_gradient_health["ww"]
+        deaths_health = snapshot.head_gradient_health["deaths"]
+        assert ww_health["expected_zero"]
+        assert not ww_health["unexpected_zero"]
+        assert not deaths_health["has_vanishing_layers"]
+
+        log_data = debugger.build_snapshot_log_data(snapshot)
+        assert log_data["grad_snapshot_head_ww_active"] == 0
+        assert log_data["grad_snapshot_head_ww_expected_zero"] == 1
+        assert log_data["grad_snapshot_head_ww_pass_rate"] == pytest.approx(0.2)
+        assert "expected-zero" in debugger.format_snapshot_status(snapshot)
 
 
 class TestHelperFunctions:
