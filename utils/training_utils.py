@@ -160,6 +160,24 @@ def inject_gpu_mobility(
     # Extract base global_t for this chunk (global_t_gpu is shape [B*T])
     global_t_gpu = mob_batch.global_t.to(device, non_blocking=True)
 
+    # If strict mode is enabled, add bounds assertions to catch
+    # out-of-bounds gathers before they corrupt the CUDA context.
+    strict = getattr(base_ds, "config", None) is not None and getattr(base_ds.config.model, "strict", False)
+    if strict:
+        max_t = gpu_mob.shape[0] - 1
+        if (global_t_gpu > max_t).any() or (global_t_gpu < 0).any():
+            import logging
+            logger = logging.getLogger(__name__)
+            msg = (
+                f"CRITICAL: global_t_gpu indices out of bounds for gpu_mob! "
+                f"Max allowed: {max_t}, Found min: {global_t_gpu.min().item()}, "
+                f"Found max: {global_t_gpu.max().item()}. "
+                f"Resolved base_ds length: {len(base_ds)}. "
+                f"Batch run_id: {getattr(mob_batch, 'run_id', 'None')}"
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+
     # Reconstruct adj_dense inside the batch!
     mob_batch.adj_dense = gpu_mob[global_t_gpu]
 

@@ -59,7 +59,6 @@ class EpiForecaster(nn.Module):
         head_dropout: float = 0.1,
         head_positional_encoding: str = "sinusoidal",
         temporal_covariates_dim: int = 0,
-        dtype: torch.dtype = torch.float32,
         strict: bool = True,
     ):
         """
@@ -87,7 +86,6 @@ class EpiForecaster(nn.Module):
             head_dropout: Transformer dropout
             head_positional_encoding: Transformer positional encoding
             temporal_covariates_dim: Dimension of temporal covariates (0=disabled, 3=dow_sin/cos+holiday)
-            dtype: Data type for model parameters (default: float32)
         """
         super().__init__()
 
@@ -105,7 +103,7 @@ class EpiForecaster(nn.Module):
         self.population_dim = population_dim
         self.device = device or torch.device("cpu")
         self.gnn_module = gnn_module
-        self.dtype = dtype
+        self.dtype = torch.float32
         self.temporal_covariates_dim = temporal_covariates_dim
         self.head_positional_encoding = head_positional_encoding
         self.strict = strict
@@ -207,8 +205,8 @@ class EpiForecaster(nn.Module):
             alpha_init=observation_heads.residual_scale,
         )
 
-        # Cast all parameters to the specified dtype (default float32)
-        self.to(self.dtype)
+        # Cast all parameters to float32
+        self.to(torch.float32)
 
         # Store parameter counts for logging
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -436,7 +434,9 @@ class EpiForecaster(nn.Module):
                 - targets_dict: Dict with target tensors for loss computation
         """
         if not skip_device_transfer:
-            batch_data = batch_data.to(device=self.device, dtype=self.dtype, non_blocking=True)
+            batch_data = batch_data.to(
+                device=self.device, dtype=self.dtype, non_blocking=True
+            )
 
         # Mask ablated inputs directly on the batch object
         if mask_ww and batch_data.bio_node is not None:
@@ -458,7 +458,11 @@ class EpiForecaster(nn.Module):
             if mob_batch.adj_dense.dtype != self.dtype:
                 mob_batch.adj_dense = mob_batch.adj_dense.to(self.dtype)
 
-        target_nodes = batch_data.target_region_index if batch_data.target_region_index is not None else batch_data.target_node
+        target_nodes = (
+            batch_data.target_region_index
+            if batch_data.target_region_index is not None
+            else batch_data.target_node
+        )
 
         # Extract temporal covariates if present
         temporal_covariates = batch_data.temporal_covariates
@@ -576,6 +580,15 @@ class EpiForecaster(nn.Module):
                     "Mobility batch missing 'mob_real_node_idx' required for region embeddings in GNN."
                 )
 
+            if self.strict:
+                max_node_idx = region_embeddings.shape[0] - 1
+                if (real_nodes < 0).any() or (real_nodes > max_node_idx).any():
+                    raise RuntimeError(
+                        f"mob_real_node_idx out of bounds for region_embeddings. "
+                        f"Max: {max_node_idx}, Min found: {real_nodes.min().item()}, "
+                        f"Max found: {real_nodes.max().item()}"
+                    )
+
             # Gather region embeddings: [N_ctx, region_dim]
             gathered_regions = region_embeddings[real_nodes]
             # Broadcast to [G, N_ctx, region_dim]
@@ -614,17 +627,22 @@ class EpiForecaster(nn.Module):
         else:
             raise ValueError("Mobility batch missing target indices.")
 
+        if self.strict:
+            max_local_idx = node_emb.shape[1] - 1
+            if (target_local < 0).any() or (target_local > max_local_idx).any():
+                raise RuntimeError(
+                    f"target_local indices out of bounds. "
+                    f"Max allowed: {max_local_idx}, Min found: {target_local.min().item()}, "
+                    f"Max found: {target_local.max().item()}"
+                )
+
         graph_ids = torch.arange(num_graphs, device=node_emb.device)
         target_embeddings = node_emb[graph_ids, target_local]
         return target_embeddings.view(B, T, self.mobility_embedding_dim)
 
     def to(self, *args, **kwargs):
-        """Override to update self.device when model is moved to a new device.
-
-        This ensures forward_batch uses the correct device for tensor transfers.
-        """
+        """Override to update self.device when model is moved to a new device."""
         result = super().to(*args, **kwargs)
-        # Extract device from args/kwargs
         if args:
             device_arg = args[0]
             if isinstance(device_arg, (str, torch.device)):
