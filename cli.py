@@ -756,10 +756,10 @@ def plot_forecasts(
             build_loader_from_config,
             evaluate_loader,
             generate_forecast_plots,
-            get_loss_from_config,
             load_model_from_checkpoint,
             select_nodes_by_loss,
         )
+        from evaluation.losses import get_loss_from_config
 
         click.echo(f"Loading checkpoint: {checkpoint}")
         overrides = list(override) if override else None
