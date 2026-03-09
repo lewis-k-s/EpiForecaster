@@ -70,9 +70,9 @@ output:
 training:
   seed: 42
   device: "cuda"
-  batch_size: 8
+  batch_size: 32
   shuffle_train_batches: true
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 1
   gradient_clip_value: 5.0
   early_stopping_patience: 5
   nan_loss_patience: 5
@@ -81,9 +81,9 @@ training:
   weight_decay: 1.0e-05
   warmup_steps: 3000
   # Worker config for 1 GPU + 20 CPUs
-  num_workers: 12
-  val_workers: 4
-  prefetch_factor: 4
+  num_workers: 8
+  val_workers: 2
+  prefetch_factor: 2
   pin_memory: true
 
   # Temporal split configuration
