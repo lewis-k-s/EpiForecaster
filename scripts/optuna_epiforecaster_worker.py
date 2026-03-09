@@ -265,98 +265,92 @@ def suggest_epiforecaster_params(
     )
 
     # --- SIR joint inference knobs (high leverage for observation heads) ---
-    # Only tune if using joint_inference loss
-    if base_cfg.training.loss.name == "joint_inference":
-        # Residual alpha is an init-sensitive knob for startup stability.
-        overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
-            "init_weights.observation_residual_scale", 0.03, 0.2
-        )
+    # Residual alpha is an init-sensitive knob for startup stability.
+    overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
+        "init_weights.observation_residual_scale", 0.03, 0.2
+    )
 
-        # Residual connection params - affects model capacity for observation heads
-        overrides["model.observation_heads.residual_hidden_dim"] = (
+    # Residual connection params - affects model capacity for observation heads
+    overrides["model.observation_heads.residual_hidden_dim"] = (
+        trial.suggest_categorical(
+            "model.observation_heads.residual_hidden_dim",
+            _categorical_choices((16, 32, 64, 128)),
+        )
+    )
+    overrides["model.observation_heads.residual_layers"] = trial.suggest_int(
+        "model.observation_heads.residual_layers", 1, 4
+    )
+    overrides["model.observation_heads.residual_dropout"] = trial.suggest_float(
+        "model.observation_heads.residual_dropout", 0.0, 0.3
+    )
+
+    # Observation context dimension - affects representational power
+    overrides["model.observation_heads.obs_context_dim"] = trial.suggest_categorical(
+        "model.observation_heads.obs_context_dim",
+        _categorical_choices((32, 64, 96, 128, 192)),
+    )
+
+    # Residual mode - additive vs modulation
+    overrides["model.observation_heads.residual_mode"] = trial.suggest_categorical(
+        "model.observation_heads.residual_mode",
+        _categorical_choices(("additive", "modulation")),
+    )
+
+    # Weekly-observed heads default to frozen kernels in base config; allow HPO to
+    # opt into learnable kernels explicitly.
+    overrides["model.observation_heads.learnable_kernel_ww"] = (
+        trial.suggest_categorical(
+            "model.observation_heads.learnable_kernel_ww",
+            _categorical_choices((False, True)),
+        )
+    )
+    overrides["model.observation_heads.learnable_kernel_hosp"] = (
+        trial.suggest_categorical(
+            "model.observation_heads.learnable_kernel_hosp",
+            _categorical_choices((False, True)),
+        )
+    )
+
+    # Nowcast continuity penalty weight
+    overrides["training.loss.joint.w_continuity"] = trial.suggest_categorical(
+        "training.loss.joint.w_continuity",
+        _categorical_choices((0.0, 0.01, 0.05, 0.1, 0.2)),
+    )
+
+    # GradNorm controller knobs (only relevant when adaptive weighting is enabled).
+    adaptive_scheme = getattr(base_cfg.training.loss.joint, "adaptive_scheme", "none")
+    if adaptive_scheme.lower() == "gradnorm":
+        overrides["training.loss.joint.gradnorm_alpha"] = trial.suggest_float(
+            "training.loss.joint.gradnorm_alpha", 0.5, 2.5
+        )
+        overrides["training.loss.joint.gradnorm_weight_lr"] = trial.suggest_float(
+            "training.loss.joint.gradnorm_weight_lr",
+            1.0e-4,
+            5.0e-3,
+            log=True,
+        )
+        overrides["training.loss.joint.gradnorm_warmup_steps"] = trial.suggest_int(
+            "training.loss.joint.gradnorm_warmup_steps",
+            0,
+            100,
+        )
+        overrides["training.loss.joint.gradnorm_update_every"] = (
             trial.suggest_categorical(
-                "model.observation_heads.residual_hidden_dim",
-                _categorical_choices((16, 32, 64, 128)),
+                "training.loss.joint.gradnorm_update_every",
+                _categorical_choices((8, 16, 32)),
             )
         )
-        overrides["model.observation_heads.residual_layers"] = trial.suggest_int(
-            "model.observation_heads.residual_layers", 1, 4
+        overrides["training.loss.joint.gradnorm_ema_decay"] = trial.suggest_float(
+            "training.loss.joint.gradnorm_ema_decay",
+            0.85,
+            0.99,
         )
-        overrides["model.observation_heads.residual_dropout"] = trial.suggest_float(
-            "model.observation_heads.residual_dropout", 0.0, 0.3
-        )
-
-        # Observation context dimension - affects representational power
-        overrides["model.observation_heads.obs_context_dim"] = (
+        overrides["training.loss.joint.gradnorm_min_weight"] = (
             trial.suggest_categorical(
-                "model.observation_heads.obs_context_dim",
-                _categorical_choices((32, 64, 96, 128, 192)),
+                "training.loss.joint.gradnorm_min_weight",
+                _categorical_choices((5.0e-4, 1.0e-3, 2.0e-3)),
             )
         )
-
-        # Residual mode - additive vs modulation
-        overrides["model.observation_heads.residual_mode"] = trial.suggest_categorical(
-            "model.observation_heads.residual_mode",
-            _categorical_choices(("additive", "modulation")),
-        )
-
-        # Weekly-observed heads default to frozen kernels in base config; allow HPO to
-        # opt into learnable kernels explicitly.
-        overrides["model.observation_heads.learnable_kernel_ww"] = (
-            trial.suggest_categorical(
-                "model.observation_heads.learnable_kernel_ww",
-                _categorical_choices((False, True)),
-            )
-        )
-        overrides["model.observation_heads.learnable_kernel_hosp"] = (
-            trial.suggest_categorical(
-                "model.observation_heads.learnable_kernel_hosp",
-                _categorical_choices((False, True)),
-            )
-        )
-
-        # Nowcast continuity penalty weight
-        overrides["training.loss.joint.w_continuity"] = trial.suggest_categorical(
-            "training.loss.joint.w_continuity",
-            _categorical_choices((0.0, 0.01, 0.05, 0.1, 0.2)),
-        )
-
-        # GradNorm controller knobs (only relevant when adaptive weighting is enabled).
-        adaptive_scheme = getattr(
-            base_cfg.training.loss.joint, "adaptive_scheme", "none"
-        ).lower()
-        if adaptive_scheme == "gradnorm":
-            overrides["training.loss.joint.gradnorm_alpha"] = trial.suggest_float(
-                "training.loss.joint.gradnorm_alpha", 0.5, 2.5
-            )
-            overrides["training.loss.joint.gradnorm_weight_lr"] = trial.suggest_float(
-                "training.loss.joint.gradnorm_weight_lr",
-                1.0e-4,
-                5.0e-3,
-                log=True,
-            )
-            overrides["training.loss.joint.gradnorm_warmup_steps"] = trial.suggest_int(
-                "training.loss.joint.gradnorm_warmup_steps",
-                0,
-                100,
-            )
-            overrides["training.loss.joint.gradnorm_update_every"] = (
-                trial.suggest_categorical(
-                    "training.loss.joint.gradnorm_update_every",
-                    _categorical_choices((8, 16, 32)),
-                )
-            )
-            overrides["training.loss.joint.gradnorm_ema_decay"] = trial.suggest_float(
-                "training.loss.joint.gradnorm_ema_decay",
-                0.85,
-                0.99,
-            )
-            overrides["training.loss.joint.gradnorm_min_weight"] = (
-                trial.suggest_categorical(
-                    "training.loss.joint.gradnorm_min_weight",
-                    _categorical_choices((5.0e-4, 1.0e-3, 2.0e-3)),
-                )
-            )
 
     return overrides
 

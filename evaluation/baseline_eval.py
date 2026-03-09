@@ -17,10 +17,9 @@ from evaluation.baseline_models import (
     predict_with_tiered_fallback,
     predict_with_var_cross_target_fallback,
 )
+from evaluation.losses import get_loss_from_config
 from evaluation.epiforecaster_eval import (
-    JointInferenceLoss,
     build_loader_from_config,
-    get_loss_from_config,
 )
 from evaluation.metrics import compute_masked_metrics_numpy
 from models.configs import EpiForecasterConfig
@@ -286,16 +285,14 @@ def _resolve_joint_observation_loss_spec(
     *,
     config: EpiForecasterConfig,
     horizon: int,
-) -> JointObservationLossSpec | None:
-    if not hasattr(config, "training") or not hasattr(config.training, "loss"):
-        return None
+) -> JointObservationLossSpec:
+    training_cfg = getattr(config, "training", None)
+    loss_cfg = getattr(training_cfg, "loss", None)
     criterion = get_loss_from_config(
-        config.training.loss,
+        loss_cfg,
         data_config=config.data,
         forecast_horizon=horizon,
     )
-    if not isinstance(criterion, JointInferenceLoss):
-        return None
 
     return JointObservationLossSpec(
         obs_weight_sum=float(criterion.obs_weight_sum),
@@ -326,6 +323,8 @@ def _joint_weighted_masked_mse_numpy(
     pred_t = torch.as_tensor(prediction, dtype=torch.float32)
     target_t = torch.as_tensor(target, dtype=torch.float32)
     observed_t = torch.as_tensor(observed_mask, dtype=torch.float32)
+    from evaluation.losses import JointInferenceLoss
+
     supervision = JointInferenceLoss._build_supervision_weights(
         target=target_t,
         observed_mask=observed_t,
@@ -483,7 +482,7 @@ def _evaluate_univariate_baseline_model(
     pair_rows: list[dict[str, Any]],
     sparsity_rows: list[dict[str, Any]],
     model_orders: list[dict[str, Any]],
-    joint_spec: JointObservationLossSpec | None,
+    joint_spec: JointObservationLossSpec,
     joint_rows: list[dict[str, Any]],
 ) -> None:
     joint_target_buffers: dict[
@@ -684,35 +683,33 @@ def _evaluate_univariate_baseline_model(
                         }
                     )
 
-            if joint_spec is not None:
-                fold_target_data = joint_target_buffers.setdefault(fold.fold, {})
-                if pred_rows:
-                    fold_target_data[target_name] = (
-                        np.vstack(pred_rows),
-                        np.vstack(target_rows),
-                        np.vstack(score_mask_rows),
-                    )
-                else:
-                    fold_target_data[target_name] = (
-                        _empty_metric_matrix(horizon),
-                        _empty_metric_matrix(horizon),
-                        _empty_metric_matrix(horizon),
-                    )
+            fold_target_data = joint_target_buffers.setdefault(fold.fold, {})
+            if pred_rows:
+                fold_target_data[target_name] = (
+                    np.vstack(pred_rows),
+                    np.vstack(target_rows),
+                    np.vstack(score_mask_rows),
+                )
+            else:
+                fold_target_data[target_name] = (
+                    _empty_metric_matrix(horizon),
+                    _empty_metric_matrix(horizon),
+                    _empty_metric_matrix(horizon),
+                )
 
-    if joint_spec is not None:
-        for fold in folds:
-            components = _compute_joint_observation_loss_for_fold(
-                fold_target_data=joint_target_buffers.get(fold.fold, {}),
-                horizon=horizon,
-                joint_spec=joint_spec,
-            )
-            joint_rows.append(
-                {
-                    "model": baseline_model,
-                    "fold": fold.fold,
-                    **components,
-                }
-            )
+    for fold in folds:
+        components = _compute_joint_observation_loss_for_fold(
+            fold_target_data=joint_target_buffers.get(fold.fold, {}),
+            horizon=horizon,
+            joint_spec=joint_spec,
+        )
+        joint_rows.append(
+            {
+                "model": baseline_model,
+                "fold": fold.fold,
+                **components,
+            }
+        )
 
 
 def _evaluate_var_cross_target_model(
@@ -731,7 +728,7 @@ def _evaluate_var_cross_target_model(
     pair_rows: list[dict[str, Any]],
     sparsity_rows: list[dict[str, Any]],
     model_orders: list[dict[str, Any]],
-    joint_spec: JointObservationLossSpec | None,
+    joint_spec: JointObservationLossSpec,
     joint_rows: list[dict[str, Any]],
 ) -> None:
     var_targets = [t for t in _VAR_TARGET_ORDER if t in target_views]
@@ -971,36 +968,35 @@ def _evaluate_var_cross_target_model(
                         }
                     )
 
-        if joint_spec is not None:
-            fold_target_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-            for target_name in _TARGET_SPECS:
-                pred_rows = pred_rows_by_target.get(target_name, [])
-                target_rows = target_rows_by_target.get(target_name, [])
-                mask_rows = score_mask_by_target.get(target_name, [])
-                if pred_rows:
-                    fold_target_data[target_name] = (
-                        np.vstack(pred_rows),
-                        np.vstack(target_rows),
-                        np.vstack(mask_rows),
-                    )
-                else:
-                    fold_target_data[target_name] = (
-                        _empty_metric_matrix(horizon),
-                        _empty_metric_matrix(horizon),
-                        _empty_metric_matrix(horizon),
-                    )
-            components = _compute_joint_observation_loss_for_fold(
-                fold_target_data=fold_target_data,
-                horizon=horizon,
-                joint_spec=joint_spec,
-            )
-            joint_rows.append(
-                {
-                    "model": "var_cross_target",
-                    "fold": fold.fold,
-                    **components,
-                }
-            )
+        fold_target_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for target_name in _TARGET_SPECS:
+            pred_rows = pred_rows_by_target.get(target_name, [])
+            target_rows = target_rows_by_target.get(target_name, [])
+            mask_rows = score_mask_by_target.get(target_name, [])
+            if pred_rows:
+                fold_target_data[target_name] = (
+                    np.vstack(pred_rows),
+                    np.vstack(target_rows),
+                    np.vstack(mask_rows),
+                )
+            else:
+                fold_target_data[target_name] = (
+                    _empty_metric_matrix(horizon),
+                    _empty_metric_matrix(horizon),
+                    _empty_metric_matrix(horizon),
+                )
+        components = _compute_joint_observation_loss_for_fold(
+            fold_target_data=fold_target_data,
+            horizon=horizon,
+            joint_spec=joint_spec,
+        )
+        joint_rows.append(
+            {
+                "model": "var_cross_target",
+                "fold": fold.fold,
+                **components,
+            }
+        )
 
 
 def run_baseline_evaluation(
@@ -1264,10 +1260,8 @@ def run_baseline_evaluation(
             "metrics": ["mae", "rmse"],
             "statistics": ["mean", "median", "std"],
         },
-        "joint_observation_loss_enabled": joint_spec is not None,
-        "joint_observation_loss_spec": None
-        if joint_spec is None
-        else {
+        "joint_observation_loss_enabled": True,
+        "joint_observation_loss_spec": {
             "obs_weight_sum": joint_spec.obs_weight_sum,
             "obs_n_eff_power": joint_spec.obs_n_eff_power,
             "obs_n_eff_reference": joint_spec.obs_n_eff_reference,

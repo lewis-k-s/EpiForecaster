@@ -13,15 +13,12 @@ import logging
 import os
 import platform
 import time
-from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import wandb
-import xarray as xr
 import yaml
 from torch.profiler import (
     ProfilerActivity,
@@ -31,19 +28,19 @@ from torch.profiler import (
 )
 from torch.utils.data import ConcatDataset, DataLoader
 
-from data.epi_dataset import (
-    EpiDataset,
-    collate_epiforecaster_batch,
-)
-from data.preprocess.config import REGION_COORD
-from data.samplers import EpidemicCurriculumSampler, ShuffledBatchSampler
+from data.dataset_factory import build_datasets
+from data.epi_batch import EpiBatch
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
-from evaluation.epiforecaster_eval import JointInferenceLoss, evaluate_loader
+from evaluation.epiforecaster_eval import evaluate_loader
+from evaluation.losses import JointInferenceLoss
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
+from training.dataloader_factory import (
+    build_dataloaders,
+    should_prestart_dataloader_workers,
+)
 from training.gradnorm import GradNormController
-from utils import setup_tensor_core_optimizations
-from utils.compiled_batch import build_compiled_batch_view
+from utils.device import setup_tensor_core_optimizations
 from utils.gradnorm_logging import (
     append_gradnorm_sidecar_metrics,
     did_gradnorm_sidecar_run,
@@ -56,7 +53,6 @@ from utils.platform import (
     cleanup_nvme_staging,
     get_nvme_path,
     is_slurm_cluster,
-    select_multiprocessing_context,
     stage_dataset_to_nvme,
 )
 from utils.train_logging import (
@@ -130,252 +126,17 @@ class EpiForecasterTrainer:
         if is_slurm_cluster():
             self._stage_data_to_nvme()
 
-        # Branch on split strategy
-        if config.training.split_strategy == "time":
-            # Temporal splits: all nodes, different time ranges
-            self.train_dataset, self.val_dataset, self.test_dataset = (
-                self._split_dataset_temporal()
-            )
-        else:
-            train_nodes: list[int]
-            val_nodes: list[int]
-            test_nodes: list[int]
-            real_run_for_split: str | None = None
-            split_dataset_path: Path | None = None
-
-            # --- Curriculum Training Setup ---
-            if self.config.training.curriculum.enabled:
-                real_run, synth_runs = self._discover_runs()
-                self.real_run_id = real_run
-                self._status(
-                    f"Curriculum enabled. Found runs: Real='{real_run}', Synth={synth_runs}"
-                )
-                real_run_for_split = real_run
-                split_dataset_path = (
-                    Path(self.config.data.real_dataset_path)
-                    if self.config.data.real_dataset_path
-                    else Path(self.config.data.dataset_path)
-                )
-
-                train_nodes, val_nodes, test_nodes = self._split_dataset_by_nodes(
-                    dataset_path=split_dataset_path,
-                    run_id=real_run_for_split,
-                )
-                train_nodes = list(train_nodes)
-                val_nodes = list(val_nodes)
-                test_nodes = list(test_nodes)
-            else:
-                # Node-based splits: different nodes, all time windows
-                # Use config run_id for splitting
-                if not self.config.data.run_id:
-                    raise ValueError(
-                        "run_id must be specified in config for node-based splits"
-                    )
-                train_nodes, val_nodes, test_nodes = self._split_dataset_by_nodes(
-                    run_id=self.config.data.run_id
-                )
-                train_nodes = list(train_nodes)
-                val_nodes = list(val_nodes)
-                test_nodes = list(test_nodes)
-
-            if self.config.training.curriculum.enabled:
-                # 1. Real Dataset (Run ID = real)
-                # If using separate real dataset, create a config copy for it
-                if self.config.data.real_dataset_path:
-                    import copy
-
-                    real_config = copy.deepcopy(self.config)
-                    real_config.data.dataset_path = self.config.data.real_dataset_path
-                else:
-                    real_config = self.config
-
-                # Resolve region IDs from real dataset for mapping into synthetic datasets
-                assert real_run_for_split is not None, (
-                    "real_run_for_split must be set in curriculum mode"
-                )
-                real_region_ids = self._load_region_ids(
-                    dataset_path=split_dataset_path
-                    or Path(self.config.data.dataset_path),
-                    run_id=real_run_for_split,
-                )
-                train_region_ids = [real_region_ids[n] for n in train_nodes]
-                region_id_index = {
-                    region_id: idx for idx, region_id in enumerate(real_region_ids)
-                }
-
-                real_train_ds = EpiDataset(
-                    config=real_config,
-                    target_nodes=train_nodes,
-                    context_nodes=train_nodes,
-                    biomarker_preprocessor=None,
-                    mobility_preprocessor=None,
-                    run_id=real_run,
-                    region_id_index=region_id_index,
-                )
-
-                # Reuse preprocessors from Real Train for real val/test only
-                fitted_bio_preprocessor = real_train_ds.biomarker_preprocessor
-                fitted_mobility_preprocessor = real_train_ds.mobility_preprocessor
-                shared_real_mobility = real_train_ds.preloaded_mobility
-                shared_real_mobility_mask = real_train_ds.mobility_mask
-                shared_real_sparse_topology = real_train_ds.shared_sparse_topology
-
-                # Fit synthetic preprocessors separately to avoid leakage
-                synth_scaler_run = self._select_synthetic_scaler_run(synth_runs)
-                synth_train_nodes = self._map_region_ids_to_nodes(
-                    train_region_ids,
-                    dataset_path=Path(self.config.data.dataset_path),
-                    run_id=synth_scaler_run,
-                )
-                if not synth_train_nodes:
-                    synth_train_nodes = self._fallback_all_nodes(
-                        dataset_path=Path(self.config.data.dataset_path),
-                        run_id=synth_scaler_run,
-                    )
-                    logger.warning(
-                        "Synthetic scaler run '%s' has no overlap with real regions; "
-                        "fitting synthetic scalers on all nodes instead.",
-                        synth_scaler_run,
-                    )
-
-                synth_scaler_ds = EpiDataset(
-                    config=self.config,
-                    target_nodes=synth_train_nodes,
-                    context_nodes=synth_train_nodes,
-                    biomarker_preprocessor=None,
-                    mobility_preprocessor=None,
-                    run_id=synth_scaler_run,
-                    region_id_index=region_id_index,
-                )
-
-                synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
-                synth_mobility_preprocessor = synth_scaler_ds.mobility_preprocessor
-
-                # 2. Synthetic Datasets (One per run_id)
-                synth_datasets = []
-                for s_run in synth_runs:
-                    if s_run == synth_scaler_run:
-                        synth_datasets.append(synth_scaler_ds)
-                        continue
-
-                    mapped_train_nodes = self._map_region_ids_to_nodes(
-                        train_region_ids,
-                        dataset_path=Path(self.config.data.dataset_path),
-                        run_id=s_run,
-                    )
-                    if not mapped_train_nodes:
-                        mapped_train_nodes = self._fallback_all_nodes(
-                            dataset_path=Path(self.config.data.dataset_path),
-                            run_id=s_run,
-                        )
-                        logger.warning(
-                            "Synthetic run '%s' has no overlap with real regions; "
-                            "using all nodes for training targets.",
-                            s_run,
-                        )
-
-                    s_ds = EpiDataset(
-                        config=self.config,
-                        target_nodes=mapped_train_nodes,
-                        context_nodes=mapped_train_nodes,
-                        biomarker_preprocessor=synth_bio_preprocessor,
-                        mobility_preprocessor=synth_mobility_preprocessor,
-                        run_id=s_run,
-                        region_id_index=region_id_index,
-                    )
-                    synth_datasets.append(s_ds)
-
-                # Combine into ConcatDataset
-                # Important: Real dataset must be first for the sampler to identify it (index 0)
-                # unless sampler inspects run_id (which it does).
-                self.train_dataset = ConcatDataset([real_train_ds] + synth_datasets)
-
-                # 3. Val/Test are ALWAYS Real Data
-                self.val_dataset = EpiDataset(
-                    config=real_config,
-                    target_nodes=val_nodes,
-                    context_nodes=train_nodes + val_nodes,
-                    biomarker_preprocessor=fitted_bio_preprocessor,
-                    mobility_preprocessor=fitted_mobility_preprocessor,
-                    preloaded_mobility=shared_real_mobility,
-                    mobility_mask=shared_real_mobility_mask,
-                    shared_sparse_topology=shared_real_sparse_topology,
-                    run_id=real_run,
-                    region_id_index=region_id_index,
-                )
-
-                self.test_dataset = EpiDataset(
-                    config=real_config,
-                    target_nodes=test_nodes,
-                    context_nodes=train_nodes + val_nodes,
-                    biomarker_preprocessor=fitted_bio_preprocessor,
-                    mobility_preprocessor=fitted_mobility_preprocessor,
-                    preloaded_mobility=shared_real_mobility,
-                    mobility_mask=shared_real_mobility_mask,
-                    shared_sparse_topology=shared_real_sparse_topology,
-                    run_id=real_run,
-                    region_id_index=region_id_index,
-                )
-
-                # Drop full shared sparse topology references after split caches are built.
-                real_train_ds.release_shared_sparse_topology()
-                self.val_dataset.release_shared_sparse_topology()
-                self.test_dataset.release_shared_sparse_topology()
-                for ds in synth_datasets:
-                    ds.release_shared_sparse_topology()
-
-            else:
-                # --- Standard Training Setup ---
-                # Build train dataset with None so it fits scaler internally on train regions
-                self.train_dataset = EpiDataset(
-                    config=self.config,
-                    target_nodes=train_nodes,
-                    context_nodes=train_nodes,
-                    biomarker_preprocessor=None,
-                    mobility_preprocessor=None,
-                )
-
-                # Reuse train dataset's fitted preprocessors for val/test
-                fitted_bio_preprocessor = self.train_dataset.biomarker_preprocessor
-                fitted_mobility_preprocessor = self.train_dataset.mobility_preprocessor
-                shared_mobility = self.train_dataset.preloaded_mobility
-                shared_mobility_mask = self.train_dataset.mobility_mask
-                shared_sparse_topology = self.train_dataset.shared_sparse_topology
-
-                self.val_dataset = EpiDataset(
-                    config=self.config,
-                    target_nodes=val_nodes,
-                    context_nodes=train_nodes + val_nodes,
-                    biomarker_preprocessor=fitted_bio_preprocessor,
-                    mobility_preprocessor=fitted_mobility_preprocessor,
-                    preloaded_mobility=shared_mobility,
-                    mobility_mask=shared_mobility_mask,
-                    shared_sparse_topology=shared_sparse_topology,
-                )
-
-                self.test_dataset = EpiDataset(
-                    config=self.config,
-                    target_nodes=test_nodes,
-                    context_nodes=train_nodes + val_nodes,
-                    biomarker_preprocessor=fitted_bio_preprocessor,
-                    mobility_preprocessor=fitted_mobility_preprocessor,
-                    preloaded_mobility=shared_mobility,
-                    mobility_mask=shared_mobility_mask,
-                    shared_sparse_topology=shared_sparse_topology,
-                )
-
-                # Drop full shared sparse topology references after split caches are built.
-                self.train_dataset.release_shared_sparse_topology()
-                self.val_dataset.release_shared_sparse_topology()
-                self.test_dataset.release_shared_sparse_topology()
+        # Build datasets using factory
+        dataset_splits = build_datasets(config)
+        self.train_dataset = dataset_splits.train
+        self.val_dataset = dataset_splits.val
+        self.test_dataset = dataset_splits.test
+        self.real_run_id = dataset_splits.real_run_id
+        self.synth_run_ids = dataset_splits.synth_run_ids
 
         # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
         if isinstance(self.train_dataset, ConcatDataset):
-            # Access the first dataset (Real)
             train_example_ds = self.train_dataset.datasets[0]
-
-            # Validate all datasets have consistent dimensions for curriculum training
-            self._validate_curriculum_dataset_dimensions()
         else:
             train_example_ds = self.train_dataset
 
@@ -421,10 +182,28 @@ class EpiForecasterTrainer:
         )
 
         # Setup data loaders before CUDA initialization when using fork
-        self.train_loader, self.val_loader, self.test_loader = (
-            self._create_data_loaders()
+        loader_bundle = build_dataloaders(
+            train_dataset=self.train_dataset,
+            val_dataset=self.val_dataset,
+            test_dataset=self.test_dataset,
+            training_config=self.config.training,
+            model_type_config=self.config.model.type,
+            curriculum_config=self.config.training.curriculum
+            if self.config.training.curriculum.enabled
+            else None,
+            real_run_id=self.real_run_id or "real",
+            device_hint=self._device_hint,
+            seed=self.config.training.seed,
         )
-        if self._should_prestart_dataloader_workers():
+        self.train_loader = loader_bundle.train
+        self.val_loader = loader_bundle.val
+        self.test_loader = loader_bundle.test
+        self.curriculum_sampler = loader_bundle.curriculum_sampler
+        self._multiprocessing_context = loader_bundle.multiprocessing_context
+
+        if should_prestart_dataloader_workers(
+            self._multiprocessing_context, self._device_hint
+        ):
             self._prestart_dataloader_workers(
                 self.train_loader, self.val_loader, self.test_loader
             )
@@ -509,11 +288,6 @@ class EpiForecasterTrainer:
             total_steps=total_steps, warmup_steps=warmup_steps
         )
         self.criterion = self._create_criterion()
-        if not isinstance(self.criterion, JointInferenceLoss):
-            raise ValueError(
-                "EpiForecasterTrainer now requires JointInferenceLoss. "
-                "Set training.loss.name=joint_inference in the config."
-            )
 
         joint_cfg = self.config.training.loss.joint
         self._adaptive_scheme = joint_cfg.adaptive_scheme
@@ -547,9 +321,7 @@ class EpiForecasterTrainer:
                 self.gradnorm_controller.parameters(),
                 lr=joint_cfg.gradnorm_weight_lr,
             )
-            self._gradnorm_cached_weights = (
-                self.gradnorm_controller.weights().detach()
-            )
+            self._gradnorm_cached_weights = self.gradnorm_controller.weights().detach()
 
         # Compile training step (forward + backward) if enabled
         self._compiled_training_step = None
@@ -615,21 +387,48 @@ class EpiForecasterTrainer:
 
         # Initialize gradient debugger (zero overhead when disabled)
         grad_debug_dir = self.config.training.gradient_debug_log_dir
-        if grad_debug_dir is None and self.config.training.enable_gradient_debug:
+        if grad_debug_dir is None and (
+            self.config.training.enable_gradient_debug
+            or self.config.training.gradient_snapshot_frequency > 0
+        ):
             # Auto-set to experiment directory if enabled but not specified
             grad_debug_dir = (
                 self.experiment_dir / "gradient_debug" if self.experiment_dir else None
             )
+        gradient_debug_enabled = self.config.training.enable_gradient_debug or (
+            self.config.training.gradient_snapshot_frequency > 0
+        )
         self.gradient_debugger = GradientDebugger(
-            enabled=self.config.training.enable_gradient_debug,
+            enabled=gradient_debug_enabled,
             log_dir=grad_debug_dir,
+            vanishing_threshold=self.config.training.gradient_vanishing_threshold,
+            exploding_threshold=self.config.training.gradient_exploding_threshold,
+            snapshot_top_k=self.config.training.gradient_snapshot_top_k,
             logger_instance=logger,
+        )
+        self._gradient_snapshot_frequency = (
+            self.config.training.gradient_snapshot_frequency
         )
         if self.gradient_debugger.enabled and self.gradient_debugger.log_dir:
             self._status(
                 f"Gradient debugging enabled. Reports will be saved to: {self.gradient_debugger.log_dir}",
                 logging.INFO,
             )
+        if self._gradient_snapshot_frequency > 0:
+            snapshot_dir = (
+                self.gradient_debugger.log_dir
+                if self.gradient_debugger.log_dir is not None
+                else "disabled (set training.gradient_debug_log_dir to persist JSON)"
+            )
+            self._status(
+                "Periodic gradient snapshots enabled: "
+                f"every {self._gradient_snapshot_frequency} steps "
+                f"(top_k={self.config.training.gradient_snapshot_top_k}, "
+                f"vanishing<={self.config.training.gradient_vanishing_threshold:.1e}, "
+                f"exploding>={self.config.training.gradient_exploding_threshold:.1e})",
+                logging.INFO,
+            )
+            self._status(f"  Snapshot output: {snapshot_dir}", logging.INFO)
 
         # Resume from checkpoint after all state is initialized
         if self.config.training.resume_checkpoint_path:
@@ -682,35 +481,34 @@ class EpiForecasterTrainer:
             self._status(f"    - Non-neg:   {physics.enforce_nonnegativity}")
 
         # Log Loss configuration
-        if self.config.training.loss.name == "joint_inference":
-            loss_cfg = self.config.training.loss.joint
-            self._status("  Joint Inference Loss:")
-            self._status(f"    - Adaptive scheme: {loss_cfg.adaptive_scheme}")
+        loss_cfg = self.config.training.loss.joint
+        self._status("  Joint Inference Loss:")
+        self._status(f"    - Adaptive scheme: {loss_cfg.adaptive_scheme}")
+        self._status(
+            f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
+        )
+        self._status(f"    - SIR weight: {loss_cfg.w_sir}")
+        self._status(f"    - Continuity weight: {loss_cfg.w_continuity}")
+        self._status(
+            "    - n_eff scaling: "
+            f"power={loss_cfg.obs_n_eff_power}, "
+            f"reference={loss_cfg.obs_n_eff_reference}, "
+            f"per_head=(ww:{loss_cfg.ww_n_eff_reference}, "
+            f"hosp:{loss_cfg.hosp_n_eff_reference}, "
+            f"cases:{loss_cfg.cases_n_eff_reference}, "
+            f"deaths:{loss_cfg.deaths_n_eff_reference})"
+        )
+        if self._gradnorm_enabled:
             self._status(
-                f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
+                "    - GradNorm settings: "
+                f"alpha={loss_cfg.gradnorm_alpha}, "
+                f"weight_lr={loss_cfg.gradnorm_weight_lr}, "
+                f"warmup_steps={loss_cfg.gradnorm_warmup_steps}, "
+                f"update_every={loss_cfg.gradnorm_update_every}, "
+                f"ema_decay={loss_cfg.gradnorm_ema_decay}, "
+                f"probe={loss_cfg.gradnorm_probe}, "
+                f"min_weight={loss_cfg.gradnorm_min_weight}"
             )
-            self._status(f"    - SIR weight: {loss_cfg.w_sir}")
-            self._status(f"    - Continuity weight: {loss_cfg.w_continuity}")
-            self._status(
-                "    - n_eff scaling: "
-                f"power={loss_cfg.obs_n_eff_power}, "
-                f"reference={loss_cfg.obs_n_eff_reference}, "
-                f"per_head=(ww:{loss_cfg.ww_n_eff_reference}, "
-                f"hosp:{loss_cfg.hosp_n_eff_reference}, "
-                f"cases:{loss_cfg.cases_n_eff_reference}, "
-                f"deaths:{loss_cfg.deaths_n_eff_reference})"
-            )
-            if self._gradnorm_enabled:
-                self._status(
-                    "    - GradNorm settings: "
-                    f"alpha={loss_cfg.gradnorm_alpha}, "
-                    f"weight_lr={loss_cfg.gradnorm_weight_lr}, "
-                    f"warmup_steps={loss_cfg.gradnorm_warmup_steps}, "
-                    f"update_every={loss_cfg.gradnorm_update_every}, "
-                    f"ema_decay={loss_cfg.gradnorm_ema_decay}, "
-                    f"probe={loss_cfg.gradnorm_probe}, "
-                    f"min_weight={loss_cfg.gradnorm_min_weight}"
-                )
 
         self._status(f"  Learning rate: {self.config.training.learning_rate}")
         self._status(f"  Batch size: {config.training.batch_size}")
@@ -817,399 +615,6 @@ class EpiForecasterTrainer:
                 if staged_real != real_path:
                     self.config.data.real_dataset_path = str(staged_real)
                     logger.info(f"Using staged real dataset: {staged_real}")
-
-    def _load_sparsity_mapping(self) -> dict[str, float]:
-        """Load run_id -> sparsity mapping from processed zarr dataset.
-
-        Reads the synthetic_sparsity_level variable from the processed dataset.
-        Returns dict mapping run_id string to sparsity float (0.0-1.0).
-
-        Returns:
-            Dictionary mapping run_id strings to sparsity values.
-            Returns empty dict if dataset is unavailable or variable is missing.
-        """
-        dataset_path = Path(self.config.data.dataset_path)
-        if not dataset_path.exists():
-            logger.warning(
-                f"Processed dataset not found at {dataset_path}. "
-                "Sparsity-based run selection will be disabled."
-            )
-            return {}
-
-        try:
-            ds = xr.open_zarr(str(dataset_path), chunks=None)
-            if "synthetic_sparsity_level" not in ds:
-                logger.warning(
-                    f"Variable 'synthetic_sparsity_level' not found in {dataset_path}. "
-                    "Sparsity-based run selection will be disabled."
-                )
-                ds.close()
-                return {}
-
-            run_ids = ds["run_id"].values
-            sparsity = ds["synthetic_sparsity_level"].values
-
-            mapping = {
-                str(run_id).strip(): float(spars)
-                for run_id, spars in zip(run_ids, sparsity)
-            }
-            ds.close()
-            logger.info(
-                f"Loaded sparsity mapping for {len(mapping)} runs from {dataset_path}"
-            )
-            return mapping
-        except Exception as e:
-            logger.warning(
-                f"Failed to load sparsity mapping from {dataset_path}: {e}. "
-                "Sparsity-based run selection will be disabled."
-            )
-            return {}
-
-    def _validate_curriculum_dataset_dimensions(self) -> None:
-        """Validate that all datasets in ConcatDataset have consistent dimensions.
-
-        When using curriculum training with mixed real and synthetic data, all
-        datasets must have the same feature dimensions. This method checks that
-        cases_output_dim, biomarkers_output_dim, and temporal_covariates_dim
-        are consistent across all datasets.
-
-        Raises:
-            ValueError: If any dataset has inconsistent dimensions.
-        """
-        if not isinstance(self.train_dataset, ConcatDataset):
-            return
-
-        datasets = self.train_dataset.datasets
-        if len(datasets) < 2:
-            return
-
-        # Get dimensions from first dataset (reference)
-        ref_ds = datasets[0]
-        ref_dims = {
-            "cases_output_dim": ref_ds.cases_output_dim,
-            "biomarkers_output_dim": ref_ds.biomarkers_output_dim,
-            "temporal_covariates_dim": ref_ds.temporal_covariates_dim,
-        }
-        ref_run_id = getattr(ref_ds, "run_id", "unknown")
-
-        # Check all other datasets
-        mismatches = []
-        for i, ds in enumerate(datasets[1:], start=1):
-            ds_run_id = getattr(ds, "run_id", f"dataset_{i}")
-            ds_dims = {
-                "cases_output_dim": ds.cases_output_dim,
-                "biomarkers_output_dim": ds.biomarkers_output_dim,
-                "temporal_covariates_dim": ds.temporal_covariates_dim,
-            }
-
-            for dim_name, ref_val in ref_dims.items():
-                ds_val = ds_dims[dim_name]
-                if ds_val != ref_val:
-                    mismatches.append(
-                        f"  {dim_name}: {ref_run_id}={ref_val} vs {ds_run_id}={ds_val}"
-                    )
-
-        if mismatches:
-            raise ValueError(
-                f"Curriculum training requires all datasets to have identical "
-                f"feature dimensions. Found {len(mismatches)} mismatch(es):\n"
-                + "\n".join(mismatches)
-                + "\n\nThis usually happens when:"
-                "\n  - Real and synthetic data have different biomarker variants"
-                "\n  - Real and synthetic data have different temporal_covariates config"
-                "\n  - Preprocessing configs are inconsistent between datasets"
-                "\n\nFix: Ensure all preprocessing configs include the same "
-                "temporal_covariates and biomarker settings."
-            )
-
-        logger.info(
-            f"Validated {len(datasets)} datasets have consistent dimensions: "
-            f"cases={ref_dims['cases_output_dim']}, "
-            f"biomarkers={ref_dims['biomarkers_output_dim']}, "
-            f"temporal_covariates={ref_dims['temporal_covariates_dim']}"
-        )
-
-    def _select_runs_for_curriculum(
-        self,
-        synth_runs: list[str],
-        sparsity_map: dict[str, float],
-        max_runs: int = 5,
-    ) -> list[str]:
-        """Select synthetic runs to maximize sparsity diversity for curriculum training.
-
-        First selects one run from each sparsity bucket (0.05, 0.20, 0.40, 0.60, 0.80)
-        to ensure coverage across all curriculum phases. Then fills remaining slots
-        randomly from available runs. Falls back to random selection if sparsity data
-        unavailable.
-
-        Args:
-            synth_runs: List of available synthetic run IDs
-            sparsity_map: Mapping from run_id to sparsity value
-            max_runs: Maximum number of runs to return (memory limit)
-
-        Returns:
-            Selected list of run IDs
-        """
-        if not sparsity_map:
-            logger.info("No sparsity map available, using random selection")
-            import random
-
-            return synth_runs[:max_runs]
-
-        target_sparsities = [0.05, 0.20, 0.40, 0.60, 0.80]
-        selected = []
-
-        # Phase 1: Select one run from each sparsity bucket
-        for target in target_sparsities:
-            if len(selected) >= max_runs:
-                break
-
-            candidates = [
-                (run_id, sparsity_map[run_id])
-                for run_id in synth_runs
-                if run_id not in selected
-                and abs(sparsity_map.get(run_id, -1.0) - target) < 0.01
-            ]
-
-            if candidates:
-                # Pick the run closest to target sparsity
-                best_match = min(candidates, key=lambda x: abs(x[1] - target))
-                selected.append(best_match[0])
-                logger.info(
-                    f"Selected run '{best_match[0]}' with sparsity {best_match[1]:.2f} "
-                    f"for target sparsity {target:.2f}"
-                )
-
-        # Phase 2: Fill remaining slots randomly from available runs
-        if len(selected) < min(max_runs, len(synth_runs)):
-            remaining_needed = min(max_runs, len(synth_runs)) - len(selected)
-            available = [r for r in synth_runs if r not in selected]
-
-            if available:
-                logger.info(
-                    f"Adding {remaining_needed} random runs to fill quota (have {len(selected)})"
-                )
-                import random
-
-                remaining = random.sample(
-                    available, min(remaining_needed, len(available))
-                )
-                selected.extend(remaining)
-
-        return selected
-
-    def _discover_runs(self) -> tuple[str, list[str]]:
-        """Discover available runs in the dataset (real vs synthetic)."""
-        real_run = "real"  # User mandate: always "real"
-        synth_runs = []
-
-        ds_path = Path(self.config.data.dataset_path)
-        if not ds_path.exists():
-            logger.warning(f"Dataset path not found: {ds_path}")
-            return real_run, []
-
-        try:
-            all_runs = EpiDataset.discover_available_runs(ds_path)
-            synth_runs = [r for r in all_runs if r != real_run]
-        except Exception as e:
-            logger.warning(f"Failed to discover runs from {ds_path}: {e}")
-            return real_run, []
-
-        max_runs = 5
-
-        if self.config.training.curriculum.enabled and len(synth_runs) > max_runs:
-            sparsity_map = self._load_sparsity_mapping()
-
-            if sparsity_map:
-                logger.info(
-                    f"Curriculum mode: selecting {max_runs} runs for sparsity diversity "
-                    f"from {len(synth_runs)} available runs"
-                )
-                synth_runs = self._select_runs_for_curriculum(
-                    synth_runs, sparsity_map, max_runs
-                )
-            else:
-                logger.warning(
-                    f"Limiting synthetic runs from {len(synth_runs)} to {max_runs} for memory safety."
-                )
-                synth_runs = synth_runs[:max_runs]
-        elif len(synth_runs) > max_runs:
-            logger.warning(
-                f"Limiting synthetic runs from {len(synth_runs)} to {max_runs} for memory safety."
-            )
-            synth_runs = synth_runs[:max_runs]
-
-        return real_run, synth_runs
-
-    def _split_dataset_by_nodes(
-        self,
-        dataset_path: Path | None = None,
-        run_id: str | None = None,
-    ) -> tuple[list[int], list[int], list[int]]:
-        """
-        Split dataset into train, val, and test sets using node holdouts.
-
-        This is the default split strategy - we use different regions for train/val/test
-        to evaluate ability of model to generalize to new regions.
-        """
-        train_split = (
-            1 - self.config.training.val_split - self.config.training.test_split
-        )
-
-        target_path = dataset_path or Path(self.config.data.dataset_path)
-        # Determine which run_id to use for loading
-        effective_run_id = run_id or self.config.data.run_id
-        if not effective_run_id:
-            raise ValueError(
-                "run_id must be provided either as argument or in config.data.run_id"
-            )
-        aligned_dataset = EpiDataset.load_canonical_dataset(
-            target_path,
-            run_id=effective_run_id,
-            run_id_chunk_size=self.config.data.run_id_chunk_size,
-        )
-        N = aligned_dataset[REGION_COORD].size
-        all_nodes = np.arange(N)
-
-        # Get valid nodes using EpiDataset class method
-        valid_mask = None
-        if self.config.data.use_valid_targets:
-            run_id_for_valid = run_id or self.config.data.run_id
-            valid_mask = EpiDataset.get_valid_nodes(
-                dataset_path=target_path,
-                run_id=run_id_for_valid,
-            )
-            self._status(
-                f"Using valid_targets filter: {valid_mask.sum()} valid regions"
-            )
-        else:
-            self._status(f"Total regions: {N}")
-
-        # Filter by valid_targets mask
-        if valid_mask is not None:
-            all_nodes = all_nodes[valid_mask]
-            N = len(all_nodes)
-
-        rng = np.random.default_rng(self.config.training.seed)
-        rng.shuffle(all_nodes)
-        n_train = int(len(all_nodes) * train_split)
-        n_val = int(len(all_nodes) * self.config.training.val_split)
-        train_nodes = all_nodes[:n_train]
-        val_nodes = all_nodes[n_train : n_train + n_val]
-        test_nodes = all_nodes[n_train + n_val :]
-
-        assert len(train_nodes) + len(val_nodes) + len(test_nodes) == len(all_nodes), (
-            "Dataset split is not correct"
-        )
-
-        aligned_dataset.close()
-        return list(train_nodes), list(val_nodes), list(test_nodes)
-
-    def _load_region_ids(
-        self,
-        dataset_path: Path,
-        run_id: str,
-    ) -> list[str]:
-        aligned_dataset = EpiDataset.load_canonical_dataset(
-            dataset_path,
-            run_id=run_id,
-            run_id_chunk_size=1,
-        )
-        region_ids = [str(r) for r in aligned_dataset[REGION_COORD].values]
-        aligned_dataset.close()
-        return region_ids
-
-    def _map_region_ids_to_nodes(
-        self,
-        region_ids: list[str],
-        dataset_path: Path,
-        run_id: str,
-    ) -> list[int]:
-        target_region_ids = self._load_region_ids(dataset_path, run_id)
-        region_id_index = {rid: i for i, rid in enumerate(target_region_ids)}
-        missing = [rid for rid in region_ids if rid not in region_id_index]
-        if missing:
-            logger.warning(
-                "Region ID mapping missing %d/%d regions for run '%s' from %s.",
-                len(missing),
-                len(region_ids),
-                run_id,
-                dataset_path,
-            )
-        return [region_id_index[rid] for rid in region_ids if rid in region_id_index]
-
-    def _fallback_all_nodes(self, dataset_path: Path, run_id: str) -> list[int]:
-        aligned_dataset = EpiDataset.load_canonical_dataset(
-            dataset_path,
-            run_id_chunk_size=1,
-            run_id=run_id,
-        )
-        num_nodes = aligned_dataset[REGION_COORD].size
-        aligned_dataset.close()
-        return list(range(num_nodes))
-
-    def _select_synthetic_scaler_run(self, synth_runs: list[str]) -> str:
-        if not synth_runs:
-            raise ValueError("No synthetic runs available for scaler fitting.")
-
-        mapping = self._load_sparsity_mapping()
-        if mapping:
-
-            def resolve_sparsity(run_id: str) -> float | None:
-                if run_id in mapping:
-                    return mapping[run_id]
-                if "_" in run_id:
-                    suffix = run_id.split("_", 1)[1]
-                    for k, v in mapping.items():
-                        if "_" in k and k.split("_", 1)[1] == suffix:
-                            return v
-                return None
-
-            candidates = [(run_id, resolve_sparsity(run_id)) for run_id in synth_runs]
-            candidates = [
-                (run_id, sparsity)
-                for run_id, sparsity in candidates
-                if sparsity is not None
-            ]
-            if candidates:
-                # FIX: Select LOWEST sparsity (cleanest data) for scaler fitting
-                # Previously used max() which selected noisiest data, causing spikes
-                # when curriculum progressed to cleaner sparsity levels
-                selected_run, selected_sparsity = min(candidates, key=lambda x: x[1])  # type: ignore[arg-type]
-                logger.info(
-                    "Synthetic scalers fitted on run '%s' (sparsity=%.3f).",
-                    selected_run,
-                    selected_sparsity,
-                )
-                return selected_run
-
-        fallback_run = synth_runs[-1]
-        logger.info(
-            "Synthetic scalers fitted on run '%s' (no sparsity metadata available).",
-            fallback_run,
-        )
-        return fallback_run
-
-    def _split_dataset_temporal(
-        self,
-    ) -> tuple[EpiDataset, EpiDataset, EpiDataset]:
-        """
-        Split dataset into train, val, and test sets using temporal boundaries.
-
-        All nodes are used as targets in each split, but data is divided by date ranges.
-        This returns pre-created datasets instead of node lists.
-        """
-        # TrainingParams.__post_init__ guarantees these are not None when split_strategy == "time"
-        train_end: str = self.config.training.train_end_date or ""
-        val_end: str = self.config.training.val_end_date or ""
-        test_end: str | None = self.config.training.test_end_date
-
-        return EpiDataset.create_temporal_splits(
-            config=self.config,
-            train_end_date=train_end,
-            val_end_date=val_end,
-            test_end_date=test_end,
-        )
 
     def _setup_device(self) -> torch.device:
         """Setup computation device with MPS support and validation."""
@@ -1345,152 +750,15 @@ class EpiForecasterTrainer:
                 f"Unknown scheduler type: {self.config.training.scheduler_type}"
             )
 
-    def _create_criterion(self) -> nn.Module:
+    def _create_criterion(self) -> JointInferenceLoss:
         """Create loss criterion."""
-        from evaluation.epiforecaster_eval import get_loss_from_config
+        from evaluation.losses import get_loss_from_config
 
         return get_loss_from_config(
             self.config.training.loss,
             data_config=self.config.data,
             forecast_horizon=self.config.model.forecast_horizon,
         )
-
-    def _create_data_loaders(self) -> tuple[DataLoader, DataLoader, DataLoader]:
-        """Create training and validation data loaders with device-aware optimizations."""
-        # Select multiprocessing context for DataLoader workers
-        all_num_workers_zero = (
-            self.config.training.num_workers == 0
-            and self.config.training.val_workers == 0
-        )
-        mp_context = select_multiprocessing_context(
-            self._device_hint, all_num_workers_zero=all_num_workers_zero
-        )
-        self._multiprocessing_context = mp_context
-
-        # Device-aware hardware optimizations
-        pin_memory = self.config.training.pin_memory and self._device_hint == "cuda"
-
-        avail_cores = (os.cpu_count() or 1) - 1
-        cfg_workers = self.config.training.num_workers
-        if cfg_workers == -1:
-            num_workers = avail_cores
-        else:
-            num_workers = min(avail_cores, cfg_workers)
-
-        # Compute val_workers similarly (capped to avoid OOM during validation)
-        cfg_val_workers = self.config.training.val_workers
-        if cfg_val_workers == -1:
-            val_num_workers = max(0, avail_cores)
-        else:
-            val_num_workers = min(max(0, avail_cores), cfg_val_workers)
-
-        persistent_workers = self.config.training.persistent_workers and num_workers > 0
-        train_loader_kwargs = {
-            "dataset": self.train_dataset,
-            "num_workers": num_workers,
-            "pin_memory": pin_memory,
-        }
-        # Only pass multiprocessing_context when using workers
-        if num_workers > 0:
-            train_loader_kwargs["multiprocessing_context"] = mp_context
-
-        # Configure Sampler & Collate based on Curriculum
-        shared_collate = partial(
-            collate_epiforecaster_batch,
-            require_region_index=bool(self.config.model.type.regions),
-        )
-        if self.config.training.curriculum.enabled and isinstance(
-            self.train_dataset, ConcatDataset
-        ):
-            self._status("Creating EpidemicCurriculumSampler...")
-            self.curriculum_sampler = EpidemicCurriculumSampler(
-                dataset=self.train_dataset,
-                batch_size=self.config.training.batch_size,
-                config=self.config.training.curriculum,
-                drop_last=True,
-                real_run_id=getattr(self, "real_run_id", "real"),
-            )
-            # When using batch_sampler, batch_size and shuffle must be omitted
-            train_loader_kwargs["batch_sampler"] = self.curriculum_sampler
-            train_loader_kwargs["collate_fn"] = shared_collate
-        else:
-            # Standard training
-            self.curriculum_sampler = None
-            if self.config.training.shuffle_train_batches:
-                train_loader_kwargs["batch_sampler"] = ShuffledBatchSampler(
-                    dataset_size=len(self.train_dataset),
-                    batch_size=self.config.training.batch_size,
-                    drop_last=True,
-                    seed=self.config.training.seed,
-                )
-            else:
-                train_loader_kwargs["batch_size"] = self.config.training.batch_size
-                train_loader_kwargs["shuffle"] = False
-                train_loader_kwargs["drop_last"] = True
-            train_loader_kwargs["collate_fn"] = shared_collate
-
-        if persistent_workers:
-            train_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None and num_workers > 0:
-            train_loader_kwargs["prefetch_factor"] = (
-                self.config.training.prefetch_factor
-            )
-        train_loader = DataLoader(**train_loader_kwargs)
-
-        val_persistent_workers = (
-            self.config.training.persistent_workers and val_num_workers > 0
-        )
-        val_loader_kwargs = {
-            "dataset": self.val_dataset,
-            "batch_size": self.config.training.batch_size,
-            "shuffle": False,
-            "num_workers": val_num_workers,
-            "pin_memory": pin_memory,
-            "collate_fn": shared_collate,
-        }
-        # Only pass multiprocessing_context when using workers
-        if val_num_workers > 0:
-            val_loader_kwargs["multiprocessing_context"] = mp_context
-        if val_persistent_workers:
-            val_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None and val_num_workers > 0:
-            val_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
-        val_loader = DataLoader(**val_loader_kwargs)
-
-        # Compute test_workers (default to 0 since test runs once at end)
-        cfg_test_workers = self.config.training.test_workers
-        if cfg_test_workers == -1:
-            test_num_workers = max(0, avail_cores)
-        else:
-            test_num_workers = min(max(0, avail_cores), cfg_test_workers)
-
-        test_persistent_workers = (
-            self.config.training.persistent_workers and test_num_workers > 0
-        )
-        test_loader_kwargs = {
-            "dataset": self.test_dataset,
-            "batch_size": self.config.training.batch_size,
-            "shuffle": False,
-            "num_workers": test_num_workers,
-            "pin_memory": pin_memory,
-            "collate_fn": shared_collate,
-        }
-        # Only pass multiprocessing_context when using workers
-        if test_num_workers > 0:
-            test_loader_kwargs["multiprocessing_context"] = mp_context
-        if test_persistent_workers:
-            test_loader_kwargs["persistent_workers"] = True
-        if self.config.training.prefetch_factor is not None and test_num_workers > 0:
-            test_loader_kwargs["prefetch_factor"] = self.config.training.prefetch_factor
-        test_loader = DataLoader(**test_loader_kwargs)
-        return train_loader, val_loader, test_loader
-
-    def _should_prestart_dataloader_workers(self) -> bool:
-        if self._multiprocessing_context != "fork":
-            return False
-        if self._device_hint != "cuda":
-            return False
-        return True
 
     def _resolve_device_hint(self) -> str:
         requested = str(self.config.training.device)
@@ -1590,16 +858,16 @@ class EpiForecasterTrainer:
     #     self.model.eval()
 
     #     try:
-    #         mob_batch = example_batch["MobBatch"].to(self.device)
+    #         mob_batch = example_batch.mob_batch.to(self.device)
     #         example_inputs = (
     #             example_batch["CaseNode"].to(self.device),
-    #             example_batch["BioNode"].to(self.device),
+    #             example_batch.bio_node.to(self.device),
     #             mob_batch,
-    #             example_batch["TargetNode"].to(self.device),
+    #             example_batch.target_node.to(self.device),
     #             self.region_embeddings
     #             if self.region_embeddings is not None
     #             else None,
-    #             example_batch["Population"].to(self.device),
+    #             example_batch.population.to(self.device),
     #         )
     #         with torch.no_grad():
     #             self.writer.add_graph(self.model, example_inputs, verbose=False)
@@ -1916,45 +1184,7 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx = current_idx
         return transition
 
-    def _move_batch_to_device(
-        self, batch_data: dict[str, Any], dtype: torch.dtype
-    ) -> dict[str, Any]:
-        """Move all tensors in batch_data to the trainer's device.
-
-        This is called before the compiled training step to ensure all tensors
-        are already on device, avoiding DeviceCopy ops that break CUDA graphs.
-
-        Args:
-            batch_data: Dictionary containing batch tensors (may be on CPU)
-            dtype: Target dtype for floating point tensors
-
-        Returns:
-            Dictionary with all tensors moved to device
-        """
-        device = self.device
-        result = {}
-        for k, v in batch_data.items():
-            if isinstance(v, torch.Tensor):
-                if v.device != device:
-                    if torch.is_floating_point(v):
-                        v = v.to(device=device, dtype=dtype, non_blocking=True)
-                    else:
-                        v = v.to(device=device, non_blocking=True)
-                elif torch.is_floating_point(v) and v.dtype != dtype:
-                    v = v.to(dtype=dtype)
-                result[k] = v
-            elif hasattr(v, "to"):  # PyG Data/Batch objects
-                v = v.to(device, non_blocking=True)
-                result[k] = v
-            else:
-                result[k] = v
-        return result
-
-    def _build_compiled_batch(self, batch_data: dict[str, Any]) -> dict[str, Any]:
-        """Build a shape-stable, tensor-only view for compiled training steps."""
-        return build_compiled_batch_view(batch_data)
-
-    def _training_step_impl(self, batch_data: dict[str, Any]) -> torch.Tensor:
+    def _training_step_impl(self, batch_data: EpiBatch) -> torch.Tensor:
         """Pure training step: forward + backward only.
 
         This method computes the forward pass, loss, and backward pass.
@@ -1991,7 +1221,7 @@ class EpiForecasterTrainer:
 
     def _training_step_impl_adaptive(
         self,
-        batch_data: dict[str, Any],
+        batch_data: EpiBatch,
         obs_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Compiled-friendly adaptive training step using cached observation weights."""
@@ -2036,9 +1266,7 @@ class EpiForecasterTrainer:
         loss.backward()
         return loss.detach()
 
-    def _gradnorm_sidecar_update(
-        self, batch_data: dict[str, Any]
-    ) -> dict[str, torch.Tensor]:
+    def _gradnorm_sidecar_update(self, batch_data: EpiBatch) -> dict[str, torch.Tensor]:
         """Periodic eager GradNorm controller update on obs_context probe."""
         if self.gradnorm_controller is None or self.gradnorm_optimizer is None:
             return {}
@@ -2229,38 +1457,37 @@ class EpiForecasterTrainer:
 
                 # Execute training step: either compiled (fast) or eager (debuggable)
                 # Move all tensors to device before training step to avoid DeviceCopy ops
-                batch_data = self._move_batch_to_device(
-                    batch_data, self.precision_policy.param_dtype
+                batch_data = batch_data.to(
+                    device=self.device, dtype=self.precision_policy.param_dtype
                 )
-                compiled_batch = self._build_compiled_batch(batch_data)
 
                 model_step_start_time = time.time()
                 if self._gradnorm_enabled:
                     if self._compiled_training_step is not None:
                         ensure_mobility_adj_dense_ready(
-                            compiled_batch,
+                            batch_data,
                             required=bool(self.config.model.type.mobility),
                             context="compiled adaptive training",
                         )
                         loss = self._compiled_training_step(
-                            compiled_batch,
+                            batch_data,
                             self._gradnorm_cached_weights,
                         )
                     else:
                         loss = self._training_step_impl_adaptive(
-                            compiled_batch,
+                            batch_data,
                             self._gradnorm_cached_weights,
                         )
                 # Call either compiled or eager version of the same step implementation
                 elif self._compiled_training_step is not None:
                     ensure_mobility_adj_dense_ready(
-                        compiled_batch,
+                        batch_data,
                         required=bool(self.config.model.type.mobility),
                         context="compiled training",
                     )
-                    loss = self._compiled_training_step(compiled_batch)
+                    loss = self._compiled_training_step(batch_data)
                 else:
-                    loss = self._training_step_impl(compiled_batch)
+                    loss = self._training_step_impl(batch_data)
                 model_step_time_s = time.time() - model_step_start_time
 
                 frequency = self.config.training.grad_norm_log_frequency
@@ -2283,15 +1510,40 @@ class EpiForecasterTrainer:
                         foreach=True,
                     )
 
+                gradient_snapshot_log_data: dict[str, float | int] = {}
+                should_capture_snapshot = (
+                    self._gradient_snapshot_frequency > 0
+                    and should_log_step(
+                        self.global_step, 1, self._gradient_snapshot_frequency
+                    )
+                )
+                if should_capture_snapshot:
+                    snapshot = self.gradient_debugger.capture_snapshot(
+                        self.model,
+                        loss=loss,
+                        step_info={
+                            "step": self.global_step,
+                            "epoch": self.current_epoch,
+                            "batch_idx": batch_idx,
+                        },
+                    )
+                    gradient_snapshot_log_data = (
+                        self.gradient_debugger.build_snapshot_log_data(snapshot)
+                    )
+                    if self.gradient_debugger.log_dir is not None:
+                        self.gradient_debugger.save_report(snapshot)
+                    self._status(
+                        self.gradient_debugger.format_snapshot_status(snapshot),
+                        logging.INFO,
+                    )
+
                 # Optimizer step and gradient zeroing (common to both paths)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
                 gradnorm_step_log_data: dict[str, torch.Tensor] = {}
                 if self._gradnorm_enabled:
-                    gradnorm_step_log_data = self._gradnorm_sidecar_update(
-                        compiled_batch
-                    )
+                    gradnorm_step_log_data = self._gradnorm_sidecar_update(batch_data)
                     for idx, task in enumerate(GradNormController.task_names):
                         if f"gradnorm_w_{task}" not in gradnorm_step_log_data:
                             gradnorm_step_log_data[f"gradnorm_w_{task}"] = (
@@ -2393,7 +1645,7 @@ class EpiForecasterTrainer:
                 fetch_start_time = time.time()
                 lr = self.optimizer.param_groups[0]["lr"]
 
-                bsz = batch_data["B"]
+                bsz = batch_data.b
                 samples_per_s = (
                     (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
                 )
@@ -2409,6 +1661,7 @@ class EpiForecasterTrainer:
                     epoch=self.current_epoch,
                     component_gradnorm_log_data=component_gradnorm_log_data,
                     gradnorm_step_log_data=gradnorm_step_log_data,
+                    gradient_snapshot_log_data=gradient_snapshot_log_data,
                 )
 
                 if log_this_step:
@@ -2441,7 +1694,7 @@ class EpiForecasterTrainer:
                         self._status(f"  {gradnorm_status_line}")
 
                     # Keep as tensor - wandb handles CPU tensor conversion
-                    window_start_mean = batch_data["WindowStart"].float().mean()
+                    window_start_mean = batch_data.window_start.float().mean()
                     log_data["time_window_start"] = window_start_mean
 
                     # Log curriculum metrics for loss-curve-critic analysis
@@ -2455,6 +1708,7 @@ class EpiForecasterTrainer:
                     log_this_step=log_this_step,
                     log_data=log_data,
                     component_gradnorm_log_data=component_gradnorm_log_data,
+                    gradient_snapshot_log_data=gradient_snapshot_log_data,
                 )
                 if self.wandb_run is not None and wandb_payload is not None:
                     wandb.log(wandb_payload, step=self.global_step)

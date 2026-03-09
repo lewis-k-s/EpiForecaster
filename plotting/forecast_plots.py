@@ -149,6 +149,8 @@ def collect_forecast_samples_for_target_nodes(
     context_pre: int = 30,
     context_post: int = 30,
     target_names: list[str] | None = None,
+    validation_mode: str = "all",
+    required_targets: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run model inference for a specific subset of target nodes and return raw series.
@@ -165,7 +167,7 @@ def collect_forecast_samples_for_target_nodes(
     import random
 
     from torch.utils.data import Subset
-    from data.epi_dataset import collate_epiforecaster_batch
+    from data.epi_batch import collate_epiforecaster_batch
 
     dataset = loader.dataset
     if not isinstance(dataset, EpiDataset):
@@ -177,12 +179,31 @@ def collect_forecast_samples_for_target_nodes(
         return []
     resolved_targets = _resolve_target_names(target_names)
 
+    # Compute valid windows specifically for plotting using the requested mode
+    dataset_name_map = {
+        "hosp": "hospitalizations",
+        "ww": "wastewater",
+        "cases": "cases",
+        "deaths": "deaths",
+    }
+
+    if required_targets is None:
+        mapped_required = [dataset_name_map[t] for t in resolved_targets]
+    else:
+        mapped_required = [
+            dataset_name_map[t] for t in required_targets if t in dataset_name_map
+        ]
+
+    valid_starts_by_node = dataset.get_valid_window_starts_dict(
+        mode=validation_mode, required_targets=mapped_required
+    )
+
     indices: list[int] = []
     start_times: list[Any] = []
     start_indices: list[int] = []
 
     for target_node in target_node_ids:
-        valid_starts = dataset._valid_window_starts_by_node.get(target_node, [])
+        valid_starts = valid_starts_by_node.get(target_node, [])
         if not valid_starts:
             continue
 
@@ -241,18 +262,18 @@ def collect_forecast_samples_for_target_nodes(
                     region_embeddings=region_embeddings,
                 )
             else:
-                target_nodes = batch.get("TargetRegionIndex", batch["TargetNode"]).to(
+                target_nodes = batch.get("TargetRegionIndex", batch.target_node).to(
                     device
                 )
                 model_outputs = model.forward(
-                    hosp_hist=batch["HospHist"].to(device),
-                    deaths_hist=batch["DeathsHist"].to(device),
-                    cases_hist=batch["CasesHist"].to(device),
-                    biomarkers_hist=batch["BioNode"].to(device),
-                    mob_graphs=batch["MobBatch"].to(device),
+                    hosp_hist=batch.hosp_hist.to(device),
+                    deaths_hist=batch.deaths_hist.to(device),
+                    cases_hist=batch.cases_hist.to(device),
+                    biomarkers_hist=batch.bio_node.to(device),
+                    mob_graphs=batch.mob_batch.to(device),
                     target_nodes=target_nodes,
                     region_embeddings=region_embeddings,
-                    population=batch["Population"].to(device),
+                    population=batch.population.to(device),
                 )
             if not isinstance(model_outputs, dict):
                 raise ValueError(
@@ -264,9 +285,9 @@ def collect_forecast_samples_for_target_nodes(
         H = dataset.config.model.forecast_horizon
         T_total = dataset.precomputed_cases_hist.shape[0]
 
-        batch_size = int(batch["TargetNode"].shape[0])
+        batch_size = int(batch.target_node.shape[0])
         for i in range(batch_size):
-            target_node = int(batch["TargetNode"][i].item())
+            target_node = int(batch.target_node[i].item())
             node_idx = target_node
             start_idx = start_indices[i] if i < len(start_indices) else -1
             t0 = start_idx + L
@@ -325,7 +346,7 @@ def collect_forecast_samples_for_target_nodes(
             samples.append(
                 {
                     "node_id": target_node,
-                    "node_label": str(batch["NodeLabels"][i]),
+                    "node_label": str(batch.node_labels[i]),
                     "actual_context": primary["actual_context"],
                     "prediction": primary["prediction"],
                     "target": primary["target"],
