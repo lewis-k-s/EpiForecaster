@@ -77,6 +77,12 @@ training:
   prefetch_factor: 2
   pin_memory: true
 
+  gradient_snapshot_frequency: 100
+  gradient_snapshot_top_k: 5
+  gradient_vanishing_threshold: 1.0e-8
+  gradient_exploding_threshold: 1.0e2
+  gradient_debug_log_dir: outputs/grad_debug
+
   # Temporal split configuration
   split_strategy: "node"
   # train_end_date: "2021-01-31"
