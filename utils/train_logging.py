@@ -40,9 +40,10 @@ def build_train_step_log_data(
     epoch: int,
     component_gradnorm_log_data: dict[str, float],
     gradnorm_step_log_data: dict[str, torch.Tensor],
-) -> dict[str, float | torch.Tensor]:
+    gradient_snapshot_log_data: dict[str, float | int],
+) -> dict[str, float | int | torch.Tensor]:
     """Build per-step logging payload before progress-only metrics are added."""
-    log_data: dict[str, float | torch.Tensor] = {
+    log_data: dict[str, float | int | torch.Tensor] = {
         "learning_rate_step": lr,
         "gradnorm_clipped_total": grad_norm,
         "time_batch_s": batch_time_s,
@@ -53,6 +54,7 @@ def build_train_step_log_data(
     }
     log_data.update(component_gradnorm_log_data)
     log_data.update(gradnorm_step_log_data)
+    log_data.update(gradient_snapshot_log_data)
     return log_data
 
 
@@ -78,14 +80,18 @@ def format_train_progress_status(
 def get_wandb_step_payload(
     *,
     log_this_step: bool,
-    log_data: dict[str, float | torch.Tensor],
+    log_data: dict[str, float | int | torch.Tensor],
     component_gradnorm_log_data: dict[str, float],
-) -> dict[str, float | torch.Tensor] | None:
+    gradient_snapshot_log_data: dict[str, float | int],
+) -> dict[str, float | int | torch.Tensor] | None:
     """Select the exact payload that should be sent to wandb for this step."""
     if log_this_step:
         return log_data
-    if component_gradnorm_log_data:
-        return component_gradnorm_log_data
+    sparse_payload: dict[str, float | int | torch.Tensor] = {}
+    sparse_payload.update(component_gradnorm_log_data)
+    sparse_payload.update(gradient_snapshot_log_data)
+    if sparse_payload:
+        return sparse_payload
     return None
 
 

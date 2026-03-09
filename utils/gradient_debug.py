@@ -63,6 +63,8 @@ class GradientSnapshot:
     has_non_finite: bool = False
     layer_stats: list[GradientStats] = field(default_factory=list)
     non_finite_layers: list[str] = field(default_factory=list)
+    vanishing_layers: list[str] = field(default_factory=list)
+    exploding_layers: list[str] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
 
 
@@ -82,6 +84,9 @@ class GradientDebugger:
         self,
         enabled: bool = False,
         log_dir: str | Path | None = None,
+        vanishing_threshold: float = 1.0e-8,
+        exploding_threshold: float = 1.0e2,
+        snapshot_top_k: int = 5,
         logger_instance: logging.Logger | None = None,
     ):
         """Initialize gradient debugger.
@@ -93,7 +98,25 @@ class GradientDebugger:
         """
         self.enabled = enabled
         self.log_dir = Path(log_dir) if log_dir else None
+        self.vanishing_threshold = float(vanishing_threshold)
+        self.exploding_threshold = float(exploding_threshold)
+        self.snapshot_top_k = int(snapshot_top_k)
         self.logger = logger_instance or logger
+
+        if self.vanishing_threshold < 0:
+            raise ValueError(
+                "vanishing_threshold must be non-negative, got "
+                f"{self.vanishing_threshold}"
+            )
+        if self.exploding_threshold <= 0:
+            raise ValueError(
+                "exploding_threshold must be positive, got "
+                f"{self.exploding_threshold}"
+            )
+        if self.snapshot_top_k < 1:
+            raise ValueError(
+                f"snapshot_top_k must be >= 1, got {self.snapshot_top_k}"
+            )
 
         if self.enabled and self.log_dir:
             self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -157,7 +180,9 @@ class GradientDebugger:
         finite_grad = grad[torch.isfinite(grad)]
         if finite_grad.numel() > 0:
             stats.mean = float(finite_grad.mean().item())
-            stats.std = float(finite_grad.std().item())
+            stats.std = (
+                float(finite_grad.std().item()) if finite_grad.numel() > 1 else 0.0
+            )
             stats.min = float(finite_grad.min().item())
             stats.max = float(finite_grad.max().item())
 
@@ -198,6 +223,8 @@ class GradientDebugger:
         # Compute stats for all parameters with gradients
         layer_stats = []
         non_finite_layers = []
+        vanishing_layers = []
+        exploding_layers = []
         total_norm_sq = 0.0
 
         for name, param in model.named_parameters():
@@ -210,6 +237,10 @@ class GradientDebugger:
                     if stats.nan_count > 0 or stats.inf_count > 0:
                         non_finite_layers.append(name)
                         snapshot.has_non_finite = True
+                    elif stats.norm <= self.vanishing_threshold:
+                        vanishing_layers.append(name)
+                    elif stats.norm >= self.exploding_threshold:
+                        exploding_layers.append(name)
 
                     # Accumulate squared norm for global norm (only finite contributions)
                     if torch.isfinite(param.grad).all():
@@ -217,6 +248,8 @@ class GradientDebugger:
 
         snapshot.layer_stats = layer_stats
         snapshot.non_finite_layers = non_finite_layers
+        snapshot.vanishing_layers = vanishing_layers
+        snapshot.exploding_layers = exploding_layers
         snapshot.global_grad_norm = float(total_norm_sq**0.5)
 
         # Generate summary statistics
@@ -232,6 +265,21 @@ class GradientDebugger:
         total_params = sum(s.numel for s in snapshot.layer_stats)
         total_nan = sum(s.nan_count for s in snapshot.layer_stats)
         total_inf = sum(s.inf_count for s in snapshot.layer_stats)
+        finite_layer_stats = [
+            s
+            for s in snapshot.layer_stats
+            if s.nan_count == 0 and s.inf_count == 0 and s.finite_ratio == 1.0
+        ]
+        finite_layer_stats.sort(key=lambda s: s.norm)
+        bottom_k = [
+            {"name": s.name, "norm": s.norm}
+            for s in finite_layer_stats[: self.snapshot_top_k]
+        ]
+        top_k = [
+            {"name": s.name, "norm": s.norm}
+            for s in finite_layer_stats[-self.snapshot_top_k :][::-1]
+        ]
+        finite_norms = [s.norm for s in finite_layer_stats]
 
         # Find layers with highest non-finite ratios
         problematic_layers = [
@@ -255,8 +303,74 @@ class GradientDebugger:
             "total_inf_values": total_inf,
             "non_finite_layers_count": len(snapshot.non_finite_layers),
             "non_finite_layers": snapshot.non_finite_layers,
+            "vanishing_layers_count": len(snapshot.vanishing_layers),
+            "exploding_layers_count": len(snapshot.exploding_layers),
+            "min_finite_layer_norm": min(finite_norms) if finite_norms else 0.0,
+            "median_finite_layer_norm": (
+                sorted(finite_norms)[len(finite_norms) // 2] if finite_norms else 0.0
+            ),
+            "max_finite_layer_norm": max(finite_norms) if finite_norms else 0.0,
+            "lowest_norm_layers": bottom_k,
+            "highest_norm_layers": top_k,
             "most_problematic_layers": problematic_layers[:10],  # Top 10
         }
+
+    def build_snapshot_log_data(
+        self, snapshot: GradientSnapshot
+    ) -> dict[str, float | int]:
+        """Build compact numeric metrics suitable for console/W&B logging."""
+        summary = snapshot.summary
+        return {
+            "grad_snapshot_global_norm": snapshot.global_grad_norm,
+            "grad_snapshot_layers_with_grads": int(
+                summary.get("total_layers_with_grads", 0)
+            ),
+            "grad_snapshot_non_finite_layers": int(
+                summary.get("non_finite_layers_count", 0)
+            ),
+            "grad_snapshot_vanishing_layers": int(
+                summary.get("vanishing_layers_count", 0)
+            ),
+            "grad_snapshot_exploding_layers": int(
+                summary.get("exploding_layers_count", 0)
+            ),
+            "grad_snapshot_min_layer_norm": float(
+                summary.get("min_finite_layer_norm", 0.0)
+            ),
+            "grad_snapshot_median_layer_norm": float(
+                summary.get("median_finite_layer_norm", 0.0)
+            ),
+            "grad_snapshot_max_layer_norm": float(
+                summary.get("max_finite_layer_norm", 0.0)
+            ),
+        }
+
+    def format_snapshot_status(self, snapshot: GradientSnapshot) -> str:
+        """Build a concise status line for periodic snapshot captures."""
+        summary = snapshot.summary
+        highest = summary.get("highest_norm_layers", [])
+        lowest = summary.get("lowest_norm_layers", [])
+        top_layer = highest[0] if highest else None
+        bottom_layer = lowest[0] if lowest else None
+
+        top_desc = (
+            f"{top_layer['name']}={top_layer['norm']:.2e}"
+            if top_layer is not None
+            else "n/a"
+        )
+        bottom_desc = (
+            f"{bottom_layer['name']}={bottom_layer['norm']:.2e}"
+            if bottom_layer is not None
+            else "n/a"
+        )
+        return (
+            f"Gradient snapshot @ step {snapshot.step}: "
+            f"median={summary.get('median_finite_layer_norm', 0.0):.2e} | "
+            f"max={summary.get('max_finite_layer_norm', 0.0):.2e} | "
+            f"vanishing={summary.get('vanishing_layers_count', 0)} | "
+            f"exploding={summary.get('exploding_layers_count', 0)} | "
+            f"low={bottom_desc} | high={top_desc}"
+        )
 
     def save_report(self, snapshot: GradientSnapshot, step: int | None = None) -> Path:
         """Save snapshot report to JSON file.
@@ -344,10 +458,16 @@ def create_gradient_debugger(
 
     enabled = getattr(config, "enable_gradient_debug", False)
     log_dir = getattr(config, "gradient_debug_log_dir", None)
+    vanishing_threshold = getattr(config, "gradient_vanishing_threshold", 1.0e-8)
+    exploding_threshold = getattr(config, "gradient_exploding_threshold", 1.0e2)
+    snapshot_top_k = getattr(config, "gradient_snapshot_top_k", 5)
 
     return GradientDebugger(
         enabled=enabled,
         log_dir=log_dir,
+        vanishing_threshold=vanishing_threshold,
+        exploding_threshold=exploding_threshold,
+        snapshot_top_k=snapshot_top_k,
         logger_instance=logger_instance,
     )
 

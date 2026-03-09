@@ -411,7 +411,7 @@ class EpiForecasterTrainer:
         )
         if self.gradient_debugger.enabled and self.gradient_debugger.log_dir:
             self._status(
-                f"Gradient debugging enabled. Reports will be saved to: {self.gradient_debugger.log_dir}",
+                f"Gradient diagnostics enabled. Reports will be saved to: {self.gradient_debugger.log_dir}",
                 logging.INFO,
             )
         if self._gradient_snapshot_frequency > 0:
@@ -1490,26 +1490,6 @@ class EpiForecasterTrainer:
                     loss = self._training_step_impl(batch_data)
                 model_step_time_s = time.time() - model_step_start_time
 
-                frequency = self.config.training.grad_norm_log_frequency
-                component_gradnorm_log_data: dict[str, float] = {}
-                if should_log_gradnorm_components(self.global_step, frequency):
-                    grad_norm, component_gradnorm_log_data = (
-                        self._compute_gradient_norms_and_clip(step=self.global_step)
-                    )
-                    self._status(
-                        format_component_gradnorm_status(
-                            self.global_step,
-                            component_gradnorm_log_data,
-                        ),
-                        logging.DEBUG,
-                    )
-                else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=self.config.training.gradient_clip_value,
-                        foreach=True,
-                    )
-
                 gradient_snapshot_log_data: dict[str, float | int] = {}
                 should_capture_snapshot = (
                     self._gradient_snapshot_frequency > 0
@@ -1535,6 +1515,26 @@ class EpiForecasterTrainer:
                     self._status(
                         self.gradient_debugger.format_snapshot_status(snapshot),
                         logging.INFO,
+                    )
+
+                frequency = self.config.training.grad_norm_log_frequency
+                component_gradnorm_log_data: dict[str, float] = {}
+                if should_log_gradnorm_components(self.global_step, frequency):
+                    grad_norm, component_gradnorm_log_data = (
+                        self._compute_gradient_norms_and_clip(step=self.global_step)
+                    )
+                    self._status(
+                        format_component_gradnorm_status(
+                            self.global_step,
+                            component_gradnorm_log_data,
+                        ),
+                        logging.DEBUG,
+                    )
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.config.training.gradient_clip_value,
+                        foreach=True,
                     )
 
                 # Optimizer step and gradient zeroing (common to both paths)
