@@ -13,8 +13,9 @@ import logging
 import os
 import platform
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -59,10 +60,14 @@ from utils.train_logging import (
     add_curriculum_metrics,
     build_epoch_logging_bundle,
     build_train_step_log_data,
-    compute_gradient_norms_and_clip,
+    get_wandb_step_payload,
+)
+from utils.console import (
     format_component_gradnorm_status,
     format_train_progress_status,
-    get_wandb_step_payload,
+)
+from training.grad_utils import (
+    compute_gradient_norms_and_clip,
     should_log_gradnorm_components,
 )
 from utils.training_utils import should_log_step
@@ -101,18 +106,14 @@ class EpiForecasterTrainer:
         # Keep CPU until DataLoader workers are forked to avoid CUDA init before forking.
         self.device = torch.device("cpu")
 
-        # Set random seeds for reproducibility
+        # Set random seeds for reproducibility (CPU only).
+        # CUDA-specific seeding is deferred until after DataLoader workers are forked.
         if config.training.seed is not None:
             import random
 
             random.seed(config.training.seed)
             np.random.seed(config.training.seed)
             torch.manual_seed(config.training.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(config.training.seed)
-                # Enable deterministic behavior for reproducibility
-                torch.backends.cudnn.deterministic = True
-                torch.backends.cudnn.benchmark = False
         self.model_id = self._resolve_model_id()
         self.experiment_dir: Path | None = None
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
@@ -142,9 +143,8 @@ class EpiForecasterTrainer:
 
         # Optional static region embeddings from dataset
         self.region_embeddings = None
-        embeddings = getattr(train_example_ds, "region_embeddings", None)
-        if embeddings is not None:
-            self.region_embeddings = embeddings.clone()
+        if dataset_splits.region_embedding_store is not None:
+            self.region_embeddings = dataset_splits.region_embedding_store.embeddings.clone()
         elif self.config.model.type.regions:
             raise ValueError(
                 "Region embeddings requested by config but region2vec_path was not provided."
@@ -212,6 +212,14 @@ class EpiForecasterTrainer:
         self.device = self._setup_device()
         self.model.device = self.device
 
+        # Initialize CUDA-specific seeding and deterministic flags now that workers
+        # are safely forked and the GPU context is initialized on the target device.
+        if config.training.seed is not None and self.device.type == "cuda":
+            torch.cuda.manual_seed_all(config.training.seed)
+            # Enable deterministic behavior for reproducibility
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
         # Setup precision policy (FP32 params + optional BF16 autocast)
         from utils.precision_policy import resolve_precision_policy
 
@@ -235,14 +243,6 @@ class EpiForecasterTrainer:
             self.region_embeddings = self.region_embeddings.to(self.device)
 
         self.model.to(self.device)
-
-        # Ensure model is FP32 (precision policy enforces this)
-        if self.model.dtype != torch.float32:
-            self._status(
-                f"Converting model from {self.model.dtype} to float32",
-                logging.INFO,
-            )
-            self.model = self.model.to(torch.float32)
 
         # Apply torch.compile if enabled
         if self.config.training.compile:
@@ -409,6 +409,7 @@ class EpiForecasterTrainer:
         self._gradient_snapshot_frequency = (
             self.config.training.gradient_snapshot_frequency
         )
+        self._gradient_snapshot_counts: dict[str, int] = defaultdict(int)
         if self.gradient_debugger.enabled and self.gradient_debugger.log_dir:
             self._status(
                 f"Gradient diagnostics enabled. Reports will be saved to: {self.gradient_debugger.log_dir}",
@@ -1363,6 +1364,90 @@ class EpiForecasterTrainer:
         )
         return log_data
 
+    @staticmethod
+    def _build_targets_dict(
+        batch_data: EpiBatch,
+    ) -> dict[str, torch.Tensor | None]:
+        """Build loss targets from the in-memory batch without a second forward pass."""
+        return {
+            "ww": batch_data.ww_target,
+            "hosp": batch_data.hosp_target,
+            "cases": batch_data.cases_target,
+            "deaths": batch_data.deaths_target,
+            "ww_mask": batch_data.ww_target_mask,
+            "hosp_mask": batch_data.hosp_target_mask,
+            "cases_mask": batch_data.cases_target_mask,
+            "deaths_mask": batch_data.deaths_target_mask,
+        }
+
+    def _compute_gradient_snapshot_head_supervision(
+        self, batch_data: EpiBatch
+    ) -> dict[str, dict[str, float | int | bool]]:
+        """Summarize per-head supervision density for a snapshot batch."""
+        obs_supervision = self.criterion.compute_observation_supervision(
+            self._build_targets_dict(batch_data),
+            device=self.device,
+        )
+        head_summary: dict[str, dict[str, float | int | bool]] = {}
+        for head in GradNormController.task_names:
+            supervision = obs_supervision[head]
+            weights = supervision["weights"]
+            if weights is None:
+                valid_points = 0
+                valid_series = 0
+            else:
+                weights_tensor = weights.float()
+                valid_points = int((weights_tensor > 0).sum().item())
+                valid_series = int((weights_tensor.sum(dim=1) > 0).sum().item())
+            head_summary[head] = {
+                "active": bool(cast(torch.Tensor, supervision["active"]).item()),
+                "n_eff": float(cast(torch.Tensor, supervision["n_eff"]).item()),
+                "valid_points": valid_points,
+                "valid_series": valid_series,
+            }
+        return head_summary
+
+    def _update_gradient_snapshot_coverage(
+        self,
+        head_supervision: dict[str, dict[str, float | int | bool]],
+        snapshot: Any,
+    ) -> dict[str, dict[str, float | int]]:
+        """Track cumulative head coverage and zero-gradient rates across snapshots."""
+        self._gradient_snapshot_counts["snapshots"] += 1
+        total_snapshots = self._gradient_snapshot_counts["snapshots"]
+
+        for head, supervision in head_supervision.items():
+            active = bool(supervision["active"])
+            health = snapshot.head_gradient_health.get(head, {})
+            if active:
+                self._gradient_snapshot_counts[f"{head}_active"] += 1
+                if bool(health.get("unexpected_zero", False)):
+                    self._gradient_snapshot_counts[f"{head}_active_zero"] += 1
+            else:
+                self._gradient_snapshot_counts[f"{head}_inactive"] += 1
+                if bool(health.get("expected_zero", False)):
+                    self._gradient_snapshot_counts[f"{head}_inactive_zero"] += 1
+
+        coverage: dict[str, dict[str, float | int]] = {}
+        for head in head_supervision:
+            active_count = self._gradient_snapshot_counts[f"{head}_active"]
+            inactive_count = self._gradient_snapshot_counts[f"{head}_inactive"]
+            coverage[head] = {
+                "snapshots_seen": total_snapshots,
+                "active_snapshots": active_count,
+                "inactive_snapshots": inactive_count,
+                "pass_rate": active_count / max(1, total_snapshots),
+                "zero_when_active_rate": self._gradient_snapshot_counts[
+                    f"{head}_active_zero"
+                ]
+                / max(1, active_count),
+                "zero_when_inactive_rate": self._gradient_snapshot_counts[
+                    f"{head}_inactive_zero"
+                ]
+                / max(1, inactive_count),
+            }
+        return coverage
+
     def _format_gradnorm_controller_status(
         self, gradnorm_step_log_data: dict[str, torch.Tensor]
     ) -> tuple[str, dict[str, float]]:
@@ -1498,6 +1583,9 @@ class EpiForecasterTrainer:
                     )
                 )
                 if should_capture_snapshot:
+                    head_supervision = self._compute_gradient_snapshot_head_supervision(
+                        batch_data
+                    )
                     snapshot = self.gradient_debugger.capture_snapshot(
                         self.model,
                         loss=loss,
@@ -1506,7 +1594,12 @@ class EpiForecasterTrainer:
                             "epoch": self.current_epoch,
                             "batch_idx": batch_idx,
                         },
+                        head_supervision=head_supervision,
                     )
+                    snapshot.head_coverage = self._update_gradient_snapshot_coverage(
+                        head_supervision, snapshot
+                    )
+                    self.gradient_debugger.refresh_snapshot_summary(snapshot)
                     gradient_snapshot_log_data = (
                         self.gradient_debugger.build_snapshot_log_data(snapshot)
                     )

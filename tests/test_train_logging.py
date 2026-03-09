@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from utils.console import (
+    format_horizon_status_lines,
+    format_joint_loss_components_status,
+)
 from utils.train_logging import (
     add_curriculum_metrics,
     add_horizon_metrics_to_log_data,
@@ -9,8 +13,6 @@ from utils.train_logging import (
     build_epoch_logging_bundle,
     build_train_step_log_data,
     compute_horizon_metric_series,
-    format_horizon_status_lines,
-    format_joint_loss_components_status,
     get_wandb_step_payload,
 )
 
