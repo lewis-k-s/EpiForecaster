@@ -292,6 +292,53 @@ class EpidemicCurriculumSampler(BatchSampler):
         """Split indices into chunks."""
         return [indices[i : i + chunk_size] for i in range(0, len(indices), chunk_size)]
 
+    def _resolve_active_synth_indices(self, epoch: int | None = None) -> list[int]:
+        """Return the synthetic datasets active for the given epoch."""
+        if epoch is not None:
+            self.set_curriculum(epoch)
+
+        available_synth = self.synth_dataset_indices
+        if self.state.min_sparsity is not None or self.state.max_sparsity is not None:
+            available_synth = self._filter_runs_by_sparsity(
+                self.synth_dataset_indices,
+                self.state.min_sparsity,
+                self.state.max_sparsity,
+            )
+            logger.info(
+                f"Sparsity filtering: {len(self.synth_dataset_indices)} -> "
+                f"{len(available_synth)} synthetic runs available"
+            )
+            if not available_synth:
+                logger.warning(
+                    "Sparsity filtering excluded all synthetic runs; "
+                    "falling back to all synthetic runs for this epoch."
+                )
+                available_synth = self.synth_dataset_indices
+
+        n_synth = len(available_synth)
+        if n_synth <= 0 or self.state.active_runs <= 0:
+            return []
+
+        if self.config.run_sampling == "round_robin":
+            start_idx = (self.state.epoch * self.state.active_runs) % n_synth
+            return [
+                available_synth[(start_idx + i) % n_synth]
+                for i in range(min(self.state.active_runs, n_synth))
+            ]
+
+        return random.sample(available_synth, min(n_synth, self.state.active_runs))
+
+    def num_batches_for_epoch(self, epoch: int | None = None) -> int:
+        """Compute the exact number of batches yielded for a curriculum epoch."""
+        active_synth_indices = self._resolve_active_synth_indices(epoch)
+        total_samples = sum(
+            len(self.sub_datasets[i]) for i in self.real_dataset_indices
+        ) + sum(len(self.sub_datasets[i]) for i in active_synth_indices)
+
+        if self.drop_last:
+            return total_samples // self.batch_size
+        return math.ceil(total_samples / self.batch_size)
+
     def __iter__(self) -> Iterator[list[int]]:
         if not self.config.enabled:
             # Fallback to standard sequential/random sampling of the whole concat dataset
@@ -312,42 +359,7 @@ class EpidemicCurriculumSampler(BatchSampler):
             return
 
         # 1. Select active synthetic runs
-        # First filter by sparsity if specified
-        available_synth = self.synth_dataset_indices
-        if self.state.min_sparsity is not None or self.state.max_sparsity is not None:
-            available_synth = self._filter_runs_by_sparsity(
-                self.synth_dataset_indices,
-                self.state.min_sparsity,
-                self.state.max_sparsity,
-            )
-            logger.info(
-                f"Sparsity filtering: {len(self.synth_dataset_indices)} -> "
-                f"{len(available_synth)} synthetic runs available"
-            )
-            if not available_synth:
-                logger.warning(
-                    "Sparsity filtering excluded all synthetic runs; "
-                    "falling back to all synthetic runs for this epoch."
-                )
-                available_synth = self.synth_dataset_indices
-
-        # Then select active runs from filtered set
-        n_synth = len(available_synth)
-        if n_synth > 0 and self.state.active_runs > 0:
-            if self.config.run_sampling == "round_robin":
-                # Deterministic rotation based on epoch
-                start_idx = (self.state.epoch * self.state.active_runs) % n_synth
-                active_synth_indices = [
-                    available_synth[(start_idx + i) % n_synth]
-                    for i in range(min(self.state.active_runs, n_synth))
-                ]
-            else:
-                # Random
-                active_synth_indices = random.sample(
-                    available_synth, min(n_synth, self.state.active_runs)
-                )
-        else:
-            active_synth_indices = []
+        active_synth_indices = self._resolve_active_synth_indices()
 
         # 2. Gather chunks from Real and Active Synthetic datasets
         real_chunks = []
@@ -402,8 +414,6 @@ class EpidemicCurriculumSampler(BatchSampler):
         real_batches = list(real_batch_iter)
         synth_batches = list(synth_batch_iter)
 
-        n_synth = len(synth_batches)
-        
         # Calculate target number of batches
         # If ratio = 0.8, we want 4 synth for 1 real.
         # Total batches depends on how much data we use.
@@ -483,27 +493,4 @@ class EpidemicCurriculumSampler(BatchSampler):
                 yield batch
 
     def __len__(self) -> int:
-        # This is approximate because of the probabilistic sampling and active runs
-        # It is used by tqdm for progress bar.
-        # We can calculate exact number if we knew the counts.
-        
-        # Estimate:
-        # We use all real data + active synth data.
-        # So len is sum of batches.
-        
-        n_real_samples = sum(len(self.sub_datasets[i]) for i in self.real_dataset_indices)
-        
-        n_synth_samples = 0
-        # This depends on active runs
-        # We don't know EXACTLY which runs are active in __len__ without recalculating.
-        # But assuming round robin or random, average size?
-        # Or just sum of ALL synth / num_runs * active_runs?
-        
-        total_synth = sum(len(self.sub_datasets[i]) for i in self.synth_dataset_indices)
-        num_synth_runs = len(self.synth_dataset_indices)
-        if num_synth_runs > 0:
-            avg_synth = total_synth / num_synth_runs
-            n_synth_samples = avg_synth * self.state.active_runs
-        
-        total_samples = n_real_samples + n_synth_samples
-        return math.ceil(total_samples / self.batch_size)
+        return self.num_batches_for_epoch()

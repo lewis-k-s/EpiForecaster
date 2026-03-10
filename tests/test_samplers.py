@@ -92,6 +92,32 @@ class TestEpidemicCurriculumSampler:
         assert len(batches) > 0
         assert isinstance(batches[0], list)
 
+    def test_num_batches_for_epoch_uses_active_runs_exactly(self, mock_concat_dataset):
+        phase = CurriculumPhaseConfig(
+            start_epoch=0,
+            end_epoch=10,
+            synth_ratio=0.5,
+            min_sparsity=0.0,
+            max_sparsity=1.0,
+        )
+        config = CurriculumConfig(
+            enabled=True,
+            active_runs=2,
+            chunk_size=10,
+            run_sampling="round_robin",
+            schedule=[phase],
+        )
+        sampler = EpidemicCurriculumSampler(
+            dataset=mock_concat_dataset,
+            batch_size=10,
+            config=config,
+            real_run_id="real",
+        )
+
+        # 100 real + 2 * 100 synthetic samples, batch size 10.
+        assert sampler.num_batches_for_epoch(0) == 30
+        assert len(sampler) == 30
+
     def test_single_dataset_fallback(self):
         # Test fallback when not ConcatDataset
         ds = MagicMock()
