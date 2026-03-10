@@ -24,9 +24,11 @@ from evaluation.selection import (
 # High-level evaluation pipelines
 from evaluation.epiforecaster_eval import (
     evaluate_checkpoint_topk_forecasts,
-    generate_forecast_plots,
     plot_forecasts_from_csv,
 )
+
+# Re-export from plotting for backwards compatibility
+from plotting.forecast_plots import generate_forecast_plots
 
 __all__ = [
     # Loaders

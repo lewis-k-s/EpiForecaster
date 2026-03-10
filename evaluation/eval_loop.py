@@ -23,7 +23,7 @@ from evaluation.metrics import TorchMaskedMetricAccumulator
 from evaluation.selection import select_nodes_by_loss
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
-from plotting.forecast_plots import DEFAULT_PLOT_TARGETS
+from plotting.forecast_plots import DEFAULT_PLOT_TARGETS, generate_forecast_plots
 from utils.sparsity_logging import log_sparsity_loss_correlation
 from utils.training_utils import drop_nowcast, inject_gpu_mobility
 
@@ -393,9 +393,6 @@ def eval_checkpoint(
         Dict with: checkpoint, config, model, loader, node_mae_dict,
                    eval_loss, eval_metrics
     """
-    # Lazy import to avoid circular dependency with epiforecaster_eval
-    from evaluation.epiforecaster_eval import generate_forecast_plots
-
     # Extract training.device from overrides if present
     resolved_device = device
     if overrides:

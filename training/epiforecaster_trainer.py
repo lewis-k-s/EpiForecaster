@@ -32,7 +32,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 from data.dataset_factory import build_datasets
 from data.epi_batch import EpiBatch
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
-from evaluation.epiforecaster_eval import evaluate_loader
+from evaluation.eval_loop import evaluate_loader
 from evaluation.losses import JointInferenceLoss
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
@@ -41,6 +41,7 @@ from training.dataloader_factory import (
     should_prestart_dataloader_workers,
 )
 from training.gradnorm import GradNormController
+from training.optim_factory import create_optimizer, create_scheduler
 from utils.device import setup_tensor_core_optimizations
 from utils.gradnorm_logging import (
     append_gradnorm_sidecar_metrics,
@@ -276,14 +277,7 @@ class EpiForecasterTrainer:
         # Setup training components (optimizer, scheduler, criterion)
         self.optimizer = self._create_optimizer()
 
-        from training.schedulers import compute_scheduler_steps
-
-        total_steps, warmup_steps = compute_scheduler_steps(
-            epochs=self.config.training.epochs,
-            batches_per_epoch=len(self.train_loader),
-            gradient_accumulation_steps=1,
-            warmup_batches=self.config.training.warmup_steps,
-        )
+        total_steps, warmup_steps = self._compute_scheduler_steps()
         self.scheduler = self._create_scheduler(
             total_steps=total_steps, warmup_steps=warmup_steps
         )
@@ -660,96 +654,48 @@ class EpiForecasterTrainer:
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on configuration."""
-        decay_params: list[torch.nn.Parameter] = []
-        no_decay_params: list[torch.nn.Parameter] = []
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            normalized_name = name.lower()
-            if (
-                name.endswith("bias")
-                or "norm" in normalized_name
-                or "alpha_" in normalized_name
-                or param.ndim < 2
-            ):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        param_groups = [
-            {"params": decay_params, "weight_decay": self.config.training.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ]
-
-        optimizer_name = self.config.training.optimizer.lower()
-        optimizer_cls: type[torch.optim.Optimizer]
-        if optimizer_name == "adam":
-            optimizer_cls = torch.optim.Adam
-        elif optimizer_name == "adamw":
-            optimizer_cls = torch.optim.AdamW
-        else:
-            raise ValueError(
-                f"Unknown optimizer type: {self.config.training.optimizer}"
-            )
-
-        optimizer_kwargs: dict[str, Any] = {
-            "lr": self.config.training.learning_rate,
-            "eps": self.precision_policy.optimizer_eps,
-        }
-
-        # CUDA fast path: fused AdamW reduces optimizer kernel launch overhead.
-        if optimizer_name == "adamw" and self.device.type == "cuda":
-            try:
-                return optimizer_cls(
-                    param_groups,
-                    fused=True,
-                    capturable=True,
-                    **optimizer_kwargs,
-                )
-            except (TypeError, ValueError, RuntimeError) as exc:
-                self._status(
-                    f"Fused AdamW unavailable, falling back to standard AdamW ({exc})",
-                    logging.WARNING,
-                )
-
-        return optimizer_cls(param_groups, **optimizer_kwargs)
+        return create_optimizer(
+            self.model,
+            optimizer_name=self.config.training.optimizer,
+            learning_rate=self.config.training.learning_rate,
+            weight_decay=self.config.training.weight_decay,
+            optimizer_eps=self.precision_policy.optimizer_eps,
+            device=self.device,
+            status_callback=self._status,
+        )
 
     def _create_scheduler(
         self, total_steps: int, warmup_steps: int = 0
     ) -> torch.optim.lr_scheduler.LRScheduler | None:
         """Create learning rate scheduler."""
-        if self.config.training.scheduler_type == "cosine":
-            if warmup_steps > 0:
-                from training.schedulers import WarmupCosineScheduler
+        return create_scheduler(
+            self.optimizer,
+            scheduler_type=self.config.training.scheduler_type,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            eta_min=self.config.training.min_learning_rate,
+            epochs=self.config.training.epochs,
+        )
 
-                return WarmupCosineScheduler(
-                    self.optimizer,
-                    warmup_steps=warmup_steps,
-                    total_steps=total_steps,
-                )
-            else:
-                return torch.optim.lr_scheduler.CosineAnnealingLR(
-                    self.optimizer, T_max=total_steps
-                )
-        elif self.config.training.scheduler_type == "step":
-            if warmup_steps > 0:
-                import logging
+    def _compute_scheduler_steps(self) -> tuple[int, int]:
+        """Compute scheduler steps, accounting for curriculum epoch sizes."""
+        from training.schedulers import compute_scheduler_steps
 
-                logger = logging.getLogger(__name__)
-                logger.warning(
-                    "warmup_steps is set but StepLR scheduler does not support warmup. "
-                    "Warmup will be ignored. Use scheduler_type='cosine' for warmup support."
-                )
-            return torch.optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=self.config.training.epochs // 3, gamma=0.1
+        accum = self.config.training.gradient_accumulation_steps
+        if self.curriculum_sampler is not None:
+            total_batches = sum(
+                self.curriculum_sampler.num_batches_for_epoch(epoch)
+                for epoch in range(self.config.training.epochs)
             )
-        elif self.config.training.scheduler_type == "none":
-            return None
-        else:
-            raise ValueError(
-                f"Unknown scheduler type: {self.config.training.scheduler_type}"
-            )
+            warmup_steps = self.config.training.warmup_steps // accum
+            return total_batches // accum, warmup_steps
+
+        return compute_scheduler_steps(
+            epochs=self.config.training.epochs,
+            batches_per_epoch=len(self.train_loader),
+            gradient_accumulation_steps=accum,
+            warmup_batches=self.config.training.warmup_steps,
+        )
 
     def _create_criterion(self) -> JointInferenceLoss:
         """Create loss criterion."""
@@ -1836,10 +1782,8 @@ class EpiForecasterTrainer:
 
     def _generate_forecast_plots(self, loader: DataLoader, split: str):
         """Generate and save forecast plots for best/worst performing regions."""
-        from evaluation.epiforecaster_eval import (
-            generate_forecast_plots,
-            select_nodes_by_loss,
-        )
+        from evaluation.selection import select_nodes_by_loss
+        from plotting.forecast_plots import generate_forecast_plots
 
         sample_count = max(1, int(self.config.training.num_forecast_samples))
         worst_nodes = select_nodes_by_loss(
