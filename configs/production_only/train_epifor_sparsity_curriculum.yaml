@@ -80,8 +80,9 @@ training:
   learning_rate: 0.001
   weight_decay: 1.0e-05
   warmup_steps: 3000
+  min_learning_rate: 5.0e-05
   # Worker config for 1 GPU + 20 CPUs
-  num_workers: 8
+  num_workers: 12
   val_workers: 2
   prefetch_factor: 2
   pin_memory: true

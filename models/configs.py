@@ -676,6 +676,7 @@ class TrainingParams:
     resume_checkpoint_path: str | None = None
     scheduler_type: str = "cosine"
     warmup_steps: int = 0
+    min_learning_rate: float = 0.0
     gradient_clip_value: float = 5.0
     early_stopping_patience: int | None = 10  # None = disabled
     nan_loss_patience: int | None = None
@@ -818,6 +819,16 @@ class TrainingParams:
         if self.warmup_steps < 0:
             raise ValueError(
                 f"warmup_steps must be non-negative, got {self.warmup_steps}"
+            )
+        if self.min_learning_rate < 0:
+            raise ValueError(
+                "min_learning_rate must be non-negative, "
+                f"got {self.min_learning_rate}"
+            )
+        if self.min_learning_rate > self.learning_rate:
+            raise ValueError(
+                "min_learning_rate must be <= learning_rate, "
+                f"got {self.min_learning_rate} > {self.learning_rate}"
             )
         valid_optimizers = {"adam", "adamw"}
         optimizer_name = self.optimizer.lower()
