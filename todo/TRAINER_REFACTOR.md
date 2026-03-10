@@ -21,7 +21,7 @@ The `EpiForecasterTrainer` class has grown to handle too many responsibilities. 
   - **Goal**: The trainer's `__init__` should just call `train_ds, val_ds, test_ds = build_datasets(config)` and focus purely on model training.
 - [x] **`training/dataloader_factory.py`**
   - **Responsibility**: Extract `_create_data_loaders`, hardware-aware worker context selection (`_should_prestart_dataloader_workers`), and pin memory logic.
-- [ ] **`training/optim_factory.py`**
+- [x] **`training/optim_factory.py`**
   - **Responsibility**: Isolate `_create_optimizer` (handling of `AdamW`, `fused=True`, etc.) and `_create_scheduler`.
 - [ ] **`training/gradnorm_manager.py` (or extend `training/gradnorm.py`)**
   - **Responsibility**: Move `_gradnorm_sidecar_update` and formatting code into a proper handler class that tracks its own state, cleaning up the main training loop.
@@ -50,9 +50,9 @@ Mixes data preprocessing schemas with model execution types.
 
 Mixes W&B payload logic, Console string formatting, and gradient mutations.
 
-- [ ] **`utils/formatting.py` (or `utils/console.py`)**
+- [x] **`utils/console.py`**
   - **Responsibility**: Extract all string formatting functions like `format_train_progress_status`, `format_component_gradnorm_status`, `format_joint_loss_components_status`, `format_horizon_status_lines`.
-- [ ] **`training/grad_utils.py`**
+- [x] **`training/grad_utils.py`**
   - **Responsibility**: Move `compute_gradient_norms_and_clip` out of the logging module since it actually performs `clip_grad_norm_` which is a critical mutation step during training, not just logging.
 - [x] **`utils/train_logging.py`**
   - **Responsibility**: Focus entirely on assembling structured dictionary payloads for Weights & Biases (e.g., `build_train_step_log_data`, `build_epoch_logging_bundle`).
@@ -61,13 +61,13 @@ Mixes W&B payload logic, Console string formatting, and gradient mutations.
 
 Combines loss definitions, dataloader construction, model loading, evaluation loops, and plotting generation.
 
-- [ ] **`evaluation/losses.py`**
+- [x] **`evaluation/losses.py`**
   - **Responsibility**: Extract `ForecastLoss`, `JointInferenceLoss`, `SMAPELoss`, `CompositeLoss`, and `get_loss_from_config`. This is core domain logic and takes up ~800 lines alone.
-- [ ] **`evaluation/loaders.py`**
+- [x] **`evaluation/loaders.py`**
   - **Responsibility**: Extract `load_model_from_checkpoint`, `build_loader_from_config`, and `split_nodes`. This isolates the data-loading layer for inference.
-- [ ] **`evaluation/selection.py`**
+- [x] **`evaluation/selection.py`**
   - **Responsibility**: Extract node selection mechanisms (`select_nodes_by_loss`, `topk_target_nodes_by_mae`).
-- [ ] **`evaluation/eval_loop.py`**
+- [x] **`evaluation/eval_loop.py`**
   - **Responsibility**: Keep `evaluate_loader` and `eval_checkpoint`. These are the core evaluation loop runners.
 
 ### 6. `utils/gradient_debug.py` (Solid)

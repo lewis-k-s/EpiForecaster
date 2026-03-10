@@ -16,9 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
-import torch
 import wandb
-from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from evaluation.eval_loop import _ensure_wandb_run, eval_checkpoint, evaluate_loader
@@ -26,11 +24,9 @@ from evaluation.loaders import build_loader_from_config, load_model_from_checkpo
 from evaluation.losses import get_loss_from_config
 from evaluation.selection import select_nodes_by_loss, topk_target_nodes_by_mae
 from plotting.forecast_plots import (
-    DEFAULT_PLOT_TARGETS,
     collect_forecast_samples_for_target_nodes,
     generate_forecast_plots,
     make_forecast_figure,
-    make_joint_forecast_figure,
 )
 
 logger = logging.getLogger(__name__)
