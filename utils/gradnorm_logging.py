@@ -34,28 +34,6 @@ def mark_gradnorm_sidecar_complete(
     )
 
 
-def append_gradnorm_sidecar_metrics(
-    log_data: dict[str, torch.Tensor],
-    *,
-    cached_weights: torch.Tensor,
-    gradnorm_terms: dict[str, torch.Tensor],
-    task_names: tuple[str, ...],
-) -> None:
-    """Append per-task GradNorm controller diagnostics to the sidecar payload."""
-    for idx, task in enumerate(task_names):
-        log_data[f"gradnorm_w_{task}"] = cached_weights[idx]
-        log_data[f"gradnorm_G_{task}"] = gradnorm_terms["grad_norms"][idx].detach()
-        log_data[f"gradnorm_G_target_{task}"] = gradnorm_terms[
-            "target_grad_norms"
-        ][idx].detach()
-        log_data[f"gradnorm_ema_loss_{task}"] = gradnorm_terms["ema_losses"][
-            idx
-        ].detach()
-        log_data[f"gradnorm_ema_G_{task}"] = gradnorm_terms["ema_grad_norms"][
-            idx
-        ].detach()
-
-
 def format_gradnorm_controller_status(
     *,
     gradnorm_enabled: bool,
@@ -84,7 +62,9 @@ def format_gradnorm_controller_status(
         weights.append(_to_float(value))
 
     active_mask = last_active_mask.detach().to(dtype=torch.bool).cpu()
-    active_indices = [idx for idx, is_active in enumerate(active_mask.tolist()) if is_active]
+    active_indices = [
+        idx for idx, is_active in enumerate(active_mask.tolist()) if is_active
+    ]
     if not active_indices:
         return "", {}
 
@@ -97,13 +77,7 @@ def format_gradnorm_controller_status(
     sidecar_ran = _to_float(gradnorm_step_log_data.get("gradnorm_sidecar_ran"))
     gradnorm_l_grad = _to_float(gradnorm_step_log_data.get("gradnorm_L_grad"))
 
-    metrics = {
-        "gradnorm_active_tasks": float(len(active_indices)),
-        "gradnorm_weight_max_active": max_weight,
-        "gradnorm_weight_min_active": min_weight,
-        "gradnorm_weight_spread_active": spread,
-        "gradnorm_dominant_task_idx": float(dominant_local_idx),
-    }
+    metrics: dict[str, float] = {}
     summary = (
         f"GN sidecar={int(round(sidecar_ran))} "
         f"Lg={gradnorm_l_grad:.3g} dom={dominant_task} spread={spread:.2f} "

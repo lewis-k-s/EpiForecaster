@@ -44,7 +44,6 @@ from training.gradnorm import GradNormController
 from training.optim_factory import create_optimizer, create_scheduler
 from utils.device import setup_tensor_core_optimizations
 from utils.gradnorm_logging import (
-    append_gradnorm_sidecar_metrics,
     did_gradnorm_sidecar_run,
     format_gradnorm_controller_status,
     init_gradnorm_sidecar_log_data,
@@ -145,7 +144,9 @@ class EpiForecasterTrainer:
         # Optional static region embeddings from dataset
         self.region_embeddings = None
         if dataset_splits.region_embedding_store is not None:
-            self.region_embeddings = dataset_splits.region_embedding_store.embeddings.clone()
+            self.region_embeddings = (
+                dataset_splits.region_embedding_store.embeddings.clone()
+            )
         elif self.config.model.type.regions:
             raise ValueError(
                 "Region embeddings requested by config but region2vec_path was not provided."
@@ -1302,12 +1303,6 @@ class EpiForecasterTrainer:
             device=self.device,
             gradnorm_loss=gradnorm_loss,
         )
-        append_gradnorm_sidecar_metrics(
-            log_data,
-            cached_weights=self._gradnorm_cached_weights,
-            gradnorm_terms=gradnorm_terms,
-            task_names=GradNormController.task_names,
-        )
         return log_data
 
     @staticmethod
@@ -1712,12 +1707,11 @@ class EpiForecasterTrainer:
                     gradnorm_status_line = ""
                     if self._gradnorm_enabled:
                         if did_gradnorm_sidecar_run(gradnorm_step_log_data):
-                            gradnorm_status_line, gradnorm_controller_metrics = (
+                            gradnorm_status_line, _ = (
                                 self._format_gradnorm_controller_status(
                                     gradnorm_step_log_data
                                 )
                             )
-                            log_data.update(gradnorm_controller_metrics)
                     self._status(
                         format_train_progress_status(
                             epoch=self.current_epoch,
@@ -1871,29 +1865,23 @@ class EpiForecasterTrainer:
 
         self._grad_norm_groups: dict[str, list[torch.nn.Parameter]] = {
             "mobility_gnn": [],
-            "ww_head": [],
-            "hosp_head": [],
-            "cases_head": [],
-            "deaths_head": [],
+            "observation_heads": [],
             "sird": [],
             "backbone": [],
             "other": [],
         }
 
+        obs_head_suffixes = ("_head", "_scale", "_projection")
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
 
             if "mobility_gnn" in name:
                 self._grad_norm_groups["mobility_gnn"].append(param)
-            elif "ww_head" in name:
-                self._grad_norm_groups["ww_head"].append(param)
-            elif "hosp_head" in name:
-                self._grad_norm_groups["hosp_head"].append(param)
-            elif "cases_head" in name:
-                self._grad_norm_groups["cases_head"].append(param)
-            elif "deaths_head" in name:
-                self._grad_norm_groups["deaths_head"].append(param)
+            elif name.endswith(obs_head_suffixes) and not any(
+                proj in name for proj in sird_projections
+            ):
+                self._grad_norm_groups["observation_heads"].append(param)
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
             elif "backbone" in name:

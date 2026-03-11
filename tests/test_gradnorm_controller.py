@@ -153,10 +153,6 @@ def test_trainer_adaptive_step_and_sidecar_updates_weights() -> None:
     trainer.model.zero_grad(set_to_none=True)
     sidecar = EpiForecasterTrainer._gradnorm_sidecar_update(trainer, {})
     assert sidecar["gradnorm_sidecar_ran"] > 0
-    assert sidecar["gradnorm_w_ww"] > 0
-    assert sidecar["gradnorm_w_hosp"] > 0
-    assert sidecar["gradnorm_w_cases"] > 0
-    assert sidecar["gradnorm_w_deaths"] > 0
     assert not torch.allclose(
         trainer.gradnorm_controller.log_weights.detach(),
         initial,
@@ -225,8 +221,4 @@ def test_gradnorm_sidecar_keeps_global_cached_weights_when_head_inactive() -> No
 
     assert sidecar["gradnorm_sidecar_ran"] > 0
     assert trainer._gradnorm_last_active_mask.tolist() == [False, True, True, True]
-    assert sidecar["gradnorm_w_ww"] > 0
     assert trainer._gradnorm_cached_weights[0] > 0
-
-
-
