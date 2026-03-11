@@ -268,6 +268,28 @@ class TestEpiForecasterTrainer:
                 trainer = EpiForecasterTrainer(minimal_config)
                 assert trainer.config.training.curriculum.enabled is True
 
+    def test_early_stopping_disabled_during_synth_only_curriculum(self):
+        trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+        trainer.config = SimpleNamespace(
+            training=SimpleNamespace(early_stopping_patience=5),
+        )
+        trainer.curriculum_sampler = SimpleNamespace(
+            state=SimpleNamespace(synth_ratio=1.0)
+        )
+
+        assert trainer._is_early_stopping_enabled() is False
+
+    def test_early_stopping_enabled_once_curriculum_mixes_real_data(self):
+        trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+        trainer.config = SimpleNamespace(
+            training=SimpleNamespace(early_stopping_patience=5),
+        )
+        trainer.curriculum_sampler = SimpleNamespace(
+            state=SimpleNamespace(synth_ratio=0.8)
+        )
+
+        assert trainer._is_early_stopping_enabled() is True
+
     @patch("data.dataset_factory.EpiDataset")
     @patch("training.epiforecaster_trainer.EpiForecaster")
     @patch("training.epiforecaster_trainer.wandb")

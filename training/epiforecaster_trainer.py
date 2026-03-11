@@ -1001,23 +1001,27 @@ class EpiForecasterTrainer:
 
             # Early stopping (disabled if patience is None)
             should_stop = False
+            early_stopping_enabled = self._is_early_stopping_enabled()
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
                 if self.config.output.save_best_only:
                     self._save_checkpoint(epoch, val_loss, is_best=True)
             else:
-                self.patience_counter += 1
-                if (
-                    self.config.training.early_stopping_patience is not None
-                    and self.patience_counter
-                    >= self.config.training.early_stopping_patience
-                ):
-                    self._status(
-                        "Early stopping triggered after "
-                        f"{self.patience_counter} epochs without improvement"
-                    )
-                    should_stop = True
+                if early_stopping_enabled:
+                    self.patience_counter += 1
+                    if (
+                        self.config.training.early_stopping_patience is not None
+                        and self.patience_counter
+                        >= self.config.training.early_stopping_patience
+                    ):
+                        self._status(
+                            "Early stopping triggered after "
+                            f"{self.patience_counter} epochs without improvement"
+                        )
+                        should_stop = True
+                else:
+                    self.patience_counter = 0
 
             _prev_val_loss = val_loss
 
@@ -1101,6 +1105,14 @@ class EpiForecasterTrainer:
         self.cleanup_dataloaders()
 
         return self.get_training_results()
+
+    def _is_early_stopping_enabled(self) -> bool:
+        """Enable early stopping only after curriculum mixes in real data."""
+        if self.config.training.early_stopping_patience is None:
+            return False
+        if self.curriculum_sampler is None:
+            return True
+        return self.curriculum_sampler.state.synth_ratio < 1.0
 
     def _status(self, message: str, level: int = logging.INFO) -> None:
         logging.log(level, message)
