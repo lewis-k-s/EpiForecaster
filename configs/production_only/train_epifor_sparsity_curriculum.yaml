@@ -17,22 +17,23 @@ data:
   mobility_threshold: 10
   missing_permit:
     input:
-      biomarkers_joint: 26
-      cases: 10
-      hospitalizations: 26
-      deaths: 10
+      biomarkers_joint: 53
+      cases: 20
+      hospitalizations: 53
+      deaths: 20
     horizon:
       biomarkers_joint: 26
       cases: 10
       hospitalizations: 26
       deaths: 10
-  window_stride: 1
-  sample_ordering: "node"
+  window_stride: 7
+  sample_ordering: "time"
   log_scale: true
   # run_id is ignored when curriculum is enabled (sampler handles run selection)
   run_id: "0_Baseline"
 
 model:
+  strict: false
   type:
     cases: true
     regions: true
@@ -43,8 +44,8 @@ model:
     region_embedding_dim: 64
     gnn_module: "gcn"
     #-- seq sizes --#
-    input_window_length: 30
-    forecast_horizon: 30
+    input_window_length: 60
+    forecast_horizon: 28
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
@@ -68,6 +69,11 @@ output:
   wandb_tags: [mn5]
 
 training:
+  compile: true
+  compile_mode: "reduce-overhead"
+  compile_dynamic: false
+  compile_fullgraph: false
+  compile_backward: true
   seed: 42
   device: "cuda"
   batch_size: 32
@@ -76,10 +82,10 @@ training:
   gradient_clip_value: 5.0
   early_stopping_patience: 5
   nan_loss_patience: 5
-  epochs: 10
+  epochs: 50
   learning_rate: 0.001
   weight_decay: 1.0e-05
-  warmup_steps: 3000
+  warmup_steps: 100
   min_learning_rate: 5.0e-05
   # Worker config for 1 GPU + 20 CPUs
   num_workers: 12
@@ -105,43 +111,54 @@ training:
     run_sampling: "round_robin"
 
     schedule:
-      # Phase 0: Clean synthetic only (learn dynamics without noise)
+      # Phase 0: Clean synthetic only, using the lowest-sparsity bucket (~0.05).
       - start_epoch: 0
-        end_epoch: 2
-        synth_ratio: 1.0 # 100% synthetic data
+        end_epoch: 10
+        synth_ratio: 1.0
         mode: "node_major"
-        min_sparsity: 0.0 # Captures 0.05, 0.20 (2 runs)
+        min_sparsity: 0.0
+        max_sparsity: 0.10
+
+      # Phase 1: Add light sparsity while still heavily favoring synthetic data.
+      - start_epoch: 10
+        end_epoch: 20
+        synth_ratio: 0.8
+        mode: "node_major"
+        min_sparsity: 0.0
         max_sparsity: 0.25
 
-      # Phase 1: Add light noise + mix with real data
-      - start_epoch: 2
-        end_epoch: 4
-        synth_ratio: 0.8 # 80% synthetic, 20% real
+      # Phase 2: Bring in the mid-sparsity bucket (~0.40) before shifting toward real.
+      - start_epoch: 20
+        end_epoch: 30
+        synth_ratio: 0.6
         mode: "node_major"
-        min_sparsity: 0.0 # Captures 0.05, 0.20, 0.40 (3 runs)
+        min_sparsity: 0.0
         max_sparsity: 0.45
 
-      # Phase 2: Medium noise, balance synthetic/real
-      - start_epoch: 4
-        end_epoch: 7
-        synth_ratio: 0.5 # 50% synthetic, 50% real
+      # Phase 3: Emphasize harder synthetic runs (~0.20-0.60) with mixed real data.
+      - start_epoch: 30
+        end_epoch: 40
+        synth_ratio: 0.4
         mode: "node_major"
-        min_sparsity: 0.15 # Captures 0.20, 0.40, 0.60, 0.80 (4 runs)
-        max_sparsity: 0.85
+        min_sparsity: 0.15
+        max_sparsity: 0.65
 
-      # Phase 3: High noise (approach real-world conditions)
-      - start_epoch: 7
-        end_epoch: 10
-        synth_ratio: 0.2 # 20% synthetic, 80% real
+      # Phase 4: Final real-heavy adaptation with the hardest synthetic buckets.
+      - start_epoch: 40
+        end_epoch: 50
+        synth_ratio: 0.2
         mode: "node_major"
-        min_sparsity: 0.35 # Captures 0.40, 0.60, 0.80 (3 runs)
+        min_sparsity: 0.35
         max_sparsity: 1.0
 
   profiler:
     enabled: true
-    profile_batches: 20
+    wait_steps: 5
+    warmup_steps: 1
+    active_steps: 2
     log_dir: auto
-    profile_epochs: [1, 2]
+    record_memory: false
+    profile_epochs: [1]
   # Joint inference loss configuration (lower w_sir for stability)
   loss:
     name: "joint_inference"
