@@ -1,6 +1,6 @@
-# Dual Graph Neural Network for Epidemiological Forecasting
+# EpiForecaster
 
-A PyTorch Geometric implementation for epidemiological forecasting which combines mobility flow networks with wastewater treatment plant (EDAR) surveillance signals for enhanced disease prediction.
+A deep learning based epidemiological forecaster which combines graph data in the form of mobility flow networks with spatio-temporal series data including WBE surveillance signals for enhanced disease prediction.
 
 For information on the forecaster model design see EPIFORECASTER.md
 For information on the region embedding model design see REGION2VEC.md
@@ -85,6 +85,7 @@ death_flow → Observed Deaths"]
 ```
 
 **Key Design Principles:**
+
 - **Physics constrains the Latent State**: SIRD dynamics enforce epidemiological consistency
 - **Observations constrain the Physics**: Multiple observation heads anchor latent states to real-world signals
 - **End-to-end Differentiable**: All three stages are jointly optimized via composite loss
@@ -126,20 +127,22 @@ uv run plot forecasts --experiment <name> --run <run_id> --nodes quartile:3
 
 ### CLI Commands
 
-All commands can be run via their standalone entrypoints or through the main CLI:
+All commands can be run via their standalone entrypoints:
 
-| Standalone | Via main | Description |
+| Entrypoint | Variants | Description |
 |------------|----------|-------------|
-| `uv run preprocess` | `uv run main preprocess` | Run preprocessing pipelines |
-| `uv run train` | `uv run main train` | Train forecasting models |
-| `uv run eval` | `uv run main eval` | Evaluate checkpoints and compute metrics |
-| `uv run plot` | `uv run main plot` | Generate forecast visualization plots |
+| `uv run preprocess` | `regions`, `epiforecaster` | Run preprocessing pipelines |
+| `uv run train` | `regions`, `epiforecaster` | Train forecasting models |
+| `uv run eval` | `baselines`, `epiforecaster` | Evaluate checkpoints and compute metrics |
+| `uv run plot` | `forecasts`, `granular-compare` | Generate forecast visualization plots |
 
 **Evaluation commands:**
+
 - `eval epiforecaster`: Evaluate checkpoint, compute metrics, generate quartile-based plots
 - `eval baselines`: Run rolling-origin baseline benchmarks (tiered, exp_smoothing, var_cross_target)
 
 **Plotting commands:**
+
 - `plot forecasts`: Generate forecast plots with flexible node selection (random, quartile, best, worst)
 
 ### Development & Testing
@@ -181,10 +184,6 @@ Run `uv run pytest --markers` to see all available markers.
 ## License
 
 MIT License
-
-## Contributing
-
-Contributions are welcome! Please see CONTRIBUTING.md for guidelines.
 
 ## Contact
 
