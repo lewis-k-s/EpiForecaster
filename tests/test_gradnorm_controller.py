@@ -166,7 +166,8 @@ def test_gradnorm_sidecar_respects_update_cadence() -> None:
 
     sidecar = EpiForecasterTrainer._gradnorm_sidecar_update(trainer, {})
 
-    assert sidecar["gradnorm_sidecar_ran"] == 0
+    # Sidecar returns empty dict when cadence doesn't match (no sidecar metrics logged)
+    assert sidecar.get("gradnorm_sidecar_ran", 0) == 0
     assert torch.allclose(trainer.gradnorm_controller.log_weights.detach(), initial)
 
 

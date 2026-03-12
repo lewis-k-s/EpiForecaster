@@ -13,11 +13,9 @@ def format_component_gradnorm_status(
     """Format debug status line for component gradient norms."""
     return (
         f"Grad norms @ step {step}: "
-        f"Total={component_gradnorm_log_data.get('gradnorm_total_preclip', 0.0):.4f} | "
         f"SIRD={component_gradnorm_log_data.get('gradnorm_sird_physics', 0.0):.4f} | "
         f"Enc={component_gradnorm_log_data.get('gradnorm_backbone_encoder', 0.0):.4f} | "
         f"GNN={component_gradnorm_log_data.get('gradnorm_mobility_gnn', 0.0):.4f} | "
-        f"Obs={component_gradnorm_log_data.get('gradnorm_observation_heads', 0.0):.4f} | "
         f"Other={component_gradnorm_log_data.get('gradnorm_other', 0.0):.4f}"
     )
 

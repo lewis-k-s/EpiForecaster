@@ -7,14 +7,9 @@ import time
 import torch
 
 
-def init_gradnorm_sidecar_log_data(device: torch.device) -> dict[str, torch.Tensor]:
-    """Create a default sidecar payload with zero-valued metrics."""
-    zero = torch.tensor(0.0, device=device)
-    return {
-        "gradnorm_sidecar_ran": zero,
-        "gradnorm_L_grad": zero,
-        "time_gradnorm_sidecar_s": zero,
-    }
+def init_gradnorm_sidecar_log_data(_device: torch.device) -> dict[str, torch.Tensor]:
+    """Create an empty sidecar payload (sidecar metrics go to console only, not W&B)."""
+    return {}
 
 
 def mark_gradnorm_sidecar_complete(
