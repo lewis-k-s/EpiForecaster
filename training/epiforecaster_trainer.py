@@ -51,7 +51,6 @@ from utils.gradnorm_logging import (
 )
 from utils.gradient_debug import GradientDebugger
 from utils.platform import (
-    cleanup_nvme_staging,
     get_nvme_path,
     is_slurm_cluster,
     stage_dataset_to_nvme,
@@ -152,10 +151,16 @@ class EpiForecasterTrainer:
                 "Region embeddings requested by config but region2vec_path was not provided."
             )
 
-        if self.config.model.temporal_covariates_dim > 0:
-            temporal_covariates_dim = self.config.model.temporal_covariates_dim
-        else:
-            temporal_covariates_dim = train_example_ds.temporal_covariates_dim
+        # Assert that config and dataset agree on temporal covariates dimension
+        if (
+            self.config.model.temporal_covariates_dim
+            != train_example_ds.temporal_covariates_dim
+        ):
+            raise ValueError(
+                f"Config temporal_covariates_dim ({self.config.model.temporal_covariates_dim}) "
+                f"does not match dataset ({train_example_ds.temporal_covariates_dim}). "
+                f"Set model.params.include_day_of_week and include_holidays to match your dataset."
+            )
 
         self.model = EpiForecaster(
             variant_type=self.config.model.type,
@@ -179,7 +184,7 @@ class EpiForecasterTrainer:
             head_num_layers=self.config.model.head_num_layers,
             head_dropout=self.config.model.head_dropout,
             head_positional_encoding=self.config.model.head_positional_encoding,
-            temporal_covariates_dim=temporal_covariates_dim,
+            temporal_covariates_dim=self.config.model.temporal_covariates_dim,
             strict=self.config.model.strict,
         )
 
@@ -565,12 +570,10 @@ class EpiForecasterTrainer:
             # Ignore errors during garbage collection
             pass
 
-        # Cleanup NVMe staging if used
-        try:
-            if self._nvme_staging_path is not None:
-                cleanup_nvme_staging(self._nvme_staging_path)
-        except Exception:
-            pass
+        # Note: We intentionally do NOT cleanup NVMe staging here.
+        # SLURM will clean up /scratch/tmp/ when the job ends.
+        # Each new trainer can re-stage if data is missing, which is needed
+        # when running multiple trials per job (e.g., Optuna HPO).
 
     def _stage_data_to_nvme(self) -> None:
         """Stage dataset(s) to node-local NVMe storage for improved I/O.
@@ -1590,11 +1593,6 @@ class EpiForecasterTrainer:
                 gradnorm_step_log_data: dict[str, torch.Tensor] = {}
                 if self._gradnorm_enabled:
                     gradnorm_step_log_data = self._gradnorm_sidecar_update(batch_data)
-                    for idx, task in enumerate(GradNormController.task_names):
-                        if f"gradnorm_w_{task}" not in gradnorm_step_log_data:
-                            gradnorm_step_log_data[f"gradnorm_w_{task}"] = (
-                                self._gradnorm_cached_weights[idx]
-                            )
 
                 # Guard against non-finite losses/gradients to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -1833,6 +1831,15 @@ class EpiForecasterTrainer:
         Returns:
             Tuple of (loss, metrics_dict, node_mae_dict)
         """
+        granular_csv_path = None
+        if self.config.output.write_granular_eval:
+            if self.experiment_dir is None:
+                raise RuntimeError("experiment_dir not set; call setup_logging() first")
+            granular_csv_path = (
+                self.experiment_dir
+                / self.config.output.resolve_granular_eval_filename(split=split_name)
+            )
+
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=self.model,
             loader=loader,
@@ -1842,6 +1849,22 @@ class EpiForecasterTrainer:
             region_embeddings=self.region_embeddings,
             split_name=split_name,
             max_batches=self.config.training.max_batches,
+            granular_csv_path=granular_csv_path,
+            granular_metadata={
+                "batch_size": loader.batch_size,
+                "checkpoint_path": None,
+                "config_path": self.experiment_dir / "config.yaml"
+                if self.experiment_dir is not None
+                else None,
+                "forecast_horizon": int(self.config.model.forecast_horizon),
+                "input_window_length": int(self.config.model.input_window_length),
+                "max_batches": self.config.training.max_batches,
+                "model_experiment_name": self.config.output.experiment_name,
+                "overrides": [],
+                "run_dir": self.experiment_dir,
+                "split": split_name.lower(),
+                "window_stride": int(self.config.data.window_stride),
+            },
         )
 
         # Store node MAE for forecast plotting

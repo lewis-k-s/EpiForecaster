@@ -53,6 +53,8 @@ model:
 output:
   experiment_name: real_local_analysis
   log_dir: outputs/training
+  write_granular_eval: true
+  granular_eval_filename: "{split}_granular.csv"
 
 training:
   seed: 42

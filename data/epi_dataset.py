@@ -1,4 +1,5 @@
 import logging
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -33,6 +34,7 @@ from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
+_DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
 
 StaticCovariates = dict[str, torch.Tensor]
 
@@ -49,6 +51,7 @@ class SharedSparseTopology:
 
 class EpiDatasetItem(TypedDict):
     node_label: str
+    region_id: str
     target_node: int
     window_start: int
     bio_node: torch.Tensor
@@ -375,7 +378,9 @@ class EpiDataset(Dataset):
             logger.warn("No temporal covariates found in dataset")
 
         self.region_embeddings = (
-            region_embedding_store.embeddings if region_embedding_store is not None else None
+            region_embedding_store.embeddings
+            if region_embedding_store is not None
+            else None
         )
 
         self.target_nodes = target_nodes
@@ -426,12 +431,20 @@ class EpiDataset(Dataset):
 
         # Extract metadata for workers to avoid zarr access in forked processes
         # This prevents hangs when workers try to reopen zarr files
-        self._region_labels = list(self._dataset[REGION_COORD].values)
+        self._region_ids = [
+            str(region_id) for region_id in self._dataset[REGION_COORD].values
+        ]
+        self._region_name_source = self._resolve_region_name_source()
+        self._region_name_by_id = self._load_region_name_map(self._region_name_source)
+        self._region_labels = [
+            self._region_name_by_id.get(region_id, region_id)
+            for region_id in self._region_ids
+        ]
         self._temporal_coords = list(self._dataset[TEMPORAL_COORD].values)
         if self._region_embedding_store is not None:
             self._local_to_global_region_index = (
                 self._region_embedding_store.build_local_to_global_index(
-                    [str(region_id) for region_id in self._region_labels]
+                    self._region_ids
                 )
             )
 
@@ -627,6 +640,7 @@ class EpiDataset(Dataset):
 
         # Use pre-extracted metadata to avoid zarr access in workers
         node_label = self._region_labels[target_idx]
+        region_id = self._region_ids[target_idx]
         target_region_index = target_idx
         if self._local_to_global_region_index is not None:
             target_region_index = int(
@@ -819,6 +833,7 @@ class EpiDataset(Dataset):
 
         return {
             "node_label": node_label,
+            "region_id": region_id,
             "target_node": target_idx,
             "target_region_index": target_region_index,
             "window_start": range_start,
@@ -842,6 +857,51 @@ class EpiDataset(Dataset):
             "cases_target_mask": cases_target_mask,
             "deaths_target_mask": deaths_target_mask,
         }
+
+    def _resolve_region_name_source(self) -> Path | None:
+        configured = self.config.data.regions_data_path.strip()
+        if configured:
+            configured_path = Path(configured)
+            if not configured_path.is_absolute():
+                configured_path = (Path.cwd() / configured_path).resolve()
+            if (
+                configured_path.exists()
+                and configured_path.suffix.lower() == ".geojson"
+            ):
+                return configured_path
+            logger.warning(
+                "Configured regions_data_path is unavailable or unsupported for "
+                "region-name lookup: %s",
+                configured_path,
+            )
+
+        default_path = (Path.cwd() / _DEFAULT_REGION_NAME_SOURCE).resolve()
+        if default_path.exists():
+            return default_path
+        return None
+
+    def _load_region_name_map(self, source_path: Path | None) -> dict[str, str]:
+        if source_path is None or source_path.suffix.lower() != ".geojson":
+            return {}
+
+        try:
+            with source_path.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            logger.warning(
+                "Failed to load region name source: %s", source_path, exc_info=True
+            )
+            return {}
+
+        mapping: dict[str, str] = {}
+        for feature in payload.get("features", []):
+            properties = feature.get("properties", {})
+            region_id = properties.get("id")
+            region_name = properties.get("name")
+            if region_id is None or region_name is None:
+                continue
+            mapping[str(region_id)] = str(region_name)
+        return mapping
 
     def _load_target_values_and_mask(
         self, var_name: str

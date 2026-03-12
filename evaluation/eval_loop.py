@@ -17,13 +17,16 @@ import wandb
 from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
+from evaluation.granular_export import (
+    GRANULAR_SCHEMA_VERSION,
+    GranularEvalWriter,
+    write_granular_metadata_sidecar,
+)
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from evaluation.metrics import TorchMaskedMetricAccumulator
-from evaluation.selection import select_nodes_by_loss
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
-from plotting.forecast_plots import DEFAULT_PLOT_TARGETS, generate_forecast_plots
 from utils.sparsity_logging import log_sparsity_loss_correlation
 from utils.training_utils import drop_nowcast, inject_gpu_mobility
 
@@ -61,6 +64,9 @@ def evaluate_loader(
     region_embeddings: torch.Tensor | None = None,
     split_name: str = "Eval",
     max_batches: int | None = None,
+    node_metrics_csv_path: Path | None = None,
+    granular_csv_path: Path | None = None,
+    granular_metadata: dict[str, Any] | None = None,
     output_csv_path: Path | None = None,
 ) -> tuple[float, dict[str, Any], dict[int, float]]:
     """Evaluate a loader and compute loss/metrics matching trainer behavior.
@@ -76,7 +82,10 @@ def evaluate_loader(
         region_embeddings: Optional pre-loaded region embeddings
         split_name: Name of the split for logging (e.g., "Val", "Test")
         max_batches: Optional limit on number of batches to evaluate
-        output_csv_path: Optional path to save per-node MAE metrics as CSV
+        node_metrics_csv_path: Optional path to save per-node MAE metrics as CSV
+        granular_csv_path: Optional path to save granular per-example error rows as CSV
+        granular_metadata: Optional metadata to write alongside the granular CSV
+        output_csv_path: Deprecated alias for node_metrics_csv_path
 
     Returns:
         Tuple of (mean_loss, metrics_dict, node_mae_dict) where:
@@ -85,6 +94,9 @@ def evaluate_loader(
         - node_mae_dict: Dictionary mapping node_id -> average MAE
     """
     logger.info(f"{split_name} evaluation started...")
+    if node_metrics_csv_path is None:
+        node_metrics_csv_path = output_csv_path
+
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
     hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
@@ -109,6 +121,15 @@ def evaluate_loader(
     num_batches = len(loader)
     eval_iter = loader
     log_every = 10
+    dataset = getattr(loader, "dataset", None)
+    temporal_coords = getattr(dataset, "_temporal_coords", None)
+    region_ids = getattr(dataset, "_region_ids", None)
+    region_labels = getattr(dataset, "_region_labels", None)
+    granular_writer = (
+        GranularEvalWriter(path=granular_csv_path, split_name=split_name)
+        if granular_csv_path is not None
+        else None
+    )
 
     model_was_training = model.training
     model.eval()
@@ -210,6 +231,17 @@ def evaluate_loader(
                             node_mae_sum[node_id] = torch.tensor(0.0, device=device)
                         node_mae_sum[node_id] += sample_mae.detach()
                         node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
+                    if granular_writer is not None:
+                        granular_writer.write_rows(
+                            batch_data=batch_data,
+                            target_name="hosp",
+                            predictions=pred_hosp,
+                            targets=hosp_targets,
+                            weights=weights,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                        )
 
                 pred_ww = sliced_model_outputs.get("pred_ww")
                 ww_targets = metric_supervision["ww"]["target"]
@@ -226,6 +258,17 @@ def evaluate_loader(
                         observed_mask=ww_mask,
                         sample_weights=ww_weights,
                     )
+                    if granular_writer is not None:
+                        granular_writer.write_rows(
+                            batch_data=batch_data,
+                            target_name="ww",
+                            predictions=pred_ww,
+                            targets=ww_targets,
+                            weights=ww_weights,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                        )
 
                 pred_cases = sliced_model_outputs.get("pred_cases")
                 cases_targets = metric_supervision["cases"]["target"]
@@ -242,6 +285,17 @@ def evaluate_loader(
                         observed_mask=cases_mask,
                         sample_weights=cases_weights,
                     )
+                    if granular_writer is not None:
+                        granular_writer.write_rows(
+                            batch_data=batch_data,
+                            target_name="cases",
+                            predictions=pred_cases,
+                            targets=cases_targets,
+                            weights=cases_weights,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                        )
 
                 pred_deaths = sliced_model_outputs.get("pred_deaths")
                 deaths_targets = metric_supervision["deaths"]["target"]
@@ -258,8 +312,21 @@ def evaluate_loader(
                         observed_mask=deaths_mask,
                         sample_weights=deaths_weights,
                     )
+                    if granular_writer is not None:
+                        granular_writer.write_rows(
+                            batch_data=batch_data,
+                            target_name="deaths",
+                            predictions=pred_deaths,
+                            targets=deaths_targets,
+                            weights=deaths_weights,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                        )
 
     finally:
+        if granular_writer is not None:
+            granular_writer.close()
         if model_was_training:
             model.train()
 
@@ -276,13 +343,30 @@ def evaluate_loader(
         for node_id in node_mae_sum
     }
 
-    if output_csv_path is not None:
-        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_csv_path, "w", newline="") as f:
+    if node_metrics_csv_path is not None:
+        node_metrics_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(node_metrics_csv_path, "w", newline="") as f:
             writer = csv_lib.writer(f)
             writer.writerow(["node_id", "mae", "num_samples"])
             for node_id in sorted(node_mae.keys()):
                 writer.writerow([node_id, node_mae[node_id], node_mae_count[node_id]])
+
+    if granular_csv_path is not None:
+        metadata = {
+            "dataset_path": getattr(dataset, "aligned_data_path", None),
+            "granular_csv_path": granular_csv_path,
+            "observed_only": True,
+            "region_name_source": getattr(dataset, "_region_name_source", None),
+            "run_id": getattr(dataset, "run_id", None),
+            "schema_version": GRANULAR_SCHEMA_VERSION,
+            "split": split_name.lower(),
+        }
+        if granular_metadata is not None:
+            metadata.update(granular_metadata)
+        write_granular_metadata_sidecar(
+            granular_csv_path,
+            metadata,
+        )
 
     metrics = {
         # Legacy primary metrics (hospitalizations)
@@ -375,6 +459,8 @@ def eval_checkpoint(
     device: str = "auto",
     log_dir: Path | None = None,
     overrides: list[str] | None = None,
+    node_metrics_csv_path: Path | None = None,
+    granular_csv_path: Path | None = None,
     output_csv_path: Path | None = None,
     batch_size: int | None = None,
 ) -> dict[str, Any]:
@@ -387,13 +473,18 @@ def eval_checkpoint(
         device: Device to use for evaluation (overridden by training.device in overrides)
         log_dir: Optional W&B run directory for forecast plots
         overrides: Optional list of dotted-key config overrides (e.g., ["training.val_workers=4"])
-        output_csv_path: Optional path to save node-level metrics CSV
+        node_metrics_csv_path: Optional path to save node-level metrics CSV
+        granular_csv_path: Optional path to save granular per-example error rows
+        output_csv_path: Deprecated alias for node_metrics_csv_path
 
     Returns:
         Dict with: checkpoint, config, model, loader, node_mae_dict,
                    eval_loss, eval_metrics
     """
     # Extract training.device from overrides if present
+    if node_metrics_csv_path is None:
+        node_metrics_csv_path = output_csv_path
+
     resolved_device = device
     if overrides:
         for ov in overrides:
@@ -419,16 +510,18 @@ def eval_checkpoint(
     dataset = cast(EpiDataset, loader.dataset)
     logger.info(f"[eval] {split} samples: {len(dataset)}")
 
-    # Run evaluation - returns node_mae_dict as third value
-    eval_loss = float("nan")
-    eval_metrics: dict[str, Any] = {}
-    node_mae_dict: dict[int, float] = {}
-    try:
-        criterion = get_loss_from_config(
-            config.training.loss,
-            data_config=config.data,
-            forecast_horizon=config.model.forecast_horizon,
+    if granular_csv_path is None and config.output.write_granular_eval:
+        granular_csv_path = (
+            checkpoint_path.parent.parent
+            / config.output.resolve_granular_eval_filename(split=split)
         )
+
+    criterion = get_loss_from_config(
+        config.training.loss,
+        data_config=config.data,
+        forecast_horizon=config.model.forecast_horizon,
+    )
+    try:
         eval_loss, eval_metrics, node_mae_dict = evaluate_loader(
             model=model,
             loader=loader,
@@ -437,40 +530,27 @@ def eval_checkpoint(
             device=next(model.parameters()).device,
             region_embeddings=region_embeddings,
             split_name=split.capitalize(),
-            output_csv_path=output_csv_path,
+            node_metrics_csv_path=node_metrics_csv_path,
+            granular_csv_path=granular_csv_path,
+            granular_metadata={
+                "batch_size": batch_size
+                if batch_size is not None
+                else loader.batch_size,
+                "checkpoint_path": checkpoint_path,
+                "config_path": checkpoint_path.parent.parent / "config.yaml",
+                "forecast_horizon": int(config.model.forecast_horizon),
+                "input_window_length": int(config.model.input_window_length),
+                "max_batches": None,
+                "model_experiment_name": config.output.experiment_name,
+                "overrides": list(overrides) if overrides else [],
+                "run_dir": checkpoint_path.parent.parent,
+                "split": split.lower(),
+                "window_stride": int(config.data.window_stride),
+            },
         )
-    except Exception as exc:
-        logger.warning(f"[eval] Metrics evaluation failed: {exc}")
-
-    forecast_plot_result: dict[str, Any] | None = None
-    if split.lower() == "test" and node_mae_dict:
-        k = max(1, int(config.training.num_forecast_samples))
-        worst_nodes = select_nodes_by_loss(
-            node_mae=node_mae_dict, strategy="worst", k=k
-        ).get("Worst", [])
-        best_nodes = select_nodes_by_loss(
-            node_mae=node_mae_dict, strategy="best", k=k
-        ).get("Best", [])
-        node_groups = {"Poorly-performing": worst_nodes, "Well-performing": best_nodes}
-
-        if any(node_groups.values()):
-            output_path = None
-            if log_dir is not None:
-                output_path = log_dir / f"{split}_forecasts_joint.png"
-            forecast_plot_result = generate_forecast_plots(
-                model=model,
-                loader=loader,
-                node_groups=node_groups,
-                window="last",
-                context_pre=30,
-                context_post=30,
-                output_path=output_path,
-                log_dir=log_dir,
-                target_names=list(DEFAULT_PLOT_TARGETS),
-                wandb_prefix=f"forecasts_{split}",
-            )
-        else:
-            logger.warning("[plot] Could not select test nodes for forecast plots")
+    except Exception:
+        logger.exception("[eval] Metrics evaluation failed")
+        raise
 
     if log_dir is not None or wandb.run is not None:
         if log_dir is not None:
@@ -497,5 +577,4 @@ def eval_checkpoint(
         "node_mae": node_mae_dict,
         "eval_loss": eval_loss,
         "eval_metrics": eval_metrics,
-        "forecast_plots": forecast_plot_result,
     }

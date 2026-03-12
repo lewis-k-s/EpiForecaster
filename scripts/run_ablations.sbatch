@@ -151,7 +151,11 @@ EXPERIMENT_NAME_OVERRIDE="output.experiment_name=mn5_ablation__${CAMPAIGN_ID}__$
 # Set W&B group and tags for easy comparison across ablations
 GROUP_OVERRIDE="output.wandb_group=ablation_campaign_${CAMPAIGN_ID}"
 
-OVERRIDE_ARGS+=(--override "$EXPERIMENT_NAME_OVERRIDE" --override "$GROUP_OVERRIDE")
+OVERRIDE_ARGS+=(
+  --override "$EXPERIMENT_NAME_OVERRIDE"
+  --override "$GROUP_OVERRIDE"
+  --override "output.write_granular_eval=true"
+)
 
 model_id_override="${SLURM_JOB_ID:-local}_a${TASK_ID}_s${SEED}"
 tags_override="output.wandb_tags=[mn5,ablation,${ABLATION_NAME},campaign_${CAMPAIGN_ID},seed_${SEED}]"

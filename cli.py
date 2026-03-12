@@ -306,10 +306,24 @@ cli.add_command(plot_cli, name="plot")
     help="Optional output image path.",
 )
 @click.option(
-    "--output-csv",
+    "--node-metrics-csv",
+    "node_metrics_csv",
     type=click.Path(path_type=Path),
     default=None,
-    help="Optional CSV output path for node-level metrics (node_id, mae, num_samples).",
+    help="Optional CSV output path for node-summary metrics (node_id, mae, num_samples).",
+)
+@click.option(
+    "--granular-csv",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional CSV output path for granular per-example error rows.",
+)
+@click.option(
+    "--output-csv",
+    "node_metrics_csv",
+    type=click.Path(path_type=Path),
+    default=None,
+    hidden=True,
 )
 @click.option(
     "--log-dir",
@@ -343,7 +357,8 @@ def eval_epiforecaster(
     checkpoint: Path | None,
     split: str,
     output: Path | None,
-    output_csv: Path | None,
+    node_metrics_csv: Path | None,
+    granular_csv: Path | None,
     log_dir: Path | None,
     override: tuple[str, ...],
     eval_batch_size: int | None,
@@ -384,13 +399,16 @@ def eval_epiforecaster(
             eval_dir = get_eval_output_dir(experiment_name=experiment, run_id=run)
             if output is None:
                 output = eval_dir / f"{split}_forecasts.png"
-            if output_csv is None:
-                output_csv = eval_dir / f"{split}_node_metrics.csv"
+            if node_metrics_csv is None:
+                node_metrics_csv = eval_dir / f"{split}_node_metrics.csv"
+            if granular_csv is None:
+                granular_csv = eval_dir / f"{split}_granular.csv"
 
             click.echo("Resolved output paths:")
             click.echo(f"  Checkpoint: {checkpoint}")
             click.echo(f"  Plot: {output}")
-            click.echo(f"  CSV: {output_csv}")
+            click.echo(f"  Node metrics CSV: {node_metrics_csv}")
+            click.echo(f"  Granular CSV: {granular_csv}")
         elif checkpoint is not None and experiment is None and run is None:
             # User provided --checkpoint but not --experiment/--run
             from utils.run_discovery import (
@@ -416,8 +434,10 @@ def eval_epiforecaster(
                     )
                     if output is None:
                         output = eval_dir / f"{split}_forecasts.png"
-                    if output_csv is None:
-                        output_csv = eval_dir / f"{split}_node_metrics.csv"
+                    if node_metrics_csv is None:
+                        node_metrics_csv = eval_dir / f"{split}_node_metrics.csv"
+                    if granular_csv is None:
+                        granular_csv = eval_dir / f"{split}_granular.csv"
                 else:
                     click.echo(
                         "Skipping persistence. Use --output to specify save location."
@@ -427,8 +447,10 @@ def eval_epiforecaster(
                 click.echo("Could not auto-detect experiment/run from checkpoint path.")
                 if output is None:
                     output = Path(f"{split}_forecasts.png")
-                if output_csv is None:
-                    output_csv = Path(f"{split}_node_metrics.csv")
+                if node_metrics_csv is None:
+                    node_metrics_csv = Path(f"{split}_node_metrics.csv")
+                if granular_csv is None:
+                    granular_csv = Path(f"{split}_granular.csv")
         elif checkpoint is None:
             raise click.ClickException(
                 "Must provide either --checkpoint or both --experiment and --run"
@@ -450,7 +472,8 @@ def eval_epiforecaster(
             split=split,
             log_dir=log_dir,
             overrides=list(override) if override else None,
-            output_csv_path=output_csv,
+            node_metrics_csv_path=node_metrics_csv,
+            granular_csv_path=granular_csv,
             batch_size=eval_batch_size,
         )
 
@@ -492,8 +515,8 @@ def eval_epiforecaster(
         if compare_baselines is not None:
             from evaluation.baseline_eval import compare_model_metrics_against_baselines
 
-            if output_csv is not None:
-                delta_csv = output_csv.with_name(f"{split}_baseline_deltas.csv")
+            if node_metrics_csv is not None:
+                delta_csv = node_metrics_csv.with_name(f"{split}_baseline_deltas.csv")
             elif output is not None:
                 delta_csv = output.with_name(f"{split}_baseline_deltas.csv")
             else:
@@ -510,8 +533,10 @@ def eval_epiforecaster(
             click.echo(f"Eval metrics logged to: {log_dir}")
         if output is not None:
             click.echo(f"Saved plot to: {output}")
-        if output_csv is not None:
-            click.echo(f"Saved node metrics to: {output_csv}")
+        if node_metrics_csv is not None:
+            click.echo(f"Saved node metrics to: {node_metrics_csv}")
+        if granular_csv is not None:
+            click.echo(f"Saved granular metrics to: {granular_csv}")
         if wandb.run is not None:
             wandb.finish()
     except Exception as exc:
@@ -858,6 +883,73 @@ def _parse_nodes_option(nodes: str) -> tuple[str, int]:
     except ValueError as e:
         raise click.ClickException(f"Invalid count in --nodes: {k_str}. {e}") from e
     return strategy, k
+
+
+@plot_cli.command("granular-compare")
+@click.option(
+    "--baseline",
+    type=click.Path(path_type=Path, exists=True),
+    required=True,
+    help="Baseline granular CSV.",
+)
+@click.option(
+    "--candidate",
+    type=click.Path(path_type=Path, exists=True),
+    required=True,
+    help="Candidate granular CSV.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Directory where paired delta tables and plots will be written.",
+)
+@click.option(
+    "--min-join-coverage",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Minimum required matched-row coverage for each input CSV.",
+)
+@click.option(
+    "--rolling-window",
+    type=int,
+    default=7,
+    show_default=True,
+    help="Rolling window size for time-series uplift plots.",
+)
+def plot_granular_compare(
+    baseline: Path,
+    candidate: Path,
+    output_dir: Path,
+    min_join_coverage: float,
+    rolling_window: int,
+) -> None:
+    """Compare two granular eval CSVs and render paired uplift artifacts."""
+    try:
+        from dataviz.granular_comparison import compare_granular_csvs
+
+        artifacts = compare_granular_csvs(
+            baseline_csv=baseline,
+            candidate_csv=candidate,
+            output_dir=output_dir,
+            min_join_coverage=min_join_coverage,
+            rolling_window=rolling_window,
+        )
+
+        click.echo(
+            "Granular comparison complete: "
+            f"{artifacts['matched_rows']} matched rows "
+            f"({artifacts['baseline_rows']} baseline, {artifacts['candidate_rows']} candidate)"
+        )
+        for name, path in artifacts["tables"].items():
+            click.echo(f"  {name}: {path}")
+        for name, path in artifacts["plots"].items():
+            click.echo(f"  {name}: {path}")
+    except Exception as exc:
+        click.echo(f"❌ Granular comparison failed: {exc}", err=True)
+        click.echo(traceback.format_exc(), err=True)
+        raise click.ClickException(str(exc)) from exc
 
 
 def _format_eval_summary(loss: float, metrics: dict) -> str:

@@ -822,8 +822,7 @@ class TrainingParams:
             )
         if self.min_learning_rate < 0:
             raise ValueError(
-                "min_learning_rate must be non-negative, "
-                f"got {self.min_learning_rate}"
+                f"min_learning_rate must be non-negative, got {self.min_learning_rate}"
             )
         if self.min_learning_rate > self.learning_rate:
             raise ValueError(
@@ -909,11 +908,24 @@ class OutputConfig:
     save_checkpoints: bool = True
     checkpoint_frequency: int = 10
     save_best_only: bool = True
+    write_granular_eval: bool = False
+    granular_eval_filename: str = "{split}_granular.csv"
     wandb_project: str = "epiforecaster"
     wandb_entity: str | None = None
     wandb_group: str | None = None
     wandb_tags: list[str] = field(default_factory=list)
     wandb_mode: str = "online"
+
+    def resolve_granular_eval_filename(self, *, split: str) -> str:
+        """Resolve the configured granular eval filename for a split."""
+        split_key = split.strip().lower()
+        filename = self.granular_eval_filename.format(
+            split=split_key,
+            split_name=split_key,
+        )
+        if not filename:
+            raise ValueError("output.granular_eval_filename must not resolve to empty")
+        return filename
 
 
 @dataclass
