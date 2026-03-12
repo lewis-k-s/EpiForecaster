@@ -85,6 +85,11 @@ def _inverse_softplus(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.log(torch.expm1(x).clamp_min(eps))
 
 
+def _float32_scalar_tensor(value: float) -> torch.Tensor:
+    """Create a float32 scalar tensor for module params/buffers."""
+    return torch.tensor(float(value), dtype=torch.float32)
+
+
 def _small_xavier_linear(layer: nn.Linear, gain: float = 0.1) -> None:
     """Initialize a linear layer with small non-zero Xavier weights."""
     nn.init.xavier_normal_(layer.weight, gain=gain)
@@ -288,10 +293,13 @@ class SheddingConvolution(nn.Module):
 
         if learnable_scale:
             self.sensitivity_scale = nn.Parameter(
-                torch.log(torch.tensor(float(sensitivity_scale)))
+                torch.log(_float32_scalar_tensor(sensitivity_scale))
             )
         else:
-            self.register_buffer("sensitivity_scale", torch.tensor(sensitivity_scale))
+            self.register_buffer(
+                "sensitivity_scale",
+                _float32_scalar_tensor(sensitivity_scale),
+            )
 
         logger.debug(
             f"Initialized SheddingConvolution: length={kernel_length}, "
@@ -490,9 +498,9 @@ class ClinicalObservationHead(nn.Module):
 
         # Learnable scale for per-100k conversion (constrained positive)
         if learnable_scale:
-            self.scale = nn.Parameter(torch.log(torch.tensor(float(scale_init))))
+            self.scale = nn.Parameter(torch.log(_float32_scalar_tensor(scale_init)))
         else:
-            self.register_buffer("scale", torch.tensor(scale_init))
+            self.register_buffer("scale", _float32_scalar_tensor(scale_init))
         self.learnable_scale = learnable_scale
 
         # Residual connection from observation context
@@ -501,9 +509,9 @@ class ClinicalObservationHead(nn.Module):
             self.residual_proj = nn.Linear(residual_dim, 1)
             _small_xavier_linear(self.residual_proj, gain=0.1)
             if learnable_scale:
-                self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+                self.alpha = nn.Parameter(_float32_scalar_tensor(alpha_init))
             else:
-                self.register_buffer("alpha", torch.tensor(alpha_init))
+                self.register_buffer("alpha", _float32_scalar_tensor(alpha_init))
         else:
             self.residual_proj = None
             self.alpha = None
@@ -633,9 +641,9 @@ class WastewaterObservationHead(nn.Module):
 
         # Learnable scale for per-100k conversion (constrained positive)
         if learnable_scale:
-            self.scale = nn.Parameter(torch.log(torch.tensor(float(scale_init))))
+            self.scale = nn.Parameter(torch.log(_float32_scalar_tensor(scale_init)))
         else:
-            self.register_buffer("scale", torch.tensor(scale_init))
+            self.register_buffer("scale", _float32_scalar_tensor(scale_init))
         self.learnable_scale = learnable_scale
 
         # Residual connection from observation context
@@ -644,9 +652,9 @@ class WastewaterObservationHead(nn.Module):
             self.residual_proj = nn.Linear(residual_dim, 1)
             _small_xavier_linear(self.residual_proj, gain=0.1)
             if learnable_scale:
-                self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+                self.alpha = nn.Parameter(_float32_scalar_tensor(alpha_init))
             else:
-                self.register_buffer("alpha", torch.tensor(alpha_init))
+                self.register_buffer("alpha", _float32_scalar_tensor(alpha_init))
         else:
             self.residual_proj = None
             self.alpha = None

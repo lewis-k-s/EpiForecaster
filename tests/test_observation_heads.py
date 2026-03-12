@@ -500,6 +500,28 @@ class TestClinicalObservationHead:
         # Relaxed tolerance for float16 precision
         assert torch.allclose(no_context, with_context, atol=1e-3)
 
+    @pytest.mark.device
+    def test_forward_on_accelerator_after_module_transfer(self, accelerator_device):
+        """Clinical head params/buffers should follow module transfer to accelerator."""
+        head = ClinicalObservationHead(
+            learnable_kernel=False,
+            learnable_scale=False,
+            residual_dim=4,
+        ).to(accelerator_device)
+
+        assert head.scale.device.type == accelerator_device.type
+        assert head.alpha is not None
+        assert head.alpha.device.type == accelerator_device.type
+        assert head.delay_kernel.kernel.device.type == accelerator_device.type
+
+        I_trajectory = _rand_tensor(2, 12).to(accelerator_device) * 0.1
+        obs_context = _rand_tensor(2, 12, 4).to(accelerator_device)
+
+        output = head(I_trajectory, obs_context)
+
+        assert output.device.type == accelerator_device.type
+        assert torch.isfinite(output).all()
+
 
 class TestWastewaterObservationHead:
     """Tests for WastewaterObservationHead wrapper."""
@@ -573,6 +595,30 @@ class TestWastewaterObservationHead:
         with_context = head(I_trajectory, population, obs_context=obs_context)
         # Relaxed tolerance for float16 precision
         assert torch.allclose(no_context, with_context, atol=1e-3)
+
+    @pytest.mark.device
+    def test_forward_on_accelerator_after_module_transfer(self, accelerator_device):
+        """Wastewater head params/buffers should follow module transfer to accelerator."""
+        head = WastewaterObservationHead(
+            learnable_kernel=False,
+            learnable_scale=False,
+            residual_dim=6,
+        ).to(accelerator_device)
+
+        assert head.scale.device.type == accelerator_device.type
+        assert head.alpha is not None
+        assert head.alpha.device.type == accelerator_device.type
+        assert head.shedding_conv.kernel.device.type == accelerator_device.type
+        assert head.shedding_conv.sensitivity_scale.device.type == accelerator_device.type
+
+        I_trajectory = _rand_tensor(2, 12).to(accelerator_device) * 0.1
+        population = (_ones_tensor(2, 12) * 1000.0).to(accelerator_device)
+        obs_context = _rand_tensor(2, 12, 6).to(accelerator_device)
+
+        output = head(I_trajectory, population, obs_context)
+
+        assert output.device.type == accelerator_device.type
+        assert torch.isfinite(output).all()
 
 
 class TestIntegration:
