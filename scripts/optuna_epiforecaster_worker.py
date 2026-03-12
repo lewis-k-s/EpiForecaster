@@ -153,16 +153,14 @@ def suggest_epiforecaster_params(
 ) -> dict[str, Any]:
     """Define the search space and return dotted-key overrides.
 
-    This is intentionally conservative and only targets params that are:
-    - Exposed in current YAML/dataclass config surface, and
-    - Actually used by dataset/trainer/model as implemented today.
-
-    If you later move to OmegaConf or expose more model-head params, add them here.
+    This is an intentionally reduced first-pass search space. The current Optuna
+    journal is failure-heavy and completion-poor, so we focus on a small set of
+    first-order knobs before revisiting startup/init and controller tuning.
     """
 
     overrides: dict[str, Any] = {}
 
-    # --- training knobs (high leverage) ---
+    # --- optimizer + data knobs ---
     overrides["training.learning_rate"] = trial.suggest_float(
         "training.learning_rate", 1e-5, 3e-3, log=True
     )
@@ -211,7 +209,17 @@ def suggest_epiforecaster_params(
         _categorical_choices((0.0, 1.0, 5.0, 10.0, 20.0, 50.0)),
     )
 
-    # --- model knobs (conditional) ---
+    # Pin fixed values for the simplified pass rather than inheriting config-specific
+    # defaults, so each trial uses the same reduced baseline.
+    overrides["model.head_positional_encoding"] = "sinusoidal"
+    overrides["model.observation_heads.residual_mode"] = "additive"
+    overrides["model.observation_heads.obs_context_dim"] = 96
+    overrides["model.observation_heads.residual_layers"] = 2
+    overrides["model.observation_heads.residual_dropout"] = 0.1
+    overrides["model.observation_heads.learnable_kernel_ww"] = False
+    overrides["model.observation_heads.learnable_kernel_hosp"] = False
+
+    # --- mobility graph knobs (conditional) ---
     if base_cfg.model.type.mobility:
         overrides["model.gnn_depth"] = trial.suggest_int("model.gnn_depth", 1, 4)
         overrides["model.gnn_module"] = trial.suggest_categorical(
@@ -227,130 +235,78 @@ def suggest_epiforecaster_params(
         pass
 
     if base_cfg.model.temporal_covariates_dim > 0:
-        use_temporal_covariates = trial.suggest_categorical(
-            "model.use_temporal_covariates",
-            _categorical_choices((True, False)),
-        )
-        overrides["model.include_day_of_week"] = (
-            base_cfg.model.include_day_of_week if use_temporal_covariates else False
-        )
-        overrides["model.include_holidays"] = (
-            base_cfg.model.include_holidays if use_temporal_covariates else False
-        )
+        overrides["model.include_day_of_week"] = base_cfg.model.include_day_of_week
+        overrides["model.include_holidays"] = base_cfg.model.include_holidays
 
-    # Backbone positional encoding type (already implemented in TransformerBackbone).
-    overrides["model.head_positional_encoding"] = trial.suggest_categorical(
-        "model.head_positional_encoding",
-        _categorical_choices(("sinusoidal", "learned")),
-    )
-
-    # --- init_weights knobs (startup dynamics / gradient transport) ---
-    overrides["model.init_weights.rezero_init"] = trial.suggest_categorical(
-        "init_weights.rezero_init",
-        _categorical_choices((1.0e-3, 3.0e-3, 1.0e-2)),
-    )
-    overrides["model.init_weights.rate_head_final_gain"] = trial.suggest_categorical(
-        "init_weights.rate_head_final_gain",
-        _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
-    )
-    overrides["model.init_weights.initial_state_final_gain"] = (
-        trial.suggest_categorical(
-            "init_weights.initial_state_final_gain",
-            _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
-        )
-    )
-    overrides["model.init_weights.obs_context_final_gain"] = trial.suggest_categorical(
-        "init_weights.obs_context_final_gain",
-        _categorical_choices((0.25, 0.5, 1.0)),
-    )
-
-    # --- SIR joint inference knobs (high leverage for observation heads) ---
-    # Residual alpha is an init-sensitive knob for startup stability.
-    overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
-        "init_weights.observation_residual_scale", 0.03, 0.2
-    )
-
-    # Residual connection params - affects model capacity for observation heads
+    # --- observation-head capacity ---
     overrides["model.observation_heads.residual_hidden_dim"] = (
         trial.suggest_categorical(
             "model.observation_heads.residual_hidden_dim",
             _categorical_choices((16, 32, 64, 128)),
         )
     )
-    overrides["model.observation_heads.residual_layers"] = trial.suggest_int(
-        "model.observation_heads.residual_layers", 1, 4
-    )
-    overrides["model.observation_heads.residual_dropout"] = trial.suggest_float(
-        "model.observation_heads.residual_dropout", 0.0, 0.3
-    )
-
-    # Observation context dimension - affects representational power
-    overrides["model.observation_heads.obs_context_dim"] = trial.suggest_categorical(
-        "model.observation_heads.obs_context_dim",
-        _categorical_choices((32, 64, 96, 128, 192)),
-    )
-
-    # Residual mode - additive vs modulation
-    overrides["model.observation_heads.residual_mode"] = trial.suggest_categorical(
-        "model.observation_heads.residual_mode",
-        _categorical_choices(("additive", "modulation")),
-    )
-
-    # Weekly-observed heads default to frozen kernels in base config; allow HPO to
-    # opt into learnable kernels explicitly.
-    overrides["model.observation_heads.learnable_kernel_ww"] = (
-        trial.suggest_categorical(
-            "model.observation_heads.learnable_kernel_ww",
-            _categorical_choices((False, True)),
-        )
-    )
-    overrides["model.observation_heads.learnable_kernel_hosp"] = (
-        trial.suggest_categorical(
-            "model.observation_heads.learnable_kernel_hosp",
-            _categorical_choices((False, True)),
-        )
-    )
-
-    # Nowcast continuity penalty weight
     overrides["training.loss.joint.w_continuity"] = trial.suggest_categorical(
         "training.loss.joint.w_continuity",
-        _categorical_choices((0.0, 0.01, 0.05, 0.1, 0.2)),
+        _categorical_choices((0.0, 0.01, 0.05, 0.1)),
     )
 
-    # GradNorm controller knobs (only relevant when adaptive weighting is enabled).
-    adaptive_scheme = getattr(base_cfg.training.loss.joint, "adaptive_scheme", "none")
-    if adaptive_scheme.lower() == "gradnorm":
-        overrides["training.loss.joint.gradnorm_alpha"] = trial.suggest_float(
-            "training.loss.joint.gradnorm_alpha", 0.5, 2.5
-        )
-        overrides["training.loss.joint.gradnorm_weight_lr"] = trial.suggest_float(
-            "training.loss.joint.gradnorm_weight_lr",
-            1.0e-4,
-            5.0e-3,
-            log=True,
-        )
-        overrides["training.loss.joint.gradnorm_warmup_steps"] = trial.suggest_int(
-            "training.loss.joint.gradnorm_warmup_steps",
-            0,
-            100,
-        )
-        overrides["training.loss.joint.gradnorm_update_every"] = (
-            trial.suggest_categorical(
-                "training.loss.joint.gradnorm_update_every",
-                _categorical_choices((8, 16, 32)),
-            )
-        )
-        overrides["training.loss.joint.gradnorm_ema_decay"] = trial.suggest_float(
-            "training.loss.joint.gradnorm_ema_decay",
-            0.85,
-            0.99,
-        )
-        overrides["training.loss.joint.gradnorm_min_weight"] = (
-            trial.suggest_categorical(
-                "training.loss.joint.gradnorm_min_weight",
-                _categorical_choices((5.0e-4, 1.0e-3, 2.0e-3)),
-            )
-        )
+    # --- deferred phase-2 tuning: init and startup dynamics ---
+    # overrides["model.init_weights.rezero_init"] = trial.suggest_categorical(
+    #     "init_weights.rezero_init",
+    #     _categorical_choices((1.0e-3, 3.0e-3, 1.0e-2)),
+    # )
+    # overrides["model.init_weights.rate_head_final_gain"] = trial.suggest_categorical(
+    #     "init_weights.rate_head_final_gain",
+    #     _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
+    # )
+    # overrides["model.init_weights.initial_state_final_gain"] = (
+    #     trial.suggest_categorical(
+    #         "init_weights.initial_state_final_gain",
+    #         _categorical_choices((5.0e-3, 1.0e-2, 2.0e-2)),
+    #     )
+    # )
+    # overrides["model.init_weights.obs_context_final_gain"] = trial.suggest_categorical(
+    #     "init_weights.obs_context_final_gain",
+    #     _categorical_choices((0.25, 0.5, 1.0)),
+    # )
+    # overrides["model.observation_heads.residual_scale"] = trial.suggest_float(
+    #     "init_weights.observation_residual_scale", 0.03, 0.2
+    # )
+
+    # --- deferred phase-2 tuning: GradNorm controller ---
+    # adaptive_scheme = base_cfg.training.loss.joint.adaptive_scheme
+    # if adaptive_scheme.lower() == "gradnorm":
+    #     overrides["training.loss.joint.gradnorm_alpha"] = trial.suggest_float(
+    #         "training.loss.joint.gradnorm_alpha", 0.5, 2.5
+    #     )
+    #     overrides["training.loss.joint.gradnorm_weight_lr"] = trial.suggest_float(
+    #         "training.loss.joint.gradnorm_weight_lr",
+    #         1.0e-4,
+    #         5.0e-3,
+    #         log=True,
+    #     )
+    #     overrides["training.loss.joint.gradnorm_warmup_steps"] = trial.suggest_int(
+    #         "training.loss.joint.gradnorm_warmup_steps",
+    #         0,
+    #         100,
+    #     )
+    #     overrides["training.loss.joint.gradnorm_update_every"] = (
+    #         trial.suggest_categorical(
+    #             "training.loss.joint.gradnorm_update_every",
+    #             _categorical_choices((8, 16, 32)),
+    #         )
+    #     )
+    #     overrides["training.loss.joint.gradnorm_ema_decay"] = trial.suggest_float(
+    #         "training.loss.joint.gradnorm_ema_decay",
+    #         0.85,
+    #         0.99,
+    #     )
+    #     overrides["training.loss.joint.gradnorm_min_weight"] = (
+    #         trial.suggest_categorical(
+    #             "training.loss.joint.gradnorm_min_weight",
+    #             _categorical_choices((5.0e-4, 1.0e-3, 2.0e-3)),
+    #         )
+    #     )
 
     return overrides
 
