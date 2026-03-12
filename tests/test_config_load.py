@@ -56,6 +56,10 @@ def test_load_config_without_overrides():
 
     assert cfg.training.learning_rate == 0.0001
     assert cfg.data.log_scale is True
+    assert cfg.output.write_granular_eval is True
+    assert (
+        cfg.output.resolve_granular_eval_filename(split="test") == "test_granular.csv"
+    )
 
 
 @pytest.mark.epiforecaster
@@ -145,3 +149,6 @@ def test_from_dict_reconstructs_config():
     assert reconstructed.training.learning_rate == original.training.learning_rate
     assert reconstructed.training.batch_size == original.training.batch_size
     assert reconstructed.output.log_dir == original.output.log_dir
+    assert (
+        reconstructed.output.write_granular_eval == original.output.write_granular_eval
+    )
