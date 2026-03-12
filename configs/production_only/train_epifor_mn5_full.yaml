@@ -30,6 +30,9 @@ model:
     mobility_embedding_dim: 32
     region_embedding_dim: 64
     gnn_module: "gcn"
+    #-- temporal covariates (must match dataset) --#
+    include_day_of_week: true
+    include_holidays: true
     #-- seq sizes --#
     input_window_length: 60
     forecast_horizon: 28
@@ -48,11 +51,13 @@ model:
       mortality_min: 0.0001
       mortality_max: 0.05
       residual_clip: 10000.0
+
 output:
   experiment_name: mn5_epiforecaster
   log_dir: outputs/training
   wandb_mode: offline
   wandb_tags: [mn5]
+
 training:
   compile: true
   compile_mode: "reduce-overhead"
