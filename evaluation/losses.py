@@ -635,10 +635,10 @@ class JointInferenceLoss(nn.Module):
             nowcast_pred: torch.Tensor, last_observed: torch.Tensor
         ) -> torch.Tensor:
             valid_mask = torch.isfinite(last_observed)
-            valid_f = valid_mask.to(dtype=nowcast_pred.dtype)
+            valid_f = valid_mask.to(device=nowcast_pred.device, dtype=nowcast_pred.dtype)
             last_observed_safe = torch.nan_to_num(
                 last_observed.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).to(nowcast_pred.dtype)
+            ).to(device=nowcast_pred.device, dtype=nowcast_pred.dtype)
             sq = (nowcast_pred - last_observed_safe) ** 2
             numerator = (sq * valid_f).sum()
             denominator = valid_f.sum().clamp_min(1.0)

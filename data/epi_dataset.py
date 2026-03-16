@@ -70,6 +70,8 @@ class EpiDatasetItem(TypedDict):
     # Temporal covariates (day-of-week sin/cos + holiday indicator)
     temporal_covariates: torch.Tensor  # [L, 3] or [L, 0] if not available
     # Joint inference targets (log1p per-100k space)
+    ww_hist: torch.Tensor  # [L] Wastewater history in log1p target space
+    ww_hist_mask: torch.Tensor  # [L] 1.0 if wastewater history is observed
     hosp_target: torch.Tensor  # [H] Hospitalization targets in log1p(per-100k)
     ww_target: torch.Tensor  # [H] Wastewater targets in log1p(per-100k)
     cases_target: torch.Tensor  # [H] Reported cases targets in log1p(per-100k)
@@ -718,6 +720,8 @@ class EpiDataset(Dataset):
 
         # Extract joint inference targets (hospitalizations and wastewater in log1p per-100k)
         # These are already precomputed in __init__
+        ww_hist = self.precomputed_ww[range_start:range_end, target_idx]
+        ww_hist_mask = self.precomputed_ww_mask[range_start:range_end, target_idx]
         hosp_target = self.precomputed_hosp[range_end:forecast_targets, target_idx]
         hosp_target_mask = self.precomputed_hosp_mask[
             range_end:forecast_targets, target_idx
@@ -848,6 +852,8 @@ class EpiDataset(Dataset):
             "population": population,
             "run_id": run_id,
             "temporal_covariates": temporal_covariates_hist,  # (L, cov_dim)
+            "ww_hist": ww_hist,
+            "ww_hist_mask": ww_hist_mask,
             "hosp_target": hosp_target,
             "ww_target": ww_target,
             "cases_target": cases_target,

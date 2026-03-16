@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.precision_policy import MODEL_PARAM_DTYPE, model_scalar
 from utils.normalization import unscale_forecasts
 from utils.device import sync_to_device
 
@@ -85,11 +86,6 @@ def _inverse_softplus(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return torch.log(torch.expm1(x).clamp_min(eps))
 
 
-def _float32_scalar_tensor(value: float) -> torch.Tensor:
-    """Create a float32 scalar tensor for module params/buffers."""
-    return torch.tensor(float(value), dtype=torch.float32)
-
-
 def _small_xavier_linear(layer: nn.Linear, gain: float = 0.1) -> None:
     """Initialize a linear layer with small non-zero Xavier weights."""
     nn.init.xavier_normal_(layer.weight, gain=gain)
@@ -154,7 +150,7 @@ class DelayKernel(nn.Module):
     ) -> torch.Tensor:
         """Initialize kernel with Gamma distribution PDF values."""
         # Compute Gamma PDF at integer positions
-        x = torch.arange(length, dtype=torch.float32)
+        x = torch.arange(length, dtype=MODEL_PARAM_DTYPE)
 
         # Gamma PDF: x^(shape-1) * exp(-x/scale) / (scale^shape * Gamma(shape))
         # Using log-space for numerical stability
@@ -293,12 +289,12 @@ class SheddingConvolution(nn.Module):
 
         if learnable_scale:
             self.sensitivity_scale = nn.Parameter(
-                torch.log(_float32_scalar_tensor(sensitivity_scale))
+                torch.log(model_scalar(sensitivity_scale))
             )
         else:
             self.register_buffer(
                 "sensitivity_scale",
-                _float32_scalar_tensor(sensitivity_scale),
+                model_scalar(sensitivity_scale),
             )
 
         logger.debug(
@@ -318,7 +314,7 @@ class SheddingConvolution(nn.Module):
 
         Uses Gamma distribution shifted to create asymmetric profile.
         """
-        x = torch.arange(length, dtype=torch.float32)
+        x = torch.arange(length, dtype=MODEL_PARAM_DTYPE)
 
         # Use Gamma(3, 2) for ascending then declining profile
         # Shape < scale creates right-skewed distribution (tail)
@@ -486,8 +482,13 @@ class ClinicalObservationHead(nn.Module):
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
+        delta_forecasting: bool = False,
+        anchor_mode: str = "last_valid_step",
     ):
         super().__init__()
+
+        self.delta_forecasting = delta_forecasting
+        self.anchor_mode = anchor_mode
 
         self.delay_kernel = DelayKernel(
             kernel_length=kernel_length,
@@ -498,9 +499,9 @@ class ClinicalObservationHead(nn.Module):
 
         # Learnable scale for per-100k conversion (constrained positive)
         if learnable_scale:
-            self.scale = nn.Parameter(torch.log(_float32_scalar_tensor(scale_init)))
+            self.scale = nn.Parameter(torch.log(model_scalar(scale_init)))
         else:
-            self.register_buffer("scale", _float32_scalar_tensor(scale_init))
+            self.register_buffer("scale", model_scalar(scale_init))
         self.learnable_scale = learnable_scale
 
         # Residual connection from observation context
@@ -509,22 +510,25 @@ class ClinicalObservationHead(nn.Module):
             self.residual_proj = nn.Linear(residual_dim, 1)
             _small_xavier_linear(self.residual_proj, gain=0.1)
             if learnable_scale:
-                self.alpha = nn.Parameter(_float32_scalar_tensor(alpha_init))
+                self.alpha = nn.Parameter(model_scalar(alpha_init))
             else:
-                self.register_buffer("alpha", _float32_scalar_tensor(alpha_init))
+                self.register_buffer("alpha", model_scalar(alpha_init))
         else:
             self.residual_proj = None
             self.alpha = None
 
         logger.info(
             f"Initialized ClinicalObservationHead: scale_init={scale_init}, "
-            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}"
+            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}, "
+            f"delta_forecasting={self.delta_forecasting}, anchor_mode={self.anchor_mode}"
         )
 
     def forward(
         self,
         I_trajectory: torch.Tensor,
         obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Generate clinical observations from infection trajectory in log1p(per-100k) space.
@@ -533,6 +537,8 @@ class ClinicalObservationHead(nn.Module):
             I_trajectory: Infected population fraction trajectory [batch_size, time_steps]
             obs_context: Optional observation context [batch_size, time_steps, residual_dim]
                 If provided, adds residual connection.
+            last_observed: Optional historically observed value to anchor delta forecasting.
+            last_observed_mask: Optional binary mask marking anchor availability.
 
         Returns:
             Predicted log1p(per-100k) values [batch_size, time_steps]
@@ -570,6 +576,21 @@ class ClinicalObservationHead(nn.Module):
                 if alpha.dtype != pred_log.dtype:
                     alpha = alpha.to(pred_log.dtype)
                 pred_log = pred_log + alpha * residual
+
+        if (
+            self.delta_forecasting
+            and self.anchor_mode != "disabled"
+            and last_observed is not None
+            and last_observed_mask is not None
+        ):
+            h0 = pred_log[:, 0:1]  # [B, 1]
+            delta = pred_log - h0
+            valid_mask = (last_observed_mask > 0.5).unsqueeze(1)  # [B, 1]
+            last_obs_safe = torch.nan_to_num(
+                last_observed, nan=0.0, posinf=0.0, neginf=0.0
+            ).unsqueeze(1)
+            anchored_pred = torch.clamp(last_obs_safe + delta, min=0.0)
+            pred_log = torch.where(valid_mask, anchored_pred, pred_log)
 
         return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
 
@@ -628,8 +649,13 @@ class WastewaterObservationHead(nn.Module):
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         strict: bool = True,
+        delta_forecasting: bool = False,
+        anchor_mode: str = "last_valid_step",
     ):
         super().__init__()
+
+        self.delta_forecasting = delta_forecasting
+        self.anchor_mode = anchor_mode
 
         self.shedding_conv = SheddingConvolution(
             kernel_length=kernel_length,
@@ -641,9 +667,9 @@ class WastewaterObservationHead(nn.Module):
 
         # Learnable scale for per-100k conversion (constrained positive)
         if learnable_scale:
-            self.scale = nn.Parameter(torch.log(_float32_scalar_tensor(scale_init)))
+            self.scale = nn.Parameter(torch.log(model_scalar(scale_init)))
         else:
-            self.register_buffer("scale", _float32_scalar_tensor(scale_init))
+            self.register_buffer("scale", model_scalar(scale_init))
         self.learnable_scale = learnable_scale
 
         # Residual connection from observation context
@@ -652,16 +678,17 @@ class WastewaterObservationHead(nn.Module):
             self.residual_proj = nn.Linear(residual_dim, 1)
             _small_xavier_linear(self.residual_proj, gain=0.1)
             if learnable_scale:
-                self.alpha = nn.Parameter(_float32_scalar_tensor(alpha_init))
+                self.alpha = nn.Parameter(model_scalar(alpha_init))
             else:
-                self.register_buffer("alpha", _float32_scalar_tensor(alpha_init))
+                self.register_buffer("alpha", model_scalar(alpha_init))
         else:
             self.residual_proj = None
             self.alpha = None
 
         logger.info(
             f"Initialized WastewaterObservationHead: scale_init={scale_init}, "
-            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}"
+            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}, "
+            f"delta_forecasting={self.delta_forecasting}, anchor_mode={self.anchor_mode}"
         )
 
     def forward(
@@ -669,6 +696,8 @@ class WastewaterObservationHead(nn.Module):
         I_trajectory: torch.Tensor,
         population: torch.Tensor,
         obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Generate wastewater predictions from infection trajectory in log1p(per-100k) space.
@@ -678,6 +707,8 @@ class WastewaterObservationHead(nn.Module):
             population: Population time series [batch_size, time_steps]
             obs_context: Optional observation context [batch_size, time_steps, residual_dim]
                 If provided, adds residual connection.
+            last_observed: Optional historically observed value to anchor delta forecasting.
+            last_observed_mask: Optional binary mask marking anchor availability.
 
         Returns:
             Predicted log1p(per-100k) values [batch_size, time_steps]
@@ -717,6 +748,21 @@ class WastewaterObservationHead(nn.Module):
                 if alpha.dtype != pred_log.dtype:
                     alpha = alpha.to(pred_log.dtype)
                 pred_log = pred_log + alpha * residual
+
+        if (
+            self.delta_forecasting
+            and self.anchor_mode != "disabled"
+            and last_observed is not None
+            and last_observed_mask is not None
+        ):
+            h0 = pred_log[:, 0:1]  # [B, 1]
+            delta = pred_log - h0
+            valid_mask = (last_observed_mask > 0.5).unsqueeze(1)  # [B, 1]
+            last_obs_safe = torch.nan_to_num(
+                last_observed, nan=0.0, posinf=0.0, neginf=0.0
+            ).unsqueeze(1)
+            anchored_pred = torch.clamp(last_obs_safe + delta, min=0.0)
+            pred_log = torch.where(valid_mask, anchored_pred, pred_log)
 
         return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
 

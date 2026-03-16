@@ -9,6 +9,7 @@ from models.configs import (
     SIRPhysicsConfig,
 )
 from models.epiforecaster import EpiForecaster
+from utils.precision_policy import MODEL_PARAM_DTYPE
 
 
 def _rand_tensor(*shape, dtype=None):
@@ -43,6 +44,8 @@ class TestEpiForecaster:
             "deaths_hist": _rand_tensor(B, T, 3),
             "cases_hist": _rand_tensor(B, T, 3),
             "biomarkers_hist": _rand_tensor(B, T, 5),
+            "ww_hist": _rand_tensor(B, T),
+            "ww_hist_mask": torch.ones(B, T, dtype=torch.float32),
             "target_nodes": torch.zeros(B, dtype=torch.long),
             "population": torch.ones(B, dtype=torch.float32) * 1000,
             "region_embeddings": _rand_tensor(10, 8),
@@ -51,6 +54,7 @@ class TestEpiForecaster:
     def test_init_basic(self, basic_config):
         model = EpiForecaster(**basic_config)
         assert isinstance(model, EpiForecaster)
+        assert model.dtype == MODEL_PARAM_DTYPE
 
     def test_forward_basic(self, basic_config, dummy_batch):
         """Test forward pass with minimal features (cases only)."""
@@ -289,6 +293,8 @@ class TestEpiForecaster:
             window_start=torch.zeros(B, dtype=torch.long),
             node_labels=["node_0", "node_1"],
             temporal_covariates=torch.zeros(B, T, 0),
+            ww_hist=dummy_batch["ww_hist"],
+            ww_hist_mask=dummy_batch["ww_hist_mask"],
             hosp_target=_rand_tensor(B, H),
             ww_target=_rand_tensor(B, H),
             cases_target=_rand_tensor(B, H),
@@ -344,6 +350,8 @@ class TestEpiForecaster:
             window_start=torch.zeros(B, dtype=torch.long),
             node_labels=["node_0"],
             temporal_covariates=torch.zeros(B, T, 0),
+            ww_hist=_rand_tensor(B, T),
+            ww_hist_mask=torch.ones(B, T),
             hosp_target=_rand_tensor(B, horizon),
             ww_target=_rand_tensor(B, horizon),
             cases_target=_rand_tensor(B, horizon),
@@ -393,6 +401,8 @@ class TestEpiForecaster:
             window_start=torch.zeros(B, dtype=torch.long),
             node_labels=["node_0", "node_1"],
             temporal_covariates=torch.zeros(B, T, 0),
+            ww_hist=_rand_tensor(B, T),
+            ww_hist_mask=torch.ones(B, T),
             hosp_target=_rand_tensor(B, horizon),
             ww_target=_rand_tensor(B, horizon),
             cases_target=_rand_tensor(B, horizon),
@@ -408,3 +418,82 @@ class TestEpiForecaster:
         assert outputs["pred_cases"].device.type == accelerator_device.type
         assert outputs["pred_hosp"].device.type == accelerator_device.type
         assert targets["cases"].device.type == accelerator_device.type
+
+    def test_delta_forecasting_anchors_clinical_heads_from_last_valid_step(
+        self, basic_config
+    ):
+        config = basic_config.copy()
+        config["observation_heads"] = ObservationHeadConfig(delta_forecasting=True)
+        model = EpiForecaster(**config)
+
+        B, T = 1, config["sequence_length"]
+        hist = torch.zeros(B, T, 3, dtype=torch.float32)
+        hist[0, -3, 0] = 1.5
+        hist[0, -3, 1] = 1.0
+
+        out = model(
+            hosp_hist=hist,
+            deaths_hist=torch.zeros(B, T, 3),
+            cases_hist=hist.clone(),
+            biomarkers_hist=torch.zeros(B, T, 5),
+            mob_graphs=None,
+            target_nodes=torch.zeros(B, dtype=torch.long),
+            population=torch.ones(B, dtype=torch.float32) * 1000,
+        )
+
+        assert out["pred_hosp"][0, 0].item() == pytest.approx(1.5, abs=1e-5)
+        assert out["pred_cases"][0, 0].item() == pytest.approx(1.5, abs=1e-5)
+
+    def test_delta_forecasting_validates_biomarker_layout(self, basic_config):
+        config = basic_config.copy()
+        config["variant_type"] = ModelVariant(
+            cases=True, mobility=False, regions=False, biomarkers=True
+        )
+        config["observation_heads"] = ObservationHeadConfig(delta_forecasting=True)
+        config["biomarkers_dim"] = 6
+        model = EpiForecaster(**config)
+
+        B, T = 1, config["sequence_length"]
+        with pytest.raises(ValueError, match="biomarkers_hist feature dim"):
+            model(
+                hosp_hist=torch.zeros(B, T, 3),
+                deaths_hist=torch.zeros(B, T, 3),
+                cases_hist=torch.zeros(B, T, 3),
+                biomarkers_hist=torch.zeros(B, T, 6),
+                ww_hist=torch.zeros(B, T),
+                ww_hist_mask=torch.ones(B, T),
+                mob_graphs=None,
+                target_nodes=torch.zeros(B, dtype=torch.long),
+                population=torch.ones(B, dtype=torch.float32),
+            )
+
+    def test_delta_forecasting_anchors_wastewater_from_target_space_history(
+        self, basic_config
+    ):
+        config = basic_config.copy()
+        config["variant_type"] = ModelVariant(
+            cases=True, mobility=False, regions=False, biomarkers=True
+        )
+        config["observation_heads"] = ObservationHeadConfig(delta_forecasting=True)
+        config["biomarkers_dim"] = 5
+        model = EpiForecaster(**config)
+
+        B, T = 1, config["sequence_length"]
+        ww_hist = torch.zeros(B, T, dtype=torch.float32)
+        ww_hist_mask = torch.zeros(B, T, dtype=torch.float32)
+        ww_hist[0, -2] = 3.25
+        ww_hist_mask[0, -2] = 1.0
+
+        out = model(
+            hosp_hist=torch.zeros(B, T, 3),
+            deaths_hist=torch.zeros(B, T, 3),
+            cases_hist=torch.zeros(B, T, 3),
+            biomarkers_hist=torch.zeros(B, T, 5),
+            ww_hist=ww_hist,
+            ww_hist_mask=ww_hist_mask,
+            mob_graphs=None,
+            target_nodes=torch.zeros(B, dtype=torch.long),
+            population=torch.ones(B, dtype=torch.float32),
+        )
+
+        assert out["pred_ww"][0, 0].item() == pytest.approx(3.25, abs=1e-5)

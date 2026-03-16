@@ -148,10 +148,12 @@ def evaluate_loader(
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
                 inject_gpu_mobility(batch_data, eval_iter.dataset, device)
+                batch_data = batch_data.to(device)
 
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
+                    skip_device_transfer=True,
                     mask_cases=criterion.mask_input_cases,
                     mask_ww=criterion.mask_input_ww,
                     mask_hosp=criterion.mask_input_hosp,

@@ -49,6 +49,14 @@ SERIES_VARIABLES = {
     "wastewater": "biomarker_mean",  # Computed from edar_biomarker_* variants
 }
 
+# Human-readable labels with scale information
+SERIES_LABELS = {
+    "cases": "Cases log₁₊(per-100k)",
+    "hospitalizations": "Hospitalizations log₁₊(per-100k)",
+    "deaths": "Deaths log₁₊(per-100k)",
+    "wastewater": "Wastewater log₁₊(raw)",
+}
+
 
 @dataclass
 class CorrelationResult:
@@ -89,18 +97,49 @@ def _discover_biomarker_variants(dataset: xr.Dataset) -> list[str]:
     return sorted(variants)
 
 
-def _aggregate_biomarker_mean(dataset: xr.Dataset, variants: list[str]) -> np.ndarray:
-    """Compute mean across variants at each (time, region) point."""
+def _aggregate_biomarker_mean(
+    dataset: xr.Dataset,
+    variants: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute masked mean across variants, matching training pipeline.
+
+    This matches the aggregation in epi_dataset.py:_precompute_wastewater_target()
+    which uses masked mean respecting observation masks, not simple nanmean.
+
+    Returns:
+        Tuple of (values, valid_mask) where valid_mask indicates points
+        with at least one observed variant.
+    """
     if not variants:
         raise ValueError("No biomarker variants found for aggregation")
 
-    arrays = []
-    for v in variants:
-        arr = dataset[v].values.astype(float)
-        arrays.append(arr)
+    component_tensors = []
+    component_masks = []
 
-    stacked = np.stack(arrays, axis=0)
-    return np.nanmean(stacked, axis=0)
+    for v in variants:
+        values = dataset[v].values.astype(float)
+        mask = _get_observed_mask(dataset, v)
+        component_tensors.append(values)
+        component_masks.append(mask)
+
+    stacked_values = np.stack(component_tensors, axis=0)  # (C, T, N)
+    stacked_masks = np.stack(component_masks, axis=0)  # (C, T, N)
+
+    # Match training pipeline: valid = mask & finite
+    valid = stacked_masks & np.isfinite(stacked_values)
+    valid_count = valid.sum(axis=0)
+
+    # Masked mean: sum of valid / count of valid
+    weighted_sum = np.where(valid, stacked_values, 0.0).sum(axis=0)
+    combined_values = np.divide(
+        weighted_sum,
+        np.where(valid_count > 0, valid_count, 1.0),
+    )
+
+    # Union mask: any variant observed
+    combined_mask = np.any(valid, axis=0)
+
+    return combined_values, combined_mask
 
 
 def _get_observed_mask(dataset: xr.Dataset, var_name: str) -> np.ndarray:
@@ -148,7 +187,7 @@ def _load_canonical_data(
         var_name = SERIES_VARIABLES[series_name]
 
         if series_name == "wastewater":
-            # Special handling: aggregate biomarker variants
+            # Special handling: aggregate biomarker variants with masked mean
             variants = _discover_biomarker_variants(dataset)
             if not variants:
                 logger.warning("No biomarker variants found, skipping wastewater")
@@ -156,14 +195,10 @@ def _load_canonical_data(
             logger.info(
                 "Aggregating %d biomarker variants: %s", len(variants), variants
             )
-            values[series_name] = _aggregate_biomarker_mean(dataset, variants)
-
-            # Compute combined mask (any variant observed counts as observed)
-            combined_mask = np.zeros(values[series_name].shape, dtype=bool)
-            for v in variants:
-                variant_mask = _get_observed_mask(dataset, v)
-                combined_mask |= variant_mask
-            masks[series_name] = combined_mask
+            # Use masked mean matching training pipeline
+            values[series_name], masks[series_name] = _aggregate_biomarker_mean(
+                dataset, variants
+            )
         else:
             if var_name not in dataset:
                 logger.warning(
@@ -379,7 +414,7 @@ def plot_pairwise_scatter_grid(
                         color="steelblue",
                         edgecolor="white",
                     )
-                ax.set_xlabel(name_i)
+                ax.set_xlabel(SERIES_LABELS.get(name_i, name_i))
                 ax.set_ylabel("Count")
             else:
                 # Off-diagonal: scatter
@@ -410,8 +445,8 @@ def plot_pairwise_scatter_grid(
                         bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
                     )
 
-                ax.set_xlabel(name_j)
-                ax.set_ylabel(name_i)
+                ax.set_xlabel(SERIES_LABELS.get(name_j, name_j))
+                ax.set_ylabel(SERIES_LABELS.get(name_i, name_i))
 
             ax.grid(True, alpha=0.3)
 
@@ -453,6 +488,9 @@ def plot_correlation_heatmap(
     # Combine: lower triangle = Pearson, upper triangle = Spearman
     combined = np.tril(pearson_matrix) + np.triu(spearman_matrix, k=1)
 
+    # Map series names to labeled versions for display
+    labeled_names = [SERIES_LABELS.get(name, name) for name in series_names]
+
     fig, ax = plt.subplots(figsize=(8, 7))
 
     # Custom annotation
@@ -474,8 +512,8 @@ def plot_correlation_heatmap(
         cmap="RdBu_r",
         vmin=-1,
         vmax=1,
-        xticklabels=series_names,
-        yticklabels=series_names,
+        xticklabels=labeled_names,
+        yticklabels=labeled_names,
         cbar_kws={"label": "Correlation"},
     )
 

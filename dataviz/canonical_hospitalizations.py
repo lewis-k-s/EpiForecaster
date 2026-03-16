@@ -127,8 +127,8 @@ def plot_municipality_series(
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
     ax.set_xlabel("Date")
-    ax.set_ylabel("Daily Hospitalizations")
-    ax.set_title("Daily Hospitalizations by Municipality")
+    ax.set_ylabel("Hospitalizations log₁₊(per-100k)")
+    ax.set_title("Hospitalizations by Municipality")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(loc="upper left")
@@ -161,8 +161,8 @@ def plot_weekly_comparison(
         )
 
     axes[0].set_xlabel("Date")
-    axes[0].set_ylabel("Daily Hospitalizations")
-    axes[0].set_title("Daily Hospitalizations (Smoothed)")
+    axes[0].set_ylabel("Hospitalizations log₁₊(per-100k)")
+    axes[0].set_title("Hospitalizations (Smoothed)")
     axes[0].legend(loc="upper left", fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
@@ -188,7 +188,7 @@ def plot_weekly_comparison(
         )
 
     axes[1].set_xlabel("Week Start Date")
-    axes[1].set_ylabel("Weekly Hospitalizations (Sum)")
+    axes[1].set_ylabel("Weekly Sum log₁₊(per-100k)")
     axes[1].set_title("Weekly Aggregated Hospitalizations (7-day Sum)")
     axes[1].legend(loc="upper left", fontsize=8)
     axes[1].grid(True, alpha=0.3)

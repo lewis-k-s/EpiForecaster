@@ -1,5 +1,4 @@
 import logging
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -10,13 +9,14 @@ import torch.nn.functional as F
 # type: ignore[import-not-found] (PyTorch Geometric has incomplete type stubs)
 from torch_geometric.data import Batch
 
-from utils.compiled_batch import COMPILED_BATCH_TENSOR_KEYS
+from utils.precision_policy import MODEL_PARAM_DTYPE
 from .configs import (
     InitWeightsConfig,
     ModelVariant,
     ObservationHeadConfig,
     SIRPhysicsConfig,
 )
+from .anchor_utils import resolve_last_valid_anchor
 from .mobility_gnn import MobilityDenseEncoder
 from .observation_heads import ClinicalObservationHead, WastewaterObservationHead
 from .sir_rollforward import SIRRollForward
@@ -103,7 +103,7 @@ class EpiForecaster(nn.Module):
         self.population_dim = population_dim
         self.device = device or torch.device("cpu")
         self.gnn_module = gnn_module
-        self.dtype = torch.float32
+        self.dtype = MODEL_PARAM_DTYPE
         self.temporal_covariates_dim = temporal_covariates_dim
         self.head_positional_encoding = head_positional_encoding
         self.strict = strict
@@ -172,6 +172,8 @@ class EpiForecaster(nn.Module):
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
             strict=self.strict,
+            delta_forecasting=observation_heads.delta_forecasting,
+            anchor_mode=observation_heads.anchor_mode,
         )
 
         # Hospitalization head
@@ -182,6 +184,8 @@ class EpiForecaster(nn.Module):
             learnable_kernel=observation_heads.learnable_kernel_hosp,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            delta_forecasting=observation_heads.delta_forecasting,
+            anchor_mode=observation_heads.anchor_mode,
         )
 
         # Cases head (reported cases observation)
@@ -192,6 +196,8 @@ class EpiForecaster(nn.Module):
             learnable_kernel=observation_heads.learnable_kernel_cases,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            delta_forecasting=observation_heads.delta_forecasting,
+            anchor_mode=observation_heads.anchor_mode,
         )
 
         # Deaths head (mortality observation)
@@ -203,10 +209,12 @@ class EpiForecaster(nn.Module):
             learnable_kernel=observation_heads.learnable_kernel_deaths,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            delta_forecasting=False, # Do not anchor deaths since death_flow lacks t=0 nowcast
+            anchor_mode="disabled",
         )
 
-        # Cast all parameters to float32
-        self.to(torch.float32)
+        # Cast all parameters to the canonical model parameter dtype.
+        self.to(MODEL_PARAM_DTYPE)
 
         # Store parameter counts for logging
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -227,6 +235,8 @@ class EpiForecaster(nn.Module):
         region_embeddings: torch.Tensor | None = None,
         population: torch.Tensor | None = None,
         temporal_covariates: torch.Tensor | None = None,
+        ww_hist: torch.Tensor | None = None,
+        ww_hist_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass of joint inference EpiForecaster.
@@ -236,6 +246,9 @@ class EpiForecaster(nn.Module):
             deaths_hist: Deaths history [batch_size, seq_len, 3] (value, mask, age)
             cases_hist: Reported cases history [batch_size, seq_len, 3] (value, mask, age)
             biomarkers_hist: Historical biomarker measurements [batch_size, seq_len, biomarkers_dim]
+                using `[value, mask, censor, age] * variants + has_data` layout.
+            ww_hist: Optional wastewater history [batch_size, seq_len] in target log1p space.
+            ww_hist_mask: Optional wastewater history mask [batch_size, seq_len] in target space.
             mob_graphs: PyG Batch-like mobility container (B*T dense graphs)
             target_nodes: Indices of target nodes in the global region list [batch_size]
             region_embeddings: Optional static region embeddings [num_regions, region_embedding_dim]
@@ -277,6 +290,7 @@ class EpiForecaster(nn.Module):
             features.append(deaths_hist)
             features.append(cases_hist)
         if self.variant_type.biomarkers:
+            self._validate_biomarker_layout(biomarkers_hist)
             features.append(biomarkers_hist)
 
         if self.variant_type.mobility:
@@ -359,31 +373,63 @@ class EpiForecaster(nn.Module):
         # Use the first forecast context as a proxy for t=0.
         obs_context_with_init = torch.cat([obs_context[:, :1, :], obs_context], dim=1)
 
+        hosp_last = hosp_last_mask = None
+        cases_last = cases_last_mask = None
+        ww_last = ww_last_mask = None
+
+        if (
+            self.observation_heads_config.delta_forecasting
+            and self.observation_heads_config.anchor_mode != "disabled"
+        ):
+            if self.variant_type.cases:
+                hosp_last, hosp_last_mask = resolve_last_valid_anchor(
+                    hosp_hist[:, :, 0], hosp_hist[:, :, 1]
+                )
+                cases_last, cases_last_mask = resolve_last_valid_anchor(
+                    cases_hist[:, :, 0], cases_hist[:, :, 1]
+                )
+
+            if self.variant_type.biomarkers:
+                if ww_hist is None or ww_hist_mask is None:
+                    raise ValueError(
+                        "ww_hist and ww_hist_mask are required for wastewater anchoring "
+                        "when biomarkers and delta forecasting are enabled."
+                    )
+                ww_last, ww_last_mask = resolve_last_valid_anchor(ww_hist, ww_hist_mask)
+
         # Wastewater prediction
         # SIR is modeled in fraction space (S+I+R=1), so population N=1.0
         pred_ww = self.ww_head(
             I_trajectory=I_traj,
             population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
             obs_context=obs_context_with_init,
+            last_observed=ww_last,
+            last_observed_mask=ww_last_mask,
         )  # [B, H+1]
 
         # Hospitalization prediction
         pred_hosp = self.hosp_head(
             I_trajectory=I_traj,
             obs_context=obs_context_with_init,
+            last_observed=hosp_last,
+            last_observed_mask=hosp_last_mask,
         )  # [B, H+1]
 
         # Cases prediction (reported cases observation)
         pred_cases = self.cases_head(
             I_trajectory=I_traj,
             obs_context=obs_context_with_init,
+            last_observed=cases_last,
+            last_observed_mask=cases_last_mask,
         )  # [B, H+1]
 
         # Deaths prediction (mortality observation)
         # Input is death_flow (fraction dying)
+        # Note: death_flow lacks t=0 nowcast, so we don't anchor it with delta_forecasting
         pred_deaths = self.deaths_head(
             I_trajectory=death_flow,
             obs_context=obs_context,
+            last_observed=None,
         )  # [B, H]
 
         # Note: Predictions include t=0 (nowcast) and are [B, H+1] or [B, H].
@@ -441,6 +487,8 @@ class EpiForecaster(nn.Module):
         # Mask ablated inputs directly on the batch object
         if mask_ww and batch_data.bio_node is not None:
             batch_data.bio_node = torch.zeros_like(batch_data.bio_node)
+            batch_data.ww_hist = torch.zeros_like(batch_data.ww_hist)
+            batch_data.ww_hist_mask = torch.zeros_like(batch_data.ww_hist_mask)
         if mask_hosp and batch_data.hosp_hist is not None:
             batch_data.hosp_hist = torch.zeros_like(batch_data.hosp_hist)
         if mask_cases and batch_data.cases_hist is not None:
@@ -473,6 +521,8 @@ class EpiForecaster(nn.Module):
             deaths_hist=batch_data.deaths_hist,
             cases_hist=batch_data.cases_hist,
             biomarkers_hist=batch_data.bio_node,
+            ww_hist=batch_data.ww_hist,
+            ww_hist_mask=batch_data.ww_hist_mask,
             mob_graphs=mob_batch,
             target_nodes=target_nodes,
             region_embeddings=region_embeddings,
@@ -522,6 +572,22 @@ class EpiForecaster(nn.Module):
         if self.variant_type.biomarkers:
             dim += self.biomarkers_dim
         return dim
+
+    @staticmethod
+    def _validate_biomarker_layout(biomarkers_hist: torch.Tensor) -> None:
+        """Validate `[value, mask, censor, age] * variants + has_data` biomarker layout."""
+        if biomarkers_hist.ndim != 3:
+            raise ValueError(
+                f"Expected biomarkers_hist to have shape [B, T, D], got {biomarkers_hist.shape}"
+            )
+        feature_dim = biomarkers_hist.shape[-1]
+        core_dim = feature_dim - 1
+        if core_dim <= 0 or core_dim % 4 != 0:
+            raise ValueError(
+                "Expected biomarkers_hist feature dim to follow "
+                "`[value, mask, censor, age] * variants + has_data`; "
+                f"got trailing dimension {feature_dim}"
+            )
 
     def _get_backbone_input_dim(self) -> int:
         """Compute backbone input dimension based on enabled variants."""
@@ -641,14 +707,17 @@ class EpiForecaster(nn.Module):
         return target_embeddings.view(B, T, self.mobility_embedding_dim)
 
     def to(self, *args, **kwargs):
-        """Override to update self.device when model is moved to a new device."""
+        """Override to update cached device/dtype when model is moved."""
         result = super().to(*args, **kwargs)
-        if args:
-            device_arg = args[0]
-            if isinstance(device_arg, (str, torch.device)):
-                self.device = torch.device(device_arg)
-        elif "device" in kwargs:
+        for arg in args:
+            if isinstance(arg, (str, torch.device)):
+                self.device = torch.device(arg)
+            elif isinstance(arg, torch.dtype):
+                self.dtype = arg
+        if "device" in kwargs:
             self.device = torch.device(kwargs["device"])
+        if "dtype" in kwargs and kwargs["dtype"] is not None:
+            self.dtype = kwargs["dtype"]
         return result
 
     def __repr__(self) -> str:

@@ -263,7 +263,7 @@ def test_getitem_maps_target_and_context_nodes_to_canonical_region_indices(tmp_p
     )
 
     item = dataset[0]
-    if item["node_label"] == 0:
+    if item["target_node"] == 0:
         assert item["target_region_index"] == 1
     else:
         assert item["target_region_index"] == 0

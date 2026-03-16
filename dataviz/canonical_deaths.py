@@ -125,8 +125,8 @@ def plot_municipality_series(
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
     ax.set_xlabel("Date")
-    ax.set_ylabel("Daily Deaths")
-    ax.set_title("Daily Deaths by Municipality")
+    ax.set_ylabel("Deaths log₁₊(per-100k)")
+    ax.set_title("Deaths by Municipality")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
         ax.legend(loc="upper left")
@@ -159,8 +159,8 @@ def plot_weekly_comparison(
         )
 
     axes[0].set_xlabel("Date")
-    axes[0].set_ylabel("Daily Deaths")
-    axes[0].set_title("Daily Deaths")
+    axes[0].set_ylabel("Deaths log₁₊(per-100k)")
+    axes[0].set_title("Deaths")
     axes[0].legend(loc="upper left", fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
@@ -187,7 +187,7 @@ def plot_weekly_comparison(
         )
 
     axes[1].set_xlabel("Week Start Date")
-    axes[1].set_ylabel("Weekly Deaths (Sum)")
+    axes[1].set_ylabel("Weekly Sum log₁₊(per-100k)")
     axes[1].set_title("Weekly Aggregated Deaths (7-day Sum)")
     axes[1].legend(loc="upper left", fontsize=8)
     axes[1].grid(True, alpha=0.3)

@@ -75,6 +75,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance = MagicMock()
         mock_dataset_instance.cases_output_dim = 1
         mock_dataset_instance.biomarkers_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset_instance.__len__.return_value = 100
         mock_dataset_instance.target_nodes = list(range(10))
         mock_dataset_cls.return_value = mock_dataset_instance
@@ -120,6 +121,7 @@ class TestEpiForecasterTrainer:
         # Mock dataset
         mock_dataset_instance = MagicMock()
         mock_dataset_instance.cases_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset.return_value = mock_dataset_instance
         mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
 
@@ -148,6 +150,7 @@ class TestEpiForecasterTrainer:
         # Mock dataset
         mock_dataset_instance = MagicMock()
         mock_dataset_instance.cases_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset.return_value = mock_dataset_instance
         mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
 
@@ -193,6 +196,7 @@ class TestEpiForecasterTrainer:
 
         mock_dataset_instance = MagicMock()
         mock_dataset_instance.cases_output_dim = 1
+        mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset.return_value = mock_dataset_instance
         mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
 
@@ -260,7 +264,9 @@ class TestEpiForecasterTrainer:
             synth_run_ids=["synth1"],
             region_embedding_store=None,
         )
-        with patch("training.epiforecaster_trainer.build_datasets", return_value=mock_splits):
+        with patch(
+            "training.epiforecaster_trainer.build_datasets", return_value=mock_splits
+        ):
             with patch(
                 "training.epiforecaster_trainer.build_dataloaders",
                 return_value=mock_loader_bundle,

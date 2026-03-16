@@ -6,8 +6,10 @@ import pytest
 import torch
 
 from utils.precision_policy import (
+    MODEL_PARAM_DTYPE,
     PrecisionPolicy,
     create_precision_signature,
+    model_scalar,
     resolve_precision_policy,
     validate_old_checkpoint_compatible,
 )
@@ -15,6 +17,14 @@ from utils.precision_policy import (
 
 class TestPrecisionPolicy:
     """Test suite for PrecisionPolicy dataclass."""
+
+    def test_model_scalar_defaults_to_param_dtype(self):
+        """Runtime scalar helper should default to model parameter dtype."""
+        scalar = model_scalar(1.25)
+
+        assert scalar.dtype == MODEL_PARAM_DTYPE
+        assert scalar.shape == ()
+        assert scalar.item() == pytest.approx(1.25)
 
     def test_default_fp32_policy(self):
         """Default policy should be FP32 with no autocast."""

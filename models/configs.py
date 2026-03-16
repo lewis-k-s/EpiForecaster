@@ -338,6 +338,10 @@ class ObservationHeadConfig:
     # Observation context dimension
     obs_context_dim: int = 96
 
+    # Structural continuity
+    delta_forecasting: bool = False
+    anchor_mode: str = "last_valid_step"
+
     def __post_init__(self) -> None:
         for name, value in [
             ("kernel_length_ww", self.kernel_length_ww),
@@ -354,6 +358,11 @@ class ObservationHeadConfig:
         if self.residual_hidden_dim <= 0:
             raise ValueError(
                 f"residual_hidden_dim must be positive, got {self.residual_hidden_dim}"
+            )
+        if self.anchor_mode not in {"last_valid_step", "disabled"}:
+            raise ValueError(
+                "anchor_mode must be one of {'last_valid_step', 'disabled'}, "
+                f"got {self.anchor_mode!r}"
             )
         if self.residual_layers < 0:
             raise ValueError(

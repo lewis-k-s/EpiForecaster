@@ -497,8 +497,8 @@ class TestClinicalObservationHead:
 
         no_context = head(I_trajectory, obs_context=None)
         with_context = head(I_trajectory, obs_context=obs_context)
-        # Relaxed tolerance for float16 precision
-        assert torch.allclose(no_context, with_context, atol=1e-3)
+        # Relaxed tolerance for small random init in residual_proj
+        assert torch.allclose(no_context, with_context, atol=1e-2)
 
     @pytest.mark.device
     def test_forward_on_accelerator_after_module_transfer(self, accelerator_device):
@@ -521,6 +521,45 @@ class TestClinicalObservationHead:
 
         assert output.device.type == accelerator_device.type
         assert torch.isfinite(output).all()
+
+    def test_delta_forecasting_uses_explicit_mask(self):
+        """Anchoring should follow the provided mask rather than value finiteness."""
+        head = ClinicalObservationHead(
+            learnable_kernel=False,
+            learnable_scale=False,
+            delta_forecasting=True,
+        )
+        I_trajectory = _ones_tensor(1, 6) * 0.001
+
+        anchored = head(
+            I_trajectory,
+            last_observed=torch.tensor([2.0]),
+            last_observed_mask=torch.tensor([1.0]),
+        )
+        unanchored = head(
+            I_trajectory,
+            last_observed=torch.tensor([2.0]),
+            last_observed_mask=torch.tensor([0.0]),
+        )
+
+        assert anchored[0, 0].item() == pytest.approx(2.0, abs=1e-6)
+        assert anchored[0, 0].item() != pytest.approx(unanchored[0, 0].item(), abs=1e-6)
+
+    def test_delta_forecasting_can_be_disabled_even_with_anchor_inputs(self):
+        head = ClinicalObservationHead(
+            learnable_kernel=False,
+            learnable_scale=False,
+            delta_forecasting=True,
+            anchor_mode="disabled",
+        )
+        I_trajectory = _ones_tensor(1, 6) * 0.001
+        output = head(
+            I_trajectory,
+            last_observed=torch.tensor([5.0]),
+            last_observed_mask=torch.tensor([1.0]),
+        )
+        baseline = head(I_trajectory)
+        assert torch.allclose(output, baseline)
 
 
 class TestWastewaterObservationHead:
@@ -593,8 +632,8 @@ class TestWastewaterObservationHead:
 
         no_context = head(I_trajectory, population, obs_context=None)
         with_context = head(I_trajectory, population, obs_context=obs_context)
-        # Relaxed tolerance for float16 precision
-        assert torch.allclose(no_context, with_context, atol=1e-3)
+        # Relaxed tolerance for small random init in residual_proj
+        assert torch.allclose(no_context, with_context, atol=1e-2)
 
     @pytest.mark.device
     def test_forward_on_accelerator_after_module_transfer(self, accelerator_device):
@@ -609,7 +648,9 @@ class TestWastewaterObservationHead:
         assert head.alpha is not None
         assert head.alpha.device.type == accelerator_device.type
         assert head.shedding_conv.kernel.device.type == accelerator_device.type
-        assert head.shedding_conv.sensitivity_scale.device.type == accelerator_device.type
+        assert (
+            head.shedding_conv.sensitivity_scale.device.type == accelerator_device.type
+        )
 
         I_trajectory = _rand_tensor(2, 12).to(accelerator_device) * 0.1
         population = (_ones_tensor(2, 12) * 1000.0).to(accelerator_device)
@@ -619,6 +660,23 @@ class TestWastewaterObservationHead:
 
         assert output.device.type == accelerator_device.type
         assert torch.isfinite(output).all()
+
+    def test_delta_forecasting_skips_when_anchor_mask_missing(self):
+        head = WastewaterObservationHead(
+            learnable_kernel=False,
+            learnable_scale=False,
+            delta_forecasting=True,
+        )
+        I_trajectory = _ones_tensor(1, 6) * 0.001
+        population = _ones_tensor(1, 6)
+        output = head(
+            I_trajectory,
+            population,
+            last_observed=torch.tensor([4.0]),
+            last_observed_mask=torch.tensor([0.0]),
+        )
+        baseline = head(I_trajectory, population)
+        assert torch.allclose(output, baseline)
 
 
 class TestIntegration:

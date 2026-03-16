@@ -29,6 +29,8 @@ class EpiBatch:
     temporal_covariates: torch.Tensor  # (B, L, cov_dim)
 
     # Joint inference targets
+    ww_hist: torch.Tensor  # (B, L)
+    ww_hist_mask: torch.Tensor  # (B, L)
     hosp_target: torch.Tensor  # (B, H)
     ww_target: torch.Tensor  # (B, H)
     cases_target: torch.Tensor  # (B, H)
@@ -180,6 +182,8 @@ def collate_epiforecaster_batch(
     population = torch.stack([item["population"] for item in batch], dim=0)
 
     # Stack joint inference targets (log1p per-100k)
+    ww_hist = torch.stack([item["ww_hist"] for item in batch], dim=0)
+    ww_hist_mask = torch.stack([item["ww_hist_mask"] for item in batch], dim=0)
     hosp_targets = torch.stack([item["hosp_target"] for item in batch], dim=0)
     ww_targets = torch.stack([item["ww_target"] for item in batch], dim=0)
     cases_targets = torch.stack([item["cases_target"] for item in batch], dim=0)
@@ -208,6 +212,8 @@ def collate_epiforecaster_batch(
     cases_hist = _replace_non_finite(cases_hist)
     bio_node = _replace_non_finite(bio_node)
     temporal_covariates = _replace_non_finite(temporal_covariates)
+    ww_hist = _replace_non_finite(ww_hist)
+    ww_hist_mask = _replace_non_finite(ww_hist_mask)
 
     # Store B and T on the batch for downstream reshaping
     T = batch[0]["mob_x"].shape[0] if B > 0 else 0
@@ -237,6 +243,8 @@ def collate_epiforecaster_batch(
         window_start=window_starts,
         node_labels=[item["node_label"] for item in batch],
         temporal_covariates=temporal_covariates,
+        ww_hist=ww_hist,
+        ww_hist_mask=ww_hist_mask,
         hosp_target=hosp_targets,
         ww_target=ww_targets,
         cases_target=cases_targets,
