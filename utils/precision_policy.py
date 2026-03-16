@@ -22,6 +22,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MODEL_PARAM_DTYPE = torch.float32
+
+
+def model_scalar(value: float, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Create a scalar tensor in the canonical model parameter dtype."""
+    return torch.tensor(float(value), dtype=dtype or MODEL_PARAM_DTYPE)
+
 
 @dataclass(frozen=True)
 class PrecisionPolicy:
@@ -92,7 +99,7 @@ def resolve_precision_policy(
         ValueError: If unsupported precision configuration is detected
     """
     # Always use float32 for parameters
-    param_dtype = torch.float32
+    param_dtype = MODEL_PARAM_DTYPE
 
     # Determine autocast settings
     autocast_enabled = False
