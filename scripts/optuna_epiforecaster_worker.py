@@ -218,6 +218,10 @@ def suggest_epiforecaster_params(
     overrides["model.observation_heads.residual_dropout"] = 0.1
     overrides["model.observation_heads.learnable_kernel_ww"] = False
     overrides["model.observation_heads.learnable_kernel_hosp"] = False
+    overrides["model.observation_heads.delta_forecasting"] = trial.suggest_categorical(
+        "model.observation_heads.delta_forecasting",
+        _categorical_choices((False, True)),
+    )
 
     # --- mobility graph knobs (conditional) ---
     if base_cfg.model.type.mobility:

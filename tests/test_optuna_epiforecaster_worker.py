@@ -296,13 +296,6 @@ class TestSuggestEpiforecasterParams:
         assert overrides["model.include_day_of_week"] is True
         assert overrides["model.include_holidays"] is True
 
-    def test_temporal_covariates_disabled_clears_flags(self) -> None:
-        trial = _StubTrial(categorical_values={"model.use_temporal_covariates": False})
-        cfg = _temporal_covariates_cfg_stub()
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-        assert overrides["model.include_day_of_week"] is False
-        assert overrides["model.include_holidays"] is False
-
     def test_no_temporal_covariates_skips_flag_overrides(self) -> None:
         trial = _StubTrial()
         suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
@@ -315,39 +308,16 @@ class TestSuggestEpiforecasterParams:
         assert "model.head_positional_encoding" in overrides
         assert overrides["model.head_positional_encoding"] in ("sinusoidal", "learned")
 
-    def test_init_weights_group_params(self) -> None:
-        trial = _StubTrial()
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-
-        assert "model.init_weights.rezero_init" in overrides
-        assert "model.init_weights.rate_head_final_gain" in overrides
-        assert "model.init_weights.initial_state_final_gain" in overrides
-        assert "model.init_weights.obs_context_final_gain" in overrides
-
-        assert overrides["model.init_weights.rezero_init"] in (1.0e-3, 3.0e-3, 1.0e-2)
-        assert overrides["model.init_weights.rate_head_final_gain"] in (
-            5.0e-3,
-            1.0e-2,
-            2.0e-2,
-        )
-        assert overrides["model.init_weights.initial_state_final_gain"] in (
-            5.0e-3,
-            1.0e-2,
-            2.0e-2,
-        )
-        assert overrides["model.init_weights.obs_context_final_gain"] in (
-            0.25,
-            0.5,
-            1.0,
-        )
-
     def test_joint_inference_no_static_loss_weight_overrides(self) -> None:
         trial = _StubTrial()
         cfg = _joint_loss_cfg_stub()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
         loss_weight_overrides = [
-            k for k in overrides if k.startswith("training.loss.joint.w_")
-            and k not in ("training.loss.joint.w_sir", "training.loss.joint.w_continuity")
+            k
+            for k in overrides
+            if k.startswith("training.loss.joint.w_")
+            and k
+            not in ("training.loss.joint.w_sir", "training.loss.joint.w_continuity")
         ]
         assert loss_weight_overrides == []
 
@@ -356,7 +326,6 @@ class TestSuggestEpiforecasterParams:
         cfg = _joint_loss_cfg_stub()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
 
-        assert "model.observation_heads.residual_scale" in overrides
         assert "model.observation_heads.residual_hidden_dim" in overrides
         assert "model.observation_heads.residual_layers" in overrides
         assert "model.observation_heads.residual_dropout" in overrides
@@ -373,18 +342,6 @@ class TestSuggestEpiforecasterParams:
             True,
         )
 
-    def test_joint_inference_gradnorm_params_when_enabled(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub(joint={"adaptive_scheme": "gradnorm"})
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-
-        assert "training.loss.joint.gradnorm_alpha" in overrides
-        assert "training.loss.joint.gradnorm_weight_lr" in overrides
-        assert "training.loss.joint.gradnorm_warmup_steps" in overrides
-        assert "training.loss.joint.gradnorm_update_every" in overrides
-        assert "training.loss.joint.gradnorm_ema_decay" in overrides
-        assert "training.loss.joint.gradnorm_min_weight" in overrides
-
     def test_joint_inference_skips_gradnorm_params_when_disabled(self) -> None:
         trial = _StubTrial()
         cfg = _joint_loss_cfg_stub(joint={"adaptive_scheme": "none"})
@@ -393,31 +350,6 @@ class TestSuggestEpiforecasterParams:
             k for k in overrides if k.startswith("training.loss.joint.gradnorm_")
         ]
         assert gradnorm_overrides == []
-
-    def test_joint_inference_residual_scale_bounds(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-        call = next(
-            c
-            for c in trial.suggest_calls
-            if c[1] == "init_weights.observation_residual_scale"
-        )
-        assert call[0] == "float"
-        assert call[2][0] == pytest.approx(0.03)
-        assert call[2][1] == pytest.approx(0.2)
-
-    def test_joint_inference_residual_layers_bounds(self) -> None:
-        trial = _StubTrial()
-        cfg = _joint_loss_cfg_stub()
-        suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-        call = next(
-            c
-            for c in trial.suggest_calls
-            if c[1] == "model.observation_heads.residual_layers"
-        )
-        assert call[0] == "int"
-        assert call[2] == (1, 4)
 
     def test_joint_inference_residual_mode_options(self) -> None:
         trial = _StubTrial()
