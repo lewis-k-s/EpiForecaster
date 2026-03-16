@@ -49,6 +49,8 @@ model:
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
+    include_day_of_week: true
+    include_holidays: true
     #-- SIR physics bounds (prevent gradient explosion) --#
     sir_physics:
       dt: 1.0

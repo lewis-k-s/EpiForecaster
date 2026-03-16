@@ -51,6 +51,8 @@ model:
       mortality_min: 0.0001
       mortality_max: 0.05
       residual_clip: 10000.0
+    observation_heads:
+      delta_forecasting: true
 
 output:
   experiment_name: mn5_epiforecaster
