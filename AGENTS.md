@@ -47,7 +47,7 @@ uv run main --help  # entrypoint cli.py
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.
 - Tensor ops: prefer `einops` (`rearrange`, `reduce`, `repeat`) for matrix/tensor manipulation over manual `view/reshape/permute` for clarity.
 - For Python types, prefer native list, dict, tuple instead of the typing library. Prefer the `x | None` notation over Optional
-- With our model and training config, use direct class attribute access instead of getattr. Config value defaults are defined on startup during yaml parsing, so runtime fallbacks are undesirable in most cases.
+- For all model and training config or feature flags, set values and defaults in our config dataclasses and use direct class attribute access instead of getattr. Config value defaults are defined on during yaml parsing, runtime fallbacks are undesirable in most cases.
 
 ## Testing Guidelines
 
