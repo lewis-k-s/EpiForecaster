@@ -52,6 +52,7 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
         },
         mob_batch=None,
     )
+    batch.to = lambda device, **_: batch
 
     loader = _DummyLoader([batch])
     criterion = JointInferenceLoss(

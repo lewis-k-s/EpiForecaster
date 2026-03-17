@@ -45,7 +45,7 @@ class _DummyModel(torch.nn.Module):
 
 
 def _make_batch() -> SimpleNamespace:
-    return SimpleNamespace(
+    batch = SimpleNamespace(
         target_node=torch.tensor([0, 1], dtype=torch.long),
         window_start=torch.tensor([0, 1], dtype=torch.long),
         node_labels=["region-a", "region-b"],
@@ -81,6 +81,8 @@ def _make_batch() -> SimpleNamespace:
         },
         mob_batch=None,
     )
+    batch.to = lambda device, **_: batch
+    return batch
 
 
 def _assert_metric_dicts_match(

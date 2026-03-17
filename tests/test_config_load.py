@@ -60,6 +60,8 @@ def test_load_config_without_overrides():
     assert (
         cfg.output.resolve_granular_eval_filename(split="test") == "test_granular.csv"
     )
+    assert cfg.training.node_split_strategy == "stratified"
+    assert cfg.training.node_split_population_bins == 5
 
 
 @pytest.mark.epiforecaster
@@ -120,6 +122,31 @@ def test_load_config_with_multiple_overrides_same_section():
     assert cfg.training.batch_size == 64
     assert cfg.training.epochs == 50
     assert cfg.training.early_stopping_patience == 15
+
+
+@pytest.mark.epiforecaster
+def test_load_config_with_node_split_overrides():
+    """Test that node split overrides load correctly."""
+    cfg = EpiForecasterConfig.load(
+        BASE_LOCAL_CONFIG,
+        overrides=[
+            "training.node_split_strategy=random",
+            "training.node_split_population_bins=4",
+        ],
+    )
+
+    assert cfg.training.node_split_strategy == "random"
+    assert cfg.training.node_split_population_bins == 4
+
+
+@pytest.mark.epiforecaster
+def test_load_config_rejects_invalid_node_split_strategy():
+    """Test that invalid node split strategy is rejected."""
+    with pytest.raises(ValueError, match="Invalid node_split_strategy"):
+        EpiForecasterConfig.load(
+            BASE_LOCAL_CONFIG,
+            overrides=["training.node_split_strategy=not_a_strategy"],
+        )
 
 
 @pytest.mark.epiforecaster

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from models.configs import EpiForecasterConfig, DataConfig, ModelConfig, ModelVariant
 from data.epi_dataset import EpiDataset
 from data.epi_batch import collate_epiforecaster_batch
+from utils.precision_policy import MODEL_PARAM_DTYPE
 
 
 class TestEpiDataset:
@@ -195,3 +196,20 @@ class TestEpiDataset:
             assert torch.isfinite(batch.bio_node).all()
             assert torch.isfinite(batch.temporal_covariates).all()
             assert torch.isfinite(batch.mob_batch.x_dense).all()
+            assert batch.hosp_hist.dtype == MODEL_PARAM_DTYPE
+            assert batch.deaths_hist.dtype == MODEL_PARAM_DTYPE
+            assert batch.cases_hist.dtype == MODEL_PARAM_DTYPE
+            assert batch.bio_node.dtype == MODEL_PARAM_DTYPE
+            assert batch.population.dtype == MODEL_PARAM_DTYPE
+            assert batch.temporal_covariates.dtype == MODEL_PARAM_DTYPE
+            assert batch.ww_hist.dtype == MODEL_PARAM_DTYPE
+            assert batch.ww_hist_mask.dtype == MODEL_PARAM_DTYPE
+            assert batch.hosp_target.dtype == MODEL_PARAM_DTYPE
+            assert batch.ww_target.dtype == MODEL_PARAM_DTYPE
+            assert batch.cases_target.dtype == MODEL_PARAM_DTYPE
+            assert batch.deaths_target.dtype == MODEL_PARAM_DTYPE
+            assert batch.hosp_target_mask.dtype == MODEL_PARAM_DTYPE
+            assert batch.ww_target_mask.dtype == MODEL_PARAM_DTYPE
+            assert batch.cases_target_mask.dtype == MODEL_PARAM_DTYPE
+            assert batch.deaths_target_mask.dtype == MODEL_PARAM_DTYPE
+            assert batch.mob_batch.x_dense.dtype == MODEL_PARAM_DTYPE

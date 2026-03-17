@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from data.epi_batch import optimized_collate_graphs
 from utils.training_utils import ensure_mobility_adj_dense_ready, inject_gpu_mobility
+from utils.precision_policy import MODEL_PARAM_DTYPE
 
 
 class _MobBatch:
@@ -46,6 +47,7 @@ def test_inject_gpu_mobility_uses_correct_concat_subdataset_by_run_id() -> None:
 
     adj_dense = batch_data.mob_batch.adj_dense
     assert adj_dense.shape == (1, 2, 2)
+    assert adj_dense.dtype == MODEL_PARAM_DTYPE
     assert float(adj_dense[0, 0, 1]) == pytest.approx(9.0, abs=1e-3)
     assert float(adj_dense[0, 0, 0]) == pytest.approx(1.0, abs=1e-3)
 
@@ -72,6 +74,8 @@ def test_inject_gpu_mobility_reuses_cached_tensor_without_crashing() -> None:
 
     assert float(first_adj[0, 0, 1]) == pytest.approx(1.0, abs=1e-3)
     assert float(second_adj[0, 0, 1]) == pytest.approx(3.0, abs=1e-3)
+    assert first_adj.dtype == MODEL_PARAM_DTYPE
+    assert second_adj.dtype == MODEL_PARAM_DTYPE
     assert hasattr(dataset, "_gpu_mobility_cache")
     assert len(dataset._gpu_mobility_cache) == 1
 

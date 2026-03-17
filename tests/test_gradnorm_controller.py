@@ -72,7 +72,6 @@ class _StepModel(torch.nn.Module):
         *,
         batch_data,
         region_embeddings=None,
-        skip_device_transfer=False,
         **kwargs,
     ):
         s = self.shared
@@ -189,7 +188,6 @@ def test_gradnorm_sidecar_keeps_global_cached_weights_when_head_inactive() -> No
         *,
         batch_data,
         region_embeddings=None,
-        skip_device_transfer=False,
         **kwargs,
     ):
         s = trainer.model.shared

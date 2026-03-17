@@ -284,7 +284,7 @@ class TestEpiForecaster:
             deaths_hist=dummy_batch["deaths_hist"],
             cases_hist=dummy_batch["cases_hist"],
             bio_node=dummy_batch["biomarkers_hist"],
-            mob_batch=torch.zeros(1),
+            mob_batch=Batch(),
             population=dummy_batch["population"],
             b=B,
             t=T,
@@ -304,6 +304,7 @@ class TestEpiForecaster:
             cases_target_mask=torch.ones(B, H),
             deaths_target_mask=torch.ones(B, H),
         )
+        batch_data = batch_data.to(model.device)
 
         outputs, targets = model.forward_batch(
             batch_data=batch_data, region_embeddings=dummy_batch["region_embeddings"]
@@ -313,8 +314,8 @@ class TestEpiForecaster:
         assert "cases" in targets
         assert targets["cases"].shape == (2, 7)
 
-    def test_forward_batch_casts_half_inputs_with_mobility(self, basic_config):
-        """Forward batch should align float inputs with model dtype."""
+    def test_forward_batch_uses_pretyped_mobility_inputs(self, basic_config):
+        """Forward batch should consume mobility tensors already in model dtype."""
         config = basic_config.copy()
         config["variant_type"] = ModelVariant(cases=True, mobility=True)
         config["gnn_hidden_dim"] = 8
@@ -329,10 +330,13 @@ class TestEpiForecaster:
         num_nodes = 4
         mob_batch = Batch()
         mob_batch.x_dense = _rand_tensor(
-            num_graphs, num_nodes, model.temporal_node_dim, dtype=torch.float64
+            num_graphs,
+            num_nodes,
+            model.temporal_node_dim,
+            dtype=expected_dtype,
         )
-        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes, dtype=torch.float64)
-        eye = torch.eye(num_nodes, dtype=torch.float64).unsqueeze(0)
+        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes, dtype=expected_dtype)
+        eye = torch.eye(num_nodes, dtype=expected_dtype).unsqueeze(0)
         mob_batch.adj_dense = torch.maximum(dense_adj, eye)
         mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
 
@@ -361,6 +365,7 @@ class TestEpiForecaster:
             cases_target_mask=torch.ones(B, horizon),
             deaths_target_mask=torch.ones(B, horizon),
         )
+        batch_data = batch_data.to(model.device)
 
         outputs, targets = model.forward_batch(batch_data=batch_data)
 
@@ -373,14 +378,7 @@ class TestEpiForecaster:
 
     @pytest.mark.device
     def test_forward_batch_cross_device(self, basic_config, accelerator_device):
-        """Test that forward_batch works when model is on accelerator and batch data on CPU.
-
-        This simulates the real training scenario where:
-        - Model is moved to GPU/MPS via .to(device)
-        - Batch data comes from DataLoader on CPU
-
-        Regression test for device mismatch bugs in forward_batch.
-        """
+        """Test that forward_batch works after explicit device transfer."""
         config = basic_config.copy()
         model = EpiForecaster(**config).to(accelerator_device)
 
@@ -392,7 +390,7 @@ class TestEpiForecaster:
             deaths_hist=_rand_tensor(B, T, 3),
             cases_hist=_rand_tensor(B, T, 3),
             bio_node=torch.zeros(B, T, 1, dtype=torch.float32),
-            mob_batch=torch.zeros(1),
+            mob_batch=Batch(),
             population=torch.full((B,), 1000.0, dtype=torch.float32),
             b=B,
             t=T,
@@ -412,6 +410,7 @@ class TestEpiForecaster:
             cases_target_mask=torch.ones(B, horizon),
             deaths_target_mask=torch.ones(B, horizon),
         )
+        batch_data = batch_data.to(accelerator_device)
 
         outputs, targets = model.forward_batch(batch_data=batch_data)
 
