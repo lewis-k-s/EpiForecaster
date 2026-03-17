@@ -6,11 +6,25 @@ from the raw data schemas.
 """
 
 import logging
-from typing import Literal
+from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
+if TYPE_CHECKING:
+    from data.epi_batch import EpiBatch
+
 PrecisionMode = Literal["tf32", "ieee"]
+
+
+@dataclass(frozen=True)
+class DeviceStreams:
+    """CUDA stream handles used to overlap transfer and compute."""
+
+    compute: torch.cuda.Stream | None = None
+    transfer: torch.cuda.Stream | None = None
+
 
 # =============================================================================
 # MODEL DTYPES (used for computation)
@@ -223,6 +237,107 @@ def resolve_device(device: str) -> torch.device:
 def _log(logger: logging.Logger | None, message: str) -> None:
     if logger:
         logger.info(message)
+
+
+def prefetch_enabled(prefetch_factor: int | None) -> bool:
+    """Return True when prefetching should be active for loaders and CUDA staging."""
+    return prefetch_factor is not None and prefetch_factor > 0
+
+
+def setup_device_streams(
+    device: torch.device,
+    logger: logging.Logger | None = None,
+) -> DeviceStreams:
+    """Create explicit compute/transfer CUDA streams for the active device."""
+    if device.type != "cuda":
+        _log(logger, "Device stream setup skipped (non-CUDA device)")
+        return DeviceStreams()
+
+    streams = DeviceStreams(
+        compute=torch.cuda.current_stream(device=device),
+        transfer=torch.cuda.Stream(device=device),
+    )
+    _log(logger, "Configured CUDA compute and transfer streams")
+    return streams
+
+
+def prepare_batch_for_device(
+    batch_data: "EpiBatch",
+    *,
+    dataset: object | None,
+    device: torch.device,
+    non_blocking: bool = True,
+) -> "EpiBatch":
+    """Inject mobility and move a dtype-normalized batch to the target device."""
+    if dataset is not None:
+        from utils.training_utils import inject_gpu_mobility
+
+        inject_gpu_mobility(batch_data, dataset, device)
+
+    return batch_data.to(
+        device=device,
+        non_blocking=non_blocking,
+    )
+
+
+def iter_device_ready_batches(
+    loader: object,
+    *,
+    device: torch.device,
+    prefetch_factor: int | None = None,
+    streams: DeviceStreams | None = None,
+) -> Iterator["EpiBatch"]:
+    """Yield batches after mobility injection and device transfer.
+
+    On CUDA with enabled prefetch, the next batch is staged on a dedicated transfer
+    stream while the current batch remains available to the compute stream.
+    """
+    dataset = getattr(loader, "dataset", None)
+
+    if device.type != "cuda" or not prefetch_enabled(prefetch_factor):
+        for batch_data in loader:
+            yield prepare_batch_for_device(
+                batch_data,
+                dataset=dataset,
+                device=device,
+            )
+        return
+
+    active_streams = streams or setup_device_streams(device)
+    compute_stream = active_streams.compute or torch.cuda.current_stream(device=device)
+    transfer_stream = active_streams.transfer
+    if transfer_stream is None:
+        for batch_data in loader:
+            yield prepare_batch_for_device(
+                batch_data,
+                dataset=dataset,
+                device=device,
+            )
+        return
+
+    iterator = iter(loader)
+
+    def _preload() -> "EpiBatch" | None:
+        try:
+            batch_data = next(iterator)
+        except StopIteration:
+            return None
+
+        with torch.cuda.stream(transfer_stream):
+            return prepare_batch_for_device(
+                batch_data,
+                dataset=dataset,
+                device=device,
+                non_blocking=True,
+            )
+
+    next_batch = _preload()
+    while next_batch is not None:
+        compute_stream.wait_stream(transfer_stream)
+        batch_data = next_batch
+        batch_data.record_stream(compute_stream)
+        next_batch = _preload()
+        yield batch_data
 
 
 def setup_tensor_core_optimizations(
