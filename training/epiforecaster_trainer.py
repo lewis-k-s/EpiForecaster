@@ -42,7 +42,11 @@ from training.dataloader_factory import (
 )
 from training.gradnorm import GradNormController
 from training.optim_factory import create_optimizer, create_scheduler
-from utils.device import setup_tensor_core_optimizations
+from utils.device import (
+    iter_device_ready_batches,
+    setup_device_streams,
+    setup_tensor_core_optimizations,
+)
 from utils.gradnorm_logging import (
     did_gradnorm_sidecar_run,
     format_gradnorm_controller_status,
@@ -276,6 +280,7 @@ class EpiForecasterTrainer:
 
         # Enable TF32 for better performance on Ampere+ GPUs
         self._setup_tensor_core_optimizations()
+        self.device_streams = setup_device_streams(self.device, logger=logger)
 
         # Pre-compute parameter groups for efficient gradient norm logging
         self._init_gradient_norm_groups()
@@ -1170,7 +1175,6 @@ class EpiForecasterTrainer:
             model_outputs, targets_dict = self.model.forward_batch(
                 batch_data=batch_data,
                 region_embeddings=self.region_embeddings,
-                skip_device_transfer=True,  # Tensors already moved by _move_batch_to_device
                 mask_cases=self.criterion.mask_input_cases,
                 mask_ww=self.criterion.mask_input_ww,
                 mask_hosp=self.criterion.mask_input_hosp,
@@ -1196,7 +1200,6 @@ class EpiForecasterTrainer:
             model_outputs, targets_dict = self.model.forward_batch(
                 batch_data=batch_data,
                 region_embeddings=self.region_embeddings,
-                skip_device_transfer=True,
                 mask_cases=self.criterion.mask_input_cases,
                 mask_ww=self.criterion.mask_input_ww,
                 mask_hosp=self.criterion.mask_input_hosp,
@@ -1248,7 +1251,6 @@ class EpiForecasterTrainer:
             model_outputs, targets_dict = self.model.forward_batch(
                 batch_data=batch_data,
                 region_embeddings=self.region_embeddings,
-                skip_device_transfer=True,
             )
             components = self.criterion.compute_components_train(
                 model_outputs, targets_dict, batch_data
@@ -1443,7 +1445,12 @@ class EpiForecasterTrainer:
         _num_batches = len(self.train_loader)
         counted_batches = 0
 
-        train_iter = self.train_loader
+        train_iter = iter_device_ready_batches(
+            self.train_loader,
+            device=self.device,
+            prefetch_factor=self.config.training.prefetch_factor,
+            streams=self.device_streams,
+        )
         profiler = None
         profiler_active = False
         profiler_complete_announced = False
@@ -1487,20 +1494,9 @@ class EpiForecasterTrainer:
                 data_time_s = time.time() - fetch_start_time
                 batch_start_time = time.time()
 
-                # Reconstruct massive dense graph tensors on the GPU directly
-                # bypassing dataloader worker IPC queue.
-                from utils.training_utils import (
-                    ensure_mobility_adj_dense_ready,
-                    inject_gpu_mobility,
-                )
-
-                inject_gpu_mobility(batch_data, train_iter.dataset, self.device)
-
-                # Execute training step: either compiled (fast) or eager (debuggable)
-                # Move all tensors to device before training step to avoid DeviceCopy ops
-                batch_data = batch_data.to(
-                    device=self.device, dtype=self.precision_policy.param_dtype
-                )
+                # Reconstruct massive dense graph tensors on the GPU directly and move
+                # the full batch to device before the model sees it.
+                from utils.training_utils import ensure_mobility_adj_dense_ready
 
                 model_step_start_time = time.time()
                 if self._gradnorm_enabled:

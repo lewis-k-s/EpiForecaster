@@ -21,7 +21,7 @@ from data.epi_batch import collate_epiforecaster_batch
 from data.epi_dataset import EpiDataset
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
-from utils.device import resolve_device
+from utils.device import prefetch_enabled, resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +185,9 @@ def build_loader_from_config(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=config.training.prefetch_factor
+        if prefetch_enabled(config.training.prefetch_factor) and num_workers > 0
+        else None,
         collate_fn=partial(
             collate_epiforecaster_batch,
             require_region_index=bool(config.model.type.regions),

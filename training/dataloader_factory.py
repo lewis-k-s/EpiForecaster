@@ -20,6 +20,7 @@ from data.epi_batch import collate_epiforecaster_batch
 from data.epi_dataset import EpiDataset
 from data.samplers import EpidemicCurriculumSampler, ShuffledBatchSampler
 from models.configs import CurriculumConfig, ModelVariant, TrainingParams
+from utils.device import prefetch_enabled
 from utils.platform import select_multiprocessing_context
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ def build_dataloaders(
 
     if persistent_workers:
         train_loader_kwargs["persistent_workers"] = True
-    if training_config.prefetch_factor is not None and num_workers > 0:
+    if prefetch_enabled(training_config.prefetch_factor) and num_workers > 0:
         train_loader_kwargs["prefetch_factor"] = training_config.prefetch_factor
 
     train_loader = DataLoader(**train_loader_kwargs)
@@ -161,7 +162,7 @@ def build_dataloaders(
         val_loader_kwargs["multiprocessing_context"] = mp_context
     if val_persistent_workers:
         val_loader_kwargs["persistent_workers"] = True
-    if training_config.prefetch_factor is not None and val_num_workers > 0:
+    if prefetch_enabled(training_config.prefetch_factor) and val_num_workers > 0:
         val_loader_kwargs["prefetch_factor"] = training_config.prefetch_factor
     val_loader = DataLoader(**val_loader_kwargs)
 
@@ -180,7 +181,7 @@ def build_dataloaders(
         test_loader_kwargs["multiprocessing_context"] = mp_context
     if test_persistent_workers:
         test_loader_kwargs["persistent_workers"] = True
-    if training_config.prefetch_factor is not None and test_num_workers > 0:
+    if prefetch_enabled(training_config.prefetch_factor) and test_num_workers > 0:
         test_loader_kwargs["prefetch_factor"] = training_config.prefetch_factor
     test_loader = DataLoader(**test_loader_kwargs)
 

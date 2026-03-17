@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
-from utils.training_utils import inject_gpu_mobility
+from utils.device import prepare_batch_for_device
 
 logger = logging.getLogger(__name__)
 
@@ -18,25 +18,25 @@ logger = logging.getLogger(__name__)
 TARGET_PLOT_SPECS: dict[str, dict[str, str]] = {
     "hosp": {
         "model_output": "pred_hosp",
-        "batch_target": "HospTarget",
+        "batch_target": "hosp_target",
         "dataset_attr": "precomputed_hosp",
         "label": "Hospitalizations",
     },
     "ww": {
         "model_output": "pred_ww",
-        "batch_target": "WWTarget",
+        "batch_target": "ww_target",
         "dataset_attr": "precomputed_ww",
         "label": "Wastewater",
     },
     "cases": {
         "model_output": "pred_cases",
-        "batch_target": "CasesTarget",
+        "batch_target": "cases_target",
         "dataset_attr": "precomputed_cases_target",
         "label": "Cases",
     },
     "deaths": {
         "model_output": "pred_deaths",
-        "batch_target": "DeathsTarget",
+        "batch_target": "deaths_target",
         "dataset_attr": "precomputed_deaths",
         "label": "Deaths",
     },
@@ -249,8 +249,14 @@ def collect_forecast_samples_for_target_nodes(
     model_was_training = model.training
     model.eval()
     try:
-        # Inject GPU mobility (adj_dense) into the batch for mobility-enabled models
-        inject_gpu_mobility(batch, dataset, device)
+        batch = cast(
+            Any,
+            prepare_batch_for_device(
+                batch,
+                dataset=dataset,
+                device=device,
+            ),
+        )
 
         region_embeddings = getattr(dataset, "region_embeddings", None)
         if region_embeddings is not None:
@@ -263,18 +269,20 @@ def collect_forecast_samples_for_target_nodes(
                     region_embeddings=region_embeddings,
                 )
             else:
-                target_nodes = batch.get("TargetRegionIndex", batch.target_node).to(
-                    device
+                target_nodes = (
+                    batch.target_region_index
+                    if getattr(batch, "target_region_index", None) is not None
+                    else batch.target_node
                 )
                 model_outputs = model.forward(
-                    hosp_hist=batch.hosp_hist.to(device),
-                    deaths_hist=batch.deaths_hist.to(device),
-                    cases_hist=batch.cases_hist.to(device),
-                    biomarkers_hist=batch.bio_node.to(device),
-                    mob_graphs=batch.mob_batch.to(device),
+                    hosp_hist=batch.hosp_hist,
+                    deaths_hist=batch.deaths_hist,
+                    cases_hist=batch.cases_hist,
+                    biomarkers_hist=batch.bio_node,
+                    mob_graphs=batch.mob_batch,
                     target_nodes=target_nodes,
                     region_embeddings=region_embeddings,
-                    population=batch.population.to(device),
+                    population=batch.population,
                 )
             if not isinstance(model_outputs, dict):
                 raise ValueError(
@@ -304,7 +312,7 @@ def collect_forecast_samples_for_target_nodes(
                 batch_key = spec["batch_target"]
                 dataset_attr = spec["dataset_attr"]
 
-                if pred_key not in model_outputs or batch_key not in batch:
+                if pred_key not in model_outputs or not hasattr(batch, batch_key):
                     continue
                 if not hasattr(dataset, dataset_attr):
                     continue

@@ -27,8 +27,9 @@ from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from evaluation.metrics import TorchMaskedMetricAccumulator
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
+from utils.device import iter_device_ready_batches, setup_device_streams
 from utils.sparsity_logging import log_sparsity_loss_correlation
-from utils.training_utils import drop_nowcast, inject_gpu_mobility
+from utils.training_utils import drop_nowcast
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,16 @@ def evaluate_loader(
     model_was_training = model.training
     model.eval()
     forward_model = cast(EpiForecaster, model)
+    dataset_config = getattr(dataset, "config", None)
+    prefetch_factor = (
+        dataset_config.training.prefetch_factor if dataset_config is not None else None
+    )
+    eval_iter = iter_device_ready_batches(
+        loader,
+        device=device,
+        prefetch_factor=prefetch_factor,
+        streams=setup_device_streams(device),
+    )
     try:
         with (
             torch.no_grad(),
@@ -147,13 +158,9 @@ def evaluate_loader(
                 if batch_idx % log_every == 0:
                     logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
 
-                inject_gpu_mobility(batch_data, eval_iter.dataset, device)
-                batch_data = batch_data.to(device)
-
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
-                    skip_device_transfer=True,
                     mask_cases=criterion.mask_input_cases,
                     mask_ww=criterion.mask_input_ww,
                     mask_hosp=criterion.mask_input_hosp,

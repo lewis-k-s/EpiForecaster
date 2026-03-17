@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.epiforecaster import EpiForecaster
+from utils.device import prepare_batch_for_device
 
 logger = logging.getLogger(__name__)
 
@@ -135,9 +136,11 @@ def topk_target_nodes_by_mae(
         with torch.no_grad():
             eval_iter = loader
             for batch in eval_iter:
-                from utils.training_utils import inject_gpu_mobility
-
-                inject_gpu_mobility(batch, eval_iter.dataset, device)
+                batch = prepare_batch_for_device(
+                    batch,
+                    dataset=getattr(loader, "dataset", None),
+                    device=device,
+                )
 
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch,
