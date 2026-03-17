@@ -209,7 +209,7 @@ class EpiForecaster(nn.Module):
             learnable_kernel=observation_heads.learnable_kernel_deaths,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
-            delta_forecasting=False, # Do not anchor deaths since death_flow lacks t=0 nowcast
+            delta_forecasting=False,  # Do not anchor deaths since death_flow lacks t=0 nowcast
             anchor_mode="disabled",
         )
 
@@ -454,36 +454,27 @@ class EpiForecaster(nn.Module):
         *,
         batch_data: EpiBatch,
         region_embeddings: torch.Tensor | None = None,
-        skip_device_transfer: bool = False,
         mask_cases: bool = False,
         mask_ww: bool = False,
         mask_hosp: bool = False,
         mask_deaths: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
         """
-        Forward pass with automatic device transfers and non-blocking I/O.
+        Forward pass for a device-ready, dtype-normalized batch.
 
-        This is the preferred entry point for training/evaluation, as it handles
-        all device transfers consistently with non-blocking transfers to reduce
-        CPU-GPU sync time.
+        This is the preferred entry point for training/evaluation once the caller
+        has already staged the batch on the target device and normalized input
+        dtypes in the dataset/collate path.
 
         Args:
-            batch_data: EpiBatch containing batch tensors
+            batch_data: EpiBatch already transferred to the model device/dtype
             region_embeddings: Optional static region embeddings [num_regions, region_dim]
-            skip_device_transfer: If True, assume all tensors are already on the correct
-                                 device and dtype. Used with compiled training to avoid
-                                 DeviceCopy ops that break CUDA graphs.
 
         Returns:
             Tuple of (model_outputs, targets_dict) where:
                 - model_outputs: Dict from forward() with predictions and latents
                 - targets_dict: Dict with target tensors for loss computation
         """
-        if not skip_device_transfer:
-            batch_data = batch_data.to(
-                device=self.device, dtype=self.dtype, non_blocking=True
-            )
-
         # Mask ablated inputs directly on the batch object
         if mask_ww and batch_data.bio_node is not None:
             batch_data.bio_node = torch.zeros_like(batch_data.bio_node)
@@ -497,14 +488,6 @@ class EpiForecaster(nn.Module):
             batch_data.deaths_hist = torch.zeros_like(batch_data.deaths_hist)
 
         mob_batch = batch_data.mob_batch
-
-        # Convert graph tensors to model dtype.
-        if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
-            if mob_batch.x_dense.dtype != self.dtype:
-                mob_batch.x_dense = mob_batch.x_dense.to(self.dtype)
-        if hasattr(mob_batch, "adj_dense") and mob_batch.adj_dense is not None:
-            if mob_batch.adj_dense.dtype != self.dtype:
-                mob_batch.adj_dense = mob_batch.adj_dense.to(self.dtype)
 
         target_nodes = (
             batch_data.target_region_index
