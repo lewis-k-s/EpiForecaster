@@ -4,6 +4,7 @@ Training utilities for the EpiForecaster project.
 
 import torch
 from data.epi_batch import EpiBatch
+from utils.precision_policy import MODEL_PARAM_DTYPE
 
 
 def drop_nowcast(prediction: torch.Tensor, horizon: int | None = None) -> torch.Tensor:
@@ -94,7 +95,7 @@ def inject_gpu_mobility(
     """
     Constructs the dense mobility adjacency matrix directly on the GPU.
 
-    This avoids passing huge float16 matrices through the DataLoader's
+    This avoids passing huge dense matrices through the DataLoader's
     multiprocessing queue, preventing severe worker OOMs on Linux systems.
 
     Args:
@@ -138,35 +139,41 @@ def inject_gpu_mobility(
     if not hasattr(base_ds, "_gpu_mobility_cache"):
         base_ds._gpu_mobility_cache = {}
 
-    if device not in base_ds._gpu_mobility_cache:
+    cache_key = (device, MODEL_PARAM_DTYPE)
+    if cache_key not in base_ds._gpu_mobility_cache:
         node_ids = torch.where(base_ds._get_graph_node_mask())[0]
         # Slice original CPU tensor to context nodes: resulting size [TotalT, N_ctx, N_ctx]
         # Using unsqueeze is faster and creates an intermediate of correct shape directly
         sliced_mob = base_ds.preloaded_mobility[:, node_ids.unsqueeze(-1), node_ids].to(
-            torch.float16
+            MODEL_PARAM_DTYPE
         )
 
         # Transfer to GPU
         gpu_mob = sliced_mob.to(device, non_blocking=True)
 
         # Enforce self-loops (diagonal >= 1.0) on the GPU
-        eye = torch.eye(len(node_ids), dtype=torch.float32, device=device).unsqueeze(0)
-        gpu_mob = torch.maximum(gpu_mob.float(), eye).to(torch.float16)
+        eye = torch.eye(
+            len(node_ids), dtype=MODEL_PARAM_DTYPE, device=device
+        ).unsqueeze(0)
+        gpu_mob = torch.maximum(gpu_mob, eye)
 
-        base_ds._gpu_mobility_cache[device] = gpu_mob
+        base_ds._gpu_mobility_cache[cache_key] = gpu_mob
     else:
-        gpu_mob = base_ds._gpu_mobility_cache[device]
+        gpu_mob = base_ds._gpu_mobility_cache[cache_key]
 
     # Extract base global_t for this chunk (global_t_gpu is shape [B*T])
     global_t_gpu = mob_batch.global_t.to(device, non_blocking=True)
 
     # If strict mode is enabled, add bounds assertions to catch
     # out-of-bounds gathers before they corrupt the CUDA context.
-    strict = getattr(base_ds, "config", None) is not None and getattr(base_ds.config.model, "strict", False)
+    strict = getattr(base_ds, "config", None) is not None and getattr(
+        base_ds.config.model, "strict", False
+    )
     if strict:
         max_t = gpu_mob.shape[0] - 1
         if (global_t_gpu > max_t).any() or (global_t_gpu < 0).any():
             import logging
+
             logger = logging.getLogger(__name__)
             msg = (
                 f"CRITICAL: global_t_gpu indices out of bounds for gpu_mob! "

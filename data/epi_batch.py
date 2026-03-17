@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch_geometric.data import Batch
+from utils.precision_policy import MODEL_PARAM_DTYPE
 
 if TYPE_CHECKING:
     from data.epi_dataset import EpiDatasetItem
@@ -18,7 +19,7 @@ class EpiBatch:
     deaths_hist: torch.Tensor  # (B, L, 3)
     cases_hist: torch.Tensor  # (B, L, 3)
     bio_node: torch.Tensor  # (B, L, D)
-    mob_batch: Any  # Batched PyG Data (MobBatch)
+    mob_batch: Batch
     population: torch.Tensor  # (B,)
     b: int
     t: int
@@ -43,40 +44,42 @@ class EpiBatch:
     def to(
         self,
         device: torch.device | str,
-        dtype: torch.dtype | None = None,
         non_blocking: bool = True,
     ) -> "EpiBatch":
-        """Move batch to target device and cast floating point tensors to target dtype."""
+        """Move batch to the target device without changing dtypes."""
         if isinstance(device, str):
             device = torch.device(device)
 
-        updates: dict[str, Any] = {}
         for field_name in self.__dataclass_fields__:
             value = getattr(self, field_name)
             if isinstance(value, torch.Tensor):
                 if value.device != device:
-                    if torch.is_floating_point(value):
-                        updates[field_name] = value.to(
-                            device=device,
-                            dtype=dtype if dtype is not None else value.dtype,
-                            non_blocking=non_blocking,
-                        )
-                    else:
-                        updates[field_name] = value.to(
-                            device=device, non_blocking=non_blocking
-                        )
-                elif (
-                    torch.is_floating_point(value)
-                    and dtype is not None
-                    and value.dtype != dtype
-                ):
-                    updates[field_name] = value.to(dtype=dtype)
-            elif hasattr(value, "to"):  # PyG Batch
-                updates[field_name] = value.to(device, non_blocking=non_blocking)
+                    value = value.to(device=device, non_blocking=non_blocking)
+                setattr(self, field_name, value)
+            elif isinstance(value, Batch):
+                setattr(self, field_name, value.to(device, non_blocking=non_blocking))
+        return self
 
-        if not updates:
-            return self
-        return replace(self, **updates)
+    def pin_memory(self) -> "EpiBatch":
+        """Pin CPU tensors recursively so CUDA transfers can be non-blocking."""
+        for field_name in self.__dataclass_fields__:
+            value = getattr(self, field_name)
+            if isinstance(value, torch.Tensor):
+                if value.device.type == "cpu":
+                    setattr(self, field_name, value.pin_memory())
+            elif isinstance(value, Batch):
+                setattr(self, field_name, value.pin_memory())
+        return self
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Record the consumer stream on all CUDA tensors in the batch."""
+        for field_name in self.__dataclass_fields__:
+            value = getattr(self, field_name)
+            if isinstance(value, torch.Tensor):
+                if value.device.type == "cuda":
+                    value.record_stream(stream)
+            elif isinstance(value, Batch):
+                value.record_stream(stream)
 
 
 def _replace_non_finite(tensor: torch.Tensor) -> torch.Tensor:
@@ -84,6 +87,13 @@ def _replace_non_finite(tensor: torch.Tensor) -> torch.Tensor:
     if not torch.is_floating_point(tensor):
         return tensor
     return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _promote_batch_float_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Promote floating tensors to the canonical model input dtype on CPU."""
+    if torch.is_floating_point(tensor) and tensor.dtype != MODEL_PARAM_DTYPE:
+        return tensor.to(MODEL_PARAM_DTYPE)
+    return tensor
 
 
 def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
@@ -180,6 +190,7 @@ def collate_epiforecaster_batch(
         [item["window_start"] for item in batch], dtype=torch.long
     )
     population = torch.stack([item["population"] for item in batch], dim=0)
+    population = population.to(MODEL_PARAM_DTYPE)
 
     # Stack joint inference targets (log1p per-100k)
     ww_hist = torch.stack([item["ww_hist"] for item in batch], dim=0)
@@ -206,14 +217,25 @@ def collate_epiforecaster_batch(
     mob_batch = optimized_collate_graphs(batch)
     if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
         mob_batch.x_dense = _replace_non_finite(mob_batch.x_dense)
+        mob_batch.x_dense = _promote_batch_float_tensor(mob_batch.x_dense)
 
-    hosp_hist = _replace_non_finite(hosp_hist)
-    deaths_hist = _replace_non_finite(deaths_hist)
-    cases_hist = _replace_non_finite(cases_hist)
-    bio_node = _replace_non_finite(bio_node)
-    temporal_covariates = _replace_non_finite(temporal_covariates)
-    ww_hist = _replace_non_finite(ww_hist)
-    ww_hist_mask = _replace_non_finite(ww_hist_mask)
+    hosp_hist = _promote_batch_float_tensor(_replace_non_finite(hosp_hist))
+    deaths_hist = _promote_batch_float_tensor(_replace_non_finite(deaths_hist))
+    cases_hist = _promote_batch_float_tensor(_replace_non_finite(cases_hist))
+    bio_node = _promote_batch_float_tensor(_replace_non_finite(bio_node))
+    temporal_covariates = _promote_batch_float_tensor(
+        _replace_non_finite(temporal_covariates)
+    )
+    ww_hist = _promote_batch_float_tensor(_replace_non_finite(ww_hist))
+    ww_hist_mask = _promote_batch_float_tensor(_replace_non_finite(ww_hist_mask))
+    hosp_targets = _promote_batch_float_tensor(hosp_targets)
+    ww_targets = _promote_batch_float_tensor(ww_targets)
+    cases_targets = _promote_batch_float_tensor(cases_targets)
+    deaths_targets = _promote_batch_float_tensor(deaths_targets)
+    hosp_target_masks = _promote_batch_float_tensor(hosp_target_masks)
+    ww_target_masks = _promote_batch_float_tensor(ww_target_masks)
+    cases_target_masks = _promote_batch_float_tensor(cases_target_masks)
+    deaths_target_masks = _promote_batch_float_tensor(deaths_target_masks)
 
     # Store B and T on the batch for downstream reshaping
     T = batch[0]["mob_x"].shape[0] if B > 0 else 0
