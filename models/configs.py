@@ -693,6 +693,12 @@ class TrainingParams:
     test_split: float = 0.1
     # Split strategy: "node" (default, region holdouts) or "time" (temporal splits)
     split_strategy: str = "node"
+    # Node split strategy when split_strategy="node".
+    # - "random": seeded shuffle across valid regions (legacy behavior)
+    # - "stratified": preserve population and wastewater-source representation
+    node_split_strategy: str = "random"
+    # Number of population quantile bins used for stratified node splits.
+    node_split_population_bins: int = 5
     # Temporal split boundaries (YYYY-MM-DD format) when split_strategy="time"
     train_end_date: str | None = None
     val_end_date: str | None = None
@@ -710,6 +716,8 @@ class TrainingParams:
     # Keep DataLoader workers alive across epochs when using fork+CUDA.
     # Disabling this can re-fork workers after CUDA init and cause hangs.
     persistent_workers: bool = True
+    # Shared prefetch knob for DataLoader workers and CUDA batch staging.
+    # Set to 0 or None to disable both.
     prefetch_factor: int | None = 4
     pin_memory: bool = True
     eval_frequency: int = 5
@@ -786,6 +794,18 @@ class TrainingParams:
             raise ValueError(
                 f"Invalid split_strategy: {self.split_strategy}. "
                 f"Valid options: {sorted(valid_strategies)}"
+            )
+
+        valid_node_split_strategies = {"random", "stratified"}
+        if self.node_split_strategy not in valid_node_split_strategies:
+            raise ValueError(
+                f"Invalid node_split_strategy: {self.node_split_strategy}. "
+                f"Valid options: {sorted(valid_node_split_strategies)}"
+            )
+        if self.node_split_population_bins <= 0:
+            raise ValueError(
+                "node_split_population_bins must be positive, "
+                f"got {self.node_split_population_bins}"
             )
 
         # Validate temporal split requirements
@@ -897,6 +917,11 @@ class TrainingParams:
         if self.optimizer_eps is not None and self.optimizer_eps <= 0:
             raise ValueError(
                 f"optimizer_eps must be positive, got {self.optimizer_eps}"
+            )
+
+        if self.prefetch_factor is not None and self.prefetch_factor < 0:
+            raise ValueError(
+                f"prefetch_factor must be >= 0 or None, got {self.prefetch_factor}"
             )
 
         # Validate horizon metric aggregation strategy

@@ -72,6 +72,9 @@ training:
   val_workers: 0
   prefetch_factor: null
   split_strategy: "node"
+  # Preserve representation across population size and wastewater-covered regions.
+  node_split_strategy: "stratified"
+  node_split_population_bins: 5
   val_split: 0.2
   test_split: 0.1
   profiler:

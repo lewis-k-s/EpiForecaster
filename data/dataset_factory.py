@@ -41,6 +41,17 @@ class DatasetSplits:
     region_embedding_store: RegionEmbeddingStore | None = None
 
 
+@dataclass(frozen=True)
+class NodeSplitMetadata:
+    """Metadata used to build node-based train/val/test splits."""
+
+    total_nodes: int
+    valid_nodes: np.ndarray
+    population_bins: np.ndarray | None = None
+    wastewater_source: np.ndarray | None = None
+    wastewater_source_name: str | None = None
+
+
 def _build_region_embedding_store(
     config: EpiForecasterConfig,
 ) -> RegionEmbeddingStore | None:
@@ -50,6 +61,336 @@ def _build_region_embedding_store(
         config.data.region2vec_path,
         expected_dim=config.model.region_embedding_dim,
     )
+
+
+def _resolve_split_sizes(
+    total_nodes: int,
+    val_split: float,
+    test_split: float,
+) -> tuple[int, int, int]:
+    train_split = 1.0 - val_split - test_split
+    n_train = int(total_nodes * train_split)
+    n_val = int(total_nodes * val_split)
+    n_test = total_nodes - n_train - n_val
+    return n_train, n_val, n_test
+
+
+def _load_valid_nodes(
+    *,
+    config: EpiForecasterConfig,
+    target_path: Path,
+    total_nodes: int,
+    effective_run_id: str,
+) -> np.ndarray:
+    if not config.data.use_valid_targets:
+        logger.info("Total regions: %d", total_nodes)
+        return np.ones(total_nodes, dtype=bool)
+
+    valid_mask = EpiDataset.get_valid_nodes(
+        dataset_path=target_path,
+        run_id=effective_run_id,
+    )
+    logger.info("Using valid_targets filter: %d valid regions", int(valid_mask.sum()))
+    return valid_mask
+
+
+def _compute_population_bins(
+    population: np.ndarray,
+    *,
+    num_bins: int,
+) -> np.ndarray:
+    if population.size == 0 or num_bins <= 1:
+        return np.zeros(population.shape[0], dtype=np.int64)
+
+    quantiles = np.linspace(0.0, 1.0, num_bins + 1)
+    edges = np.quantile(population, quantiles)
+    for idx in range(1, len(edges)):
+        if edges[idx] <= edges[idx - 1]:
+            edges[idx] = np.nextafter(edges[idx - 1], np.inf)
+    return np.digitize(population, edges[1:-1], right=True).astype(np.int64)
+
+
+def _resolve_wastewater_source(
+    aligned_dataset,
+    total_nodes: int,
+) -> tuple[np.ndarray, str]:
+    if "edar_has_source" in aligned_dataset:
+        wastewater_source = np.asarray(
+            aligned_dataset["edar_has_source"].values
+        ).reshape(-1)
+        if wastewater_source.size != total_nodes:
+            raise ValueError(
+                "edar_has_source must match region dimension for stratified node splits"
+            )
+        return wastewater_source.astype(bool), "edar_has_source"
+
+    if "biomarker_data_start" in aligned_dataset:
+        biomarker_data_start = np.asarray(
+            aligned_dataset["biomarker_data_start"].values
+        ).reshape(-1)
+        if biomarker_data_start.size != total_nodes:
+            raise ValueError(
+                "biomarker_data_start must match region dimension for stratified node splits"
+            )
+        return biomarker_data_start >= 0, "biomarker_data_start"
+
+    logger.warning(
+        "No wastewater availability metadata found; stratified node split will "
+        "balance only population bins."
+    )
+    return np.zeros(total_nodes, dtype=bool), "none"
+
+
+def _load_node_split_metadata(
+    *,
+    config: EpiForecasterConfig,
+    dataset_path: Path,
+    run_id: str,
+) -> NodeSplitMetadata:
+    aligned_dataset = EpiDataset.load_canonical_dataset(
+        dataset_path,
+        run_id=run_id,
+        run_id_chunk_size=config.data.run_id_chunk_size,
+    )
+    try:
+        total_nodes = int(aligned_dataset[REGION_COORD].size)
+        valid_mask = _load_valid_nodes(
+            config=config,
+            target_path=dataset_path,
+            total_nodes=total_nodes,
+            effective_run_id=run_id,
+        )
+        valid_nodes = np.arange(total_nodes, dtype=np.int64)[valid_mask]
+
+        if config.training.node_split_strategy == "stratified":
+            if "population" not in aligned_dataset:
+                raise ValueError(
+                    "population is required for stratified node splits but was not found"
+                )
+            population = np.asarray(
+                aligned_dataset["population"].values, dtype=np.float64
+            )
+            if population.shape != (total_nodes,):
+                raise ValueError(
+                    "population must be a 1D region-level array for stratified node splits"
+                )
+
+            population_bins = np.full(total_nodes, -1, dtype=np.int64)
+            population_bins[valid_nodes] = _compute_population_bins(
+                population[valid_nodes],
+                num_bins=config.training.node_split_population_bins,
+            )
+            wastewater_source, wastewater_source_name = _resolve_wastewater_source(
+                aligned_dataset,
+                total_nodes,
+            )
+        else:
+            population_bins = None
+            wastewater_source = None
+            wastewater_source_name = None
+
+        return NodeSplitMetadata(
+            total_nodes=total_nodes,
+            valid_nodes=valid_nodes,
+            population_bins=population_bins,
+            wastewater_source=wastewater_source,
+            wastewater_source_name=wastewater_source_name,
+        )
+    finally:
+        aligned_dataset.close()
+
+
+def _shuffle_nodes(
+    nodes: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    shuffled = np.array(nodes, copy=True)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
+def _split_nodes_random(
+    *,
+    valid_nodes: np.ndarray,
+    rng: np.random.Generator,
+    val_split: float,
+    test_split: float,
+) -> tuple[list[int], list[int], list[int]]:
+    all_nodes = _shuffle_nodes(valid_nodes, rng)
+    n_train, n_val, _n_test = _resolve_split_sizes(
+        len(all_nodes),
+        val_split=val_split,
+        test_split=test_split,
+    )
+    train_nodes = all_nodes[:n_train]
+    val_nodes = all_nodes[n_train : n_train + n_val]
+    test_nodes = all_nodes[n_train + n_val :]
+    return list(train_nodes), list(val_nodes), list(test_nodes)
+
+
+def _allocate_split_across_strata(
+    *,
+    stratum_sizes: dict[tuple[int, int], int],
+    target_size: int,
+) -> dict[tuple[int, int], int]:
+    if target_size <= 0:
+        return {key: 0 for key in stratum_sizes}
+
+    total_size = sum(stratum_sizes.values())
+    if target_size > total_size:
+        raise ValueError("target split size exceeds available stratum capacity")
+
+    quotas = {
+        key: (size * target_size / total_size) if total_size > 0 else 0.0
+        for key, size in stratum_sizes.items()
+    }
+    allocation = {
+        key: min(stratum_sizes[key], int(np.floor(quota)))
+        for key, quota in quotas.items()
+    }
+    remaining = target_size - sum(allocation.values())
+
+    if remaining > 0:
+        ranked = sorted(
+            stratum_sizes,
+            key=lambda key: (
+                quotas[key] - allocation[key],
+                stratum_sizes[key],
+                -key[0],
+                -key[1],
+            ),
+            reverse=True,
+        )
+        for key in ranked:
+            if remaining == 0:
+                break
+            if allocation[key] >= stratum_sizes[key]:
+                continue
+            allocation[key] += 1
+            remaining -= 1
+
+    return allocation
+
+
+def _split_nodes_stratified(
+    *,
+    metadata: NodeSplitMetadata,
+    rng: np.random.Generator,
+    val_split: float,
+    test_split: float,
+) -> tuple[list[int], list[int], list[int]]:
+    if metadata.population_bins is None:
+        raise ValueError(
+            "population_bins is required for stratified splits but was not loaded"
+        )
+    if metadata.wastewater_source is None:
+        raise ValueError(
+            "wastewater_source is required for stratified splits but was not loaded"
+        )
+
+    valid_nodes = metadata.valid_nodes
+    n_train, n_val, n_test = _resolve_split_sizes(
+        len(valid_nodes),
+        val_split=val_split,
+        test_split=test_split,
+    )
+
+    shuffled_nodes = _shuffle_nodes(valid_nodes, rng)
+    strata: dict[tuple[int, int], list[int]] = {}
+    for node in shuffled_nodes:
+        key = (
+            int(metadata.population_bins[node]),
+            int(metadata.wastewater_source[node]),
+        )
+        strata.setdefault(key, []).append(int(node))
+
+    train_nodes: list[int] = []
+    val_nodes: list[int] = []
+    test_nodes: list[int] = []
+
+    remaining = {key: list(nodes) for key, nodes in strata.items()}
+    remaining_sizes = {key: len(nodes) for key, nodes in remaining.items()}
+
+    train_alloc = _allocate_split_across_strata(
+        stratum_sizes=remaining_sizes,
+        target_size=n_train,
+    )
+    for key, count in train_alloc.items():
+        train_nodes.extend(remaining[key][:count])
+        remaining[key] = remaining[key][count:]
+
+    remaining_sizes = {key: len(nodes) for key, nodes in remaining.items()}
+    val_alloc = _allocate_split_across_strata(
+        stratum_sizes=remaining_sizes,
+        target_size=n_val,
+    )
+    for key, count in val_alloc.items():
+        val_nodes.extend(remaining[key][:count])
+        remaining[key] = remaining[key][count:]
+
+    for nodes in remaining.values():
+        test_nodes.extend(nodes)
+
+    if (
+        len(train_nodes) != n_train
+        or len(val_nodes) != n_val
+        or len(test_nodes) != n_test
+    ):
+        raise AssertionError("Stratified node split did not match expected split sizes")
+
+    train_nodes = list(_shuffle_nodes(np.asarray(train_nodes, dtype=np.int64), rng))
+    val_nodes = list(_shuffle_nodes(np.asarray(val_nodes, dtype=np.int64), rng))
+    test_nodes = list(_shuffle_nodes(np.asarray(test_nodes, dtype=np.int64), rng))
+    return train_nodes, val_nodes, test_nodes
+
+
+def _log_split_summary(
+    *,
+    name: str,
+    nodes: list[int],
+    metadata: NodeSplitMetadata,
+) -> None:
+    if not nodes:
+        logger.info("%s split: n=0", name)
+        return
+
+    if metadata.wastewater_source is None or metadata.population_bins is None:
+        logger.info("%s split: n=%d", name, len(nodes))
+        return
+
+    split_nodes = np.asarray(nodes, dtype=np.int64)
+    wastewater_count = int(metadata.wastewater_source[split_nodes].sum())
+    population_bins = metadata.population_bins[split_nodes]
+    population_counts = np.bincount(population_bins, minlength=1).tolist()
+    logger.info(
+        "%s split: n=%d | %s=%d (%.3f) | population_bins=%s",
+        name,
+        len(nodes),
+        metadata.wastewater_source_name or "unknown",
+        wastewater_count,
+        wastewater_count / len(nodes),
+        population_counts,
+    )
+
+
+def _log_node_split_diagnostics(
+    *,
+    strategy: str,
+    metadata: NodeSplitMetadata,
+    train_nodes: list[int],
+    val_nodes: list[int],
+    test_nodes: list[int],
+) -> None:
+    logger.info(
+        "Node split strategy=%s | valid_nodes=%d/%d | wastewater_source=%s",
+        strategy,
+        len(metadata.valid_nodes),
+        metadata.total_nodes,
+        metadata.wastewater_source_name or "n/a",
+    )
+    _log_split_summary(name="Train", nodes=train_nodes, metadata=metadata)
+    _log_split_summary(name="Val", nodes=val_nodes, metadata=metadata)
+    _log_split_summary(name="Test", nodes=test_nodes, metadata=metadata)
 
 
 def split_nodes_by_ratio(
@@ -67,8 +408,6 @@ def split_nodes_by_ratio(
     Returns:
         Tuple of (train_nodes, val_nodes, test_nodes)
     """
-    train_split = 1 - config.training.val_split - config.training.test_split
-
     target_path = dataset_path or Path(config.data.dataset_path)
     effective_run_id = run_id or config.data.run_id
     if not effective_run_id:
@@ -76,43 +415,40 @@ def split_nodes_by_ratio(
             "run_id must be provided either as argument or in config.data.run_id"
         )
 
-    aligned_dataset = EpiDataset.load_canonical_dataset(
-        target_path,
-        run_id=effective_run_id,
-        run_id_chunk_size=config.data.run_id_chunk_size,
-    )
-    N = aligned_dataset[REGION_COORD].size
-    all_nodes = np.arange(N)
-
-    valid_mask = None
-    if config.data.use_valid_targets:
-        run_id_for_valid = run_id or config.data.run_id
-        valid_mask = EpiDataset.get_valid_nodes(
-            dataset_path=target_path,
-            run_id=run_id_for_valid,
-        )
-        logger.info(f"Using valid_targets filter: {valid_mask.sum()} valid regions")
-    else:
-        logger.info(f"Total regions: {N}")
-
-    if valid_mask is not None:
-        all_nodes = all_nodes[valid_mask]
-        N = len(all_nodes)
-
     rng = np.random.default_rng(config.training.seed)
-    rng.shuffle(all_nodes)
-    n_train = int(len(all_nodes) * train_split)
-    n_val = int(len(all_nodes) * config.training.val_split)
-    train_nodes = all_nodes[:n_train]
-    val_nodes = all_nodes[n_train : n_train + n_val]
-    test_nodes = all_nodes[n_train + n_val :]
-
-    assert len(train_nodes) + len(val_nodes) + len(test_nodes) == len(all_nodes), (
-        "Dataset split is not correct"
+    metadata = _load_node_split_metadata(
+        config=config,
+        dataset_path=target_path,
+        run_id=effective_run_id,
     )
 
-    aligned_dataset.close()
-    return list(train_nodes), list(val_nodes), list(test_nodes)
+    if config.training.node_split_strategy == "stratified":
+        train_nodes, val_nodes, test_nodes = _split_nodes_stratified(
+            metadata=metadata,
+            rng=rng,
+            val_split=config.training.val_split,
+            test_split=config.training.test_split,
+        )
+    else:
+        train_nodes, val_nodes, test_nodes = _split_nodes_random(
+            valid_nodes=metadata.valid_nodes,
+            rng=rng,
+            val_split=config.training.val_split,
+            test_split=config.training.test_split,
+        )
+
+    assert len(train_nodes) + len(val_nodes) + len(test_nodes) == len(
+        metadata.valid_nodes
+    ), "Dataset split is not correct"
+
+    _log_node_split_diagnostics(
+        strategy=config.training.node_split_strategy,
+        metadata=metadata,
+        train_nodes=train_nodes,
+        val_nodes=val_nodes,
+        test_nodes=test_nodes,
+    )
+    return train_nodes, val_nodes, test_nodes
 
 
 def _build_standard_splits(
@@ -236,12 +572,8 @@ def _build_temporal_splits(
     logger.info(
         "  TRAIN: %s", format_date_range(aligned_dataset, (train_start, train_end))
     )
-    logger.info(
-        "  VAL:   %s", format_date_range(aligned_dataset, (train_end, val_end))
-    )
-    logger.info(
-        "  TEST:  %s", format_date_range(aligned_dataset, (val_end, test_end))
-    )
+    logger.info("  VAL:   %s", format_date_range(aligned_dataset, (train_end, val_end)))
+    logger.info("  TEST:  %s", format_date_range(aligned_dataset, (val_end, test_end)))
 
     train_dataset = EpiDataset(
         config=config,
