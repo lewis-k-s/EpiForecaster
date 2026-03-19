@@ -23,6 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.log_keys import TENSORBOARD_SCALARS
+
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.skill_output import SkillOutputBuilder, print_output
 
@@ -676,9 +678,7 @@ def analyze_events(
     ea.Reload()
 
     # Load training loss
-    loss_steps, loss_values = load_scalars(ea, "Loss/Train_step")
-    if not loss_values:
-        loss_steps, loss_values = load_scalars(ea, "Loss/Train")
+    loss_steps, loss_values = load_scalars(ea, TENSORBOARD_SCALARS["loss_train"])
 
     if not loss_values:
         raise ValueError("No training loss data found in event files")
@@ -697,12 +697,16 @@ def analyze_events(
     convergence = analyze_convergence(loss_steps, loss_values)
 
     # Load additional metrics for correlation
-    grad_steps, grad_values = load_scalars(ea, "GradNorm/Total_PreClip")
-    data_steps, data_values = load_scalars(ea, "Time/DataLoad_s")
+    grad_steps, grad_values = load_scalars(
+        ea, TENSORBOARD_SCALARS["gradnorm_total_preclip"]
+    )
+    data_steps, data_values = load_scalars(ea, TENSORBOARD_SCALARS["time_dataload_s"])
 
     # Load curriculum metrics if available
-    epoch_steps, _ = load_scalars(ea, "epoch")
-    sparsity_steps, sparsity_values = load_scalars(ea, "Train/Sparsity")
+    epoch_steps, _ = load_scalars(ea, TENSORBOARD_SCALARS["epoch"])
+    sparsity_steps, sparsity_values = load_scalars(
+        ea, TENSORBOARD_SCALARS["train_sparsity"]
+    )
 
     # Compute correlations with step-aligned interpolation
     correlations = compute_correlations(

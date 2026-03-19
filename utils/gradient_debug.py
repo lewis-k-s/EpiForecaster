@@ -27,6 +27,11 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
+from utils.log_keys import (
+    build_grad_snapshot_head_key,
+    infer_observation_head_from_name,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -340,34 +345,48 @@ class GradientDebugger:
     @classmethod
     def infer_observation_head(cls, layer_name: str) -> str | None:
         """Map parameter names to observation head names when applicable."""
-        for head in cls._OBS_HEAD_MARKERS:
-            if f".{head}_head." in layer_name or layer_name.startswith(f"{head}_head."):
-                return head
-        return None
+        return infer_observation_head_from_name(layer_name)
 
     def _build_head_gradient_health(
         self, snapshot: GradientSnapshot
     ) -> dict[str, dict[str, float | int | bool]]:
-        """Summarize expected vs unexpected zero-gradient head behavior."""
+        """Summarize aggregate head gradient health for observation heads."""
         if not snapshot.head_supervision:
             return {}
 
-        vanishing_by_head: dict[str, list[str]] = {head: [] for head in self._OBS_HEAD_MARKERS}
-        for layer_name in snapshot.vanishing_layers:
-            head = self.infer_observation_head(layer_name)
+        layer_stats_by_head: dict[str, list[GradientStats]] = {
+            head: [] for head in self._OBS_HEAD_MARKERS
+        }
+        for layer_stats in snapshot.layer_stats:
+            head = self.infer_observation_head(layer_stats.name)
             if head is not None:
-                vanishing_by_head[head].append(layer_name)
+                layer_stats_by_head[head].append(layer_stats)
 
         head_health: dict[str, dict[str, float | int | bool]] = {}
         for head, supervision in snapshot.head_supervision.items():
             active = bool(supervision.get("active", False))
-            vanishing_layers = vanishing_by_head.get(head, [])
+            layer_stats = layer_stats_by_head.get(head, [])
+            vanishing_layers = [
+                stats.name
+                for stats in layer_stats
+                if stats.norm <= self.vanishing_threshold
+            ]
+            aggregate_grad_norm = sum(stats.norm**2 for stats in layer_stats) ** 0.5
+            vanishing_layer_count = len(vanishing_layers)
+            layer_count = len(layer_stats)
             head_health[head] = {
                 "active": active,
-                "vanishing_layer_count": len(vanishing_layers),
+                "grad_norm": aggregate_grad_norm,
+                "layer_count": layer_count,
+                "vanishing_layer_count": vanishing_layer_count,
+                "vanishing_layer_fraction": (
+                    vanishing_layer_count / layer_count if layer_count > 0 else 0.0
+                ),
                 "has_vanishing_layers": bool(vanishing_layers),
-                "expected_zero": (not active) and bool(vanishing_layers),
-                "unexpected_zero": active and bool(vanishing_layers),
+                "expected_zero": (not active)
+                and aggregate_grad_norm <= self.vanishing_threshold,
+                "unexpected_zero": active
+                and aggregate_grad_norm <= self.vanishing_threshold,
                 "vanishing_layers": vanishing_layers,
             }
 
@@ -403,36 +422,43 @@ class GradientDebugger:
             ),
         }
         for head, supervision in snapshot.head_supervision.items():
-            log_data[f"grad_snapshot_head_{head}_active"] = int(
+            log_data[build_grad_snapshot_head_key(head, "active")] = int(
                 bool(supervision.get("active", False))
             )
-            log_data[f"grad_snapshot_head_{head}_n_eff"] = float(
+            log_data[build_grad_snapshot_head_key(head, "grad_norm")] = float(
+                snapshot.head_gradient_health.get(head, {}).get("grad_norm", 0.0)
+            )
+            log_data[build_grad_snapshot_head_key(head, "n_eff")] = float(
                 supervision.get("n_eff", 0.0)
             )
-            log_data[f"grad_snapshot_head_{head}_valid_points"] = int(
+            log_data[build_grad_snapshot_head_key(head, "valid_points")] = int(
                 supervision.get("valid_points", 0)
             )
-            log_data[f"grad_snapshot_head_{head}_valid_series"] = int(
+            log_data[build_grad_snapshot_head_key(head, "valid_series")] = int(
                 supervision.get("valid_series", 0)
             )
         for head, health in snapshot.head_gradient_health.items():
-            log_data[f"grad_snapshot_head_{head}_expected_zero"] = int(
+            log_data[build_grad_snapshot_head_key(head, "expected_zero")] = int(
                 bool(health.get("expected_zero", False))
             )
-            log_data[f"grad_snapshot_head_{head}_unexpected_zero"] = int(
+            log_data[build_grad_snapshot_head_key(head, "unexpected_zero")] = int(
                 bool(health.get("unexpected_zero", False))
             )
-            log_data[f"grad_snapshot_head_{head}_vanishing_layers"] = int(
+            log_data[build_grad_snapshot_head_key(head, "vanishing_layers")] = int(
                 health.get("vanishing_layer_count", 0)
             )
         for head, coverage in snapshot.head_coverage.items():
-            log_data[f"grad_snapshot_head_{head}_pass_rate"] = float(
+            log_data[build_grad_snapshot_head_key(head, "pass_rate")] = float(
                 coverage.get("pass_rate", 0.0)
             )
-            log_data[f"grad_snapshot_head_{head}_zero_when_active_rate"] = float(
+            log_data[
+                build_grad_snapshot_head_key(head, "zero_when_active_rate")
+            ] = float(
                 coverage.get("zero_when_active_rate", 0.0)
             )
-            log_data[f"grad_snapshot_head_{head}_zero_when_inactive_rate"] = float(
+            log_data[
+                build_grad_snapshot_head_key(head, "zero_when_inactive_rate")
+            ] = float(
                 coverage.get("zero_when_inactive_rate", 0.0)
             )
         return log_data

@@ -126,6 +126,9 @@ def build_loader_from_config(
     split: str,
     batch_size: int | None = None,
     device: str = "auto",
+    num_workers: int | None = None,
+    pin_memory: bool | None = None,
+    prefetch_factor: int | None = None,
 ) -> tuple[DataLoader[EpiDataset], torch.Tensor | None]:
     """Build a DataLoader for the given split from the checkpoint config.
 
@@ -139,6 +142,9 @@ def build_loader_from_config(
         split: Which split to load ("val" or "test")
         batch_size: Optional batch size override (default: use config value)
         device: Device to load tensors to ("auto", "cuda", "cpu")
+        num_workers: Optional DataLoader worker override
+        pin_memory: Optional pin-memory override
+        prefetch_factor: Optional prefetch override. Use 0 or None to disable.
 
     Returns:
         Tuple of (DataLoader, region_embeddings). Region embeddings are pre-loaded
@@ -163,16 +169,27 @@ def build_loader_from_config(
     cfg_workers = (
         config.training.val_workers
         if split_key == "val"
-        else getattr(config.training, "test_workers", 0)
+        else config.training.test_workers
     )
-    if cfg_workers == -1:
-        num_workers = max(0, avail_cores)
+    if num_workers is None:
+        resolved_worker_cfg = cfg_workers
     else:
-        num_workers = min(max(0, avail_cores), cfg_workers)
+        resolved_worker_cfg = num_workers
+    if resolved_worker_cfg == -1:
+        resolved_num_workers = max(0, avail_cores)
+    else:
+        resolved_num_workers = min(max(0, avail_cores), resolved_worker_cfg)
 
     resolved_batch = batch_size or config.training.batch_size
     resolved_device = resolve_device(device)
-    pin_memory = bool(config.training.pin_memory) and resolved_device.type == "cuda"
+    resolved_pin_memory = (
+        bool(config.training.pin_memory) if pin_memory is None else bool(pin_memory)
+    ) and resolved_device.type == "cuda"
+    resolved_prefetch = (
+        config.training.prefetch_factor
+        if prefetch_factor is None
+        else prefetch_factor
+    )
 
     # Pre-load region embeddings to device to avoid repeated transfers
     region_embeddings = getattr(dataset, "region_embeddings", None)
@@ -183,15 +200,15 @@ def build_loader_from_config(
         dataset,
         batch_size=resolved_batch,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=config.training.prefetch_factor
-        if prefetch_enabled(config.training.prefetch_factor) and num_workers > 0
+        num_workers=resolved_num_workers,
+        pin_memory=resolved_pin_memory,
+        prefetch_factor=resolved_prefetch
+        if prefetch_enabled(resolved_prefetch) and resolved_num_workers > 0
         else None,
         collate_fn=partial(
             collate_epiforecaster_batch,
             require_region_index=bool(config.model.type.regions),
         ),
-        worker_init_fn=_suppress_zarr_warnings if num_workers > 0 else None,
+        worker_init_fn=_suppress_zarr_warnings if resolved_num_workers > 0 else None,
     )
     return loader, region_embeddings

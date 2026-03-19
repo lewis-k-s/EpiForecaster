@@ -23,6 +23,7 @@ from evaluation.eval_loop import _ensure_wandb_run, eval_checkpoint, evaluate_lo
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.losses import get_loss_from_config
 from evaluation.selection import select_nodes_by_loss, topk_target_nodes_by_mae
+from utils.log_keys import CORE_EVAL_METRICS, build_eval_metric_key, build_loss_key
 from plotting.forecast_plots import (
     collect_forecast_samples_for_target_nodes,
     generate_forecast_plots,
@@ -125,10 +126,10 @@ def evaluate_checkpoint_topk_forecasts(
         if wandb.run is not None:
             log_data: dict[str, Any] = {}
             if math.isfinite(eval_loss):
-                log_data[f"loss_{split}"] = eval_loss
-            for key in ("mae", "rmse", "smape", "r2"):
+                log_data[build_loss_key(split=split)] = eval_loss
+            for key in CORE_EVAL_METRICS:
                 if key in eval_metrics:
-                    log_data[f"{key}_{split}"] = eval_metrics[key]
+                    log_data[build_eval_metric_key(key, split)] = eval_metrics[key]
             if log_data:
                 wandb.log(log_data, step=0)
 

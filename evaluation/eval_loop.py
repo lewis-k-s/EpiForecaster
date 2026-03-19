@@ -27,7 +27,12 @@ from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from evaluation.metrics import TorchMaskedMetricAccumulator
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
-from utils.device import iter_device_ready_batches, setup_device_streams
+from utils.device import (
+    iter_device_ready_batches,
+    prefetch_enabled,
+    setup_device_streams,
+)
+from utils.log_keys import CORE_EVAL_METRICS, build_eval_metric_key, build_loss_key
 from utils.sparsity_logging import log_sparsity_loss_correlation
 from utils.training_utils import drop_nowcast
 
@@ -69,6 +74,7 @@ def evaluate_loader(
     granular_csv_path: Path | None = None,
     granular_metadata: dict[str, Any] | None = None,
     output_csv_path: Path | None = None,
+    log_every: int = 10,
 ) -> tuple[float, dict[str, Any], dict[int, float]]:
     """Evaluate a loader and compute loss/metrics matching trainer behavior.
 
@@ -87,6 +93,7 @@ def evaluate_loader(
         granular_csv_path: Optional path to save granular per-example error rows as CSV
         granular_metadata: Optional metadata to write alongside the granular CSV
         output_csv_path: Deprecated alias for node_metrics_csv_path
+        log_every: Progress logging cadence in batches
 
     Returns:
         Tuple of (mean_loss, metrics_dict, node_mae_dict) where:
@@ -121,7 +128,7 @@ def evaluate_loader(
 
     num_batches = len(loader)
     eval_iter = loader
-    log_every = 10
+    effective_log_every = max(1, log_every)
     dataset = getattr(loader, "dataset", None)
     temporal_coords = getattr(dataset, "_temporal_coords", None)
     region_ids = getattr(dataset, "_region_ids", None)
@@ -139,12 +146,16 @@ def evaluate_loader(
     prefetch_factor = (
         dataset_config.training.prefetch_factor if dataset_config is not None else None
     )
+    use_prefetch = prefetch_enabled(prefetch_factor)
     eval_iter = iter_device_ready_batches(
         loader,
         device=device,
         prefetch_factor=prefetch_factor,
-        streams=setup_device_streams(device),
+        streams=setup_device_streams(device) if use_prefetch else None,
     )
+    current_batch_idx: int | None = None
+    current_stage = "init"
+    processed_batches = 0
     try:
         with (
             torch.no_grad(),
@@ -155,9 +166,19 @@ def evaluate_loader(
             for batch_idx, batch_data in enumerate(eval_iter):
                 if max_batches and batch_idx >= max_batches:
                     break
-                if batch_idx % log_every == 0:
-                    logger.info(f"{split_name} evaluation: {batch_idx}/{num_batches}")
+                current_batch_idx = batch_idx
+                current_stage = "batch_fetched"
+                should_log_batch = batch_idx % effective_log_every == 0
+                if should_log_batch:
+                    logger.info(
+                        "[eval][progress] split=%s batch=%d/%d stage=%s",
+                        split_name,
+                        batch_idx,
+                        num_batches,
+                        current_stage,
+                    )
 
+                current_stage = "forward_batch"
                 model_outputs, targets_dict = forward_model.forward_batch(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
@@ -166,6 +187,14 @@ def evaluate_loader(
                     mask_hosp=criterion.mask_input_hosp,
                     mask_deaths=criterion.mask_input_deaths,
                 )
+                if should_log_batch:
+                    logger.info(
+                        "[eval][progress] split=%s batch=%d/%d stage=%s",
+                        split_name,
+                        batch_idx,
+                        num_batches,
+                        current_stage,
+                    )
 
                 # Create sliced model outputs for metric computation
                 sliced_model_outputs = {
@@ -176,6 +205,7 @@ def evaluate_loader(
                 }
 
                 # Compute loss with batch_data for continuity penalty
+                current_stage = "loss_components"
                 components = criterion.compute_components(
                     model_outputs, targets_dict, batch_data
                 )
@@ -197,6 +227,14 @@ def evaluate_loader(
                 loss_cases_weighted_sum += components["cases_weighted"].detach()
                 loss_deaths_weighted_sum += components["deaths_weighted"].detach()
                 loss_sir_weighted_sum += components["sir_weighted"].detach()
+                if should_log_batch:
+                    logger.info(
+                        "[eval][progress] split=%s batch=%d/%d stage=%s",
+                        split_name,
+                        batch_idx,
+                        num_batches,
+                        current_stage,
+                    )
 
                 # Log sparsity-loss correlation during evaluation (moved from training)
                 if batch_idx % 10 == 0:
@@ -218,7 +256,7 @@ def evaluate_loader(
                     and hosp_targets is not None
                     and hosp_weights is not None
                 ):
-                    _diff, abs_diff, weights = hosp_metrics.update(
+                    _unused_diff, abs_diff, weights = hosp_metrics.update(
                         predictions=pred_hosp,
                         targets=hosp_targets,
                         observed_mask=hosp_mask,
@@ -251,6 +289,15 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                    del (
+                        _unused_diff,
+                        abs_diff,
+                        weights,
+                        valid_per_sample,
+                        per_sample_mae,
+                        target_nodes,
+                    )
+                del pred_hosp, hosp_targets, hosp_mask, hosp_weights
 
                 pred_ww = sliced_model_outputs.get("pred_ww")
                 ww_targets = metric_supervision["ww"]["target"]
@@ -278,6 +325,7 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                del pred_ww, ww_targets, ww_mask, ww_weights
 
                 pred_cases = sliced_model_outputs.get("pred_cases")
                 cases_targets = metric_supervision["cases"]["target"]
@@ -305,6 +353,7 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                del pred_cases, cases_targets, cases_mask, cases_weights
 
                 pred_deaths = sliced_model_outputs.get("pred_deaths")
                 deaths_targets = metric_supervision["deaths"]["target"]
@@ -332,7 +381,30 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                del pred_deaths, deaths_targets, deaths_mask, deaths_weights
+                current_stage = "granular_write_complete"
+                if should_log_batch:
+                    logger.info(
+                        "[eval][progress] split=%s batch=%d/%d stage=%s",
+                        split_name,
+                        batch_idx,
+                        num_batches,
+                        current_stage,
+                    )
+                processed_batches += 1
+                del components, metric_supervision, model_outputs, targets_dict
+                del sliced_model_outputs, batch_data, loss
 
+    except Exception:
+        logger.error(
+            "[eval] Evaluation failed: split=%s batch=%s stage=%s",
+            split_name,
+            current_batch_idx if current_batch_idx is not None else "n/a",
+            current_stage,
+        )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        raise
     finally:
         if granular_writer is not None:
             granular_writer.close()
@@ -340,7 +412,7 @@ def evaluate_loader(
             model.train()
 
     # Final sync - transfer metrics to CPU once
-    mean_loss = (total_loss / max(1, num_batches)).item()
+    mean_loss = (total_loss / max(1, processed_batches)).item()
     hosp_summary = hosp_metrics.finalize()
     ww_summary = ww_metrics.finalize()
     cases_summary = cases_metrics.finalize()
@@ -369,6 +441,20 @@ def evaluate_loader(
             "run_id": getattr(dataset, "run_id", None),
             "schema_version": GRANULAR_SCHEMA_VERSION,
             "split": split_name.lower(),
+            "training_seed": getattr(getattr(dataset, "config", None), "training", None)
+            and getattr(dataset.config.training, "seed", None),
+            "node_split_strategy": getattr(
+                getattr(dataset, "config", None), "training", None
+            )
+            and getattr(dataset.config.training, "node_split_strategy", None),
+            "node_split_population_bins": getattr(
+                getattr(dataset, "config", None), "training", None
+            )
+            and getattr(dataset.config.training, "node_split_population_bins", None),
+            "val_split": getattr(getattr(dataset, "config", None), "training", None)
+            and getattr(dataset.config.training, "val_split", None),
+            "test_split": getattr(getattr(dataset, "config", None), "training", None)
+            and getattr(dataset.config.training, "test_split", None),
         }
         if granular_metadata is not None:
             metadata.update(granular_metadata)
@@ -414,16 +500,20 @@ def evaluate_loader(
         "observed_count_deaths": deaths_summary.observed_count,
         "effective_count_deaths": deaths_summary.effective_count,
         # Joint loss components (averaged per batch, same reduction as mean_loss)
-        "loss_ww": (loss_ww_sum / max(1, num_batches)).item(),
-        "loss_hosp": (loss_hosp_sum / max(1, num_batches)).item(),
-        "loss_cases": (loss_cases_sum / max(1, num_batches)).item(),
-        "loss_deaths": (loss_deaths_sum / max(1, num_batches)).item(),
-        "loss_sir": (loss_sir_sum / max(1, num_batches)).item(),
-        "loss_ww_weighted": (loss_ww_weighted_sum / max(1, num_batches)).item(),
-        "loss_hosp_weighted": (loss_hosp_weighted_sum / max(1, num_batches)).item(),
-        "loss_cases_weighted": (loss_cases_weighted_sum / max(1, num_batches)).item(),
-        "loss_deaths_weighted": (loss_deaths_weighted_sum / max(1, num_batches)).item(),
-        "loss_sir_weighted": (loss_sir_weighted_sum / max(1, num_batches)).item(),
+        "loss_ww": (loss_ww_sum / max(1, processed_batches)).item(),
+        "loss_hosp": (loss_hosp_sum / max(1, processed_batches)).item(),
+        "loss_cases": (loss_cases_sum / max(1, processed_batches)).item(),
+        "loss_deaths": (loss_deaths_sum / max(1, processed_batches)).item(),
+        "loss_sir": (loss_sir_sum / max(1, processed_batches)).item(),
+        "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
+        "loss_hosp_weighted": (loss_hosp_weighted_sum / max(1, processed_batches)).item(),
+        "loss_cases_weighted": (
+            loss_cases_weighted_sum / max(1, processed_batches)
+        ).item(),
+        "loss_deaths_weighted": (
+            loss_deaths_weighted_sum / max(1, processed_batches)
+        ).item(),
+        "loss_sir_weighted": (loss_sir_weighted_sum / max(1, processed_batches)).item(),
     }
 
     logger.info("EVAL COMPLETE")
@@ -472,6 +562,10 @@ def eval_checkpoint(
     granular_csv_path: Path | None = None,
     output_csv_path: Path | None = None,
     batch_size: int | None = None,
+    num_workers: int | None = None,
+    pin_memory: bool | None = None,
+    prefetch_factor: int | None = None,
+    log_every: int = 10,
 ) -> dict[str, Any]:
     """
     Evaluate checkpoint - pure evaluation, no selection or plotting.
@@ -485,6 +579,11 @@ def eval_checkpoint(
         node_metrics_csv_path: Optional path to save node-level metrics CSV
         granular_csv_path: Optional path to save granular per-example error rows
         output_csv_path: Deprecated alias for node_metrics_csv_path
+        batch_size: Optional batch size override
+        num_workers: Optional DataLoader worker override
+        pin_memory: Optional pin-memory override
+        prefetch_factor: Optional prefetch override. Use 0 or None to disable.
+        log_every: Progress logging cadence in batches
 
     Returns:
         Dict with: checkpoint, config, model, loader, node_mae_dict,
@@ -511,13 +610,42 @@ def eval_checkpoint(
         f"[eval] Loaded model (params={sum(p.numel() for p in model.parameters()):,})"
     )
     logger.info(
-        f"[eval] Building {split} loader from dataset: {config.data.dataset_path}"
+        "[eval] Building %s loader from dataset=%s resolved_device=%s batch_size=%s "
+        "num_workers=%s prefetch_factor=%s pin_memory=%s",
+        split,
+        config.data.dataset_path,
+        resolved_device,
+        batch_size if batch_size is not None else config.training.batch_size,
+        num_workers if num_workers is not None else "config",
+        (
+            prefetch_factor
+            if prefetch_factor is not None
+            else config.training.prefetch_factor
+        ),
+        pin_memory if pin_memory is not None else config.training.pin_memory,
     )
     loader, region_embeddings = build_loader_from_config(
-        config, split=split, device=resolved_device, batch_size=batch_size
+        config,
+        split=split,
+        device=resolved_device,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
     )
     dataset = cast(EpiDataset, loader.dataset)
-    logger.info(f"[eval] {split} samples: {len(dataset)}")
+    logger.info(
+        "[eval] Environment: split=%s dataset=%s samples=%d batch_size=%s num_workers=%d "
+        "prefetch_factor=%s pin_memory=%s device=%s",
+        split,
+        config.data.dataset_path,
+        len(dataset),
+        loader.batch_size,
+        loader.num_workers,
+        loader.prefetch_factor,
+        loader.pin_memory,
+        next(model.parameters()).device,
+    )
 
     if granular_csv_path is None and config.output.write_granular_eval:
         granular_csv_path = (
@@ -541,6 +669,7 @@ def eval_checkpoint(
             split_name=split.capitalize(),
             node_metrics_csv_path=node_metrics_csv_path,
             granular_csv_path=granular_csv_path,
+            log_every=log_every,
             granular_metadata={
                 "batch_size": batch_size
                 if batch_size is not None
@@ -551,10 +680,21 @@ def eval_checkpoint(
                 "input_window_length": int(config.model.input_window_length),
                 "max_batches": None,
                 "model_experiment_name": config.output.experiment_name,
+                "node_split_population_bins": int(
+                    config.training.node_split_population_bins
+                ),
+                "node_split_strategy": config.training.node_split_strategy,
                 "overrides": list(overrides) if overrides else [],
                 "run_dir": checkpoint_path.parent.parent,
                 "split": split.lower(),
+                "test_split": float(config.training.test_split),
+                "training_seed": config.training.seed,
+                "val_split": float(config.training.val_split),
                 "window_stride": int(config.data.window_stride),
+                "eval_log_every": int(log_every),
+                "eval_num_workers": int(loader.num_workers),
+                "eval_prefetch_factor": loader.prefetch_factor,
+                "eval_pin_memory": bool(loader.pin_memory),
             },
         )
     except Exception:
@@ -571,10 +711,10 @@ def eval_checkpoint(
         if wandb.run is not None:
             log_data: dict[str, Any] = {}
             if math.isfinite(eval_loss):
-                log_data[f"loss_{split}"] = eval_loss
-            for key in ("mae", "rmse", "smape", "r2"):
+                log_data[build_loss_key(split=split)] = eval_loss
+            for key in CORE_EVAL_METRICS:
                 if key in eval_metrics:
-                    log_data[f"{key}_{split}"] = eval_metrics[key]
+                    log_data[build_eval_metric_key(key, split)] = eval_metrics[key]
             if log_data:
                 wandb.log(log_data, step=0)
 

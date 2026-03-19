@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from utils.log_keys import OBSERVATION_HEADS, build_gradnorm_obs_key
+
 
 def should_log_gradnorm_components(step: int, frequency: int) -> bool:
     """Return whether component gradnorm diagnostics should run for this step."""
@@ -23,10 +25,9 @@ def compute_gradient_norms_and_clip(
     should_log = should_log_gradnorm_components(step, frequency)
 
     gnn_sq_sum = torch.tensor(0.0, device=device)
-    ww_sq_sum = torch.tensor(0.0, device=device)
-    hosp_sq_sum = torch.tensor(0.0, device=device)
-    cases_sq_sum = torch.tensor(0.0, device=device)
-    deaths_sq_sum = torch.tensor(0.0, device=device)
+    head_sq_sums = {
+        head: torch.tensor(0.0, device=device) for head in OBSERVATION_HEADS
+    }
     sird_sq_sum = torch.tensor(0.0, device=device)
     encoder_sq_sum = torch.tensor(0.0, device=device)
     other_sq_sum = torch.tensor(0.0, device=device)
@@ -45,11 +46,12 @@ def compute_gradient_norms_and_clip(
             if should_log:
                 if group_name == "mobility_gnn":
                     gnn_sq_sum += sq_norm
-                elif group_name == "observation_heads":
-                    ww_sq_sum += sq_norm
-                    hosp_sq_sum += sq_norm
-                    cases_sq_sum += sq_norm
-                    deaths_sq_sum += sq_norm
+                elif group_name.startswith("observation_head_"):
+                    head_name = group_name.removeprefix("observation_head_")
+                    if head_name in head_sq_sums:
+                        head_sq_sums[head_name] += sq_norm
+                    else:
+                        other_sq_sum += sq_norm
                 elif group_name == "sird":
                     sird_sq_sum += sq_norm
                 elif group_name == "backbone":
@@ -71,34 +73,19 @@ def compute_gradient_norms_and_clip(
 
     norms_dict: dict[str, float] = {}
     if should_log:
-        obs_heads_sq_sum = ww_sq_sum + hosp_sq_sum + cases_sq_sum + deaths_sq_sum
-        component_sq_sums = torch.stack(
-            [
-                sird_sq_sum,
-                encoder_sq_sum,
-                gnn_sq_sum,
-                obs_heads_sq_sum,
-                other_sq_sum,
-            ]
-        )
-        total_sq_sum = component_sq_sums.sum()
-        per_head_sq_sums = torch.stack(
-            [ww_sq_sum, hosp_sq_sum, cases_sq_sum, deaths_sq_sum]
-        )
-        all_sq_sums = torch.cat(
-            [total_sq_sum.unsqueeze(0), component_sq_sums, per_head_sq_sums]
-        )
-        all_norms = all_sq_sums.sqrt().cpu().numpy()
-
         norms_dict = {
-            "gradnorm_sird_physics": float(all_norms[1]),
-            "gradnorm_backbone_encoder": float(all_norms[2]),
-            "gradnorm_mobility_gnn": float(all_norms[3]),
-            "gradnorm_other": float(all_norms[5]),
-            "gradnorm_obs_ww": float(all_norms[6]),
-            "gradnorm_obs_hosp": float(all_norms[7]),
-            "gradnorm_obs_cases": float(all_norms[8]),
-            "gradnorm_obs_deaths": float(all_norms[9]),
+            "gradnorm_sird_physics": float(sird_sq_sum.sqrt().item()),
+            "gradnorm_backbone_encoder": float(encoder_sq_sum.sqrt().item()),
+            "gradnorm_mobility_gnn": float(gnn_sq_sum.sqrt().item()),
+            "gradnorm_other": float(other_sq_sum.sqrt().item()),
+            build_gradnorm_obs_key("ww"): float(head_sq_sums["ww"].sqrt().item()),
+            build_gradnorm_obs_key("hosp"): float(head_sq_sums["hosp"].sqrt().item()),
+            build_gradnorm_obs_key("cases"): float(
+                head_sq_sums["cases"].sqrt().item()
+            ),
+            build_gradnorm_obs_key("deaths"): float(
+                head_sq_sums["deaths"].sqrt().item()
+            ),
         }
 
     return global_norm, norms_dict

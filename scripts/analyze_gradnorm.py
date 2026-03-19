@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.log_keys import TENSORBOARD_SCALARS
+
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.skill_output import SkillOutputBuilder, print_output
 
@@ -463,35 +465,26 @@ def analyze_events(event_dir: str | Path) -> tuple[GradnormAnalysis, list[str]]:
     ea = event_accumulator.EventAccumulator(str(event_dir))
     ea.Reload()
 
-    # Load all gradnorm scalars. Backward-compatible with legacy ForecasterHead tag.
+    # Load canonical gradnorm scalars.
     component_tags = {
-        "Total_PreClip": ["GradNorm/Total_PreClip"],
-        "MobilityGNN": ["GradNorm/MobilityGNN"],
-        "Backbone": ["GradNorm/Backbone", "GradNorm/ForecasterHead"],
-        "Other": ["GradNorm/Other"],
-        "Clipped_Total": ["GradNorm/Clipped_Total"],
+        "Total_PreClip": TENSORBOARD_SCALARS["gradnorm_total_preclip"],
+        "MobilityGNN": TENSORBOARD_SCALARS["gradnorm_mobility_gnn"],
+        "Backbone": TENSORBOARD_SCALARS["gradnorm_backbone"],
+        "Other": TENSORBOARD_SCALARS["gradnorm_other"],
+        "Clipped_Total": TENSORBOARD_SCALARS["gradnorm_clipped_total"],
     }
 
     components: dict[str, ComponentMetrics] = {}
-    for name, tags in component_tags.items():
-        steps: list[int] = []
-        values: list[float] = []
-        for tag in tags:
-            steps, values = load_scalars(ea, tag)
-            if values:
-                break
+    for name, tag in component_tags.items():
+        steps, values = load_scalars(ea, tag)
         components[name] = ComponentMetrics(name=name, values=values, steps=steps)
 
     # Load learning rate
-    lr_steps, lr_values = load_scalars(ea, "Learning_Rate/step")
-    if not lr_values:
-        lr_steps, lr_values = load_scalars(ea, "Learning_Rate")
+    lr_steps, lr_values = load_scalars(ea, TENSORBOARD_SCALARS["learning_rate_step"])
     lr_median = float(np.median(lr_values)) if lr_values else 0.0
 
     # Load loss for correlation
-    loss_steps, loss_values = load_scalars(ea, "Loss/Train_step")
-    if not loss_values:
-        loss_steps, loss_values = load_scalars(ea, "Loss/Train")
+    loss_steps, loss_values = load_scalars(ea, TENSORBOARD_SCALARS["loss_train"])
 
     # Compute component shares (with time series)
     total = components["Total_PreClip"]
