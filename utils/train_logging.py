@@ -11,8 +11,13 @@ from utils.console import (
     format_horizon_status_lines,
     format_joint_loss_components_status,
 )
-
-JOINT_LOSS_COMPONENTS: tuple[str, ...] = ("ww", "hosp", "cases", "deaths", "sir")
+from utils.log_keys import (
+    JOINT_LOSS_COMPONENTS,
+    build_curriculum_metric_key,
+    build_eval_metric_key,
+    build_horizon_metric_key,
+    build_loss_key,
+)
 
 
 def build_train_step_log_data(
@@ -29,7 +34,7 @@ def build_train_step_log_data(
 ) -> dict[str, float | torch.Tensor]:
     """Build per-step logging payload before progress-only metrics are added."""
     log_data: dict[str, float | torch.Tensor] = {
-        "learning_rate_step": lr,
+        build_eval_metric_key("learning_rate", "step"): lr,
         "gradnorm_clipped_total": grad_norm,
         "time_batch_s": batch_time_s,
         "time_dataload_s": data_time_s,
@@ -69,14 +74,16 @@ def add_joint_loss_metrics(
 ) -> None:
     """Append optional joint-loss metrics (raw + weighted) to epoch payload."""
     for component in JOINT_LOSS_COMPONENTS:
-        raw_key = f"loss_{component}"
-        weighted_key = f"{raw_key}_weighted"
+        raw_key = build_loss_key(component=component)
+        weighted_key = build_loss_key(component=component, weighted=True)
         if raw_key in metrics:
-            log_data[f"loss_{split_prefix}_{component}"] = metrics[raw_key]
-        if weighted_key in metrics:
-            log_data[f"loss_{split_prefix}_{component}_weighted"] = metrics[
-                weighted_key
+            log_data[build_loss_key(split=split_prefix, component=component)] = metrics[
+                raw_key
             ]
+        if weighted_key in metrics:
+            log_data[
+                build_loss_key(split=split_prefix, component=component, weighted=True)
+            ] = metrics[weighted_key]
 
 
 def compute_horizon_metric_series(
@@ -117,8 +124,8 @@ def add_horizon_metrics_to_log_data(
 ) -> None:
     """Append per-horizon metrics to an epoch logging payload."""
     for label, mae, rmse in horizon_metrics:
-        log_data[f"mae_{split_prefix}_{label}"] = mae
-        log_data[f"rmse_{split_prefix}_{label}"] = rmse
+        log_data[build_horizon_metric_key("mae", split_prefix, label)] = mae
+        log_data[build_horizon_metric_key("rmse", split_prefix, label)] = rmse
 
 
 def add_curriculum_metrics(
@@ -132,11 +139,11 @@ def add_curriculum_metrics(
     if curriculum_sampler is None or not hasattr(curriculum_sampler, "state"):
         return
 
-    log_data[f"train_sparsity_{key_suffix}"] = (
+    log_data[build_curriculum_metric_key("sparsity", key_suffix)] = (
         curriculum_sampler.state.max_sparsity or 0.0
     )
     if include_synth_ratio:
-        log_data[f"train_synth_ratio_{key_suffix}"] = (
+        log_data[build_curriculum_metric_key("synth_ratio", key_suffix)] = (
             curriculum_sampler.state.synth_ratio
         )
 
@@ -156,11 +163,11 @@ def build_epoch_logging_bundle(
 
     log_data: dict[str, Any] = {
         "epoch": epoch,
-        f"loss_{prefix_lower}": loss,
-        f"mae_{prefix_lower}": metrics["mae"],
-        f"rmse_{prefix_lower}": metrics["rmse"],
-        f"smape_{prefix_lower}": metrics["smape"],
-        f"r2_{prefix_lower}": metrics["r2"],
+        build_loss_key(split=prefix_lower): loss,
+        build_eval_metric_key("mae", prefix_lower): metrics["mae"],
+        build_eval_metric_key("rmse", prefix_lower): metrics["rmse"],
+        build_eval_metric_key("smape", prefix_lower): metrics["smape"],
+        build_eval_metric_key("r2", prefix_lower): metrics["r2"],
     }
 
     add_joint_loss_metrics(
