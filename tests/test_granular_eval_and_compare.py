@@ -3,13 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import logging
 import math
 import pandas as pd
 import pytest
 import torch
 
+import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
-from evaluation.eval_loop import evaluate_loader
+from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
 
 
@@ -21,6 +23,9 @@ class _DummyDataset:
         self._region_labels = ["Region A", "08002"]
         self._region_name_source = Path("/tmp/regions.geojson")
         self.run_id = "real"
+
+    def __len__(self) -> int:
+        return 2
 
 
 class _DummyLoader:
@@ -104,6 +109,7 @@ def _assert_metric_dicts_match(
 
 def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     model = _DummyModel()
     batch = _make_batch()
@@ -119,19 +125,23 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     )
 
     granular_csv = tmp_path / "eval_granular.csv"
-    granular_loss, granular_metrics, granular_node_mae = evaluate_loader(
-        model=model,
-        loader=loader,
-        criterion=criterion,
-        horizon=2,
-        device=torch.device("cpu"),
-        granular_csv_path=granular_csv,
-        granular_metadata={"max_batches": 50},
-    )
+    with caplog.at_level(logging.INFO):
+        granular_loss, granular_metrics, granular_node_mae = evaluate_loader(
+            model=model,
+            loader=loader,
+            criterion=criterion,
+            horizon=2,
+            device=torch.device("cpu"),
+            granular_csv_path=granular_csv,
+            granular_metadata={"max_batches": 50},
+            log_every=1,
+        )
 
     assert granular_loss == pytest.approx(baseline_loss)
     _assert_metric_dicts_match(granular_metrics, baseline_metrics)
     assert granular_node_mae == pytest.approx(baseline_node_mae)
+    assert any("stage=batch_fetched" in record.message for record in caplog.records)
+    assert any("stage=granular_write_complete" in record.message for record in caplog.records)
 
     df = pd.read_csv(granular_csv, dtype={"region_id": str})
     assert list(df.columns) == [
@@ -192,6 +202,161 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     assert meta["max_batches"] == 50
     assert meta["region_name_source"] == "/tmp/regions.geojson"
     assert meta["run_id"] == "real"
+    assert "training_seed" in meta.index
+    assert "node_split_strategy" in meta.index
+    assert "node_split_population_bins" in meta.index
+    assert "val_split" in meta.index
+    assert "test_split" in meta.index
+
+
+class _ExplodingModel(_DummyModel):
+    def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        raise RuntimeError("boom")
+
+
+def test_evaluate_loader_logs_batch_context_on_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    model = _ExplodingModel()
+    batch = _make_batch()
+    loader = _DummyLoader([batch])
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sir=0.0)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError, match="boom"):
+            evaluate_loader(
+                model=model,
+                loader=loader,
+                criterion=criterion,
+                horizon=2,
+                device=torch.device("cpu"),
+                split_name="Eval",
+                log_every=1,
+            )
+
+    assert any(
+        "[eval] Evaluation failed: split=Eval batch=0 stage=forward_batch"
+        in record.message
+        for record in caplog.records
+    )
+
+
+def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model = _DummyModel()
+    config = SimpleNamespace(
+        data=SimpleNamespace(dataset_path=Path("/tmp/dummy-dataset.zarr"), window_stride=7),
+        model=SimpleNamespace(forecast_horizon=2, input_window_length=3),
+        output=SimpleNamespace(
+            write_granular_eval=True,
+            resolve_granular_eval_filename=lambda *, split: f"{split}_granular.csv",
+            experiment_name="crossval-test",
+        ),
+        training=SimpleNamespace(
+            loss=SimpleNamespace(),
+            node_split_population_bins=5,
+            node_split_strategy="random",
+            test_split=0.2,
+            val_split=0.1,
+            seed=42,
+            batch_size=32,
+            prefetch_factor=4,
+            pin_memory=True,
+        ),
+    )
+    dataset = _DummyDataset()
+    loader = SimpleNamespace(
+        dataset=dataset,
+        batch_size=8,
+        num_workers=0,
+        prefetch_factor=None,
+        pin_memory=False,
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_load_model_from_checkpoint(checkpoint_path, *, device, overrides):  # noqa: ANN001
+        captured["load_device"] = device
+        captured["load_overrides"] = overrides
+        return model, config, {"checkpoint_path": checkpoint_path}
+
+    def _fake_build_loader_from_config(  # noqa: ANN001
+        cfg,
+        *,
+        split,
+        batch_size,
+        device,
+        num_workers,
+        pin_memory,
+        prefetch_factor,
+    ):
+        captured["loader_args"] = {
+            "cfg": cfg,
+            "split": split,
+            "batch_size": batch_size,
+            "device": device,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "prefetch_factor": prefetch_factor,
+        }
+        return loader, None
+
+    def _fake_get_loss_from_config(*args, **kwargs):  # noqa: ANN001
+        return SimpleNamespace()
+
+    def _fake_evaluate_loader(**kwargs):  # noqa: ANN001
+        captured["evaluate_kwargs"] = kwargs
+        return 1.25, {"mae": 2.5}, {1: 0.5}
+
+    monkeypatch.setattr(
+        eval_loop_module,
+        "load_model_from_checkpoint",
+        _fake_load_model_from_checkpoint,
+    )
+    monkeypatch.setattr(
+        eval_loop_module,
+        "build_loader_from_config",
+        _fake_build_loader_from_config,
+    )
+    monkeypatch.setattr(
+        eval_loop_module,
+        "get_loss_from_config",
+        _fake_get_loss_from_config,
+    )
+    monkeypatch.setattr(eval_loop_module, "evaluate_loader", _fake_evaluate_loader)
+
+    checkpoint_path = tmp_path / "run" / "checkpoints" / "best_model.pt"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text("stub", encoding="utf-8")
+
+    result = eval_checkpoint(
+        checkpoint_path=checkpoint_path,
+        split="test",
+        device="cpu",
+        overrides=["training.device=cpu", "training.prefetch_factor=2"],
+        batch_size=8,
+        num_workers=0,
+        pin_memory=False,
+        prefetch_factor=0,
+        log_every=3,
+    )
+
+    assert result["eval_loss"] == pytest.approx(1.25)
+    assert result["eval_metrics"]["mae"] == pytest.approx(2.5)
+    assert captured["loader_args"] == {
+        "cfg": config,
+        "split": "test",
+        "batch_size": 8,
+        "device": "cpu",
+        "num_workers": 0,
+        "pin_memory": False,
+        "prefetch_factor": 0,
+    }
+    assert captured["evaluate_kwargs"]["log_every"] == 3
+    assert captured["evaluate_kwargs"]["granular_metadata"]["eval_num_workers"] == 0
+    assert captured["evaluate_kwargs"]["granular_metadata"]["eval_prefetch_factor"] is None
+    assert captured["evaluate_kwargs"]["granular_metadata"]["eval_pin_memory"] is False
 
 
 def _write_granular_fixture(path: Path, rows: list[dict[str, object]]) -> None:
