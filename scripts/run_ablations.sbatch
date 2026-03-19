@@ -42,12 +42,6 @@ module load EB/apps EB/install CUDA/12.1.1 || (echo "CUDA module not found" && e
 
 cd "$PROJECT_ROOT"
 
-# Activate virtualenv if present.
-if [ -d "$VENV_PATH" ]; then
-  # shellcheck disable=SC1090
-  source "$VENV_PATH/bin/activate"
-fi
-
 # Keep thread counts aligned with allocation.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
@@ -167,14 +161,8 @@ RUN_ARGS=(
 
 echo "Model ID override: $model_id_override"
 
-# Prefer uv runner if available; fall back to plain python.
-if command -v uv >/dev/null 2>&1; then
-  EPIFORECASTER_MODEL_ID="$model_id_override" \
-    uv run main train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
-else
-  EPIFORECASTER_MODEL_ID="$model_id_override" \
-    python -m cli train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
-fi
+EPIFORECASTER_MODEL_ID="$model_id_override" \
+  uv run main train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
 
 echo "Completed 1 run for ablation '${ABLATION_NAME}'."
 
@@ -188,35 +176,19 @@ if [ "$RUN_ANALYSIS" = "1" ] && [ "$TASK_ID" -eq "$LAST_TASK_INDEX" ]; then
 
   ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-outputs/reports/ablation_analysis}"
 
-  if command -v uv >/dev/null 2>&1; then
-    uv run python scripts/analyze_ablations.py \
-      --training-dir outputs/training \
-      --output-dir "$ANALYSIS_OUTPUT_DIR" \
-      --campaign-id "$CAMPAIGN_ID" \
-      --baseline baseline
+  uv run python scripts/analyze_ablations.py \
+    --training-dir outputs/training \
+    --output-dir "$ANALYSIS_OUTPUT_DIR" \
+    --campaign-id "$CAMPAIGN_ID" \
+    --baseline baseline
 
-    uv run python -m dataviz.ablation_plots \
-      "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
-      --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
-      --cross-head-mean-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_mean_matrix.csv" \
-      --cross-head-std-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_std_matrix.csv" \
-      --output-dir "$ANALYSIS_OUTPUT_DIR" \
-      --baseline baseline
-  else
-    python scripts/analyze_ablations.py \
-      --training-dir outputs/training \
-      --output-dir "$ANALYSIS_OUTPUT_DIR" \
-      --campaign-id "$CAMPAIGN_ID" \
-      --baseline baseline
-
-    python -m dataviz.ablation_plots \
-      "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
-      --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
-      --cross-head-mean-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_mean_matrix.csv" \
-      --cross-head-std-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_std_matrix.csv" \
-      --output-dir "$ANALYSIS_OUTPUT_DIR" \
-      --baseline baseline
-  fi
+  uv run python -m dataviz.ablation_plots \
+    "$ANALYSIS_OUTPUT_DIR/ablation_metrics_aggregated.csv" \
+    --deltas-csv "$ANALYSIS_OUTPUT_DIR/ablation_metrics_deltas.csv" \
+    --cross-head-mean-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_mean_matrix.csv" \
+    --cross-head-std-csv "$ANALYSIS_OUTPUT_DIR/cross_head/cross_head_std_matrix.csv" \
+    --output-dir "$ANALYSIS_OUTPUT_DIR" \
+    --baseline baseline
 
   echo ""
   echo "========================================"

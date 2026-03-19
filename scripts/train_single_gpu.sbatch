@@ -32,12 +32,6 @@ module load CUDA/12.1.1 || (echo "CUDA module not found" && exit 1)
 
 cd "$PROJECT_ROOT"
 
-# Activate virtualenv if present.
-if [ -d "$VENV_PATH" ]; then
-  # shellcheck disable=SC1090
-  source "$VENV_PATH/bin/activate"
-fi
-
 # Torch Inductor compiles helper C++ kernels at runtime for torch.compile.
 # Force GNU compilers to avoid ICC deprecation and unsupported warning flag noise.
 export CXX=g++
@@ -49,8 +43,6 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
 # Build CLI args.
 ARGS=(
-  train
-  epiforecaster
   --config "$CONFIG"
 )
 
@@ -70,9 +62,4 @@ if [ -n "$OVERRIDES" ]; then
   done
 fi
 
-# Prefer uv runner if available; fall back to plain python.
-if command -v uv >/dev/null 2>&1; then
-  uv run main "${ARGS[@]}"
-else
-  python -m cli "${ARGS[@]}"
-fi
+uv run train epiforecaster "${ARGS[@]}"
