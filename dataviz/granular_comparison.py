@@ -202,9 +202,20 @@ def _save_region_time_heatmap(
     region_time_df: pd.DataFrame,
     output_path: Path,
     *,
-    top_regions: int = 20,
+    top_regions: int | None = None,
     max_date_ticks: int = 4,
 ) -> Path:
+    """Save region-time heatmap showing MAE uplift per region and date.
+
+    Args:
+        region_time_df: DataFrame with region-time aggregates
+        output_path: Path to save the figure
+        top_regions: Number of top regions by count to include. If None, show all regions.
+        max_date_ticks: Maximum number of date tick labels
+
+    Returns:
+        Path to saved figure
+    """
     targets = _ordered_targets(region_time_df["target"])
     fig, axes = plt.subplots(
         len(targets),
@@ -214,10 +225,11 @@ def _save_region_time_heatmap(
     )
     for axis, target in zip(axes.flatten(), targets, strict=False):
         target_df = region_time_df[region_time_df["target"] == target].copy()
-        top_region_labels = (
-            target_df.groupby("region_label")["count"].sum().nlargest(top_regions).index
-        )
-        target_df = target_df[target_df["region_label"].isin(top_region_labels)]
+        if top_regions is not None:
+            top_region_labels = (
+                target_df.groupby("region_label")["count"].sum().nlargest(top_regions).index
+            )
+            target_df = target_df[target_df["region_label"].isin(top_region_labels)]
         pivot = target_df.pivot_table(
             index="region_label",
             columns="target_date",
@@ -618,6 +630,7 @@ def compare_ablation_suite(
     min_join_coverage: float = 1.0,
     rolling_window: int = 7,
     region_geojson_path: str | Path = DEFAULT_REGION_GEOJSON,
+    top_regions: int | None = None,
 ) -> dict[str, dict[str, object]]:
     training_dir = Path(training_dir)
     output_dir = Path(output_dir)
@@ -652,6 +665,7 @@ def compare_ablation_suite(
             min_join_coverage=min_join_coverage,
             rolling_window=rolling_window,
             region_geojson_path=region_geojson_path,
+            top_regions=top_regions,
         )
 
     summary_rows = []
@@ -687,8 +701,22 @@ def compare_granular_csvs(
     min_join_coverage: float = 1.0,
     rolling_window: int = 7,
     region_geojson_path: str | Path = DEFAULT_REGION_GEOJSON,
+    top_regions: int | None = None,
 ) -> dict[str, object]:
-    """Compare two granular eval CSVs, write paired tables, and render uplift plots."""
+    """Compare two granular eval CSVs, write paired tables, and render uplift plots.
+
+    Args:
+        baseline_csv: Path to baseline granular metrics CSV
+        candidate_csv: Path to candidate granular metrics CSV
+        output_dir: Directory to write outputs
+        min_join_coverage: Minimum fraction of rows that must match on join
+        rolling_window: Window size for rolling time plots
+        region_geojson_path: Path to region GeoJSON for choropleths
+        top_regions: Number of top regions to include in heatmaps. If None, show all.
+
+    Returns:
+        Dict with matched_rows, tables, and plots paths
+    """
     baseline_path = Path(baseline_csv)
     candidate_path = Path(candidate_csv)
     output_dir = Path(output_dir)
@@ -731,7 +759,7 @@ def compare_granular_csvs(
 
     plots = {
         "region_time_heatmap": _save_region_time_heatmap(
-            region_time_df, output_dir / "region_time_heatmap.png"
+            region_time_df, output_dir / "region_time_heatmap.png", top_regions=top_regions
         ),
         "rolling_time_uplift": _save_rolling_time_plot(
             time_df,
@@ -809,6 +837,12 @@ Examples:
     )
     parser.add_argument("--min-join-coverage", type=float, default=1.0)
     parser.add_argument("--rolling-window", type=int, default=7)
+    parser.add_argument(
+        "--top-regions",
+        type=int,
+        default=None,
+        help="Number of top regions to show in heatmaps. Default: show all regions.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -827,6 +861,7 @@ Examples:
             min_join_coverage=args.min_join_coverage,
             rolling_window=args.rolling_window,
             region_geojson_path=args.region_geojson_path,
+            top_regions=args.top_regions,
         )
         logger.info(
             "Compared %s vs %s with %d matched rows",
@@ -852,6 +887,7 @@ Examples:
         min_join_coverage=args.min_join_coverage,
         rolling_window=args.rolling_window,
         region_geojson_path=args.region_geojson_path,
+        top_regions=args.top_regions,
     )
     logger.info("Generated %d granular comparison suites", len(results))
     return 0

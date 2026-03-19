@@ -377,7 +377,12 @@ def plot_pairwise_scatter_grid(
     alpha: float = 0.3,
     title_suffix: str = "",
 ) -> None:
-    """Create 4x4 scatter grid with histograms on diagonal.
+    """Create scatter grid with histograms on diagonal and correlation in upper triangle.
+
+    Layout:
+    - Diagonal: Histograms
+    - Lower triangle (i > j): Scatter plots with regression lines
+    - Upper triangle (i < j): Correlation coefficient only (no scatter)
 
     Args:
         values: Dict mapping series_name -> 1D array of values
@@ -416,8 +421,8 @@ def plot_pairwise_scatter_grid(
                     )
                 ax.set_xlabel(SERIES_LABELS.get(name_i, name_i))
                 ax.set_ylabel("Count")
-            else:
-                # Off-diagonal: scatter
+            elif i > j:
+                # Lower triangle: scatter plot with regression line
                 x = values[name_j]  # x-axis is column index
                 y = values[name_i]  # y-axis is row index
 
@@ -447,6 +452,29 @@ def plot_pairwise_scatter_grid(
 
                 ax.set_xlabel(SERIES_LABELS.get(name_j, name_j))
                 ax.set_ylabel(SERIES_LABELS.get(name_i, name_i))
+            else:
+                # Upper triangle (i < j): correlation coefficient only
+                x = values[name_j]
+                y = values[name_i]
+
+                valid = np.isfinite(x) & np.isfinite(y)
+                if valid.sum() >= 3:
+                    r, p = stats.pearsonr(x[valid], y[valid])
+                    # Display correlation centered in the cell
+                    ax.text(
+                        0.5,
+                        0.5,
+                        f"r = {r:.2f}\np = {p:.2e}",
+                        transform=ax.transAxes,
+                        horizontalalignment="center",
+                        verticalalignment="center",
+                        fontsize=12,
+                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9),
+                    )
+
+                # Hide ticks for upper triangle cells
+                ax.set_xticks([])
+                ax.set_yticks([])
 
             ax.grid(True, alpha=0.3)
 
