@@ -84,11 +84,13 @@ training:
   prefetch_factor: 2
   pin_memory: true
 
-  gradient_snapshot_frequency: 100
+  progress_log_frequency: 100
+
+  grad_norm_log_frequency: 500
+  gradient_snapshot_frequency: 500
   gradient_snapshot_top_k: 5
   gradient_vanishing_threshold: 1.0e-8
   gradient_exploding_threshold: 1.0e2
-  gradient_debug_log_dir: outputs/grad_debug
 
   # Temporal split configuration
   split_strategy: "node"
