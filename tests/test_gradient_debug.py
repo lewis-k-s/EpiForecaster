@@ -216,7 +216,7 @@ class TestGradientDebugger:
         assert "exploding=" in status
 
     def test_snapshot_marks_expected_vs_unexpected_zero_heads(self, tmp_path):
-        """Vanishing head layers should be contextualized by supervision activity."""
+        """Aggregate head health should not fail active heads for one dead parameter."""
         debugger = GradientDebugger(enabled=True, log_dir=tmp_path)
         model = HeadModel()
 
@@ -226,6 +226,7 @@ class TestGradientDebugger:
 
         model.ww_head.weight.grad.zero_()
         model.ww_head.bias.grad.zero_()
+        model.deaths_head.bias.grad.zero_()
 
         snapshot = debugger.capture_snapshot(
             model,
@@ -254,11 +255,17 @@ class TestGradientDebugger:
         deaths_health = snapshot.head_gradient_health["deaths"]
         assert ww_health["expected_zero"]
         assert not ww_health["unexpected_zero"]
-        assert not deaths_health["has_vanishing_layers"]
+        assert ww_health["grad_norm"] == pytest.approx(0.0)
+        assert deaths_health["has_vanishing_layers"]
+        assert deaths_health["vanishing_layer_count"] == 1
+        assert deaths_health["grad_norm"] > debugger.vanishing_threshold
+        assert not deaths_health["unexpected_zero"]
 
         log_data = debugger.build_snapshot_log_data(snapshot)
         assert log_data["grad_snapshot_head_ww_active"] == 0
+        assert log_data["grad_snapshot_head_ww_grad_norm"] == pytest.approx(0.0)
         assert log_data["grad_snapshot_head_ww_expected_zero"] == 1
+        assert log_data["grad_snapshot_head_deaths_grad_norm"] > 0.0
         assert log_data["grad_snapshot_head_ww_pass_rate"] == pytest.approx(0.2)
         assert "expected-zero" in debugger.format_snapshot_status(snapshot)
 
