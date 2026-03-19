@@ -5,6 +5,8 @@ This module isolates model execution, dtype coercion, and numerical stability
 from the raw data schemas.
 """
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
