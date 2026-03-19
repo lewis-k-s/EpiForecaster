@@ -54,6 +54,7 @@ from utils.gradnorm_logging import (
     mark_gradnorm_sidecar_complete,
 )
 from utils.gradient_debug import GradientDebugger
+from utils.log_keys import infer_observation_head_from_name
 from utils.platform import (
     get_nvme_path,
     is_slurm_cluster,
@@ -1896,25 +1897,28 @@ class EpiForecasterTrainer:
 
         self._grad_norm_groups: dict[str, list[torch.nn.Parameter]] = {
             "mobility_gnn": [],
-            "observation_heads": [],
             "sird": [],
             "backbone": [],
             "other": [],
+            **{
+                f"observation_head_{head}": []
+                for head in GradNormController.task_names
+            },
         }
 
-        obs_head_suffixes = ("_head", "_scale", "_projection")
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
 
+            observation_head_name = infer_observation_head_from_name(name)
             if "mobility_gnn" in name:
                 self._grad_norm_groups["mobility_gnn"].append(param)
-            elif name.endswith(obs_head_suffixes) and not any(
-                proj in name for proj in sird_projections
-            ):
-                self._grad_norm_groups["observation_heads"].append(param)
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
+            elif observation_head_name is not None:
+                self._grad_norm_groups[f"observation_head_{observation_head_name}"].append(
+                    param
+                )
             elif "backbone" in name:
                 self._grad_norm_groups["backbone"].append(param)
             else:

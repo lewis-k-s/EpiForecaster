@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from evaluation.losses import JointInferenceLoss
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from training.gradnorm import GradNormController
+from training.grad_utils import compute_gradient_norms_and_clip
 
 
 def test_gradnorm_weights_positive_and_sum_invariant() -> None:
@@ -99,6 +101,36 @@ class _StepModel(torch.nn.Module):
         return model_outputs, targets
 
 
+class _ToyDelayKernel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.kernel = torch.nn.Parameter(torch.tensor([0.5, -0.25], dtype=torch.float32))
+
+
+class _ToyObservationHead(torch.nn.Module):
+    def __init__(self, *, include_delay_kernel: bool) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.alpha = torch.nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        if include_delay_kernel:
+            self.delay_kernel = _ToyDelayKernel()
+        self.residual_proj = torch.nn.Linear(2, 1)
+
+
+class _ToyGradNormModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mobility_gnn = torch.nn.Linear(3, 2)
+        self.backbone = torch.nn.Module()
+        self.backbone.beta_projection = torch.nn.Linear(2, 1)
+        self.backbone.encoder_projection = torch.nn.Linear(2, 2)
+        self.ww_head = _ToyObservationHead(include_delay_kernel=False)
+        self.hosp_head = _ToyObservationHead(include_delay_kernel=False)
+        self.cases_head = _ToyObservationHead(include_delay_kernel=True)
+        self.deaths_head = _ToyObservationHead(include_delay_kernel=True)
+        self.other_block = torch.nn.Linear(2, 2)
+
+
 def _make_gradnorm_stub_trainer(*, update_every: int) -> EpiForecasterTrainer:
     trainer = object.__new__(EpiForecasterTrainer)
     trainer.device = torch.device("cpu")
@@ -128,6 +160,101 @@ def _make_gradnorm_stub_trainer(*, update_every: int) -> EpiForecasterTrainer:
         training=SimpleNamespace(gradient_clip_value=5.0),
     )
     return trainer
+
+
+def test_gradient_norm_group_init_assigns_observation_heads() -> None:
+    trainer = object.__new__(EpiForecasterTrainer)
+    trainer.model = _ToyGradNormModel()
+
+    EpiForecasterTrainer._init_gradient_norm_groups(trainer)
+
+    name_by_id = {id(param): name for name, param in trainer.model.named_parameters()}
+    grouped_names = {
+        group: [name_by_id[id(param)] for param in params]
+        for group, params in trainer._grad_norm_groups.items()
+    }
+
+    assert grouped_names["observation_head_ww"] == [
+        "ww_head.scale",
+        "ww_head.alpha",
+        "ww_head.residual_proj.weight",
+        "ww_head.residual_proj.bias",
+    ]
+    assert grouped_names["observation_head_hosp"] == [
+        "hosp_head.scale",
+        "hosp_head.alpha",
+        "hosp_head.residual_proj.weight",
+        "hosp_head.residual_proj.bias",
+    ]
+    assert grouped_names["observation_head_cases"] == [
+        "cases_head.scale",
+        "cases_head.alpha",
+        "cases_head.delay_kernel.kernel",
+        "cases_head.residual_proj.weight",
+        "cases_head.residual_proj.bias",
+    ]
+    assert grouped_names["observation_head_deaths"] == [
+        "deaths_head.scale",
+        "deaths_head.alpha",
+        "deaths_head.delay_kernel.kernel",
+        "deaths_head.residual_proj.weight",
+        "deaths_head.residual_proj.bias",
+    ]
+    assert all("_head." not in name for name in grouped_names["other"])
+
+
+def test_compute_gradient_norms_logs_distinct_observation_heads() -> None:
+    trainer = object.__new__(EpiForecasterTrainer)
+    trainer.model = _ToyGradNormModel()
+    EpiForecasterTrainer._init_gradient_norm_groups(trainer)
+
+    grad_scales = {
+        "mobility_gnn": 1.5,
+        "sird": 2.0,
+        "backbone": 2.5,
+        "other": 3.0,
+        "observation_head_ww": 4.0,
+        "observation_head_hosp": 5.0,
+        "observation_head_cases": 6.0,
+        "observation_head_deaths": 7.0,
+    }
+    for group_name, params in trainer._grad_norm_groups.items():
+        fill_value = grad_scales[group_name]
+        for param in params:
+            param.grad = torch.full_like(param, fill_value)
+
+    _, norms = compute_gradient_norms_and_clip(
+        grad_norm_groups=trainer._grad_norm_groups,
+        model=trainer.model,
+        device=torch.device("cpu"),
+        step=0,
+        frequency=1,
+        clip_value=1.0e9,
+    )
+
+    expected = {}
+    for group_name, params in trainer._grad_norm_groups.items():
+        sq_sum = sum(float(param.grad.pow(2).sum().item()) for param in params)
+        expected[group_name] = sq_sum**0.5
+
+    assert norms["gradnorm_mobility_gnn"] == pytest.approx(expected["mobility_gnn"])
+    assert norms["gradnorm_sird_physics"] == pytest.approx(expected["sird"])
+    assert norms["gradnorm_backbone_encoder"] == pytest.approx(expected["backbone"])
+    assert norms["gradnorm_other"] == pytest.approx(expected["other"])
+    assert norms["gradnorm_obs_ww"] == pytest.approx(expected["observation_head_ww"])
+    assert norms["gradnorm_obs_hosp"] == pytest.approx(
+        expected["observation_head_hosp"]
+    )
+    assert norms["gradnorm_obs_cases"] == pytest.approx(
+        expected["observation_head_cases"]
+    )
+    assert norms["gradnorm_obs_deaths"] == pytest.approx(
+        expected["observation_head_deaths"]
+    )
+
+    assert norms["gradnorm_obs_ww"] != norms["gradnorm_obs_hosp"]
+    assert norms["gradnorm_obs_hosp"] != norms["gradnorm_obs_cases"]
+    assert norms["gradnorm_obs_cases"] != norms["gradnorm_obs_deaths"]
 
 
 def test_trainer_adaptive_step_and_sidecar_updates_weights() -> None:
