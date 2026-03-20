@@ -26,16 +26,10 @@ DRY_RUN_MAX_EPOCHS="${DRY_RUN_MAX_EPOCHS:-1}"
 # Path to an existing virtual environment (override or comment out if using modules).
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 
-module load EB/apps EB/install || (echo "Core EB modules not found" && exit 1)
-module load gcc/12.3.0 || module load gcc || (echo "GCC module not found" && exit 1)
-module load CUDA/12.1.1 || (echo "CUDA module not found" && exit 1)
+# shellcheck disable=SC1091
+source "$PROJECT_ROOT/scripts/mn5_module_setup.sh"
 
 cd "$PROJECT_ROOT"
-
-# Torch Inductor compiles helper C++ kernels at runtime for torch.compile.
-# Force GNU compilers to avoid ICC deprecation and unsupported warning flag noise.
-export CXX=g++
-export CC=gcc
 echo "Compiler selection: CC=${CC:-<auto>} CXX=${CXX:-<auto>}"
 
 # Keep thread counts aligned with allocation.

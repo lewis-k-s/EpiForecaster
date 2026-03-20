@@ -39,7 +39,8 @@ DRY_RUN_MAX_EPOCHS="${DRY_RUN_MAX_EPOCHS:-1}"
 EVAL_DEVICE="${EVAL_DEVICE:-auto}"
 OUTPUT_LOG_DIR="${OUTPUT_LOG_DIR:-outputs/training}"
 
-module load EB/apps EB/install CUDA/12.1.1 || (echo "CUDA module not found" && exit 1)
+# shellcheck disable=SC1091
+source "$PROJECT_ROOT/scripts/mn5_module_setup.sh"
 
 cd "$PROJECT_ROOT"
 

@@ -17,6 +17,9 @@ SPLIT="${SPLIT:-test}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/reports/crossval/${CAMPAIGN_ID}/${SPLIT}}"
 ANALYZE_VERBOSE="${ANALYZE_VERBOSE:-0}"
 
+# shellcheck disable=SC1091
+source "$PROJECT_ROOT/scripts/mn5_module_setup.sh"
+
 cd "$PROJECT_ROOT"
 
 echo "Starting crossval aggregate job"
