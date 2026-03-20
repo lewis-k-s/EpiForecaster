@@ -99,8 +99,40 @@ uv sync
 # Install development dependencies
 uv sync --group dev
 
+# Install ONNX export dependencies (onnx + onnxscript)
+uv sync --extra onnx
+
+# Install optional ONNX simplification support
+uv sync --extra onnx --extra onnx-simplify
+
 # Or manually install with pip
 pip install -e .
+```
+
+### MN5 Module Setup
+
+On MareNostrum 5, the batch scripts now source a shared module bootstrap at
+[`scripts/mn5_module_setup.sh`](/Volumes/HUBSSD/code/EpiForecaster/scripts/mn5_module_setup.sh).
+It loads a consistent toolchain across training and evaluation jobs:
+
+- `EB/apps` and `EB/install`
+- `gcc/12.3.0`
+- `CUDA/12.1.1`
+- `cmake/4.1.2-gcc`
+
+`cmake` is required on MN5 when installing the optional ONNX simplification stack,
+because `uv sync --extra onnx --extra onnx-simplify` may need to build
+`onnx-simplifier` / `onnxsim`.
+
+If you are working interactively on MN5 before creating or syncing the virtualenv,
+load the same module stack first:
+
+```bash
+source scripts/mn5_module_setup.sh
+uv sync --extra onnx --dev
+
+# Optional, only if you want onnx-simplifier
+uv sync --extra onnx --extra onnx-simplify --dev
 ```
 
 The installation provides access to the `epiforecaster` command-line interface:

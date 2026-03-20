@@ -34,6 +34,10 @@ sbatch scripts/train_single_gpu.sbatch
 sbatch scripts/optuna_epiforecaster.sbatch
 ```
 
+The MN5 batch scripts share a common module bootstrap in `scripts/mn5_module_setup.sh`.
+That setup loads the GCC, CUDA, and CMake modules needed for both runtime jobs and
+optional ONNX simplification tooling installation.
+
 ## Development Alternatives
 
 For local development, use the standard configs instead:
