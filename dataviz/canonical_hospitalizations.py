@@ -334,6 +334,7 @@ def plot_mask_coverage(
 def compute_summary_statistics(
     hosp_da: xr.DataArray,
     region_ids: np.ndarray,
+    mask_da: xr.DataArray | None = None,
     indices: list[int] | None = None,
 ) -> pd.DataFrame:
     """Compute per-municipality summary statistics."""
@@ -342,13 +343,17 @@ def compute_summary_statistics(
 
     stats = []
     raw_values = hosp_da.values
+    mask_values = None if mask_da is None else (mask_da.values > 0)
     n_total_days = raw_values.shape[0]
 
     for idx in indices:
         region_data = raw_values[:, idx]
         region_id = str(region_ids[idx])
 
-        valid_mask = np.isfinite(region_data)
+        if mask_values is not None:
+            valid_mask = mask_values[:, idx] & np.isfinite(region_data)
+        else:
+            valid_mask = np.isfinite(region_data)
         valid_data = region_data[valid_mask]
         n_valid = valid_mask.sum()
         coverage = n_valid / n_total_days
@@ -459,6 +464,7 @@ def _select_region_indices(
 def _select_regions_by_coverage(
     hosp_da: xr.DataArray,
     region_ids: np.ndarray,
+    mask_da: xr.DataArray | None,
     top_n: int | None,
     bottom_n: int | None,
 ) -> list[int]:
@@ -467,11 +473,15 @@ def _select_regions_by_coverage(
         return []
 
     raw_values = hosp_da.values
+    mask_values = None if mask_da is None else (mask_da.values > 0)
     n_days = raw_values.shape[0]
 
     coverage = []
     for idx in range(len(region_ids)):
-        valid_mask = np.isfinite(raw_values[:, idx])
+        if mask_values is not None:
+            valid_mask = mask_values[:, idx] & np.isfinite(raw_values[:, idx])
+        else:
+            valid_mask = np.isfinite(raw_values[:, idx])
         coverage.append((idx, valid_mask.sum() / n_days))
 
     coverage.sort(key=lambda x: x[1], reverse=True)
@@ -587,7 +597,7 @@ def main() -> None:
     heatmap_indices: list[int] = []
 
     coverage_indices = _select_regions_by_coverage(
-        hosp_da, region_ids, args.top_n, args.bottom_n
+        hosp_da, region_ids, mask_da, args.top_n, args.bottom_n
     )
 
     if coverage_indices:
@@ -620,7 +630,12 @@ def main() -> None:
         )
 
     # Compute and display summary statistics
-    stats_df = compute_summary_statistics(hosp_da, region_ids, series_indices)
+    stats_df = compute_summary_statistics(
+        hosp_da,
+        region_ids,
+        mask_da=mask_da,
+        indices=series_indices,
+    )
     print_summary_statistics(stats_df)
 
     if args.stats_output:

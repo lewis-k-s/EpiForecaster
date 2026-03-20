@@ -216,14 +216,13 @@ def _save_region_time_heatmap(
     Returns:
         Path to saved figure
     """
+    from matplotlib.gridspec import GridSpec
+
     targets = _ordered_targets(region_time_df["target"])
-    fig, axes = plt.subplots(
-        len(targets),
-        1,
-        figsize=(18, max(5, len(targets) * 5)),
-        squeeze=False,
-    )
-    for axis, target in zip(axes.flatten(), targets, strict=False):
+
+    # Pre-compute pivots and region counts for each target
+    pivots = {}
+    for target in targets:
         target_df = region_time_df[region_time_df["target"] == target].copy()
         if top_regions is not None:
             top_region_labels = (
@@ -236,9 +235,25 @@ def _save_region_time_heatmap(
             values="abs_error_uplift_mean",
             aggfunc="mean",
         )
-        if pivot.empty:
-            axis.set_visible(False)
-            continue
+        if not pivot.empty:
+            pivots[target] = pivot
+
+    if not pivots:
+        # No data, create empty figure
+        fig, _ = plt.subplots(figsize=(18, 5))
+        fig.savefig(output_path)
+        plt.close(fig)
+        return output_path
+
+    # Calculate height ratios based on region counts (min 3 inches per subplot)
+    height_ratios = [max(3, len(pivots[t].index) * 0.18) for t in pivots]
+    total_height = sum(height_ratios) + 0.5  # Add margin
+
+    fig = plt.figure(figsize=(18, total_height))
+    gs = GridSpec(len(pivots), 1, height_ratios=height_ratios, hspace=0.3)
+
+    for i, (target, pivot) in enumerate(pivots.items()):
+        axis = fig.add_subplot(gs[i])
         sns.heatmap(
             pivot,
             ax=axis,
@@ -247,6 +262,11 @@ def _save_region_time_heatmap(
             cbar=True,
             cbar_kws={"label": "MAE uplift"},
         )
+        # Explicitly set y-ticks to show all region labels
+        n_regions = len(pivot.index)
+        axis.set_yticks([i + 0.5 for i in range(n_regions)])
+        axis.set_yticklabels(pivot.index, fontsize=max(4, 10 - n_regions // 15))
+
         columns = list(pivot.columns)
         if columns:
             tick_count = min(max_date_ticks, len(columns))
@@ -254,8 +274,8 @@ def _save_region_time_heatmap(
                 tick_positions = [0]
             else:
                 tick_positions = [
-                    round(i * (len(columns) - 1) / (tick_count - 1))
-                    for i in range(tick_count)
+                    round(j * (len(columns) - 1) / (tick_count - 1))
+                    for j in range(tick_count)
                 ]
             tick_positions = sorted(set(tick_positions))
             tick_labels = []
@@ -267,8 +287,8 @@ def _save_region_time_heatmap(
         axis.set_title(f"{_format_target_label(target)}: region-time MAE uplift")
         axis.set_xlabel("Target date")
         axis.set_ylabel("Region")
-    fig.subplots_adjust(hspace=0.4)
-    fig.savefig(output_path)
+
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     return output_path
 
@@ -542,6 +562,73 @@ def _save_region_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
     return output_path
 
 
+def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
+    """Save scatter plot showing correlation between data density and MAE uplift per region."""
+    targets = _ordered_targets(region_df["target"])
+    n_targets = len(targets)
+
+    fig, axes = plt.subplots(
+        n_targets,
+        1,
+        figsize=(10, max(4, n_targets * 4)),
+        squeeze=False,
+    )
+
+    for axis, target in zip(axes.flatten(), targets, strict=False):
+        target_df = region_df[region_df["target"] == target].copy()
+        if target_df.empty:
+            axis.set_visible(False)
+            continue
+
+        # Scatter: x=count (density), y=uplift
+        norm = _signed_norm(target_df["abs_error_uplift_mean"])
+        sns.scatterplot(
+            data=target_df,
+            x="count",
+            y="abs_error_uplift_mean",
+            hue="abs_error_uplift_mean",
+            palette=ERROR_DIVERGING_CMAP,
+            hue_norm=norm,
+            size="baseline_mae",
+            sizes=(20, 150),
+            alpha=0.7,
+            ax=axis,
+            legend=False,
+        )
+
+        # Add regression line
+        if len(target_df) > 2:
+            corr = target_df["count"].corr(target_df["abs_error_uplift_mean"])
+            sns.regplot(
+                data=target_df,
+                x="count",
+                y="abs_error_uplift_mean",
+                scatter=False,
+                ax=axis,
+                color="#333333",
+                line_kws={"linestyle": "--", "linewidth": 1.5},
+            )
+            axis.annotate(
+                f"r = {corr:.2f}",
+                xy=(0.95, 0.95),
+                xycoords="axes fraction",
+                ha="right",
+                va="top",
+                fontsize=10,
+                color="#333333",
+            )
+
+        axis.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+        axis.set_title(f"{_format_target_label(target)}: density vs uplift")
+        axis.set_xlabel("Sample count (density)")
+        axis.set_ylabel("MAE uplift")
+
+    plt.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
 def _save_target_choropleths(
     region_df: pd.DataFrame,
     output_path: Path,
@@ -783,6 +870,9 @@ def compare_granular_csvs(
         ),
         "region_scatter": _save_region_scatter(
             region_df, output_dir / "region_scatter.png"
+        ),
+        "density_uplift_scatter": _save_density_uplift_scatter(
+            region_df, output_dir / "density_uplift_scatter.png"
         ),
         "target_choropleths": _save_target_choropleths(
             region_df,
