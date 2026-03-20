@@ -122,9 +122,10 @@ def evaluate_loader(
     loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
     loss_sir_weighted_sum = torch.tensor(0.0, device=device)
 
-    # For node-level MAE, accumulate in dict but defer item() calls
-    node_mae_sum: dict[int, torch.Tensor] = {}
-    node_mae_count: dict[int, int] = {}
+    # For node-level MAE, collect tensors and process on CPU at the end
+    node_mae_accum_maes: list[torch.Tensor] = []
+    node_mae_accum_nodes: list[torch.Tensor] = []
+    node_mae_accum_valid: list[torch.Tensor] = []
 
     num_batches = len(loader)
     eval_iter = loader
@@ -268,16 +269,11 @@ def evaluate_loader(
                         dim=1
                     ).clamp_min(1e-8)
                     target_nodes = batch_data.target_node
-                    for sample_mae, target_node, is_valid in zip(
-                        per_sample_mae, target_nodes, valid_per_sample, strict=False
-                    ):
-                        if not bool(is_valid):
-                            continue
-                        node_id = int(target_node)
-                        if node_id not in node_mae_sum:
-                            node_mae_sum[node_id] = torch.tensor(0.0, device=device)
-                        node_mae_sum[node_id] += sample_mae.detach()
-                        node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
+                    
+                    node_mae_accum_maes.append(per_sample_mae.detach())
+                    node_mae_accum_nodes.append(target_nodes.detach())
+                    node_mae_accum_valid.append(valid_per_sample.detach())
+                    
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -418,9 +414,24 @@ def evaluate_loader(
     cases_summary = cases_metrics.finalize()
     deaths_summary = deaths_metrics.finalize()
 
+    node_mae_sum: dict[int, float] = {}
+    node_mae_count: dict[int, int] = {}
+    if node_mae_accum_maes:
+        all_maes = torch.cat(node_mae_accum_maes).cpu().tolist()
+        all_nodes = torch.cat(node_mae_accum_nodes).cpu().tolist()
+        all_valid = torch.cat(node_mae_accum_valid).cpu().tolist()
+        for mae, node_id, is_valid in zip(all_maes, all_nodes, all_valid):
+            if not is_valid:
+                continue
+            if node_id not in node_mae_sum:
+                node_mae_sum[node_id] = 0.0
+                node_mae_count[node_id] = 0
+            node_mae_sum[node_id] += mae
+            node_mae_count[node_id] += 1
+
     # Convert node MAE tensors to scalars
     node_mae = {
-        node_id: (node_mae_sum[node_id] / max(1, node_mae_count[node_id])).item()
+        node_id: node_mae_sum[node_id] / max(1, node_mae_count[node_id])
         for node_id in node_mae_sum
     }
 

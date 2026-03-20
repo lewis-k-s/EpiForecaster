@@ -55,3 +55,41 @@ def test_torch_metric_accumulator_matches_weighted_numpy() -> None:
     assert np.isclose(torch_metrics.effective_count, numpy_metrics.effective_count)
     assert np.allclose(torch_metrics.mae_per_h, numpy_metrics.mae_per_h)
     assert np.allclose(torch_metrics.rmse_per_h, numpy_metrics.rmse_per_h)
+
+
+def test_sparse_horizons_remain_nan_in_torch_and_numpy() -> None:
+    pred = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0]])
+    target = torch.zeros_like(pred)
+    weights = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+
+    acc = TorchMaskedMetricAccumulator(device=torch.device("cpu"), horizon=7)
+    acc.update(
+        predictions=pred,
+        targets=target,
+        observed_mask=None,
+        sample_weights=weights,
+    )
+    torch_metrics = acc.finalize()
+
+    numpy_metrics = compute_masked_metrics_numpy(
+        predictions=pred.numpy(),
+        targets=target.numpy(),
+        observed_mask=None,
+        sample_weights=weights.numpy(),
+        horizon=7,
+    )
+
+    assert np.isnan(torch_metrics.mae_per_h[:6]).all()
+    assert np.isnan(torch_metrics.rmse_per_h[:6]).all()
+    assert torch_metrics.mae_per_h[6] == 2.0
+    assert torch_metrics.rmse_per_h[6] == 2.0
+    assert np.allclose(
+        torch_metrics.mae_per_h,
+        numpy_metrics.mae_per_h,
+        equal_nan=True,
+    )
+    assert np.allclose(
+        torch_metrics.rmse_per_h,
+        numpy_metrics.rmse_per_h,
+        equal_nan=True,
+    )

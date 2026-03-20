@@ -630,6 +630,7 @@ class JointInferenceLoss(nn.Module):
             * 0.0
         )
         component_losses: list[torch.Tensor] = []
+        active_flags: list[torch.Tensor] = []
 
         def _masked_mse(
             nowcast_pred: torch.Tensor, last_observed: torch.Tensor
@@ -646,19 +647,21 @@ class JointInferenceLoss(nn.Module):
 
         for head_name, hist_field, pred_key in self._CONTINUITY_HEADS:
             active = cast(torch.Tensor, obs_supervision[head_name]["active"])
-            if not bool(active):
-                continue
 
-            prediction = model_outputs[pred_key]
-            if prediction.shape[1] == 0:
+            prediction = model_outputs.get(pred_key)
+            if prediction is None or prediction.shape[1] == 0:
                 continue
             hist_tensor = getattr(batch_data, hist_field, None)
             if hist_tensor is None:
                 continue
 
             head_loss = _masked_mse(prediction[:, 0], hist_tensor[:, -1, 0])
-            component_losses.append(head_loss)
+            active_f = active.to(dtype=head_loss.dtype)
+            component_losses.append(head_loss * active_f)
+            active_flags.append(active_f)
 
         if component_losses:
-            return torch.stack(component_losses).mean()
+            stacked_losses = torch.stack(component_losses)
+            stacked_flags = torch.stack(active_flags)
+            return stacked_losses.sum() / stacked_flags.sum().clamp_min(1.0)
         return zero_anchor

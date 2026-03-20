@@ -10,6 +10,36 @@ _EPSILON = 1e-6
 _VALUE_CLAMP = 1.0e6
 
 
+def _compute_per_horizon_metrics(
+    abs_sum: torch.Tensor,
+    mse_sum: torch.Tensor,
+    count_sum: torch.Tensor,
+) -> tuple[list[float], list[float]]:
+    """Return per-horizon metrics, preserving unsupported horizons as NaN."""
+    mae = torch.full_like(abs_sum, float("nan"))
+    rmse = torch.full_like(mse_sum, float("nan"))
+    valid = count_sum > 0
+    if torch.any(valid):
+        mae[valid] = abs_sum[valid] / count_sum[valid]
+        rmse[valid] = torch.sqrt(mse_sum[valid] / count_sum[valid])
+    return mae.tolist(), rmse.tolist()
+
+
+def _compute_per_horizon_metrics_numpy(
+    abs_sum: np.ndarray,
+    mse_sum: np.ndarray,
+    count_sum: np.ndarray,
+) -> tuple[list[float], list[float]]:
+    """Return per-horizon metrics, preserving unsupported horizons as NaN."""
+    mae = np.full_like(abs_sum, np.nan, dtype=np.float64)
+    rmse = np.full_like(mse_sum, np.nan, dtype=np.float64)
+    valid = count_sum > 0
+    if np.any(valid):
+        mae[valid] = abs_sum[valid] / count_sum[valid]
+        rmse[valid] = np.sqrt(mse_sum[valid] / count_sum[valid])
+    return mae.tolist(), rmse.tolist()
+
+
 @dataclass
 class MaskedMetricResult:
     mae: float
@@ -136,9 +166,11 @@ class TorchMaskedMetricAccumulator:
         mae_per_h: list[float] = []
         rmse_per_h: list[float] = []
         if self.horizon is not None and self.per_h_count_sum is not None:
-            denom = self.per_h_count_sum.clamp_min(1.0)
-            mae_per_h = (self.per_h_mae_sum / denom).tolist()
-            rmse_per_h = (self.per_h_mse_sum / denom).sqrt().tolist()
+            mae_per_h, rmse_per_h = _compute_per_horizon_metrics(
+                abs_sum=self.per_h_mae_sum,
+                mse_sum=self.per_h_mse_sum,
+                count_sum=self.per_h_count_sum,
+            )
 
         return MaskedMetricResult(
             mae=mae,
@@ -227,9 +259,11 @@ def compute_masked_metrics_numpy(
         per_h_abs_sum = (abs_diff * mask).sum(axis=0)
         per_h_sq_sum = ((diff**2) * mask).sum(axis=0)
         per_h_count = mask.sum(axis=0)
-        per_h_count = np.maximum(per_h_count, 1.0)
-        mae_per_h = (per_h_abs_sum / per_h_count).tolist()
-        rmse_per_h = np.sqrt(per_h_sq_sum / per_h_count).tolist()
+        mae_per_h, rmse_per_h = _compute_per_horizon_metrics_numpy(
+            abs_sum=per_h_abs_sum,
+            mse_sum=per_h_sq_sum,
+            count_sum=per_h_count,
+        )
 
     return MaskedMetricResult(
         mae=mae,

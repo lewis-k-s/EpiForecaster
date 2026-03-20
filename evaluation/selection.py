@@ -127,7 +127,7 @@ def topk_target_nodes_by_mae(
     device = next(model.parameters()).device
     forward_model = cast(EpiForecaster, model)
 
-    node_mae_sum: dict[int, torch.Tensor] = {}
+    node_mae_sum: dict[int, float] = {}
     node_mae_count: dict[int, int] = {}
 
     model_was_training = model.training
@@ -162,15 +162,15 @@ def topk_target_nodes_by_mae(
                     dim=1
                 ).clamp_min(1.0)
                 target_nodes = batch.target_node
-                for sample_mae, target_node, is_valid in zip(
-                    per_sample_mae, target_nodes, valid_per_sample, strict=False
-                ):
-                    if not bool(is_valid):
+                valid_cpu = valid_per_sample.cpu().tolist()
+                nodes_cpu = target_nodes.cpu().tolist()
+                maes_cpu = per_sample_mae.detach().cpu().tolist()
+                for is_valid, node_id, sample_mae in zip(valid_cpu, nodes_cpu, maes_cpu):
+                    if not is_valid:
                         continue
-                    node_id = int(target_node)
                     if node_id not in node_mae_sum:
-                        node_mae_sum[node_id] = torch.tensor(0.0, device=device)
-                    node_mae_sum[node_id] += sample_mae.detach()
+                        node_mae_sum[node_id] = 0.0
+                    node_mae_sum[node_id] += sample_mae
                     node_mae_count[node_id] = node_mae_count.get(node_id, 0) + 1
     finally:
         if model_was_training:
@@ -180,7 +180,7 @@ def topk_target_nodes_by_mae(
         return []
 
     node_mae = {
-        node_id: (node_mae_sum[node_id] / max(1, node_mae_count[node_id])).item()
+        node_id: node_mae_sum[node_id] / max(1, node_mae_count[node_id])
         for node_id in node_mae_sum
     }
     return [
