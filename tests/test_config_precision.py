@@ -106,3 +106,19 @@ class TestPrecisionConfigValidation:
         for eps in [1e-4, 1e-6, 1e-8, 1e-10, 1e-12]:
             config = TrainingParams(optimizer_eps=eps)
             assert config.optimizer_eps == eps
+
+    def test_negative_wandb_gradient_histogram_frequency_rejected(self):
+        """Histogram logging frequency must be non-negative."""
+        with pytest.raises(
+            ValueError,
+            match="wandb_gradient_histogram_frequency must be non-negative",
+        ):
+            TrainingParams(wandb_gradient_histogram_frequency=-1)
+
+    def test_non_positive_wandb_gradient_histogram_max_params_rejected(self):
+        """Histogram logging max params must be at least one."""
+        with pytest.raises(
+            ValueError,
+            match="wandb_gradient_histogram_max_params must be >= 1",
+        ):
+            TrainingParams(wandb_gradient_histogram_max_params=0)

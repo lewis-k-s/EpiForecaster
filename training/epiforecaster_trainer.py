@@ -12,6 +12,7 @@ import importlib
 import logging
 import os
 import platform
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -1280,7 +1281,7 @@ class EpiForecasterTrainer:
         # Keep cached weights current even before warmup/GradNorm loss activation.
         self._gradnorm_cached_weights = self.gradnorm_controller.weights().detach()
 
-        if not bool(obs_active_mask.any()):
+        if not obs_active_mask.any().item():
             mark_gradnorm_sidecar_complete(
                 log_data,
                 started_at=sidecar_start_time,
@@ -1288,9 +1289,7 @@ class EpiForecasterTrainer:
             )
             return log_data
 
-        if not bool(
-            self.gradnorm_controller.l0_initialized[obs_active_mask].all().item()
-        ):
+        if not self.gradnorm_controller.l0_initialized[obs_active_mask].all().item():
             mark_gradnorm_sidecar_complete(
                 log_data,
                 started_at=sidecar_start_time,
@@ -1407,6 +1406,86 @@ class EpiForecasterTrainer:
             }
         return coverage
 
+    @staticmethod
+    def _sanitize_wandb_histogram_name(name: str) -> str:
+        """Convert a parameter name into a stable W&B histogram key fragment."""
+        sanitized = re.sub(r"[^0-9A-Za-z]+", "_", name)
+        sanitized = re.sub(r"_+", "_", sanitized)
+        return sanitized.strip("_")
+
+    @classmethod
+    def _build_wandb_gradient_histogram_payload(
+        cls,
+        *,
+        model: torch.nn.Module,
+        step: int,
+        frequency: int,
+        patterns: list[str],
+        max_params: int,
+    ) -> dict[str, wandb.Histogram | int]:
+        """Build a W&B histogram payload from selected pre-clip gradients."""
+        if frequency <= 0 or not patterns:
+            return {}
+        if not should_log_step(step, 1, frequency):
+            return {}
+
+        payload: dict[str, wandb.Histogram | int] = {}
+        for name, param in sorted(model.named_parameters(), key=lambda item: item[0]):
+            if len(payload) >= max_params:
+                break
+            if not any(pattern in name for pattern in patterns):
+                continue
+            if param.grad is None or param.grad.numel() < 2:
+                continue
+
+            finite_grad = param.grad.detach().float()
+            finite_grad = finite_grad[torch.isfinite(finite_grad)]
+            if finite_grad.numel() < 2:
+                continue
+
+            key = f"grad_hist/{cls._sanitize_wandb_histogram_name(name)}"
+            payload[key] = wandb.Histogram(finite_grad.cpu().numpy())
+
+        if payload:
+            payload["grad_histograms_logged"] = len(payload)
+        return payload
+
+    def _build_wandb_payload(
+        self,
+        *,
+        log_this_step: bool,
+        log_data: dict[str, float | int | torch.Tensor],
+        component_gradnorm_log_data: dict[str, float],
+        gradient_snapshot_log_data: dict[str, float | int],
+    ) -> dict[str, float | int | torch.Tensor | wandb.Histogram] | None:
+        """Build the final W&B payload, excluding grad scalars and adding histograms."""
+        payload = get_wandb_step_payload(
+            log_this_step=log_this_step,
+            log_data=log_data,
+            component_gradnorm_log_data=component_gradnorm_log_data,
+            gradient_snapshot_log_data=gradient_snapshot_log_data,
+        )
+        if self.wandb_run is None:
+            return payload
+
+        histogram_payload = self._build_wandb_gradient_histogram_payload(
+            model=self.model,
+            step=self.global_step,
+            frequency=self.config.training.wandb_gradient_histogram_frequency,
+            patterns=self.config.training.wandb_gradient_histogram_patterns,
+            max_params=self.config.training.wandb_gradient_histogram_max_params,
+        )
+        if not histogram_payload:
+            return payload
+
+        merged_payload: dict[str, float | int | torch.Tensor | wandb.Histogram]
+        if payload is None:
+            merged_payload = {}
+        else:
+            merged_payload = dict(payload)
+        merged_payload.update(histogram_payload)
+        return merged_payload
+
     def _format_gradnorm_controller_status(
         self, gradnorm_step_log_data: dict[str, torch.Tensor]
     ) -> tuple[str, dict[str, float]]:
@@ -1461,6 +1540,8 @@ class EpiForecasterTrainer:
         fetch_start_time = time.time()
         max_batches = self.config.training.max_batches
         first_iteration_done = False
+        sps_samples_accum = 0
+        sps_time_accum = 0.0
 
         # Initialize optimizer state
         self.optimizer.zero_grad(set_to_none=True)
@@ -1687,8 +1768,11 @@ class EpiForecasterTrainer:
                 lr = self.optimizer.param_groups[0]["lr"]
 
                 bsz = batch_data.b
+                sps_samples_accum += bsz
+                sps_time_accum += batch_time_s
+                
                 samples_per_s = (
-                    (bsz / batch_time_s) if batch_time_s > 0 else float("inf")
+                    (sps_samples_accum / sps_time_accum) if sps_time_accum > 0 else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
                 log_this_step = should_log_step(self.global_step, 1, log_frequency)
@@ -1736,6 +1820,11 @@ class EpiForecasterTrainer:
                     # Keep as tensor - wandb handles CPU tensor conversion
                     window_start_mean = batch_data.window_start.float().mean()
                     log_data["time_window_start"] = window_start_mean
+                    log_data["train_step/sps"] = float(samples_per_s)
+
+                    # Reset SPS accumulators after logging to track next interval
+                    sps_samples_accum = 0
+                    sps_time_accum = 0.0
 
                     # Log curriculum metrics for loss-curve-critic analysis
                     add_curriculum_metrics(
@@ -1744,7 +1833,7 @@ class EpiForecasterTrainer:
                         key_suffix="step",
                         include_synth_ratio=False,
                     )
-                wandb_payload = get_wandb_step_payload(
+                wandb_payload = self._build_wandb_payload(
                     log_this_step=log_this_step,
                     log_data=log_data,
                     component_gradnorm_log_data=component_gradnorm_log_data,

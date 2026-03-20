@@ -756,6 +756,26 @@ class TrainingParams:
     gradient_snapshot_top_k: int = 5
     gradient_vanishing_threshold: float = 1.0e-8
     gradient_exploding_threshold: float = 1.0e2
+    # W&B gradient histogram logging (manual shortlist, pre-clip gradients only).
+    # Set frequency to 0 to disable remote histogram logging.
+    wandb_gradient_histogram_frequency: int = 0
+    wandb_gradient_histogram_max_params: int = 24
+    wandb_gradient_histogram_patterns: list[str] = field(
+        default_factory=lambda: [
+            "backbone.beta_projection",
+            "backbone.gamma_projection",
+            "backbone.mortality_projection",
+            "backbone.initial_states_projection",
+            "backbone.obs_context_projection",
+            "ww_head.shedding_conv",
+            "ww_head.residual_proj",
+            "hosp_head.residual_proj",
+            "cases_head.residual_proj",
+            "deaths_head.residual_proj",
+            "cases_head.delay_kernel",
+            "deaths_head.delay_kernel",
+        ]
+    )
     # Apply torch.compile to the model for performance
     compile: bool = False
     # torch.compile mode. "reduce-overhead" can improve GPU utilization by reducing
@@ -922,6 +942,16 @@ class TrainingParams:
         if self.prefetch_factor is not None and self.prefetch_factor < 0:
             raise ValueError(
                 f"prefetch_factor must be >= 0 or None, got {self.prefetch_factor}"
+            )
+        if self.wandb_gradient_histogram_frequency < 0:
+            raise ValueError(
+                "wandb_gradient_histogram_frequency must be non-negative, got "
+                f"{self.wandb_gradient_histogram_frequency}"
+            )
+        if self.wandb_gradient_histogram_max_params < 1:
+            raise ValueError(
+                "wandb_gradient_histogram_max_params must be >= 1, got "
+                f"{self.wandb_gradient_histogram_max_params}"
             )
 
         # Validate horizon metric aggregation strategy

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 from utils.console import (
@@ -42,6 +43,29 @@ def test_compute_horizon_metric_series_weekly_uses_median() -> None:
     )
 
     assert horizon_metrics == [("w1", 4.0, 5.0), ("w2", 9.0, 10.0)]
+
+
+def test_compute_horizon_metric_series_weekly_ignores_missing_horizons() -> None:
+    horizon_metrics = compute_horizon_metric_series(
+        aggregation="weekly",
+        mae_per_h=[math.nan, math.nan, math.nan, math.nan, math.nan, math.nan, 2.0],
+        rmse_per_h=[math.nan, math.nan, math.nan, math.nan, math.nan, math.nan, 3.0],
+    )
+
+    assert horizon_metrics == [("w1", 2.0, 3.0)]
+
+
+def test_compute_horizon_metric_series_weekly_returns_nan_for_empty_week() -> None:
+    horizon_metrics = compute_horizon_metric_series(
+        aggregation="weekly",
+        mae_per_h=[math.nan] * 7,
+        rmse_per_h=[math.nan] * 7,
+    )
+
+    assert len(horizon_metrics) == 1
+    assert horizon_metrics[0][0] == "w1"
+    assert math.isnan(horizon_metrics[0][1])
+    assert math.isnan(horizon_metrics[0][2])
 
 
 def test_horizon_helpers_build_log_data_and_status_lines() -> None:
@@ -179,7 +203,24 @@ def test_wandb_step_payload_merges_sparse_gradient_metrics() -> None:
         gradient_snapshot_log_data={"grad_snapshot_max_layer_norm": 9.0},
     )
 
+    assert payload is None
+
+
+def test_wandb_step_payload_filters_gradient_scalars_on_logged_steps() -> None:
+    payload = get_wandb_step_payload(
+        log_this_step=True,
+        log_data={
+            "loss_train_step": 1.0,
+            "gradnorm_clipped_total": 2.0,
+            "gradnorm_sidecar_ran": 1.0,
+            "grad_snapshot_max_layer_norm": 9.0,
+            "time_batch_s": 0.2,
+        },
+        component_gradnorm_log_data={"gradnorm_sird_physics": 3.0},
+        gradient_snapshot_log_data={"grad_snapshot_global_norm": 4.0},
+    )
+
     assert payload == {
-        "gradnorm_sird_physics": 3.0,
-        "grad_snapshot_max_layer_norm": 9.0,
+        "loss_train_step": 1.0,
+        "time_batch_s": 0.2,
     }

@@ -89,4 +89,4 @@ def did_gradnorm_sidecar_run(
     value = gradnorm_step_log_data.get("gradnorm_sidecar_ran")
     if value is None:
         return False
-    return bool(float(value.detach()) > 0.5)
+    return bool(value.detach().item() > 0.5)

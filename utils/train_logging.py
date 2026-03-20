@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import statistics
+import math
 from typing import Any
 
 import torch
@@ -56,13 +57,16 @@ def get_wandb_step_payload(
     gradient_snapshot_log_data: dict[str, float | int],
 ) -> dict[str, float | int | torch.Tensor] | None:
     """Select the exact payload that should be sent to wandb for this step."""
+    del component_gradnorm_log_data
+    del gradient_snapshot_log_data
+
+    filtered_log_data = {
+        key: value
+        for key, value in log_data.items()
+        if not (key.startswith("gradnorm_") or key.startswith("grad_snapshot_"))
+    }
     if log_this_step:
-        return log_data
-    sparse_payload: dict[str, float | int | torch.Tensor] = {}
-    sparse_payload.update(component_gradnorm_log_data)
-    sparse_payload.update(gradient_snapshot_log_data)
-    if sparse_payload:
-        return sparse_payload
+        return filtered_log_data
     return None
 
 
@@ -98,13 +102,25 @@ def compute_horizon_metric_series(
         week_num = 1
         for start_idx in range(0, len(mae_per_h), 7):
             end_idx = min(start_idx + 7, len(mae_per_h))
-            week_mae_values = mae_per_h[start_idx:end_idx]
-            week_rmse_values = rmse_per_h[start_idx:end_idx]
+            week_mae_values = [
+                value
+                for value in mae_per_h[start_idx:end_idx]
+                if math.isfinite(value)
+            ]
+            week_rmse_values = [
+                value
+                for value in rmse_per_h[start_idx:end_idx]
+                if math.isfinite(value)
+            ]
             horizon_metrics.append(
                 (
                     f"w{week_num}",
-                    float(statistics.median(week_mae_values)),
-                    float(statistics.median(week_rmse_values)),
+                    float(statistics.median(week_mae_values))
+                    if week_mae_values
+                    else float("nan"),
+                    float(statistics.median(week_rmse_values))
+                    if week_rmse_values
+                    else float("nan"),
                 )
             )
             week_num += 1
