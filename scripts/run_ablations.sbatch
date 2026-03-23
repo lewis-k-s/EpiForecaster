@@ -175,7 +175,7 @@ if [ "$RUN_ANALYSIS" = "1" ] && [ "$TASK_ID" -eq "$LAST_TASK_INDEX" ]; then
   echo "Running ablation analysis on last task..."
   echo "========================================"
 
-  ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-outputs/reports/ablation_analysis}"
+  ANALYSIS_OUTPUT_DIR="${ANALYSIS_OUTPUT_DIR:-"outputs/reports/$CAMPAIGN_ID"}"
 
   uv run python scripts/analyze_ablations.py \
     --training-dir outputs/training \
