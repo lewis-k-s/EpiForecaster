@@ -1,6 +1,7 @@
 import pytest
-from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import torch
 
 from training.epiforecaster_trainer import EpiForecasterTrainer
@@ -17,6 +18,21 @@ from models.configs import (
     CurriculumConfig,
 )
 from evaluation.losses import JointInferenceLoss
+
+
+class _HistogramTestModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.backbone = torch.nn.Module()
+        self.backbone.beta_projection = torch.nn.Linear(2, 2)
+        self.backbone.obs_context_projection = torch.nn.Linear(2, 2)
+        self.cases_head = torch.nn.Module()
+        self.cases_head.delay_kernel = torch.nn.Module()
+        self.cases_head.delay_kernel.kernel = torch.nn.Parameter(
+            torch.tensor([1.0, -1.0], dtype=torch.float32)
+        )
+        self.other = torch.nn.Linear(2, 1)
+        self.scalar_param = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
 
 class TestEpiForecasterTrainer:
@@ -435,3 +451,161 @@ class TestEpiForecasterTrainer:
         checkpoint = torch.load(ckpt_files[0], map_location="cpu", weights_only=False)
         assert "gradnorm_controller_state_dict" in checkpoint
         assert "gradnorm_optimizer_state_dict" in checkpoint
+
+
+@patch("training.epiforecaster_trainer.wandb.Histogram")
+def test_build_wandb_gradient_histogram_payload_selects_and_filters(mock_histogram):
+    mock_histogram.side_effect = lambda values: {"count": len(values)}
+
+    model = _HistogramTestModel()
+    model.backbone.beta_projection.weight.grad = torch.tensor(
+        [[1.0, 2.0], [float("nan"), 4.0]], dtype=torch.float32
+    )
+    model.backbone.beta_projection.bias.grad = torch.tensor(
+        [0.5, 1.5], dtype=torch.float32
+    )
+    model.backbone.obs_context_projection.weight.grad = torch.tensor(
+        [[float("inf"), 1.0], [2.0, 3.0]], dtype=torch.float32
+    )
+    model.backbone.obs_context_projection.bias.grad = torch.tensor(
+        [0.25, -0.25], dtype=torch.float32
+    )
+    model.cases_head.delay_kernel.kernel.grad = torch.tensor(
+        [0.1, 0.2], dtype=torch.float32
+    )
+    model.other.weight.grad = torch.ones_like(model.other.weight)
+    model.other.bias.grad = torch.ones_like(model.other.bias)
+    model.scalar_param.grad = torch.tensor(1.0, dtype=torch.float32)
+
+    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
+        model=model,
+        step=10,
+        frequency=5,
+        patterns=["backbone.beta_projection", "backbone.obs_context_projection"],
+        max_params=2,
+    )
+
+    assert payload == {
+        "grad_hist/backbone_beta_projection_bias": {"count": 2},
+        "grad_hist/backbone_beta_projection_weight": {"count": 3},
+        "grad_histograms_logged": 2,
+    }
+
+
+def test_build_wandb_gradient_histogram_payload_returns_empty_when_disabled():
+    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
+        model=_HistogramTestModel(),
+        step=10,
+        frequency=0,
+        patterns=["backbone.beta_projection"],
+        max_params=4,
+    )
+
+    assert payload == {}
+
+
+def test_build_wandb_gradient_histogram_payload_respects_logging_cadence():
+    model = _HistogramTestModel()
+    model.backbone.beta_projection.weight.grad = torch.ones(
+        (2, 2), dtype=torch.float32
+    )
+
+    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
+        model=model,
+        step=6,
+        frequency=5,
+        patterns=["backbone.beta_projection"],
+        max_params=4,
+    )
+
+    assert payload == {}
+
+
+@patch("training.epiforecaster_trainer.wandb.Histogram")
+def test_build_wandb_gradient_histogram_payload_skips_scalar_and_missing_grads(
+    mock_histogram,
+):
+    mock_histogram.side_effect = lambda values: {"count": len(values)}
+
+    model = _HistogramTestModel()
+    model.scalar_param.grad = torch.tensor(1.0, dtype=torch.float32)
+
+    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
+        model=model,
+        step=10,
+        frequency=5,
+        patterns=["scalar_param", "other"],
+        max_params=4,
+    )
+
+    assert payload == {}
+    mock_histogram.assert_not_called()
+
+
+@patch("training.epiforecaster_trainer.wandb.Histogram")
+def test_build_wandb_payload_filters_grad_scalars_and_merges_histograms(mock_histogram):
+    mock_histogram.side_effect = lambda values: {"count": len(values)}
+
+    trainer = object.__new__(EpiForecasterTrainer)
+    trainer.model = _HistogramTestModel()
+    trainer.model.backbone.beta_projection.weight.grad = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32
+    )
+    trainer.model.backbone.beta_projection.bias.grad = torch.tensor(
+        [0.5, -0.5], dtype=torch.float32
+    )
+    trainer.global_step = 10
+    trainer.wandb_run = object()
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(
+            wandb_gradient_histogram_frequency=5,
+            wandb_gradient_histogram_patterns=["backbone.beta_projection"],
+            wandb_gradient_histogram_max_params=4,
+        )
+    )
+
+    payload = trainer._build_wandb_payload(
+        log_this_step=True,
+        log_data={
+            "loss_train_step": 1.0,
+            "time_batch_s": 0.2,
+            "gradnorm_clipped_total": 2.0,
+            "grad_snapshot_max_layer_norm": 3.0,
+            "gradnorm_sidecar_ran": 1.0,
+        },
+        component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
+        gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
+    )
+
+    assert payload is not None
+    assert payload["loss_train_step"] == 1.0
+    assert payload["time_batch_s"] == 0.2
+    assert "gradnorm_clipped_total" not in payload
+    assert "grad_snapshot_max_layer_norm" not in payload
+    assert "gradnorm_sidecar_ran" not in payload
+    assert payload["grad_hist/backbone_beta_projection_bias"] == {"count": 2}
+    assert payload["grad_hist/backbone_beta_projection_weight"] == {"count": 4}
+    assert payload["grad_histograms_logged"] == 2
+
+
+def test_build_wandb_payload_omits_histograms_when_frequency_is_zero():
+    trainer = object.__new__(EpiForecasterTrainer)
+    trainer.model = _HistogramTestModel()
+    trainer.global_step = 10
+    trainer.wandb_run = object()
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(
+            wandb_gradient_histogram_frequency=0,
+            wandb_gradient_histogram_patterns=["backbone.beta_projection"],
+            wandb_gradient_histogram_max_params=4,
+        )
+    )
+
+    payload = trainer._build_wandb_payload(
+        log_this_step=False,
+        log_data={"gradnorm_clipped_total": 2.0},
+        component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
+        gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
+    )
+
+    assert payload is None

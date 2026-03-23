@@ -87,7 +87,7 @@ training:
   progress_log_frequency: 100
 
   grad_norm_log_frequency: 500
-  gradient_snapshot_frequency: 1000
+  gradient_snapshot_frequency: 0 # disable or recommend 1000
   gradient_snapshot_top_k: 5
   gradient_vanishing_threshold: 1.0e-8
   gradient_exploding_threshold: 1.0e2

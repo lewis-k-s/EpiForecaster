@@ -128,7 +128,7 @@ class GradNormController(nn.Module):
         losses_detached = losses.detach().float()
         active_mask = active_mask.to(device=losses_detached.device, dtype=torch.bool)
         needs_init = active_mask & (~self.l0_initialized)
-        if not needs_init.any():
+        if not needs_init.any().item():
             return False
 
         safe_losses = losses_detached.clamp_min(self.eps)
@@ -152,7 +152,7 @@ class GradNormController(nn.Module):
         active_mask = active_mask.to(device=losses.device, dtype=torch.bool)
 
         first_update = active_mask & (~self.ema_initialized)
-        if first_update.any():
+        if first_update.any().item():
             self.ema_losses = torch.where(first_update, losses, self.ema_losses)
             self.ema_grad_norms = torch.where(
                 first_update, grad_norms, self.ema_grad_norms
@@ -164,7 +164,7 @@ class GradNormController(nn.Module):
             )
 
         steady = active_mask & self.ema_initialized
-        if steady.any():
+        if steady.any().item():
             d = self.ema_decay
             self.ema_losses = torch.where(
                 steady,
@@ -185,8 +185,9 @@ class GradNormController(nn.Module):
         active_mask: torch.Tensor,
     ) -> torch.Tensor:
         base_grad_norms = torch.zeros_like(losses)
+        active_list = active_mask.cpu().tolist()
         for idx in range(losses.numel()):
-            if not bool(active_mask[idx]):
+            if not active_list[idx]:
                 continue
             grad = torch.autograd.grad(
                 losses[idx],
@@ -212,7 +213,7 @@ class GradNormController(nn.Module):
         losses_f32 = losses.float()
         active_mask = active_mask.to(device=device, dtype=torch.bool)
 
-        if active_mask.sum() == 0:
+        if not active_mask.any().item():
             zeros = torch.zeros_like(losses_f32)
             return {
                 "weights": zeros,
