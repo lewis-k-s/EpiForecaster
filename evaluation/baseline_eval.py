@@ -628,7 +628,6 @@ def _evaluate_univariate_baseline_model(
                 "fold": fold.fold,
                 "mae": metric.mae,
                 "rmse": metric.rmse,
-                "smape": metric.smape,
                 "r2": metric.r2,
                 "observed_count": metric.observed_count,
                 "node_target_pairs": node_pairs,
@@ -676,7 +675,6 @@ def _evaluate_univariate_baseline_model(
                             "sparsity_bin": int(bin_idx),
                             "mae": bin_metric.mae,
                             "rmse": bin_metric.rmse,
-                            "smape": bin_metric.smape,
                             "r2": bin_metric.r2,
                             "observed_count": bin_metric.observed_count,
                             "node_count": len(per_bin_preds[bin_idx]),
@@ -910,7 +908,6 @@ def _evaluate_var_cross_target_model(
                 "fold": fold.fold,
                 "mae": metric.mae,
                 "rmse": metric.rmse,
-                "smape": metric.smape,
                 "r2": metric.r2,
                 "observed_count": metric.observed_count,
                 "node_target_pairs": node_pairs,
@@ -961,7 +958,6 @@ def _evaluate_var_cross_target_model(
                             "sparsity_bin": int(bin_idx),
                             "mae": bin_metric.mae,
                             "rmse": bin_metric.rmse,
-                            "smape": bin_metric.smape,
                             "r2": bin_metric.r2,
                             "observed_count": bin_metric.observed_count,
                             "node_count": len(per_bin_preds[target_name][bin_idx]),
@@ -1125,7 +1121,7 @@ def run_baseline_evaluation(
             "target": target_name,
             "folds": int(group["fold"].nunique()),
         }
-        for metric_name in ["mae", "rmse", "smape", "r2", "observed_count"]:
+        for metric_name in ["mae", "rmse", "r2", "observed_count"]:
             values = pd.to_numeric(group[metric_name], errors="coerce").dropna()
             if values.empty:
                 row[f"{metric_name}_mean"] = float("nan")
@@ -1334,7 +1330,6 @@ def compare_model_metrics_against_baselines(
         "target",
         "mae",
         "rmse",
-        "smape",
         "r2",
     }.issubset(set(baseline_df.columns))
     has_joint_fold_metrics = "joint_obs_loss_total" in baseline_df.columns
@@ -1350,7 +1345,6 @@ def compare_model_metrics_against_baselines(
                     "target": target_name,
                     "mae_mean": pd.to_numeric(group["mae"], errors="coerce").mean(),
                     "rmse_mean": pd.to_numeric(group["rmse"], errors="coerce").mean(),
-                    "smape_mean": pd.to_numeric(group["smape"], errors="coerce").mean(),
                     "r2_mean": pd.to_numeric(group["r2"], errors="coerce").mean(),
                 }
             )
@@ -1371,25 +1365,21 @@ def compare_model_metrics_against_baselines(
         "hospitalizations": {
             "mae": eval_metrics.get("mae_hosp_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_hosp_log1p_per_100k"),
-            "smape": eval_metrics.get("smape_hosp_log1p_per_100k"),
             "r2": eval_metrics.get("r2_hosp_log1p_per_100k"),
         },
         "wastewater": {
             "mae": eval_metrics.get("mae_ww_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_ww_log1p_per_100k"),
-            "smape": eval_metrics.get("smape_ww_log1p_per_100k"),
             "r2": eval_metrics.get("r2_ww_log1p_per_100k"),
         },
         "cases": {
             "mae": eval_metrics.get("mae_cases_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_cases_log1p_per_100k"),
-            "smape": eval_metrics.get("smape_cases_log1p_per_100k"),
             "r2": eval_metrics.get("r2_cases_log1p_per_100k"),
         },
         "deaths": {
             "mae": eval_metrics.get("mae_deaths_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_deaths_log1p_per_100k"),
-            "smape": eval_metrics.get("smape_deaths_log1p_per_100k"),
             "r2": eval_metrics.get("r2_deaths_log1p_per_100k"),
         },
     }
@@ -1417,7 +1407,7 @@ def compare_model_metrics_against_baselines(
         target = str(baseline_row.get("target"))
         model_name = str(baseline_row["model"])
         if target in model_target_metrics:
-            for metric_name in ["mae", "rmse", "smape", "r2"]:
+            for metric_name in ["mae", "rmse", "r2"]:
                 baseline_value = baseline_row.get(f"{metric_name}_mean")
                 model_value = model_target_metrics[target].get(metric_name)
                 if baseline_value is None or model_value is None:

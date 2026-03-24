@@ -145,7 +145,6 @@ def test_build_epoch_logging_bundle_includes_payload_and_status_lines() -> None:
     metrics = {
         "mae": 0.1,
         "rmse": 0.2,
-        "smape": 0.3,
         "r2": 0.4,
         "loss_ww": 1.0,
         "loss_hosp": 2.0,

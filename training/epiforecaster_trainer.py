@@ -1088,7 +1088,6 @@ class EpiForecasterTrainer:
             f"Test loss: {test_loss:.4g} | "
             f"MAE: {test_metrics['mae']:.4g} | "
             f"RMSE: {test_metrics['rmse']:.4g} | "
-            f"sMAPE: {test_metrics['smape']:.4g} | "
             f"R2: {test_metrics['r2']:.4g} | "
             f"Time: {test_time:.2f}s"
         )
@@ -1106,7 +1105,6 @@ class EpiForecasterTrainer:
             self.wandb_run.summary["loss_test"] = test_loss
             self.wandb_run.summary["mae_test"] = test_metrics["mae"]
             self.wandb_run.summary["rmse_test"] = test_metrics["rmse"]
-            self.wandb_run.summary["smape_test"] = test_metrics["smape"]
             self.wandb_run.summary["r2_test"] = test_metrics["r2"]
             self.wandb_run.summary["best_val_loss"] = self.best_val_loss
             self.wandb_run.finish()

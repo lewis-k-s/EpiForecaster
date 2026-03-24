@@ -259,7 +259,7 @@ def test_run_tiered_baseline_writes_artifacts(tmp_path: Path, monkeypatch):
         assert artifacts[key].exists()
 
     fold_df = pd.read_csv(artifacts["baseline_fold_metrics"])
-    assert set(["model", "target", "fold", "mae", "rmse", "smape", "r2"]).issubset(
+    assert set(["model", "target", "fold", "mae", "rmse", "r2"]).issubset(
         fold_df.columns
     )
 
@@ -313,7 +313,6 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
                 "fold": 0,
                 "mae": 0.9,
                 "rmse": 1.9,
-                "smape": 0.4,
                 "r2": 0.2,
             },
             {
@@ -322,7 +321,6 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
                 "fold": 0,
                 "mae": 1.4,
                 "rmse": 2.4,
-                "smape": 0.55,
                 "r2": 0.25,
             },
             # Fold 1
@@ -332,7 +330,6 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
                 "fold": 1,
                 "mae": 1.1,
                 "rmse": 2.1,
-                "smape": 0.6,
                 "r2": 0.0,
             },
             {
@@ -341,7 +338,6 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
                 "fold": 1,
                 "mae": 1.6,
                 "rmse": 2.6,
-                "smape": 0.65,
                 "r2": 0.15,
             },
         ]
@@ -351,19 +347,15 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
     eval_metrics = {
         "mae_hosp_log1p_per_100k": 0.9,
         "rmse_hosp_log1p_per_100k": 1.9,
-        "smape_hosp_log1p_per_100k": 0.4,
         "r2_hosp_log1p_per_100k": 0.2,
         "mae_ww_log1p_per_100k": 0.0,
         "rmse_ww_log1p_per_100k": 0.0,
-        "smape_ww_log1p_per_100k": 0.0,
         "r2_ww_log1p_per_100k": 0.0,
         "mae_cases_log1p_per_100k": 1.0,
         "rmse_cases_log1p_per_100k": 2.0,
-        "smape_cases_log1p_per_100k": 0.5,
         "r2_cases_log1p_per_100k": 0.3,
         "mae_deaths_log1p_per_100k": 0.0,
         "rmse_deaths_log1p_per_100k": 0.0,
-        "smape_deaths_log1p_per_100k": 0.0,
         "r2_deaths_log1p_per_100k": 0.0,
     }
     compare_model_metrics_against_baselines(

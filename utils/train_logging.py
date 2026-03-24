@@ -182,7 +182,6 @@ def build_epoch_logging_bundle(
         build_loss_key(split=prefix_lower): loss,
         build_eval_metric_key("mae", prefix_lower): metrics["mae"],
         build_eval_metric_key("rmse", prefix_lower): metrics["rmse"],
-        build_eval_metric_key("smape", prefix_lower): metrics["smape"],
         build_eval_metric_key("r2", prefix_lower): metrics["r2"],
     }
 
@@ -212,8 +211,7 @@ def build_epoch_logging_bundle(
     status_lines = [
         (
             f"{prefix} loss: {loss:.4g} | MAE: {metrics['mae']:.4g} | "
-            f"RMSE: {metrics['rmse']:.4g} | sMAPE: {metrics['smape']:.4g} | "
-            f"R2: {metrics['r2']:.4g}"
+            f"RMSE: {metrics['rmse']:.4g} | R2: {metrics['r2']:.4g}"
         )
     ]
     components_str = format_joint_loss_components_status(metrics)

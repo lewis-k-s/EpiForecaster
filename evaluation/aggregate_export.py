@@ -14,8 +14,6 @@ _TARGET_AGGREGATE_COLUMNS = [
     "mae_iqr",
     "rmse_median",
     "rmse_iqr",
-    "smape_median",
-    "smape_iqr",
     "r2_median",
     "r2_iqr",
     "observed_count_median",
@@ -80,28 +78,24 @@ def build_main_model_target_aggregate(
         "hospitalizations": {
             "mae": "mae_hosp_log1p_per_100k",
             "rmse": "rmse_hosp_log1p_per_100k",
-            "smape": "smape_hosp_log1p_per_100k",
             "r2": "r2_hosp_log1p_per_100k",
             "observed_count": "observed_count_hosp",
         },
         "wastewater": {
             "mae": "mae_ww_log1p_per_100k",
             "rmse": "rmse_ww_log1p_per_100k",
-            "smape": "smape_ww_log1p_per_100k",
             "r2": "r2_ww_log1p_per_100k",
             "observed_count": "observed_count_ww",
         },
         "cases": {
             "mae": "mae_cases_log1p_per_100k",
             "rmse": "rmse_cases_log1p_per_100k",
-            "smape": "smape_cases_log1p_per_100k",
             "r2": "r2_cases_log1p_per_100k",
             "observed_count": "observed_count_cases",
         },
         "deaths": {
             "mae": "mae_deaths_log1p_per_100k",
             "rmse": "rmse_deaths_log1p_per_100k",
-            "smape": "smape_deaths_log1p_per_100k",
             "r2": "r2_deaths_log1p_per_100k",
             "observed_count": "observed_count_deaths",
         },
@@ -114,7 +108,7 @@ def build_main_model_target_aggregate(
             "target": target_name,
             "folds": 1,
         }
-        for metric_name in ["mae", "rmse", "smape", "r2", "observed_count"]:
+        for metric_name in ["mae", "rmse", "r2", "observed_count"]:
             value = _finite_or_nan(eval_metrics.get(key_map[metric_name]))
             median, iqr = _median_and_iqr(value)
             row[f"{metric_name}_median"] = median

@@ -51,7 +51,6 @@ def _format_eval_summary(loss: float, metrics: dict[str, Any]) -> str:
         ("Loss", _fmt(loss)),
         ("MAE", _fmt(metrics.get("mae"))),
         ("RMSE", _fmt(metrics.get("rmse"))),
-        ("sMAPE", _fmt(metrics.get("smape"))),
         ("R2", _fmt(metrics.get("r2"))),
     ]
     table = ["| Metric | Value |", "|---|---|"]
@@ -478,35 +477,30 @@ def evaluate_loader(
         # Legacy primary metrics (hospitalizations)
         "mae": hosp_summary.mae,
         "rmse": hosp_summary.rmse,
-        "smape": hosp_summary.smape,
         "r2": hosp_summary.r2,
         "mae_per_h": hosp_summary.mae_per_h,
         "rmse_per_h": hosp_summary.rmse_per_h,
         # Hospitalization metrics in log1p(per-100k) space
         "mae_hosp_log1p_per_100k": hosp_summary.mae,
         "rmse_hosp_log1p_per_100k": hosp_summary.rmse,
-        "smape_hosp_log1p_per_100k": hosp_summary.smape,
         "r2_hosp_log1p_per_100k": hosp_summary.r2,
         "observed_count_hosp": hosp_summary.observed_count,
         "effective_count_hosp": hosp_summary.effective_count,
         # Wastewater metrics in log1p(per-100k) space
         "mae_ww_log1p_per_100k": ww_summary.mae,
         "rmse_ww_log1p_per_100k": ww_summary.rmse,
-        "smape_ww_log1p_per_100k": ww_summary.smape,
         "r2_ww_log1p_per_100k": ww_summary.r2,
         "observed_count_ww": ww_summary.observed_count,
         "effective_count_ww": ww_summary.effective_count,
         # Cases metrics in log1p(per-100k) space
         "mae_cases_log1p_per_100k": cases_summary.mae,
         "rmse_cases_log1p_per_100k": cases_summary.rmse,
-        "smape_cases_log1p_per_100k": cases_summary.smape,
         "r2_cases_log1p_per_100k": cases_summary.r2,
         "observed_count_cases": cases_summary.observed_count,
         "effective_count_cases": cases_summary.effective_count,
         # Deaths metrics in log1p(per-100k) space
         "mae_deaths_log1p_per_100k": deaths_summary.mae,
         "rmse_deaths_log1p_per_100k": deaths_summary.rmse,
-        "smape_deaths_log1p_per_100k": deaths_summary.smape,
         "r2_deaths_log1p_per_100k": deaths_summary.r2,
         "observed_count_deaths": deaths_summary.observed_count,
         "effective_count_deaths": deaths_summary.effective_count,
