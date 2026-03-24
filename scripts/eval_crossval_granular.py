@@ -146,7 +146,6 @@ def main() -> int:
                     pin_memory=effective_pin_memory,
                     prefetch_factor=effective_prefetch_factor,
                     log_every=args.log_every,
-                    memory_log_every=args.memory_log_every,
                 )
             except Exception:
                 elapsed_s = time.perf_counter() - started_at

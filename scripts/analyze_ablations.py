@@ -512,6 +512,10 @@ def main() -> int:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
+    # Determine default output directory based on campaign_id
+    if args.output_dir == Path("outputs/reports/ablation_analysis") and args.campaign_id:
+        args.output_dir = Path("outputs/reports") / f"ablation_cv_{args.campaign_id}"
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
@@ -609,6 +613,29 @@ def main() -> int:
     except Exception as exc:
         logger.warning(f"Cross-head impact analysis failed: {exc}")
         cross_head_success = False
+
+    # Granular Comparison Suite
+    if args.campaign_id:
+        logger.info("Running granular comparison suite...")
+        try:
+            from dataviz.granular_comparison import compare_ablation_suite
+            
+            candidate_ablations = [
+                m for m in aggregated_df["model"].unique() if m != args.baseline
+            ]
+            
+            granular_dir = args.output_dir / "granular_comparison"
+            compare_ablation_suite(
+                training_dir=args.training_dir,
+                campaign_id=args.campaign_id,
+                baseline_ablation=args.baseline,
+                candidate_ablations=candidate_ablations,
+                output_dir=granular_dir,
+                split="test",
+            )
+            logger.info(f"Saved granular comparison suite to {granular_dir}")
+        except Exception as exc:
+            logger.warning(f"Granular comparison suite failed: {exc}")
 
     print("\n" + "=" * 80)
     print("ABLATION STUDY SUMMARY")

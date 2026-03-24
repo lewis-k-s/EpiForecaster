@@ -5,7 +5,7 @@ Computes how ablating each observation head affects losses on all other heads,
 using pairwise subtraction against baseline (matched by seed).
 
 This creates a matrix showing cross-head dependencies:
-- Rows: Which head is ablated (no_ww, no_cases, no_hosp, no_deaths)
+- Rows: Which head's supervision is removed (sig:ww:aux, sig:cases:aux, ...)
 - Columns: Which head's loss is measured (ww, cases, hosp, deaths)
 - Values: Percentage change in loss (Δ = (ablated - baseline) / baseline * 100)
 
@@ -44,12 +44,12 @@ HEAD_TO_COLUMN = {
     "deaths": "joint_loss_deaths_median",
 }
 
-# Ablations that zero out specific heads (from run_ablations.sbatch)
+# Ablations that remove supervision for specific heads while leaving inputs active.
 ABLATION_TO_HEAD = {
-    "no_ww_loss": "ww",
-    "no_cases_loss": "cases",
-    "no_hosp_loss": "hosp",
-    "no_deaths_loss": "deaths",
+    "sig:ww:aux": "ww",
+    "sig:cases:aux": "cases",
+    "sig:hosp:aux": "hosp",
+    "sig:deaths:aux": "deaths",
 }
 
 FINGERPRINT_EXCLUDE_PATHS = {

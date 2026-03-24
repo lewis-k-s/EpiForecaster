@@ -11,9 +11,7 @@ This is a panel of tests corresponding to the cross-head impact analysis
 module (scripts/analyze_cross_head_impact.py).
 """
 
-import re
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import numpy as np
 import pandas as pd
@@ -59,10 +57,10 @@ class TestHeadConstants:
 
     def test_ablation_to_head_mapping(self):
         """Test ablation names map to correct heads."""
-        assert ABLATION_TO_HEAD["no_ww_loss"] == "ww"
-        assert ABLATION_TO_HEAD["no_cases_loss"] == "cases"
-        assert ABLATION_TO_HEAD["no_hosp_loss"] == "hosp"
-        assert ABLATION_TO_HEAD["no_deaths_loss"] == "deaths"
+        assert ABLATION_TO_HEAD["sig:ww:aux"] == "ww"
+        assert ABLATION_TO_HEAD["sig:cases:aux"] == "cases"
+        assert ABLATION_TO_HEAD["sig:hosp:aux"] == "hosp"
+        assert ABLATION_TO_HEAD["sig:deaths:aux"] == "deaths"
 
 
 class TestSeedExtraction:
@@ -207,7 +205,7 @@ epiforecaster,1,{1.0 + seed * 0.01},{0.5 + seed * 0.01}
             )
 
         # Create ablation runs
-        ablation_dir = tmp_path / "no_ww"
+        ablation_dir = tmp_path / "sig_ww_aux"
         ablation_dir.mkdir()
 
         for seed in [42, 43]:
@@ -234,10 +232,10 @@ epiforecaster,1,{1.5 + seed * 0.01},{0.6 + seed * 0.01}
 
         ablation_runs = [
             CrossHeadRun(
-                "no_ww_loss", "test", ablation_dir, ablation_dir / "run_42", 42
+                "sig:ww:aux", "test", ablation_dir, ablation_dir / "run_42", 42
             ),
             CrossHeadRun(
-                "no_ww_loss", "test", ablation_dir, ablation_dir / "run_43", 43
+                "sig:ww:aux", "test", ablation_dir, ablation_dir / "run_43", 43
             ),
         ]
 
@@ -265,7 +263,7 @@ epiforecaster,1,{1.5 + seed * 0.01},{0.6 + seed * 0.01}
 
         ablation_runs = [
             CrossHeadRun(
-                "no_ww_loss", "test", tmp_path, tmp_path / "run_1", 99
+                "sig:ww:aux", "test", tmp_path, tmp_path / "run_1", 99
             ),  # Different seed
         ]
 
@@ -284,7 +282,7 @@ epiforecaster,1,{1.5 + seed * 0.01},{0.6 + seed * 0.01}
         ]
 
         ablation_runs = [
-            CrossHeadRun("no_ww_loss", "test", tmp_path, run_dir, 42),
+            CrossHeadRun("sig:ww:aux", "test", tmp_path, run_dir, 42),
         ]
 
         result = compute_pairwise_deltas(baseline_runs, ablation_runs, split="test")
@@ -405,7 +403,7 @@ epiforecaster,1,0.0,0.5
         (run_dir / "test_main_model_joint_loss_aggregate.csv").write_text(csv_content)
 
         # Create ablation with non-zero loss
-        ablation_dir = tmp_path / "no_ww"
+        ablation_dir = tmp_path / "sig_ww_aux"
         ablation_dir.mkdir()
         run_dir = ablation_dir / "run_42"
         run_dir.mkdir()
@@ -423,7 +421,7 @@ epiforecaster,1,0.5,0.6
 
         ablation_runs = [
             CrossHeadRun(
-                "no_ww_loss", "test", ablation_dir, ablation_dir / "run_42", 42
+                "sig:ww:aux", "test", ablation_dir, ablation_dir / "run_42", 42
             ),
         ]
 
@@ -452,7 +450,7 @@ epiforecaster,1,1.0
 """
         (run_dir / "test_main_model_joint_loss_aggregate.csv").write_text(csv_content)
 
-        ablation_dir = tmp_path / "no_ww"
+        ablation_dir = tmp_path / "sig_ww_aux"
         ablation_dir.mkdir()
         run_dir = ablation_dir / "run_42"
         run_dir.mkdir()
@@ -471,7 +469,7 @@ epiforecaster,1,0.8
 
         ablation_runs = [
             CrossHeadRun(
-                "no_ww_loss", "test", ablation_dir, ablation_dir / "run_42", 42
+                "sig:ww:aux", "test", ablation_dir, ablation_dir / "run_42", 42
             ),
         ]
 
@@ -579,8 +577,8 @@ epiforecaster,1,{ww_loss},{hosp_loss},{cases_loss},{deaths_loss}
                 CrossHeadRun("baseline", "test", baseline_dir, run_dir, seed)
             )
 
-        # Create ablation runs (no_ww, 3 seeds matching baseline)
-        ablation_dir = tmp_path / "no_ww"
+        # Create ablation runs (sig:ww:aux, 3 seeds matching baseline)
+        ablation_dir = tmp_path / "sig_ww_aux"
         ablation_dir.mkdir()
 
         ablation_runs = []
@@ -605,7 +603,7 @@ epiforecaster,1,{ww_loss},{hosp_loss},{cases_loss},{deaths_loss}
             )
 
             ablation_runs.append(
-                CrossHeadRun("no_ww_loss", "test", ablation_dir, run_dir, seed)
+                CrossHeadRun("sig:ww:aux", "test", ablation_dir, run_dir, seed)
             )
 
         # Compute pairwise deltas

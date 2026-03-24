@@ -40,7 +40,7 @@ TARGET_LABELS = {
     "hospitalizations": "Hosp.",
     "deaths": "Deaths",
 }
-DEFAULT_KNOCKOUT_ABLATIONS = ["no_mobility", "no_regions", "no_mobility_and_regions"]
+DEFAULT_KNOCKOUT_ABLATIONS = ["mobility:off", "regions:off", "context:off"]
 ERROR_DIVERGING_CMAP = "RdYlGn_r"
 DEFAULT_REGION_GEOJSON = Path("data/files/geo/fl_municipios_catalonia.geojson")
 
@@ -75,7 +75,25 @@ def _load_granular_csv(path: Path) -> pd.DataFrame:
     missing = [column for column in GRANULAR_FIELDNAMES if column not in df.columns]
     if missing:
         raise ValueError(f"{path} is missing required granular columns: {missing}")
-    duplicate_mask = df.duplicated(GRANULAR_KEY_COLUMNS, keep=False)
+
+    # Check for sidecar metadata to get seed
+    sidecar_path = path.with_suffix(f"{path.suffix}.meta.json")
+    if sidecar_path.exists():
+        try:
+            import json
+            meta = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            seed = meta.get("training_seed")
+            if seed is not None:
+                df["seed"] = seed
+        except Exception as exc:
+            logger.warning(f"Failed to read sidecar {sidecar_path}: {exc}")
+
+    # Use seed in duplication check if present
+    key_cols = list(GRANULAR_KEY_COLUMNS)
+    if "seed" in df.columns:
+        key_cols.append("seed")
+
+    duplicate_mask = df.duplicated(key_cols, keep=False)
     if duplicate_mask.any():
         duplicate_count = int(duplicate_mask.sum())
         raise ValueError(
@@ -113,9 +131,15 @@ def _prepare_joined_frame(
     candidate_df: pd.DataFrame,
     min_join_coverage: float,
 ) -> pd.DataFrame:
+    # Use seed in join if present in both
+    key_cols = list(GRANULAR_KEY_COLUMNS)
+    if "seed" in baseline_df.columns and "seed" in candidate_df.columns:
+        key_cols.append("seed")
+        logger.info(f"Joining with seed-pairing: {len(baseline_df['seed'].unique())} unique seeds")
+
     merged = baseline_df.merge(
         candidate_df,
-        on=GRANULAR_KEY_COLUMNS,
+        on=key_cols,
         how="inner",
         suffixes=("_baseline", "_candidate"),
     )
@@ -683,13 +707,14 @@ def _save_target_choropleths(
     return output_path
 
 
-def _find_single_granular_csv(
+def _load_ablation_granular_data(
     *,
     training_dir: Path,
     campaign_id: str,
     ablation_name: str,
     split: str,
-) -> Path:
+) -> pd.DataFrame:
+    """Load and concatenate all granular results for an ablation across seeds."""
     experiment_dir = training_dir / f"mn5_ablation__{campaign_id}__{ablation_name}"
     if not experiment_dir.exists():
         raise FileNotFoundError(f"Ablation experiment not found: {experiment_dir}")
@@ -699,11 +724,13 @@ def _find_single_granular_csv(
         raise FileNotFoundError(
             f"No {split}_granular_metrics.csv found under {experiment_dir}"
         )
-    if len(matches) > 1:
-        raise ValueError(
-            f"Expected exactly one granular CSV for {ablation_name}, found {len(matches)}"
-        )
-    return matches[0]
+    
+    logger.info(f"Loading {len(matches)} runs for ablation '{ablation_name}'")
+    dfs = []
+    for csv_path in matches:
+        dfs.append(_load_granular_csv(csv_path))
+    
+    return pd.concat(dfs, ignore_index=True)
 
 
 def compare_ablation_suite(
@@ -723,7 +750,7 @@ def compare_ablation_suite(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline_csv = _find_single_granular_csv(
+    baseline_df = _load_ablation_granular_data(
         training_dir=training_dir,
         campaign_id=campaign_id,
         ablation_name=baseline_ablation,
@@ -732,28 +759,32 @@ def compare_ablation_suite(
     results: dict[str, dict[str, object]] = {}
 
     for candidate_ablation in candidate_ablations:
-        candidate_csv = _find_single_granular_csv(
-            training_dir=training_dir,
-            campaign_id=campaign_id,
-            ablation_name=candidate_ablation,
-            split=split,
-        )
-        comparison_dir = output_dir / f"{baseline_ablation}__vs__{candidate_ablation}"
-        logger.info(
-            "Comparing %s against %s -> %s",
-            candidate_ablation,
-            baseline_ablation,
-            comparison_dir,
-        )
-        results[candidate_ablation] = compare_granular_csvs(
-            baseline_csv=baseline_csv,
-            candidate_csv=candidate_csv,
-            output_dir=comparison_dir,
-            min_join_coverage=min_join_coverage,
-            rolling_window=rolling_window,
-            region_geojson_path=region_geojson_path,
-            top_regions=top_regions,
-        )
+        try:
+            candidate_df = _load_ablation_granular_data(
+                training_dir=training_dir,
+                campaign_id=campaign_id,
+                ablation_name=candidate_ablation,
+                split=split,
+            )
+            comparison_dir = output_dir / f"{baseline_ablation}__vs__{candidate_ablation}"
+            logger.info(
+                "Comparing %s against %s (paired seeds) -> %s",
+                candidate_ablation,
+                baseline_ablation,
+                comparison_dir,
+            )
+            results[candidate_ablation] = compare_granular_csvs(
+                baseline_csv=baseline_df,
+                candidate_csv=candidate_df,
+                output_dir=comparison_dir,
+                min_join_coverage=min_join_coverage,
+                rolling_window=rolling_window,
+                region_geojson_path=region_geojson_path,
+                top_regions=top_regions,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to compare {candidate_ablation} against baseline: {exc}")
+            continue
 
     summary_rows = []
     for candidate_ablation, artifacts in results.items():
@@ -782,19 +813,19 @@ def compare_ablation_suite(
 
 def compare_granular_csvs(
     *,
-    baseline_csv: str | Path,
-    candidate_csv: str | Path,
+    baseline_csv: str | Path | pd.DataFrame,
+    candidate_csv: str | Path | pd.DataFrame,
     output_dir: str | Path,
     min_join_coverage: float = 1.0,
     rolling_window: int = 7,
     region_geojson_path: str | Path = DEFAULT_REGION_GEOJSON,
     top_regions: int | None = None,
 ) -> dict[str, object]:
-    """Compare two granular eval CSVs, write paired tables, and render uplift plots.
+    """Compare two sets of granular eval results, write paired tables, and render uplift plots.
 
     Args:
-        baseline_csv: Path to baseline granular metrics CSV
-        candidate_csv: Path to candidate granular metrics CSV
+        baseline_csv: Path to baseline granular metrics CSV or pre-loaded DataFrame
+        candidate_csv: Path to candidate granular metrics CSV or pre-loaded DataFrame
         output_dir: Directory to write outputs
         min_join_coverage: Minimum fraction of rows that must match on join
         rolling_window: Window size for rolling time plots
@@ -804,13 +835,19 @@ def compare_granular_csvs(
     Returns:
         Dict with matched_rows, tables, and plots paths
     """
-    baseline_path = Path(baseline_csv)
-    candidate_path = Path(candidate_csv)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    baseline_df = _load_granular_csv(baseline_path)
-    candidate_df = _load_granular_csv(candidate_path)
+    if isinstance(baseline_csv, pd.DataFrame):
+        baseline_df = baseline_csv
+    else:
+        baseline_df = _load_granular_csv(Path(baseline_csv))
+
+    if isinstance(candidate_csv, pd.DataFrame):
+        candidate_df = candidate_csv
+    else:
+        candidate_df = _load_granular_csv(Path(candidate_csv))
+
     paired_df = _prepare_joined_frame(
         baseline_df=baseline_df,
         candidate_df=candidate_df,
@@ -898,8 +935,8 @@ def main() -> int:
 Examples:
   uv run python -m dataviz.granular_comparison \
       --baseline-csv outputs/.../baseline/test_granular_metrics.csv \
-      --candidate-csv outputs/.../no_mobility/test_granular_metrics.csv \
-      --output-dir outputs/reports/granular_compare/no_mobility
+      --candidate-csv outputs/.../mobility:off/test_granular_metrics.csv \
+      --output-dir outputs/reports/granular_compare/mobility_off
 
   uv run python -m dataviz.granular_comparison \
       --training-dir outputs/training \
