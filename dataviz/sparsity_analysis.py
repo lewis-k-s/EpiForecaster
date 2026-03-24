@@ -1,444 +1,215 @@
 """
-High sparsity region analysis with geographic visualization.
+Sparsity analysis with population scatter plots.
 
-Creates choropleth maps and time-aggregated scatter plots to analyze
-sparsity patterns across regions and time windows.
+Creates per-variable sparsity vs population scatter plots using explicit
+mask variables from the canonical dataset.
+
+Uses explicit mask variables to distinguish truly observed values from
+interpolated/imputed values.
 """
 
 import argparse
 import logging
 from pathlib import Path
 
-import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import seaborn as sns
 import xarray as xr
 
 sys_path = str(Path(__file__).parent.parent)
 if sys_path not in __import__("sys").path:
     __import__("sys").path.append(sys_path)
 
-from data.epi_dataset import EpiDataset  # noqa: E402
-from data.preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
-from models.configs import EpiForecasterConfig  # noqa: E402
 from utils.plotting import Style  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Wastewater biomarker variants
+WW_BIOMARKERS = ["edar_biomarker_N1", "edar_biomarker_N2", "edar_biomarker_IP4"]
 
-def compute_windowed_sparsity(
-    cases_da: xr.DataArray, window_size: int = 14
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute sparsity per region over time windows.
+# Variables with weekly reporting (use 7-day window aggregation)
+WEEKLY_VARIABLES = {"hospitalizations", "wastewater"}
+
+
+def get_sparsity_mask(dataset: xr.Dataset, var_name: str) -> np.ndarray:
+    """Extract sparsity mask from dataset for a given variable.
+
+    Uses explicit {var_name}_mask if available, where mask=1 means observed
+    and mask=0 means sparse/interpolated. Returns a boolean array where
+    True = sparse/interpolated.
 
     Args:
-        cases_da: (time, region) cases data
-        window_size: Size of time window for aggregation
+        dataset: xarray Dataset with mask variables
+        var_name: Variable name (e.g., "cases", "hospitalizations")
 
     Returns:
-        sparsity_matrix: (num_windows, num_regions) sparsity percentages
-        window_starts: Array of window start indices
+        Boolean array (date, region_id) where True = sparse
     """
-    missing_mask = cases_da.isnull().values
-    T, N = missing_mask.shape
+    mask_name = f"{var_name}_mask"
 
+    if mask_name not in dataset:
+        raise ValueError(f"Mask variable {mask_name} not found in dataset")
+
+    mask = dataset[mask_name]
+
+    # Handle run_id dimension if present (select run_id=0)
+    if "run_id" in mask.dims:
+        mask = mask.isel(run_id=0)
+
+    # mask=1 means observed, mask=0 means sparse
+    # Return True where sparse (mask == 0)
+    return (mask.values == 0).astype(bool)
+
+
+def get_wastewater_sparsity_mask(dataset: xr.Dataset) -> np.ndarray:
+    """Compute combined sparsity mask from all wastewater biomarker variants.
+
+    A point is considered sparse only if ALL biomarker variants are sparse.
+    This is because any single biomarker observation provides value.
+
+    Args:
+        dataset: xarray Dataset with biomarker mask variables
+
+    Returns:
+        Boolean array (date, region_id) where True = sparse (all variants missing)
+    """
+    masks = []
+    available_biomarkers = []
+
+    for biomarker in WW_BIOMARKERS:
+        mask_name = f"{biomarker}_mask"
+        if mask_name in dataset:
+            mask = dataset[mask_name]
+            if "run_id" in mask.dims:
+                mask = mask.isel(run_id=0)
+            # mask=1 means observed, so sparse where mask==0
+            masks.append(mask.values == 0)
+            available_biomarkers.append(biomarker)
+
+    if not masks:
+        raise ValueError("No wastewater biomarker masks found in dataset")
+
+    logger.info(
+        "Using wastewater biomarkers: %s",
+        ", ".join(b.replace("edar_biomarker_", "") for b in available_biomarkers),
+    )
+
+    # Stack masks and compute combined sparsity
+    # A point is sparse only if ALL biomarkers are sparse
+    stacked = np.stack(masks, axis=0)  # (num_biomarkers, date, region_id)
+    combined_sparse = np.all(stacked, axis=0)  # (date, region_id)
+
+    return combined_sparse.astype(bool)
+
+
+def compute_weekly_sparsity(mask: np.ndarray) -> np.ndarray:
+    """Compute sparsity using 7-day windows for weekly-reported variables.
+
+    For weekly data, a window is considered sparse only if there are ZERO
+    observations in that 7-day period. This avoids penalizing regions that
+    report consistently on a weekly schedule.
+
+    Args:
+        mask: Boolean array (date, region_id) where True = observed (mask==1)
+
+    Returns:
+        Array of sparsity percentages per region (N,)
+    """
+    # mask is True where observed, False where sparse
+    T, N = mask.shape
+    window_size = 7
     num_windows = T // window_size
-    sparsity_matrix = np.full((num_windows, N), np.nan, dtype=np.float32)
 
-    for w in range(num_windows):
-        start = w * window_size
-        end = min((w + 1) * window_size, T)
-        window_mask = missing_mask[start:end]
-        sparsity_matrix[w] = window_mask.sum(axis=0) / window_size * 100
-
-    window_starts = np.arange(num_windows) * window_size
-    return sparsity_matrix, window_starts
-
-
-def compute_overall_sparsity(cases_da: xr.DataArray) -> pd.Series:
-    """Compute overall sparsity percentage per region.
-
-    Args:
-        cases_da: (time, region) cases data
-
-    Returns:
-        Series with region_id as index, sparsity percentage as values
-    """
-    missing_mask = cases_da.isnull().values
-    sparsity_per_region = missing_mask.sum(axis=0) / missing_mask.shape[0] * 100
-
-    return pd.Series(
-        sparsity_per_region,
-        index=cases_da[REGION_COORD].values,
-        name="sparsity_percent",
-    )
-
-
-def compute_consecutive_missing(cases_da: xr.DataArray) -> pd.Series:
-    """Compute max consecutive missing values per region.
-
-    Args:
-        cases_da: (time, region) cases data
-
-    Returns:
-        Series with region_id as index, max consecutive missing as values
-    """
-    missing_mask = cases_da.isnull().values
-
-    max_consecutive = []
-    for region in range(missing_mask.shape[1]):
-        series = missing_mask[:, region]
-        consecutive = 0
-        max_consecutive_region = 0
-        for val in series:
-            if val:
-                consecutive += 1
-                max_consecutive_region = max(max_consecutive_region, consecutive)
-            else:
-                consecutive = 0
-        max_consecutive.append(max_consecutive_region)
-
-    return pd.Series(
-        max_consecutive,
-        index=cases_da[REGION_COORD].values,
-        name="max_consecutive_missing",
-    )
-
-
-def plot_choropleth(
-    geo_df: gpd.GeoDataFrame,
-    sparsity_series: pd.Series,
-    output_path: Path,
-    title: str,
-    vmin: float = 0,
-    vmax: float = 100,
-) -> None:
-    """Create choropleth map of sparsity.
-
-    Args:
-        geo_df: GeoDataFrame with region geometries
-        sparsity_series: Series mapping region_id to sparsity percentage
-        output_path: Path to save plot
-        title: Plot title
-        vmin: Minimum value for color scale
-        vmax: Maximum value for color scale
-    """
-    merged = geo_df.merge(
-        sparsity_series.rename("sparsity_percent"),
-        left_index=True,
-        right_index=True,
-        how="left",
-    )
-
-    fig, ax = plt.subplots(figsize=(14, 12))
-    merged.plot(
-        column="sparsity_percent",
-        cmap="Reds",
-        legend=True,
-        vmin=vmin,
-        vmax=vmax,
-        missing_kwds={"color": "lightgray", "label": "No data"},
-        edgecolor="black",
-        linewidth=0.2,
-        ax=ax,
-    )
-
-    cbar = ax.get_figure().axes[-1]
-    cbar.set_ylabel("Sparsity (%)", rotation=270, labelpad=20)
-
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.set_axis_off()
-
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved choropleth map to %s", output_path)
-
-
-def plot_windowed_sparsity_scatter(
-    sparsity_matrix: np.ndarray,
-    window_starts: np.ndarray,
-    region_ids: np.ndarray,
-    dates: pd.DatetimeIndex,
-    output_dir: Path,
-    top_n_regions: int = 100,
-) -> None:
-    """Create scatter plot of sparsity over time windows for high-sparsity regions.
-
-    Args:
-        sparsity_matrix: (num_windows, num_regions) sparsity percentages
-        window_starts: Array of window start indices
-        region_ids: Array of region IDs
-        dates: Date index for the full time series
-        output_dir: Directory to save plot
-        top_n_regions: Number of highest-sparsity regions to highlight
-    """
-    num_windows, num_regions = sparsity_matrix.shape
-
-    mean_sparsity = np.nanmean(sparsity_matrix, axis=0)
-    top_indices = np.argsort(mean_sparsity)[-top_n_regions:]
-
-    fig, ax = plt.subplots(figsize=(14, 8))
-
-    for idx in top_indices:
-        region_id = region_ids[idx]
-        sparsity_values = sparsity_matrix[:, idx]
-        window_dates = dates[window_starts + window_starts[0] // 2]
-        ax.scatter(
-            window_dates,
-            sparsity_values,
-            alpha=0.7,
-            s=20,
-            label=f"{region_id} ({mean_sparsity[idx]:.1f}%)",
+    if num_windows == 0:
+        # Not enough data for even one window, fall back to daily
+        logger.warning(
+            "Dataset too short for weekly windowing (%d days), using daily", T
         )
+        return (~mask).mean(axis=0) * 100
 
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Sparsity (%)")
-    ax.set_title(f"Sparsity Over Time (Top {top_n_regions} Highest-Sparsity Regions)")
-    ax.grid(True, alpha=0.3)
+    # Reshape to (num_windows, window_size, N)
+    # Truncate to full windows
+    truncated_mask = mask[: num_windows * window_size]
+    windowed = truncated_mask.reshape(num_windows, window_size, N)
 
-    plt.tight_layout()
-    output_path = output_dir / "windowed_sparsity_scatter.png"
-    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved windowed sparsity scatter to %s", output_path)
+    # A window has data if ANY day in that window has an observation
+    window_has_data = windowed.any(axis=1)  # (num_windows, N)
 
+    # Sparsity = % of windows with NO data
+    sparsity_pct = (~window_has_data).mean(axis=0) * 100  # (N,)
 
-def plot_sparsity_distribution(
-    sparsity_series: pd.Series,
-    consecutive_series: pd.Series,
-    output_dir: Path,
-) -> None:
-    """Plot distribution of sparsity and consecutive missing values.
-
-    Args:
-        sparsity_series: Series with sparsity percentages
-        consecutive_series: Series with max consecutive missing
-        output_dir: Directory to save plot
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    sns.histplot(sparsity_series, bins=50, ax=axes[0])
-    axes[0].set_title("Distribution of Sparsity Across Regions")
-    axes[0].set_xlabel("Sparsity (%)")
-    axes[0].set_ylabel("Number of Regions")
-    axes[0].axvline(
-        sparsity_series.median(),
-        color="red",
-        linestyle="--",
-        label=f"Median: {sparsity_series.median():.1f}%",
-    )
-    axes[0].legend()
-
-    sns.histplot(consecutive_series, bins=50, ax=axes[1])
-    axes[1].set_title("Distribution of Max Consecutive Missing")
-    axes[1].set_xlabel("Max Consecutive Missing (days)")
-    axes[1].set_ylabel("Number of Regions")
-    axes[1].axvline(
-        consecutive_series.median(),
-        color="red",
-        linestyle="--",
-        label=f"Median: {consecutive_series.median():.0f}",
-    )
-    axes[1].legend()
-
-    plt.tight_layout()
-    output_path = output_dir / "sparsity_distribution.png"
-    fig.savefig(output_path, dpi=Style.DPI)
-    plt.close(fig)
-    logger.info("Saved sparsity distribution plot to %s", output_path)
+    return sparsity_pct
 
 
-def plot_sparsity_heatmap(
-    sparsity_matrix: np.ndarray,
-    region_ids: np.ndarray,
-    dates: pd.DatetimeIndex,
-    window_starts: np.ndarray,
-    output_dir: Path,
-    max_regions: int = 50,
-) -> None:
-    """Create heatmap of sparsity over time and regions.
+def compute_daily_sparsity(mask: np.ndarray) -> np.ndarray:
+    """Compute sparsity using daily granularity.
 
     Args:
-        sparsity_matrix: (num_windows, num_regions) sparsity percentages
-        region_ids: Array of region IDs
-        dates: Date index for the full time series
-        window_starts: Array of window start indices
-        output_dir: Directory to save plot
-        max_regions: Maximum number of regions to show
+        mask: Boolean array (date, region_id) where True = observed (mask==1)
+
+    Returns:
+        Array of sparsity percentages per region (N,)
     """
-    num_regions = min(max_regions, sparsity_matrix.shape[1])
-
-    sorted_mean_sparsity = np.nanmean(sparsity_matrix, axis=0)
-    top_indices = np.argsort(sorted_mean_sparsity)[-num_regions:]
-
-    sparsity_subset = sparsity_matrix[:, top_indices]
-    region_ids_subset = region_ids[top_indices]
-
-    window_dates = [dates[start + window_starts[0] // 2] for start in window_starts]
-
-    fig, ax = plt.subplots(figsize=(16, 8))
-    im = ax.imshow(
-        sparsity_subset.T,
-        aspect="auto",
-        cmap="Reds",
-        vmin=0,
-        vmax=100,
-        interpolation="nearest",
-    )
-
-    ax.set_xticks(np.arange(0, len(window_dates), len(window_dates) // 10))
-    ax.set_xticklabels(
-        [str(d.date()) for d in window_dates[:: len(window_dates) // 10]],
-        rotation=45,
-        ha="right",
-    )
-    ax.set_yticks(np.arange(num_regions))
-    ax.set_yticklabels(region_ids_subset, fontsize=8)
-
-    ax.set_xlabel("Time Window")
-    ax.set_ylabel("Region")
-    ax.set_title(f"Sparsity Heatmap (Top {num_regions} Highest-Sparsity Regions)")
-
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label("Sparsity (%)")
-
-    plt.tight_layout()
-    output_path = output_dir / "sparsity_heatmap.png"
-    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved sparsity heatmap to %s", output_path)
+    # mask is True where observed, False where sparse
+    return (~mask).mean(axis=0) * 100
 
 
 def plot_sparsity_vs_population(
-    sparsity_series: pd.Series,
-    population: xr.DataArray,
+    sparsity_pct: np.ndarray,
+    population: np.ndarray,
     output_dir: Path,
+    var_name: str,
+    frequency: str = "daily",
 ) -> None:
-    """Plot relationship between sparsity and population.
+    """Plot relationship between sparsity and population for a variable.
 
     Args:
-        sparsity_series: Series with sparsity percentages
-        population: (region,) population array
+        sparsity_pct: Array of sparsity percentages per region (N,)
+        population: Array of population values per region (N,)
         output_dir: Directory to save plot
+        var_name: Variable name for filename and title
+        frequency: Reporting frequency note for title (e.g., "daily", "weekly")
     """
-    pop_df = pd.DataFrame(
-        {"population": population.values, "sparsity": sparsity_series.values},
-        index=sparsity_series.index,
-    )
-
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.scatter(pop_df["population"], pop_df["sparsity"], alpha=0.5, s=30)
+    ax.scatter(population, sparsity_pct, alpha=0.5, s=30)
 
     ax.set_xlabel("Population")
     ax.set_ylabel("Sparsity (%)")
-    ax.set_title("Sparsity vs Population")
+    ax.set_ylim(0, 100)
+    # Capitalize first letter for title, include frequency note
+    title_var = var_name.capitalize()
+    ax.set_title(f"{title_var} Sparsity vs Population ({frequency})")
     ax.set_xscale("log")
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    output_path = output_dir / "sparsity_vs_population.png"
-    fig.savefig(output_path, dpi=Style.DPI)
+    output_path = output_dir / f"{var_name}_sparsity_vs_population.png"
+    fig.savefig(output_path, dpi=Style.DPI, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Saved sparsity vs population plot to %s", output_path)
-
-
-def write_high_sparsity_report(
-    sparsity_series: pd.Series,
-    consecutive_series: pd.Series,
-    sparsity_matrix: np.ndarray,
-    region_ids: np.ndarray,
-    dates: pd.DatetimeIndex,
-    window_starts: np.ndarray,
-    output_dir: Path,
-    top_n: int = 30,
-) -> None:
-    """Write detailed report on high-sparsity regions.
-
-    Args:
-        sparsity_series: Series with sparsity percentages
-        consecutive_series: Series with max consecutive missing
-        sparsity_matrix: (num_windows, num_regions) sparsity percentages
-        region_ids: Array of region IDs
-        dates: Date index for the full time series
-        window_starts: Array of window start indices
-        output_dir: Directory to save report
-        top_n: Number of top sparsity regions to report
-    """
-    report_path = output_dir / "high_sparsity_report.txt"
-
-    with open(report_path, "w") as f:
-        f.write("High Sparsity Region Analysis Report\n")
-        f.write("=" * 60 + "\n\n")
-
-        top_indices = sparsity_series.nlargest(top_n).index
-
-        f.write(f"Top {top_n} Highest Sparsity Regions\n")
-        f.write("-" * 60 + "\n")
-        f.write(f"{'Region':<20} {'Sparsity (%)':<15} {'Max Consecutive':<20}\n")
-        f.write("-" * 60 + "\n")
-
-        for region_id in top_indices:
-            f.write(
-                f"{region_id:<20} {sparsity_series[region_id]:<15.2f} "
-                f"{consecutive_series[region_id]:<20}\n"
-            )
-
-        f.write("\n\n")
-        f.write("Summary Statistics\n")
-        f.write("-" * 60 + "\n")
-        f.write(f"Total regions: {len(sparsity_series)}\n")
-        f.write(f"Mean sparsity: {sparsity_series.mean():.2f}%\n")
-        f.write(f"Median sparsity: {sparsity_series.median():.2f}%\n")
-        f.write(f"Max sparsity: {sparsity_series.max():.2f}%\n")
-        f.write(f"Regions with >50% sparsity: {(sparsity_series > 50).sum()}\n")
-        f.write(f"Regions with >75% sparsity: {(sparsity_series > 75).sum()}\n")
-        f.write(f"Regions with >90% sparsity: {(sparsity_series > 90).sum()}\n")
-
-        f.write("\n")
-        f.write(f"Mean max consecutive missing: {consecutive_series.mean():.1f}\n")
-        f.write(f"Median max consecutive missing: {consecutive_series.median():.0f}\n")
-        f.write(f"Max consecutive missing: {consecutive_series.max():.0f}\n")
-
-        f.write(f"\nTime windows analyzed: {len(window_starts)}\n")
-        f.write(f"Date range: {dates[0].date()} to {dates[-1].date()}\n")
-
-    logger.info("Saved high sparsity report to %s", report_path)
+    logger.info("Saved %s sparsity vs population plot to %s", var_name, output_path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="High sparsity region analysis")
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path("configs/train_epifor_full.yaml"),
-        help="Training config path for dataset loading",
+    parser = argparse.ArgumentParser(
+        description="Sparsity analysis with population scatter plots"
     )
     parser.add_argument(
-        "--geo-path",
-        type=str,
-        default="data/files/geo/fl_municipios_catalonia.geojson",
-        help="Path to geojson file with region boundaries",
+        "--dataset-path",
+        type=Path,
+        required=True,
+        help="Path to canonical Zarr dataset",
+    )
+    parser.add_argument(
+        "--variables",
+        nargs="+",
+        default=["cases", "hospitalizations", "deaths", "wastewater"],
+        help="Variables to analyze",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("outputs/reports/sparsity_analysis"),
-        help="Directory to save plots and reports",
-    )
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=14,
-        help="Time window size in days for aggregation",
-    )
-    parser.add_argument(
-        "--top-regions",
-        type=int,
-        default=20,
-        help="Number of top sparsity regions to highlight in plots",
+        help="Directory to save plots",
     )
 
     args = parser.parse_args()
@@ -447,105 +218,43 @@ def main() -> None:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = EpiForecasterConfig.from_file(str(args.config))
+    # Load dataset
+    dataset = xr.open_zarr(args.dataset_path)
+    logger.info("Loaded dataset: %s", args.dataset_path)
 
-    # Load dataset to get node count
-    dataset = xr.open_zarr(cfg.data.dataset_path)
-    num_nodes = dataset[REGION_COORD].size
-    dataset.close()
+    # Get population
+    population = dataset["population"].values
 
-    # Use all nodes as targets and context
-    target_nodes = list(range(num_nodes))
-    context_nodes = list(range(num_nodes))
+    logger.info("Regions: %d", len(population))
 
-    epi_dataset = EpiDataset(
-        cfg,
-        target_nodes=target_nodes,
-        context_nodes=context_nodes,
-    )
+    for var_name in args.variables:
+        logger.info("Processing variable: %s", var_name)
 
-    dataset = epi_dataset.dataset
-    logger.info("Loaded dataset: %s", cfg.data.dataset_path)
-    logger.info("Variables: %s", list(dataset.keys()))
+        if var_name == "wastewater":
+            # Get combined sparse mask (True = sparse)
+            sparse_mask = get_wastewater_sparsity_mask(dataset)
+            # Convert to observed mask (True = observed)
+            obs_mask = ~sparse_mask
+        else:
+            # Get sparse mask (True = sparse)
+            sparse_mask = get_sparsity_mask(dataset, var_name)
+            # Convert to observed mask (True = observed)
+            obs_mask = ~sparse_mask
 
-    cases_da = dataset.cases
-    population = dataset.population
-    dates = pd.DatetimeIndex(dataset[TEMPORAL_COORD].values)
-    regions = list(dataset[REGION_COORD].values)
+        # Use weekly windowing for weekly-reported variables
+        if var_name in WEEKLY_VARIABLES:
+            logger.info("  Using 7-day window aggregation (weekly reporting)")
+            sparsity_pct = compute_weekly_sparsity(obs_mask)
+            frequency = "weekly windows"
+        else:
+            sparsity_pct = compute_daily_sparsity(obs_mask)
+            frequency = "daily"
 
-    # Filter by valid_targets if available
-    if "valid_targets" in dataset:
-        valid_mask = dataset.valid_targets.values.astype(bool)
-        cases_da = cases_da.isel({REGION_COORD: valid_mask})
-        population = population.isel({REGION_COORD: valid_mask})
-        regions = [r for r, v in zip(regions, valid_mask, strict=False) if v]
-        logger.info(
-            "Using valid_targets filter: %d regions (out of %d total)",
-            valid_mask.sum(),
-            valid_mask.size,
+        plot_sparsity_vs_population(
+            sparsity_pct, population, output_dir, var_name, frequency
         )
-    else:
-        logger.info("No valid_targets filter found, using all regions")
 
-    logger.info("Time steps: %d, Regions: %d", len(dates), len(regions))
-
-    geo_df = gpd.read_file(args.geo_path)
-    logger.info("Loaded geo data: %d features", len(geo_df))
-
-    geo_df.index = geo_df["id"].astype(str)
-
-    sparsity_series = compute_overall_sparsity(cases_da)
-    consecutive_series = compute_consecutive_missing(cases_da)
-    sparsity_matrix, window_starts = compute_windowed_sparsity(
-        cases_da, args.window_size
-    )
-
-    plot_choropleth(
-        geo_df,
-        sparsity_series,
-        output_dir / "sparsity_choropleth.png",
-        "Overall Sparsity Across Regions",
-    )
-
-    plot_choropleth(
-        geo_df,
-        consecutive_series.rename("max_consecutive_missing"),
-        output_dir / "consecutive_missing_choropleth.png",
-        "Max Consecutive Missing Days Across Regions",
-    )
-
-    plot_windowed_sparsity_scatter(
-        sparsity_matrix,
-        window_starts,
-        np.array(regions),
-        dates,
-        output_dir,
-        # top_n_regions=args.top_regions,
-    )
-
-    plot_sparsity_distribution(sparsity_series, consecutive_series, output_dir)
-
-    plot_sparsity_heatmap(
-        sparsity_matrix,
-        np.array(regions),
-        dates,
-        window_starts,
-        output_dir,
-        max_regions=args.top_regions,
-    )
-
-    plot_sparsity_vs_population(sparsity_series, population, output_dir)
-
-    write_high_sparsity_report(
-        sparsity_series,
-        consecutive_series,
-        sparsity_matrix,
-        np.array(regions),
-        dates,
-        window_starts,
-        output_dir,
-        top_n=args.top_regions,
-    )
+    logger.info("Analysis complete. Output saved to: %s", output_dir)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,9 @@ from utils.logging import setup_logging, suppress_zarr_warnings
 suppress_zarr_warnings()
 logger = logging.getLogger(__name__)
 
+# Variables reported on weekly schedule (use 7-day window aggregation)
+WEEKLY_VARIABLES = frozenset({"hospitalizations", "biomarkers"})
+
 
 def load_dataset_for_viz(config: EpiForecasterConfig) -> xr.Dataset | None:
     """Load the dataset from config for visualization."""
@@ -67,6 +70,7 @@ def compute_sparsity_stats(
     da: xr.DataArray,
     da_mask: xr.DataArray | None = None,
     include_all_regions: bool = False,
+    weekly: bool = False,
 ) -> pd.DataFrame:
     """Compute sparsity statistics for each region.
 
@@ -74,6 +78,10 @@ def compute_sparsity_stats(
         da: 2D DataArray with dimensions (date, region_id)
         da_mask: Optional 2D binary observation mask (1=observed, 0=missing)
         include_all_regions: If True, include regions with zero observations
+        weekly: If True, use 7-day window aggregation for weekly-reported variables.
+            A window is considered sparse only if there are ZERO observations in
+            that 7-day period. This avoids penalizing regions that report
+            consistently on a weekly schedule.
 
     Returns:
         DataFrame with sparsity statistics per region
@@ -91,6 +99,69 @@ def compute_sparsity_stats(
 
     n_time, n_regions = values.shape
 
+    # For weekly variables, use 7-day window aggregation
+    if weekly:
+        window_size = 7
+        num_windows = n_time // window_size
+
+        if num_windows == 0:
+            # Not enough data for even one window, fall back to daily
+            logger.warning(
+                "Dataset too short for weekly windowing (%d days), using daily", n_time
+            )
+            weekly = False
+        else:
+            # Truncate to full windows
+            truncated_len = num_windows * window_size
+
+            rows = []
+            region_ids = da[REGION_COORD].values
+
+            for i, region_id in enumerate(region_ids):
+                series = values[:truncated_len, i]
+
+                if mask_values is not None:
+                    observed = mask_values[:truncated_len, i]
+                else:
+                    observed = np.isfinite(series)
+
+                # Reshape to (num_windows, window_size)
+                windowed_observed = observed.reshape(num_windows, window_size)
+
+                # A window has data if ANY day in that window has an observation
+                window_has_data = windowed_observed.any(axis=1)
+
+                # Skip regions with no observations unless explicitly requested
+                if (not include_all_regions) and (not np.any(window_has_data)):
+                    continue
+
+                n_windows_with_data = int(np.sum(window_has_data))
+                sparsity_pct = 100 * (1 - n_windows_with_data / num_windows)
+
+                # Compute max consecutive missing windows
+                missing_windows = ~window_has_data
+                max_consecutive = 0
+                current = 0
+                for is_missing in missing_windows:
+                    if is_missing:
+                        current += 1
+                        max_consecutive = max(max_consecutive, current)
+                    else:
+                        current = 0
+
+                rows.append(
+                    {
+                        "region_id": region_id,
+                        "n_measurements": n_windows_with_data,
+                        "total_timesteps": num_windows,
+                        "sparsity_pct": round(sparsity_pct, 2),
+                        "max_consecutive_missing": max_consecutive * window_size,
+                    }
+                )
+
+            return pd.DataFrame(rows)
+
+    # Daily granularity (default)
     rows = []
     region_ids = da[REGION_COORD].values
 
@@ -163,6 +234,7 @@ def plot_age_heatmap(
     input_window_length: int | None = None,
     age_max: int = 14,
     title: str = "Data",
+    n_regions: int | None = None,
 ) -> None:
     """Plot age/staleness heatmap.
 
@@ -174,6 +246,7 @@ def plot_age_heatmap(
         input_window_length: Optional separator line position
         age_max: Maximum age for normalization
         title: Plot title
+        n_regions: Optional count of regions to display in y-axis label
     """
     # Filter to regions with any data
     if observed_mask is not None:
@@ -207,7 +280,8 @@ def plot_age_heatmap(
 
     ax.set_title(f"{title} - Data Age/Staleness", fontsize=10, fontweight="semibold")
     ax.set_xlabel("Time")
-    ax.set_ylabel("Region")
+    y_label = f"Region (n={n_regions})" if n_regions is not None else "Region"
+    ax.set_ylabel(y_label)
 
 
 def make_age_sparsity_figure(
@@ -217,6 +291,7 @@ def make_age_sparsity_figure(
     input_window_length: int | None = None,
     age_max: int = 14,
     title: str = "Data",
+    weekly: bool = False,
 ) -> Figure | None:
     """Create multi-panel age/sparsity figure.
 
@@ -226,6 +301,7 @@ def make_age_sparsity_figure(
         input_window_length: Optional separator position
         age_max: Maximum age for normalization
         title: Figure title
+        weekly: If True, use 7-day window aggregation for sparsity calculation
 
     Returns:
         Matplotlib Figure or None if no data
@@ -245,7 +321,7 @@ def make_age_sparsity_figure(
         return None
 
     # Compute sparsity stats
-    stats_df = compute_sparsity_stats(da_values, da_mask=da_mask)
+    stats_df = compute_sparsity_stats(da_values, da_mask=da_mask, weekly=weekly)
 
     # Create figure
     fig = plt.figure(figsize=(14, 8))
@@ -262,6 +338,7 @@ def make_age_sparsity_figure(
         input_window_length=input_window_length,
         age_max=age_max,
         title=title,
+        n_regions=len(stats_df),
     )
 
     # Panel 2: Sparsity distribution
@@ -277,7 +354,9 @@ def make_age_sparsity_figure(
         ax2.set_xlabel("Sparsity (%)")
         ax2.set_ylabel("Number of regions")
         ax2.set_title(
-            f"{title} Sparsity Distribution", fontsize=10, fontweight="semibold"
+            f"{title} Sparsity Distribution (n={len(stats_df)})",
+            fontsize=10,
+            fontweight="semibold",
         )
         ax2.axvline(
             stats_df["sparsity_pct"].median(),
@@ -362,8 +441,11 @@ def generate_age_mask_plots(
             da_age = ds[age_var]
             da_mask = ds.get(f"{value_var}_mask")
 
-            # Compute sparsity stats
-            stats_df = compute_sparsity_stats(da_values, da_mask=da_mask)
+            # Compute sparsity stats (use weekly windowing for weekly-reported variables)
+            is_weekly = value_var in WEEKLY_VARIABLES
+            if is_weekly:
+                logger.info("  Using 7-day window aggregation (weekly reporting)")
+            stats_df = compute_sparsity_stats(da_values, da_mask=da_mask, weekly=is_weekly)
 
             # Generate figure
             fig = make_age_sparsity_figure(
@@ -372,6 +454,7 @@ def generate_age_mask_plots(
                 da_mask=da_mask,
                 input_window_length=config.model.input_window_length,
                 title=title,
+                weekly=is_weekly,
             )
 
             # Save figure
@@ -461,10 +544,13 @@ def generate_age_mask_plots(
             )
 
             # Compute sparsity (treating 1.0 as has data, 0.0 as missing)
+            # Biomarkers are weekly-reported, use 7-day window aggregation
+            logger.info("  Using 7-day window aggregation for biomarkers (weekly reporting)")
             stats_df = compute_sparsity_stats(
                 da_combined_values,
                 da_mask=da_combined_values,
                 include_all_regions=True,
+                weekly=True,
             )
 
             # Generate figure
@@ -474,6 +560,7 @@ def generate_age_mask_plots(
                 da_mask=da_combined_values,
                 input_window_length=config.model.input_window_length,
                 title="Biomarkers (combined)",
+                weekly=True,
             )
 
             if fig is not None:
