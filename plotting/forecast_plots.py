@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -12,6 +12,9 @@ from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
 from utils.device import prepare_batch_for_device
 
+if TYPE_CHECKING:
+    from evaluation.selection import WindowSelectionSpec
+
 logger = logging.getLogger(__name__)
 
 
@@ -19,30 +22,52 @@ TARGET_PLOT_SPECS: dict[str, dict[str, str]] = {
     "hosp": {
         "model_output": "pred_hosp",
         "batch_target": "hosp_target",
+        "batch_mask": "hosp_target_mask",
         "dataset_attr": "precomputed_hosp",
         "label": "Hospitalizations",
     },
     "ww": {
         "model_output": "pred_ww",
         "batch_target": "ww_target",
+        "batch_mask": "ww_target_mask",
         "dataset_attr": "precomputed_ww",
         "label": "Wastewater",
     },
     "cases": {
         "model_output": "pred_cases",
         "batch_target": "cases_target",
+        "batch_mask": "cases_target_mask",
         "dataset_attr": "precomputed_cases_target",
         "label": "Cases",
     },
     "deaths": {
         "model_output": "pred_deaths",
         "batch_target": "deaths_target",
+        "batch_mask": "deaths_target_mask",
         "dataset_attr": "precomputed_deaths",
         "label": "Deaths",
     },
 }
 
 DEFAULT_PLOT_TARGETS = ["hosp", "ww", "cases", "deaths"]
+LATENT_PLOT_SPECS: dict[str, dict[str, str]] = {
+    "latent_s": {
+        "model_output": "S_trajectory",
+        "label": "Latent S",
+    },
+    "latent_i": {
+        "model_output": "I_trajectory",
+        "label": "Latent I",
+    },
+    "latent_r": {
+        "model_output": "R_trajectory",
+        "label": "Latent R",
+    },
+    "latent_d": {
+        "model_output": "D_trajectory",
+        "label": "Latent D",
+    },
+}
 
 
 def _resolve_target_names(target_names: list[str] | None) -> list[str]:
@@ -57,10 +82,48 @@ def _resolve_target_names(target_names: list[str] | None) -> list[str]:
     return out
 
 
+def _resolve_latent_series(
+    model_outputs: dict[str, Any],
+) -> dict[str, torch.Tensor | np.ndarray]:
+    latents: dict[str, torch.Tensor | np.ndarray] = {}
+    for latent_name, spec in LATENT_PLOT_SPECS.items():
+        model_output = spec["model_output"]
+        if model_output in model_outputs:
+            latents[latent_name] = model_outputs[model_output]
+    return latents
+
+
+def _build_prediction_only_context(
+    *,
+    t_rel: np.ndarray,
+    horizon: int,
+    prediction: np.ndarray,
+) -> np.ndarray:
+    context = np.full(len(t_rel), np.nan, dtype=np.float32)
+    horizon_mask = (t_rel >= 0) & (t_rel < horizon)
+    points_to_plot = min(int(horizon_mask.sum()), int(prediction.shape[0]))
+    if points_to_plot > 0:
+        context[np.where(horizon_mask)[0][:points_to_plot]] = prediction[:points_to_plot]
+    return context
+
+
 def _as_numpy_1d(value: torch.Tensor | np.ndarray) -> np.ndarray:
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy().reshape(-1)
     return np.asarray(value).reshape(-1)
+
+
+def _align_prediction_to_target(
+    prediction: torch.Tensor | np.ndarray,
+    *,
+    target_length: int,
+) -> np.ndarray:
+    aligned = _as_numpy_1d(prediction).astype(np.float32)
+    if aligned.shape[0] == target_length + 1:
+        return aligned[1:]
+    if aligned.shape[0] >= target_length:
+        return aligned[:target_length]
+    return aligned
 
 
 def _dataset_series_window(
@@ -89,19 +152,47 @@ def _history_window(
     )
 
 
-def _extract_target_payload(
-    sample: dict[str, Any], *, target: str | None
-) -> tuple[np.ndarray, np.ndarray]:
-    if target is not None and "targets" in sample and target in sample["targets"]:
-        payload = sample["targets"][target]
+def _extract_series_payload(
+    sample: dict[str, Any],
+    *,
+    target: str | None,
+    payload_collection: str = "targets",
+) -> tuple[np.ndarray, np.ndarray, float | None]:
+    payloads = sample.get(payload_collection)
+    if target is not None and isinstance(payloads, dict) and target in payloads:
+        payload = payloads[target]
         return (
             np.asarray(payload["actual_context"]).reshape(-1),
             np.asarray(payload["prediction"]).reshape(-1),
+            float(payload["window_mae"]) if payload.get("window_mae") is not None else None,
         )
     return (
         np.asarray(sample["actual_context"]).reshape(-1),
         np.asarray(sample["prediction"]).reshape(-1),
+        float(sample["window_mae"]) if sample.get("window_mae") is not None else None,
     )
+
+
+def _compute_window_mae(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    observed_mask: np.ndarray | None,
+) -> float | None:
+    pred = np.asarray(prediction, dtype=np.float32).reshape(-1)
+    actual = np.asarray(target, dtype=np.float32).reshape(-1)
+    if pred.shape[0] != actual.shape[0]:
+        size = min(pred.shape[0], actual.shape[0])
+        pred = pred[:size]
+        actual = actual[:size]
+    if observed_mask is None:
+        if pred.size == 0:
+            return None
+        return float(np.abs(pred - actual).mean())
+    mask = np.asarray(observed_mask, dtype=np.float32).reshape(-1)
+    mask = mask[: pred.shape[0]] > 0
+    if not np.any(mask):
+        return None
+    return float(np.abs(pred[mask] - actual[mask]).mean())
 
 
 def indices_for_target_nodes_in_window(
@@ -220,11 +311,7 @@ def collect_forecast_samples_for_target_nodes(
         if idx is not None:
             indices.append(idx)
             start_indices.append(start_idx)
-            try:
-                time_val = dataset.dataset[TEMPORAL_COORD].values[start_idx]
-                start_times.append(str(time_val).split("T")[0])
-            except Exception:
-                start_times.append(f"t={start_idx}")
+            start_times.append(_format_start_time(dataset, start_idx))
 
     if not indices:
         return []
@@ -306,10 +393,12 @@ def collect_forecast_samples_for_target_nodes(
             t_rel = np.arange(t_min, t_max, dtype=np.int64) - t0
 
             target_payloads: dict[str, dict[str, np.ndarray]] = {}
+            latent_payloads: dict[str, dict[str, np.ndarray]] = {}
             for target_name in resolved_targets:
                 spec = TARGET_PLOT_SPECS[target_name]
                 pred_key = spec["model_output"]
                 batch_key = spec["batch_target"]
+                mask_key = spec["batch_mask"]
                 dataset_attr = spec["dataset_attr"]
 
                 if pred_key not in model_outputs or not hasattr(batch, batch_key):
@@ -317,8 +406,16 @@ def collect_forecast_samples_for_target_nodes(
                 if not hasattr(dataset, dataset_attr):
                     continue
 
-                pred_series = _as_numpy_1d(model_outputs[pred_key][i])
-                target_series = _as_numpy_1d(batch[batch_key][i])
+                target_series = _as_numpy_1d(getattr(batch, batch_key)[i])
+                pred_series = _align_prediction_to_target(
+                    model_outputs[pred_key][i],
+                    target_length=target_series.shape[0],
+                )
+                target_mask = (
+                    _as_numpy_1d(getattr(batch, mask_key)[i])
+                    if hasattr(batch, mask_key)
+                    else None
+                )
                 dataset_tensor = getattr(dataset, dataset_attr)
                 actual_context_full = _dataset_series_window(
                     dataset_tensor,
@@ -338,9 +435,32 @@ def collect_forecast_samples_for_target_nodes(
                     "prediction": np.asarray(pred_series, dtype=np.float32),
                     "target": np.asarray(target_series, dtype=np.float32),
                     "history": history_series,
+                    "window_mae": _compute_window_mae(
+                        pred_series,
+                        target_series,
+                        target_mask,
+                    ),
                 }
 
-            if not target_payloads:
+            latent_outputs = _resolve_latent_series(model_outputs)
+            for latent_name, latent_series_raw in latent_outputs.items():
+                pred_series = _align_prediction_to_target(
+                    latent_series_raw[i],
+                    target_length=H,
+                ).astype(np.float32)
+                latent_payloads[latent_name] = {
+                    "actual_context": _build_prediction_only_context(
+                        t_rel=t_rel,
+                        horizon=H,
+                        prediction=pred_series,
+                    ),
+                    "prediction": pred_series,
+                    "target": np.full_like(pred_series, np.nan),
+                    "history": np.empty(0, dtype=np.float32),
+                    "window_mae": None,
+                }
+
+            if not target_payloads and not latent_payloads:
                 logger.debug(
                     "[plot] Skipping node %s because no target payload was available",
                     target_node,
@@ -363,12 +483,253 @@ def collect_forecast_samples_for_target_nodes(
                     "t_rel": t_rel,
                     "t0_idx_in_context": t0 - t_min,
                     "start_time": start_times[i] if i < len(start_times) else "",
+                    "window_start": start_idx,
+                    "window_mae": primary.get("window_mae"),
                     "L": L,
                     "H": H,
                     "targets": target_payloads,
+                    "latents": latent_payloads,
                 }
             )
         return samples
+    finally:
+        if model_was_training:
+            model.train()
+
+
+def _format_start_time(dataset: Any, start_idx: int) -> str:
+    temporal_coords = getattr(dataset, "_temporal_coords", None)
+    if temporal_coords is not None and 0 <= start_idx < len(temporal_coords):
+        return str(temporal_coords[start_idx]).split("T")[0]
+    try:
+        time_val = dataset.dataset[TEMPORAL_COORD].values[start_idx]
+        return str(time_val).split("T")[0]
+    except Exception:
+        return f"t={start_idx}"
+
+
+def _resolve_dataset_index_for_window_start(
+    dataset: Any,
+    *,
+    target_node: int,
+    window_start: int,
+) -> int | None:
+    index_lookup = getattr(dataset, "_index_lookup", None)
+    if index_lookup is not None:
+        dataset_idx = index_lookup.get((target_node, window_start))
+        if dataset_idx is not None:
+            return int(dataset_idx)
+
+    window_starts = getattr(dataset, "window_starts", None)
+    if window_starts is None:
+        return None
+
+    try:
+        window_idx = list(window_starts).index(window_start)
+    except ValueError:
+        return None
+
+    try:
+        return int(
+            dataset.index_for_target_node_window(
+                target_node=target_node,
+                window_idx=window_idx,
+            )
+        )
+    except Exception:
+        return None
+
+
+def collect_forecast_samples_for_window_specs(
+    *,
+    window_specs: list[WindowSelectionSpec],
+    model: torch.nn.Module,
+    loader: DataLoader,
+    context_pre: int = 30,
+    context_post: int = 30,
+    target_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    import os
+
+    from torch.utils.data import Subset
+
+    from data.epi_batch import collate_epiforecaster_batch
+
+    dataset = loader.dataset
+    if not isinstance(dataset, EpiDataset):
+        raise TypeError(
+            "collect_forecast_samples_for_window_specs currently expects an EpiDataset."
+        )
+
+    if not window_specs:
+        return []
+
+    resolved_targets = _resolve_target_names(target_names)
+    indices: list[int] = []
+    start_indices: list[int] = []
+    start_times: list[str] = []
+    ordered_specs: list[WindowSelectionSpec] = []
+
+    for spec in window_specs:
+        dataset_idx = _resolve_dataset_index_for_window_start(
+            dataset,
+            target_node=int(spec.node_id),
+            window_start=int(spec.window_start),
+        )
+        if dataset_idx is None:
+            continue
+        indices.append(int(dataset_idx))
+        start_indices.append(int(spec.window_start))
+        start_times.append(_format_start_time(dataset, int(spec.window_start)))
+        ordered_specs.append(spec)
+
+    if not indices:
+        return []
+
+    avail_cores = (os.cpu_count() or 1) - 1
+    num_workers = min(avail_cores, 4)
+    subset_dataset = Subset(dataset, indices)
+    sample_loader = DataLoader(
+        subset_dataset,
+        batch_size=len(indices),
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_epiforecaster_batch,
+    )
+
+    batch = next(iter(sample_loader))
+    device = next(model.parameters()).device
+    model_was_training = model.training
+    model.eval()
+    try:
+        batch = cast(
+            Any,
+            prepare_batch_for_device(
+                batch,
+                dataset=dataset,
+                device=device,
+            ),
+        )
+        region_embeddings = getattr(dataset, "region_embeddings", None)
+        if region_embeddings is not None:
+            region_embeddings = region_embeddings.to(device)
+        with torch.no_grad():
+            if hasattr(model, "forward_batch"):
+                model_outputs, _targets_dict = model.forward_batch(
+                    batch_data=batch,
+                    region_embeddings=region_embeddings,
+                )
+            else:
+                raise ValueError("Exact-window plotting expects forward_batch support.")
+
+        results: list[dict[str, Any]] = []
+        L = dataset.config.model.input_window_length
+        H = dataset.config.model.forecast_horizon
+        T_total = dataset.precomputed_cases_hist.shape[0]
+        for i, spec in enumerate(ordered_specs):
+            node_idx = int(spec.node_id)
+            start_idx = int(spec.window_start)
+            t0 = start_idx + L
+            t_min = max(0, t0 - context_pre)
+            t_max = min(T_total, t0 + H + context_post)
+            t_rel = np.arange(t_min, t_max, dtype=np.int64) - t0
+
+            target_payloads: dict[str, dict[str, np.ndarray]] = {}
+            latent_payloads: dict[str, dict[str, np.ndarray]] = {}
+            for target_name in resolved_targets:
+                plot_spec = TARGET_PLOT_SPECS[target_name]
+                pred_key = plot_spec["model_output"]
+                batch_key = plot_spec["batch_target"]
+                mask_key = plot_spec["batch_mask"]
+                dataset_attr = plot_spec["dataset_attr"]
+                if pred_key not in model_outputs or not hasattr(batch, batch_key):
+                    continue
+                if not hasattr(dataset, dataset_attr):
+                    continue
+                target_series = _as_numpy_1d(getattr(batch, batch_key)[i])
+                pred_series = _align_prediction_to_target(
+                    model_outputs[pred_key][i],
+                    target_length=target_series.shape[0],
+                )
+                target_mask = (
+                    _as_numpy_1d(getattr(batch, mask_key)[i])
+                    if hasattr(batch, mask_key)
+                    else None
+                )
+                dataset_tensor = getattr(dataset, dataset_attr)
+                actual_context_full = _dataset_series_window(
+                    dataset_tensor,
+                    t_min=t_min,
+                    t_max=t_max,
+                    node_idx=node_idx,
+                ).astype(np.float32)
+                history_series = _history_window(
+                    dataset_tensor,
+                    start_idx=start_idx,
+                    input_window_length=L,
+                    node_idx=node_idx,
+                ).astype(np.float32)
+                target_payloads[target_name] = {
+                    "actual_context": actual_context_full,
+                    "prediction": np.asarray(pred_series, dtype=np.float32),
+                    "target": np.asarray(target_series, dtype=np.float32),
+                    "history": history_series,
+                    "window_mae": _compute_window_mae(
+                        pred_series,
+                        target_series,
+                        target_mask,
+                    ),
+                }
+
+            latent_outputs = _resolve_latent_series(model_outputs)
+            for latent_name, latent_series_raw in latent_outputs.items():
+                pred_series = _align_prediction_to_target(
+                    latent_series_raw[i],
+                    target_length=H,
+                ).astype(np.float32)
+                latent_payloads[latent_name] = {
+                    "actual_context": _build_prediction_only_context(
+                        t_rel=t_rel,
+                        horizon=H,
+                        prediction=pred_series,
+                    ),
+                    "prediction": pred_series,
+                    "target": np.full_like(pred_series, np.nan),
+                    "history": np.empty(0, dtype=np.float32),
+                    "window_mae": None,
+                }
+
+            if not target_payloads and not latent_payloads:
+                continue
+            primary_target = resolved_targets[0]
+            if primary_target not in target_payloads:
+                primary_target = next(iter(target_payloads.keys()), None)
+            if primary_target is not None:
+                primary = target_payloads[primary_target]
+            else:
+                first_latent = next(iter(latent_payloads.values()))
+                primary = first_latent
+            results.append(
+                {
+                    "node_id": node_idx,
+                    "node_label": str(batch.node_labels[i]),
+                    "actual_context": primary["actual_context"],
+                    "prediction": primary["prediction"],
+                    "target": primary["target"],
+                    "history": primary["history"],
+                    "t_rel": t_rel,
+                    "t0_idx_in_context": t0 - t_min,
+                    "start_time": start_times[i],
+                    "window_start": start_idx,
+                    "window_mae": primary.get("window_mae"),
+                    "L": L,
+                    "H": H,
+                    "targets": target_payloads,
+                    "latents": latent_payloads,
+                }
+            )
+        return results
     finally:
         if model_was_training:
             model.train()
@@ -383,6 +744,13 @@ def make_forecast_figure(
     context_post: int = 30,
     target: str | None = "hosp",
     target_label: str | None = None,
+    figure_title: str | None = None,
+    shared_xlabel: str | None = None,
+    payload_collection: str = "targets",
+    connect_from_history: bool = True,
+    overlay_target: str | None = None,
+    overlay_payload_collection: str = "latents",
+    overlay_label: str | None = None,
 ):
     """
     Build a figure showing actual series vs forecasts with wider context.
@@ -427,7 +795,11 @@ def make_forecast_figure(
         row_samples = groups[row_name]
         for j, sample in enumerate(row_samples):
             ax = axes[i, j]
-            actual_context, pred_series = _extract_target_payload(sample, target=target)
+            actual_context, pred_series, window_mae = _extract_series_payload(
+                sample,
+                target=target,
+                payload_collection=payload_collection,
+            )
             t_rel = np.asarray(sample["t_rel"]).reshape(-1)
             H = sample["H"]
 
@@ -441,7 +813,7 @@ def make_forecast_figure(
 
             # Include last history point (t=-1) so forecast line connects from history endpoint
             history_end_mask = t_rel == -1
-            if history_end_mask.any():
+            if connect_from_history and history_end_mask.any():
                 forecast_series_full[history_end_mask] = actual_context[
                     history_end_mask
                 ]
@@ -465,6 +837,48 @@ def make_forecast_figure(
                 legend=(j == 0 and i == 0),
             )
 
+            payloads = sample.get(overlay_payload_collection)
+            if (
+                overlay_target is not None
+                and isinstance(payloads, dict)
+                and overlay_target in payloads
+            ):
+                _overlay_context, overlay_prediction, _overlay_mae = _extract_series_payload(
+                    sample,
+                    target=overlay_target,
+                    payload_collection=overlay_payload_collection,
+                )
+                overlay_series_full = np.full(len(t_rel), np.nan, dtype=np.float32)
+                overlay_horizon_mask = (t_rel >= 0) & (t_rel < H)
+                overlay_points = min(
+                    int(overlay_horizon_mask.sum()),
+                    int(overlay_prediction.shape[0]),
+                )
+                if overlay_points > 0:
+                    overlay_series_full[np.where(overlay_horizon_mask)[0][:overlay_points]] = (
+                        overlay_prediction[:overlay_points]
+                    )
+
+                overlay_ax = ax.twinx()
+                overlay_name = overlay_label or overlay_target
+                overlay_df = pd.DataFrame(
+                    {
+                        "t": t_rel,
+                        "value": overlay_series_full,
+                    }
+                )
+                sns.lineplot(
+                    data=overlay_df,
+                    x="t",
+                    y="value",
+                    ax=overlay_ax,
+                    color="#C44E52",
+                    linewidth=1.5,
+                    legend=False,
+                )
+                overlay_ax.set_ylabel(overlay_name if j == ncols - 1 else "")
+                overlay_ax.grid(False)
+
             ax.axvline(0, color="black", linestyle="--", alpha=0.5)
             ax.axvspan(-input_window_length, 0, color="gray", alpha=0.15)
 
@@ -473,6 +887,8 @@ def make_forecast_figure(
             title_parts = [node_label]
             if start_time:
                 title_parts.append(f"({start_time})")
+            if window_mae is not None:
+                title_parts.append(f"MAE={window_mae:.3f}")
 
             if j == 0:
                 if target_label is None and target in TARGET_PLOT_SPECS:
@@ -486,7 +902,7 @@ def make_forecast_figure(
                 ax.set_ylabel("")
 
             if i == nrows - 1:
-                ax.set_xlabel("Time (days relative to forecast start)")
+                ax.set_xlabel("" if shared_xlabel is not None else "Time (days relative to forecast start)")
             else:
                 ax.set_xlabel("")
 
@@ -495,7 +911,16 @@ def make_forecast_figure(
         for j in range(len(row_samples), ncols):
             axes[i, j].set_visible(False)
 
-    fig.tight_layout()
+    if figure_title is not None:
+        fig.suptitle(figure_title)
+
+    if shared_xlabel is not None:
+        fig.supxlabel(shared_xlabel)
+
+    if figure_title is not None or shared_xlabel is not None:
+        fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+    else:
+        fig.tight_layout()
     return fig
 
 
@@ -534,6 +959,7 @@ def make_joint_forecast_figure(
                     row_sample["prediction"] = payload["prediction"]
                     row_sample["target"] = payload["target"]
                     row_sample["history"] = payload["history"]
+                    row_sample["window_mae"] = payload.get("window_mae")
                 materialized.append(row_sample)
             if materialized:
                 expanded_groups[f"{group_name} | {target_label}"] = materialized
@@ -556,7 +982,8 @@ def generate_forecast_plots(
     *,
     model: torch.nn.Module,
     loader: DataLoader,
-    node_groups: dict[str, list[int]],
+    node_groups: dict[str, list[int]] | None = None,
+    window_groups: dict[str, list[WindowSelectionSpec]] | None = None,
     window: str = "last",
     context_pre: int = 30,
     context_post: int = 30,
@@ -576,7 +1003,7 @@ def generate_forecast_plots(
         model: The trained model
         loader: Original DataLoader for data access
         node_groups: Dict mapping group name -> list of node IDs
-                     (could be quartiles, topk, worst, random, anything!)
+        window_groups: Dict mapping group name -> exact `(node, window)` specs
         window: Which time window to plot ("last" or "random")
         context_pre: Days before forecast start
         context_post: Days after forecast end
@@ -586,16 +1013,37 @@ def generate_forecast_plots(
         wandb_prefix: Prefix for W&B logged images
 
     Returns:
-        Dict with figure, all_samples, selected_nodes, node_groups
+        Dict with figure, all_samples, selected_nodes, node_groups, window_groups
     """
     import wandb
 
     from evaluation.eval_loop import _ensure_wandb_run
 
-    # Flatten all nodes to collect samples once
+    if window_groups is None and node_groups is None:
+        raise ValueError("generate_forecast_plots requires node_groups or window_groups")
+
+    if window_groups is not None:
+        all_selected_windows: list[WindowSelectionSpec] = []
+        for group_specs in window_groups.values():
+            all_selected_windows.extend(group_specs)
+        if not all_selected_windows:
+            logger.warning("[plot] No windows selected for plotting")
+            return {
+                "figure": None,
+                "all_samples": [],
+                "selected_nodes": [],
+                "node_groups": {},
+                "window_groups": {},
+            }
+    else:
+        all_selected_windows = []
+
     all_selected_nodes: list[int] = []
-    for group_nodes in node_groups.values():
-        all_selected_nodes.extend(group_nodes)
+    if node_groups is not None:
+        for group_nodes in node_groups.values():
+            all_selected_nodes.extend(group_nodes)
+    elif window_groups is not None:
+        all_selected_nodes = [spec.node_id for spec in all_selected_windows]
 
     if not all_selected_nodes:
         logger.warning("[plot] No nodes selected for plotting")
@@ -604,6 +1052,7 @@ def generate_forecast_plots(
             "all_samples": [],
             "selected_nodes": [],
             "node_groups": {},
+            "window_groups": {},
         }
 
     logger.info(
@@ -613,30 +1062,48 @@ def generate_forecast_plots(
     # Use existing function - it handles subset creation internally
     resolved_targets = target_names or list(DEFAULT_PLOT_TARGETS)
 
-    samples = collect_forecast_samples_for_target_nodes(
-        target_node_ids=all_selected_nodes,
-        model=model,
-        loader=loader,
-        window=window,
-        context_pre=context_pre,
-        context_post=context_post,
-        target_names=resolved_targets,
-    )
+    if window_groups is not None:
+        samples = collect_forecast_samples_for_window_specs(
+            window_specs=all_selected_windows,
+            model=model,
+            loader=loader,
+            context_pre=context_pre,
+            context_post=context_post,
+            target_names=resolved_targets,
+        )
+        sample_key_to_group: dict[tuple[int, int], str] = {}
+        for group_name, specs in window_groups.items():
+            for spec in specs:
+                sample_key_to_group[(spec.node_id, spec.window_start)] = group_name
+        grouped_samples: dict[str, list[dict[str, Any]]] = {}
+        for sample in samples:
+            group_name = sample_key_to_group.get(
+                (int(sample["node_id"]), int(sample.get("window_start", -1)))
+            )
+            if group_name is None:
+                continue
+            grouped_samples.setdefault(group_name, []).append(sample)
+    else:
+        samples = collect_forecast_samples_for_target_nodes(
+            target_node_ids=all_selected_nodes,
+            model=model,
+            loader=loader,
+            window=window,
+            context_pre=context_pre,
+            context_post=context_post,
+            target_names=resolved_targets,
+        )
+        node_to_group: dict[int, str] = {}
+        for group_name, nodes in (node_groups or {}).items():
+            for node_id in nodes:
+                node_to_group[node_id] = group_name
 
-    # Group samples by original group names
-    node_to_group: dict[int, str] = {}
-    for group_name, nodes in node_groups.items():
-        for node_id in nodes:
-            node_to_group[node_id] = group_name
-
-    grouped_samples: dict[str, list[dict[str, Any]]] = {}
-    for sample in samples:
-        node_id = sample["node_id"]
-        if node_id in node_to_group:
-            group_name = node_to_group[node_id]
-            if group_name not in grouped_samples:
-                grouped_samples[group_name] = []
-            grouped_samples[group_name].append(sample)
+        grouped_samples = {}
+        for sample in samples:
+            node_id = sample["node_id"]
+            if node_id in node_to_group:
+                group_name = node_to_group[node_id]
+                grouped_samples.setdefault(group_name, []).append(sample)
 
     # Generate figure using existing generic function
     dataset = cast(EpiDataset, loader.dataset)
@@ -656,24 +1123,14 @@ def generate_forecast_plots(
         logger.info(f"[plot] Saved figure to: {output_path}")
 
     separate_figures: dict[str, Any] = {}
-    for target_name in resolved_targets:
-        target_fig = make_forecast_figure(
-            samples=grouped_samples,
-            input_window_length=int(config.model.input_window_length),
-            forecast_horizon=int(config.model.forecast_horizon),
-            context_pre=context_pre,
-            context_post=context_post,
-            target=target_name,
-        )
-        if target_fig is None:
-            continue
-        separate_figures[target_name] = target_fig
-        if output_path is not None:
-            target_output_path = output_path.with_name(
+    if output_path is not None:
+        for target_name in resolved_targets:
+            legacy_target_output = output_path.with_name(
                 f"{output_path.stem}_{target_name}{output_path.suffix}"
             )
-            target_fig.savefig(target_output_path, dpi=200, bbox_inches="tight")
-            logger.info(f"[plot] Saved figure to: {target_output_path}")
+            if legacy_target_output.exists():
+                legacy_target_output.unlink()
+                logger.info(f"[plot] Removed legacy target figure: {legacy_target_output}")
 
     if fig is not None and (log_dir is not None or wandb.run is not None):
         if log_dir is not None:
@@ -688,8 +1145,6 @@ def generate_forecast_plots(
             log_payload: dict[str, Any] = {}
             if fig is not None:
                 log_payload[f"{wandb_prefix}/joint"] = wandb.Image(fig)
-            for target_name, target_fig in separate_figures.items():
-                log_payload[f"{wandb_prefix}/{target_name}"] = wandb.Image(target_fig)
             if log_payload:
                 wandb.log(log_payload, step=0)
 
@@ -699,5 +1154,6 @@ def generate_forecast_plots(
         "separate_figures": separate_figures,
         "all_samples": samples,
         "selected_nodes": all_selected_nodes,
-        "node_groups": node_groups,
+        "node_groups": node_groups or {},
+        "window_groups": window_groups or {},
     }
