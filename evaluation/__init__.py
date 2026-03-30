@@ -19,6 +19,7 @@ from evaluation.selection import (
     _GLOBAL_RNG,
     select_nodes_by_loss,
     topk_target_nodes_by_mae,
+    VALID_NODE_METRIC_TARGETS,
 )
 
 # High-level evaluation pipelines
@@ -37,6 +38,7 @@ __all__ = [
     # Selection
     "select_nodes_by_loss",
     "topk_target_nodes_by_mae",
+    "VALID_NODE_METRIC_TARGETS",
     "_GLOBAL_RNG",
     # Evaluation
     "evaluate_loader",

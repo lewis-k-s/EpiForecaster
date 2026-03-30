@@ -15,7 +15,6 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-import numpy as np
 import wandb
 
 from data.epi_dataset import EpiDataset
@@ -44,6 +43,7 @@ def evaluate_checkpoint_topk_forecasts(
     log_dir: Path | None = None,
     eval_csv_path: Path | None = None,
     batch_size: int | None = None,
+    node_metrics_target: str = "hospitalizations",
 ) -> dict[str, Any]:
     """
     End-to-end: load checkpoint, compute top-k nodes, collect series, and (optionally) save figure.
@@ -70,7 +70,11 @@ def evaluate_checkpoint_topk_forecasts(
     logger.info(f"[eval] Scanning for top-k nodes by MAE (k={k})...")
 
     topk_nodes = topk_target_nodes_by_mae(
-        model=model, loader=loader, region_embeddings=region_embeddings, k=k
+        model=model,
+        loader=loader,
+        region_embeddings=region_embeddings,
+        k=k,
+        target_name=node_metrics_target,
     )
     logger.debug(f"[eval] Top-k scan done in {time.time() - start_time:.2f}s")
     logger.info("[eval] Collecting forecast samples for top-k nodes...")
@@ -96,7 +100,7 @@ def evaluate_checkpoint_topk_forecasts(
 
     eval_loss = float("nan")
     eval_metrics: dict[str, Any] = {}
-    node_mae_dict: dict[int, float] = {}
+    node_mae_dict: dict[str, dict[int, float]] = {}
     try:
         criterion = get_loss_from_config(
             config.training.loss,
@@ -112,6 +116,7 @@ def evaluate_checkpoint_topk_forecasts(
             region_embeddings=region_embeddings,
             split_name=split.capitalize(),
             node_metrics_csv_path=eval_csv_path,
+            node_metrics_target=node_metrics_target,
         )
     except Exception as exc:  # pragma: no cover - evaluation best-effort
         logger.warning(f"[eval] Metrics evaluation failed: {exc}")
@@ -152,19 +157,20 @@ def plot_forecasts_from_csv(
     *,
     csv_path: Path,
     checkpoint_path: Path,
-    samples_per_quartile: int = 2,
+    samples_per_quartile: int = 4,
     window: str = "last",
     device: str = "auto",
     output_path: Path | None = None,
     batch_size: int | None = None,
+    node_metrics_target: str = "hospitalizations",
 ) -> dict[str, Any]:
     """
     Load evaluation CSV, sample nodes from quartiles, and generate forecast plots.
 
     Args:
-        csv_path: Path to CSV with columns node_id, mae, num_samples
+        csv_path: Path to CSV with columns target, node_id, mae, num_samples
         checkpoint_path: Path to model checkpoint
-        samples_per_quartile: Number of nodes to sample from each quartile (default 2)
+        samples_per_quartile: Number of nodes to sample from each quartile (default 4)
         window: Which window to plot ('last' or 'random')
         device: Device to use for inference
         output_path: Optional path to save the figure
@@ -173,19 +179,19 @@ def plot_forecasts_from_csv(
         Dict containing: figure, selected_nodes, quartile_groups, config
     """
     import csv as csv_lib
-    import random
 
     logger.info(f"[plot] Loading evaluation CSV: {csv_path}")
-    node_mae_list: list[tuple[int, float, int]] = []
+    node_mae: dict[int, float] = {}
     with open(csv_path, "r", newline="") as f:
         reader = csv_lib.DictReader(f)
         for row in reader:
+            row_target = str(row.get("target", "hospitalizations")).strip().lower()
+            if row_target != node_metrics_target:
+                continue
             node_id = int(row["node_id"])
-            mae = float(row["mae"])
-            num_samples = int(row["num_samples"])
-            node_mae_list.append((node_id, mae, num_samples))
+            node_mae[node_id] = float(row["mae"])
 
-    if not node_mae_list:
+    if not node_mae:
         logger.warning("[plot] No valid nodes found in CSV")
         return {
             "figure": None,
@@ -194,40 +200,20 @@ def plot_forecasts_from_csv(
             "config": None,
         }
 
-    node_mae_list.sort(key=lambda x: x[1])
-
-    maes = [mae for _, mae, _ in node_mae_list]
-    q1_cutoff = np.percentile(maes, 25)
-    q2_cutoff = np.percentile(maes, 50)
-    q3_cutoff = np.percentile(maes, 75)
-
-    quartile_groups: dict[str, list[int]] = {
-        "Q1 (Worst)": [],
-        "Q2 (Poor)": [],
-        "Q3 (Average)": [],
-        "Q4 (Best)": [],
-    }
-
-    for node_id, mae, _num_samples in node_mae_list:
-        if mae <= q1_cutoff:
-            quartile_groups["Q1 (Worst)"].append(node_id)
-        elif mae <= q2_cutoff:
-            quartile_groups["Q2 (Poor)"].append(node_id)
-        elif mae <= q3_cutoff:
-            quartile_groups["Q3 (Average)"].append(node_id)
-        else:
-            quartile_groups["Q4 (Best)"].append(node_id)
-
-    selected_nodes: list[int] = []
-
+    quartile_groups = select_nodes_by_loss(
+        node_mae=node_mae,
+        target_name=node_metrics_target,
+        strategy="quartile",
+        samples_per_group=samples_per_quartile,
+    )
+    selected_nodes = [
+        node_id for nodes in quartile_groups.values() for node_id in nodes
+    ]
     for quartile_name, nodes in quartile_groups.items():
-        available = len(nodes)
-        k = min(samples_per_quartile, available)
-        sampled = random.sample(nodes, k)
-        quartile_groups[quartile_name] = sampled
-        selected_nodes.extend(sampled)
         logger.info(
-            f"[plot] {quartile_name}: sampled {k} nodes (available: {available})"
+            "[plot] %s: sampled %d nodes",
+            quartile_name,
+            len(nodes),
         )
 
     if not selected_nodes:
