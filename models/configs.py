@@ -323,6 +323,10 @@ class ObservationHeadConfig:
     learnable_kernel_hosp: bool = False
     learnable_kernel_cases: bool = True
     learnable_kernel_deaths: bool = True
+    kernel_parameterization_ww: str = "simplex"
+    kernel_parameterization_hosp: str = "simplex"
+    kernel_parameterization_cases: str = "simplex"
+    kernel_parameterization_deaths: str = "simplex"
     learnable_scale_ww: bool = True
     learnable_scale_hosp: bool = True
     learnable_scale_cases: bool = True
@@ -351,6 +355,16 @@ class ObservationHeadConfig:
         ]:
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        for name, value in [
+            ("kernel_parameterization_ww", self.kernel_parameterization_ww),
+            ("kernel_parameterization_hosp", self.kernel_parameterization_hosp),
+            ("kernel_parameterization_cases", self.kernel_parameterization_cases),
+            ("kernel_parameterization_deaths", self.kernel_parameterization_deaths),
+        ]:
+            if value not in {"simplex", "free"}:
+                raise ValueError(
+                    f"{name} must be one of {{'simplex', 'free'}}, got {value!r}"
+                )
         if self.residual_scale < 0:
             raise ValueError(
                 f"residual_scale must be non-negative, got {self.residual_scale}"
@@ -696,9 +710,19 @@ class TrainingParams:
     # Node split strategy when split_strategy="node".
     # - "random": seeded shuffle across valid regions (legacy behavior)
     # - "stratified": preserve population and wastewater-source representation
+    # - "crossval": fold-based biomarker-aware held-out regions
     node_split_strategy: str = "random"
     # Number of population quantile bins used for stratified node splits.
     node_split_population_bins: int = 5
+    # Number of biomarker coverage quantile bins used for biomarker-aware node splits.
+    node_split_biomarker_bins: int = 3
+    # Fold-based cross-validation controls for node splits.
+    crossval_enabled: bool = False
+    crossval_num_folds: int = 5
+    crossval_fold_index: int = 0
+    # Which held-out fold the configured crossval_fold_index represents.
+    # Validation always uses the next fold cyclically.
+    crossval_holdout_role: str = "test"
     # Temporal split boundaries (YYYY-MM-DD format) when split_strategy="time"
     train_end_date: str | None = None
     val_end_date: str | None = None
@@ -816,7 +840,7 @@ class TrainingParams:
                 f"Valid options: {sorted(valid_strategies)}"
             )
 
-        valid_node_split_strategies = {"random", "stratified"}
+        valid_node_split_strategies = {"random", "stratified", "crossval"}
         if self.node_split_strategy not in valid_node_split_strategies:
             raise ValueError(
                 f"Invalid node_split_strategy: {self.node_split_strategy}. "
@@ -826,6 +850,27 @@ class TrainingParams:
             raise ValueError(
                 "node_split_population_bins must be positive, "
                 f"got {self.node_split_population_bins}"
+            )
+        if self.node_split_biomarker_bins <= 0:
+            raise ValueError(
+                "node_split_biomarker_bins must be positive, "
+                f"got {self.node_split_biomarker_bins}"
+            )
+        if self.crossval_num_folds <= 1:
+            raise ValueError(
+                "crossval_num_folds must be greater than 1, "
+                f"got {self.crossval_num_folds}"
+            )
+        if self.crossval_fold_index < 0:
+            raise ValueError(
+                "crossval_fold_index must be non-negative, "
+                f"got {self.crossval_fold_index}"
+            )
+        valid_crossval_roles = {"test", "val"}
+        if self.crossval_holdout_role not in valid_crossval_roles:
+            raise ValueError(
+                f"Invalid crossval_holdout_role: {self.crossval_holdout_role}. "
+                f"Valid options: {sorted(valid_crossval_roles)}"
             )
 
         # Validate temporal split requirements

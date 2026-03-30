@@ -50,6 +50,10 @@ class NodeSplitMetadata:
     population_bins: np.ndarray | None = None
     wastewater_source: np.ndarray | None = None
     wastewater_source_name: str | None = None
+    biomarker_has_data: np.ndarray | None = None
+    biomarker_first_seen_bin: np.ndarray | None = None
+    biomarker_observed_fraction_bin: np.ndarray | None = None
+    biomarker_variant_count_bin: np.ndarray | None = None
 
 
 def _build_region_embedding_store(
@@ -110,6 +114,39 @@ def _compute_population_bins(
     return np.digitize(population, edges[1:-1], right=True).astype(np.int64)
 
 
+def _compute_quantile_bins(
+    values: np.ndarray,
+    *,
+    valid_mask: np.ndarray,
+    num_bins: int,
+    fill_value: int = -1,
+) -> np.ndarray:
+    bins = np.full(values.shape[0], fill_value, dtype=np.int64)
+    candidate_indices = np.flatnonzero(valid_mask)
+    finite_indices = candidate_indices[np.isfinite(values[candidate_indices])]
+    valid_indices = finite_indices
+    if valid_indices.size == 0:
+        return bins
+
+    valid_values = np.asarray(values[valid_indices], dtype=np.float64)
+    if valid_values.size == 0 or num_bins <= 1:
+        bins[valid_indices] = 0
+        return bins
+
+    quantiles = np.linspace(0.0, 1.0, num_bins + 1)
+    edges = np.quantile(valid_values, quantiles)
+    for idx in range(1, len(edges)):
+        if edges[idx] <= edges[idx - 1]:
+            edges[idx] = np.nextafter(edges[idx - 1], np.inf)
+
+    bins[valid_indices] = np.digitize(
+        valid_values,
+        edges[1:-1],
+        right=True,
+    ).astype(np.int64)
+    return bins
+
+
 def _resolve_wastewater_source(
     aligned_dataset,
     total_nodes: int,
@@ -141,6 +178,114 @@ def _resolve_wastewater_source(
     return np.zeros(total_nodes, dtype=bool), "none"
 
 
+def _resolve_biomarker_split_features(
+    aligned_dataset,
+    *,
+    total_nodes: int,
+    valid_nodes: np.ndarray,
+    num_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    biomarker_has_data = np.zeros(total_nodes, dtype=bool)
+    biomarker_first_seen_bin = np.full(total_nodes, -1, dtype=np.int64)
+    biomarker_observed_fraction_bin = np.full(total_nodes, -1, dtype=np.int64)
+    biomarker_variant_count_bin = np.full(total_nodes, -1, dtype=np.int64)
+
+    if "biomarker_data_start" in aligned_dataset:
+        biomarker_data_start = np.asarray(
+            aligned_dataset["biomarker_data_start"].values
+        ).reshape(-1)
+        if biomarker_data_start.size != total_nodes:
+            raise ValueError(
+                "biomarker_data_start must match region dimension for biomarker-aware splits"
+            )
+        biomarker_has_data = biomarker_data_start >= 0
+
+    mask_vars = sorted(
+        name
+        for name in aligned_dataset.data_vars
+        if str(name).startswith("edar_biomarker_") and str(name).endswith("_mask")
+    )
+    if not mask_vars:
+        valid_has_data_mask = np.zeros(total_nodes, dtype=bool)
+        valid_has_data_mask[valid_nodes] = biomarker_has_data[valid_nodes]
+        biomarker_first_seen_bin = _compute_quantile_bins(
+            np.where(biomarker_has_data, 0.0, -1.0),
+            valid_mask=valid_has_data_mask,
+            num_bins=num_bins,
+        )
+        biomarker_observed_fraction_bin = _compute_quantile_bins(
+            biomarker_has_data.astype(np.float64),
+            valid_mask=np.isin(np.arange(total_nodes), valid_nodes),
+            num_bins=num_bins,
+        )
+        biomarker_variant_count_bin = _compute_quantile_bins(
+            biomarker_has_data.astype(np.float64),
+            valid_mask=valid_has_data_mask,
+            num_bins=num_bins,
+        )
+        return (
+            biomarker_has_data,
+            biomarker_first_seen_bin,
+            biomarker_observed_fraction_bin,
+            biomarker_variant_count_bin,
+        )
+
+    observed_any = np.zeros(total_nodes, dtype=bool)
+    observed_count = np.zeros(total_nodes, dtype=np.float64)
+    variant_count = np.zeros(total_nodes, dtype=np.float64)
+    first_seen = np.full(total_nodes, np.inf, dtype=np.float64)
+
+    for mask_var in mask_vars:
+        mask_values = np.asarray(aligned_dataset[mask_var].values)
+        if mask_values.ndim == 3:
+            mask_values = mask_values.reshape(mask_values.shape[-2], mask_values.shape[-1])
+        if mask_values.ndim != 2 or mask_values.shape[-1] != total_nodes:
+            raise ValueError(
+                f"{mask_var} must be a 2D time-by-region array for biomarker-aware splits"
+            )
+        observed = mask_values.astype(bool)
+        observed_any |= observed.any(axis=0)
+        observed_count += observed.sum(axis=0, dtype=np.float64)
+        variant_count += observed.any(axis=0).astype(np.float64)
+
+        if observed.shape[0] > 0:
+            first_idx = np.argmax(observed, axis=0).astype(np.float64)
+            has_variant = observed.any(axis=0)
+            first_idx[~has_variant] = np.inf
+            first_seen = np.minimum(first_seen, first_idx)
+
+    biomarker_has_data |= observed_any
+    total_observation_slots = float(mask_values.shape[0] * max(1, len(mask_vars)))
+    observed_fraction = observed_count / total_observation_slots
+    first_seen[~biomarker_has_data] = -1.0
+
+    valid_node_mask = np.zeros(total_nodes, dtype=bool)
+    valid_node_mask[valid_nodes] = True
+    valid_has_data_mask = valid_node_mask & biomarker_has_data
+
+    biomarker_first_seen_bin = _compute_quantile_bins(
+        first_seen,
+        valid_mask=valid_has_data_mask,
+        num_bins=num_bins,
+    )
+    biomarker_observed_fraction_bin = _compute_quantile_bins(
+        observed_fraction,
+        valid_mask=valid_node_mask,
+        num_bins=num_bins,
+    )
+    biomarker_variant_count_bin = _compute_quantile_bins(
+        variant_count,
+        valid_mask=valid_has_data_mask,
+        num_bins=num_bins,
+    )
+    return (
+        biomarker_has_data,
+        biomarker_first_seen_bin,
+        biomarker_observed_fraction_bin,
+        biomarker_variant_count_bin,
+    )
+
+
 def _load_node_split_metadata(
     *,
     config: EpiForecasterConfig,
@@ -162,7 +307,16 @@ def _load_node_split_metadata(
         )
         valid_nodes = np.arange(total_nodes, dtype=np.int64)[valid_mask]
 
-        if config.training.node_split_strategy == "stratified":
+        use_biomarker_crossval = (
+            config.training.node_split_strategy == "crossval"
+            or config.training.crossval_enabled
+        )
+        use_stratified_metadata = (
+            config.training.node_split_strategy == "stratified"
+            or use_biomarker_crossval
+        )
+
+        if use_stratified_metadata:
             if "population" not in aligned_dataset:
                 raise ValueError(
                     "population is required for stratified node splits but was not found"
@@ -189,12 +343,28 @@ def _load_node_split_metadata(
             wastewater_source = None
             wastewater_source_name = None
 
+        (
+            biomarker_has_data,
+            biomarker_first_seen_bin,
+            biomarker_observed_fraction_bin,
+            biomarker_variant_count_bin,
+        ) = _resolve_biomarker_split_features(
+            aligned_dataset,
+            total_nodes=total_nodes,
+            valid_nodes=valid_nodes,
+            num_bins=config.training.node_split_biomarker_bins,
+        )
+
         return NodeSplitMetadata(
             total_nodes=total_nodes,
             valid_nodes=valid_nodes,
             population_bins=population_bins,
             wastewater_source=wastewater_source,
             wastewater_source_name=wastewater_source_name,
+            biomarker_has_data=biomarker_has_data,
+            biomarker_first_seen_bin=biomarker_first_seen_bin,
+            biomarker_observed_fraction_bin=biomarker_observed_fraction_bin,
+            biomarker_variant_count_bin=biomarker_variant_count_bin,
         )
     finally:
         aligned_dataset.close()
@@ -344,6 +514,90 @@ def _split_nodes_stratified(
     return train_nodes, val_nodes, test_nodes
 
 
+def _build_crossval_strata(
+    *,
+    metadata: NodeSplitMetadata,
+    shuffled_nodes: np.ndarray,
+) -> dict[tuple[int, int, int], list[int]]:
+    if metadata.population_bins is None:
+        raise ValueError(
+            "population_bins is required for biomarker-aware cross-validation"
+        )
+    if metadata.biomarker_has_data is None:
+        raise ValueError(
+            "biomarker_has_data is required for biomarker-aware cross-validation"
+        )
+    if metadata.biomarker_observed_fraction_bin is None:
+        raise ValueError(
+            "biomarker_observed_fraction_bin is required for biomarker-aware cross-validation"
+        )
+
+    strata: dict[tuple[int, int, int], list[int]] = {}
+    for node in shuffled_nodes:
+        key = (
+            int(metadata.population_bins[node]),
+            int(metadata.biomarker_has_data[node]),
+            int(metadata.biomarker_observed_fraction_bin[node]),
+        )
+        strata.setdefault(key, []).append(int(node))
+    return strata
+
+
+def _split_nodes_crossval(
+    *,
+    metadata: NodeSplitMetadata,
+    rng: np.random.Generator,
+    num_folds: int,
+    fold_index: int,
+    holdout_role: str,
+) -> tuple[list[int], list[int], list[int]]:
+    if fold_index >= num_folds:
+        raise ValueError(
+            f"crossval_fold_index={fold_index} must be less than crossval_num_folds={num_folds}"
+        )
+
+    shuffled_nodes = _shuffle_nodes(metadata.valid_nodes, rng)
+    strata = _build_crossval_strata(metadata=metadata, shuffled_nodes=shuffled_nodes)
+    sparse_strata = [
+        key for key, nodes in strata.items() if 0 < len(nodes) < num_folds
+    ]
+    if sparse_strata:
+        logger.warning(
+            "Biomarker-aware crossval has %d sparse strata with fewer nodes than folds; "
+            "balance will be approximate.",
+            len(sparse_strata),
+        )
+
+    folds: list[list[int]] = [[] for _ in range(num_folds)]
+    for nodes in strata.values():
+        start_offset = int(rng.integers(num_folds))
+        for idx, node in enumerate(nodes):
+            folds[(start_offset + idx) % num_folds].append(node)
+
+    primary_holdout = fold_index
+    secondary_holdout = (fold_index + 1) % num_folds
+    if holdout_role == "val":
+        val_fold = primary_holdout
+        test_fold = secondary_holdout
+    else:
+        test_fold = primary_holdout
+        val_fold = secondary_holdout
+
+    train_nodes: list[int] = []
+    for idx, fold_nodes in enumerate(folds):
+        if idx in {val_fold, test_fold}:
+            continue
+        train_nodes.extend(fold_nodes)
+
+    val_nodes = list(folds[val_fold])
+    test_nodes = list(folds[test_fold])
+
+    train_nodes = list(_shuffle_nodes(np.asarray(train_nodes, dtype=np.int64), rng))
+    val_nodes = list(_shuffle_nodes(np.asarray(val_nodes, dtype=np.int64), rng))
+    test_nodes = list(_shuffle_nodes(np.asarray(test_nodes, dtype=np.int64), rng))
+    return train_nodes, val_nodes, test_nodes
+
+
 def _log_split_summary(
     *,
     name: str,
@@ -362,14 +616,29 @@ def _log_split_summary(
     wastewater_count = int(metadata.wastewater_source[split_nodes].sum())
     population_bins = metadata.population_bins[split_nodes]
     population_counts = np.bincount(population_bins, minlength=1).tolist()
+    biomarker_count = (
+        int(metadata.biomarker_has_data[split_nodes].sum())
+        if metadata.biomarker_has_data is not None
+        else 0
+    )
+    biomarker_coverage_counts = None
+    if metadata.biomarker_observed_fraction_bin is not None:
+        coverage_bins = metadata.biomarker_observed_fraction_bin[split_nodes]
+        valid_coverage_bins = coverage_bins[coverage_bins >= 0]
+        if valid_coverage_bins.size > 0:
+            biomarker_coverage_counts = np.bincount(valid_coverage_bins).tolist()
     logger.info(
-        "%s split: n=%d | %s=%d (%.3f) | population_bins=%s",
+        "%s split: n=%d | %s=%d (%.3f) | biomarker_nodes=%d (%.3f) | "
+        "population_bins=%s | biomarker_coverage_bins=%s",
         name,
         len(nodes),
         metadata.wastewater_source_name or "unknown",
         wastewater_count,
         wastewater_count / len(nodes),
+        biomarker_count,
+        biomarker_count / len(nodes),
         population_counts,
+        biomarker_coverage_counts,
     )
 
 
@@ -428,6 +697,17 @@ def split_nodes_by_ratio(
             rng=rng,
             val_split=config.training.val_split,
             test_split=config.training.test_split,
+        )
+    elif (
+        config.training.node_split_strategy == "crossval"
+        or config.training.crossval_enabled
+    ):
+        train_nodes, val_nodes, test_nodes = _split_nodes_crossval(
+            metadata=metadata,
+            rng=rng,
+            num_folds=config.training.crossval_num_folds,
+            fold_index=config.training.crossval_fold_index,
+            holdout_role=config.training.crossval_holdout_role,
         )
     else:
         train_nodes, val_nodes, test_nodes = _split_nodes_random(
