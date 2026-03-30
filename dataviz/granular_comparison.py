@@ -43,6 +43,14 @@ TARGET_LABELS = {
 DEFAULT_KNOCKOUT_ABLATIONS = ["mobility:off", "regions:off", "context:off"]
 ERROR_DIVERGING_CMAP = "RdYlGn_r"
 DEFAULT_REGION_GEOJSON = Path("data/files/geo/fl_municipios_catalonia.geojson")
+ExcludedTargets = dict[str, dict[str, int]]
+ExcludedSeeds = dict[int, dict[str, int]]
+
+
+def _require_column(df: pd.DataFrame, column: str) -> str:
+    if column not in df.columns:
+        raise ValueError(f"Required column '{column}' not found in granular comparison data")
+    return column
 
 
 def _ordered_targets(values: pd.Series) -> list[str]:
@@ -64,7 +72,9 @@ def _signed_norm(values: pd.Series | list[float]) -> colors.Normalize:
     return colors.TwoSlopeNorm(vmin=-max_abs, vcenter=0.0, vmax=max_abs)
 
 
-def _value_colors(values: pd.Series | list[float]) -> list[tuple[float, float, float, float]]:
+def _value_colors(
+    values: pd.Series | list[float],
+) -> list[tuple[float, float, float, float]]:
     cmap = colormaps[ERROR_DIVERGING_CMAP]
     norm = _signed_norm(values)
     return [cmap(norm(float(value))) for value in values]
@@ -81,6 +91,7 @@ def _load_granular_csv(path: Path) -> pd.DataFrame:
     if sidecar_path.exists():
         try:
             import json
+
             meta = json.loads(sidecar_path.read_text(encoding="utf-8"))
             seed = meta.get("training_seed")
             if seed is not None:
@@ -125,27 +136,120 @@ def _validate_join_coverage(
         )
 
 
+def _filter_common_targets(
+    baseline_df: pd.DataFrame,
+    candidate_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, ExcludedTargets]:
+    baseline_targets = set(baseline_df["target"].dropna().unique())
+    candidate_targets = set(candidate_df["target"].dropna().unique())
+    common_targets = baseline_targets & candidate_targets
+
+    excluded: ExcludedTargets = {}
+    for target in sorted(baseline_targets - candidate_targets):
+        target_rows = baseline_df["target"] == target
+        excluded[str(target)] = {
+            "baseline_rows": int(target_rows.sum()),
+            "candidate_rows": 0,
+        }
+    for target in sorted(candidate_targets - baseline_targets):
+        target_rows = candidate_df["target"] == target
+        excluded[str(target)] = {
+            "baseline_rows": 0,
+            "candidate_rows": int(target_rows.sum()),
+        }
+
+    if excluded:
+        logger.warning(
+            "Excluding targets not present in both datasets: %s",
+            ", ".join(
+                (
+                    f"{target} (baseline={counts['baseline_rows']}, "
+                    f"candidate={counts['candidate_rows']})"
+                )
+                for target, counts in excluded.items()
+            ),
+        )
+
+    filtered_baseline = baseline_df[baseline_df["target"].isin(common_targets)].copy()
+    filtered_candidate = candidate_df[
+        candidate_df["target"].isin(common_targets)
+    ].copy()
+    return filtered_baseline, filtered_candidate, excluded
+
+
+def _filter_common_seeds(
+    baseline_df: pd.DataFrame,
+    candidate_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, ExcludedSeeds]:
+    if "seed" not in baseline_df.columns or "seed" not in candidate_df.columns:
+        return baseline_df, candidate_df, {}
+
+    baseline_seeds = set(baseline_df["seed"].dropna().unique())
+    candidate_seeds = set(candidate_df["seed"].dropna().unique())
+    common_seeds = baseline_seeds & candidate_seeds
+
+    excluded: ExcludedSeeds = {}
+    for seed in sorted(baseline_seeds - candidate_seeds):
+        seed_rows = baseline_df["seed"] == seed
+        excluded[int(seed)] = {
+            "baseline_rows": int(seed_rows.sum()),
+            "candidate_rows": 0,
+        }
+    for seed in sorted(candidate_seeds - baseline_seeds):
+        seed_rows = candidate_df["seed"] == seed
+        excluded[int(seed)] = {
+            "baseline_rows": 0,
+            "candidate_rows": int(seed_rows.sum()),
+        }
+
+    filtered_baseline = baseline_df[baseline_df["seed"].isin(common_seeds)].copy()
+    filtered_candidate = candidate_df[candidate_df["seed"].isin(common_seeds)].copy()
+    return filtered_baseline, filtered_candidate, excluded
+
+
 def _prepare_joined_frame(
     *,
     baseline_df: pd.DataFrame,
     candidate_df: pd.DataFrame,
     min_join_coverage: float,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, ExcludedTargets, ExcludedSeeds]:
+    filtered_baseline_df, filtered_candidate_df, excluded_targets = (
+        _filter_common_targets(
+            baseline_df,
+            candidate_df,
+        )
+    )
+    if filtered_baseline_df.empty or filtered_candidate_df.empty:
+        raise ValueError("Granular comparison requires at least one common target")
+
+    filtered_baseline_df, filtered_candidate_df, excluded_seeds = _filter_common_seeds(
+        filtered_baseline_df,
+        filtered_candidate_df,
+    )
+    if filtered_baseline_df.empty or filtered_candidate_df.empty:
+        raise ValueError("Granular comparison requires at least one common seed")
+
     # Use seed in join if present in both
     key_cols = list(GRANULAR_KEY_COLUMNS)
-    if "seed" in baseline_df.columns and "seed" in candidate_df.columns:
+    if (
+        "seed" in filtered_baseline_df.columns
+        and "seed" in filtered_candidate_df.columns
+    ):
         key_cols.append("seed")
-        logger.info(f"Joining with seed-pairing: {len(baseline_df['seed'].unique())} unique seeds")
+        logger.info(
+            "Joining with seed-pairing: %d unique seeds",
+            len(filtered_baseline_df["seed"].unique()),
+        )
 
-    merged = baseline_df.merge(
-        candidate_df,
+    merged = filtered_baseline_df.merge(
+        filtered_candidate_df,
         on=key_cols,
         how="inner",
         suffixes=("_baseline", "_candidate"),
     )
     _validate_join_coverage(
-        baseline_rows=len(baseline_df),
-        candidate_rows=len(candidate_df),
+        baseline_rows=len(filtered_baseline_df),
+        candidate_rows=len(filtered_candidate_df),
         matched_rows=len(merged),
         min_join_coverage=min_join_coverage,
     )
@@ -181,34 +285,32 @@ def _prepare_joined_frame(
     ].clip(lower=1e-6)
     merged["smape_delta"] = merged["smape_candidate"] - merged["smape_baseline"]
     merged["smape_uplift"] = merged["smape_baseline"] - merged["smape_candidate"]
-    return merged
+    return merged, excluded_targets, excluded_seeds
 
 
 def _aggregate_pairs(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
-    grouped = (
-        df.groupby(group_cols, dropna=False)
-        .agg(
-            count=("abs_error_baseline", "size"),
-            observed_mean=("observed_baseline", "mean"),
-            baseline_mae=("abs_error_baseline", "mean"),
-            candidate_mae=("abs_error_candidate", "mean"),
-            baseline_mse=("sq_error_baseline", "mean"),
-            candidate_mse=("sq_error_candidate", "mean"),
-            baseline_smape=("smape_baseline", "mean"),
-            candidate_smape=("smape_candidate", "mean"),
-            abs_error_delta_mean=("abs_error_delta", "mean"),
-            abs_error_uplift_mean=("abs_error_uplift", "mean"),
-            sq_error_delta_mean=("sq_error_delta", "mean"),
-            sq_error_uplift_mean=("sq_error_uplift", "mean"),
-            smape_delta_mean=("smape_delta", "mean"),
-            smape_uplift_mean=("smape_uplift", "mean"),
-        )
-        .reset_index()
-    )
+    agg_dict = {
+        "count": ("abs_error_baseline", "size"),
+        "observed_mean": ("observed_baseline", "mean"),
+        "baseline_mae": ("abs_error_baseline", "mean"),
+        "candidate_mae": ("abs_error_candidate", "mean"),
+        "baseline_mse": ("sq_error_baseline", "mean"),
+        "candidate_mse": ("sq_error_candidate", "mean"),
+        "baseline_smape": ("smape_baseline", "mean"),
+        "candidate_smape": ("smape_candidate", "mean"),
+        "abs_error_delta_mean": ("abs_error_delta", "mean"),
+        "abs_error_uplift_mean": ("abs_error_uplift", "mean"),
+        "sq_error_delta_mean": ("sq_error_delta", "mean"),
+        "sq_error_uplift_mean": ("sq_error_uplift", "mean"),
+        "smape_delta_mean": ("smape_delta", "mean"),
+        "smape_uplift_mean": ("smape_uplift", "mean"),
+    }
+    grouped = df.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
     grouped["baseline_rmse"] = grouped["baseline_mse"].clip(lower=0.0).map(math.sqrt)
     grouped["candidate_rmse"] = grouped["candidate_mse"].clip(lower=0.0).map(math.sqrt)
     grouped["rmse_delta"] = grouped["candidate_rmse"] - grouped["baseline_rmse"]
     grouped["rmse_uplift"] = grouped["baseline_rmse"] - grouped["candidate_rmse"]
+    grouped["mae_delta"] = grouped["candidate_mae"] - grouped["baseline_mae"]
     grouped = grouped.drop(columns=["baseline_mse", "candidate_mse"])
     if "target" in grouped.columns:
         grouped["target"] = pd.Categorical(
@@ -222,99 +324,153 @@ def _aggregate_pairs(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
     return grouped
 
 
-def _save_region_time_heatmap(
-    region_time_df: pd.DataFrame,
+def _save_single_target_region_time_heatmap(
+    pivot: pd.DataFrame,
+    target: str,
     output_path: Path,
     *,
-    top_regions: int | None = None,
-    max_date_ticks: int = 4,
+    max_date_ticks: int = 6,
 ) -> Path:
-    """Save region-time heatmap showing MAE uplift per region and date.
+    """Save a single target's region-time heatmap with symmetric scale.
 
     Args:
-        region_time_df: DataFrame with region-time aggregates
+        pivot: Pivot table with region_label rows, target_date columns, % change values
+        target: Target name for labeling
         output_path: Path to save the figure
-        top_regions: Number of top regions by count to include. If None, show all regions.
         max_date_ticks: Maximum number of date tick labels
 
     Returns:
         Path to saved figure
     """
-    from matplotlib.gridspec import GridSpec
+    n_regions = len(pivot.index)
+    fig_height = max(8, n_regions * 0.25)
 
-    targets = _ordered_targets(region_time_df["target"])
+    fig, ax = plt.subplots(figsize=(18, fig_height))
 
-    # Pre-compute pivots and region counts for each target
-    pivots = {}
-    for target in targets:
-        target_df = region_time_df[region_time_df["target"] == target].copy()
-        if top_regions is not None:
-            top_region_labels = (
-                target_df.groupby("region_label")["count"].sum().nlargest(top_regions).index
-            )
-            target_df = target_df[target_df["region_label"].isin(top_region_labels)]
-        pivot = target_df.pivot_table(
-            index="region_label",
-            columns="target_date",
-            values="abs_error_uplift_mean",
-            aggfunc="mean",
-        )
-        if not pivot.empty:
-            pivots[target] = pivot
+    # Symmetric scale centered at 0
+    vmax = max(abs(pivot.min().min()), abs(pivot.max().max()))
+    if vmax == 0 or pd.isna(vmax):
+        vmax = 1e-6
 
-    if not pivots:
-        # No data, create empty figure
-        fig, _ = plt.subplots(figsize=(18, 5))
-        fig.savefig(output_path)
-        plt.close(fig)
-        return output_path
+    sns.heatmap(
+        pivot,
+        ax=ax,
+        cmap=ERROR_DIVERGING_CMAP,
+        center=0.0,
+        vmin=-vmax,
+        vmax=vmax,
+        cbar=True,
+        cbar_kws={"label": "MAE delta vs baseline"},
+    )
 
-    # Calculate height ratios based on region counts (min 3 inches per subplot)
-    height_ratios = [max(3, len(pivots[t].index) * 0.18) for t in pivots]
-    total_height = sum(height_ratios) + 0.5  # Add margin
+    ax.set_yticks([i + 0.5 for i in range(n_regions)])
+    ax.set_yticklabels(pivot.index, fontsize=max(6, 10 - n_regions // 20))
 
-    fig = plt.figure(figsize=(18, total_height))
-    gs = GridSpec(len(pivots), 1, height_ratios=height_ratios, hspace=0.3)
+    columns = list(pivot.columns)
+    if columns:
+        tick_count = min(max_date_ticks, len(columns))
+        if tick_count == 1:
+            tick_positions = [0]
+        else:
+            tick_positions = [
+                round(j * (len(columns) - 1) / (tick_count - 1))
+                for j in range(tick_count)
+            ]
+        tick_positions = sorted(set(tick_positions))
+        tick_labels = []
+        for pos in tick_positions:
+            value = pd.Timestamp(columns[pos])
+            tick_labels.append(value.strftime("%Y-%m-%d"))
+        ax.set_xticks([pos + 0.5 for pos in tick_positions])
+        ax.set_xticklabels(tick_labels, rotation=0, ha="center")
 
-    for i, (target, pivot) in enumerate(pivots.items()):
-        axis = fig.add_subplot(gs[i])
-        sns.heatmap(
-            pivot,
-            ax=axis,
-            cmap=ERROR_DIVERGING_CMAP,
-            center=0.0,
-            cbar=True,
-            cbar_kws={"label": "MAE uplift"},
-        )
-        # Explicitly set y-ticks to show all region labels
-        n_regions = len(pivot.index)
-        axis.set_yticks([i + 0.5 for i in range(n_regions)])
-        axis.set_yticklabels(pivot.index, fontsize=max(4, 10 - n_regions // 15))
-
-        columns = list(pivot.columns)
-        if columns:
-            tick_count = min(max_date_ticks, len(columns))
-            if tick_count == 1:
-                tick_positions = [0]
-            else:
-                tick_positions = [
-                    round(j * (len(columns) - 1) / (tick_count - 1))
-                    for j in range(tick_count)
-                ]
-            tick_positions = sorted(set(tick_positions))
-            tick_labels = []
-            for pos in tick_positions:
-                value = pd.Timestamp(columns[pos])
-                tick_labels.append(value.strftime("%Y-%m-%d"))
-            axis.set_xticks([pos + 0.5 for pos in tick_positions])
-            axis.set_xticklabels(tick_labels, rotation=0, ha="center")
-        axis.set_title(f"{_format_target_label(target)}: region-time MAE uplift")
-        axis.set_xlabel("Target date")
-        axis.set_ylabel("Region")
+    ax.set_title(f"{_format_target_label(target)}: region-time MAE delta vs baseline")
+    ax.set_xlabel("Target date")
+    ax.set_ylabel("Region")
 
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     return output_path
+
+
+def _filter_top_regions_by_count(
+    df: pd.DataFrame,
+    *,
+    top_regions: int | None,
+) -> pd.DataFrame:
+    """Keep the highest-density regions per target based on aggregated sample count."""
+    if top_regions is None:
+        return df
+
+    filtered_frames: list[pd.DataFrame] = []
+    for target in _ordered_targets(df["target"]):
+        target_df = df[df["target"] == target].copy()
+        if target_df.empty:
+            continue
+        top_region_labels = (
+            target_df.groupby("region_label")["count"].sum().nlargest(top_regions).index
+        )
+        filtered_frames.append(
+            target_df[target_df["region_label"].isin(top_region_labels)].copy()
+        )
+
+    if not filtered_frames:
+        return df.iloc[0:0].copy()
+    return pd.concat(filtered_frames, ignore_index=True)
+
+
+def _save_region_time_heatmap(
+    region_time_df: pd.DataFrame,
+    output_dir: Path,
+    *,
+    top_regions: int | None = None,
+    max_date_ticks: int = 6,
+) -> dict[str, Path]:
+    """Save per-target region-time heatmaps showing MAE delta vs baseline.
+
+    Args:
+        region_time_df: DataFrame with region-time aggregates
+        output_dir: Directory to save figures
+        top_regions: Number of top regions by count to include. If None, show all regions.
+        max_date_ticks: Maximum number of date tick labels
+
+    Returns:
+        Dict mapping target names to saved figure paths
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    targets = _ordered_targets(region_time_df["target"])
+    saved_paths: dict[str, Path] = {}
+
+    for target in targets:
+        target_df = region_time_df[region_time_df["target"] == target].copy()
+        target_df = _filter_top_regions_by_count(
+            target_df,
+            top_regions=top_regions,
+        )
+
+        value_col = _require_column(target_df, "mae_delta")
+        pivot = target_df.pivot_table(
+            index="region_label",
+            columns="target_date",
+            values=value_col,
+            aggfunc="mean",
+        )
+
+        if pivot.empty:
+            continue
+
+        output_path = output_dir / f"region_time_heatmap_{target}.png"
+        _save_single_target_region_time_heatmap(
+            pivot,
+            target,
+            output_path,
+            max_date_ticks=max_date_ticks,
+        )
+        saved_paths[target] = output_path
+
+    return saved_paths
 
 
 def _save_rolling_time_plot(
@@ -323,25 +479,24 @@ def _save_rolling_time_plot(
     *,
     rolling_window: int,
 ) -> Path:
+    value_col = _require_column(time_df, "mae_delta")
     fig, ax = plt.subplots(figsize=(12, 5))
     for target in _ordered_targets(time_df["target"]):
         target_df = time_df[time_df["target"] == target]
         ordered = target_df.sort_values("target_date").copy()
-        ordered["rolling_abs_error_uplift"] = (
-            ordered["abs_error_uplift_mean"]
-            .rolling(rolling_window, min_periods=1)
-            .mean()
+        ordered["rolling_value"] = (
+            ordered[value_col].rolling(rolling_window, min_periods=1).mean()
         )
         ax.plot(
             ordered["target_date"],
-            ordered["rolling_abs_error_uplift"],
+            ordered["rolling_value"],
             label=_format_target_label(str(target)),
             linewidth=2.0,
         )
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
-    ax.set_title("Rolling MAE uplift over time")
+    ax.set_title("Rolling MAE delta vs baseline over time")
     ax.set_xlabel("Target date")
-    ax.set_ylabel("MAE uplift")
+    ax.set_ylabel("MAE delta vs baseline")
     ax.legend(title="Target")
     fig.autofmt_xdate()
     plt.tight_layout()
@@ -351,11 +506,12 @@ def _save_rolling_time_plot(
 
 
 def _save_horizon_curve(horizon_df: pd.DataFrame, output_path: Path) -> Path:
+    value_col = _require_column(horizon_df, "mae_delta")
     fig, ax = plt.subplots(figsize=(10, 5))
     sns.lineplot(
         data=horizon_df,
         x="horizon",
-        y="abs_error_uplift_mean",
+        y=value_col,
         hue="target",
         marker="o",
         ax=ax,
@@ -366,9 +522,9 @@ def _save_horizon_curve(horizon_df: pd.DataFrame, output_path: Path) -> Path:
     if legend is not None:
         for text in legend.get_texts():
             text.set_text(_format_target_label(text.get_text()))
-    ax.set_title("MAE uplift by forecast horizon")
+    ax.set_title("MAE delta vs baseline by forecast horizon")
     ax.set_xlabel("Horizon")
-    ax.set_ylabel("MAE uplift")
+    ax.set_ylabel("MAE delta vs baseline")
     plt.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -380,7 +536,9 @@ def _save_region_bars(
     output_path: Path,
     *,
     n_regions: int = 8,
+    top_regions: int | None = None,
 ) -> Path:
+    value_col = _require_column(region_df, "mae_delta")
     targets = _ordered_targets(region_df["target"])
     fig, axes = plt.subplots(
         len(targets),
@@ -390,28 +548,35 @@ def _save_region_bars(
     )
     for axis, target in zip(axes.flatten(), targets, strict=False):
         target_df = region_df[region_df["target"] == target].copy()
-        winners = target_df.nlargest(n_regions, "abs_error_uplift_mean")
-        losers = target_df.nsmallest(n_regions, "abs_error_uplift_mean")
-        plot_df = pd.concat([losers, winners], ignore_index=True).drop_duplicates(
-            subset=["region_label"]
+        target_df = _filter_top_regions_by_count(
+            target_df,
+            top_regions=top_regions,
         )
-        plot_df = plot_df.sort_values("abs_error_uplift_mean")
+        if top_regions is None:
+            winners = target_df.nsmallest(n_regions, value_col)
+            losers = target_df.nlargest(n_regions, value_col)
+            plot_df = pd.concat([winners, losers], ignore_index=True).drop_duplicates(
+                subset=["region_label"]
+            )
+        else:
+            plot_df = target_df.copy()
+        plot_df = plot_df.sort_values(value_col)
         if plot_df.empty:
             axis.set_visible(False)
             continue
         sns.barplot(
             data=plot_df,
-            x="abs_error_uplift_mean",
+            x=value_col,
             y="region_label",
             hue="region_label",
             orient="h",
             ax=axis,
-            palette=_value_colors(plot_df["abs_error_uplift_mean"]),
+            palette=_value_colors(plot_df[value_col]),
             legend=False,
         )
         axis.axvline(0.0, color="black", linewidth=1.0, alpha=0.6)
-        axis.set_title(f"{_format_target_label(target)}: region gain/loss ranking")
-        axis.set_xlabel("MAE uplift")
+        axis.set_title(f"{_format_target_label(target)}: regional MAE delta ranking")
+        axis.set_xlabel("MAE delta vs baseline")
         axis.set_ylabel("Region")
     plt.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
@@ -422,22 +587,22 @@ def _save_region_bars(
 def _save_target_summary(target_df: pd.DataFrame, output_path: Path) -> Path:
     melted = target_df.melt(
         id_vars=["target"],
-        value_vars=["abs_error_uplift_mean", "rmse_uplift", "smape_uplift_mean"],
+        value_vars=["abs_error_uplift_mean", "rmse_uplift"],
         var_name="metric",
         value_name="uplift",
     )
     metric_labels = {
         "abs_error_uplift_mean": "MAE uplift",
         "rmse_uplift": "RMSE uplift",
-        "smape_uplift_mean": "sMAPE uplift",
     }
     melted["metric"] = melted["metric"].map(metric_labels)
     melted["target_label"] = melted["target"].map(_format_target_label)
-    target_order = [_format_target_label(target) for target in _ordered_targets(melted["target"])]
+    target_order = [
+        _format_target_label(target) for target in _ordered_targets(melted["target"])
+    ]
     metric_palette = {
         "MAE uplift": "#4C72B0",
         "RMSE uplift": "#DD8452",
-        "sMAPE uplift": "#55A868",
     }
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -475,31 +640,40 @@ def _save_target_summary(target_df: pd.DataFrame, output_path: Path) -> Path:
 
 
 def _save_target_horizon_heatmap(horizon_df: pd.DataFrame, output_path: Path) -> Path:
+    value_col = _require_column(horizon_df, "mae_delta")
     pivot = (
         horizon_df.assign(target_label=horizon_df["target"].map(_format_target_label))
         .pivot_table(
             index="target_label",
             columns="horizon",
-            values="abs_error_uplift_mean",
+            values=value_col,
             aggfunc="mean",
             observed=False,
         )
         .reindex(
-            [_format_target_label(target) for target in _ordered_targets(horizon_df["target"])]
+            [
+                _format_target_label(target)
+                for target in _ordered_targets(horizon_df["target"])
+            ]
         )
     )
     fig, ax = plt.subplots(figsize=(12, 4.5))
+    # Compute symmetric color scale bounds
+    vmax = max(abs(pivot.min().min()), abs(pivot.max().max()))
+    if vmax == 0:
+        vmax = 1.0  # fallback for all-zero data
     sns.heatmap(
         pivot,
         cmap=ERROR_DIVERGING_CMAP,
         center=0.0,
-        annot=True,
-        fmt=".3f",
+        vmin=-vmax,
+        vmax=vmax,
+        annot=False,
         linewidths=0.4,
-        cbar_kws={"label": "MAE uplift"},
+        cbar_kws={"label": "MAE delta vs baseline"},
         ax=ax,
     )
-    ax.set_title("MAE uplift by target and horizon")
+    ax.set_title("MAE delta vs baseline by target and horizon")
     ax.set_xlabel("Horizon")
     ax.set_ylabel("")
     plt.tight_layout()
@@ -509,12 +683,13 @@ def _save_target_horizon_heatmap(horizon_df: pd.DataFrame, output_path: Path) ->
 
 
 def _save_uplift_distribution(paired_df: pd.DataFrame, output_path: Path) -> Path:
-    plot_df = paired_df[["target", "abs_error_uplift"]].copy()
+    value_col = _require_column(paired_df, "abs_error_delta")
+    plot_df = paired_df[["target", value_col]].copy()
     plot_df["target_label"] = plot_df["target"].map(_format_target_label)
     ordered_labels = [
         _format_target_label(target) for target in _ordered_targets(plot_df["target"])
     ]
-    median_by_target = plot_df.groupby("target_label", sort=False)["abs_error_uplift"].median()
+    median_by_target = plot_df.groupby("target_label", sort=False)[value_col].median()
     palette = {
         label: _value_colors([median_by_target.get(label, 0.0)])[0]
         for label in ordered_labels
@@ -523,7 +698,7 @@ def _save_uplift_distribution(paired_df: pd.DataFrame, output_path: Path) -> Pat
     sns.boxenplot(
         data=plot_df,
         x="target_label",
-        y="abs_error_uplift",
+        y=value_col,
         order=ordered_labels,
         hue="target_label",
         palette=palette,
@@ -531,9 +706,9 @@ def _save_uplift_distribution(paired_df: pd.DataFrame, output_path: Path) -> Pat
         ax=ax,
     )
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
-    ax.set_title("Per-example MAE uplift distribution")
+    ax.set_title("Per-example MAE delta vs baseline distribution")
     ax.set_xlabel("Target")
-    ax.set_ylabel("MAE uplift")
+    ax.set_ylabel("MAE delta vs baseline")
     plt.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -541,15 +716,16 @@ def _save_uplift_distribution(paired_df: pd.DataFrame, output_path: Path) -> Pat
 
 
 def _save_region_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
+    value_col = _require_column(region_df, "mae_delta")
     plot_df = region_df.copy()
     plot_df["target_label"] = plot_df["target"].map(_format_target_label)
-    norm = _signed_norm(plot_df["abs_error_uplift_mean"])
+    norm = _signed_norm(plot_df[value_col])
     fig, ax = plt.subplots(figsize=(12, 7))
     sns.scatterplot(
         data=plot_df,
         x="baseline_mae",
-        y="abs_error_uplift_mean",
-        hue="abs_error_uplift_mean",
+        y=value_col,
+        hue=value_col,
         palette=ERROR_DIVERGING_CMAP,
         hue_norm=norm,
         style="target_label",
@@ -559,27 +735,29 @@ def _save_region_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
         ax=ax,
     )
     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
-    ax.set_title("Regional uplift vs baseline error")
+    ax.set_title("Regional MAE delta vs baseline error")
     ax.set_xlabel("Baseline MAE")
-    ax.set_ylabel("MAE uplift")
+    ax.set_ylabel("MAE delta vs baseline")
 
     label_df = pd.concat(
         [
-            plot_df.nlargest(6, "abs_error_uplift_mean"),
-            plot_df.nsmallest(6, "abs_error_uplift_mean"),
+            plot_df.nlargest(6, value_col),
+            plot_df.nsmallest(6, value_col),
         ],
         ignore_index=True,
     ).drop_duplicates(subset=["target", "region_label"])
     for row in label_df.itertuples():
         ax.text(
             row.baseline_mae,
-            row.abs_error_uplift_mean,
+            getattr(row, value_col),
             str(row.region_label),
             fontsize=8,
             alpha=0.85,
         )
 
-    ax.legend(title="Uplift / target / count", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.legend(
+        title="MAE delta / target / count", bbox_to_anchor=(1.02, 1), loc="upper left"
+    )
     plt.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -587,7 +765,8 @@ def _save_region_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
 
 
 def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
-    """Save scatter plot showing correlation between data density and MAE uplift per region."""
+    """Save scatter plot showing correlation between data density and MAE delta per region."""
+    value_col = _require_column(region_df, "mae_delta")
     targets = _ordered_targets(region_df["target"])
     n_targets = len(targets)
 
@@ -604,13 +783,12 @@ def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> 
             axis.set_visible(False)
             continue
 
-        # Scatter: x=count (density), y=uplift
-        norm = _signed_norm(target_df["abs_error_uplift_mean"])
+        norm = _signed_norm(target_df[value_col])
         sns.scatterplot(
             data=target_df,
             x="count",
-            y="abs_error_uplift_mean",
-            hue="abs_error_uplift_mean",
+            y=value_col,
+            hue=value_col,
             palette=ERROR_DIVERGING_CMAP,
             hue_norm=norm,
             size="baseline_mae",
@@ -622,11 +800,11 @@ def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> 
 
         # Add regression line
         if len(target_df) > 2:
-            corr = target_df["count"].corr(target_df["abs_error_uplift_mean"])
+            corr = target_df["count"].corr(target_df[value_col])
             sns.regplot(
                 data=target_df,
                 x="count",
-                y="abs_error_uplift_mean",
+                y=value_col,
                 scatter=False,
                 ax=axis,
                 color="#333333",
@@ -643,9 +821,9 @@ def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> 
             )
 
         axis.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
-        axis.set_title(f"{_format_target_label(target)}: density vs uplift")
+        axis.set_title(f"{_format_target_label(target)}: density vs MAE delta")
         axis.set_xlabel("Sample count (density)")
-        axis.set_ylabel("MAE uplift")
+        axis.set_ylabel("MAE delta vs baseline")
 
     plt.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
@@ -659,12 +837,13 @@ def _save_target_choropleths(
     *,
     region_geojson_path: str | Path = DEFAULT_REGION_GEOJSON,
 ) -> Path:
+    value_col = _require_column(region_df, "mae_delta")
     geo_df = gpd.read_file(region_geojson_path)
     geo_df["region_id"] = geo_df["id"].astype(str).str.zfill(5)
 
     target_order = _ordered_targets(region_df["target"])
     fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-    norm = _signed_norm(region_df["abs_error_uplift_mean"])
+    norm = _signed_norm(region_df[value_col])
 
     for axis, target in zip(axes, TARGET_ORDER, strict=False):
         if target not in target_order:
@@ -672,14 +851,16 @@ def _save_target_choropleths(
             continue
 
         target_df = region_df[region_df["target"] == target].copy()
-        target_df["region_id"] = target_df["region_id"].fillna("").astype(str).str.zfill(5)
+        target_df["region_id"] = (
+            target_df["region_id"].fillna("").astype(str).str.zfill(5)
+        )
         merged = geo_df.merge(
-            target_df[["region_id", "abs_error_uplift_mean"]],
+            target_df[["region_id", value_col]],
             on="region_id",
             how="left",
         )
         merged.plot(
-            column="abs_error_uplift_mean",
+            column=value_col,
             cmap=ERROR_DIVERGING_CMAP,
             norm=norm,
             legend=False,
@@ -699,8 +880,8 @@ def _save_target_choropleths(
         fraction=0.025,
         pad=0.02,
     )
-    cbar.set_label("Mean MAE uplift")
-    fig.suptitle("Per-target mean regional MAE uplift", y=0.98)
+    cbar.set_label("MAE delta vs baseline")
+    fig.suptitle("Per-target mean regional MAE delta vs baseline", y=0.98)
     fig.subplots_adjust(left=0.01, right=0.92, top=0.90, bottom=0.02, wspace=0.02)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
@@ -719,17 +900,19 @@ def _load_ablation_granular_data(
     if not experiment_dir.exists():
         raise FileNotFoundError(f"Ablation experiment not found: {experiment_dir}")
 
-    matches = sorted(experiment_dir.glob(f"*/{split}_granular_metrics.csv"))
+    matches = sorted(experiment_dir.glob(f"*/{split}_granular.csv"))
+    if not matches:
+        matches = sorted(experiment_dir.glob(f"*/{split}_granular_metrics.csv"))
     if not matches:
         raise FileNotFoundError(
-            f"No {split}_granular_metrics.csv found under {experiment_dir}"
+            f"No {split}_granular.csv or {split}_granular_metrics.csv found under {experiment_dir}"
         )
-    
+
     logger.info(f"Loading {len(matches)} runs for ablation '{ablation_name}'")
     dfs = []
     for csv_path in matches:
         dfs.append(_load_granular_csv(csv_path))
-    
+
     return pd.concat(dfs, ignore_index=True)
 
 
@@ -757,6 +940,8 @@ def compare_ablation_suite(
         split=split,
     )
     results: dict[str, dict[str, object]] = {}
+    suite_excluded_targets: dict[str, ExcludedTargets] = {}
+    suite_excluded_seeds: dict[str, ExcludedSeeds] = {}
 
     for candidate_ablation in candidate_ablations:
         try:
@@ -766,7 +951,9 @@ def compare_ablation_suite(
                 ablation_name=candidate_ablation,
                 split=split,
             )
-            comparison_dir = output_dir / f"{baseline_ablation}__vs__{candidate_ablation}"
+            comparison_dir = (
+                output_dir / f"{baseline_ablation}__vs__{candidate_ablation}"
+            )
             logger.info(
                 "Comparing %s against %s (paired seeds) -> %s",
                 candidate_ablation,
@@ -782,8 +969,16 @@ def compare_ablation_suite(
                 region_geojson_path=region_geojson_path,
                 top_regions=top_regions,
             )
+            excluded_targets = results[candidate_ablation]["excluded_targets"]
+            if excluded_targets:
+                suite_excluded_targets[candidate_ablation] = excluded_targets
+            excluded_seeds = results[candidate_ablation]["excluded_seeds"]
+            if excluded_seeds:
+                suite_excluded_seeds[candidate_ablation] = excluded_seeds
         except Exception as exc:
-            logger.error(f"Failed to compare {candidate_ablation} against baseline: {exc}")
+            logger.error(
+                f"Failed to compare {candidate_ablation} against baseline: {exc}"
+            )
             continue
 
     summary_rows = []
@@ -807,7 +1002,38 @@ def compare_ablation_suite(
                     "smape_uplift": row.smape_uplift_mean,
                 }
             )
-    pd.DataFrame(summary_rows).to_csv(output_dir / "suite_target_summary.csv", index=False)
+    pd.DataFrame(summary_rows).to_csv(
+        output_dir / "suite_target_summary.csv", index=False
+    )
+
+    if suite_excluded_targets:
+        summary = "; ".join(
+            f"{ablation}: "
+            + ", ".join(
+                (
+                    f"{target} (baseline={counts['baseline_rows']}, "
+                    f"candidate={counts['candidate_rows']})"
+                )
+                for target, counts in sorted(excluded_targets.items())
+            )
+            for ablation, excluded_targets in sorted(suite_excluded_targets.items())
+        )
+        logger.warning("Suite comparisons excluded unmatched targets: %s", summary)
+
+    if suite_excluded_seeds:
+        summary = "; ".join(
+            f"{ablation}: "
+            + ", ".join(
+                (
+                    f"seed={seed} (baseline={counts['baseline_rows']}, "
+                    f"candidate={counts['candidate_rows']})"
+                )
+                for seed, counts in sorted(excluded.items())
+            )
+            for ablation, excluded in sorted(suite_excluded_seeds.items())
+        )
+        logger.warning("Suite comparisons excluded unmatched seeds: %s", summary)
+
     return results
 
 
@@ -848,7 +1074,7 @@ def compare_granular_csvs(
     else:
         candidate_df = _load_granular_csv(Path(candidate_csv))
 
-    paired_df = _prepare_joined_frame(
+    paired_df, excluded_targets, excluded_seeds = _prepare_joined_frame(
         baseline_df=baseline_df,
         candidate_df=candidate_df,
         min_join_coverage=min_join_coverage,
@@ -882,8 +1108,10 @@ def compare_granular_csvs(
     target_df.to_csv(tables["target_aggregates"], index=False)
 
     plots = {
-        "region_time_heatmap": _save_region_time_heatmap(
-            region_time_df, output_dir / "region_time_heatmap.png", top_regions=top_regions
+        "region_time_heatmaps": _save_region_time_heatmap(
+            region_time_df,
+            output_dir,
+            top_regions=top_regions,
         ),
         "rolling_time_uplift": _save_rolling_time_plot(
             time_df,
@@ -894,7 +1122,9 @@ def compare_granular_csvs(
             horizon_df, output_dir / "horizon_uplift_curve.png"
         ),
         "region_gain_loss_bars": _save_region_bars(
-            region_df, output_dir / "region_gain_loss_bars.png"
+            region_df,
+            output_dir / "region_gain_loss_bars.png",
+            top_regions=top_regions,
         ),
         "target_summary": _save_target_summary(
             target_df, output_dir / "target_summary.png"
@@ -918,10 +1148,22 @@ def compare_granular_csvs(
         ),
     }
 
+    paired_targets = paired_df["target"].unique()
+    paired_seeds = paired_df["seed"].unique() if "seed" in paired_df.columns else None
+    filtered_baseline_rows = baseline_df["target"].isin(paired_targets)
+    filtered_candidate_rows = candidate_df["target"].isin(paired_targets)
+    if paired_seeds is not None:
+        filtered_baseline_rows &= baseline_df["seed"].isin(paired_seeds)
+        filtered_candidate_rows &= candidate_df["seed"].isin(paired_seeds)
+
     return {
         "baseline_rows": len(baseline_df),
         "candidate_rows": len(candidate_df),
         "matched_rows": len(paired_df),
+        "filtered_baseline_rows": int(filtered_baseline_rows.sum()),
+        "filtered_candidate_rows": int(filtered_candidate_rows.sum()),
+        "excluded_targets": excluded_targets,
+        "excluded_seeds": excluded_seeds,
         "tables": tables,
         "plots": plots,
     }
@@ -980,7 +1222,9 @@ Examples:
 
     if args.baseline_csv is not None or args.candidate_csv is not None:
         if args.baseline_csv is None or args.candidate_csv is None:
-            raise ValueError("Pairwise mode requires both --baseline-csv and --candidate-csv")
+            raise ValueError(
+                "Pairwise mode requires both --baseline-csv and --candidate-csv"
+            )
         artifacts = compare_granular_csvs(
             baseline_csv=args.baseline_csv,
             candidate_csv=args.candidate_csv,

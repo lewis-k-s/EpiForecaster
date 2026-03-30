@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -36,19 +37,64 @@ TARGET_LABELS = {
 METRIC_LABELS = {
     "mae": "MAE",
     "rmse": "RMSE",
-    "smape": "sMAPE",
     "r2": "R²",
 }
+PRIMARY_ABLATION_ORDER = [
+    "mobility:off",
+    "regions:off",
+    "context:off",
+    "residual:off",
+    "sir:off",
+]
+HEAD_ABLATION_RE = re.compile(r"^sig:(ww|cases|hosp|deaths):(aux|off|proxy)$")
+HEAD_ORDER = {"ww": 0, "cases": 1, "hosp": 2, "deaths": 3}
+HEAD_VARIANT_ORDER = {"aux": 0, "off": 1, "proxy": 2}
+PRIMARY_ABLATION_RANK = {
+    ablation: index for index, ablation in enumerate(PRIMARY_ABLATION_ORDER)
+}
+KERNEL_ABLATION_RANK = {
+    "kernel:fixed": 0,
+    "kernel:ww:mlp": 1,
+    "kernel:hosp:mlp": 2,
+    "kernel:cases:mlp": 3,
+    "kernel:deaths:mlp": 4,
+    "kernel:all:mlp": 5,
+}
+
+# Ablation categories for separate heatmaps
+MOBILITY_ABLATIONS = ["mobility:off", "regions:off", "context:off"]
+PHYSICS_ABLATIONS = ["residual:off", "sir:off"]
+
+# Unified colormap for all heatmaps
+HEATMAP_CMAP = "RdYlGn_r"  # Red = worse (higher delta), Green = better (lower delta)
 
 
 def _prepare_model_order(
     df: pd.DataFrame, baseline_name: str = "baseline"
 ) -> list[str]:
-    """Prepare model order with baseline first, then alphabetical."""
-    models = sorted(df["model"].unique())
-    if baseline_name in models:
-        models.remove(baseline_name)
-        models.insert(0, baseline_name)
+    """Prepare model order with semantic clustering for ablation families."""
+
+    def sort_key(model: str) -> tuple[int, int, int, str]:
+        if model == baseline_name:
+            return (-1, 0, 0, model)
+        if model in PRIMARY_ABLATION_RANK:
+            return (0, PRIMARY_ABLATION_RANK[model], 0, model)
+        head_match = HEAD_ABLATION_RE.match(model)
+        if head_match:
+            head, variant = head_match.groups()
+            return (
+                1,
+                HEAD_ORDER.get(head, len(HEAD_ORDER)),
+                HEAD_VARIANT_ORDER.get(variant, len(HEAD_VARIANT_ORDER)),
+                model,
+            )
+        if model == "gradnorm:off":
+            return (2, 0, 0, model)
+        if model in KERNEL_ABLATION_RANK:
+            return (3, KERNEL_ABLATION_RANK[model], 0, model)
+        return (4, 0, 0, model)
+
+    models = sorted(df["model"].unique(), key=sort_key)
     return models
 
 
@@ -78,7 +124,7 @@ def plot_ablation_comparison(
     Args:
         csv_path: Path to ablation_metrics_aggregated.csv
         output_dir: Directory to save plots (default: same as csv_path parent)
-        metrics: List of metrics to plot (default: ["mae", "rmse", "smape", "r2"])
+        metrics: List of metrics to plot (default: ["mae", "rmse", "r2"])
         baseline_name: Name of baseline ablation
         figsize: Figure size (width, height)
         show: Whether to display plots interactively
@@ -99,7 +145,7 @@ def plot_ablation_comparison(
     df = pd.read_csv(csv_path)
 
     if metrics is None:
-        metrics = ["mae", "rmse", "smape", "r2"]
+        metrics = ["mae", "rmse", "r2"]
 
     # Prepare ordering
     model_order = _prepare_model_order(df, baseline_name)
@@ -205,6 +251,8 @@ def plot_ablation_deltas_heatmap(
     output_dir: str | Path | None = None,
     metric: str = "mae",
     baseline_name: str = "baseline",
+    ablation_filter: list[str] | None = None,
+    output_filename: str | None = None,
     figsize: tuple[float, float] | None = None,
     show: bool = False,
 ) -> Path:
@@ -215,6 +263,8 @@ def plot_ablation_deltas_heatmap(
         output_dir: Directory to save plot
         metric: Metric to visualize (default: "mae")
         baseline_name: Name of baseline ablation (not shown, used for ordering)
+        ablation_filter: Optional list of ablation names to include (default: all)
+        output_filename: Custom output filename (default: ablation_delta_heatmap_{metric}.png)
         figsize: Figure size (width, height)
         show: Whether to display plot interactively
 
@@ -245,7 +295,14 @@ def plot_ablation_deltas_heatmap(
 
     # Prepare ordering
     target_order = _prepare_target_order(df)
-    model_order = sorted(df["model"].unique())
+    model_order = _prepare_model_order(df, baseline_name)
+
+    # Apply filter if specified
+    if ablation_filter is not None:
+        df = df[df["model"].isin(ablation_filter)]
+        model_order = [m for m in model_order if m in ablation_filter]
+        if df.empty:
+            raise ValueError(f"No ablations found matching filter: {ablation_filter}")
 
     # Create pivot
     pivot = df.pivot_table(
@@ -256,7 +313,7 @@ def plot_ablation_deltas_heatmap(
 
     # Create plot
     if figsize is None:
-        figsize = (max(8, len(target_order) * 1.5), max(6, len(model_order) * 0.5))
+        figsize = (max(10, len(target_order) * 2.0), max(8, len(model_order) * 0.8))
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -268,7 +325,7 @@ def plot_ablation_deltas_heatmap(
         pivot,
         annot=True,
         fmt=".1f",
-        cmap="RdYlGn_r",  # Red = worse, Green = better
+        cmap=HEATMAP_CMAP,  # Red = worse, Green = better
         center=0,
         vmin=vmin,
         vmax=vmax,
@@ -287,7 +344,9 @@ def plot_ablation_deltas_heatmap(
 
     # Save
     metric_slug = metric.replace("_median", "").replace("_", "-")
-    output_path = output_dir / f"ablation_delta_heatmap_{metric_slug}.png"
+    if output_filename is None:
+        output_filename = f"ablation_delta_heatmap_{metric_slug}.png"
+    output_path = output_dir / output_filename
     fig.savefig(output_path, bbox_inches="tight")
     logger.info(f"Saved heatmap to {output_path}")
 
@@ -309,7 +368,7 @@ def plot_ablation_summary_grid(
 ) -> Path:
     """Create comprehensive summary grid with all metrics.
 
-    Creates a 2x2 grid showing MAE, RMSE, sMAPE, and R² comparisons.
+    Creates a compact grid showing MAE, RMSE, and R² comparisons.
 
     Args:
         aggregated_csv: Path to ablation_metrics_aggregated.csv
@@ -338,14 +397,13 @@ def plot_ablation_summary_grid(
     model_order = _prepare_model_order(df, baseline_name)
     target_order = _prepare_target_order(df)
 
-    # Create 2x2 grid
-    metrics = ["mae", "rmse", "smape", "r2"]
+    metrics = ["mae", "rmse", "r2"]
 
     if figsize is None:
-        figsize = (16, max(10, len(model_order) * 0.3))
+        figsize = (18, max(8, len(model_order) * 0.3))
 
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
-    axes = axes.flatten()
+    fig, axes = plt.subplots(1, len(metrics), figsize=figsize)
+    axes = np.atleast_1d(axes)
 
     for idx, metric in enumerate(metrics):
         ax = axes[idx]
@@ -397,7 +455,7 @@ def plot_ablation_summary_grid(
 
         # Styling
         ax.set_yticks(y_positions)
-        if idx % 2 == 0:  # Left column
+        if idx == 0:
             ax.set_yticklabels(model_order)
         else:
             ax.set_yticklabels([])
@@ -488,6 +546,9 @@ def plot_cross_head_impact_heatmap(
 
     # Load mean matrix
     mean_df = pd.read_csv(mean_csv, index_col=0)
+    ordered_heads = [head for head in HEAD_ORDER if head in mean_df.index]
+    ordered_columns = [head for head in HEAD_ORDER if head in mean_df.columns]
+    mean_df = mean_df.reindex(index=ordered_heads, columns=ordered_columns)
 
     # Load std matrix if available
     std_df = None
@@ -495,6 +556,7 @@ def plot_cross_head_impact_heatmap(
         std_path = Path(std_csv)
         if std_path.exists():
             std_df = pd.read_csv(std_path, index_col=0)
+            std_df = std_df.reindex(index=ordered_heads, columns=ordered_columns)
 
     # Create plot
     if figsize is None:
@@ -531,7 +593,7 @@ def plot_cross_head_impact_heatmap(
         mean_df,
         annot=annotations,
         fmt=annot_fmt,
-        cmap="RdBu_r",  # Red = worse (positive delta), Blue = better (negative delta)
+        cmap=HEATMAP_CMAP,  # Unified colormap: Red = worse, Green = better
         center=0,
         vmin=vmin,
         vmax=vmax,
@@ -582,6 +644,87 @@ def plot_cross_head_impact_heatmap(
         plt.close(fig)
 
     return output_path
+
+
+def plot_mobility_ablation_heatmap(
+    csv_path: str | Path,
+    output_dir: str | Path | None = None,
+    metric: str = "mae",
+    baseline_name: str = "baseline",
+    figsize: tuple[float, float] | None = None,
+    show: bool = False,
+) -> Path:
+    """Create heatmap for mobility-related ablations only.
+
+    Shows percentage change from baseline for mobility:off, regions:off, context:off.
+
+    Args:
+        csv_path: Path to ablation_metrics_deltas.csv
+        output_dir: Directory to save plot
+        metric: Metric to visualize (default: "mae")
+        baseline_name: Name of baseline ablation (not shown, used for ordering)
+        figsize: Figure size (width, height)
+        show: Whether to display plot interactively
+
+    Returns:
+        Path to saved figure
+    """
+    metric_slug = metric.replace("_median", "").replace("_", "-")
+    return plot_ablation_deltas_heatmap(
+        csv_path,
+        output_dir=output_dir,
+        metric=metric,
+        baseline_name=baseline_name,
+        ablation_filter=MOBILITY_ABLATIONS,
+        output_filename=f"mobility_ablation_heatmap_{metric_slug}.png",
+        figsize=figsize,
+        show=show,
+    )
+
+
+def plot_head_ablation_heatmap(
+    csv_path: str | Path,
+    output_dir: str | Path | None = None,
+    metric: str = "mae",
+    baseline_name: str = "baseline",
+    figsize: tuple[float, float] | None = None,
+    show: bool = False,
+) -> Path:
+    """Create heatmap for observation head ablations.
+
+    Shows percentage change from baseline for sig:*:aux and sig:*:off ablations.
+
+    Args:
+        csv_path: Path to ablation_metrics_deltas.csv
+        output_dir: Directory to save plot
+        metric: Metric to visualize (default: "mae")
+        baseline_name: Name of baseline ablation (not shown, used for ordering)
+        figsize: Figure size (width, height)
+        show: Whether to display plot interactively
+
+    Returns:
+        Path to saved figure
+    """
+    # Load data to find head ablations
+    csv_path = Path(csv_path)
+    df = pd.read_csv(csv_path)
+
+    # Filter to only head ablations matching the pattern
+    head_ablations = [
+        model for model in df["model"].unique() if HEAD_ABLATION_RE.match(model)
+    ]
+
+    metric_slug = metric.replace("_median", "").replace("_", "-")
+    return plot_ablation_deltas_heatmap(
+        csv_path,
+        output_dir=output_dir,
+        metric=metric,
+        baseline_name=baseline_name,
+        ablation_filter=head_ablations,
+        output_filename=f"head_ablation_heatmap_{metric_slug}.png",
+        figsize=figsize,
+        show=show,
+    )
 
 
 def main():
@@ -670,6 +813,26 @@ Examples:
     if args.deltas_csv and args.deltas_csv.exists():
         logger.info("Generating delta heatmap...")
         plot_ablation_deltas_heatmap(
+            args.deltas_csv,
+            output_dir=args.output_dir,
+            metric="mae",
+            baseline_name=args.baseline,
+            show=args.show,
+        )
+
+        # Generate separate mobility ablation heatmap
+        logger.info("Generating mobility ablation heatmap...")
+        plot_mobility_ablation_heatmap(
+            args.deltas_csv,
+            output_dir=args.output_dir,
+            metric="mae",
+            baseline_name=args.baseline,
+            show=args.show,
+        )
+
+        # Generate separate head ablation heatmap
+        logger.info("Generating head ablation heatmap...")
+        plot_head_ablation_heatmap(
             args.deltas_csv,
             output_dir=args.output_dir,
             metric="mae",

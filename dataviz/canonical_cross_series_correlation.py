@@ -30,6 +30,7 @@ import pandas as pd
 import seaborn as sns
 import xarray as xr
 from matplotlib.axes import Axes
+from matplotlib.colors import TwoSlopeNorm
 from scipy import stats
 
 sys_path = str(Path(__file__).parent.parent)
@@ -382,7 +383,7 @@ def plot_pairwise_scatter_grid(
     Layout:
     - Diagonal: Histograms
     - Lower triangle (i > j): Scatter plots with regression lines
-    - Upper triangle (i < j): Correlation coefficient only (no scatter)
+    - Upper triangle (i < j): Correlation coefficient with heatmap coloring
 
     Args:
         values: Dict mapping series_name -> 1D array of values
@@ -402,6 +403,22 @@ def plot_pairwise_scatter_grid(
     # Handle single series case
     if n == 1:
         axes = np.array([[axes]])
+
+    # Pre-compute correlations for upper triangle to enable heatmap coloring
+    upper_triangle_correlations: dict[tuple[int, int], tuple[float, float]] = {}
+    for i, name_i in enumerate(series_names):
+        for j, name_j in enumerate(series_names):
+            if i < j:
+                x = values[name_j]
+                y = values[name_i]
+                valid = np.isfinite(x) & np.isfinite(y)
+                if valid.sum() >= 3:
+                    r, p = stats.pearsonr(x[valid], y[valid])
+                    upper_triangle_correlations[(i, j)] = (r, p)
+
+    # Set up colormap for heatmap (diverging, centered at 0)
+    cmap = plt.get_cmap("RdBu_r")
+    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
 
     for i, name_i in enumerate(series_names):
         for j, name_j in enumerate(series_names):
@@ -453,13 +470,17 @@ def plot_pairwise_scatter_grid(
                 ax.set_xlabel(SERIES_LABELS.get(name_j, name_j))
                 ax.set_ylabel(SERIES_LABELS.get(name_i, name_i))
             else:
-                # Upper triangle (i < j): correlation coefficient only
-                x = values[name_j]
-                y = values[name_i]
+                # Upper triangle (i < j): correlation coefficient with heatmap coloring
+                # Set background color based on correlation value
+                if (i, j) in upper_triangle_correlations:
+                    r, p = upper_triangle_correlations[(i, j)]
+                    face_color = cmap(norm(r))
+                    ax.set_facecolor(face_color)
 
-                valid = np.isfinite(x) & np.isfinite(y)
-                if valid.sum() >= 3:
-                    r, p = stats.pearsonr(x[valid], y[valid])
+                    # Choose text color for contrast against colored background
+                    # Use white text for dark backgrounds (strong positive/negative)
+                    text_color = "white" if abs(r) > 0.5 else "black"
+
                     # Display correlation centered in the cell
                     ax.text(
                         0.5,
@@ -469,8 +490,12 @@ def plot_pairwise_scatter_grid(
                         horizontalalignment="center",
                         verticalalignment="center",
                         fontsize=12,
-                        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9),
+                        color=text_color,
+                        fontweight="bold",
                     )
+                else:
+                    # No valid correlation, keep default background
+                    pass
 
                 # Hide ticks for upper triangle cells
                 ax.set_xticks([])
