@@ -63,6 +63,11 @@ def _add_terminal_trial(
 def test_ablation_names_are_valid() -> None:
     assert "regions:off" in worker.ABLATIONS
     assert worker.ABLATIONS["regions:off"] == "model.type.regions=false"
+    assert "kernel:all:mlp" in worker.ABLATIONS
+    assert (
+        "model.observation_heads.kernel_parameterization_cases=free"
+        in worker.ABLATIONS["kernel:all:mlp"]
+    )
     assert "model.type.regions=false" not in worker.ABLATIONS
 
 

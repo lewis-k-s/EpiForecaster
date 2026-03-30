@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,25 +10,27 @@ import pytest
 import torch
 
 from evaluation.baseline_eval import (
-    _generate_rolling_folds,
+    _compute_metrics_from_granular_rows,
+    _compute_valid_node_mask_for_target,
+    _resolve_baseline_models,
     compare_model_metrics_against_baselines,
     run_baseline_evaluation,
-    run_tiered_baseline_evaluation,
+    run_same_slice_baseline_evaluation,
 )
 from evaluation.baseline_models import (
     predict_with_exponential_smoothing_fallback,
+    predict_with_sarima_fallback,
     predict_with_tiered_fallback,
+    predict_with_var_fallback,
     predict_with_var_cross_target_fallback,
 )
 from evaluation.metrics import compute_masked_metrics_numpy
 
 
 class _DummyDataConfig:
-    run_id = "real"
-
-    @staticmethod
-    def resolve_missing_permit_map() -> dict[str, dict[str, int]]:
-        return {
+    def __init__(self, permits: dict[str, dict[str, int]] | None = None) -> None:
+        self.run_id = "real"
+        self._permits = permits or {
             "input": {
                 "cases": 0,
                 "hospitalizations": 0,
@@ -42,20 +45,47 @@ class _DummyDataConfig:
             },
         }
 
+    def resolve_missing_permit_map(self) -> dict[str, dict[str, int]]:
+        return self._permits
+
 
 class _DummyModelConfig:
-    input_window_length = 4
-    forecast_horizon = 3
+    def __init__(self, *, input_window_length: int = 4, forecast_horizon: int = 3) -> None:
+        self.input_window_length = input_window_length
+        self.forecast_horizon = forecast_horizon
+
+
+class _DummyTrainingConfig:
+    def __init__(self) -> None:
+        self.loss = None
 
 
 class _DummyConfig:
-    data = _DummyDataConfig()
-    model = _DummyModelConfig()
+    def __init__(
+        self,
+        *,
+        permits: dict[str, dict[str, int]] | None = None,
+        input_window_length: int = 4,
+        forecast_horizon: int = 3,
+    ) -> None:
+        self.data = _DummyDataConfig(permits=permits)
+        self.model = _DummyModelConfig(
+            input_window_length=input_window_length,
+            forecast_horizon=forecast_horizon,
+        )
+        self.training = _DummyTrainingConfig()
 
 
 class _DummyDataset:
-    def __init__(self, *, T: int = 40, N: int = 2):
-        self.config = _DummyConfig()
+    def __init__(
+        self,
+        *,
+        T: int = 40,
+        N: int = 2,
+        config: _DummyConfig | None = None,
+        masks: dict[str, np.ndarray] | None = None,
+    ):
+        self.config = config or _DummyConfig()
         self.time_range = (0, T)
         self.mobility_lags: list[int] = []
         self._temporal_coords = list(range(T))
@@ -64,26 +94,82 @@ class _DummyDataset:
         self._dataset = None
 
         values = np.linspace(0.1, 2.0, T * N, dtype=np.float64).reshape(T, N)
-        mask = np.ones((T, N), dtype=np.float64)
+        default_mask = np.ones((T, N), dtype=np.float64)
+        masks = masks or {}
+        hosp_mask = masks.get("hospitalizations", default_mask)
+        ww_mask = masks.get("wastewater", default_mask)
+        cases_mask = masks.get("cases", default_mask)
+        deaths_mask = masks.get("deaths", default_mask)
 
         self.precomputed_hosp = torch.tensor(values, dtype=torch.float32)
-        self.precomputed_hosp_mask = torch.tensor(mask, dtype=torch.float32)
+        self.precomputed_hosp_mask = torch.tensor(hosp_mask, dtype=torch.float32)
         self.precomputed_ww = torch.tensor(values + 0.2, dtype=torch.float32)
-        self.precomputed_ww_mask = torch.tensor(mask, dtype=torch.float32)
+        self.precomputed_ww_mask = torch.tensor(ww_mask, dtype=torch.float32)
         self.precomputed_cases_target = torch.tensor(values + 0.4, dtype=torch.float32)
-        self.precomputed_cases_mask = torch.tensor(mask, dtype=torch.float32)
+        self.precomputed_cases_mask = torch.tensor(cases_mask, dtype=torch.float32)
         self.precomputed_deaths = torch.tensor(values + 0.6, dtype=torch.float32)
-        self.precomputed_deaths_mask = torch.tensor(mask, dtype=torch.float32)
+        self.precomputed_deaths_mask = torch.tensor(deaths_mask, dtype=torch.float32)
 
 
-def test_generate_rolling_folds_has_no_leakage():
-    dataset = _DummyDataset(T=50)
-    folds = _generate_rolling_folds(dataset=dataset, rolling_folds=5)
-    assert folds, "expected at least one fold"
-    for fold in folds:
-        assert fold.train_end == fold.forecast_start
-        assert fold.forecast_start > fold.train_start
-        assert fold.forecast_end > fold.train_end
+def _weekly_mask(T: int, N: int, *, offset: int = 0) -> np.ndarray:
+    mask = np.zeros((T, N), dtype=np.float64)
+    mask[offset::7, :] = 1.0
+    return mask
+
+
+class _SameSliceLoader:
+    def __init__(self, batches: list[object]) -> None:
+        self._batches = batches
+        self.dataset = _DummyDataset(T=8, N=2)
+
+    def __iter__(self):
+        return iter(self._batches)
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+
+def _make_same_slice_batch() -> SimpleNamespace:
+    batch = SimpleNamespace(
+        target_node=torch.tensor([0, 1], dtype=torch.long),
+        window_start=torch.tensor([0, 1], dtype=torch.long),
+        hosp_hist=torch.tensor(
+            [
+                [[1.0, 1.0, 0.0], [2.0, 1.0, 0.0], [3.0, 1.0, 0.0]],
+                [[2.0, 1.0, 0.0], [3.0, 1.0, 0.0], [4.0, 1.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        cases_hist=torch.tensor(
+            [
+                [[1.0, 1.0, 0.0], [1.5, 1.0, 0.0], [2.0, 1.0, 0.0]],
+                [[2.0, 1.0, 0.0], [2.5, 1.0, 0.0], [3.0, 1.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        deaths_hist=torch.tensor(
+            [
+                [[0.5, 1.0, 0.0], [0.8, 1.0, 0.0], [1.0, 1.0, 0.0]],
+                [[1.0, 1.0, 0.0], [1.2, 1.0, 0.0], [1.4, 1.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        ww_hist=torch.tensor(
+            [[0.5, 0.7, 1.0], [1.0, 1.2, 1.4]],
+            dtype=torch.float32,
+        ),
+        ww_hist_mask=torch.ones((2, 3), dtype=torch.float32),
+        hosp_target=torch.tensor([[3.5, 4.0], [4.5, 5.0]], dtype=torch.float32),
+        hosp_target_mask=torch.ones((2, 2), dtype=torch.float32),
+        cases_target=torch.tensor([[2.5, 3.0], [3.5, 4.0]], dtype=torch.float32),
+        cases_target_mask=torch.ones((2, 2), dtype=torch.float32),
+        deaths_target=torch.tensor([[1.1, 1.2], [1.5, 1.6]], dtype=torch.float32),
+        deaths_target_mask=torch.ones((2, 2), dtype=torch.float32),
+        ww_target=torch.tensor([[1.1, 1.2], [1.5, 1.6]], dtype=torch.float32),
+        ww_target_mask=torch.ones((2, 2), dtype=torch.float32),
+    )
+    batch.to = lambda device, **_: batch
+    return batch
 
 
 def test_tiered_fallback_chain_deterministic_when_sparse(monkeypatch):
@@ -146,6 +232,48 @@ def test_exp_smoothing_fits_on_simple_seasonal_series():
     assert np.all(np.isfinite(result.predictions))
 
 
+def test_sarima_fallback_chain_deterministic_when_sparse() -> None:
+    train_values = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    train_mask = np.zeros(3, dtype=np.float64)
+    result = predict_with_sarima_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=2,
+        global_train_median=2.5,
+        seasonal_period=7,
+    )
+    assert result.model_name == "global_train_median"
+    assert result.fit_status == "fallback"
+    assert np.allclose(result.predictions, np.array([2.5, 2.5], dtype=np.float64))
+
+
+def test_sarima_falls_back_when_fit_returns_huge_finite_forecast(monkeypatch) -> None:
+    import evaluation.baseline_models as baseline_models
+
+    monkeypatch.setattr(
+        baseline_models,
+        "_fit_best_sarimax",
+        lambda **kwargs: (
+            np.array([1.0e200, 1.0e200], dtype=np.float64),
+            "order=(1, 1, 1);seasonal_order=(0, 0, 0, 7)",
+        ),
+    )
+
+    train_values = np.array([1.0, 2.0, 3.0, 4.0, 3.5, 3.0, 2.5], dtype=np.float64)
+    train_mask = np.ones_like(train_values, dtype=np.float64)
+    result = predict_with_sarima_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=2,
+        global_train_median=2.5,
+        seasonal_period=7,
+    )
+    assert result.model_name == "seasonal_naive_7d"
+    assert result.fit_status == "fallback"
+    assert "sarima_unavailable" in result.fallback_reason
+    assert np.allclose(result.predictions, np.array([1.0, 2.0], dtype=np.float64))
+
+
 def test_var_cross_target_predicts_jointly():
     rng = np.random.default_rng(42)
     train_values = np.zeros((48, 4), dtype=np.float64)
@@ -171,10 +299,26 @@ def test_var_cross_target_predicts_jointly():
     assert set(result.keys()) == set(target_names)
     for target in target_names:
         pred = result[target]
-        assert pred.model_name == "var_cross_target"
+        assert pred.model_name == "var"
         assert pred.fit_status == "fit_success"
         assert pred.predictions.shape == (3,)
         assert np.all(np.isfinite(pred.predictions))
+
+
+def test_predict_with_var_fallback_matches_canonical_target_order():
+    train_values = np.arange(48, dtype=np.float64).reshape(12, 4)
+    train_mask = np.ones_like(train_values, dtype=np.float64)
+    target_names = ["hospitalizations", "wastewater", "cases", "deaths"]
+    result = predict_with_var_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=2,
+        target_names=target_names,
+        global_train_medians=np.median(train_values, axis=0),
+        seasonal_period=7,
+        maxlags=4,
+    )
+    assert list(result) == target_names
 
 
 def test_var_cross_target_falls_back_to_univariate_when_var_unavailable(monkeypatch):
@@ -211,6 +355,14 @@ def test_var_cross_target_falls_back_to_univariate_when_var_unavailable(monkeypa
         )
 
 
+def test_resolve_baseline_models_includes_var() -> None:
+    assert _resolve_baseline_models(None) == ["sarima"]
+    assert _resolve_baseline_models(["var"]) == ["var"]
+    assert _resolve_baseline_models(["all"]) == ["exp_smoothing", "sarima", "var"]
+    with pytest.raises(ValueError, match="Unsupported baseline model"):
+        _resolve_baseline_models(["nope"])
+
+
 def test_masked_metrics_ignore_unobserved_points():
     pred = np.array([[10.0, 0.0], [0.0, 0.0]], dtype=np.float64)
     target = np.array([[0.0, 0.0], [0.0, 0.0]], dtype=np.float64)
@@ -222,54 +374,322 @@ def test_masked_metrics_ignore_unobserved_points():
     assert metrics.rmse == 0.0
 
 
-def test_run_tiered_baseline_writes_artifacts(tmp_path: Path, monkeypatch):
-    dataset = _DummyDataset(T=48, N=3)
-    dummy_loader = SimpleNamespace(dataset=dataset)
-
-    import evaluation.baseline_eval as baseline_eval
-
-    monkeypatch.setattr(
-        baseline_eval,
-        "build_loader_from_config",
-        lambda **kwargs: (dummy_loader, None),
+def test_compute_valid_node_mask_for_target_preserves_daily_behavior():
+    mask = np.ones((16, 2), dtype=np.float64)
+    target_view = SimpleNamespace(
+        spec=SimpleNamespace(target_name="cases", cadence_mode="daily"),
+        mask=mask,
     )
-
-    out_dir = tmp_path / "baseline"
-    artifacts = run_tiered_baseline_evaluation(
-        config=_DummyConfig(),
-        output_dir=out_dir,
-        split="test",
-        rolling_folds=3,
-        include_sparsity_bins=True,
+    permit_map = {
+        "input": {"cases": 0},
+        "horizon": {"cases": 0},
+    }
+    valid = _compute_valid_node_mask_for_target(
+        target_view=target_view,
+        forecast_start=8,
+        input_window_length=4,
+        horizon=4,
+        permit_map=permit_map,
     )
+    assert valid.tolist() == [True, True]
 
-    expected = [
-        "baseline_fold_metrics",
-        "baseline_aggregate_metrics",
-        "baseline_joint_loss_fold",
-        "baseline_joint_loss_aggregate",
-        "baseline_coverage",
-        "baseline_pair_details",
-        "baseline_vs_model_deltas",
-        "baseline_metadata",
-        "baseline_sparsity_stratified_metrics",
-    ]
-    for key in expected:
-        assert key in artifacts
-        assert artifacts[key].exists()
 
-    fold_df = pd.read_csv(artifacts["baseline_fold_metrics"])
-    assert set(["model", "target", "fold", "mae", "rmse", "r2"]).issubset(
-        fold_df.columns
+def test_compute_valid_node_mask_for_target_maps_weekly_permits():
+    weekly = _weekly_mask(84, 2)
+    target_view = SimpleNamespace(
+        spec=SimpleNamespace(
+            target_name="hospitalizations",
+            cadence_mode="weekly_observed_dates",
+        ),
+        mask=weekly,
     )
+    permit_map = {
+        "input": {"hospitalizations": 21},
+        "horizon": {"hospitalizations": 21},
+    }
+    valid = _compute_valid_node_mask_for_target(
+        target_view=target_view,
+        forecast_start=56,
+        input_window_length=28,
+        horizon=28,
+        permit_map=permit_map,
+    )
+    assert valid.tolist() == [True, True]
+
+    strict_map = {
+        "input": {"hospitalizations": 0},
+        "horizon": {"hospitalizations": 0},
+    }
+    strict_weekly = weekly.copy()
+    strict_weekly[56 + 14, 1] = 0.0
+    strict_view = SimpleNamespace(
+        spec=SimpleNamespace(
+            target_name="hospitalizations",
+            cadence_mode="weekly_observed_dates",
+        ),
+        mask=strict_weekly,
+    )
+    strict_valid = _compute_valid_node_mask_for_target(
+        target_view=strict_view,
+        forecast_start=56,
+        input_window_length=28,
+        horizon=28,
+        permit_map=strict_map,
+    )
+    assert strict_valid.tolist() == [True, False]
 
 
-def test_run_baseline_evaluation_multiple_models_writes_artifacts(
+def test_run_same_slice_baseline_evaluation_writes_eval_aligned_artifacts(
     tmp_path: Path,
     monkeypatch,
 ):
-    dataset = _DummyDataset(T=60, N=3)
-    dummy_loader = SimpleNamespace(dataset=dataset)
+    loader = _SameSliceLoader([_make_same_slice_batch()])
+
+    import evaluation.baseline_eval as baseline_eval
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice",
+        models=["exp_smoothing", "sarima"],
+        split="test",
+    )
+
+    granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    assert set(
+        [
+            "model",
+            "selected_model",
+            "split",
+            "target",
+            "node_id",
+            "window_start",
+            "horizon",
+            "target_index",
+            "target_date",
+        ]
+    ).issubset(granular_df.columns)
+    assert set(granular_df["model"].unique()) == {"sarima", "exp_smoothing"}
+
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    assert {"model", "target", "mae_mean", "rmse_mean", "r2_mean"}.issubset(
+        aggregate_df.columns
+    )
+    assert {"sarima", "exp_smoothing"}.issubset(set(aggregate_df["model"].astype(str)))
+
+    metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
+    assert metadata["comparison_scope"] == "same_eval_slice"
+
+
+def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+):
+    loader = _SameSliceLoader([_make_same_slice_batch()])
+
+    import evaluation.baseline_eval as baseline_eval
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice_var",
+        models=["var"],
+        split="test",
+    )
+
+    granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    usage_df = pd.read_csv(artifacts["baseline_model_usage"])
+    metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
+
+    assert set(granular_df["model"].unique()) == {"var"}
+    assert "selected_model" in granular_df.columns
+    assert set(aggregate_df["model"].unique()) == {"var"}
+    assert set(aggregate_df["target"].unique()) == {
+        "hospitalizations",
+        "wastewater",
+        "cases",
+        "deaths",
+    }
+    assert set(usage_df["model"].unique()) == {"var"}
+    assert metadata["models"] == ["var"]
+
+
+def test_run_same_slice_baseline_evaluation_var_usage_counts_fallbacks(
+    tmp_path: Path,
+    monkeypatch,
+):
+    loader = _SameSliceLoader([_make_same_slice_batch()])
+
+    import evaluation.baseline_eval as baseline_eval
+    import evaluation.baseline_models as baseline_models
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+    monkeypatch.setattr(baseline_models, "_fit_var_cross_target", lambda **kwargs: None)
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice_var_fallback",
+        models=["var"],
+        split="test",
+    )
+
+    usage_df = pd.read_csv(artifacts["baseline_model_usage"])
+    assert set(usage_df["model"].unique()) == {"var"}
+    assert set(usage_df["selected_model"].unique()) == {"exp_smoothing"}
+
+
+def test_run_same_slice_baseline_evaluation_skips_unstable_granular_rows(
+    tmp_path: Path,
+    monkeypatch,
+):
+    loader = _SameSliceLoader([_make_same_slice_batch()])
+
+    import evaluation.baseline_eval as baseline_eval
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+
+    def _huge_pred(*, train_values, horizon, **kwargs):
+        return SimpleNamespace(
+            model_name="sarima",
+            predictions=np.full(horizon, 1.0e200, dtype=np.float64),
+            fit_status="fit_success",
+            fallback_reason="",
+            model_order="order=(1, 1, 1)",
+        )
+
+    monkeypatch.setattr(baseline_eval, "_predict_univariate_baseline", _huge_pred)
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice_unstable",
+        models=["sarima"],
+        split="test",
+    )
+
+    granular_df = pd.read_csv(artifacts["baseline_granular"])
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    assert granular_df.empty
+    assert aggregate_df.empty
+
+
+def test_compute_metrics_from_granular_rows_filters_non_finite_values() -> None:
+    rows = pd.DataFrame(
+        [
+            {"observed": 1.0, "abs_error": 0.5, "sq_error": 0.25},
+            {"observed": np.inf, "abs_error": 1.0, "sq_error": 1.0},
+            {"observed": 2.0, "abs_error": np.nan, "sq_error": 4.0},
+            {"observed": 3.0, "abs_error": 1.5, "sq_error": np.inf},
+        ]
+    )
+
+    metrics = _compute_metrics_from_granular_rows(rows)
+    assert metrics["observed_count"] == pytest.approx(1.0)
+    assert metrics["mae"] == pytest.approx(0.5)
+    assert metrics["rmse"] == pytest.approx(0.5)
+
+
+def test_run_baseline_evaluation_delegates_to_same_slice_outputs(
+    tmp_path: Path,
+    monkeypatch,
+):
+    out_dir = tmp_path / "baseline_multi"
+    import evaluation.baseline_eval as baseline_eval
+
+    captured: dict[str, object] = {}
+
+    def _fake_run_same_slice_baseline_evaluation(**kwargs):
+        captured["kwargs"] = kwargs
+        output_dir = kwargs["output_dir"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        granular = output_dir / "baseline_granular.csv"
+        aggregate = output_dir / "baseline_aggregate_metrics.csv"
+        usage = output_dir / "baseline_model_usage.csv"
+        metadata = output_dir / "baseline_metadata.json"
+        granular.write_text("model,target\n", encoding="utf-8")
+        aggregate.write_text("model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8")
+        usage.write_text("model,selected_model,count\n", encoding="utf-8")
+        metadata.write_text('{"comparison_scope":"same_eval_slice"}', encoding="utf-8")
+        return {
+            "baseline_granular": granular,
+            "baseline_aggregate_metrics": aggregate,
+            "baseline_model_usage": usage,
+            "baseline_metadata": metadata,
+        }
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "run_same_slice_baseline_evaluation",
+        _fake_run_same_slice_baseline_evaluation,
+    )
+
+    artifacts = run_baseline_evaluation(
+        config=_DummyConfig(),
+        output_dir=out_dir,
+        models=["exp_smoothing", "sarima"],
+        split="test",
+    )
+    assert set(artifacts) == {
+        "baseline_granular",
+        "baseline_aggregate_metrics",
+        "baseline_model_usage",
+        "baseline_metadata",
+    }
+    assert captured["kwargs"]["models"] == ["exp_smoothing", "sarima"]
+
+
+def test_run_baseline_evaluation_weekly_heads_use_observed_cadence(
+    tmp_path: Path,
+    monkeypatch,
+):
+    permits = {
+        "input": {
+            "cases": 0,
+            "hospitalizations": 21,
+            "deaths": 0,
+            "wastewater": 21,
+        },
+        "horizon": {
+            "cases": 0,
+            "hospitalizations": 21,
+            "deaths": 0,
+            "wastewater": 21,
+        },
+    }
+    config = _DummyConfig(
+        permits=permits,
+        input_window_length=28,
+        forecast_horizon=28,
+    )
+    dataset = _DummyDataset(
+        T=140,
+        N=3,
+        config=config,
+        masks={
+            "hospitalizations": _weekly_mask(140, 3),
+            "wastewater": _weekly_mask(140, 3, offset=2),
+        },
+    )
+    dummy_loader = _SameSliceLoader([_make_same_slice_batch()])
+    dummy_loader.dataset = dataset
 
     import evaluation.baseline_eval as baseline_eval
 
@@ -279,66 +699,54 @@ def test_run_baseline_evaluation_multiple_models_writes_artifacts(
         lambda **kwargs: (dummy_loader, None),
     )
 
-    out_dir = tmp_path / "baseline_multi"
+    out_dir = tmp_path / "baseline_weekly"
     artifacts = run_baseline_evaluation(
-        config=_DummyConfig(),
+        config=config,
         output_dir=out_dir,
-        models=["tiered", "exp_smoothing", "var_cross_target"],
+        models=["sarima"],
         split="test",
-        rolling_folds=2,
-        include_sparsity_bins=True,
     )
-    assert artifacts["baseline_fold_metrics"].exists()
-    assert artifacts["baseline_joint_loss_fold"].exists()
-    assert artifacts["baseline_joint_loss_aggregate"].exists()
-    fold_df = pd.read_csv(artifacts["baseline_fold_metrics"])
-    joint_fold_df = pd.read_csv(artifacts["baseline_joint_loss_fold"])
-    assert {"tiered", "exp_smoothing", "var_cross_target"}.issubset(
-        set(fold_df["model"].unique())
-    )
-    assert {"joint_obs_loss_total", "joint_loss_hosp_weighted"}.issubset(
-        set(joint_fold_df.columns)
-    )
+
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
+    hosp_row = aggregate_df[
+        (aggregate_df["model"] == "sarima")
+        & (aggregate_df["target"] == "hospitalizations")
+    ].iloc[0]
+    ww_row = aggregate_df[
+        (aggregate_df["model"] == "sarima")
+        & (aggregate_df["target"] == "wastewater")
+    ].iloc[0]
+    assert hosp_row["observed_count_mean"] > 0
+    assert ww_row["observed_count_mean"] > 0
+    assert metadata["comparison_scope"] == "same_eval_slice"
+    assert metadata["models"] == ["sarima"]
 
 
 def test_compare_model_metrics_against_baselines(tmp_path: Path):
-    baseline_csv = tmp_path / "baseline_fold_metrics.csv"
-    # Provide fold-level data that the function aggregates
+    baseline_csv = tmp_path / "baseline_aggregate_metrics.csv"
     pd.DataFrame(
         [
-            # Fold 0
             {
-                "model": "tiered",
+                "model": "sarima",
                 "target": "hospitalizations",
-                "fold": 0,
-                "mae": 0.9,
-                "rmse": 1.9,
-                "r2": 0.2,
+                "mae_mean": 1.0,
+                "rmse_mean": 2.0,
+                "r2_mean": 0.1,
             },
             {
-                "model": "tiered",
+                "model": "sarima",
                 "target": "cases",
-                "fold": 0,
-                "mae": 1.4,
-                "rmse": 2.4,
-                "r2": 0.25,
+                "mae_mean": 1.5,
+                "rmse_mean": 2.5,
+                "r2_mean": 0.2,
             },
-            # Fold 1
             {
-                "model": "tiered",
+                "model": "exp_smoothing",
                 "target": "hospitalizations",
-                "fold": 1,
-                "mae": 1.1,
-                "rmse": 2.1,
-                "r2": 0.0,
-            },
-            {
-                "model": "tiered",
-                "target": "cases",
-                "fold": 1,
-                "mae": 1.6,
-                "rmse": 2.6,
-                "r2": 0.15,
+                "mae_mean": 0.8,
+                "rmse_mean": 1.8,
+                "r2_mean": 0.3,
             },
         ]
     ).to_csv(baseline_csv, index=False)
@@ -366,54 +774,51 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
     deltas = pd.read_csv(output_csv)
     assert not deltas.empty
     hosp_mae = deltas[
-        (deltas["target"] == "hospitalizations") & (deltas["metric"] == "mae")
+        (deltas["target"] == "hospitalizations")
+        & (deltas["metric"] == "mae")
+        & (deltas["baseline_model"] == "sarima")
     ]["delta_model_minus_baseline"].iloc[0]
     assert hosp_mae == pytest.approx(-0.1)
 
 
-def test_compare_model_metrics_against_joint_baseline_aggregate(tmp_path: Path):
-    baseline_csv = tmp_path / "baseline_joint_loss_fold.csv"
-    # Provide fold-level data that the function aggregates
+def test_compare_model_metrics_against_same_slice_baselines_uses_direct_aggregate(
+    tmp_path: Path,
+):
+    baseline_dir = tmp_path / "baseline_same_slice"
+    baseline_dir.mkdir()
+    baseline_csv = baseline_dir / "baseline_aggregate_metrics.csv"
     pd.DataFrame(
         [
-            # Fold 0
             {
-                "model": "tiered",
-                "fold": 0,
-                "joint_obs_loss_total": 1.3,
-                "joint_loss_ww_weighted": 0.25,
-                "joint_loss_hosp_weighted": 0.35,
-                "joint_loss_cases_weighted": 0.45,
-                "joint_loss_deaths_weighted": 0.25,
-            },
-            # Fold 1
-            {
-                "model": "tiered",
-                "fold": 1,
-                "joint_obs_loss_total": 1.5,
-                "joint_loss_ww_weighted": 0.35,
-                "joint_loss_hosp_weighted": 0.45,
-                "joint_loss_cases_weighted": 0.55,
-                "joint_loss_deaths_weighted": 0.15,
-            },
+                "model": "sarima",
+                "target": "cases",
+                "mae_mean": 0.8,
+                "rmse_mean": 1.2,
+                "r2_mean": 0.4,
+            }
         ]
     ).to_csv(baseline_csv, index=False)
+    (baseline_dir / "baseline_metadata.json").write_text(
+        json.dumps({"comparison_scope": "same_eval_slice"}),
+        encoding="utf-8",
+    )
 
-    output_csv = tmp_path / "joint_deltas.csv"
-    eval_metrics = {
-        "loss_ww_weighted": 0.2,
-        "loss_hosp_weighted": 0.35,
-        "loss_cases_weighted": 0.45,
-        "loss_deaths_weighted": 0.25,
-    }
+    output_csv = tmp_path / "same_slice_deltas.csv"
     compare_model_metrics_against_baselines(
-        eval_metrics=eval_metrics,
+        eval_metrics={
+            "mae_cases_log1p_per_100k": 0.5,
+            "rmse_cases_log1p_per_100k": 0.9,
+            "r2_cases_log1p_per_100k": 0.6,
+        },
         baseline_results_csv=baseline_csv,
         output_csv=output_csv,
+        candidate_granular_csv=tmp_path / "missing_candidate.csv",
     )
+
     deltas = pd.read_csv(output_csv)
-    joint_total = deltas[
-        (deltas["target"] == "joint_observation")
-        & (deltas["metric"] == "joint_obs_loss_total")
+    cases_r2 = deltas[
+        (deltas["target"] == "cases")
+        & (deltas["baseline_model"] == "sarima")
+        & (deltas["metric"] == "r2")
     ]["delta_model_minus_baseline"].iloc[0]
-    assert joint_total == pytest.approx(-0.15)
+    assert cases_r2 == pytest.approx(0.2)

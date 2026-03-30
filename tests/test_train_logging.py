@@ -144,16 +144,14 @@ def test_build_epoch_logging_bundle_includes_payload_and_status_lines() -> None:
     sampler = SimpleNamespace(state=SimpleNamespace(max_sparsity=0.2, synth_ratio=0.4))
     metrics = {
         "mae": 0.1,
-        "rmse": 0.2,
-        "r2": 0.4,
         "loss_ww": 1.0,
         "loss_hosp": 2.0,
         "loss_sir": 3.0,
         "loss_ww_weighted": 0.1,
         "loss_hosp_weighted": 0.2,
         "loss_sir_weighted": 0.3,
-        "mae_per_h": [0.11, 0.12],
-        "rmse_per_h": [0.21, 0.22],
+        "mae_hosp_per_h": [0.11, 0.12],
+        "rmse_hosp_per_h": [0.21, 0.22],
     }
 
     log_data, status_lines = build_epoch_logging_bundle(
@@ -172,7 +170,7 @@ def test_build_epoch_logging_bundle_includes_payload_and_status_lines() -> None:
     assert log_data["train_sparsity_epoch"] == 0.2
     assert log_data["train_synth_ratio_epoch"] == 0.4
 
-    assert status_lines[0].startswith("Val loss:")
+    assert status_lines[0] == "Val loss: 1.23 | Joint Obs Loss: 0.1"
     assert any("Val loss components:" in line for line in status_lines)
     assert any("Val MAE_h1" in line for line in status_lines)
 

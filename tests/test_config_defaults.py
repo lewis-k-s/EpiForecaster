@@ -8,6 +8,8 @@ def test_observation_heads_default_weekly_kernels_frozen() -> None:
     cfg = ObservationHeadConfig()
     assert cfg.learnable_kernel_ww is False
     assert cfg.learnable_kernel_hosp is False
+    assert cfg.kernel_parameterization_ww == "simplex"
+    assert cfg.kernel_parameterization_hosp == "simplex"
     assert cfg.anchor_mode == "last_valid_step"
 
 

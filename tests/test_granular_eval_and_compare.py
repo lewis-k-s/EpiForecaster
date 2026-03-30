@@ -5,10 +5,12 @@ from types import SimpleNamespace
 
 import logging
 import math
+import json
 import pandas as pd
 import pytest
 import torch
 
+import dataviz.granular_comparison as granular_comparison_module
 import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
@@ -23,6 +25,8 @@ class _DummyDataset:
         self._region_labels = ["Region A", "08002"]
         self._region_name_source = Path("/tmp/regions.geojson")
         self.run_id = "real"
+        self._run_id_value = "real"
+        self.node_static_covariates = {"Pop": torch.tensor([1000.0, 10000.0])}
 
     def __len__(self) -> int:
         return 2
@@ -107,6 +111,15 @@ def _assert_metric_dicts_match(
         assert left_value == pytest.approx(right_value)
 
 
+def _assert_nested_node_mae_match(
+    left: dict[str, dict[int, float]],
+    right: dict[str, dict[int, float]],
+) -> None:
+    assert left.keys() == right.keys()
+    for target in left:
+        assert left[target] == pytest.approx(right[target])
+
+
 def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -125,6 +138,7 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     )
 
     granular_csv = tmp_path / "eval_granular.csv"
+    per_head_csv = tmp_path / "eval_node_metrics_per_head.csv"
     with caplog.at_level(logging.INFO):
         granular_loss, granular_metrics, granular_node_mae = evaluate_loader(
             model=model,
@@ -133,15 +147,18 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
             horizon=2,
             device=torch.device("cpu"),
             granular_csv_path=granular_csv,
+            per_head_node_metrics_csv_path=per_head_csv,
             granular_metadata={"max_batches": 50},
             log_every=1,
         )
 
     assert granular_loss == pytest.approx(baseline_loss)
     _assert_metric_dicts_match(granular_metrics, baseline_metrics)
-    assert granular_node_mae == pytest.approx(baseline_node_mae)
+    _assert_nested_node_mae_match(granular_node_mae, baseline_node_mae)
     assert any("stage=batch_fetched" in record.message for record in caplog.records)
-    assert any("stage=granular_write_complete" in record.message for record in caplog.records)
+    assert any(
+        "stage=granular_write_complete" in record.message for record in caplog.records
+    )
 
     df = pd.read_csv(granular_csv, dtype={"region_id": str})
     assert list(df.columns) == [
@@ -208,6 +225,43 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     assert "val_split" in meta.index
     assert "test_split" in meta.index
 
+    per_head_df = pd.read_csv(per_head_csv, dtype={"region_id": str})
+    assert list(per_head_df.columns) == [
+        "target",
+        "node_id",
+        "region_id",
+        "region_label",
+        "population",
+        "observed_count",
+        "mae",
+        "rmse",
+    ]
+    assert len(per_head_df) == 8
+
+    hosp_row = per_head_df[
+        (per_head_df["target"] == "hospitalizations") & (per_head_df["node_id"] == 0)
+    ].iloc[0]
+    assert hosp_row["region_id"] == "08001"
+    assert hosp_row["region_label"] == "Region A"
+    assert hosp_row["population"] == pytest.approx(1000.0)
+    assert hosp_row["observed_count"] == 2
+    assert hosp_row["mae"] == pytest.approx(0.25)
+    assert hosp_row["rmse"] == pytest.approx(math.sqrt(0.125))
+
+    deaths_row = per_head_df[
+        (per_head_df["target"] == "deaths") & (per_head_df["node_id"] == 1)
+    ].iloc[0]
+    assert deaths_row["observed_count"] == 1
+    assert deaths_row["mae"] == pytest.approx(1.0)
+
+    per_head_meta = json.loads(
+        per_head_csv.with_suffix(".csv.meta.json").read_text(encoding="utf-8")
+    )
+    assert per_head_meta["schema_version"] == "1"
+    assert per_head_meta["dataset_path"] == "/tmp/dummy-dataset.zarr"
+    assert per_head_meta["run_id"] == "real"
+    assert per_head_meta["split"] == "eval"
+
 
 class _ExplodingModel(_DummyModel):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
@@ -247,7 +301,9 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
 ) -> None:
     model = _DummyModel()
     config = SimpleNamespace(
-        data=SimpleNamespace(dataset_path=Path("/tmp/dummy-dataset.zarr"), window_stride=7),
+        data=SimpleNamespace(
+            dataset_path=Path("/tmp/dummy-dataset.zarr"), window_stride=7
+        ),
         model=SimpleNamespace(forecast_horizon=2, input_window_length=3),
         output=SimpleNamespace(
             write_granular_eval=True,
@@ -307,7 +363,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
 
     def _fake_evaluate_loader(**kwargs):  # noqa: ANN001
         captured["evaluate_kwargs"] = kwargs
-        return 1.25, {"mae": 2.5}, {1: 0.5}
+        return 1.25, {"mae": 2.5}, {"hospitalizations": {1: 0.5}}
 
     monkeypatch.setattr(
         eval_loop_module,
@@ -335,6 +391,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         split="test",
         device="cpu",
         overrides=["training.device=cpu", "training.prefetch_factor=2"],
+        per_head_node_metrics_csv_path=tmp_path / "test_node_metrics_per_head.csv",
         batch_size=8,
         num_workers=0,
         pin_memory=False,
@@ -354,9 +411,16 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         "prefetch_factor": 0,
     }
     assert captured["evaluate_kwargs"]["log_every"] == 3
+    assert (
+        captured["evaluate_kwargs"]["per_head_node_metrics_csv_path"]
+        == tmp_path / "test_node_metrics_per_head.csv"
+    )
     assert captured["evaluate_kwargs"]["granular_metadata"]["eval_num_workers"] == 0
-    assert captured["evaluate_kwargs"]["granular_metadata"]["eval_prefetch_factor"] is None
+    assert (
+        captured["evaluate_kwargs"]["granular_metadata"]["eval_prefetch_factor"] is None
+    )
     assert captured["evaluate_kwargs"]["granular_metadata"]["eval_pin_memory"] is False
+    assert captured["evaluate_kwargs"]["node_metrics_target"] == "hospitalizations"
 
 
 def _write_granular_fixture(path: Path, rows: list[dict[str, object]]) -> None:
@@ -450,7 +514,7 @@ def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> Non
     assert region_row["candidate_rmse"] == pytest.approx((5.0) ** 0.5)
 
     expected_plots = [
-        "region_time_heatmap.png",
+        "region_time_heatmap_cases.png",
         "rolling_time_uplift.png",
         "horizon_uplift_curve.png",
         "region_gain_loss_bars.png",
@@ -459,6 +523,293 @@ def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> Non
     ]
     for plot_name in expected_plots:
         assert (output_dir / plot_name).exists()
+
+
+def test_compare_granular_csvs_excludes_missing_targets(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    baseline_csv = tmp_path / "baseline.csv"
+    candidate_csv = tmp_path / "candidate.csv"
+
+    baseline_rows = [
+        {
+            "split": "test",
+            "target": "cases",
+            "node_id": 1,
+            "region_id": "08001",
+            "region_label": "region-a",
+            "window_start": 0,
+            "window_start_date": "2024-01-01",
+            "horizon": 1,
+            "target_index": 3,
+            "target_date": "2024-01-04",
+            "observed": 10.0,
+            "abs_error": 2.0,
+            "sq_error": 4.0,
+            "smape_num": 4.0,
+            "smape_den": 20.0,
+        },
+        {
+            "split": "test",
+            "target": "deaths",
+            "node_id": 1,
+            "region_id": "08001",
+            "region_label": "region-a",
+            "window_start": 0,
+            "window_start_date": "2024-01-01",
+            "horizon": 1,
+            "target_index": 3,
+            "target_date": "2024-01-04",
+            "observed": 3.0,
+            "abs_error": 1.0,
+            "sq_error": 1.0,
+            "smape_num": 2.0,
+            "smape_den": 6.0,
+        },
+    ]
+    candidate_rows = [
+        {
+            **baseline_rows[0],
+            "abs_error": 1.0,
+            "sq_error": 1.0,
+            "smape_num": 2.0,
+            "smape_den": 20.0,
+        }
+    ]
+
+    _write_granular_fixture(baseline_csv, baseline_rows)
+    _write_granular_fixture(candidate_csv, candidate_rows)
+
+    caplog.set_level(logging.WARNING, logger="granular_comparison")
+    artifacts = compare_granular_csvs(
+        baseline_csv=baseline_csv,
+        candidate_csv=candidate_csv,
+        output_dir=tmp_path / "compare",
+    )
+
+    assert artifacts["matched_rows"] == 1
+    assert artifacts["filtered_baseline_rows"] == 1
+    assert artifacts["filtered_candidate_rows"] == 1
+    assert artifacts["excluded_targets"] == {
+        "deaths": {"baseline_rows": 1, "candidate_rows": 0}
+    }
+    assert "Excluding targets not present in both datasets" in caplog.text
+    assert "deaths (baseline=1, candidate=0)" in caplog.text
+
+    paired_df = pd.read_csv(tmp_path / "compare" / "paired_row_deltas.csv")
+    assert paired_df["target"].tolist() == ["cases"]
+
+    target_df = pd.read_csv(tmp_path / "compare" / "target_aggregates.csv")
+    assert target_df["target"].tolist() == ["cases"]
+
+
+def test_compare_granular_csvs_excludes_unmatched_seeds(
+    tmp_path: Path,
+) -> None:
+    baseline_csv = tmp_path / "baseline.csv"
+    candidate_csv = tmp_path / "candidate.csv"
+
+    baseline_rows = [
+        {
+            "split": "test",
+            "target": "cases",
+            "node_id": 1,
+            "region_id": "08001",
+            "region_label": "region-a",
+            "window_start": 0,
+            "window_start_date": "2024-01-01",
+            "horizon": 1,
+            "target_index": 3,
+            "target_date": "2024-01-04",
+            "observed": 10.0,
+            "abs_error": 2.0,
+            "sq_error": 4.0,
+            "smape_num": 4.0,
+            "smape_den": 20.0,
+            "seed": 1,
+        },
+        {
+            "split": "test",
+            "target": "cases",
+            "node_id": 1,
+            "region_id": "08001",
+            "region_label": "region-a",
+            "window_start": 0,
+            "window_start_date": "2024-01-01",
+            "horizon": 1,
+            "target_index": 3,
+            "target_date": "2024-01-04",
+            "observed": 10.0,
+            "abs_error": 3.0,
+            "sq_error": 9.0,
+            "smape_num": 6.0,
+            "smape_den": 20.0,
+            "seed": 2,
+        },
+    ]
+    candidate_rows = [
+        {
+            **baseline_rows[0],
+            "abs_error": 1.0,
+            "sq_error": 1.0,
+            "smape_num": 2.0,
+        }
+    ]
+
+    _write_granular_fixture(baseline_csv, baseline_rows)
+    _write_granular_fixture(candidate_csv, candidate_rows)
+
+    artifacts = compare_granular_csvs(
+        baseline_csv=baseline_csv,
+        candidate_csv=candidate_csv,
+        output_dir=tmp_path / "compare",
+    )
+
+    assert artifacts["matched_rows"] == 1
+    assert artifacts["excluded_seeds"] == {2: {"baseline_rows": 1, "candidate_rows": 0}}
+
+    paired_df = pd.read_csv(tmp_path / "compare" / "paired_row_deltas.csv")
+    assert paired_df["seed"].tolist() == [1]
+
+
+def test_filter_top_regions_by_count_aligns_region_views() -> None:
+    region_df = pd.DataFrame(
+        [
+            {
+                "target": "cases",
+                "region_label": "region-a",
+                "count": 10,
+                "mae_pct_change": 5.0,
+            },
+            {
+                "target": "cases",
+                "region_label": "region-b",
+                "count": 9,
+                "mae_pct_change": -4.0,
+            },
+            {
+                "target": "cases",
+                "region_label": "region-c",
+                "count": 2,
+                "mae_pct_change": -30.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-x",
+                "count": 7,
+                "mae_pct_change": 8.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-y",
+                "count": 5,
+                "mae_pct_change": -6.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-z",
+                "count": 1,
+                "mae_pct_change": 20.0,
+            },
+        ]
+    )
+    region_time_df = pd.DataFrame(
+        [
+            {
+                "target": "cases",
+                "region_label": "region-a",
+                "target_date": "2024-01-01",
+                "count": 6,
+                "mae_pct_change": 1.0,
+            },
+            {
+                "target": "cases",
+                "region_label": "region-a",
+                "target_date": "2024-01-02",
+                "count": 4,
+                "mae_pct_change": 2.0,
+            },
+            {
+                "target": "cases",
+                "region_label": "region-b",
+                "target_date": "2024-01-01",
+                "count": 4,
+                "mae_pct_change": -1.0,
+            },
+            {
+                "target": "cases",
+                "region_label": "region-b",
+                "target_date": "2024-01-02",
+                "count": 5,
+                "mae_pct_change": -2.0,
+            },
+            {
+                "target": "cases",
+                "region_label": "region-c",
+                "target_date": "2024-01-01",
+                "count": 2,
+                "mae_pct_change": -10.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-x",
+                "target_date": "2024-01-01",
+                "count": 3,
+                "mae_pct_change": 6.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-x",
+                "target_date": "2024-01-02",
+                "count": 4,
+                "mae_pct_change": 7.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-y",
+                "target_date": "2024-01-01",
+                "count": 2,
+                "mae_pct_change": -4.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-y",
+                "target_date": "2024-01-02",
+                "count": 3,
+                "mae_pct_change": -5.0,
+            },
+            {
+                "target": "deaths",
+                "region_label": "region-z",
+                "target_date": "2024-01-01",
+                "count": 1,
+                "mae_pct_change": 12.0,
+            },
+        ]
+    )
+
+    filtered_regions = granular_comparison_module._filter_top_regions_by_count(
+        region_df,
+        top_regions=2,
+    )
+    filtered_region_time = granular_comparison_module._filter_top_regions_by_count(
+        region_time_df,
+        top_regions=2,
+    )
+
+    assert set(
+        filtered_regions[filtered_regions["target"] == "cases"]["region_label"]
+    ) == {"region-a", "region-b"}
+    assert set(
+        filtered_region_time[filtered_region_time["target"] == "cases"]["region_label"]
+    ) == {"region-a", "region-b"}
+    assert set(
+        filtered_regions[filtered_regions["target"] == "deaths"]["region_label"]
+    ) == {"region-x", "region-y"}
+    assert set(
+        filtered_region_time[filtered_region_time["target"] == "deaths"]["region_label"]
+    ) == {"region-x", "region-y"}
 
 
 def test_compare_granular_csvs_fails_on_poor_join_coverage(tmp_path: Path) -> None:
@@ -528,6 +879,63 @@ def test_compare_granular_csvs_fails_on_poor_join_coverage(tmp_path: Path) -> No
     )
 
     with pytest.raises(ValueError, match="Granular join coverage below threshold"):
+        compare_granular_csvs(
+            baseline_csv=baseline_csv,
+            candidate_csv=candidate_csv,
+            output_dir=tmp_path / "compare",
+        )
+
+
+def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> None:
+    baseline_csv = tmp_path / "baseline.csv"
+    candidate_csv = tmp_path / "candidate.csv"
+
+    _write_granular_fixture(
+        baseline_csv,
+        [
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "region_id": "08001",
+                "region_label": "region-a",
+                "window_start": 0,
+                "window_start_date": "2024-01-01",
+                "horizon": 1,
+                "target_index": 3,
+                "target_date": "2024-01-04",
+                "observed": 10.0,
+                "abs_error": 2.0,
+                "sq_error": 4.0,
+                "smape_num": 4.0,
+                "smape_den": 20.0,
+            }
+        ],
+    )
+    _write_granular_fixture(
+        candidate_csv,
+        [
+            {
+                "split": "test",
+                "target": "deaths",
+                "node_id": 1,
+                "region_id": "08001",
+                "region_label": "region-a",
+                "window_start": 0,
+                "window_start_date": "2024-01-01",
+                "horizon": 1,
+                "target_index": 3,
+                "target_date": "2024-01-04",
+                "observed": 1.0,
+                "abs_error": 1.0,
+                "sq_error": 1.0,
+                "smape_num": 2.0,
+                "smape_den": 2.0,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires at least one common target"):
         compare_granular_csvs(
             baseline_csv=baseline_csv,
             candidate_csv=candidate_csv,

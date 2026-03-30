@@ -21,6 +21,7 @@ def _write_crossval_run(
     run_id: str,
     *,
     seed: int,
+    fold_index: int | None = None,
     learning_rate: float = 1e-3,
     metric_offset: float = 0.0,
 ) -> Path:
@@ -32,6 +33,10 @@ def _write_crossval_run(
             "seed": seed,
             "epochs": 50,
             "split_strategy": "node",
+            "crossval_enabled": fold_index is not None,
+            "crossval_num_folds": 5 if fold_index is not None else None,
+            "crossval_fold_index": fold_index,
+            "node_split_strategy": "crossval" if fold_index is not None else "random",
             "learning_rate": learning_rate,
         },
         "output": {
@@ -170,8 +175,8 @@ def test_collect_crossval_runs_filters_campaign(tmp_path: Path) -> None:
 def test_validate_crossval_run_consistency_accepts_seed_only_variation(
     tmp_path: Path,
 ) -> None:
-    _write_crossval_run(tmp_path, "camp_ok", "run_1", seed=42)
-    _write_crossval_run(tmp_path, "camp_ok", "run_2", seed=43)
+    _write_crossval_run(tmp_path, "camp_ok", "run_1", seed=42, fold_index=0)
+    _write_crossval_run(tmp_path, "camp_ok", "run_2", seed=42, fold_index=1)
     runs, _ = collect_crossval_runs(tmp_path, "camp_ok")
 
     _config, fingerprint = validate_crossval_run_consistency(
@@ -208,8 +213,12 @@ def test_validate_crossval_run_consistency_rejects_config_drift(tmp_path: Path) 
 
 
 def test_analyze_crossval_campaign_writes_expected_outputs(tmp_path: Path) -> None:
-    _write_crossval_run(tmp_path, "camp_z", "run_1", seed=42, metric_offset=0.0)
-    _write_crossval_run(tmp_path, "camp_z", "run_2", seed=43, metric_offset=0.2)
+    _write_crossval_run(
+        tmp_path, "camp_z", "run_1", seed=42, fold_index=0, metric_offset=0.0
+    )
+    _write_crossval_run(
+        tmp_path, "camp_z", "run_2", seed=42, fold_index=1, metric_offset=0.2
+    )
 
     output_dir = tmp_path / "reports"
     artifacts = analyze_crossval_campaign(
@@ -233,4 +242,4 @@ def test_analyze_crossval_campaign_writes_expected_outputs(tmp_path: Path) -> No
     metadata = json.loads(Path(artifacts["crossval_metadata"]).read_text())
     assert metadata["campaign_id"] == "camp_z"
     assert metadata["fold_count"] == 2
-    assert metadata["seeds"] == [42, 43]
+    assert metadata["seeds"] == [42, 42]

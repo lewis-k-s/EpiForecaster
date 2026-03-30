@@ -26,8 +26,12 @@ def _build_config(
     *,
     node_split_strategy: str,
     node_split_population_bins: int = 5,
+    node_split_biomarker_bins: int = 3,
     use_valid_targets: bool = True,
     seed: int = 42,
+    crossval_enabled: bool = False,
+    crossval_num_folds: int = 5,
+    crossval_fold_index: int = 0,
 ) -> EpiForecasterConfig:
     return EpiForecasterConfig(
         model=ModelConfig(
@@ -55,6 +59,10 @@ def _build_config(
             split_strategy="node",
             node_split_strategy=node_split_strategy,
             node_split_population_bins=node_split_population_bins,
+            node_split_biomarker_bins=node_split_biomarker_bins,
+            crossval_enabled=crossval_enabled,
+            crossval_num_folds=crossval_num_folds,
+            crossval_fold_index=crossval_fold_index,
             loss=LossConfig(name="joint_inference"),
             curriculum=CurriculumConfig(enabled=False),
             enable_mixed_precision=False,
@@ -81,6 +89,7 @@ def _write_node_split_dataset(
     biomarker_data_start = np.full(total_nodes, -1, dtype=np.int16)
     valid_targets = np.ones(total_nodes, dtype=bool)
     strata_by_node: dict[int, tuple[int, int]] = {}
+    biomarker_fraction_by_node: dict[int, int] = {}
 
     node_idx = 0
     for pop_bin in range(population_levels):
@@ -91,9 +100,21 @@ def _write_node_split_dataset(
                 biomarker_data_start[node_idx] = 0 if has_wastewater else -1
                 valid_targets[node_idx] = node_idx not in invalid_nodes
                 strata_by_node[node_idx] = (pop_bin, has_wastewater)
+                biomarker_fraction_by_node[node_idx] = offset % 5
                 node_idx += 1
 
     cases = np.ones((1, date_count, total_nodes), dtype=np.float32)
+    n1_mask = np.zeros((1, date_count, total_nodes), dtype=bool)
+    n2_mask = np.zeros((1, date_count, total_nodes), dtype=bool)
+    for node_idx in range(total_nodes):
+        if biomarker_data_start[node_idx] < 0:
+            continue
+        observed_steps = biomarker_fraction_by_node[node_idx]
+        if observed_steps > 0:
+            n1_mask[0, :observed_steps, node_idx] = True
+        if observed_steps > 2:
+            n2_mask[0, : observed_steps - 2, node_idx] = True
+
     coords = {
         "run_id": np.array(["real"], dtype=object),
         "date": np.arange(date_count),
@@ -107,6 +128,8 @@ def _write_node_split_dataset(
             ("run_id", "region_id"),
             biomarker_data_start[np.newaxis, :],
         ),
+        "edar_biomarker_N1_mask": (("run_id", "date", "region_id"), n1_mask),
+        "edar_biomarker_N2_mask": (("run_id", "date", "region_id"), n2_mask),
     }
     if include_edar_has_source:
         data_vars["edar_has_source"] = (("region_id",), edar_has_source)
@@ -162,6 +185,16 @@ def test_split_nodes_by_ratio_stratified_balances_population_and_wastewater(
     assert _count_strata(test_nodes, strata_by_node) == expected_test
 
 
+def _coverage_bins_for_nodes(
+    nodes: list[int], metadata_bins: np.ndarray
+) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for node in nodes:
+        key = int(metadata_bins[node])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 @pytest.mark.epiforecaster
 def test_split_nodes_by_ratio_respects_valid_targets_filter(tmp_path: Path) -> None:
     invalid_nodes = {8, 9, 18, 19}
@@ -197,3 +230,137 @@ def test_split_nodes_by_ratio_stratified_falls_back_to_biomarker_metadata(
     assert _count_strata(train_nodes, strata_by_node) == expected_train
     assert _count_strata(val_nodes, strata_by_node) == expected_val
     assert _count_strata(test_nodes, strata_by_node) == expected_test
+
+
+@pytest.mark.epiforecaster
+def test_split_nodes_by_ratio_crossval_is_deterministic(tmp_path: Path) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(tmp_path)
+    config = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        seed=17,
+        crossval_enabled=True,
+        crossval_num_folds=5,
+        crossval_fold_index=2,
+    )
+
+    split_a = split_nodes_by_ratio(config)
+    split_b = split_nodes_by_ratio(config)
+
+    assert split_a == split_b
+
+
+@pytest.mark.epiforecaster
+def test_split_nodes_by_ratio_crossval_distributes_all_nodes_across_folds(
+    tmp_path: Path,
+) -> None:
+    dataset_path, _strata_by_node, valid_targets = _write_node_split_dataset(tmp_path)
+    all_nodes: set[int] = set()
+    held_out_nodes: set[int] = set()
+    per_fold_test_sizes: list[int] = []
+
+    for fold_idx in range(5):
+        config = _build_config(
+            dataset_path,
+            node_split_strategy="crossval",
+            seed=17,
+            crossval_enabled=True,
+            crossval_num_folds=5,
+            crossval_fold_index=fold_idx,
+        )
+        train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(config)
+
+        split_nodes = set(train_nodes) | set(val_nodes) | set(test_nodes)
+        assert split_nodes == set(range(int(valid_targets.sum())))
+        assert set(train_nodes).isdisjoint(val_nodes)
+        assert set(train_nodes).isdisjoint(test_nodes)
+        assert set(val_nodes).isdisjoint(test_nodes)
+
+        all_nodes |= split_nodes
+        held_out_nodes |= set(test_nodes)
+        per_fold_test_sizes.append(len(test_nodes))
+
+    assert all_nodes == set(range(int(valid_targets.sum())))
+    assert held_out_nodes == set(range(int(valid_targets.sum())))
+    assert min(per_fold_test_sizes) >= 19
+    assert max(per_fold_test_sizes) <= 21
+
+
+@pytest.mark.epiforecaster
+def test_split_nodes_by_ratio_crossval_balances_biomarker_coverage_bins(
+    tmp_path: Path,
+) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(tmp_path)
+    metadata_config = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        crossval_enabled=True,
+        crossval_num_folds=5,
+    )
+    from data.dataset_factory import _load_node_split_metadata
+
+    metadata = _load_node_split_metadata(
+        config=metadata_config,
+        dataset_path=dataset_path,
+        run_id="real",
+    )
+    assert metadata.biomarker_observed_fraction_bin is not None
+
+    test_bin_counts: list[dict[int, int]] = []
+    for fold_idx in range(5):
+        config = _build_config(
+            dataset_path,
+            node_split_strategy="crossval",
+            seed=17,
+            crossval_enabled=True,
+            crossval_num_folds=5,
+            crossval_fold_index=fold_idx,
+        )
+        _train_nodes, _val_nodes, test_nodes = split_nodes_by_ratio(config)
+        test_bin_counts.append(
+            _coverage_bins_for_nodes(test_nodes, metadata.biomarker_observed_fraction_bin)
+        )
+
+    for coverage_bin in {0, 1, 2}:
+        values = [counts.get(coverage_bin, 0) for counts in test_bin_counts]
+        assert max(values) - min(values) <= 3
+
+
+@pytest.mark.epiforecaster
+def test_split_nodes_by_ratio_crossval_falls_back_without_edar_source(
+    tmp_path: Path,
+) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(
+        tmp_path,
+        include_edar_has_source=False,
+    )
+    config = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        seed=17,
+        crossval_enabled=True,
+        crossval_num_folds=5,
+        crossval_fold_index=1,
+    )
+
+    train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(config)
+
+    assert len(train_nodes) + len(val_nodes) + len(test_nodes) == 100
+
+
+@pytest.mark.epiforecaster
+def test_split_nodes_by_ratio_crossval_handles_sparse_strata(tmp_path: Path) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(tmp_path)
+    config = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        seed=17,
+        crossval_enabled=True,
+        crossval_num_folds=9,
+        crossval_fold_index=3,
+        node_split_biomarker_bins=4,
+    )
+
+    train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(config)
+
+    assert len(train_nodes) + len(val_nodes) + len(test_nodes) == 100

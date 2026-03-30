@@ -67,10 +67,19 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
         device=torch.device("cpu"),
     )
 
-    assert metrics["mae"] == 0.0
+    expected_joint_obs_loss = (
+        metrics["loss_ww_weighted"]
+        + metrics["loss_hosp_weighted"]
+        + metrics["loss_cases_weighted"]
+        + metrics["loss_deaths_weighted"]
+    )
+    assert metrics["mae"] == expected_joint_obs_loss
+    assert "rmse" not in metrics
+    assert "r2" not in metrics
     assert metrics["mae_hosp_log1p_per_100k"] == 0.0
     assert "mae_cases_log1p_per_100k" in metrics
     assert "mae_deaths_log1p_per_100k" in metrics
     assert metrics["observed_count_cases"] == 3
     assert metrics["observed_count_deaths"] == 2
     assert metrics["mae_cases_log1p_per_100k"] > 0.0
+    assert _node_mae["hospitalizations"] == {0: 0.0, 1: 0.0}

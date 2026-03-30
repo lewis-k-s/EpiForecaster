@@ -140,6 +140,26 @@ def test_load_config_with_node_split_overrides():
 
 
 @pytest.mark.epiforecaster
+def test_load_config_with_crossval_node_split_overrides():
+    cfg = EpiForecasterConfig.load(
+        BASE_LOCAL_CONFIG,
+        overrides=[
+            "training.node_split_strategy=crossval",
+            "training.crossval_enabled=true",
+            "training.crossval_num_folds=4",
+            "training.crossval_fold_index=2",
+            "training.node_split_biomarker_bins=2",
+        ],
+    )
+
+    assert cfg.training.node_split_strategy == "crossval"
+    assert cfg.training.crossval_enabled is True
+    assert cfg.training.crossval_num_folds == 4
+    assert cfg.training.crossval_fold_index == 2
+    assert cfg.training.node_split_biomarker_bins == 2
+
+
+@pytest.mark.epiforecaster
 def test_load_config_rejects_invalid_node_split_strategy():
     """Test that invalid node split strategy is rejected."""
     with pytest.raises(ValueError, match="Invalid node_split_strategy"):

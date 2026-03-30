@@ -102,6 +102,25 @@ class TestDelayKernelBasics:
         # Expected mean: shape × scale = 10 days
         assert 8 < mean_delay < 12  # Allow some tolerance
 
+    def test_free_parameterization_preserves_signed_weights(self):
+        """Free kernels should expose raw signed weights instead of simplex weights."""
+        kernel = DelayKernel(kernel_length=3, learnable=True, parameterization="free")
+
+        with torch.no_grad():
+            kernel.kernel.copy_(torch.tensor([-0.5, 0.25, 1.5], dtype=kernel.kernel.dtype))
+
+        weights = kernel.get_kernel_weights()
+        expected = torch.tensor([-0.5, 0.25, 1.5], dtype=weights.dtype)
+
+        assert torch.allclose(weights, expected)
+
+    def test_mean_delay_requires_simplex_kernel(self):
+        """Mean delay is only well-defined for normalized positive kernels."""
+        kernel = DelayKernel(kernel_length=5, learnable=True, parameterization="free")
+
+        with pytest.raises(ValueError, match="only defined for simplex kernels"):
+            kernel.get_mean_delay()
+
 
 class TestDelayKernelCausality:
     """Tests for causal properties (no future leakage)."""
@@ -122,7 +141,7 @@ class TestDelayKernelCausality:
         # Output at positions 0-4 should be 0 (causality)
         # The impulse at t=5 should only affect outputs t >= 5
         assert torch.all(output[0, 0:5] < 1e-6)
-        assert output[0, 5] > 1e-3  # Should have some signal
+        assert output[0, 5:].sum() > 1e-3  # Should have some downstream signal
 
     def test_causality_impulse_response(self):
         """Test impulse response shows correct delay."""
@@ -146,6 +165,27 @@ class TestDelayKernelCausality:
         # Response should start at or after t=5 (causality)
         assert len(first_response) > 0
         assert first_response[0] >= 5
+
+    def test_impulse_response_matches_forward_kernel_order(self):
+        """An impulse should reproduce the kernel in increasing lag order."""
+        kernel = DelayKernel(
+            kernel_length=7,
+            gamma_shape=3.0,
+            gamma_scale=1.0,
+            learnable=False,
+        )
+
+        I_trajectory = _zeros_tensor(1, 20)
+        I_trajectory[0, 5] = 1.0
+
+        output = kernel(I_trajectory)
+        weights = kernel.get_kernel_weights()
+
+        assert torch.allclose(
+            output[0, 5 : 5 + kernel.kernel_length],
+            weights,
+            atol=1e-6,
+        )
 
 
 class TestDelayKernelGradients:
@@ -244,6 +284,27 @@ class TestSheddingConvolutionBasics:
         weights = conv.get_kernel_weights()
         assert torch.allclose(
             weights.sum(), torch.tensor(1.0, dtype=torch.float32), atol=1e-5
+        )
+
+    def test_impulse_response_matches_forward_kernel_order(self):
+        """A shedding impulse should follow the biologically ordered kernel."""
+        conv = SheddingConvolution(
+            kernel_length=7,
+            learnable_kernel=False,
+            learnable_scale=False,
+        )
+
+        I_trajectory = _zeros_tensor(1, 20)
+        I_trajectory[0, 4] = 1.0
+        population = _ones_tensor(1, 20)
+
+        output = conv(I_trajectory, population)
+        weights = conv.get_kernel_weights()
+
+        assert torch.allclose(
+            output[0, 4 : 4 + conv.kernel_length],
+            weights,
+            atol=1e-6,
         )
 
 
