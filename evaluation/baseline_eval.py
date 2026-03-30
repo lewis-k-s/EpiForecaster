@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -14,56 +15,84 @@ from data.epi_dataset import EpiDataset
 from evaluation.baseline_models import (
     BaselinePredictionResult,
     predict_with_exponential_smoothing_fallback,
-    predict_with_tiered_fallback,
-    predict_with_var_cross_target_fallback,
+    predict_with_sarima_fallback,
+    predict_with_var_fallback,
 )
 from evaluation.losses import get_loss_from_config
 from evaluation.epiforecaster_eval import (
     build_loader_from_config,
 )
-from evaluation.metrics import compute_masked_metrics_numpy
+from evaluation.granular_export import (
+    GRANULAR_FIELDNAMES,
+    _format_temporal_coord,
+    write_granular_metadata_sidecar,
+)
 from models.configs import EpiForecasterConfig
 
 logger = logging.getLogger(__name__)
 
+_WEEKLY_CADENCE_DAYS = 7
+_BASELINE_PROGRESS_LOG_BATCH_INTERVAL = 10
+_BASELINE_PROGRESS_LOG_TIME_INTERVAL_SEC = 30.0
+
+
+@dataclass(frozen=True)
+class BaselineTargetSpec:
+    target_name: str
+    value_attr: str
+    mask_attr: str
+    cadence_mode: str
+    joint_alias: str
+
+
 _TARGET_SPECS = {
-    "wastewater": ("precomputed_ww", "precomputed_ww_mask"),
-    "hospitalizations": ("precomputed_hosp", "precomputed_hosp_mask"),
-    "cases": ("precomputed_cases_target", "precomputed_cases_mask"),
-    "deaths": ("precomputed_deaths", "precomputed_deaths_mask"),
+    "wastewater": BaselineTargetSpec(
+        target_name="wastewater",
+        value_attr="precomputed_ww",
+        mask_attr="precomputed_ww_mask",
+        cadence_mode="weekly_observed_dates",
+        joint_alias="ww",
+    ),
+    "hospitalizations": BaselineTargetSpec(
+        target_name="hospitalizations",
+        value_attr="precomputed_hosp",
+        mask_attr="precomputed_hosp_mask",
+        cadence_mode="weekly_observed_dates",
+        joint_alias="hosp",
+    ),
+    "cases": BaselineTargetSpec(
+        target_name="cases",
+        value_attr="precomputed_cases_target",
+        mask_attr="precomputed_cases_mask",
+        cadence_mode="daily",
+        joint_alias="cases",
+    ),
+    "deaths": BaselineTargetSpec(
+        target_name="deaths",
+        value_attr="precomputed_deaths",
+        mask_attr="precomputed_deaths_mask",
+        cadence_mode="daily",
+        joint_alias="deaths",
+    ),
 }
-_SUPPORTED_BASELINE_MODELS = ["tiered", "exp_smoothing", "var_cross_target"]
-_VAR_TARGET_ORDER = ["hospitalizations", "wastewater", "cases", "deaths"]
-
-
-@dataclass
-class RollingFold:
-    fold: int
-    train_start: int
-    train_end: int
-    forecast_start: int
-    forecast_end: int
-
-    def to_dict(self, temporal_coords: list[Any]) -> dict[str, Any]:
-        return {
-            "fold": self.fold,
-            "train_start_idx": self.train_start,
-            "train_end_idx": self.train_end,
-            "forecast_start_idx": self.forecast_start,
-            "forecast_end_idx": self.forecast_end,
-            "train_start_date": str(temporal_coords[self.train_start]),
-            "train_end_date": str(temporal_coords[self.train_end - 1]),
-            "forecast_start_date": str(temporal_coords[self.forecast_start]),
-            "forecast_end_date": str(temporal_coords[self.forecast_end - 1]),
-        }
-
+_SUPPORTED_BASELINE_MODELS = ["exp_smoothing", "sarima", "var"]
+_SAME_SLICE_BASELINE_SCHEMA_VERSION = "1"
+_SAME_SLICE_COMPARISON_SCOPE = "same_eval_slice"
+_MAX_SAFE_ABS_ERROR = float(np.sqrt(np.finfo(np.float64).max) / 4.0)
+_BASELINE_GRANULAR_FIELDNAMES = [
+    "model",
+    "selected_model",
+    "fit_status",
+    "fallback_reason",
+    *GRANULAR_FIELDNAMES,
+]
 
 @dataclass
 class TargetSeriesView:
+    spec: BaselineTargetSpec
     values: np.ndarray
     mask: np.ndarray
     node_to_bin: dict[int, int]
-
 
 @dataclass
 class JointObservationLossSpec:
@@ -80,6 +109,48 @@ class JointObservationLossSpec:
     deaths_min_observed: int
 
 
+@dataclass(frozen=True)
+class SameSliceTargetSpec:
+    canonical_name: str
+    history_attr: str
+    target_attr: str
+    target_mask_attr: str
+    prediction_key: str
+
+
+_SAME_SLICE_TARGET_SPECS = {
+    "hospitalizations": SameSliceTargetSpec(
+        canonical_name="hospitalizations",
+        history_attr="hosp_hist",
+        target_attr="hosp_target",
+        target_mask_attr="hosp_target_mask",
+        prediction_key="pred_hosp",
+    ),
+    "wastewater": SameSliceTargetSpec(
+        canonical_name="wastewater",
+        history_attr="ww_hist",
+        target_attr="ww_target",
+        target_mask_attr="ww_target_mask",
+        prediction_key="pred_ww",
+    ),
+    "cases": SameSliceTargetSpec(
+        canonical_name="cases",
+        history_attr="cases_hist",
+        target_attr="cases_target",
+        target_mask_attr="cases_target_mask",
+        prediction_key="pred_cases",
+    ),
+    "deaths": SameSliceTargetSpec(
+        canonical_name="deaths",
+        history_attr="deaths_hist",
+        target_attr="deaths_target",
+        target_mask_attr="deaths_target_mask",
+        prediction_key="pred_deaths",
+    ),
+}
+_SAME_SLICE_TARGET_ORDER = list(_SAME_SLICE_TARGET_SPECS)
+
+
 def _torch_to_numpy_2d(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
         # Upcast float16/bfloat16 to float32 before numpy conversion to prevent overflow
@@ -94,78 +165,6 @@ def _resolve_split_bounds(dataset: EpiDataset) -> tuple[int, int]:
         return int(dataset.time_range[0]), int(dataset.time_range[1])
     max_lag = max(dataset.mobility_lags, default=0) if dataset.mobility_lags else 0
     return int(max_lag), int(len(dataset._temporal_coords))
-
-
-def _generate_rolling_folds(
-    *,
-    dataset: EpiDataset,
-    rolling_folds: int,
-) -> list[RollingFold]:
-    L = int(dataset.config.model.input_window_length)
-    H = int(dataset.config.model.forecast_horizon)
-    split_start, split_end = _resolve_split_bounds(dataset)
-
-    min_forecast_start = split_start + L + 2 * H
-    max_forecast_start = split_end - H
-    if min_forecast_start > max_forecast_start:
-        return []
-
-    forecast_starts = list(range(min_forecast_start, max_forecast_start + 1, H))
-    selected = (
-        forecast_starts[-rolling_folds:]
-        if len(forecast_starts) > rolling_folds
-        else forecast_starts
-    )
-
-    folds: list[RollingFold] = []
-    for idx, forecast_start in enumerate(selected):
-        folds.append(
-            RollingFold(
-                fold=idx,
-                train_start=split_start,
-                train_end=forecast_start,
-                forecast_start=forecast_start,
-                forecast_end=forecast_start + H,
-            )
-        )
-    return folds
-
-
-def _resolve_calendar_exog(dataset: EpiDataset) -> np.ndarray | None:
-    cov = _torch_to_numpy_2d(dataset.temporal_covariates)
-    if cov.ndim != 2 or cov.shape[1] == 0:
-        return None
-
-    ds = dataset._dataset
-    if ds is not None and "temporal_covariates" in ds:
-        da = ds["temporal_covariates"]
-        if "covariate" in da.coords:
-            cov_names = [str(x).lower() for x in da.coords["covariate"].values.tolist()]
-            idx = [
-                i
-                for i, name in enumerate(cov_names)
-                if ("dow" in name) or ("holiday" in name)
-            ]
-            if idx:
-                return cov[:, idx]
-    return cov
-
-
-def _compute_valid_node_mask_for_target(
-    *,
-    target_mask: np.ndarray,
-    forecast_start: int,
-    input_window_length: int,
-    horizon: int,
-    permit: int,
-) -> np.ndarray:
-    history_slice = target_mask[forecast_start - input_window_length : forecast_start]
-    target_slice = target_mask[forecast_start : forecast_start + horizon]
-    history_counts = history_slice.sum(axis=0)
-    target_counts = target_slice.sum(axis=0)
-    history_threshold = max(0, input_window_length - permit)
-    target_threshold = max(0, horizon - permit)
-    return (history_counts >= history_threshold) & (target_counts >= target_threshold)
 
 
 def _compute_sparsity_bins(
@@ -196,7 +195,7 @@ def _compute_sparsity_bins(
 
 def _resolve_baseline_models(models: list[str] | None) -> list[str]:
     if not models:
-        return ["tiered"]
+        return ["sarima"]
 
     resolved: list[str] = []
     for model in models:
@@ -225,9 +224,9 @@ def _prepare_target_views(
     include_sparsity_bins: bool,
 ) -> dict[str, TargetSeriesView]:
     out: dict[str, TargetSeriesView] = {}
-    for target_name, (value_attr, mask_attr) in _TARGET_SPECS.items():
-        values = _torch_to_numpy_2d(getattr(dataset, value_attr))
-        mask = _torch_to_numpy_2d(getattr(dataset, mask_attr))
+    for target_name, spec in _TARGET_SPECS.items():
+        values = _torch_to_numpy_2d(getattr(dataset, spec.value_attr))
+        mask = _torch_to_numpy_2d(getattr(dataset, spec.mask_attr))
         mask = (mask > 0).astype(np.float64)
         node_to_bin = (
             _compute_sparsity_bins(
@@ -240,9 +239,55 @@ def _prepare_target_views(
             else {}
         )
         out[target_name] = TargetSeriesView(
-            values=values, mask=mask, node_to_bin=node_to_bin
+            spec=spec,
+            values=values,
+            mask=mask,
+            node_to_bin=node_to_bin,
         )
     return out
+
+
+def _required_observed_points(
+    *,
+    window_length: int,
+    permit: int,
+    cadence_mode: str,
+) -> int:
+    dense_required = max(0, int(window_length) - int(permit))
+    if cadence_mode == "daily":
+        return dense_required
+    if cadence_mode == "weekly_observed_dates":
+        return int(np.ceil(dense_required / _WEEKLY_CADENCE_DAYS))
+    raise ValueError(f"Unsupported cadence mode: {cadence_mode}")
+
+
+def _compute_valid_node_mask_for_target(
+    *,
+    target_view: TargetSeriesView,
+    forecast_start: int,
+    input_window_length: int,
+    horizon: int,
+    permit_map: dict[str, dict[str, int]],
+) -> np.ndarray:
+    target_name = target_view.spec.target_name
+    cadence_mode = target_view.spec.cadence_mode
+    history_slice = target_view.mask[
+        forecast_start - input_window_length : forecast_start
+    ]
+    target_slice = target_view.mask[forecast_start : forecast_start + horizon]
+    history_counts = history_slice.sum(axis=0)
+    target_counts = target_slice.sum(axis=0)
+    history_threshold = _required_observed_points(
+        window_length=input_window_length,
+        permit=int(permit_map["input"][target_name]),
+        cadence_mode=cadence_mode,
+    )
+    target_threshold = _required_observed_points(
+        window_length=horizon,
+        permit=int(permit_map["horizon"][target_name]),
+        cadence_mode=cadence_mode,
+    )
+    return (history_counts >= history_threshold) & (target_counts >= target_threshold)
 
 
 def _global_median_for_target(
@@ -256,29 +301,6 @@ def _global_median_for_target(
     train_mask_view = mask[train_start:train_end]
     global_obs = train_view[train_mask_view > 0]
     return float(np.nanmedian(global_obs)) if global_obs.size > 0 else 0.0
-
-
-def _sanitize_metric_inputs(
-    *,
-    predictions: np.ndarray,
-    targets: np.ndarray,
-    observed_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    pred = np.asarray(predictions, dtype=np.float64)
-    target = np.asarray(targets, dtype=np.float64)
-    mask = np.clip(
-        np.nan_to_num(np.asarray(observed_mask, dtype=np.float64), nan=0.0),
-        0.0,
-        1.0,
-    )
-    invalid = (~np.isfinite(pred)) | (~np.isfinite(target))
-    dropped_invalid_observed = int((invalid & (mask > 0)).sum())
-    if dropped_invalid_observed > 0:
-        mask = mask.copy()
-        mask[invalid] = 0.0
-    pred = np.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
-    target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
-    return pred, target, mask, dropped_invalid_observed
 
 
 def _resolve_joint_observation_loss_spec(
@@ -307,132 +329,6 @@ def _resolve_joint_observation_loss_spec(
         cases_min_observed=int(criterion.cases_min_observed),
         deaths_min_observed=int(criterion.deaths_min_observed),
     )
-
-
-def _empty_metric_matrix(horizon: int) -> np.ndarray:
-    return np.zeros((1, horizon), dtype=np.float64)
-
-
-def _joint_weighted_masked_mse_numpy(
-    *,
-    prediction: np.ndarray,
-    target: np.ndarray,
-    observed_mask: np.ndarray,
-    min_observed: int,
-) -> tuple[float, float]:
-    pred_t = torch.as_tensor(prediction, dtype=torch.float32)
-    target_t = torch.as_tensor(target, dtype=torch.float32)
-    observed_t = torch.as_tensor(observed_mask, dtype=torch.float32)
-    from evaluation.losses import JointInferenceLoss
-
-    supervision = JointInferenceLoss._build_supervision_weights(
-        target=target_t,
-        observed_mask=observed_t,
-        min_observed=min_observed,
-        device=pred_t.device,
-    )
-    loss = JointInferenceLoss._weighted_masked_mse_from_weights(
-        prediction=pred_t,
-        target=cast(torch.Tensor, supervision["target"]),
-        weights=cast(torch.Tensor, supervision["weights"]),
-    )
-    n_eff = cast(torch.Tensor, supervision["n_eff"])
-    return float(loss.item()), float(n_eff.item())
-
-
-def _joint_head_n_eff_scale_numpy(
-    *,
-    target_name: str,
-    n_eff: float,
-    joint_spec: JointObservationLossSpec,
-) -> float:
-    power = float(joint_spec.obs_n_eff_power)
-    if power <= 0:
-        return 1.0
-    head_specific = {
-        "wastewater": joint_spec.ww_n_eff_reference,
-        "hospitalizations": joint_spec.hosp_n_eff_reference,
-        "cases": joint_spec.cases_n_eff_reference,
-        "deaths": joint_spec.deaths_n_eff_reference,
-    }
-    reference = float(head_specific.get(target_name, 0.0))
-    if reference <= 0:
-        reference = float(joint_spec.obs_n_eff_reference)
-    if reference <= 0:
-        reference = 1.0
-    ratio = min(1.0, max(0.0, float(n_eff) / reference))
-    return float(ratio**power)
-
-
-def _compute_joint_observation_loss_for_fold(
-    *,
-    fold_target_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
-    horizon: int,
-    joint_spec: JointObservationLossSpec,
-) -> dict[str, Any]:
-    target_aliases = {
-        "wastewater": "ww",
-        "hospitalizations": "hosp",
-        "cases": "cases",
-        "deaths": "deaths",
-    }
-    target_min_observed = {
-        "wastewater": joint_spec.ww_min_observed,
-        "hospitalizations": joint_spec.hosp_min_observed,
-        "cases": joint_spec.cases_min_observed,
-        "deaths": joint_spec.deaths_min_observed,
-    }
-
-    components: dict[str, Any] = {"joint_obs_loss_total": 0.0}
-    raw_losses: dict[str, float] = {}
-    observed_counts: dict[str, int] = {}
-    effective_counts: dict[str, float] = {}
-    for target_name, alias in target_aliases.items():
-        pred, target, mask = fold_target_data.get(
-            target_name,
-            (
-                _empty_metric_matrix(horizon),
-                _empty_metric_matrix(horizon),
-                _empty_metric_matrix(horizon),
-            ),
-        )
-        min_observed = target_min_observed[target_name]
-        loss_value, n_eff = _joint_weighted_masked_mse_numpy(
-            prediction=pred,
-            target=target,
-            observed_mask=mask,
-            min_observed=min_observed,
-        )
-        loss_value *= _joint_head_n_eff_scale_numpy(
-            target_name=target_name,
-            n_eff=n_eff,
-            joint_spec=joint_spec,
-        )
-        observed_count = int((mask > 0).sum())
-        raw_losses[target_name] = loss_value
-        observed_counts[target_name] = observed_count
-        effective_counts[target_name] = n_eff
-        components[f"joint_loss_{alias}"] = loss_value
-        components[f"joint_observed_count_{alias}"] = observed_count
-        components[f"joint_effective_count_{alias}"] = n_eff
-
-    active_targets = [
-        target_name
-        for target_name, effective_count in effective_counts.items()
-        if effective_count > 0
-    ]
-    num_active = len(active_targets)
-    equal_weight = (joint_spec.obs_weight_sum / num_active) if num_active > 0 else 0.0
-
-    for target_name, alias in target_aliases.items():
-        weight = equal_weight if target_name in active_targets else 0.0
-        weighted_value = weight * raw_losses[target_name]
-        components[f"joint_loss_{alias}_weighted"] = weighted_value
-        components["joint_obs_loss_total"] += weighted_value
-
-    return components
-
-
 def _predict_univariate_baseline(
     *,
     baseline_model: str,
@@ -444,15 +340,13 @@ def _predict_univariate_baseline(
     exog_train: np.ndarray | None,
     exog_future: np.ndarray | None,
 ) -> BaselinePredictionResult:
-    if baseline_model == "tiered":
-        return predict_with_tiered_fallback(
+    if baseline_model == "sarima":
+        return predict_with_sarima_fallback(
             train_values=train_values,
             train_mask=train_mask,
             horizon=horizon,
             global_train_median=global_train_median,
             seasonal_period=seasonal_period,
-            exog_train=exog_train,
-            exog_future=exog_future,
         )
     if baseline_model == "exp_smoothing":
         return predict_with_exponential_smoothing_fallback(
@@ -465,536 +359,55 @@ def _predict_univariate_baseline(
     raise ValueError(f"Unsupported univariate baseline model: {baseline_model}")
 
 
-def _evaluate_univariate_baseline_model(
+def _predict_var_baseline(
     *,
-    baseline_model: str,
-    target_views: dict[str, TargetSeriesView],
-    folds: list[RollingFold],
-    target_nodes: list[int],
-    permit_map: dict[str, dict[str, int]],
-    input_window_length: int,
+    batch_data: Any,
     horizon: int,
+    global_medians: dict[str, float],
     seasonal_period: int,
-    calendar_exog: np.ndarray | None,
-    include_sparsity_bins: bool,
-    fold_rows: list[dict[str, Any]],
-    coverage_rows: list[dict[str, Any]],
-    pair_rows: list[dict[str, Any]],
-    sparsity_rows: list[dict[str, Any]],
-    model_orders: list[dict[str, Any]],
-    joint_spec: JointObservationLossSpec,
-    joint_rows: list[dict[str, Any]],
-) -> None:
-    joint_target_buffers: dict[
-        int, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
-    ] = {}
+) -> dict[str, list[BaselinePredictionResult]]:
+    history_values_by_target: dict[str, np.ndarray] = {}
+    history_masks_by_target: dict[str, np.ndarray] = {}
+    for target_name in _SAME_SLICE_TARGET_ORDER:
+        spec = _SAME_SLICE_TARGET_SPECS[target_name]
+        history_values, history_mask = _extract_same_slice_history(
+            batch_data,
+            spec=spec,
+        )
+        history_values_by_target[target_name] = history_values
+        history_masks_by_target[target_name] = history_mask
 
-    for target_name, target_view in target_views.items():
-        values = target_view.values
-        mask = target_view.mask
-        node_to_bin = target_view.node_to_bin
+    batch_size = history_values_by_target[_SAME_SLICE_TARGET_ORDER[0]].shape[0]
+    results = {target_name: [] for target_name in _SAME_SLICE_TARGET_ORDER}
+    global_train_medians = np.asarray(
+        [global_medians[target_name] for target_name in _SAME_SLICE_TARGET_ORDER],
+        dtype=np.float64,
+    )
 
-        for fold in folds:
-            valid_nodes_mask = _compute_valid_node_mask_for_target(
-                target_mask=mask,
-                forecast_start=fold.forecast_start,
-                input_window_length=input_window_length,
-                horizon=horizon,
-                permit=int(permit_map["horizon"][target_name]),
-            )
-
-            global_median = _global_median_for_target(
-                values=values,
-                mask=mask,
-                train_start=fold.train_start,
-                train_end=fold.train_end,
-            )
-
-            pred_rows: list[np.ndarray] = []
-            target_rows: list[np.ndarray] = []
-            score_mask_rows: list[np.ndarray] = []
-            model_usage: dict[str, int] = {}
-            fit_success = 0
-            node_pairs = 0
-            scored_points = 0
-            dropped_invalid_observed = 0
-
-            per_bin_preds: dict[int, list[np.ndarray]] = {}
-            per_bin_targets: dict[int, list[np.ndarray]] = {}
-            per_bin_masks: dict[int, list[np.ndarray]] = {}
-
-            for node in target_nodes:
-                if not bool(valid_nodes_mask[node]):
-                    continue
-
-                node_pairs += 1
-                train_values = values[fold.train_start : fold.train_end, node]
-                train_mask = mask[fold.train_start : fold.train_end, node]
-                target_values = values[fold.forecast_start : fold.forecast_end, node]
-                target_mask = mask[fold.forecast_start : fold.forecast_end, node]
-
-                exog_train = None
-                exog_future = None
-                if baseline_model == "tiered" and calendar_exog is not None:
-                    exog_train = calendar_exog[fold.train_start : fold.train_end]
-                    exog_future = calendar_exog[fold.forecast_start : fold.forecast_end]
-
-                pred = _predict_univariate_baseline(
-                    baseline_model=baseline_model,
-                    train_values=train_values,
-                    train_mask=train_mask,
-                    horizon=horizon,
-                    global_train_median=global_median,
-                    seasonal_period=seasonal_period,
-                    exog_train=exog_train,
-                    exog_future=exog_future,
-                )
-                if pred.fit_status == "fit_success":
-                    fit_success += 1
-                model_usage[pred.model_name] = model_usage.get(pred.model_name, 0) + 1
-                if pred.model_order:
-                    model_orders.append(
-                        {
-                            "baseline_model": baseline_model,
-                            "target": target_name,
-                            "fold": fold.fold,
-                            "node": int(node),
-                            "model": pred.model_name,
-                            "order": pred.model_order,
-                        }
-                    )
-
-                cleaned_pred, cleaned_target, cleaned_mask, dropped = (
-                    _sanitize_metric_inputs(
-                        predictions=pred.predictions,
-                        targets=target_values,
-                        observed_mask=target_mask,
-                    )
-                )
-                dropped_invalid_observed += dropped
-                scored_points += int(cleaned_mask.sum())
-
-                pred_rows.append(cleaned_pred)
-                target_rows.append(cleaned_target)
-                score_mask_rows.append(cleaned_mask)
-                pair_rows.append(
-                    {
-                        "model": baseline_model,
-                        "target": target_name,
-                        "fold": fold.fold,
-                        "node_id": int(node),
-                        "selected_model": pred.model_name,
-                        "fit_status": pred.fit_status,
-                        "fallback_reason": pred.fallback_reason,
-                        "observed_count": int(cleaned_mask.sum()),
-                        "invalid_observed_dropped": dropped,
-                    }
-                )
-
-                if include_sparsity_bins:
-                    bin_idx = node_to_bin.get(int(node), 0)
-                    per_bin_preds.setdefault(bin_idx, []).append(cleaned_pred)
-                    per_bin_targets.setdefault(bin_idx, []).append(cleaned_target)
-                    per_bin_masks.setdefault(bin_idx, []).append(cleaned_mask)
-
-            if dropped_invalid_observed > 0:
-                logger.warning(
-                    "Dropped %d invalid observed points while scoring baseline=%s "
-                    "target=%s fold=%d",
-                    dropped_invalid_observed,
-                    baseline_model,
-                    target_name,
-                    fold.fold,
-                )
-
-            if node_pairs == 0:
-                metric = compute_masked_metrics_numpy(
-                    predictions=np.zeros((1, horizon), dtype=np.float64),
-                    targets=np.zeros((1, horizon), dtype=np.float64),
-                    observed_mask=np.zeros((1, horizon), dtype=np.float64),
-                    horizon=horizon,
-                )
-            else:
-                metric = compute_masked_metrics_numpy(
-                    predictions=np.vstack(pred_rows),
-                    targets=np.vstack(target_rows),
-                    observed_mask=np.vstack(score_mask_rows),
-                    horizon=horizon,
-                )
-
-            fold_row: dict[str, Any] = {
-                "model": baseline_model,
-                "target": target_name,
-                "fold": fold.fold,
-                "mae": metric.mae,
-                "rmse": metric.rmse,
-                "r2": metric.r2,
-                "observed_count": metric.observed_count,
-                "node_target_pairs": node_pairs,
-                "train_start": fold.train_start,
-                "train_end": fold.train_end,
-                "forecast_start": fold.forecast_start,
-                "forecast_end": fold.forecast_end,
-            }
-            for h_idx, (mae_h, rmse_h) in enumerate(
-                zip(metric.mae_per_h, metric.rmse_per_h, strict=False)
-            ):
-                fold_row[f"mae_h{h_idx + 1}"] = mae_h
-                fold_row[f"rmse_h{h_idx + 1}"] = rmse_h
-            fold_rows.append(fold_row)
-
-            coverage_row = {
-                "model": baseline_model,
-                "target": target_name,
-                "fold": fold.fold,
-                "node_target_pairs": node_pairs,
-                "fit_success_rate": (fit_success / node_pairs) if node_pairs else 0.0,
-                "scored_points": scored_points,
-                "total_points": node_pairs * horizon,
-                "scored_point_coverage": (scored_points / (node_pairs * horizon))
-                if node_pairs
-                else 0.0,
-            }
-            for used_model, count in model_usage.items():
-                coverage_row[f"used_{used_model}"] = count
-            coverage_rows.append(coverage_row)
-
-            if include_sparsity_bins:
-                for bin_idx in sorted(per_bin_preds.keys()):
-                    bin_metric = compute_masked_metrics_numpy(
-                        predictions=np.vstack(per_bin_preds[bin_idx]),
-                        targets=np.vstack(per_bin_targets[bin_idx]),
-                        observed_mask=np.vstack(per_bin_masks[bin_idx]),
-                        horizon=horizon,
-                    )
-                    sparsity_rows.append(
-                        {
-                            "model": baseline_model,
-                            "target": target_name,
-                            "fold": fold.fold,
-                            "sparsity_bin": int(bin_idx),
-                            "mae": bin_metric.mae,
-                            "rmse": bin_metric.rmse,
-                            "r2": bin_metric.r2,
-                            "observed_count": bin_metric.observed_count,
-                            "node_count": len(per_bin_preds[bin_idx]),
-                        }
-                    )
-
-            fold_target_data = joint_target_buffers.setdefault(fold.fold, {})
-            if pred_rows:
-                fold_target_data[target_name] = (
-                    np.vstack(pred_rows),
-                    np.vstack(target_rows),
-                    np.vstack(score_mask_rows),
-                )
-            else:
-                fold_target_data[target_name] = (
-                    _empty_metric_matrix(horizon),
-                    _empty_metric_matrix(horizon),
-                    _empty_metric_matrix(horizon),
-                )
-
-    for fold in folds:
-        components = _compute_joint_observation_loss_for_fold(
-            fold_target_data=joint_target_buffers.get(fold.fold, {}),
+    for batch_index in range(batch_size):
+        train_values = np.column_stack(
+            [
+                history_values_by_target[target_name][batch_index]
+                for target_name in _SAME_SLICE_TARGET_ORDER
+            ]
+        ).astype(np.float64)
+        train_mask = np.column_stack(
+            [
+                history_masks_by_target[target_name][batch_index]
+                for target_name in _SAME_SLICE_TARGET_ORDER
+            ]
+        ).astype(np.float64)
+        per_target_result = predict_with_var_fallback(
+            train_values=train_values,
+            train_mask=train_mask,
             horizon=horizon,
-            joint_spec=joint_spec,
+            target_names=list(_SAME_SLICE_TARGET_ORDER),
+            global_train_medians=global_train_medians,
+            seasonal_period=seasonal_period,
         )
-        joint_rows.append(
-            {
-                "model": baseline_model,
-                "fold": fold.fold,
-                **components,
-            }
-        )
-
-
-def _evaluate_var_cross_target_model(
-    *,
-    target_views: dict[str, TargetSeriesView],
-    folds: list[RollingFold],
-    target_nodes: list[int],
-    permit_map: dict[str, dict[str, int]],
-    input_window_length: int,
-    horizon: int,
-    seasonal_period: int,
-    include_sparsity_bins: bool,
-    var_maxlags: int,
-    fold_rows: list[dict[str, Any]],
-    coverage_rows: list[dict[str, Any]],
-    pair_rows: list[dict[str, Any]],
-    sparsity_rows: list[dict[str, Any]],
-    model_orders: list[dict[str, Any]],
-    joint_spec: JointObservationLossSpec,
-    joint_rows: list[dict[str, Any]],
-) -> None:
-    var_targets = [t for t in _VAR_TARGET_ORDER if t in target_views]
-    if not var_targets:
-        return
-
-    for fold in folds:
-        valid_nodes_by_target: dict[str, np.ndarray] = {}
-        global_medians_by_target: dict[str, float] = {}
-        for target_name in var_targets:
-            target_view = target_views[target_name]
-            valid_nodes_by_target[target_name] = _compute_valid_node_mask_for_target(
-                target_mask=target_view.mask,
-                forecast_start=fold.forecast_start,
-                input_window_length=input_window_length,
-                horizon=horizon,
-                permit=int(permit_map["horizon"][target_name]),
-            )
-            global_medians_by_target[target_name] = _global_median_for_target(
-                values=target_view.values,
-                mask=target_view.mask,
-                train_start=fold.train_start,
-                train_end=fold.train_end,
-            )
-
-        pred_rows_by_target: dict[str, list[np.ndarray]] = {t: [] for t in var_targets}
-        target_rows_by_target: dict[str, list[np.ndarray]] = {
-            t: [] for t in var_targets
-        }
-        score_mask_by_target: dict[str, list[np.ndarray]] = {t: [] for t in var_targets}
-        model_usage_by_target: dict[str, dict[str, int]] = {t: {} for t in var_targets}
-        fit_success_by_target: dict[str, int] = {t: 0 for t in var_targets}
-        node_pairs_by_target: dict[str, int] = {t: 0 for t in var_targets}
-        scored_points_by_target: dict[str, int] = {t: 0 for t in var_targets}
-        dropped_invalid_by_target: dict[str, int] = {t: 0 for t in var_targets}
-
-        per_bin_preds: dict[str, dict[int, list[np.ndarray]]] = {
-            t: {} for t in var_targets
-        }
-        per_bin_targets: dict[str, dict[int, list[np.ndarray]]] = {
-            t: {} for t in var_targets
-        }
-        per_bin_masks: dict[str, dict[int, list[np.ndarray]]] = {
-            t: {} for t in var_targets
-        }
-
-        for node in target_nodes:
-            if not any(bool(valid_nodes_by_target[t][node]) for t in var_targets):
-                continue
-
-            train_matrix = np.column_stack(
-                [
-                    target_views[t].values[fold.train_start : fold.train_end, node]
-                    for t in var_targets
-                ]
-            )
-            train_mask_matrix = np.column_stack(
-                [
-                    target_views[t].mask[fold.train_start : fold.train_end, node]
-                    for t in var_targets
-                ]
-            )
-            global_median_vec = np.asarray(
-                [global_medians_by_target[t] for t in var_targets],
-                dtype=np.float64,
-            )
-
-            preds = predict_with_var_cross_target_fallback(
-                train_values=train_matrix,
-                train_mask=train_mask_matrix,
-                horizon=horizon,
-                target_names=var_targets,
-                global_train_medians=global_median_vec,
-                seasonal_period=seasonal_period,
-                maxlags=var_maxlags,
-            )
-
-            for target_name in var_targets:
-                if not bool(valid_nodes_by_target[target_name][node]):
-                    continue
-
-                target_view = target_views[target_name]
-                target_values = target_view.values[
-                    fold.forecast_start : fold.forecast_end,
-                    node,
-                ]
-                target_mask = target_view.mask[
-                    fold.forecast_start : fold.forecast_end,
-                    node,
-                ]
-                pred = preds[target_name]
-
-                cleaned_pred, cleaned_target, cleaned_mask, dropped = (
-                    _sanitize_metric_inputs(
-                        predictions=pred.predictions,
-                        targets=target_values,
-                        observed_mask=target_mask,
-                    )
-                )
-
-                node_pairs_by_target[target_name] += 1
-                scored_points_by_target[target_name] += int(cleaned_mask.sum())
-                dropped_invalid_by_target[target_name] += dropped
-                if pred.fit_status == "fit_success":
-                    fit_success_by_target[target_name] += 1
-                model_usage = model_usage_by_target[target_name]
-                model_usage[pred.model_name] = model_usage.get(pred.model_name, 0) + 1
-
-                if pred.model_order:
-                    model_orders.append(
-                        {
-                            "baseline_model": "var_cross_target",
-                            "target": target_name,
-                            "fold": fold.fold,
-                            "node": int(node),
-                            "model": pred.model_name,
-                            "order": pred.model_order,
-                        }
-                    )
-
-                pred_rows_by_target[target_name].append(cleaned_pred)
-                target_rows_by_target[target_name].append(cleaned_target)
-                score_mask_by_target[target_name].append(cleaned_mask)
-                pair_rows.append(
-                    {
-                        "model": "var_cross_target",
-                        "target": target_name,
-                        "fold": fold.fold,
-                        "node_id": int(node),
-                        "selected_model": pred.model_name,
-                        "fit_status": pred.fit_status,
-                        "fallback_reason": pred.fallback_reason,
-                        "observed_count": int(cleaned_mask.sum()),
-                        "invalid_observed_dropped": dropped,
-                    }
-                )
-
-                if include_sparsity_bins:
-                    bin_idx = target_view.node_to_bin.get(int(node), 0)
-                    per_bin_preds[target_name].setdefault(bin_idx, []).append(
-                        cleaned_pred
-                    )
-                    per_bin_targets[target_name].setdefault(bin_idx, []).append(
-                        cleaned_target
-                    )
-                    per_bin_masks[target_name].setdefault(bin_idx, []).append(
-                        cleaned_mask
-                    )
-
-        for target_name in var_targets:
-            node_pairs = node_pairs_by_target[target_name]
-            if dropped_invalid_by_target[target_name] > 0:
-                logger.warning(
-                    "Dropped %d invalid observed points while scoring baseline=%s "
-                    "target=%s fold=%d",
-                    dropped_invalid_by_target[target_name],
-                    "var_cross_target",
-                    target_name,
-                    fold.fold,
-                )
-            if node_pairs == 0:
-                metric = compute_masked_metrics_numpy(
-                    predictions=np.zeros((1, horizon), dtype=np.float64),
-                    targets=np.zeros((1, horizon), dtype=np.float64),
-                    observed_mask=np.zeros((1, horizon), dtype=np.float64),
-                    horizon=horizon,
-                )
-            else:
-                metric = compute_masked_metrics_numpy(
-                    predictions=np.vstack(pred_rows_by_target[target_name]),
-                    targets=np.vstack(target_rows_by_target[target_name]),
-                    observed_mask=np.vstack(score_mask_by_target[target_name]),
-                    horizon=horizon,
-                )
-
-            fold_row: dict[str, Any] = {
-                "model": "var_cross_target",
-                "target": target_name,
-                "fold": fold.fold,
-                "mae": metric.mae,
-                "rmse": metric.rmse,
-                "r2": metric.r2,
-                "observed_count": metric.observed_count,
-                "node_target_pairs": node_pairs,
-                "train_start": fold.train_start,
-                "train_end": fold.train_end,
-                "forecast_start": fold.forecast_start,
-                "forecast_end": fold.forecast_end,
-            }
-            for h_idx, (mae_h, rmse_h) in enumerate(
-                zip(metric.mae_per_h, metric.rmse_per_h, strict=False)
-            ):
-                fold_row[f"mae_h{h_idx + 1}"] = mae_h
-                fold_row[f"rmse_h{h_idx + 1}"] = rmse_h
-            fold_rows.append(fold_row)
-
-            scored_points = scored_points_by_target[target_name]
-            coverage_row = {
-                "model": "var_cross_target",
-                "target": target_name,
-                "fold": fold.fold,
-                "node_target_pairs": node_pairs,
-                "fit_success_rate": (fit_success_by_target[target_name] / node_pairs)
-                if node_pairs
-                else 0.0,
-                "scored_points": scored_points,
-                "total_points": node_pairs * horizon,
-                "scored_point_coverage": (scored_points / (node_pairs * horizon))
-                if node_pairs
-                else 0.0,
-            }
-            for used_model, count in model_usage_by_target[target_name].items():
-                coverage_row[f"used_{used_model}"] = count
-            coverage_rows.append(coverage_row)
-
-            if include_sparsity_bins:
-                for bin_idx in sorted(per_bin_preds[target_name].keys()):
-                    bin_metric = compute_masked_metrics_numpy(
-                        predictions=np.vstack(per_bin_preds[target_name][bin_idx]),
-                        targets=np.vstack(per_bin_targets[target_name][bin_idx]),
-                        observed_mask=np.vstack(per_bin_masks[target_name][bin_idx]),
-                        horizon=horizon,
-                    )
-                    sparsity_rows.append(
-                        {
-                            "model": "var_cross_target",
-                            "target": target_name,
-                            "fold": fold.fold,
-                            "sparsity_bin": int(bin_idx),
-                            "mae": bin_metric.mae,
-                            "rmse": bin_metric.rmse,
-                            "r2": bin_metric.r2,
-                            "observed_count": bin_metric.observed_count,
-                            "node_count": len(per_bin_preds[target_name][bin_idx]),
-                        }
-                    )
-
-        fold_target_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        for target_name in _TARGET_SPECS:
-            pred_rows = pred_rows_by_target.get(target_name, [])
-            target_rows = target_rows_by_target.get(target_name, [])
-            mask_rows = score_mask_by_target.get(target_name, [])
-            if pred_rows:
-                fold_target_data[target_name] = (
-                    np.vstack(pred_rows),
-                    np.vstack(target_rows),
-                    np.vstack(mask_rows),
-                )
-            else:
-                fold_target_data[target_name] = (
-                    _empty_metric_matrix(horizon),
-                    _empty_metric_matrix(horizon),
-                    _empty_metric_matrix(horizon),
-                )
-        components = _compute_joint_observation_loss_for_fold(
-            fold_target_data=fold_target_data,
-            horizon=horizon,
-            joint_spec=joint_spec,
-        )
-        joint_rows.append(
-            {
-                "model": "var_cross_target",
-                "fold": fold.fold,
-                **components,
-            }
-        )
-
-
+        for target_name in _SAME_SLICE_TARGET_ORDER:
+            results[target_name].append(per_target_result[target_name])
+    return results
 def run_baseline_evaluation(
     *,
     config: EpiForecasterConfig,
@@ -1002,319 +415,15 @@ def run_baseline_evaluation(
     models: list[str] | None = None,
     config_path: str | None = None,
     split: str = "test",
-    rolling_folds: int = 5,
     seasonal_period: int = 7,
-    include_sparsity_bins: bool = True,
-    var_maxlags: int = 14,
 ) -> dict[str, Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    resolved_models = _resolve_baseline_models(models)
-
-    loader, _region_embeddings = build_loader_from_config(
-        config=config,
-        split=split,
-        batch_size=1,
-        device="cpu",
-    )
-    dataset = loader.dataset
-
-    folds = _generate_rolling_folds(dataset=dataset, rolling_folds=rolling_folds)
-    if not folds:
-        raise ValueError(
-            "No valid rolling-origin folds found. Check split boundaries and horizon."
-        )
-
-    split_start, split_end = _resolve_split_bounds(dataset)
-    temporal_coords = list(dataset._temporal_coords)
-    target_nodes = list(dataset.target_nodes)
-    horizon = int(config.model.forecast_horizon)
-    input_window_length = int(config.model.input_window_length)
-    permit_map = config.data.resolve_missing_permit_map()
-    calendar_exog = _resolve_calendar_exog(dataset)
-    joint_spec = _resolve_joint_observation_loss_spec(config=config, horizon=horizon)
-    target_views = _prepare_target_views(
-        dataset=dataset,
-        split_start=split_start,
-        split_end=split_end,
-        target_nodes=target_nodes,
-        include_sparsity_bins=include_sparsity_bins,
-    )
-
-    fold_rows: list[dict[str, Any]] = []
-    coverage_rows: list[dict[str, Any]] = []
-    pair_rows: list[dict[str, Any]] = []
-    sparsity_rows: list[dict[str, Any]] = []
-    model_orders: list[dict[str, Any]] = []
-    joint_rows: list[dict[str, Any]] = []
-
-    for model_name in resolved_models:
-        if model_name in {"tiered", "exp_smoothing"}:
-            _evaluate_univariate_baseline_model(
-                baseline_model=model_name,
-                target_views=target_views,
-                folds=folds,
-                target_nodes=target_nodes,
-                permit_map=permit_map,
-                input_window_length=input_window_length,
-                horizon=horizon,
-                seasonal_period=seasonal_period,
-                calendar_exog=calendar_exog,
-                include_sparsity_bins=include_sparsity_bins,
-                fold_rows=fold_rows,
-                coverage_rows=coverage_rows,
-                pair_rows=pair_rows,
-                sparsity_rows=sparsity_rows,
-                model_orders=model_orders,
-                joint_spec=joint_spec,
-                joint_rows=joint_rows,
-            )
-        elif model_name == "var_cross_target":
-            _evaluate_var_cross_target_model(
-                target_views=target_views,
-                folds=folds,
-                target_nodes=target_nodes,
-                permit_map=permit_map,
-                input_window_length=input_window_length,
-                horizon=horizon,
-                seasonal_period=seasonal_period,
-                include_sparsity_bins=include_sparsity_bins,
-                var_maxlags=var_maxlags,
-                fold_rows=fold_rows,
-                coverage_rows=coverage_rows,
-                pair_rows=pair_rows,
-                sparsity_rows=sparsity_rows,
-                model_orders=model_orders,
-                joint_spec=joint_spec,
-                joint_rows=joint_rows,
-            )
-
-    fold_df = pd.DataFrame(fold_rows)
-    coverage_df = pd.DataFrame(coverage_rows)
-    pair_df = pd.DataFrame(pair_rows)
-    sparsity_df = pd.DataFrame(sparsity_rows)
-    joint_cols = [
-        "model",
-        "fold",
-        "joint_obs_loss_total",
-        "joint_loss_ww",
-        "joint_loss_hosp",
-        "joint_loss_cases",
-        "joint_loss_deaths",
-        "joint_loss_ww_weighted",
-        "joint_loss_hosp_weighted",
-        "joint_loss_cases_weighted",
-        "joint_loss_deaths_weighted",
-        "joint_observed_count_ww",
-        "joint_observed_count_hosp",
-        "joint_observed_count_cases",
-        "joint_observed_count_deaths",
-    ]
-    joint_fold_df = (
-        pd.DataFrame(joint_rows) if joint_rows else pd.DataFrame(columns=joint_cols)
-    )
-
-    aggregate_rows: list[dict[str, Any]] = []
-    for (model_name, target_name), group in fold_df.groupby(["model", "target"]):
-        row: dict[str, Any] = {
-            "model": model_name,
-            "target": target_name,
-            "folds": int(group["fold"].nunique()),
-        }
-        for metric_name in ["mae", "rmse", "r2", "observed_count"]:
-            values = pd.to_numeric(group[metric_name], errors="coerce").dropna()
-            if values.empty:
-                row[f"{metric_name}_mean"] = float("nan")
-                row[f"{metric_name}_std"] = float("nan")
-            else:
-                row[f"{metric_name}_mean"] = float(values.mean())
-                row[f"{metric_name}_std"] = float(values.std(ddof=1))
-
-        per_h_cols = [
-            c for c in group.columns if c.startswith("mae_h") or c.startswith("rmse_h")
-        ]
-        if per_h_cols:
-            max_h = max(int(c.split("_h")[1]) for c in per_h_cols if "_h" in c)
-            for start_idx in range(0, max_h, 7):
-                end_idx = min(start_idx + 7, max_h)
-                week_num = (start_idx // 7) + 1
-                week_mae_cols = [f"mae_h{h}" for h in range(start_idx + 1, end_idx + 1)]
-                week_rmse_cols = [
-                    f"rmse_h{h}" for h in range(start_idx + 1, end_idx + 1)
-                ]
-
-                week_mae_values: list[float] = []
-                week_rmse_values: list[float] = []
-                for col in week_mae_cols:
-                    if col in group.columns:
-                        vals = pd.to_numeric(group[col], errors="coerce").dropna()
-                        week_mae_values.extend(vals.tolist())
-                for col in week_rmse_cols:
-                    if col in group.columns:
-                        vals = pd.to_numeric(group[col], errors="coerce").dropna()
-                        week_rmse_values.extend(vals.tolist())
-
-                if week_mae_values:
-                    week_mae_arr = np.array(week_mae_values)
-                    row[f"mae_w{week_num}_mean"] = float(np.nanmean(week_mae_arr))
-                    row[f"mae_w{week_num}_median"] = float(np.nanmedian(week_mae_arr))
-                    row[f"mae_w{week_num}_std"] = float(np.nanstd(week_mae_arr))
-                else:
-                    row[f"mae_w{week_num}_mean"] = float("nan")
-                    row[f"mae_w{week_num}_median"] = float("nan")
-                    row[f"mae_w{week_num}_std"] = float("nan")
-
-                if week_rmse_values:
-                    week_rmse_arr = np.array(week_rmse_values)
-                    row[f"rmse_w{week_num}_mean"] = float(np.nanmean(week_rmse_arr))
-                    row[f"rmse_w{week_num}_median"] = float(np.nanmedian(week_rmse_arr))
-                    row[f"rmse_w{week_num}_std"] = float(np.nanstd(week_rmse_arr))
-                else:
-                    row[f"rmse_w{week_num}_mean"] = float("nan")
-                    row[f"rmse_w{week_num}_median"] = float("nan")
-                    row[f"rmse_w{week_num}_std"] = float("nan")
-
-        aggregate_rows.append(row)
-    aggregate_df = pd.DataFrame(aggregate_rows)
-    joint_aggregate_rows: list[dict[str, Any]] = []
-    if not joint_fold_df.empty:
-        value_cols = [
-            col for col in joint_fold_df.columns if col not in {"model", "fold"}
-        ]
-        for model_name, group in joint_fold_df.groupby("model"):
-            row: dict[str, Any] = {
-                "model": model_name,
-                "folds": int(group["fold"].nunique()),
-            }
-            for value_col in value_cols:
-                values = pd.to_numeric(group[value_col], errors="coerce").dropna()
-                if values.empty:
-                    row[f"{value_col}_mean"] = float("nan")
-                    row[f"{value_col}_std"] = float("nan")
-                else:
-                    row[f"{value_col}_mean"] = float(values.mean())
-                    row[f"{value_col}_std"] = float(values.std(ddof=1))
-            joint_aggregate_rows.append(row)
-    joint_aggregate_df = pd.DataFrame(joint_aggregate_rows)
-    if joint_aggregate_df.empty:
-        joint_aggregate_df = pd.DataFrame(columns=["model", "folds"])
-
-    baseline_fold_metrics = output_dir / "baseline_fold_metrics.csv"
-    baseline_aggregate_metrics = output_dir / "baseline_aggregate_metrics.csv"
-    baseline_joint_loss_fold = output_dir / "baseline_joint_loss_fold.csv"
-    baseline_joint_loss_aggregate = output_dir / "baseline_joint_loss_aggregate.csv"
-    baseline_coverage = output_dir / "baseline_coverage.csv"
-    baseline_pair_details = output_dir / "baseline_pair_details.csv"
-    baseline_model_usage = output_dir / "baseline_model_usage.csv"
-    baseline_sparsity = output_dir / "baseline_sparsity_stratified_metrics.csv"
-    baseline_vs_model_deltas = output_dir / "baseline_vs_model_deltas.csv"
-    baseline_metadata = output_dir / "baseline_metadata.json"
-
-    fold_df.to_csv(baseline_fold_metrics, index=False)
-    aggregate_df.to_csv(baseline_aggregate_metrics, index=False)
-    joint_fold_df.to_csv(baseline_joint_loss_fold, index=False)
-    joint_aggregate_df.to_csv(baseline_joint_loss_aggregate, index=False)
-    coverage_df.to_csv(baseline_coverage, index=False)
-    pair_df.to_csv(baseline_pair_details, index=False)
-    usage_df = (
-        pair_df.groupby(["model", "selected_model"], dropna=False)
-        .size()
-        .reset_index(name="count")
-    )
-    usage_df["count"] = usage_df["count"].astype(int)
-    usage_df = usage_df.sort_values(
-        by=["model", "count", "selected_model"],
-        ascending=[True, False, True],
-        ignore_index=True,
-    )
-    usage_df.to_csv(baseline_model_usage, index=False)
-    if include_sparsity_bins:
-        sparsity_df.to_csv(baseline_sparsity, index=False)
-    pd.DataFrame(
-        columns=[
-            "target",
-            "fold",
-            "metric",
-            "model_value",
-            "baseline_value",
-            "delta_model_minus_baseline",
-        ]
-    ).to_csv(baseline_vs_model_deltas, index=False)
-
-    metadata = {
-        "split": split,
-        "rolling_folds_requested": rolling_folds,
-        "rolling_folds_used": len(folds),
-        "input_window_length": input_window_length,
-        "forecast_horizon": horizon,
-        "seasonal_period": seasonal_period,
-        "var_maxlags": var_maxlags,
-        "models": resolved_models,
-        "weekly_horizon_aggregation": {
-            "enabled": True,
-            "days_per_week": 7,
-            "metrics": ["mae", "rmse"],
-            "statistics": ["mean", "median", "std"],
-        },
-        "joint_observation_loss_enabled": True,
-        "joint_observation_loss_spec": {
-            "obs_weight_sum": joint_spec.obs_weight_sum,
-            "obs_n_eff_power": joint_spec.obs_n_eff_power,
-            "obs_n_eff_reference": joint_spec.obs_n_eff_reference,
-            "ww_n_eff_reference": joint_spec.ww_n_eff_reference,
-            "hosp_n_eff_reference": joint_spec.hosp_n_eff_reference,
-            "cases_n_eff_reference": joint_spec.cases_n_eff_reference,
-            "deaths_n_eff_reference": joint_spec.deaths_n_eff_reference,
-            "ww_min_observed": joint_spec.ww_min_observed,
-            "hosp_min_observed": joint_spec.hosp_min_observed,
-            "cases_min_observed": joint_spec.cases_min_observed,
-            "deaths_min_observed": joint_spec.deaths_min_observed,
-        },
-        "missing_permit_map": permit_map,
-        "split_start": split_start,
-        "split_end": split_end,
-        "folds": [f.to_dict(temporal_coords) for f in folds],
-        "model_orders": model_orders,
-        "config_path": config_path,
-        "run_id": config.data.run_id,
-    }
-    baseline_metadata.write_text(json.dumps(metadata, indent=2))
-
-    result = {
-        "baseline_fold_metrics": baseline_fold_metrics,
-        "baseline_aggregate_metrics": baseline_aggregate_metrics,
-        "baseline_joint_loss_fold": baseline_joint_loss_fold,
-        "baseline_joint_loss_aggregate": baseline_joint_loss_aggregate,
-        "baseline_coverage": baseline_coverage,
-        "baseline_pair_details": baseline_pair_details,
-        "baseline_model_usage": baseline_model_usage,
-        "baseline_vs_model_deltas": baseline_vs_model_deltas,
-        "baseline_metadata": baseline_metadata,
-    }
-    if include_sparsity_bins:
-        result["baseline_sparsity_stratified_metrics"] = baseline_sparsity
-    return result
-
-
-def run_tiered_baseline_evaluation(
-    *,
-    config: EpiForecasterConfig,
-    config_path: str | None = None,
-    output_dir: Path,
-    split: str = "test",
-    rolling_folds: int = 5,
-    seasonal_period: int = 7,
-    include_sparsity_bins: bool = True,
-) -> dict[str, Path]:
-    return run_baseline_evaluation(
+    return run_same_slice_baseline_evaluation(
         config=config,
         output_dir=output_dir,
-        models=["tiered"],
+        models=models,
         config_path=config_path,
         split=split,
-        rolling_folds=rolling_folds,
         seasonal_period=seasonal_period,
-        include_sparsity_bins=include_sparsity_bins,
     )
 
 
@@ -1323,43 +432,10 @@ def compare_model_metrics_against_baselines(
     eval_metrics: dict[str, Any],
     baseline_results_csv: Path,
     output_csv: Path,
+    candidate_granular_csv: Path | None = None,
 ) -> Path:
     baseline_df = pd.read_csv(baseline_results_csv)
-    has_fold = "fold" in baseline_df.columns
-    has_target_metrics = {
-        "target",
-        "mae",
-        "rmse",
-        "r2",
-    }.issubset(set(baseline_df.columns))
-    has_joint_fold_metrics = "joint_obs_loss_total" in baseline_df.columns
-
-    if has_fold and has_target_metrics:
-        agg_rows: list[dict[str, Any]] = []
-        for (model_name, target_name), group in baseline_df.groupby(
-            ["model", "target"]
-        ):
-            agg_rows.append(
-                {
-                    "model": model_name,
-                    "target": target_name,
-                    "mae_mean": pd.to_numeric(group["mae"], errors="coerce").mean(),
-                    "rmse_mean": pd.to_numeric(group["rmse"], errors="coerce").mean(),
-                    "r2_mean": pd.to_numeric(group["r2"], errors="coerce").mean(),
-                }
-            )
-        baseline_df = pd.DataFrame(agg_rows)
-    elif has_fold and has_joint_fold_metrics:
-        joint_value_cols = [
-            col for col in baseline_df.columns if col not in {"model", "fold"}
-        ]
-        agg_rows = []
-        for model_name, group in baseline_df.groupby("model"):
-            row: dict[str, Any] = {"model": model_name}
-            for col in joint_value_cols:
-                row[f"{col}_mean"] = pd.to_numeric(group[col], errors="coerce").mean()
-            agg_rows.append(row)
-        baseline_df = pd.DataFrame(agg_rows)
+    baseline_df = _normalize_baseline_target_metrics_csv(baseline_results_csv)
 
     model_target_metrics = {
         "hospitalizations": {
@@ -1383,26 +459,7 @@ def compare_model_metrics_against_baselines(
             "r2": eval_metrics.get("r2_deaths_log1p_per_100k"),
         },
     }
-    joint_component_metrics = {
-        "joint_loss_ww_weighted": eval_metrics.get("loss_ww_weighted"),
-        "joint_loss_hosp_weighted": eval_metrics.get("loss_hosp_weighted"),
-        "joint_loss_cases_weighted": eval_metrics.get("loss_cases_weighted"),
-        "joint_loss_deaths_weighted": eval_metrics.get("loss_deaths_weighted"),
-    }
-    joint_obs_total = 0.0
-    has_joint_obs_component = False
-    for value in joint_component_metrics.values():
-        if value is None:
-            continue
-        numeric_value = float(value)
-        if not np.isfinite(numeric_value):
-            continue
-        joint_obs_total += numeric_value
-        has_joint_obs_component = True
-
     rows: list[dict[str, Any]] = []
-    joint_total_recorded: set[str] = set()
-    joint_component_recorded: set[tuple[str, str]] = set()
     for baseline_row in baseline_df.to_dict(orient="records"):
         target = str(baseline_row.get("target"))
         model_name = str(baseline_row["model"])
@@ -1424,45 +481,539 @@ def compare_model_metrics_against_baselines(
                     }
                 )
 
-        if has_joint_obs_component and model_name not in joint_total_recorded:
-            baseline_joint_total = baseline_row.get("joint_obs_loss_total_mean")
-            if baseline_joint_total is not None and pd.notna(baseline_joint_total):
-                rows.append(
-                    {
-                        "target": "joint_observation",
-                        "baseline_model": model_name,
-                        "metric": "joint_obs_loss_total",
-                        "model_value": float(joint_obs_total),
-                        "baseline_value": float(baseline_joint_total),
-                        "delta_model_minus_baseline": float(joint_obs_total)
-                        - float(baseline_joint_total),
-                    }
-                )
-                joint_total_recorded.add(model_name)
-
-        for baseline_key, model_metric in joint_component_metrics.items():
-            if (model_name, baseline_key) in joint_component_recorded:
-                continue
-            if model_metric is None:
-                continue
-            metric_value = float(model_metric)
-            if not np.isfinite(metric_value):
-                continue
-            baseline_value = baseline_row.get(f"{baseline_key}_mean")
-            if baseline_value is None or not pd.notna(baseline_value):
-                continue
-            rows.append(
-                {
-                    "target": "joint_observation",
-                    "baseline_model": model_name,
-                    "metric": baseline_key,
-                    "model_value": metric_value,
-                    "baseline_value": float(baseline_value),
-                    "delta_model_minus_baseline": metric_value - float(baseline_value),
-                }
-            )
-            joint_component_recorded.add((model_name, baseline_key))
-
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_csv, index=False)
     return output_csv
+
+
+def _normalize_baseline_target_metrics_csv(
+    baseline_results_csv: Path,
+) -> pd.DataFrame:
+    baseline_df = pd.read_csv(baseline_results_csv)
+    has_aggregate_target_metrics = {
+        "target",
+        "mae_mean",
+        "rmse_mean",
+        "r2_mean",
+    }.issubset(set(baseline_df.columns))
+
+    if has_aggregate_target_metrics:
+        return baseline_df
+
+    return pd.DataFrame(columns=["model", "target", "mae_mean", "rmse_mean", "r2_mean"])
+
+
+def _compute_metrics_from_granular_rows(rows: pd.DataFrame) -> dict[str, float]:
+    if rows.empty:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "observed_count": 0.0,
+        }
+
+    observed = pd.to_numeric(rows["observed"], errors="coerce")
+    abs_error = pd.to_numeric(rows["abs_error"], errors="coerce")
+    sq_error = pd.to_numeric(rows["sq_error"], errors="coerce")
+    valid = np.isfinite(observed) & np.isfinite(abs_error) & np.isfinite(sq_error)
+    observed = observed[valid].astype(float)
+    abs_error = abs_error[valid].astype(float)
+    sq_error = sq_error[valid].astype(float)
+    if observed.empty:
+        return {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "r2": float("nan"),
+            "observed_count": 0.0,
+        }
+
+    weight_sum = float(len(observed))
+    mae = float(abs_error.sum() / weight_sum)
+    rmse = float(np.sqrt(sq_error.sum() / weight_sum))
+    ss_res = float(sq_error.sum())
+    target_weighted_sum = float(observed.sum())
+    target_weighted_sq_sum = float((observed**2).sum())
+    ss_tot = target_weighted_sq_sum - (target_weighted_sum**2) / max(weight_sum, 1.0)
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "observed_count": weight_sum,
+    }
+
+
+def _extract_same_slice_history(
+    batch_data: Any,
+    *,
+    spec: SameSliceTargetSpec,
+) -> tuple[np.ndarray, np.ndarray]:
+    history = getattr(batch_data, spec.history_attr, None)
+    if history is None:
+        raise ValueError(f"Missing history tensor for target {spec.canonical_name}")
+
+    if spec.canonical_name == "wastewater":
+        history_values = _torch_to_numpy_2d(history)
+        history_mask_tensor = getattr(batch_data, "ww_hist_mask", None)
+        if history_mask_tensor is None:
+            raise ValueError("Missing ww_hist_mask for wastewater same-slice baseline")
+        history_mask = _torch_to_numpy_2d(history_mask_tensor)
+        return history_values, (history_mask > 0).astype(np.float64)
+
+    history_np = np.asarray(history.detach().cpu().numpy(), dtype=np.float64)
+    if history_np.ndim != 3 or history_np.shape[2] < 2:
+        raise ValueError(f"Unexpected history shape for {spec.canonical_name}: {history_np.shape}")
+    history_values = history_np[:, :, 0]
+    history_mask = (history_np[:, :, 1] > 0).astype(np.float64)
+    return history_values, history_mask
+
+
+def _targets_dict_from_batch(batch_data: Any) -> dict[str, torch.Tensor | None]:
+    return {
+        "ww": getattr(batch_data, "ww_target", None),
+        "hosp": getattr(batch_data, "hosp_target", None),
+        "cases": getattr(batch_data, "cases_target", None),
+        "deaths": getattr(batch_data, "deaths_target", None),
+        "ww_mask": getattr(batch_data, "ww_target_mask", None),
+        "hosp_mask": getattr(batch_data, "hosp_target_mask", None),
+        "cases_mask": getattr(batch_data, "cases_target_mask", None),
+        "deaths_mask": getattr(batch_data, "deaths_target_mask", None),
+    }
+
+
+def _build_same_slice_granular_rows(
+    *,
+    batch_data: Any,
+    spec: SameSliceTargetSpec,
+    predictions: np.ndarray,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+    temporal_coords: list[Any] | None,
+    region_ids: list[str] | None,
+    region_labels: list[str] | None,
+    split: str,
+    model_name: str,
+    selected_model: str | list[str],
+    fit_status: str | list[str],
+    fallback_reason: str | list[str],
+    batch_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    pred = np.asarray(predictions, dtype=np.float64)
+    target = (
+        torch.nan_to_num(targets.detach().float(), nan=0.0).cpu().numpy().astype(np.float64)
+    )
+    observed_weights = (
+        torch.nan_to_num(weights.detach().float(), nan=0.0).cpu().numpy().astype(np.float64)
+    )
+    with np.errstate(over="ignore", invalid="ignore"):
+        error = pred - target
+        abs_error = np.abs(error)
+        sq_error = np.square(error)
+    smape_num = 2.0 * abs_error
+    smape_den = np.abs(pred) + np.abs(target) + 1.0e-6
+
+    target_nodes = batch_data.target_node.detach().cpu().tolist()
+    window_starts = batch_data.window_start.detach().cpu().tolist()
+    input_window_length = int(getattr(batch_data, "hosp_hist").shape[1])
+
+    rows: list[dict[str, Any]] = []
+    batch_size, horizon_size = target.shape
+    source_indices = batch_indices or list(range(batch_size))
+    for batch_index, source_index in enumerate(source_indices):
+        selected_model_value = (
+            selected_model[source_index]
+            if isinstance(selected_model, list)
+            else selected_model
+        )
+        fit_status_value = (
+            fit_status[source_index] if isinstance(fit_status, list) else fit_status
+        )
+        fallback_reason_value = (
+            fallback_reason[source_index]
+            if isinstance(fallback_reason, list)
+            else fallback_reason
+        )
+        node_id = int(target_nodes[source_index])
+        window_start = int(window_starts[source_index])
+        window_start_date = _format_temporal_coord(temporal_coords, window_start)
+        region_id = ""
+        region_label = ""
+        if region_ids is not None and 0 <= node_id < len(region_ids):
+            region_id = str(region_ids[node_id])
+        if region_labels is not None and 0 <= node_id < len(region_labels):
+            region_label = str(region_labels[node_id])
+        if not region_label:
+            region_label = region_id
+
+        for horizon_index in range(horizon_size):
+            if not bool(observed_weights[batch_index, horizon_index] > 0):
+                continue
+            pred_value = float(pred[batch_index, horizon_index])
+            target_value = float(target[batch_index, horizon_index])
+            abs_error_value = float(abs_error[batch_index, horizon_index])
+            sq_error_value = float(sq_error[batch_index, horizon_index])
+            smape_num_value = float(smape_num[batch_index, horizon_index])
+            smape_den_value = float(smape_den[batch_index, horizon_index])
+            if not all(
+                np.isfinite(value)
+                for value in (
+                    pred_value,
+                    target_value,
+                    abs_error_value,
+                    sq_error_value,
+                    smape_num_value,
+                    smape_den_value,
+                )
+            ):
+                continue
+            if abs_error_value > _MAX_SAFE_ABS_ERROR:
+                continue
+            target_index = window_start + input_window_length + horizon_index
+            rows.append(
+                {
+                    "model": model_name,
+                    "selected_model": selected_model_value,
+                    "fit_status": fit_status_value,
+                    "fallback_reason": fallback_reason_value,
+                    "split": split,
+                    "target": spec.canonical_name,
+                    "node_id": node_id,
+                    "region_id": region_id,
+                    "region_label": region_label,
+                    "window_start": window_start,
+                    "window_start_date": window_start_date,
+                    "horizon": horizon_index + 1,
+                    "target_index": target_index,
+                    "target_date": _format_temporal_coord(temporal_coords, target_index),
+                    "observed": target_value,
+                    "abs_error": abs_error_value,
+                    "sq_error": sq_error_value,
+                    "smape_num": smape_num_value,
+                    "smape_den": smape_den_value,
+                }
+            )
+    return rows
+
+
+def _aggregate_same_slice_granular_rows(granular_df: pd.DataFrame) -> pd.DataFrame:
+    if granular_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "model",
+                "target",
+                "mae_mean",
+                "rmse_mean",
+                "r2_mean",
+                "observed_count_mean",
+            ]
+        )
+
+    aggregate_rows: list[dict[str, Any]] = []
+    for (model_name, target_name), group in granular_df.groupby(["model", "target"]):
+        metrics = _compute_metrics_from_granular_rows(group)
+        aggregate_rows.append(
+            {
+                "model": str(model_name),
+                "target": str(target_name),
+                "mae_mean": metrics["mae"],
+                "rmse_mean": metrics["rmse"],
+                "r2_mean": metrics["r2"],
+                "observed_count_mean": metrics["observed_count"],
+            }
+        )
+
+    return pd.DataFrame(aggregate_rows)
+
+
+def _safe_len(obj: Any) -> int | None:
+    try:
+        return int(len(obj))
+    except (TypeError, ValueError):
+        return None
+
+
+def run_same_slice_baseline_evaluation(
+    *,
+    config: EpiForecasterConfig,
+    output_dir: Path,
+    models: list[str] | None = None,
+    config_path: str | None = None,
+    split: str = "test",
+    seasonal_period: int = 7,
+) -> dict[str, Path]:
+    eval_start = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_models = _resolve_baseline_models(models)
+    logger.info(
+        "[baseline_eval] Starting same-slice baseline evaluation: split=%s models=%s output_dir=%s",
+        split.lower(),
+        ",".join(resolved_models),
+        output_dir,
+    )
+
+    loader_build_start = time.perf_counter()
+    loader, _region_embeddings = build_loader_from_config(
+        config=config,
+        split=split,
+        batch_size=1,
+        device="cpu",
+    )
+    logger.info(
+        "[baseline_eval] Loader ready in %.2fs",
+        time.perf_counter() - loader_build_start,
+    )
+    dataset = loader.dataset
+    split_start, split_end = _resolve_split_bounds(dataset)
+    target_nodes = list(dataset.target_nodes)
+    total_batches = _safe_len(loader)
+    logger.info(
+        "[baseline_eval] Dataset summary: split_bounds=(%d,%d) target_nodes=%d loader_batches=%s forecast_horizon=%d",
+        split_start,
+        split_end,
+        len(target_nodes),
+        total_batches if total_batches is not None else "unknown",
+        int(config.model.forecast_horizon),
+    )
+    criterion = get_loss_from_config(
+        config.training.loss,
+        data_config=config.data,
+        forecast_horizon=config.model.forecast_horizon,
+    )
+    temporal_coords = list(getattr(dataset, "_temporal_coords", []))
+    region_ids = list(getattr(dataset, "_region_ids", []) or [])
+    region_labels = list(getattr(dataset, "_region_labels", []) or [])
+    target_views = _prepare_target_views(
+        dataset=dataset,
+        split_start=split_start,
+        split_end=split_end,
+        target_nodes=target_nodes,
+        include_sparsity_bins=False,
+    )
+    global_medians = {
+        target_name: _global_median_for_target(
+            values=target_view.values,
+            mask=target_view.mask,
+            train_start=split_start,
+            train_end=split_end,
+        )
+        for target_name, target_view in target_views.items()
+    }
+    logger.info(
+        "[baseline_eval] Prepared target views and global medians in %.2fs",
+        time.perf_counter() - eval_start,
+    )
+
+    granular_rows: list[dict[str, Any]] = []
+    processed_batches = 0
+    completed_series = 0
+    last_progress_log = time.perf_counter()
+    current_model_name = ""
+    current_target_name = ""
+    for batch_data in loader:
+        batch_start = time.perf_counter()
+        if hasattr(batch_data, "to"):
+            batch_data = batch_data.to(torch.device("cpu"))
+        targets_dict = _targets_dict_from_batch(batch_data)
+        obs_supervision = criterion.compute_observation_supervision(
+            targets_dict,
+            device=torch.device("cpu"),
+        )
+
+        for model_name in resolved_models:
+            current_model_name = model_name
+            if model_name == "var":
+                per_target_results = _predict_var_baseline(
+                    batch_data=batch_data,
+                    horizon=int(config.model.forecast_horizon),
+                    global_medians=global_medians,
+                    seasonal_period=seasonal_period,
+                )
+                for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
+                    current_target_name = target_name
+                    supervision_key = {
+                        "hospitalizations": "hosp",
+                        "wastewater": "ww",
+                        "cases": "cases",
+                        "deaths": "deaths",
+                    }[target_name]
+                    supervision = obs_supervision[supervision_key]
+                    target_tensor = supervision["target"]
+                    weights = supervision["weights"]
+                    if target_tensor is None or weights is None:
+                        continue
+
+                    target_results = per_target_results[target_name]
+                    predictions = np.stack(
+                        [pred.predictions for pred in target_results],
+                        axis=0,
+                    )
+                    selected_models = [pred.model_name for pred in target_results]
+                    fit_statuses = [pred.fit_status for pred in target_results]
+                    fallback_reasons = [
+                        pred.fallback_reason for pred in target_results
+                    ]
+                    completed_series += len(target_results)
+                    granular_rows.extend(
+                        _build_same_slice_granular_rows(
+                            batch_data=batch_data,
+                            spec=spec,
+                            predictions=predictions,
+                            targets=target_tensor,
+                            weights=weights,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                            split=split.lower(),
+                            model_name=model_name,
+                            selected_model=selected_models,
+                            fit_status=fit_statuses,
+                            fallback_reason=fallback_reasons,
+                        )
+                    )
+                continue
+
+            if model_name not in {"sarima", "exp_smoothing"}:
+                continue
+            for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
+                current_target_name = target_name
+                supervision_key = {
+                    "hospitalizations": "hosp",
+                    "wastewater": "ww",
+                    "cases": "cases",
+                    "deaths": "deaths",
+                }[target_name]
+                supervision = obs_supervision[supervision_key]
+                target_tensor = supervision["target"]
+                weights = supervision["weights"]
+                if target_tensor is None or weights is None:
+                    continue
+
+                history_values, history_mask = _extract_same_slice_history(
+                    batch_data,
+                    spec=spec,
+                )
+                batch_size = history_values.shape[0]
+                predictions = np.zeros_like(target_tensor.detach().cpu().numpy(), dtype=np.float64)
+                selected_models: list[str] = []
+                fit_statuses: list[str] = []
+                fallback_reasons: list[str] = []
+                for batch_index in range(batch_size):
+                    pred = _predict_univariate_baseline(
+                        baseline_model=model_name,
+                        train_values=history_values[batch_index],
+                        train_mask=history_mask[batch_index],
+                        horizon=int(target_tensor.shape[1]),
+                        global_train_median=global_medians[target_name],
+                        seasonal_period=seasonal_period,
+                        exog_train=None,
+                        exog_future=None,
+                    )
+                    predictions[batch_index] = pred.predictions
+                    selected_models.append(pred.model_name)
+                    fit_statuses.append(pred.fit_status)
+                    fallback_reasons.append(pred.fallback_reason)
+                completed_series += batch_size
+                granular_rows.extend(
+                    _build_same_slice_granular_rows(
+                        batch_data=batch_data,
+                        spec=spec,
+                        predictions=predictions,
+                        targets=target_tensor,
+                        weights=weights,
+                        temporal_coords=temporal_coords,
+                        region_ids=region_ids,
+                        region_labels=region_labels,
+                        split=split.lower(),
+                        model_name=model_name,
+                        selected_model=selected_models,
+                        fit_status=fit_statuses,
+                        fallback_reason=fallback_reasons,
+                    )
+                )
+        processed_batches += 1
+        now = time.perf_counter()
+        should_log_progress = (
+            processed_batches == 1
+            or processed_batches % _BASELINE_PROGRESS_LOG_BATCH_INTERVAL == 0
+            or (now - last_progress_log) >= _BASELINE_PROGRESS_LOG_TIME_INTERVAL_SEC
+        )
+        if should_log_progress:
+            batch_suffix = (
+                f"/{total_batches}" if total_batches is not None else ""
+            )
+            logger.info(
+                "[baseline_eval] Progress: batches=%d%s series=%d rows=%d current_model=%s current_target=%s elapsed=%.2fs last_batch=%.2fs",
+                processed_batches,
+                batch_suffix,
+                completed_series,
+                len(granular_rows),
+                current_model_name or "unknown",
+                current_target_name or "unknown",
+                now - eval_start,
+                now - batch_start,
+            )
+            last_progress_log = now
+
+    aggregate_start = time.perf_counter()
+    granular_df = pd.DataFrame(granular_rows, columns=_BASELINE_GRANULAR_FIELDNAMES)
+    aggregate_df = _aggregate_same_slice_granular_rows(granular_df)
+    logger.info(
+        "[baseline_eval] Aggregated granular rows in %.2fs: rows=%d aggregate_rows=%d",
+        time.perf_counter() - aggregate_start,
+        len(granular_df),
+        len(aggregate_df),
+    )
+
+    baseline_granular = output_dir / "baseline_granular.csv"
+    baseline_aggregate_metrics = output_dir / "baseline_aggregate_metrics.csv"
+    baseline_metadata = output_dir / "baseline_metadata.json"
+    baseline_model_usage = output_dir / "baseline_model_usage.csv"
+
+    granular_df.to_csv(baseline_granular, index=False)
+    aggregate_df.to_csv(baseline_aggregate_metrics, index=False)
+    usage_df = (
+        granular_df.groupby(["model", "selected_model"], dropna=False)
+        .size()
+        .reset_index(name="count")
+        if not granular_df.empty
+        else pd.DataFrame(columns=["model", "selected_model", "count"])
+    )
+    usage_df.to_csv(baseline_model_usage, index=False)
+    logger.info(
+        "[baseline_eval] Wrote artifacts in %.2fs: granular=%s aggregate=%s usage=%s total_elapsed=%.2fs",
+        time.perf_counter() - aggregate_start,
+        baseline_granular,
+        baseline_aggregate_metrics,
+        baseline_model_usage,
+        time.perf_counter() - eval_start,
+    )
+
+    write_granular_metadata_sidecar(
+        baseline_granular,
+        {
+            "comparison_scope": _SAME_SLICE_COMPARISON_SCOPE,
+            "split": split.lower(),
+            "config_path": config_path,
+        },
+    )
+    baseline_metadata.write_text(
+        json.dumps(
+            {
+                "comparison_scope": _SAME_SLICE_COMPARISON_SCOPE,
+                "schema_version": _SAME_SLICE_BASELINE_SCHEMA_VERSION,
+                "split": split.lower(),
+                "models": resolved_models,
+                "config_path": config_path,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "baseline_granular": baseline_granular,
+        "baseline_aggregate_metrics": baseline_aggregate_metrics,
+        "baseline_model_usage": baseline_model_usage,
+        "baseline_metadata": baseline_metadata,
+    }

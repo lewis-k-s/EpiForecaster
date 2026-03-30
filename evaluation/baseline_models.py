@@ -8,8 +8,13 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tsa.vector_ar.var_model import VAR
 
-_DEFAULT_ORDERS = [(1, 0, 0), (0, 1, 1), (1, 1, 1)]
+# Short-window SARIMA policy for 60d history / 28d horizon evaluation.
+_DEFAULT_ORDERS = [(1, 0, 0), (0, 1, 1)]
 _DEFAULT_SEASONAL_ORDERS = [(0, 0, 0, 7), (1, 0, 0, 7)]
+_SARIMAX_MAXITER = 20
+_FORECAST_ABS_SCALE_MULTIPLIER = 1.0e6
+_FORECAST_ABS_MIN_LIMIT = 1.0e6
+_MAX_SAFE_ABS_PREDICTION = float(np.sqrt(np.finfo(np.float64).max) / 4.0)
 
 
 @dataclass
@@ -19,6 +24,36 @@ class BaselinePredictionResult:
     fit_status: str
     fallback_reason: str
     model_order: str
+
+
+def _has_runtime_warning(caught_warnings: list[warnings.WarningMessage]) -> bool:
+    return any(issubclass(w.category, RuntimeWarning) for w in caught_warnings)
+
+
+def _prediction_abs_limit(
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+) -> float:
+    observed = np.asarray(train_values, dtype=np.float64)[np.asarray(train_mask) > 0]
+    observed = observed[np.isfinite(observed)]
+    if observed.size == 0:
+        return _FORECAST_ABS_MIN_LIMIT
+    baseline_scale = max(float(np.max(np.abs(observed))), 1.0)
+    return min(
+        _MAX_SAFE_ABS_PREDICTION,
+        max(_FORECAST_ABS_MIN_LIMIT, baseline_scale * _FORECAST_ABS_SCALE_MULTIPLIER),
+    )
+
+
+def _predictions_are_stable(
+    preds: np.ndarray,
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+) -> bool:
+    preds = np.asarray(preds, dtype=np.float64).reshape(-1)
+    if np.any(~np.isfinite(preds)):
+        return False
+    return bool(np.all(np.abs(preds) <= _prediction_abs_limit(train_values, train_mask)))
 
 
 def _impute_univariate_for_fit(
@@ -147,11 +182,11 @@ def _fit_best_sarimax(
     best_fit = None
     best_order_repr = ""
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore")
-        for order in orders:
-            for seasonal in seasonal_orders:
-                try:
+    for order in orders:
+        for seasonal in seasonal_orders:
+            try:
+                with warnings.catch_warnings(record=True) as caught_warnings:
+                    warnings.simplefilter("always", RuntimeWarning)
                     model = SARIMAX(
                         y,
                         exog=exog_train,
@@ -161,23 +196,29 @@ def _fit_best_sarimax(
                         enforce_stationarity=False,
                         enforce_invertibility=False,
                     )
-                    result = model.fit(disp=False, maxiter=50)
-                    if np.isfinite(result.aic) and result.aic < best_aic:
-                        best_aic = float(result.aic)
-                        best_fit = result
-                        best_order_repr = f"order={order};seasonal_order={seasonal}"
-                except Exception:
+                    result = model.fit(disp=False, maxiter=_SARIMAX_MAXITER)
+                if _has_runtime_warning(caught_warnings):
                     continue
+                if np.isfinite(result.aic) and result.aic < best_aic:
+                    best_aic = float(result.aic)
+                    best_fit = result
+                    best_order_repr = f"order={order};seasonal_order={seasonal}"
+            except Exception:
+                continue
 
     if best_fit is None:
         return None
 
     try:
-        forecast = best_fit.get_forecast(steps=horizon, exog=exog_future)
-        preds = np.asarray(forecast.predicted_mean, dtype=np.float64)
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always", RuntimeWarning)
+            forecast = best_fit.get_forecast(steps=horizon, exog=exog_future)
+            preds = np.asarray(forecast.predicted_mean, dtype=np.float64)
+        if _has_runtime_warning(caught_warnings):
+            return None
         if preds.shape[0] != horizon:
             return None
-        if np.any(~np.isfinite(preds)):
+        if not _predictions_are_stable(preds, train_values, train_mask):
             return None
         return preds, best_order_repr
     except Exception:
@@ -260,7 +301,7 @@ def _fit_best_exponential_smoothing(
         preds = np.asarray(best_fit.forecast(horizon), dtype=np.float64).reshape(-1)
         if preds.shape[0] != horizon:
             return None
-        if np.any(~np.isfinite(preds)):
+        if not _predictions_are_stable(preds, train_values, train_mask):
             return None
         return preds, best_order_repr
     except Exception:
@@ -340,13 +381,14 @@ def predict_with_tiered_fallback(
         )
         if sarimax_out is not None:
             preds, order_repr = sarimax_out
-            return BaselinePredictionResult(
-                model_name="sarimax_calendar",
-                predictions=preds,
-                fit_status="fit_success",
-                fallback_reason="",
-                model_order=order_repr,
-            )
+            if _predictions_are_stable(preds, train_values, train_mask):
+                return BaselinePredictionResult(
+                    model_name="sarimax_calendar",
+                    predictions=preds,
+                    fit_status="fit_success",
+                    fallback_reason="",
+                    model_order=order_repr,
+                )
         fallback_reasons.append("sarimax_unavailable")
     else:
         fallback_reasons.append("sarimax_no_exog")
@@ -360,13 +402,86 @@ def predict_with_tiered_fallback(
     )
     if sarima_out is not None:
         preds, order_repr = sarima_out
+        if _predictions_are_stable(preds, train_values, train_mask):
+            return BaselinePredictionResult(
+                model_name="sarima",
+                predictions=preds,
+                fit_status="fit_success",
+                fallback_reason="|".join(fallback_reasons),
+                model_order=order_repr,
+            )
+    fallback_reasons.append("sarima_unavailable")
+
+    seasonal_pred = _predict_seasonal_naive(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        seasonal_period=seasonal_period,
+    )
+    if seasonal_pred is not None:
         return BaselinePredictionResult(
-            model_name="sarima",
-            predictions=preds,
-            fit_status="fit_success",
+            model_name="seasonal_naive_7d",
+            predictions=seasonal_pred,
+            fit_status="fallback",
             fallback_reason="|".join(fallback_reasons),
-            model_order=order_repr,
+            model_order="",
         )
+    fallback_reasons.append("seasonal_naive_unavailable")
+
+    last_obs_pred = _predict_last_observed(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+    )
+    if last_obs_pred is not None:
+        return BaselinePredictionResult(
+            model_name="last_observed",
+            predictions=last_obs_pred,
+            fit_status="fallback",
+            fallback_reason="|".join(fallback_reasons),
+            model_order="",
+        )
+
+    fallback_reasons.append("last_observed_unavailable")
+    return BaselinePredictionResult(
+        model_name="global_train_median",
+        predictions=np.full(horizon, float(global_train_median), dtype=np.float64),
+        fit_status="fallback",
+        fallback_reason="|".join(fallback_reasons),
+        model_order="",
+    )
+
+
+def predict_with_sarima_fallback(
+    *,
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+    horizon: int,
+    global_train_median: float,
+    seasonal_period: int = 7,
+) -> BaselinePredictionResult:
+    """Predict with pure-series SARIMA followed by deterministic sparse fallbacks."""
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+
+    fallback_reasons: list[str] = []
+    sarima_out = _fit_best_sarimax(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        exog_train=None,
+        exog_future=None,
+    )
+    if sarima_out is not None:
+        preds, order_repr = sarima_out
+        if _predictions_are_stable(preds, train_values, train_mask):
+            return BaselinePredictionResult(
+                model_name="sarima",
+                predictions=preds,
+                fit_status="fit_success",
+                fallback_reason="",
+                model_order=order_repr,
+            )
     fallback_reasons.append("sarima_unavailable")
 
     seasonal_pred = _predict_seasonal_naive(
@@ -489,6 +604,28 @@ def predict_with_var_cross_target_fallback(
     seasonal_period: int = 7,
     maxlags: int = 14,
 ) -> dict[str, BaselinePredictionResult]:
+    """Backward-compatible alias for the public VAR baseline wrapper."""
+    return predict_with_var_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        target_names=target_names,
+        global_train_medians=global_train_medians,
+        seasonal_period=seasonal_period,
+        maxlags=maxlags,
+    )
+
+
+def predict_with_var_fallback(
+    *,
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+    horizon: int,
+    target_names: list[str],
+    global_train_medians: np.ndarray,
+    seasonal_period: int = 7,
+    maxlags: int = 14,
+) -> dict[str, BaselinePredictionResult]:
     """Predict all targets jointly with VAR, fallback to per-target smoothing chain."""
     if horizon <= 0:
         raise ValueError("horizon must be positive")
@@ -511,7 +648,7 @@ def predict_with_var_cross_target_fallback(
         preds, order_repr = var_out
         return {
             name: BaselinePredictionResult(
-                model_name="var_cross_target",
+                model_name="var",
                 predictions=preds[:, idx].astype(np.float64),
                 fit_status="fit_success",
                 fallback_reason="",

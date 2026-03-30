@@ -20,6 +20,7 @@ from data.epi_dataset import EpiDataset
 from evaluation.granular_export import (
     GRANULAR_SCHEMA_VERSION,
     GranularEvalWriter,
+    write_metadata_sidecar,
     write_granular_metadata_sidecar,
 )
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
@@ -38,6 +39,106 @@ from utils.training_utils import drop_nowcast
 
 logger = logging.getLogger(__name__)
 
+PER_HEAD_NODE_METRICS_SCHEMA_VERSION = "1"
+PER_HEAD_NODE_METRICS_FIELDNAMES = [
+    "target",
+    "node_id",
+    "region_id",
+    "region_label",
+    "population",
+    "observed_count",
+    "mae",
+    "rmse",
+]
+_HEAD_CANONICAL_NAMES = {
+    "hosp": "hospitalizations",
+    "ww": "wastewater",
+    "cases": "cases",
+    "deaths": "deaths",
+}
+
+
+def _accumulate_per_head_node_metrics(
+    *,
+    target_name: str,
+    target_nodes: torch.Tensor,
+    diff: torch.Tensor,
+    abs_diff: torch.Tensor,
+    weights: torch.Tensor,
+    accumulator: dict[str, dict[int, dict[str, float]]],
+) -> None:
+    canonical_target = _HEAD_CANONICAL_NAMES[target_name]
+    target_stats = accumulator.setdefault(canonical_target, {})
+    target_node_ids = target_nodes.detach().cpu().tolist()
+    per_sample_abs_sum = (abs_diff * weights).sum(dim=1).detach().cpu().tolist()
+    per_sample_sq_sum = ((diff**2) * weights).sum(dim=1).detach().cpu().tolist()
+    per_sample_count = (weights > 0).sum(dim=1).detach().cpu().tolist()
+
+    for node_id, abs_sum, sq_sum, observed_count in zip(
+        target_node_ids,
+        per_sample_abs_sum,
+        per_sample_sq_sum,
+        per_sample_count,
+        strict=False,
+    ):
+        count_value = int(observed_count)
+        if count_value <= 0:
+            continue
+        node_stats = target_stats.setdefault(
+            int(node_id),
+            {"abs_error_sum": 0.0, "sq_error_sum": 0.0, "observed_count": 0.0},
+        )
+        node_stats["abs_error_sum"] += float(abs_sum)
+        node_stats["sq_error_sum"] += float(sq_sum)
+        node_stats["observed_count"] += float(count_value)
+
+
+def _write_per_head_node_metrics_csv(
+    *,
+    output_path: Path,
+    per_head_node_metrics: dict[str, dict[int, dict[str, float]]],
+    region_ids: list[str] | None,
+    region_labels: list[str] | None,
+    population_by_node: list[float] | None,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv_lib.DictWriter(f, fieldnames=PER_HEAD_NODE_METRICS_FIELDNAMES)
+        writer.writeheader()
+        for target in _HEAD_CANONICAL_NAMES.values():
+            target_stats = per_head_node_metrics.get(target, {})
+            for node_id in sorted(target_stats):
+                stats = target_stats[node_id]
+                observed_count = int(stats["observed_count"])
+                if observed_count <= 0:
+                    continue
+                region_id = ""
+                region_label = ""
+                population = float("nan")
+                if region_ids is not None and 0 <= node_id < len(region_ids):
+                    region_id = str(region_ids[node_id])
+                if region_labels is not None and 0 <= node_id < len(region_labels):
+                    region_label = str(region_labels[node_id])
+                if not region_label:
+                    region_label = region_id
+                if population_by_node is not None and 0 <= node_id < len(
+                    population_by_node
+                ):
+                    population = float(population_by_node[node_id])
+
+                writer.writerow(
+                    {
+                        "target": target,
+                        "node_id": node_id,
+                        "region_id": region_id,
+                        "region_label": region_label,
+                        "population": population,
+                        "observed_count": observed_count,
+                        "mae": stats["abs_error_sum"] / observed_count,
+                        "rmse": math.sqrt(stats["sq_error_sum"] / observed_count),
+                    }
+                )
+
 
 def _format_eval_summary(loss: float, metrics: dict[str, Any]) -> str:
     """Format evaluation results as a markdown table."""
@@ -49,9 +150,9 @@ def _format_eval_summary(loss: float, metrics: dict[str, Any]) -> str:
 
     rows = [
         ("Loss", _fmt(loss)),
-        ("MAE", _fmt(metrics.get("mae"))),
-        ("RMSE", _fmt(metrics.get("rmse"))),
-        ("R2", _fmt(metrics.get("r2"))),
+        ("Joint Obs Loss", _fmt(metrics.get("mae"))),
+        ("Hosp MAE", _fmt(metrics.get("mae_hosp_log1p_per_100k"))),
+        ("WW MAE", _fmt(metrics.get("mae_ww_log1p_per_100k"))),
     ]
     table = ["| Metric | Value |", "|---|---|"]
     for name, value in rows:
@@ -70,11 +171,13 @@ def evaluate_loader(
     split_name: str = "Eval",
     max_batches: int | None = None,
     node_metrics_csv_path: Path | None = None,
+    per_head_node_metrics_csv_path: Path | None = None,
     granular_csv_path: Path | None = None,
     granular_metadata: dict[str, Any] | None = None,
     output_csv_path: Path | None = None,
+    node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
-) -> tuple[float, dict[str, Any], dict[int, float]]:
+) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
     """Evaluate a loader and compute loss/metrics matching trainer behavior.
 
     Uses device-local metric accumulation to minimize CPU-GPU synchronization.
@@ -89,20 +192,27 @@ def evaluate_loader(
         split_name: Name of the split for logging (e.g., "Val", "Test")
         max_batches: Optional limit on number of batches to evaluate
         node_metrics_csv_path: Optional path to save per-node MAE metrics as CSV
+        per_head_node_metrics_csv_path: Optional path to save per-head node metrics CSV
         granular_csv_path: Optional path to save granular per-example error rows as CSV
         granular_metadata: Optional metadata to write alongside the granular CSV
         output_csv_path: Deprecated alias for node_metrics_csv_path
+        node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
 
     Returns:
         Tuple of (mean_loss, metrics_dict, node_mae_dict) where:
         - mean_loss: Average loss per batch
-        - metrics_dict: Dictionary of computed metrics (MAE, RMSE, sMAPE, R2, etc.)
-        - node_mae_dict: Dictionary mapping node_id -> average MAE
+        - metrics_dict: Dictionary of computed metrics
+        - node_mae_dict: Dictionary mapping target name -> node_id -> average MAE
     """
     logger.info(f"{split_name} evaluation started...")
     if node_metrics_csv_path is None:
         node_metrics_csv_path = output_csv_path
+    if node_metrics_target not in _HEAD_CANONICAL_NAMES.values():
+        raise ValueError(
+            f"Unknown node_metrics_target {node_metrics_target!r}; expected one of "
+            f"{tuple(_HEAD_CANONICAL_NAMES.values())}."
+        )
 
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
@@ -121,10 +231,7 @@ def evaluate_loader(
     loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
     loss_sir_weighted_sum = torch.tensor(0.0, device=device)
 
-    # For node-level MAE, collect tensors and process on CPU at the end
-    node_mae_accum_maes: list[torch.Tensor] = []
-    node_mae_accum_nodes: list[torch.Tensor] = []
-    node_mae_accum_valid: list[torch.Tensor] = []
+    per_head_node_metrics: dict[str, dict[int, dict[str, float]]] = {}
 
     num_batches = len(loader)
     eval_iter = loader
@@ -262,17 +369,17 @@ def evaluate_loader(
                         observed_mask=hosp_mask,
                         sample_weights=hosp_weights,
                     )
-                    # Per-node MAE - keep tensors on device until end
-                    valid_per_sample = weights.sum(dim=1) > 0
-                    per_sample_mae = (abs_diff * weights).sum(dim=1) / weights.sum(
-                        dim=1
-                    ).clamp_min(1e-8)
                     target_nodes = batch_data.target_node
-                    
-                    node_mae_accum_maes.append(per_sample_mae.detach())
-                    node_mae_accum_nodes.append(target_nodes.detach())
-                    node_mae_accum_valid.append(valid_per_sample.detach())
-                    
+
+                    _accumulate_per_head_node_metrics(
+                        target_name="hosp",
+                        target_nodes=target_nodes,
+                        diff=_unused_diff,
+                        abs_diff=abs_diff,
+                        weights=weights,
+                        accumulator=per_head_node_metrics,
+                    )
+
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -288,8 +395,6 @@ def evaluate_loader(
                         _unused_diff,
                         abs_diff,
                         weights,
-                        valid_per_sample,
-                        per_sample_mae,
                         target_nodes,
                     )
                 del pred_hosp, hosp_targets, hosp_mask, hosp_weights
@@ -303,11 +408,19 @@ def evaluate_loader(
                     and ww_targets is not None
                     and ww_weights is not None
                 ):
-                    ww_metrics.update(
+                    ww_diff, ww_abs_diff, ww_effective_weights = ww_metrics.update(
                         predictions=pred_ww,
                         targets=ww_targets,
                         observed_mask=ww_mask,
                         sample_weights=ww_weights,
+                    )
+                    _accumulate_per_head_node_metrics(
+                        target_name="ww",
+                        target_nodes=batch_data.target_node,
+                        diff=ww_diff,
+                        abs_diff=ww_abs_diff,
+                        weights=ww_effective_weights,
+                        accumulator=per_head_node_metrics,
                     )
                     if granular_writer is not None:
                         granular_writer.write_rows(
@@ -331,11 +444,21 @@ def evaluate_loader(
                     and cases_targets is not None
                     and cases_weights is not None
                 ):
-                    cases_metrics.update(
-                        predictions=pred_cases,
-                        targets=cases_targets,
-                        observed_mask=cases_mask,
-                        sample_weights=cases_weights,
+                    cases_diff, cases_abs_diff, cases_effective_weights = (
+                        cases_metrics.update(
+                            predictions=pred_cases,
+                            targets=cases_targets,
+                            observed_mask=cases_mask,
+                            sample_weights=cases_weights,
+                        )
+                    )
+                    _accumulate_per_head_node_metrics(
+                        target_name="cases",
+                        target_nodes=batch_data.target_node,
+                        diff=cases_diff,
+                        abs_diff=cases_abs_diff,
+                        weights=cases_effective_weights,
+                        accumulator=per_head_node_metrics,
                     )
                     if granular_writer is not None:
                         granular_writer.write_rows(
@@ -359,11 +482,21 @@ def evaluate_loader(
                     and deaths_targets is not None
                     and deaths_weights is not None
                 ):
-                    deaths_metrics.update(
-                        predictions=pred_deaths,
-                        targets=deaths_targets,
-                        observed_mask=deaths_mask,
-                        sample_weights=deaths_weights,
+                    deaths_diff, deaths_abs_diff, deaths_effective_weights = (
+                        deaths_metrics.update(
+                            predictions=pred_deaths,
+                            targets=deaths_targets,
+                            observed_mask=deaths_mask,
+                            sample_weights=deaths_weights,
+                        )
+                    )
+                    _accumulate_per_head_node_metrics(
+                        target_name="deaths",
+                        target_nodes=batch_data.target_node,
+                        diff=deaths_diff,
+                        abs_diff=deaths_abs_diff,
+                        weights=deaths_effective_weights,
+                        accumulator=per_head_node_metrics,
                     )
                     if granular_writer is not None:
                         granular_writer.write_rows(
@@ -413,34 +546,65 @@ def evaluate_loader(
     cases_summary = cases_metrics.finalize()
     deaths_summary = deaths_metrics.finalize()
 
-    node_mae_sum: dict[int, float] = {}
-    node_mae_count: dict[int, int] = {}
-    if node_mae_accum_maes:
-        all_maes = torch.cat(node_mae_accum_maes).cpu().tolist()
-        all_nodes = torch.cat(node_mae_accum_nodes).cpu().tolist()
-        all_valid = torch.cat(node_mae_accum_valid).cpu().tolist()
-        for mae, node_id, is_valid in zip(all_maes, all_nodes, all_valid):
-            if not is_valid:
+    node_mae_by_target: dict[str, dict[int, float]] = {}
+    node_mae_count_by_target: dict[str, dict[int, int]] = {}
+    for target_name, target_stats in per_head_node_metrics.items():
+        node_mae_by_target[target_name] = {}
+        node_mae_count_by_target[target_name] = {}
+        for node_id, stats in target_stats.items():
+            observed_count = int(stats["observed_count"])
+            if observed_count <= 0:
                 continue
-            if node_id not in node_mae_sum:
-                node_mae_sum[node_id] = 0.0
-                node_mae_count[node_id] = 0
-            node_mae_sum[node_id] += mae
-            node_mae_count[node_id] += 1
-
-    # Convert node MAE tensors to scalars
-    node_mae = {
-        node_id: node_mae_sum[node_id] / max(1, node_mae_count[node_id])
-        for node_id in node_mae_sum
-    }
+            node_mae_by_target[target_name][node_id] = (
+                stats["abs_error_sum"] / observed_count
+            )
+            node_mae_count_by_target[target_name][node_id] = observed_count
 
     if node_metrics_csv_path is not None:
         node_metrics_csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(node_metrics_csv_path, "w", newline="") as f:
             writer = csv_lib.writer(f)
-            writer.writerow(["node_id", "mae", "num_samples"])
-            for node_id in sorted(node_mae.keys()):
-                writer.writerow([node_id, node_mae[node_id], node_mae_count[node_id]])
+            writer.writerow(["target", "node_id", "mae", "num_samples"])
+            selected_node_mae = node_mae_by_target.get(node_metrics_target, {})
+            selected_node_counts = node_mae_count_by_target.get(node_metrics_target, {})
+            for node_id in sorted(selected_node_mae.keys()):
+                writer.writerow(
+                    [
+                        node_metrics_target,
+                        node_id,
+                        selected_node_mae[node_id],
+                        selected_node_counts[node_id],
+                    ]
+                )
+
+    population_by_node: list[float] | None = None
+    if dataset is not None and hasattr(dataset, "node_static_covariates"):
+        population_tensor = dataset.node_static_covariates.get("Pop")
+        if population_tensor is not None:
+            population_by_node = population_tensor.detach().cpu().tolist()
+
+    if per_head_node_metrics_csv_path is not None:
+        _write_per_head_node_metrics_csv(
+            output_path=per_head_node_metrics_csv_path,
+            per_head_node_metrics=per_head_node_metrics,
+            region_ids=region_ids,
+            region_labels=region_labels,
+            population_by_node=population_by_node,
+        )
+        per_head_metadata = {
+            "dataset_path": getattr(dataset, "aligned_data_path", None),
+            "run_id": getattr(dataset, "_run_id_value", None)
+            if dataset is not None
+            else None,
+            "split": split_name.lower(),
+        }
+        if granular_metadata is not None:
+            per_head_metadata.update(granular_metadata)
+        write_metadata_sidecar(
+            per_head_node_metrics_csv_path,
+            per_head_metadata,
+            schema_version=PER_HEAD_NODE_METRICS_SCHEMA_VERSION,
+        )
 
     if granular_csv_path is not None:
         metadata = {
@@ -473,13 +637,22 @@ def evaluate_loader(
             metadata,
         )
 
+    joint_obs_loss_total = float(
+        (
+            loss_ww_weighted_sum
+            + loss_hosp_weighted_sum
+            + loss_cases_weighted_sum
+            + loss_deaths_weighted_sum
+        )
+        / max(1, processed_batches)
+    )
     metrics = {
-        # Legacy primary metrics (hospitalizations)
-        "mae": hosp_summary.mae,
-        "rmse": hosp_summary.rmse,
-        "r2": hosp_summary.r2,
-        "mae_per_h": hosp_summary.mae_per_h,
-        "rmse_per_h": hosp_summary.rmse_per_h,
+        # Generic primary metric: aliased joint observation loss
+        "mae": joint_obs_loss_total,
+        "joint_obs_loss_total": joint_obs_loss_total,
+        # Explicit hospitalization metrics
+        "mae_hosp_per_h": hosp_summary.mae_per_h,
+        "rmse_hosp_per_h": hosp_summary.rmse_per_h,
         # Hospitalization metrics in log1p(per-100k) space
         "mae_hosp_log1p_per_100k": hosp_summary.mae,
         "rmse_hosp_log1p_per_100k": hosp_summary.rmse,
@@ -511,7 +684,9 @@ def evaluate_loader(
         "loss_deaths": (loss_deaths_sum / max(1, processed_batches)).item(),
         "loss_sir": (loss_sir_sum / max(1, processed_batches)).item(),
         "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
-        "loss_hosp_weighted": (loss_hosp_weighted_sum / max(1, processed_batches)).item(),
+        "loss_hosp_weighted": (
+            loss_hosp_weighted_sum / max(1, processed_batches)
+        ).item(),
         "loss_cases_weighted": (
             loss_cases_weighted_sum / max(1, processed_batches)
         ).item(),
@@ -522,7 +697,7 @@ def evaluate_loader(
     }
 
     logger.info("EVAL COMPLETE")
-    return mean_loss, metrics, node_mae
+    return mean_loss, metrics, node_mae_by_target
 
 
 def _ensure_wandb_run(
@@ -564,12 +739,14 @@ def eval_checkpoint(
     log_dir: Path | None = None,
     overrides: list[str] | None = None,
     node_metrics_csv_path: Path | None = None,
+    per_head_node_metrics_csv_path: Path | None = None,
     granular_csv_path: Path | None = None,
     output_csv_path: Path | None = None,
     batch_size: int | None = None,
     num_workers: int | None = None,
     pin_memory: bool | None = None,
     prefetch_factor: int | None = None,
+    node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
 ) -> dict[str, Any]:
     """
@@ -582,12 +759,14 @@ def eval_checkpoint(
         log_dir: Optional W&B run directory for forecast plots
         overrides: Optional list of dotted-key config overrides (e.g., ["training.val_workers=4"])
         node_metrics_csv_path: Optional path to save node-level metrics CSV
+        per_head_node_metrics_csv_path: Optional path to save per-head node metrics CSV
         granular_csv_path: Optional path to save granular per-example error rows
         output_csv_path: Deprecated alias for node_metrics_csv_path
         batch_size: Optional batch size override
         num_workers: Optional DataLoader worker override
         pin_memory: Optional pin-memory override
         prefetch_factor: Optional prefetch override. Use 0 or None to disable.
+        node_metrics_target: Canonical target name for node-level CSV export
         log_every: Progress logging cadence in batches
 
     Returns:
@@ -673,7 +852,9 @@ def eval_checkpoint(
             region_embeddings=region_embeddings,
             split_name=split.capitalize(),
             node_metrics_csv_path=node_metrics_csv_path,
+            per_head_node_metrics_csv_path=per_head_node_metrics_csv_path,
             granular_csv_path=granular_csv_path,
+            node_metrics_target=node_metrics_target,
             log_every=log_every,
             granular_metadata={
                 "batch_size": batch_size
@@ -689,6 +870,7 @@ def eval_checkpoint(
                     config.training.node_split_population_bins
                 ),
                 "node_split_strategy": config.training.node_split_strategy,
+                "node_metrics_target": node_metrics_target,
                 "overrides": list(overrides) if overrides else [],
                 "run_dir": checkpoint_path.parent.parent,
                 "split": split.lower(),

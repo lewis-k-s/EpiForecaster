@@ -66,24 +66,35 @@ def _format_temporal_coord(
     return str(value)
 
 
-def write_granular_metadata_sidecar(
-    granular_csv_path: Path,
+def write_metadata_sidecar(
+    output_path: Path,
     metadata: dict[str, Any],
+    *,
+    schema_version: str,
 ) -> Path:
-    sidecar_path = granular_csv_path.with_suffix(
-        f"{granular_csv_path.suffix}.meta.json"
-    )
+    sidecar_path = output_path.with_suffix(f"{output_path.suffix}.meta.json")
     existing: dict[str, Any] = {}
     if sidecar_path.exists():
         existing = json.loads(sidecar_path.read_text(encoding="utf-8"))
     merged = {**existing, **metadata}
-    merged["schema_version"] = GRANULAR_SCHEMA_VERSION
+    merged["schema_version"] = schema_version
     normalized = {key: _format_metadata_value(value) for key, value in merged.items()}
     sidecar_path.write_text(
         json.dumps(normalized, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return sidecar_path
+
+
+def write_granular_metadata_sidecar(
+    granular_csv_path: Path,
+    metadata: dict[str, Any],
+) -> Path:
+    return write_metadata_sidecar(
+        granular_csv_path,
+        metadata,
+        schema_version=GRANULAR_SCHEMA_VERSION,
+    )
 
 
 class GranularEvalWriter:
