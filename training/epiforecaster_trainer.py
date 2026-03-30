@@ -386,7 +386,7 @@ class EpiForecasterTrainer:
         }
         self.metric_artifacts: dict[str, Path] = {}
         self._model_graph_logged = False
-        self._last_node_mae: dict[int, float] = {}
+        self._last_node_mae: dict[str, dict[int, float]] = {}
         # Curriculum phase tracking for LR warmup at transitions
         self._last_curriculum_phase_idx: int | None = None
         self._lr_warmup_remaining: int = 0
@@ -465,16 +465,36 @@ class EpiForecasterTrainer:
             self._status("  Observation Heads:")
             heads = self.config.model.observation_heads
             self._status(
-                f"    - Wastewater: kernel={heads.kernel_length_ww}, learnable={heads.learnable_kernel_ww}"
+                "    - Wastewater: kernel=%s, learnable=%s, mode=%s"
+                % (
+                    heads.kernel_length_ww,
+                    heads.learnable_kernel_ww,
+                    heads.kernel_parameterization_ww,
+                )
             )
             self._status(
-                f"    - Hospital:   kernel={heads.kernel_length_hosp}, learnable={heads.learnable_kernel_hosp}"
+                "    - Hospital:   kernel=%s, learnable=%s, mode=%s"
+                % (
+                    heads.kernel_length_hosp,
+                    heads.learnable_kernel_hosp,
+                    heads.kernel_parameterization_hosp,
+                )
             )
             self._status(
-                f"    - Cases:      kernel={heads.kernel_length_cases}, learnable={heads.learnable_kernel_cases}"
+                "    - Cases:      kernel=%s, learnable=%s, mode=%s"
+                % (
+                    heads.kernel_length_cases,
+                    heads.learnable_kernel_cases,
+                    heads.kernel_parameterization_cases,
+                )
             )
             self._status(
-                f"    - Deaths:     kernel={heads.kernel_length_deaths}, learnable={heads.learnable_kernel_deaths}"
+                "    - Deaths:     kernel=%s, learnable=%s, mode=%s"
+                % (
+                    heads.kernel_length_deaths,
+                    heads.learnable_kernel_deaths,
+                    heads.kernel_parameterization_deaths,
+                )
             )
             self._status(
                 f"    - Residual:   mode={heads.residual_mode}, scale={heads.residual_scale}"
@@ -1084,12 +1104,19 @@ class EpiForecasterTrainer:
         test_time = time.time() - test_start_time
         self._status(f"{'=' * 60}")
         self._status("TESTING COMPLETED")
+        hosp_mae = test_metrics.get("mae_hosp_log1p_per_100k")
+        ww_mae = test_metrics.get("mae_ww_log1p_per_100k")
+        test_status_parts = [
+            f"Test loss: {test_loss:.4g}",
+            f"Joint Obs Loss: {test_metrics['mae']:.4g}",
+        ]
+        if hosp_mae is not None:
+            test_status_parts.append(f"Hosp MAE: {hosp_mae:.4g}")
+        if ww_mae is not None:
+            test_status_parts.append(f"WW MAE: {ww_mae:.4g}")
+        test_status_parts.append(f"Time: {test_time:.2f}s")
         self._status(
-            f"Test loss: {test_loss:.4g} | "
-            f"MAE: {test_metrics['mae']:.4g} | "
-            f"RMSE: {test_metrics['rmse']:.4g} | "
-            f"R2: {test_metrics['r2']:.4g} | "
-            f"Time: {test_time:.2f}s"
+            " | ".join(test_status_parts)
         )
         if self.config.training.plot_forecasts:
             try:
@@ -1104,8 +1131,10 @@ class EpiForecasterTrainer:
         if self.wandb_run is not None:
             self.wandb_run.summary["loss_test"] = test_loss
             self.wandb_run.summary["mae_test"] = test_metrics["mae"]
-            self.wandb_run.summary["rmse_test"] = test_metrics["rmse"]
-            self.wandb_run.summary["r2_test"] = test_metrics["r2"]
+            if hosp_mae is not None:
+                self.wandb_run.summary["mae_hosp_test"] = hosp_mae
+            if ww_mae is not None:
+                self.wandb_run.summary["mae_ww_test"] = ww_mae
             self.wandb_run.summary["best_val_loss"] = self.best_val_loss
             self.wandb_run.finish()
 
@@ -1875,12 +1904,14 @@ class EpiForecasterTrainer:
 
         sample_count = max(1, int(self.config.training.num_forecast_samples))
         worst_nodes = select_nodes_by_loss(
-            node_mae=self._last_node_mae,
+            node_mae=self._last_node_mae.get("hospitalizations", {}),
+            target_name="hospitalizations",
             strategy="worst",
             k=sample_count,
         ).get("Worst", [])
         best_nodes = select_nodes_by_loss(
-            node_mae=self._last_node_mae,
+            node_mae=self._last_node_mae.get("hospitalizations", {}),
+            target_name="hospitalizations",
             strategy="best",
             k=sample_count,
         ).get("Best", [])
@@ -1909,7 +1940,7 @@ class EpiForecasterTrainer:
 
     def _evaluate_split(
         self, loader: DataLoader, split_name: str
-    ) -> tuple[float, dict[str, Any], dict[int, float]]:
+    ) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
         """Shared evaluation for validation and test splits with extra metrics.
 
         Returns:
@@ -1956,7 +1987,7 @@ class EpiForecasterTrainer:
 
         return eval_loss, eval_metrics, node_mae_dict
 
-    def test_epoch(self) -> tuple[float, dict[str, Any], dict[int, float]]:
+    def test_epoch(self) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
         """Public test evaluation entrypoint."""
         test_loss, test_metrics, test_node_mae = self._evaluate_split(
             self.test_loader, split_name="Test"
