@@ -26,12 +26,28 @@ resolve_output_log_root() {
   esac
 }
 
+select_first_seed() {
+  local cv_seeds="$1"
+  local -a seed_list=()
+
+  read -r -a seed_list <<<"$cv_seeds"
+  if [ "${#seed_list[@]}" -eq 0 ]; then
+    echo "Error: CV_SEEDS must contain at least one seed" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${seed_list[0]}"
+}
+
 main() {
 PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 CAMPAIGN_ID="${CAMPAIGN_ID:-crossval_${SLURM_ARRAY_JOB_ID:-local}}"
 CV_SEEDS="${CV_SEEDS:-42 43 44 45 46}"
+CV_FOLDS="${CV_FOLDS:-5}"
+CV_HOLDOUT_ROLE="${CV_HOLDOUT_ROLE:-test}"
+CROSSVAL_ENABLED="${CROSSVAL_ENABLED:-0}"
 OVERRIDES="${OVERRIDES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -46,18 +62,33 @@ cd "$PROJECT_ROOT"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-read -r -a SEED_LIST <<<"$CV_SEEDS"
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
-LAST_TASK_INDEX=$((${#SEED_LIST[@]} - 1))
+FOLD_INDEX=0
 
-if [ "$TASK_ID" -gt "$LAST_TASK_INDEX" ]; then
-  echo "Error: task index $TASK_ID is out of bounds for CV_SEEDS='$CV_SEEDS'"
-  echo "Update --array=0-$LAST_TASK_INDEX to match the configured seed list."
-  exit 1
+if [ "$CROSSVAL_ENABLED" = "1" ]; then
+  LAST_TASK_INDEX=$((CV_FOLDS - 1))
+  if [ "$TASK_ID" -gt "$LAST_TASK_INDEX" ]; then
+    echo "Error: task index $TASK_ID is out of bounds for CV_FOLDS='$CV_FOLDS'"
+    echo "Update --array=0-$LAST_TASK_INDEX to match the configured fold count."
+    exit 1
+  fi
+  FOLD_INDEX="$TASK_ID"
+  SEED="$(select_first_seed "$CV_SEEDS")"
+  MODEL_ID="${SLURM_ARRAY_JOB_ID:-local}_fold${FOLD_INDEX}_s${SEED}"
+else
+  read -r -a SEED_LIST <<<"$CV_SEEDS"
+  LAST_TASK_INDEX=$((${#SEED_LIST[@]} - 1))
+
+  if [ "$TASK_ID" -gt "$LAST_TASK_INDEX" ]; then
+    echo "Error: task index $TASK_ID is out of bounds for CV_SEEDS='$CV_SEEDS'"
+    echo "Update --array=0-$LAST_TASK_INDEX to match the configured seed list."
+    exit 1
+  fi
+
+  SEED="${SEED_LIST[$TASK_ID]}"
+  MODEL_ID="${SLURM_ARRAY_JOB_ID:-local}_cv${TASK_ID}_s${SEED}"
 fi
 
-SEED="${SEED_LIST[$TASK_ID]}"
-MODEL_ID="${SLURM_ARRAY_JOB_ID:-local}_cv${TASK_ID}_s${SEED}"
 OUTPUT_LOG_ROOT="$(resolve_output_log_root "$PROJECT_ROOT" "$OUTPUT_LOG_DIR")"
 RUN_DIR="$OUTPUT_LOG_ROOT/crossval__${CAMPAIGN_ID}/${MODEL_ID}"
 
@@ -79,7 +110,7 @@ fi
 
 EXPERIMENT_NAME_OVERRIDE="output.experiment_name=crossval__${CAMPAIGN_ID}"
 GROUP_OVERRIDE="output.wandb_group=crossval_campaign_${CAMPAIGN_ID}"
-TAGS_OVERRIDE="output.wandb_tags=[crossval,campaign_${CAMPAIGN_ID},seed_${SEED}]"
+TAGS_OVERRIDE="output.wandb_tags=[crossval,campaign_${CAMPAIGN_ID},seed_${SEED},fold_${FOLD_INDEX}]"
 
 OVERRIDE_ARGS+=(
   --override "output.log_dir=${OUTPUT_LOG_DIR}"
@@ -90,7 +121,17 @@ OVERRIDE_ARGS+=(
   --override "$TAGS_OVERRIDE"
 )
 
-echo "Running cross-val seed=${SEED} task_id=${TASK_ID}"
+if [ "$CROSSVAL_ENABLED" = "1" ]; then
+  OVERRIDE_ARGS+=(
+    --override "training.crossval_enabled=true"
+    --override "training.node_split_strategy=crossval"
+    --override "training.crossval_num_folds=${CV_FOLDS}"
+    --override "training.crossval_fold_index=${FOLD_INDEX}"
+    --override "training.crossval_holdout_role=${CV_HOLDOUT_ROLE}"
+  )
+fi
+
+echo "Running cross-val seed=${SEED} task_id=${TASK_ID} fold_index=${FOLD_INDEX}"
 echo "Campaign ID: $CAMPAIGN_ID"
 echo "Config: $CONFIG"
 echo "Model ID: $MODEL_ID"

@@ -15,6 +15,17 @@ derive_array_spec_from_seeds() {
   printf '0-%d\n' "$(( ${#seed_list[@]} - 1 ))"
 }
 
+derive_array_spec_from_fold_count() {
+  local fold_count="$1"
+
+  if [ -z "$fold_count" ] || [ "$fold_count" -le 1 ]; then
+    echo "Error: CROSSVAL_NUM_FOLDS must be greater than 1" >&2
+    return 1
+  fi
+
+  printf '0-%d\n' "$(( fold_count - 1 ))"
+}
+
 parse_explicit_array_arg() {
   local expect_value=0
   local arg
@@ -49,6 +60,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CAMPAIGN_ID="${CAMPAIGN_ID:-crossval_$(date +%s)}"
 CV_SEEDS="${CV_SEEDS:-42 43 44 45 46}"
 CV_ARRAY_SPEC="${CV_ARRAY_SPEC:-}"
+CROSSVAL_ENABLED="${CROSSVAL_ENABLED:-0}"
+CROSSVAL_NUM_FOLDS="${CROSSVAL_NUM_FOLDS:-5}"
 
 export PROJECT_ROOT
 export CAMPAIGN_ID
@@ -58,6 +71,9 @@ if explicit_array_spec="$(parse_explicit_array_arg "$@")"; then
   array_args=()
 elif [ -n "$CV_ARRAY_SPEC" ]; then
   array_spec="$CV_ARRAY_SPEC"
+  array_args=(--array "$array_spec")
+elif [ "$CROSSVAL_ENABLED" = "1" ]; then
+  array_spec="$(derive_array_spec_from_fold_count "$CROSSVAL_NUM_FOLDS")"
   array_args=(--array "$array_spec")
 else
   array_spec="$(derive_array_spec_from_seeds "$CV_SEEDS")"

@@ -4,8 +4,8 @@
 #SBATCH --qos=acc_bscls
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=20
-#SBATCH --time=04:00:00
-#SBATCH --array=0-7
+#SBATCH --time=08:00:00
+#SBATCH --array=0-10
 #SBATCH --output=logs/slurm-%x-%A_%a.out
 #SBATCH --error=logs/slurm-%x-%A_%a.err
 
@@ -15,7 +15,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 CAMPAIGN_ID="${CAMPAIGN_ID:-ablation_optuna_${SLURM_ARRAY_JOB_ID:-local}}"
 STUDY_NAME="ablation_study_${CAMPAIGN_ID}"
-JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal}"
+JOURNAL_FILE="${JOURNAL_FILE:-}"
 CV_SEEDS="${CV_SEEDS:-42 43 44 45 46}"
 N_TRIALS="${N_TRIALS:-}"
 # Worker timeout in seconds (auto-calculated from SLURM time limit minus 15min buffer).
@@ -39,7 +39,7 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 echo "Starting Optuna Ablation Worker"
 echo "  Campaign: $CAMPAIGN_ID"
 echo "  Study: $STUDY_NAME"
-echo "  Journal: $JOURNAL_FILE"
+echo "  Journal: ${JOURNAL_FILE:-<default>}"
 echo "  Seeds: $CV_SEEDS"
 echo "  N_TRIALS: ${N_TRIALS:-<until-timeout>}"
 echo "  TIMEOUT_SECS: $TIMEOUT_SECS"
@@ -53,11 +53,14 @@ fi
 ARGS=(
   --config "$CONFIG"
   --study-name "$STUDY_NAME"
-  --journal-file "$JOURNAL_FILE"
   --campaign-id "$CAMPAIGN_ID"
   --seeds "$CV_SEEDS"
   --timeout-s "$TIMEOUT_SECS"
 )
+
+if [ -n "$JOURNAL_FILE" ]; then
+  ARGS+=(--journal-file "$JOURNAL_FILE")
+fi
 
 if [ -n "$N_TRIALS" ]; then
   ARGS+=(--n-trials "$N_TRIALS")

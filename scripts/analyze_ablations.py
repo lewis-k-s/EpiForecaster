@@ -27,6 +27,7 @@ EXPERIMENT_REGEX_LEGACY = re.compile(r"^mn5_ablation_(.+)$")
 METRICS = ["mae_median", "rmse_median", "smape_median", "r2_median"]
 FINGERPRINT_EXCLUDE_PATHS = {
     ("training", "seed"),
+    ("training", "crossval_fold_index"),
     ("output", "wandb_group"),
     ("output", "wandb_tags"),
     ("output", "experiment_name"),
@@ -513,7 +514,10 @@ def main() -> int:
     )
 
     # Determine default output directory based on campaign_id
-    if args.output_dir == Path("outputs/reports/ablation_analysis") and args.campaign_id:
+    if (
+        args.output_dir == Path("outputs/reports/ablation_analysis")
+        and args.campaign_id
+    ):
         args.output_dir = Path("outputs/reports") / f"ablation_cv_{args.campaign_id}"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -619,11 +623,11 @@ def main() -> int:
         logger.info("Running granular comparison suite...")
         try:
             from dataviz.granular_comparison import compare_ablation_suite
-            
+
             candidate_ablations = [
                 m for m in aggregated_df["model"].unique() if m != args.baseline
             ]
-            
+
             granular_dir = args.output_dir / "granular_comparison"
             compare_ablation_suite(
                 training_dir=args.training_dir,
@@ -636,6 +640,56 @@ def main() -> int:
             logger.info(f"Saved granular comparison suite to {granular_dir}")
         except Exception as exc:
             logger.warning(f"Granular comparison suite failed: {exc}")
+
+    logger.info("Generating ablation plots...")
+    try:
+        from dataviz.ablation_plots import (
+            plot_ablation_comparison,
+            plot_ablation_deltas_heatmap,
+            plot_ablation_summary_grid,
+            plot_cross_head_impact_heatmap,
+            plot_mobility_ablation_heatmap,
+            plot_head_ablation_heatmap,
+        )
+
+        plot_ablation_comparison(
+            aggregated_path,
+            output_dir=args.output_dir,
+            baseline_name=args.baseline,
+        )
+        plot_ablation_summary_grid(
+            aggregated_path,
+            deltas_csv=deltas_path if not deltas_df.empty else None,
+            output_dir=args.output_dir,
+            baseline_name=args.baseline,
+        )
+        if not deltas_df.empty:
+            plot_ablation_deltas_heatmap(
+                deltas_path,
+                output_dir=args.output_dir,
+                metric="mae",
+                baseline_name=args.baseline,
+            )
+            plot_mobility_ablation_heatmap(
+                deltas_path,
+                output_dir=args.output_dir,
+                metric="mae",
+                baseline_name=args.baseline,
+            )
+            plot_head_ablation_heatmap(
+                deltas_path,
+                output_dir=args.output_dir,
+                metric="mae",
+                baseline_name=args.baseline,
+            )
+        if cross_head_success:
+            plot_cross_head_impact_heatmap(
+                cross_head_dir / "cross_head_mean_matrix.csv",
+                std_csv=cross_head_dir / "cross_head_std_matrix.csv",
+                output_dir=cross_head_dir,
+            )
+    except Exception as exc:
+        logger.warning(f"Ablation plot generation failed: {exc}")
 
     print("\n" + "=" * 80)
     print("ABLATION STUDY SUMMARY")

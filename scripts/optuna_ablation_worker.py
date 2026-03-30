@@ -56,6 +56,11 @@ ABLATIONS: dict[str, str] = {
     "regions:off": "model.type.regions=false",
     "context:off": "model.type.mobility=false model.type.regions=false",
     "kernel:fixed": "model.observation_heads.learnable_kernel_hosp=false model.observation_heads.learnable_kernel_cases=false model.observation_heads.learnable_kernel_deaths=false",
+    "kernel:ww:mlp": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.kernel_parameterization_ww=free",
+    "kernel:hosp:mlp": "model.observation_heads.learnable_kernel_hosp=true model.observation_heads.kernel_parameterization_hosp=free",
+    "kernel:cases:mlp": "model.observation_heads.learnable_kernel_cases=true model.observation_heads.kernel_parameterization_cases=free",
+    "kernel:deaths:mlp": "model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_deaths=free",
+    "kernel:all:mlp": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.learnable_kernel_hosp=true model.observation_heads.learnable_kernel_cases=true model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_ww=free model.observation_heads.kernel_parameterization_hosp=free model.observation_heads.kernel_parameterization_cases=free model.observation_heads.kernel_parameterization_deaths=free",
     "gradnorm:off": "training.loss.joint.adaptive_scheme=none",
 }
 
@@ -262,7 +267,7 @@ def objective(
 @click.command()
 @click.option("--config", type=click.Path(exists=True, path_type=Path), required=True)
 @click.option("--study-name", type=str, required=True)
-@click.option("--journal-file", type=click.Path(path_type=Path), required=True)
+@click.option("--journal-file", type=click.Path(path_type=Path), required=False, default=None)
 @click.option("--campaign-id", type=str, required=True)
 @click.option("--seeds", type=str, default="42 43 44 45 46", show_default=True)
 @click.option(
@@ -312,6 +317,9 @@ def main(
 
     seed_list = [int(item) for item in seeds.split()]
     run_root.mkdir(parents=True, exist_ok=True)
+
+    if journal_file is None:
+        journal_file = Path("outputs/optuna") / f"{study_name}.journal"
     journal_file.parent.mkdir(parents=True, exist_ok=True)
 
     worker_seed = _compute_worker_seed(seed)

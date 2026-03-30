@@ -15,6 +15,7 @@ import pandas as pd
 from dataviz.granular_crossval import CrossvalGranularRun, analyze_crossval_granular
 from scripts.analyze_ablations import (
     build_config_fingerprint,
+    _nested_get,
     get_run_seed,
     load_run_config,
 )
@@ -31,6 +32,22 @@ class CrossvalRun:
     run_dir: Path
     seed: int | None
     fold: int
+
+
+def get_run_fold(run_dir: Path) -> int | None:
+    """Extract cross-validation fold index from run config if available."""
+    try:
+        config = load_run_config(run_dir)
+    except ValueError:
+        return None
+
+    fold = _nested_get(config, ("training", "crossval_fold_index"))
+    if fold is None:
+        return None
+    try:
+        return int(fold)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_crossval_experiment_name(experiment_name: str) -> str | None:
@@ -60,27 +77,30 @@ def collect_crossval_runs(
         return runs, campaigns_found
     campaigns_found.add(parsed_campaign)
 
-    unsorted_runs: list[tuple[Path, int | None]] = []
+    unsorted_runs: list[tuple[Path, int | None, int | None]] = []
     for run_dir in sorted(d for d in experiment_dir.iterdir() if d.is_dir()):
         seed = get_run_seed(run_dir)
-        unsorted_runs.append((run_dir, seed))
+        fold = get_run_fold(run_dir)
+        unsorted_runs.append((run_dir, seed, fold))
 
     unsorted_runs.sort(
         key=lambda item: (
+            item[2] is None,
+            item[2] if item[2] is not None else 10**18,
             item[1] is None,
             item[1] if item[1] is not None else 10**18,
             item[0].name,
         )
     )
 
-    for fold, (run_dir, seed) in enumerate(unsorted_runs):
+    for ordinal_fold, (run_dir, seed, fold) in enumerate(unsorted_runs):
         runs.append(
             CrossvalRun(
                 campaign_id=campaign_id,
                 experiment_dir=experiment_dir,
                 run_dir=run_dir,
                 seed=seed,
-                fold=fold,
+                fold=fold if fold is not None else ordinal_fold,
             )
         )
 
@@ -128,7 +148,8 @@ def validate_crossval_run_consistency(
     if len(set(fingerprint_by_run.values())) > 1:
         errors.append(
             "config fingerprint mismatch after excluding "
-            "training.seed/output.wandb_group/output.wandb_tags/output.experiment_name"
+            "training.seed/training.crossval_fold_index/output.wandb_group/"
+            "output.wandb_tags/output.experiment_name"
         )
 
     if errors:
