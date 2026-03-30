@@ -351,6 +351,33 @@ cli.add_command(plot_cli, name="plot")
         "checkpoint metrics."
     ),
 )
+@click.option(
+    "--selection-mode",
+    type=click.Choice(
+        ["node_quartile", "granular_window_quartile"], case_sensitive=False
+    ),
+    default="node_quartile",
+    show_default=True,
+    help="How to select plotted examples after evaluation.",
+)
+@click.option(
+    "--node-metric-target",
+    type=click.Choice(
+        ["hospitalizations", "wastewater", "cases", "deaths"],
+        case_sensitive=False,
+    ),
+    default="hospitalizations",
+    show_default=True,
+    help="Explicit target to use for node-based MAE selection and node CSV export.",
+)
+@click.option(
+    "--compare-evals",
+    is_flag=True,
+    help=(
+        "Run matching baseline evaluations for this config/split and compare the "
+        "fresh baseline artifacts against the current checkpoint metrics."
+    ),
+)
 def eval_epiforecaster(
     experiment: str | None,
     run: str | None,
@@ -363,6 +390,9 @@ def eval_epiforecaster(
     override: tuple[str, ...],
     eval_batch_size: int | None,
     compare_baselines: Path | None,
+    selection_mode: str,
+    node_metric_target: str,
+    compare_evals: bool,
 ):
     """Evaluate an EpiForecaster checkpoint and generate quartile-based forecast plots.
 
@@ -374,6 +404,31 @@ def eval_epiforecaster(
     --override training.num_forecast_samples=6  # Sample 6 nodes per quartile
     """
     try:
+        per_head_node_metrics_csv: Path | None = None
+
+        def _derive_per_head_node_metrics_path(path: Path) -> Path:
+            return path.with_name(f"{path.stem}_per_head{path.suffix}")
+
+        output_dir_override: Path | None = None
+        if output is not None and (
+            (output.exists() and output.is_dir()) or (not output.exists() and not output.suffix)
+        ):
+            output_dir_override = output
+            output_dir_override.mkdir(parents=True, exist_ok=True)
+            output = output / f"{split}_forecasts.png"
+
+        def _apply_output_dir_defaults(base_dir: Path) -> None:
+            nonlocal output, node_metrics_csv, per_head_node_metrics_csv, granular_csv
+            if output is None:
+                output = base_dir / f"{split}_forecasts.png"
+            if node_metrics_csv is None:
+                node_metrics_csv = base_dir / f"{split}_node_metrics.csv"
+            per_head_node_metrics_csv = _derive_per_head_node_metrics_path(
+                node_metrics_csv
+            )
+            if granular_csv is None:
+                granular_csv = base_dir / f"{split}_granular.csv"
+
         # Resolve paths from experiment/run if provided
         if experiment and run:
             from utils.run_discovery import (
@@ -397,17 +452,13 @@ def eval_epiforecaster(
 
             # Auto-resolve output paths to eval directory
             eval_dir = get_eval_output_dir(experiment_name=experiment, run_id=run)
-            if output is None:
-                output = eval_dir / f"{split}_forecasts.png"
-            if node_metrics_csv is None:
-                node_metrics_csv = eval_dir / f"{split}_node_metrics.csv"
-            if granular_csv is None:
-                granular_csv = eval_dir / f"{split}_granular.csv"
+            _apply_output_dir_defaults(output_dir_override or eval_dir)
 
             click.echo("Resolved output paths:")
             click.echo(f"  Checkpoint: {checkpoint}")
             click.echo(f"  Plot: {output}")
             click.echo(f"  Node metrics CSV: {node_metrics_csv}")
+            click.echo(f"  Per-head node metrics CSV: {per_head_node_metrics_csv}")
             click.echo(f"  Granular CSV: {granular_csv}")
         elif checkpoint is not None and experiment is None and run is None:
             # User provided --checkpoint but not --experiment/--run
@@ -432,12 +483,7 @@ def eval_epiforecaster(
                     eval_dir = get_eval_output_dir(
                         experiment_name=extracted_experiment, run_id=extracted_run
                     )
-                    if output is None:
-                        output = eval_dir / f"{split}_forecasts.png"
-                    if node_metrics_csv is None:
-                        node_metrics_csv = eval_dir / f"{split}_node_metrics.csv"
-                    if granular_csv is None:
-                        granular_csv = eval_dir / f"{split}_granular.csv"
+                    _apply_output_dir_defaults(output_dir_override or eval_dir)
                 else:
                     click.echo(
                         "Skipping persistence. Use --output to specify save location."
@@ -445,15 +491,15 @@ def eval_epiforecaster(
             else:
                 # Could not extract - default to current directory
                 click.echo("Could not auto-detect experiment/run from checkpoint path.")
-                if output is None:
-                    output = Path(f"{split}_forecasts.png")
-                if node_metrics_csv is None:
-                    node_metrics_csv = Path(f"{split}_node_metrics.csv")
-                if granular_csv is None:
-                    granular_csv = Path(f"{split}_granular.csv")
+                _apply_output_dir_defaults(output_dir_override or Path.cwd())
         elif checkpoint is None:
             raise click.ClickException(
                 "Must provide either --checkpoint or both --experiment and --run"
+            )
+
+        if per_head_node_metrics_csv is None and node_metrics_csv is not None:
+            per_head_node_metrics_csv = _derive_per_head_node_metrics_path(
+                node_metrics_csv
             )
 
         # Suppress zarr logging spam
@@ -473,19 +519,47 @@ def eval_epiforecaster(
             log_dir=log_dir,
             overrides=list(override) if override else None,
             node_metrics_csv_path=node_metrics_csv,
+            per_head_node_metrics_csv_path=per_head_node_metrics_csv,
             granular_csv_path=granular_csv,
             batch_size=eval_batch_size,
+            node_metrics_target=node_metric_target,
         )
 
         # Get samples_per_group from config (default 3)
         samples_per_group = eval_result["config"].training.num_forecast_samples
 
-        # Step 2: Select nodes (quartile strategy)
-        node_groups = select_nodes_by_loss(
-            node_mae=eval_result["node_mae"],
-            strategy="quartile",
-            samples_per_group=samples_per_group,
-        )
+        node_groups: dict[str, list[int]] | None = None
+        window_groups = None
+        if selection_mode.lower() == "granular_window_quartile":
+            from evaluation.selection import (
+                load_window_selection_specs_from_granular,
+                select_windows_by_loss,
+            )
+
+            if granular_csv is None or not granular_csv.exists():
+                raise click.ClickException(
+                    "granular_window_quartile selection requires granular eval CSV; "
+                    "no granular CSV was produced for this eval."
+                )
+            window_specs = load_window_selection_specs_from_granular(
+                granular_csv=granular_csv,
+                split=split,
+            )
+            if not window_specs:
+                raise click.ClickException(
+                    f"No granular window candidates found in {granular_csv}"
+                )
+            window_groups = select_windows_by_loss(
+                window_specs=window_specs,
+                samples_per_group=samples_per_group,
+            )
+        else:
+            node_groups = select_nodes_by_loss(
+                node_mae=eval_result["node_mae"].get(node_metric_target, {}),
+                target_name=node_metric_target,
+                strategy="quartile",
+                samples_per_group=samples_per_group,
+            )
 
         # Step 3: Generate plots (use "last" window by default)
         try:
@@ -493,6 +567,7 @@ def eval_epiforecaster(
                 model=eval_result["model"],
                 loader=eval_result["loader"],
                 node_groups=node_groups,
+                window_groups=window_groups,
                 window="last",
                 output_path=output,
                 log_dir=log_dir,
@@ -500,11 +575,42 @@ def eval_epiforecaster(
 
             # Step 4: Show results
             total_nodes = len(plot_result["selected_nodes"])
-            click.echo(f"Selected {total_nodes} nodes from quartiles:")
-            for group_name, nodes in plot_result["node_groups"].items():
-                click.echo(f"  {group_name}: {len(nodes)} nodes")
+            if selection_mode.lower() == "granular_window_quartile":
+                click.echo(f"Selected {total_nodes} node-window examples from quartiles:")
+                for group_name, specs in plot_result["window_groups"].items():
+                    click.echo(f"  {group_name}: {len(specs)} windows")
+            else:
+                click.echo(f"Selected {total_nodes} nodes from quartiles:")
+                for group_name, nodes in plot_result["node_groups"].items():
+                    click.echo(f"  {group_name}: {len(nodes)} nodes")
+
+            saved_forecast_paths: list[Path] = []
+            if output is not None:
+                if output.exists():
+                    saved_forecast_paths.append(output)
+                saved_forecast_paths.extend(
+                    sorted(output.parent.glob(f"{output.stem}_*{output.suffix}"))
+                )
+                if not saved_forecast_paths:
+                    click.echo(
+                        "Warning: Forecast plotting completed but no forecast image files "
+                        f"were written under {output.parent}"
+                    )
         except Exception as e:
             click.echo(f"Warning: Plotting failed: {e}")
+
+        per_head_plot_artifacts: dict[str, Path] = {}
+        if per_head_node_metrics_csv is not None:
+            try:
+                from dataviz.eval_head_plots import render_eval_per_head_plots
+
+                per_head_plot_artifacts = render_eval_per_head_plots(
+                    per_head_node_metrics_csv=per_head_node_metrics_csv,
+                    output_dir=per_head_node_metrics_csv.parent,
+                    samples_per_quartile=4,
+                )
+            except Exception as e:
+                click.echo(f"Warning: Per-head eval plotting failed: {e}")
 
         # Show eval metrics
         loss = eval_result["eval_loss"]
@@ -512,8 +618,45 @@ def eval_epiforecaster(
         summary = _format_eval_summary(loss, metrics)
         click.echo(f"\nEval summary ({split}):\n{summary}")
 
-        if compare_baselines is not None:
+        baseline_results_csv = compare_baselines
+        if compare_evals:
+            from evaluation.baseline_eval import (
+                compare_model_metrics_against_baselines,
+                run_same_slice_baseline_evaluation,
+            )
+
+            if compare_baselines is not None:
+                click.echo(
+                    "--compare-evals supplied; ignoring explicit --compare-baselines "
+                    f"path: {compare_baselines}"
+                )
+
+            if node_metrics_csv is not None:
+                baseline_output_dir = (
+                    node_metrics_csv.parent / f"{split}_baseline_eval_same_window"
+                )
+            elif output is not None:
+                baseline_output_dir = (
+                    output.parent / f"{split}_baseline_eval_same_window"
+                )
+            else:
+                baseline_output_dir = Path.cwd() / f"{split}_baseline_eval_same_window"
+
+            artifacts = run_same_slice_baseline_evaluation(
+                config=eval_result["config"],
+                output_dir=baseline_output_dir,
+                models=["exp_smoothing", "sarima", "var"],
+                config_path=str(checkpoint.parent.parent / "config.yaml"),
+                split=split,
+            )
+            baseline_results_csv = artifacts["baseline_aggregate_metrics"]
+            click.echo(
+                f"Saved fresh baseline artifacts to: {baseline_output_dir}"
+            )
+
+        if baseline_results_csv is not None:
             from evaluation.baseline_eval import compare_model_metrics_against_baselines
+            from dataviz.eval_head_plots import render_baseline_delta_plots
 
             if node_metrics_csv is not None:
                 delta_csv = node_metrics_csv.with_name(f"{split}_baseline_deltas.csv")
@@ -524,17 +667,31 @@ def eval_epiforecaster(
 
             compare_model_metrics_against_baselines(
                 eval_metrics=metrics,
-                baseline_results_csv=compare_baselines,
+                baseline_results_csv=baseline_results_csv,
                 output_csv=delta_csv,
+                candidate_granular_csv=granular_csv,
             )
             click.echo(f"Saved baseline deltas to: {delta_csv}")
+            try:
+                baseline_plot_artifacts = render_baseline_delta_plots(
+                    baseline_deltas_csv=delta_csv,
+                    output_dir=delta_csv.parent,
+                )
+                for plot_name, plot_path in sorted(baseline_plot_artifacts.items()):
+                    click.echo(f"Saved {plot_name} to: {plot_path}")
+            except Exception as e:
+                click.echo(f"Warning: Baseline delta plotting failed: {e}")
 
         if log_dir is not None:
             click.echo(f"Eval metrics logged to: {log_dir}")
-        if output is not None:
+        if output is not None and output.exists():
             click.echo(f"Saved plot to: {output}")
         if node_metrics_csv is not None:
             click.echo(f"Saved node metrics to: {node_metrics_csv}")
+        if per_head_node_metrics_csv is not None:
+            click.echo(f"Saved per-head node metrics to: {per_head_node_metrics_csv}")
+        for plot_name, plot_path in sorted(per_head_plot_artifacts.items()):
+            click.echo(f"Saved {plot_name} to: {plot_path}")
         if granular_csv is not None:
             click.echo(f"Saved granular metrics to: {granular_csv}")
         if wandb.run is not None:
@@ -549,20 +706,10 @@ def eval_epiforecaster(
 @click.option("--config", required=True, help="Path to training configuration file.")
 @click.option(
     "--models",
-    type=click.Choice(
-        ["tiered", "exp_smoothing", "var_cross_target", "all"],
-        case_sensitive=False,
-    ),
-    default="tiered",
+    type=click.Choice(["sarima", "exp_smoothing", "var", "all"], case_sensitive=False),
+    default="sarima",
     show_default=True,
     help="Baseline model family to evaluate.",
-)
-@click.option(
-    "--rolling-folds",
-    type=int,
-    default=5,
-    show_default=True,
-    help="Number of expanding rolling-origin folds.",
 )
 @click.option(
     "--split",
@@ -592,16 +739,13 @@ def eval_epiforecaster(
 def eval_baselines(
     config: str,
     models: str,
-    rolling_folds: int,
     split: str,
     seasonal_period: int,
     output_dir: Path,
     disable_sparsity_bins: bool,
 ):
-    """Run fair rolling-origin baseline benchmarking for EpiForecaster targets."""
+    """Run same-slice baseline benchmarking for EpiForecaster targets."""
     try:
-        if rolling_folds <= 0:
-            raise click.ClickException("--rolling-folds must be positive.")
         if seasonal_period <= 0:
             raise click.ClickException("--seasonal-period must be positive.")
 
@@ -610,7 +754,7 @@ def eval_baselines(
         from evaluation.baseline_eval import run_baseline_evaluation
 
         selected_models = (
-            ["tiered", "exp_smoothing", "var_cross_target"]
+            ["exp_smoothing", "sarima", "var"]
             if models.lower() == "all"
             else [models.lower()]
         )
@@ -628,9 +772,7 @@ def eval_baselines(
                 config_path=config,
                 output_dir=run_output_dir,
                 split=split_name,
-                rolling_folds=rolling_folds,
                 seasonal_period=seasonal_period,
-                include_sparsity_bins=not disable_sparsity_bins,
             )
 
             click.echo(f"Baseline evaluation completed ({split_name}).")
@@ -677,8 +819,9 @@ def eval_baselines(
     default="random:5",
     show_default=True,
     help=(
-        "Node selection strategy: 'random:N', 'quartile:N', 'best:N', 'worst:N'. "
-        "Quartile/best/worst require a mini-eval to compute per-node MAE."
+        "Selection strategy: 'random:N', 'quartile:N', 'best:N', 'worst:N', "
+        "'window_quartile:N'. Quartile/best/worst require a mini-eval to compute "
+        "per-node MAE. window_quartile uses granular eval rows."
     ),
 )
 @click.option(
@@ -713,6 +856,22 @@ def eval_baselines(
     multiple=True,
     help="Override config values (e.g., training.device=cuda, training.val_workers=0)",
 )
+@click.option(
+    "--granular-csv",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Granular eval CSV to use for window_quartile selection.",
+)
+@click.option(
+    "--node-metric-target",
+    type=click.Choice(
+        ["hospitalizations", "wastewater", "cases", "deaths"],
+        case_sensitive=False,
+    ),
+    default="hospitalizations",
+    show_default=True,
+    help="Explicit target to use for node-based MAE selection.",
+)
 def plot_forecasts(
     experiment: str | None,
     run: str | None,
@@ -723,6 +882,8 @@ def plot_forecasts(
     device: str,
     output: Path | None,
     override: tuple[str, ...],
+    granular_csv: Path | None,
+    node_metric_target: str,
 ):
     """Generate forecast plots from checkpoint with flexible node selection.
 
@@ -732,6 +893,7 @@ def plot_forecasts(
       quartile:N  - N nodes per MAE quartile (requires mini-eval)
       best:N      - N best-performing nodes (requires mini-eval)
       worst:N     - N worst-performing nodes (requires mini-eval)
+      window_quartile:N - N exact (node, window) examples per MAE quartile from granular eval
 
     \b
     Examples:
@@ -784,6 +946,10 @@ def plot_forecasts(
             load_model_from_checkpoint,
             select_nodes_by_loss,
         )
+        from evaluation.selection import (
+            load_window_selection_specs_from_granular,
+            select_windows_by_loss,
+        )
         from evaluation.losses import get_loss_from_config
 
         click.echo(f"Loading checkpoint: {checkpoint}")
@@ -803,7 +969,8 @@ def plot_forecasts(
 
         strategy, k = _parse_nodes_option(nodes)
 
-        node_mae: dict[int, float] | None = None
+        node_mae_by_target: dict[str, dict[int, float]] | None = None
+        window_groups = None
         if strategy in ("quartile", "best", "worst"):
             click.echo(f"Running mini-eval for {strategy} selection...")
             criterion = get_loss_from_config(
@@ -811,7 +978,7 @@ def plot_forecasts(
                 data_config=config.data,
                 forecast_horizon=config.model.forecast_horizon,
             )
-            _, _, node_mae = evaluate_loader(
+            _, _, node_mae_by_target = evaluate_loader(
                 model=model,
                 loader=loader,
                 criterion=criterion,
@@ -819,6 +986,7 @@ def plot_forecasts(
                 device=next(model.parameters()).device,
                 region_embeddings=region_embeddings,
                 split_name=split.capitalize(),
+                node_metrics_target=node_metric_target,
             )
 
         if strategy == "random":
@@ -829,24 +997,56 @@ def plot_forecasts(
             random.seed(42)
             selected = random.sample(all_nodes, min(k, len(all_nodes)))
             node_groups = {"Random": selected}
+        elif strategy == "window_quartile":
+            if granular_csv is None:
+                granular_csv = (
+                    checkpoint.parent.parent
+                    / config.output.resolve_granular_eval_filename(split=split)
+                )
+            if not granular_csv.exists():
+                raise click.ClickException(
+                    f"window_quartile selection requires granular CSV, not found: {granular_csv}"
+                )
+            click.echo(f"Loading granular selection candidates from: {granular_csv}")
+            window_specs = load_window_selection_specs_from_granular(
+                granular_csv=granular_csv,
+                split=split,
+            )
+            if not window_specs:
+                raise click.ClickException(
+                    f"No granular window candidates found in {granular_csv}"
+                )
+            window_groups = select_windows_by_loss(
+                window_specs=window_specs,
+                samples_per_group=k,
+            )
+            node_groups = None
         else:
             node_groups = select_nodes_by_loss(
-                node_mae=node_mae or {},
+                node_mae=(node_mae_by_target or {}).get(node_metric_target, {}),
+                target_name=node_metric_target,
                 strategy=strategy,
                 k=k,
                 samples_per_group=k,
             )
 
-        total_nodes = sum(len(v) for v in node_groups.values())
-        click.echo(f"Selected {total_nodes} nodes via {strategy}:")
-        for group_name, group_nodes in node_groups.items():
-            click.echo(f"  {group_name}: {len(group_nodes)} nodes")
+        if window_groups is not None:
+            total_nodes = sum(len(v) for v in window_groups.values())
+            click.echo(f"Selected {total_nodes} node-window examples via {strategy}:")
+            for group_name, group_specs in window_groups.items():
+                click.echo(f"  {group_name}: {len(group_specs)} windows")
+        else:
+            total_nodes = sum(len(v) for v in node_groups.values())
+            click.echo(f"Selected {total_nodes} nodes via {strategy}:")
+            for group_name, group_nodes in node_groups.items():
+                click.echo(f"  {group_name}: {len(group_nodes)} nodes")
 
         click.echo(f"Generating plots (window={window})...")
         generate_forecast_plots(
             model=model,
             loader=loader,
             node_groups=node_groups,
+            window_groups=window_groups,
             window=window,
             output_path=output,
         )
@@ -871,7 +1071,7 @@ def _parse_nodes_option(nodes: str) -> tuple[str, int]:
             f"Invalid --nodes format: '{nodes}'. Expected 'strategy:N' (e.g., 'random:5')"
         )
     strategy, k_str = parts[0].lower(), parts[1]
-    valid_strategies = ("random", "quartile", "best", "worst")
+    valid_strategies = ("random", "quartile", "best", "worst", "window_quartile")
     if strategy not in valid_strategies:
         raise click.ClickException(
             f"Invalid strategy: '{strategy}'. Valid: {', '.join(valid_strategies)}"
@@ -960,10 +1160,11 @@ def _format_eval_summary(loss: float, metrics: dict) -> str:
 
     rows = [
         ("Loss", _fmt(loss)),
-        ("MAE", _fmt(metrics.get("mae"))),
-        ("RMSE", _fmt(metrics.get("rmse"))),
-        ("sMAPE", _fmt(metrics.get("smape"))),
-        ("R2", _fmt(metrics.get("r2"))),
+        ("Joint Obs Loss", _fmt(metrics.get("mae"))),
+        ("Hosp MAE", _fmt(metrics.get("mae_hosp_log1p_per_100k"))),
+        ("WW MAE", _fmt(metrics.get("mae_ww_log1p_per_100k"))),
+        ("Cases MAE", _fmt(metrics.get("mae_cases_log1p_per_100k"))),
+        ("Deaths MAE", _fmt(metrics.get("mae_deaths_log1p_per_100k"))),
     ]
     lines = ["Metric  Value"]
     lines.append("------  ------")
