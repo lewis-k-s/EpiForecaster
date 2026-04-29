@@ -1,0 +1,4 @@
+[submodule "tex"]
+	path = tex
+	url = git@github.com:lewis-k-s/epiforecaster-manuscript.git
+	branch = master

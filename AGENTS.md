@@ -105,6 +105,15 @@ The canonical data pipeline follows: raw data → preprocessing → Zarr dataset
 
 - Use `uv run train (regions|epiforecaster)` to train on the prepared dataset.
 
+## Paper Workflow
+
+- Manuscript workspace overview: `tex/README.md`
+- Main manuscript source: `tex/EpiForecaster/sn-article.tex`
+- Paper build and clean workflow: `tex/EpiForecaster/WORKFLOW.md`
+- Manuscript helper functions: `tex/spells.sh`
+- When editing paper sources or figure references, review the TeX workspace context files first, especially `tex/README.md` and `tex/EpiForecaster/WORKFLOW.md`.
+- After any manuscript edit, build the paper before finishing by sourcing `tex/spells.sh` and running `compile_paper`.
+
 ## Commit & Pull Request Guidelines
 
 - Commits: imperative mood, scoped, and small (e.g., `graph: add OD edge builder`). Reference issues when applicable.
