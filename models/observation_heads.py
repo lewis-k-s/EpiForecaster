@@ -36,6 +36,16 @@ _KERNEL_LOGIT_CLAMP_MIN = -30.0
 _KERNEL_LOGIT_CLAMP_MAX = 30.0
 
 
+def _sanitize_free_kernel_weights(weights: torch.Tensor) -> torch.Tensor:
+    """Sanitize unconstrained kernel weights before applying them directly."""
+    return torch.nan_to_num(
+        weights.float(),
+        nan=0.0,
+        posinf=_KERNEL_LOGIT_CLAMP_MAX,
+        neginf=_KERNEL_LOGIT_CLAMP_MIN,
+    ).clamp(min=_KERNEL_LOGIT_CLAMP_MIN, max=_KERNEL_LOGIT_CLAMP_MAX)
+
+
 def _autocast_disabled_for(tensor: torch.Tensor):
     """Disable autocast for numerically sensitive blocks on supported devices."""
     if tensor.device.type in {"cpu", "cuda", "mps"}:
@@ -115,6 +125,9 @@ class DelayKernel(nn.Module):
         gamma_shape: Shape parameter for Gamma distribution initialization
         gamma_scale: Scale parameter for Gamma distribution initialization
         learnable: If True, kernel weights are trainable; if False, frozen
+        parameterization: Kernel parameterization mode. "simplex" enforces
+            positivity and sum-to-one normalization; "free" learns unconstrained
+            signed weights initialized from the same gamma prior.
     """
 
     def __init__(
@@ -123,12 +136,20 @@ class DelayKernel(nn.Module):
         gamma_shape: float = 5.0,
         gamma_scale: float = 2.0,
         learnable: bool = True,
+        parameterization: str = "simplex",
     ):
         super().__init__()
         self.kernel_length = kernel_length
         self.gamma_shape = gamma_shape
         self.gamma_scale = gamma_scale
         self.learnable = learnable
+        self.parameterization = parameterization
+
+        if self.parameterization not in {"simplex", "free"}:
+            raise ValueError(
+                "parameterization must be one of {'simplex', 'free'}, "
+                f"got {self.parameterization!r}"
+            )
 
         # Initialize kernel weights with Gamma distribution
         kernel_weights = self._init_gamma_kernel(
@@ -136,13 +157,18 @@ class DelayKernel(nn.Module):
         )
 
         if learnable:
-            self.kernel = nn.Parameter(_inverse_softplus(kernel_weights))
+            if self.parameterization == "simplex":
+                kernel_param = _inverse_softplus(kernel_weights)
+            else:
+                kernel_param = kernel_weights
+            self.kernel = nn.Parameter(kernel_param)
         else:
             self.register_buffer("kernel", kernel_weights)
 
         logger.debug(
             f"Initialized DelayKernel: length={kernel_length}, "
-            f"gamma({gamma_shape}, {gamma_scale}), learnable={learnable}"
+            f"gamma({gamma_shape}, {gamma_scale}), learnable={learnable}, "
+            f"parameterization={parameterization}"
         )
 
     def _init_gamma_kernel(
@@ -187,16 +213,19 @@ class DelayKernel(nn.Module):
         batch_size, time_steps = I_trajectory.shape
 
         with _autocast_disabled_for(I_trajectory):
-            if self.learnable:
+            if self.learnable and self.parameterization == "simplex":
                 kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+                kernel_weights = _safe_normalize(kernel_weights)
+            elif self.learnable:
+                kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             else:
                 kernel_weights = self.kernel
-            normalized_kernel = _safe_normalize(kernel_weights)
+            flipped_kernel = torch.flip(kernel_weights, dims=[0])
 
             I_reshaped = torch.nan_to_num(
                 I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
             ).unsqueeze(1)
-            kernel_reshaped = normalized_kernel.view(1, 1, -1)
+            kernel_reshaped = flipped_kernel.view(1, 1, -1)
 
             output = F.conv1d(
                 I_reshaped,
@@ -208,17 +237,23 @@ class DelayKernel(nn.Module):
         return output.to(I_trajectory.dtype)
 
     def get_kernel_weights(self) -> torch.Tensor:
-        """Get current kernel weights (normalized)."""
-        if self.learnable:
+        """Get current kernel weights in forward-space order."""
+        if self.learnable and self.parameterization == "simplex":
             kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+            kernel_weights = _safe_normalize(kernel_weights)
+            output_dtype = self.kernel.dtype
+        elif self.learnable:
+            kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             output_dtype = self.kernel.dtype
         else:
             kernel_weights = self.kernel
             output_dtype = kernel_weights.dtype
-        return _safe_normalize(kernel_weights).to(output_dtype)
+        return kernel_weights.to(output_dtype)
 
     def get_mean_delay(self) -> float:
         """Compute mean delay in days based on current kernel."""
+        if self.parameterization != "simplex":
+            raise ValueError("mean delay is only defined for simplex kernels")
         weights = self.get_kernel_weights()
         positions = torch.arange(
             len(weights), device=weights.device, dtype=torch.float32
@@ -229,7 +264,7 @@ class DelayKernel(nn.Module):
         return (
             f"DelayKernel(length={self.kernel_length}, "
             f"gamma({self.gamma_shape}, {self.gamma_scale}), "
-            f"learnable={self.learnable})"
+            f"learnable={self.learnable}, parameterization={self.parameterization})"
         )
 
 
@@ -259,6 +294,8 @@ class SheddingConvolution(nn.Module):
         sensitivity_scale: Measurement sensitivity (absorbs FlowPerCapita)
         learnable_kernel: If True, shedding profile is trainable
         learnable_scale: If True, sensitivity scale is trainable
+        kernel_parameterization: "simplex" for positive normalized kernels,
+            "free" for unconstrained signed kernels with gamma priming
     """
 
     def __init__(
@@ -267,19 +304,31 @@ class SheddingConvolution(nn.Module):
         sensitivity_scale: float = 1.0,
         learnable_kernel: bool = True,
         learnable_scale: bool = True,
+        kernel_parameterization: str = "simplex",
         strict: bool = True,
     ):
         super().__init__()
         self.kernel_length = kernel_length
         self.learnable_kernel = learnable_kernel
         self.learnable_scale = learnable_scale
+        self.kernel_parameterization = kernel_parameterization
         self.strict = strict
+
+        if self.kernel_parameterization not in {"simplex", "free"}:
+            raise ValueError(
+                "kernel_parameterization must be one of {'simplex', 'free'}, "
+                f"got {self.kernel_parameterization!r}"
+            )
 
         # Initialize shedding kernel with biologically-informed profile
         kernel_weights = self._init_shedding_kernel(kernel_length)
 
         if learnable_kernel:
-            self.kernel = nn.Parameter(_inverse_softplus(kernel_weights))
+            if self.kernel_parameterization == "simplex":
+                kernel_param = _inverse_softplus(kernel_weights)
+            else:
+                kernel_param = kernel_weights
+            self.kernel = nn.Parameter(kernel_param)
         else:
             self.register_buffer("kernel", kernel_weights)
 
@@ -300,7 +349,8 @@ class SheddingConvolution(nn.Module):
         logger.debug(
             f"Initialized SheddingConvolution: length={kernel_length}, "
             f"sensitivity_scale={sensitivity_scale:.4f}, "
-            f"learnable_kernel={learnable_kernel}, learnable_scale={learnable_scale}"
+            f"learnable_kernel={learnable_kernel}, learnable_scale={learnable_scale}, "
+            f"kernel_parameterization={kernel_parameterization}"
         )
 
     def _init_shedding_kernel(self, length: int) -> torch.Tensor:
@@ -376,16 +426,19 @@ class SheddingConvolution(nn.Module):
                 population = population.unsqueeze(1).expand(-1, time_steps)
 
         with _autocast_disabled_for(I_trajectory):
-            if self.learnable_kernel:
+            if self.learnable_kernel and self.kernel_parameterization == "simplex":
                 kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+                kernel_weights = _safe_normalize(kernel_weights)
+            elif self.learnable_kernel:
+                kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             else:
                 kernel_weights = self.kernel
-            normalized_kernel = _safe_normalize(kernel_weights)
+            flipped_kernel = torch.flip(kernel_weights, dims=[0])
 
             I_reshaped = torch.nan_to_num(
                 I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
             ).unsqueeze(1)
-            kernel_reshaped = normalized_kernel.view(1, 1, -1)
+            kernel_reshaped = flipped_kernel.view(1, 1, -1)
 
             total_shedding = F.conv1d(
                 I_reshaped,
@@ -408,14 +461,18 @@ class SheddingConvolution(nn.Module):
         return viral_concentration.to(I_trajectory.dtype)
 
     def get_kernel_weights(self) -> torch.Tensor:
-        """Get current shedding kernel weights (normalized)."""
-        if self.learnable_kernel:
+        """Get current shedding kernel weights in forward-space order."""
+        if self.learnable_kernel and self.kernel_parameterization == "simplex":
             kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
+            kernel_weights = _safe_normalize(kernel_weights)
+            output_dtype = self.kernel.dtype
+        elif self.learnable_kernel:
+            kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             output_dtype = self.kernel.dtype
         else:
             kernel_weights = self.kernel
             output_dtype = kernel_weights.dtype
-        return _safe_normalize(kernel_weights).to(output_dtype)
+        return kernel_weights.to(output_dtype)
 
     def get_sensitivity_scale(self) -> torch.Tensor:
         """Get positive sensitivity scale."""
@@ -434,8 +491,52 @@ class SheddingConvolution(nn.Module):
         return (
             f"SheddingConvolution(length={self.kernel_length}, "
             f"sensitivity_scale={self.get_sensitivity_scale().item():.4f}, "
-            f"learnable_kernel={self.learnable_kernel}, learnable_scale={self.learnable_scale})"
+            f"learnable_kernel={self.learnable_kernel}, learnable_scale={self.learnable_scale}, "
+            f"kernel_parameterization={self.kernel_parameterization})"
         )
+
+
+class MLPKernel(nn.Module):
+    """Pointwise MLP replacing the causal delay/shedding kernel convolution.
+
+    Instead of a fixed-shape kernel applied via ``F.conv1d``, this module
+    extracts a sliding window of the input trajectory and passes each window
+    through a small MLP (Linear → GELU → Linear).  The final layer is
+    zero-initialised for conservative startup (matching the residual-path
+    pattern used elsewhere).
+    """
+
+    def __init__(
+        self, kernel_length: int = 21, hidden_dim: int = 32, include_population: bool = False
+    ):
+        super().__init__()
+        self.kernel_length = kernel_length
+        self.include_population = include_population
+        in_dim = kernel_length + (1 if include_population else 0)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        _small_xavier_linear(self.mlp[0], gain=0.1)  # type: ignore[arg-type]
+        # Zero-init final layer for conservative startup
+        nn.init.zeros_(self.mlp[-1].weight)  # type: ignore[union-attr]
+        nn.init.zeros_(self.mlp[-1].bias)  # type: ignore[union-attr]
+
+    def forward(
+        self, I_trajectory: torch.Tensor, population: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        B, T = I_trajectory.shape
+        with _autocast_disabled_for(I_trajectory):
+            padded = F.pad(I_trajectory.float(), (self.kernel_length - 1, 0))  # causal
+            windows = padded.unfold(1, self.kernel_length, 1)  # [B, T, K]
+            if self.include_population and population is not None:
+                pop = population.float()
+                if pop.ndim == 2:
+                    pop = pop[:, :1]  # [B, 1] – same pop for all timesteps
+                pop = pop.unsqueeze(-1).expand(B, T, -1)  # [B, T, 1]
+                windows = torch.cat([windows, pop], dim=-1)
+            return self.mlp(windows).squeeze(-1).to(I_trajectory.dtype)  # [B, T]
 
 
 class ClinicalObservationHead(nn.Module):
@@ -466,6 +567,8 @@ class ClinicalObservationHead(nn.Module):
         gamma_shape: Gamma shape parameter for kernel init
         gamma_scale: Gamma scale parameter for kernel init
         learnable_kernel: If True, delay kernel is trainable
+        kernel_parameterization: "simplex" for positive normalized kernels,
+            "free" for unconstrained signed kernels with gamma priming
         scale_init: Initial scale for per-100k conversion (default 1.0)
         learnable_scale: If True, scale is trainable
         residual_dim: Dimension of observation context for residual
@@ -478,24 +581,30 @@ class ClinicalObservationHead(nn.Module):
         gamma_shape: float = 5.0,
         gamma_scale: float = 2.0,
         learnable_kernel: bool = True,
+        kernel_parameterization: str = "simplex",
         scale_init: float = 1.0,
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
+        kernel_mlp: bool = False,
     ):
         super().__init__()
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
 
-        self.delay_kernel = DelayKernel(
-            kernel_length=kernel_length,
-            gamma_shape=gamma_shape,
-            gamma_scale=gamma_scale,
-            learnable=learnable_kernel,
-        )
+        if kernel_mlp:
+            self.delay_kernel = MLPKernel(kernel_length=kernel_length, hidden_dim=32)
+        else:
+            self.delay_kernel = DelayKernel(
+                kernel_length=kernel_length,
+                gamma_shape=gamma_shape,
+                gamma_scale=gamma_scale,
+                learnable=learnable_kernel,
+                parameterization=kernel_parameterization,
+            )
 
         # Learnable scale for per-100k conversion (constrained positive)
         if learnable_scale:
@@ -626,10 +735,10 @@ class WastewaterObservationHead(nn.Module):
     log1p(per-100k) space for joint inference.
 
     Architecture:
-        1. SheddingConvolution: (I_trajectory, population) → viral_load
-        2. Convert to per-100k: viral_load × 100,000 / population
-        3. Apply log1p: log1p(per_100k × scale)
-        4. Add residual: pred_log + alpha × residual(obs_context)
+        1. SheddingConvolution: (I_trajectory, population) → diluted shedding proxy
+        2. Convert to per-100k scale: proxy × 100,000
+        3. Apply learnable positive scale and log1p transform
+        4. Optionally add a residual correction from observation context
 
     Args:
         kernel_length: Length of shedding kernel (default 14 days)
@@ -645,25 +754,33 @@ class WastewaterObservationHead(nn.Module):
         kernel_length: int = 14,
         scale_init: float = 1.0,
         learnable_kernel: bool = True,
+        kernel_parameterization: str = "simplex",
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
         strict: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
+        kernel_mlp: bool = False,
     ):
         super().__init__()
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
 
-        self.shedding_conv = SheddingConvolution(
-            kernel_length=kernel_length,
-            sensitivity_scale=1.0,  # Fixed, we'll handle scaling separately
-            learnable_kernel=learnable_kernel,
-            learnable_scale=False,  # We handle scale separately
-            strict=strict,
-        )
+        if kernel_mlp:
+            self.shedding_conv = MLPKernel(
+                kernel_length=kernel_length, hidden_dim=32, include_population=True
+            )
+        else:
+            self.shedding_conv = SheddingConvolution(
+                kernel_length=kernel_length,
+                sensitivity_scale=1.0,  # Fixed, we'll handle scaling separately
+                learnable_kernel=learnable_kernel,
+                kernel_parameterization=kernel_parameterization,
+                learnable_scale=False,  # We handle scale separately
+                strict=strict,
+            )
 
         # Learnable scale for per-100k conversion (constrained positive)
         if learnable_scale:

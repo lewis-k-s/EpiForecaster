@@ -3,9 +3,12 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
+import torch
+
 from utils.console import (
     format_horizon_status_lines,
     format_joint_loss_components_status,
+    format_train_progress_status,
 )
 from utils.train_logging import (
     add_curriculum_metrics,
@@ -23,7 +26,7 @@ def test_add_joint_loss_metrics_only_adds_present_keys() -> None:
     metrics = {
         "loss_ww": 1.0,
         "loss_ww_weighted": 0.1,
-        "loss_sir": 2.0,
+        "loss_sird_supervision": 2.0,
     }
 
     add_joint_loss_metrics(log_data=log_data, split_prefix="val", metrics=metrics)
@@ -31,7 +34,7 @@ def test_add_joint_loss_metrics_only_adds_present_keys() -> None:
     assert log_data == {
         "loss_val_ww": 1.0,
         "loss_val_ww_weighted": 0.1,
-        "loss_val_sir": 2.0,
+        "loss_val_sird_supervision": 2.0,
     }
 
 
@@ -94,6 +97,23 @@ def test_horizon_helpers_build_log_data_and_status_lines() -> None:
     ]
 
 
+def test_format_train_progress_status_appends_optional_loss_details() -> None:
+    status = format_train_progress_status(
+        epoch=2,
+        step=10,
+        loss_value=1.25,
+        lr=1.0e-3,
+        grad_norm=torch.tensor(2.0),
+        samples_per_s=64.0,
+        loss_detail_suffix=" | SIRD: 0.1 (w=0.001)",
+        gradnorm_status_suffix="",
+    )
+
+    assert "Epoch 2 | Step 10" in status
+    assert "Loss: 1.25" in status
+    assert "| SIRD: 0.1 (w=0.001)" in status
+
+
 def test_format_joint_loss_components_status_requires_core_keys() -> None:
     assert format_joint_loss_components_status({"loss_ww": 1.0}) is None
 
@@ -101,10 +121,10 @@ def test_format_joint_loss_components_status_requires_core_keys() -> None:
         {
             "loss_ww": 1.0,
             "loss_hosp": 2.0,
-            "loss_sir": 3.0,
+            "loss_sird_supervision": 3.0,
             "loss_ww_weighted": 0.1,
             "loss_hosp_weighted": 0.2,
-            "loss_sir_weighted": 0.3,
+            "loss_sird_supervision_weighted": 0.3,
             "loss_cases": 4.0,
             "loss_cases_weighted": 0.4,
         }
@@ -113,7 +133,7 @@ def test_format_joint_loss_components_status_requires_core_keys() -> None:
     assert components is not None
     assert "WW=1" in components
     assert "Hosp=2" in components
-    assert "SIR=3" in components
+    assert "SIRD=3" in components
     assert "Cases=4" in components
 
 
@@ -146,10 +166,10 @@ def test_build_epoch_logging_bundle_includes_payload_and_status_lines() -> None:
         "mae": 0.1,
         "loss_ww": 1.0,
         "loss_hosp": 2.0,
-        "loss_sir": 3.0,
+        "loss_sird_supervision": 3.0,
         "loss_ww_weighted": 0.1,
         "loss_hosp_weighted": 0.2,
-        "loss_sir_weighted": 0.3,
+        "loss_sird_supervision_weighted": 0.3,
         "mae_hosp_per_h": [0.11, 0.12],
         "rmse_hosp_per_h": [0.21, 0.22],
     }
@@ -208,6 +228,8 @@ def test_wandb_step_payload_filters_gradient_scalars_on_logged_steps() -> None:
         log_this_step=True,
         log_data={
             "loss_train_step": 1.0,
+            "loss_train_sird_supervision": 0.1,
+            "loss_train_sird_supervision_weighted": 0.001,
             "gradnorm_clipped_total": 2.0,
             "gradnorm_sidecar_ran": 1.0,
             "grad_snapshot_max_layer_norm": 9.0,
@@ -219,5 +241,7 @@ def test_wandb_step_payload_filters_gradient_scalars_on_logged_steps() -> None:
 
     assert payload == {
         "loss_train_step": 1.0,
+        "loss_train_sird_supervision": 0.1,
+        "loss_train_sird_supervision_weighted": 0.001,
         "time_batch_s": 0.2,
     }

@@ -140,7 +140,10 @@ def _make_gradnorm_stub_trainer(*, update_every: int) -> EpiForecasterTrainer:
         autocast_dtype=torch.bfloat16,
         autocast_enabled=False,
     )
-    trainer.criterion = JointInferenceLoss(obs_weight_sum=0.95, w_sir=0.0)
+    trainer.criterion = JointInferenceLoss(
+        obs_weight_sum=0.95,
+        w_sird_supervision=0.0,
+    )
     trainer.gradnorm_controller = GradNormController(
         warmup_steps=0,
         update_every=update_every,

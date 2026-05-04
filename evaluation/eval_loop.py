@@ -224,12 +224,16 @@ def evaluate_loader(
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
     loss_deaths_sum = torch.tensor(0.0, device=device)
-    loss_sir_sum = torch.tensor(0.0, device=device)
+    loss_sird_supervision_sum = torch.tensor(0.0, device=device)
     loss_ww_weighted_sum = torch.tensor(0.0, device=device)
     loss_hosp_weighted_sum = torch.tensor(0.0, device=device)
     loss_cases_weighted_sum = torch.tensor(0.0, device=device)
     loss_deaths_weighted_sum = torch.tensor(0.0, device=device)
-    loss_sir_weighted_sum = torch.tensor(0.0, device=device)
+    loss_sird_supervision_weighted_sum = torch.tensor(0.0, device=device)
+    loss_latent_s_sum = torch.tensor(0.0, device=device)
+    loss_latent_i_sum = torch.tensor(0.0, device=device)
+    loss_latent_r_sum = torch.tensor(0.0, device=device)
+    loss_latent_d_sum = torch.tensor(0.0, device=device)
 
     per_head_node_metrics: dict[str, dict[int, dict[str, float]]] = {}
 
@@ -326,14 +330,20 @@ def evaluate_loader(
                 loss_hosp_sum += components["hosp"].detach()
                 loss_cases_sum += components["cases"].detach()
                 loss_deaths_sum += components["deaths"].detach()
-                loss_sir_sum += components["sir"].detach()
+                loss_sird_supervision_sum += components["sird_supervision"].detach()
+                loss_latent_s_sum += components["latent_s"].detach()
+                loss_latent_i_sum += components["latent_i"].detach()
+                loss_latent_r_sum += components["latent_r"].detach()
+                loss_latent_d_sum += components["latent_d"].detach()
                 if "continuity" in components:
                     pass  # Don't accumulate continuity loss in metrics
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
                 loss_hosp_weighted_sum += components["hosp_weighted"].detach()
                 loss_cases_weighted_sum += components["cases_weighted"].detach()
                 loss_deaths_weighted_sum += components["deaths_weighted"].detach()
-                loss_sir_weighted_sum += components["sir_weighted"].detach()
+                loss_sird_supervision_weighted_sum += components[
+                    "sird_supervision_weighted"
+                ].detach()
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -682,7 +692,13 @@ def evaluate_loader(
         "loss_hosp": (loss_hosp_sum / max(1, processed_batches)).item(),
         "loss_cases": (loss_cases_sum / max(1, processed_batches)).item(),
         "loss_deaths": (loss_deaths_sum / max(1, processed_batches)).item(),
-        "loss_sir": (loss_sir_sum / max(1, processed_batches)).item(),
+        "loss_sird_supervision": (
+            loss_sird_supervision_sum / max(1, processed_batches)
+        ).item(),
+        "loss_latent_s": (loss_latent_s_sum / max(1, processed_batches)).item(),
+        "loss_latent_i": (loss_latent_i_sum / max(1, processed_batches)).item(),
+        "loss_latent_r": (loss_latent_r_sum / max(1, processed_batches)).item(),
+        "loss_latent_d": (loss_latent_d_sum / max(1, processed_batches)).item(),
         "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
         "loss_hosp_weighted": (
             loss_hosp_weighted_sum / max(1, processed_batches)
@@ -693,7 +709,9 @@ def evaluate_loader(
         "loss_deaths_weighted": (
             loss_deaths_weighted_sum / max(1, processed_batches)
         ).item(),
-        "loss_sir_weighted": (loss_sir_weighted_sum / max(1, processed_batches)).item(),
+        "loss_sird_supervision_weighted": (
+            loss_sird_supervision_weighted_sum / max(1, processed_batches)
+        ).item(),
     }
 
     logger.info("EVAL COMPLETE")
@@ -754,7 +772,7 @@ def eval_checkpoint(
 
     Args:
         checkpoint_path: Path to checkpoint file
-        split: Which split to evaluate ("val" or "test")
+        split: Which split to evaluate ("val", "test", or "full")
         device: Device to use for evaluation (overridden by training.device in overrides)
         log_dir: Optional W&B run directory for forecast plots
         overrides: Optional list of dotted-key config overrides (e.g., ["training.val_workers=4"])

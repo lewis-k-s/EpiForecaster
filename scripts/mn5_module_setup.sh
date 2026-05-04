@@ -15,10 +15,8 @@ _mn5_fail() {
 }
 
 if ! command -v module >/dev/null 2>&1; then
-  if [ -f /etc/profile.d/modules.sh ]; then
-    # shellcheck disable=SC1091
-    source /etc/profile.d/modules.sh
-  fi
+  echo "HPC modules not found!"
+  exit 1
 fi
 
 command -v module >/dev/null 2>&1 || _mn5_fail "Environment modules command not found."

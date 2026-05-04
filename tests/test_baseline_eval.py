@@ -19,10 +19,12 @@ from evaluation.baseline_eval import (
 )
 from evaluation.baseline_models import (
     predict_with_exponential_smoothing_fallback,
+    predict_with_last_observed_fallback,
     predict_with_sarima_fallback,
     predict_with_tiered_fallback,
     predict_with_var_fallback,
     predict_with_var_cross_target_fallback,
+    predict_with_varmax_fallback,
 )
 from evaluation.metrics import compute_masked_metrics_numpy
 
@@ -90,7 +92,7 @@ class _DummyDataset:
         self.mobility_lags: list[int] = []
         self._temporal_coords = list(range(T))
         self.target_nodes = list(range(N))
-        self.temporal_covariates = torch.zeros((T, 0), dtype=torch.float32)
+        self.temporal_covariates = torch.arange(T * 3, dtype=torch.float32).reshape(T, 3)
         self._dataset = None
 
         values = np.linspace(0.1, 2.0, T * N, dtype=np.float64).reshape(T, N)
@@ -159,6 +161,13 @@ def _make_same_slice_batch() -> SimpleNamespace:
             dtype=torch.float32,
         ),
         ww_hist_mask=torch.ones((2, 3), dtype=torch.float32),
+        temporal_covariates=torch.tensor(
+            [
+                [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]],
+                [[3.0, 4.0, 5.0], [6.0, 7.0, 8.0], [9.0, 10.0, 11.0]],
+            ],
+            dtype=torch.float32,
+        ),
         hosp_target=torch.tensor([[3.5, 4.0], [4.5, 5.0]], dtype=torch.float32),
         hosp_target_mask=torch.ones((2, 2), dtype=torch.float32),
         cases_target=torch.tensor([[2.5, 3.0], [3.5, 4.0]], dtype=torch.float32),
@@ -172,7 +181,7 @@ def _make_same_slice_batch() -> SimpleNamespace:
     return batch
 
 
-def test_tiered_fallback_chain_deterministic_when_sparse(monkeypatch):
+def test_tiered_baseline_reports_failure_when_sparse(monkeypatch):
     import evaluation.baseline_models as baseline_models
 
     monkeypatch.setattr(baseline_models, "_fit_best_sarimax", lambda **kwargs: None)
@@ -186,12 +195,13 @@ def test_tiered_fallback_chain_deterministic_when_sparse(monkeypatch):
         exog_train=None,
         exog_future=None,
     )
-    assert result.model_name == "global_train_median"
-    assert result.fit_status == "fallback"
-    assert np.allclose(result.predictions, np.array([1.25, 1.25], dtype=np.float64))
+    assert result.model_name == "sarima"
+    assert result.fit_status == "fit_failed"
+    assert result.fallback_reason == "sarima_unavailable"
+    assert np.all(np.isnan(result.predictions))
 
 
-def test_exp_smoothing_fallback_chain_deterministic_when_sparse(monkeypatch):
+def test_exp_smoothing_reports_failure_when_sparse(monkeypatch):
     import evaluation.baseline_models as baseline_models
 
     monkeypatch.setattr(
@@ -208,9 +218,10 @@ def test_exp_smoothing_fallback_chain_deterministic_when_sparse(monkeypatch):
         global_train_median=2.5,
         seasonal_period=7,
     )
-    assert result.model_name == "global_train_median"
-    assert result.fit_status == "fallback"
-    assert np.allclose(result.predictions, np.array([2.5, 2.5], dtype=np.float64))
+    assert result.model_name == "exp_smoothing"
+    assert result.fit_status == "fit_failed"
+    assert result.fallback_reason == "exp_smoothing_unavailable"
+    assert np.all(np.isnan(result.predictions))
 
 
 def test_exp_smoothing_fits_on_simple_seasonal_series():
@@ -232,7 +243,7 @@ def test_exp_smoothing_fits_on_simple_seasonal_series():
     assert np.all(np.isfinite(result.predictions))
 
 
-def test_sarima_fallback_chain_deterministic_when_sparse() -> None:
+def test_sarima_reports_failure_when_sparse() -> None:
     train_values = np.array([1.0, 2.0, 3.0], dtype=np.float64)
     train_mask = np.zeros(3, dtype=np.float64)
     result = predict_with_sarima_fallback(
@@ -242,12 +253,29 @@ def test_sarima_fallback_chain_deterministic_when_sparse() -> None:
         global_train_median=2.5,
         seasonal_period=7,
     )
-    assert result.model_name == "global_train_median"
-    assert result.fit_status == "fallback"
-    assert np.allclose(result.predictions, np.array([2.5, 2.5], dtype=np.float64))
+    assert result.model_name == "sarima"
+    assert result.fit_status == "fit_failed"
+    assert result.fallback_reason == "sarima_unavailable"
+    assert np.all(np.isnan(result.predictions))
 
 
-def test_sarima_falls_back_when_fit_returns_huge_finite_forecast(monkeypatch) -> None:
+def test_last_observed_baseline_uses_latest_observed_value() -> None:
+    train_values = np.array([1.0, 5.0, 3.0, 7.0], dtype=np.float64)
+    train_mask = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float64)
+    result = predict_with_last_observed_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=3,
+        global_train_median=2.5,
+    )
+    assert result.model_name == "last_observed"
+    assert result.fit_status == "fit_success"
+    assert np.allclose(result.predictions, np.array([3.0, 3.0, 3.0], dtype=np.float64))
+
+
+def test_sarima_reports_failure_when_fit_returns_huge_finite_forecast(
+    monkeypatch,
+) -> None:
     import evaluation.baseline_models as baseline_models
 
     monkeypatch.setattr(
@@ -268,10 +296,10 @@ def test_sarima_falls_back_when_fit_returns_huge_finite_forecast(monkeypatch) ->
         global_train_median=2.5,
         seasonal_period=7,
     )
-    assert result.model_name == "seasonal_naive_7d"
-    assert result.fit_status == "fallback"
-    assert "sarima_unavailable" in result.fallback_reason
-    assert np.allclose(result.predictions, np.array([1.0, 2.0], dtype=np.float64))
+    assert result.model_name == "sarima"
+    assert result.fit_status == "fit_failed"
+    assert result.fallback_reason == "sarima_unavailable"
+    assert np.all(np.isnan(result.predictions))
 
 
 def test_var_cross_target_predicts_jointly():
@@ -301,6 +329,7 @@ def test_var_cross_target_predicts_jointly():
         pred = result[target]
         assert pred.model_name == "var"
         assert pred.fit_status == "fit_success"
+        assert "trend=n" in pred.model_order
         assert pred.predictions.shape == (3,)
         assert np.all(np.isfinite(pred.predictions))
 
@@ -321,7 +350,101 @@ def test_predict_with_var_fallback_matches_canonical_target_order():
     assert list(result) == target_names
 
 
-def test_var_cross_target_falls_back_to_univariate_when_var_unavailable(monkeypatch):
+def test_var_accepts_fully_missing_target_column_as_zero_history(monkeypatch):
+    import evaluation.baseline_models as baseline_models
+
+    captured: dict[str, np.ndarray] = {}
+
+    def _fit_var(train_values, train_mask, horizon, maxlags):
+        y = baseline_models._impute_multivariate_for_fit(
+            train_values=train_values,
+            train_mask=train_mask,
+        )
+        assert y is not None
+        captured["fit_values"] = y
+        return np.ones((horizon, train_values.shape[1]), dtype=np.float64), "k_ar=1"
+
+    monkeypatch.setattr(baseline_models, "_fit_var_cross_target", _fit_var)
+
+    train_values = np.column_stack(
+        [
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+            np.array([9.0, 9.0, 9.0, 9.0], dtype=np.float64),
+            np.array([3.0, 4.0, 5.0, 6.0], dtype=np.float64),
+            np.array([4.0, 5.0, 6.0, 7.0], dtype=np.float64),
+        ]
+    )
+    train_mask = np.ones_like(train_values, dtype=np.float64)
+    train_mask[:, 1] = 0.0
+    target_names = ["hospitalizations", "wastewater", "cases", "deaths"]
+    result = predict_with_var_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=2,
+        target_names=target_names,
+        global_train_medians=np.median(train_values, axis=0),
+    )
+
+    assert np.allclose(captured["fit_values"][:, 1], 0.0)
+    assert all(pred.fit_status == "fit_success" for pred in result.values())
+
+
+def test_varmax_passes_mask_calendar_exog(monkeypatch):
+    import evaluation.baseline_models as baseline_models
+
+    captured: dict[str, np.ndarray] = {}
+
+    def _fit_varmax(train_values, train_mask, horizon, exog_train, exog_future):
+        captured["train_values"] = train_values
+        captured["train_mask"] = train_mask
+        captured["exog_train"] = exog_train
+        captured["exog_future"] = exog_future
+        return np.ones((horizon, train_values.shape[1]), dtype=np.float64), "order=(1,0)"
+
+    monkeypatch.setattr(baseline_models, "_fit_varmax_cross_target", _fit_varmax)
+
+    train_values = np.arange(48, dtype=np.float64).reshape(12, 4)
+    train_mask = np.ones_like(train_values, dtype=np.float64)
+    exog_train = np.ones((12, 7), dtype=np.float64)
+    exog_future = np.ones((2, 7), dtype=np.float64) * 2.0
+    target_names = ["hospitalizations", "wastewater", "cases", "deaths"]
+    result = predict_with_varmax_fallback(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=2,
+        target_names=target_names,
+        global_train_medians=np.median(train_values, axis=0),
+        exog_train=exog_train,
+        exog_future=exog_future,
+    )
+
+    assert np.array_equal(captured["exog_train"], exog_train)
+    assert np.array_equal(captured["exog_future"], exog_future)
+    assert list(result) == target_names
+    assert all(pred.model_name == "varmax" for pred in result.values())
+    assert all(pred.fit_status == "fit_success" for pred in result.values())
+
+
+def test_varmax_all_missing_history_returns_zero_predictions() -> None:
+    import evaluation.baseline_models as baseline_models
+
+    train_values = np.ones((8, 4), dtype=np.float64)
+    train_mask = np.zeros_like(train_values, dtype=np.float64)
+    out = baseline_models._fit_varmax_cross_target(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=2,
+        exog_train=np.zeros((8, 7), dtype=np.float64),
+        exog_future=np.zeros((2, 7), dtype=np.float64),
+    )
+
+    assert out is not None
+    preds, order_repr = out
+    assert np.allclose(preds, 0.0)
+    assert "active_targets=0" in order_repr
+
+
+def test_var_cross_target_reports_failures_when_var_unavailable(monkeypatch):
     import evaluation.baseline_models as baseline_models
 
     monkeypatch.setattr(baseline_models, "_fit_var_cross_target", lambda **kwargs: None)
@@ -345,20 +468,25 @@ def test_var_cross_target_falls_back_to_univariate_when_var_unavailable(monkeypa
         seasonal_period=7,
         maxlags=4,
     )
-    for idx, target in enumerate(target_names):
+    for target in target_names:
         pred = result[target]
-        assert pred.model_name == "global_train_median"
-        assert "var_unavailable" in pred.fallback_reason
-        assert np.allclose(
-            pred.predictions,
-            np.array([1.1 + idx, 1.1 + idx], dtype=np.float64),
-        )
+        assert pred.model_name == "var"
+        assert pred.fit_status == "fit_failed"
+        assert pred.fallback_reason == "var_unavailable"
+        assert np.all(np.isnan(pred.predictions))
 
 
 def test_resolve_baseline_models_includes_var() -> None:
     assert _resolve_baseline_models(None) == ["sarima"]
+    assert _resolve_baseline_models(["last_observed"]) == ["last_observed"]
     assert _resolve_baseline_models(["var"]) == ["var"]
-    assert _resolve_baseline_models(["all"]) == ["exp_smoothing", "sarima", "var"]
+    assert _resolve_baseline_models(["all"]) == [
+        "exp_smoothing",
+        "last_observed",
+        "sarima",
+        "var",
+    ]
+    assert _resolve_baseline_models(["varmax"]) == ["varmax"]
     with pytest.raises(ValueError, match="Unsupported baseline model"):
         _resolve_baseline_models(["nope"])
 
@@ -461,6 +589,7 @@ def test_run_same_slice_baseline_evaluation_writes_eval_aligned_artifacts(
     )
 
     granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    failures_df = pd.read_csv(artifacts["baseline_failures"])
     assert set(
         [
             "model",
@@ -474,19 +603,20 @@ def test_run_same_slice_baseline_evaluation_writes_eval_aligned_artifacts(
             "target_date",
         ]
     ).issubset(granular_df.columns)
-    assert set(granular_df["model"].unique()) == {"sarima", "exp_smoothing"}
+    assert set(granular_df["model"].unique()) == {"exp_smoothing"}
+    assert set(failures_df["model"].unique()) == {"sarima"}
 
     aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
     assert {"model", "target", "mae_mean", "rmse_mean", "r2_mean"}.issubset(
         aggregate_df.columns
     )
-    assert {"sarima", "exp_smoothing"}.issubset(set(aggregate_df["model"].astype(str)))
+    assert set(aggregate_df["model"].astype(str)) == {"exp_smoothing"}
 
     metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
     assert metadata["comparison_scope"] == "same_eval_slice"
 
 
-def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
+def test_run_same_slice_baseline_evaluation_supports_last_observed(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -498,6 +628,40 @@ def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
         baseline_eval,
         "build_loader_from_config",
         lambda **kwargs: (loader, None),
+    )
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice_lo",
+        models=["last_observed"],
+        split="test",
+    )
+
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    assert set(aggregate_df["model"].astype(str)) == {"last_observed"}
+
+
+def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+):
+    loader = _SameSliceLoader([_make_same_slice_batch()])
+
+    import evaluation.baseline_eval as baseline_eval
+    import evaluation.baseline_models as baseline_models
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+    monkeypatch.setattr(
+        baseline_models,
+        "_fit_var_cross_target",
+        lambda train_values, horizon, **kwargs: (
+            np.ones((horizon, train_values.shape[1]), dtype=np.float64),
+            "k_ar=1",
+        ),
     )
 
     artifacts = run_same_slice_baseline_evaluation(
@@ -525,7 +689,68 @@ def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
     assert metadata["models"] == ["var"]
 
 
-def test_run_same_slice_baseline_evaluation_var_usage_counts_fallbacks(
+def test_run_same_slice_baseline_evaluation_writes_varmax_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+):
+    batch = _make_same_slice_batch()
+    batch.hosp_target_mask = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+    batch.ww_target_mask = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float32)
+    batch.cases_target_mask = torch.tensor([[1.0, 1.0], [0.0, 1.0]], dtype=torch.float32)
+    batch.deaths_target_mask = torch.tensor([[0.0, 1.0], [1.0, 1.0]], dtype=torch.float32)
+    loader = _SameSliceLoader([batch])
+
+    import evaluation.baseline_eval as baseline_eval
+    import evaluation.baseline_models as baseline_models
+
+    captured: dict[str, np.ndarray] = {}
+
+    def _fit_varmax(train_values, train_mask, horizon, exog_train, exog_future):
+        captured.setdefault("exog_train", exog_train.copy())
+        captured.setdefault("exog_future", exog_future.copy())
+        return (
+            np.ones((horizon, train_values.shape[1]), dtype=np.float64),
+            "order=(1,0);trend=n",
+        )
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+    monkeypatch.setattr(baseline_models, "_fit_varmax_cross_target", _fit_varmax)
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice_varmax",
+        models=["varmax"],
+        split="test",
+    )
+
+    granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    usage_df = pd.read_csv(artifacts["baseline_model_usage"])
+    metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
+
+    assert set(granular_df["model"].unique()) == {"varmax"}
+    assert set(aggregate_df["model"].unique()) == {"varmax"}
+    assert set(usage_df["model"].unique()) == {"varmax"}
+    assert metadata["models"] == ["varmax"]
+    assert captured["exog_train"].shape == (3, 7)
+    assert captured["exog_future"].shape == (2, 7)
+    np.testing.assert_array_equal(captured["exog_train"][:, :4], np.ones((3, 4)))
+    np.testing.assert_array_equal(captured["exog_future"][:, :4], np.zeros((2, 4)))
+    np.testing.assert_array_equal(
+        captured["exog_train"][:, 4:],
+        np.array([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]),
+    )
+    np.testing.assert_array_equal(
+        captured["exog_future"][:, 4:],
+        np.array([[9.0, 10.0, 11.0], [12.0, 13.0, 14.0]]),
+    )
+
+
+def test_run_same_slice_baseline_evaluation_var_usage_counts_failures(
     tmp_path: Path,
     monkeypatch,
 ):
@@ -543,14 +768,19 @@ def test_run_same_slice_baseline_evaluation_var_usage_counts_fallbacks(
 
     artifacts = run_same_slice_baseline_evaluation(
         config=_DummyConfig(input_window_length=3, forecast_horizon=2),
-        output_dir=tmp_path / "same_slice_var_fallback",
+        output_dir=tmp_path / "same_slice_var_failure",
         models=["var"],
         split="test",
     )
 
     usage_df = pd.read_csv(artifacts["baseline_model_usage"])
+    failures_df = pd.read_csv(artifacts["baseline_failures"])
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
     assert set(usage_df["model"].unique()) == {"var"}
-    assert set(usage_df["selected_model"].unique()) == {"exp_smoothing"}
+    assert set(usage_df["selected_model"].unique()) == {"var"}
+    assert set(failures_df["model"].unique()) == {"var"}
+    assert set(failures_df["error_reason"].unique()) == {"var_unavailable"}
+    assert aggregate_df.empty
 
 
 def test_run_same_slice_baseline_evaluation_skips_unstable_granular_rows(
@@ -623,15 +853,18 @@ def test_run_baseline_evaluation_delegates_to_same_slice_outputs(
         granular = output_dir / "baseline_granular.csv"
         aggregate = output_dir / "baseline_aggregate_metrics.csv"
         usage = output_dir / "baseline_model_usage.csv"
+        failures = output_dir / "baseline_failures.csv"
         metadata = output_dir / "baseline_metadata.json"
         granular.write_text("model,target\n", encoding="utf-8")
         aggregate.write_text("model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8")
         usage.write_text("model,selected_model,count\n", encoding="utf-8")
+        failures.write_text("model,selected_model,target,error_reason\n", encoding="utf-8")
         metadata.write_text('{"comparison_scope":"same_eval_slice"}', encoding="utf-8")
         return {
             "baseline_granular": granular,
             "baseline_aggregate_metrics": aggregate,
             "baseline_model_usage": usage,
+            "baseline_failures": failures,
             "baseline_metadata": metadata,
         }
 
@@ -651,6 +884,7 @@ def test_run_baseline_evaluation_delegates_to_same_slice_outputs(
         "baseline_granular",
         "baseline_aggregate_metrics",
         "baseline_model_usage",
+        "baseline_failures",
         "baseline_metadata",
     }
     assert captured["kwargs"]["models"] == ["exp_smoothing", "sarima"]
@@ -692,11 +926,17 @@ def test_run_baseline_evaluation_weekly_heads_use_observed_cadence(
     dummy_loader.dataset = dataset
 
     import evaluation.baseline_eval as baseline_eval
+    import evaluation.baseline_models as baseline_models
 
     monkeypatch.setattr(
         baseline_eval,
         "build_loader_from_config",
         lambda **kwargs: (dummy_loader, None),
+    )
+    monkeypatch.setattr(
+        baseline_models,
+        "_fit_best_sarimax",
+        lambda horizon, **kwargs: (np.ones(horizon, dtype=np.float64), "order=(1,0,0)"),
     )
 
     out_dir = tmp_path / "baseline_weekly"
@@ -748,6 +988,13 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
                 "rmse_mean": 1.8,
                 "r2_mean": 0.3,
             },
+            {
+                "model": "last_observed",
+                "target": "hospitalizations",
+                "mae_mean": 1.2,
+                "rmse_mean": 2.4,
+                "r2_mean": 0.0,
+            },
         ]
     ).to_csv(baseline_csv, index=False)
 
@@ -779,6 +1026,14 @@ def test_compare_model_metrics_against_baselines(tmp_path: Path):
         & (deltas["baseline_model"] == "sarima")
     ]["delta_model_minus_baseline"].iloc[0]
     assert hosp_mae == pytest.approx(-0.1)
+    hosp_skill = deltas[
+        (deltas["target"] == "hospitalizations")
+        & (deltas["metric"] == "skill_mae")
+        & (deltas["baseline_model"] == "last_observed")
+    ]["model_value"].iloc[0]
+    assert hosp_skill == pytest.approx(0.9 / 1.2)
+    assert eval_metrics["skill_mae_hosp_log1p_per_100k_vs_lo"] == pytest.approx(0.9 / 1.2)
+    assert eval_metrics["skill_rmse_hosp_log1p_per_100k_vs_lo"] == pytest.approx(1.9 / 2.4)
 
 
 def test_compare_model_metrics_against_same_slice_baselines_uses_direct_aggregate(

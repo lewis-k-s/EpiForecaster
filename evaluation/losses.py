@@ -44,9 +44,8 @@ def get_loss_from_config(
 
     return JointInferenceLoss(
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
-        w_sir=joint_cfg.w_sir,
+        w_sird_supervision=joint_cfg.w_sird_supervision,
         w_continuity=joint_cfg.w_continuity,
-        sir_residual_clip=joint_cfg.sir_residual_clip,
         disable_ww=joint_cfg.disable_ww,
         disable_hosp=joint_cfg.disable_hosp,
         disable_cases=joint_cfg.disable_cases,
@@ -59,18 +58,12 @@ def get_loss_from_config(
         hosp_min_observed=min_obs["hospitalizations"],
         cases_min_observed=min_obs["cases"],
         deaths_min_observed=min_obs["deaths"],
-        obs_n_eff_power=joint_cfg.obs_n_eff_power,
-        obs_n_eff_reference=joint_cfg.obs_n_eff_reference,
-        ww_n_eff_reference=joint_cfg.ww_n_eff_reference,
-        hosp_n_eff_reference=joint_cfg.hosp_n_eff_reference,
-        cases_n_eff_reference=joint_cfg.cases_n_eff_reference,
-        deaths_n_eff_reference=joint_cfg.deaths_n_eff_reference,
     )
 
 
 class JointInferenceLoss(nn.Module):
     """
-    Joint inference loss combining wastewater, hospitalization, and SIR physics losses.
+    Joint inference loss combining observation and latent SIRD supervision losses.
 
     This loss is designed for the joint inference framework where the model outputs
     latent SIR states and observation predictions rather than direct forecasts.
@@ -101,24 +94,25 @@ class JointInferenceLoss(nn.Module):
         "cases": "cases_min_observed",
         "deaths": "deaths_min_observed",
     }
-    _HEAD_N_EFF_REF_ATTR = {
-        "ww": "ww_n_eff_reference",
-        "hosp": "hosp_n_eff_reference",
-        "cases": "cases_n_eff_reference",
-        "deaths": "deaths_n_eff_reference",
-    }
     _CONTINUITY_HEADS = (
         ("hosp", "hosp_hist", "pred_hosp"),
         ("cases", "cases_hist", "pred_cases"),
         ("deaths", "deaths_hist", "pred_deaths"),
     )
+    _LATENT_COMPONENTS = (
+        ("latent_s", "S_trajectory", "S_target", "S_target_mask"),
+        ("latent_i", "I_trajectory", "I_target", "I_target_mask"),
+        ("latent_r", "R_trajectory", "R_target", "R_target_mask"),
+        ("latent_d", "D_trajectory", "D_target", "D_target_mask"),
+    )
 
     def __init__(
         self,
         obs_weight_sum: float = 0.95,
-        w_sir: float = 0.1,
+        w_sird_supervision: float = 0.0,
+        w_sir: float | None = None,
         w_continuity: float = 0.0,
-        sir_residual_clip: float = 1.0e3,
+        sir_residual_clip: float | None = None,
         disable_ww: bool = False,
         disable_hosp: bool = False,
         disable_cases: bool = False,
@@ -131,18 +125,14 @@ class JointInferenceLoss(nn.Module):
         hosp_min_observed: int = 0,
         cases_min_observed: int = 0,
         deaths_min_observed: int = 0,
-        obs_n_eff_power: float = 0.0,
-        obs_n_eff_reference: float = 0.0,
-        ww_n_eff_reference: float = 0.0,
-        hosp_n_eff_reference: float = 0.0,
-        cases_n_eff_reference: float = 0.0,
-        deaths_n_eff_reference: float = 0.0,
     ):
         super().__init__()
         self.obs_weight_sum = float(obs_weight_sum)
-        self.w_sir = w_sir
+        del sir_residual_clip
+        if w_sir is not None and w_sird_supervision == 0.0:
+            w_sird_supervision = float(w_sir)
+        self.w_sird_supervision = float(w_sird_supervision)
         self.w_continuity = w_continuity
-        self.sir_residual_clip = float(sir_residual_clip)
         self.disable_ww = bool(disable_ww)
         self.disable_hosp = bool(disable_hosp)
         self.disable_cases = bool(disable_cases)
@@ -155,29 +145,15 @@ class JointInferenceLoss(nn.Module):
         self.hosp_min_observed = int(hosp_min_observed)
         self.cases_min_observed = int(cases_min_observed)
         self.deaths_min_observed = int(deaths_min_observed)
-        self.obs_n_eff_power = float(obs_n_eff_power)
-        self.obs_n_eff_reference = float(obs_n_eff_reference)
-        self.ww_n_eff_reference = float(ww_n_eff_reference)
-        self.hosp_n_eff_reference = float(hosp_n_eff_reference)
-        self.cases_n_eff_reference = float(cases_n_eff_reference)
-        self.deaths_n_eff_reference = float(deaths_n_eff_reference)
         if self.obs_weight_sum <= 0:
             raise ValueError(
                 f"obs_weight_sum must be positive, got {self.obs_weight_sum}"
             )
-        if self.obs_n_eff_power < 0:
+        if self.w_sird_supervision < 0:
             raise ValueError(
-                f"obs_n_eff_power must be non-negative, got {self.obs_n_eff_power}"
+                "w_sird_supervision must be non-negative, "
+                f"got {self.w_sird_supervision}"
             )
-        for name, value in [
-            ("obs_n_eff_reference", self.obs_n_eff_reference),
-            ("ww_n_eff_reference", self.ww_n_eff_reference),
-            ("hosp_n_eff_reference", self.hosp_n_eff_reference),
-            ("cases_n_eff_reference", self.cases_n_eff_reference),
-            ("deaths_n_eff_reference", self.deaths_n_eff_reference),
-        ]:
-            if value < 0:
-                raise ValueError(f"{name} must be non-negative, got {value}")
 
     @staticmethod
     def fixed_obs_weights(
@@ -226,9 +202,11 @@ class JointInferenceLoss(nn.Module):
 
         obs_weighted = obs_weights * obs_losses
         obs_total = obs_weighted.sum()
-        sir_weighted = self.w_sir * components["sir"]
+        sird_supervision_weighted = (
+            self.w_sird_supervision * components["sird_supervision"]
+        )
         continuity_weighted = self.w_continuity * components["continuity"]
-        total = obs_total + sir_weighted + continuity_weighted
+        total = obs_total + sird_supervision_weighted + continuity_weighted
         return {
             "obs_weights": obs_weights,
             "obs_total": obs_total,
@@ -237,7 +215,7 @@ class JointInferenceLoss(nn.Module):
             "hosp_weighted": obs_weighted[1],
             "cases_weighted": obs_weighted[2],
             "deaths_weighted": obs_weighted[3],
-            "sir_weighted": sir_weighted,
+            "sird_supervision_weighted": sird_supervision_weighted,
             "continuity_weighted": continuity_weighted,
         }
 
@@ -314,35 +292,7 @@ class JointInferenceLoss(nn.Module):
         target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
 
         sq = (prediction_safe - target_safe) ** 2
-
-        # PER-SERIES NORMALIZATION
-        # 1. Sum squared errors per series
-        series_sq_sum = (sq * weights_f32).sum(dim=1)
-
-        # 2. Divide by number of active points in that series
-        series_weight_sum = weights_f32.sum(dim=1)
-        series_mse = series_sq_sum / series_weight_sum.clamp_min(1.0)
-
-        # 3. The final loss is the average across all active series in the batch
-        batch_active_series = (series_weight_sum > 0).to(weights_f32.dtype)
-        total_active_series = batch_active_series.sum()
-
-        return (series_mse * batch_active_series).sum() / total_active_series.clamp_min(
-            1e-8
-        )
-
-    def _head_n_eff_scale(self, *, head_name: str, n_eff: torch.Tensor) -> torch.Tensor:
-        if self.obs_n_eff_power <= 0:
-            return torch.as_tensor(1.0, device=n_eff.device, dtype=torch.float32)
-        head_ref_attr = self._HEAD_N_EFF_REF_ATTR[head_name]
-        reference_value = float(getattr(self, head_ref_attr))
-        if reference_value <= 0:
-            reference_value = float(self.obs_n_eff_reference)
-        if reference_value <= 0:
-            reference_value = 1.0
-        ref = torch.as_tensor(reference_value, device=n_eff.device, dtype=torch.float32)
-        ratio = (n_eff.float() / ref).clamp(min=0.0, max=1.0)
-        return torch.pow(ratio, self.obs_n_eff_power)
+        return (sq * weights_f32).sum() / weights_f32.sum().clamp_min(1e-8)
 
     def compute_observation_supervision(
         self,
@@ -404,12 +354,13 @@ class JointInferenceLoss(nn.Module):
                 - pred_hosp: [B, H+1] predicted hospitalizations (includes t=0 nowcast)
                 - pred_cases: [B, H+1] predicted reported cases (includes t=0 nowcast)
                 - pred_deaths: [B, H] predicted deaths (no nowcast needed)
-                - physics_residual: [B, H] SIR dynamics residual
+                - S_trajectory/I_trajectory/R_trajectory/D_trajectory: [B, H+1]
             targets: Dict containing target tensors:
                 - ww: [B, H] wastewater targets (optional)
                 - hosp: [B, H] hospitalization targets (optional)
                 - cases: [B, H] reported cases targets (optional)
                 - deaths: [B, H] deaths targets (optional)
+                - S_target/I_target/R_target/D_target: [B, H+1] latent targets (optional)
             batch_data: Optional EpiBatch containing historical data for continuity:
                 - hosp_hist: [B, L, 3] hospitalization history
                 - cases_hist: [B, L, 3] cases history
@@ -417,8 +368,9 @@ class JointInferenceLoss(nn.Module):
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
-                - ww, hosp, cases, deaths, sir, continuity
-                - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted, sir_weighted, continuity_weighted
+                - ww, hosp, cases, deaths, latent_s, latent_i, latent_r, latent_d, sird_supervision, continuity
+                - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted,
+                  sird_supervision_weighted, continuity_weighted
                 - total
         """
         # Keep losses attached to graph while avoiding NaN propagation from non-finite preds.
@@ -432,7 +384,11 @@ class JointInferenceLoss(nn.Module):
         hosp_loss = zero_anchor
         cases_loss = zero_anchor
         deaths_loss = zero_anchor
-        sir_loss = zero_anchor
+        latent_s_loss = zero_anchor
+        latent_i_loss = zero_anchor
+        latent_r_loss = zero_anchor
+        latent_d_loss = zero_anchor
+        sird_supervision_loss = zero_anchor
         continuity_loss = zero_anchor
         obs_supervision = self.compute_observation_supervision(
             targets,
@@ -460,7 +416,7 @@ class JointInferenceLoss(nn.Module):
                 target=ww_target,
                 weights=ww_weights,
             )
-            ww_loss = ww_base * self._head_n_eff_scale(head_name="ww", n_eff=ww_n_eff)
+            ww_loss = ww_base
 
         hosp_target = obs_supervision["hosp"]["target"]
         hosp_weights = obs_supervision["hosp"]["weights"]
@@ -472,10 +428,7 @@ class JointInferenceLoss(nn.Module):
                 target=hosp_target,
                 weights=hosp_weights,
             )
-            hosp_loss = hosp_base * self._head_n_eff_scale(
-                head_name="hosp",
-                n_eff=hosp_n_eff,
-            )
+            hosp_loss = hosp_base
 
         cases_target = obs_supervision["cases"]["target"]
         cases_weights = obs_supervision["cases"]["weights"]
@@ -487,10 +440,7 @@ class JointInferenceLoss(nn.Module):
                 target=cases_target,
                 weights=cases_weights,
             )
-            cases_loss = cases_base * self._head_n_eff_scale(
-                head_name="cases",
-                n_eff=cases_n_eff,
-            )
+            cases_loss = cases_base
 
         deaths_target = obs_supervision["deaths"]["target"]
         deaths_weights = obs_supervision["deaths"]["weights"]
@@ -500,55 +450,39 @@ class JointInferenceLoss(nn.Module):
                 target=deaths_target,
                 weights=deaths_weights,
             )
-            deaths_loss = deaths_base * self._head_n_eff_scale(
-                head_name="deaths",
-                n_eff=deaths_n_eff,
-            )
+            deaths_loss = deaths_base
 
-        # SIR physics loss (always computed from residual)
-        if self.w_sir > 0:
-            physics_residual = model_outputs["physics_residual"]
-            if self.sir_residual_clip > 0:
-                physics_residual = torch.clamp(
-                    physics_residual,
-                    min=-self.sir_residual_clip,
-                    max=self.sir_residual_clip,
+        if self.w_sird_supervision > 0:
+            latent_component_losses: list[torch.Tensor] = []
+            latent_component_map: dict[str, torch.Tensor] = {}
+            for component_name, output_key, target_key, mask_key in self._LATENT_COMPONENTS:
+                target = targets.get(target_key)
+                if target is None:
+                    continue
+                supervision = self._build_supervision_weights(
+                    target=target,
+                    observed_mask=targets.get(mask_key),
+                    min_observed=0,
+                    device=zero_anchor.device,
                 )
-            ww_mask = targets.get("ww_mask")
-            hosp_mask = targets.get("hosp_mask")
-            cases_mask = targets.get("cases_mask")
-            deaths_mask = targets.get("deaths_mask")
-
-            combined_mask: torch.Tensor | None = None
-            masks = [
-                m
-                for m in [ww_mask, hosp_mask, cases_mask, deaths_mask]
-                if m is not None
-            ]
-            if masks:
-                combined_mask = torch.nan_to_num(
-                    masks[0].float().to(physics_residual.device),
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                ).clamp(min=0.0, max=1.0)
-                for mask in masks[1:]:
-                    cleaned = torch.nan_to_num(
-                        mask.float().to(physics_residual.device),
-                        nan=0.0,
-                        posinf=1.0,
-                        neginf=0.0,
-                    ).clamp(min=0.0, max=1.0)
-                    combined_mask = torch.maximum(combined_mask, cleaned)
-
-            if combined_mask is None:
-                sir_loss = physics_residual.mean()
-            else:
-                sir_loss = self._weighted_masked_mse_from_weights(
-                    prediction=physics_residual,
-                    target=torch.zeros_like(physics_residual),
-                    weights=combined_mask.float(),
+                latent_target = supervision["target"]
+                latent_weights = supervision["weights"]
+                if latent_target is None or latent_weights is None:
+                    continue
+                latent_loss = self._weighted_masked_mse_from_weights(
+                    prediction=model_outputs[output_key],
+                    target=latent_target,
+                    weights=latent_weights,
                 )
+                latent_component_losses.append(latent_loss)
+                latent_component_map[component_name] = latent_loss
+
+            latent_s_loss = latent_component_map.get("latent_s", zero_anchor)
+            latent_i_loss = latent_component_map.get("latent_i", zero_anchor)
+            latent_r_loss = latent_component_map.get("latent_r", zero_anchor)
+            latent_d_loss = latent_component_map.get("latent_d", zero_anchor)
+            if latent_component_losses:
+                sird_supervision_loss = torch.stack(latent_component_losses).mean()
 
         # Nowcast continuity penalty
         if self.w_continuity > 0 and batch_data is not None:
@@ -563,7 +497,11 @@ class JointInferenceLoss(nn.Module):
             "hosp": hosp_loss,
             "cases": cases_loss,
             "deaths": deaths_loss,
-            "sir": sir_loss,
+            "latent_s": latent_s_loss,
+            "latent_i": latent_i_loss,
+            "latent_r": latent_r_loss,
+            "latent_d": latent_d_loss,
+            "sird_supervision": sird_supervision_loss,
             "continuity": continuity_loss,
         }
         totals = self.compose_total_loss(
@@ -576,13 +514,17 @@ class JointInferenceLoss(nn.Module):
             "hosp": hosp_loss,
             "cases": cases_loss,
             "deaths": deaths_loss,
-            "sir": sir_loss,
+            "latent_s": latent_s_loss,
+            "latent_i": latent_i_loss,
+            "latent_r": latent_r_loss,
+            "latent_d": latent_d_loss,
+            "sird_supervision": sird_supervision_loss,
             "continuity": continuity_loss,
             "ww_weighted": totals["ww_weighted"],
             "hosp_weighted": totals["hosp_weighted"],
             "cases_weighted": totals["cases_weighted"],
             "deaths_weighted": totals["deaths_weighted"],
-            "sir_weighted": totals["sir_weighted"],
+            "sird_supervision_weighted": totals["sird_supervision_weighted"],
             "continuity_weighted": totals["continuity_weighted"],
             "ww_n_eff": ww_n_eff,
             "hosp_n_eff": hosp_n_eff,

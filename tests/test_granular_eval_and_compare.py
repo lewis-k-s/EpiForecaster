@@ -127,7 +127,7 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     model = _DummyModel()
     batch = _make_batch()
     loader = _DummyLoader([batch])
-    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sir=0.0)
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0)
 
     baseline_loss, baseline_metrics, baseline_node_mae = evaluate_loader(
         model=model,
@@ -274,7 +274,7 @@ def test_evaluate_loader_logs_batch_context_on_failure(
     model = _ExplodingModel()
     batch = _make_batch()
     loader = _DummyLoader([batch])
-    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sir=0.0)
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0)
 
     with caplog.at_level(logging.INFO):
         with pytest.raises(RuntimeError, match="boom"):

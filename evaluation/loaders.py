@@ -15,6 +15,7 @@ from typing import Any
 import torch
 import zarr.errors
 from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset
 
 from data.dataset_factory import build_datasets
 from data.epi_batch import collate_epiforecaster_batch
@@ -139,7 +140,7 @@ def build_loader_from_config(
 
     Args:
         config: The model configuration containing data paths and settings
-        split: Which split to load ("val" or "test")
+        split: Which split to load ("val", "test", or "full")
         batch_size: Optional batch size override (default: use config value)
         device: Device to load tensors to ("auto", "cuda", "cpu")
         num_workers: Optional DataLoader worker override
@@ -151,15 +152,41 @@ def build_loader_from_config(
         to the target device to avoid repeated transfers during evaluation.
     """
     split_key = split.lower()
-    if split_key not in {"val", "test"}:
-        raise ValueError("split must be 'val' or 'test'")
+    if split_key not in {"val", "test", "full"}:
+        raise ValueError("split must be 'val', 'test', or 'full'")
 
     # Use factory to get all splits with fitted preprocessors (same as training)
     # This ensures fair evaluation - same preprocessing as training
     splits = build_datasets(config)
 
-    # Select requested split, discard others
-    dataset = splits.val if split_key == "val" else splits.test
+    if split_key == "full":
+        if isinstance(splits.train, ConcatDataset):
+            raise ValueError(
+                "split='full' is not supported for curriculum datasets yet."
+            )
+
+        train_dataset = splits.train
+        val_dataset = splits.val
+        test_dataset = splits.test
+        all_target_nodes = sorted(
+            set(train_dataset.target_nodes)
+            | set(val_dataset.target_nodes)
+            | set(test_dataset.target_nodes)
+        )
+        dataset = EpiDataset(
+            config=config,
+            target_nodes=all_target_nodes,
+            context_nodes=all_target_nodes,
+            biomarker_preprocessor=val_dataset.biomarker_preprocessor,
+            mobility_preprocessor=val_dataset.mobility_preprocessor,
+            preloaded_mobility=val_dataset.preloaded_mobility,
+            mobility_mask=val_dataset.mobility_mask,
+            run_id=splits.real_run_id,
+            region_embedding_store=splits.region_embedding_store,
+        )
+    else:
+        # Select requested split, discard others
+        dataset = splits.val if split_key == "val" else splits.test
     # splits.train and the other eval split are garbage collected here
 
     # Worker configuration mirrors training defaults:
@@ -168,7 +195,7 @@ def build_loader_from_config(
     avail_cores = (os.cpu_count() or 1) - 1
     cfg_workers = (
         config.training.val_workers
-        if split_key == "val"
+        if split_key in {"val", "full"}
         else config.training.test_workers
     )
     if num_workers is None:

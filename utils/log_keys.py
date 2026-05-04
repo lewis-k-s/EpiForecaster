@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 OBSERVATION_HEADS: tuple[str, ...] = ("ww", "hosp", "cases", "deaths")
-JOINT_LOSS_COMPONENTS: tuple[str, ...] = (*OBSERVATION_HEADS, "sir")
+JOINT_LOSS_COMPONENTS: tuple[str, ...] = (*OBSERVATION_HEADS, "sird_supervision")
 CORE_EVAL_METRICS: tuple[str, ...] = ("mae",)
 
 GRAD_SNAPSHOT_HEAD_FIELDS: tuple[str, ...] = (

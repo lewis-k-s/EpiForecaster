@@ -88,8 +88,8 @@ def _prepare_model_order(
                 HEAD_VARIANT_ORDER.get(variant, len(HEAD_VARIANT_ORDER)),
                 model,
             )
-        if model == "gradnorm:off":
-            return (2, 0, 0, model)
+        if model in {"gradnorm:on", "gradnorm:off"}:
+            return (2, 0 if model == "gradnorm:on" else 1, 0, model)
         if model in KERNEL_ABLATION_RANK:
             return (3, KERNEL_ABLATION_RANK[model], 0, model)
         return (4, 0, 0, model)
@@ -286,10 +286,13 @@ def plot_ablation_deltas_heatmap(
     delta_col = f"{metric}_delta_pct"
     if delta_col not in df.columns:
         logger.warning(f"Delta column {delta_col} not found in data")
-        # Try alternative naming
+        # Try alternative naming conventions
         alt_col = f"{metric.replace('_median', '')}_delta_pct"
+        mean_col = f"{metric}_delta_pct_mean"
         if alt_col in df.columns:
             delta_col = alt_col
+        elif mean_col in df.columns:
+            delta_col = mean_col
         else:
             raise ValueError(f"Could not find delta column for {metric}")
 

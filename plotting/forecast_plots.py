@@ -136,6 +136,14 @@ def _dataset_series_window(
     return series_tensor[t_min:t_max, node_idx].detach().cpu().numpy().reshape(-1)
 
 
+def _dataset_series_full(
+    series_tensor: torch.Tensor,
+    *,
+    node_idx: int,
+) -> np.ndarray:
+    return series_tensor[:, node_idx].detach().cpu().numpy().reshape(-1)
+
+
 def _history_window(
     series_tensor: torch.Tensor,
     *,
@@ -429,12 +437,17 @@ def collect_forecast_samples_for_target_nodes(
                     input_window_length=L,
                     node_idx=node_idx,
                 ).astype(np.float32)
+                full_series = _dataset_series_full(
+                    dataset_tensor,
+                    node_idx=node_idx,
+                ).astype(np.float32)
 
                 target_payloads[target_name] = {
                     "actual_context": actual_context_full,
                     "prediction": np.asarray(pred_series, dtype=np.float32),
                     "target": np.asarray(target_series, dtype=np.float32),
                     "history": history_series,
+                    "full_series": full_series,
                     "window_mae": _compute_window_mae(
                         pred_series,
                         target_series,
@@ -457,6 +470,7 @@ def collect_forecast_samples_for_target_nodes(
                     "prediction": pred_series,
                     "target": np.full_like(pred_series, np.nan),
                     "history": np.empty(0, dtype=np.float32),
+                    "full_series": np.full(T_total, np.nan, dtype=np.float32),
                     "window_mae": None,
                 }
 
@@ -487,6 +501,8 @@ def collect_forecast_samples_for_target_nodes(
                     "window_mae": primary.get("window_mae"),
                     "L": L,
                     "H": H,
+                    "t0": t0,
+                    "series_t": np.arange(T_total, dtype=np.int64),
                     "targets": target_payloads,
                     "latents": latent_payloads,
                 }
@@ -670,11 +686,16 @@ def collect_forecast_samples_for_window_specs(
                     input_window_length=L,
                     node_idx=node_idx,
                 ).astype(np.float32)
+                full_series = _dataset_series_full(
+                    dataset_tensor,
+                    node_idx=node_idx,
+                ).astype(np.float32)
                 target_payloads[target_name] = {
                     "actual_context": actual_context_full,
                     "prediction": np.asarray(pred_series, dtype=np.float32),
                     "target": np.asarray(target_series, dtype=np.float32),
                     "history": history_series,
+                    "full_series": full_series,
                     "window_mae": _compute_window_mae(
                         pred_series,
                         target_series,
@@ -697,6 +718,7 @@ def collect_forecast_samples_for_window_specs(
                     "prediction": pred_series,
                     "target": np.full_like(pred_series, np.nan),
                     "history": np.empty(0, dtype=np.float32),
+                    "full_series": np.full(T_total, np.nan, dtype=np.float32),
                     "window_mae": None,
                 }
 
@@ -725,6 +747,8 @@ def collect_forecast_samples_for_window_specs(
                     "window_mae": primary.get("window_mae"),
                     "L": L,
                     "H": H,
+                    "t0": t0,
+                    "series_t": np.arange(T_total, dtype=np.int64),
                     "targets": target_payloads,
                     "latents": latent_payloads,
                 }
@@ -976,6 +1000,175 @@ def make_joint_forecast_figure(
         target=None,
         target_label=None,
     )
+
+
+def make_forecast_history_figure(
+    *,
+    samples: list[dict[str, Any]] | dict[str, list[dict[str, Any]]],
+    input_window_length: int,
+    forecast_horizon: int,
+    target: str | None = "hosp",
+    target_label: str | None = None,
+    figure_title: str | None = None,
+    shared_xlabel: str | None = None,
+    payload_collection: str = "targets",
+    max_forecasts_per_region: int | None = None,
+):
+    """Build a figure with a long observed series and multiple forecast windows per node."""
+    if not samples:
+        return None
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    if isinstance(samples, list):
+        groups = {"All": samples}
+    else:
+        groups = samples
+
+    groups = {k: v for k, v in groups.items() if v}
+    if not groups:
+        return None
+
+    grouped_nodes: dict[str, list[tuple[int, list[dict[str, Any]]]]] = {}
+    for group_name, group_samples in groups.items():
+        node_map: dict[int, list[dict[str, Any]]] = {}
+        for sample in group_samples:
+            node_map.setdefault(int(sample["node_id"]), []).append(sample)
+        ordered_nodes = sorted(
+            node_map.items(),
+            key=lambda item: (
+                np.nanmean(
+                    [
+                        float(s.get("window_mae"))
+                        for s in item[1]
+                        if s.get("window_mae") is not None
+                    ]
+                )
+                if any(s.get("window_mae") is not None for s in item[1])
+                else np.inf,
+                item[0],
+            ),
+        )
+        grouped_nodes[group_name] = ordered_nodes
+
+    row_names = list(grouped_nodes.keys())
+    nrows = len(row_names)
+    ncols = max(len(v) for v in grouped_nodes.values())
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(5 * ncols, 3.5 * nrows),
+        squeeze=False,
+    )
+
+    forecast_color = sns.color_palette()[1]
+    actual_color = sns.color_palette()[0]
+
+    for i, row_name in enumerate(row_names):
+        row_nodes = grouped_nodes[row_name]
+        for j, (_node_id, node_samples) in enumerate(row_nodes):
+            ax = axes[i, j]
+            sorted_samples = sorted(
+                node_samples,
+                key=lambda sample: int(sample.get("window_start", sample.get("t0", 0))),
+            )
+            if max_forecasts_per_region is not None and len(sorted_samples) > max_forecasts_per_region:
+                selected_idx = np.linspace(
+                    0,
+                    len(sorted_samples) - 1,
+                    num=max_forecasts_per_region,
+                    dtype=int,
+                )
+                sorted_samples = [sorted_samples[idx] for idx in selected_idx]
+
+            full_series, _pred_series, _window_mae = _extract_series_payload(
+                sorted_samples[0],
+                target=target,
+                payload_collection=payload_collection,
+            )
+            payloads = sorted_samples[0].get(payload_collection)
+            if (
+                target is not None
+                and isinstance(payloads, dict)
+                and target in payloads
+                and "full_series" in payloads[target]
+            ):
+                full_series = np.asarray(payloads[target]["full_series"]).reshape(-1)
+            series_t = np.asarray(
+                sorted_samples[0].get("series_t", np.arange(len(full_series), dtype=np.int64))
+            ).reshape(-1)
+
+            ax.plot(series_t, full_series, color=actual_color, linewidth=1.5, label="Actual")
+
+            mae_values = [
+                float(sample["window_mae"])
+                for sample in sorted_samples
+                if sample.get("window_mae") is not None
+            ]
+            mean_mae = float(np.mean(mae_values)) if mae_values else None
+
+            for forecast_idx, sample in enumerate(sorted_samples):
+                _actual_context, pred_series, _sample_mae = _extract_series_payload(
+                    sample,
+                    target=target,
+                    payload_collection=payload_collection,
+                )
+                t0 = int(sample.get("t0", int(sample["window_start"]) + forecast_horizon))
+                pred_t = t0 + np.arange(len(pred_series), dtype=np.int64)
+                valid_mask = pred_t < len(full_series)
+                pred_t = pred_t[valid_mask]
+                pred_values = pred_series[: pred_t.shape[0]]
+                if pred_t.size == 0:
+                    continue
+                ax.plot(
+                    pred_t,
+                    pred_values,
+                    color=forecast_color,
+                    linewidth=1.8,
+                    alpha=0.45 + (0.45 * ((forecast_idx + 1) / max(len(sorted_samples), 1))),
+                    label="Forecast" if forecast_idx == 0 else None,
+                )
+                ax.axvline(t0, color=forecast_color, linestyle="--", alpha=0.12, linewidth=0.8)
+
+            node_label = sorted_samples[0].get("node_label", "")
+            title_parts = [str(node_label), f"n={len(sorted_samples)} forecasts"]
+            if mean_mae is not None:
+                title_parts.append(f"mean MAE={mean_mae:.3f}")
+            ax.set_title(" | ".join(title_parts), fontsize=10)
+
+            if j == 0:
+                if target_label is None and target in TARGET_PLOT_SPECS:
+                    axis_label = TARGET_PLOT_SPECS[target]["label"]
+                elif target_label is not None:
+                    axis_label = target_label
+                else:
+                    axis_label = "Target"
+                ax.set_ylabel(f"{row_name}\n{axis_label}", fontweight="bold")
+            else:
+                ax.set_ylabel("")
+
+            if i == nrows - 1:
+                ax.set_xlabel("" if shared_xlabel is not None else "Time index")
+            else:
+                ax.set_xlabel("")
+
+            if i == 0 and j == 0:
+                ax.legend(loc="upper left")
+
+        for j in range(len(row_nodes), ncols):
+            axes[i, j].set_visible(False)
+
+    if figure_title is not None:
+        fig.suptitle(figure_title)
+    if shared_xlabel is not None:
+        fig.supxlabel(shared_xlabel)
+    if figure_title is not None or shared_xlabel is not None:
+        fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+    else:
+        fig.tight_layout()
+    return fig
 
 
 def generate_forecast_plots(

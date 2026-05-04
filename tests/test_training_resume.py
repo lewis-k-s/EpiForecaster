@@ -143,3 +143,57 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     assert trainer.training_history["train_loss"] == [1.0]
     for key, value in trainer.model.state_dict().items():
         assert torch.allclose(value, updated_state[key])
+
+
+@pytest.mark.epiforecaster
+def test_initialize_model_from_checkpoint_loads_model_only(tmp_path) -> None:
+    from utils.precision_policy import PrecisionPolicy
+
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            init_checkpoint_path=checkpoint_path,
+            resume_checkpoint_path=None,
+        ),
+        output=SimpleNamespace(
+            log_dir=str(tmp_path),
+            experiment_name="exp",
+            save_checkpoints=True,
+        ),
+    )
+    trainer = _make_trainer_stub(config)
+    trainer.model = torch.nn.Linear(2, 2, dtype=torch.float32)
+    trainer.current_epoch = 7
+    trainer.best_val_loss = 9.9
+    trainer.training_history = {"train_loss": [5.0]}
+    trainer.precision_policy = PrecisionPolicy(
+        param_dtype=torch.float32,
+        autocast_dtype=torch.bfloat16,
+        autocast_enabled=False,
+        optimizer_eps=1e-8,
+        device_type="cpu",
+    )
+
+    for param in trainer.model.parameters():
+        torch.nn.init.constant_(param, 0.0)
+    updated_state = {k: v + 3.0 for k, v in trainer.model.state_dict().items()}
+
+    torch.save(
+        {
+            "epoch": 4,
+            "model_state_dict": updated_state,
+            "optimizer_state_dict": {"unused": True},
+            "best_val_loss": 0.123,
+            "training_history": {"train_loss": [1.0]},
+        },
+        checkpoint_path,
+    )
+
+    trainer._initialize_model_from_checkpoint()
+
+    assert trainer.current_epoch == 7
+    assert trainer.best_val_loss == 9.9
+    assert trainer.training_history == {"train_loss": [5.0]}
+    for key, value in trainer.model.state_dict().items():
+        assert torch.allclose(value, updated_state[key])

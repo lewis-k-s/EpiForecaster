@@ -46,6 +46,14 @@ def _make_batch() -> EpiBatch:
         ww_target_mask=torch.ones(1, 1, dtype=torch.float32),
         cases_target_mask=torch.ones(1, 1, dtype=torch.float32),
         deaths_target_mask=torch.ones(1, 1, dtype=torch.float32),
+        S_target=None,
+        I_target=None,
+        R_target=None,
+        D_target=None,
+        S_target_mask=None,
+        I_target_mask=None,
+        R_target_mask=None,
+        D_target_mask=None,
     )
 
 
@@ -159,3 +167,25 @@ def test_prepare_batch_for_device_requires_epibatch_contract() -> None:
             dataset=None,
             device=torch.device("cpu"),
         )
+
+
+@pytest.mark.device
+def test_epibatch_to_preserves_integer_indices_on_accelerator(accelerator_device) -> None:
+    if accelerator_device.type == "cpu":
+        pytest.skip("No accelerator available")
+
+    batch = _make_batch()
+    batch.target_node = torch.tensor([17], dtype=torch.long)
+    batch.target_region_index = torch.tensor([23], dtype=torch.long)
+    batch.window_start = torch.tensor([31], dtype=torch.long)
+    batch.mob_batch.target_node = torch.tensor([5], dtype=torch.long)
+    batch.mob_batch.global_t = torch.tensor([11], dtype=torch.long)
+
+    moved = batch.to(accelerator_device, non_blocking=True)
+
+    assert moved.target_node.cpu().tolist() == [17]
+    assert moved.target_region_index is not None
+    assert moved.target_region_index.cpu().tolist() == [23]
+    assert moved.window_start.cpu().tolist() == [31]
+    assert moved.mob_batch.target_node.cpu().tolist() == [5]
+    assert moved.mob_batch.global_t.cpu().tolist() == [11]

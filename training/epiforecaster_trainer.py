@@ -55,7 +55,7 @@ from utils.gradnorm_logging import (
     mark_gradnorm_sidecar_complete,
 )
 from utils.gradient_debug import GradientDebugger
-from utils.log_keys import infer_observation_head_from_name
+from utils.log_keys import build_loss_key, infer_observation_head_from_name
 from utils.platform import (
     get_nvme_path,
     is_slurm_cluster,
@@ -257,7 +257,8 @@ class EpiForecasterTrainer:
 
         self.model.to(self.device)
 
-        # Apply torch.compile if enabled
+        # Apply torch.compile *before* loading checkpoints so that
+        # compiled-checkpoint keys (_orig_mod.) match the live model.
         if self.config.training.compile:
             compile_kwargs: dict[str, Any] = {}
             if self.config.training.compile_mode != "default":
@@ -279,6 +280,9 @@ class EpiForecasterTrainer:
                 logging.INFO,
             )
             self.model = torch.compile(self.model, **compile_kwargs)
+
+        if self.config.training.init_checkpoint_path:
+            self._initialize_model_from_checkpoint()
 
         # Enable TF32 for better performance on Ampere+ GPUs
         self._setup_tensor_core_optimizations()
@@ -515,17 +519,9 @@ class EpiForecasterTrainer:
         self._status(
             f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
         )
-        self._status(f"    - SIR weight: {loss_cfg.w_sir}")
+        self._status(f"    - SIRD supervision weight: {loss_cfg.w_sird_supervision}")
         self._status(f"    - Continuity weight: {loss_cfg.w_continuity}")
-        self._status(
-            "    - n_eff scaling: "
-            f"power={loss_cfg.obs_n_eff_power}, "
-            f"reference={loss_cfg.obs_n_eff_reference}, "
-            f"per_head=(ww:{loss_cfg.ww_n_eff_reference}, "
-            f"hosp:{loss_cfg.hosp_n_eff_reference}, "
-            f"cases:{loss_cfg.cases_n_eff_reference}, "
-            f"deaths:{loss_cfg.deaths_n_eff_reference})"
-        )
+        self._status("    - n_eff: diagnostic only; no loss scaling")
         if self._gradnorm_enabled:
             self._status(
                 "    - GradNorm settings: "
@@ -584,6 +580,12 @@ class EpiForecasterTrainer:
             else "disabled"
         )
         self._status(f"  Resume: {resume_status}")
+        init_status = (
+            f"enabled from {self.config.training.init_checkpoint_path}"
+            if self.config.training.init_checkpoint_path
+            else "disabled"
+        )
+        self._status(f"  Model init checkpoint: {init_status}")
         self._status("=" * 60)
 
     def __del__(self) -> None:
@@ -964,6 +966,27 @@ class EpiForecasterTrainer:
         )
         self._status(f"Resumed from checkpoint: {checkpoint_path}")
 
+    def _initialize_model_from_checkpoint(self) -> None:
+        from utils.precision_policy import validate_old_checkpoint_compatible
+
+        checkpoint_path = self.config.training.init_checkpoint_path
+        if checkpoint_path is None:
+            raise ValueError("init_checkpoint_path is not set")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        actual_dtype = next(iter(self.model.parameters())).dtype
+        if actual_dtype != torch.float32:
+            raise ValueError(
+                f"Checkpoint dtype mismatch: model has {actual_dtype}, "
+                "but only float32 parameters are supported."
+            )
+        self._status(
+            f"Initialized model weights from checkpoint: {checkpoint_path}",
+            logging.INFO,
+        )
+
     def run(self) -> dict[str, Any]:
         """Execute training loop."""
         self._status(f"\n{'=' * 60}")
@@ -1144,10 +1167,17 @@ class EpiForecasterTrainer:
         return self.get_training_results()
 
     def _is_early_stopping_enabled(self) -> bool:
-        """Enable early stopping only after curriculum mixes in real data."""
+        """Enable early stopping only after curriculum mixes in real data.
+
+        For synth-only pretraining (no real run), early stopping is always enabled
+        since there is no real data to wait for.
+        """
         if self.config.training.early_stopping_patience is None:
             return False
         if self.curriculum_sampler is None:
+            return True
+        # Synth-only mode: enable early stopping normally
+        if not self.real_run_id:
             return True
         return self.curriculum_sampler.state.synth_ratio < 1.0
 
@@ -1359,10 +1389,18 @@ class EpiForecasterTrainer:
             "hosp": batch_data.hosp_target,
             "cases": batch_data.cases_target,
             "deaths": batch_data.deaths_target,
+            "S_target": batch_data.S_target,
+            "I_target": batch_data.I_target,
+            "R_target": batch_data.R_target,
+            "D_target": batch_data.D_target,
             "ww_mask": batch_data.ww_target_mask,
             "hosp_mask": batch_data.hosp_target_mask,
             "cases_mask": batch_data.cases_target_mask,
             "deaths_mask": batch_data.deaths_target_mask,
+            "S_target_mask": batch_data.S_target_mask,
+            "I_target_mask": batch_data.I_target_mask,
+            "R_target_mask": batch_data.R_target_mask,
+            "D_target_mask": batch_data.D_target_mask,
         }
 
     def _compute_gradient_snapshot_head_supervision(
@@ -1523,6 +1561,52 @@ class EpiForecasterTrainer:
             cached_weights=self._gradnorm_cached_weights,
             last_active_mask=self._gradnorm_last_active_mask,
             task_names=GradNormController.task_names,
+        )
+
+    def _compute_train_step_sird_metrics(
+        self, batch_data: EpiBatch
+    ) -> tuple[str, dict[str, float]]:
+        """Build optional SIRD loss detail text and metrics for step logging."""
+        if self.criterion.w_sird_supervision <= 0:
+            return "", {}
+        if all(
+            getattr(batch_data, key, None) is None
+            for key in ("S_target", "I_target", "R_target", "D_target")
+        ):
+            return "", {}
+
+        with torch.no_grad():
+            with torch.autocast(
+                device_type=self.device.type,
+                dtype=self.precision_policy.autocast_dtype,
+                enabled=self.precision_policy.autocast_enabled,
+            ):
+                model_outputs, targets_dict = self.model.forward_batch(
+                    batch_data=batch_data,
+                    region_embeddings=self.region_embeddings,
+                    mask_cases=self.criterion.mask_input_cases,
+                    mask_ww=self.criterion.mask_input_ww,
+                    mask_hosp=self.criterion.mask_input_hosp,
+                    mask_deaths=self.criterion.mask_input_deaths,
+                )
+                components = self.criterion.compute_components_train(
+                    model_outputs,
+                    targets_dict,
+                    batch_data,
+                )
+
+        sird_raw = float(components["sird_supervision"])
+        sird_weighted = float(components["sird_supervision_weighted"])
+        return (
+            f" | SIRD: {sird_raw:.4g} (w={sird_weighted:.4g})",
+            {
+                build_loss_key(split="train", component="sird_supervision"): sird_raw,
+                build_loss_key(
+                    split="train",
+                    component="sird_supervision",
+                    weighted=True,
+                ): sird_weighted,
+            },
         )
 
     def _train_epoch(self) -> float:
@@ -1822,6 +1906,10 @@ class EpiForecasterTrainer:
                     log_data["loss_train_step"] = loss_detached
                     # Convert to scalar only for console logging
                     loss_value = float(loss_detached)
+                    loss_detail_suffix, sird_step_log_data = (
+                        self._compute_train_step_sird_metrics(batch_data)
+                    )
+                    log_data.update(sird_step_log_data)
                     gradnorm_status_line = ""
                     if self._gradnorm_enabled:
                         if did_gradnorm_sidecar_run(gradnorm_step_log_data):
@@ -1838,6 +1926,7 @@ class EpiForecasterTrainer:
                             lr=lr,
                             grad_norm=last_gradnorm,
                             samples_per_s=samples_per_s,
+                            loss_detail_suffix=loss_detail_suffix,
                             gradnorm_status_suffix="",
                         ),
                     )

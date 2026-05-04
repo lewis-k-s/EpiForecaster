@@ -38,7 +38,7 @@ ANALYSIS_LAUNCHED_ATTR = "ablation_analysis_launched"
 # Keep baseline first so each seed block starts with a matched baseline run.
 ABLATIONS: dict[str, str] = {
     "baseline": "",
-    "sir:off": "training.loss.joint.w_sir=0.0",
+    "sir:off": "training.loss.joint.w_sird_supervision=0.0",
     "sig:ww:aux": "training.loss.joint.disable_ww=true",
     "sig:ww:proxy": "training.loss.joint.mask_input_ww=true",
     "sig:ww:off": "training.loss.joint.disable_ww=true training.loss.joint.mask_input_ww=true",
@@ -56,12 +56,13 @@ ABLATIONS: dict[str, str] = {
     "regions:off": "model.type.regions=false",
     "context:off": "model.type.mobility=false model.type.regions=false",
     "kernel:fixed": "model.observation_heads.learnable_kernel_hosp=false model.observation_heads.learnable_kernel_cases=false model.observation_heads.learnable_kernel_deaths=false",
-    "kernel:ww:mlp": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.kernel_parameterization_ww=free",
-    "kernel:hosp:mlp": "model.observation_heads.learnable_kernel_hosp=true model.observation_heads.kernel_parameterization_hosp=free",
-    "kernel:cases:mlp": "model.observation_heads.learnable_kernel_cases=true model.observation_heads.kernel_parameterization_cases=free",
-    "kernel:deaths:mlp": "model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_deaths=free",
-    "kernel:all:mlp": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.learnable_kernel_hosp=true model.observation_heads.learnable_kernel_cases=true model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_ww=free model.observation_heads.kernel_parameterization_hosp=free model.observation_heads.kernel_parameterization_cases=free model.observation_heads.kernel_parameterization_deaths=free",
-    "gradnorm:off": "training.loss.joint.adaptive_scheme=none",
+    "kernel:ww:free": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.kernel_parameterization_ww=free",
+    "kernel:hosp:free": "model.observation_heads.learnable_kernel_hosp=true model.observation_heads.kernel_parameterization_hosp=free",
+    "kernel:cases:free": "model.observation_heads.learnable_kernel_cases=true model.observation_heads.kernel_parameterization_cases=free",
+    "kernel:deaths:free": "model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_deaths=free",
+    "kernel:all:free": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.learnable_kernel_hosp=true model.observation_heads.learnable_kernel_cases=true model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_ww=free model.observation_heads.kernel_parameterization_hosp=free model.observation_heads.kernel_parameterization_cases=free model.observation_heads.kernel_parameterization_deaths=free",
+    "kernel:all:mlp": "model.observation_heads.kernel_mlp_ww=true model.observation_heads.kernel_mlp_hosp=true model.observation_heads.kernel_mlp_cases=true model.observation_heads.kernel_mlp_deaths=true",
+    "gradnorm:on": "training.loss.joint.adaptive_scheme=gradnorm",
 }
 
 TERMINAL_TRIAL_STATES = {
@@ -253,7 +254,7 @@ def objective(
         overrides.append("training.epochs=1")
 
     cfg = EpiForecasterConfig.load(str(base_config_path), overrides=overrides)
-    cfg.output.log_dir = str(run_root)
+    cfg.output.log_dir = str(run_root / campaign_id)
 
     trainer = EpiForecasterTrainer(cfg)
     trainer.model_id = f"optuna_t{trial.number}_s{seed}"

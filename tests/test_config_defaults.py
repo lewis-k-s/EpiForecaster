@@ -1,6 +1,6 @@
 import pytest
 
-from models.configs import DataConfig, JointLossConfig, ObservationHeadConfig
+from models.configs import DataConfig, JointLossConfig, ModelConfig, ObservationHeadConfig
 
 
 @pytest.mark.epiforecaster
@@ -40,11 +40,51 @@ def test_data_config_resolves_min_observed_from_missing_permit() -> None:
 
 
 @pytest.mark.epiforecaster
-def test_joint_loss_defaults_use_balanced_n_eff_scaling() -> None:
+def test_joint_loss_defaults_use_static_raw_observation_loss() -> None:
     cfg = JointLossConfig()
-    assert cfg.obs_n_eff_power == 0.5
-    assert cfg.obs_n_eff_reference == 28.0
-    assert cfg.ww_n_eff_reference == 0.0
-    assert cfg.hosp_n_eff_reference == 0.0
-    assert cfg.cases_n_eff_reference == 0.0
-    assert cfg.deaths_n_eff_reference == 0.0
+    assert cfg.adaptive_scheme == "none"
+    assert cfg.w_sird_supervision == 0.05
+
+
+@pytest.mark.epiforecaster
+def test_model_graph_adjacency_source_defaults_to_mobility() -> None:
+    cfg = ModelConfig(
+        type={"cases": True, "mobility": True},
+        mobility_embedding_dim=4,
+        region_embedding_dim=4,
+        input_window_length=3,
+        forecast_horizon=1,
+        max_neighbors=2,
+        gnn_module="gcn",
+    )
+    assert cfg.graph_adjacency_source == "mobility"
+
+
+@pytest.mark.epiforecaster
+def test_model_graph_adjacency_source_accepts_spatial_knn() -> None:
+    cfg = ModelConfig(
+        type={"cases": True, "mobility": True},
+        mobility_embedding_dim=4,
+        region_embedding_dim=4,
+        input_window_length=3,
+        forecast_horizon=1,
+        max_neighbors=2,
+        gnn_module="gcn",
+        graph_adjacency_source="spatial_knn",
+    )
+    assert cfg.graph_adjacency_source == "spatial_knn"
+
+
+@pytest.mark.epiforecaster
+def test_model_graph_adjacency_source_rejects_invalid_value() -> None:
+    with pytest.raises(ValueError, match="graph_adjacency_source"):
+        ModelConfig(
+            type={"cases": True, "mobility": True},
+            mobility_embedding_dim=4,
+            region_embedding_dim=4,
+            input_window_length=3,
+            forecast_horizon=1,
+            max_neighbors=2,
+            gnn_module="gcn",
+            graph_adjacency_source="unknown",
+        )

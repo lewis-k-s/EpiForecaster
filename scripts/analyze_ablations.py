@@ -663,21 +663,27 @@ def main() -> int:
             output_dir=args.output_dir,
             baseline_name=args.baseline,
         )
-        if not deltas_df.empty:
+        heatmap_df = seed_matched_df if not seed_matched_df.empty else deltas_df
+        heatmap_csv = (
+            seed_matched_path
+            if not seed_matched_df.empty and seed_matched_path.exists()
+            else deltas_path
+        )
+        if not heatmap_df.empty:
             plot_ablation_deltas_heatmap(
-                deltas_path,
+                heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
                 baseline_name=args.baseline,
             )
             plot_mobility_ablation_heatmap(
-                deltas_path,
+                heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
                 baseline_name=args.baseline,
             )
             plot_head_ablation_heatmap(
-                deltas_path,
+                heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
                 baseline_name=args.baseline,

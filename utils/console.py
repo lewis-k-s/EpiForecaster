@@ -29,13 +29,14 @@ def format_train_progress_status(
     grad_norm: torch.Tensor,
     samples_per_s: float,
     gradnorm_status_suffix: str,
+    loss_detail_suffix: str = "",
 ) -> str:
     """Format the console status line emitted at progress log cadence."""
     return (
         f"Epoch {epoch} | Step {step} | "
         f"Loss: {loss_value:.4g} | Lr: {lr:.2e} | "
         f"Grad: {float(grad_norm):.3f} | SPS: {samples_per_s:7.1f}"
-        f"{gradnorm_status_suffix}"
+        f"{loss_detail_suffix}{gradnorm_status_suffix}"
     )
 
 
@@ -44,10 +45,10 @@ def format_joint_loss_components_status(metrics: dict[str, Any]) -> str | None:
     required = (
         "loss_ww",
         "loss_hosp",
-        "loss_sir",
+        "loss_sird_supervision",
         "loss_ww_weighted",
         "loss_hosp_weighted",
-        "loss_sir_weighted",
+        "loss_sird_supervision_weighted",
     )
     if not all(key in metrics for key in required):
         return None
@@ -55,7 +56,9 @@ def format_joint_loss_components_status(metrics: dict[str, Any]) -> str | None:
     components = [
         f"WW={metrics['loss_ww']:.4g} (w={metrics['loss_ww_weighted']:.4g})",
         f"Hosp={metrics['loss_hosp']:.4g} (w={metrics['loss_hosp_weighted']:.4g})",
-        f"SIR={metrics['loss_sir']:.4g} (w={metrics['loss_sir_weighted']:.4g})",
+        "SIRD="
+        f"{metrics['loss_sird_supervision']:.4g} "
+        f"(w={metrics['loss_sird_supervision_weighted']:.4g})",
     ]
     if "loss_cases" in metrics:
         components.append(

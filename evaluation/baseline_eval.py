@@ -15,8 +15,10 @@ from data.epi_dataset import EpiDataset
 from evaluation.baseline_models import (
     BaselinePredictionResult,
     predict_with_exponential_smoothing_fallback,
+    predict_with_last_observed_fallback,
     predict_with_sarima_fallback,
     predict_with_var_fallback,
+    predict_with_varmax_fallback,
 )
 from evaluation.losses import get_loss_from_config
 from evaluation.epiforecaster_eval import (
@@ -75,7 +77,19 @@ _TARGET_SPECS = {
         joint_alias="deaths",
     ),
 }
-_SUPPORTED_BASELINE_MODELS = ["exp_smoothing", "sarima", "var"]
+_SUPPORTED_BASELINE_MODELS = [
+    "exp_smoothing",
+    "last_observed",
+    "sarima",
+    "var",
+    "varmax",
+]
+_DEFAULT_ALL_BASELINE_MODELS = [
+    "exp_smoothing",
+    "last_observed",
+    "sarima",
+    "var",
+]
 _SAME_SLICE_BASELINE_SCHEMA_VERSION = "1"
 _SAME_SLICE_COMPARISON_SCOPE = "same_eval_slice"
 _MAX_SAFE_ABS_ERROR = float(np.sqrt(np.finfo(np.float64).max) / 4.0)
@@ -86,6 +100,19 @@ _BASELINE_GRANULAR_FIELDNAMES = [
     "fallback_reason",
     *GRANULAR_FIELDNAMES,
 ]
+_BASELINE_FAILURE_FIELDNAMES = [
+    "model",
+    "selected_model",
+    "target",
+    "node_id",
+    "region_id",
+    "region_label",
+    "window_start",
+    "window_start_date",
+    "fit_status",
+    "error_reason",
+]
+
 
 @dataclass
 class TargetSeriesView:
@@ -94,15 +121,10 @@ class TargetSeriesView:
     mask: np.ndarray
     node_to_bin: dict[int, int]
 
+
 @dataclass
 class JointObservationLossSpec:
     obs_weight_sum: float
-    obs_n_eff_power: float
-    obs_n_eff_reference: float
-    ww_n_eff_reference: float
-    hosp_n_eff_reference: float
-    cases_n_eff_reference: float
-    deaths_n_eff_reference: float
     ww_min_observed: int
     hosp_min_observed: int
     cases_min_observed: int
@@ -201,7 +223,7 @@ def _resolve_baseline_models(models: list[str] | None) -> list[str]:
     for model in models:
         key = model.lower()
         if key == "all":
-            for baseline in _SUPPORTED_BASELINE_MODELS:
+            for baseline in _DEFAULT_ALL_BASELINE_MODELS:
                 if baseline not in resolved:
                     resolved.append(baseline)
             continue
@@ -318,17 +340,13 @@ def _resolve_joint_observation_loss_spec(
 
     return JointObservationLossSpec(
         obs_weight_sum=float(criterion.obs_weight_sum),
-        obs_n_eff_power=float(criterion.obs_n_eff_power),
-        obs_n_eff_reference=float(criterion.obs_n_eff_reference),
-        ww_n_eff_reference=float(criterion.ww_n_eff_reference),
-        hosp_n_eff_reference=float(criterion.hosp_n_eff_reference),
-        cases_n_eff_reference=float(criterion.cases_n_eff_reference),
-        deaths_n_eff_reference=float(criterion.deaths_n_eff_reference),
         ww_min_observed=int(criterion.ww_min_observed),
         hosp_min_observed=int(criterion.hosp_min_observed),
         cases_min_observed=int(criterion.cases_min_observed),
         deaths_min_observed=int(criterion.deaths_min_observed),
     )
+
+
 def _predict_univariate_baseline(
     *,
     baseline_model: str,
@@ -340,6 +358,13 @@ def _predict_univariate_baseline(
     exog_train: np.ndarray | None,
     exog_future: np.ndarray | None,
 ) -> BaselinePredictionResult:
+    if baseline_model == "last_observed":
+        return predict_with_last_observed_fallback(
+            train_values=train_values,
+            train_mask=train_mask,
+            horizon=horizon,
+            global_train_median=global_train_median,
+        )
     if baseline_model == "sarima":
         return predict_with_sarima_fallback(
             train_values=train_values,
@@ -408,6 +433,102 @@ def _predict_var_baseline(
         for target_name in _SAME_SLICE_TARGET_ORDER:
             results[target_name].append(per_target_result[target_name])
     return results
+
+
+def _future_temporal_covariates_from_batch(
+    *,
+    batch_data: Any,
+    temporal_covariates: np.ndarray,
+    horizon: int,
+) -> np.ndarray:
+    window_starts = batch_data.window_start.detach().cpu().tolist()
+    history_length = int(getattr(batch_data, "hosp_hist").shape[1])
+    covariates = np.asarray(temporal_covariates, dtype=np.float64)
+    if covariates.ndim != 2:
+        raise ValueError(f"Expected temporal covariates to be 2D, got {covariates.shape}")
+    future = np.zeros((len(window_starts), horizon, covariates.shape[1]), dtype=np.float64)
+    for batch_index, window_start in enumerate(window_starts):
+        start = int(window_start) + history_length
+        end = start + horizon
+        if end > covariates.shape[0]:
+            raise ValueError(
+                "Temporal covariates do not cover the full forecast horizon: "
+                f"end={end}, available={covariates.shape[0]}"
+            )
+        future[batch_index] = covariates[start:end]
+    return future
+
+
+def _predict_varmax_baseline(
+    *,
+    batch_data: Any,
+    horizon: int,
+    global_medians: dict[str, float],
+    temporal_covariates: np.ndarray,
+) -> dict[str, list[BaselinePredictionResult]]:
+    history_values_by_target: dict[str, np.ndarray] = {}
+    history_masks_by_target: dict[str, np.ndarray] = {}
+    for target_name in _SAME_SLICE_TARGET_ORDER:
+        spec = _SAME_SLICE_TARGET_SPECS[target_name]
+        history_values, history_mask = _extract_same_slice_history(
+            batch_data,
+            spec=spec,
+        )
+        history_values_by_target[target_name] = history_values
+        history_masks_by_target[target_name] = history_mask
+
+    history_temporal_covariates = _torch_to_numpy_2d(
+        getattr(batch_data, "temporal_covariates")
+    )
+    future_temporal_covariates = _future_temporal_covariates_from_batch(
+        batch_data=batch_data,
+        temporal_covariates=temporal_covariates,
+        horizon=horizon,
+    )
+
+    batch_size = history_values_by_target[_SAME_SLICE_TARGET_ORDER[0]].shape[0]
+    results = {target_name: [] for target_name in _SAME_SLICE_TARGET_ORDER}
+    global_train_medians = np.asarray(
+        [global_medians[target_name] for target_name in _SAME_SLICE_TARGET_ORDER],
+        dtype=np.float64,
+    )
+
+    for batch_index in range(batch_size):
+        train_values = np.column_stack(
+            [
+                history_values_by_target[target_name][batch_index]
+                for target_name in _SAME_SLICE_TARGET_ORDER
+            ]
+        ).astype(np.float64)
+        train_mask = np.column_stack(
+            [
+                history_masks_by_target[target_name][batch_index]
+                for target_name in _SAME_SLICE_TARGET_ORDER
+            ]
+        ).astype(np.float64)
+        future_mask = np.zeros((horizon, train_mask.shape[1]), dtype=np.float64)
+        exog_train = np.concatenate(
+            [train_mask, history_temporal_covariates[batch_index]],
+            axis=1,
+        )
+        exog_future = np.concatenate(
+            [future_mask, future_temporal_covariates[batch_index]],
+            axis=1,
+        )
+        per_target_result = predict_with_varmax_fallback(
+            train_values=train_values,
+            train_mask=train_mask,
+            horizon=horizon,
+            target_names=list(_SAME_SLICE_TARGET_ORDER),
+            global_train_medians=global_train_medians,
+            exog_train=exog_train,
+            exog_future=exog_future,
+        )
+        for target_name in _SAME_SLICE_TARGET_ORDER:
+            results[target_name].append(per_target_result[target_name])
+    return results
+
+
 def run_baseline_evaluation(
     *,
     config: EpiForecasterConfig,
@@ -434,7 +555,6 @@ def compare_model_metrics_against_baselines(
     output_csv: Path,
     candidate_granular_csv: Path | None = None,
 ) -> Path:
-    baseline_df = pd.read_csv(baseline_results_csv)
     baseline_df = _normalize_baseline_target_metrics_csv(baseline_results_csv)
 
     model_target_metrics = {
@@ -459,6 +579,19 @@ def compare_model_metrics_against_baselines(
             "r2": eval_metrics.get("r2_deaths_log1p_per_100k"),
         },
     }
+    lo_baseline_by_target_metric: dict[tuple[str, str], float] = {}
+    for baseline_row in baseline_df.to_dict(orient="records"):
+        if str(baseline_row.get("model")) != "last_observed":
+            continue
+        target = str(baseline_row.get("target"))
+        for metric_name in ("mae", "rmse"):
+            baseline_value = baseline_row.get(f"{metric_name}_mean")
+            if baseline_value is None:
+                continue
+            baseline_float = float(baseline_value)
+            if np.isfinite(baseline_float):
+                lo_baseline_by_target_metric[(target, metric_name)] = baseline_float
+
     rows: list[dict[str, Any]] = []
     for baseline_row in baseline_df.to_dict(orient="records"):
         target = str(baseline_row.get("target"))
@@ -480,10 +613,53 @@ def compare_model_metrics_against_baselines(
                         - float(baseline_value),
                     }
                 )
+            for metric_name in ("mae", "rmse"):
+                lo_baseline_value = lo_baseline_by_target_metric.get((target, metric_name))
+                model_value = model_target_metrics[target].get(metric_name)
+                if lo_baseline_value is None or model_value is None:
+                    continue
+                skill_value = _safe_skill_ratio(
+                    numerator=float(model_value),
+                    denominator=lo_baseline_value,
+                )
+                if skill_value is None:
+                    continue
+                eval_metrics[_build_skill_metric_key(target=target, metric_name=metric_name)] = (
+                    skill_value
+                )
+                if model_name == "last_observed":
+                    rows.append(
+                        {
+                            "target": target,
+                            "baseline_model": model_name,
+                            "metric": f"skill_{metric_name}",
+                            "model_value": float(skill_value),
+                            "baseline_value": 1.0,
+                            "delta_model_minus_baseline": float(skill_value) - 1.0,
+                        }
+                    )
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_csv, index=False)
     return output_csv
+
+
+def _build_skill_metric_key(*, target: str, metric_name: str) -> str:
+    target_alias = {
+        "hospitalizations": "hosp",
+        "wastewater": "ww",
+        "cases": "cases",
+        "deaths": "deaths",
+    }[target]
+    return f"skill_{metric_name}_{target_alias}_log1p_per_100k_vs_lo"
+
+
+def _safe_skill_ratio(*, numerator: float, denominator: float) -> float | None:
+    if not np.isfinite(numerator) or not np.isfinite(denominator):
+        return None
+    if denominator == 0.0:
+        return None
+    return float(numerator / denominator)
 
 
 def _normalize_baseline_target_metrics_csv(
@@ -574,10 +750,18 @@ def _targets_dict_from_batch(batch_data: Any) -> dict[str, torch.Tensor | None]:
         "hosp": getattr(batch_data, "hosp_target", None),
         "cases": getattr(batch_data, "cases_target", None),
         "deaths": getattr(batch_data, "deaths_target", None),
+        "S_target": getattr(batch_data, "S_target", None),
+        "I_target": getattr(batch_data, "I_target", None),
+        "R_target": getattr(batch_data, "R_target", None),
+        "D_target": getattr(batch_data, "D_target", None),
         "ww_mask": getattr(batch_data, "ww_target_mask", None),
         "hosp_mask": getattr(batch_data, "hosp_target_mask", None),
         "cases_mask": getattr(batch_data, "cases_target_mask", None),
         "deaths_mask": getattr(batch_data, "deaths_target_mask", None),
+        "S_target_mask": getattr(batch_data, "S_target_mask", None),
+        "I_target_mask": getattr(batch_data, "I_target_mask", None),
+        "R_target_mask": getattr(batch_data, "R_target_mask", None),
+        "D_target_mask": getattr(batch_data, "D_target_mask", None),
     }
 
 
@@ -695,6 +879,52 @@ def _build_same_slice_granular_rows(
     return rows
 
 
+def _build_baseline_failure_rows(
+    *,
+    batch_data: Any,
+    spec: SameSliceTargetSpec,
+    results: list[BaselinePredictionResult],
+    temporal_coords: list[Any] | None,
+    region_ids: list[str] | None,
+    region_labels: list[str] | None,
+    model_name: str,
+) -> list[dict[str, Any]]:
+    target_nodes = batch_data.target_node.detach().cpu().tolist()
+    window_starts = batch_data.window_start.detach().cpu().tolist()
+
+    rows: list[dict[str, Any]] = []
+    for batch_index, result in enumerate(results):
+        if result.fit_status == "fit_success":
+            continue
+        node_id = int(target_nodes[batch_index])
+        window_start = int(window_starts[batch_index])
+        region_id = ""
+        region_label = ""
+        if region_ids is not None and 0 <= node_id < len(region_ids):
+            region_id = str(region_ids[node_id])
+        if region_labels is not None and 0 <= node_id < len(region_labels):
+            region_label = str(region_labels[node_id])
+        if not region_label:
+            region_label = region_id
+        rows.append(
+            {
+                "model": model_name,
+                "selected_model": result.model_name,
+                "target": spec.canonical_name,
+                "node_id": node_id,
+                "region_id": region_id,
+                "region_label": region_label,
+                "window_start": window_start,
+                "window_start_date": _format_temporal_coord(
+                    temporal_coords, window_start
+                ),
+                "fit_status": result.fit_status,
+                "error_reason": result.fallback_reason,
+            }
+        )
+    return rows
+
+
 def _aggregate_same_slice_granular_rows(granular_df: pd.DataFrame) -> pd.DataFrame:
     if granular_df.empty:
         return pd.DataFrame(
@@ -780,6 +1010,13 @@ def run_same_slice_baseline_evaluation(
         forecast_horizon=config.model.forecast_horizon,
     )
     temporal_coords = list(getattr(dataset, "_temporal_coords", []))
+    dataset_temporal_covariates = _torch_to_numpy_2d(
+        getattr(
+            dataset,
+            "temporal_covariates",
+            torch.zeros((len(temporal_coords), 0), dtype=torch.float32),
+        )
+    )
     region_ids = list(getattr(dataset, "_region_ids", []) or [])
     region_labels = list(getattr(dataset, "_region_labels", []) or [])
     target_views = _prepare_target_views(
@@ -804,6 +1041,7 @@ def run_same_slice_baseline_evaluation(
     )
 
     granular_rows: list[dict[str, Any]] = []
+    failure_rows: list[dict[str, Any]] = []
     processed_batches = 0
     completed_series = 0
     last_progress_log = time.perf_counter()
@@ -853,6 +1091,17 @@ def run_same_slice_baseline_evaluation(
                         pred.fallback_reason for pred in target_results
                     ]
                     completed_series += len(target_results)
+                    failure_rows.extend(
+                        _build_baseline_failure_rows(
+                            batch_data=batch_data,
+                            spec=spec,
+                            results=target_results,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                            model_name=model_name,
+                        )
+                    )
                     granular_rows.extend(
                         _build_same_slice_granular_rows(
                             batch_data=batch_data,
@@ -872,7 +1121,69 @@ def run_same_slice_baseline_evaluation(
                     )
                 continue
 
-            if model_name not in {"sarima", "exp_smoothing"}:
+            if model_name == "varmax":
+                per_target_results = _predict_varmax_baseline(
+                    batch_data=batch_data,
+                    horizon=int(config.model.forecast_horizon),
+                    global_medians=global_medians,
+                    temporal_covariates=dataset_temporal_covariates,
+                )
+                for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
+                    current_target_name = target_name
+                    supervision_key = {
+                        "hospitalizations": "hosp",
+                        "wastewater": "ww",
+                        "cases": "cases",
+                        "deaths": "deaths",
+                    }[target_name]
+                    supervision = obs_supervision[supervision_key]
+                    target_tensor = supervision["target"]
+                    weights = supervision["weights"]
+                    if target_tensor is None or weights is None:
+                        continue
+
+                    target_results = per_target_results[target_name]
+                    predictions = np.stack(
+                        [pred.predictions for pred in target_results],
+                        axis=0,
+                    )
+                    selected_models = [pred.model_name for pred in target_results]
+                    fit_statuses = [pred.fit_status for pred in target_results]
+                    fallback_reasons = [
+                        pred.fallback_reason for pred in target_results
+                    ]
+                    completed_series += len(target_results)
+                    failure_rows.extend(
+                        _build_baseline_failure_rows(
+                            batch_data=batch_data,
+                            spec=spec,
+                            results=target_results,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                            model_name=model_name,
+                        )
+                    )
+                    granular_rows.extend(
+                        _build_same_slice_granular_rows(
+                            batch_data=batch_data,
+                            spec=spec,
+                            predictions=predictions,
+                            targets=target_tensor,
+                            weights=weights,
+                            temporal_coords=temporal_coords,
+                            region_ids=region_ids,
+                            region_labels=region_labels,
+                            split=split.lower(),
+                            model_name=model_name,
+                            selected_model=selected_models,
+                            fit_status=fit_statuses,
+                            fallback_reason=fallback_reasons,
+                        )
+                    )
+                continue
+
+            if model_name not in {"exp_smoothing", "last_observed", "sarima"}:
                 continue
             for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
                 current_target_name = target_name
@@ -897,6 +1208,7 @@ def run_same_slice_baseline_evaluation(
                 selected_models: list[str] = []
                 fit_statuses: list[str] = []
                 fallback_reasons: list[str] = []
+                target_results: list[BaselinePredictionResult] = []
                 for batch_index in range(batch_size):
                     pred = _predict_univariate_baseline(
                         baseline_model=model_name,
@@ -912,7 +1224,19 @@ def run_same_slice_baseline_evaluation(
                     selected_models.append(pred.model_name)
                     fit_statuses.append(pred.fit_status)
                     fallback_reasons.append(pred.fallback_reason)
+                    target_results.append(pred)
                 completed_series += batch_size
+                failure_rows.extend(
+                    _build_baseline_failure_rows(
+                        batch_data=batch_data,
+                        spec=spec,
+                        results=target_results,
+                        temporal_coords=temporal_coords,
+                        region_ids=region_ids,
+                        region_labels=region_labels,
+                        model_name=model_name,
+                    )
+                )
                 granular_rows.extend(
                     _build_same_slice_granular_rows(
                         batch_data=batch_data,
@@ -956,35 +1280,61 @@ def run_same_slice_baseline_evaluation(
 
     aggregate_start = time.perf_counter()
     granular_df = pd.DataFrame(granular_rows, columns=_BASELINE_GRANULAR_FIELDNAMES)
+    failure_df = pd.DataFrame(failure_rows, columns=_BASELINE_FAILURE_FIELDNAMES)
     aggregate_df = _aggregate_same_slice_granular_rows(granular_df)
     logger.info(
-        "[baseline_eval] Aggregated granular rows in %.2fs: rows=%d aggregate_rows=%d",
+        "[baseline_eval] Aggregated granular rows in %.2fs: rows=%d failures=%d aggregate_rows=%d",
         time.perf_counter() - aggregate_start,
         len(granular_df),
+        len(failure_df),
         len(aggregate_df),
     )
+    if not failure_df.empty:
+        failure_summary = (
+            failure_df.groupby(["model", "target", "error_reason"], dropna=False)
+            .size()
+            .reset_index(name="count")
+        )
+        for row in failure_summary.itertuples(index=False):
+            logger.warning(
+                "[baseline_eval] Baseline failures: model=%s target=%s reason=%s count=%d",
+                row.model,
+                row.target,
+                row.error_reason,
+                int(row.count),
+            )
 
     baseline_granular = output_dir / "baseline_granular.csv"
     baseline_aggregate_metrics = output_dir / "baseline_aggregate_metrics.csv"
     baseline_metadata = output_dir / "baseline_metadata.json"
     baseline_model_usage = output_dir / "baseline_model_usage.csv"
+    baseline_failures = output_dir / "baseline_failures.csv"
 
     granular_df.to_csv(baseline_granular, index=False)
+    failure_df.to_csv(baseline_failures, index=False)
     aggregate_df.to_csv(baseline_aggregate_metrics, index=False)
+    usage_source = pd.concat(
+        [
+            granular_df[["model", "selected_model"]],
+            failure_df[["model", "selected_model"]],
+        ],
+        ignore_index=True,
+    )
     usage_df = (
-        granular_df.groupby(["model", "selected_model"], dropna=False)
+        usage_source.groupby(["model", "selected_model"], dropna=False)
         .size()
         .reset_index(name="count")
-        if not granular_df.empty
+        if not usage_source.empty
         else pd.DataFrame(columns=["model", "selected_model", "count"])
     )
     usage_df.to_csv(baseline_model_usage, index=False)
     logger.info(
-        "[baseline_eval] Wrote artifacts in %.2fs: granular=%s aggregate=%s usage=%s total_elapsed=%.2fs",
+        "[baseline_eval] Wrote artifacts in %.2fs: granular=%s aggregate=%s usage=%s failures=%s total_elapsed=%.2fs",
         time.perf_counter() - aggregate_start,
         baseline_granular,
         baseline_aggregate_metrics,
         baseline_model_usage,
+        baseline_failures,
         time.perf_counter() - eval_start,
     )
 
@@ -1015,5 +1365,6 @@ def run_same_slice_baseline_evaluation(
         "baseline_granular": baseline_granular,
         "baseline_aggregate_metrics": baseline_aggregate_metrics,
         "baseline_model_usage": baseline_model_usage,
+        "baseline_failures": baseline_failures,
         "baseline_metadata": baseline_metadata,
     }

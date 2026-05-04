@@ -125,6 +125,7 @@ def build_dataloaders(
             config=curriculum_config,
             drop_last=True,
             real_run_id=real_run_id,
+            seed=seed,
         )
         train_loader_kwargs["batch_sampler"] = curriculum_sampler
         train_loader_kwargs["collate_fn"] = shared_collate

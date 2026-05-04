@@ -113,8 +113,9 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
     assert eval_kwargs["per_head_node_metrics_csv_path"] == (
         output_dir / "test_node_metrics_per_head.csv"
     )
-    assert eval_kwargs["granular_csv_path"] == output_dir / "test_granular.csv"
+    assert eval_kwargs["granular_csv_path"] is None
     assert eval_kwargs["node_metrics_target"] == "hospitalizations"
+    assert "output.write_granular_eval=false" in eval_kwargs["overrides"]
 
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["output_path"] == output_dir / "test_forecasts.png"
@@ -201,7 +202,157 @@ def test_eval_cli_creates_missing_output_directory_for_all_artifacts(
     assert eval_kwargs["per_head_node_metrics_csv_path"] == (
         output_dir / "test_node_metrics_per_head.csv"
     )
+    assert eval_kwargs["granular_csv_path"] is None
+
+
+def test_eval_cli_granular_flag_enables_auto_granular_output(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint_path = tmp_path / "best_model.pt"
+    checkpoint_path.write_bytes(b"dummy")
+    output_dir = tmp_path / "eval_outputs"
+    output_dir.mkdir()
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "utils.run_discovery.extract_run_from_checkpoint_path",
+        lambda _checkpoint: None,
+    )
+
+    def _fake_eval_checkpoint(**kwargs):
+        captured["eval_checkpoint_kwargs"] = kwargs
+        return {
+            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
+            "model": object(),
+            "loader": object(),
+            "node_mae": {"hospitalizations": {0: 0.1}},
+            "eval_loss": 0.5,
+            "eval_metrics": {
+                "mae": 0.1,
+                "mae_hosp_log1p_per_100k": 0.2,
+                "mae_ww_log1p_per_100k": 0.3,
+                "mae_cases_log1p_per_100k": 0.4,
+                "mae_deaths_log1p_per_100k": 0.5,
+            },
+        }
+
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.eval_checkpoint",
+        _fake_eval_checkpoint,
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.select_nodes_by_loss",
+        lambda **kwargs: {"Q1 (Best MAE)": [0]},
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.generate_forecast_plots",
+        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
+    )
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.render_eval_per_head_plots",
+        lambda **kwargs: {},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "eval",
+            "epiforecaster",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--split",
+            "test",
+            "--output",
+            str(output_dir),
+            "--granular",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    eval_kwargs = captured["eval_checkpoint_kwargs"]
+    assert eval_kwargs["node_metrics_csv_path"] == output_dir / "test_node_metrics.csv"
+    assert eval_kwargs["per_head_node_metrics_csv_path"] == (
+        output_dir / "test_node_metrics_per_head.csv"
+    )
     assert eval_kwargs["granular_csv_path"] == output_dir / "test_granular.csv"
+    assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
+
+
+def test_eval_cli_full_split_is_accepted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint_path = tmp_path / "best_model.pt"
+    checkpoint_path.write_bytes(b"dummy")
+    output_dir = tmp_path / "eval_outputs"
+    output_dir.mkdir()
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "utils.run_discovery.extract_run_from_checkpoint_path",
+        lambda _checkpoint: None,
+    )
+
+    def _fake_eval_checkpoint(**kwargs):
+        captured["eval_checkpoint_kwargs"] = kwargs
+        return {
+            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
+            "model": object(),
+            "loader": object(),
+            "node_mae": {"hospitalizations": {0: 0.1}},
+            "eval_loss": 0.5,
+            "eval_metrics": {
+                "mae": 0.1,
+                "mae_hosp_log1p_per_100k": 0.2,
+                "mae_ww_log1p_per_100k": 0.3,
+                "mae_cases_log1p_per_100k": 0.4,
+                "mae_deaths_log1p_per_100k": 0.5,
+            },
+        }
+
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.eval_checkpoint",
+        _fake_eval_checkpoint,
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.select_nodes_by_loss",
+        lambda **kwargs: {"Q1 (Best MAE)": [0]},
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.generate_forecast_plots",
+        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
+    )
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.render_eval_per_head_plots",
+        lambda **kwargs: {},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "eval",
+            "epiforecaster",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--split",
+            "full",
+            "--output",
+            str(output_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    eval_kwargs = captured["eval_checkpoint_kwargs"]
+    assert eval_kwargs["split"] == "full"
+    assert eval_kwargs["node_metrics_csv_path"] == output_dir / "full_node_metrics.csv"
+    assert eval_kwargs["per_head_node_metrics_csv_path"] == (
+        output_dir / "full_node_metrics_per_head.csv"
+    )
 
 
 def test_eval_cli_compare_evals_runs_fresh_baselines(
@@ -325,6 +476,7 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
             "test",
             "--output",
             str(output_dir),
+            "--granular",
             "--compare-evals",
             "--compare-baselines",
             str(tmp_path / "ignored.csv"),
@@ -333,7 +485,12 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
 
     assert result.exit_code == 0, result.output
     baseline_kwargs = captured["run_same_slice_baseline_evaluation_kwargs"]
-    assert baseline_kwargs["models"] == ["exp_smoothing", "sarima", "var"]
+    assert baseline_kwargs["models"] == [
+        "exp_smoothing",
+        "last_observed",
+        "sarima",
+        "var",
+    ]
     assert baseline_kwargs["split"] == "test"
     assert baseline_kwargs["output_dir"] == output_dir / "test_baseline_eval_same_window"
 
@@ -346,6 +503,69 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
     assert baseline_plot_kwargs["baseline_deltas_csv"] == output_dir / "test_baseline_deltas.csv"
     assert baseline_plot_kwargs["output_dir"] == output_dir
     assert "--compare-evals supplied; ignoring explicit --compare-baselines path" in result.output
+
+
+def test_eval_cli_compare_evals_rejects_full_split(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint_path = tmp_path / "best_model.pt"
+    checkpoint_path.write_bytes(b"dummy")
+    output_dir = tmp_path / "eval_outputs"
+    output_dir.mkdir()
+
+    monkeypatch.setattr(
+        "utils.run_discovery.extract_run_from_checkpoint_path",
+        lambda _checkpoint: None,
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.eval_checkpoint",
+        lambda **kwargs: {
+            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
+            "model": object(),
+            "loader": object(),
+            "node_mae": {"hospitalizations": {0: 0.1}},
+            "eval_loss": 0.5,
+            "eval_metrics": {
+                "mae": 0.1,
+                "mae_hosp_log1p_per_100k": 0.2,
+                "mae_ww_log1p_per_100k": 0.3,
+                "mae_cases_log1p_per_100k": 0.4,
+                "mae_deaths_log1p_per_100k": 0.5,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.select_nodes_by_loss",
+        lambda **kwargs: {"Q1 (Best MAE)": [0]},
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.generate_forecast_plots",
+        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
+    )
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.render_eval_per_head_plots",
+        lambda **kwargs: {},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "eval",
+            "epiforecaster",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--split",
+            "full",
+            "--output",
+            str(output_dir),
+            "--compare-evals",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--compare-evals is not supported with --split full" in result.output
 
 
 def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
@@ -448,6 +668,7 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
             "test",
             "--output",
             str(output_dir),
+            "--granular",
             "--selection-mode",
             "granular_window_quartile",
         ],

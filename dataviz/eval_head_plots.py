@@ -24,7 +24,11 @@ from dataviz.granular_comparison import (
 from dataviz.sparsity_analysis import get_wastewater_sparsity_mask
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.selection import WindowSelectionSpec, select_windows_by_loss
-from plotting.forecast_plots import collect_forecast_samples_for_window_specs, make_forecast_figure
+from plotting.forecast_plots import (
+    collect_forecast_samples_for_window_specs,
+    make_forecast_figure,
+    make_forecast_history_figure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +85,12 @@ _BASELINE_COMPARISON_METRICS = {
     "mae": "MAE",
     "r2": "R²",
 }
-_TARGET_PLOT_BASELINES = {"sarima", "exp_smoothing", "var"}
+_TARGET_PLOT_BASELINES = {
+    "sarima",
+    "exp_smoothing",
+    "last_observed",
+    "var",
+}
 
 
 def _format_baseline_model_label(name: str) -> str:
@@ -454,6 +463,180 @@ def _group_samples_by_region_quartile(
     return grouped_samples
 
 
+def _select_history_window_specs_for_target(
+    *,
+    target_df: pd.DataFrame,
+    target_name: str,
+    granular_df: pd.DataFrame,
+    samples_per_quartile: int,
+    forecasts_per_region: int,
+    min_window_spacing: int,
+) -> dict[str, list[WindowSelectionSpec]]:
+    node_mae = {
+        int(row.node_id): float(row.mae)
+        for row in target_df.itertuples()
+        if pd.notna(row.mae)
+    }
+    node_groups = _select_quartile_nodes_in_order(node_mae=node_mae)
+    if granular_df.empty:
+        return {}
+
+    target_granular = granular_df[granular_df["target"].astype(str) == target_name].copy()
+    if target_granular.empty:
+        return {}
+
+    per_window = (
+        target_granular.groupby(["node_id", "window_start"], dropna=False)
+        .agg(
+            mae=("abs_error", "mean"),
+            observed_points=("abs_error", "size"),
+        )
+        .reset_index()
+        .sort_values(["node_id", "window_start"], kind="stable")
+    )
+    if per_window.empty:
+        return {}
+
+    grouped_specs: dict[str, list[WindowSelectionSpec]] = {}
+    for group_name, node_ids in node_groups.items():
+        group_specs: list[WindowSelectionSpec] = []
+        selected_nodes = node_ids[:samples_per_quartile]
+        for node_id in selected_nodes:
+            node_windows = per_window[per_window["node_id"] == int(node_id)].copy()
+            if node_windows.empty:
+                continue
+            spaced_rows: list[pd.Series] = []
+            last_window_start: int | None = None
+            for row in node_windows.itertuples(index=False):
+                window_start = int(row.window_start)
+                if (
+                    last_window_start is not None
+                    and window_start - last_window_start < min_window_spacing
+                ):
+                    continue
+                spaced_rows.append(pd.Series(row._asdict()))
+                last_window_start = window_start
+
+            if not spaced_rows:
+                continue
+
+            if len(spaced_rows) > forecasts_per_region:
+                keep_idx = np.round(
+                    np.linspace(
+                    0,
+                    len(spaced_rows) - 1,
+                    num=forecasts_per_region,
+                    )
+                ).astype(int)
+                spaced_rows = [spaced_rows[idx] for idx in keep_idx]
+
+            for row in spaced_rows:
+                group_specs.append(
+                    WindowSelectionSpec(
+                        node_id=int(node_id),
+                        window_start=int(row["window_start"]),
+                        score=float(row["mae"]),
+                        observed_targets=(target_name,),
+                        observed_points=int(row["observed_points"]),
+                    )
+                )
+        if group_specs:
+            grouped_specs[group_name] = group_specs
+    return grouped_specs
+
+
+def _render_forecast_history_quartile_plots(
+    *,
+    metrics_df: pd.DataFrame,
+    granular_df: pd.DataFrame,
+    sidecar: dict[str, Any],
+    output_dir: Path,
+    samples_per_quartile: int,
+    forecasts_per_region: int,
+) -> dict[str, Path]:
+    checkpoint_path_raw = sidecar.get("checkpoint_path")
+    if not checkpoint_path_raw:
+        logger.info(
+            "Skipping long-history forecast example plots because checkpoint_path is absent from sidecar"
+        )
+        return {}
+    if granular_df.empty:
+        return {}
+
+    checkpoint_path = Path(checkpoint_path_raw)
+    model, config, _checkpoint = load_model_from_checkpoint(
+        checkpoint_path,
+        device="auto",
+    )
+    loader, _region_embeddings = build_loader_from_config(
+        config,
+        split=str(sidecar.get("split", "test")),
+        device="auto",
+    )
+
+    forecast_horizon = int(config.model.forecast_horizon)
+    artifacts: dict[str, Path] = {}
+    for target in _ordered_targets(metrics_df["target"].astype(str)):
+        plot_target = _TARGET_TO_PLOT_NAME.get(target)
+        if plot_target is None:
+            continue
+        target_df = metrics_df[metrics_df["target"].astype(str) == target].copy()
+        grouped_specs = _select_history_window_specs_for_target(
+            target_df=target_df,
+            target_name=target,
+            granular_df=granular_df,
+            samples_per_quartile=samples_per_quartile,
+            forecasts_per_region=forecasts_per_region,
+            min_window_spacing=forecast_horizon,
+        )
+        if not grouped_specs:
+            continue
+
+        ordered_specs = [spec for specs in grouped_specs.values() for spec in specs]
+        samples = collect_forecast_samples_for_window_specs(
+            window_specs=ordered_specs,
+            model=model,
+            loader=loader,
+            context_pre=30,
+            context_post=30,
+            target_names=[plot_target],
+        )
+        samples_by_key = {
+            (int(sample["node_id"]), int(sample["window_start"])): sample for sample in samples
+        }
+        grouped_samples: dict[str, list[dict[str, Any]]] = {}
+        for group_name, specs in grouped_specs.items():
+            matched_samples = [
+                samples_by_key[(spec.node_id, spec.window_start)]
+                for spec in specs
+                if (spec.node_id, spec.window_start) in samples_by_key
+            ]
+            if matched_samples:
+                grouped_samples[group_name] = matched_samples
+
+        if not grouped_samples:
+            continue
+
+        fig = make_forecast_history_figure(
+            samples=grouped_samples,
+            input_window_length=int(config.model.input_window_length),
+            forecast_horizon=forecast_horizon,
+            target=plot_target,
+            target_label=_format_target_label(target),
+            figure_title=f"{_format_target_label(target)} (history-spanning forecasts)",
+            shared_xlabel="Time index",
+            max_forecasts_per_region=forecasts_per_region,
+        )
+        if fig is None:
+            continue
+        output_path = output_dir / f"forecast_examples_history_quartiles_{target}.png"
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        artifacts[f"forecast_examples_history_quartiles_{target}"] = output_path
+
+    return artifacts
+
+
 def _select_joint_window_specs_by_quartile(
     *,
     granular_df: pd.DataFrame,
@@ -675,7 +858,14 @@ def render_baseline_delta_plots(
         for baseline_model in baseline_models
     }
     hue_order = ["Our model", *[baseline_labels[name] for name in baseline_models]]
-    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"][: len(hue_order)]
+    palette = [
+        "#4C72B0",
+        "#DD8452",
+        "#55A868",
+        "#C44E52",
+        "#8172B3",
+        "#937860",
+    ][: len(hue_order)]
 
     for metric_key, metric_label in _BASELINE_COMPARISON_METRICS.items():
         metric_df = delta_df[delta_df["metric"] == metric_key].copy()
@@ -752,7 +942,8 @@ def render_eval_per_head_plots(
     output_dir: str | Path | None = None,
     samples_per_quartile: int = 4,
     granular_metrics_csv: str | Path | None = None,
-    forecast_window: str = "last",
+    forecast_window: str = "both",
+    history_forecasts_per_region: int = 6,
 ) -> dict[str, Path]:
     csv_path = Path(per_head_node_metrics_csv)
     output_dir = Path(output_dir) if output_dir is not None else csv_path.parent
@@ -817,15 +1008,31 @@ def render_eval_per_head_plots(
             output_path=sparsity_path,
         )
 
-    artifacts.update(
-        _render_forecast_quartile_plots(
-            metrics_df=metrics_df,
-            granular_df=granular_df,
-            sidecar=sidecar,
-            output_dir=output_dir,
-            samples_per_quartile=samples_per_quartile,
+    if forecast_window not in {"last", "history", "both"}:
+        raise ValueError(
+            "forecast_window must be one of {'last', 'history', 'both'}"
         )
-    )
+    if forecast_window in {"last", "both"}:
+        artifacts.update(
+            _render_forecast_quartile_plots(
+                metrics_df=metrics_df,
+                granular_df=granular_df,
+                sidecar=sidecar,
+                output_dir=output_dir,
+                samples_per_quartile=samples_per_quartile,
+            )
+        )
+    if forecast_window in {"history", "both"}:
+        artifacts.update(
+            _render_forecast_history_quartile_plots(
+                metrics_df=metrics_df,
+                granular_df=granular_df,
+                sidecar=sidecar,
+                output_dir=output_dir,
+                samples_per_quartile=samples_per_quartile,
+                forecasts_per_region=history_forecasts_per_region,
+            )
+        )
     artifacts.update(
         _render_joint_latent_quartile_plots(
             granular_df=granular_df,

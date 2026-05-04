@@ -7,6 +7,7 @@ import yaml
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 GNN_TYPES = ["gcn", "gat"]
+GRAPH_ADJACENCY_SOURCES = ["mobility", "spatial_knn"]
 FORECASTER_HEAD_TYPES = ["transformer"]
 POSITIONAL_ENCODING_TYPES = ["sinusoidal", "learned"]
 
@@ -38,9 +39,9 @@ class JointLossConfig:
     """Loss weights for joint inference training."""
 
     # Observation loss weighting policy:
-    # - "gradnorm": adaptive weights for ww/hosp/cases/deaths (default cutover path)
     # - "none": fixed equal-split weighting across active observation targets
-    adaptive_scheme: str = "gradnorm"
+    # - "gradnorm": adaptive weights for ww/hosp/cases/deaths
+    adaptive_scheme: str = "none"
     gradnorm_alpha: float = 1.5
     gradnorm_weight_lr: float = 1.0e-3
     gradnorm_warmup_steps: int = 50
@@ -51,24 +52,9 @@ class JointLossConfig:
     gradnorm_probe: str = "obs_context"
     gradnorm_min_weight: float = 1.0e-3
     gradnorm_obs_weight_sum: float = 0.95
-    # Confidence scaling based on effective supervised points (n_eff).
-    # Per-head factor: min(1, n_eff / reference) ** obs_n_eff_power.
-    # Reference resolution order per head:
-    #   1) <head>_n_eff_reference when > 0
-    #   2) obs_n_eff_reference when > 0
-    #   3) 1.0 fallback
-    # Defaults use a balanced shared reference across heads.
-    # Set obs_n_eff_power=0.0 to disable scaling.
-    obs_n_eff_power: float = 0.5
-    obs_n_eff_reference: float = 28.0
-    ww_n_eff_reference: float = 0.0
-    hosp_n_eff_reference: float = 0.0
-    cases_n_eff_reference: float = 0.0
-    deaths_n_eff_reference: float = 0.0
-    w_sir: float = 0.05
-    # Cap on absolute physics residual before squaring in SIR loss.
-    # Prevents occasional residual spikes from dominating gradients.
-    sir_residual_clip: float = 1.0e3
+    # Fixed weight for synthetic latent S/I/R/D supervision.
+    # Latent supervision auto-disables when latent targets are absent.
+    w_sird_supervision: float = 0.05
     # Optional target-level ablation toggles for observation losses.
     disable_ww: bool = False
     disable_hosp: bool = False
@@ -101,20 +87,13 @@ class JointLossConfig:
             )
 
         for name, value in [
-            ("w_sir", self.w_sir),
-            ("sir_residual_clip", self.sir_residual_clip),
+            ("w_sird_supervision", self.w_sird_supervision),
             ("w_continuity", self.w_continuity),
             ("gradnorm_alpha", self.gradnorm_alpha),
             ("gradnorm_weight_lr", self.gradnorm_weight_lr),
             ("gradnorm_ema_decay", self.gradnorm_ema_decay),
             ("gradnorm_min_weight", self.gradnorm_min_weight),
             ("gradnorm_obs_weight_sum", self.gradnorm_obs_weight_sum),
-            ("obs_n_eff_power", self.obs_n_eff_power),
-            ("obs_n_eff_reference", self.obs_n_eff_reference),
-            ("ww_n_eff_reference", self.ww_n_eff_reference),
-            ("hosp_n_eff_reference", self.hosp_n_eff_reference),
-            ("cases_n_eff_reference", self.cases_n_eff_reference),
-            ("deaths_n_eff_reference", self.deaths_n_eff_reference),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
@@ -197,7 +176,8 @@ class CurriculumConfig:
     """Curriculum training configuration from ``training.curriculum`` YAML block."""
 
     enabled: bool = False
-    # Number of synthetic runs to sample from per epoch (1-2 recommended for locality)
+    # Number of synthetic runs to sample from per epoch (1-2 recommended for locality).
+    # Set to -1 to use all available synthetic runs each epoch (for synth-only pretraining).
     active_runs: int = 1
     # Contiguous windows per run before rotating to next run
     chunk_size: int = 512
@@ -212,8 +192,8 @@ class CurriculumConfig:
             raise ValueError(
                 f"run_sampling must be one of {valid_run_sampling}, got {self.run_sampling}"
             )
-        if self.active_runs < 1:
-            raise ValueError(f"active_runs must be >= 1, got {self.active_runs}")
+        if self.active_runs < -1 or self.active_runs == 0:
+            raise ValueError(f"active_runs must be >= -1 and != 0, got {self.active_runs}")
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
 
@@ -327,6 +307,10 @@ class ObservationHeadConfig:
     kernel_parameterization_hosp: str = "simplex"
     kernel_parameterization_cases: str = "simplex"
     kernel_parameterization_deaths: str = "simplex"
+    kernel_mlp_ww: bool = False
+    kernel_mlp_hosp: bool = False
+    kernel_mlp_cases: bool = False
+    kernel_mlp_deaths: bool = False
     learnable_scale_ww: bool = True
     learnable_scale_hosp: bool = True
     learnable_scale_cases: bool = True
@@ -582,11 +566,16 @@ class ModelConfig:
     input_window_length: int
     forecast_horizon: int
 
-    # -- graph params --#
     # DEPRECATED: Now uses full graphs with k-hop feature masking
     # max_neighbors is kept for config compatibility but not used
     # Neighborhood size is determined by gnn_depth
     max_neighbors: int
+
+    # -- graph params --#
+    # Source for the dense graph passed to the mobility GNN.
+    # - "mobility": dynamic OD mobility adjacency (default/current behavior)
+    # - "spatial_knn": static centroid-distance KNN graph for spatial ablations
+    graph_adjacency_source: str = "mobility"
 
     # -- dimensionality --#
     # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
@@ -660,6 +649,17 @@ class ModelConfig:
         if isinstance(self.observation_heads, (dict, DictConfig)):
             self.observation_heads = ObservationHeadConfig(**self.observation_heads)
 
+        if self.graph_adjacency_source not in GRAPH_ADJACENCY_SOURCES:
+            raise ValueError(
+                "graph_adjacency_source must be one of "
+                f"{GRAPH_ADJACENCY_SOURCES}, got {self.graph_adjacency_source!r}"
+            )
+        if self.graph_adjacency_source == "spatial_knn" and self.max_neighbors <= 0:
+            raise ValueError(
+                "model.max_neighbors must be positive when "
+                "graph_adjacency_source='spatial_knn'"
+            )
+
         if self.type.mobility:
             if not self.gnn_module:
                 raise ValueError("Mobility is enabled but GNN module is not specified")
@@ -696,6 +696,7 @@ class TrainingParams:
     learning_rate: float = 1.0e-3
     optimizer: str = "adamw"
     weight_decay: float = 1.0e-5
+    init_checkpoint_path: str | None = None
     resume_checkpoint_path: str | None = None
     scheduler_type: str = "cosine"
     warmup_steps: int = 0
@@ -922,6 +923,13 @@ class TrainingParams:
             raise ValueError(
                 "min_learning_rate must be <= learning_rate, "
                 f"got {self.min_learning_rate} > {self.learning_rate}"
+            )
+        if (
+            self.init_checkpoint_path is not None
+            and self.resume_checkpoint_path is not None
+        ):
+            raise ValueError(
+                "init_checkpoint_path and resume_checkpoint_path are mutually exclusive"
             )
         valid_optimizers = {"adam", "adamw"}
         optimizer_name = self.optimizer.lower()

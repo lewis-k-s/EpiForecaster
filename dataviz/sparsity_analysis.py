@@ -223,7 +223,10 @@ def main() -> None:
     logger.info("Loaded dataset: %s", args.dataset_path)
 
     # Get population
-    population = dataset["population"].values
+    population = dataset["population"]
+    if "run_id" in population.dims:
+        population = population.isel(run_id=0)
+    population = population.values
 
     logger.info("Regions: %d", len(population))
 

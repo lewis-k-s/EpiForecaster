@@ -294,7 +294,7 @@ cli.add_command(plot_cli, name="plot")
 )
 @click.option(
     "--split",
-    type=click.Choice(["val", "test"], case_sensitive=False),
+    type=click.Choice(["val", "test", "full"], case_sensitive=False),
     default="val",
     show_default=True,
     help="Which split to evaluate.",
@@ -317,6 +317,11 @@ cli.add_command(plot_cli, name="plot")
     type=click.Path(path_type=Path),
     default=None,
     help="Optional CSV output path for granular per-example error rows.",
+)
+@click.option(
+    "--granular",
+    is_flag=True,
+    help="Enable granular per-example error export.",
 )
 @click.option(
     "--output-csv",
@@ -386,6 +391,7 @@ def eval_epiforecaster(
     output: Path | None,
     node_metrics_csv: Path | None,
     granular_csv: Path | None,
+    granular: bool,
     log_dir: Path | None,
     override: tuple[str, ...],
     eval_batch_size: int | None,
@@ -405,6 +411,13 @@ def eval_epiforecaster(
     """
     try:
         per_head_node_metrics_csv: Path | None = None
+        effective_overrides = list(override)
+        write_granular_eval = bool(granular or granular_csv is not None)
+
+        if not any(item.startswith("output.write_granular_eval=") for item in override):
+            effective_overrides.append(
+                f"output.write_granular_eval={'true' if write_granular_eval else 'false'}"
+            )
 
         def _derive_per_head_node_metrics_path(path: Path) -> Path:
             return path.with_name(f"{path.stem}_per_head{path.suffix}")
@@ -426,7 +439,7 @@ def eval_epiforecaster(
             per_head_node_metrics_csv = _derive_per_head_node_metrics_path(
                 node_metrics_csv
             )
-            if granular_csv is None:
+            if granular_csv is None and write_granular_eval:
                 granular_csv = base_dir / f"{split}_granular.csv"
 
         # Resolve paths from experiment/run if provided
@@ -517,7 +530,7 @@ def eval_epiforecaster(
             checkpoint_path=checkpoint,
             split=split,
             log_dir=log_dir,
-            overrides=list(override) if override else None,
+            overrides=effective_overrides,
             node_metrics_csv_path=node_metrics_csv,
             per_head_node_metrics_csv_path=per_head_node_metrics_csv,
             granular_csv_path=granular_csv,
@@ -620,6 +633,10 @@ def eval_epiforecaster(
 
         baseline_results_csv = compare_baselines
         if compare_evals:
+            if split.lower() == "full":
+                raise click.ClickException(
+                    "--compare-evals is not supported with --split full"
+                )
             from evaluation.baseline_eval import (
                 compare_model_metrics_against_baselines,
                 run_same_slice_baseline_evaluation,
@@ -645,7 +662,7 @@ def eval_epiforecaster(
             artifacts = run_same_slice_baseline_evaluation(
                 config=eval_result["config"],
                 output_dir=baseline_output_dir,
-                models=["exp_smoothing", "sarima", "var"],
+                models=["exp_smoothing", "last_observed", "sarima", "var"],
                 config_path=str(checkpoint.parent.parent / "config.yaml"),
                 split=split,
             )
@@ -706,7 +723,10 @@ def eval_epiforecaster(
 @click.option("--config", required=True, help="Path to training configuration file.")
 @click.option(
     "--models",
-    type=click.Choice(["sarima", "exp_smoothing", "var", "all"], case_sensitive=False),
+    type=click.Choice(
+        ["sarima", "exp_smoothing", "last_observed", "var", "varmax", "all"],
+        case_sensitive=False,
+    ),
     default="sarima",
     show_default=True,
     help="Baseline model family to evaluate.",
@@ -754,7 +774,7 @@ def eval_baselines(
         from evaluation.baseline_eval import run_baseline_evaluation
 
         selected_models = (
-            ["exp_smoothing", "sarima", "var"]
+            ["exp_smoothing", "last_observed", "sarima", "var"]
             if models.lower() == "all"
             else [models.lower()]
         )

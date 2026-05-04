@@ -69,7 +69,7 @@ def test_build_main_model_target_aggregate_missing_metrics_are_nan() -> None:
     assert df["observed_count_iqr"].isna().all()
 
 
-def test_build_main_model_joint_observation_aggregate_excludes_sir() -> None:
+def test_build_main_model_joint_observation_aggregate_excludes_sird_supervision() -> None:
     eval_metrics = {
         "loss_ww": 1.0,
         "loss_hosp": 2.0,
@@ -79,7 +79,7 @@ def test_build_main_model_joint_observation_aggregate_excludes_sir() -> None:
         "loss_hosp_weighted": 20.0,
         "loss_cases_weighted": 30.0,
         "loss_deaths_weighted": 40.0,
-        "loss_sir_weighted": 99999.0,
+        "loss_sird_supervision_weighted": 99999.0,
         "observed_count_ww": 7,
         "observed_count_hosp": 8,
         "observed_count_cases": 9,

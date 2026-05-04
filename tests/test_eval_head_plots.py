@@ -11,6 +11,7 @@ import xarray as xr
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from dataviz.eval_head_plots import (
     _compute_canonical_sparsity,
+    _select_history_window_specs_for_target,
     _select_representative_window_specs_for_target,
     render_baseline_delta_plots,
     render_eval_per_head_plots,
@@ -152,7 +153,10 @@ def test_render_eval_per_head_plots_writes_expected_files(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    artifacts = render_eval_per_head_plots(per_head_node_metrics_csv=csv_path)
+    artifacts = render_eval_per_head_plots(
+        per_head_node_metrics_csv=csv_path,
+        forecast_window="last",
+    )
 
     expected_names = {
         "perf_vs_population_hospitalizations",
@@ -251,6 +255,20 @@ def test_render_baseline_delta_plots_groups_all_baselines_by_metric(
                 "metric": "r2",
                 "model_value": 0.20,
                 "baseline_value": 0.05,
+            },
+            {
+                "target": "cases",
+                "baseline_model": "last_observed",
+                "metric": "mae",
+                "model_value": 0.30,
+                "baseline_value": 0.42,
+            },
+            {
+                "target": "cases",
+                "baseline_model": "last_observed",
+                "metric": "r2",
+                "model_value": 0.20,
+                "baseline_value": 0.08,
             },
             {
                 "target": "hospitalizations",
@@ -441,6 +459,7 @@ def test_render_eval_per_head_plots_adds_forecast_example_artifacts_when_availab
     artifacts = render_eval_per_head_plots(
         per_head_node_metrics_csv=csv_path,
         samples_per_quartile=1,
+        forecast_window="last",
     )
 
     forecast_key = "forecast_examples_quartiles_hospitalizations"
@@ -573,7 +592,10 @@ def test_render_eval_per_head_plots_uses_four_examples_per_quartile_by_default(
         _fake_make_forecast_figure,
     )
 
-    artifacts = render_eval_per_head_plots(per_head_node_metrics_csv=csv_path)
+    artifacts = render_eval_per_head_plots(
+        per_head_node_metrics_csv=csv_path,
+        forecast_window="last",
+    )
 
     forecast_key = "forecast_examples_quartiles_hospitalizations"
     assert forecast_key in artifacts
@@ -714,6 +736,7 @@ def test_render_eval_per_head_plots_emits_latent_forecast_artifacts_when_availab
     artifacts = render_eval_per_head_plots(
         per_head_node_metrics_csv=csv_path,
         samples_per_quartile=1,
+        forecast_window="last",
     )
 
     assert "forecast_examples_quartiles_hospitalizations" in artifacts
@@ -865,6 +888,7 @@ def test_render_eval_per_head_plots_emits_joint_latent_quartile_artifacts(
     artifacts = render_eval_per_head_plots(
         per_head_node_metrics_csv=csv_path,
         samples_per_quartile=1,
+        forecast_window="last",
     )
 
     assert "forecast_examples_quartiles_joint_latent_s" in artifacts
@@ -915,6 +939,35 @@ def test_select_representative_window_specs_for_target_uses_median_and_tiebreaks
     assert spec.window_start == 15
     assert spec.score == pytest.approx(0.4)
     assert spec.observed_points == 3
+
+
+def test_select_history_window_specs_for_target_spreads_windows_by_horizon() -> None:
+    target_df = pd.DataFrame(
+        [
+            {"target": "cases", "node_id": 7, "mae": 0.5},
+        ]
+    )
+    granular_df = pd.DataFrame(
+        [
+            {"target": "cases", "node_id": 7, "window_start": 10, "abs_error": 0.1},
+            {"target": "cases", "node_id": 7, "window_start": 11, "abs_error": 0.2},
+            {"target": "cases", "node_id": 7, "window_start": 13, "abs_error": 0.3},
+            {"target": "cases", "node_id": 7, "window_start": 16, "abs_error": 0.4},
+            {"target": "cases", "node_id": 7, "window_start": 20, "abs_error": 0.5},
+        ]
+    )
+
+    grouped = _select_history_window_specs_for_target(
+        target_df=target_df,
+        target_name="cases",
+        granular_df=granular_df,
+        samples_per_quartile=1,
+        forecasts_per_region=3,
+        min_window_spacing=3,
+    )
+
+    assert list(grouped) == ["Q1 (Best MAE)"]
+    assert [spec.window_start for spec in grouped["Q1 (Best MAE)"]] == [10, 16, 20]
 
 
 def test_render_eval_per_head_plots_backfills_same_quartile_with_eligible_nodes(
@@ -1145,8 +1198,127 @@ def test_render_eval_per_head_plots_regression_uses_non_last_representative_wind
     render_eval_per_head_plots(
         per_head_node_metrics_csv=csv_path,
         samples_per_quartile=2,
+        forecast_window="last",
     )
 
     grouped_samples = captured_figures[0]
     assert [sample["node_id"] for sample in grouped_samples["Q1 (Best MAE)"]] == [0, 1]
     assert [sample["window_start"] for sample in grouped_samples["Q1 (Best MAE)"]] == [10, 11]
+
+
+def test_render_eval_per_head_plots_emits_history_quartile_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset_path = tmp_path / "aligned.zarr"
+    _write_test_dataset(dataset_path)
+
+    csv_path = tmp_path / "test_node_metrics_per_head.csv"
+    pd.DataFrame(
+        [
+            {
+                "target": "cases",
+                "node_id": node_id,
+                "region_id": f"{8000 + node_id:05d}",
+                "region_label": f"Region {node_id}",
+                "population": 1000.0 + node_id,
+                "observed_count": 4,
+                "mae": 0.1 + (node_id * 0.1),
+                "rmse": 0.2 + (node_id * 0.1),
+            }
+            for node_id in range(4)
+        ]
+    ).to_csv(csv_path, index=False)
+    csv_path.with_suffix(".csv.meta.json").write_text(
+        json.dumps(
+            {
+                "checkpoint_path": str(tmp_path / "checkpoint.ckpt"),
+                "dataset_path": str(dataset_path),
+                "run_id": 0,
+                "schema_version": "1",
+                "split": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(
+        [
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": node_id,
+                "window_start": window_start,
+                "abs_error": 0.1 + (node_id * 0.1),
+            }
+            for node_id in range(4)
+            for window_start in [10, 11, 14, 18]
+        ]
+    ).to_csv(tmp_path / "test_granular.csv", index=False)
+
+    class _DummyModelConfig:
+        input_window_length = 3
+        forecast_horizon = 3
+
+    class _DummyConfig:
+        model = _DummyModelConfig()
+
+    class _DummyModel:
+        pass
+
+    class _DummyLoader:
+        pass
+
+    captured_history_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.load_model_from_checkpoint",
+        lambda *args, **kwargs: (_DummyModel(), _DummyConfig(), {}),
+    )
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.build_loader_from_config",
+        lambda *args, **kwargs: (_DummyLoader(), None),
+    )
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.collect_forecast_samples_for_window_specs",
+        lambda **kwargs: [
+            {
+                "node_id": spec.node_id,
+                "window_start": spec.window_start,
+                "node_label": f"Region {spec.node_id}",
+                "t0": spec.window_start + 3,
+                "series_t": np.arange(30),
+                "t_rel": np.arange(-2, 3),
+                "H": 3,
+                "targets": {
+                    "cases": {
+                        "actual_context": np.array([1, 2, 3, 4, 5], dtype=np.float32),
+                        "prediction": np.array([4, 5, 6], dtype=np.float32),
+                        "target": np.array([4, 5, 6], dtype=np.float32),
+                        "history": np.array([1, 2, 3], dtype=np.float32),
+                        "full_series": np.linspace(0.0, 1.0, 30, dtype=np.float32),
+                        "window_mae": float(spec.score),
+                    }
+                },
+                "window_mae": float(spec.score),
+            }
+            for spec in kwargs["window_specs"]
+        ],
+    )
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.make_forecast_history_figure",
+        lambda **kwargs: captured_history_calls.append(kwargs)
+        or __import__("matplotlib.pyplot").pyplot.figure(),
+    )
+
+    artifacts = render_eval_per_head_plots(
+        per_head_node_metrics_csv=csv_path,
+        samples_per_quartile=1,
+        forecast_window="history",
+    )
+
+    assert "forecast_examples_history_quartiles_cases" in artifacts
+    assert len(captured_history_calls) == 1
+    grouped_samples = captured_history_calls[0]["samples"]
+    assert grouped_samples["Q1 (Best MAE)"][0]["window_start"] == 10
+    assert grouped_samples["Q1 (Best MAE)"][1]["window_start"] == 14
+    assert grouped_samples["Q1 (Best MAE)"][2]["window_start"] == 18
