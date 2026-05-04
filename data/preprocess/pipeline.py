@@ -129,6 +129,7 @@ class OfflinePreprocessingPipeline:
                 population_data=processed_data["population"],
                 hospitalizations_data=processed_data.get("hospitalizations"),
                 deaths_data=processed_data.get("deaths"),
+                latent_sird_data=processed_data.get("latent_sird"),
             )
 
             self._log_sample_stats(
@@ -347,9 +348,15 @@ class OfflinePreprocessingPipeline:
         cases_da = aligned_dataset.cases
         density_threshold = self.config.min_density_threshold
 
-        # Compute data density per (run_id, region) (fraction of non-NaN values)
-        # cases_da has shape (run_id, date, region_id)
-        valid_count = cases_da.notnull().sum(dim="date")
+        # Compute observed data density per (run_id, region). The cases value
+        # channel can contain causal smoother predictions in missing periods, so
+        # cases_mask is the source of truth for observed clinical coverage.
+        if "cases_mask" in aligned_dataset:
+            coverage_source = aligned_dataset["cases_mask"] > 0
+        else:
+            coverage_source = cases_da.notnull()
+
+        valid_count = coverage_source.sum(dim="date")
         total_per_region = cases_da["date"].size
         density = valid_count / total_per_region
 
@@ -518,7 +525,7 @@ class OfflinePreprocessingPipeline:
             elif var_name == "biomarker_data_start":
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["index"])
                 print(f"  {var_name}: {old_dtype} -> int16")
-            elif var_name in ("edar_has_source", "valid_targets"):
+            elif var_name in ("edar_has_source", "valid_targets", "mobility_time_mask"):
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["mask"])
                 print(f"  {var_name}: {old_dtype} -> bool")
             elif var_name == "population":
@@ -528,6 +535,12 @@ class OfflinePreprocessingPipeline:
             elif var_name == "temporal_covariates" and var.dtype == np.float32:
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
                 print(f"  {var_name}: float32 -> float16")
+            elif var_name.startswith("latent_") and var.dtype in (
+                np.float32,
+                np.float64,
+            ):
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
+                print(f"  {var_name}: {old_dtype} -> float16")
             # Generic float64 -> float16 (continuous values) - check LAST
             elif var.dtype == np.float64:
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])

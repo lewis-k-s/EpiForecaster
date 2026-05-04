@@ -42,9 +42,36 @@ def _write_minimal_synthetic_zarr(path, *, run_ids, dates, region_ids, edar_ids)
     )
 
     population = xr.DataArray(
-        rng.random((len(run_ids), len(region_ids))),
+        rng.integers(500, 1500, size=(len(run_ids), len(region_ids))).astype(
+            np.float32
+        ),
         dims=("run_id", "region_id"),
         coords={"run_id": run_ids, "region_id": region_ids},
+    )
+
+    latent_s = xr.DataArray(
+        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
+        * population.values[:, :, None],
+        dims=("run_id", "region_id", "date"),
+        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
+    )
+    latent_i = xr.DataArray(
+        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
+        * 10.0,
+        dims=("run_id", "region_id", "date"),
+        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
+    )
+    latent_r = xr.DataArray(
+        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
+        * population.values[:, :, None]
+        * 0.2,
+        dims=("run_id", "region_id", "date"),
+        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
+    )
+    latent_d = xr.DataArray(
+        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32),
+        dims=("run_id", "region_id", "date"),
+        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
     )
 
     edar_vars = {}
@@ -56,12 +83,12 @@ def _write_minimal_synthetic_zarr(path, *, run_ids, dates, region_ids, edar_ids)
             coords={"run_id": run_ids, "date": dates, "edar_id": edar_ids},
         )
         lod = xr.DataArray(
-            rng.random((len(run_ids), len(edar_ids))),
-            dims=("run_id", "edar_id"),
-            coords={"run_id": run_ids, "edar_id": edar_ids},
+            rng.random((len(run_ids), len(dates), len(edar_ids))),
+            dims=("run_id", "date", "edar_id"),
+            coords={"run_id": run_ids, "date": dates, "edar_id": edar_ids},
         )
         edar_vars[f"edar_biomarker_{variant}"] = biomarker
-        edar_vars[f"edar_biomarker_{variant}_LoD"] = lod
+        edar_vars[f"limit_of_detection_{variant}"] = lod
 
     ds = xr.Dataset(
         {
@@ -70,6 +97,10 @@ def _write_minimal_synthetic_zarr(path, *, run_ids, dates, region_ids, edar_ids)
             "mobility_base": mobility_base,
             "mobility_kappa0": mobility_kappa0,
             "population": population,
+            "latent_S_true": latent_s,
+            "latent_I_true": latent_i,
+            "latent_R_true": latent_r,
+            "latent_D_true": latent_d,
             **edar_vars,
         }
     )
@@ -157,11 +188,39 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
     cases = result["cases"]["cases"]
     mobility = result["mobility"]["mobility"]
     population = result["population"]
+    latent_sird = result["latent_sird"]
 
     assert cases.dims == ("run_id", "date", "region_id")
     assert mobility.dims == ("run_id", "date", "origin", "destination")
     assert population.dims == ("run_id", "region_id")
+    assert latent_sird["latent_S_true"].dims == ("run_id", "date", "region_id")
+    assert latent_sird["latent_S_true_mask"].dims == ("run_id", "date", "region_id")
     assert len(cases.run_id) == 2
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_resolves_nested_zarr_wrapper(tmp_path):
+    wrapper_path = tmp_path / "raw_synth_wrapper.zarr"
+    nested_path = wrapper_path / "reduced_raw_synthetic_observations.zarr"
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+    edar_ids = np.array(["e1"], dtype="U10")
+    nested_path.parent.mkdir(parents=True)
+    _write_minimal_synthetic_zarr(
+        nested_path,
+        run_ids=run_ids,
+        dates=dates,
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+
+    config = _make_config(tmp_path, wrapper_path)
+    processor = SyntheticProcessor(config)
+
+    result = processor.process(str(wrapper_path))
+    assert "latent_sird" in result
+    assert result["cases"]["cases"].shape[0] == 1
 
 
 @pytest.mark.epiforecaster
@@ -431,6 +490,11 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
+    assert "latent_S_true" in ds
+    assert "latent_I_true" in ds
+    assert "latent_R_true" in ds
+    assert "latent_D_true" in ds
+    assert "latent_S_true_mask" in ds
     assert ds["temporal_covariates"].dims == ("date", "covariate")
     assert list(ds["temporal_covariates"]["covariate"].values) == [
         "dow_sin",

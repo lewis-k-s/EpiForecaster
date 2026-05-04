@@ -132,21 +132,40 @@ def inject_gpu_mobility(
                 if dataset_index is not None:
                     base_ds = dataset.datasets[dataset_index]
 
-    if not hasattr(base_ds, "preloaded_mobility") or base_ds.preloaded_mobility is None:
+    config = getattr(base_ds, "config", None)
+    adjacency_source = (
+        config.model.graph_adjacency_source if config is not None else "mobility"
+    )
+    if adjacency_source == "spatial_knn":
+        if not hasattr(base_ds, "spatial_knn_adjacency"):
+            return
+        source_adjacency = base_ds.spatial_knn_adjacency
+        if source_adjacency is None:
+            return
+    elif not hasattr(base_ds, "preloaded_mobility") or base_ds.preloaded_mobility is None:
         return
+    else:
+        source_adjacency = base_ds.preloaded_mobility
 
     # Cache GPU mobility directly on the dataset object keyed by device
     if not hasattr(base_ds, "_gpu_mobility_cache"):
         base_ds._gpu_mobility_cache = {}
 
-    cache_key = (device, MODEL_PARAM_DTYPE)
+    cache_key = (device, MODEL_PARAM_DTYPE, adjacency_source)
     if cache_key not in base_ds._gpu_mobility_cache:
         node_ids = torch.where(base_ds._get_graph_node_mask())[0]
-        # Slice original CPU tensor to context nodes: resulting size [TotalT, N_ctx, N_ctx]
-        # Using unsqueeze is faster and creates an intermediate of correct shape directly
-        sliced_mob = base_ds.preloaded_mobility[:, node_ids.unsqueeze(-1), node_ids].to(
-            MODEL_PARAM_DTYPE
-        )
+        if adjacency_source == "spatial_knn":
+            sliced_mob = source_adjacency[node_ids.unsqueeze(-1), node_ids].to(
+                MODEL_PARAM_DTYPE
+            )
+            total_t = base_ds.preloaded_mobility.shape[0]
+            sliced_mob = sliced_mob.unsqueeze(0).expand(total_t, -1, -1)
+        else:
+            # Slice original CPU tensor to context nodes: resulting size [TotalT, N_ctx, N_ctx]
+            # Using unsqueeze is faster and creates an intermediate of correct shape directly
+            sliced_mob = source_adjacency[:, node_ids.unsqueeze(-1), node_ids].to(
+                MODEL_PARAM_DTYPE
+            )
 
         # Transfer to GPU
         gpu_mob = sliced_mob.to(device, non_blocking=True)
@@ -166,9 +185,7 @@ def inject_gpu_mobility(
 
     # If strict mode is enabled, add bounds assertions to catch
     # out-of-bounds gathers before they corrupt the CUDA context.
-    strict = getattr(base_ds, "config", None) is not None and getattr(
-        base_ds.config.model, "strict", False
-    )
+    strict = config is not None and getattr(base_ds.config.model, "strict", False)
     if strict:
         max_t = gpu_mob.shape[0] - 1
         if (global_t_gpu > max_t).any() or (global_t_gpu < 0).any():

@@ -378,6 +378,14 @@ class TestEpiForecaster:
             ww_target_mask=torch.ones(B, H),
             cases_target_mask=torch.ones(B, H),
             deaths_target_mask=torch.ones(B, H),
+            S_target=None,
+            I_target=None,
+            R_target=None,
+            D_target=None,
+            S_target_mask=None,
+            I_target_mask=None,
+            R_target_mask=None,
+            D_target_mask=None,
         )
         batch_data = batch_data.to(model.device)
 
@@ -439,6 +447,14 @@ class TestEpiForecaster:
             ww_target_mask=torch.ones(B, horizon),
             cases_target_mask=torch.ones(B, horizon),
             deaths_target_mask=torch.ones(B, horizon),
+            S_target=None,
+            I_target=None,
+            R_target=None,
+            D_target=None,
+            S_target_mask=None,
+            I_target_mask=None,
+            R_target_mask=None,
+            D_target_mask=None,
         )
         batch_data = batch_data.to(model.device)
 
@@ -484,6 +500,14 @@ class TestEpiForecaster:
             ww_target_mask=torch.ones(B, horizon),
             cases_target_mask=torch.ones(B, horizon),
             deaths_target_mask=torch.ones(B, horizon),
+            S_target=None,
+            I_target=None,
+            R_target=None,
+            D_target=None,
+            S_target_mask=None,
+            I_target_mask=None,
+            R_target_mask=None,
+            D_target_mask=None,
         )
         batch_data = batch_data.to(accelerator_device)
 

@@ -305,6 +305,18 @@ class EDARProcessor:
         # Process from xarray (shared with synthetic)
         return self.process_from_xarray(flow_xr, censor_xr, region_metadata_file)
 
+    def process_site_level(
+        self,
+        wastewater_file: str,
+    ) -> tuple[xr.DataArray, xr.DataArray]:
+        """Return smoothed site-level EDAR series before region aggregation.
+
+        Values are on the pre-log flow/concentration scale. Callers that compare
+        against canonical outputs should apply the same log1p transform used by
+        ``OfflinePreprocessingPipeline``.
+        """
+        return self._load_and_tidy_raw_data(wastewater_file)
+
     def _load_and_tidy_raw_data(
         self,
         wastewater_file: str,

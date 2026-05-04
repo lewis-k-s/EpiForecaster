@@ -931,7 +931,6 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             region_embedding_store=region_embedding_store,
         )
 
-    real_run_for_split: str | None = None
     split_dataset_path: Path | None = None
 
     if config.training.curriculum.enabled:
@@ -939,17 +938,24 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
         logger.info(
             f"Curriculum enabled. Found runs: Real='{real_run}', Synth={synth_runs}"
         )
-        real_run_for_split = real_run
-        split_dataset_path = (
-            Path(config.data.real_dataset_path)
-            if config.data.real_dataset_path
-            else Path(config.data.dataset_path)
-        )
+
+        # For synth-only mode (real_run is empty), use first synth run for splitting
+        # since all runs share the same region structure.
+        if real_run:
+            split_run_id = real_run
+            split_dataset_path = (
+                Path(config.data.real_dataset_path)
+                if config.data.real_dataset_path
+                else Path(config.data.dataset_path)
+            )
+        else:
+            split_run_id = synth_runs[0]
+            split_dataset_path = Path(config.data.dataset_path)
 
         train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(
             config=config,
             dataset_path=split_dataset_path,
-            run_id=real_run_for_split,
+            run_id=split_run_id,
         )
 
         result = build_curriculum_datasets(

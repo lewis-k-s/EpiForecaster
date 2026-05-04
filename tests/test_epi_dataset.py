@@ -213,3 +213,43 @@ class TestEpiDataset:
             assert batch.cases_target_mask.dtype == MODEL_PARAM_DTYPE
             assert batch.deaths_target_mask.dtype == MODEL_PARAM_DTYPE
             assert batch.mob_batch.x_dense.dtype == MODEL_PARAM_DTYPE
+
+    def test_collate_reuses_shared_mob_real_node_idx(
+        self, config, mock_xarray_dataset
+    ):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1, 2],
+            )
+            item_a = ds[0]
+            item_b = ds[1]
+
+            batch = collate_epiforecaster_batch(
+                [item_a, item_b], require_region_index=False
+            )
+
+            assert batch.mob_batch.mob_real_node_idx is item_a["mob_real_node_idx"]
+
+    def test_collate_rejects_inconsistent_mob_real_node_idx(
+        self, config, mock_xarray_dataset
+    ):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1, 2],
+            )
+            item_a = ds[0]
+            item_b = ds[1]
+            item_b["mob_real_node_idx"] = item_b["mob_real_node_idx"].clone()
+
+            with pytest.raises(ValueError, match="same cached tensor"):
+                collate_epiforecaster_batch(
+                    [item_a, item_b], require_region_index=False
+                )

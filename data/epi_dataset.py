@@ -35,6 +35,7 @@ from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
+_SPATIAL_KNN_CRS = "EPSG:25831"
 
 StaticCovariates = dict[str, torch.Tensor]
 
@@ -80,6 +81,14 @@ class EpiDatasetItem(TypedDict):
     ww_target_mask: torch.Tensor  # [H] 1.0 if wastewater target is observed
     cases_target_mask: torch.Tensor  # [H] 1.0 if cases target is observed
     deaths_target_mask: torch.Tensor  # [H] 1.0 if deaths target is observed
+    S_target: torch.Tensor | None  # [H+1] latent susceptible fraction target
+    I_target: torch.Tensor | None  # [H+1] latent infected fraction target
+    R_target: torch.Tensor | None  # [H+1] latent recovered fraction target
+    D_target: torch.Tensor | None  # [H+1] latent deceased fraction target
+    S_target_mask: torch.Tensor | None  # [H+1] latent susceptible target mask
+    I_target_mask: torch.Tensor | None  # [H+1] latent infected target mask
+    R_target_mask: torch.Tensor | None  # [H+1] latent recovered target mask
+    D_target_mask: torch.Tensor | None  # [H+1] latent deceased target mask
 
 
 class EpiDataset(Dataset):
@@ -123,7 +132,9 @@ class EpiDataset(Dataset):
         # Store run_id for curriculum sampler to identify real vs synthetic datasets
         self.run_id = effective_run_id
         self._region_embedding_store = region_embedding_store
-        self._local_to_global_region_index: torch.Tensor | None = None
+        self._region_embedding_index_by_id: dict[str, int] | None = None
+        self._graph_node_ids: torch.Tensor | None = None
+        self._graph_region_indices: torch.Tensor | None = None
 
         # Load dataset with run_id filtering for memory efficiency
         # This ensures only the required run is loaded, not all runs
@@ -207,6 +218,18 @@ class EpiDataset(Dataset):
         self.precomputed_deaths, self.precomputed_deaths_mask = (
             self._precompute_joint_target("deaths", per_100k=True)
         )
+        self.precomputed_S_target, self.precomputed_S_mask = (
+            self._precompute_latent_target("latent_S_true")
+        )
+        self.precomputed_I_target, self.precomputed_I_mask = (
+            self._precompute_latent_target("latent_I_true")
+        )
+        self.precomputed_R_target, self.precomputed_R_mask = (
+            self._precompute_latent_target("latent_R_true")
+        )
+        self.precomputed_D_target, self.precomputed_D_mask = (
+            self._precompute_latent_target("latent_D_true")
+        )
 
         # Setup mobility preprocessor
         # Data is already log1p-transformed from preprocessing pipeline
@@ -259,6 +282,12 @@ class EpiDataset(Dataset):
             # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
             mobility_threshold = float(config.data.mobility_threshold)
             self.mobility_mask = self.preloaded_mobility >= mobility_threshold
+            if "mobility_time_mask" in self._dataset:
+                time_mask_np = self._dataset["mobility_time_mask"].values.astype(bool)
+                time_mask = torch.from_numpy(time_mask_np).to(torch.bool)
+                while time_mask.ndim < self.mobility_mask.ndim:
+                    time_mask = time_mask.unsqueeze(-1)
+                self.mobility_mask &= time_mask
 
             logger.info(
                 f"Mobility preloaded: {self.preloaded_mobility.shape}, "
@@ -294,6 +323,7 @@ class EpiDataset(Dataset):
 
         # Cache for adjacency matrices keyed by time step (CPU tensors only)
         self._adjacency_cache: dict[int, torch.Tensor] = {}
+        self.spatial_knn_adjacency: torch.Tensor | None = None
 
         # Cache for global-to-local node index mapping keyed by time step
         # Each entry is a (N,) tensor with local indices or -1 for non-context nodes
@@ -444,11 +474,11 @@ class EpiDataset(Dataset):
         ]
         self._temporal_coords = list(self._dataset[TEMPORAL_COORD].values)
         if self._region_embedding_store is not None:
-            self._local_to_global_region_index = (
-                self._region_embedding_store.build_local_to_global_index(
-                    self._region_ids
-                )
+            self._region_embedding_index_by_id = (
+                self._region_embedding_store.region_id_to_index
             )
+        if self.config.model.graph_adjacency_source == "spatial_knn":
+            self.spatial_knn_adjacency = self._build_spatial_knn_adjacency()
 
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
         # This moves expensive matrix operations from per-sample to startup time
@@ -482,6 +512,15 @@ class EpiDataset(Dataset):
             f"Target k-hop mask: {self._target_khop_mask.sum().item()}/{self.num_nodes} nodes "
             f"(depth={self.config.model.gnn_depth}, targets={len(self.target_nodes)})"
         )
+        self._graph_node_ids = torch.where(self._target_khop_mask)[0]
+        if self._region_embedding_index_by_id is not None:
+            self._graph_region_indices = torch.tensor(
+                [
+                    self._region_embedding_index_by_id[self._region_ids[node_idx]]
+                    for node_idx in self._graph_node_ids.tolist()
+                ],
+                dtype=torch.long,
+            )
 
         # Close dataset and clear reference to avoid pickling issues
         self._dataset.close()
@@ -644,10 +683,8 @@ class EpiDataset(Dataset):
         node_label = self._region_labels[target_idx]
         region_id = self._region_ids[target_idx]
         target_region_index = target_idx
-        if self._local_to_global_region_index is not None:
-            target_region_index = int(
-                self._local_to_global_region_index[target_idx].item()
-            )
+        if self._region_embedding_index_by_id is not None:
+            target_region_index = self._region_embedding_index_by_id[region_id]
 
         range_end = range_start + L
         forecast_targets = range_end + H
@@ -740,6 +777,30 @@ class EpiDataset(Dataset):
         deaths_target_mask = self.precomputed_deaths_mask[
             range_end:forecast_targets, target_idx
         ]
+        S_target = self._slice_latent_target(
+            self.precomputed_S_target, range_end - 1, forecast_targets, target_idx
+        )
+        I_target = self._slice_latent_target(
+            self.precomputed_I_target, range_end - 1, forecast_targets, target_idx
+        )
+        R_target = self._slice_latent_target(
+            self.precomputed_R_target, range_end - 1, forecast_targets, target_idx
+        )
+        D_target = self._slice_latent_target(
+            self.precomputed_D_target, range_end - 1, forecast_targets, target_idx
+        )
+        S_target_mask = self._slice_latent_target(
+            self.precomputed_S_mask, range_end - 1, forecast_targets, target_idx
+        )
+        I_target_mask = self._slice_latent_target(
+            self.precomputed_I_mask, range_end - 1, forecast_targets, target_idx
+        )
+        R_target_mask = self._slice_latent_target(
+            self.precomputed_R_mask, range_end - 1, forecast_targets, target_idx
+        )
+        D_target_mask = self._slice_latent_target(
+            self.precomputed_D_mask, range_end - 1, forecast_targets, target_idx
+        )
 
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
@@ -776,11 +837,14 @@ class EpiDataset(Dataset):
         local_target_idx = int(local_target_idx_tensor.item())
 
         # Determine node IDs in the context mask
-        node_mask = self._get_graph_node_mask()
-        node_ids = torch.where(node_mask)[0]
-        mob_real_node_idx = node_ids
-        if self._local_to_global_region_index is not None:
-            mob_real_node_idx = self._local_to_global_region_index[node_ids]
+        if self._graph_node_ids is None:
+            raise RuntimeError("Graph node ids not initialized")
+        node_ids = self._graph_node_ids
+        mob_real_node_idx = (
+            self._graph_region_indices
+            if self._graph_region_indices is not None
+            else node_ids
+        )
 
         for t in range(L):
             global_t = range_start + t
@@ -800,6 +864,10 @@ class EpiDataset(Dataset):
                 feat.append(cases_t[node_ids])
             if self.config.model.type.biomarkers:
                 feat.append(bio_t[node_ids])
+                ww_val = self.precomputed_ww[global_t, node_ids].unsqueeze(-1)
+                ww_msk = self.precomputed_ww_mask[global_t, node_ids].unsqueeze(-1)
+                feat.append(ww_val)
+                feat.append(ww_msk)
             x = torch.cat(feat, dim=-1)  # (num_nodes, feat_dim)
 
             # Apply k-hop feature masking based on target node
@@ -862,6 +930,14 @@ class EpiDataset(Dataset):
             "ww_target_mask": ww_target_mask,
             "cases_target_mask": cases_target_mask,
             "deaths_target_mask": deaths_target_mask,
+            "S_target": S_target,
+            "I_target": I_target,
+            "R_target": R_target,
+            "D_target": D_target,
+            "S_target_mask": S_target_mask,
+            "I_target_mask": I_target_mask,
+            "R_target_mask": R_target_mask,
+            "D_target_mask": D_target_mask,
         }
 
     def _resolve_region_name_source(self) -> Path | None:
@@ -908,6 +984,74 @@ class EpiDataset(Dataset):
                 continue
             mapping[str(region_id)] = str(region_name)
         return mapping
+
+    def _build_spatial_knn_adjacency(self) -> torch.Tensor:
+        """Build a static symmetric binary KNN graph from municipality centroids."""
+        region_source = self._resolve_region_name_source()
+        if region_source is None:
+            raise ValueError(
+                "graph_adjacency_source='spatial_knn' requires a valid GeoJSON in "
+                "data.regions_data_path or data/files/geo/fl_municipios_catalonia.geojson"
+            )
+
+        try:
+            import geopandas as gpd
+        except ImportError as exc:
+            raise ImportError(
+                "geopandas is required for graph_adjacency_source='spatial_knn'"
+            ) from exc
+
+        regions = gpd.read_file(region_source)
+        if "id" not in regions.columns:
+            raise ValueError(f"GeoJSON {region_source} must contain an 'id' property")
+
+        regions = regions[["id", "geometry"]].copy()
+        regions["id"] = regions["id"].astype(str)
+        regions = regions.drop_duplicates(subset="id", keep="first").set_index("id")
+
+        dataset_region_ids = [str(region_id) for region_id in self._region_ids]
+        missing = [region_id for region_id in dataset_region_ids if region_id not in regions.index]
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise ValueError(
+                f"GeoJSON {region_source} is missing {len(missing)} dataset region_id "
+                f"values needed for spatial_knn adjacency: {preview}"
+            )
+
+        ordered = regions.loc[dataset_region_ids]
+        if ordered.crs is None:
+            logger.warning(
+                "GeoJSON %s has no CRS metadata; assuming %s for spatial KNN",
+                region_source,
+                _SPATIAL_KNN_CRS,
+            )
+            ordered = ordered.set_crs(_SPATIAL_KNN_CRS)
+        else:
+            ordered = ordered.to_crs(_SPATIAL_KNN_CRS)
+
+        centroids = ordered.geometry.centroid
+        xy = np.column_stack([centroids.x.to_numpy(), centroids.y.to_numpy()])
+        if not np.isfinite(xy).all():
+            raise ValueError(
+                f"GeoJSON {region_source} produced non-finite centroids for spatial_knn"
+            )
+
+        num_nodes = len(dataset_region_ids)
+        k = min(int(self.config.model.max_neighbors), max(0, num_nodes - 1))
+        adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+        if k == 0:
+            return adjacency
+
+        deltas = xy[:, None, :] - xy[None, :, :]
+        distances = np.sum(deltas * deltas, axis=-1)
+        np.fill_diagonal(distances, np.inf)
+        nearest = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+        row_idx = np.repeat(np.arange(num_nodes), k)
+        col_idx = nearest.reshape(-1)
+        adjacency[row_idx, col_idx] = True
+        adjacency = adjacency | adjacency.T
+        adjacency.fill_diagonal_(False)
+        return adjacency
 
     def _load_target_values_and_mask(
         self, var_name: str
@@ -1047,6 +1191,40 @@ class EpiDataset(Dataset):
         mask_t = torch.from_numpy(mask.astype(np.float16)).to(torch.float16)
 
         return torch.from_numpy(values.astype(np.float16)).to(torch.float16), mask_t
+
+    def _precompute_latent_target(
+        self,
+        var_name: str,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Precompute latent trajectory supervision target in fraction space."""
+        ds = self._dataset
+        if ds is None:
+            raise RuntimeError(
+                "Dataset not loaded. Call load_canonical_dataset() first."
+            )
+
+        values, mask = self._load_target_values_and_mask(var_name)
+        if values is None or mask is None:
+            logger.info("Latent target '%s' not found in dataset; disabling it.", var_name)
+            return None, None
+
+        mask = (mask > 0) & np.isfinite(values)
+        values = np.where(np.isfinite(values), values, np.nan)
+        return (
+            torch.from_numpy(values.astype(np.float16)).to(torch.float16),
+            torch.from_numpy(mask.astype(np.float16)).to(torch.float16),
+        )
+
+    @staticmethod
+    def _slice_latent_target(
+        target_tensor: torch.Tensor | None,
+        start_idx: int,
+        end_idx: int,
+        target_idx: int,
+    ) -> torch.Tensor | None:
+        if target_tensor is None:
+            return None
+        return target_tensor[start_idx:end_idx, target_idx]
 
     def static_covariates(self) -> StaticCovariates:
         "Returns static covariates for the dataset. (num_nodes, num_features)"
@@ -1225,10 +1403,14 @@ class EpiDataset(Dataset):
         if time_step in self._adjacency_cache:
             return self._adjacency_cache[time_step]
 
-        # Get mobility matrix for this time step from preloaded tensor
-        mobility_matrix = self.preloaded_mobility[time_step]
-
-        adjacency = mobility_matrix > 0
+        if self.config.model.graph_adjacency_source == "spatial_knn":
+            if self.spatial_knn_adjacency is None:
+                raise RuntimeError("spatial_knn adjacency has not been initialized")
+            adjacency = self.spatial_knn_adjacency.clone()
+        else:
+            # Get mobility matrix for this time step from preloaded tensor
+            mobility_matrix = self.preloaded_mobility[time_step]
+            adjacency = mobility_matrix > 0
         if self.context_mask is not None:
             mask = self.context_mask
             adjacency = adjacency & mask[:, None] & mask[None, :]

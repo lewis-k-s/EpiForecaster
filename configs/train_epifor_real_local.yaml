@@ -59,6 +59,7 @@ output:
 training:
   seed: 42
   device: "cpu"
+  init_checkpoint_path: null
   batch_size: 8
   gradient_accumulation_steps: 1
   gradient_clip_value: 5.0
@@ -85,11 +86,10 @@ training:
   loss:
     name: "joint_inference"
     joint:
-      adaptive_scheme: "gradnorm"
+      adaptive_scheme: "none"
       gradnorm_obs_weight_sum: 0.95
       gradnorm_update_every: 16
       gradnorm_ema_decay: 0.9
       gradnorm_probe: "obs_context"
-      w_sir: 0.005
-      sir_residual_clip: 100
+      w_sird_supervision: 0.0
       w_continuity: 0.01

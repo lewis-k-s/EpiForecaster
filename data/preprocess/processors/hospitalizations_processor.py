@@ -148,10 +148,11 @@ class HospitalizationsProcessor:
 
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply configured causal smoothing for time series.
+        Apply configured causal filtering for time series.
 
         Unlike wastewater data, hospitalizations don't have detection limits,
-        so we use non-censored smoothers for preprocessing.
+        so we use non-censored smoothers for preprocessing. Recorded values are
+        preserved in the output, and filtered values are only used to fill gaps.
         """
         method = self.config.smoothing.clinical_method
         print(f"  Applying causal smoothing (method={method})...")
@@ -213,15 +214,15 @@ class HospitalizationsProcessor:
             # Apply smoother
             filtered_values, flags = smoother.filter_series(values)
 
-            # Create smoothed records
+            # Preserve recorded values at observed timesteps; use filtered values for gaps.
             for i, date in enumerate(muni_data.index):
+                filtered_value = float(np.exp(filtered_values[i]))
+                hosp_value = float(values[i]) if observed[i] else filtered_value
                 smoothed_records.append(
                     {
                         "date": date,
                         "municipality_code": muni_code,
-                        "hospitalizations": np.exp(
-                            filtered_values[i]
-                        ),  # Back-transform from log space
+                        "hospitalizations": hosp_value,
                         "hospitalizations_log": filtered_values[i],
                         "missing_flag": flags[i],  # 0=normal, 2=missing/interpolated
                         "hospitalizations_observed": float(observed[i]),
@@ -299,14 +300,12 @@ class HospitalizationsProcessor:
     def process(
         self,
         data_dir: str | Path,
-        apply_smoothing: bool = True,
     ) -> xr.Dataset:
         """
         Process hospitalization data into xarray Dataset.
 
         Args:
             data_dir: Directory containing hospitalization CSV file
-            apply_smoothing: Whether to apply Kalman smoothing
 
         Returns:
             xarray Dataset with variables:
@@ -341,9 +340,7 @@ class HospitalizationsProcessor:
         # Resample to daily (sparse observations)
         daily_df = self._resample_weekly_to_daily(muni_weekly)
 
-        # Apply Kalman smoothing if requested
-        if apply_smoothing:
-            daily_df = self._apply_kalman_smoothing(daily_df)
+        daily_df = self._apply_kalman_smoothing(daily_df)
 
         # Create mask and age channels
         daily_df = self._create_mask_and_age_channels(daily_df)

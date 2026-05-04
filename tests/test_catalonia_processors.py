@@ -109,7 +109,7 @@ def test_catalonia_cases_output_format(
         temp_data_dir
         / "Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv"
     )
-    result = proc.process(cases_file, apply_smoothing=False)
+    result = proc.process(cases_file)
 
     assert "cases" in result
     assert "cases_mask" in result
@@ -119,7 +119,9 @@ def test_catalonia_cases_output_format(
     assert result.cases.sizes["run_id"] == 1  # single run
     assert result.cases.sizes["date"] == 15  # full date range (reindexed)
     assert result.cases.sizes["region_id"] == 2  # 2 municipalities
-    assert result.cases.sum() == 15  # 5+3+7
+    assert result.cases.sel(run_id="real", date="2022-01-01", region_id="08019") == 5
+    assert result.cases.sel(run_id="real", date="2022-01-01", region_id="08021") == 3
+    assert result.cases.sel(run_id="real", date="2022-01-02", region_id="08019") == 7
     # Check mask and age are present and have correct shape
     assert result.cases_mask.dims == ("run_id", "date", "region_id")
     assert result.cases_age.dims == ("run_id", "date", "region_id")
@@ -147,17 +149,6 @@ def test_deaths_processor_municipality_level(
     # Age channel should include staleness beyond observation days
     assert float(result.deaths_age.max()) > 1.0
 
-
-@pytest.mark.region
-def test_deaths_processor_can_disable_smoothing(
-    config: PreprocessingConfig, temp_data_dir: Path
-):
-    """Raw mode should preserve sparsity (NaNs on unobserved days)."""
-    proc = DeathsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=False)
-    assert result.deaths.isnull().any()
-
-
 @pytest.mark.region
 def test_deaths_processor_holt_damped_keeps_mask_age_semantics(
     config: PreprocessingConfig, temp_data_dir: Path
@@ -165,7 +156,7 @@ def test_deaths_processor_holt_damped_keeps_mask_age_semantics(
     """Switching to holt_damped should not change mask/age observation semantics."""
     config.smoothing.clinical_method = "holt_damped"
     proc = DeathsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=True)
+    result = proc.process(temp_data_dir)
 
     assert result.deaths.notnull().all()
     assert float(result.deaths_mask.sum()) == 3.0
@@ -184,7 +175,7 @@ def test_hospitalizations_processor_weekly_data(
     because it tests multiple components together (resample + smooth + mask).
     """
     proc = HospitalizationsProcessor(config)
-    result = proc.process(temp_data_dir, apply_smoothing=True)
+    result = proc.process(temp_data_dir)
 
     assert "hospitalizations" in result
     assert "hospitalizations_mask" in result

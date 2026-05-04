@@ -10,7 +10,7 @@ env: "mn5"
 # adapt to noisier, more realistic conditions.
 
 data:
-  dataset_path: data/processed/synthetic_full_holt_damped.zarr
+  dataset_path: data/processed/synthetic_full.zarr
   real_dataset_path: data/processed/real_with_id.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
@@ -161,11 +161,10 @@ training:
     log_dir: auto
     record_memory: false
     profile_epochs: [1]
-  # Joint inference loss configuration (lower w_sir for stability)
+  # Joint inference loss configuration
   loss:
     name: "joint_inference"
     joint:
-      w_sir: 0.01
-      sir_residual_clip: 100.0
+      w_sird_supervision: 0.01
   plot_forecasts: true
   num_forecast_samples: 3

@@ -36,7 +36,7 @@ def mock_config(tmp_path):
     )
 
 def test_cases_smoothing_non_negative_finite(mock_config):
-    """Verify that smoothing does not emit inf/-inf and preserves non-negativity."""
+    """Verify gap filling stays finite/non-negative and preserves observed values."""
     proc = CataloniaCasesProcessor(mock_config)
     
     dates = pd.date_range("2022-01-01", periods=10)
@@ -51,6 +51,9 @@ def test_cases_smoothing_non_negative_finite(mock_config):
     
     assert np.all(np.isfinite(smoothed["cases"]))
     assert np.all(smoothed["cases"] >= 0)
+    assert smoothed.iloc[0]["cases"] == pytest.approx(10.0)
+    assert smoothed.iloc[2]["cases"] == pytest.approx(15.0)
+    assert smoothed.iloc[4]["cases"] == pytest.approx(20.0)
     # Check that we have a range of values (not all the same or zero)
     assert smoothed["cases"].std() > 0
 
@@ -110,6 +113,9 @@ def test_cases_holt_damped_preserves_mask_age_semantics(mock_config):
     result = proc._create_mask_and_age_channels(smoothed)
 
     expected_mask = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0]
+    assert smoothed.iloc[0]["cases"] == pytest.approx(10.0)
+    assert smoothed.iloc[3]["cases"] == pytest.approx(11.0)
+    assert smoothed.iloc[5]["cases"] == pytest.approx(12.0)
     assert result["cases_mask"].tolist() == expected_mask
     assert result.iloc[0]["cases_age"] == 1.0
     assert result.iloc[1]["cases_age"] == 2.0

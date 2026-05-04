@@ -3,6 +3,7 @@
 import pytest
 from pathlib import Path
 
+from data.preprocess.config import PreprocessingConfig
 from models.configs import EpiForecasterConfig
 from training.region2vec_trainer import RegionTrainerConfig
 
@@ -12,9 +13,12 @@ EPIFORECASTER_TRAINING_CONFIGS = [
     "configs/train_epifor_curriculum.yaml",
     "configs/train_epifor_real_local.yaml",
     "configs/train_epifor_synth_local.yaml",
+    "configs/production_only/train_epifor_mn5_best.yaml",
     "configs/production_only/train_epifor_mn5_full.yaml",
     "configs/production_only/train_epifor_mn5_synth.yaml",
+    "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
     "configs/production_only/train_epifor_sparsity_curriculum.yaml",
+    "configs/production_only/train_epifor_supersparse.yaml",
 ]
 
 REGION2VEC_CONFIGS = [
@@ -70,13 +74,11 @@ def test_region2vec_configs_parse(config_path):
 @pytest.mark.parametrize("config_path", PREPROCESSING_CONFIGS)
 def test_preprocessing_configs_parse(config_path):
     """Test that all preprocessing configs can be parsed."""
-    # PreprocessingConfig validates paths exist, so we expect FileNotFoundError
-    # but we can verify the YAML structure is valid
-    import yaml
-
     config_path = Path(config_path)
-    with open(config_path) as f:
-        config_dict = yaml.safe_load(f)
+    config_dict = PreprocessingConfig._load_config_dict(
+        config_path,
+        seen_paths=set(),
+    )
 
     # Verify required top-level fields exist
     assert "data_dir" in config_dict

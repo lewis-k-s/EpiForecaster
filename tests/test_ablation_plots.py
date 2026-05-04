@@ -17,7 +17,7 @@ def test_prepare_model_order_clusters_ablations() -> None:
                 "sig:cases:off",
                 "context:off",
                 "sir:off",
-                "gradnorm:off",
+                "gradnorm:on",
                 "sig:deaths:aux",
             ],
             "target": ["cases"] * 12,
@@ -35,6 +35,6 @@ def test_prepare_model_order_clusters_ablations() -> None:
         "sig:cases:off",
         "sig:hosp:proxy",
         "sig:deaths:aux",
-        "gradnorm:off",
+        "gradnorm:on",
         "kernel:fixed",
     ]

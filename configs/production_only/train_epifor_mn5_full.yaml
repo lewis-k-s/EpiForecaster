@@ -68,6 +68,7 @@ training:
   compile_backward: true
   seed: 42
   device: "cuda"
+  init_checkpoint_path: null
   batch_size: 32
   shuffle_train_batches: true
   gradient_accumulation_steps: 1
@@ -114,9 +115,8 @@ training:
     log_dir: auto
   plot_forecasts: true
   num_forecast_samples: 3
-  # Joint inference loss configuration (lower w_sir for stability)
+  # Joint inference loss configuration
   loss:
     name: "joint_inference"
     joint:
-      w_sir: 0.01
-      sir_residual_clip: 100.0
+      w_sird_supervision: 0.0

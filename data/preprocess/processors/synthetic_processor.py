@@ -9,8 +9,12 @@ Synthetic data MUST use concentration mode (not total_flow) because it
 contains pre-computed concentrations without flow rate information.
 """
 
+from pathlib import Path
+
 import numpy as np
 import xarray as xr
+
+from constants import EDAR_BIOMARKER_PREFIX, EDAR_BIOMARKER_VARIANTS
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 from .temporal_covariates_processor import TemporalCovariatesProcessor
@@ -24,6 +28,37 @@ ZARR_ENCODING_KEYS_TO_CLEAR = {
     "serializer",
     "object_codec",
     "shards",
+}
+
+SYNTHETIC_ZARR_SCHEMA = {
+    "required_vars": {
+        "cases": ("run_id", "date", "region_id"),
+        "population": ("run_id", "region_id"),
+    },
+    "mobility_alternatives": [
+        ("mobility_time_varying", ("run_id", "origin", "destination", "date")),
+        ("mobility_base", ("origin", "target")),
+        ("mobility_kappa0", ("run_id", "date")),
+    ],
+    "edar_biomarkers": {
+        f"{EDAR_BIOMARKER_PREFIX}{v}": ("run_id", "date", "edar_id")
+        for v in EDAR_BIOMARKER_VARIANTS
+    },
+    "edar_lod": {
+        f"limit_of_detection_{v}": ("run_id", "date", "edar_id")
+        for v in EDAR_BIOMARKER_VARIANTS
+    },
+    "optional_vars": {
+        "hospitalizations_raw": ("run_id", "date", "region_id"),
+        "hospitalizations": ("run_id", "date", "region_id"),
+        "deaths_raw": ("run_id", "date", "region_id"),
+        "deaths": ("run_id", "date", "region_id"),
+        "latent_S_true": ("run_id", "region_id", "date"),
+        "latent_I_true": ("run_id", "region_id", "date"),
+        "latent_R_true": ("run_id", "region_id", "date"),
+        "latent_D_true": ("run_id", "region_id", "date"),
+        "synthetic_sparsity_level": ("run_id",),
+    },
 }
 
 
@@ -77,8 +112,11 @@ class SyntheticProcessor:
 
         print(f"Loading synthetic data from {synthetic_path}")
 
+        resolved_store_path = self._resolve_synthetic_store_path(synthetic_path)
+        print(f"Resolved synthetic zarr group: {resolved_store_path}")
+
         ds = xr.open_zarr(
-            synthetic_path,
+            resolved_store_path,
             chunks={"run_id": self.config.run_id_chunk_size},  # type: ignore[arg-type]
         )
         self._clear_source_zarr_encodings(ds)
@@ -93,47 +131,12 @@ class SyntheticProcessor:
             print(f"Filtered to {len(ds.run_id)} runs: {ds.run_id.values}")
             print()
 
-        # Validate required variables exist
-        # Mobility can be in two formats:
-        # - New: mobility_time_varying (pre-computed with kappa0 applied)
-        # - Legacy: mobility_base + mobility_kappa0 (factorized format)
-        required_vars = ["cases", "population"]
-        missing = [v for v in required_vars if v not in ds]
-        if missing:
-            raise ValueError(f"Synthetic data missing required variables: {missing}")
-
-        # Check mobility format
-        has_time_varying = "mobility_time_varying" in ds
-        has_factorized = "mobility_base" in ds and "mobility_kappa0" in ds
-        if not has_time_varying and not has_factorized:
-            raise ValueError(
-                "Synthetic data missing mobility data. "
-                "Expected either 'mobility_time_varying' or "
-                "('mobility_base' + 'mobility_kappa0')"
-            )
+        # Validate schema before extraction
+        self._validate_schema(ds)
 
         synthetic_sparsity_level = None
         if "synthetic_sparsity_level" in ds:
             synthetic_sparsity_level = ds["synthetic_sparsity_level"]
-            print(
-                "  ✓ Found synthetic_sparsity_level metadata: "
-                f"{synthetic_sparsity_level.shape}"
-            )
-        else:
-            print(
-                "Warning: synthetic_sparsity_level not found; "
-                "curriculum sparsity filtering will be unavailable."
-            )
-
-        # Check for EDAR biomarkers (optional but recommended)
-        # type: ignore[reportOperatorIssue] (xarray data_vars iteration)
-        edar_vars = [
-            v for v in ds.data_vars if "edar_biomarker" in str(v) and "_LoD" in str(v)
-        ]
-        if not edar_vars:
-            print(
-                "Warning: No EDAR LoD variables found. Wastewater preprocessing will fail."
-            )
 
         # EDAR returns tuple (flow_xr, censor_xr) for shared processing path
         edar_flow, edar_censor = self._extract_edar(ds)
@@ -158,10 +161,39 @@ class SyntheticProcessor:
         if deaths_data is not None:
             result["deaths"] = deaths_data
 
+        latent_sird = self._extract_latent_sird(ds)
+        if latent_sird is not None:
+            result["latent_sird"] = latent_sird
+
         if synthetic_sparsity_level is not None:
             result["synthetic_sparsity_level"] = synthetic_sparsity_level
 
         return result
+
+    def _resolve_synthetic_store_path(self, synthetic_path: str) -> str:
+        """Resolve wrapper directories that contain the actual Zarr group."""
+        path = Path(synthetic_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Synthetic zarr path does not exist: {path}")
+
+        if (path / ".zgroup").exists() or (path / ".zattrs").exists():
+            return str(path)
+
+        nested_candidates = sorted(
+            child
+            for child in path.iterdir()
+            if child.is_dir()
+            and child.suffix == ".zarr"
+            and ((child / ".zgroup").exists() or (child / ".zattrs").exists())
+        )
+        if len(nested_candidates) == 1:
+            return str(nested_candidates[0])
+        if len(nested_candidates) > 1:
+            raise ValueError(
+                "Synthetic zarr wrapper contains multiple nested zarr groups; "
+                f"cannot choose automatically: {[c.name for c in nested_candidates]}"
+            )
+        return str(path)
 
     def _clear_source_zarr_encodings(self, dataset: xr.Dataset) -> None:
         """Remove inherited source chunk/compressor encodings from opened Zarr vars."""
@@ -174,6 +206,82 @@ class SyntheticProcessor:
             coord = dataset.coords[coord_name]
             for key in ZARR_ENCODING_KEYS_TO_CLEAR:
                 coord.encoding.pop(key, None)
+
+    def _validate_schema(self, ds: xr.Dataset) -> None:
+        """Validate dataset against SYNTHETIC_ZARR_SCHEMA before extraction.
+
+        Checks required variables, mobility formats, EDAR biomarker/LoD pairs,
+        and warns for missing optional variables. Raises ValueError with all
+        failures listed at once.
+        """
+        errors: list[str] = []
+
+        # Required variables
+        for var_name, expected_dims in SYNTHETIC_ZARR_SCHEMA["required_vars"].items():
+            if var_name not in ds:
+                errors.append(f"Missing required variable: '{var_name}'")
+            elif set(ds[var_name].dims) != set(expected_dims):
+                errors.append(
+                    f"Variable '{var_name}' has dims {ds[var_name].dims}, "
+                    f"expected {expected_dims}"
+                )
+
+        # Mobility: at least one format must be present
+        mobility_ok = False
+        for var_name, expected_dims in SYNTHETIC_ZARR_SCHEMA["mobility_alternatives"]:
+            if var_name in ds:
+                if set(ds[var_name].dims) == set(expected_dims):
+                    mobility_ok = True
+                    break
+        if not mobility_ok:
+            errors.append(
+                "No valid mobility format found. Expected either "
+                "'mobility_time_varying' with dims (run_id, origin, destination, date) "
+                "or 'mobility_base' + 'mobility_kappa0' with dims "
+                "(origin, target) and (run_id, date)."
+            )
+
+        # EDAR biomarkers + LoD
+        for var_name, expected_dims in SYNTHETIC_ZARR_SCHEMA["edar_biomarkers"].items():
+            if var_name not in ds:
+                errors.append(f"Missing EDAR biomarker variable: '{var_name}'")
+            elif set(ds[var_name].dims) != set(expected_dims):
+                errors.append(
+                    f"Biomarker '{var_name}' has dims {ds[var_name].dims}, "
+                    f"expected {expected_dims}"
+                )
+
+        for var_name, expected_dims in SYNTHETIC_ZARR_SCHEMA["edar_lod"].items():
+            if var_name not in ds:
+                errors.append(f"Missing EDAR LoD variable: '{var_name}'")
+            elif set(ds[var_name].dims) != set(expected_dims):
+                errors.append(
+                    f"LoD '{var_name}' has dims {ds[var_name].dims}, "
+                    f"expected {expected_dims}"
+                )
+
+        if errors:
+            raise ValueError(
+                "Synthetic zarr schema validation failed:\n"
+                + "\n".join(f"  - {e}" for e in errors)
+            )
+
+        # Optional variables (warn only)
+        for var_name in SYNTHETIC_ZARR_SCHEMA["optional_vars"]:
+            if var_name not in ds:
+                print(f"  Note: optional variable '{var_name}' not present")
+
+        if "synthetic_sparsity_level" in ds:
+            sparsity = ds["synthetic_sparsity_level"]
+            print(
+                "  ✓ Found synthetic_sparsity_level metadata: "
+                f"{sparsity.shape}"
+            )
+        else:
+            print(
+                "Warning: synthetic_sparsity_level not found; "
+                "curriculum sparsity filtering will be unavailable."
+            )
 
     def _select_optional_observed_series(
         self,
@@ -428,9 +536,9 @@ class SyntheticProcessor:
 
         Preserves run_id dimension.
 
-        Expected variables:
+        Expected variables (validated by _validate_schema):
         - edar_biomarker_N1, N2, IP4: (run_id, date, edar_id)
-        - edar_biomarker_N1_LoD, N2_LoD, IP4_LoD: (run_id, edar_id)
+        - limit_of_detection_N1, N2, IP4: (run_id, date, edar_id)
 
         Returns:
             Tuple of (flow_xr, censor_xr) with dimensions (run_id, date, edar_id, variant)
@@ -438,34 +546,25 @@ class SyntheticProcessor:
         """
         print("Extracting EDAR biomarkers...")
 
-        from constants import EDAR_BIOMARKER_PREFIX, EDAR_BIOMARKER_VARIANTS
-
         flow_list = []
         censor_list = []
 
+        start_date = np.datetime64(self.config.start_date)
+        end_date = np.datetime64(self.config.end_date)
+
         for variant in EDAR_BIOMARKER_VARIANTS:
             var_name = f"{EDAR_BIOMARKER_PREFIX}{variant}"
-            lod_name = f"{var_name}_LoD"
+            lod_name = f"limit_of_detection_{variant}"
 
-            if var_name not in ds:
-                continue
-            if lod_name not in ds:
-                print(f"  Warning: {lod_name} not found, skipping {variant}")
-                continue
-
-            # Extract biomarker values: (run_id, date, edar_id)
             biomarker = ds[var_name]
-            lod = ds[lod_name]  # (run_id, edar_id,)
+            lod = ds[lod_name]
 
-            # Filter by date range
-            start_date = np.datetime64(self.config.start_date)
-            end_date = np.datetime64(self.config.end_date)
-
+            # Filter both biomarker and LoD by date range
             time_mask = (biomarker[TEMPORAL_COORD] >= start_date) & (
                 biomarker[TEMPORAL_COORD] <= end_date
             )
             biomarker_filtered = biomarker.isel({TEMPORAL_COORD: time_mask})
-            lod_filtered = lod  # LoD doesn't vary by time
+            lod_filtered = lod.isel({TEMPORAL_COORD: time_mask})
 
             # Compute censor flag: 1.0 if value <= LoD, else 0.0 (for finite values only)
             censor = xr.where(
@@ -509,6 +608,61 @@ class SyntheticProcessor:
         num_runs = len(pop.run_id)
         print(f"  ✓ Extracted population with {num_runs} runs: {pop.shape}")
         return pop
+
+    def _extract_latent_sird(self, ds: xr.Dataset) -> xr.Dataset | None:
+        """Extract latent SIRD compartments normalized to fraction space."""
+        latent_names = (
+            "latent_S_true",
+            "latent_I_true",
+            "latent_R_true",
+            "latent_D_true",
+        )
+        missing = [name for name in latent_names if name not in ds]
+        if missing:
+            print(
+                "  Warning: latent SIRD variables missing from synthetic dataset; "
+                f"skipping latent supervision targets: {missing}"
+            )
+            return None
+
+        if "population" not in ds:
+            print(
+                "  Warning: population missing from synthetic dataset; "
+                "skipping latent supervision targets."
+            )
+            return None
+
+        print("Extracting latent SIRD targets...")
+        start_date = np.datetime64(self.config.start_date)
+        end_date = np.datetime64(self.config.end_date)
+        population = ds["population"].rename({"region_id": REGION_COORD}).astype(
+            np.float32
+        )
+        population = population.where(population > 0)
+        latent_vars: dict[str, xr.DataArray] = {}
+
+        for name in latent_names:
+            latent = ds[name].transpose("run_id", TEMPORAL_COORD, REGION_COORD)
+            time_mask = (latent[TEMPORAL_COORD] >= start_date) & (
+                latent[TEMPORAL_COORD] <= end_date
+            )
+            latent = latent.isel({TEMPORAL_COORD: time_mask}).astype(np.float32)
+
+            # The model roll-forward runs in fraction space with N=1.0, so
+            # normalize raw synthetic counts by population during preprocessing.
+            latent_fraction = (latent / population).astype(np.float32)
+            latent_mask = latent_fraction.notnull()
+
+            latent_vars[name] = latent_fraction
+            latent_vars[f"{name}_mask"] = latent_mask
+
+        num_runs = len(ds.run_id)
+        example_name = latent_names[0]
+        print(
+            "  ✓ Extracted latent SIRD targets with "
+            f"{num_runs} runs: {latent_vars[example_name].shape}"
+        )
+        return xr.Dataset(latent_vars)
 
     def _extract_hospitalizations(self, ds: xr.Dataset) -> xr.Dataset | None:
         """Extract hospitalizations data from synthetic bundle.

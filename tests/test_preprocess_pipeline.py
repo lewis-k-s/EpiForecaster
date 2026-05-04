@@ -192,6 +192,30 @@ class TestPipelineMasksAndMetadata:
         mask = pipeline._compute_valid_targets_mask(ds)
         assert mask.sel(run_id=0, region_id="R2") == 1
 
+    def test_compute_valid_targets_mask_uses_cases_mask(self, mock_config):
+        """Imputed/non-null case values should not count as observed density."""
+        pipeline = OfflinePreprocessingPipeline(mock_config)
+
+        dates = pd.date_range("2022-01-01", periods=10)
+        regions = ["R1", "R2"]
+        cases_data = np.ones((1, 10, 2), dtype=np.float32)
+        cases_mask = np.ones((1, 10, 2), dtype=bool)
+        cases_mask[0, 3:, 1] = False
+
+        ds = xr.Dataset(
+            {
+                "cases": (["run_id", "date", REGION_COORD], cases_data),
+                "cases_mask": (["run_id", "date", REGION_COORD], cases_mask),
+            },
+            coords={"run_id": [0], "date": dates, REGION_COORD: regions},
+        )
+
+        mock_config.min_density_threshold = 0.5
+        mask = pipeline._compute_valid_targets_mask(ds)
+
+        assert bool(mask.sel(run_id=0, region_id="R1"))
+        assert not bool(mask.sel(run_id=0, region_id="R2"))
+
     @patch("xarray.open_dataarray")
     def test_compute_edar_region_mask(self, mock_open_da, mock_config):
         """Test edar_has_source mask alignment/reindex."""

@@ -78,7 +78,7 @@ Question: which objectives are carrying performance and identifiability?
   - [ ] `-L_cases`
   - [ ] `-L_hosp`
   - [ ] `-L_deaths`
-- [ ] Weight sweeps around defaults (`w_sir`, head weights)
+- [ ] Weight sweeps around defaults (`w_sird_supervision`, head weights)
 - [ ] Measure both observed-target error and latent plausibility impact
 
 Primary deliverable: ablation heatmap (metric deltas vs default model).

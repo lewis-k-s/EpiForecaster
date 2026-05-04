@@ -170,7 +170,9 @@ def discover_runs(config: EpiForecasterConfig) -> tuple[str, list[str]]:
         config: EpiForecasterConfig with dataset path
 
     Returns:
-        Tuple of (real_run_id, list_of_synthetic_run_ids)
+        Tuple of (real_run_id, list_of_synthetic_run_ids).
+        When no real run exists, returns ("", all_synthetic_run_ids) for
+        synth-only pretraining mode.
     """
     real_run = REAL_RUN_ID
     synth_runs = []
@@ -186,6 +188,14 @@ def discover_runs(config: EpiForecasterConfig) -> tuple[str, list[str]]:
     except Exception as e:
         logger.warning(f"Failed to discover runs from {ds_path}: {e}")
         return real_run, []
+
+    has_real = real_run in all_runs
+    if not has_real and synth_runs:
+        logger.info(
+            f"No real run found; using all {len(synth_runs)} synthetic runs "
+            "for synth-only pretraining."
+        )
+        return "", synth_runs
 
     if config.training.curriculum.enabled and len(synth_runs) > MAX_SYNTH_RUNS:
         sparsity_map = load_sparsity_mapping(ds_path)
@@ -377,6 +387,115 @@ def build_curriculum_datasets(
     """
     dataset_path = Path(config.data.dataset_path)
 
+    # --- Synth-only mode: no real dataset ---
+    if not real_run:
+        reference_run = _select_synthetic_scaler_run(synth_runs, dataset_path)
+        region_ids = _load_region_ids(dataset_path, reference_run)
+        train_region_ids = [region_ids[n] for n in train_nodes]
+
+        synth_scaler_run = reference_run
+        synth_train_nodes = _map_region_ids_to_nodes(
+            train_region_ids,
+            dataset_path=dataset_path,
+            run_id=synth_scaler_run,
+        )
+        if not synth_train_nodes:
+            synth_train_nodes = _fallback_all_nodes(dataset_path, synth_scaler_run)
+            logger.warning(
+                "Synthetic scaler run '%s' has no overlap with reference regions; "
+                "fitting synthetic scalers on all nodes instead.",
+                synth_scaler_run,
+            )
+
+        synth_scaler_ds = EpiDataset(
+            config=config,
+            target_nodes=synth_train_nodes,
+            context_nodes=synth_train_nodes,
+            biomarker_preprocessor=None,
+            mobility_preprocessor=None,
+            run_id=synth_scaler_run,
+            region_embedding_store=region_embedding_store,
+        )
+
+        synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
+        synth_mobility_preprocessor = synth_scaler_ds.mobility_preprocessor
+
+        synth_datasets = []
+        for s_run in synth_runs:
+            if s_run == synth_scaler_run:
+                synth_datasets.append(synth_scaler_ds)
+                continue
+
+            mapped_train_nodes = _map_region_ids_to_nodes(
+                train_region_ids,
+                dataset_path=dataset_path,
+                run_id=s_run,
+            )
+            if not mapped_train_nodes:
+                mapped_train_nodes = _fallback_all_nodes(dataset_path, s_run)
+                logger.warning(
+                    "Synthetic run '%s' has no overlap with reference regions; "
+                    "using all nodes for training targets.",
+                    s_run,
+                )
+
+            s_ds = EpiDataset(
+                config=config,
+                target_nodes=mapped_train_nodes,
+                context_nodes=mapped_train_nodes,
+                biomarker_preprocessor=synth_bio_preprocessor,
+                mobility_preprocessor=synth_mobility_preprocessor,
+                run_id=s_run,
+                region_embedding_store=region_embedding_store,
+            )
+            synth_datasets.append(s_ds)
+
+        train_dataset = ConcatDataset(synth_datasets)
+
+        val_dataset = EpiDataset(
+            config=config,
+            target_nodes=val_nodes,
+            context_nodes=train_nodes + val_nodes,
+            biomarker_preprocessor=synth_bio_preprocessor,
+            mobility_preprocessor=synth_mobility_preprocessor,
+            preloaded_mobility=synth_scaler_ds.preloaded_mobility,
+            mobility_mask=synth_scaler_ds.mobility_mask,
+            shared_sparse_topology=synth_scaler_ds.shared_sparse_topology,
+            run_id=reference_run,
+            region_embedding_store=region_embedding_store,
+        )
+
+        test_dataset = EpiDataset(
+            config=config,
+            target_nodes=test_nodes,
+            context_nodes=train_nodes + val_nodes,
+            biomarker_preprocessor=synth_bio_preprocessor,
+            mobility_preprocessor=synth_mobility_preprocessor,
+            preloaded_mobility=synth_scaler_ds.preloaded_mobility,
+            mobility_mask=synth_scaler_ds.mobility_mask,
+            shared_sparse_topology=synth_scaler_ds.shared_sparse_topology,
+            run_id=reference_run,
+            region_embedding_store=region_embedding_store,
+        )
+
+        synth_scaler_ds.release_shared_sparse_topology()
+        val_dataset.release_shared_sparse_topology()
+        test_dataset.release_shared_sparse_topology()
+        for ds in synth_datasets:
+            ds.release_shared_sparse_topology()
+
+        _validate_curriculum_dataset_dimensions(synth_datasets)
+
+        return CurriculumBuildResult(
+            train_dataset=train_dataset,
+            val_dataset=val_dataset,
+            test_dataset=test_dataset,
+            real_run_id="",
+            synth_run_ids=synth_runs,
+            region_embedding_store=region_embedding_store,
+        )
+
+    # --- Standard mode: real + synthetic ---
     real_config = config
     if config.data.real_dataset_path:
         real_config = copy.deepcopy(config)

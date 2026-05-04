@@ -94,6 +94,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         config: CurriculumConfig,
         drop_last: bool = False,
         real_run_id: str = "real",
+        seed: int | None = None,
     ):
         """
         Args:
@@ -112,6 +113,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.config = config
         self.drop_last = drop_last
         self.real_run_id = real_run_id.strip()
+        self.seed = seed
 
         self.state = CurriculumState()
 
@@ -254,43 +256,157 @@ class EpidemicCurriculumSampler(BatchSampler):
             f"Curriculum Epoch {epoch}: ratio={self.state.synth_ratio:.2f}, "
             f"mode={self.state.mode}{sparsity_info}"
         )
+        logger.info(
+            "Curriculum mode is informational only; dataset-native "
+            "data.sample_ordering controls within-dataset iteration order."
+        )
 
     def _get_indices_for_dataset(self, dataset_idx: int) -> list[int]:
         """Get global indices for a specific sub-dataset."""
-        ds = self.sub_datasets[dataset_idx]
         offset = self.dataset_offsets[dataset_idx]
-        
-        # We can implement 'mode' logic here (Node-Major vs Time-Major)
-        # For now, we just take linear indices (which depends on dataset.sample_ordering)
-        # If we want to enforce Time-Major or Node-Major, we might need to sort.
-        # But EpiDataset is usually sorted by (Target, Time) or (Time, Target).
-        # We assume the dataset's native ordering is acceptable for 'node_major' if it was configured as such.
-        # But the curriculum might want to CHANGE the ordering.
-        
-        # NOTE: Re-sorting indices per epoch is expensive if N is large.
-        # For Phase 1 (Data Access), let's stick to the dataset's native order
-        # and just iterate chunks.
-        
-        n_samples = len(ds)
-        local_indices = list(range(n_samples))
-        
-        # Apply mode-based shuffling if needed?
-        # If mode == 'time_major', we might want random access across nodes but sequential in time?
-        # Actually, "Time-Major" usually means [T0_N0, T0_N1, ... T1_N0, T1_N1 ...]
-        # "Node-Major" usually means [N0_T0, N0_T1, ... N1_T0, N1_T1 ...]
-        # The dataset creation config `sample_ordering` sets the physical layout.
-        # Changing it here would mean hopping around the file, hurting locality.
-        # We rely on "Chunking" to give us locality.
-        
-        # If we want "Snapshot-based" (Time-Major) batches, we should ideally ensure
-        # the dataset is Time-Major.
-        
-        global_indices = [idx + offset for idx in local_indices]
-        return global_indices
+        n_samples = len(self.sub_datasets[dataset_idx])
+        return [idx + offset for idx in range(n_samples)]
 
     def _chunk_indices(self, indices: list[int], chunk_size: int) -> list[list[int]]:
         """Split indices into chunks."""
         return [indices[i : i + chunk_size] for i in range(0, len(indices), chunk_size)]
+
+    def _rng_for_epoch(self, epoch: int | None = None) -> random.Random:
+        epoch_value = self.state.epoch if epoch is None else epoch
+        if self.seed is None:
+            return random.Random(epoch_value)
+        return random.Random(self.seed + epoch_value)
+
+    def _chunk_to_batches(self, chunk: list[int]) -> list[list[int]]:
+        batches = []
+        for i in range(0, len(chunk), self.batch_size):
+            batch = chunk[i : i + self.batch_size]
+            if len(batch) == self.batch_size or not self.drop_last:
+                batches.append(batch)
+        return batches
+
+    def _build_chunk_streams(
+        self,
+        dataset_indices: list[int],
+        rng: random.Random,
+    ) -> list[list[list[int]]]:
+        streams: list[list[list[int]]] = []
+        for dataset_idx in dataset_indices:
+            indices = self._get_indices_for_dataset(dataset_idx)
+            chunks = self._chunk_indices(indices, self.config.chunk_size)
+            rng.shuffle(chunks)
+            for chunk in chunks:
+                chunk_batches = self._chunk_to_batches(chunk)
+                if chunk_batches:
+                    streams.append(chunk_batches)
+        rng.shuffle(streams)
+        return streams
+
+    @staticmethod
+    def _stream_batch_count(streams: list[list[list[int]]]) -> int:
+        return sum(len(chunk_batches) for chunk_batches in streams)
+
+    @staticmethod
+    def _synth_ratio(real_batches: int, synth_batches: int) -> float:
+        total = real_batches + synth_batches
+        if total <= 0:
+            return 0.0
+        return synth_batches / total
+
+    def _resolve_batch_budget(
+        self,
+        real_available: int,
+        synth_available: int,
+    ) -> tuple[int, int]:
+        target_ratio = self.state.synth_ratio
+        if real_available <= 0:
+            return 0, synth_available
+        if synth_available <= 0:
+            return real_available, 0
+        if target_ratio <= 0.0:
+            return real_available, 0
+        if target_ratio >= 1.0:
+            return 0, synth_available
+
+        candidates: set[tuple[int, int]] = set()
+
+        synth_from_real = real_available * target_ratio / (1.0 - target_ratio)
+        for synth_count in {
+            math.floor(synth_from_real),
+            math.ceil(synth_from_real),
+            synth_available,
+        }:
+            if 0 <= synth_count <= synth_available:
+                candidates.add((real_available, synth_count))
+
+        real_from_synth = synth_available * (1.0 - target_ratio) / target_ratio
+        for real_count in {
+            math.floor(real_from_synth),
+            math.ceil(real_from_synth),
+            real_available,
+        }:
+            if 0 <= real_count <= real_available:
+                candidates.add((real_count, synth_available))
+
+        candidates = {
+            (real_count, synth_count)
+            for real_count, synth_count in candidates
+            if real_count > 0 or synth_count > 0
+        }
+        if not candidates:
+            return real_available, synth_available
+
+        return min(
+            candidates,
+            key=lambda counts: (
+                abs(self._synth_ratio(*counts) - target_ratio),
+                -(counts[0] + counts[1]),
+                -counts[0],
+            ),
+        )
+
+    def _interleave_chunk_streams(
+        self,
+        real_streams: list[list[list[int]]],
+        synth_streams: list[list[list[int]]],
+        real_budget: int,
+        synth_budget: int,
+    ) -> list[list[int]]:
+        batches: list[list[int]] = []
+        real_idx = 0
+        synth_idx = 0
+        real_used = 0
+        synth_used = 0
+
+        while real_used < real_budget or synth_used < synth_budget:
+            choose_synth = False
+            if synth_used >= synth_budget:
+                choose_synth = False
+            elif real_used >= real_budget:
+                choose_synth = True
+            else:
+                real_progress = real_used / real_budget if real_budget > 0 else 1.0
+                synth_progress = synth_used / synth_budget if synth_budget > 0 else 1.0
+                choose_synth = synth_progress < real_progress
+
+            if choose_synth:
+                if synth_idx >= len(synth_streams):
+                    break
+                chunk_batches = synth_streams[synth_idx]
+                synth_idx += 1
+                take = min(len(chunk_batches), synth_budget - synth_used)
+                batches.extend(chunk_batches[:take])
+                synth_used += take
+            else:
+                if real_idx >= len(real_streams):
+                    break
+                chunk_batches = real_streams[real_idx]
+                real_idx += 1
+                take = min(len(chunk_batches), real_budget - real_used)
+                batches.extend(chunk_batches[:take])
+                real_used += take
+
+        return batches
 
     def _resolve_active_synth_indices(self, epoch: int | None = None) -> list[int]:
         """Return the synthetic datasets active for the given epoch."""
@@ -316,181 +432,59 @@ class EpidemicCurriculumSampler(BatchSampler):
                 available_synth = self.synth_dataset_indices
 
         n_synth = len(available_synth)
-        if n_synth <= 0 or self.state.active_runs <= 0:
+        if n_synth <= 0 or self.state.active_runs == 0:
             return []
 
+        # -1 means "use all available synthetic runs"
+        n_active = n_synth if self.state.active_runs < 0 else min(n_synth, self.state.active_runs)
+
         if self.config.run_sampling == "round_robin":
-            start_idx = (self.state.epoch * self.state.active_runs) % n_synth
+            start_idx = (self.state.epoch * n_active) % n_synth
             return [
                 available_synth[(start_idx + i) % n_synth]
-                for i in range(min(self.state.active_runs, n_synth))
+                for i in range(n_active)
             ]
 
-        return random.sample(available_synth, min(n_synth, self.state.active_runs))
+        rng = self._rng_for_epoch()
+        return rng.sample(available_synth, n_active)
 
-    def num_batches_for_epoch(self, epoch: int | None = None) -> int:
-        """Compute the exact number of batches yielded for a curriculum epoch."""
-        active_synth_indices = self._resolve_active_synth_indices(epoch)
-        total_samples = sum(
-            len(self.sub_datasets[i]) for i in self.real_dataset_indices
-        ) + sum(len(self.sub_datasets[i]) for i in active_synth_indices)
+    def _build_epoch_batches(self, epoch: int | None = None) -> list[list[int]]:
+        if epoch is not None:
+            self.set_curriculum(epoch)
 
-        if self.drop_last:
-            return total_samples // self.batch_size
-        return math.ceil(total_samples / self.batch_size)
+        rng = self._rng_for_epoch()
 
-    def __iter__(self) -> Iterator[list[int]]:
         if not self.config.enabled:
-            # Fallback to standard sequential/random sampling of the whole concat dataset
-            # But normally if disabled, we might not even use this sampler.
-            # If we do, just yield all real data.
             all_indices = []
             for idx in self.real_dataset_indices:
                 all_indices.extend(self._get_indices_for_dataset(idx))
-            
-            # Simple shuffle for standard training
-            random.shuffle(all_indices)
-            
-            # Yield batches
-            for i in range(0, len(all_indices), self.batch_size):
-                batch = all_indices[i : i + self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:
-                    yield batch
-            return
+            rng.shuffle(all_indices)
+            return self._chunk_to_batches(all_indices)
 
-        # 1. Select active synthetic runs
         active_synth_indices = self._resolve_active_synth_indices()
+        real_streams = self._build_chunk_streams(self.real_dataset_indices, rng)
+        synth_streams = self._build_chunk_streams(active_synth_indices, rng)
 
-        # 2. Gather chunks from Real and Active Synthetic datasets
-        real_chunks = []
-        for idx in self.real_dataset_indices:
-            indices = self._get_indices_for_dataset(idx)
-            # Shuffle indices within the dataset before chunking?
-            # No, keep them sequential for locality, shuffle chunks later?
-            # Or shuffle WITHIN chunks.
-            # "Contiguous chunk of chunk_size windows" -> Linear read.
-            real_chunks.extend(self._chunk_indices(indices, self.config.chunk_size))
-            
-        synth_chunks = []
-        for idx in active_synth_indices:
-            indices = self._get_indices_for_dataset(idx)
-            synth_chunks.extend(self._chunk_indices(indices, self.config.chunk_size))
+        real_available = self._stream_batch_count(real_streams)
+        synth_available = self._stream_batch_count(synth_streams)
+        real_budget, synth_budget = self._resolve_batch_budget(
+            real_available, synth_available
+        )
 
-        # Shuffle the order of chunks (but keep items within chunk contiguous-ish?)
-        # Actually, if we shuffle chunks, we jump around the file.
-        # But we only have a few active runs.
-        random.shuffle(real_chunks)
-        random.shuffle(synth_chunks)
+        return self._interleave_chunk_streams(
+            real_streams=real_streams,
+            synth_streams=synth_streams,
+            real_budget=real_budget,
+            synth_budget=synth_budget,
+        )
 
-        # 3. Interleave batches
-        # We turn chunks into batches.
-        # A chunk (e.g. 512 items) becomes ~16 batches (size 32).
-        
-        def batches_from_chunks(chunks):
-            for chunk in chunks:
-                # Optional: Shuffle within the chunk for local randomness
-                # (Preserves block locality but randomizes sample order)
-                # chunk_copy = chunk[:]
-                # random.shuffle(chunk_copy)
-                
-                # Create batches from this chunk
-                for i in range(0, len(chunk), self.batch_size):
-                    yield chunk[i : i + self.batch_size]
+    def num_batches_for_epoch(self, epoch: int | None = None) -> int:
+        """Compute the exact number of batches yielded for a curriculum epoch."""
+        return len(self._build_epoch_batches(epoch))
 
-        real_batch_iter = batches_from_chunks(real_chunks)
-        synth_batch_iter = batches_from_chunks(synth_chunks)
-        
-        # Create a pool of batches
-        # We want to yield batches with probability P(synth) = ratio
-        
-        # We can just collect all batches and shuffle them?
-        # If we collect ALL batches and shuffle, we lose the "Chunked Interleaving" benefit
-        # which is about temporal locality of access.
-        # "Chunked Interleaving": Read a chunk of Synth, yield its batches. Read a chunk of Real...
-        
-        # Let's implement the "Chunked Interleaving" as described:
-        # "Emit k synthetic batches from the chunk and interleave m real batches"
-        
-        real_batches = list(real_batch_iter)
-        synth_batches = list(synth_batch_iter)
-
-        # Calculate target number of batches
-        # If ratio = 0.8, we want 4 synth for 1 real.
-        # Total batches depends on how much data we use.
-        # "One epoch" usually means "One pass over the Real data" or "One pass over Active data"?
-        # Usually defined by the sampler length.
-        
-        # Let's assume we want to iterate over the available Real and Active Synth data.
-        # But we might drop some data to satisfy the ratio.
-        # Or we oversample?
-        
-        # Simplest approach: Use all available real and active synth data, 
-        # but mixed in order.
-        # If the ratio implies we have too much Synth, we drop some?
-        # Or we just mix what we have.
-        # But "Curriculum" implies controlling the distribution.
-        
-        # If we just mix `real_batches` and `synth_batches`, the ratio is determined by dataset sizes.
-        # We want to enforce `self.state.synth_ratio`.
-        
-        target_ratio = self.state.synth_ratio
-        
-        # Generator that yields batches according to ratio
-        # We pull from real_batches and synth_batches queues.
-        
-        # We can assign a "score" to each batch? No.
-        # We can just iterate and probabilistically pick?
-        
-        # To strictly respect "Chunked Interleaving" (Process a whole chunk of Synth, then Real...):
-        # We should work with Chunks, not Batches.
-        
-        # Re-think:
-        # We have `real_chunks` and `synth_chunks`.
-        # We want to form a sequence of chunks that respects the ratio.
-        # e.g. [S, S, S, S, R, S, S, S, S, R...]
-        
-        # If we have N_R real chunks and N_S synth chunks.
-        # And we want Ratio P_S.
-        # This implies we might need to oversample or undersample chunks.
-        
-        # Let's try to consume both pools exhaustively if possible, but mixing them.
-        # If we just shuffle `real_chunks + synth_chunks`, the ratio is fixed by data size.
-        # If we want to CHANGE the ratio (e.g. 80% synth), we need to sample with replacement?
-        
-        # Given the complexity of "exact ratio" vs "dataset size", and the user's plan:
-        # "Emit k synthetic batches ... and interleave m real batches"
-        # This implies we are generating the stream.
-        
-        # Let's use a probabilistic generator that pulls from the pools.
-        
-        idx_r = 0
-        idx_s = 0
-        
-        # While we have data in EITHER pool
-        while idx_r < len(real_batches) or idx_s < len(synth_batches):
-            # Decide whether to pick Synth or Real
-            # If we run out of one, force the other?
-            # Or stop?
-            
-            # If we want to strictly follow ratio, we toss a coin.
-            if idx_s < len(synth_batches) and idx_r < len(real_batches):
-                is_synth = random.random() < target_ratio
-            elif idx_s < len(synth_batches):
-                is_synth = True
-            elif idx_r < len(real_batches):
-                is_synth = False
-            else:
-                break
-                
-            if is_synth:
-                batch = synth_batches[idx_s]
-                idx_s += 1
-            else:
-                batch = real_batches[idx_r]
-                idx_r += 1
-            
-            if len(batch) == self.batch_size or not self.drop_last:
-                yield batch
+    def __iter__(self) -> Iterator[list[int]]:
+        for batch in self._build_epoch_batches():
+            yield batch
 
     def __len__(self) -> int:
         return self.num_batches_for_epoch()

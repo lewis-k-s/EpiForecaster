@@ -71,6 +71,88 @@ class AlignmentProcessor:
         final_age = xr.where(valid_history, np.minimum(current_age, max_age), max_age)
         return final_age.transpose(*mask.dims).astype(np.uint8)
 
+    def _align_temporal_dataset(
+        self,
+        data: xr.Dataset | xr.DataArray,
+        target_dates: pd.DatetimeIndex,
+        *,
+        label: str,
+        allow_subset_in_strict: bool = False,
+    ) -> xr.Dataset | xr.DataArray:
+        source_dates = data[TEMPORAL_COORD].values
+        target_values = target_dates.values
+
+        if self.config.temporal_alignment_mode == "strict":
+            if len(source_dates) != len(target_values) or not np.array_equal(
+                source_dates, target_values
+            ):
+                if allow_subset_in_strict and np.isin(
+                    source_dates, target_values
+                ).all():
+                    print(f"Expanding {label} dates to target dates (preserving NaNs)")
+                    return data.reindex({TEMPORAL_COORD: target_dates})
+                raise AssertionError(f"{label} dates are not the same")
+            print(f"{label} dates are already the same")
+            return data
+
+        if not np.isin(source_dates, target_values).all():
+            raise ValueError(
+                f"{label} dates are not a subset of configured target dates"
+            )
+        if len(source_dates) == len(target_values) and np.array_equal(
+            source_dates, target_values
+        ):
+            print(f"{label} dates already match target range")
+            return data
+
+        print(f"Reindexing {label} dates to target dates (preserving missingness)")
+        return data.reindex({TEMPORAL_COORD: target_dates})
+
+    def _align_clinical_dataset(
+        self,
+        data: xr.Dataset | xr.DataArray,
+        target_dates: pd.DatetimeIndex,
+        *,
+        value_name: str,
+        label: str,
+    ) -> xr.Dataset | xr.DataArray:
+        aligned = self._align_temporal_dataset(data, target_dates, label=label)
+        if not isinstance(aligned, xr.Dataset):
+            return aligned
+
+        mask_name = f"{value_name}_mask"
+        age_name = f"{value_name}_age"
+        if mask_name in aligned.data_vars:
+            mask = aligned[mask_name].fillna(False)
+        else:
+            mask = aligned[value_name].notnull()
+        aligned[mask_name] = mask
+        aligned[age_name] = self._compute_age_from_mask(mask)
+        return aligned
+
+    def _build_mobility_time_mask(
+        self,
+        mobility_data: xr.Dataset,
+        target_dates: pd.DatetimeIndex,
+        run_ids: np.ndarray,
+    ) -> xr.DataArray:
+        source_dates = mobility_data[TEMPORAL_COORD].values
+        if "run_id" in mobility_data.dims:
+            source_run_ids = mobility_data["run_id"].values
+        else:
+            source_run_ids = run_ids
+
+        source_mask = xr.DataArray(
+            np.ones((len(source_run_ids), len(source_dates)), dtype=bool),
+            dims=["run_id", TEMPORAL_COORD],
+            coords={"run_id": source_run_ids, TEMPORAL_COORD: source_dates},
+            name="mobility_time_mask",
+        )
+        return source_mask.reindex(
+            {"run_id": run_ids, TEMPORAL_COORD: target_dates},
+            fill_value=False,
+        )
+
     def align_datasets(
         self,
         cases_data: xr.DataArray,
@@ -79,6 +161,7 @@ class AlignmentProcessor:
         population_data: xr.DataArray,
         hospitalizations_data: xr.Dataset | None = None,
         deaths_data: xr.Dataset | None = None,
+        latent_sird_data: xr.Dataset | None = None,
     ) -> xr.Dataset:
         """
         Align all datasets to common temporal and spatial grid using xarray.
@@ -90,6 +173,7 @@ class AlignmentProcessor:
             population_data: Processed population dataset
             hospitalizations_data: Optional processed hospitalizations dataset
             deaths_data: Optional processed deaths dataset
+            latent_sird_data: Optional latent SIRD targets from synthetic data
 
         Returns:
             xr.Dataset of all aligned datasets
@@ -102,36 +186,23 @@ class AlignmentProcessor:
         )
         print(f"Target date range: {len(target_dates)} days")
 
-        # check if dates are already the same
-        assert (cases_data[TEMPORAL_COORD].values == target_dates.values).all(), (
-            "Cases dates are not the same"
+        cases_aligned = self._align_clinical_dataset(
+            cases_data,
+            target_dates,
+            value_name="cases",
+            label="Cases",
         )
-        print("Cases dates are already the same")
-        cases_aligned = cases_data
-
-        assert (mobility_data[TEMPORAL_COORD].values == target_dates.values).all(), (
-            "Mobility dates are not the same"
+        mobility_aligned = self._align_temporal_dataset(
+            mobility_data,
+            target_dates,
+            label="Mobility",
         )
-        print("Mobility dates are already the same")
-        mobility_aligned = mobility_data
-
-        # edar data does not cover the same range so we only expect that it is subset of target dates
-        assert np.isin(edar_data[TEMPORAL_COORD].values, target_dates.values).all(), (
-            "EDAR subset dates are not the same"
+        edar_aligned = self._align_temporal_dataset(
+            edar_data,
+            target_dates,
+            label="EDAR",
+            allow_subset_in_strict=True,
         )
-
-        # Check if EDAR already matches target range (e.g., synthetic data)
-        edar_matches_target = (
-            edar_data[TEMPORAL_COORD].values[0] == target_dates.values[0]
-            and edar_data[TEMPORAL_COORD].values[-1] == target_dates.values[-1]
-        )
-
-        if edar_matches_target:
-            print("EDAR dates already match target range (no expansion needed)")
-            edar_aligned = edar_data
-        else:
-            print("Expanding EDAR dates to target dates (preserving NaNs)")
-            edar_aligned = edar_data.reindex({TEMPORAL_COORD: target_dates})
 
         # STEP 2: Spatial alignment - identify common regions
         # All datasets should use REGION_COORD for spatial dimension
@@ -196,7 +267,13 @@ class AlignmentProcessor:
 
         # Align hospitalizations if provided
         if hospitalizations_data is not None:
-            hosp_final = hospitalizations_data.reindex({REGION_COORD: common_regions})
+            hosp_temporal = self._align_clinical_dataset(
+                hospitalizations_data,
+                target_dates,
+                value_name="hospitalizations",
+                label="Hospitalizations",
+            )
+            hosp_final = hosp_temporal.reindex({REGION_COORD: common_regions})
             # Preserve missingness signal before zero-filling values.
             if "hospitalizations_mask" in hosp_final.data_vars:
                 hosp_mask = hosp_final["hospitalizations_mask"].fillna(False)
@@ -211,7 +288,13 @@ class AlignmentProcessor:
 
         # Align deaths if provided
         if deaths_data is not None:
-            deaths_final = deaths_data.reindex({REGION_COORD: common_regions})
+            deaths_temporal = self._align_clinical_dataset(
+                deaths_data,
+                target_dates,
+                value_name="deaths",
+                label="Deaths",
+            )
+            deaths_final = deaths_temporal.reindex({REGION_COORD: common_regions})
             # Preserve missingness signal before zero-filling values.
             if "deaths_mask" in deaths_final.data_vars:
                 deaths_mask = deaths_final["deaths_mask"].fillna(False)
@@ -223,6 +306,21 @@ class AlignmentProcessor:
             )
         else:
             deaths_final = None
+
+        # Align latent SIRD targets if provided (synthetic-only path)
+        if latent_sird_data is not None:
+            latent_sird_final = latent_sird_data.reindex({REGION_COORD: common_regions})
+            for var_name in list(latent_sird_final.data_vars):
+                if var_name.endswith("_mask"):
+                    latent_sird_final[var_name] = latent_sird_final[var_name].fillna(
+                        False
+                    )
+                else:
+                    latent_sird_final[var_name] = latent_sird_final[var_name].where(
+                        np.isfinite(latent_sird_final[var_name])
+                    )
+        else:
+            latent_sird_final = None
 
         # Fill mask/censor/age channels with proper defaults for regions without EDAR data
         # Mask: False (no measurement), Censor: 0 (not censored), Age: 14 (max age)
@@ -248,6 +346,11 @@ class AlignmentProcessor:
         # run_id always exists on all data variables
         first_biomarker = edar_final[biomarker_vars[0]]
         run_ids = first_biomarker["run_id"].values
+        mobility_time_mask = self._build_mobility_time_mask(
+            mobility_data,
+            target_dates,
+            run_ids,
+        )
 
         # Create 2D array for (run_id, region) pairs
         biomarker_data_start = xr.DataArray(
@@ -298,6 +401,7 @@ class AlignmentProcessor:
         datasets_to_merge = [
             cases_final,
             mobility_final,
+            mobility_time_mask,
             population_final,
             edar_final,
             biomarker_data_start,
@@ -306,6 +410,8 @@ class AlignmentProcessor:
             datasets_to_merge.append(hosp_final)
         if deaths_final is not None:
             datasets_to_merge.append(deaths_final)
+        if latent_sird_final is not None:
+            datasets_to_merge.append(latent_sird_final)
 
         aligned_dataset = xr.merge(datasets_to_merge, join="exact")
         print("-" * 50)

@@ -123,3 +123,76 @@ def test_edar_expansion_preserves_nan_gaps(mock_config):
     assert (
         jan4["edar_biomarker_N1_age"].values == 1
     )  # Preserved from original (uint8: 1 day)
+
+
+def test_outer_alignment_preserves_full_range_and_mobility_mask(mock_config):
+    """Outer temporal alignment keeps wastewater-only dates and masks mobility."""
+    mock_config.temporal_alignment_mode = "outer"
+    proc = AlignmentProcessor(mock_config)
+
+    target_dates = pd.date_range("2022-01-01", periods=10)
+    short_dates = pd.date_range("2022-01-01", periods=5)
+    edar_dates = pd.date_range("2022-01-03", periods=8)
+    regions = ["R1"]
+
+    cases = xr.Dataset(
+        {
+            "cases": (
+                ["run_id", "date", REGION_COORD],
+                np.ones((1, 5, 1), dtype=np.float32),
+            ),
+            "cases_mask": (
+                ["run_id", "date", REGION_COORD],
+                np.ones((1, 5, 1), dtype=bool),
+            ),
+        },
+        coords={"run_id": ["real"], "date": short_dates, REGION_COORD: regions},
+    )
+    mobility = xr.Dataset(
+        {
+            "mobility": (
+                ["run_id", "date", "origin", "destination"],
+                np.ones((1, 5, 1, 1), dtype=np.float32),
+            )
+        },
+        coords={
+            "run_id": ["real"],
+            "date": short_dates,
+            "origin": regions,
+            "destination": regions,
+        },
+    )
+    edar = xr.Dataset(
+        {
+            "edar_biomarker_N1": (
+                ["run_id", "date", REGION_COORD],
+                np.ones((1, 8, 1), dtype=np.float32),
+            ),
+            "edar_biomarker_N1_mask": (
+                ["run_id", "date", REGION_COORD],
+                np.ones((1, 8, 1), dtype=bool),
+            ),
+        },
+        coords={"run_id": ["real"], "date": edar_dates, REGION_COORD: regions},
+    )
+    pop = xr.DataArray(
+        np.ones(1),
+        coords={REGION_COORD: regions},
+        dims=[REGION_COORD],
+        name="population",
+    )
+
+    aligned = proc.align_datasets(
+        cases_data=cases,
+        mobility_data=mobility,
+        edar_data=edar,
+        population_data=pop,
+    )
+
+    np.testing.assert_array_equal(aligned["date"].values, target_dates.values)
+    np.testing.assert_array_equal(
+        aligned["mobility_time_mask"].values,
+        np.array([[True, True, True, True, True, False, False, False, False, False]]),
+    )
+    assert not bool(aligned["cases_mask"].sel(date="2022-01-06").values.item())
+    assert bool(aligned["edar_biomarker_N1_mask"].sel(date="2022-01-10").values.item())

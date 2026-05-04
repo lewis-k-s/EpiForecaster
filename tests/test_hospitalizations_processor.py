@@ -172,7 +172,7 @@ class TestKalmanSmoothing:
     """Tests for the _apply_kalman_smoothing method."""
 
     def test_kalman_interpolates_gaps(self, mock_config):
-        """Test that Kalman smoothing interpolates missing values."""
+        """Test that filtering interpolates gaps without changing observations."""
         proc = HospitalizationsProcessor(mock_config)
 
         # Create sparse daily data with gaps
@@ -204,6 +204,8 @@ class TestKalmanSmoothing:
 
         # All values should be finite after smoothing
         assert smoothed["hospitalizations"].notna().all()
+        assert smoothed.iloc[0]["hospitalizations"] == pytest.approx(10.0)
+        assert smoothed.iloc[7]["hospitalizations"] == pytest.approx(15.0)
 
         # Original observations should be tracked
         assert "hospitalizations_observed" in smoothed.columns
@@ -261,6 +263,10 @@ class TestKalmanSmoothing:
         smoothed = proc._apply_kalman_smoothing(daily_df)
         enriched = proc._create_mask_and_age_channels(smoothed)
         assert smoothed["hospitalizations"].notna().all()
+        assert smoothed.iloc[0]["hospitalizations"] == pytest.approx(10.0)
+        assert smoothed.iloc[3]["hospitalizations"] == pytest.approx(12.0)
+        assert smoothed.iloc[5]["hospitalizations"] == pytest.approx(14.0)
+        assert smoothed.iloc[6]["hospitalizations"] == pytest.approx(15.0)
         assert "missing_flag" in smoothed.columns
         assert enriched["hospitalizations_mask"].tolist() == [
             1.0,
@@ -414,7 +420,7 @@ class TestFullPipeline:
         """Test full processing pipeline with weekly data."""
         proc = HospitalizationsProcessor(mock_config)
 
-        result = proc.process(mock_hospitalizations_file, apply_smoothing=True)
+        result = proc.process(mock_hospitalizations_file)
 
         # Check output structure
         assert "hospitalizations" in result
@@ -439,24 +445,6 @@ class TestFullPipeline:
         # Note: mask is only 1.0 on actual observation days (week starts)
         assert float(result["hospitalizations_mask"].sum()) == 6.0
 
-    def test_process_without_smoothing(self, mock_config, mock_hospitalizations_file):
-        """Test processing without Kalman smoothing."""
-        proc = HospitalizationsProcessor(mock_config)
-
-        result = proc.process(mock_hospitalizations_file, apply_smoothing=False)
-
-        # Check that mask correctly identifies observation days
-        # 3 weeks × 2 municipalities = 6 observations
-        assert float(result["hospitalizations_mask"].sum()) == 6.0
-
-        # Non-observation days should be marked in mask
-        assert (result["hospitalizations_mask"] == 0).any()
-
-        # Data should exist (not all NaN) since observations are present
-        # Note: pivot_table with aggfunc="sum" converts NaN to 0 for the output,
-        # but the mask tells us which are real observations vs filled
-        assert result["hospitalizations"].notnull().any()
-
     def test_process_empty_data(self, mock_config, tmp_path: Path):
         """Test processing with empty data."""
         # Create empty hospitalizations file
@@ -468,7 +456,7 @@ class TestFullPipeline:
         )
 
         proc = HospitalizationsProcessor(mock_config)
-        result = proc.process(data_dir, apply_smoothing=True)
+        result = proc.process(data_dir)
 
         # Should return empty but valid dataset
         assert "hospitalizations" in result

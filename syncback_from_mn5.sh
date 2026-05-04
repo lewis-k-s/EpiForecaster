@@ -12,12 +12,17 @@ rsync -avz --progress \
 # Sync region training runs (if any) for the same experiment name.
 rsync -avz --progress \
     "${REMOTE_ROOT}/outputs/region_training/${EXPERIMENT_NAME}" \
-    ./outputs/region_training/ || true
+    ./outputs/region_training/ 2>/dev/null || true
+
+# Sync logs (SLURM output, etc.).
+rsync -avz --progress \
+    "${REMOTE_ROOT}/logs/" \
+    ./logs/ 2>/dev/null || true
 
 # Sync repo-level wandb offline logs (if created by ad-hoc runs).
 rsync -avz --progress \
     "${REMOTE_ROOT}/wandb" \
-    ./wandb/ || true
+    ./wandb/ 2>/dev/null || true
 
 if [ "$SYNC_WANDB" = "1" ]; then
   if command -v wandb >/dev/null 2>&1; then

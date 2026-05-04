@@ -52,7 +52,11 @@ def _make_config(
     return EpiForecasterConfig(model=model, data=data_cfg)
 
 
-def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
+def _write_tiny_dataset(
+    zarr_path: str,
+    periods: int = 10,
+    mobility_time_mask: np.ndarray | None = None,
+) -> None:
     dates = pd.date_range("2020-01-01", periods=periods, freq="D")
     regions = np.array([0, 1], dtype=np.int64)
     # Use padded run_id to match production data format
@@ -95,6 +99,8 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
 
     # Mobility: full connectivity - add run_id dimension
     mobility = np.ones((1, periods, 2, 2), dtype=np.float32)
+    if mobility_time_mask is None:
+        mobility_time_mask = np.ones((1, periods), dtype=bool)
 
     population = np.array([1000.0, 1000.0], dtype=np.float32)
 
@@ -134,6 +140,10 @@ def _write_tiny_dataset(zarr_path: str, periods: int = 10) -> None:
             "mobility": (
                 ("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"),
                 mobility,
+            ),
+            "mobility_time_mask": (
+                ("run_id", TEMPORAL_COORD),
+                mobility_time_mask,
             ),
             "population": ((REGION_COORD,), population),
         },
@@ -175,6 +185,27 @@ def test_getitem_preserves_target_history_when_self_edge_missing(tmp_path):
     assert torch.all(cases_hist[:, 1] > 0.5), (
         "target history mask got zeroed by mobility masking"
     )
+
+
+@pytest.mark.epiforecaster
+def test_mobility_time_mask_blocks_edges_when_threshold_zero(tmp_path):
+    zarr_path = tmp_path / "mobility_time_mask.zarr"
+    mobility_time_mask = np.array(
+        [[True, True, True, True, False, False, False, False]],
+        dtype=bool,
+    )
+    _write_tiny_dataset(
+        str(zarr_path),
+        periods=8,
+        mobility_time_mask=mobility_time_mask,
+    )
+
+    config = _make_config(str(zarr_path), log_scale=False)
+    config.data.mobility_threshold = 0.0
+    dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+
+    assert torch.all(dataset.mobility_mask[:4])
+    assert not torch.any(dataset.mobility_mask[4:])
 
 
 @pytest.mark.epiforecaster
@@ -269,6 +300,27 @@ def test_getitem_maps_target_and_context_nodes_to_canonical_region_indices(tmp_p
         assert item["target_region_index"] == 0
 
     assert torch.equal(item["mob_real_node_idx"], torch.tensor([1, 0]))
+
+
+@pytest.mark.epiforecaster
+def test_getitem_reuses_cached_graph_region_indices(tmp_path):
+    zarr_path = tmp_path / "cached_region_mapping.zarr"
+    _write_tiny_dataset(str(zarr_path), periods=8)
+
+    config = _make_config(str(zarr_path), log_scale=False)
+    store = RegionEmbeddingStore(
+        embeddings=torch.randn(2, 1),
+        region_id_to_index={"0": 1, "1": 0},
+    )
+    dataset = EpiDataset(
+        config=config,
+        target_nodes=[0, 1],
+        context_nodes=[0, 1],
+        region_embedding_store=store,
+    )
+
+    item = dataset[0]
+    assert item["mob_real_node_idx"] is dataset._graph_region_indices
 
 
 @pytest.mark.epiforecaster

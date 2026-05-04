@@ -40,6 +40,14 @@ class EpiBatch:
     ww_target_mask: torch.Tensor  # (B, H)
     cases_target_mask: torch.Tensor  # (B, H)
     deaths_target_mask: torch.Tensor  # (B, H)
+    S_target: torch.Tensor | None  # (B, H+1)
+    I_target: torch.Tensor | None  # (B, H+1)
+    R_target: torch.Tensor | None  # (B, H+1)
+    D_target: torch.Tensor | None  # (B, H+1)
+    S_target_mask: torch.Tensor | None  # (B, H+1)
+    I_target_mask: torch.Tensor | None  # (B, H+1)
+    R_target_mask: torch.Tensor | None  # (B, H+1)
+    D_target_mask: torch.Tensor | None  # (B, H+1)
 
     def to(
         self,
@@ -49,15 +57,20 @@ class EpiBatch:
         """Move batch to the target device without changing dtypes."""
         if isinstance(device, str):
             device = torch.device(device)
+        safe_non_blocking = bool(non_blocking) and device.type == "cuda"
 
         for field_name in self.__dataclass_fields__:
             value = getattr(self, field_name)
             if isinstance(value, torch.Tensor):
                 if value.device != device:
-                    value = value.to(device=device, non_blocking=non_blocking)
+                    value = value.to(device=device, non_blocking=safe_non_blocking)
                 setattr(self, field_name, value)
             elif isinstance(value, Batch):
-                setattr(self, field_name, value.to(device, non_blocking=non_blocking))
+                setattr(
+                    self,
+                    field_name,
+                    value.to(device, non_blocking=safe_non_blocking),
+                )
         return self
 
     def pin_memory(self) -> "EpiBatch":
@@ -94,6 +107,25 @@ def _promote_batch_float_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if torch.is_floating_point(tensor) and tensor.dtype != MODEL_PARAM_DTYPE:
         return tensor.to(MODEL_PARAM_DTYPE)
     return tensor
+
+
+def _stack_optional_batch_tensor(
+    batch: list[EpiDatasetItem], key: str
+) -> torch.Tensor | None:
+    first_value = batch[0].get(key)
+    if first_value is None:
+        if any(item.get(key) is not None for item in batch[1:]):
+            raise ValueError(
+                f"Inconsistent optional batch key {key!r}: mixed None and tensor"
+            )
+        return None
+
+    values = [item.get(key) for item in batch]
+    if any(value is None for value in values):
+        raise ValueError(
+            f"Inconsistent optional batch key {key!r}: mixed None and tensor"
+        )
+    return torch.stack(values, dim=0)  # type: ignore[arg-type]
 
 
 def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
@@ -141,11 +173,17 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     if len(non_none_run_ids) == len(run_ids) and len(normalized_run_ids) == 1:
         batch_run_id = next(iter(normalized_run_ids))
 
-    # Context node mapping (constant across batch, so we can take from the first item)
+    # Context node mapping is cached once on the dataset and shared by identity
+    # across all samples in the batch.
+    mob_real_node_idx = None
     if "mob_real_node_idx" in batch[0]:
         mob_real_node_idx = batch[0]["mob_real_node_idx"]
-    else:
-        mob_real_node_idx = None
+        for item_idx, item in enumerate(batch[1:], start=1):
+            if item.get("mob_real_node_idx") is not mob_real_node_idx:
+                raise ValueError(
+                    "Inconsistent mobility batch: mob_real_node_idx must be the "
+                    f"same cached tensor for all samples; sample {item_idx} differs."
+                )
 
     # 5) Batch-like container
     mob_batch = Batch()
@@ -207,6 +245,14 @@ def collate_epiforecaster_batch(
     deaths_target_masks = torch.stack(
         [item["deaths_target_mask"] for item in batch], dim=0
     )
+    S_targets = _stack_optional_batch_tensor(batch, "S_target")
+    I_targets = _stack_optional_batch_tensor(batch, "I_target")
+    R_targets = _stack_optional_batch_tensor(batch, "R_target")
+    D_targets = _stack_optional_batch_tensor(batch, "D_target")
+    S_target_masks = _stack_optional_batch_tensor(batch, "S_target_mask")
+    I_target_masks = _stack_optional_batch_tensor(batch, "I_target_mask")
+    R_target_masks = _stack_optional_batch_tensor(batch, "R_target_mask")
+    D_target_masks = _stack_optional_batch_tensor(batch, "D_target_mask")
 
     # Stack temporal covariates
     temporal_covariates = torch.stack(
@@ -236,6 +282,30 @@ def collate_epiforecaster_batch(
     ww_target_masks = _promote_batch_float_tensor(ww_target_masks)
     cases_target_masks = _promote_batch_float_tensor(cases_target_masks)
     deaths_target_masks = _promote_batch_float_tensor(deaths_target_masks)
+    if S_targets is not None:
+        S_targets = _promote_batch_float_tensor(_replace_non_finite(S_targets))
+    if I_targets is not None:
+        I_targets = _promote_batch_float_tensor(_replace_non_finite(I_targets))
+    if R_targets is not None:
+        R_targets = _promote_batch_float_tensor(_replace_non_finite(R_targets))
+    if D_targets is not None:
+        D_targets = _promote_batch_float_tensor(_replace_non_finite(D_targets))
+    if S_target_masks is not None:
+        S_target_masks = _promote_batch_float_tensor(
+            _replace_non_finite(S_target_masks)
+        )
+    if I_target_masks is not None:
+        I_target_masks = _promote_batch_float_tensor(
+            _replace_non_finite(I_target_masks)
+        )
+    if R_target_masks is not None:
+        R_target_masks = _promote_batch_float_tensor(
+            _replace_non_finite(R_target_masks)
+        )
+    if D_target_masks is not None:
+        D_target_masks = _promote_batch_float_tensor(
+            _replace_non_finite(D_target_masks)
+        )
 
     # Store B and T on the batch for downstream reshaping
     T = batch[0]["mob_x"].shape[0] if B > 0 else 0
@@ -275,6 +345,14 @@ def collate_epiforecaster_batch(
         ww_target_mask=ww_target_masks,
         cases_target_mask=cases_target_masks,
         deaths_target_mask=deaths_target_masks,
+        S_target=S_targets,
+        I_target=I_targets,
+        R_target=R_targets,
+        D_target=D_targets,
+        S_target_mask=S_target_masks,
+        I_target_mask=I_target_masks,
+        R_target_mask=R_target_masks,
+        D_target_mask=D_target_masks,
     )
 
 

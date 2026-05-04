@@ -16,7 +16,7 @@ Because `cases` and EDAR biomarkers resolve to `(time, region)` series, the comb
 ## Processing Stages
 
 1. **Raw loaders (`CasesProcessor`, `EDARProcessor`, `MobilityProcessor`)** – Each processor reads its source (CSV, NetCDF, etc.), performs source-specific cleaning, and emits tensors plus metadata (date ranges, region lists).
-2. **Alignment (`AlignmentProcessor`)** – Harmonizes temporal indices to the cases timeline and uses `region_metadata` to translate biomarker/mobility regions into the case region ID space. Coverage stats and any dropped rows are tracked in the stage report.
+2. **Alignment (`AlignmentProcessor`)** – Harmonizes temporal indices to the configured timeline and uses `region_metadata` to translate biomarker/mobility regions into the case region ID space. The default `temporal_alignment_mode: "strict"` preserves the historical exact-match behavior for cases and mobility; `temporal_alignment_mode: "outer"` reindexes sources to the configured range so wastewater-only tails can remain in the canonical output without marking unavailable cases or mobility as observed.
 3. **Static transforms** – All continuous series are log1p-transformed before dtype conversion to prevent float16 overflow:
    - **Clinical series** (`cases`, `hospitalizations`, `deaths`): log1p(per-100k) using population
    - **Mobility**: log1p only
@@ -97,6 +97,7 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | `edar_biomarker_<variant>_age` | `(run_id, time, region)` | uint8 | Days since last measurement (0-14). 14 = no EDAR coverage. |
 | `biomarker_data_start` | `(run_id, region)` | int16 | First time index with biomarker data. -1 = no coverage. |
 | `mobility` | `(run_id, time, origin, destination)` | float16 | Origin–destination flow tensor (log1p-transformed). |
+| `mobility_time_mask` | `(run_id, time)` | bool | True when the mobility tensor has source data for the timestep. False for outer-aligned dates beyond the OD data range. |
 | `population` | `(region,)` | int32 | Static population per region. |
 | `edar_has_source` | `(region,)` | bool | True if region has EDAR site contributions. |
 | `valid_targets` | `(run_id, region)` | bool | True if (run, region) meets minimum data density. |

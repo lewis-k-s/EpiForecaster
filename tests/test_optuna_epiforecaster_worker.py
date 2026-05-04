@@ -99,7 +99,7 @@ def _joint_loss_cfg_stub(**overrides: Any) -> SimpleNamespace:
     joint_overrides = overrides.pop("joint", {})
     joint_defaults = {
         "adaptive_scheme": "gradnorm",
-        "w_sir": 1.0,
+        "w_sird_supervision": 1.0,
         "gradnorm_obs_weight_sum": 0.95,
     }
     joint_defaults.update(joint_overrides)
@@ -317,7 +317,10 @@ class TestSuggestEpiforecasterParams:
             for k in overrides
             if k.startswith("training.loss.joint.w_")
             and k
-            not in ("training.loss.joint.w_sir", "training.loss.joint.w_continuity")
+            not in (
+                "training.loss.joint.w_sird_supervision",
+                "training.loss.joint.w_continuity",
+            )
         ]
         assert loss_weight_overrides == []
 

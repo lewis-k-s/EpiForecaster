@@ -17,7 +17,7 @@ env: "mn5"
 # - Test:  [val_end_date, test_end_date) or end of dataset if test_end_date is omitted
 
 data:
-  dataset_path: data/processed/synthetic_full_holt_damped.zarr
+  dataset_path: data/processed/synthetic_full.zarr
   region2vec_path: checkpoints/region_embedding/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
@@ -54,6 +54,9 @@ model:
     #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
+    #-- temporal covariates (must match dataset) --#
+    include_day_of_week: true
+    include_holidays: true
     #-- SIR physics bounds (prevent gradient explosion) --#
     sir_physics:
       dt: 1.0
@@ -82,7 +85,7 @@ training:
   gradient_clip_value: 5.0
   early_stopping_patience: 5
   nan_loss_patience: 5
-  epochs: 2
+  epochs: 15
   learning_rate: 0.0005
   weight_decay: 1.0e-05
   warmup_steps: 3000
@@ -113,9 +116,8 @@ training:
     profile_epochs: [1, 2]
   plot_forecasts: true
   num_forecast_samples: 3
-  # Joint inference loss configuration (lower w_sir for stability)
+  # Joint inference loss configuration
   loss:
     name: "joint_inference"
     joint:
-      w_sir: 0.01
-      sir_residual_clip: 100.0
+      w_sird_supervision: 0.01

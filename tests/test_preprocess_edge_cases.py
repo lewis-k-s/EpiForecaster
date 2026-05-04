@@ -178,13 +178,13 @@ class TestProcessorsKalmanFallback:
 
 class TestSmoothedDataValidity:
     def test_catalonia_cases_smoothed_validity(self, minimal_config):
-        """Verify smoothed cases are finite and non-negative."""
+        """Verify case gap filling is finite and preserves observed values."""
         proc = CataloniaCasesProcessor(minimal_config)
 
-        # Create noisy but valid data
         dates = pd.date_range("2022-01-01", periods=20)
         rng = np.random.default_rng(42)
         cases = rng.lognormal(mean=2, sigma=0.5, size=20)
+        cases[[3, 8, 14]] = np.nan
 
         daily_df = pd.DataFrame(
             {"date": dates, "municipality_code": "001", "cases": cases}
@@ -194,18 +194,22 @@ class TestSmoothedDataValidity:
 
         assert np.all(np.isfinite(smoothed["cases"])), "Smoothed cases must be finite"
         assert np.all(smoothed["cases"] >= 0), "Smoothed cases must be non-negative"
-        # Check that we actually did something (values changed)
-        assert not np.allclose(smoothed["cases"], cases), (
-            "Smoothing should modify values"
+        observed_mask = np.isfinite(cases)
+        assert np.allclose(smoothed["cases"][observed_mask], cases[observed_mask]), (
+            "Observed case values should be preserved"
+        )
+        assert np.all(np.isfinite(smoothed["cases"][~observed_mask])), (
+            "Missing case values should be interpolated"
         )
 
     def test_hospitalization_smoothed_validity(self, minimal_config):
-        """Verify smoothed hospitalizations are finite and non-negative."""
+        """Verify hospitalization gap filling is finite and preserves observations."""
         proc = HospitalizationsProcessor(minimal_config)
 
         dates = pd.date_range("2022-01-01", periods=20)
         rng = np.random.default_rng(42)
         hosp = rng.lognormal(mean=1, sigma=0.5, size=20)
+        hosp[[4, 9, 15]] = np.nan
 
         daily_df = pd.DataFrame(
             {"date": dates, "municipality_code": "001", "hospitalizations": hosp}
@@ -218,6 +222,13 @@ class TestSmoothedDataValidity:
         )
         assert np.all(smoothed["hospitalizations"] >= 0), (
             "Smoothed hosp must be non-negative"
+        )
+        observed_mask = np.isfinite(hosp)
+        assert np.allclose(
+            smoothed["hospitalizations"][observed_mask], hosp[observed_mask]
+        ), "Observed hospitalization values should be preserved"
+        assert np.all(np.isfinite(smoothed["hospitalizations"][~observed_mask])), (
+            "Missing hospitalization values should be interpolated"
         )
 
     def test_edar_censor_flags_aggregation(self, minimal_config):

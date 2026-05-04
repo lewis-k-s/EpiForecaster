@@ -135,6 +135,9 @@ class PreprocessingConfig:
         wastewater_flow_mode: "total_flow" or "concentration" for EDAR
 
         alignment_strategy: Strategy for aligning multiple datasets
+        temporal_alignment_mode: "strict" requires datasets to already match the
+            configured range; "outer" reindexes sources to the configured range
+            and preserves source availability in masks.
         target_dataset: Which dataset to align others to
         crop_datasets: Whether to crop datasets to common temporal range
         validate_alignment: Whether to run comprehensive alignment validation
@@ -204,6 +207,7 @@ class PreprocessingConfig:
 
     # Alignment and validation options
     alignment_strategy: str = "interpolate"  # "interpolate", "nearest", "spline"
+    temporal_alignment_mode: str = "strict"  # "strict" or "outer"
     target_dataset: str = "cases"  # "cases", "mobility", "wastewater"
     crop_datasets: bool = True
     validate_alignment: bool = True
@@ -345,6 +349,13 @@ class PreprocessingConfig:
                 f"Valid options: {valid_alignments}"
             )
 
+        valid_temporal_modes = ["strict", "outer"]
+        if self.temporal_alignment_mode not in valid_temporal_modes:
+            raise ValueError(
+                f"Invalid temporal_alignment_mode: {self.temporal_alignment_mode}. "
+                f"Valid options: {valid_temporal_modes}"
+            )
+
         if self.num_workers <= 0:
             raise ValueError("num_workers must be positive")
 
@@ -390,11 +401,7 @@ class PreprocessingConfig:
             PreprocessingConfig instance
         """
         config_path = Path(config_path)
-        if not config_path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {config_path}")
-
-        with open(config_path) as f:
-            config_dict = yaml.safe_load(f)
+        config_dict = cls._load_config_dict(config_path, seen_paths=set())
 
         # Convert string dates to datetime objects
         if "start_date" in config_dict:
@@ -405,6 +412,54 @@ class PreprocessingConfig:
             config_dict["end_date"] = datetime.fromisoformat(config_dict["end_date"])
 
         return cls(**config_dict)
+
+    @classmethod
+    def _load_config_dict(
+        cls,
+        config_path: Path,
+        *,
+        seen_paths: set[Path],
+    ) -> dict[str, Any]:
+        """Load a preprocessing config dict with optional base-config inheritance."""
+        config_path = config_path.resolve()
+        if config_path in seen_paths:
+            raise ValueError(
+                f"Cyclic preprocessing config inheritance detected at: {config_path}"
+            )
+        if not config_path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+        with open(config_path) as f:
+            config_dict = yaml.safe_load(f) or {}
+
+        base_config = config_dict.pop("base_config", None)
+        if base_config is None:
+            return config_dict
+
+        base_path = Path(base_config)
+        if not base_path.is_absolute():
+            base_path = (config_path.parent / base_path).resolve()
+
+        merged = cls._load_config_dict(
+            base_path,
+            seen_paths=seen_paths | {config_path},
+        )
+        return cls._deep_merge_dicts(merged, config_dict)
+
+    @staticmethod
+    def _deep_merge_dicts(
+        base: dict[str, Any],
+        override: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Recursively merge config dictionaries with override precedence."""
+        merged = base.copy()
+        for key, value in override.items():
+            base_value = merged.get(key)
+            if isinstance(base_value, dict) and isinstance(value, dict):
+                merged[key] = PreprocessingConfig._deep_merge_dicts(base_value, value)
+            else:
+                merged[key] = value
+        return merged
 
     def to_file(self, config_path: str | Path) -> None:
         """
@@ -470,6 +525,7 @@ class PreprocessingConfig:
             },
             "alignment": {
                 "strategy": self.alignment_strategy,
+                "temporal_alignment_mode": self.temporal_alignment_mode,
                 "target_dataset": self.target_dataset,
                 "crop_datasets": self.crop_datasets,
                 "validate_alignment": self.validate_alignment,

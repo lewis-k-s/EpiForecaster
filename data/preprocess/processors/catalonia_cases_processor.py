@@ -132,9 +132,11 @@ class CataloniaCasesProcessor:
         return aggregated
 
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply configured causal smoothing for case data.
+        """Apply configured causal filtering for case data.
 
-        Helps reduce reporting noise (weekend effects, holiday delays).
+        Observed positive counts are preserved in the output value channel, while
+        the filter is used to fill timesteps treated as missing by the current
+        preprocessing semantics.
         """
         method = self.config.smoothing.clinical_method
         print(f"  Applying causal smoothing to cases (method={method})...")
@@ -194,15 +196,17 @@ class CataloniaCasesProcessor:
             # Apply causal smoother
             filtered_values, flags = smoother.filter_series(values)
 
-            # Create smoothed records
+            observed_mask = np.asarray(flags) < 1.5
+
+            # Preserve recorded values at observed timesteps; use filtered values for gaps.
             for i, date in enumerate(muni_data.index):
+                filtered_value = float(np.exp(filtered_values[i]))
+                case_value = float(values[i]) if observed_mask[i] else filtered_value
                 smoothed_records.append(
                     {
                         "date": date,
                         "municipality_code": muni_code,
-                        "cases": np.exp(
-                            filtered_values[i]
-                        ),  # Back-transform from log space
+                        "cases": case_value,
                         "cases_log": filtered_values[i],
                         "missing_flag": flags[i],  # 0=normal, 2=missing
                     }
@@ -269,14 +273,12 @@ class CataloniaCasesProcessor:
         self,
         aggregated: pd.DataFrame,
         date_range: pd.DatetimeIndex,
-        apply_smoothing: bool = True,
     ) -> xr.Dataset:
-        """Build cases dataset with Kalman smoothing and mask/age channels.
+        """Build cases dataset with filtered gap filling and mask/age channels.
 
         Args:
             aggregated: DataFrame with columns [date, municipality_code, cases]
             date_range: Complete date range for reindexing
-            apply_smoothing: Whether to apply Kalman smoothing
 
         Returns:
             xr.Dataset with cases, cases_mask, cases_age variables
@@ -304,9 +306,7 @@ class CataloniaCasesProcessor:
             value_name="cases",
         )
 
-        # Apply Kalman smoothing
-        if apply_smoothing:
-            daily_df = self._apply_kalman_smoothing(daily_df)
+        daily_df = self._apply_kalman_smoothing(daily_df)
 
         # Create mask and age channels
         daily_df = self._create_mask_and_age_channels(daily_df)
@@ -385,7 +385,6 @@ class CataloniaCasesProcessor:
         self,
         cases_file: str | Path,
         by_test_type: bool = False,
-        apply_smoothing: bool = True,
     ) -> xr.Dataset:
         """
         Process COVID case data into canonical xarray Dataset.
@@ -393,7 +392,6 @@ class CataloniaCasesProcessor:
         Args:
             cases_file: Path to cases CSV file (Catalonia or Flowmaps format)
             by_test_type: If True, return separate variables for PCR/TAR cases
-            apply_smoothing: If True, apply Kalman smoothing to case data
 
         Returns:
             xarray Dataset with structure:
@@ -433,9 +431,7 @@ class CataloniaCasesProcessor:
         aggregated_total = self._aggregate_by_municipality(cases_df, by_test_type=False)
 
         # Build main cases dataset with smoothing and mask/age
-        result_ds = self._build_cases_dataset(
-            aggregated_total, date_range, apply_smoothing=apply_smoothing
-        )
+        result_ds = self._build_cases_dataset(aggregated_total, date_range)
 
         if by_test_type:
             # Process PCR cases
@@ -446,7 +442,6 @@ class CataloniaCasesProcessor:
                 pcr_ds = self._build_cases_dataset(
                     aggregated_pcr.rename(columns={"n_cases": "cases"}),
                     date_range,
-                    apply_smoothing=apply_smoothing,
                 )
                 result_ds["cases_pcr"] = pcr_ds["cases"]
 
@@ -458,7 +453,6 @@ class CataloniaCasesProcessor:
                 tar_ds = self._build_cases_dataset(
                     aggregated_tar.rename(columns={"n_cases": "cases"}),
                     date_range,
-                    apply_smoothing=apply_smoothing,
                 )
                 result_ds["cases_tar"] = tar_ds["cases"]
 

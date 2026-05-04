@@ -57,7 +57,7 @@ These variables represent the "raw" data that would be available in a real-world
 | `edar_biomarker_N2` | `(run_id, date, edar_id)` | Raw N2 gene target concentration with log-normal noise (sigma ~0.8) and censoring (LoD = 500) |
 | `edar_biomarker_IP4` | `(run_id, date, edar_id)` | Raw IP4 gene target concentration with log-normal noise (sigma ~0.6) and censoring (LoD = 800) |
 | `edar_biomarker_*_censor_hints` | `(run_id, date, edar_id)` | Censoring flags: 0=observed, 1=censored, 2=missing (optional reference) |
-| `edar_biomarker_*_LoD` | `(run_id, edar_id)` | Limit of Detection values per EDAR (constant across runs) |
+| `limit_of_detection_*` | `(run_id, date, edar_id)` | Limit of Detection values per EDAR and date |
 | `mobility_base` | `(origin, target)` | Base mobility matrix (shared across all runs) - factorized format |
 | `mobility_kappa0` | `(run_id, date)` | Mobility reduction factor per run and date (κ₀) - factorized format |
 | `mobility_time_varying` | `(run_id, origin, target, date)` | Full time-varying mobility matrix per run (optional, large format) |
@@ -353,7 +353,7 @@ for scenario in ["Baseline", "Global_Timed", "Local_Static"]:
 # Load N1 biomarker with censoring info
 n1_conc = ds["edar_biomarker_N1"]  # (run_id, date, edar_id)
 n1_censor = ds["edar_biomarker_N1_censor_hints"]  # (run_id, date, edar_id)
-n1_lod = ds["edar_biomarker_N1_LoD"]  # (run_id, edar_id)
+n1_lod = ds["limit_of_detection_N1"]  # (run_id, date, edar_id)
 
 # For a specific run
 run_idx = 0

@@ -5,6 +5,8 @@ limiting specified by gnn_depth. The critical issue being tested is whether
 feature masking works correctly with the full graph topology.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -22,6 +24,8 @@ def _make_config(
     gnn_depth: int = 2,
     log_scale: bool = False,
     sample_ordering: str = "node",
+    graph_adjacency_source: str = "mobility",
+    regions_data_path: str = "",
 ) -> EpiForecasterConfig:
     """Create a minimal config for testing k-hop behavior."""
     model = ModelConfig(
@@ -40,9 +44,11 @@ def _make_config(
         gnn_module="gcn",
         gnn_hidden_dim=8,
         population_dim=1,
+        graph_adjacency_source=graph_adjacency_source,
     )
     data_cfg = DataConfig(
         dataset_path=str(dataset_path),
+        regions_data_path=regions_data_path,
         mobility_threshold=0.0,
         missing_permit={
             "input": {
@@ -62,6 +68,38 @@ def _make_config(
         sample_ordering=sample_ordering,
     )
     return EpiForecasterConfig(model=model, data=data_cfg)
+
+
+def _write_spatial_geojson(path: str, xs: list[float]) -> None:
+    features = []
+    for region_id, x in enumerate(xs):
+        y = 0.0
+        coords = [
+            [
+                [x - 1.0, y - 1.0],
+                [x + 1.0, y - 1.0],
+                [x + 1.0, y + 1.0],
+                [x - 1.0, y + 1.0],
+                [x - 1.0, y - 1.0],
+            ]
+        ]
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {"id": str(region_id), "name": f"Region {region_id}"},
+                "geometry": {"type": "Polygon", "coordinates": coords},
+            }
+        )
+    payload = {
+        "type": "FeatureCollection",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:EPSG::25831"},
+        },
+        "features": features,
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
 
 
 def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) -> None:
@@ -219,6 +257,85 @@ def _verify_node_features_masked(
 def _global_to_local_map(mob_graph: dict) -> dict[int, int]:
     """Build a global->local node index map for a reconstructed graph."""
     return {int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())}
+
+
+@pytest.mark.epiforecaster
+def test_spatial_knn_adjacency_connects_expected_nearest_nodes(tmp_path):
+    zarr_path = str(tmp_path / "chain.zarr")
+    geo_path = str(tmp_path / "regions.geojson")
+    _write_chain_dataset(zarr_path, num_nodes=4, periods=10)
+    _write_spatial_geojson(geo_path, xs=[0.0, 10.0, 30.0, 60.0])
+    config = _make_config(
+        zarr_path,
+        gnn_depth=1,
+        graph_adjacency_source="spatial_knn",
+        regions_data_path=geo_path,
+    )
+
+    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
+
+    adjacency = dataset.spatial_knn_adjacency
+    assert adjacency is not None
+    assert adjacency.dtype == torch.bool
+    assert torch.equal(adjacency, adjacency.T)
+    assert not adjacency.diagonal().any()
+    assert adjacency[0, 1]
+    assert adjacency[1, 2]
+    assert adjacency[2, 3]
+    assert not adjacency[0, 2]
+    assert not adjacency[0, 3]
+
+
+@pytest.mark.epiforecaster
+def test_spatial_knn_depth_one_masks_to_direct_neighbors(tmp_path):
+    zarr_path = str(tmp_path / "chain.zarr")
+    geo_path = str(tmp_path / "regions.geojson")
+    _write_chain_dataset(zarr_path, num_nodes=4, periods=10)
+    _write_spatial_geojson(geo_path, xs=[0.0, 10.0, 30.0, 60.0])
+    config = _make_config(
+        zarr_path,
+        gnn_depth=1,
+        graph_adjacency_source="spatial_knn",
+        regions_data_path=geo_path,
+    )
+
+    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
+    item = dataset[0]
+    node_ids = dataset._graph_node_ids.tolist()
+
+    assert node_ids == [0, 1]
+    assert not torch.allclose(
+        item["mob_x"][0, node_ids.index(0)],
+        torch.zeros_like(item["mob_x"][0, 0]),
+    )
+    assert not torch.allclose(
+        item["mob_x"][0, node_ids.index(1)],
+        torch.zeros_like(item["mob_x"][0, 1]),
+    )
+
+
+@pytest.mark.epiforecaster
+def test_spatial_knn_depth_two_includes_second_hop_neighbors(tmp_path):
+    zarr_path = str(tmp_path / "chain.zarr")
+    geo_path = str(tmp_path / "regions.geojson")
+    _write_chain_dataset(zarr_path, num_nodes=4, periods=10)
+    _write_spatial_geojson(geo_path, xs=[0.0, 10.0, 30.0, 60.0])
+    config = _make_config(
+        zarr_path,
+        gnn_depth=2,
+        graph_adjacency_source="spatial_knn",
+        regions_data_path=geo_path,
+    )
+
+    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
+    item = dataset[0]
+    node_ids = dataset._graph_node_ids.tolist()
+
+    assert node_ids == [0, 1, 2]
+    assert not torch.allclose(
+        item["mob_x"][0, node_ids.index(2)],
+        torch.zeros_like(item["mob_x"][0, 2]),
+    )
 
 
 @pytest.mark.epiforecaster

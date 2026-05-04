@@ -65,9 +65,13 @@ def test_ablation_names_are_valid() -> None:
     assert worker.ABLATIONS["regions:off"] == "model.type.regions=false"
     assert "kernel:all:mlp" in worker.ABLATIONS
     assert (
-        "model.observation_heads.kernel_parameterization_cases=free"
+        "model.observation_heads.kernel_mlp_cases=true"
         in worker.ABLATIONS["kernel:all:mlp"]
     )
+    assert worker.ABLATIONS["gradnorm:on"] == (
+        "training.loss.joint.adaptive_scheme=gradnorm"
+    )
+    assert "gradnorm:off" not in worker.ABLATIONS
     assert "model.type.regions=false" not in worker.ABLATIONS
 
 

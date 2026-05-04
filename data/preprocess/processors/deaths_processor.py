@@ -90,7 +90,7 @@ class DeathsProcessor:
         return aggregated
 
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
-        """Smooth deaths time series and interpolate missing days per municipality."""
+        """Filter deaths time series and interpolate missing days per municipality."""
         print("  Applying Kalman smoothing to deaths...")
 
         fallback_process = float(
@@ -125,12 +125,15 @@ class DeathsProcessor:
             )
             filtered_values, flags = kf.filter_series(values)
 
+            # Preserve recorded values at observed timesteps; use filtered values for gaps.
             for i, date in enumerate(muni_data.index):
+                filtered_value = float(np.exp(filtered_values[i]))
+                death_value = float(values[i]) if observed[i] else filtered_value
                 smoothed_records.append(
                     {
                         "date": date,
                         "municipality_code": muni_code,
-                        "deaths": float(np.exp(filtered_values[i])),
+                        "deaths": death_value,
                         "deaths_missing_flag": float(flags[i]),
                         "deaths_observed": float(observed[i]),
                     }
@@ -181,14 +184,12 @@ class DeathsProcessor:
     def process(
         self,
         data_dir: str | Path,
-        apply_smoothing: bool = True,
     ) -> xr.Dataset:
         """
         Process deaths data into xarray Dataset.
 
         Args:
             data_dir: Directory containing deaths CSV file
-            apply_smoothing: Whether to apply Kalman smoothing/interpolation
 
         Returns:
             xarray Dataset with deaths variable
@@ -259,8 +260,7 @@ class DeathsProcessor:
             value_name="deaths",
         )
 
-        if apply_smoothing:
-            daily_df = self._apply_kalman_smoothing(daily_df)
+        daily_df = self._apply_kalman_smoothing(daily_df)
 
         daily_df = self._create_mask_and_age_channels(daily_df)
 

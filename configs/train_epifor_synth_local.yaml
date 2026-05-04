@@ -1,83 +1,95 @@
-# CAUTION: Local test config for synthetic data training
-#
-# This is a MINIMAL config for testing gradient accumulation on a local machine.
-# Uses very conservative settings to avoid OOM:
-# - Tiny micro-batch (2 samples)
-# - Minimal workers (no multiprocessing)
-# - Profiling disabled
-# - run_id_chunk_size: 1 for memory-efficient loading
+# Local test config for SYNTHETIC data analysis
+# Mirrors the real local config, but targets the processed synthetic dataset
+# and enables direct latent SIRD supervision.
 
 data:
-    dataset_path: data/processed/synthetic_full.zarr
-    region2vec_path: checkpoints/region_embedding/region_embeddings.pt
-    use_valid_targets: false # Reduces dataset size
-    mobility_threshold: 10
-    missing_permit:
-        input:
-            biomarkers_joint: 2
-            cases: 2
-            hospitalizations: 2
-            deaths: 2
-        horizon:
-            biomarkers_joint: 1
-            cases: 1
-            hospitalizations: 1
-            deaths: 1
-    window_stride: 1
-    sample_ordering: "time"
-    log_scale: true
-    run_id: "0_Baseline"
-    run_id_chunk_size: 1 # Load data in small chunks for memory safety
+  dataset_path: data/processed/synthetic_full_holt_damped.zarr
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
+  use_valid_targets: true
+  mobility_threshold: 10
+  missing_permit:
+    input:
+      biomarkers_joint: 53
+      cases: 20
+      hospitalizations: 53
+      deaths: 20
+    horizon:
+      biomarkers_joint: 26
+      cases: 10
+      hospitalizations: 26
+      deaths: 10
+  window_stride: 1
+  sample_ordering: "time"
+  log_scale: true
+  run_id: "0_Baseline"
+  run_id_chunk_size: 1
 
 model:
-    type:
-        cases: true
-        regions: true
-        biomarkers: true
-        mobility: true
-    params:
-        mobility_embedding_dim: 32
-        region_embedding_dim: 64
-        gnn_module: "gcn"
-        input_window_length: 21
-        forecast_horizon: 7
-        max_neighbors: 20
-        gnn_depth: 2
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 16
+    region_embedding_dim: 64
+    include_day_of_week: true
+    include_holidays: true
+    gnn_module: "gcn"
+    input_window_length: 60
+    forecast_horizon: 28
+    max_neighbors: 20
+    gnn_depth: 2
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
 
 output:
-    experiment_name: synth_local_test
-    log_dir: outputs/training
+  experiment_name: synth_local_analysis
+  log_dir: outputs/training
+  write_granular_eval: true
+  granular_eval_filename: "{split}_granular.csv"
 
 training:
-    seed: 42
-    device: "auto" # Will use CPU if no GPU available
-    batch_size: 2 # Tiny micro-batch for local testing
-    gradient_accumulation_steps: 2 # Effective batch = 4
-    early_stopping_patience: 3
-    nan_loss_patience: 3
-    epochs: 2 # Quick test - just 2 epochs
-    learning_rate: 0.001
-    weight_decay: 1.0e-05
-    num_workers: 0 # No multiprocessing for simplicity
-    val_workers: 0
-    prefetch_factor: null
-
-    # Use node split (smaller effective dataset than time split for synthetic)
-    split_strategy: "node"
-
-    val_split: 0.1
-    test_split: 0.1
-
-    profiler:
-        enabled: false # Disable profiling for local test
-    plot_forecasts: false # Disable plotting for faster test
-    enable_mixed_precision: false # Disable for CPU compatibility
-    # Joint inference loss configuration
-    loss:
-        name: "joint_inference"
-        joint:
-            adaptive_scheme: "gradnorm"
-            gradnorm_obs_weight_sum: 0.95
-            gradnorm_update_every: 16
-            gradnorm_ema_decay: 0.9
-            gradnorm_probe: "obs_context"
+  seed: 42
+  device: "cpu"
+  init_checkpoint_path: null
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  gradient_clip_value: 5.0
+  warmup_steps: 50
+  early_stopping_patience: 3
+  nan_loss_patience: 3
+  epochs: 1
+  learning_rate: 0.0001
+  weight_decay: 1.0e-05
+  num_workers: 0
+  val_workers: 0
+  prefetch_factor: null
+  split_strategy: "node"
+  node_split_strategy: "stratified"
+  node_split_population_bins: 5
+  val_split: 0.2
+  test_split: 0.1
+  profiler:
+    enabled: false
+  plot_forecasts: false
+  enable_mixed_precision: false
+  loss:
+    name: "joint_inference"
+    joint:
+      adaptive_scheme: "none"
+      gradnorm_obs_weight_sum: 0.95
+      gradnorm_update_every: 16
+      gradnorm_ema_decay: 0.9
+      gradnorm_probe: "obs_context"
+      w_sird_supervision: 0.01
+      w_continuity: 0.01

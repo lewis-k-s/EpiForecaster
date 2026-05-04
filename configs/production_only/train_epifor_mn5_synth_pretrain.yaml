@@ -1,24 +1,32 @@
 env: "mn5"
 
+# Production synthetic pretraining config.
+# Mirrors the MN5 full training template but targets the processed synthetic
+# dataset and enables direct latent SIRD supervision for stage-1 pretraining.
+# Stage-2 fine-tuning should use train_epifor_mn5_full.yaml with
+# training.init_checkpoint_path set to the best checkpoint from this run.
+
 data:
-  dataset_path: data/processed/real_with_id.zarr
+  dataset_path: data/processed/synthetic_full_holt_damped.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
   missing_permit:
     input:
       biomarkers_joint: 53
-      cases: 40
+      cases: 20
       hospitalizations: 53
-      deaths: 40
+      deaths: 20
     horizon:
       biomarkers_joint: 26
-      cases: 14
+      cases: 10
       hospitalizations: 26
-      deaths: 14
+      deaths: 10
   window_stride: 7
   sample_ordering: "time"
   log_scale: true
+  run_id_chunk_size: 1
+
 model:
   strict: false
   type:
@@ -30,16 +38,12 @@ model:
     mobility_embedding_dim: 32
     region_embedding_dim: 64
     gnn_module: "gcn"
-    #-- temporal covariates (must match dataset) --#
     include_day_of_week: true
     include_holidays: true
-    #-- seq sizes --#
     input_window_length: 60
     forecast_horizon: 28
-    #-- graph params --#
     max_neighbors: 20
     gnn_depth: 2
-    #-- SIR physics bounds (prevent gradient explosion) --#
     sir_physics:
       dt: 1.0
       enforce_nonnegativity: true
@@ -55,10 +59,10 @@ model:
       delta_forecasting: true
 
 output:
-  experiment_name: mn5_epiforecaster
+  experiment_name: mn5_epiforecaster_synth_pretrain
   log_dir: outputs/training
   wandb_mode: offline
-  wandb_tags: [mn5]
+  wandb_tags: [mn5, synth, pretrain]
 
 training:
   compile: true
@@ -68,6 +72,7 @@ training:
   compile_backward: true
   seed: 42
   device: "cuda"
+  init_checkpoint_path: null
   batch_size: 32
   shuffle_train_batches: true
   gradient_accumulation_steps: 1
@@ -78,7 +83,6 @@ training:
   learning_rate: 0.001
   weight_decay: 1.0e-05
   warmup_steps: 100
-  # Worker config for 1 GPU + 20 CPUs
   num_workers: 4
   val_workers: 2
   prefetch_factor: 2
@@ -87,35 +91,38 @@ training:
   progress_log_frequency: 100
 
   grad_norm_log_frequency: 500
-  gradient_snapshot_frequency: 0 # disable or recommend 1000
+  gradient_snapshot_frequency: 0
   gradient_snapshot_top_k: 5
   gradient_vanishing_threshold: 1.0e-8
   gradient_exploding_threshold: 1.0e2
 
-  # Temporal split configuration
   split_strategy: "node"
-  # train_end_date: "2021-01-31"
-  # val_end_date: "2021-03-31"
-  # test_end_date omitted - uses all remaining data
 
-  # ignored
   val_split: 0.2
   test_split: 0.1
 
   profiler:
-    # Optimized for minimal overhead (~10% vs 234% with defaults)
-    # Duration controlled by: wait_steps + warmup_steps + active_steps = 5+1+2 = 8 batches
     enabled: true
     wait_steps: 5
     warmup_steps: 1
     active_steps: 2
     profile_epochs: [1]
-    record_memory: false # Disabled - saves ~15-20% profiler overhead
+    record_memory: false
     log_dir: auto
   plot_forecasts: true
   num_forecast_samples: 3
-  # Joint inference loss configuration
   loss:
     name: "joint_inference"
     joint:
-      w_sird_supervision: 0.0
+      w_sird_supervision: 0.01
+      w_continuity: 0.01
+
+  curriculum:
+    enabled: true
+    active_runs: -1          # Use all available synthetic runs each epoch
+    chunk_size: 512
+    run_sampling: "round_robin"
+    schedule:
+      - start_epoch: 0
+        end_epoch: 50        # Must match training.epochs
+        synth_ratio: 1.0     # All synthetic, no real data
