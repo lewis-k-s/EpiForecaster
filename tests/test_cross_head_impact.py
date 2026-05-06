@@ -7,22 +7,15 @@ Tests cover:
 4. Edge cases (missing data, NaN handling, baseline=0)
 5. Visualization functions (heatmap generation)
 
-This is a panel of tests corresponding to the cross-head impact analysis
-module (scripts/analyze_cross_head_impact.py).
+This is a panel of tests corresponding to the cross-head impact analysis module.
 """
-
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import yaml
 
-# Import the module under test
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-from analyze_cross_head_impact import (
+from scripts.analysis.analyze_cross_head_impact import (
     ABLATION_TO_HEAD,
     HEADS,
     HEAD_TO_COLUMN,
@@ -223,7 +216,7 @@ epiforecaster,1,{1.5 + seed * 0.01},{0.6 + seed * 0.01}
             )
 
         # Create CrossHeadRun objects
-        from analyze_cross_head_impact import CrossHeadRun
+        from scripts.analysis.analyze_cross_head_impact import CrossHeadRun
 
         baseline_runs = [
             CrossHeadRun("baseline", "test", baseline_dir, baseline_dir / "run_42", 42),
@@ -255,7 +248,7 @@ epiforecaster,1,{1.5 + seed * 0.01},{0.6 + seed * 0.01}
 
     def test_compute_pairwise_deltas_no_matching_seeds(self, tmp_path):
         """Test when no seeds match between baseline and ablation."""
-        from analyze_cross_head_impact import CrossHeadRun
+        from scripts.analysis.analyze_cross_head_impact import CrossHeadRun
 
         baseline_runs = [
             CrossHeadRun("baseline", "test", tmp_path, tmp_path / "run_1", 42),
@@ -272,7 +265,7 @@ epiforecaster,1,{1.5 + seed * 0.01},{0.6 + seed * 0.01}
 
     def test_compute_pairwise_deltas_missing_metrics(self, tmp_path):
         """Test handling when metrics files are missing."""
-        from analyze_cross_head_impact import CrossHeadRun
+        from scripts.analysis.analyze_cross_head_impact import CrossHeadRun
 
         run_dir = tmp_path / "run"
         run_dir.mkdir()
@@ -387,7 +380,7 @@ class TestEdgeCases:
 
     def test_baseline_zero_handling(self, tmp_path):
         """Test handling when baseline loss is zero."""
-        from analyze_cross_head_impact import CrossHeadRun
+        from scripts.analysis.analyze_cross_head_impact import CrossHeadRun
 
         # Create baseline with zero loss
         baseline_dir = tmp_path / "baseline"
@@ -436,7 +429,7 @@ epiforecaster,1,0.5,0.6
 
     def test_negative_delta(self, tmp_path):
         """Test handling when ablation improves loss (negative delta)."""
-        from analyze_cross_head_impact import CrossHeadRun
+        from scripts.analysis.analyze_cross_head_impact import CrossHeadRun
 
         baseline_dir = tmp_path / "baseline"
         baseline_dir.mkdir()
@@ -543,7 +536,7 @@ class TestIntegration:
 
     def test_end_to_end_workflow(self, tmp_path):
         """Test complete workflow from runs to matrices."""
-        from analyze_cross_head_impact import (
+        from scripts.analysis.analyze_cross_head_impact import (
             CrossHeadRun,
             compute_pairwise_deltas,
             aggregate_cross_head_matrix,

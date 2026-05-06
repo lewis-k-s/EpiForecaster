@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from scripts.analyze_crossval import (
+from scripts.analysis.analyze_crossval import (
     analyze_crossval_campaign,
     collect_crossval_runs,
     parse_crossval_experiment_name,

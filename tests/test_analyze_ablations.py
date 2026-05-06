@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from scripts.analyze_ablations import (
+from scripts.analysis.analyze_ablations import (
     aggregate_ablation_metrics,
     collect_ablation_runs,
     compute_baseline_deltas,

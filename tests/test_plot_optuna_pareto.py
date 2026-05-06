@@ -4,7 +4,7 @@ import csv
 
 import optuna
 
-from scripts.plot_optuna_pareto import export_pareto_artifacts
+from scripts.hpo.plot_optuna_pareto import export_pareto_artifacts
 
 
 def _journal_storage(path):

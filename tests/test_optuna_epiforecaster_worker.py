@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
-from scripts.optuna_epiforecaster_worker import (
+from scripts.hpo.optuna_epiforecaster_worker import (
     _categorical_choices,
     _compute_worker_seed,
     _decode_categorical_value,

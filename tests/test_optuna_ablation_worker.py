@@ -11,7 +11,7 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 from optuna.trial import create_trial
 
-from scripts import optuna_ablation_worker as worker
+from scripts.hpo import optuna_ablation_worker as worker
 
 
 SEED_CHOICES = [42, 43]

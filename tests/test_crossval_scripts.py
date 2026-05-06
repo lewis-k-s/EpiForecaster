@@ -19,7 +19,7 @@ def _run_bash(script: str) -> subprocess.CompletedProcess[str]:
 
 def test_submit_crossval_derives_array_spec_from_seed_count() -> None:
     result = _run_bash(
-        'source scripts/submit_crossval.sh >/dev/null; '
+        'source scripts/cluster/submit_crossval.sh >/dev/null; '
         'derive_array_spec_from_seeds "42 43 44"'
     )
 
@@ -29,7 +29,7 @@ def test_submit_crossval_derives_array_spec_from_seed_count() -> None:
 
 def test_submit_crossval_derives_array_spec_from_fold_count() -> None:
     result = _run_bash(
-        "source scripts/submit_crossval.sh >/dev/null; "
+        "source scripts/cluster/submit_crossval.sh >/dev/null; "
         'derive_array_spec_from_fold_count "5"'
     )
 
@@ -39,7 +39,7 @@ def test_submit_crossval_derives_array_spec_from_fold_count() -> None:
 
 def test_submit_crossval_parses_explicit_array_arg() -> None:
     result = _run_bash(
-        "source scripts/submit_crossval.sh >/dev/null; "
+        "source scripts/cluster/submit_crossval.sh >/dev/null; "
         'parse_explicit_array_arg --qos debug --array=3-7'
     )
 
@@ -49,7 +49,7 @@ def test_submit_crossval_parses_explicit_array_arg() -> None:
 
 def test_run_crossval_resolves_relative_output_log_dir() -> None:
     result = _run_bash(
-        "source scripts/run_crossval.sbatch >/dev/null; "
+        "source scripts/cluster/run_crossval.sbatch >/dev/null; "
         'resolve_output_log_root "/repo" "outputs/training"'
     )
 
@@ -59,7 +59,7 @@ def test_run_crossval_resolves_relative_output_log_dir() -> None:
 
 def test_run_crossval_preserves_absolute_output_log_dir() -> None:
     result = _run_bash(
-        "source scripts/run_crossval.sbatch >/dev/null; "
+        "source scripts/cluster/run_crossval.sbatch >/dev/null; "
         'resolve_output_log_root "/repo" "/scratch/training"'
     )
 
@@ -69,7 +69,7 @@ def test_run_crossval_preserves_absolute_output_log_dir() -> None:
 
 def test_run_crossval_selects_first_seed_for_fold_mode() -> None:
     result = _run_bash(
-        "source scripts/run_crossval.sbatch >/dev/null; "
+        "source scripts/cluster/run_crossval.sbatch >/dev/null; "
         'select_first_seed "42 43 44"'
     )
 
