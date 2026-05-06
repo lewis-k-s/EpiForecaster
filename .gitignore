@@ -78,3 +78,4 @@ Thumbs.db
 # No leaking cluster details
 docs/marenostrum5_hardware.md
 PROD_RUN.md
+.opencode

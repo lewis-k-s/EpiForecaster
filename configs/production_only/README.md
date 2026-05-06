@@ -33,27 +33,27 @@ These configs should only be run on the MN5 cluster via SLURM scripts:
 
 ```bash
 # For training
-sbatch scripts/train_single_gpu.sbatch
+sbatch scripts/cluster/train_single_gpu.sbatch
 
 # For synthetic pretraining with the regular single-GPU sbatch wrapper
 CONFIG=configs/production_only/train_epifor_mn5_synth_pretrain.yaml \
-sbatch scripts/train_single_gpu.sbatch
+sbatch scripts/cluster/train_single_gpu.sbatch
 
 # Convenience wrapper for the same synth-pretrain submission
-scripts/submit_synth_pretrain.sh
+scripts/cluster/submit_synth_pretrain.sh
 
 # Submit synth pretraining, then fine-tune on real data after the pretrain job succeeds
-scripts/submit_pretrain_then_finetune.sh
+scripts/cluster/submit_pretrain_then_finetune.sh
 
 # For hyperparameter optimization
-sbatch scripts/optuna_epiforecaster.sbatch
+sbatch scripts/cluster/optuna_epiforecaster.sbatch
 ```
 
 The chained submission helper uses a fixed `EPIFORECASTER_MODEL_ID` for the
 pretrain run so the fine-tune job can point `training.init_checkpoint_path` at
 `.../checkpoints/best_model.pt` deterministically.
 
-The MN5 batch scripts share a common module bootstrap in `scripts/mn5_module_setup.sh`.
+The MN5 batch scripts share a common module bootstrap in `scripts/cluster/mn5_module_setup.sh`.
 That setup loads the GCC, CUDA, and CMake modules needed for both runtime jobs and
 optional ONNX simplification tooling installation.
 

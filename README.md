@@ -112,7 +112,7 @@ pip install -e .
 ### MN5 Module Setup
 
 On MareNostrum 5, the batch scripts now source a shared module bootstrap at
-[`scripts/mn5_module_setup.sh`](/Volumes/HUBSSD/code/EpiForecaster/scripts/mn5_module_setup.sh).
+[`scripts/cluster/mn5_module_setup.sh`](/Volumes/HUBSSD/code/EpiForecaster/scripts/cluster/mn5_module_setup.sh).
 It loads a consistent toolchain across training and evaluation jobs:
 
 - `EB/apps` and `EB/install`
@@ -128,7 +128,7 @@ If you are working interactively on MN5 before creating or syncing the virtualen
 load the same module stack first:
 
 ```bash
-source scripts/mn5_module_setup.sh
+source scripts/cluster/mn5_module_setup.sh
 uv sync --extra onnx --dev
 
 # Optional, only if you want onnx-simplifier

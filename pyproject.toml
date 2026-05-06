@@ -84,19 +84,17 @@ train = "cli:train_cli"
 eval = "cli:eval_cli"
 plot = "cli:plot_cli"
 # Analysis CLI tools
-perf-analyze = "scripts.analyze_trace:main"
-step-breakdown = "scripts.breakdown_step:main"
-loss-curve-critic = "scripts.analyze_loss_curve:main"
-gradnorm-analyze = "scripts.analyze_gradnorm:main"
-dead-code-analyze = "scripts.dead_code_analyze:main"
-remote-train = "scripts.remote_train:main"
-remote-preprocess = "scripts.remote_preprocess:main"
+perf-analyze = "scripts.analysis.analyze_trace:main"
+step-breakdown = "scripts.analysis.breakdown_step:main"
+loss-curve-critic = "scripts.analysis.analyze_loss_curve:main"
+gradnorm-analyze = "scripts.analysis.analyze_gradnorm:main"
+dead-code-analyze = "scripts.analysis.dead_code_analyze:main"
 # Data visualization runner
-dataviz = "scripts.dataviz_runner:main"
+dataviz = "scripts.analysis.dataviz_runner:main"
 # Optuna HPO worker for manual SLURM array jobs
-optuna-worker = "scripts.optuna_epiforecaster_worker:main"
-optuna-missing-permit-worker = "scripts.optuna_epiforecaster_missing_permit_worker:main"
-optuna-pareto-plot = "scripts.plot_optuna_pareto:main"
+optuna-worker = "scripts.hpo.optuna_epiforecaster_worker:main"
+optuna-missing-permit-worker = "scripts.hpo.optuna_epiforecaster_missing_permit_worker:main"
+optuna-pareto-plot = "scripts.hpo.plot_optuna_pareto:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]

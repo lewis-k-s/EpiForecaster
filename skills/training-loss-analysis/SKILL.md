@@ -59,7 +59,7 @@ Return:
 
 ## Implementation Notes
 
-- Loss script: `scripts/analyze_loss_curve.py`
-- Gradnorm script: `scripts/analyze_gradnorm.py`
+- Loss script: `scripts/analysis/analyze_loss_curve.py`
+- Gradnorm script: `scripts/analysis/analyze_gradnorm.py`
 - Prefer `--text` for human debugging and JSON output for structured follow-up.
 - If either command fails on path resolution, retry with the explicit event directory.
