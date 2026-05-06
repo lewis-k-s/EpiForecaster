@@ -1,0 +1,108 @@
+#!/bin/bash
+#SBATCH --job-name=epi-hpo
+#SBATCH --account=bsc08
+#SBATCH --qos=acc_bscls
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=20
+#SBATCH --time=05:00:00
+#SBATCH --array=0-3 # saturate the node with parallel tasks on each GPU
+#SBATCH --output=logs/slurm-%x-%A_%a.out
+#SBATCH --error=logs/slurm-%x-%A_%a.err
+
+# Fail fast on errors; print commands for easier debugging.
+set -euo pipefail
+
+# Root of the repository (defaults to submission directory).
+PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
+# Base training config (override per run).
+CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
+# Optuna study identity.
+STUDY_NAME="${STUDY_NAME:-epiforecaster_hpo_v1}"
+# Shared journal file for coordination (must be on shared filesystem).
+JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal}"
+# Trial outputs root (log_dir override).
+RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
+# Optional speed knobs (set to empty to disable).
+MAX_EPOCHS="${MAX_EPOCHS:-20}"
+N_TRIALS="${N_TRIALS:-}"
+SEED="${SEED:-42}"                                    # Reproducibility seed
+SAMPLER="${SAMPLER:-tpe}"                             # tpe (default), cmaes, or random
+PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N epochs
+# Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
+OVERRIDES="${OVERRIDES:-}"
+# Smoke-test mode:
+#   DRY_RUN=1 sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/optuna_epiforecaster.sbatch
+DRY_RUN="${DRY_RUN:-0}"
+DRY_RUN_MAX_EPOCHS="${DRY_RUN_MAX_EPOCHS:-1}"
+DRY_RUN_TIMEOUT_SECS="${DRY_RUN_TIMEOUT_SECS:-600}"
+DRY_RUN_N_TRIALS="${DRY_RUN_N_TRIALS:-1}"
+# Worker timeout in seconds (auto-calculated from SLURM time limit minus 15min buffer).
+# Falls back to 5 hours - 15 minutes if SLURM_TIME_LIMIT is not set.
+if [ -n "${SLURM_TIME_LIMIT:-}" ]; then
+  # Convert SLURM_TIME_LIMIT (in minutes) to seconds and subtract 15min buffer
+  TIMEOUT_SECS="${TIMEOUT_SECS:-$((SLURM_TIME_LIMIT * 60 - 900))}"
+else
+  TIMEOUT_SECS="${TIMEOUT_SECS:-17100}" # 5 hours - 15 minutes (in seconds)
+fi
+# Path to an existing virtual environment (override or comment out if using modules).
+VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
+
+# shellcheck disable=SC1091
+source "$PROJECT_ROOT/scripts/cluster/mn5_module_setup.sh"
+
+cd "$PROJECT_ROOT"
+
+# Activate virtualenv if present.
+if [ -d "$VENV_PATH" ]; then
+  # shellcheck disable=SC1090
+  source "$VENV_PATH/bin/activate"
+fi
+
+# Keep thread counts aligned with allocation.
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+
+if [ "$DRY_RUN" = "1" ]; then
+  MAX_EPOCHS="$DRY_RUN_MAX_EPOCHS"
+  N_TRIALS="${N_TRIALS:-$DRY_RUN_N_TRIALS}"
+  TIMEOUT_SECS="$DRY_RUN_TIMEOUT_SECS"
+  echo "DRY_RUN enabled: max_epochs=${MAX_EPOCHS}, n_trials=${N_TRIALS}, timeout_s=${TIMEOUT_SECS}"
+  echo "Tip: submit with short walltime and single worker, e.g. sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/optuna_epiforecaster.sbatch"
+fi
+
+ARGS=(
+  --config "$CONFIG"
+  --study-name "$STUDY_NAME"
+  --journal-file "$JOURNAL_FILE"
+  --run-root "$RUN_ROOT"
+)
+
+if [ -n "$MAX_EPOCHS" ]; then
+  ARGS+=(--epochs "$MAX_EPOCHS")
+fi
+if [ -n "$N_TRIALS" ]; then
+  ARGS+=(--n-trials "$N_TRIALS")
+fi
+if [ -n "$SEED" ]; then
+  ARGS+=(--seed "$SEED")
+fi
+if [ -n "$SAMPLER" ]; then
+  ARGS+=(--sampler "$SAMPLER")
+fi
+if [ -n "$PRUNING_START_EPOCH" ]; then
+  ARGS+=(--pruning-start-epoch "$PRUNING_START_EPOCH")
+fi
+if [ -n "$TIMEOUT_SECS" ]; then
+  ARGS+=(--timeout-s "$TIMEOUT_SECS")
+fi
+if [ -n "$OVERRIDES" ]; then
+  for override in $OVERRIDES; do
+    ARGS+=(--override "$override")
+  done
+fi
+
+# Prefer uv runner if available; fall back to plain python.
+if command -v uv >/dev/null 2>&1; then
+  uv run python -m scripts.hpo.optuna_epiforecaster_worker "${ARGS[@]}"
+else
+  python -m scripts.hpo.optuna_epiforecaster_worker "${ARGS[@]}"
+fi
