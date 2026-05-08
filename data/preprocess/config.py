@@ -15,13 +15,14 @@ import yaml
 
 REGION_COORD = "region_id"
 TEMPORAL_COORD = "date"
-TEMPORAL_COVARIATE_DIM = 3
+TEMPORAL_COVARIATE_DIM = 4
 
 
 @dataclass
 class TemporalCovariatesConfig:
     include_day_of_week: bool = True
     include_holidays: bool = True
+    include_lockdown_severity: bool = False
     holiday_calendar_file: str | None = None
 
     def __post_init__(self):
@@ -36,6 +37,8 @@ class TemporalCovariatesConfig:
         if self.include_day_of_week:
             dim += 2
         if self.include_holidays:
+            dim += 1
+        if self.include_lockdown_severity:
             dim += 1
         return dim
 
@@ -125,6 +128,7 @@ class PreprocessingConfig:
         hospitalizations_file: Optional path to hospitalizations data CSV
         deaths_file: Optional path to deaths data CSV (comarca-level)
         catalonia_cases_file: Optional path to Catalonia official cases data
+        vaccination_file: Optional path to COVID-19 vaccination data CSV
 
         start_date: Start date for temporal processing
         end_date: End date for temporal processing
@@ -174,6 +178,7 @@ class PreprocessingConfig:
     hospitalizations_file: str | None = None
     deaths_file: str | None = None  # Deaths data (comarca-level)
     catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
+    vaccination_file: str | None = None  # Municipality-level COVID vaccination data
 
     # Optional environment
     env: str | None = None
@@ -301,6 +306,13 @@ class PreprocessingConfig:
             if not catalonia_cases_path.exists():
                 raise ValueError(
                     f"Catalonia cases file does not exist: {self.catalonia_cases_file}"
+                )
+
+        if self.vaccination_file:
+            vaccination_path = Path(self.vaccination_file)
+            if not vaccination_path.exists():
+                raise ValueError(
+                    f"Vaccination file does not exist: {self.vaccination_file}"
                 )
 
         if (
@@ -518,6 +530,7 @@ class PreprocessingConfig:
                 "hospitalizations": self.hospitalizations_file,
                 "deaths": self.deaths_file,
                 "catalonia_cases": self.catalonia_cases_file,
+                "vaccination": self.vaccination_file,
             },
             "processing_parameters": {
                 "forecast_horizon": self.forecast_horizon,

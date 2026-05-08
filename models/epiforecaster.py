@@ -59,6 +59,7 @@ class EpiForecaster(nn.Module):
         head_dropout: float = 0.1,
         head_positional_encoding: str = "sinusoidal",
         temporal_covariates_dim: int = 0,
+        vaccination_dim: int = 0,
         strict: bool = True,
     ):
         """
@@ -85,7 +86,8 @@ class EpiForecaster(nn.Module):
             head_num_layers: Transformer layers
             head_dropout: Transformer dropout
             head_positional_encoding: Transformer positional encoding
-            temporal_covariates_dim: Dimension of temporal covariates (0=disabled, 3=dow_sin/cos+holiday)
+            temporal_covariates_dim: Dimension of temporal covariates (0=disabled;
+                commonly dow_sin/cos, holiday, and optional lockdown severity)
         """
         super().__init__()
 
@@ -105,6 +107,7 @@ class EpiForecaster(nn.Module):
         self.gnn_module = gnn_module
         self.dtype = MODEL_PARAM_DTYPE
         self.temporal_covariates_dim = temporal_covariates_dim
+        self.vaccination_dim = vaccination_dim
         self.head_positional_encoding = head_positional_encoding
         self.strict = strict
 
@@ -243,6 +246,7 @@ class EpiForecaster(nn.Module):
         region_embeddings: torch.Tensor | None = None,
         population: torch.Tensor | None = None,
         temporal_covariates: torch.Tensor | None = None,
+        vaccination_hist: torch.Tensor | None = None,
         ww_hist: torch.Tensor | None = None,
         ww_hist_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
@@ -332,6 +336,9 @@ class EpiForecaster(nn.Module):
 
         if temporal_covariates is not None:
             features.append(temporal_covariates)
+
+        if vaccination_hist is not None and self.vaccination_dim > 0:
+            features.append(vaccination_hist)
 
         x_seq = torch.cat(features, dim=-1)
 
@@ -521,6 +528,7 @@ class EpiForecaster(nn.Module):
             region_embeddings=region_embeddings,
             population=batch_data.population,
             temporal_covariates=temporal_covariates,
+            vaccination_hist=batch_data.vaccination_hist,
         )
 
         # Prepare targets dict
@@ -608,6 +616,8 @@ class EpiForecaster(nn.Module):
             dim += self.population_dim
         if self.temporal_covariates_dim > 0:
             dim += self.temporal_covariates_dim
+        if self.vaccination_dim > 0:
+            dim += self.vaccination_dim
         return dim
 
     def _trim_prediction(self, prediction: torch.Tensor) -> torch.Tensor:

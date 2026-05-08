@@ -32,6 +32,8 @@ model:
     region_embedding_dim: 64
     include_day_of_week: true
     include_holidays: true
+    include_lockdown_severity: true
+    include_vaccination: true
     gnn_module: "gcn"
     input_window_length: 60
     forecast_horizon: 28

@@ -15,6 +15,9 @@ deaths_file: "data/files/deaths_municipality.csv"
 # Hospitalizations data (pre-aggregated municipality-level)
 hospitalizations_file: "data/files/hospitalizations_municipality.csv"
 
+# COVID-19 vaccination data (official Generalitat municipality-level doses)
+vaccination_file: "data/files/vaccination_municipality.csv"
+
 # Other data sources
 wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
 region_metadata_file: "data/files/edar_muni_edges.nc"
@@ -54,6 +57,7 @@ memory_limit_gb: 8.0
 temporal_covariates:
   include_day_of_week: true
   include_holidays: true
+  include_lockdown_severity: true
   holiday_calendar_file: data/files/catalonia_holidays.csv
 
 # Offline causal smoothing configuration

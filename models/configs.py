@@ -133,7 +133,11 @@ class LossConfig:
 
     def __post_init__(self) -> None:
         if isinstance(self.joint, (dict, DictConfig)):
-            self.joint = JointLossConfig(**self.joint)
+            init_fields = {f.name for f in fields(JointLossConfig) if f.init}
+            joint_dict = dict(self.joint)
+            self.joint = JointLossConfig(
+                **{k: v for k, v in joint_dict.items() if k in init_fields}
+            )
 
 
 @dataclass
@@ -605,7 +609,10 @@ class ModelConfig:
     population_dim: int = 1
     include_day_of_week: bool = False
     include_holidays: bool = False
+    include_lockdown_severity: bool = False
+    include_vaccination: bool = False
     temporal_covariates_dim: int = field(init=False)
+    vaccination_dim: int = field(init=False)
 
     # -- module choices --#
     gnn_module: str = ""
@@ -633,9 +640,12 @@ class ModelConfig:
     region2vec_path: str = ""
 
     def __post_init__(self) -> None:
-        self.temporal_covariates_dim = (2 if self.include_day_of_week else 0) + (
-            1 if self.include_holidays else 0
+        self.temporal_covariates_dim = (
+            (2 if self.include_day_of_week else 0)
+            + (1 if self.include_holidays else 0)
+            + (1 if self.include_lockdown_severity else 0)
         )
+        self.vaccination_dim = 3 if self.include_vaccination else 0
 
         if isinstance(self.type, (dict, DictConfig)):
             self.type = ModelVariant(**self.type)  # type: ignore[arg-type]

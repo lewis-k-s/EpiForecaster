@@ -68,8 +68,10 @@ class EpiDatasetItem(TypedDict):
     population: torch.Tensor
     run_id: int | str | None
     target_region_index: int | None
-    # Temporal covariates (day-of-week sin/cos + holiday indicator)
-    temporal_covariates: torch.Tensor  # [L, 3] or [L, 0] if not available
+    # Temporal covariates (calendar/policy features)
+    temporal_covariates: torch.Tensor  # [L, covariate_dim] or [L, 0] if unavailable
+    # Vaccination rate (3-channel: value, mask, age)
+    vaccination_hist: torch.Tensor  # [L, 3]
     # Joint inference targets (log1p per-100k space)
     ww_hist: torch.Tensor  # [L] Wastewater history in log1p target space
     ww_hist_mask: torch.Tensor  # [L] 1.0 if wastewater history is observed
@@ -390,6 +392,27 @@ class EpiDataset(Dataset):
             for idx in range(3, channel_count, 4):
                 dummy[:, :, idx] = 1.0
             self.precomputed_biomarkers = dummy
+
+        # Precompute vaccination rate (3-channel) if enabled and available
+        if (
+            self.config.model.include_vaccination
+            and "vaccination_rate" in self._dataset.data_vars
+        ):
+            vaccination_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="vaccination_rate",
+            )
+            self.precomputed_vaccination_hist = vaccination_preprocessor.preprocess_dataset(
+                self._dataset
+            )
+            self.precomputed_vaccination_hist[..., 0] = _replace_non_finite(
+                self.precomputed_vaccination_hist[..., 0]
+            )
+            logger.info(
+                f"Loaded vaccination history: shape={self.precomputed_vaccination_hist.shape}"
+            )
+        else:
+            self.precomputed_vaccination_hist = None
 
         # Load temporal covariates if available in dataset
         if "temporal_covariates" in self._dataset:
@@ -903,6 +926,16 @@ class EpiDataset(Dataset):
         # Extract temporal covariates for the history window
         temporal_covariates_hist = self.temporal_covariates[range_start:range_end]
 
+        # Extract vaccination history if available
+        if self.precomputed_vaccination_hist is not None:
+            vaccination_hist = self.precomputed_vaccination_hist[
+                range_start:range_end, target_idx, :
+            ]  # (L, 3)
+        else:
+            vaccination_hist = torch.zeros(
+                L, 3, dtype=dtype_utils.STORAGE_DTYPES["continuous"]
+            )
+
         return {
             "node_label": node_label,
             "region_id": region_id,
@@ -920,6 +953,7 @@ class EpiDataset(Dataset):
             "population": population,
             "run_id": run_id,
             "temporal_covariates": temporal_covariates_hist,  # (L, cov_dim)
+            "vaccination_hist": vaccination_hist,  # (L, 3)
             "ww_hist": ww_hist,
             "ww_hist_mask": ww_hist_mask,
             "hosp_target": hosp_target,

@@ -8,6 +8,7 @@ This document summarizes how `data/preprocess/pipeline.py` converts raw epidemio
 | --- | --- | --- |
 | `population` | `(region,)` (persisted as `(region, 1)` in Zarr) | Static per administrative region. Sourced from the case metadata. Required for per-100k normalization in preprocessing. |
 | `cases` | `(time, region)` | Daily (or configured cadence) case counts. Required input that defines the master time/region grid. |
+| `vaccination_rate` | `(time, region)` | Cumulative first-dose COVID-19 vaccination coverage per municipality, computed from official Generalitat administered-dose records and population. |
 | `edar_biomarker_<variant>` | `(time, region)` | Per-variant wastewater signal (e.g., N1, N2, IP4) aggregated from EDAR sites to target regions using the contribution matrix. |
 | `mobility` | `(time, region, region)` | Origin–destination matrix per timestamp. Optional but expected for the standard build; placeholder tensors are created if mobility is missing so the output schema stays stable. |
 
@@ -21,6 +22,7 @@ Because `cases` and EDAR biomarkers resolve to `(time, region)` series, the comb
    - **Clinical series** (`cases`, `hospitalizations`, `deaths`): log1p(per-100k) using population
    - **Mobility**: log1p only
    - **Biomarker values**: log1p only
+   - **Vaccination coverage**: left in rate space `[0, 1]`
 4. **Validation and storage** – Consistency checks guarantee every batch has identical node/edge counts and no NaNs before persisting via `DatasetStorage.save_dataset()`.
 5. **Reporting** – A JSON report (same directory as the Zarr store) captures configuration, alignment outcomes, statistics, and warnings for reproducibility.
 
@@ -91,6 +93,9 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | `deaths` | `(time, region)` | float16 | Death counts (log1p per-100k, Kalman-smoothed). |
 | `deaths_mask` | `(time, region)` | bool | True if observed, False if missing/interpolated. |
 | `deaths_age` | `(time, region)` | uint8 | Days since last observation (0-14). |
+| `vaccination_rate` | `(run_id, time, region)` | float16 | Cumulative first-dose vaccination coverage, clipped to `[0, 1]`. |
+| `vaccination_rate_mask` | `(run_id, time, region)` | bool | True if the source had administered first-dose rows for the municipality-date. |
+| `vaccination_rate_age` | `(run_id, time, region)` | uint8 | Days since last source first-dose observation (0-14). |
 | `edar_biomarker_<variant>` | `(run_id, time, region)` | float16 | Per-variant biomarker intensity (log1p, Kalman-filtered). |
 | `edar_biomarker_<variant>_mask` | `(run_id, time, region)` | bool | True if measured (finite and positive), False otherwise. |
 | `edar_biomarker_<variant>_censor` | `(run_id, time, region)` | uint8 | 0=uncensored, 1=censored at LOD, 2=missing/imputed. |
@@ -101,7 +106,7 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | `population` | `(region,)` | int32 | Static population per region. |
 | `edar_has_source` | `(region,)` | bool | True if region has EDAR site contributions. |
 | `valid_targets` | `(run_id, region)` | bool | True if (run, region) meets minimum data density. |
-| `temporal_covariates` | `(time, 3)` | float16 | `[dow_sin, dow_cos, is_holiday]` features. |
+| `temporal_covariates` | `(time, covariate)` | float16 | Calendar features such as `[dow_sin, dow_cos, is_holiday, lockdown_severity]` when enabled. |
 
 ### Dataset Attributes
 

@@ -10,6 +10,7 @@ canonical tensor formats. Each processor handles a specific data type:
 - AlignmentProcessor: Multi-dataset temporal and spatial alignment
 - DeathsProcessor: Catalonia COVID deaths data → xarray tensors
 - HospitalizationsProcessor: Catalonia COVID hospitalizations → daily municipality-level tensors
+- VaccinationProcessor: Catalonia COVID vaccinations → cumulative municipality coverage
 - MunicipalityMappingProcessor: Municipality to comarca mapping table with ABS support
 - SyntheticProcessor: Bundled synthetic zarr data → extracted components
 
@@ -25,6 +26,7 @@ from .hospitalizations_processor import HospitalizationsProcessor
 from .mobility_processor import MobilityProcessor
 from .municipality_mapping_processor import MunicipalityMappingProcessor
 from .synthetic_processor import SyntheticProcessor
+from .vaccination_processor import VaccinationProcessor
 
 __all__ = [
     "MobilityProcessor",
@@ -33,6 +35,7 @@ __all__ = [
     "AlignmentProcessor",
     "DeathsProcessor",
     "HospitalizationsProcessor",
+    "VaccinationProcessor",
     "MunicipalityMappingProcessor",
     "SyntheticProcessor",
 ]

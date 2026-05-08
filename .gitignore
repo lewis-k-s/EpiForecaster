@@ -35,6 +35,7 @@ checkpoints/
 # Data files
 data/files/*.csv
 !data/files/catalonia_holidays.csv
+!data/files/vaccination_municipality.csv
 data/files/*.parquet
 data/files/*.h5
 data/processed/*.zarr
@@ -76,6 +77,6 @@ Thumbs.db
 .claude/
 
 # No leaking cluster details
-docs/marenostrum5_hardware.md
+# docs/marenostrum5_hardware.md
 PROD_RUN.md
 .opencode

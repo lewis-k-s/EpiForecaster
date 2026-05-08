@@ -191,6 +191,7 @@ class EpiForecasterTrainer:
             head_dropout=self.config.model.head_dropout,
             head_positional_encoding=self.config.model.head_positional_encoding,
             temporal_covariates_dim=self.config.model.temporal_covariates_dim,
+            vaccination_dim=self.config.model.vaccination_dim,
             strict=self.config.model.strict,
         )
 

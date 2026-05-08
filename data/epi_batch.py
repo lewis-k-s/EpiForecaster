@@ -28,6 +28,7 @@ class EpiBatch:
     window_start: torch.Tensor  # (B,)
     node_labels: list[str]
     temporal_covariates: torch.Tensor  # (B, L, cov_dim)
+    vaccination_hist: torch.Tensor  # (B, L, 3)
 
     # Joint inference targets
     ww_hist: torch.Tensor  # (B, L)
@@ -259,6 +260,11 @@ def collate_epiforecaster_batch(
         [item["temporal_covariates"] for item in batch], dim=0
     )  # (B, L, cov_dim)
 
+    # Stack vaccination history (3-channel)
+    vaccination_hist = torch.stack(
+        [item["vaccination_hist"] for item in batch], dim=0
+    )  # (B, L, 3)
+
     # 2. Batch Temporal Graphs (Optimized Manual Batching)
     mob_batch = optimized_collate_graphs(batch)
     if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
@@ -271,6 +277,9 @@ def collate_epiforecaster_batch(
     bio_node = _promote_batch_float_tensor(_replace_non_finite(bio_node))
     temporal_covariates = _promote_batch_float_tensor(
         _replace_non_finite(temporal_covariates)
+    )
+    vaccination_hist = _promote_batch_float_tensor(
+        _replace_non_finite(vaccination_hist)
     )
     ww_hist = _promote_batch_float_tensor(_replace_non_finite(ww_hist))
     ww_hist_mask = _promote_batch_float_tensor(_replace_non_finite(ww_hist_mask))
@@ -335,6 +344,7 @@ def collate_epiforecaster_batch(
         window_start=window_starts,
         node_labels=[item["node_label"] for item in batch],
         temporal_covariates=temporal_covariates,
+        vaccination_hist=vaccination_hist,
         ww_hist=ww_hist,
         ww_hist_mask=ww_hist_mask,
         hosp_target=hosp_targets,

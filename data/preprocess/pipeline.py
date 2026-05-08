@@ -26,6 +26,7 @@ from .processors.hospitalizations_processor import HospitalizationsProcessor
 from .processors.mobility_processor import MobilityProcessor
 from .processors.synthetic_processor import SyntheticProcessor
 from .processors.temporal_covariates_processor import TemporalCovariatesProcessor
+from .processors.vaccination_processor import VaccinationProcessor
 
 
 class OfflinePreprocessingPipeline:
@@ -69,6 +70,10 @@ class OfflinePreprocessingPipeline:
         # Initialize hospitalizations processor if hospitalizations file is provided
         if self.config.hospitalizations_file:
             self.processors["hospitalizations"] = HospitalizationsProcessor(self.config)
+
+        # Initialize vaccination processor if vaccination file is provided
+        if self.config.vaccination_file:
+            self.processors["vaccination"] = VaccinationProcessor(self.config)
 
         # Initialize temporal covariates processor if configured
         if self.config.temporal_covariates is not None:
@@ -129,6 +134,7 @@ class OfflinePreprocessingPipeline:
                 population_data=processed_data["population"],
                 hospitalizations_data=processed_data.get("hospitalizations"),
                 deaths_data=processed_data.get("deaths"),
+                vaccination_data=processed_data.get("vaccination"),
                 latent_sird_data=processed_data.get("latent_sird"),
             )
 
@@ -234,6 +240,14 @@ class OfflinePreprocessingPipeline:
                 processed["hospitalizations"] = None
             if "deaths" not in processed:
                 processed["deaths"] = None
+            # Process vaccination data from real file if configured
+            if "vaccination" in self.processors:
+                print("Processing vaccination data...")
+                processed["vaccination"] = self.processors["vaccination"].process(
+                    self.config.vaccination_file
+                )
+            else:
+                processed["vaccination"] = None
 
             return processed
 
@@ -319,6 +333,20 @@ class OfflinePreprocessingPipeline:
                 raw_data["deaths"] = None
         else:
             raw_data["deaths"] = None
+
+        # Process vaccination data (optional)
+        if self.config.vaccination_file and "vaccination" in self.processors:
+            print("Processing vaccination data...")
+            try:
+                vaccination_data = self.processors["vaccination"].process(
+                    self.config.vaccination_file
+                )
+                raw_data["vaccination"] = vaccination_data
+            except Exception as e:
+                print(f"  ! Warning: Failed to process vaccination data: {str(e)}")
+                raw_data["vaccination"] = None
+        else:
+            raw_data["vaccination"] = None
 
         print()
         return raw_data
@@ -406,24 +434,6 @@ class OfflinePreprocessingPipeline:
             self.config.dataset_name + ".zarr"
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Clear source Zarr encodings before rechunking to avoid conflicts
-        # Variables loaded from source Zarr files retain chunk encodings that
-        # conflict with our desired chunking strategy
-        v3_encoding_keys = {
-            "chunks",
-            "preferred_chunks",
-            "compressors",
-            "compressor",
-            "filters",
-            "serializer",
-            "object_codec",
-            "shards",
-        }
-        for var_name in aligned_dataset.data_vars:
-            var = aligned_dataset.data_vars[var_name]
-            for key in v3_encoding_keys:
-                var.encoding.pop(key, None)
 
         # Rechunk to uniform chunks for Zarr compatibility
         # Chunk run_id, date, and spatial dims to avoid oversized chunks
@@ -535,6 +545,12 @@ class OfflinePreprocessingPipeline:
             elif var_name == "temporal_covariates" and var.dtype == np.float32:
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
                 print(f"  {var_name}: float32 -> float16")
+            elif var_name == "vaccination_rate" and var.dtype in (
+                np.float32,
+                np.float64,
+            ):
+                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
+                print(f"  {var_name}: {old_dtype} -> float16")
             elif var_name.startswith("latent_") and var.dtype in (
                 np.float32,
                 np.float64,
@@ -554,8 +570,8 @@ class OfflinePreprocessingPipeline:
         )
 
         # Clear conflicting encodings from data variables and coordinates.
-        # Variables from source zarr files retain v3-specific encodings that
-        # are incompatible with zarr v2 format used for output.
+        # This is the canonical cleanup point — after dtype conversion rebuilds the
+        # Dataset, source-Zarr v3 encodings may still linger on variables/coords.
         v3_encoding_keys = {
             "chunks",  # old chunk sizes conflict with rechunking
             "preferred_chunks",
