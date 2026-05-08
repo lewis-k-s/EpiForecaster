@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
@@ -48,6 +48,7 @@ class EpiBatch:
     I_target_mask: torch.Tensor | None  # (B, H+1)
     R_target_mask: torch.Tensor | None  # (B, H+1)
     D_target_mask: torch.Tensor | None  # (B, H+1)
+    region_ids: list[str] = field(default_factory=list)
 
     def to(
         self,
@@ -334,6 +335,7 @@ def collate_epiforecaster_batch(
         else None,
         window_start=window_starts,
         node_labels=[item["node_label"] for item in batch],
+        region_ids=[item["region_id"] for item in batch],
         temporal_covariates=temporal_covariates,
         ww_hist=ww_hist,
         ww_hist_mask=ww_hist_mask,

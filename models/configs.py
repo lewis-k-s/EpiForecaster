@@ -193,7 +193,9 @@ class CurriculumConfig:
                 f"run_sampling must be one of {valid_run_sampling}, got {self.run_sampling}"
             )
         if self.active_runs < -1 or self.active_runs == 0:
-            raise ValueError(f"active_runs must be >= -1 and != 0, got {self.active_runs}")
+            raise ValueError(
+                f"active_runs must be >= -1 and != 0, got {self.active_runs}"
+            )
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
 
@@ -704,6 +706,11 @@ class TrainingParams:
     gradient_clip_value: float = 5.0
     early_stopping_patience: int | None = 10  # None = disabled
     nan_loss_patience: int | None = None
+    # Loss outlier diagnostics: track EMA loss stats and log batches above N stddevs.
+    # Set loss_outlier_stddev_threshold=None to disable this per-batch diagnostic.
+    loss_outlier_stddev_threshold: float | None = 5.0
+    loss_outlier_ema_decay: float = 0.99
+    loss_outlier_max_logged_items: int = 8
     val_split: float = 0.2
     test_split: float = 0.1
     # Split strategy: "node" (default, region holdouts) or "time" (temporal splits)
@@ -923,6 +930,24 @@ class TrainingParams:
             raise ValueError(
                 "min_learning_rate must be <= learning_rate, "
                 f"got {self.min_learning_rate} > {self.learning_rate}"
+            )
+        if (
+            self.loss_outlier_stddev_threshold is not None
+            and self.loss_outlier_stddev_threshold <= 0.0
+        ):
+            raise ValueError(
+                "loss_outlier_stddev_threshold must be positive or None, "
+                f"got {self.loss_outlier_stddev_threshold}"
+            )
+        if not 0.0 <= self.loss_outlier_ema_decay < 1.0:
+            raise ValueError(
+                "loss_outlier_ema_decay must be in [0, 1), "
+                f"got {self.loss_outlier_ema_decay}"
+            )
+        if self.loss_outlier_max_logged_items <= 0:
+            raise ValueError(
+                "loss_outlier_max_logged_items must be positive, "
+                f"got {self.loss_outlier_max_logged_items}"
             )
         if (
             self.init_checkpoint_path is not None

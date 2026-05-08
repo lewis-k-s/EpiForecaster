@@ -56,6 +56,7 @@ from utils.gradnorm_logging import (
 )
 from utils.gradient_debug import GradientDebugger
 from utils.log_keys import build_loss_key, infer_observation_head_from_name
+from utils.loss_monitoring import EmaLossStats, stringify_epi_batch_indices
 from utils.platform import (
     get_nvme_path,
     is_slurm_cluster,
@@ -378,6 +379,15 @@ class EpiForecasterTrainer:
         self.patience_counter = 0
         self.nan_loss_counter = 0
         self.nan_loss_triggered = False
+        loss_outlier_stddev_threshold = (
+            self.config.training.loss_outlier_stddev_threshold
+        )
+        self.loss_stats = None
+        if loss_outlier_stddev_threshold is not None:
+            self.loss_stats = EmaLossStats(
+                decay=self.config.training.loss_outlier_ema_decay,
+                stddev_threshold=loss_outlier_stddev_threshold,
+            )
         self.training_history = {
             "train_loss": [],
             "val_loss": [],
@@ -1138,9 +1148,7 @@ class EpiForecasterTrainer:
         if ww_mae is not None:
             test_status_parts.append(f"WW MAE: {ww_mae:.4g}")
         test_status_parts.append(f"Time: {test_time:.2f}s")
-        self._status(
-            " | ".join(test_status_parts)
-        )
+        self._status(" | ".join(test_status_parts))
         if self.config.training.plot_forecasts:
             try:
                 self._generate_forecast_plots(self.test_loader, split="test")
@@ -1720,6 +1728,26 @@ class EpiForecasterTrainer:
                     loss = self._training_step_impl(batch_data)
                 model_step_time_s = time.time() - model_step_start_time
 
+                if self.loss_stats is not None:
+                    loss_value_for_stats = float(loss.detach().cpu())
+                    loss_outlier = self.loss_stats.update(loss_value_for_stats)
+                    if loss_outlier is not None:
+                        batch_identifiers = stringify_epi_batch_indices(
+                            batch_data,
+                            max_items=self.config.training.loss_outlier_max_logged_items,
+                        )
+                        self._status(
+                            "Training loss outlier detected at "
+                            f"epoch={self.current_epoch}, step={self.global_step}, "
+                            f"batch={batch_idx}: loss={loss_outlier.value:.6g}, "
+                            f"ema_mean={loss_outlier.mean:.6g}, "
+                            f"ema_std={loss_outlier.stddev:.6g}, "
+                            f"threshold={loss_outlier.threshold:.6g}, "
+                            f"z={loss_outlier.z_score:.2f}; "
+                            f"samples=[{batch_identifiers}]",
+                            logging.WARNING,
+                        )
+
                 gradient_snapshot_log_data: dict[str, float | int] = {}
                 should_capture_snapshot = (
                     self._gradient_snapshot_frequency > 0
@@ -1881,9 +1909,11 @@ class EpiForecasterTrainer:
                 bsz = batch_data.b
                 sps_samples_accum += bsz
                 sps_time_accum += batch_time_s
-                
+
                 samples_per_s = (
-                    (sps_samples_accum / sps_time_accum) if sps_time_accum > 0 else float("inf")
+                    (sps_samples_accum / sps_time_accum)
+                    if sps_time_accum > 0
+                    else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
                 log_this_step = should_log_step(self.global_step, 1, log_frequency)
@@ -2108,8 +2138,7 @@ class EpiForecasterTrainer:
             "backbone": [],
             "other": [],
             **{
-                f"observation_head_{head}": []
-                for head in GradNormController.task_names
+                f"observation_head_{head}": [] for head in GradNormController.task_names
             },
         }
 
@@ -2123,9 +2152,9 @@ class EpiForecasterTrainer:
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
             elif observation_head_name is not None:
-                self._grad_norm_groups[f"observation_head_{observation_head_name}"].append(
-                    param
-                )
+                self._grad_norm_groups[
+                    f"observation_head_{observation_head_name}"
+                ].append(param)
             elif "backbone" in name:
                 self._grad_norm_groups["backbone"].append(param)
             else:
