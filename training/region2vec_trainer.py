@@ -82,8 +82,25 @@ class EncoderConfig:
     num_layers: int = 2
     dropout: float = 0.2
     aggregation: str = "mean"
+    activation: str = "relu"
+    hidden_norm: str = "layer"
+    sage_normalize: bool = False
     residual: bool = False
     normalize: bool = True
+
+    def __post_init__(self) -> None:
+        valid_activations = {"relu", "gelu", "tanh"}
+        valid_hidden_norms = {"layer", "batch", "none"}
+        if self.activation not in valid_activations:
+            raise ValueError(
+                f"encoder.activation must be one of {sorted(valid_activations)}, "
+                f"got {self.activation!r}"
+            )
+        if self.hidden_norm not in valid_hidden_norms:
+            raise ValueError(
+                f"encoder.hidden_norm must be one of {sorted(valid_hidden_norms)}, "
+                f"got {self.hidden_norm!r}"
+            )
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> EncoderConfig:
@@ -190,6 +207,7 @@ class OutputConfig:
 
     output_dir: Path = Path("outputs/region_embeddings")
     embedding_filename: str = "region_embeddings.pt"
+    partial_embedding_filename: str = "region_embeddings.partial.pt"
     metrics_filename: str = "region_training_metrics.json"
     cluster_labels_filename: str = "region_clusters.json"
     save_numpy: bool = True
@@ -213,6 +231,9 @@ class OutputConfig:
         return cls(
             output_dir=output_dir,
             embedding_filename=raw.get("embedding_filename", cls.embedding_filename),
+            partial_embedding_filename=raw.get(
+                "partial_embedding_filename", cls.partial_embedding_filename
+            ),
             metrics_filename=raw.get("metrics_filename", cls.metrics_filename),
             cluster_labels_filename=raw.get(
                 "cluster_labels_filename", cls.cluster_labels_filename
@@ -481,6 +502,9 @@ class Region2VecTrainer:
             num_layers=self.config.encoder.num_layers,
             aggregation=self.config.encoder.aggregation,
             dropout=self.config.encoder.dropout,
+            activation=self.config.encoder.activation,
+            hidden_norm=self.config.encoder.hidden_norm,
+            sage_normalize=self.config.encoder.sage_normalize,
             residual=self.config.encoder.residual,
             normalize=self.config.encoder.normalize,
         ).to(self.device)
@@ -559,6 +583,9 @@ class Region2VecTrainer:
             "num_layers": self.config.encoder.num_layers,
             "dropout": self.config.encoder.dropout,
             "aggregation": self.config.encoder.aggregation,
+            "activation": self.config.encoder.activation,
+            "hidden_norm": self.config.encoder.hidden_norm,
+            "sage_normalize": self.config.encoder.sage_normalize,
             "residual": self.config.encoder.residual,
             "normalize": self.config.encoder.normalize,
             "loss_type": self.config.loss.loss_type,
@@ -610,9 +637,29 @@ class Region2VecTrainer:
                 self.best_state = {
                     k: v.detach().cpu() for k, v in self.encoder.state_dict().items()
                 }
+                self._save_partial_artifact(
+                    epoch=epoch,
+                    metrics=metrics,
+                    state_dict=self.best_state,
+                    is_best=True,
+                )
                 patience_counter = 0
             else:
                 patience_counter += 1
+
+            if (
+                self.config.training.checkpoint_every > 0
+                and epoch % self.config.training.checkpoint_every == 0
+            ):
+                state_dict = {
+                    k: v.detach().cpu() for k, v in self.encoder.state_dict().items()
+                }
+                self._save_partial_artifact(
+                    epoch=epoch,
+                    metrics=metrics,
+                    state_dict=state_dict,
+                    is_best=False,
+                )
 
             # Early stopping check
             if (
@@ -1061,6 +1108,45 @@ class Region2VecTrainer:
             "metrics_path": str(metrics_path),
             "cluster_labels_path": str(cluster_path) if cluster_path else None,
         }
+
+    def _save_partial_artifact(
+        self,
+        *,
+        epoch: int,
+        metrics: dict[str, float],
+        state_dict: dict[str, Any],
+        is_best: bool,
+    ) -> None:
+        output_dir = self.config.output.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        was_training = self.encoder.training
+        self.encoder.eval()
+        with torch.no_grad():
+            embeddings = self.encoder(self.features, self.edge_index).cpu()
+        if was_training:
+            self.encoder.train()
+
+        payload = {
+            "embeddings": embeddings.to(dtype_utils.MODEL_DTYPE),
+            "region_ids": self.region_ids,
+            "config": self.config.to_dict(),
+            "encoder_state_dict": state_dict,
+            "feature_dim": self.feature_dim,
+            "epoch": epoch,
+            "metrics": metrics,
+            "best_loss": float(self.best_loss),
+            "partial": True,
+            "is_best": is_best,
+        }
+        latest_path = output_dir / self.config.output.partial_embedding_filename
+        torch.save(payload, latest_path)
+
+        if is_best:
+            return
+
+        checkpoint_path = output_dir / f"region_embeddings.epoch_{epoch:06d}.pt"
+        torch.save(payload, checkpoint_path)
 
     # ------------------------------------------------------------------
     # Misc helpers

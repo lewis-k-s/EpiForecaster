@@ -50,6 +50,8 @@ class Region2Vec(nn.Module):
         dropout: float = 0.5,
         activation: str = "relu",
         normalize: bool = True,
+        hidden_norm: str = "layer",
+        sage_normalize: bool = False,
         residual: bool = False,
     ):
         """
@@ -63,7 +65,9 @@ class Region2Vec(nn.Module):
             aggregation: Aggregation method ('mean', 'max', 'lstm', 'attention')
             dropout: Dropout probability
             activation: Activation function ('relu', 'gelu', 'tanh')
-            normalize: Whether to apply L2 normalization
+            normalize: Whether to apply final L2 normalization to embeddings
+            hidden_norm: Hidden normalization layer ('layer', 'batch', 'none')
+            sage_normalize: Whether GraphSAGE layers apply internal L2 normalization
             residual: Whether to use residual connections
         """
         super().__init__()
@@ -75,10 +79,20 @@ class Region2Vec(nn.Module):
         self.aggregation = aggregation
         self.dropout = dropout
         self.normalize = normalize
+        self.hidden_norm = hidden_norm
+        self.sage_normalize = sage_normalize
         self.residual = residual
+
+        valid_hidden_norms = {"layer", "batch", "none"}
+        if hidden_norm not in valid_hidden_norms:
+            raise ValueError(
+                f"hidden_norm must be one of {sorted(valid_hidden_norms)}, "
+                f"got {hidden_norm!r}"
+            )
 
         # Build GraphSAGE layers
         self.convs = nn.ModuleList()
+        # Kept as batch_norms for checkpoint compatibility with older artifacts.
         self.batch_norms = nn.ModuleList()
 
         for i in range(num_layers):
@@ -89,13 +103,20 @@ class Region2Vec(nn.Module):
             if aggregation == "attention":
                 conv = GATConv(in_dim, out_dim, heads=1, concat=False, dropout=dropout)
             else:
-                conv = SAGEConv(in_dim, out_dim, aggr=aggregation, normalize=normalize)
+                conv = SAGEConv(
+                    in_dim, out_dim, aggr=aggregation, normalize=sage_normalize
+                )
 
             self.convs.append(conv)
 
-            # Batch normalization (not for last layer)
+            # Hidden normalization (not for last layer)
             if i < num_layers - 1:
-                self.batch_norms.append(nn.BatchNorm1d(out_dim))
+                if hidden_norm == "layer":
+                    self.batch_norms.append(nn.LayerNorm(out_dim))
+                elif hidden_norm == "batch":
+                    self.batch_norms.append(nn.BatchNorm1d(out_dim))
+                else:
+                    self.batch_norms.append(nn.Identity())
 
         # Activation function
         if activation == "relu":
@@ -134,7 +155,7 @@ class Region2Vec(nn.Module):
         for i, conv in enumerate(self.convs):
             x = conv(x, edge_index)
 
-            # Apply batch normalization (except last layer)
+            # Apply hidden normalization (except last layer)
             if i < len(self.batch_norms):
                 x = self.batch_norms[i](x)
 
@@ -197,6 +218,17 @@ class Region2Vec(nn.Module):
         if embedding_dim is None:
             embedding_dim = encoder_cfg.get("hidden_dim", 128)
 
+        state_dict = region_artifact.get("encoder_state_dict")
+        if state_dict is None:
+            raise ValueError(
+                "Region encoder artifact missing 'encoder_state_dict'; cannot load weights."
+            )
+        default_hidden_norm = (
+            "batch"
+            if any(key.startswith("batch_norms.") for key in state_dict)
+            else "layer"
+        )
+
         encoder = cls(
             input_dim=int(feature_dim),
             hidden_dim=int(encoder_cfg.get("hidden_dim", 128)),
@@ -206,14 +238,11 @@ class Region2Vec(nn.Module):
             dropout=float(encoder_cfg.get("dropout", 0.5)),
             activation=str(encoder_cfg.get("activation", "relu")),
             normalize=bool(encoder_cfg.get("normalize", True)),
+            hidden_norm=str(encoder_cfg.get("hidden_norm", default_hidden_norm)),
+            sage_normalize=bool(encoder_cfg.get("sage_normalize", False)),
             residual=bool(encoder_cfg.get("residual", False)),
         )
 
-        state_dict = region_artifact.get("encoder_state_dict")
-        if state_dict is None:
-            raise ValueError(
-                "Region encoder artifact missing 'encoder_state_dict'; cannot load weights."
-            )
         encoder.load_state_dict(state_dict)
         encoder.eval()
         return encoder, region_artifact

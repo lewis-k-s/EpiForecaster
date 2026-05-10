@@ -10,6 +10,9 @@ encoder:
   num_layers: 2
   dropout: 0.2
   aggregation: "mean"
+  activation: "relu"
+  hidden_norm: "layer"
+  sage_normalize: false
   residual: true
   normalize: true
 
