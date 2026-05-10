@@ -206,10 +206,12 @@ def test_train_step_logging_includes_gradient_snapshot_metrics() -> None:
         component_gradnorm_log_data={"gradnorm_sird_physics": 3.0},
         gradnorm_step_log_data={},
         gradient_snapshot_log_data={"grad_snapshot_max_layer_norm": 9.0},
+        model_diagnostics_log_data={"model_diag/backbone/final_norm/rms": 1.0},
     )
 
     assert log_data["gradnorm_sird_physics"] == 3.0
     assert log_data["grad_snapshot_max_layer_norm"] == 9.0
+    assert log_data["model_diag/backbone/final_norm/rms"] == 1.0
 
 
 def test_wandb_step_payload_merges_sparse_gradient_metrics() -> None:
@@ -218,9 +220,22 @@ def test_wandb_step_payload_merges_sparse_gradient_metrics() -> None:
         log_data={"loss_train_step": 1.0},
         component_gradnorm_log_data={"gradnorm_sird_physics": 3.0},
         gradient_snapshot_log_data={"grad_snapshot_max_layer_norm": 9.0},
+        model_diagnostics_log_data={},
     )
 
     assert payload is None
+
+
+def test_wandb_step_payload_logs_sparse_model_diagnostics() -> None:
+    payload = get_wandb_step_payload(
+        log_this_step=False,
+        log_data={"loss_train_step": 1.0},
+        component_gradnorm_log_data={},
+        gradient_snapshot_log_data={},
+        model_diagnostics_log_data={"model_diag/backbone/final_norm/rms": 1.0},
+    )
+
+    assert payload == {"model_diag/backbone/final_norm/rms": 1.0}
 
 
 def test_wandb_step_payload_filters_gradient_scalars_on_logged_steps() -> None:
@@ -237,6 +252,7 @@ def test_wandb_step_payload_filters_gradient_scalars_on_logged_steps() -> None:
         },
         component_gradnorm_log_data={"gradnorm_sird_physics": 3.0},
         gradient_snapshot_log_data={"grad_snapshot_global_norm": 4.0},
+        model_diagnostics_log_data={},
     )
 
     assert payload == {

@@ -11,6 +11,7 @@ from data.epi_batch import EpiBatch
 from evaluation.selection import (
     WindowSelectionSpec,
     load_window_selection_specs_from_granular,
+    select_worst_windows_by_loss,
     select_windows_by_loss,
 )
 
@@ -31,7 +32,9 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
         def num_windows(self) -> int:
             return 1
 
-        def get_valid_window_starts_dict(self, *, mode: str, required_targets: list[str]):
+        def get_valid_window_starts_dict(
+            self, *, mode: str, required_targets: list[str]
+        ):
             assert mode == "all"
             assert required_targets == ["hospitalizations"]
             return {0: [5]}
@@ -59,6 +62,7 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
         window_start=torch.tensor([5], dtype=torch.long),
         node_labels=["Region 0"],
         temporal_covariates=torch.zeros((1, 3, 0), dtype=torch.float32),
+        vaccination_hist=torch.zeros((1, 3, 3), dtype=torch.float32),
         ww_hist=torch.zeros((1, 3), dtype=torch.float32),
         ww_hist_mask=torch.zeros((1, 3), dtype=torch.float32),
         hosp_target=torch.tensor([[8.0, 9.0]], dtype=torch.float32),
@@ -69,6 +73,14 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
         ww_target_mask=torch.zeros((1, 2), dtype=torch.float32),
         cases_target_mask=torch.zeros((1, 2), dtype=torch.float32),
         deaths_target_mask=torch.zeros((1, 2), dtype=torch.float32),
+        S_target=None,
+        I_target=None,
+        R_target=None,
+        D_target=None,
+        S_target_mask=None,
+        I_target_mask=None,
+        R_target_mask=None,
+        D_target_mask=None,
     )
 
     class _FakeDataLoader:
@@ -89,7 +101,9 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
             }, {}
 
     monkeypatch.setattr(forecast_plots, "DataLoader", _FakeDataLoader)
-    monkeypatch.setattr(forecast_plots, "prepare_batch_for_device", lambda batch, **_: batch)
+    monkeypatch.setattr(
+        forecast_plots, "prepare_batch_for_device", lambda batch, **_: batch
+    )
 
     loader = SimpleNamespace(dataset=dummy_dataset)
     model = _DummyModel()
@@ -116,10 +130,34 @@ def test_load_window_selection_specs_from_granular_aggregates_per_target_means(
     granular_csv = tmp_path / "granular.csv"
     pd.DataFrame(
         [
-            {"split": "test", "target": "cases", "node_id": 1, "window_start": 10, "abs_error": 1.0},
-            {"split": "test", "target": "cases", "node_id": 1, "window_start": 10, "abs_error": 3.0},
-            {"split": "test", "target": "hospitalizations", "node_id": 1, "window_start": 10, "abs_error": 10.0},
-            {"split": "test", "target": "cases", "node_id": 2, "window_start": 11, "abs_error": 5.0},
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 10,
+                "abs_error": 1.0,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 10,
+                "abs_error": 3.0,
+            },
+            {
+                "split": "test",
+                "target": "hospitalizations",
+                "node_id": 1,
+                "window_start": 10,
+                "abs_error": 10.0,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 2,
+                "window_start": 11,
+                "abs_error": 5.0,
+            },
         ]
     ).to_csv(granular_csv, index=False)
 
@@ -136,10 +174,7 @@ def test_load_window_selection_specs_from_granular_aggregates_per_target_means(
 
 
 def test_select_windows_by_loss_returns_window_specs() -> None:
-    specs = [
-        WindowSelectionSpec(i, 100 + i, float(i), ("cases",), 2)
-        for i in range(8)
-    ]
+    specs = [WindowSelectionSpec(i, 100 + i, float(i), ("cases",), 2) for i in range(8)]
     groups = select_windows_by_loss(window_specs=specs, samples_per_group=1)
     assert set(groups) == {
         "Q1 (Best MAE)",
@@ -149,6 +184,22 @@ def test_select_windows_by_loss_returns_window_specs() -> None:
     }
     assert all(len(group) == 1 for group in groups.values())
     assert all(isinstance(group[0], WindowSelectionSpec) for group in groups.values())
+
+
+def test_select_worst_windows_by_loss_returns_highest_scored_windows() -> None:
+    specs = [
+        WindowSelectionSpec(3, 103, 3.0, ("cases",), 2),
+        WindowSelectionSpec(1, 101, 1.0, ("cases",), 2),
+        WindowSelectionSpec(2, 102, 5.0, ("cases",), 2),
+    ]
+
+    groups = select_worst_windows_by_loss(window_specs=specs, k=2)
+
+    assert list(groups) == ["Worst MAE"]
+    assert [(spec.node_id, spec.score) for spec in groups["Worst MAE"]] == [
+        (2, 5.0),
+        (3, 3.0),
+    ]
 
 
 def test_collect_forecast_samples_for_window_specs_uses_exact_window(
@@ -188,6 +239,7 @@ def test_collect_forecast_samples_for_window_specs_uses_exact_window(
         window_start=torch.tensor([4], dtype=torch.long),
         node_labels=["Region 0"],
         temporal_covariates=torch.zeros((1, 3, 0), dtype=torch.float32),
+        vaccination_hist=torch.zeros((1, 3, 3), dtype=torch.float32),
         ww_hist=torch.zeros((1, 3), dtype=torch.float32),
         ww_hist_mask=torch.zeros((1, 3), dtype=torch.float32),
         hosp_target=torch.tensor([[7.0, 8.0]], dtype=torch.float32),
@@ -198,6 +250,14 @@ def test_collect_forecast_samples_for_window_specs_uses_exact_window(
         ww_target_mask=torch.zeros((1, 2), dtype=torch.float32),
         cases_target_mask=torch.zeros((1, 2), dtype=torch.float32),
         deaths_target_mask=torch.zeros((1, 2), dtype=torch.float32),
+        S_target=None,
+        I_target=None,
+        R_target=None,
+        D_target=None,
+        S_target_mask=None,
+        I_target_mask=None,
+        R_target_mask=None,
+        D_target_mask=None,
     )
 
     class _FakeDataLoader:
@@ -218,7 +278,9 @@ def test_collect_forecast_samples_for_window_specs_uses_exact_window(
             }, {}
 
     monkeypatch.setattr(forecast_plots, "DataLoader", _FakeDataLoader)
-    monkeypatch.setattr(forecast_plots, "prepare_batch_for_device", lambda batch, **_: batch)
+    monkeypatch.setattr(
+        forecast_plots, "prepare_batch_for_device", lambda batch, **_: batch
+    )
 
     loader = SimpleNamespace(dataset=dummy_dataset)
     model = _DummyModel()
@@ -307,3 +369,48 @@ def test_make_forecast_figure_supports_shared_labels() -> None:
         text.get_text() == "Time (days relative to forecast start)"
         for text in fig.texts
     )
+
+
+def test_make_joint_latent_forecast_figure_plots_sird_rows() -> None:
+    sample = {
+        "node_id": 1,
+        "node_label": "Region 1",
+        "actual_context": [1.0, 2.0, 3.0, 4.0],
+        "prediction": [3.0, 5.0],
+        "target": [3.0, 4.0],
+        "history": [1.0, 2.0],
+        "t_rel": [-2, -1, 0, 1],
+        "t0_idx_in_context": 2,
+        "start_time": "2024-01-01",
+        "window_start": 10,
+        "window_mae": 0.5,
+        "L": 2,
+        "H": 2,
+        "latents": {
+            "latent_s": {
+                "actual_context": [float("nan"), float("nan"), 0.9, 0.8],
+                "prediction": [0.9, 0.8],
+                "target": [float("nan"), float("nan")],
+                "history": [],
+                "window_mae": None,
+            },
+            "latent_i": {
+                "actual_context": [float("nan"), float("nan"), 0.1, 0.2],
+                "prediction": [0.1, 0.2],
+                "target": [float("nan"), float("nan")],
+                "history": [],
+                "window_mae": None,
+            },
+        },
+    }
+
+    fig = forecast_plots.make_joint_latent_forecast_figure(
+        samples={"Worst MAE": [sample]},
+        input_window_length=2,
+        forecast_horizon=2,
+    )
+
+    assert fig is not None
+    ylabels = [ax.get_ylabel() for ax in fig.axes if ax.get_ylabel()]
+    assert any("Latent S" in label for label in ylabels)
+    assert any("Latent I" in label for label in ylabels)

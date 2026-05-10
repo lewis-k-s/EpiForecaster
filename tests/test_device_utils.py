@@ -36,6 +36,7 @@ def _make_batch() -> EpiBatch:
         window_start=torch.zeros(1, dtype=torch.long),
         node_labels=["node-0"],
         temporal_covariates=torch.ones(1, 2, 1, dtype=torch.float32),
+        vaccination_hist=torch.zeros(1, 2, 3, dtype=torch.float32),
         ww_hist=torch.ones(1, 2, dtype=torch.float32),
         ww_hist_mask=torch.ones(1, 2, dtype=torch.float32),
         hosp_target=torch.ones(1, 1, dtype=torch.float32),

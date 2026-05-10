@@ -26,9 +26,7 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
     def _fake_eval_checkpoint(**kwargs):
         captured["eval_checkpoint_kwargs"] = kwargs
         return {
-            "config": SimpleNamespace(
-                training=SimpleNamespace(num_forecast_samples=2)
-            ),
+            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=2)),
             "model": object(),
             "loader": object(),
             "node_mae": {"hospitalizations": {0: 0.1, 1: 0.2}},
@@ -143,9 +141,7 @@ def test_eval_cli_creates_missing_output_directory_for_all_artifacts(
     def _fake_eval_checkpoint(**kwargs):
         captured["eval_checkpoint_kwargs"] = kwargs
         return {
-            "config": SimpleNamespace(
-                training=SimpleNamespace(num_forecast_samples=1)
-            ),
+            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
             "model": object(),
             "loader": object(),
             "node_mae": {"hospitalizations": {0: 0.1}},
@@ -373,9 +369,7 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
     def _fake_eval_checkpoint(**kwargs):
         captured["eval_checkpoint_kwargs"] = kwargs
         return {
-            "config": SimpleNamespace(
-                training=SimpleNamespace(num_forecast_samples=2)
-            ),
+            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=2)),
             "model": object(),
             "loader": object(),
             "node_mae": {"hospitalizations": {0: 0.1, 1: 0.2}},
@@ -409,7 +403,9 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
         baseline_dir = kwargs["output_dir"]
         baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_csv = baseline_dir / "baseline_aggregate_metrics.csv"
-        baseline_csv.write_text("model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8")
+        baseline_csv.write_text(
+            "model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8"
+        )
         (baseline_dir / "baseline_metadata.json").write_text(
             '{"comparison_scope":"same_eval_slice"}',
             encoding="utf-8",
@@ -492,7 +488,9 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
         "var",
     ]
     assert baseline_kwargs["split"] == "test"
-    assert baseline_kwargs["output_dir"] == output_dir / "test_baseline_eval_same_window"
+    assert (
+        baseline_kwargs["output_dir"] == output_dir / "test_baseline_eval_same_window"
+    )
 
     compare_kwargs = captured["compare_kwargs"]
     assert compare_kwargs["baseline_results_csv"] == (
@@ -500,9 +498,15 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
     )
     assert compare_kwargs["candidate_granular_csv"] == output_dir / "test_granular.csv"
     baseline_plot_kwargs = captured["render_baseline_delta_plots_kwargs"]
-    assert baseline_plot_kwargs["baseline_deltas_csv"] == output_dir / "test_baseline_deltas.csv"
+    assert (
+        baseline_plot_kwargs["baseline_deltas_csv"]
+        == output_dir / "test_baseline_deltas.csv"
+    )
     assert baseline_plot_kwargs["output_dir"] == output_dir
-    assert "--compare-evals supplied; ignoring explicit --compare-baselines path" in result.output
+    assert (
+        "--compare-evals supplied; ignoring explicit --compare-baselines path"
+        in result.output
+    )
 
 
 def test_eval_cli_compare_evals_rejects_full_split(
@@ -583,7 +587,9 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
 
     def _fake_eval_checkpoint(**kwargs):
         granular_csv = kwargs["granular_csv_path"]
-        granular_csv.write_text("split,target,node_id,window_start,abs_error\n", encoding="utf-8")
+        granular_csv.write_text(
+            "split,target,node_id,window_start,abs_error\n", encoding="utf-8"
+        )
         return {
             "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=2)),
             "model": object(),
@@ -675,7 +681,10 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
     )
 
     assert result.exit_code == 0, result.output
-    assert captured["load_window_specs_kwargs"]["granular_csv"] == output_dir / "test_granular.csv"
+    assert (
+        captured["load_window_specs_kwargs"]["granular_csv"]
+        == output_dir / "test_granular.csv"
+    )
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["node_groups"] is None
     assert plot_kwargs["window_groups"]["Q1 (Best MAE)"][0].window_start == 11
@@ -739,7 +748,9 @@ def test_plot_forecasts_window_quartile_uses_granular_csv(
     )
 
     granular_csv = checkpoint_path.parent.parent / "test_granular.csv"
-    granular_csv.write_text("split,target,node_id,window_start,abs_error\n", encoding="utf-8")
+    granular_csv.write_text(
+        "split,target,node_id,window_start,abs_error\n", encoding="utf-8"
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -760,3 +771,84 @@ def test_plot_forecasts_window_quartile_uses_granular_csv(
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["node_groups"] is None
     assert plot_kwargs["window_groups"]["Q1 (Best MAE)"][0].node_id == 3
+
+
+def test_plot_forecasts_window_worst_uses_granular_tail_selection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint_path = tmp_path / "run" / "checkpoints" / "best_model.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    checkpoint_path.write_bytes(b"dummy")
+    granular_csv = checkpoint_path.parent.parent / "test_granular.csv"
+    granular_csv.write_text(
+        "split,target,node_id,window_start,abs_error\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.load_model_from_checkpoint",
+        lambda checkpoint, device="auto", overrides=None: (
+            __import__("torch").nn.Linear(1, 1),
+            SimpleNamespace(
+                output=SimpleNamespace(
+                    resolve_granular_eval_filename=lambda split: f"{split}_granular.csv"
+                ),
+                training=SimpleNamespace(),
+            ),
+            object(),
+        ),
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.build_loader_from_config",
+        lambda config, split, device="auto": (
+            SimpleNamespace(
+                dataset=type(
+                    "_Dataset",
+                    (),
+                    {
+                        "_valid_window_starts_by_node": {},
+                        "__len__": lambda self: 0,
+                    },
+                )()
+            ),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "evaluation.selection.load_window_selection_specs_from_granular",
+        lambda **kwargs: [
+            WindowSelectionSpec(3, 9, 0.2, ("cases",), 2),
+        ],
+    )
+    monkeypatch.setattr(
+        "evaluation.selection.select_worst_windows_by_loss",
+        lambda **kwargs: {"Worst MAE": kwargs["window_specs"]},
+    )
+    monkeypatch.setattr(
+        "evaluation.epiforecaster_eval.generate_forecast_plots",
+        lambda **kwargs: captured.setdefault("generate_forecast_plots_kwargs", kwargs),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "plot",
+            "forecasts",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--split",
+            "test",
+            "--nodes",
+            "window_worst:1",
+            "--include-sird-latents",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    plot_kwargs = captured["generate_forecast_plots_kwargs"]
+    assert plot_kwargs["node_groups"] is None
+    assert plot_kwargs["window_groups"]["Worst MAE"][0].node_id == 3
+    assert plot_kwargs["include_sird_latents"] is True

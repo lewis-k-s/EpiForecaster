@@ -575,6 +575,7 @@ def test_build_wandb_payload_filters_grad_scalars_and_merges_histograms(mock_his
         },
         component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
         gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
+        model_diagnostics_log_data={},
     )
 
     assert payload is not None
@@ -606,6 +607,7 @@ def test_build_wandb_payload_omits_histograms_when_frequency_is_zero():
         log_data={"gradnorm_clipped_total": 2.0},
         component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
         gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
+        model_diagnostics_log_data={},
     )
 
     assert payload is None

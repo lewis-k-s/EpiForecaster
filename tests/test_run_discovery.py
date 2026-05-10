@@ -31,12 +31,12 @@ class TestExtractRunFromCheckpointPath:
 
         assert result == ("my_experiment", "run_1234567890")
 
-    def test_extract_from_optuna_path(self, tmp_path: Path):
-        """Test extraction with optuna checkpoint path."""
+    def test_extract_from_hpsearch_path(self, tmp_path: Path):
+        """Test extraction with hpsearch checkpoint path."""
         checkpoint = (
             tmp_path
             / "outputs"
-            / "optuna"
+            / "hpsearch"
             / "hpo_experiment"
             / "local_trial29_1768952246597587000"
             / "checkpoints"
@@ -135,7 +135,7 @@ class TestExtractRunFromCheckpointPath:
         assert result is None
 
     def test_extract_with_different_trial_patterns(self, tmp_path: Path):
-        """Test extraction works with various optuna trial patterns."""
+        """Test extraction works with various trial patterns."""
         test_cases = [
             "local_trial1_123",
             "remote_trial5_456",
@@ -146,7 +146,7 @@ class TestExtractRunFromCheckpointPath:
             checkpoint = (
                 tmp_path
                 / "outputs"
-                / "optuna"
+                / "hpsearch"
                 / "hpo_exp"
                 / run_id
                 / "checkpoints"
