@@ -56,16 +56,6 @@ uv run main --help  # entrypoint cli.py
 - Use fixtures for sample data; keep tests deterministic (seed RNGs).
 - Quick examples: `uv run pytest -k graph tests/`, `uv run pytest -q tests/`.
 
-## Configuration Files
-
-> **WARNING: Production Configs**
->
-> Do not run configs in `configs/production_only/` locally. They require 100GB+ memory and GPU cluster resources, and will cause out-of-memory crashes on typical development machines. See `configs/production_only/README.md` for details.
->
-> For local development, use configs in the main `configs/` directory instead.
-
-### Pytest Markers
-
 Tests are organized with markers for selective execution:
 
 - `@pytest.mark.region`: Tests related to region2vec, region losses, spatial autocorrelation
@@ -74,36 +64,23 @@ Tests are organized with markers for selective execution:
 Usage:
 
 ```bash
-# Run only region tests
 uv run pytest -m region -v
-
-# Run only epiforecaster tests
 uv run pytest -m epiforecaster -v
-
-# Run all tests except region
 uv run pytest -m "not region" -v
-
-# List all markers
 uv run pytest --markers
 ```
 
-## Configuration-Driven Development
+## Training & Dataset Workflow
 
-This project uses YAML configuration files for reproducible experiments:
+For training commands, config-driven development workflow, dataset pipeline, and remote (MN5) dispatch, load the **`model-training`** skill.
 
-- Copy and modify configuration templates from the `configs/` directory
-- Preprocessing configs: specify data sources and processing parameters
-- Training configs: define model type, hyperparameters, and training settings
-- All model variants (base, regions, mobility, full) use the same interface
-- Config parsing goes through Python dataclasses (see `training/epiforecaster_trainer.py`, `training/region_embedder_trainer.py`); keep the YAML schema and the dataclass fields in sync and add/adjust docstrings when new config keys are introduced.
+Key entry points:
 
-## Dataset Workflow
+- `uv run train (regions|epiforecaster) --config <yaml>` — local training
+- `uv run preprocess (regions|epiforecaster)` — data preparation
+- `bash syncto_mn5.sh && ssh mn5 '...'` — remote training (see `mn5-dispatch` skill)
 
-The canonical data pipeline follows: raw data → preprocessing → Zarr datasets → training
-
-- Use `uv run preprocess (regions|epiforecaster)` to convert raw data to canonical format
-
-- Use `uv run train (regions|epiforecaster)` to train on the prepared dataset.
+> **WARNING**: Do not run configs in `configs/production_only/` locally. They require GPU cluster resources. See `configs/production_only/README.md`.
 
 ## Paper Workflow
 
