@@ -115,51 +115,36 @@ class EDARProcessor:
         Uses max-severity aggregation: missing (2) > censored (1) > uncensored (0).
         Where multiple EDAR sites contribute to a region, takes the maximum flag value.
 
-        Preserves run_id dimension if present in input.
+        Uses vectorized xr.dot instead of per-(variant, region) loops for
+        orders-of-magnitude speedup on large datasets.
 
         Args:
-            censor_xr: Censor flags with dimensions (run_id?, date, edar_id, variant)
+            censor_xr: Censor flags with dimensions (run_id, date, edar_id, variant)
             emap: EDAR contribution matrix (edar_id, region_id)
 
         Returns:
-            Censor flags aggregated to regions with dimensions (run_id?, date, region_id, variant)
+            Censor flags aggregated to regions with dimensions (run_id, date, region_id, variant)
         """
-        # Align and take max over EDAR sites contributing to each region
         censor_xr_aligned, emap_aligned = xr.align(censor_xr, emap, join="inner")
 
-        # run_id dimension is always present
         assert "run_id" in censor_xr_aligned.dims, "run_id dimension is required"
 
-        coords = {
-            "run_id": censor_xr_aligned["run_id"].values,
-            "date": censor_xr_aligned["date"].values,
-            REGION_COORD: emap_aligned[REGION_COORD].values,
-            "variant": censor_xr_aligned["variant"].values,
-        }
+        emap_bool = (emap_aligned > 0).astype(float)
+        censor_filled = censor_xr_aligned.fillna(2.0)
+
+        any_missing = xr.dot(
+            (censor_filled == 2).astype(float), emap_bool, dim="edar_id"
+        ) > 0
+        any_censored = xr.dot(
+            (censor_filled == 1).astype(float), emap_bool, dim="edar_id"
+        ) > 0
+        has_any_site = emap_bool.sum(dim="edar_id") > 0
+
+        severity = xr.where(any_missing, 2.0, xr.where(any_censored, 1.0, 0.0))
+        result = xr.where(has_any_site, severity, np.nan)
+
         dims = ["run_id", "date", REGION_COORD, "variant"]
-
-        result = xr.DataArray(coords=coords, dims=dims)
-
-        for variant in censor_xr_aligned["variant"].values:
-            variant_censor = censor_xr_aligned.sel(variant=variant)
-            # Fill NaN with 2 (missing) for sites without data
-            variant_censor_filled = variant_censor.fillna(2)
-
-            # Max-severity aggregation: for each region, take max of contributing sites
-            # We compute this by iterating over regions and taking max where emap > 0
-            for region in emap_aligned[REGION_COORD].values:
-                # Find EDAR sites that contribute to this region
-                contributing_sites = emap_aligned.sel({REGION_COORD: region}) > 0
-
-                # Take max censor flag among contributing sites
-                region_censor = variant_censor_filled.where(contributing_sites).max(
-                    dim="edar_id"
-                )
-                result.loc[{"variant": variant, REGION_COORD: region}] = (
-                    region_censor.values
-                )
-
-        return result
+        return result.transpose(*dims)
 
     def _compute_age_channel(
         self,
@@ -231,10 +216,7 @@ class EDARProcessor:
         # Get dimension order - run_id may or may not be present
         dims = mask.dims
         date_dim = "date"
-        region_dim = REGION_COORD
-        has_run_id = "run_id" in dims
 
-        # Create time indices along date dimension
         time_indices = xr.DataArray(
             np.arange(len(mask[date_dim])),
             dims=[date_dim],
@@ -258,20 +240,8 @@ class EDARProcessor:
         # Current time index for each position
         current_time_indices = time_indices
 
-        # Expand current_time_indices to match the shape of last_seen_filled
-        # If run_id exists, we need to broadcast to (run_id, date, region_id)
-        if has_run_id:
-            # Broadcast: (date,) -> (run_id, date, region_id)
-            current_time_indices = current_time_indices.expand_dims(
-                {region_dim: len(mask[region_dim]), "run_id": len(mask["run_id"])}
-            )
-        else:
-            # Broadcast: (date,) -> (date, region_id)
-            current_time_indices = current_time_indices.expand_dims(
-                {region_dim: len(mask[region_dim])}
-            )
-
         # Calculate age = current_time - last_seen_time
+        # xarray broadcasts (date,) against (run_id?, date, region_id) automatically
         current_age = current_time_indices - last_seen_filled
 
         # For positions with no history (NaN after ffill), set age to max_age
@@ -492,29 +462,27 @@ class EDARProcessor:
         # Skip early data quality validation - we'll assess quality at aligned stage
 
         biomarkers: dict[str, xr.DataArray] = {}
-        for variant in result["variant"].values.tolist():
-            variant_da = result.sel(variant=variant).drop_vars("variant")
+
+        # Compute masks for all variants at once (vectorized)
+        mask_all = xr.where((censor_aggregated < 1.5) & (result > 0), 1.0, 0.0)
+        age_all = self._compute_age_channel(mask_all).fillna(1.0)
+
+        for i, variant in enumerate(result["variant"].values.tolist()):
+            variant_da = result.isel(variant=i).drop_vars("variant")
             variant_name = f"edar_biomarker_{variant}"
             variant_da.name = variant_name
             biomarkers[variant_name] = variant_da
 
-            # Censor flag channel: 0=uncensored, 1=censored, 2=missing
-            # Fill NaN with 2.0 (missing) for regions without EDAR data
             censor_variant = (
-                censor_aggregated.sel(variant=variant).drop_vars("variant").fillna(2.0)
+                censor_aggregated.isel(variant=i).drop_vars("variant").fillna(2.0)
             )
             biomarkers[f"{variant_name}_censor"] = censor_variant
-
-            # Mask channel: 1.0 if measured (not missing), 0.0 otherwise
-            # Value is considered "measured" if it's not missing (censor < 2)
-            # and it has a positive value (to exclude zero-fill artifacts)
-            mask = xr.where((censor_variant < 1.5) & (variant_da > 0), 1.0, 0.0)
-            biomarkers[f"{variant_name}_mask"] = mask
-
-            # Age channel: normalized days since last actual measurement
-            # Compute age based on the mask (which now correctly identifies actual measurements)
-            age = self._compute_age_channel(mask).fillna(1.0)
-            biomarkers[f"{variant_name}_age"] = age
+            biomarkers[f"{variant_name}_mask"] = mask_all.isel(variant=i).drop_vars(
+                "variant"
+            )
+            biomarkers[f"{variant_name}_age"] = age_all.isel(variant=i).drop_vars(
+                "variant"
+            )
 
         return xr.Dataset(biomarkers)
 
