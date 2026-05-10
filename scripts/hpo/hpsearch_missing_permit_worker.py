@@ -1,4 +1,4 @@
-"""Optuna worker for missing-permit-only multi-objective EpiForecaster search.
+"""HPO worker for missing-permit-only multi-objective EpiForecaster search.
 
 This worker runs a dedicated sweep over data.missing_permit.* parameters while
 freezing all non-missing-permit hyperparameters from a prior full-HPO study.
@@ -21,7 +21,7 @@ from typing import Any
 import click
 
 from models.configs import EpiForecasterConfig
-from scripts.hpo.optuna_epiforecaster_worker import (
+from scripts.hpo.hpsearch_worker import (
     _compute_worker_seed,
     _overrides_to_dotlist,
     _slurm_identity,
@@ -390,7 +390,7 @@ def objective(
     "--journal-file",
     type=click.Path(path_type=Path),
     required=True,
-    help="Shared Optuna journal file for this missing-permit sweep.",
+    help="Shared journal file for this missing-permit sweep.",
 )
 @click.option(
     "--freeze-journal-file",
@@ -425,7 +425,7 @@ def objective(
 @click.option(
     "--run-root",
     type=click.Path(path_type=Path),
-    default=Path("outputs/optuna"),
+    default=Path("outputs/hpsearch"),
     show_default=True,
     help="Root directory for trial outputs (log_dir override).",
 )
@@ -488,7 +488,7 @@ def main(
     pruning_start_epoch: int,
     cli_overrides: tuple[str, ...],
 ) -> None:
-    """Run one Optuna worker for missing-permit Pareto sweep."""
+    """Run one HPO worker for missing-permit Pareto sweep."""
     setup_logging()
 
     try:
@@ -584,7 +584,7 @@ def main(
         pruner=selected_pruner,
     )
 
-    logger.info("Starting missing-permit Optuna worker for study '%s'", study_name)
+    logger.info("Starting missing-permit HPO worker for study '%s'", study_name)
     logger.info("Config: %s", config_path)
     logger.info("Journal file: %s", journal_file)
     logger.info("Run root: %s", run_root)

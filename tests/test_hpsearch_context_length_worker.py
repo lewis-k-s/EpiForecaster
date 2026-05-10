@@ -11,7 +11,7 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 from optuna.trial import create_trial
 
-from scripts.hpo import optuna_epiforecaster_context_length_worker as worker
+from scripts.hpo import hpsearch_context_length_worker as worker
 
 
 CONTEXT_LENGTH_CHOICES = [14, 28, 60]

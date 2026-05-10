@@ -12,7 +12,7 @@ provides insights into:
 Usage:
     python scripts/analysis/analyze_gradnorm.py <path_to_events_dir>
     python scripts/analysis/analyze_gradnorm.py <experiment_name> <run_id>
-    python scripts/analysis/analyze_gradnorm.py --optuna <trial_path> --json
+    python scripts/analysis/analyze_gradnorm.py --hpsearch-trial <trial_path> --json
 """
 
 import argparse
@@ -732,13 +732,13 @@ def print_analysis(analysis: GradnormAnalysis) -> None:
 
 def resolve_event_path(
     path: str,
-    optuna: bool = False,
+    hpsearch_trial: bool = False,
     experiment: str | None = None,
     run_id: str | None = None,
 ) -> Path:
     """Resolve event directory path from various input formats."""
-    if optuna:
-        # Optuna trial path - use directly
+    if hpsearch_trial:
+        # HPO trial path - use directly
         return Path(path)
 
     if experiment and run_id:
@@ -771,9 +771,9 @@ def main():
         help="Path to event directory, experiment name, or trial path",
     )
     parser.add_argument(
-        "--optuna",
+        "--hpsearch-trial",
         action="store_true",
-        help="Treat path as Optuna trial directory",
+        help="Treat path as HPO trial directory",
     )
     parser.add_argument(
         "--experiment",
@@ -802,7 +802,7 @@ def main():
     try:
         event_path = resolve_event_path(
             args.path,
-            optuna=args.optuna,
+            hpsearch_trial=args.hpsearch_trial,
             experiment=args.experiment,
             run_id=args.run_id,
         )

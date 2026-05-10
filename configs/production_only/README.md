@@ -46,7 +46,7 @@ scripts/cluster/submit_synth_pretrain.sh
 scripts/cluster/submit_pretrain_then_finetune.sh
 
 # For hyperparameter optimization
-sbatch scripts/cluster/optuna_epiforecaster.sbatch
+sbatch scripts/cluster/hpsearch.sbatch
 ```
 
 The chained submission helper uses a fixed `EPIFORECASTER_MODEL_ID` for the

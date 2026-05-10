@@ -1,4 +1,4 @@
-"""Optuna worker for paired-seed ablation study coordination.
+"""Ablation worker for paired-seed ablation study coordination.
 
 Uses Optuna JournalStorage to distribute ablation x seed trials across a
 smaller pool of long-running workers. Trials are enqueued in seed-major order
@@ -21,6 +21,7 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.ablation_status import ablation_journal_status
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
@@ -30,9 +31,15 @@ QUEUE_INITIALIZED_ATTR = "ablation_queue_initialized"
 ANALYSIS_LAUNCHED_ATTR = "ablation_analysis_launched"
 
 # Keep baseline first so each seed block starts with a matched baseline run.
+# Order: baseline → spatial/context → physics → loss → signal heads → kernels.
 ABLATIONS: dict[str, str] = {
     "baseline": "",
+    "mobility:off": "model.type.mobility=false",
+    "regions:off": "model.type.regions=false",
+    "context:off": "model.type.mobility=false model.type.regions=false",
+    "residual:off": "model.observation_heads.residual_scale=0.0",
     "sir:off": "training.loss.joint.w_sird_supervision=0.0",
+    "gradnorm:on": "training.loss.joint.adaptive_scheme=gradnorm",
     "sig:ww:aux": "training.loss.joint.disable_ww=true",
     "sig:ww:proxy": "training.loss.joint.mask_input_ww=true",
     "sig:ww:off": "training.loss.joint.disable_ww=true training.loss.joint.mask_input_ww=true",
@@ -45,10 +52,6 @@ ABLATIONS: dict[str, str] = {
     "sig:deaths:aux": "training.loss.joint.disable_deaths=true",
     "sig:deaths:proxy": "training.loss.joint.mask_input_deaths=true",
     "sig:deaths:off": "training.loss.joint.disable_deaths=true training.loss.joint.mask_input_deaths=true",
-    "residual:off": "model.observation_heads.residual_scale=0.0",
-    "mobility:off": "model.type.mobility=false",
-    "regions:off": "model.type.regions=false",
-    "context:off": "model.type.mobility=false model.type.regions=false",
     "kernel:fixed": "model.observation_heads.learnable_kernel_hosp=false model.observation_heads.learnable_kernel_cases=false model.observation_heads.learnable_kernel_deaths=false",
     "kernel:ww:free": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.kernel_parameterization_ww=free",
     "kernel:hosp:free": "model.observation_heads.learnable_kernel_hosp=true model.observation_heads.kernel_parameterization_hosp=free",
@@ -56,7 +59,6 @@ ABLATIONS: dict[str, str] = {
     "kernel:deaths:free": "model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_deaths=free",
     "kernel:all:free": "model.observation_heads.learnable_kernel_ww=true model.observation_heads.learnable_kernel_hosp=true model.observation_heads.learnable_kernel_cases=true model.observation_heads.learnable_kernel_deaths=true model.observation_heads.kernel_parameterization_ww=free model.observation_heads.kernel_parameterization_hosp=free model.observation_heads.kernel_parameterization_cases=free model.observation_heads.kernel_parameterization_deaths=free",
     "kernel:all:mlp": "model.observation_heads.kernel_mlp_ww=true model.observation_heads.kernel_mlp_hosp=true model.observation_heads.kernel_mlp_cases=true model.observation_heads.kernel_mlp_deaths=true",
-    "gradnorm:on": "training.loss.joint.adaptive_scheme=gradnorm",
 }
 
 TERMINAL_TRIAL_STATES = {
@@ -252,7 +254,7 @@ def objective(
     cfg.output.log_dir = str(run_root / campaign_id)
 
     trainer = EpiForecasterTrainer(cfg)
-    trainer.model_id = f"optuna_t{trial.number}_s{seed}"
+    trainer.model_id = f"ablation_t{trial.number}_s{seed}"
 
     results = trainer.run()
     val_loss = float(results.get("best_val_loss", float("inf")))
@@ -315,7 +317,7 @@ def main(
     run_root.mkdir(parents=True, exist_ok=True)
 
     if journal_file is None:
-        journal_file = Path("outputs/optuna") / f"{study_name}.journal"
+        journal_file = Path("outputs/ablation_studies") / f"{study_name}.journal"
     journal_file.parent.mkdir(parents=True, exist_ok=True)
 
     worker_seed = _compute_worker_seed(seed)

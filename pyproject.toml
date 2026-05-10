@@ -91,10 +91,10 @@ gradnorm-analyze = "scripts.analysis.analyze_gradnorm:main"
 dead-code-analyze = "scripts.analysis.dead_code_analyze:main"
 # Data visualization runner
 dataviz = "scripts.analysis.dataviz_runner:main"
-# Optuna HPO worker for manual SLURM array jobs
-optuna-worker = "scripts.hpo.optuna_epiforecaster_worker:main"
-optuna-missing-permit-worker = "scripts.hpo.optuna_epiforecaster_missing_permit_worker:main"
-optuna-pareto-plot = "scripts.hpo.plot_optuna_pareto:main"
+# HPO worker for manual SLURM array jobs
+hpsearch-worker = "scripts.hpo.hpsearch_worker:main"
+hpsearch-missing-permit-worker = "scripts.hpo.hpsearch_missing_permit_worker:main"
+hpsearch-pareto-plot = "scripts.hpo.plot_hpsearch_pareto:main"
 
 [build-system]
 requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]

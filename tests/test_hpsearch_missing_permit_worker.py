@@ -6,7 +6,7 @@ from typing import Any
 import optuna
 import pytest
 
-from scripts.hpo.optuna_epiforecaster_missing_permit_worker import (
+from scripts.hpo.hpsearch_missing_permit_worker import (
     _compute_val_coverage_ratio,
     create_missing_permit_study,
     load_frozen_non_permit_overrides,
@@ -161,7 +161,7 @@ def test_compute_val_coverage_ratio_guard() -> None:
 
 
 def test_objective_returns_multiobjective_tuple(monkeypatch, tmp_path) -> None:
-    import scripts.hpo.optuna_epiforecaster_missing_permit_worker as module
+    import scripts.hpo.hpsearch_missing_permit_worker as module
 
     trial = _StubTrial()
 

@@ -2,15 +2,15 @@ DEFAULT_STUDY_NAME="epiforecaster_hpo_v1"
 STUDY_NAME="${1:-$DEFAULT_STUDY_NAME}"
 
 REMOTE_ROOT="/home/bsc/bsc008913/EpiForecaster"
-REMOTE_OPTUNA="$REMOTE_ROOT/outputs/optuna"
-LOCAL_OPTUNA="./outputs/optuna"
+REMOTE_HPSEARCH="$REMOTE_ROOT/outputs/hpsearch"
+LOCAL_HPSEARCH="./outputs/hpsearch"
 
-mkdir -p "$LOCAL_OPTUNA"
-
-rsync -avz --progress \
-    dt:${REMOTE_OPTUNA}/${STUDY_NAME}.journal \
-    "$LOCAL_OPTUNA/"
+mkdir -p "$LOCAL_HPSEARCH"
 
 rsync -avz --progress \
-    dt:${REMOTE_OPTUNA}/${STUDY_NAME} \
-    "$LOCAL_OPTUNA/"
+    dt:${REMOTE_HPSEARCH}/${STUDY_NAME}.journal \
+    "$LOCAL_HPSEARCH/"
+
+rsync -avz --progress \
+    dt:${REMOTE_HPSEARCH}/${STUDY_NAME} \
+    "$LOCAL_HPSEARCH/"

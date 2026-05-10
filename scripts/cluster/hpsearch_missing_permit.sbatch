@@ -20,13 +20,13 @@ CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 # New study identity for missing-permit Pareto sweep.
 STUDY_NAME="${STUDY_NAME:-epiforecaster_missing_permit_pareto_v1}"
 # Shared journal for this new sweep.
-JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal}"
+JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/hpsearch/${STUDY_NAME}.journal}"
 # Trial outputs root (log_dir override).
-RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
+RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/hpsearch}"
 
 # Freeze source (full-HPO study).
 FREEZE_STUDY_NAME="${FREEZE_STUDY_NAME:-epiforecaster_hpo_v1}"
-FREEZE_JOURNAL_FILE="${FREEZE_JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${FREEZE_STUDY_NAME}.journal}"
+FREEZE_JOURNAL_FILE="${FREEZE_JOURNAL_FILE:-$PROJECT_ROOT/outputs/hpsearch/${FREEZE_STUDY_NAME}.journal}"
 # Optional explicit trial number from freeze study (default: best trial in study).
 FREEZE_TRIAL_NUMBER="${FREEZE_TRIAL_NUMBER:-}"
 
@@ -100,7 +100,7 @@ if [ -n "$OVERRIDES" ]; then
 fi
 
 if command -v uv >/dev/null 2>&1; then
-  uv run python -m scripts.hpo.optuna_epiforecaster_missing_permit_worker "${ARGS[@]}"
+  uv run python -m scripts.hpo.hpsearch_missing_permit_worker "${ARGS[@]}"
 else
-  python -m scripts.hpo.optuna_epiforecaster_missing_permit_worker "${ARGS[@]}"
+  python -m scripts.hpo.hpsearch_missing_permit_worker "${ARGS[@]}"
 fi

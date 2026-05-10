@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract and reconstruct config for a specific Optuna trial.
+"""Extract and reconstruct config for a specific HPO trial.
 
 Reconstructs the full config used for a trial by:
 1. Loading the base config (from trial user_attrs or --base-config)
@@ -8,19 +8,19 @@ Reconstructs the full config used for a trial by:
 
 Usage:
   # Extract trial 127 from horizon_fix study (base config stored in journal)
-  uv run python scripts/hpo/extract_optuna_trial_config.py \
-    --journal outputs/optuna/horizon_fix.journal \
+  uv run python scripts/hpo/extract_hpsearch_trial_config.py \
+    --journal outputs/hpsearch/horizon_fix.journal \
     --study horizon_fix \
     --trial 127 \
-    --output outputs/optuna/horizon_fix/trial_127_config.yaml
+    --output outputs/hpsearch/horizon_fix/trial_127_config.yaml
 
   # Override base config (for older sweeps without stored base)
-  uv run python scripts/hpo/extract_optuna_trial_config.py \
-    --journal outputs/optuna/horizon_fix.journal \
+  uv run python scripts/hpo/extract_hpsearch_trial_config.py \
+    --journal outputs/hpsearch/horizon_fix.journal \
     --study horizon_fix \
     --trial 127 \
     --base-config configs/production_only/train_epifor_mn5_full.yaml \
-    --output outputs/optuna/horizon_fix/trial_127_config.yaml
+    --output outputs/hpsearch/horizon_fix/trial_127_config.yaml
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
     "journal_file",
     type=click.Path(path_type=Path),
     required=True,
-    help="Path to Optuna journal file (.journal)",
+    help="Path to journal file (.journal)",
 )
 @click.option("--study", "study_name", type=str, required=True, help="Study name")
 @click.option("--trial", "trial_number", type=int, required=True, help="Trial number")
@@ -83,7 +83,7 @@ def main(
     base_config_path: Path | None,
     output_path: Path,
 ) -> None:
-    """Extract and reconstruct config for a specific Optuna trial."""
+    """Extract and reconstruct config for a specific HPO trial."""
     try:
         optuna = importlib.import_module("optuna")
         storages = importlib.import_module("optuna.storages")

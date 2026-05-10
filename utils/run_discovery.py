@@ -289,7 +289,8 @@ def extract_run_from_checkpoint_path(
 
     Supports both patterns:
     - outputs_root/training/{experiment}/{run_id}/checkpoints/best_model.pt
-    - outputs_root/optuna/{experiment}/{run_id}/checkpoints/best_model.pt
+    - outputs_root/hpsearch/{experiment}/{run_id}/checkpoints/best_model.pt
+    - outputs_root/ablation_studies/{experiment}/{run_id}/checkpoints/best_model.pt
 
     Args:
         checkpoint_path: Path to checkpoint file
@@ -312,14 +313,15 @@ def extract_run_from_checkpoint_path(
     else:
         outputs_root = Path.cwd() / outputs_root
 
-    # Check if path contains outputs_root/training/ or outputs_root/optuna/
+    # Check if path contains outputs_root/training/ or outputs_root/hpsearch/
     checkpoint_str = str(checkpoint_path)
     outputs_str = str(outputs_root)
 
     # Pattern 1: outputs_root/training/{experiment}/{run_id}/checkpoints/best_model.pt
-    # Pattern 2: outputs_root/optuna/{experiment}/{run_id}/checkpoints/best_model.pt
+    # Pattern 2: outputs_root/hpsearch/{experiment}/{run_id}/checkpoints/best_model.pt
+    # Pattern 3: outputs_root/ablation_studies/{experiment}/{run_id}/checkpoints/best_model.pt
     training_pattern = (
-        rf"{re.escape(outputs_str)}/(training|optuna)/([^/]+)/([^/]+)/checkpoints/"
+        rf"{re.escape(outputs_str)}/(training|hpsearch|ablation_studies)/([^/]+)/([^/]+)/checkpoints/"
     )
     match = re.search(training_pattern, checkpoint_str)
 

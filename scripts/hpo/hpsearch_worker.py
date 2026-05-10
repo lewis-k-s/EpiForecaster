@@ -1,4 +1,4 @@
-"""Optuna worker for EpiForecaster hyperparameter search.
+"""HPO worker for EpiForecaster hyperparameter search.
 
 Designed for SLURM task arrays + Optuna JournalStorage coordination.
 
@@ -15,10 +15,10 @@ Typical SLURM usage pattern:
 - Run one (or a few) trials per task-array worker.
 
 Example:
-  uv run python scripts/hpo/optuna_epiforecaster_worker.py \
+  uv run python scripts/hpo/hpsearch_worker.py \
     --config configs/train_epiforecaster.yaml \
     --study-name epiforecaster_hpo_v1 \
-    --journal-file outputs/optuna/epiforecaster_hpo_v1.journal \
+    --journal-file outputs/hpsearch/epiforecaster_hpo_v1.journal \
     --n-trials 1
 
 Notes:
@@ -340,9 +340,9 @@ def objective(
     # Add runtime-specific overrides
     override_list.append("training.plot_forecasts=false")
     override_list.append("training.profiler.enabled=false")
-    # Disable WandB by default for Optuna sweeps (Optuna tracks metrics/parameters)
+    # Disable WandB by default for HPO sweeps (Optuna tracks metrics/parameters)
     override_list.append("output.wandb_mode=disabled")
-    # Disable early stopping for HPO - rely on Optuna pruning instead
+    # Disable early stopping for HPO - rely on pruning instead
     override_list.append("training.early_stopping_patience=null")
     if fixed_epochs is not None:
         override_list.append(f"training.epochs={fixed_epochs}")
@@ -470,7 +470,7 @@ def objective(
     "--journal-file",
     type=click.Path(path_type=Path),
     required=True,
-    help="Shared Optuna journal file (for SLURM array coordination).",
+    help="Shared journal file (for SLURM array coordination).",
 )
 @click.option(
     "--n-trials",
@@ -487,7 +487,7 @@ def objective(
 @click.option(
     "--run-root",
     type=click.Path(path_type=Path),
-    default=Path("outputs/optuna"),
+    default=Path("outputs/hpsearch"),
     show_default=True,
     help="Root directory for trial outputs (log_dir override).",
 )
@@ -547,7 +547,7 @@ def main(
     pruning_start_epoch: int,
     cli_overrides: tuple[str, ...],
 ) -> None:
-    """Run one Optuna worker process."""
+    """Run one HPO worker process."""
     setup_logging()
 
     try:
@@ -621,7 +621,7 @@ def main(
         pruner=selected_pruner,
     )
 
-    logger.info("Starting Optuna worker for study '%s'", study_name)
+    logger.info("Starting HPO worker for study '%s'", study_name)
     logger.info("Config: %s", config_path)
     logger.info("Journal file: %s", journal_file)
     logger.info("Run root: %s", run_root)
@@ -639,7 +639,7 @@ def main(
 
     def _log_trial_complete(study: Any, trial: Any) -> None:
         logger.info(
-            "Trial %d recorded by Optuna (value=%.6f). Completed %d/%s in study '%s'.",
+            "Trial %d recorded (value=%.6f). Completed %d/%s in study '%s'.",
             trial.number,
             float(trial.value) if trial.value is not None else float("inf"),
             len(study.trials),

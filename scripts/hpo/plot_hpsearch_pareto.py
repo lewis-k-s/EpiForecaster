@@ -1,4 +1,4 @@
-"""Plot and export Pareto results for missing-permit multi-objective Optuna studies."""
+"""Plot and export Pareto results for missing-permit multi-objective HPO studies."""
 
 from __future__ import annotations
 
@@ -112,19 +112,19 @@ def _default_out_path(*, journal_file: Path, study_name: str, suffix: str) -> Pa
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot and export Pareto front from Optuna journal study.",
+        description="Plot and export Pareto front from HPO journal study.",
     )
     parser.add_argument(
         "--journal-file",
         type=Path,
         required=True,
-        help="Path to Optuna journal file.",
+        help="Path to HPO journal file.",
     )
     parser.add_argument(
         "--study-name",
         type=str,
         required=True,
-        help="Optuna study name within the journal.",
+        help="Study name within the journal.",
     )
     parser.add_argument(
         "--out-html",

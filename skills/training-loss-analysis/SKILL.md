@@ -14,7 +14,7 @@ Run a two-pass diagnosis:
 
 - TensorBoard event directory path, or
 - Experiment name under `outputs/training/<experiment>/` (latest run auto-resolved), or
-- Optuna trial path for gradnorm (`--optuna`).
+- HPO trial path for gradnorm (`--hpsearch-trial`).
 
 ## Commands
 
@@ -28,8 +28,8 @@ uv run loss-curve-critic <path-or-experiment> --text --diagnose
 # 2) Gradnorm analysis (JSON)
 uv run gradnorm-analyze <path-or-experiment>
 
-# 2b) Gradnorm analysis for Optuna trial
-uv run gradnorm-analyze <trial-path> --optuna --text
+# 2b) Gradnorm analysis for HPO trial
+uv run gradnorm-analyze <trial-path> --hpsearch-trial --text
 ```
 
 ## Triage Workflow

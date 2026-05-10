@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=epi-ablation-optuna
+#SBATCH --job-name=epi-ablation
 #SBATCH --account=bsc08
 #SBATCH --qos=acc_bscls
 #SBATCH --gres=gpu:1
@@ -13,7 +13,7 @@ set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
-CAMPAIGN_ID="${CAMPAIGN_ID:-ablation_optuna_${SLURM_ARRAY_JOB_ID:-local}}"
+CAMPAIGN_ID="${CAMPAIGN_ID:-ablation_${SLURM_ARRAY_JOB_ID:-local}}"
 STUDY_NAME="ablation_study_${CAMPAIGN_ID}"
 JOURNAL_FILE="${JOURNAL_FILE:-}"
 CV_SEEDS="${CV_SEEDS:-42 43 44 45 46}"
@@ -36,7 +36,7 @@ cd "$PROJECT_ROOT"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-echo "Starting Optuna Ablation Worker"
+echo "Starting Ablation Worker"
 echo "  Campaign: $CAMPAIGN_ID"
 echo "  Study: $STUDY_NAME"
 echo "  Journal: ${JOURNAL_FILE:-<default>}"
@@ -71,6 +71,6 @@ if [ "$SMOKETEST" = "1" ]; then
   echo "SMOKETEST enabled: max_batches=2, epochs=1"
 fi
 
-uv run python -m scripts.hpo.optuna_ablation_worker "${ARGS[@]}"
+uv run python -m scripts.hpo.ablation_worker "${ARGS[@]}"
 
 # Optional: You can increase --n-trials if workers finish quickly and you want to reuse them.

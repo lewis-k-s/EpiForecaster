@@ -19,9 +19,9 @@ CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 # Optuna study identity.
 STUDY_NAME="${STUDY_NAME:-epiforecaster_hpo_v1}"
 # Shared journal file for coordination (must be on shared filesystem).
-JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal}"
+JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/hpsearch/${STUDY_NAME}.journal}"
 # Trial outputs root (log_dir override).
-RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
+RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/hpsearch}"
 # Optional speed knobs (set to empty to disable).
 MAX_EPOCHS="${MAX_EPOCHS:-20}"
 N_TRIALS="${N_TRIALS:-}"
@@ -31,7 +31,7 @@ PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N ep
 # Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
 OVERRIDES="${OVERRIDES:-}"
 # Smoke-test mode:
-#   DRY_RUN=1 sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/optuna_epiforecaster.sbatch
+#   DRY_RUN=1 sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/hpsearch.sbatch
 DRY_RUN="${DRY_RUN:-0}"
 DRY_RUN_MAX_EPOCHS="${DRY_RUN_MAX_EPOCHS:-1}"
 DRY_RUN_TIMEOUT_SECS="${DRY_RUN_TIMEOUT_SECS:-600}"
@@ -66,7 +66,7 @@ if [ "$DRY_RUN" = "1" ]; then
   N_TRIALS="${N_TRIALS:-$DRY_RUN_N_TRIALS}"
   TIMEOUT_SECS="$DRY_RUN_TIMEOUT_SECS"
   echo "DRY_RUN enabled: max_epochs=${MAX_EPOCHS}, n_trials=${N_TRIALS}, timeout_s=${TIMEOUT_SECS}"
-  echo "Tip: submit with short walltime and single worker, e.g. sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/optuna_epiforecaster.sbatch"
+  echo "Tip: submit with short walltime and single worker, e.g. sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/hpsearch.sbatch"
 fi
 
 ARGS=(
@@ -102,7 +102,7 @@ fi
 
 # Prefer uv runner if available; fall back to plain python.
 if command -v uv >/dev/null 2>&1; then
-  uv run python -m scripts.hpo.optuna_epiforecaster_worker "${ARGS[@]}"
+  uv run python -m scripts.hpo.hpsearch_worker "${ARGS[@]}"
 else
-  python -m scripts.hpo.optuna_epiforecaster_worker "${ARGS[@]}"
+  python -m scripts.hpo.hpsearch_worker "${ARGS[@]}"
 fi

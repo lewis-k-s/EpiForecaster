@@ -1,4 +1,4 @@
-"""Analyze Optuna journal hyperparameter search results.
+"""Analyze HPO journal hyperparameter search results.
 
 This script parses Optuna journal files and produces:
 - Summary statistics of completed trials
@@ -8,7 +8,7 @@ This script parses Optuna journal files and produces:
 - Recommendations for search space refinement
 
 Usage:
-    uv run python scripts/analysis/analyze_optuna_journal.py outputs/optuna/epiforecaster_hpo_v1.journal
+    uv run python scripts/analysis/analyze_hpsearch_journal.py outputs/hpsearch/epiforecaster_hpo_v1.journal
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from scripts.analysis.skill_output import SkillOutputBuilder, print_output
 
 @dataclass
 class Trial:
-    """Represents a single Optuna trial."""
+    """Represents a single trial."""
 
     number: int
     params: dict[str, Any]
@@ -40,7 +40,7 @@ class Trial:
 
 @dataclass
 class StudySummary:
-    """Summary of an Optuna study."""
+    """Summary of a study."""
 
     study_name: str
     trials: list[Trial] = field(default_factory=list)
@@ -66,7 +66,7 @@ class StudySummary:
 
 
 def parse_journal(path: Path) -> StudySummary:
-    """Parse an Optuna journal file.
+    """Parse a journal file.
 
     The journal format is line-delimited JSON with op_codes:
     - 0: REGISTER_STUDY
@@ -517,12 +517,12 @@ def print_importance(summary: StudySummary) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze Optuna journal hyperparameter search results"
+        description="Analyze HPO journal hyperparameter search results"
     )
     parser.add_argument(
         "journal",
         type=Path,
-        help="Path to Optuna journal file",
+        help="Path to journal file",
     )
     parser.add_argument(
         "--top",
@@ -547,7 +547,7 @@ def main() -> None:
     args = parser.parse_args()
 
     builder = SkillOutputBuilder(
-        skill_name="optuna-analyze",
+        skill_name="hpsearch-analyze",
         input_path=str(args.journal),
     )
 

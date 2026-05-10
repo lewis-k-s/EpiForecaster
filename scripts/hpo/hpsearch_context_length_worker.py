@@ -1,4 +1,4 @@
-"""Optuna worker for controlled input-window length studies.
+"""HPO worker for controlled input-window length studies.
 
 This is intentionally a fixed-design study, not a hyperparameter sweep:
 workers enqueue the full ``context_length x seed`` matrix and only vary
@@ -237,7 +237,7 @@ def objective(
     trial.set_user_attr("slurm", _slurm_identity())
 
     trainer = EpiForecasterTrainer(cfg)
-    trainer.model_id = f"optuna_t{trial.number}_s{seed}_L{context_length}"
+    trainer.model_id = f"hpsearch_t{trial.number}_s{seed}_L{context_length}"
 
     results = trainer.run()
     best_val = float(results.get("best_val_loss", float("inf")))
@@ -296,7 +296,7 @@ def objective(
 @click.option(
     "--run-root",
     type=click.Path(path_type=Path),
-    default=Path("outputs/optuna"),
+    default=Path("outputs/hpsearch"),
     show_default=True,
 )
 @click.option(

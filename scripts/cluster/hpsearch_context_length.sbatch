@@ -15,8 +15,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-$PWD}"
 CONFIG="${CONFIG:-configs/production_only/train_epifor_mn5_full.yaml}"
 CAMPAIGN_ID="${CAMPAIGN_ID:-context_length_${SLURM_ARRAY_JOB_ID:-local}}"
 STUDY_NAME="${STUDY_NAME:-epiforecaster_context_length_${CAMPAIGN_ID}}"
-JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/optuna/${STUDY_NAME}.journal}"
-RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/optuna}"
+JOURNAL_FILE="${JOURNAL_FILE:-$PROJECT_ROOT/outputs/hpsearch/${STUDY_NAME}.journal}"
+RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/outputs/hpsearch}"
 
 # Keep these as an explicit study grid, not a free HPO search space.
 CONTEXT_LENGTHS="${CONTEXT_LENGTHS:-14 28 42 60 84 112}"
@@ -101,7 +101,7 @@ if [ -n "$OVERRIDES" ]; then
 fi
 
 if command -v uv >/dev/null 2>&1; then
-  uv run python -m scripts.hpo.optuna_epiforecaster_context_length_worker "${ARGS[@]}"
+  uv run python -m scripts.hpo.hpsearch_context_length_worker "${ARGS[@]}"
 else
-  python -m scripts.hpo.optuna_epiforecaster_context_length_worker "${ARGS[@]}"
+  python -m scripts.hpo.hpsearch_context_length_worker "${ARGS[@]}"
 fi
