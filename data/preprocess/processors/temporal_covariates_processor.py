@@ -1,8 +1,9 @@
 """
-Processor for temporal covariates (day-of-week, holidays).
+Processor for temporal covariates.
 
 This module generates temporal covariate features for epidemiological forecasting,
-including cyclic day-of-week encoding and holiday indicators.
+including cyclic day-of-week encoding, holiday indicators, and optional ordinal
+lockdown severity.
 """
 
 import math
@@ -14,6 +15,22 @@ import xarray as xr
 
 from ..config import TEMPORAL_COORD, PreprocessingConfig, TemporalCovariatesConfig
 
+LOCKDOWN_SEVERITY_PERIODS = [
+    ("Spain-wide lockdown", pd.Timestamp("2020-03-15"), pd.Timestamp("2020-06-21"), 3.0),
+    (
+        "Catalunya perimeter+weekend",
+        pd.Timestamp("2020-10-30"),
+        pd.Timestamp("2020-11-14"),
+        1.0,
+    ),
+    (
+        "Catalunya perimeter+municipal",
+        pd.Timestamp("2021-01-07"),
+        pd.Timestamp("2021-01-18"),
+        2.0,
+    ),
+]
+
 
 class TemporalCovariatesProcessor:
     """
@@ -22,8 +39,9 @@ class TemporalCovariatesProcessor:
     Features are computed as:
     - Day-of-week sin/cos: sin(2π * day_of_week / 7), cos(2π * day_of_week / 7)
     - Holiday indicator: 1.0 if date is a holiday, 0.0 otherwise
+    - Lockdown severity: ordinal 0..3 policy/restriction severity
 
-    Output shape: (time, covariate_dim) where covariate_dim = 2 (dow) + 1 (holiday) = 3
+    Output shape: (time, covariate_dim), controlled by TemporalCovariatesConfig.
     """
 
     def __init__(self, config: PreprocessingConfig):
@@ -98,6 +116,11 @@ class TemporalCovariatesProcessor:
             features.append(is_holiday.reshape(-1, 1))
             feature_names.append("is_holiday")
 
+        if self.tc_config.include_lockdown_severity:
+            lockdown_severity = self._compute_lockdown_severity(date_range)
+            features.append(lockdown_severity.reshape(-1, 1))
+            feature_names.append("lockdown_severity")
+
         data = np.concatenate(features, axis=1).astype(np.float16)
 
         da = xr.DataArray(
@@ -120,3 +143,12 @@ class TemporalCovariatesProcessor:
         print(f"  Holidays in range: {n_holidays}")
 
         return da
+
+    @staticmethod
+    def _compute_lockdown_severity(date_range: pd.DatetimeIndex) -> np.ndarray:
+        """Compute ordinal lockdown/restriction severity for each date."""
+        severity = np.zeros(len(date_range), dtype=np.float32)
+        for _, start, end, value in LOCKDOWN_SEVERITY_PERIODS:
+            mask = (date_range >= start) & (date_range <= end)
+            severity[mask] = np.maximum(severity[mask], value)
+        return severity

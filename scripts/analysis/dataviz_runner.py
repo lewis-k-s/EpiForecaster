@@ -60,6 +60,7 @@ def check_dataset_variables(dataset_path: str | None) -> dict[str, bool]:
         "hospitalizations": False,
         "deaths": False,
         "biomarkers": False,
+        "vaccination": False,
     }
 
     if not dataset_path:
@@ -74,6 +75,7 @@ def check_dataset_variables(dataset_path: str | None) -> dict[str, bool]:
         available["hospitalizations"] = "hospitalizations" in data_vars
         available["deaths"] = "deaths" in data_vars
         available["biomarkers"] = any(v.startswith("edar_biomarker") for v in data_vars)
+        available["vaccination"] = "vaccination_rate" in data_vars
 
         ds.close()
     except Exception:
@@ -350,6 +352,24 @@ Examples:
                     run_id,
                     "--output-dir",
                     str(args.output_dir / "canonical_deaths"),
+                ],
+            )
+        )
+
+    if available_vars["vaccination"] and dataset_path:
+        analyses.append(
+            (
+                "canonical_vaccination",
+                Path("dataviz/canonical_vaccination.py"),
+                [
+                    "--dataset",
+                    str(dataset_path),
+                    "--run-id",
+                    run_id,
+                    "--geojson",
+                    "data/files/geo/fl_municipios_catalonia.geojson",
+                    "--output-dir",
+                    str(args.output_dir / "canonical_vaccination"),
                 ],
             )
         )

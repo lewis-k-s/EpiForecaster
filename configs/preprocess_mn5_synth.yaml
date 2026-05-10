@@ -57,6 +57,7 @@ memory_limit_gb: 100.0
 temporal_covariates:
   include_day_of_week: true
   include_holidays: true
+  include_lockdown_severity: true
   holiday_calendar_file: data/files/catalonia_holidays.csv
 
 # Graph construction options

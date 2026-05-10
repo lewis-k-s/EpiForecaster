@@ -22,6 +22,9 @@ region_metadata_file: "data/files/edar_muni_edges.nc"
 # hospitalizations_file: "../EpiSim.jl/runs/synthetic_catalonia/raw_synthetic_observations.zarr *.yaml --fixed-strings"
 # deaths_file: "../EpiSim.jl/runs/synthetic_catalonia/raw_synthetic_observations.zarr *.yaml --fixed-strings"
 
+# Vaccination data (real-world Catalonia coverage; will be zero-filled for pre-vaccine date ranges)
+vaccination_file: "data/files/vaccination_municipality.csv"
+
 # Temporal processing parameters - match synthetic data range
 start_date: "2020-02-09"
 end_date: "2020-06-01"
@@ -57,6 +60,7 @@ memory_limit_gb: 100.0
 temporal_covariates:
   include_day_of_week: true
   include_holidays: true
+  include_lockdown_severity: true
   holiday_calendar_file: data/files/catalonia_holidays.csv
 
 # Graph construction options

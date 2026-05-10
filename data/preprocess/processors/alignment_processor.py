@@ -161,6 +161,7 @@ class AlignmentProcessor:
         population_data: xr.DataArray,
         hospitalizations_data: xr.Dataset | None = None,
         deaths_data: xr.Dataset | None = None,
+        vaccination_data: xr.Dataset | None = None,
         latent_sird_data: xr.Dataset | None = None,
     ) -> xr.Dataset:
         """
@@ -173,6 +174,7 @@ class AlignmentProcessor:
             population_data: Processed population dataset
             hospitalizations_data: Optional processed hospitalizations dataset
             deaths_data: Optional processed deaths dataset
+            vaccination_data: Optional processed vaccination coverage dataset
             latent_sird_data: Optional latent SIRD targets from synthetic data
 
         Returns:
@@ -251,6 +253,17 @@ class AlignmentProcessor:
                 f"  Deaths data: {len(deaths_regions)} regions, {len(overlap)} overlap with common"
             )
 
+        # Validate vaccination regions if provided
+        if vaccination_data is not None:
+            vaccination_regions = set(vaccination_data[REGION_COORD].values)
+            overlap = vaccination_regions.intersection(common_regions)
+            if not overlap:
+                raise ValueError("No vaccination regions found in common regions")
+            print(
+                f"  Vaccination data: {len(vaccination_regions)} regions, "
+                f"{len(overlap)} overlap with common"
+            )
+
         if not common_regions:
             raise ValueError("No common regions found between datasets")
 
@@ -306,6 +319,29 @@ class AlignmentProcessor:
             )
         else:
             deaths_final = None
+
+        # Align vaccination if provided
+        if vaccination_data is not None:
+            vaccination_temporal = self._align_clinical_dataset(
+                vaccination_data,
+                target_dates,
+                value_name="vaccination_rate",
+                label="Vaccination",
+            )
+            vaccination_final = vaccination_temporal.reindex(
+                {REGION_COORD: common_regions}
+            )
+            vaccination_final["vaccination_rate"] = vaccination_final[
+                "vaccination_rate"
+            ].fillna(0.0)
+            vaccination_final["vaccination_rate_mask"] = vaccination_final[
+                "vaccination_rate_mask"
+            ].fillna(False)
+            vaccination_final["vaccination_rate_age"] = self._compute_age_from_mask(
+                vaccination_final["vaccination_rate_mask"]
+            )
+        else:
+            vaccination_final = None
 
         # Align latent SIRD targets if provided (synthetic-only path)
         if latent_sird_data is not None:
@@ -410,6 +446,8 @@ class AlignmentProcessor:
             datasets_to_merge.append(hosp_final)
         if deaths_final is not None:
             datasets_to_merge.append(deaths_final)
+        if vaccination_final is not None:
+            datasets_to_merge.append(vaccination_final)
         if latent_sird_final is not None:
             datasets_to_merge.append(latent_sird_final)
 

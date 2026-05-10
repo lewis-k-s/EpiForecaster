@@ -21,7 +21,7 @@ from utils.logging import suppress_zarr_warnings
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MOBILITY_WINDOW_DAYS = 30
+DEFAULT_BASELINE_MOBILITY_WINDOW_DAYS = 7
 
 
 @dataclass
@@ -35,8 +35,8 @@ class RegionGraphPreprocessConfig:
     contiguity: str = "queen"  # "queen" or "rook"
     metric_crs: str = "EPSG:3035"
     mobility_zarr_path: Path | None = Path("data/files/mobility.zarr")
-    start_date: str | None = "2021-04-10"
-    end_date: str | None = "2021-05-09"
+    start_date: str | None = None
+    end_date: str | None = None
 
 
 class RegionGraphPreprocessor:
@@ -280,10 +280,19 @@ class RegionGraphPreprocessor:
         available_start = dates.min()
         available_end = dates.max()
 
-        if self.config.end_date:
+        if self.config.start_date and self.config.end_date:
+            start = pd.Timestamp(self.config.start_date)
             end = pd.Timestamp(self.config.end_date)
+        elif self.config.start_date:
+            start = pd.Timestamp(self.config.start_date)
+            end = start + pd.Timedelta(days=DEFAULT_BASELINE_MOBILITY_WINDOW_DAYS - 1)
+        elif self.config.end_date:
+            end = pd.Timestamp(self.config.end_date)
+            start = end - pd.Timedelta(days=DEFAULT_BASELINE_MOBILITY_WINDOW_DAYS - 1)
         else:
-            end = available_end
+            start = available_start
+            end = start + pd.Timedelta(days=DEFAULT_BASELINE_MOBILITY_WINDOW_DAYS - 1)
+
         if end > available_end:
             logger.warning(
                 "Requested end date %s truncated to dataset max %s",
@@ -296,10 +305,6 @@ class RegionGraphPreprocessor:
                 f"Requested end date {end.date()} precedes available data ({available_start.date()})"
             )
 
-        if self.config.start_date:
-            start = pd.Timestamp(self.config.start_date)
-        else:
-            start = end - pd.Timedelta(days=DEFAULT_MOBILITY_WINDOW_DAYS - 1)
         if start < available_start:
             logger.warning(
                 "Requested start date %s raised to dataset min %s",

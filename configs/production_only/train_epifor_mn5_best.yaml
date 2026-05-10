@@ -17,7 +17,7 @@ model:
   population_dim: 1
   include_day_of_week: true
   include_holidays: true
-  temporal_covariates_dim: 3
+  include_lockdown_severity: true
   gnn_module: gat
   forecaster_head: transformer
   strict: false

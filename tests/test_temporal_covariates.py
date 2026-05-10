@@ -21,6 +21,7 @@ class TestTemporalCovariatesConfig:
         config = TemporalCovariatesConfig(holiday_calendar_file="/dev/null")
         assert config.include_day_of_week is True
         assert config.include_holidays is True
+        assert config.include_lockdown_severity is False
 
     def test_output_dim_both_enabled(self, tmp_path):
         holiday_file = tmp_path / "holidays.csv"
@@ -31,6 +32,17 @@ class TestTemporalCovariatesConfig:
             holiday_calendar_file=str(holiday_file),
         )
         assert config.output_dim == 3
+
+    def test_output_dim_all_enabled(self, tmp_path):
+        holiday_file = tmp_path / "holidays.csv"
+        holiday_file.write_text("date\n2020-01-01\n")
+        config = TemporalCovariatesConfig(
+            include_day_of_week=True,
+            include_holidays=True,
+            include_lockdown_severity=True,
+            holiday_calendar_file=str(holiday_file),
+        )
+        assert config.output_dim == 4
 
     def test_output_dim_dow_only(self):
         config = TemporalCovariatesConfig(
@@ -164,6 +176,34 @@ class TestTemporalCovariatesProcessor:
         is_holiday = result.sel(covariate="is_holiday", date="2020-09-11").item()
         assert is_holiday == 1.0
 
+    def test_lockdown_severity_covariate(self, sample_holiday_file: Path):
+        config = MagicMock(spec=PreprocessingConfig)
+        config.temporal_covariates = TemporalCovariatesConfig(
+            include_day_of_week=True,
+            include_holidays=True,
+            include_lockdown_severity=True,
+            holiday_calendar_file=str(sample_holiday_file),
+        )
+        processor = TemporalCovariatesProcessor(config)
+
+        result = processor.process(
+            pd.Timestamp("2020-03-14"),
+            pd.Timestamp("2021-01-18"),
+        )
+
+        assert result.shape[1] == 4
+        assert list(result.coords["covariate"].values) == [
+            "dow_sin",
+            "dow_cos",
+            "is_holiday",
+            "lockdown_severity",
+        ]
+        severity = result.sel(covariate="lockdown_severity")
+        assert severity.sel(date="2020-03-14").item() == 0.0
+        assert severity.sel(date="2020-03-15").item() == 3.0
+        assert severity.sel(date="2020-10-30").item() == 1.0
+        assert severity.sel(date="2021-01-07").item() == 2.0
+
     def test_catalonia_holiday_file_exists(self):
         holiday_path = Path("data/files/catalonia_holidays.csv")
         assert holiday_path.exists(), "Catalonia holidays file should exist"
@@ -179,4 +219,4 @@ class TestTemporalCovariatesProcessor:
 
 class TestTemporalCovariatesConstants:
     def test_temporal_covariate_dim_constant(self):
-        assert TEMPORAL_COVARIATE_DIM == 3
+        assert TEMPORAL_COVARIATE_DIM == 4
