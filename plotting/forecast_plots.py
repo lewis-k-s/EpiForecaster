@@ -103,7 +103,9 @@ def _build_prediction_only_context(
     horizon_mask = (t_rel >= 0) & (t_rel < horizon)
     points_to_plot = min(int(horizon_mask.sum()), int(prediction.shape[0]))
     if points_to_plot > 0:
-        context[np.where(horizon_mask)[0][:points_to_plot]] = prediction[:points_to_plot]
+        context[np.where(horizon_mask)[0][:points_to_plot]] = prediction[
+            :points_to_plot
+        ]
     return context
 
 
@@ -172,7 +174,9 @@ def _extract_series_payload(
         return (
             np.asarray(payload["actual_context"]).reshape(-1),
             np.asarray(payload["prediction"]).reshape(-1),
-            float(payload["window_mae"]) if payload.get("window_mae") is not None else None,
+            float(payload["window_mae"])
+            if payload.get("window_mae") is not None
+            else None,
         )
     return (
         np.asarray(sample["actual_context"]).reshape(-1),
@@ -867,10 +871,12 @@ def make_forecast_figure(
                 and isinstance(payloads, dict)
                 and overlay_target in payloads
             ):
-                _overlay_context, overlay_prediction, _overlay_mae = _extract_series_payload(
-                    sample,
-                    target=overlay_target,
-                    payload_collection=overlay_payload_collection,
+                _overlay_context, overlay_prediction, _overlay_mae = (
+                    _extract_series_payload(
+                        sample,
+                        target=overlay_target,
+                        payload_collection=overlay_payload_collection,
+                    )
                 )
                 overlay_series_full = np.full(len(t_rel), np.nan, dtype=np.float32)
                 overlay_horizon_mask = (t_rel >= 0) & (t_rel < H)
@@ -879,9 +885,9 @@ def make_forecast_figure(
                     int(overlay_prediction.shape[0]),
                 )
                 if overlay_points > 0:
-                    overlay_series_full[np.where(overlay_horizon_mask)[0][:overlay_points]] = (
-                        overlay_prediction[:overlay_points]
-                    )
+                    overlay_series_full[
+                        np.where(overlay_horizon_mask)[0][:overlay_points]
+                    ] = overlay_prediction[:overlay_points]
 
                 overlay_ax = ax.twinx()
                 overlay_name = overlay_label or overlay_target
@@ -926,7 +932,11 @@ def make_forecast_figure(
                 ax.set_ylabel("")
 
             if i == nrows - 1:
-                ax.set_xlabel("" if shared_xlabel is not None else "Time (days relative to forecast start)")
+                ax.set_xlabel(
+                    ""
+                    if shared_xlabel is not None
+                    else "Time (days relative to forecast start)"
+                )
             else:
                 ax.set_xlabel("")
 
@@ -1002,6 +1012,72 @@ def make_joint_forecast_figure(
     )
 
 
+def make_joint_latent_forecast_figure(
+    *,
+    samples: list[dict[str, Any]] | dict[str, list[dict[str, Any]]],
+    input_window_length: int,
+    forecast_horizon: int,
+    context_pre: int = 30,
+    context_post: int = 30,
+    latent_names: list[str] | None = None,
+):
+    """Build a single figure containing all available SIRD latent trajectories."""
+    if isinstance(samples, list):
+        base_groups = {"All": samples}
+    else:
+        base_groups = samples
+
+    base_groups = {k: v for k, v in base_groups.items() if v}
+    if not base_groups:
+        return None
+
+    requested_latents = latent_names or list(LATENT_PLOT_SPECS)
+    unknown_latents = [
+        latent_name
+        for latent_name in requested_latents
+        if latent_name not in LATENT_PLOT_SPECS
+    ]
+    if unknown_latents:
+        raise ValueError(
+            f"Unknown latent series {unknown_latents}. "
+            f"Valid latents: {sorted(LATENT_PLOT_SPECS)}"
+        )
+
+    expanded_groups: dict[str, list[dict[str, Any]]] = {}
+    for latent_name in requested_latents:
+        latent_label = LATENT_PLOT_SPECS[latent_name]["label"]
+        for group_name, group_samples in base_groups.items():
+            materialized: list[dict[str, Any]] = []
+            for sample in group_samples:
+                if "latents" not in sample or latent_name not in sample["latents"]:
+                    continue
+                row_sample = dict(sample)
+                payload = sample["latents"][latent_name]
+                row_sample["actual_context"] = payload["actual_context"]
+                row_sample["prediction"] = payload["prediction"]
+                row_sample["target"] = payload["target"]
+                row_sample["history"] = payload["history"]
+                row_sample["window_mae"] = payload.get("window_mae")
+                materialized.append(row_sample)
+            if materialized:
+                expanded_groups[f"{group_name} | {latent_label}"] = materialized
+
+    if not expanded_groups:
+        return None
+
+    return make_forecast_figure(
+        samples=expanded_groups,
+        input_window_length=input_window_length,
+        forecast_horizon=forecast_horizon,
+        context_pre=context_pre,
+        context_post=context_post,
+        target=None,
+        target_label=None,
+        payload_collection="latents",
+        connect_from_history=False,
+    )
+
+
 def make_forecast_history_figure(
     *,
     samples: list[dict[str, Any]] | dict[str, list[dict[str, Any]]],
@@ -1074,7 +1150,10 @@ def make_forecast_history_figure(
                 node_samples,
                 key=lambda sample: int(sample.get("window_start", sample.get("t0", 0))),
             )
-            if max_forecasts_per_region is not None and len(sorted_samples) > max_forecasts_per_region:
+            if (
+                max_forecasts_per_region is not None
+                and len(sorted_samples) > max_forecasts_per_region
+            ):
                 selected_idx = np.linspace(
                     0,
                     len(sorted_samples) - 1,
@@ -1097,10 +1176,14 @@ def make_forecast_history_figure(
             ):
                 full_series = np.asarray(payloads[target]["full_series"]).reshape(-1)
             series_t = np.asarray(
-                sorted_samples[0].get("series_t", np.arange(len(full_series), dtype=np.int64))
+                sorted_samples[0].get(
+                    "series_t", np.arange(len(full_series), dtype=np.int64)
+                )
             ).reshape(-1)
 
-            ax.plot(series_t, full_series, color=actual_color, linewidth=1.5, label="Actual")
+            ax.plot(
+                series_t, full_series, color=actual_color, linewidth=1.5, label="Actual"
+            )
 
             mae_values = [
                 float(sample["window_mae"])
@@ -1115,7 +1198,9 @@ def make_forecast_history_figure(
                     target=target,
                     payload_collection=payload_collection,
                 )
-                t0 = int(sample.get("t0", int(sample["window_start"]) + forecast_horizon))
+                t0 = int(
+                    sample.get("t0", int(sample["window_start"]) + forecast_horizon)
+                )
                 pred_t = t0 + np.arange(len(pred_series), dtype=np.int64)
                 valid_mask = pred_t < len(full_series)
                 pred_t = pred_t[valid_mask]
@@ -1127,10 +1212,13 @@ def make_forecast_history_figure(
                     pred_values,
                     color=forecast_color,
                     linewidth=1.8,
-                    alpha=0.45 + (0.45 * ((forecast_idx + 1) / max(len(sorted_samples), 1))),
+                    alpha=0.45
+                    + (0.45 * ((forecast_idx + 1) / max(len(sorted_samples), 1))),
                     label="Forecast" if forecast_idx == 0 else None,
                 )
-                ax.axvline(t0, color=forecast_color, linestyle="--", alpha=0.12, linewidth=0.8)
+                ax.axvline(
+                    t0, color=forecast_color, linestyle="--", alpha=0.12, linewidth=0.8
+                )
 
             node_label = sorted_samples[0].get("node_label", "")
             title_parts = [str(node_label), f"n={len(sorted_samples)} forecasts"]
@@ -1184,6 +1272,7 @@ def generate_forecast_plots(
     log_dir: Path | None = None,
     target_names: list[str] | None = None,
     wandb_prefix: str = "forecasts",
+    include_sird_latents: bool = False,
 ) -> dict[str, Any]:
     """
     Generate forecast plots for given node groups (generic).
@@ -1204,6 +1293,7 @@ def generate_forecast_plots(
         log_dir: Optional W&B run directory for eval metrics
         target_names: List of targets to plot (default: all)
         wandb_prefix: Prefix for W&B logged images
+        include_sird_latents: Save/log an additional joint SIRD latent forecast figure
 
     Returns:
         Dict with figure, all_samples, selected_nodes, node_groups, window_groups
@@ -1213,7 +1303,9 @@ def generate_forecast_plots(
     from evaluation.eval_loop import _ensure_wandb_run
 
     if window_groups is None and node_groups is None:
-        raise ValueError("generate_forecast_plots requires node_groups or window_groups")
+        raise ValueError(
+            "generate_forecast_plots requires node_groups or window_groups"
+        )
 
     if window_groups is not None:
         all_selected_windows: list[WindowSelectionSpec] = []
@@ -1310,10 +1402,30 @@ def generate_forecast_plots(
         target_names=resolved_targets,
     )
 
+    latent_fig = (
+        make_joint_latent_forecast_figure(
+            samples=grouped_samples,
+            input_window_length=int(config.model.input_window_length),
+            forecast_horizon=int(config.model.forecast_horizon),
+            context_pre=context_pre,
+            context_post=context_post,
+        )
+        if include_sird_latents
+        else None
+    )
+
     if fig is not None and output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output_path, dpi=200, bbox_inches="tight")
         logger.info(f"[plot] Saved figure to: {output_path}")
+
+    latent_output_path: Path | None = None
+    if latent_fig is not None and output_path is not None:
+        latent_output_path = output_path.with_name(
+            f"{output_path.stem}_sird_latents{output_path.suffix}"
+        )
+        latent_fig.savefig(latent_output_path, dpi=200, bbox_inches="tight")
+        logger.info(f"[plot] Saved SIRD latent figure to: {latent_output_path}")
 
     separate_figures: dict[str, Any] = {}
     if output_path is not None:
@@ -1323,7 +1435,9 @@ def generate_forecast_plots(
             )
             if legacy_target_output.exists():
                 legacy_target_output.unlink()
-                logger.info(f"[plot] Removed legacy target figure: {legacy_target_output}")
+                logger.info(
+                    f"[plot] Removed legacy target figure: {legacy_target_output}"
+                )
 
     if fig is not None and (log_dir is not None or wandb.run is not None):
         if log_dir is not None:
@@ -1338,12 +1452,16 @@ def generate_forecast_plots(
             log_payload: dict[str, Any] = {}
             if fig is not None:
                 log_payload[f"{wandb_prefix}/joint"] = wandb.Image(fig)
+            if latent_fig is not None:
+                log_payload[f"{wandb_prefix}/sird_latents"] = wandb.Image(latent_fig)
             if log_payload:
                 wandb.log(log_payload, step=0)
 
     return {
         "figure": fig,
         "joint_figure": fig,
+        "latent_figure": latent_fig,
+        "latent_output_path": latent_output_path,
         "separate_figures": separate_figures,
         "all_samples": samples,
         "selected_nodes": all_selected_nodes,

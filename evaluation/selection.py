@@ -251,6 +251,24 @@ def select_windows_by_loss(
     return sampled
 
 
+def select_worst_windows_by_loss(
+    *,
+    window_specs: list[WindowSelectionSpec],
+    k: int = 8,
+) -> dict[str, list[WindowSelectionSpec]]:
+    """Select the highest-MAE exact windows from granular eval rows."""
+    if not window_specs:
+        logger.warning("[eval] No granular window scores available for tail selection")
+        return {"Worst MAE": []}
+
+    k = min(k, len(window_specs))
+    worst_specs = sorted(
+        window_specs,
+        key=lambda spec: (-spec.score, spec.node_id, spec.window_start),
+    )[:k]
+    return {"Worst MAE": worst_specs}
+
+
 def topk_target_nodes_by_mae(
     *,
     model: torch.nn.Module,
@@ -325,7 +343,9 @@ def topk_target_nodes_by_mae(
                 valid_cpu = valid_per_sample.cpu().tolist()
                 nodes_cpu = target_nodes.cpu().tolist()
                 maes_cpu = per_sample_mae.detach().cpu().tolist()
-                for is_valid, node_id, sample_mae in zip(valid_cpu, nodes_cpu, maes_cpu):
+                for is_valid, node_id, sample_mae in zip(
+                    valid_cpu, nodes_cpu, maes_cpu
+                ):
                     if not is_valid:
                         continue
                     if node_id not in node_mae_sum:

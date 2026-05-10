@@ -119,13 +119,13 @@ def preprocess_cli(debug: bool):
     "--start-date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
-    help="Start date (YYYY-MM-DD) for averaging OD flows; defaults to last 30 days",
+    help="Start date (YYYY-MM-DD) for averaging OD flows; defaults to first available baseline week",
 )
 @click.option(
     "--end-date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
-    help="End date (YYYY-MM-DD) for averaging OD flows; defaults to dataset max",
+    help="End date (YYYY-MM-DD) for averaging OD flows; defaults to start date plus baseline week",
 )
 def preprocess_regions(
     geojson: Path,
@@ -359,11 +359,17 @@ cli.add_command(plot_cli, name="plot")
 @click.option(
     "--selection-mode",
     type=click.Choice(
-        ["node_quartile", "granular_window_quartile"], case_sensitive=False
+        ["node_quartile", "granular_window_quartile", "granular_window_worst"],
+        case_sensitive=False,
     ),
     default="node_quartile",
     show_default=True,
     help="How to select plotted examples after evaluation.",
+)
+@click.option(
+    "--include-sird-latents",
+    is_flag=True,
+    help="Also save a joint SIRD latent trajectory figure for selected forecasts.",
 )
 @click.option(
     "--node-metric-target",
@@ -397,6 +403,7 @@ def eval_epiforecaster(
     eval_batch_size: int | None,
     compare_baselines: Path | None,
     selection_mode: str,
+    include_sird_latents: bool,
     node_metric_target: str,
     compare_evals: bool,
 ):
@@ -424,7 +431,8 @@ def eval_epiforecaster(
 
         output_dir_override: Path | None = None
         if output is not None and (
-            (output.exists() and output.is_dir()) or (not output.exists() and not output.suffix)
+            (output.exists() and output.is_dir())
+            or (not output.exists() and not output.suffix)
         ):
             output_dir_override = output
             output_dir_override.mkdir(parents=True, exist_ok=True)
@@ -543,15 +551,17 @@ def eval_epiforecaster(
 
         node_groups: dict[str, list[int]] | None = None
         window_groups = None
-        if selection_mode.lower() == "granular_window_quartile":
+        selection_mode_key = selection_mode.lower()
+        if selection_mode_key in ("granular_window_quartile", "granular_window_worst"):
             from evaluation.selection import (
                 load_window_selection_specs_from_granular,
                 select_windows_by_loss,
+                select_worst_windows_by_loss,
             )
 
             if granular_csv is None or not granular_csv.exists():
                 raise click.ClickException(
-                    "granular_window_quartile selection requires granular eval CSV; "
+                    f"{selection_mode_key} selection requires granular eval CSV; "
                     "no granular CSV was produced for this eval."
                 )
             window_specs = load_window_selection_specs_from_granular(
@@ -562,10 +572,16 @@ def eval_epiforecaster(
                 raise click.ClickException(
                     f"No granular window candidates found in {granular_csv}"
                 )
-            window_groups = select_windows_by_loss(
-                window_specs=window_specs,
-                samples_per_group=samples_per_group,
-            )
+            if selection_mode_key == "granular_window_worst":
+                window_groups = select_worst_windows_by_loss(
+                    window_specs=window_specs,
+                    k=samples_per_group,
+                )
+            else:
+                window_groups = select_windows_by_loss(
+                    window_specs=window_specs,
+                    samples_per_group=samples_per_group,
+                )
         else:
             node_groups = select_nodes_by_loss(
                 node_mae=eval_result["node_mae"].get(node_metric_target, {}),
@@ -584,12 +600,23 @@ def eval_epiforecaster(
                 window="last",
                 output_path=output,
                 log_dir=log_dir,
+                include_sird_latents=include_sird_latents,
             )
 
             # Step 4: Show results
             total_nodes = len(plot_result["selected_nodes"])
-            if selection_mode.lower() == "granular_window_quartile":
-                click.echo(f"Selected {total_nodes} node-window examples from quartiles:")
+            if selection_mode_key in (
+                "granular_window_quartile",
+                "granular_window_worst",
+            ):
+                selection_label = (
+                    "worst granular windows"
+                    if selection_mode_key == "granular_window_worst"
+                    else "quartiles"
+                )
+                click.echo(
+                    f"Selected {total_nodes} node-window examples from {selection_label}:"
+                )
                 for group_name, specs in plot_result["window_groups"].items():
                     click.echo(f"  {group_name}: {len(specs)} windows")
             else:
@@ -667,9 +694,7 @@ def eval_epiforecaster(
                 split=split,
             )
             baseline_results_csv = artifacts["baseline_aggregate_metrics"]
-            click.echo(
-                f"Saved fresh baseline artifacts to: {baseline_output_dir}"
-            )
+            click.echo(f"Saved fresh baseline artifacts to: {baseline_output_dir}")
 
         if baseline_results_csv is not None:
             from evaluation.baseline_eval import compare_model_metrics_against_baselines
@@ -840,8 +865,8 @@ def eval_baselines(
     show_default=True,
     help=(
         "Selection strategy: 'random:N', 'quartile:N', 'best:N', 'worst:N', "
-        "'window_quartile:N'. Quartile/best/worst require a mini-eval to compute "
-        "per-node MAE. window_quartile uses granular eval rows."
+        "'window_quartile:N', 'window_worst:N'. Quartile/best/worst require a "
+        "mini-eval to compute per-node MAE. Window strategies use granular eval rows."
     ),
 )
 @click.option(
@@ -880,7 +905,12 @@ def eval_baselines(
     "--granular-csv",
     type=click.Path(path_type=Path),
     default=None,
-    help="Granular eval CSV to use for window_quartile selection.",
+    help="Granular eval CSV to use for window-based selection.",
+)
+@click.option(
+    "--include-sird-latents",
+    is_flag=True,
+    help="Also save a joint SIRD latent trajectory figure for selected forecasts.",
 )
 @click.option(
     "--node-metric-target",
@@ -903,6 +933,7 @@ def plot_forecasts(
     output: Path | None,
     override: tuple[str, ...],
     granular_csv: Path | None,
+    include_sird_latents: bool,
     node_metric_target: str,
 ):
     """Generate forecast plots from checkpoint with flexible node selection.
@@ -914,6 +945,7 @@ def plot_forecasts(
       best:N      - N best-performing nodes (requires mini-eval)
       worst:N     - N worst-performing nodes (requires mini-eval)
       window_quartile:N - N exact (node, window) examples per MAE quartile from granular eval
+      window_worst:N - N highest-MAE exact (node, window) examples from granular eval
 
     \b
     Examples:
@@ -969,6 +1001,7 @@ def plot_forecasts(
         from evaluation.selection import (
             load_window_selection_specs_from_granular,
             select_windows_by_loss,
+            select_worst_windows_by_loss,
         )
         from evaluation.losses import get_loss_from_config
 
@@ -1017,7 +1050,7 @@ def plot_forecasts(
             random.seed(42)
             selected = random.sample(all_nodes, min(k, len(all_nodes)))
             node_groups = {"Random": selected}
-        elif strategy == "window_quartile":
+        elif strategy in ("window_quartile", "window_worst"):
             if granular_csv is None:
                 granular_csv = (
                     checkpoint.parent.parent
@@ -1025,7 +1058,7 @@ def plot_forecasts(
                 )
             if not granular_csv.exists():
                 raise click.ClickException(
-                    f"window_quartile selection requires granular CSV, not found: {granular_csv}"
+                    f"{strategy} selection requires granular CSV, not found: {granular_csv}"
                 )
             click.echo(f"Loading granular selection candidates from: {granular_csv}")
             window_specs = load_window_selection_specs_from_granular(
@@ -1036,10 +1069,16 @@ def plot_forecasts(
                 raise click.ClickException(
                     f"No granular window candidates found in {granular_csv}"
                 )
-            window_groups = select_windows_by_loss(
-                window_specs=window_specs,
-                samples_per_group=k,
-            )
+            if strategy == "window_worst":
+                window_groups = select_worst_windows_by_loss(
+                    window_specs=window_specs,
+                    k=k,
+                )
+            else:
+                window_groups = select_windows_by_loss(
+                    window_specs=window_specs,
+                    samples_per_group=k,
+                )
             node_groups = None
         else:
             node_groups = select_nodes_by_loss(
@@ -1069,6 +1108,7 @@ def plot_forecasts(
             window_groups=window_groups,
             window=window,
             output_path=output,
+            include_sird_latents=include_sird_latents,
         )
 
         if output is not None:
@@ -1091,7 +1131,14 @@ def _parse_nodes_option(nodes: str) -> tuple[str, int]:
             f"Invalid --nodes format: '{nodes}'. Expected 'strategy:N' (e.g., 'random:5')"
         )
     strategy, k_str = parts[0].lower(), parts[1]
-    valid_strategies = ("random", "quartile", "best", "worst", "window_quartile")
+    valid_strategies = (
+        "random",
+        "quartile",
+        "best",
+        "worst",
+        "window_quartile",
+        "window_worst",
+    )
     if strategy not in valid_strategies:
         raise click.ClickException(
             f"Invalid strategy: '{strategy}'. Valid: {', '.join(valid_strategies)}"
@@ -1238,6 +1285,15 @@ def train_regions(
             raise click.ClickException(
                 "Production training configs (env=mn5) must run on SLURM."
             )
+        if epochs is not None:
+            region_config.training.epochs = epochs
+            region_config.training.train_until_plateau = False
+        if device and device != "auto":
+            region_config.training.device = device
+        if output_dir is not None:
+            region_config.output.output_dir = output_dir
+        if no_cluster:
+            region_config.clustering.enabled = False
 
         trainer = Region2VecTrainer(region_config)
 

@@ -26,12 +26,47 @@ from utils.device import prefetch_enabled, resolve_device
 
 logger = logging.getLogger(__name__)
 
+_MOBILITY_INPUT_WEIGHT_KEYS = (
+    "mobility_gnn.layers.0.lin.weight",
+    "mobility_gnn.skips.0.weight",
+)
+
 
 def _suppress_zarr_warnings(worker_id: int) -> None:
     """Suppress zarr/numcodecs warnings in DataLoader worker processes."""
     import warnings
 
     warnings.filterwarnings("ignore", category=zarr.errors.ZarrUserWarning)
+
+
+def _pad_legacy_mobility_input_weights(
+    *,
+    state_dict: dict[str, torch.Tensor],
+    model_state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Pad old mobility-input weights when new node feature channels were added."""
+    patched = dict(state_dict)
+    for key in _MOBILITY_INPUT_WEIGHT_KEYS:
+        saved = patched.get(key)
+        expected = model_state_dict.get(key)
+        if saved is None or expected is None:
+            continue
+        if saved.shape == expected.shape:
+            continue
+        if saved.ndim != 2 or expected.ndim != 2:
+            continue
+        if saved.shape[0] != expected.shape[0] or saved.shape[1] > expected.shape[1]:
+            continue
+        padded = expected.new_zeros(expected.shape)
+        padded[:, : saved.shape[1]] = saved.to(dtype=expected.dtype)
+        patched[key] = padded
+        logger.info(
+            "Padded legacy checkpoint weight %s from %s to %s",
+            key,
+            tuple(saved.shape),
+            tuple(expected.shape),
+        )
+    return patched
 
 
 def load_model_from_checkpoint(
@@ -116,6 +151,10 @@ def load_model_from_checkpoint(
     state_dict = checkpoint["model_state_dict"]
     if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
         state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+    state_dict = _pad_legacy_mobility_input_weights(
+        state_dict=state_dict,
+        model_state_dict=model.state_dict(),
+    )
     model.load_state_dict(state_dict)
     model.to(resolve_device(device))
     return model, config, checkpoint
