@@ -56,6 +56,10 @@ from utils.gradnorm_logging import (
 )
 from utils.gradient_debug import GradientDebugger
 from utils.log_keys import build_loss_key, infer_observation_head_from_name
+from utils.model_diagnostics import (
+    capture_model_diagnostics,
+    should_capture_model_diagnostics,
+)
 from utils.platform import (
     get_nvme_path,
     is_slurm_cluster,
@@ -1523,6 +1527,7 @@ class EpiForecasterTrainer:
         log_data: dict[str, float | int | torch.Tensor],
         component_gradnorm_log_data: dict[str, float],
         gradient_snapshot_log_data: dict[str, float | int],
+        model_diagnostics_log_data: dict[str, float],
     ) -> dict[str, float | int | torch.Tensor | wandb.Histogram] | None:
         """Build the final W&B payload, excluding grad scalars and adding histograms."""
         payload = get_wandb_step_payload(
@@ -1530,6 +1535,7 @@ class EpiForecasterTrainer:
             log_data=log_data,
             component_gradnorm_log_data=component_gradnorm_log_data,
             gradient_snapshot_log_data=gradient_snapshot_log_data,
+            model_diagnostics_log_data=model_diagnostics_log_data,
         )
         if self.wandb_run is None:
             return payload
@@ -1693,32 +1699,47 @@ class EpiForecasterTrainer:
                 from utils.training_utils import ensure_mobility_adj_dense_ready
 
                 model_step_start_time = time.time()
-                if self._gradnorm_enabled:
+                should_capture_model_diag = should_capture_model_diagnostics(
+                    self.global_step,
+                    self.config.training.model_diagnostics_frequency,
+                )
+                model_diagnostics_capture = None
+
+                def run_training_step() -> torch.Tensor:
+                    if self._gradnorm_enabled:
+                        if self._compiled_training_step is not None:
+                            ensure_mobility_adj_dense_ready(
+                                batch_data,
+                                required=bool(self.config.model.type.mobility),
+                                context="compiled adaptive training",
+                            )
+                            return self._compiled_training_step(
+                                batch_data,
+                                self._gradnorm_cached_weights,
+                            )
+                        return self._training_step_impl_adaptive(
+                            batch_data,
+                            self._gradnorm_cached_weights,
+                        )
+                    # Call either compiled or eager version of the same step implementation
                     if self._compiled_training_step is not None:
                         ensure_mobility_adj_dense_ready(
                             batch_data,
                             required=bool(self.config.model.type.mobility),
-                            context="compiled adaptive training",
+                            context="compiled training",
                         )
-                        loss = self._compiled_training_step(
-                            batch_data,
-                            self._gradnorm_cached_weights,
-                        )
-                    else:
-                        loss = self._training_step_impl_adaptive(
-                            batch_data,
-                            self._gradnorm_cached_weights,
-                        )
-                # Call either compiled or eager version of the same step implementation
-                elif self._compiled_training_step is not None:
-                    ensure_mobility_adj_dense_ready(
-                        batch_data,
-                        required=bool(self.config.model.type.mobility),
-                        context="compiled training",
-                    )
-                    loss = self._compiled_training_step(batch_data)
+                        return self._compiled_training_step(batch_data)
+                    return self._training_step_impl(batch_data)
+
+                if should_capture_model_diag:
+                    with capture_model_diagnostics(
+                        self.model,
+                        include_mobility=self.config.training.model_diagnostics_include_mobility,
+                    ) as capture:
+                        loss = run_training_step()
+                    model_diagnostics_capture = capture
                 else:
-                    loss = self._training_step_impl(batch_data)
+                    loss = run_training_step()
                 model_step_time_s = time.time() - model_step_start_time
 
                 gradient_snapshot_log_data: dict[str, float | int] = {}
@@ -1754,6 +1775,12 @@ class EpiForecasterTrainer:
                     self._status(
                         self.gradient_debugger.format_snapshot_status(snapshot),
                         logging.INFO,
+                    )
+
+                model_diagnostics_log_data: dict[str, float] = {}
+                if model_diagnostics_capture is not None:
+                    model_diagnostics_log_data = model_diagnostics_capture.build_log_data(
+                        self.model
                     )
 
                 frequency = self.config.training.grad_norm_log_frequency
@@ -1899,6 +1926,7 @@ class EpiForecasterTrainer:
                     component_gradnorm_log_data=component_gradnorm_log_data,
                     gradnorm_step_log_data=gradnorm_step_log_data,
                     gradient_snapshot_log_data=gradient_snapshot_log_data,
+                    model_diagnostics_log_data=model_diagnostics_log_data,
                 )
 
                 if log_this_step:
@@ -1955,6 +1983,7 @@ class EpiForecasterTrainer:
                     log_data=log_data,
                     component_gradnorm_log_data=component_gradnorm_log_data,
                     gradient_snapshot_log_data=gradient_snapshot_log_data,
+                    model_diagnostics_log_data=model_diagnostics_log_data,
                 )
                 if self.wandb_run is not None and wandb_payload is not None:
                     wandb.log(wandb_payload, step=self.global_step)

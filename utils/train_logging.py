@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import statistics
 import math
+import statistics
 from typing import Any
 
 import torch
@@ -32,6 +32,7 @@ def build_train_step_log_data(
     component_gradnorm_log_data: dict[str, float],
     gradnorm_step_log_data: dict[str, torch.Tensor],
     gradient_snapshot_log_data: dict[str, float | int],
+    model_diagnostics_log_data: dict[str, float] | None = None,
 ) -> dict[str, float | torch.Tensor]:
     """Build per-step logging payload before progress-only metrics are added."""
     log_data: dict[str, float | torch.Tensor] = {
@@ -46,6 +47,8 @@ def build_train_step_log_data(
     log_data.update(component_gradnorm_log_data)
     log_data.update(gradnorm_step_log_data)
     log_data.update(gradient_snapshot_log_data)
+    if model_diagnostics_log_data:
+        log_data.update(model_diagnostics_log_data)
     return log_data
 
 
@@ -55,6 +58,7 @@ def get_wandb_step_payload(
     log_data: dict[str, float | int | torch.Tensor],
     component_gradnorm_log_data: dict[str, float],
     gradient_snapshot_log_data: dict[str, float | int],
+    model_diagnostics_log_data: dict[str, float] | None = None,
 ) -> dict[str, float | int | torch.Tensor] | None:
     """Select the exact payload that should be sent to wandb for this step."""
     del component_gradnorm_log_data
@@ -67,6 +71,8 @@ def get_wandb_step_payload(
     }
     if log_this_step:
         return filtered_log_data
+    if model_diagnostics_log_data:
+        return dict(model_diagnostics_log_data)
     return None
 
 

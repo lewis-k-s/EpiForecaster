@@ -122,3 +122,11 @@ class TestPrecisionConfigValidation:
             match="wandb_gradient_histogram_max_params must be >= 1",
         ):
             TrainingParams(wandb_gradient_histogram_max_params=0)
+
+    def test_negative_model_diagnostics_frequency_rejected(self):
+        """Model diagnostics frequency must be non-negative."""
+        with pytest.raises(
+            ValueError,
+            match="model_diagnostics_frequency must be non-negative",
+        ):
+            TrainingParams(model_diagnostics_frequency=-1)

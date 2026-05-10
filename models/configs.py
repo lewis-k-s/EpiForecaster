@@ -811,6 +811,10 @@ class TrainingParams:
             "deaths_head.delay_kernel",
         ]
     )
+    # Lightweight model activation/norm diagnostics. Disabled by default for zero
+    # overhead; when enabled, scalar summaries are logged at this step frequency.
+    model_diagnostics_frequency: int = 0
+    model_diagnostics_include_mobility: bool = True
     # Apply torch.compile to the model for performance
     compile: bool = False
     # torch.compile mode. "reduce-overhead" can improve GPU utilization by reducing
@@ -1015,6 +1019,11 @@ class TrainingParams:
             raise ValueError(
                 "wandb_gradient_histogram_max_params must be >= 1, got "
                 f"{self.wandb_gradient_histogram_max_params}"
+            )
+        if self.model_diagnostics_frequency < 0:
+            raise ValueError(
+                "model_diagnostics_frequency must be non-negative, got "
+                f"{self.model_diagnostics_frequency}"
             )
 
         # Validate horizon metric aggregation strategy

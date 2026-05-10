@@ -61,6 +61,23 @@ def test_model_graph_adjacency_source_defaults_to_mobility() -> None:
 
 
 @pytest.mark.epiforecaster
+def test_model_temporal_covariates_dim_includes_lockdown_severity() -> None:
+    cfg = ModelConfig(
+        type={"cases": True, "mobility": True},
+        mobility_embedding_dim=4,
+        region_embedding_dim=4,
+        input_window_length=3,
+        forecast_horizon=1,
+        max_neighbors=2,
+        gnn_module="gcn",
+        include_day_of_week=True,
+        include_holidays=True,
+        include_lockdown_severity=True,
+    )
+    assert cfg.temporal_covariates_dim == 4
+
+
+@pytest.mark.epiforecaster
 def test_model_graph_adjacency_source_accepts_spatial_knn() -> None:
     cfg = ModelConfig(
         type={"cases": True, "mobility": True},
