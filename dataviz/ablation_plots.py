@@ -37,8 +37,10 @@ TARGET_LABELS = {
 METRIC_LABELS = {
     "mae": "MAE",
     "rmse": "RMSE",
+    "smape": "sMAPE",
     "r2": "R²",
 }
+DEFAULT_DELTA_METRICS = ["mae", "rmse", "smape", "r2"]
 PRIMARY_ABLATION_ORDER = [
     "mobility:off",
     "regions:off",
@@ -67,6 +69,17 @@ PHYSICS_ABLATIONS = ["residual:off", "sir:off"]
 
 # Unified colormap for all heatmaps
 HEATMAP_CMAP = "RdYlGn_r"  # Red = worse (higher delta), Green = better (lower delta)
+R2_HEATMAP_CMAP = "RdYlGn"  # Red = worse (lower R²), Green = better (higher R²)
+
+
+def _delta_colormap(metric: str) -> str:
+    """Return a semantic diverging colormap for baseline deltas."""
+    return R2_HEATMAP_CMAP if metric == "r2" else HEATMAP_CMAP
+
+
+def _delta_colorbar_label(metric: str) -> str:
+    direction = "positive is better" if metric == "r2" else "positive is worse"
+    return f"% change from baseline ({direction})"
 
 
 def _prepare_model_order(
@@ -328,11 +341,11 @@ def plot_ablation_deltas_heatmap(
         pivot,
         annot=True,
         fmt=".1f",
-        cmap=HEATMAP_CMAP,  # Red = worse, Green = better
+        cmap=_delta_colormap(metric),
         center=0,
         vmin=vmin,
         vmax=vmax,
-        cbar_kws={"label": "% change from baseline"},
+        cbar_kws={"label": _delta_colorbar_label(metric)},
         ax=ax,
     )
 
@@ -359,6 +372,143 @@ def plot_ablation_deltas_heatmap(
         plt.close(fig)
 
     return output_path
+
+
+def plot_ablation_delta_histograms(
+    pairwise_csv: str | Path,
+    output_dir: str | Path | None = None,
+    metric: str = "mae",
+    figsize: tuple[float, float] | None = None,
+    bins: int = 20,
+    show: bool = False,
+) -> Path:
+    """Create target-faceted histograms of seed-paired deltas.
+
+    The input should be ``ablation_metrics_deltas_seed_pairwise.csv`` so each
+    histogram reflects the distribution of matched-seed ablation-vs-baseline
+    changes rather than an aggregate training objective.
+    """
+    pairwise_csv = Path(pairwise_csv)
+
+    if output_dir is None:
+        output_dir = pairwise_csv.parent
+    else:
+        output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(pairwise_csv)
+    delta_col = f"{metric}_delta_pct"
+    if delta_col not in df.columns:
+        raise ValueError(f"Could not find delta column for {metric}: {delta_col}")
+
+    df = df.dropna(subset=[delta_col, "target"])
+    if df.empty:
+        raise ValueError(f"No finite {metric} deltas available for histogram")
+
+    target_order = _prepare_target_order(df)
+    n_targets = len(target_order)
+    n_cols = min(2, n_targets)
+    n_rows = int(np.ceil(n_targets / n_cols))
+    if figsize is None:
+        figsize = (6.5 * n_cols, 3.6 * n_rows)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+    axes_flat = axes.ravel()
+
+    for ax, target in zip(axes_flat, target_order, strict=False):
+        target_df = df[df["target"] == target]
+        values = target_df[delta_col].astype(float)
+        if values.empty:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        else:
+            sns.histplot(values, bins=bins, kde=True, ax=ax, color="#4C78A8")
+            mean_val = float(values.mean())
+            ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
+            ax.axvline(mean_val, color="#D62728", linewidth=1.4, alpha=0.9)
+            ax.text(
+                0.98,
+                0.95,
+                f"n={len(values)}\nmean={mean_val:+.1f}%",
+                transform=ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=9,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.75},
+            )
+        ax.set_title(TARGET_LABELS.get(target, target), fontweight="bold")
+        ax.set_xlabel(f"{METRIC_LABELS.get(metric, metric)} delta vs baseline (%)")
+        ax.set_ylabel("Seed-paired comparisons")
+        ax.grid(axis="y", alpha=0.25)
+
+    for ax in axes_flat[n_targets:]:
+        ax.axis("off")
+
+    fig.suptitle(
+        f"Seed-Matched Ablation Deltas: {METRIC_LABELS.get(metric, metric)}",
+        fontsize=13,
+        fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    metric_slug = metric.replace("_median", "").replace("_", "-")
+    output_path = output_dir / f"ablation_delta_histogram_{metric_slug}.png"
+    fig.savefig(output_path, bbox_inches="tight")
+    logger.info("Saved delta histogram to %s", output_path)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return output_path
+
+
+def plot_seed_matched_delta_diagnostics(
+    summary_csv: str | Path,
+    pairwise_csv: str | Path,
+    output_dir: str | Path | None = None,
+    metrics: list[str] | None = None,
+    baseline_name: str = "baseline",
+    show: bool = False,
+) -> dict[str, Path]:
+    """Create per-metric heatmaps and histograms for seed-matched deltas."""
+    summary_csv = Path(summary_csv)
+    pairwise_csv = Path(pairwise_csv)
+    if output_dir is None:
+        output_dir = summary_csv.parent
+    else:
+        output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if metrics is None:
+        metrics = DEFAULT_DELTA_METRICS
+
+    artifacts: dict[str, Path] = {}
+    for metric in metrics:
+        try:
+            artifacts[f"heatmap_{metric}"] = plot_ablation_deltas_heatmap(
+                summary_csv,
+                output_dir=output_dir,
+                metric=metric,
+                baseline_name=baseline_name,
+                output_filename=f"ablation_delta_heatmap_{metric}.png",
+                show=show,
+            )
+        except ValueError as exc:
+            logger.warning("Skipping %s delta heatmap: %s", metric, exc)
+
+        try:
+            artifacts[f"histogram_{metric}"] = plot_ablation_delta_histograms(
+                pairwise_csv,
+                output_dir=output_dir,
+                metric=metric,
+                show=show,
+            )
+        except ValueError as exc:
+            logger.warning("Skipping %s delta histogram: %s", metric, exc)
+
+    return artifacts
 
 
 def plot_ablation_summary_grid(
@@ -755,6 +905,12 @@ Examples:
         help="Path to ablation_metrics_deltas.csv (optional)",
     )
     parser.add_argument(
+        "--seed-pairwise-deltas-csv",
+        type=Path,
+        default=None,
+        help="Path to ablation_metrics_deltas_seed_pairwise.csv for histograms (optional)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=None,
@@ -815,13 +971,30 @@ Examples:
     # Heatmap if deltas available
     if args.deltas_csv and args.deltas_csv.exists():
         logger.info("Generating delta heatmap...")
-        plot_ablation_deltas_heatmap(
-            args.deltas_csv,
-            output_dir=args.output_dir,
-            metric="mae",
-            baseline_name=args.baseline,
-            show=args.show,
-        )
+        for metric in DEFAULT_DELTA_METRICS:
+            try:
+                plot_ablation_deltas_heatmap(
+                    args.deltas_csv,
+                    output_dir=args.output_dir,
+                    metric=metric,
+                    baseline_name=args.baseline,
+                    show=args.show,
+                )
+            except ValueError as exc:
+                logger.warning("Skipping %s delta heatmap: %s", metric, exc)
+
+        if args.seed_pairwise_deltas_csv and args.seed_pairwise_deltas_csv.exists():
+            logger.info("Generating seed-matched delta histograms...")
+            for metric in DEFAULT_DELTA_METRICS:
+                try:
+                    plot_ablation_delta_histograms(
+                        args.seed_pairwise_deltas_csv,
+                        output_dir=args.output_dir,
+                        metric=metric,
+                        show=args.show,
+                    )
+                except ValueError as exc:
+                    logger.warning("Skipping %s delta histogram: %s", metric, exc)
 
         # Generate separate mobility ablation heatmap
         logger.info("Generating mobility ablation heatmap...")

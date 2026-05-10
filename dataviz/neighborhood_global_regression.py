@@ -630,7 +630,7 @@ def main() -> None:
     horizon = int(config.model.forecast_horizon)
     window_len = history_len + horizon
     window_stride = int(args.window_stride)
-    missing_permit = int(config.data.missing_permit)
+    missing_permit = int(config.data.missing_permit.input.get("cases", 0))
 
     # Compute valid windows
     starts, valid_mask = compute_valid_window_mask(

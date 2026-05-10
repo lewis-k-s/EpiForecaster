@@ -650,6 +650,7 @@ def main() -> int:
             plot_cross_head_impact_heatmap,
             plot_mobility_ablation_heatmap,
             plot_head_ablation_heatmap,
+            plot_seed_matched_delta_diagnostics,
         )
 
         plot_ablation_comparison(
@@ -670,12 +671,13 @@ def main() -> int:
             else deltas_path
         )
         if not heatmap_df.empty:
-            plot_ablation_deltas_heatmap(
-                heatmap_csv,
-                output_dir=args.output_dir,
-                metric="mae",
-                baseline_name=args.baseline,
-            )
+            for metric in ["mae", "rmse", "smape", "r2"]:
+                plot_ablation_deltas_heatmap(
+                    heatmap_csv,
+                    output_dir=args.output_dir,
+                    metric=metric,
+                    baseline_name=args.baseline,
+                )
             plot_mobility_ablation_heatmap(
                 heatmap_csv,
                 output_dir=args.output_dir,
@@ -686,6 +688,13 @@ def main() -> int:
                 heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
+                baseline_name=args.baseline,
+            )
+        if not seed_matched_df.empty and not seed_pairwise_df.empty:
+            plot_seed_matched_delta_diagnostics(
+                seed_matched_path,
+                seed_pairwise_path,
+                output_dir=args.output_dir / "seed_matched_diagnostics",
                 baseline_name=args.baseline,
             )
         if cross_head_success:

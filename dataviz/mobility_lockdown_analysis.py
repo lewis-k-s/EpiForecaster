@@ -69,6 +69,8 @@ LOCKDOWN_PERIODS = [
     ),
 ]
 
+MIN_CORRELATION_WINDOWS = 20
+
 
 def resolve_mobility_array(mobility_da: xr.DataArray | xr.Dataset) -> np.ndarray:
     """Return mobility array in (time, origin, destination) order."""
@@ -127,7 +129,9 @@ def compute_mobility_reduction(
         )
 
     # Compute total volume per day
-    daily_totals = mobility.sum(axis=(1, 2))
+    mobility = np.asarray(mobility, dtype=float)
+    mobility = np.where(np.isfinite(mobility), mobility, np.nan)
+    daily_totals = np.nansum(mobility, axis=(1, 2), dtype=float)
     daily_series = pd.Series(daily_totals, index=dates)
 
     # Compute rolling median baseline (14-day window)
@@ -139,7 +143,9 @@ def compute_mobility_reduction(
     rolling_baseline[baseline_mask] = daily_series[baseline_mask]
 
     # Compute reduction percentage
-    reduction_pct = (rolling_baseline - daily_series) / rolling_baseline * 100
+    valid_baseline = rolling_baseline.where(rolling_baseline > 0)
+    reduction_pct = (valid_baseline - daily_series) / valid_baseline * 100
+    reduction_pct = reduction_pct.replace([np.inf, -np.inf], np.nan)
 
     # Apply 7-day smoothing to reduction
     reduction_smoothed = reduction_pct.rolling(
@@ -175,7 +181,7 @@ def load_or_compute_regression_results(
     history_len = int(config.model.input_window_length)
     horizon = int(config.model.forecast_horizon)
     window_len = history_len + horizon
-    missing_permit = int(config.data.missing_permit)
+    missing_permit = int(config.data.missing_permit.input.get("cases", 0))
 
     starts, valid_mask = compute_valid_window_mask(
         cases_da, history_len, horizon, window_stride, missing_permit
@@ -419,6 +425,7 @@ def plot_lockdown_correlation_scatter(
     agg_df: pd.DataFrame,
     dates: pd.DatetimeIndex,
     output_path: Path,
+    min_correlation_windows: int = MIN_CORRELATION_WINDOWS,
 ) -> None:
     """Plot scatter of mobility reduction vs regression quality, colored by lockdown status.
 
@@ -454,6 +461,7 @@ def plot_lockdown_correlation_scatter(
         mobility_values.append(mobility_reduction_smoothed.iloc[idx])
 
     mobility_values = np.array(mobility_values, dtype=float)
+    r2_values = agg_df["r2_mean"].values.astype(float)
 
     # Determine which windows are during lockdowns
     lockdown_status = []
@@ -470,65 +478,73 @@ def plot_lockdown_correlation_scatter(
     # Create scatter plot
     fig, ax = plt.subplots(figsize=(12, 8))
 
-    # Plot non-lockdown windows
-    mask = ~lockdown_status
-    if mask.sum() > 0:
+    finite_values = np.isfinite(mobility_values) & np.isfinite(r2_values)
+
+    def add_group(
+        mask: np.ndarray,
+        color: str,
+        label: str,
+        trend_label: str,
+        edgecolors: str | None = None,
+        linewidth: float = 0.0,
+        size: int = 60,
+    ) -> int:
+        n = int(mask.sum())
+        if n == 0:
+            return n
         ax.scatter(
             mobility_values[mask],
-            agg_df["r2_mean"].values[mask].astype(float),
-            alpha=0.6,
-            color="#1f77b4",
-            label="Outside lockdown",
-            s=60,
+            r2_values[mask],
+            alpha=0.75,
+            color=color,
+            label=f"{label} (n={n})",
+            s=size,
+            edgecolors=edgecolors,
+            linewidth=linewidth,
         )
-
-        # Add trend line for non-lockdown
-        if mask.sum() >= 2:
+        if n >= min_correlation_windows and np.unique(mobility_values[mask]).size >= 2:
             x_vals = mobility_values[mask]
-            y_vals = agg_df["r2_mean"].values[mask].astype(float)
+            y_vals = r2_values[mask]
             z = np.polyfit(x_vals, y_vals, 1)
             p = np.poly1d(z)
             x_line = np.linspace(x_vals.min(), x_vals.max(), 100)
             ax.plot(
                 x_line,
                 p(x_line),
-                color="#1f77b4",
+                color=color,
                 linestyle="--",
                 alpha=0.7,
                 linewidth=2,
-                label=f"Non-lockdown trend: slope={z[0]:.3f}",
+                label=f"{trend_label}: slope={z[0]:.3f}",
             )
+        return n
 
-    # Plot lockdown windows
-    mask = lockdown_status
-    if mask.sum() > 0:
-        ax.scatter(
-            mobility_values[mask],
-            agg_df["r2_mean"].values[mask].astype(float),
-            alpha=0.8,
-            color="#d62728",
-            label="During lockdown",
-            s=80,
-            edgecolors="black",
-            linewidth=1.5,
+    outside_n = add_group(
+        ~lockdown_status & finite_values,
+        color="#1f77b4",
+        label="Outside lockdown",
+        trend_label="Non-lockdown trend",
+    )
+    lockdown_n = add_group(
+        lockdown_status & finite_values,
+        color="#d62728",
+        label="During lockdown",
+        trend_label="Lockdown trend",
+        edgecolors="black",
+        linewidth=1.5,
+        size=80,
+    )
+
+    if outside_n < min_correlation_windows or lockdown_n < min_correlation_windows:
+        ax.text(
+            0.02,
+            0.04,
+            "Trend lines suppressed: too few independent windows "
+            f"(minimum n={min_correlation_windows} per group).",
+            transform=ax.transAxes,
+            fontsize=10,
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#cccccc"},
         )
-
-        # Add trend line for lockdown
-        if mask.sum() >= 2:
-            x_vals = mobility_values[mask]
-            y_vals = agg_df["r2_mean"].values[mask].astype(float)
-            z = np.polyfit(x_vals, y_vals, 1)
-            p = np.poly1d(z)
-            x_line = np.linspace(x_vals.min(), x_vals.max(), 100)
-            ax.plot(
-                x_line,
-                p(x_line),
-                color="#d62728",
-                linestyle="--",
-                alpha=0.7,
-                linewidth=2,
-                label=f"Lockdown trend: slope={z[0]:.3f}",
-            )
 
     ax.set_xlabel("Mobility reduction (%)", fontsize=12)
     ax.set_ylabel("Mean R²", fontsize=12)
@@ -555,6 +571,7 @@ def compute_lockdown_statistics(
     mobility_reduction_smoothed: pd.Series,
     agg_df: pd.DataFrame,
     dates: pd.DatetimeIndex,
+    min_correlation_windows: int = MIN_CORRELATION_WINDOWS,
 ) -> dict[str, dict[str, Any]]:
     """Compute statistics for each lockdown period.
 
@@ -591,17 +608,17 @@ def compute_lockdown_statistics(
         # Regression quality stats during lockdown
         lockdown_mask = (window_dates >= start_dt) & (window_dates <= end_dt)
         r2_during = agg_df["r2_mean"].values[lockdown_mask]
+        r2_during_finite = r2_during[np.isfinite(r2_during)]
 
         # Pre-lockdown regression quality
         pre_mask = (window_dates >= pre_start) & (window_dates <= pre_end)
         r2_pre = agg_df["r2_mean"].values[pre_mask]
+        r2_pre_finite = r2_pre[np.isfinite(r2_pre)]
 
-        mobility_mean_during = (
-            float(mobility_during.mean()) if len(mobility_during) > 0 else np.nan
-        )
-        mobility_mean_pre = (
-            float(mobility_pre.mean()) if len(mobility_pre) > 0 else np.nan
-        )
+        mobility_during = mobility_during.replace([np.inf, -np.inf], np.nan)
+        mobility_pre = mobility_pre.replace([np.inf, -np.inf], np.nan)
+        mobility_mean_during = float(mobility_during.mean(skipna=True))
+        mobility_mean_pre = float(mobility_pre.mean(skipna=True))
 
         stats[lockdown.name] = {
             "mobility_reduction_during_mean": mobility_mean_during,
@@ -626,6 +643,14 @@ def compute_lockdown_statistics(
             "r2_delta": float(np.nanmean(r2_during) - np.nanmean(r2_pre))
             if len(r2_during) > 0 and len(r2_pre) > 0
             else np.nan,
+            "n_r2_windows_during": int(len(r2_during_finite)),
+            "n_r2_windows_pre": int(len(r2_pre_finite)),
+            "r2_delta_sample_warning": (
+                "too_few_windows"
+                if len(r2_during_finite) < min_correlation_windows
+                or len(r2_pre_finite) < min_correlation_windows
+                else "ok"
+            ),
         }
 
     # Overall statistics
@@ -642,6 +667,8 @@ def compute_lockdown_statistics(
 
     r2_during = agg_df["r2_mean"].values[overall_lockdown_mask]
     r2_outside = agg_df["r2_mean"].values[overall_non_lockdown_mask]
+    r2_during_finite = r2_during[np.isfinite(r2_during)]
+    r2_outside_finite = r2_outside[np.isfinite(r2_outside)]
 
     stats["overall"] = {
         "r2_mean_during_lockdown": float(np.nanmean(r2_during))
@@ -655,6 +682,14 @@ def compute_lockdown_statistics(
         else np.nan,
         "n_windows_during_lockdown": int(overall_lockdown_mask.sum()),
         "n_windows_outside_lockdown": int(overall_non_lockdown_mask.sum()),
+        "n_finite_r2_windows_during_lockdown": int(len(r2_during_finite)),
+        "n_finite_r2_windows_outside_lockdown": int(len(r2_outside_finite)),
+        "correlation_sample_warning": (
+            "too_few_windows"
+            if len(r2_during_finite) < min_correlation_windows
+            or len(r2_outside_finite) < min_correlation_windows
+            else "ok"
+        ),
     }
 
     return stats
@@ -699,6 +734,15 @@ def main() -> None:
         type=float,
         default=None,
         help="Minimum incoming flow for neighbors (default: config value)",
+    )
+    parser.add_argument(
+        "--min-correlation-windows",
+        type=int,
+        default=MIN_CORRELATION_WINDOWS,
+        help=(
+            "Minimum finite windows per group before drawing a fitted trend line "
+            f"(default: {MIN_CORRELATION_WINDOWS})"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -821,16 +865,27 @@ def main() -> None:
         agg_df,
         dates,
         output_dir / "lockdown_correlation_scatter.png",
+        min_correlation_windows=args.min_correlation_windows,
     )
 
     # Compute and print lockdown statistics
     logger.info("Computing lockdown statistics...")
-    stats = compute_lockdown_statistics(mobility_reduction_smoothed, agg_df, dates)
+    stats = compute_lockdown_statistics(
+        mobility_reduction_smoothed,
+        agg_df,
+        dates,
+        min_correlation_windows=args.min_correlation_windows,
+    )
 
     stats_path = output_dir / "lockdown_statistics.txt"
     with open(stats_path, "w") as f:
         f.write("Lockdown Statistics\n")
         f.write("=" * 60 + "\n\n")
+        f.write(
+            "Correlation/trend diagnostics are treated as exploratory only. "
+            f"Trend lines require at least {args.min_correlation_windows} finite "
+            "windows per group.\n\n"
+        )
 
         for lockdown_name, lockdown_stats in stats.items():
             if lockdown_name == "overall":
