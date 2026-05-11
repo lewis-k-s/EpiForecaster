@@ -295,6 +295,7 @@ class TestEpiForecasterTrainer:
         trainer.config = SimpleNamespace(
             training=SimpleNamespace(early_stopping_patience=5),
         )
+        trainer.real_run_id = "real"
         trainer.curriculum_sampler = SimpleNamespace(
             state=SimpleNamespace(synth_ratio=1.0)
         )
@@ -306,6 +307,7 @@ class TestEpiForecasterTrainer:
         trainer.config = SimpleNamespace(
             training=SimpleNamespace(early_stopping_patience=5),
         )
+        trainer.real_run_id = "real"
         trainer.curriculum_sampler = SimpleNamespace(
             state=SimpleNamespace(synth_ratio=0.8)
         )
@@ -405,6 +407,7 @@ class TestEpiForecasterTrainer:
         mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
 
         minimal_config.training.compile_backward = True
+        minimal_config.training.loss.joint.adaptive_scheme = "gradnorm"
         trainer = EpiForecasterTrainer(minimal_config)
         assert trainer._compiled_training_step is not None
         assert trainer.gradnorm_controller is not None
@@ -443,6 +446,7 @@ class TestEpiForecasterTrainer:
 
         minimal_config.output.log_dir = str(tmp_path)
         minimal_config.output.experiment_name = "gradnorm_ckpt"
+        minimal_config.training.loss.joint.adaptive_scheme = "gradnorm"
         trainer = EpiForecasterTrainer(minimal_config)
         trainer._save_checkpoint(epoch=0, val_loss=1.0, is_best=False, is_final=False)
 

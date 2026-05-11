@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from types import SimpleNamespace
 
@@ -73,7 +74,7 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
         + metrics["loss_cases_weighted"]
         + metrics["loss_deaths_weighted"]
     )
-    assert metrics["mae"] == expected_joint_obs_loss
+    assert metrics["mae"] == pytest.approx(expected_joint_obs_loss, rel=1e-5)
     assert "rmse" not in metrics
     assert "r2" not in metrics
     assert metrics["mae_hosp_log1p_per_100k"] == 0.0
