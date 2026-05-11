@@ -94,4 +94,3 @@ training:
       gradnorm_ema_decay: 0.9
       gradnorm_probe: "obs_context"
       w_sird_supervision: 0.0
-      w_continuity: 0.01

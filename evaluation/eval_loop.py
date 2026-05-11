@@ -315,7 +315,7 @@ def evaluate_loader(
                     for k, v in model_outputs.items()
                 }
 
-                # Compute loss with batch_data for continuity penalty
+                # Compute loss components
                 current_stage = "loss_components"
                 components = criterion.compute_components(
                     model_outputs, targets_dict, batch_data
@@ -335,8 +335,6 @@ def evaluate_loader(
                 loss_latent_i_sum += components["latent_i"].detach()
                 loss_latent_r_sum += components["latent_r"].detach()
                 loss_latent_d_sum += components["latent_d"].detach()
-                if "continuity" in components:
-                    pass  # Don't accumulate continuity loss in metrics
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
                 loss_hosp_weighted_sum += components["hosp_weighted"].detach()
                 loss_cases_weighted_sum += components["cases_weighted"].detach()

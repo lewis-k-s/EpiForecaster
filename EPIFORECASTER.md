@@ -58,7 +58,7 @@ Differentiable layers mapping latent states to observable metrics.
 
 The model is trained end-to-end using a composite loss function:
 
-$$ L_{total} = L_{obs} + w_{sir} L_{SIR} + w_{continuity} L_{continuity} $$
+$$ L_{total} = L_{obs} + w_{sir} L_{SIR} $$
 
 where:
 
@@ -74,8 +74,6 @@ where:
 
 *   **Observation Losses ($L_{WW}, L_{Hosp}, \dots$)**: Minimize error between predictions and ground truth data. Per-target masks allow training even when some signals are missing (e.g., missing wastewater data).
 *   **SIR Physics Loss ($L_{SIR}$)**: A regularization term that enforces consistency between the unconstrained updates and the strict SIRD equations, preventing the model from "breaking physics" to fit noise.
-*   **Continuity Loss ($L_{continuity}$)**: Optional nowcast continuity penalty that
-    discourages discontinuity between the last observed point and first forecast step.
 
 ### Observation Supervision and `n_eff`
 

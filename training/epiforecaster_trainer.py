@@ -525,7 +525,6 @@ class EpiForecasterTrainer:
             f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
         )
         self._status(f"    - SIRD supervision weight: {loss_cfg.w_sird_supervision}")
-        self._status(f"    - Continuity weight: {loss_cfg.w_continuity}")
         self._status("    - n_eff: diagnostic only; no loss scaling")
         if self._gradnorm_enabled:
             self._status(

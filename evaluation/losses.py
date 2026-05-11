@@ -45,7 +45,6 @@ def get_loss_from_config(
     return JointInferenceLoss(
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
         w_sird_supervision=joint_cfg.w_sird_supervision,
-        w_continuity=joint_cfg.w_continuity,
         disable_ww=joint_cfg.disable_ww,
         disable_hosp=joint_cfg.disable_hosp,
         disable_cases=joint_cfg.disable_cases,
@@ -94,11 +93,6 @@ class JointInferenceLoss(nn.Module):
         "cases": "cases_min_observed",
         "deaths": "deaths_min_observed",
     }
-    _CONTINUITY_HEADS = (
-        ("hosp", "hosp_hist", "pred_hosp"),
-        ("cases", "cases_hist", "pred_cases"),
-        ("deaths", "deaths_hist", "pred_deaths"),
-    )
     _LATENT_COMPONENTS = (
         ("latent_s", "S_trajectory", "S_target", "S_target_mask"),
         ("latent_i", "I_trajectory", "I_target", "I_target_mask"),
@@ -111,7 +105,6 @@ class JointInferenceLoss(nn.Module):
         obs_weight_sum: float = 0.95,
         w_sird_supervision: float = 0.0,
         w_sir: float | None = None,
-        w_continuity: float = 0.0,
         sir_residual_clip: float | None = None,
         disable_ww: bool = False,
         disable_hosp: bool = False,
@@ -132,7 +125,6 @@ class JointInferenceLoss(nn.Module):
         if w_sir is not None and w_sird_supervision == 0.0:
             w_sird_supervision = float(w_sir)
         self.w_sird_supervision = float(w_sird_supervision)
-        self.w_continuity = w_continuity
         self.disable_ww = bool(disable_ww)
         self.disable_hosp = bool(disable_hosp)
         self.disable_cases = bool(disable_cases)
@@ -205,8 +197,7 @@ class JointInferenceLoss(nn.Module):
         sird_supervision_weighted = (
             self.w_sird_supervision * components["sird_supervision"]
         )
-        continuity_weighted = self.w_continuity * components["continuity"]
-        total = obs_total + sird_supervision_weighted + continuity_weighted
+        total = obs_total + sird_supervision_weighted
         return {
             "obs_weights": obs_weights,
             "obs_total": obs_total,
@@ -216,7 +207,6 @@ class JointInferenceLoss(nn.Module):
             "cases_weighted": obs_weighted[2],
             "deaths_weighted": obs_weighted[3],
             "sird_supervision_weighted": sird_supervision_weighted,
-            "continuity_weighted": continuity_weighted,
         }
 
     @staticmethod
@@ -361,16 +351,13 @@ class JointInferenceLoss(nn.Module):
                 - cases: [B, H] reported cases targets (optional)
                 - deaths: [B, H] deaths targets (optional)
                 - S_target/I_target/R_target/D_target: [B, H+1] latent targets (optional)
-            batch_data: Optional EpiBatch containing historical data for continuity:
-                - hosp_hist: [B, L, 3] hospitalization history
-                - cases_hist: [B, L, 3] cases history
-                - deaths_hist: [B, L, 3] deaths history
+            batch_data: Unused, retained for API compatibility.
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
-                - ww, hosp, cases, deaths, latent_s, latent_i, latent_r, latent_d, sird_supervision, continuity
+                - ww, hosp, cases, deaths, latent_s, latent_i, latent_r, latent_d, sird_supervision
                 - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted,
-                  sird_supervision_weighted, continuity_weighted
+                  sird_supervision_weighted
                 - total
         """
         # Keep losses attached to graph while avoiding NaN propagation from non-finite preds.
@@ -389,7 +376,6 @@ class JointInferenceLoss(nn.Module):
         latent_r_loss = zero_anchor
         latent_d_loss = zero_anchor
         sird_supervision_loss = zero_anchor
-        continuity_loss = zero_anchor
         obs_supervision = self.compute_observation_supervision(
             targets,
             device=zero_anchor.device,
@@ -484,14 +470,6 @@ class JointInferenceLoss(nn.Module):
             if latent_component_losses:
                 sird_supervision_loss = torch.stack(latent_component_losses).mean()
 
-        # Nowcast continuity penalty
-        if self.w_continuity > 0 and batch_data is not None:
-            continuity_loss = self._compute_continuity_loss(
-                model_outputs=model_outputs,
-                batch_data=batch_data,
-                obs_supervision=obs_supervision,
-            )
-
         components = {
             "ww": ww_loss,
             "hosp": hosp_loss,
@@ -502,7 +480,6 @@ class JointInferenceLoss(nn.Module):
             "latent_r": latent_r_loss,
             "latent_d": latent_d_loss,
             "sird_supervision": sird_supervision_loss,
-            "continuity": continuity_loss,
         }
         totals = self.compose_total_loss(
             components=components,
@@ -519,13 +496,11 @@ class JointInferenceLoss(nn.Module):
             "latent_r": latent_r_loss,
             "latent_d": latent_d_loss,
             "sird_supervision": sird_supervision_loss,
-            "continuity": continuity_loss,
             "ww_weighted": totals["ww_weighted"],
             "hosp_weighted": totals["hosp_weighted"],
             "cases_weighted": totals["cases_weighted"],
             "deaths_weighted": totals["deaths_weighted"],
             "sird_supervision_weighted": totals["sird_supervision_weighted"],
-            "continuity_weighted": totals["continuity_weighted"],
             "ww_n_eff": ww_n_eff,
             "hosp_n_eff": hosp_n_eff,
             "cases_n_eff": cases_n_eff,
@@ -544,66 +519,3 @@ class JointInferenceLoss(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Compile-safe train path (kept separate to avoid eval-path regressions)."""
         return self.compute_components(model_outputs, targets, batch_data)
-
-    def _compute_continuity_loss(
-        self,
-        model_outputs: dict[str, torch.Tensor],
-        batch_data: EpiBatch,
-        obs_supervision: dict[str, dict[str, torch.Tensor | None]],
-    ) -> torch.Tensor:
-        """
-        Compute nowcast continuity penalty for active observation heads only.
-
-        Penalizes the discontinuity between the last observed value and the
-        model's first forecast prediction (t=0, the nowcast).
-
-        Args:
-            model_outputs: Dict containing predictions with t=0 (nowcast)
-            batch_data: EpiBatch dataclass containing historical observations
-            obs_supervision: Per-head supervision info including active flags
-
-        Returns:
-            Scalar continuity loss averaged over active continuity heads
-        """
-        zero_anchor = (
-            torch.nan_to_num(
-                model_outputs["pred_hosp"].float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).sum()
-            * 0.0
-        )
-        component_losses: list[torch.Tensor] = []
-        active_flags: list[torch.Tensor] = []
-
-        def _masked_mse(
-            nowcast_pred: torch.Tensor, last_observed: torch.Tensor
-        ) -> torch.Tensor:
-            valid_mask = torch.isfinite(last_observed)
-            valid_f = valid_mask.to(device=nowcast_pred.device, dtype=nowcast_pred.dtype)
-            last_observed_safe = torch.nan_to_num(
-                last_observed.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).to(device=nowcast_pred.device, dtype=nowcast_pred.dtype)
-            sq = (nowcast_pred - last_observed_safe) ** 2
-            numerator = (sq * valid_f).sum()
-            denominator = valid_f.sum().clamp_min(1.0)
-            return numerator / denominator
-
-        for head_name, hist_field, pred_key in self._CONTINUITY_HEADS:
-            active = cast(torch.Tensor, obs_supervision[head_name]["active"])
-
-            prediction = model_outputs.get(pred_key)
-            if prediction is None or prediction.shape[1] == 0:
-                continue
-            hist_tensor = getattr(batch_data, hist_field, None)
-            if hist_tensor is None:
-                continue
-
-            head_loss = _masked_mse(prediction[:, 0], hist_tensor[:, -1, 0])
-            active_f = active.to(dtype=head_loss.dtype)
-            component_losses.append(head_loss * active_f)
-            active_flags.append(active_f)
-
-        if component_losses:
-            stacked_losses = torch.stack(component_losses)
-            stacked_flags = torch.stack(active_flags)
-            return stacked_losses.sum() / stacked_flags.sum().clamp_min(1.0)
-        return zero_anchor

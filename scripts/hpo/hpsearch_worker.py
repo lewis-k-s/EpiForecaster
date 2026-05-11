@@ -243,10 +243,6 @@ def suggest_epiforecaster_params(
             _categorical_choices((16, 32, 64, 128)),
         )
     )
-    overrides["training.loss.joint.w_continuity"] = trial.suggest_categorical(
-        "training.loss.joint.w_continuity",
-        _categorical_choices((0.0, 0.01, 0.05, 0.1)),
-    )
 
     # --- deferred phase-2 tuning: init and startup dynamics ---
     # overrides["model.init_weights.rezero_init"] = trial.suggest_categorical(

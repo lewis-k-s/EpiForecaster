@@ -319,7 +319,6 @@ class TestSuggestEpiforecasterParams:
             and k
             not in (
                 "training.loss.joint.w_sird_supervision",
-                "training.loss.joint.w_continuity",
             )
         ]
         assert loss_weight_overrides == []
@@ -367,4 +366,3 @@ class TestSuggestEpiforecasterParams:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
         assert "model.observation_heads.residual_hidden_dim" in overrides
-        assert "training.loss.joint.w_continuity" in overrides

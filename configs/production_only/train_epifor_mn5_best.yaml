@@ -162,7 +162,6 @@ training:
       mask_input_hosp: false
       mask_input_cases: false
       mask_input_deaths: false
-      w_continuity: 0.05
   plot_forecasts: true
   num_forecast_samples: 3
   grad_norm_log_frequency: 500

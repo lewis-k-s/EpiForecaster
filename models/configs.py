@@ -65,10 +65,6 @@ class JointLossConfig:
     mask_input_hosp: bool = False
     mask_input_cases: bool = False
     mask_input_deaths: bool = False
-    # Nowcast continuity penalty weight.
-    # Penalizes discontinuity between last observed value and first forecast prediction.
-    # 0.0 disables the penalty.
-    w_continuity: float = 0.0
 
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
@@ -88,7 +84,6 @@ class JointLossConfig:
 
         for name, value in [
             ("w_sird_supervision", self.w_sird_supervision),
-            ("w_continuity", self.w_continuity),
             ("gradnorm_alpha", self.gradnorm_alpha),
             ("gradnorm_weight_lr", self.gradnorm_weight_lr),
             ("gradnorm_ema_decay", self.gradnorm_ema_decay),

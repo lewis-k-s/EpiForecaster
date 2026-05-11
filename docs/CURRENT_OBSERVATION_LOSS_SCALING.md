@@ -86,7 +86,6 @@ The full training loss also includes optional non-observation terms:
 ```text
 L_total = L_obs
         + w_sird_supervision * L_sird_supervision
-        + w_continuity * L_continuity
 ```
 
 ## GradNorm Loss Mode

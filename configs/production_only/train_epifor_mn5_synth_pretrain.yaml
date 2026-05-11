@@ -115,7 +115,6 @@ training:
     name: "joint_inference"
     joint:
       w_sird_supervision: 0.01
-      w_continuity: 0.01
 
   curriculum:
     enabled: true

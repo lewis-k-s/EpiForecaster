@@ -1,6 +1,5 @@
 import pytest
 import torch
-from types import SimpleNamespace
 
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from models.configs import LossConfig
@@ -284,7 +283,7 @@ def test_joint_inference_obs_active_mask_from_masks() -> None:
 
 
 def test_joint_inference_compute_components_train_matches_default() -> None:
-    loss_fn = JointInferenceLoss(w_sird_supervision=0.2, w_continuity=0.0)
+    loss_fn = JointInferenceLoss(w_sird_supervision=0.2)
     model_outputs = {
         "pred_ww": torch.tensor([[0.2, 0.4]]),
         "pred_hosp": torch.tensor([[0.1, 0.3]]),
@@ -466,42 +465,3 @@ def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:
     ).to(dtype=torch.bool)
     components = loss_fn.compute_components(model_outputs, targets)
     assert torch.equal(components["obs_active_mask"], expected_active)
-
-
-def test_continuity_uses_only_active_heads() -> None:
-    loss_fn = JointInferenceLoss(
-        w_sird_supervision=0.0,
-        w_continuity=1.0,
-        disable_ww=True,
-    )
-    model_outputs = {
-        "pred_ww": torch.zeros(1, 2),
-        "pred_hosp": torch.tensor([[1.0, 0.0]]),
-        "pred_cases": torch.tensor([[10.0, 0.0]]),
-        "pred_deaths": torch.tensor([[20.0]]),
-        "physics_residual": torch.zeros(1, 1),
-    }
-    targets = {
-        "ww": None,
-        "hosp": torch.tensor([[0.0]]),
-        "cases": torch.tensor([[0.0]]),
-        "deaths": torch.tensor([[0.0]]),
-        "ww_mask": None,
-        "hosp_mask": torch.tensor([[1.0]]),
-        "cases_mask": torch.tensor([[0.0]]),
-        "deaths_mask": torch.tensor([[0.0]]),
-    }
-    batch_data = SimpleNamespace(
-        hosp_hist=torch.tensor([[[0.0, 0.0, 0.0], [3.0, 1.0, 0.0]]]),
-        cases_hist=torch.tensor([[[0.0, 0.0, 0.0], [1000.0, 1.0, 0.0]]]),
-        deaths_hist=torch.tensor([[[0.0, 0.0, 0.0], [2000.0, 1.0, 0.0]]]),
-    )
-
-    components = loss_fn.compute_components(
-        model_outputs=model_outputs,
-        targets=targets,
-        batch_data=batch_data,
-    )
-
-    assert components["obs_active_mask"].tolist() == [False, True, False, False]
-    assert torch.isclose(components["continuity"], torch.tensor(4.0))
