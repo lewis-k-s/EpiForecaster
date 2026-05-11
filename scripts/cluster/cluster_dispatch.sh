@@ -6,11 +6,20 @@
 
 set -euo pipefail
 
+# --- Repo root (for resolving relative config paths when CWD != repo) ---
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
 # --- Config loading ---
 CONF="${CLUSTER_CONF:-.cluster/dispatch.conf}"
 
+# If CONF is relative and not found from CWD, resolve against repo root
+if [ ! -f "$CONF" ] && [[ "$CONF" != /* ]]; then
+  CONF="$REPO_ROOT/$CONF"
+fi
+
 if [ ! -f "$CONF" ]; then
-  echo "Config not found: $CONF (set CLUSTER_CONF or symlink .cluster/dispatch.conf)" >&2
+  echo "Config not found: $CONF" >&2
+  echo "Hint: run 'bash syncto_mn5.sh' to sync the cluster config, or set CLUSTER_CONF to an absolute path." >&2
   exit 1
 fi
 
