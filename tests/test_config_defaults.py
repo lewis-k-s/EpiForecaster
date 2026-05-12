@@ -42,6 +42,7 @@ def test_data_config_resolves_min_observed_from_missing_permit() -> None:
 @pytest.mark.epiforecaster
 def test_joint_loss_defaults_use_static_raw_observation_loss() -> None:
     cfg = JointLossConfig()
+    assert cfg.observation_loss == "mse"
     assert cfg.adaptive_scheme == "none"
     assert cfg.w_sird_supervision == 0.05
 

@@ -38,6 +38,9 @@ class ProfilerConfig:
 class JointLossConfig:
     """Loss weights for joint inference training."""
 
+    # Per-head observation objective. The same objective is used for
+    # ww/hosp/cases/deaths before fixed or GradNorm observation weighting.
+    observation_loss: str = "mse"
     # Observation loss weighting policy:
     # - "none": fixed equal-split weighting across active observation targets
     # - "gradnorm": adaptive weights for ww/hosp/cases/deaths
@@ -69,8 +72,16 @@ class JointLossConfig:
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
         valid_probes = {"obs_context"}
+        valid_observation_losses = {"mse", "rmse", "mae"}
+        self.observation_loss = self.observation_loss.lower()
         self.adaptive_scheme = self.adaptive_scheme.lower()
         self.gradnorm_probe = self.gradnorm_probe.lower()
+        if self.observation_loss not in valid_observation_losses:
+            raise ValueError(
+                "observation_loss must be one of "
+                f"{sorted(valid_observation_losses)}, "
+                f"got {self.observation_loss!r}"
+            )
         if self.adaptive_scheme not in valid_schemes:
             raise ValueError(
                 f"adaptive_scheme must be one of {sorted(valid_schemes)}, "

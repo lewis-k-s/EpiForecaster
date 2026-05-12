@@ -67,6 +67,7 @@ def test_joint_inference_latent_loss_zero_when_all_latent_masks_missing():
 def test_get_loss_from_config_default_is_joint_inference() -> None:
     criterion = get_loss_from_config(None)
     assert isinstance(criterion, JointInferenceLoss)
+    assert criterion.observation_loss == "mse"
 
 
 def test_get_loss_from_config_rejects_non_joint_name() -> None:
@@ -74,6 +75,15 @@ def test_get_loss_from_config_rejects_non_joint_name() -> None:
     loss_cfg.name = "mse"
     with pytest.raises(ValueError, match="Only training.loss.name='joint_inference'"):
         _ = get_loss_from_config(loss_cfg)
+
+
+def test_get_loss_from_config_passes_observation_loss() -> None:
+    loss_cfg = LossConfig(name="joint_inference")
+    loss_cfg.joint.observation_loss = "mae"
+
+    criterion = get_loss_from_config(loss_cfg)
+
+    assert criterion.observation_loss == "mae"
 
 
 def test_joint_inference_latent_loss_respects_latent_mask():
@@ -429,6 +439,83 @@ def test_joint_inference_observation_loss_means_over_observed_points() -> None:
     # equally. The previous per-series reduction would produce 5.0.
     assert torch.isclose(components["ww"], torch.tensor(11.0 / 3.0))
     assert torch.isclose(components["total"], torch.tensor(11.0 / 3.0))
+
+
+@pytest.mark.parametrize(
+    ("observation_loss", "expected"),
+    [
+        ("mse", 11.0 / 3.0),
+        ("rmse", (11.0 / 3.0 + 1.0e-8) ** 0.5 - (1.0e-8) ** 0.5),
+        ("mae", 5.0 / 3.0),
+    ],
+)
+def test_joint_inference_observation_loss_type(
+    observation_loss: str,
+    expected: float,
+) -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss=observation_loss,
+        obs_weight_sum=1.0,
+        w_sird_supervision=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.tensor([[0.0, 3.0, 1.0, 1.0]]),
+        "pred_hosp": torch.zeros(1, 3),
+        "pred_cases": torch.zeros(1, 3),
+        "pred_deaths": torch.zeros(1, 3),
+        "physics_residual": torch.zeros(1, 3),
+    }
+    targets = {
+        "ww": torch.zeros(1, 3),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones(1, 3),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    assert torch.isclose(components["ww"], torch.tensor(expected))
+    assert torch.isclose(components["total"], torch.tensor(expected))
+
+
+def test_joint_inference_rmse_observation_loss_is_zero_for_exact_match() -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss="rmse",
+        obs_weight_sum=1.0,
+        w_sird_supervision=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.tensor([[0.0, 2.0, 3.0]]),
+        "pred_hosp": torch.zeros(1, 2),
+        "pred_cases": torch.zeros(1, 2),
+        "pred_deaths": torch.zeros(1, 2),
+        "physics_residual": torch.zeros(1, 2),
+    }
+    targets = {
+        "ww": torch.tensor([[2.0, 3.0]]),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones(1, 2),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    assert torch.isclose(components["ww"], torch.tensor(0.0))
+    assert torch.isclose(components["total"], torch.tensor(0.0))
 
 
 def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:

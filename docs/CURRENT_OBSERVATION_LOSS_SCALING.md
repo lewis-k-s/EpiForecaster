@@ -36,20 +36,32 @@ before `n_eff_h` is computed.
 
 ## Per-Head Component Loss
 
-Each active observation head first computes a masked MSE over all observed
-points:
+Each active observation head first computes a masked error over all observed
+points. The default objective is MSE, configured as:
+
+```yaml
+training:
+  loss:
+    joint:
+      observation_loss: mse
+```
+
+Supported values are `mse`, `rmse`, and `mae`. For the default MSE objective:
 
 ```text
 L_raw_h = sum_i,t observed_i,t * (prediction_i,t - target_i,t)^2
           / max(sum_i,t observed_i,t, 1)
 ```
 
+For `rmse`, the same masked MSE is square-rooted. For `mae`, the squared error
+term is replaced by absolute error before reduction.
+
 `n_eff_h` is logged for diagnostics and active-head detection. It does not scale
 the loss.
 
 Important current behavior: `JointInferenceLoss` returns `ww`, `hosp`, `cases`,
-and `deaths` as the raw masked per-head MSE values, plus separate diagnostic
-`ww_n_eff`, `hosp_n_eff`, `cases_n_eff`, and `deaths_n_eff` counts.
+and `deaths` as the raw masked per-head objective values, plus separate
+diagnostic `ww_n_eff`, `hosp_n_eff`, `cases_n_eff`, and `deaths_n_eff` counts.
 
 ## Static Loss Mode
 

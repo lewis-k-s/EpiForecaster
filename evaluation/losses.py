@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from data.epi_batch import EpiBatch
 
 _LOSS_VALUE_CLAMP = 1.0e6
+_RMSE_EPS = 1.0e-8
 
 
 def get_loss_from_config(
@@ -43,6 +44,7 @@ def get_loss_from_config(
         )
 
     return JointInferenceLoss(
+        observation_loss=joint_cfg.observation_loss,
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
         w_sird_supervision=joint_cfg.w_sird_supervision,
         disable_ww=joint_cfg.disable_ww,
@@ -102,6 +104,7 @@ class JointInferenceLoss(nn.Module):
 
     def __init__(
         self,
+        observation_loss: str = "mse",
         obs_weight_sum: float = 0.95,
         w_sird_supervision: float = 0.0,
         w_sir: float | None = None,
@@ -120,6 +123,7 @@ class JointInferenceLoss(nn.Module):
         deaths_min_observed: int = 0,
     ):
         super().__init__()
+        self.observation_loss = observation_loss.lower()
         self.obs_weight_sum = float(obs_weight_sum)
         del sir_residual_clip
         if w_sir is not None and w_sird_supervision == 0.0:
@@ -140,6 +144,11 @@ class JointInferenceLoss(nn.Module):
         if self.obs_weight_sum <= 0:
             raise ValueError(
                 f"obs_weight_sum must be positive, got {self.obs_weight_sum}"
+            )
+        if self.observation_loss not in {"mse", "rmse", "mae"}:
+            raise ValueError(
+                "observation_loss must be one of ['mae', 'mse', 'rmse'], "
+                f"got {self.observation_loss!r}"
             )
         if self.w_sird_supervision < 0:
             raise ValueError(
@@ -252,13 +261,14 @@ class JointInferenceLoss(nn.Module):
         }
 
     @staticmethod
-    def _weighted_masked_mse_from_weights(
+    def _weighted_masked_error_from_weights(
         *,
         prediction: torch.Tensor,
         target: torch.Tensor,
         weights: torch.Tensor,
+        loss_type: str,
     ) -> torch.Tensor:
-        """Compute weighted masked MSE from precomputed effective weights."""
+        """Compute weighted masked error from precomputed effective weights."""
         prediction_f32 = prediction.float()
         target_f32 = target.float()
         weights_f32 = weights.float()
@@ -281,8 +291,52 @@ class JointInferenceLoss(nn.Module):
         )
         target_safe = torch.where(active, target_clean, torch.zeros_like(target_clean))
 
-        sq = (prediction_safe - target_safe) ** 2
-        return (sq * weights_f32).sum() / weights_f32.sum().clamp_min(1e-8)
+        abs_error = (prediction_safe - target_safe).abs()
+        if loss_type == "mae":
+            point_loss = abs_error
+        else:
+            point_loss = abs_error**2
+
+        mean_loss = (point_loss * weights_f32).sum() / weights_f32.sum().clamp_min(
+            1e-8
+        )
+        if loss_type == "rmse":
+            return torch.sqrt(mean_loss + _RMSE_EPS) - torch.sqrt(
+                torch.as_tensor(
+                    _RMSE_EPS, dtype=mean_loss.dtype, device=mean_loss.device
+                )
+            )
+        return mean_loss
+
+    def _weighted_masked_observation_loss_from_weights(
+        self,
+        *,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._weighted_masked_error_from_weights(
+            prediction=prediction,
+            target=target,
+            weights=weights,
+            loss_type=self.observation_loss,
+        )
+
+    @classmethod
+    def _weighted_masked_mse_from_weights(
+        cls,
+        *,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute weighted masked MSE from precomputed effective weights."""
+        return cls._weighted_masked_error_from_weights(
+            prediction=prediction,
+            target=target,
+            weights=weights,
+            loss_type="mse",
+        )
 
     def compute_observation_supervision(
         self,
@@ -397,7 +451,7 @@ class JointInferenceLoss(nn.Module):
         ww_target = obs_supervision["ww"]["target"]
         ww_weights = obs_supervision["ww"]["weights"]
         if ww_target is not None and ww_weights is not None:
-            ww_base = self._weighted_masked_mse_from_weights(
+            ww_base = self._weighted_masked_observation_loss_from_weights(
                 prediction=drop_nowcast(model_outputs["pred_ww"], ww_target.shape[1]),
                 target=ww_target,
                 weights=ww_weights,
@@ -407,7 +461,7 @@ class JointInferenceLoss(nn.Module):
         hosp_target = obs_supervision["hosp"]["target"]
         hosp_weights = obs_supervision["hosp"]["weights"]
         if hosp_target is not None and hosp_weights is not None:
-            hosp_base = self._weighted_masked_mse_from_weights(
+            hosp_base = self._weighted_masked_observation_loss_from_weights(
                 prediction=drop_nowcast(
                     model_outputs["pred_hosp"], hosp_target.shape[1]
                 ),
@@ -419,7 +473,7 @@ class JointInferenceLoss(nn.Module):
         cases_target = obs_supervision["cases"]["target"]
         cases_weights = obs_supervision["cases"]["weights"]
         if cases_target is not None and cases_weights is not None:
-            cases_base = self._weighted_masked_mse_from_weights(
+            cases_base = self._weighted_masked_observation_loss_from_weights(
                 prediction=drop_nowcast(
                     model_outputs["pred_cases"], cases_target.shape[1]
                 ),
@@ -431,7 +485,7 @@ class JointInferenceLoss(nn.Module):
         deaths_target = obs_supervision["deaths"]["target"]
         deaths_weights = obs_supervision["deaths"]["weights"]
         if deaths_target is not None and deaths_weights is not None:
-            deaths_base = self._weighted_masked_mse_from_weights(
+            deaths_base = self._weighted_masked_observation_loss_from_weights(
                 prediction=model_outputs["pred_deaths"],
                 target=deaths_target,
                 weights=deaths_weights,
