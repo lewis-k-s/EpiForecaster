@@ -4,7 +4,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from training.epiforecaster_trainer import EpiForecasterTrainer
+from training.epiforecaster_trainer import (
+    EpiForecasterTrainer,
+    compute_mean_target_mae,
+)
 from models.configs import (
     EpiForecasterConfig,
     ModelConfig,
@@ -18,6 +21,109 @@ from models.configs import (
     CurriculumConfig,
 )
 from evaluation.losses import JointInferenceLoss
+
+
+def test_compute_mean_target_mae_averages_finite_available_targets() -> None:
+    metrics = {
+        "mae_ww_log1p_per_100k": 1.0,
+        "mae_hosp_log1p_per_100k": 2.0,
+        "mae_cases_log1p_per_100k": float("nan"),
+        "mae_deaths_log1p_per_100k": None,
+        "rmse_ww_log1p_per_100k": 100.0,
+    }
+
+    assert compute_mean_target_mae(metrics) == pytest.approx(1.5)
+
+
+def test_compute_mean_target_mae_returns_inf_when_no_finite_targets() -> None:
+    metrics = {
+        "mae_ww_log1p_per_100k": float("nan"),
+        "mae_hosp_log1p_per_100k": float("inf"),
+    }
+
+    assert compute_mean_target_mae(metrics) == float("inf")
+
+
+def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    reports: list[tuple[float, int]] = []
+
+    class _Trial:
+        def report(self, value: float, step: int) -> None:
+            reports.append((value, step))
+
+        def should_prune(self) -> bool:
+            return False
+
+    class _Model:
+        def parameters(self):
+            return []
+
+    trainer.config = SimpleNamespace(
+        output=SimpleNamespace(
+            experiment_name="selection_test",
+            save_checkpoints=True,
+            checkpoint_frequency=1,
+            save_best_only=True,
+        ),
+        training=SimpleNamespace(
+            profiler=SimpleNamespace(enabled=False),
+            max_batches=None,
+            epochs=1,
+            scheduler_type="none",
+            plot_forecasts=False,
+        ),
+    )
+    trainer.experiment_dir = None
+    trainer.wandb_run = None
+    trainer.current_epoch = 0
+    trainer.global_step = 0
+    trainer.device = torch.device("cpu")
+    trainer.nan_loss_triggered = False
+    trainer.best_val_loss = float("inf")
+    trainer.best_val_selection_score = float("inf")
+    trainer.best_val_selection_metric = "mean_target_mae"
+    trainer.best_val_joint_loss = float("inf")
+    trainer.best_val_series_metrics = {}
+    trainer.patience_counter = 0
+    trainer.scheduler = None
+    trainer.trial = _Trial()
+    trainer.pruning_start_epoch = 0
+    trainer.val_loader = object()
+    trainer.test_loader = object()
+    trainer.model = _Model()
+    trainer._status = lambda *args, **kwargs: None
+    trainer._train_epoch = lambda: 123.0
+    trainer._log_epoch = lambda *args, **kwargs: None
+    trainer._write_main_model_aggregate_csvs = lambda *args, **kwargs: None
+    trainer._shutdown_loader_iterator = lambda *args, **kwargs: None
+    trainer._is_early_stopping_enabled = lambda: True
+    trainer._save_checkpoint = lambda *args, **kwargs: None
+    trainer.cleanup_dataloaders = lambda: None
+    trainer._evaluate_split = lambda *args, **kwargs: (
+        999.0,
+        {
+            "mae_ww_log1p_per_100k": 1.0,
+            "mae_hosp_log1p_per_100k": 3.0,
+            "mae_cases_log1p_per_100k": float("nan"),
+            "mae_deaths_log1p_per_100k": None,
+            "loss_ww": 10.0,
+        },
+        {},
+    )
+    trainer.test_epoch = lambda: (
+        888.0,
+        {"mae": 2.0, "mae_hosp_log1p_per_100k": 3.0},
+        {},
+    )
+
+    results = trainer.run()
+
+    assert reports == [(2.0, 0)]
+    assert results["best_val_selection_score"] == pytest.approx(2.0)
+    assert results["best_val_loss"] == pytest.approx(2.0)
+    assert results["best_val_joint_loss"] == pytest.approx(999.0)
+    assert results["best_val_series_metrics"]["loss_ww"] == pytest.approx(10.0)
 
 
 class _HistogramTestModel(torch.nn.Module):

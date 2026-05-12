@@ -83,6 +83,43 @@ from utils.training_utils import should_log_step
 
 logger = logging.getLogger(__name__)
 
+_PER_SERIES_METRIC_KEYS = [
+    "loss_ww",
+    "loss_hosp",
+    "loss_cases",
+    "loss_deaths",
+    "mae_ww_log1p_per_100k",
+    "mae_hosp_log1p_per_100k",
+    "mae_cases_log1p_per_100k",
+    "mae_deaths_log1p_per_100k",
+    "r2_ww_log1p_per_100k",
+    "r2_hosp_log1p_per_100k",
+    "r2_cases_log1p_per_100k",
+    "r2_deaths_log1p_per_100k",
+]
+_TARGET_MAE_METRIC_KEYS = [
+    "mae_ww_log1p_per_100k",
+    "mae_hosp_log1p_per_100k",
+    "mae_cases_log1p_per_100k",
+    "mae_deaths_log1p_per_100k",
+]
+_SELECTION_METRIC_NAME = "mean_target_mae"
+
+
+def compute_mean_target_mae(metrics: dict[str, Any]) -> float:
+    """Compute the locked validation endpoint score from per-target MAEs."""
+    values: list[float] = []
+    for key in _TARGET_MAE_METRIC_KEYS:
+        value = metrics.get(key)
+        if value is None:
+            continue
+        value_float = float(value)
+        if np.isfinite(value_float):
+            values.append(value_float)
+    if not values:
+        return float("inf")
+    return float(np.mean(values))
+
 
 class EpiForecasterTrainer:
     """
@@ -380,6 +417,10 @@ class EpiForecasterTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float("inf")
+        self.best_val_selection_score = float("inf")
+        self.best_val_selection_metric = _SELECTION_METRIC_NAME
+        self.best_val_joint_loss = float("inf")
+        self.best_val_series_metrics: dict[str, float] = {}
         self.patience_counter = 0
         self.nan_loss_counter = 0
         self.nan_loss_triggered = False
@@ -964,7 +1005,27 @@ class EpiForecasterTrainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
         self.current_epoch = int(checkpoint.get("epoch", -1)) + 1
-        self.best_val_loss = checkpoint.get("best_val_loss", self.best_val_loss)
+        current_best_selection = getattr(
+            self, "best_val_selection_score", self.best_val_loss
+        )
+        self.best_val_selection_score = checkpoint.get(
+            "best_val_selection_score",
+            checkpoint.get("best_val_loss", current_best_selection),
+        )
+        self.best_val_loss = self.best_val_selection_score
+        self.best_val_selection_metric = checkpoint.get(
+            "best_val_selection_metric",
+            getattr(self, "best_val_selection_metric", _SELECTION_METRIC_NAME),
+        )
+        self.best_val_joint_loss = checkpoint.get(
+            "best_val_joint_loss",
+            checkpoint.get(
+                "best_val_loss", getattr(self, "best_val_joint_loss", float("inf"))
+            ),
+        )
+        self.best_val_series_metrics = checkpoint.get(
+            "best_val_series_metrics", {}
+        )
         self.training_history = checkpoint.get(
             "training_history", self.training_history
         )
@@ -1037,6 +1098,7 @@ class EpiForecasterTrainer:
             val_loss, val_metrics, _val_node_mae = self._evaluate_split(
                 self.val_loader, split_name="Val"
             )
+            val_selection_score = compute_mean_target_mae(val_metrics)
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
@@ -1054,16 +1116,35 @@ class EpiForecasterTrainer:
                 self.config.output.save_checkpoints
                 and (epoch + 1) % self.config.output.checkpoint_frequency == 0
             ):
-                self._save_checkpoint(epoch, val_loss)
+                self._save_checkpoint(
+                    epoch,
+                    val_loss,
+                    val_selection_score=val_selection_score,
+                )
 
             # Early stopping (disabled if patience is None)
             should_stop = False
             early_stopping_enabled = self._is_early_stopping_enabled()
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+            if val_selection_score < self.best_val_selection_score:
+                self.best_val_selection_score = val_selection_score
+                self.best_val_loss = val_selection_score
+                self.best_val_joint_loss = val_loss
+                self.best_val_series_metrics = {
+                    k: v
+                    for k in _PER_SERIES_METRIC_KEYS
+                    if (v := val_metrics.get(k)) is not None
+                }
                 self.patience_counter = 0
-                if self.config.output.save_best_only:
-                    self._save_checkpoint(epoch, val_loss, is_best=True)
+                if (
+                    self.config.output.save_checkpoints
+                    and self.config.output.save_best_only
+                ):
+                    self._save_checkpoint(
+                        epoch,
+                        val_loss,
+                        val_selection_score=val_selection_score,
+                        is_best=True,
+                    )
             else:
                 if early_stopping_enabled:
                     self.patience_counter += 1
@@ -1084,11 +1165,12 @@ class EpiForecasterTrainer:
 
             # Optuna pruning: report intermediate value and check if trial should be pruned
             if self.trial is not None and epoch >= self.pruning_start_epoch:
-                self.trial.report(val_loss, epoch)
+                self.trial.report(val_selection_score, epoch)
                 if self.trial.should_prune():
                     self._status(
                         f"Trial pruned by Optuna at epoch {epoch} "
-                        f"(val_loss={val_loss:.6f})"
+                        f"({self.best_val_selection_metric}={val_selection_score:.6f}, "
+                        f"val_joint_loss={val_loss:.6f})"
                     )
                     # Lazy import to avoid hard dependency on optuna
                     optuna_module = importlib.import_module("optuna")
@@ -1111,13 +1193,22 @@ class EpiForecasterTrainer:
 
         self._status(f"\n{'=' * 60}")
         self._status("TRAINING COMPLETED")
-        self._status(f"Best validation loss: {self.best_val_loss:.4g}")
+        self._status(
+            "Best validation selection score "
+            f"({self.best_val_selection_metric}): {self.best_val_selection_score:.4g}"
+        )
+        self._status(f"Best validation joint loss: {self.best_val_joint_loss:.4g}")
         self._status(f"Total epochs trained: {self.current_epoch}")
         self._status(f"{'=' * 60}")
 
         # Save final model
         if self.config.output.save_checkpoints:
-            self._save_checkpoint(self.current_epoch, self.best_val_loss, is_final=True)
+            self._save_checkpoint(
+                self.current_epoch,
+                self.best_val_joint_loss,
+                val_selection_score=self.best_val_selection_score,
+                is_final=True,
+            )
 
         # Test phase
         test_start_time = time.time()
@@ -1163,6 +1254,13 @@ class EpiForecasterTrainer:
             if ww_mae is not None:
                 self.wandb_run.summary["mae_ww_test"] = ww_mae
             self.wandb_run.summary["best_val_loss"] = self.best_val_loss
+            self.wandb_run.summary["best_val_selection_score"] = (
+                self.best_val_selection_score
+            )
+            self.wandb_run.summary["best_val_selection_metric"] = (
+                self.best_val_selection_metric
+            )
+            self.wandb_run.summary["best_val_joint_loss"] = self.best_val_joint_loss
             self.wandb_run.finish()
 
         # Cleanup dataloader workers to prevent orphaned processes
@@ -2260,17 +2358,30 @@ class EpiForecasterTrainer:
         return config_dict
 
     def _save_checkpoint(
-        self, epoch: int, val_loss: float, is_best: bool = False, is_final: bool = False
+        self,
+        epoch: int,
+        val_loss: float,
+        val_selection_score: float | None = None,
+        is_best: bool = False,
+        is_final: bool = False,
     ):
         """Save model checkpoint."""
         from utils.precision_policy import create_precision_signature
+
+        if val_selection_score is None:
+            val_selection_score = self.best_val_selection_score
 
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
+            "val_selection_score": val_selection_score,
             "best_val_loss": self.best_val_loss,
+            "best_val_selection_score": self.best_val_selection_score,
+            "best_val_selection_metric": self.best_val_selection_metric,
+            "best_val_joint_loss": self.best_val_joint_loss,
+            "best_val_series_metrics": self.best_val_series_metrics,
             "config": self._get_config_for_save(),
             "training_history": self.training_history,
             "precision_signature": create_precision_signature(self.precision_policy),
@@ -2375,6 +2486,10 @@ class EpiForecasterTrainer:
         """Return training results summary dictionary."""
         return {
             "best_val_loss": self.best_val_loss,
+            "best_val_selection_score": self.best_val_selection_score,
+            "best_val_selection_metric": self.best_val_selection_metric,
+            "best_val_joint_loss": self.best_val_joint_loss,
+            "best_val_series_metrics": dict(self.best_val_series_metrics),
             "total_epochs": self.current_epoch,
             "metric_artifacts": dict(getattr(self, "metric_artifacts", {})),
             "model_info": {
