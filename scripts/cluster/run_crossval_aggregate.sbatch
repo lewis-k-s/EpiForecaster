@@ -35,7 +35,7 @@ if [ "$ANALYZE_VERBOSE" = "1" ]; then
   ANALYZE_ARGS+=(-v)
 fi
 
-uv run python -m scripts.analysis.analyze_crossval \
+$UV_RUN python -m scripts.analysis.analyze_crossval \
   --training-dir "$TRAINING_DIR" \
   --campaign-id "$CAMPAIGN_ID" \
   --split "$SPLIT" \

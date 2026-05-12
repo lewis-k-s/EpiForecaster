@@ -100,7 +100,7 @@ if [ -n "$OVERRIDES" ]; then
 fi
 
 if command -v uv >/dev/null 2>&1; then
-  uv run python -m scripts.hpo.hpsearch_missing_permit_worker "${ARGS[@]}"
+  $UV_RUN python -m scripts.hpo.hpsearch_missing_permit_worker "${ARGS[@]}"
 else
   python -m scripts.hpo.hpsearch_missing_permit_worker "${ARGS[@]}"
 fi

@@ -71,6 +71,6 @@ if [ "$SMOKETEST" = "1" ]; then
   echo "SMOKETEST enabled: max_batches=2, epochs=1"
 fi
 
-uv run python -m scripts.hpo.ablation_worker "${ARGS[@]}"
+$UV_RUN python -m scripts.hpo.ablation_worker "${ARGS[@]}"
 
 # Optional: You can increase --n-trials if workers finish quickly and you want to reuse them.

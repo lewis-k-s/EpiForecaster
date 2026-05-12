@@ -122,7 +122,7 @@ echo "Model ID override: $model_id_override"
 
 if command -v uv >/dev/null 2>&1; then
   EPIFORECASTER_MODEL_ID="$model_id_override" \
-    uv run main train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
+    $UV_RUN main train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"
 else
   EPIFORECASTER_MODEL_ID="$model_id_override" \
     python -m cli train epiforecaster --config "$CONFIG" "${RUN_ARGS[@]}"

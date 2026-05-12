@@ -71,4 +71,4 @@ echo "  output_dir: $REAL_EVAL_OUTPUT_DIR"
 echo "  real_dataset_path: $REAL_DATASET_PATH"
 echo "  splits: $REAL_EVAL_SPLITS"
 
-uv run python -m scripts.analysis.eval_checkpoint_on_real "${ARGS[@]}"
+$UV_RUN python -m scripts.analysis.eval_checkpoint_on_real "${ARGS[@]}"

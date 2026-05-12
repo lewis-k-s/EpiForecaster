@@ -16,4 +16,4 @@ PREPROCESS_TASK="${PREPROCESS_TASK:-epiforecaster}"
 cd "$PROJECT_ROOT"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
 
-uv run preprocess "$PREPROCESS_TASK" --config "$CONFIG"
+$UV_RUN preprocess "$PREPROCESS_TASK" --config "$CONFIG"

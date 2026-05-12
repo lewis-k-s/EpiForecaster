@@ -138,9 +138,9 @@ echo "Model ID: $MODEL_ID"
 echo "Run dir: $RUN_DIR"
 
 EPIFORECASTER_MODEL_ID="$MODEL_ID" \
-  uv run main train epiforecaster --config "$CONFIG" "${OVERRIDE_ARGS[@]}"
+  $UV_RUN main train epiforecaster --config "$CONFIG" "${OVERRIDE_ARGS[@]}"
 
-uv run python -m scripts.tasks.eval_crossval_granular \
+$UV_RUN python -m scripts.tasks.eval_crossval_granular \
   --run-dir "$RUN_DIR" \
   --splits val test \
   --device "$EVAL_DEVICE" \

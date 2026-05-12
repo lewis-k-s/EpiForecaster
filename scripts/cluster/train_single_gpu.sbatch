@@ -56,4 +56,4 @@ if [ -n "$OVERRIDES" ]; then
   done
 fi
 
-uv run train epiforecaster "${ARGS[@]}"
+$UV_RUN train epiforecaster "${ARGS[@]}"

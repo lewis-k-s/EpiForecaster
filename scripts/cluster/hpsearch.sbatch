@@ -30,6 +30,8 @@ SAMPLER="${SAMPLER:-tpe}"                             # tpe (default), cmaes, or
 PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N epochs
 # Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
 OVERRIDES="${OVERRIDES:-}"
+# Opt in to sampling training.loss.joint.observation_loss over mse|rmse|mae.
+SAMPLE_TRAINING_LOSS_OBJECTIVE="${SAMPLE_TRAINING_LOSS_OBJECTIVE:-0}"
 # Smoke-test mode:
 #   DRY_RUN=1 sbatch --array=0-0 --time=00:10:00 --export=ALL,DRY_RUN=1 scripts/cluster/hpsearch.sbatch
 DRY_RUN="${DRY_RUN:-0}"
@@ -99,10 +101,13 @@ if [ -n "$OVERRIDES" ]; then
     ARGS+=(--override "$override")
   done
 fi
+if [ "$SAMPLE_TRAINING_LOSS_OBJECTIVE" = "1" ]; then
+  ARGS+=(--sample-training-loss-objective)
+fi
 
 # Prefer uv runner if available; fall back to plain python.
 if command -v uv >/dev/null 2>&1; then
-  uv run python -m scripts.hpo.hpsearch_worker "${ARGS[@]}"
+  $UV_RUN python -m scripts.hpo.hpsearch_worker "${ARGS[@]}"
 else
   python -m scripts.hpo.hpsearch_worker "${ARGS[@]}"
 fi

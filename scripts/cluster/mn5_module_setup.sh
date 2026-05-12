@@ -55,6 +55,12 @@ fi
 export CC="${CC:-gcc}"
 export CXX="${CXX:-g++}"
 
+# Compute nodes have no internet access.  Prevent uv from trying to rebuild
+# the editable install (which would hit PyPI) and from running a sync that
+# requires network.  The login node must run `uv sync` before job submission.
+export UV_NO_BUILD_ISOLATION=1
+export UV_RUN="${UV_RUN:-uv run --no-sync}"
+
 if [ "${MN5_SETUP_VERBOSE:-0}" = "1" ]; then
   echo "MN5 modules initialized: CC=${CC} CXX=${CXX} CUDA=${MN5_LOAD_CUDA:-1} CMAKE=${MN5_LOAD_CMAKE:-1}"
 fi
