@@ -24,6 +24,13 @@ import numpy as np
 
 from scripts.analysis.skill_output import SkillOutputBuilder, print_output
 
+_NON_SERIES_BEST_ATTRS = {
+    "best_val_loss",
+    "best_val_selection_score",
+    "best_val_selection_metric",
+    "best_val_joint_loss",
+}
+
 
 @dataclass
 class Trial:
@@ -243,6 +250,14 @@ def format_summary(summary: StudySummary) -> dict[str, Any]:
     }
 
     if completed:
+        result["objective_metric"] = next(
+            (
+                str(t.user_attrs["best_val_selection_metric"])
+                for t in completed
+                if t.user_attrs.get("best_val_selection_metric") is not None
+            ),
+            "best_val_loss",
+        )
         values = [t.value for t in completed if t.value is not None]
         if values:
             result["objective_stats"] = {
@@ -270,7 +285,7 @@ def print_summary(summary: StudySummary) -> None:
 
     if "objective_stats" in result:
         stats = result["objective_stats"]
-        print("\nObjective (best_val_loss):")
+        print(f"\nObjective ({result.get('objective_metric', 'best_val_loss')}):")
         print(f"  Best:            {stats['best']:.6f}")
         print(f"  Median:          {stats['median']:.6f}")
         print(f"  Mean:            {stats['mean']:.6f}")
@@ -299,6 +314,11 @@ def format_best_trials(summary: StudySummary, n: int = 5) -> list[dict[str, Any]
             "trial_number": trial.number,
             "value": float(trial.value) if trial.value is not None else None,
             "params": trial.params,
+            "series_metrics": {
+                k: v
+                for k, v in trial.user_attrs.items()
+                if k.startswith("best_val_") and k not in _NON_SERIES_BEST_ATTRS
+            },
         }
         for i, trial in enumerate(sorted_trials, 1)
     ]
@@ -320,6 +340,116 @@ def print_best_trials(summary: StudySummary, n: int = 5) -> None:
         )
         for param, value in sorted(trial["params"].items()):
             print(f"  {param}: {value}")
+        series = trial.get("series_metrics", {})
+        if series:
+            print("  Per-series metrics:")
+            for k, v in sorted(series.items()):
+                label = k.removeprefix("best_val_")
+                print(f"    {label}: {v:.6f}")
+
+
+# Canonical ordering for per-series metric display
+_SERIES_DISPLAY_ORDER = [
+    "loss_ww",
+    "loss_hosp",
+    "loss_cases",
+    "loss_deaths",
+    "mae_ww_log1p_per_100k",
+    "mae_hosp_log1p_per_100k",
+    "mae_cases_log1p_per_100k",
+    "mae_deaths_log1p_per_100k",
+    "r2_ww_log1p_per_100k",
+    "r2_hosp_log1p_per_100k",
+    "r2_cases_log1p_per_100k",
+    "r2_deaths_log1p_per_100k",
+]
+
+
+def format_series_rankings(
+    summary: StudySummary, top_n: int = 3
+) -> dict[str, list[dict[str, Any]]]:
+    """Rank completed trials independently for each per-series metric.
+
+    Returns a dict keyed by metric name, each value a list of top-N entries:
+    {"rank", "trial_number", "series_value", "joint_value", "params"}.
+    """
+    completed = [t for t in summary.completed_trials if t.value is not None]
+    if not completed:
+        return {}
+
+    # Collect all per-series metric keys present across trials
+    series_keys: set[str] = set()
+    for t in completed:
+        for k in t.user_attrs:
+            if k.startswith("best_val_") and k != "best_val_loss":
+                if k in _NON_SERIES_BEST_ATTRS:
+                    continue
+                series_keys.add(k)
+
+    if not series_keys:
+        return {}
+
+    rankings: dict[str, list[dict[str, Any]]] = {}
+    for key in sorted(series_keys):
+        label = key.removeprefix("best_val_")
+        # Collect trials that have this metric
+        candidates: list[dict[str, Any]] = []
+        for t in completed:
+            val = t.user_attrs.get(key)
+            if val is not None:
+                candidates.append(
+                    {
+                        "trial_number": t.number,
+                        "series_value": float(val),
+                        "joint_value": float(t.value) if t.value is not None else None,
+                        "params": t.params,
+                    }
+                )
+        if not candidates:
+            continue
+
+        # For loss/mae metrics lower is better; for r2 higher is better
+        is_higher_better = key.startswith("best_val_r2_")
+        candidates.sort(
+            key=lambda x: x["series_value"], reverse=is_higher_better
+        )
+        rankings[label] = [
+            {"rank": i + 1, **entry}
+            for i, entry in enumerate(candidates[:top_n])
+        ]
+
+    return rankings
+
+
+def print_series_rankings(summary: StudySummary, top_n: int = 3) -> None:
+    """Print per-series metric rankings."""
+    rankings = format_series_rankings(summary, top_n=top_n)
+
+    if not rankings:
+        return
+
+    # Display in canonical order, falling back to alphabetical
+    ordered_keys = [k for k in _SERIES_DISPLAY_ORDER if k in rankings]
+    remaining = [k for k in sorted(rankings) if k not in ordered_keys]
+    display_order = ordered_keys + remaining
+
+    print(f"\n{'=' * 60}")
+    print("Per-Series Rankings (top-3 per metric)")
+    print(f"{'=' * 60}")
+
+    for label in display_order:
+        entries = rankings[label]
+        print(f"\n  {label}:")
+        for entry in entries:
+            joint_str = (
+                f"{entry['joint_value']:.6f}"
+                if entry["joint_value"] is not None
+                else "N/A"
+            )
+            print(
+                f"    #{entry['rank']} Trial {entry['trial_number']}: "
+                f"{entry['series_value']:.6f}  (joint: {joint_str})"
+            )
 
 
 def format_param_distributions(summary: StudySummary) -> dict[str, dict[str, Any]]:
@@ -557,6 +687,7 @@ def main() -> None:
         data = {
             "summary": format_summary(summary),
             "best_trials": format_best_trials(summary, n=args.top),
+            "series_rankings": format_series_rankings(summary),
             "param_distributions": format_param_distributions(summary),
             "recommendations": format_recommendations(summary),
         }
@@ -570,6 +701,7 @@ def main() -> None:
         if args.text:
             print_summary(summary)
             print_best_trials(summary, n=args.top)
+            print_series_rankings(summary)
             print_param_distributions(summary)
 
             if args.importance:

@@ -2,13 +2,13 @@
 
 Designed for SLURM task arrays + Optuna JournalStorage coordination.
 
-This script intentionally does NOT modify existing config dataclasses or CLI wiring.
+This script intentionally keeps HPO-specific runtime overrides in the worker.
 It:
 - Loads a base YAML config via `EpiForecasterConfig.from_file()`.
 - Samples a trial's hyperparameters with Optuna.
 - Applies overrides directly to the in-memory config object.
 - Runs a single training job via `EpiForecasterTrainer`.
-- Reports `best_val_loss` back to Optuna.
+- Reports `best_val_selection_score` back to Optuna.
 
 Typical SLURM usage pattern:
 - Use a shared journal file on a shared filesystem.
@@ -144,6 +144,7 @@ def suggest_epiforecaster_params(
     *,
     trial: Any,
     base_cfg: EpiForecasterConfig,
+    sample_training_loss_objective: bool = False,
 ) -> dict[str, Any]:
     """Define the search space and return dotted-key overrides.
 
@@ -155,6 +156,12 @@ def suggest_epiforecaster_params(
     overrides: dict[str, Any] = {}
 
     # --- optimizer + data knobs ---
+    if sample_training_loss_objective:
+        overrides["training.loss.joint.observation_loss"] = trial.suggest_categorical(
+            "training.loss.joint.observation_loss",
+            _categorical_choices(("mse", "rmse", "mae")),
+        )
+
     overrides["training.learning_rate"] = trial.suggest_float(
         "training.learning_rate", 1e-5, 3e-3, log=True
     )
@@ -316,6 +323,7 @@ def objective(
     seed: int | None,
     cli_overrides: list[str],
     pruning_start_epoch: int = 10,
+    sample_training_loss_objective: bool = False,
 ) -> float:
     start_time = time.time()
     logger.info("=== Trial %d started ===", trial.number)
@@ -329,6 +337,7 @@ def objective(
     overrides = suggest_epiforecaster_params(
         trial=trial,
         base_cfg=cfg,
+        sample_training_loss_objective=sample_training_loss_objective,
     )
 
     override_list = _overrides_to_dotlist(overrides)
@@ -394,7 +403,32 @@ def objective(
 
     try:
         results = trainer.run()
-        best_val = float(results.get("best_val_loss", float("inf")))
+        best_val = float(
+            results.get(
+                "best_val_selection_score",
+                results.get("best_val_loss", float("inf")),
+            )
+        )
+        best_val_joint_loss = float(
+            results.get(
+                "best_val_joint_loss",
+                results.get("best_val_loss", float("inf")),
+            )
+        )
+        selection_metric = str(
+            results.get("best_val_selection_metric", "mean_target_mae")
+        )
+        training_loss_objective = cfg.training.loss.joint.observation_loss
+
+        trial.set_user_attr("best_val_selection_score", best_val)
+        trial.set_user_attr("best_val_selection_metric", selection_metric)
+        trial.set_user_attr("best_val_joint_loss", best_val_joint_loss)
+        trial.set_user_attr("training_loss_objective", training_loss_objective)
+
+        # Store per-series metrics as trial user attrs for downstream analysis
+        series_metrics = results.get("best_val_series_metrics", {})
+        for metric_key, metric_value in series_metrics.items():
+            trial.set_user_attr(f"best_val_{metric_key}", metric_value)
     except Exception as exc:
         # Check if this is an Optuna TrialPruned exception
         if hasattr(exc, "__class__") and exc.__class__.__name__ == "TrialPruned":
@@ -405,9 +439,11 @@ def objective(
 
     duration_s = time.time() - start_time
     logger.info(
-        "Trial %d complete: loss=%.6f, duration=%.1fs",
+        "Trial %d complete: selection_score=%.6f (%s), joint_loss=%.6f, duration=%.1fs",
         trial.number,
         best_val,
+        selection_metric,
+        best_val_joint_loss,
         duration_s,
     )
     logger.info("=== Trial %d finished ===", trial.number)
@@ -420,9 +456,10 @@ def objective(
 
     if best_val == best_so_far:
         logger.info(
-            "Trial %d is the new best trial! Best loss: %.6f",
+            "Trial %d is the new best trial! Best selection_score: %.6f (%s)",
             trial.number,
             best_val,
+            selection_metric,
         )
 
     # Persist a small JSON summary next to the run logs if desired.
@@ -437,8 +474,13 @@ def objective(
                     "study": study_name,
                     "trial_number": trial.number,
                     "value": best_val,
+                    "selection_metric": selection_metric,
+                    "best_val_selection_score": best_val,
+                    "best_val_joint_loss": best_val_joint_loss,
+                    "training_loss_objective": training_loss_objective,
                     "params": trial.params,
                     "overrides": overrides,
+                    "series_metrics": series_metrics,
                     "slurm": slurm,
                     "config_effective": {
                         "output.log_dir": cfg.output.log_dir,
@@ -528,6 +570,11 @@ def objective(
     multiple=True,
     help="Override config values using dotted keys (e.g., env=mn5, training.device=cuda). Can be repeated.",
 )
+@click.option(
+    "--sample-training-loss-objective",
+    is_flag=True,
+    help="Include training.loss.joint.observation_loss=mse|rmse|mae in the Optuna search space.",
+)
 def main(
     *,
     config_path: Path,
@@ -542,6 +589,7 @@ def main(
     sampler: str,
     pruning_start_epoch: int,
     cli_overrides: tuple[str, ...],
+    sample_training_loss_objective: bool,
 ) -> None:
     """Run one HPO worker process."""
     setup_logging()
@@ -632,6 +680,9 @@ def main(
     if any(slurm.values()):
         logger.info("SLURM identity: %s", slurm)
     logger.info("Starting trials: n_trials=%s, timeout_s=%s", n_trials, timeout_s)
+    logger.info(
+        "Sample training loss objective: %s", sample_training_loss_objective
+    )
 
     def _log_trial_complete(study: Any, trial: Any) -> None:
         logger.info(
@@ -657,6 +708,7 @@ def main(
             seed=seed,
             cli_overrides=base_overrides,
             pruning_start_epoch=pruning_start_epoch,
+            sample_training_loss_objective=sample_training_loss_objective,
         ),
         n_trials=n_trials,
         timeout=timeout_s,

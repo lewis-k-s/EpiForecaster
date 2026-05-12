@@ -12,6 +12,7 @@ from scripts.hpo.hpsearch_worker import (
     _compute_worker_seed,
     _decode_categorical_value,
     _overrides_to_dotlist,
+    objective,
     suggest_epiforecaster_params,
 )
 
@@ -30,6 +31,9 @@ class _StubTrial:
         self._int_values = int_values or {}
         self.params: dict[str, object] = {}
         self.suggest_calls: list[tuple[str, str, Any]] = []
+        self.number = 0
+        self.user_attrs: dict[str, object] = {}
+        self.study = SimpleNamespace(best_value=0.4)
 
     def suggest_float(
         self, name: str, low: float, high: float, log: bool = False
@@ -38,6 +42,9 @@ class _StubTrial:
         value = self._float_values.get(name, low)
         self.params[name] = value
         return value
+
+    def set_user_attr(self, key: str, value: object) -> None:
+        self.user_attrs[key] = value
 
     def suggest_int(self, name: str, low: int, high: int) -> int:
         self.suggest_calls.append(("int", name, (low, high)))
@@ -236,6 +243,29 @@ class TestSuggestEpiforecasterParams:
         call = next(c for c in trial.suggest_calls if c[1] == "training.weight_decay")
         assert call[0] == "float"
 
+    def test_training_loss_objective_not_sampled_by_default(self) -> None:
+        trial = _StubTrial()
+        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
+        assert "training.loss.joint.observation_loss" not in overrides
+
+    def test_training_loss_objective_sampled_when_requested(self) -> None:
+        trial = _StubTrial(
+            categorical_values={"training.loss.joint.observation_loss": "rmse"}
+        )
+        overrides = suggest_epiforecaster_params(
+            trial=trial,
+            base_cfg=_base_cfg_stub(),
+            sample_training_loss_objective=True,
+        )
+        assert overrides["training.loss.joint.observation_loss"] == "rmse"
+        call = next(
+            c
+            for c in trial.suggest_calls
+            if c[1] == "training.loss.joint.observation_loss"
+        )
+        assert call[0] == "categorical"
+        assert call[2] == ("mse", "rmse", "mae")
+
     def test_data_knobs_sample_ordering(self) -> None:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
@@ -366,3 +396,79 @@ class TestSuggestEpiforecasterParams:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
         assert "model.observation_heads.residual_hidden_dim" in overrides
+
+
+def test_objective_returns_selection_score_and_records_joint_loss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    cfg = _joint_loss_cfg_stub(joint={"observation_loss": "mae"})
+    cfg.output = SimpleNamespace(log_dir=str(tmp_path), experiment_name="study")
+    cfg.training.epochs = 1
+    captured: dict[str, object] = {}
+
+    class _FakeConfig:
+        @staticmethod
+        def from_file(_path: str):
+            return cfg
+
+        @staticmethod
+        def load(_path: str, overrides: list[str]):
+            captured["overrides"] = overrides
+            return cfg
+
+    class _FakeTrainer:
+        def __init__(self, config, trial=None, pruning_start_epoch=10):
+            captured["trainer_config"] = config
+            captured["trainer_trial"] = trial
+            captured["pruning_start_epoch"] = pruning_start_epoch
+            self.model_id = "trial_0"
+
+        def run(self):
+            return {
+                "best_val_selection_score": 0.25,
+                "best_val_selection_metric": "mean_target_mae",
+                "best_val_joint_loss": 1.75,
+                "best_val_series_metrics": {
+                    "mae_ww_log1p_per_100k": 0.2,
+                    "mae_hosp_log1p_per_100k": 0.3,
+                },
+            }
+
+    monkeypatch.setattr("scripts.hpo.hpsearch_worker.EpiForecasterConfig", _FakeConfig)
+    monkeypatch.setattr("scripts.hpo.hpsearch_worker.EpiForecasterTrainer", _FakeTrainer)
+    monkeypatch.setattr(
+        "scripts.hpo.hpsearch_worker.suggest_epiforecaster_params",
+        lambda *, trial, base_cfg, sample_training_loss_objective=False: {
+            "training.learning_rate": 1.0e-3
+        },
+    )
+
+    trial = _StubTrial()
+    value = objective(
+        trial,
+        base_config_path=tmp_path / "config.yaml",
+        study_name="study",
+        run_root=tmp_path,
+        fixed_epochs=1,
+        fixed_max_batches=None,
+        seed=None,
+        cli_overrides=["training.loss.joint.observation_loss=mae"],
+        pruning_start_epoch=3,
+        sample_training_loss_objective=False,
+    )
+
+    assert value == pytest.approx(0.25)
+    assert trial.user_attrs["best_val_selection_score"] == pytest.approx(0.25)
+    assert trial.user_attrs["best_val_selection_metric"] == "mean_target_mae"
+    assert trial.user_attrs["best_val_joint_loss"] == pytest.approx(1.75)
+    assert trial.user_attrs["training_loss_objective"] == "mae"
+    assert trial.user_attrs["best_val_mae_ww_log1p_per_100k"] == pytest.approx(0.2)
+    assert captured["pruning_start_epoch"] == 3
+
+    summary_path = tmp_path / "study" / "trial_0" / "optuna_trial.json"
+    summary = __import__("json").loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["value"] == pytest.approx(0.25)
+    assert summary["best_val_selection_score"] == pytest.approx(0.25)
+    assert summary["best_val_joint_loss"] == pytest.approx(1.75)
+    assert summary["training_loss_objective"] == "mae"
