@@ -37,18 +37,10 @@ dependencies = [
   "h5netcdf>=1.6.4",
   "plotly>=6.3.0",
   "networkx>=3.5",
-  "pytest>=8.4.1",
   "einops>=0.8.1",
   "click>=8.2.1",
   "zarr>=2.18.0",
   "wandb>=0.17.0",
-  "ipython>=9.6.0",
-  "pyright>=1.1.0",
-  "types-pyyaml>=6.0.12.20250915",
-  # Type stubs for external libraries
-  "pandas-stubs>=2.0.0",
-  "scipy-stubs>=1.11.0",
-  "ipykernel>=7.0.1",
   "folium>=0.20.0",
   "mapclassify>=2.10.0",
   "bottleneck>=1.6.0",
@@ -58,7 +50,6 @@ dependencies = [
   "statsmodels>=0.14.6",
   "optuna>=4.7.0",
   "optuna-dashboard>=0.20.0",
-  "vulture>=2.14",
   "cmaes>=0.12.0",
 ]
 
@@ -73,6 +64,12 @@ dev = [
   "ruff>=0.1.0",
   "pyright>=1.1.0",
   "pre-commit>=3.4.0",
+  "types-pyyaml>=6.0.12.20250915",
+  "pandas-stubs>=2.0.0",
+  "scipy-stubs>=1.11.0",
+  "vulture>=2.14",
+  "ipython>=9.6.0",
+  "ipykernel>=7.0.1",
 ]
 notebook = ["jupyter>=1.0.0", "ipykernel>=6.23.0", "notebook>=7.0.0"]
 profiling = ["memory-profiler>=0.60.0", "line-profiler>=4.0.0"]

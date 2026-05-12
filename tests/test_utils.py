@@ -87,7 +87,7 @@ class TestTensorCore:
             logger.info.assert_called()
 
     def test_setup_skipped_cpu(self):
-        with patch("torch.backends.cuda") as mock_cuda:
+        with patch("torch.backends.cuda"):
             device = torch.device("cpu")
             setup_tensor_core_optimizations(device)
             # Should not access cuda settings
