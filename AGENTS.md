@@ -72,13 +72,16 @@ uv run pytest --markers
 
 ## Training & Dataset Workflow
 
-For training commands, config-driven development workflow, dataset pipeline, and remote (MN5) dispatch, load the **`model-training`** skill.
+For local training commands, config-driven development workflow, and the dataset pipeline, load the **`model-training`** skill.
 
-Key entry points:
+Key local entry points:
 
 - `uv run train (regions|epiforecaster) --config <yaml>` — local training
 - `uv run preprocess (regions|epiforecaster)` — data preparation
-- `bash syncto_mn5.sh && ssh mn5 '...'` — remote training (see `mn5-dispatch` skill)
+
+### Remote MN5 Cluster Work
+
+All remote cluster operations — including `syncto_mn5.sh`, `syncback_mn5.sh`, `ssh mn5`, `cluster_dispatch.sh`, and sbatch job submission — are encapsulated in the **`mn5-dispatch`** skill. **Load that skill** before attempting any remote work. It configures the required permissions for rsync, SSH, and job dispatch commands.
 
 > **WARNING**: Do not run configs in `configs/production_only/` locally. They require GPU cluster resources. See `configs/production_only/README.md`.
 
@@ -99,6 +102,8 @@ Key entry points:
 
 ## Agent-Specific Instructions
 
+- `git checkout` is denied by permissions. Use `git switch` for branch switching and `git restore` for discarding file changes instead.
+- Do not chain git commands with `&&` (e.g. `git add ... && git commit ...`). The permissions system matches against the full command string, so chaining breaks pattern matching. Use separate bash calls instead.
 - New features and refactors are assumed to be 'cutover' implementations, not preserving backwards compatibility with previous behavior, unless specified otherwise.
 - Prefer `uv run` for execution and CLI commands over ad-hoc commands; update `pyproject.toml` if adding deps.
 - Do not modify `data/` inputs or commit large `outputs/`. Place generated artifacts in `outputs/` and ignore by default.
