@@ -24,7 +24,6 @@ data:
       deaths: 10
   window_stride: 7
   sample_ordering: "time"
-  log_scale: true
   run_id_chunk_size: 1
 
 model:

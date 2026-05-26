@@ -28,7 +28,7 @@ N_TRIALS="${N_TRIALS:-}"
 SEED="${SEED:-42}"                                    # Reproducibility seed
 SAMPLER="${SAMPLER:-tpe}"                             # tpe (default), cmaes, or random
 PRUNING_START_EPOCH="${PRUNING_START_EPOCH:-10}"      # Start pruning after N epochs
-# Space-separated config overrides applied to base config before HPO (e.g., "data.log_scale=false").
+# Space-separated config overrides applied to base config before HPO (e.g., "data.mobility_threshold=0.0").
 OVERRIDES="${OVERRIDES:-}"
 # Opt in to sampling training.loss.joint.observation_loss over mse|rmse|mae.
 SAMPLE_TRAINING_LOSS_OBJECTIVE="${SAMPLE_TRAINING_LOSS_OBJECTIVE:-0}"

@@ -1,13 +1,13 @@
+import numpy as np
+import pandas as pd
 import pytest
 import torch
-import numpy as np
 import xarray as xr
-import pandas as pd
+
 from data.clinical_series_preprocessor import (
     ClinicalSeriesPreprocessor,
     ClinicalSeriesPreprocessorConfig,
 )
-from data.cases_preprocessor import CasesPreprocessor, CasesPreprocessorConfig
 
 
 class TestClinicalSeriesPreprocessor:
@@ -81,57 +81,3 @@ class TestClinicalSeriesPreprocessor:
 
         with pytest.raises(ValueError, match="Variable 'missing_var' not found"):
             processor.preprocess_dataset(ds, population=pop)
-
-
-class TestCasesPreprocessor:
-    """Tests for CasesPreprocessor (legacy but used for internal logic)."""
-
-    @pytest.fixture
-    def mock_cases_dataset(self):
-        times = pd.date_range("2020-01-01", periods=20)
-        regions = [0, 1]
-        values = np.random.rand(20, 2).astype(np.float32) * 100
-
-        ds = xr.Dataset(
-            {
-                "cases": (("date", "region_id"), values),
-                "population": (("region_id"), np.array([10000, 20000])),
-            },
-            coords={"date": times, "region_id": regions},
-        )
-
-        return ds
-
-    def test_preprocess_dataset(self, mock_cases_dataset):
-        config = CasesPreprocessorConfig(
-            input_window_length=7, per_100k=True, log_scale=True
-        )
-        processor = CasesPreprocessor(config)
-
-        processed, mean, std = processor.preprocess_dataset(mock_cases_dataset)
-
-        # Check shapes
-        # processed: (T, N, 3)
-        # mean/std: (T, N, 1)
-        T, N = 20, 2
-        assert processed.shape == (T, N, 3)
-        assert mean.shape == (T, N, 1)
-        assert std.shape == (T, N, 1)
-
-        # Check channels
-        # Channel 1 is mask (should be all 1s since we generated finite data)
-        assert torch.all(processed[..., 1] == 1.0)
-
-    def test_make_normalized_window(self, mock_cases_dataset):
-        config = CasesPreprocessorConfig(input_window_length=5)
-        processor = CasesPreprocessor(config)
-        processor.preprocess_dataset(mock_cases_dataset)
-
-        norm_window, mean, std = processor.make_normalized_window(
-            range_start=0, input_window_length=5, forecast_horizon=3
-        )
-
-        # Window size = L + H = 5 + 3 = 8
-        assert norm_window.shape == (8, 2, 3)
-        assert mean.shape == (2, 1)
-        assert std.shape == (2, 1)

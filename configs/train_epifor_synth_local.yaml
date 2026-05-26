@@ -20,7 +20,6 @@ data:
       deaths: 10
   window_stride: 1
   sample_ordering: "time"
-  log_scale: true
   run_id: "0_Baseline"
   run_id_chunk_size: 1
 

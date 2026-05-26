@@ -84,7 +84,6 @@ data:
       hospitalizations: 26
       deaths: 10
   sample_ordering: time
-  log_scale: true
   mobility_clip_range:
   - -8.0
   - 8.0

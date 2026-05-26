@@ -33,7 +33,6 @@ data:
       cases: 4
       hospitalizations: 4
       deaths: 4
-  log_scale: true
   run_id: "real" # Default/Real run ID
 
 training:

@@ -1,7 +1,7 @@
-"""Test that all YAML configs in configs/ can parse successfully."""
+from pathlib import Path
+import subprocess
 
 import pytest
-from pathlib import Path
 
 from data.preprocess.config import PreprocessingConfig
 from models.configs import EpiForecasterConfig
@@ -27,7 +27,7 @@ REGION2VEC_CONFIGS = [
 
 PREPROCESSING_CONFIGS = [
     "configs/preprocess_full.yaml",
-    "configs/preprocess_mn5_synth_holt_damped.yaml",
+    "configs/preprocess_mn5_synth.yaml",
     "configs/preprocess_real_holt.yaml",
     "configs/production_only/preprocess_mn5_synth.yaml",
     "configs/production_only/preprocess_mn5_synth_kalman_predict.yaml",
@@ -93,13 +93,14 @@ def test_preprocessing_configs_parse(config_path):
 
 
 def test_all_config_files_accounted_for():
-    """Ensure test lists match actual files in configs/ directory."""
-    configs_dir = Path("configs")
-
-    # Find all YAML files recursively
-    yaml_files = sorted(
-        [str(f.relative_to(configs_dir.parent)) for f in configs_dir.rglob("*.yaml")]
+    """Ensure test lists match tracked config files in configs/ directory."""
+    result = subprocess.run(
+        ["git", "ls-files", "configs/*.yaml", "configs/**/*.yaml"],
+        check=True,
+        capture_output=True,
+        text=True,
     )
+    yaml_files = sorted(result.stdout.splitlines())
 
     # Combine all test lists
     tested_files = (

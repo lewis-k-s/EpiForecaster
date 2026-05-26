@@ -13,11 +13,11 @@ def test_load_config_with_simple_overrides():
     """Test that simple dotted overrides work correctly."""
     cfg = EpiForecasterConfig.load(
         BASE_LOCAL_CONFIG,
-        overrides=["training.learning_rate=0.0005", "data.log_scale=false"],
+        overrides=["training.learning_rate=0.0005", "data.mobility_threshold=2.5"],
     )
 
     assert cfg.training.learning_rate == 0.0005
-    assert cfg.data.log_scale is False
+    assert cfg.data.mobility_threshold == 2.5
 
 
 @pytest.mark.epiforecaster
@@ -42,11 +42,11 @@ def test_load_config_with_bool_override():
     """Test that boolean overrides are handled correctly."""
     cfg = EpiForecasterConfig.load(
         BASE_LOCAL_CONFIG,
-        overrides=["training.plot_forecasts=false", "data.log_scale=true"],
+        overrides=["training.plot_forecasts=false", "data.use_valid_targets=true"],
     )
 
     assert cfg.training.plot_forecasts is False
-    assert cfg.data.log_scale is True
+    assert cfg.data.use_valid_targets is True
 
 
 @pytest.mark.epiforecaster
@@ -55,7 +55,6 @@ def test_load_config_without_overrides():
     cfg = EpiForecasterConfig.load(BASE_LOCAL_CONFIG)
 
     assert cfg.training.learning_rate == 0.0001
-    assert cfg.data.log_scale is True
     assert cfg.output.write_granular_eval is True
     assert (
         cfg.output.resolve_granular_eval_filename(split="test") == "test_granular.csv"
@@ -175,7 +174,6 @@ def test_backward_compatibility_from_file():
     cfg = EpiForecasterConfig.from_file(BASE_LOCAL_CONFIG)
 
     assert cfg.training.learning_rate == 0.0001
-    assert cfg.data.log_scale is True
 
 
 @pytest.mark.epiforecaster
@@ -192,7 +190,6 @@ def test_from_dict_reconstructs_config():
     assert reconstructed.model.type == original.model.type
     assert reconstructed.model.gnn_depth == original.model.gnn_depth
     assert reconstructed.data.dataset_path == original.data.dataset_path
-    assert reconstructed.data.log_scale == original.data.log_scale
     assert reconstructed.training.learning_rate == original.training.learning_rate
     assert reconstructed.training.batch_size == original.training.batch_size
     assert reconstructed.output.log_dir == original.output.log_dir

@@ -19,7 +19,6 @@ data:
       deaths: 10
   window_stride: 1
   sample_ordering: "time"
-  log_scale: true
 
 model:
   type:

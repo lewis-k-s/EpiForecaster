@@ -456,8 +456,6 @@ class DataConfig:
     missing_permit: MissingPermitConfig = field(default_factory=MissingPermitConfig)
     # Dataset sample ordering: "node" (node-major) or "time" (time-major)
     sample_ordering: str = "node"
-    # Log transformation for cases (used by legacy CasesPreprocessor only)
-    log_scale: bool = False
     # Mobility preprocessing configuration (data already log1p-transformed from pipeline)
     mobility_clip_range: tuple[float, float] = (-8.0, 8.0)
     mobility_scale_epsilon: float = 1e-6
@@ -1166,7 +1164,7 @@ class EpiForecasterConfig:
         Example:
             >>> cfg = EpiForecasterConfig.load(
             ...     "configs/train_epifor_full.yaml",
-            ...     overrides=["training.learning_rate=0.001", "data.log_scale=true"],
+            ...     overrides=["training.learning_rate=0.001"],
             ...     strict=True,
             ... )
         """

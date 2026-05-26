@@ -9,8 +9,8 @@ The 3-channel format:
 - Channel 1: Mask (1.0 if observed, 0.0 if missing/interpolated)
 - Channel 2: Age (days since last observation, normalized to [0, 1])
 
-Unlike the old CasesPreprocessor, this does NOT compute rolling statistics since
-SIR-based forecasting uses population fractions rather than normalized signals.
+It does not compute rolling statistics because SIR-based forecasting uses
+population fractions rather than normalized signals.
 """
 
 import logging
@@ -49,8 +49,8 @@ class ClinicalSeriesPreprocessor:
         - Value channel is already log1p(per-100k) transformed from preprocessing
         - Age channel is normalized to [0, 1] range (age / age_max)
 
-    Unlike CasesPreprocessor, this does NOT compute rolling mean/std since SIR-based
-    forecasting outputs population fractions rather than normalized signals.
+    This does NOT compute rolling mean/std since SIR-based forecasting outputs
+    population fractions rather than normalized signals.
     """
 
     def __init__(self, config: ClinicalSeriesPreprocessorConfig, var_name: str):

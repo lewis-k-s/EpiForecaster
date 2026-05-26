@@ -90,9 +90,9 @@ Running the pipeline always yields a Zarr dataset whose arrays follow this layou
 | `hospitalizations` | `(run_id, time, region, 1)` | float16 | Hospitalization counts (log1p per-100k, Kalman-smoothed). |
 | `hospitalizations_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
 | `hospitalizations_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). |
-| `deaths` | `(time, region)` | float16 | Death counts (log1p per-100k, Kalman-smoothed). |
-| `deaths_mask` | `(time, region)` | bool | True if observed, False if missing/interpolated. |
-| `deaths_age` | `(time, region)` | uint8 | Days since last observation (0-14). |
+| `deaths` | `(run_id, time, region, 1)` | float16 | Death counts (log1p per-100k, Kalman-smoothed). |
+| `deaths_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
+| `deaths_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). |
 | `vaccination_rate` | `(run_id, time, region)` | float16 | Cumulative first-dose vaccination coverage, clipped to `[0, 1]`. |
 | `vaccination_rate_mask` | `(run_id, time, region)` | bool | True if the source had administered first-dose rows for the municipality-date. |
 | `vaccination_rate_age` | `(run_id, time, region)` | uint8 | Days since last source first-dose observation (0-14). |
@@ -134,12 +134,12 @@ Any additional metadata (alignment summaries, preprocessing config, pipeline tim
 ## Running the Pipeline
 
 ```bash
-uv run python -m data.preprocess.pipeline --config configs/preprocess/<your_config>.yaml
+uv run preprocess epiforecaster --config configs/preprocess_full.yaml
 ```
 
 * Use a single configuration file to describe the desired dataset. Variant-specific switches should live in the training/model configs, not here.
 * The pipeline infers the output path via `PreprocessingConfig.get_output_dataset_path()` and overwrites previous artifacts if they share the same dataset name—copy/rename if you need historical snapshots.
-* To inspect the result, point `DatasetStorage.validate_dataset(<zarr_path>)`.
+* To inspect the result, open the Zarr with `xarray.open_zarr(<zarr_path>)` and validate expected dimensions, masks, and attributes.
 
 ## Practical Notes
 

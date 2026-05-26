@@ -34,7 +34,6 @@ data:
       deaths: 10
   window_stride: 1
   sample_ordering: "time"
-  log_scale: true
   run_id: "0_Baseline" # Synthetic run to use for training
   run_id_chunk_size: 1 # Load one run at a time for memory safety
 

@@ -28,7 +28,6 @@ data:
       deaths: 10
   window_stride: 7
   sample_ordering: "time"
-  log_scale: true
   # run_id is ignored when curriculum is enabled (sampler handles run selection)
   run_id: "0_Baseline"
 
