@@ -115,11 +115,7 @@ class SyntheticProcessor:
         resolved_store_path = self._resolve_synthetic_store_path(synthetic_path)
         print(f"Resolved synthetic zarr group: {resolved_store_path}")
 
-        ds = xr.open_zarr(
-            resolved_store_path,
-            chunks={"run_id": self.config.run_id_chunk_size},  # type: ignore[arg-type]
-        )
-        self._clear_source_zarr_encodings(ds)
+        ds = self._open_synthetic_zarr(resolved_store_path)
         print(ds)
         print()
 
@@ -141,7 +137,9 @@ class SyntheticProcessor:
         # EDAR returns tuple (flow_xr, censor_xr) for shared processing path
         edar_flow, edar_censor = self._extract_edar(ds)
         cases_data = self._extract_cases(ds)
-        temporal_covariates = self._extract_temporal_covariates(cases_data["cases"])
+        temporal_covariates = self._extract_temporal_covariates(
+            cases_data["cases"], raw_ds=ds
+        )
 
         result = {
             "cases": cases_data,
@@ -194,6 +192,89 @@ class SyntheticProcessor:
                 f"cannot choose automatically: {[c.name for c in nested_candidates]}"
             )
         return str(path)
+
+    def _open_synthetic_zarr(self, resolved_path: str) -> xr.Dataset:
+        """Open synthetic zarr, handling inconsistent run_id dimensions.
+
+        Some synthetic zarrs have variables with conflicting run_id sizes
+        (e.g., LoD arrays with run_id=2 while others have run_id=8).
+        This method detects such conflicts, drops the conflicting variables,
+        and re-loads them with corrected coordinates.
+        """
+        chunks = {"run_id": self.config.run_id_chunk_size}
+        try:
+            ds = xr.open_zarr(
+                resolved_path,
+                chunks=chunks,  # type: ignore[arg-type]
+            )
+            self._clear_source_zarr_encodings(ds)
+            return ds
+        except ValueError as e:
+            if "conflicting sizes" not in str(e):
+                raise
+
+            # Detect which variables have mismatched run_id sizes
+            import zarr as _zarr
+
+            store = _zarr.open(resolved_path, mode="r")
+            run_id_size = None
+            conflicting_vars: list[str] = []
+            for name in store.array_keys():
+                arr = store[name]
+                dims = arr.attrs.get("_ARRAY_DIMENSIONS", [])
+                if "run_id" in dims:
+                    idx = dims.index("run_id")
+                    size = arr.shape[idx]
+                    if run_id_size is None:
+                        run_id_size = size
+                    elif size != run_id_size:
+                        conflicting_vars.append(name)
+
+            if not conflicting_vars:
+                raise
+
+            print(
+                f"  Note: dropping {len(conflicting_vars)} variables with "
+                f"conflicting run_id size: {conflicting_vars}"
+            )
+            ds = xr.open_zarr(
+                resolved_path,
+                drop_variables=conflicting_vars,
+                chunks=chunks,  # type: ignore[arg-type]
+            )
+            self._clear_source_zarr_encodings(ds)
+
+            # Re-add dropped LoD variables with corrected run_id coords
+            if run_id_size is not None:
+                run_id_coords = ds.run_id.values
+                for var_name in conflicting_vars:
+                    arr = store[var_name]
+                    dims = arr.attrs.get("_ARRAY_DIMENSIONS", [])
+                    data = np.array(arr)
+
+                    # Broadcast along run_id to match the main dataset
+                    if "run_id" in dims and data.shape[0] != len(run_id_coords):
+                        data = np.broadcast_to(
+                            data[0:1],
+                            (len(run_id_coords),) + data.shape[1:],
+                        ).copy()
+
+                    da = xr.DataArray(
+                        data,
+                        dims=dims,
+                        coords={
+                            d: ds.coords[d].values
+                            if d in ds.coords
+                            else np.arange(s)
+                            for d, s in zip(dims, data.shape)
+                        },
+                        name=var_name,
+                    )
+                    ds[var_name] = da
+
+            print(ds)
+            print()
+            return ds
 
     def _clear_source_zarr_encodings(self, dataset: xr.Dataset) -> None:
         """Remove inherited source chunk/compressor encodings from opened Zarr vars."""
@@ -326,10 +407,43 @@ class SyntheticProcessor:
                 "`include_holidays`, and `holiday_calendar_file`."
             )
 
-    def _extract_temporal_covariates(self, cases: xr.DataArray) -> xr.DataArray:
-        """Generate calendar-driven temporal covariates aligned to filtered dates."""
+    def _extract_temporal_covariates(
+        self, cases: xr.DataArray, raw_ds: xr.Dataset | None = None
+    ) -> xr.DataArray:
+        """Generate temporal covariates aligned to filtered dates.
+
+        When ``include_lockdown_severity`` is enabled and the raw synthetic
+        zarr contains ``mobility_kappa0``, the continuous κ₀ values are
+        bucketed into an ordinal 0–3 lockdown severity channel and the
+        output is promoted to ``(run_id, date, covariate)`` so each
+        synthetic scenario carries its own NPI profile.  Downstream
+        run-filtering squeezes singleton run_ids, so consumption code
+        needs no changes.
+
+        κ₀ bucketing:
+            0   → 0  (no lockdown)
+            (0, 0.2] → 1  (mild)
+            (0.2, 0.5] → 2  (moderate)
+            > 0.5 → 3  (strict)
+        """
         if cases.sizes[TEMPORAL_COORD] == 0:
             raise ValueError("No dates available to generate temporal covariates")
+
+        tc_cfg = self.config.temporal_covariates
+        use_kappa_lockdown = (
+            tc_cfg is not None
+            and tc_cfg.include_lockdown_severity
+            and raw_ds is not None
+            and "mobility_kappa0" in raw_ds
+        )
+
+        # Build base calendar covariates via TemporalCovariatesProcessor.
+        # Temporarily disable lockdown_severity so the processor only emits
+        # calendar features (dow, holidays); the synthetic lockdown channel
+        # is derived from kappa0 instead.
+        if use_kappa_lockdown:
+            saved_lockdown = tc_cfg.include_lockdown_severity
+            tc_cfg.include_lockdown_severity = False
 
         processor = TemporalCovariatesProcessor(self.config)
         temporal_covariates = processor.process(
@@ -344,8 +458,77 @@ class SyntheticProcessor:
             temporal_covariates = temporal_covariates.reindex(
                 {TEMPORAL_COORD: target_dates}
             )
+
+        if use_kappa_lockdown:
+            tc_cfg.include_lockdown_severity = saved_lockdown
+            temporal_covariates = self._inject_kappa0_lockdown(
+                temporal_covariates, raw_ds
+            )
+
         print("  ✓ Added temporal covariates to synthetic payload")
         return temporal_covariates
+
+    def _inject_kappa0_lockdown(
+        self, base_covariates: xr.DataArray, raw_ds: xr.Dataset
+    ) -> xr.DataArray:
+        """Bucket mobility_kappa0 into ordinal lockdown severity and merge.
+
+        Args:
+            base_covariates: Calendar covariates with dims (date, covariate).
+            raw_ds: Raw synthetic zarr containing ``mobility_kappa0``.
+
+        Returns:
+            DataArray with dims (run_id, date, covariate) where the last
+            covariate is ``"lockdown_severity"`` derived from bucketed κ₀.
+        """
+        kappa0 = raw_ds["mobility_kappa0"]  # (run_id, date)
+
+        # Filter to target date range
+        start_date = np.datetime64(self.config.start_date)
+        end_date = np.datetime64(self.config.end_date)
+        time_mask = (kappa0[TEMPORAL_COORD] >= start_date) & (
+            kappa0[TEMPORAL_COORD] <= end_date
+        )
+        kappa0_filtered = kappa0.isel({TEMPORAL_COORD: time_mask})
+
+        # Reindex to exact target dates (in case of gaps)
+        target_dates = base_covariates[TEMPORAL_COORD].values
+        kappa0_aligned = kappa0_filtered.reindex(
+            {TEMPORAL_COORD: target_dates}, fill_value=0.0
+        )
+
+        # Bucket: 0→0, (0,0.2]→1, (0.2,0.5]→2, >0.5→3
+        kappa0_np = kappa0_aligned.values  # (run_id, date)
+        bucketed = np.digitize(kappa0_np, bins=[0.0, 0.2, 0.5]).astype(np.float32)
+
+        # Build lockdown severity DataArray (run_id, date, 1)
+        lockdown_da = xr.DataArray(
+            bucketed[:, :, np.newaxis],
+            dims=["run_id", TEMPORAL_COORD, "covariate"],
+            coords={
+                "run_id": kappa0_aligned.run_id.values,
+                TEMPORAL_COORD: target_dates,
+                "covariate": ["lockdown_severity"],
+            },
+        )
+
+        # Broadcast base covariates (date, covariate) → (run_id, date, covariate)
+        run_ids = kappa0_aligned.run_id.values
+        base_broadcast = base_covariates.expand_dims(
+            {"run_id": run_ids}, axis=0
+        )
+
+        # Concatenate along covariate dim
+        result = xr.concat(
+            [base_broadcast, lockdown_da], dim="covariate"
+        )
+        result.name = "temporal_covariates"
+
+        print(
+            f"  ✓ Injected lockdown severity from mobility_kappa0: "
+            f"{len(run_ids)} runs, buckets={np.unique(bucketed).tolist()}"
+        )
+        return result
 
     def _extract_cases(self, ds: xr.Dataset) -> xr.Dataset:
         """Extract cases data from synthetic bundle.
