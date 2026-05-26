@@ -30,7 +30,7 @@ The `EpiForecasterTrainer` class has grown to handle too many responsibilities. 
 
 Currently mixes generic tensor utilities with data pipeline-specific logic.
 
-- [ ] **`data/mobility_utils.py` (or move into `data/epi_dataset.py` / `data/compiled_batch.py`)**
+- [ ] **`data/mobility_utils.py` (or move into `data/epi_dataset.py`)**
   - **Responsibility**: `inject_gpu_mobility` and `ensure_mobility_adj_dense_ready`. These strictly concern the handling of `MobBatch` and data pipeline structures.
 - [x] **`data/epi_batch.py` (extend with collate functions)**
   - **Responsibility**: Move `collate_epiforecaster_batch`, `optimized_collate_graphs` from `data/epi_dataset.py`, and `mask_ablated_inputs` from `utils/training_utils.py`. Centralize all collation logic with the `EpiBatch` dataclass for better cohesion. Used by both trainer and eval.

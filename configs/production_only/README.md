@@ -54,13 +54,11 @@ pretrain run so the fine-tune job can point `training.init_checkpoint_path` at
 `.../checkpoints/best_model.pt` deterministically.
 
 The MN5 batch scripts share a common module bootstrap in `scripts/cluster/mn5_module_setup.sh`.
-That setup loads the GCC, CUDA, and CMake modules needed for both runtime jobs and
-optional ONNX simplification tooling installation.
+That setup loads the GCC, CUDA, and CMake modules used by runtime jobs.
 
 ## Development Alternatives
 
 For local development, use the standard configs instead:
 
-- `configs/train_epifor_full.yaml` - Full model on real data (local-scale)
-- `configs/train_epifor_temporal.yaml` - Temporal model (local-scale)
+- `configs/train_epifor_real_local.yaml` - Real-data training (local-scale)
 - `configs/train_epifor_synth_local.yaml` - Synthetic data training (local-scale)

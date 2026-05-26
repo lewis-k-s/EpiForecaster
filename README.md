@@ -97,13 +97,7 @@ death_flow → Observed Deaths"]
 uv sync
 
 # Install development dependencies
-uv sync --group dev
-
-# Install ONNX export dependencies (onnx + onnxscript)
-uv sync --extra onnx
-
-# Install optional ONNX simplification support
-uv sync --extra onnx --extra onnx-simplify
+uv sync --extra dev
 
 # Or manually install with pip
 pip install -e .
@@ -112,7 +106,7 @@ pip install -e .
 ### MN5 Module Setup
 
 On MareNostrum 5, the batch scripts now source a shared module bootstrap at
-[`scripts/cluster/mn5_module_setup.sh`](/Volumes/HUBSSD/code/EpiForecaster/scripts/cluster/mn5_module_setup.sh).
+[`scripts/cluster/mn5_module_setup.sh`](scripts/cluster/mn5_module_setup.sh).
 It loads a consistent toolchain across training and evaluation jobs:
 
 - `EB/apps` and `EB/install`
@@ -120,26 +114,20 @@ It loads a consistent toolchain across training and evaluation jobs:
 - `CUDA/12.1.1`
 - `cmake/4.1.2-gcc`
 
-`cmake` is required on MN5 when installing the optional ONNX simplification stack,
-because `uv sync --extra onnx --extra onnx-simplify` may need to build
-`onnx-simplifier` / `onnxsim`.
-
 If you are working interactively on MN5 before creating or syncing the virtualenv,
 load the same module stack first:
 
 ```bash
 source scripts/cluster/mn5_module_setup.sh
-uv sync --extra onnx --dev
-
-# Optional, only if you want onnx-simplifier
-uv sync --extra onnx --extra onnx-simplify --dev
+uv sync --extra dev
 ```
 
-The installation provides access to the `epiforecaster` command-line interface:
+The installation provides the standalone `preprocess`, `train`, `eval`, and
+`plot` entrypoints, plus the grouped `main` command.
 
 ## Usage
 
-EpiForecaster follows a two-step workflow: data preprocessing followed by model training. All operations are managed through the `epiforecaster` CLI with YAML configuration files.
+EpiForecaster follows a two-step workflow: data preprocessing followed by model training. All operations are managed through YAML configuration files and Click-based CLI entrypoints.
 
 ### Quick Start
 
@@ -171,7 +159,7 @@ All commands can be run via their standalone entrypoints:
 **Evaluation commands:**
 
 - `eval epiforecaster`: Evaluate checkpoint, compute metrics, generate quartile-based plots
-- `eval baselines`: Run rolling-origin baseline benchmarks (tiered, exp_smoothing, var_cross_target)
+- `eval baselines`: Run rolling-origin baseline benchmarks (`sarima`, `exp_smoothing`, `last_observed`, `var`, `varmax`)
 
 **Plotting commands:**
 
