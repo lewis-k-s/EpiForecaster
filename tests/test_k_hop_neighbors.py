@@ -22,7 +22,6 @@ from models.mobility_gnn import MobilityDenseEncoder
 def _make_config(
     dataset_path: str,
     gnn_depth: int = 2,
-    log_scale: bool = False,
     sample_ordering: str = "node",
     graph_adjacency_source: str = "mobility",
     regions_data_path: str = "",
@@ -64,7 +63,6 @@ def _make_config(
                 "deaths": 0,
             },
         },
-        log_scale=log_scale,
         sample_ordering=sample_ordering,
     )
     return EpiForecasterConfig(model=model, data=data_cfg)

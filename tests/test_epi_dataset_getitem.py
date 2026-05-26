@@ -13,7 +13,6 @@ from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 
 def _make_config(
     dataset_path: str,
-    log_scale: bool = False,
     sample_ordering: str = "node",
 ) -> EpiForecasterConfig:
     # Minimal config
@@ -46,7 +45,6 @@ def _make_config(
                 "deaths": 0,
             },
         },
-        log_scale=log_scale,
         sample_ordering=sample_ordering,
     )
     return EpiForecasterConfig(model=model, data=data_cfg)
@@ -168,7 +166,7 @@ def test_getitem_preserves_target_history_when_self_edge_missing(tmp_path):
     zarr_path = tmp_path / "self_edge_missing.zarr"
     _write_tiny_dataset(str(zarr_path), periods=8)
 
-    config = _make_config(str(zarr_path), log_scale=False)
+    config = _make_config(str(zarr_path))
     config.data.mobility_threshold = 0.5  # require positive flow
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
@@ -200,7 +198,7 @@ def test_mobility_time_mask_blocks_edges_when_threshold_zero(tmp_path):
         mobility_time_mask=mobility_time_mask,
     )
 
-    config = _make_config(str(zarr_path), log_scale=False)
+    config = _make_config(str(zarr_path))
     config.data.mobility_threshold = 0.0
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
@@ -218,7 +216,7 @@ def test_getitem_values(tmp_path):
     # Node 1: 50 cases per day. Pop 1000. -> 5,000 per 100k.
     # Note: Log scaling is now done in offline preprocessor, so dataset receives raw values
 
-    config = _make_config(str(zarr_path), log_scale=False)
+    config = _make_config(str(zarr_path))
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
     # Check item 0 (window start 0)
@@ -281,7 +279,7 @@ def test_getitem_maps_target_and_context_nodes_to_canonical_region_indices(tmp_p
     zarr_path = tmp_path / "region_mapping.zarr"
     _write_tiny_dataset(str(zarr_path), periods=8)
 
-    config = _make_config(str(zarr_path), log_scale=False)
+    config = _make_config(str(zarr_path))
     store = RegionEmbeddingStore(
         embeddings=torch.randn(2, 1),
         region_id_to_index={"0": 1, "1": 0},
@@ -307,7 +305,7 @@ def test_getitem_reuses_cached_graph_region_indices(tmp_path):
     zarr_path = tmp_path / "cached_region_mapping.zarr"
     _write_tiny_dataset(str(zarr_path), periods=8)
 
-    config = _make_config(str(zarr_path), log_scale=False)
+    config = _make_config(str(zarr_path))
     store = RegionEmbeddingStore(
         embeddings=torch.randn(2, 1),
         region_id_to_index={"0": 1, "1": 0},

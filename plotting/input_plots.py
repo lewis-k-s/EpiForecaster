@@ -79,7 +79,6 @@ def collect_case_window_samples(
     loader: DataLoader,
     n: int = 5,
     cases_feature_idx: int = 0,
-    biomarker_feature_idx: int | None = 0,
     include_biomarkers: bool = True,
     include_mobility: bool = True,
     shuffle: bool = False,

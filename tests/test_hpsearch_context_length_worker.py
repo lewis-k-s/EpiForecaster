@@ -153,11 +153,11 @@ def test_runtime_overrides_keep_context_length_study_specific() -> None:
         campaign_id="camp-a",
         epochs=20,
         max_batches=None,
-        cli_overrides=["data.log_scale=false"],
+        cli_overrides=["data.mobility_threshold=0.0"],
         smoketest=False,
     )
 
-    assert overrides[0] == "data.log_scale=false"
+    assert overrides[0] == "data.mobility_threshold=0.0"
     assert "model.input_window_length=28" in overrides
     assert "training.seed=43" in overrides
     assert "training.epochs=20" in overrides

@@ -193,9 +193,6 @@ def suggest_epiforecaster_params(
     # )
 
     # --- data knobs (high leverage; affect effective signal/noise) ---
-    # overrides["data.log_scale"] = trial.suggest_categorical(
-    #     "data.log_scale", _categorical_choices((False, True))
-    # )
 
     # Node vs time iteration order; independent of split_strategy.
     overrides["data.sample_ordering"] = trial.suggest_categorical(

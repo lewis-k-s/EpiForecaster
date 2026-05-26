@@ -21,7 +21,6 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
 from models.configs import EpiForecasterConfig
-from scripts.hpo.ablation_status import ablation_journal_status
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 

@@ -623,4 +623,3 @@ def has_non_finite_gradients(model: nn.Module) -> bool:
         if param.grad is not None and not torch.isfinite(param.grad).all():
             return True
     return False
-    _OBS_HEAD_MARKERS = ("ww", "hosp", "cases", "deaths")
