@@ -202,6 +202,10 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
     trainer.metric_artifacts = {}
     trainer.model = torch.nn.Linear(1, 1)
     trainer.device = torch.device("cpu")
+    trainer.best_val_selection_score = float("inf")
+    trainer.best_val_selection_metric = "mean_target_mae"
+    trainer.best_val_joint_loss = float("inf")
+    trainer.best_val_series_metrics = {}
     trainer.cleanup_dataloaders = lambda: None
     trainer._train_epoch = lambda: 0.0
     trainer._log_epoch = lambda **_kwargs: None

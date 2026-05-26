@@ -38,8 +38,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["tiered"],
-        help="Baseline model families to run (e.g. tiered exp_smoothing var_cross_target all).",
+        default=["sarima"],
+        help="Baseline model families to run (e.g. sarima exp_smoothing var all).",
     )
     parser.add_argument(
         "--split",

@@ -21,9 +21,7 @@ from evaluation.baseline_models import (
     predict_with_exponential_smoothing_fallback,
     predict_with_last_observed_fallback,
     predict_with_sarima_fallback,
-    predict_with_tiered_fallback,
     predict_with_var_fallback,
-    predict_with_var_cross_target_fallback,
     predict_with_varmax_fallback,
 )
 from evaluation.metrics import compute_masked_metrics_numpy
@@ -181,26 +179,6 @@ def _make_same_slice_batch() -> SimpleNamespace:
     return batch
 
 
-def test_tiered_baseline_reports_failure_when_sparse(monkeypatch):
-    import evaluation.baseline_models as baseline_models
-
-    monkeypatch.setattr(baseline_models, "_fit_best_sarimax", lambda **kwargs: None)
-    train_values = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-    train_mask = np.zeros(3, dtype=np.float64)
-    result = predict_with_tiered_fallback(
-        train_values=train_values,
-        train_mask=train_mask,
-        horizon=2,
-        global_train_median=1.25,
-        exog_train=None,
-        exog_future=None,
-    )
-    assert result.model_name == "sarima"
-    assert result.fit_status == "fit_failed"
-    assert result.fallback_reason == "sarima_unavailable"
-    assert np.all(np.isnan(result.predictions))
-
-
 def test_exp_smoothing_reports_failure_when_sparse(monkeypatch):
     import evaluation.baseline_models as baseline_models
 
@@ -302,7 +280,7 @@ def test_sarima_reports_failure_when_fit_returns_huge_finite_forecast(
     assert np.all(np.isnan(result.predictions))
 
 
-def test_var_cross_target_predicts_jointly():
+def test_var_predicts_jointly():
     rng = np.random.default_rng(42)
     train_values = np.zeros((48, 4), dtype=np.float64)
     train_values[0] = np.array([0.4, 0.2, 0.3, 0.1], dtype=np.float64)
@@ -315,7 +293,7 @@ def test_var_cross_target_predicts_jointly():
         train_values[step, 3] = 0.25 * prev[1] + 0.50 * prev[3] + 0.03 + noise[3]
     train_mask = np.ones_like(train_values, dtype=np.float64)
     target_names = ["hospitalizations", "wastewater", "cases", "deaths"]
-    result = predict_with_var_cross_target_fallback(
+    result = predict_with_var_fallback(
         train_values=train_values,
         train_mask=train_mask,
         horizon=3,
@@ -364,7 +342,7 @@ def test_var_accepts_fully_missing_target_column_as_zero_history(monkeypatch):
         captured["fit_values"] = y
         return np.ones((horizon, train_values.shape[1]), dtype=np.float64), "k_ar=1"
 
-    monkeypatch.setattr(baseline_models, "_fit_var_cross_target", _fit_var)
+    monkeypatch.setattr(baseline_models, "_fit_var_joint", _fit_var)
 
     train_values = np.column_stack(
         [
@@ -444,10 +422,10 @@ def test_varmax_all_missing_history_returns_zero_predictions() -> None:
     assert "active_targets=0" in order_repr
 
 
-def test_var_cross_target_reports_failures_when_var_unavailable(monkeypatch):
+def test_var_reports_failures_when_var_unavailable(monkeypatch):
     import evaluation.baseline_models as baseline_models
 
-    monkeypatch.setattr(baseline_models, "_fit_var_cross_target", lambda **kwargs: None)
+    monkeypatch.setattr(baseline_models, "_fit_var_joint", lambda **kwargs: None)
 
     train_values = np.column_stack(
         [
@@ -459,7 +437,7 @@ def test_var_cross_target_reports_failures_when_var_unavailable(monkeypatch):
     )
     train_mask = np.zeros_like(train_values, dtype=np.float64)
     target_names = ["hospitalizations", "wastewater", "cases", "deaths"]
-    result = predict_with_var_cross_target_fallback(
+    result = predict_with_var_fallback(
         train_values=train_values,
         train_mask=train_mask,
         horizon=2,
@@ -657,7 +635,7 @@ def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
     )
     monkeypatch.setattr(
         baseline_models,
-        "_fit_var_cross_target",
+        "_fit_var_joint",
         lambda train_values, horizon, **kwargs: (
             np.ones((horizon, train_values.shape[1]), dtype=np.float64),
             "k_ar=1",
@@ -764,7 +742,7 @@ def test_run_same_slice_baseline_evaluation_var_usage_counts_failures(
         "build_loader_from_config",
         lambda **kwargs: (loader, None),
     )
-    monkeypatch.setattr(baseline_models, "_fit_var_cross_target", lambda **kwargs: None)
+    monkeypatch.setattr(baseline_models, "_fit_var_joint", lambda **kwargs: None)
 
     artifacts = run_same_slice_baseline_evaluation(
         config=_DummyConfig(input_window_length=3, forecast_horizon=2),
@@ -1067,7 +1045,6 @@ def test_compare_model_metrics_against_same_slice_baselines_uses_direct_aggregat
         },
         baseline_results_csv=baseline_csv,
         output_csv=output_csv,
-        candidate_granular_csv=tmp_path / "missing_candidate.csv",
     )
 
     deltas = pd.read_csv(output_csv)

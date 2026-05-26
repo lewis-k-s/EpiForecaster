@@ -496,7 +496,6 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
     assert compare_kwargs["baseline_results_csv"] == (
         output_dir / "test_baseline_eval_same_window" / "baseline_aggregate_metrics.csv"
     )
-    assert compare_kwargs["candidate_granular_csv"] == output_dir / "test_granular.csv"
     baseline_plot_kwargs = captured["render_baseline_delta_plots_kwargs"]
     assert (
         baseline_plot_kwargs["baseline_deltas_csv"]

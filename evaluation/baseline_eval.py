@@ -553,7 +553,6 @@ def compare_model_metrics_against_baselines(
     eval_metrics: dict[str, Any],
     baseline_results_csv: Path,
     output_csv: Path,
-    candidate_granular_csv: Path | None = None,
 ) -> Path:
     baseline_df = _normalize_baseline_target_metrics_csv(baseline_results_csv)
 

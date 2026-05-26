@@ -711,7 +711,6 @@ def eval_epiforecaster(
                 eval_metrics=metrics,
                 baseline_results_csv=baseline_results_csv,
                 output_csv=delta_csv,
-                candidate_granular_csv=granular_csv,
             )
             click.echo(f"Saved baseline deltas to: {delta_csv}")
             try:

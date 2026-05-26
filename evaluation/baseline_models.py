@@ -351,7 +351,7 @@ def _fit_best_exponential_smoothing(
         return None
 
 
-def _fit_var_cross_target(
+def _fit_var_joint(
     train_values: np.ndarray,
     train_mask: np.ndarray,
     horizon: int,
@@ -486,53 +486,6 @@ def _fit_varmax_cross_target(
             return None
 
 
-def predict_with_tiered_fallback(
-    *,
-    train_values: np.ndarray,
-    train_mask: np.ndarray,
-    horizon: int,
-    global_train_median: float,
-    seasonal_period: int = 7,
-    exog_train: np.ndarray | None = None,
-    exog_future: np.ndarray | None = None,
-) -> BaselinePredictionResult:
-    """Predict with SARIMAX when exogenous features are present, otherwise SARIMA."""
-    if horizon <= 0:
-        raise ValueError("horizon must be positive")
-
-    if exog_train is not None and exog_future is not None:
-        sarimax_out = _fit_best_sarimax(
-            train_values=train_values,
-            train_mask=train_mask,
-            horizon=horizon,
-            exog_train=exog_train,
-            exog_future=exog_future,
-        )
-        if sarimax_out is not None:
-            preds, order_repr = sarimax_out
-            if _predictions_are_stable(preds, train_values, train_mask):
-                return BaselinePredictionResult(
-                    model_name="sarimax_calendar",
-                    predictions=preds,
-                    fit_status="fit_success",
-                    fallback_reason="",
-                    model_order=order_repr,
-                )
-        return _failed_prediction(
-            model_name="sarimax_calendar",
-            horizon=horizon,
-            reason="sarimax_unavailable",
-        )
-
-    return predict_with_sarima_fallback(
-        train_values=train_values,
-        train_mask=train_mask,
-        horizon=horizon,
-        global_train_median=global_train_median,
-        seasonal_period=seasonal_period,
-    )
-
-
 def predict_with_sarima_fallback(
     *,
     train_values: np.ndarray,
@@ -635,28 +588,6 @@ def predict_with_last_observed_fallback(
     )
 
 
-def predict_with_var_cross_target_fallback(
-    *,
-    train_values: np.ndarray,
-    train_mask: np.ndarray,
-    horizon: int,
-    target_names: list[str],
-    global_train_medians: np.ndarray,
-    seasonal_period: int = 7,
-    maxlags: int = 14,
-) -> dict[str, BaselinePredictionResult]:
-    """Backward-compatible alias for the public VAR baseline wrapper."""
-    return predict_with_var_fallback(
-        train_values=train_values,
-        train_mask=train_mask,
-        horizon=horizon,
-        target_names=target_names,
-        global_train_medians=global_train_medians,
-        seasonal_period=seasonal_period,
-        maxlags=maxlags,
-    )
-
-
 def predict_with_var_fallback(
     *,
     train_values: np.ndarray,
@@ -679,7 +610,7 @@ def predict_with_var_fallback(
     if global_train_medians.shape[0] != len(target_names):
         raise ValueError("global_train_medians length must match target_names")
 
-    var_out = _fit_var_cross_target(
+    var_out = _fit_var_joint(
         train_values=train_values,
         train_mask=train_mask,
         horizon=horizon,
