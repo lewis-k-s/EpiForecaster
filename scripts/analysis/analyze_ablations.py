@@ -43,6 +43,23 @@ class AblationRun:
     seed: int | None
 
 
+def _run_label(run: AblationRun) -> str:
+    return f"{run.experiment_dir.name}/{run.run_dir.name}"
+
+
+def _has_test_metrics(run: AblationRun) -> bool:
+    return (run.run_dir / "test_main_model_aggregate_metrics.csv").exists()
+
+
+def _parse_csv_set(raw: str | None, *, cast_type: type = str) -> set[Any] | None:
+    if raw is None:
+        return None
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        return set()
+    return {cast_type(value) for value in values}
+
+
 def parse_experiment_name(experiment_name: str) -> tuple[str | None, str] | None:
     """Parse experiment names for new and legacy ablation naming conventions."""
     if experiment_name.startswith(EXPERIMENT_PREFIX_NEW):
@@ -166,6 +183,124 @@ def collect_ablation_runs(
             )
 
     return ablation_runs, campaigns_found
+
+
+def build_seed_coverage_report(
+    ablation_runs: dict[str, list[AblationRun]],
+) -> pd.DataFrame:
+    """Build per-ablation/per-seed run coverage diagnostics."""
+    records: list[dict[str, Any]] = []
+    for ablation, runs in sorted(ablation_runs.items()):
+        seeds = sorted({run.seed for run in runs if run.seed is not None})
+        report_seeds: list[int | None] = []
+        if any(run.seed is None for run in runs):
+            report_seeds.append(None)
+        report_seeds.extend(seeds)
+
+        if not report_seeds:
+            records.append(
+                {
+                    "model": ablation,
+                    "seed": None,
+                    "run_count": len(runs),
+                    "metrics_count": sum(_has_test_metrics(run) for run in runs),
+                    "runs": ";".join(_run_label(run) for run in runs),
+                    "metric_runs": ";".join(
+                        _run_label(run) for run in runs if _has_test_metrics(run)
+                    ),
+                }
+            )
+            continue
+
+        for seed in report_seeds:
+            seed_runs = [run for run in runs if run.seed == seed]
+            metric_runs = [run for run in seed_runs if _has_test_metrics(run)]
+            records.append(
+                {
+                    "model": ablation,
+                    "seed": seed,
+                    "run_count": len(seed_runs),
+                    "metrics_count": len(metric_runs),
+                    "runs": ";".join(_run_label(run) for run in seed_runs),
+                    "metric_runs": ";".join(_run_label(run) for run in metric_runs),
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def validate_seed_coverage(
+    ablation_runs: dict[str, list[AblationRun]],
+    baseline_name: str,
+    *,
+    included_ablations: set[str] | None = None,
+    expected_seeds: set[int] | None = None,
+) -> None:
+    """Assert a complete one-run-per-seed block across selected ablations."""
+    if included_ablations is None:
+        included_ablations = set(ablation_runs)
+    else:
+        included_ablations = set(included_ablations)
+    included_ablations.add(baseline_name)
+
+    missing_ablations = sorted(
+        ablation for ablation in included_ablations if ablation not in ablation_runs
+    )
+    errors: list[str] = []
+    if missing_ablations:
+        errors.append(f"missing ablations: {', '.join(missing_ablations)}")
+
+    metrics_by_ablation: dict[str, dict[int, list[AblationRun]]] = {}
+    for ablation in sorted(included_ablations):
+        runs = ablation_runs.get(ablation, [])
+        by_seed: dict[int, list[AblationRun]] = {}
+        unseeded_metric_runs = [
+            run for run in runs if run.seed is None and _has_test_metrics(run)
+        ]
+        if unseeded_metric_runs:
+            errors.append(
+                f"{ablation}: metric-bearing runs with missing seed "
+                f"{[_run_label(run) for run in unseeded_metric_runs]}"
+            )
+        for run in runs:
+            if run.seed is None or not _has_test_metrics(run):
+                continue
+            by_seed.setdefault(run.seed, []).append(run)
+        metrics_by_ablation[ablation] = by_seed
+
+    if expected_seeds is None:
+        expected_seeds = set().union(
+            *(set(seed_runs) for seed_runs in metrics_by_ablation.values())
+        )
+    expected_seeds = set(expected_seeds)
+
+    if not expected_seeds:
+        errors.append("no expected seeds resolved from metric-bearing runs")
+
+    for ablation in sorted(included_ablations):
+        by_seed = metrics_by_ablation.get(ablation, {})
+        present_seeds = set(by_seed)
+        missing_seeds = sorted(expected_seeds - present_seeds)
+        extra_seeds = sorted(present_seeds - expected_seeds)
+        duplicate_seeds = sorted(
+            seed for seed, seed_runs in by_seed.items() if len(seed_runs) > 1
+        )
+
+        if missing_seeds:
+            errors.append(f"{ablation}: missing metric-bearing seeds {missing_seeds}")
+        if extra_seeds:
+            errors.append(f"{ablation}: unexpected metric-bearing seeds {extra_seeds}")
+        if duplicate_seeds:
+            duplicate_details = ", ".join(
+                f"{seed} -> {[_run_label(run) for run in by_seed[seed]]}"
+                for seed in duplicate_seeds
+            )
+            errors.append(
+                f"{ablation}: duplicate metric-bearing seeds {duplicate_details}"
+            )
+
+    if errors:
+        message = "\n".join(f"- {error}" for error in errors)
+        raise ValueError(f"Seed coverage validation failed:\n{message}")
 
 
 def validate_ablation_run_consistency(
@@ -494,11 +629,49 @@ def main() -> int:
         help="Glob pattern for ablation experiment directories",
     )
     parser.add_argument(
+        "--include-ablations",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated candidate ablations to include in the analysis. "
+            "Baseline is always included. Defaults to all discovered ablations."
+        ),
+    )
+    parser.add_argument(
         "--assert-consistent-config",
         dest="assert_consistent_config",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Assert run config consistency per ablation (default: enabled)",
+    )
+    parser.add_argument(
+        "--seed-coverage",
+        choices=("off", "warn", "strict"),
+        default="warn",
+        help=(
+            "Seed coverage policy for metric-bearing runs. 'strict' fails before "
+            "aggregation when selected ablations do not have exactly one run per "
+            "expected seed (default: warn)."
+        ),
+    )
+    parser.add_argument(
+        "--seed-coverage-ablations",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated ablations to include in seed coverage validation. "
+            "Baseline is always included. Defaults to all discovered ablations."
+        ),
+    )
+    parser.add_argument(
+        "--expected-seeds",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated expected seeds for seed coverage validation "
+            "(for example: 42,43,44,45,46). Defaults to the union of selected "
+            "metric-bearing seeds."
+        ),
     )
     parser.add_argument(
         "-v",
@@ -545,6 +718,46 @@ def main() -> int:
     )
     if campaigns_found:
         logger.info("Campaigns found: %s", ", ".join(sorted(campaigns_found)))
+
+    include_ablations = _parse_csv_set(args.include_ablations)
+    if include_ablations is not None:
+        include_ablations.add(args.baseline)
+        excluded_ablations = sorted(set(ablation_runs) - include_ablations)
+        ablation_runs = {
+            ablation: runs
+            for ablation, runs in ablation_runs.items()
+            if ablation in include_ablations
+        }
+        logger.info(
+            "Filtered analysis to %d ablations: %s",
+            len(ablation_runs),
+            ", ".join(sorted(ablation_runs)),
+        )
+        if excluded_ablations:
+            logger.info(
+                "Excluded ablations from focused analysis: %s",
+                ", ".join(excluded_ablations),
+            )
+
+    seed_coverage_df = build_seed_coverage_report(ablation_runs)
+    seed_coverage_path = args.output_dir / "seed_coverage_report.csv"
+    seed_coverage_df.to_csv(seed_coverage_path, index=False)
+    logger.info("Saved seed coverage report to %s", seed_coverage_path)
+
+    if args.seed_coverage != "off":
+        try:
+            validate_seed_coverage(
+                ablation_runs,
+                baseline_name=args.baseline,
+                included_ablations=_parse_csv_set(args.seed_coverage_ablations),
+                expected_seeds=_parse_csv_set(args.expected_seeds, cast_type=int),
+            )
+            logger.info("Seed coverage validation passed")
+        except ValueError as exc:
+            if args.seed_coverage == "strict":
+                logger.error("%s", exc)
+                return 1
+            logger.warning("%s", exc)
 
     logger.info("Aggregating metrics...")
     aggregated_df = aggregate_ablation_metrics(
@@ -715,6 +928,7 @@ def main() -> int:
     print(f"\nOutput directory: {args.output_dir}")
     print("\nFiles generated:")
     print(f"  - {aggregated_path.name}")
+    print(f"  - {seed_coverage_path.name}")
     if not deltas_df.empty:
         print(f"  - {deltas_path.name}")
     if not seed_pairwise_df.empty:
