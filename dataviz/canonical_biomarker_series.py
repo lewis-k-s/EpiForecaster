@@ -37,6 +37,13 @@ from utils.plotting import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+BIOMARKER_VARIANTS = ("N1", "N2", "IP4")
+BIOMARKER_SUFFIXES = ("_mask", "_age", "_censor")
+
+
+def _is_biomarker_value_var(name: str) -> bool:
+    return name.startswith("edar_biomarker_") and not name.endswith(BIOMARKER_SUFFIXES)
+
 
 def _load_biomarkers(
     dataset_path: Path,
@@ -45,7 +52,7 @@ def _load_biomarkers(
     variant_vars: dict[str, xr.DataArray] = {}
     for name in dataset.data_vars:
         name_str = str(name)
-        if name_str.startswith("edar_biomarker_"):
+        if _is_biomarker_value_var(name_str):
             variant_vars[name_str] = dataset[name]
     if not variant_vars:
         if "edar_biomarker" not in dataset:
@@ -53,6 +60,8 @@ def _load_biomarkers(
         variant_vars = {"edar_biomarker": dataset["edar_biomarker"]}
 
     data_start = dataset.get("biomarker_data_start")
+    if data_start is not None and "run_id" in data_start.dims:
+        data_start = data_start.isel(run_id=0)
 
     if "edar_has_source" in dataset:
         mask = dataset["edar_has_source"].astype(bool)
@@ -72,13 +81,49 @@ def _load_biomarkers(
         # Handle run_id dimension if present (multi-run datasets)
         if "run_id" in biomarker.dims:
             biomarker = biomarker.isel(run_id=0)  # Select first run
-            variant_vars[name] = biomarker
         variant_vars[name] = biomarker.transpose(TEMPORAL_COORD, REGION_COORD)
 
     data_start_values = data_start.values if data_start is not None else None
 
     logger.info("Loaded %d biomarker variants", len(variant_vars))
     return variant_vars, data_start_values
+
+
+def _ordered_variant_names(dataset: xr.Dataset | None = None) -> list[str]:
+    if dataset is None:
+        return [f"edar_biomarker_{variant}" for variant in BIOMARKER_VARIANTS]
+    names = {
+        str(name) for name in dataset.data_vars if _is_biomarker_value_var(str(name))
+    }
+    ordered = [f"edar_biomarker_{variant}" for variant in BIOMARKER_VARIANTS]
+    ordered = [name for name in ordered if name in names]
+    ordered.extend(sorted(names.difference(ordered)))
+    return ordered
+
+
+def _load_mask(dataset: xr.Dataset, variant_name: str) -> xr.DataArray | None:
+    mask_name = f"{variant_name}_mask"
+    if mask_name not in dataset:
+        return None
+    mask = dataset[mask_name]
+    if "run_id" in mask.dims:
+        mask = mask.isel(run_id=0)
+    return mask.transpose(TEMPORAL_COORD, REGION_COORD)
+
+
+def _mask_pre_data_start(
+    values: np.ndarray, data_start: np.ndarray | None
+) -> np.ndarray:
+    masked = values.astype(float, copy=True)
+    if data_start is None:
+        return masked
+    starts = np.asarray(data_start).reshape(-1)
+    for idx, start in enumerate(starts):
+        if start < 0:
+            masked[:, idx] = np.nan
+        else:
+            masked[: int(start), idx] = np.nan
+    return masked
 
 
 def _select_region_indices(
@@ -117,9 +162,19 @@ def plot_region_series(
         with np.errstate(all="ignore"):
             global_mean = np.nanmean(values_positive, axis=1)
             global_median = np.nanmedian(values_positive, axis=1)
-        ax.plot(dates, global_mean, color=Colors.GLOBAL_MEAN, linewidth=2, label="Global mean")
         ax.plot(
-            dates, global_median, color=Colors.GLOBAL_MEDIAN, linewidth=2, label="Global median"
+            dates,
+            global_mean,
+            color=Colors.GLOBAL_MEAN,
+            linewidth=2,
+            label="Global mean",
+        )
+        ax.plot(
+            dates,
+            global_median,
+            color=Colors.GLOBAL_MEDIAN,
+            linewidth=2,
+            label="Global median",
         )
 
     bounds = robust_bounds(values[:, indices], positive_only=True)
@@ -449,9 +504,15 @@ def plot_time_window_zoom(
         with np.errstate(all="ignore"):
             zoom_mean = np.nanmean(zoom_positive, axis=1)
             zoom_median = np.nanmedian(zoom_positive, axis=1)
-        ax.plot(zoom_dates, zoom_mean, color=Colors.GLOBAL_MEAN, linewidth=2.5, label="Mean")
         ax.plot(
-            zoom_dates, zoom_median, color=Colors.GLOBAL_MEDIAN, linewidth=2.5, label="Median"
+            zoom_dates, zoom_mean, color=Colors.GLOBAL_MEAN, linewidth=2.5, label="Mean"
+        )
+        ax.plot(
+            zoom_dates,
+            zoom_median,
+            color=Colors.GLOBAL_MEDIAN,
+            linewidth=2.5,
+            label="Median",
         )
 
     bounds = robust_bounds(zoom_values, positive_only=True)
@@ -474,6 +535,226 @@ def plot_time_window_zoom(
 
     plt.tight_layout()
     save_figure(fig, output_path, dpi=Style.DPI, log_msg="Saved time window zoom")
+
+
+def plot_manuscript_support_summary(dataset_path: Path, output_path: Path) -> None:
+    dataset = xr.open_zarr(dataset_path)
+    source = dataset["edar_has_source"].values.astype(bool)
+    total_regions = int(dataset.sizes[REGION_COORD])
+    source_regions = int(source.sum())
+    no_source_regions = total_regions - source_regions
+    no_source_pct = no_source_regions / total_regions * 100
+
+    variant_support: dict[str, int] = {}
+    for variant_name in _ordered_variant_names(dataset):
+        label = variant_name.replace("edar_biomarker_", "")
+        mask = _load_mask(dataset, variant_name)
+        if mask is None:
+            continue
+        region_support = mask.values.astype(bool).any(axis=0)
+        variant_support[label] = int((region_support & source).sum())
+
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        2,
+        1,
+        figsize=(8.4, 5.6),
+        height_ratios=(1.0, 1.45),
+        constrained_layout=True,
+    )
+
+    support_color = "#2a9d8f"
+    no_source_color = "#6c757d"
+    variant_colors = {
+        "N1": "#1f77b4",
+        "N2": "#e76f51",
+        "IP4": "#7a5195",
+    }
+
+    ax_top.barh(
+        ["Municipalities"],
+        [no_source_regions],
+        color=no_source_color,
+        label="No biomarker source support",
+    )
+    ax_top.barh(
+        ["Municipalities"],
+        [source_regions],
+        left=[no_source_regions],
+        color=support_color,
+        label="EDAR-supported",
+    )
+    ax_top.set_xlim(0, total_regions)
+    ax_top.set_xlabel("Municipalities in canonical panel")
+    ax_top.set_title("Wastewater Source Support")
+    ax_top.text(
+        no_source_regions / 2,
+        0,
+        f"No source support\n{no_source_regions} ({no_source_pct:.1f}%)",
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=10,
+        fontweight="bold",
+    )
+    ax_top.text(
+        no_source_regions + source_regions / 2,
+        0,
+        f"EDAR-supported\n{source_regions}",
+        ha="center",
+        va="center",
+        color="white",
+        fontsize=10,
+        fontweight="bold",
+    )
+
+    labels = list(variant_support)
+    counts = [variant_support[label] for label in labels]
+    colors = [variant_colors.get(label, "#4c78a8") for label in labels]
+    ax_bottom.bar(labels, counts, color=colors)
+    ax_bottom.axhline(source_regions, color="#333333", linewidth=1.2, linestyle="--")
+    ax_bottom.text(
+        len(labels) - 0.15,
+        source_regions + 4,
+        f"{source_regions} EDAR-supported municipalities",
+        ha="right",
+        va="bottom",
+        fontsize=9,
+    )
+    for x_pos, count in enumerate(counts):
+        ax_bottom.text(
+            x_pos,
+            count + 4,
+            f"{count}",
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            fontweight="bold",
+        )
+    ax_bottom.set_ylim(0, max(source_regions * 1.18, max(counts, default=0) + 25))
+    ax_bottom.set_ylabel("Municipalities with direct observations")
+    ax_bottom.set_xlabel("Biomarker target")
+    ax_bottom.set_title("Direct Observation Support Within EDAR-Supported Regions")
+    ax_bottom.grid(True, axis="y", alpha=0.25)
+    ax_bottom.set_axisbelow(True)
+
+    save_figure(
+        fig,
+        output_path,
+        dpi=Style.DPI,
+        log_msg="Saved manuscript support summary",
+    )
+
+
+def plot_manuscript_variant_panel(
+    dates: pd.DatetimeIndex,
+    values: np.ndarray,
+    mask: np.ndarray | None,
+    region_ids: np.ndarray,
+    output_path: Path,
+    variant_label: str,
+    *,
+    max_heatmap_regions: int,
+) -> None:
+    if mask is None:
+        direct_counts = np.isfinite(values).sum(axis=0)
+    else:
+        direct_counts = mask.astype(bool).sum(axis=0)
+    supported_indices = np.flatnonzero(direct_counts > 0)
+    if supported_indices.size == 0:
+        raise ValueError(f"No directly supported regions for {variant_label}")
+    ordered_indices = supported_indices[
+        np.argsort(direct_counts[supported_indices])[::-1]
+    ]
+    heatmap_indices = ordered_indices[:max_heatmap_regions].tolist()
+
+    values_positive = np.where(values > 0, values, np.nan)
+    supported_values = values_positive[:, supported_indices]
+    valid_times = np.isfinite(supported_values).any(axis=1)
+    global_mean = np.full(len(dates), np.nan, dtype=float)
+    global_median = np.full(len(dates), np.nan, dtype=float)
+    with np.errstate(all="ignore"):
+        global_mean[valid_times] = np.nanmean(supported_values[valid_times], axis=1)
+        global_median[valid_times] = np.nanmedian(supported_values[valid_times], axis=1)
+
+    fig, (ax_series, ax_heatmap) = plt.subplots(
+        2,
+        1,
+        figsize=(9.0, 7.0),
+        height_ratios=(1.05, 1.45),
+        constrained_layout=True,
+    )
+
+    ax_series.plot(
+        dates,
+        global_mean,
+        color=Colors.GLOBAL_MEAN,
+        linewidth=2.2,
+        label="Mean across supported municipalities",
+    )
+    ax_series.plot(
+        dates,
+        global_median,
+        color=Colors.GLOBAL_MEDIAN,
+        linewidth=2.2,
+        label="Median across supported municipalities",
+    )
+    if mask is not None:
+        daily_observed = mask[:, supported_indices].astype(bool).sum(axis=1)
+        ax_obs = ax_series.twinx()
+        ax_obs.fill_between(
+            dates,
+            daily_observed,
+            color="#495057",
+            alpha=0.16,
+            linewidth=0,
+            label="Daily direct-observation support",
+        )
+        ax_obs.set_ylabel("Observed municipalities")
+        ax_obs.set_ylim(0, max(int(daily_observed.max()) + 5, 10))
+        ax_obs.grid(False)
+
+    format_date_axis(ax_series)
+    ax_series.set_ylabel("Processed concentration")
+    ax_series.set_title(
+        f"{variant_label}: Canonical Biomarker Series "
+        f"({supported_indices.size} EDAR-supported municipalities)"
+    )
+    ax_series.grid(True, alpha=0.3)
+    ax_series.legend(loc="upper left")
+
+    subset = values[:, heatmap_indices]
+    bounds = robust_bounds(subset, positive_only=True)
+    vmax = bounds[1] if bounds is not None else None
+    heatmap_df = pd.DataFrame(
+        subset,
+        index=dates,
+        columns=[str(region_ids[idx]) for idx in heatmap_indices],
+    )
+    sns.heatmap(
+        heatmap_df.T,
+        ax=ax_heatmap,
+        cmap="mako",
+        vmin=0,
+        vmax=vmax,
+        cbar_kws={"label": "Processed concentration"},
+    )
+    step = max(1, len(dates) // 8)
+    ax_heatmap.set_xticks(np.arange(0, len(dates), step))
+    ax_heatmap.set_xticklabels(
+        [d.strftime("%Y-%m") for d in dates[::step]], rotation=45, ha="right"
+    )
+    ax_heatmap.set_xlabel("Date")
+    ax_heatmap.set_ylabel("Municipality")
+    ax_heatmap.set_title(
+        f"Top {len(heatmap_indices)} municipalities by direct-observation count"
+    )
+
+    save_figure(
+        fig,
+        output_path,
+        dpi=Style.DPI,
+        log_msg=f"Saved manuscript {variant_label} panel",
+    )
 
 
 def _select_regions_by_coverage(
@@ -586,19 +867,49 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable time window zoom plot",
     )
+    parser.add_argument(
+        "--manuscript-plots",
+        action="store_true",
+        help=(
+            "Also generate stable manuscript assets: canonical_biomarker_support.png "
+            "and canonical_biomarker_series_{N1,N2,IP4}.png"
+        ),
+    )
+    parser.add_argument(
+        "--manuscript-heatmap-regions",
+        type=int,
+        default=40,
+        help="Number of top direct-observation regions in manuscript heatmaps",
+    )
+    parser.add_argument(
+        "--manuscript-only",
+        action="store_true",
+        help="Generate only stable manuscript assets and skip exploratory report plots",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.manuscript_only:
+        args.manuscript_plots = True
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     biomarker_variants, data_start = _load_biomarkers(args.dataset)
-    variant_names = list(biomarker_variants.keys())
+    variant_names = [
+        name for name in _ordered_variant_names() if name in biomarker_variants
+    ]
+    variant_names.extend(sorted(set(biomarker_variants).difference(variant_names)))
 
     reference = biomarker_variants[variant_names[0]]
     region_ids = reference[REGION_COORD].values
     dates = pd.DatetimeIndex(reference[TEMPORAL_COORD].values)
+
+    if args.manuscript_plots:
+        plot_manuscript_support_summary(
+            args.dataset,
+            args.output_dir / "canonical_biomarker_support.png",
+        )
 
     # Determine which region indices to analyze
     series_indices: list[int] = []
@@ -640,15 +951,29 @@ def main() -> None:
 
     for variant_name in variant_names:
         biomarker = biomarker_variants[variant_name]
-        raw_values = biomarker.values.astype(float)
-        if data_start is not None:
-            for idx, start in enumerate(data_start):
-                if start < 0:
-                    raw_values[:, idx] = np.nan
-                else:
-                    raw_values[: int(start), idx] = np.nan
+        raw_values = _mask_pre_data_start(biomarker.values, data_start)
         values = np.log1p(raw_values)
         variant_label = variant_name.replace("edar_biomarker_", "")
+
+        manuscript_mask: np.ndarray | None = None
+        if args.manuscript_plots:
+            dataset = xr.open_zarr(args.dataset)
+            mask = _load_mask(dataset, variant_name)
+            if mask is not None:
+                mask = mask.sel({REGION_COORD: region_ids})
+                manuscript_mask = mask.values.astype(bool)
+            plot_manuscript_variant_panel(
+                dates,
+                raw_values,
+                manuscript_mask,
+                region_ids,
+                args.output_dir / f"canonical_biomarker_series_{variant_label}.png",
+                variant_label,
+                max_heatmap_regions=args.manuscript_heatmap_regions,
+            )
+
+        if args.manuscript_only:
+            continue
 
         # Compute and display summary statistics
         stats_df = compute_summary_statistics(biomarker, region_ids, series_indices)
