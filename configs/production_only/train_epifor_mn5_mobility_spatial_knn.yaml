@@ -1,0 +1,114 @@
+env: "mn5"
+
+data:
+  dataset_path: data/processed/real_with_id.zarr
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
+  use_valid_targets: true
+  mobility_threshold: 0.0
+  missing_permit:
+    input:
+      biomarkers_joint: 53
+      cases: 20
+      hospitalizations: 53
+      deaths: 20
+    horizon:
+      biomarkers_joint: 26
+      cases: 10
+      hospitalizations: 26
+      deaths: 10
+  window_stride: 7
+  sample_ordering: "time"
+
+model:
+  strict: false
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 16
+    region_embedding_dim: 64
+    gnn_module: "gat"
+    include_day_of_week: true
+    include_holidays: true
+    include_lockdown_severity: true
+    input_window_length: 60
+    forecast_horizon: 28
+    max_neighbors: 20
+    gnn_depth: 3
+    graph_adjacency_source: "spatial_knn"
+    cases_dim: 9
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
+    observation_heads:
+      delta_forecasting: true
+
+output:
+  experiment_name: "mn5_ablation__ablation_optuna_40327571__mobility:spatial_knn"
+  log_dir: outputs/training/ablation_optuna_40327571
+  write_granular_eval: true
+  wandb_mode: offline
+  wandb_group: ablation_cv_ablation_optuna_40327571
+  wandb_tags:
+    - mn5
+    - ablation
+    - cv
+    - "mobility:spatial_knn"
+    - campaign_ablation_optuna_40327571
+
+training:
+  compile: true
+  compile_mode: "reduce-overhead"
+  compile_dynamic: false
+  compile_fullgraph: false
+  compile_backward: true
+  seed: 42
+  device: "cuda"
+  init_checkpoint_path: null
+  batch_size: 32
+  shuffle_train_batches: true
+  gradient_accumulation_steps: 1
+  gradient_clip_value: 5.0
+  early_stopping_patience: 5
+  nan_loss_patience: 5
+  epochs: 50
+  learning_rate: 0.0017360279618333185
+  weight_decay: 0.00032480462513494467
+  warmup_steps: 100
+  num_workers: 4
+  val_workers: 2
+  prefetch_factor: 2
+  pin_memory: true
+  progress_log_frequency: 100
+  grad_norm_log_frequency: 500
+  gradient_snapshot_frequency: 0
+  gradient_snapshot_top_k: 5
+  gradient_vanishing_threshold: 1.0e-8
+  gradient_exploding_threshold: 1.0e2
+  split_strategy: "node"
+  val_split: 0.2
+  test_split: 0.1
+  profiler:
+    enabled: true
+    wait_steps: 5
+    warmup_steps: 1
+    active_steps: 2
+    profile_epochs: [1]
+    record_memory: false
+    log_dir: auto
+  plot_forecasts: true
+  num_forecast_samples: 3
+  loss:
+    name: "joint_inference"
+    joint:
+      w_sird_supervision: 0.0
