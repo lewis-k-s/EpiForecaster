@@ -8,6 +8,8 @@ import yaml
 
 from scripts.analysis.analyze_ablations import (
     aggregate_ablation_metrics,
+    build_neighborhood_context_report,
+    build_run_context_report,
     collect_ablation_runs,
     compute_baseline_deltas,
     parse_experiment_name,
@@ -170,6 +172,79 @@ def test_compute_baseline_deltas_includes_absolute_columns() -> None:
     assert row["rmse_delta_pct"] == pytest.approx(25.0)
     assert row["smape_delta_pct"] == pytest.approx(20.0)
     assert "r2_delta_pct" not in deltas.columns
+
+
+def test_build_neighborhood_context_report_labels_aggregation_methods(
+    tmp_path: Path,
+) -> None:
+    experiments = {
+        "baseline": (True, True, "mobility"),
+        "mobility:off": (False, True, "mobility"),
+        "mobility:spatial_knn": (True, True, "spatial_knn"),
+        "mobility:spatial_queen": (True, True, "spatial_queen"),
+        "context:off": (False, False, "mobility"),
+        "context:spatial_knn": (True, False, "spatial_knn"),
+        "context:spatial_queen": (True, False, "spatial_queen"),
+    }
+    for ablation, (
+        mobility_enabled,
+        regions_enabled,
+        adjacency_source,
+    ) in experiments.items():
+        run_dir = _write_run(
+            tmp_path,
+            f"mn5_ablation__camp_neighborhood__{ablation}",
+            "s42",
+            seed=42,
+        )
+        config = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
+        config["model"] = {
+            "type": {"mobility": mobility_enabled, "regions": regions_enabled},
+            "mobility_embedding_dim": 16,
+            "graph_adjacency_source": adjacency_source,
+            "max_neighbors": 20,
+            "gnn_depth": 3,
+            "gnn_hidden_dim": 32,
+            "gnn_module": "gat",
+            "input_window_length": 60,
+            "forecast_horizon": 28,
+        }
+        config["data"] = {
+            "dataset_path": "data/processed/real_with_id.zarr",
+            "mobility_threshold": 0.0,
+            "mobility_lags": [],
+        }
+        (run_dir / "config.yaml").write_text(
+            yaml.safe_dump(config),
+            encoding="utf-8",
+        )
+
+    ablation_runs, _ = collect_ablation_runs(
+        tmp_path,
+        experiment_pattern="mn5_ablation__*__*",
+        campaign_id="camp_neighborhood",
+    )
+
+    run_context = build_run_context_report(ablation_runs)
+    summary = build_neighborhood_context_report(run_context)
+    methods = dict(
+        zip(
+            summary["model"],
+            summary["neighborhood_aggregation_method"],
+            strict=True,
+        )
+    )
+
+    assert methods == {
+        "baseline": "dynamic_mobility",
+        "context:off": "disabled",
+        "context:spatial_knn": "static_spatial_knn",
+        "context:spatial_queen": "static_spatial_queen",
+        "mobility:off": "disabled",
+        "mobility:spatial_knn": "static_spatial_knn",
+        "mobility:spatial_queen": "static_spatial_queen",
+    }
+    assert set(summary["seeds"]) == {"42"}
 
 
 def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:

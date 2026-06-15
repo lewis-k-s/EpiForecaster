@@ -71,6 +71,14 @@ def test_ablation_names_are_valid() -> None:
     assert worker.ABLATIONS["gradnorm:on"] == (
         "training.loss.joint.adaptive_scheme=gradnorm"
     )
+    assert worker.ABLATIONS["mobility:spatial_queen"] == (
+        "model.graph_adjacency_source=spatial_queen"
+    )
+    assert worker.ABLATIONS["context:spatial_queen"] == (
+        "model.type.regions=false model.graph_adjacency_source=spatial_queen"
+    )
+    assert "mobility:spatial_knn" not in worker.ABLATIONS
+    assert "context:spatial_knn" not in worker.ABLATIONS
     assert "gradnorm:off" not in worker.ABLATIONS
     assert "model.type.regions=false" not in worker.ABLATIONS
 
@@ -175,7 +183,9 @@ def test_maybe_run_analysis_skips_partial_campaign(tmp_path: Path) -> None:
     assert worker.ANALYSIS_LAUNCHED_ATTR not in study.user_attrs
 
 
-def test_main_passes_timeout_and_catch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_main_passes_timeout_and_catch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     fake_study = _FakeStudy()
 
     monkeypatch.setattr(worker, "JournalStorage", lambda backend: object())

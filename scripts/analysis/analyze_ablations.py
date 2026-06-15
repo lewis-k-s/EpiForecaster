@@ -32,6 +32,28 @@ FINGERPRINT_EXCLUDE_PATHS = {
     ("output", "wandb_tags"),
     ("output", "experiment_name"),
 }
+CONTEXT_PATHS: dict[str, tuple[str, ...]] = {
+    "model_type_mobility": ("model", "type", "mobility"),
+    "model_type_regions": ("model", "type", "regions"),
+    "model_mobility_embedding_dim": ("model", "mobility_embedding_dim"),
+    "model_graph_adjacency_source": ("model", "graph_adjacency_source"),
+    "model_max_neighbors": ("model", "max_neighbors"),
+    "model_gnn_depth": ("model", "gnn_depth"),
+    "model_gnn_hidden_dim": ("model", "gnn_hidden_dim"),
+    "model_gnn_module": ("model", "gnn_module"),
+    "model_input_window_length": ("model", "input_window_length"),
+    "model_forecast_horizon": ("model", "forecast_horizon"),
+    "data_dataset_path": ("data", "dataset_path"),
+    "data_mobility_threshold": ("data", "mobility_threshold"),
+    "data_mobility_lags": ("data", "mobility_lags"),
+    "training_epochs": ("training", "epochs"),
+    "training_split_strategy": ("training", "split_strategy"),
+    "training_node_split_strategy": ("training", "node_split_strategy"),
+    "training_crossval_enabled": ("training", "crossval_enabled"),
+    "training_crossval_fold_index": ("training", "crossval_fold_index"),
+    "output_experiment_name": ("output", "experiment_name"),
+    "output_wandb_group": ("output", "wandb_group"),
+}
 
 
 @dataclass(frozen=True)
@@ -225,6 +247,125 @@ def build_seed_coverage_report(
                     "metric_runs": ";".join(_run_label(run) for run in metric_runs),
                 }
             )
+    return pd.DataFrame(records)
+
+
+def _context_value(config: dict[str, Any], key: str) -> Any:
+    value = _nested_get(config, CONTEXT_PATHS[key])
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True)
+    return value
+
+
+def _classify_neighborhood_aggregation(
+    config: dict[str, Any],
+) -> tuple[bool, str, str]:
+    mobility_enabled = bool(_nested_get(config, ("model", "type", "mobility")))
+    adjacency_source = str(
+        _nested_get(config, ("model", "graph_adjacency_source")) or "unknown"
+    )
+
+    if not mobility_enabled:
+        return (
+            False,
+            "disabled",
+            "Neighborhood aggregation disabled; mobility branch is ablated.",
+        )
+    if adjacency_source == "mobility":
+        return (
+            True,
+            "dynamic_mobility",
+            "Dynamic origin-destination mobility matrix neighborhoods.",
+        )
+    if adjacency_source == "spatial_knn":
+        return (
+            True,
+            "static_spatial_knn",
+            "Static centroid-distance KNN neighborhoods.",
+        )
+    if adjacency_source == "spatial_queen":
+        return (
+            True,
+            "static_spatial_queen",
+            "Static queen-contiguity neighborhoods.",
+        )
+    return (
+        True,
+        adjacency_source,
+        f"Neighborhood aggregation source: {adjacency_source}",
+    )
+
+
+def build_run_context_report(
+    ablation_runs: dict[str, list[AblationRun]],
+) -> pd.DataFrame:
+    """Build per-run context for neighborhood aggregation comparisons."""
+    records: list[dict[str, Any]] = []
+    for ablation, runs in sorted(ablation_runs.items()):
+        for run in sorted(runs, key=lambda item: (item.seed is None, item.seed or -1)):
+            try:
+                config = load_run_config(run.run_dir)
+            except ValueError as exc:
+                logger.warning("Skipping context for %s: %s", _run_label(run), exc)
+                continue
+
+            enabled, method, description = _classify_neighborhood_aggregation(config)
+            record: dict[str, Any] = {
+                "campaign_id": run.campaign_id,
+                "model": ablation,
+                "seed": run.seed,
+                "run": _run_label(run),
+                "has_test_metrics": _has_test_metrics(run),
+                "neighborhood_aggregation_enabled": enabled,
+                "neighborhood_aggregation_method": method,
+                "neighborhood_aggregation_description": description,
+            }
+            for key in CONTEXT_PATHS:
+                record[key] = _context_value(config, key)
+            records.append(record)
+
+    return pd.DataFrame(records)
+
+
+def build_neighborhood_context_report(run_context_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize the run context at the ablation/method level."""
+    if run_context_df.empty:
+        return pd.DataFrame()
+
+    context_cols = [
+        "model",
+        "neighborhood_aggregation_enabled",
+        "neighborhood_aggregation_method",
+        "neighborhood_aggregation_description",
+        "model_type_mobility",
+        "model_type_regions",
+        "model_graph_adjacency_source",
+        "model_max_neighbors",
+        "model_gnn_depth",
+        "model_gnn_hidden_dim",
+        "model_gnn_module",
+        "model_mobility_embedding_dim",
+        "data_mobility_threshold",
+        "data_mobility_lags",
+        "model_input_window_length",
+        "model_forecast_horizon",
+        "training_epochs",
+        "training_split_strategy",
+        "training_node_split_strategy",
+        "training_crossval_enabled",
+        "data_dataset_path",
+        "output_wandb_group",
+    ]
+    records: list[dict[str, Any]] = []
+    for values, group in run_context_df.groupby(context_cols, dropna=False, sort=True):
+        record = dict(zip(context_cols, values, strict=True))
+        seeds = sorted(seed for seed in group["seed"].dropna().astype(int).unique())
+        record["seeds"] = ",".join(str(seed) for seed in seeds)
+        record["run_count"] = int(len(group))
+        record["metric_run_count"] = int(group["has_test_metrics"].sum())
+        record["runs"] = ";".join(group["run"].astype(str))
+        records.append(record)
+
     return pd.DataFrame(records)
 
 
@@ -744,6 +885,20 @@ def main() -> int:
     seed_coverage_df.to_csv(seed_coverage_path, index=False)
     logger.info("Saved seed coverage report to %s", seed_coverage_path)
 
+    run_context_df = build_run_context_report(ablation_runs)
+    run_context_path = args.output_dir / "ablation_run_context.csv"
+    run_context_df.to_csv(run_context_path, index=False)
+    logger.info("Saved ablation run context to %s", run_context_path)
+
+    neighborhood_context_df = build_neighborhood_context_report(run_context_df)
+    neighborhood_context_path = args.output_dir / "neighborhood_aggregation_context.csv"
+    if not neighborhood_context_df.empty:
+        neighborhood_context_df.to_csv(neighborhood_context_path, index=False)
+        logger.info(
+            "Saved neighborhood aggregation context to %s",
+            neighborhood_context_path,
+        )
+
     if args.seed_coverage != "off":
         try:
             validate_seed_coverage(
@@ -861,8 +1016,9 @@ def main() -> int:
             plot_ablation_deltas_heatmap,
             plot_ablation_summary_grid,
             plot_cross_head_impact_heatmap,
-            plot_mobility_ablation_heatmap,
             plot_head_ablation_heatmap,
+            plot_mobility_ablation_heatmap,
+            plot_neighborhood_aggregation_heatmap,
             plot_seed_matched_delta_diagnostics,
         )
 
@@ -885,24 +1041,36 @@ def main() -> int:
         )
         if not heatmap_df.empty:
             for metric in ["mae", "rmse", "smape", "r2"]:
-                plot_ablation_deltas_heatmap(
-                    heatmap_csv,
-                    output_dir=args.output_dir,
-                    metric=metric,
-                    baseline_name=args.baseline,
-                )
+                try:
+                    plot_ablation_deltas_heatmap(
+                        heatmap_csv,
+                        output_dir=args.output_dir,
+                        metric=metric,
+                        baseline_name=args.baseline,
+                    )
+                except ValueError as exc:
+                    logger.warning("Skipping %s delta heatmap: %s", metric, exc)
+            plot_neighborhood_aggregation_heatmap(
+                heatmap_csv,
+                output_dir=args.output_dir,
+                metric="mae",
+                baseline_name=args.baseline,
+            )
             plot_mobility_ablation_heatmap(
                 heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
                 baseline_name=args.baseline,
             )
-            plot_head_ablation_heatmap(
-                heatmap_csv,
-                output_dir=args.output_dir,
-                metric="mae",
-                baseline_name=args.baseline,
-            )
+            try:
+                plot_head_ablation_heatmap(
+                    heatmap_csv,
+                    output_dir=args.output_dir,
+                    metric="mae",
+                    baseline_name=args.baseline,
+                )
+            except ValueError as exc:
+                logger.warning("Skipping head ablation heatmap: %s", exc)
         if not seed_matched_df.empty and not seed_pairwise_df.empty:
             plot_seed_matched_delta_diagnostics(
                 seed_matched_path,
@@ -929,6 +1097,9 @@ def main() -> int:
     print("\nFiles generated:")
     print(f"  - {aggregated_path.name}")
     print(f"  - {seed_coverage_path.name}")
+    print(f"  - {run_context_path.name}")
+    if not neighborhood_context_df.empty:
+        print(f"  - {neighborhood_context_path.name}")
     if not deltas_df.empty:
         print(f"  - {deltas_path.name}")
     if not seed_pairwise_df.empty:

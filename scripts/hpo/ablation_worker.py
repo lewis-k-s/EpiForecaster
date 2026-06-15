@@ -34,8 +34,12 @@ ANALYSIS_LAUNCHED_ATTR = "ablation_analysis_launched"
 ABLATIONS: dict[str, str] = {
     "baseline": "",
     "mobility:off": "model.type.mobility=false",
+    "mobility:spatial_queen": "model.graph_adjacency_source=spatial_queen",
+    # "mobility:spatial_knn": "model.graph_adjacency_source=spatial_knn",
     "regions:off": "model.type.regions=false",
     "context:off": "model.type.mobility=false model.type.regions=false",
+    "context:spatial_queen": "model.type.regions=false model.graph_adjacency_source=spatial_queen",
+    # "context:spatial_knn": "model.type.regions=false model.graph_adjacency_source=spatial_knn",
     "residual:off": "model.observation_heads.residual_scale=0.0",
     "sir:off": "training.loss.joint.w_sird_supervision=0.0",
     "gradnorm:on": "training.loss.joint.adaptive_scheme=gradnorm",
@@ -65,6 +69,7 @@ TERMINAL_TRIAL_STATES = {
     optuna.trial.TrialState.FAIL,
     optuna.trial.TrialState.PRUNED,
 }
+
 
 def _compute_worker_seed(base_seed: int) -> int:
     slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
@@ -129,7 +134,11 @@ def initialize_study_queue(
             for trial in study.trials
             if (identity := trial_identity(trial)) is not None
         }
-        missing = [params for params in expected if (params["seed"], params["ablation"]) not in existing]
+        missing = [
+            params
+            for params in expected
+            if (params["seed"], params["ablation"]) not in existing
+        ]
         for params in missing:
             study.enqueue_trial(params)
         if missing or not study.user_attrs.get(QUEUE_INITIALIZED_ATTR, False):
@@ -264,7 +273,9 @@ def objective(
 @click.command()
 @click.option("--config", type=click.Path(exists=True, path_type=Path), required=True)
 @click.option("--study-name", type=str, required=True)
-@click.option("--journal-file", type=click.Path(path_type=Path), required=False, default=None)
+@click.option(
+    "--journal-file", type=click.Path(path_type=Path), required=False, default=None
+)
 @click.option("--campaign-id", type=str, required=True)
 @click.option("--seeds", type=str, default="42 43 44 45 46", show_default=True)
 @click.option(
@@ -331,7 +342,9 @@ def main(
     )
 
     queue_lock_path = journal_file.with_suffix(f"{journal_file.suffix}.queue.lock")
-    analysis_lock_path = journal_file.with_suffix(f"{journal_file.suffix}.analysis.lock")
+    analysis_lock_path = journal_file.with_suffix(
+        f"{journal_file.suffix}.analysis.lock"
+    )
     initialize_study_queue(study=study, seeds=seed_list, lock_path=queue_lock_path)
 
     logger.info("Ablation worker started for study '%s'", study_name)
@@ -342,7 +355,9 @@ def main(
     if smoketest:
         logger.info("SMOKETEST MODE: max_batches=2, epochs=1")
 
-    def _log_trial_complete(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    def _log_trial_complete(
+        study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
         logger.info(
             "Trial %d recorded (state=%s, value=%s)",
             trial.number,

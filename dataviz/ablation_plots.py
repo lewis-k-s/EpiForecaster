@@ -43,8 +43,12 @@ METRIC_LABELS = {
 DEFAULT_DELTA_METRICS = ["mae", "rmse", "smape", "r2"]
 PRIMARY_ABLATION_ORDER = [
     "mobility:off",
+    "mobility:spatial_queen",
+    "mobility:spatial_knn",
     "regions:off",
     "context:off",
+    "context:spatial_queen",
+    "context:spatial_knn",
     "residual:off",
     "sir:off",
 ]
@@ -64,7 +68,23 @@ KERNEL_ABLATION_RANK = {
 }
 
 # Ablation categories for separate heatmaps
-MOBILITY_ABLATIONS = ["mobility:off", "regions:off", "context:off"]
+NEIGHBORHOOD_AGGREGATION_ABLATIONS = [
+    "mobility:off",
+    "mobility:spatial_queen",
+    "mobility:spatial_knn",
+    "context:off",
+    "context:spatial_queen",
+    "context:spatial_knn",
+]
+MOBILITY_ABLATIONS = [
+    "mobility:off",
+    "mobility:spatial_queen",
+    "mobility:spatial_knn",
+    "regions:off",
+    "context:off",
+    "context:spatial_queen",
+    "context:spatial_knn",
+]
 PHYSICS_ABLATIONS = ["residual:off", "sir:off"]
 
 # Unified colormap for all heatmaps
@@ -298,7 +318,6 @@ def plot_ablation_deltas_heatmap(
 
     delta_col = f"{metric}_delta_pct"
     if delta_col not in df.columns:
-        logger.warning(f"Delta column {delta_col} not found in data")
         # Try alternative naming conventions
         alt_col = f"{metric.replace('_median', '')}_delta_pct"
         mean_col = f"{metric}_delta_pct_mean"
@@ -307,6 +326,7 @@ def plot_ablation_deltas_heatmap(
         elif mean_col in df.columns:
             delta_col = mean_col
         else:
+            logger.warning(f"Delta column {delta_col} not found in data")
             raise ValueError(f"Could not find delta column for {metric}")
 
     # Prepare ordering
@@ -799,7 +819,7 @@ def plot_cross_head_impact_heatmap(
     return output_path
 
 
-def plot_mobility_ablation_heatmap(
+def plot_neighborhood_aggregation_heatmap(
     csv_path: str | Path,
     output_dir: str | Path | None = None,
     metric: str = "mae",
@@ -807,9 +827,10 @@ def plot_mobility_ablation_heatmap(
     figsize: tuple[float, float] | None = None,
     show: bool = False,
 ) -> Path:
-    """Create heatmap for mobility-related ablations only.
+    """Create heatmap for neighborhood aggregation ablations.
 
-    Shows percentage change from baseline for mobility:off, regions:off, context:off.
+    Shows percentage change from baseline for the dynamic mobility neighborhood
+    control and static spatial neighborhood substitutions.
 
     Args:
         csv_path: Path to ablation_metrics_deltas.csv
@@ -821,6 +842,32 @@ def plot_mobility_ablation_heatmap(
 
     Returns:
         Path to saved figure
+    """
+    metric_slug = metric.replace("_median", "").replace("_", "-")
+    return plot_ablation_deltas_heatmap(
+        csv_path,
+        output_dir=output_dir,
+        metric=metric,
+        baseline_name=baseline_name,
+        ablation_filter=NEIGHBORHOOD_AGGREGATION_ABLATIONS,
+        output_filename=f"neighborhood_aggregation_heatmap_{metric_slug}.png",
+        figsize=figsize,
+        show=show,
+    )
+
+
+def plot_mobility_ablation_heatmap(
+    csv_path: str | Path,
+    output_dir: str | Path | None = None,
+    metric: str = "mae",
+    baseline_name: str = "baseline",
+    figsize: tuple[float, float] | None = None,
+    show: bool = False,
+) -> Path:
+    """Create heatmap for mobility-related ablations.
+
+    Retained for existing callers; includes static spatial neighborhood aggregation
+    ablations in addition to the original mobility/context controls.
     """
     metric_slug = metric.replace("_median", "").replace("_", "-")
     return plot_ablation_deltas_heatmap(
