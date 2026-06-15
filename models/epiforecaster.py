@@ -739,7 +739,11 @@ class EpiForecaster(nn.Module):
                 f"(B={B}, T={T})."
             )
 
-        if (
+        if hasattr(mob_batch, "target_node") and mob_batch.target_node is not None:
+            target_local = mob_batch.target_node.reshape(-1).to(
+                node_emb.device, dtype=torch.long
+            )
+        elif (
             hasattr(mob_batch, "mob_real_node_idx")
             and mob_batch.mob_real_node_idx is not None
         ):
@@ -763,10 +767,6 @@ class EpiForecaster(nn.Module):
                     f"match_count={match_counts[first_bad].item()}."
                 )
             target_local = matches.to(torch.long).argmax(dim=1)
-        elif hasattr(mob_batch, "target_node"):
-            target_local = mob_batch.target_node.reshape(-1).to(
-                node_emb.device, dtype=torch.long
-            )
         else:
             raise ValueError("Mobility batch missing target indices.")
 

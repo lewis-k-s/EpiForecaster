@@ -250,7 +250,7 @@ class TestEpiForecaster:
 
         assert out["beta_t"].shape == (B, config["forecast_horizon"])
 
-    def test_forward_with_mobility_and_regions_maps_global_targets_to_local_context(
+    def test_forward_with_mobility_and_regions_uses_collated_local_targets(
         self, basic_config, dummy_batch
     ):
         config = basic_config.copy()
@@ -272,9 +272,46 @@ class TestEpiForecaster:
         eye = torch.eye(num_ctx_nodes, dtype=dense_adj.dtype).unsqueeze(0)
         mob_batch.adj_dense = torch.maximum(dense_adj, eye)
 
-        # Deliberately poison the cached local target tensor to verify the model
-        # uses the authoritative global target_nodes + mob_real_node_idx mapping.
-        mob_batch.target_node = torch.full((num_graphs,), 99999, dtype=torch.long)
+        mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
+        mob_batch.target_node = torch.tensor([1, 2], dtype=torch.long).repeat_interleave(
+            T
+        )
+
+        target_nodes = torch.tensor([3, 9], dtype=torch.long)
+        out = model(
+            hosp_hist=dummy_batch["hosp_hist"],
+            deaths_hist=dummy_batch["deaths_hist"],
+            cases_hist=dummy_batch["cases_hist"],
+            biomarkers_hist=dummy_batch["biomarkers_hist"],
+            mob_graphs=mob_batch,
+            target_nodes=target_nodes,
+            region_embeddings=torch.randn(16, 8),
+            population=dummy_batch["population"],
+        )
+
+        assert out["beta_t"].shape == (B, config["forecast_horizon"])
+
+    def test_forward_with_mobility_and_regions_maps_global_targets_without_local_index(
+        self, basic_config, dummy_batch
+    ):
+        config = basic_config.copy()
+        config["variant_type"] = ModelVariant(cases=True, mobility=True, regions=True)
+        config["gnn_hidden_dim"] = 8
+        config["mobility_embedding_dim"] = 8
+        config["region_embedding_dim"] = 8
+
+        model = EpiForecaster(**config)
+
+        B, T = dummy_batch["hosp_hist"].shape[:2]
+        num_graphs = B * T
+        num_ctx_nodes = 3
+        mob_batch = Batch()
+        mob_batch.x_dense = _rand_tensor(
+            num_graphs, num_ctx_nodes, model.temporal_node_dim
+        )
+        dense_adj = torch.rand(num_graphs, num_ctx_nodes, num_ctx_nodes)
+        eye = torch.eye(num_ctx_nodes, dtype=dense_adj.dtype).unsqueeze(0)
+        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
         mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
 
         target_nodes = torch.tensor([3, 9], dtype=torch.long)
