@@ -19,6 +19,7 @@ EPIFORECASTER_TRAINING_CONFIGS = [
     "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
     "configs/production_only/train_epifor_sparsity_curriculum.yaml",
     "configs/production_only/train_epifor_supersparse.yaml",
+    "configs/production_only/train_epifor_mn5_small_constrained.yaml",
 ]
 
 REGION2VEC_CONFIGS = [
