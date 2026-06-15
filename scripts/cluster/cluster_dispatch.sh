@@ -40,6 +40,7 @@ usage() {
 Usage:
   $(basename "$0") submit <mode> [sbatch-args...]
   $(basename "$0") alloc  <mode> [salloc-args...]
+  $(basename "$0") interactive [salloc-args...]
   $(basename "$0") run    <mode> [args...]
   $(basename "$0") status <job-id>
   $(basename "$0") logs   <job-id> [task-id]
@@ -145,6 +146,44 @@ alloc_session() {
 
   echo "Allocating session: salloc $resources $account_arg $*"
   salloc $resources $account_arg "$@" bash
+}
+
+interactive_session() {
+  local resources="${INTERACTIVE_RESOURCES:-}"
+  local -a account_args=()
+
+  repo_cd
+
+  if [ -z "$resources" ]; then
+    echo "No interactive resource spec configured (set INTERACTIVE_RESOURCES in config)" >&2
+    return 1
+  fi
+
+  if [ -n "$SLURM_ACCOUNT" ]; then
+    account_args=(--account="$SLURM_ACCOUNT")
+  fi
+
+  export PROJECT_ROOT="${PROJECT_ROOT:-$REMOTE_BASE}"
+  export MODULE_SETUP
+
+  local bootstrap
+  read -r -d '' bootstrap <<'EOF' || true
+set -euo pipefail
+cd "${PROJECT_ROOT:-$PWD}"
+if [ -n "${MODULE_SETUP:-}" ] && [ -f "${MODULE_SETUP}" ]; then
+  # shellcheck disable=SC1090
+  source "$MODULE_SETUP"
+fi
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+echo "Interactive MN5 allocation ready on $(hostname)"
+echo "Project root: ${PROJECT_ROOT:-$PWD}"
+echo "Example: ${UV_RUN:-uv run --no-sync} train epiforecaster --config configs/production_only/train_epifor_mn5_full.yaml --max-batches 5"
+set +euo pipefail
+exec bash -i
+EOF
+
+  echo "Allocating interactive compute shell: salloc $resources ${account_args[*]} $*"
+  salloc $resources "${account_args[@]}" "$@" srun --pty bash -lc "$bootstrap"
 }
 
 run_job() {
@@ -278,6 +317,10 @@ main() {
     alloc)
       shift
       alloc_session "$@"
+      ;;
+    interactive)
+      shift
+      interactive_session "$@"
       ;;
     run)
       shift

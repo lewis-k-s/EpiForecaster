@@ -214,8 +214,8 @@ Request high-memory nodes (216 available, 1TB RAM each):
 # GPP interactive session
 salloc -A {account} -q gp_interactive -t 00:10:00 -n 1 -c 4
 
-# ACC interactive session with GPUs
-salloc -A {account} -q acc_bsccase -n 2 -c 20 --gres=gpu:2
+# ACC interactive session with one GPU and its matching 20 CPUs
+salloc -A {account} -q acc_interactive -t 01:00:00 -n 1 -c 20 --gres=gpu:1
 ```
 
 ### Job Arrays

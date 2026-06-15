@@ -32,6 +32,7 @@ The dispatch script is `scripts/cluster/cluster_dispatch.sh`. `mn5_dispatch.sh` 
 ```
 cluster_dispatch.sh submit <mode> [sbatch-args...]   # Submit via sbatch (or invoke shell modes)
 cluster_dispatch.sh alloc  <mode> [salloc-args...]   # Interactive salloc session with mode resources
+cluster_dispatch.sh interactive [salloc-args...]      # One-hour MN5 ACC interactive GPU shell
 cluster_dispatch.sh run    <mode> [args...]           # Execute .sbatch/.sh directly (no scheduler)
 cluster_dispatch.sh status <job-id>                   # Show squeue + sacct
 cluster_dispatch.sh logs   <job-id> [task-id]         # List log file paths
@@ -108,12 +109,34 @@ Always do a dry run first for new configurations:
 ssh mn5 'DRY_RUN=1 /home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh submit single --time=00:10:00'
 ```
 
-### Interactive Allocation
+### Interactive GPU Allocation
 
-For debugging or interactive work on a compute node with mode-appropriate resources:
+For fast iteration/profiling, use the purpose-built MN5 ACC interactive command.
+It waits for Slurm once, requests `acc_interactive`, one GPU, 20 CPUs, one task,
+and a one-hour walltime, then starts a compute-node shell with
+`scripts/cluster/mn5_module_setup.sh` already sourced.
 
 ```bash
-ssh mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh alloc single'
+ssh -tt mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh interactive'
+```
+
+Inside that shell, run small batches directly without another Slurm queue wait:
+
+```bash
+$UV_RUN train epiforecaster --config configs/production_only/train_epifor_mn5_full.yaml --max-batches 5
+```
+
+Pass extra `salloc` arguments after `interactive` when needed:
+
+```bash
+ssh -tt mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh interactive --time=00:30:00'
+```
+
+The older generic allocation command is still available when you want a mode's
+configured resources instead of the ACC interactive queue:
+
+```bash
+ssh -tt mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh alloc single'
 ```
 
 This runs `salloc` with the resource spec from `RESOURCES_single` in config and drops into a shell.
@@ -380,12 +403,12 @@ ssh mn5 'CHAIN_ID=pf_experiment /home/bsc/bsc008913/EpiForecaster/scripts/cluste
 bash syncback_from_mn5.sh mn5_epiforecaster_synth_pretrain
 ```
 
-### Interactive debugging on compute node
+### Interactive debugging/profiling on compute node
 
 ```bash
-# Get an interactive shell with single-GPU resources
-ssh mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh alloc single'
+# Get a one-hour ACC interactive shell with 1 GPU + 20 CPUs
+ssh -tt mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh interactive'
 
-# Run a job script directly (no Slurm scheduler)
-ssh mn5 '/home/bsc/bsc008913/EpiForecaster/scripts/cluster/cluster_dispatch.sh run single'
+# Then run short training/profiling loops inside the allocated compute shell
+$UV_RUN train epiforecaster --config configs/production_only/train_epifor_mn5_full.yaml --max-batches 5
 ```
