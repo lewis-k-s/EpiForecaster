@@ -4,7 +4,7 @@
 
 The `EpiForecaster` implements a **Joint Inference-Observation** framework designed for real-world epidemiological forecasting where the "True Infection Rate" is unknown.
 
-Instead of training on synthetic ground truth, the model infers latent epidemiological states ($S, I, R, D$) via a differentiable physics roll-forward and anchors them to observable proxy signals (Wastewater, Hospitalizations, Reported Cases, and Deaths).
+The model infers latent epidemiological states ($S, I, H, R, D$) via a differentiable physics roll-forward and anchors them to observable proxy signals (Wastewater, Hospitalizations, Reported Cases, and Deaths).
 
 The core philosophy is: **Physics constrains the Latent State, while Observations constrain the Physics.**
 
@@ -24,19 +24,23 @@ The model operates as a three-stage differentiable pipeline:
 *   **Output**:
     *   **Transmission Rate ($\beta_t$)**: Time-varying infection rate.
     *   **Recovery Rate ($\gamma_t$)**: Time-varying recovery rate.
-    *   **Mortality Rate ($\mu_t$)**: Time-varying mortality rate.
-    *   **Initial States**: ($S_0, I_0, R_0$) fractions summing to 1.
-    *   **Observation Context**: Residual features for observation heads to model non-SIRD dynamics (e.g., reporting delays, ascertainment noise).
+    *   **Direct Mortality Rate ($\mu^I_t$)**: Time-varying non-hospital death rate from infected state.
+    *   **Hospitalization Rate ($\alpha_t$)**: Time-varying admission rate from infected to hospitalized state.
+    *   **Hospital Recovery Rate ($\rho_t$)**: Time-varying discharge/recovery rate from hospitalized state.
+    *   **Hospital Mortality Rate ($\mu^H_t$)**: Time-varying severe mortality rate from hospitalized state.
+    *   **Initial States**: ($S_0, I_0, H_0, R_0$) fractions summing to 1.
+    *   **Observation Context**: Residual features for observation heads to model non-SIRHD dynamics (e.g., reporting delays, ascertainment noise).
 
 ### Stage 2: The Physics Core (SIRRollForward)
-*   **Role**: Generates latent trajectories consistent with SIRD dynamics.
+*   **Role**: Generates latent trajectories consistent with SIRHD dynamics.
 *   **Mechanism**: A differentiable Euler integration step.
     $$ \frac{dS}{dt} = -\beta_t \frac{SI}{N} $$
-    $$ \frac{dI}{dt} = \beta_t \frac{SI}{N} - \gamma_t I - \mu_t I $$
-    $$ \frac{dR}{dt} = \gamma_t I $$
-    $$ \frac{dD}{dt} = \mu_t I $$
-*   **Latent Contract**: All states are modeled as **fractions** of the population ($S+I+R+D=1.0$). The physics core uses a normalized population $N=1.0$ internally to ensure scale invariance.
-*   **Outputs**: Trajectories for $S, I, R$ and `death_flow` (flux into $D$ state).
+    $$ \frac{dI}{dt} = \beta_t \frac{SI}{N} - \gamma_t I - \alpha_t I - \mu^I_t I $$
+    $$ \frac{dH}{dt} = \alpha_t I - \rho_t H - \mu^H_t H $$
+    $$ \frac{dR}{dt} = \gamma_t I + \rho_t H $$
+    $$ \frac{dD}{dt} = \mu^I_t I + \mu^H_t H $$
+*   **Latent Contract**: All states are modeled as **fractions** of the population ($S+I+H+R+D=1.0$). The physics core uses a normalized population $N=1.0$ internally to ensure scale invariance.
+*   **Outputs**: Trajectories for $S, I, H, R, D$, `hospitalization_flow` (flux into $H$), and `death_flow` (flux into $D$).
 
 ### Stage 3: Observation Heads
 Differentiable layers mapping latent states to observable metrics.
@@ -45,8 +49,8 @@ Differentiable layers mapping latent states to observable metrics.
     *   **Mechanism**: Convolves latent $I$ trajectory with a shedding kernel.
     *   **Function**: $I_{t-k:t} \to \text{Viral Load}_t$
 2.  **Hospitalization Head (`pred_hosp`)**:
-    *   **Mechanism**: Applies delay kernel and scaling to latent $I$.
-    *   **Function**: $I_{t-k:t} \to \text{Hospital Admissions}_t$
+    *   **Mechanism**: Applies delay kernel and scaling to the latent hospitalization/admission flow.
+    *   **Function**: $\text{hospitalization\_flow}_{t-k:t} \to \text{Hospital Admissions}_t$
 3.  **Cases Head (`pred_cases`)**:
     *   **Mechanism**: Models ascertainment rate and reporting delays.
     *   **Function**: $I_{t-k:t} \to \text{Reported Cases}_t$
@@ -73,7 +77,7 @@ where:
     early-stopping comparisons.
 
 *   **Observation Losses ($L_{WW}, L_{Hosp}, \dots$)**: Minimize error between predictions and ground truth data. Per-target masks allow training even when some signals are missing (e.g., missing wastewater data).
-*   **SIR Physics Loss ($L_{SIR}$)**: A regularization term that enforces consistency between the unconstrained updates and the strict SIRD equations, preventing the model from "breaking physics" to fit noise.
+*   **SIRHD latent supervision ($L_{SIRHD}$)**: A regularization term for synthetic runs that supervises available latent compartment trajectories, preventing the model from "breaking physics" to fit noise.
 
 ### Observation Supervision and `n_eff`
 

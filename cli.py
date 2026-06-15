@@ -369,7 +369,7 @@ cli.add_command(plot_cli, name="plot")
 @click.option(
     "--include-sird-latents",
     is_flag=True,
-    help="Also save a joint SIRD latent trajectory figure for selected forecasts.",
+    help="Also save a joint SIRHD latent trajectory figure for selected forecasts.",
 )
 @click.option(
     "--node-metric-target",
@@ -909,7 +909,7 @@ def eval_baselines(
 @click.option(
     "--include-sird-latents",
     is_flag=True,
-    help="Also save a joint SIRD latent trajectory figure for selected forecasts.",
+    help="Also save a joint SIRHD latent trajectory figure for selected forecasts.",
 )
 @click.option(
     "--node-metric-target",

@@ -31,8 +31,8 @@ class EpiForecaster(nn.Module):
 
     Three-stage architecture:
     1. Encoder (TransformerBackbone): Estimates beta_t, initial states, obs_context
-    2. Physics Core (SIRRollForward): Generates latent SIR trajectories
-    3. Observation Heads: Map latent I(t) to observable signals (WW, Hosp)
+    2. Physics Core (SIRRollForward): Generates latent SIRHD trajectories
+    3. Observation Heads: Map latent/flow signals to observable surveillance streams
     """
 
     def __init__(
@@ -272,12 +272,14 @@ class EpiForecaster(nn.Module):
                 - beta_t: [batch_size, horizon] - transmission rates
                 - S_trajectory: [batch_size, horizon+1] - susceptible trajectory
                 - I_trajectory: [batch_size, horizon+1] - infected trajectory (latent)
+                - H_trajectory: [batch_size, horizon+1] - hospitalized trajectory (latent)
                 - R_trajectory: [batch_size, horizon+1] - recovered trajectory
+                - hospitalization_flow: [batch_size, horizon] - I -> H admission flow
                 - physics_residual: [batch_size, horizon] - SIR dynamics residual
                 - pred_ww: [batch_size, horizon] - predicted wastewater signal
                 - pred_hosp: [batch_size, horizon] - predicted hospitalizations
                 - obs_context: [batch_size, horizon, obs_context_dim] - observation context
-                - initial_states: [batch_size, 3] - S0, I0, R0 proportions (sum=1)
+                - initial_states: [batch_size, 4] - S0, I0, H0, R0 proportions (sum=1)
         """
         B, T, _ = hosp_hist.shape
 
@@ -349,17 +351,21 @@ class EpiForecaster(nn.Module):
         encoder_outputs = self.backbone(x_seq)
         beta_t = encoder_outputs["beta_t"]  # [B, H]
         mortality_t = encoder_outputs["mortality_t"]  # [B, H]
+        hospitalization_rate_t = encoder_outputs["hospitalization_rate_t"]  # [B, H]
+        hospital_recovery_t = encoder_outputs["hospital_recovery_t"]  # [B, H]
+        hospital_mortality_t = encoder_outputs["hospital_mortality_t"]  # [B, H]
         gamma_t = encoder_outputs["gamma_t"]  # [B, H]
-        initial_states_logits = encoder_outputs["initial_states_logits"]  # [B, 3]
+        initial_states_logits = encoder_outputs["initial_states_logits"]  # [B, 4]
         obs_context = encoder_outputs["obs_context"]  # [B, H, C_obs]
 
         # Convert logits to proportions (softmax ensures sum=1, nonnegative)
-        initial_states = F.softmax(initial_states_logits, dim=-1)  # [B, 3]
+        initial_states = F.softmax(initial_states_logits, dim=-1)  # [B, 4]
 
-        # Keep SIR states in fraction space (sum to 1 per sample)
+        # Keep SIRH states in fraction space (sum to 1 per sample)
         S0 = initial_states[:, 0]  # [B]
         I0 = initial_states[:, 1]  # [B]
-        R0 = initial_states[:, 2]  # [B]
+        H0 = initial_states[:, 2]  # [B]
+        R0 = initial_states[:, 3]  # [B]
 
         # Stage 2: SIR Roll-Forward
         sir_outputs = self.sir_rollforward(
@@ -369,15 +375,21 @@ class EpiForecaster(nn.Module):
             S0=S0,
             I0=I0,
             R0=R0,
-            # SIR is modeled in fraction space (S+I+R=1), so population N=1.0 ensures
-            # the standard SIR equations (beta*S*I/N) work correctly with fractions.
+            H0=H0,
+            hospitalization_rate_t=hospitalization_rate_t,
+            hospital_recovery_t=hospital_recovery_t,
+            hospital_mortality_t=hospital_mortality_t,
+            # SIRHD is modeled in fraction space (S+I+H+R=1 at t0), so population
+            # N=1.0 ensures the standard equations work correctly with fractions.
             population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
         )
 
         S_traj = sir_outputs["S_trajectory"]  # [B, H+1]
         I_traj = sir_outputs["I_trajectory"]  # [B, H+1]
+        H_traj = sir_outputs["H_trajectory"]  # [B, H+1]
         R_traj = sir_outputs["R_trajectory"]  # [B, H+1]
         D_traj = sir_outputs["D_trajectory"]  # [B, H+1]
+        hospitalization_flow = sir_outputs["hospitalization_flow"]  # [B, H]
         death_flow = sir_outputs["death_flow"]  # [B, H]
         physics_residual = sir_outputs["physics_residual"]  # [B, H]
 
@@ -423,9 +435,17 @@ class EpiForecaster(nn.Module):
             last_observed_mask=ww_last_mask,
         )  # [B, H+1]
 
-        # Hospitalization prediction
+        # Hospitalization prediction. Observed hospitalizations are modeled as
+        # reported admissions, so the clinical head consumes the I -> H flow.
+        hospitalization_source = torch.cat(
+            [
+                torch.zeros(B, 1, device=beta_t.device, dtype=beta_t.dtype),
+                hospitalization_flow,
+            ],
+            dim=1,
+        )
         pred_hosp = self.hosp_head(
-            I_trajectory=I_traj,
+            I_trajectory=hospitalization_source,
             obs_context=obs_context_with_init,
             last_observed=hosp_last,
             last_observed_mask=hosp_last_mask,
@@ -453,10 +473,16 @@ class EpiForecaster(nn.Module):
 
         return {
             "beta_t": beta_t,
+            "mortality_t": mortality_t,
+            "hospitalization_rate_t": hospitalization_rate_t,
+            "hospital_recovery_t": hospital_recovery_t,
+            "hospital_mortality_t": hospital_mortality_t,
             "S_trajectory": S_traj,
             "I_trajectory": I_traj,
+            "H_trajectory": H_traj,
             "R_trajectory": R_traj,
             "D_trajectory": D_traj,
+            "hospitalization_flow": hospitalization_flow,
             "physics_residual": physics_residual,
             "pred_ww": pred_ww,
             "pred_hosp": pred_hosp,
@@ -540,16 +566,13 @@ class EpiForecaster(nn.Module):
             "deaths": batch_data.deaths_target,
             "S_target": batch_data.S_target,
             "I_target": batch_data.I_target,
+            "H_target": batch_data.H_target,
             "R_target": batch_data.R_target,
             "D_target": batch_data.D_target,
             "ww_mask": batch_data.ww_target_mask,
             "hosp_mask": batch_data.hosp_target_mask,
             "cases_mask": batch_data.cases_target_mask,
             "deaths_mask": batch_data.deaths_target_mask,
-            "S_target_mask": batch_data.S_target_mask,
-            "I_target_mask": batch_data.I_target_mask,
-            "R_target_mask": batch_data.R_target_mask,
-            "D_target_mask": batch_data.D_target_mask,
         }
 
         return model_outputs, targets_dict
@@ -716,13 +739,18 @@ class EpiForecaster(nn.Module):
                 f"(B={B}, T={T})."
             )
 
-        if hasattr(mob_batch, "mob_real_node_idx") and mob_batch.mob_real_node_idx is not None:
+        if (
+            hasattr(mob_batch, "mob_real_node_idx")
+            and mob_batch.mob_real_node_idx is not None
+        ):
             real_nodes = torch.as_tensor(
                 mob_batch.mob_real_node_idx,
                 device=node_emb.device,
                 dtype=torch.long,
             ).reshape(-1)
-            target_global = target_nodes.to(node_emb.device, dtype=torch.long).repeat_interleave(T)
+            target_global = target_nodes.to(
+                node_emb.device, dtype=torch.long
+            ).repeat_interleave(T)
             matches = real_nodes.unsqueeze(0) == target_global.unsqueeze(1)
             match_counts = matches.sum(dim=1)
             if self.strict and not torch.all(match_counts == 1):

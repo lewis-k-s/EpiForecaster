@@ -171,7 +171,9 @@ class TransformerEncoderBlock(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.ffn = SwiGLUFeedForward(d_model=d_model, hidden_dim=ffn_dim, dropout=dropout)
+        self.ffn = SwiGLUFeedForward(
+            d_model=d_model, hidden_dim=ffn_dim, dropout=dropout
+        )
         self.attn_dropout = nn.Dropout(dropout)
         self.norm1 = nn.RMSNorm(d_model) if use_norm else nn.Identity()
         self.norm2 = nn.RMSNorm(d_model) if use_norm else nn.Identity()
@@ -268,8 +270,7 @@ class TransformerBackbone(nn.Module):
             raise ValueError(f"rezero_init must be positive, got {rezero_init}")
         if rate_head_final_gain <= 0:
             raise ValueError(
-                "rate_head_final_gain must be positive, "
-                f"got {rate_head_final_gain}"
+                f"rate_head_final_gain must be positive, got {rate_head_final_gain}"
             )
         if initial_state_final_gain <= 0:
             raise ValueError(
@@ -278,8 +279,7 @@ class TransformerBackbone(nn.Module):
             )
         if obs_context_final_gain <= 0:
             raise ValueError(
-                "obs_context_final_gain must be positive, "
-                f"got {obs_context_final_gain}"
+                f"obs_context_final_gain must be positive, got {obs_context_final_gain}"
             )
         self.rezero_init = rezero_init
         self.rate_head_final_gain = rate_head_final_gain
@@ -330,6 +330,27 @@ class TransformerBackbone(nn.Module):
             nn.Linear(d_model // 2, horizon),
         )
 
+        # Hospital admission rate: I -> H flow [B, H]
+        self.hospitalization_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, horizon),
+        )
+
+        # Hospital discharge/recovery rate: H -> R flow [B, H]
+        self.hospital_recovery_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, horizon),
+        )
+
+        # Hospital mortality rate: H -> D flow [B, H]
+        self.hospital_mortality_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, horizon),
+        )
+
         # Gamma (recovery rate): time-varying recovery rate [B, H]
         self.gamma_projection = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
@@ -337,11 +358,11 @@ class TransformerBackbone(nn.Module):
             nn.Linear(d_model // 2, horizon),
         )
 
-        # Initial states: logits for S0, I0, R0 proportions [B, 3]
+        # Initial states: logits for S0, I0, H0, R0 proportions [B, 4]
         self.initial_states_projection = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 2, 3),
+            nn.Linear(d_model // 2, 4),
         )
 
         # Observation context: per-timestep features for observation heads [B, H, C_obs]
@@ -368,6 +389,9 @@ class TransformerBackbone(nn.Module):
             self.beta_projection[0],
             self.gamma_projection[0],
             self.mortality_projection[0],
+            self.hospitalization_projection[0],
+            self.hospital_recovery_projection[0],
+            self.hospital_mortality_projection[0],
             self.initial_states_projection[0],
             self.obs_context_projection[0],
         ]
@@ -389,14 +413,32 @@ class TransformerBackbone(nn.Module):
         )
         self._init_rate_head(
             self.mortality_projection[2],
-            prior=0.002,
+            prior=0.0005,
             min_value=cfg.mortality_min,
             max_value=cfg.mortality_max,
         )
+        self._init_rate_head(
+            self.hospitalization_projection[2],
+            prior=0.02,
+            min_value=cfg.hospitalization_min,
+            max_value=cfg.hospitalization_max,
+        )
+        self._init_rate_head(
+            self.hospital_recovery_projection[2],
+            prior=0.1,
+            min_value=cfg.hospital_recovery_min,
+            max_value=cfg.hospital_recovery_max,
+        )
+        self._init_rate_head(
+            self.hospital_mortality_projection[2],
+            prior=0.005,
+            min_value=cfg.hospital_mortality_min,
+            max_value=cfg.hospital_mortality_max,
+        )
 
-        # Encourage plausible initial composition at startup: S >> I > R.
+        # Encourage plausible initial composition at startup: S >> I > H ~= R.
         # Use default dtype (float32) for initial prior
-        initial_prior = torch.tensor([0.995, 0.004, 0.001])
+        initial_prior = torch.tensor([0.9945, 0.004, 0.0005, 0.001])
         initial_bias = torch.log(initial_prior)
         self._init_linear_small_xavier_with_bias(
             self.initial_states_projection[2],
@@ -466,7 +508,10 @@ class TransformerBackbone(nn.Module):
             Dictionary containing:
                 - beta_t: [batch_size, horizon] - time-varying transmission rate (positive via softplus)
                 - mortality_t: [batch_size, horizon] - time-varying mortality rate (positive via softplus)
-                - initial_states_logits: [batch_size, 3] - logits for S0, I0, R0 proportions
+                - hospitalization_rate_t: [batch_size, horizon] - I -> H rate
+                - hospital_recovery_t: [batch_size, horizon] - H -> R rate
+                - hospital_mortality_t: [batch_size, horizon] - H -> D rate
+                - initial_states_logits: [batch_size, 4] - logits for S0, I0, H0, R0 proportions
                 - obs_context: [batch_size, horizon, obs_context_dim] - observation context
         """
         batch_size, seq_len, _ = x_seq.shape
@@ -509,6 +554,21 @@ class TransformerBackbone(nn.Module):
             min=cfg.mortality_min,
             max=cfg.mortality_max,
         )
+        hospitalization_rate_t = torch.clamp(
+            F.softplus(self.hospitalization_projection(final_hidden)),
+            min=cfg.hospitalization_min,
+            max=cfg.hospitalization_max,
+        )
+        hospital_recovery_t = torch.clamp(
+            F.softplus(self.hospital_recovery_projection(final_hidden)),
+            min=cfg.hospital_recovery_min,
+            max=cfg.hospital_recovery_max,
+        )
+        hospital_mortality_t = torch.clamp(
+            F.softplus(self.hospital_mortality_projection(final_hidden)),
+            min=cfg.hospital_mortality_min,
+            max=cfg.hospital_mortality_max,
+        )
         gamma_t = torch.clamp(
             F.softplus(self.gamma_projection(final_hidden)),
             min=cfg.gamma_min,
@@ -536,6 +596,9 @@ class TransformerBackbone(nn.Module):
         return {
             "beta_t": beta_t,
             "mortality_t": mortality_t,
+            "hospitalization_rate_t": hospitalization_rate_t,
+            "hospital_recovery_t": hospital_recovery_t,
+            "hospital_mortality_t": hospital_mortality_t,
             "gamma_t": gamma_t,
             "initial_states_logits": initial_states_logits,
             "obs_context": obs_context,

@@ -44,6 +44,9 @@ class TestTransformerBackbone:
         expected_keys = {
             "beta_t",
             "mortality_t",
+            "hospitalization_rate_t",
+            "hospital_recovery_t",
+            "hospital_mortality_t",
             "gamma_t",
             "initial_states_logits",
             "obs_context",
@@ -53,8 +56,11 @@ class TestTransformerBackbone:
         # Check shapes
         assert outputs["beta_t"].shape == (batch_size, horizon)
         assert outputs["mortality_t"].shape == (batch_size, horizon)
+        assert outputs["hospitalization_rate_t"].shape == (batch_size, horizon)
+        assert outputs["hospital_recovery_t"].shape == (batch_size, horizon)
+        assert outputs["hospital_mortality_t"].shape == (batch_size, horizon)
         assert outputs["gamma_t"].shape == (batch_size, horizon)
-        assert outputs["initial_states_logits"].shape == (batch_size, 3)
+        assert outputs["initial_states_logits"].shape == (batch_size, 4)
 
         # Obs context shape: [B, H, C_obs]
         assert outputs["obs_context"].shape == (
@@ -116,7 +122,10 @@ class TestTransformerBackbone:
         expected_priors = {
             "beta_t": 0.25,
             "gamma_t": 0.14,
-            "mortality_t": 0.002,
+            "mortality_t": 0.0005,
+            "hospitalization_rate_t": 0.02,
+            "hospital_recovery_t": 0.1,
+            "hospital_mortality_t": 0.005,
         }
 
         for key, expected in expected_priors.items():
@@ -131,9 +140,15 @@ class TestTransformerBackbone:
         assert torch.all(outputs["gamma_t"] < cfg.gamma_max)
         assert torch.all(outputs["mortality_t"] > cfg.mortality_min)
         assert torch.all(outputs["mortality_t"] < cfg.mortality_max)
+        assert torch.all(outputs["hospitalization_rate_t"] > cfg.hospitalization_min)
+        assert torch.all(outputs["hospitalization_rate_t"] < cfg.hospitalization_max)
+        assert torch.all(outputs["hospital_recovery_t"] > cfg.hospital_recovery_min)
+        assert torch.all(outputs["hospital_recovery_t"] < cfg.hospital_recovery_max)
+        assert torch.all(outputs["hospital_mortality_t"] > cfg.hospital_mortality_min)
+        assert torch.all(outputs["hospital_mortality_t"] < cfg.hospital_mortality_max)
 
     def test_initial_states_start_from_epidemiological_prior(self, backbone_config):
-        """Initial state logits should stay near the conservative S/I/R prior."""
+        """Initial state logits should stay near the conservative S/I/H/R prior."""
         model = create_transformer_backbone(**backbone_config)
         model.eval()
 
@@ -141,7 +156,10 @@ class TestTransformerBackbone:
         outputs = model(x_seq)
         initial_states = torch.softmax(outputs["initial_states_logits"], dim=-1)
 
-        expected = torch.tensor([0.995, 0.004, 0.001], dtype=initial_states.dtype)
+        expected = torch.tensor(
+            [0.9945, 0.004, 0.0005, 0.001],
+            dtype=initial_states.dtype,
+        )
         expected = expected.unsqueeze(0).expand_as(initial_states)
         assert torch.allclose(initial_states, expected, atol=5e-3)
 

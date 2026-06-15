@@ -55,6 +55,7 @@ SYNTHETIC_ZARR_SCHEMA = {
         "deaths": ("run_id", "date", "region_id"),
         "latent_S_true": ("run_id", "region_id", "date"),
         "latent_I_true": ("run_id", "region_id", "date"),
+        "latent_H_true": ("run_id", "region_id", "date"),
         "latent_R_true": ("run_id", "region_id", "date"),
         "latent_D_true": ("run_id", "region_id", "date"),
         "synthetic_sparsity_level": ("run_id",),
@@ -263,9 +264,7 @@ class SyntheticProcessor:
                         data,
                         dims=dims,
                         coords={
-                            d: ds.coords[d].values
-                            if d in ds.coords
-                            else np.arange(s)
+                            d: ds.coords[d].values if d in ds.coords else np.arange(s)
                             for d, s in zip(dims, data.shape)
                         },
                         name=var_name,
@@ -354,10 +353,7 @@ class SyntheticProcessor:
 
         if "synthetic_sparsity_level" in ds:
             sparsity = ds["synthetic_sparsity_level"]
-            print(
-                "  ✓ Found synthetic_sparsity_level metadata: "
-                f"{sparsity.shape}"
-            )
+            print(f"  ✓ Found synthetic_sparsity_level metadata: {sparsity.shape}")
         else:
             print(
                 "Warning: synthetic_sparsity_level not found; "
@@ -514,14 +510,10 @@ class SyntheticProcessor:
 
         # Broadcast base covariates (date, covariate) → (run_id, date, covariate)
         run_ids = kappa0_aligned.run_id.values
-        base_broadcast = base_covariates.expand_dims(
-            {"run_id": run_ids}, axis=0
-        )
+        base_broadcast = base_covariates.expand_dims({"run_id": run_ids}, axis=0)
 
         # Concatenate along covariate dim
-        result = xr.concat(
-            [base_broadcast, lockdown_da], dim="covariate"
-        )
+        result = xr.concat([base_broadcast, lockdown_da], dim="covariate")
         result.name = "temporal_covariates"
 
         print(
@@ -793,17 +785,20 @@ class SyntheticProcessor:
         return pop
 
     def _extract_latent_sird(self, ds: xr.Dataset) -> xr.Dataset | None:
-        """Extract latent SIRD compartments normalized to fraction space."""
-        latent_names = (
+        """Extract latent SIRHD compartments normalized to fraction space."""
+        required_latent_names = (
             "latent_S_true",
             "latent_I_true",
             "latent_R_true",
             "latent_D_true",
         )
-        missing = [name for name in latent_names if name not in ds]
+        optional_latent_aliases = {
+            "latent_H_true": ("latent_H_true", "latent_hospitalized_true")
+        }
+        missing = [name for name in required_latent_names if name not in ds]
         if missing:
             print(
-                "  Warning: latent SIRD variables missing from synthetic dataset; "
+                "  Warning: latent SIRHD variables missing from synthetic dataset; "
                 f"skipping latent supervision targets: {missing}"
             )
             return None
@@ -815,17 +810,23 @@ class SyntheticProcessor:
             )
             return None
 
-        print("Extracting latent SIRD targets...")
+        latent_sources = {name: name for name in required_latent_names}
+        for canonical_name, aliases in optional_latent_aliases.items():
+            source_name = next((alias for alias in aliases if alias in ds), None)
+            if source_name is not None:
+                latent_sources[canonical_name] = source_name
+
+        print("Extracting latent SIRHD targets...")
         start_date = np.datetime64(self.config.start_date)
         end_date = np.datetime64(self.config.end_date)
-        population = ds["population"].rename({"region_id": REGION_COORD}).astype(
-            np.float32
+        population = (
+            ds["population"].rename({"region_id": REGION_COORD}).astype(np.float32)
         )
         population = population.where(population > 0)
         latent_vars: dict[str, xr.DataArray] = {}
 
-        for name in latent_names:
-            latent = ds[name].transpose("run_id", TEMPORAL_COORD, REGION_COORD)
+        for name, source_name in latent_sources.items():
+            latent = ds[source_name].transpose("run_id", TEMPORAL_COORD, REGION_COORD)
             time_mask = (latent[TEMPORAL_COORD] >= start_date) & (
                 latent[TEMPORAL_COORD] <= end_date
             )
@@ -834,15 +835,12 @@ class SyntheticProcessor:
             # The model roll-forward runs in fraction space with N=1.0, so
             # normalize raw synthetic counts by population during preprocessing.
             latent_fraction = (latent / population).astype(np.float32)
-            latent_mask = latent_fraction.notnull()
-
             latent_vars[name] = latent_fraction
-            latent_vars[f"{name}_mask"] = latent_mask
 
         num_runs = len(ds.run_id)
-        example_name = latent_names[0]
+        example_name = required_latent_names[0]
         print(
-            "  ✓ Extracted latent SIRD targets with "
+            "  ✓ Extracted latent SIRHD targets with "
             f"{num_runs} runs: {latent_vars[example_name].shape}"
         )
         return xr.Dataset(latent_vars)

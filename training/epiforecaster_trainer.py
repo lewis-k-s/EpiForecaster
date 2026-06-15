@@ -565,7 +565,7 @@ class EpiForecasterTrainer:
         self._status(
             f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
         )
-        self._status(f"    - SIRD supervision weight: {loss_cfg.w_sird_supervision}")
+        self._status(f"    - SIRHD supervision weight: {loss_cfg.w_sird_supervision}")
         self._status("    - n_eff: diagnostic only; no loss scaling")
         if self._gradnorm_enabled:
             self._status(
@@ -1023,9 +1023,7 @@ class EpiForecasterTrainer:
                 "best_val_loss", getattr(self, "best_val_joint_loss", float("inf"))
             ),
         )
-        self.best_val_series_metrics = checkpoint.get(
-            "best_val_series_metrics", {}
-        )
+        self.best_val_series_metrics = checkpoint.get("best_val_series_metrics", {})
         self.training_history = checkpoint.get(
             "training_history", self.training_history
         )
@@ -1233,9 +1231,7 @@ class EpiForecasterTrainer:
         if ww_mae is not None:
             test_status_parts.append(f"WW MAE: {ww_mae:.4g}")
         test_status_parts.append(f"Time: {test_time:.2f}s")
-        self._status(
-            " | ".join(test_status_parts)
-        )
+        self._status(" | ".join(test_status_parts))
         if self.config.training.plot_forecasts:
             try:
                 self._generate_forecast_plots(self.test_loader, split="test")
@@ -1493,16 +1489,13 @@ class EpiForecasterTrainer:
             "deaths": batch_data.deaths_target,
             "S_target": batch_data.S_target,
             "I_target": batch_data.I_target,
+            "H_target": batch_data.H_target,
             "R_target": batch_data.R_target,
             "D_target": batch_data.D_target,
             "ww_mask": batch_data.ww_target_mask,
             "hosp_mask": batch_data.hosp_target_mask,
             "cases_mask": batch_data.cases_target_mask,
             "deaths_mask": batch_data.deaths_target_mask,
-            "S_target_mask": batch_data.S_target_mask,
-            "I_target_mask": batch_data.I_target_mask,
-            "R_target_mask": batch_data.R_target_mask,
-            "D_target_mask": batch_data.D_target_mask,
         }
 
     def _compute_gradient_snapshot_head_supervision(
@@ -1670,12 +1663,12 @@ class EpiForecasterTrainer:
     def _compute_train_step_sird_metrics(
         self, batch_data: EpiBatch
     ) -> tuple[str, dict[str, float]]:
-        """Build optional SIRD loss detail text and metrics for step logging."""
+        """Build optional SIRHD loss detail text and metrics for step logging."""
         if self.criterion.w_sird_supervision <= 0:
             return "", {}
         if all(
             getattr(batch_data, key, None) is None
-            for key in ("S_target", "I_target", "R_target", "D_target")
+            for key in ("S_target", "I_target", "H_target", "R_target", "D_target")
         ):
             return "", {}
 
@@ -1702,7 +1695,7 @@ class EpiForecasterTrainer:
         sird_raw = float(components["sird_supervision"])
         sird_weighted = float(components["sird_supervision_weighted"])
         return (
-            f" | SIRD: {sird_raw:.4g} (w={sird_weighted:.4g})",
+            f" | SIRHD: {sird_raw:.4g} (w={sird_weighted:.4g})",
             {
                 build_loss_key(split="train", component="sird_supervision"): sird_raw,
                 build_loss_key(
@@ -1876,8 +1869,8 @@ class EpiForecasterTrainer:
 
                 model_diagnostics_log_data: dict[str, float] = {}
                 if model_diagnostics_capture is not None:
-                    model_diagnostics_log_data = model_diagnostics_capture.build_log_data(
-                        self.model
+                    model_diagnostics_log_data = (
+                        model_diagnostics_capture.build_log_data(self.model)
                     )
 
                 frequency = self.config.training.grad_norm_log_frequency
@@ -2006,9 +1999,11 @@ class EpiForecasterTrainer:
                 bsz = batch_data.b
                 sps_samples_accum += bsz
                 sps_time_accum += batch_time_s
-                
+
                 samples_per_s = (
-                    (sps_samples_accum / sps_time_accum) if sps_time_accum > 0 else float("inf")
+                    (sps_samples_accum / sps_time_accum)
+                    if sps_time_accum > 0
+                    else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
                 log_this_step = should_log_step(self.global_step, 1, log_frequency)
@@ -2226,6 +2221,9 @@ class EpiForecasterTrainer:
             "beta_projection",
             "gamma_projection",
             "mortality_projection",
+            "hospitalization_projection",
+            "hospital_recovery_projection",
+            "hospital_mortality_projection",
             "initial_states_projection",
         }
 
@@ -2235,8 +2233,7 @@ class EpiForecasterTrainer:
             "backbone": [],
             "other": [],
             **{
-                f"observation_head_{head}": []
-                for head in GradNormController.task_names
+                f"observation_head_{head}": [] for head in GradNormController.task_names
             },
         }
 
@@ -2250,9 +2247,9 @@ class EpiForecasterTrainer:
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
             elif observation_head_name is not None:
-                self._grad_norm_groups[f"observation_head_{observation_head_name}"].append(
-                    param
-                )
+                self._grad_norm_groups[
+                    f"observation_head_{observation_head_name}"
+                ].append(param)
             elif "backbone" in name:
                 self._grad_norm_groups["backbone"].append(param)
             else:

@@ -241,6 +241,12 @@ class SIRPhysicsConfig:
     gamma_max: float = 0.5
     mortality_min: float = 1e-4
     mortality_max: float = 0.05
+    hospitalization_min: float = 1e-4
+    hospitalization_max: float = 0.2
+    hospital_recovery_min: float = 0.02
+    hospital_recovery_max: float = 0.5
+    hospital_mortality_min: float = 1e-5
+    hospital_mortality_max: float = 0.1
     # Physics residual clipping at source (prevents extreme gradients)
     residual_clip: float = 1e4
 
@@ -258,6 +264,24 @@ class SIRPhysicsConfig:
         if self.mortality_min >= self.mortality_max:
             raise ValueError(
                 f"mortality_min ({self.mortality_min}) must be < mortality_max ({self.mortality_max})"
+            )
+        if self.hospitalization_min >= self.hospitalization_max:
+            raise ValueError(
+                "hospitalization_min "
+                f"({self.hospitalization_min}) must be < hospitalization_max "
+                f"({self.hospitalization_max})"
+            )
+        if self.hospital_recovery_min >= self.hospital_recovery_max:
+            raise ValueError(
+                "hospital_recovery_min "
+                f"({self.hospital_recovery_min}) must be < hospital_recovery_max "
+                f"({self.hospital_recovery_max})"
+            )
+        if self.hospital_mortality_min >= self.hospital_mortality_max:
+            raise ValueError(
+                "hospital_mortality_min "
+                f"({self.hospital_mortality_min}) must be < hospital_mortality_max "
+                f"({self.hospital_mortality_max})"
             )
         if self.residual_clip <= 0:
             raise ValueError(
@@ -804,6 +828,9 @@ class TrainingParams:
             "backbone.beta_projection",
             "backbone.gamma_projection",
             "backbone.mortality_projection",
+            "backbone.hospitalization_projection",
+            "backbone.hospital_recovery_projection",
+            "backbone.hospital_mortality_projection",
             "backbone.initial_states_projection",
             "backbone.obs_context_projection",
             "ww_head.shedding_conv",

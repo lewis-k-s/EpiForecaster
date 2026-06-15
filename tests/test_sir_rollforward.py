@@ -705,3 +705,87 @@ class TestEdgeCases:
         assert result["S_trajectory"].shape == (batch_size, 2)
         assert result["I_trajectory"].shape == (batch_size, 2)
         assert result["R_trajectory"].shape == (batch_size, 2)
+
+
+class TestSIRHDFlows:
+    """Tests for hospitalized latent state and H -> D mortality path."""
+
+    def test_sirhd_outputs_and_mass_conservation(self):
+        batch_size = 2
+        horizon = 4
+        module = SIRRollForward(enforce_mass_conservation=True)
+
+        beta_t = torch.zeros(batch_size, horizon)
+        gamma_t = torch.ones(batch_size, horizon) * 0.1
+        mortality_t = torch.zeros(batch_size, horizon)
+        hospitalization_rate_t = torch.ones(batch_size, horizon) * 0.2
+        hospital_recovery_t = torch.ones(batch_size, horizon) * 0.05
+        hospital_mortality_t = torch.ones(batch_size, horizon) * 0.03
+        population = torch.tensor([1000.0, 2000.0])
+        S0 = population * 0.8
+        I0 = population * 0.1
+        H0 = population * 0.05
+        R0 = population * 0.05
+
+        result = module(
+            beta_t=beta_t,
+            gamma_t=gamma_t,
+            mortality_t=mortality_t,
+            S0=S0,
+            I0=I0,
+            R0=R0,
+            population=population,
+            hospitalization_rate_t=hospitalization_rate_t,
+            hospital_recovery_t=hospital_recovery_t,
+            hospital_mortality_t=hospital_mortality_t,
+            H0=H0,
+        )
+
+        assert result["H_trajectory"].shape == (batch_size, horizon + 1)
+        assert result["hospitalization_flow"].shape == (batch_size, horizon)
+        assert result["hospital_death_flow"].shape == (batch_size, horizon)
+        assert result["direct_death_flow"].shape == (batch_size, horizon)
+
+        total = (
+            result["S_trajectory"]
+            + result["I_trajectory"]
+            + result["H_trajectory"]
+            + result["R_trajectory"]
+            + result["D_trajectory"]
+        )
+        expected_total = population.unsqueeze(1).expand(-1, horizon + 1)
+        assert torch.allclose(total, expected_total, rtol=1e-4, atol=1e-4)
+
+    def test_hospital_death_flow_feeds_deceased_compartment(self):
+        module = SIRRollForward(enforce_mass_conservation=False)
+        beta_t = torch.zeros(1, 1)
+        gamma_t = torch.zeros(1, 1)
+        mortality_t = torch.zeros(1, 1)
+        hospitalization_rate_t = torch.zeros(1, 1)
+        hospital_recovery_t = torch.zeros(1, 1)
+        hospital_mortality_t = torch.tensor([[0.25]])
+        population = torch.tensor([1000.0])
+        S0 = torch.tensor([800.0])
+        I0 = torch.tensor([100.0])
+        H0 = torch.tensor([80.0])
+        R0 = torch.tensor([20.0])
+
+        result = module(
+            beta_t=beta_t,
+            gamma_t=gamma_t,
+            mortality_t=mortality_t,
+            S0=S0,
+            I0=I0,
+            R0=R0,
+            population=population,
+            hospitalization_rate_t=hospitalization_rate_t,
+            hospital_recovery_t=hospital_recovery_t,
+            hospital_mortality_t=hospital_mortality_t,
+            H0=H0,
+        )
+
+        expected_hospital_deaths = torch.tensor([[20.0]])
+        assert torch.allclose(result["hospital_death_flow"], expected_hospital_deaths)
+        assert torch.allclose(result["death_flow"], expected_hospital_deaths)
+        assert torch.allclose(result["D_trajectory"][:, 1], torch.tensor([20.0]))
+        assert torch.allclose(result["H_trajectory"][:, 1], torch.tensor([60.0]))

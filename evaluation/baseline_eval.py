@@ -751,16 +751,13 @@ def _targets_dict_from_batch(batch_data: Any) -> dict[str, torch.Tensor | None]:
         "deaths": getattr(batch_data, "deaths_target", None),
         "S_target": getattr(batch_data, "S_target", None),
         "I_target": getattr(batch_data, "I_target", None),
+        "H_target": getattr(batch_data, "H_target", None),
         "R_target": getattr(batch_data, "R_target", None),
         "D_target": getattr(batch_data, "D_target", None),
         "ww_mask": getattr(batch_data, "ww_target_mask", None),
         "hosp_mask": getattr(batch_data, "hosp_target_mask", None),
         "cases_mask": getattr(batch_data, "cases_target_mask", None),
         "deaths_mask": getattr(batch_data, "deaths_target_mask", None),
-        "S_target_mask": getattr(batch_data, "S_target_mask", None),
-        "I_target_mask": getattr(batch_data, "I_target_mask", None),
-        "R_target_mask": getattr(batch_data, "R_target_mask", None),
-        "D_target_mask": getattr(batch_data, "D_target_mask", None),
     }
 
 

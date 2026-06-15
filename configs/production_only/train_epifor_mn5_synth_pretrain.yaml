@@ -39,6 +39,7 @@ model:
     gnn_module: "gcn"
     include_day_of_week: true
     include_holidays: true
+    include_lockdown_severity: true
     input_window_length: 60
     forecast_horizon: 28
     max_neighbors: 20
@@ -113,6 +114,7 @@ training:
   loss:
     name: "joint_inference"
     joint:
+      observation_loss: mae
       w_sird_supervision: 0.01
 
   curriculum:

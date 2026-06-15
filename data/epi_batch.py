@@ -45,10 +45,7 @@ class EpiBatch:
     I_target: torch.Tensor | None  # (B, H+1)
     R_target: torch.Tensor | None  # (B, H+1)
     D_target: torch.Tensor | None  # (B, H+1)
-    S_target_mask: torch.Tensor | None  # (B, H+1)
-    I_target_mask: torch.Tensor | None  # (B, H+1)
-    R_target_mask: torch.Tensor | None  # (B, H+1)
-    D_target_mask: torch.Tensor | None  # (B, H+1)
+    H_target: torch.Tensor | None = None  # (B, H+1)
 
     def to(
         self,
@@ -248,12 +245,9 @@ def collate_epiforecaster_batch(
     )
     S_targets = _stack_optional_batch_tensor(batch, "S_target")
     I_targets = _stack_optional_batch_tensor(batch, "I_target")
+    H_targets = _stack_optional_batch_tensor(batch, "H_target")
     R_targets = _stack_optional_batch_tensor(batch, "R_target")
     D_targets = _stack_optional_batch_tensor(batch, "D_target")
-    S_target_masks = _stack_optional_batch_tensor(batch, "S_target_mask")
-    I_target_masks = _stack_optional_batch_tensor(batch, "I_target_mask")
-    R_target_masks = _stack_optional_batch_tensor(batch, "R_target_mask")
-    D_target_masks = _stack_optional_batch_tensor(batch, "D_target_mask")
 
     # Stack temporal covariates
     temporal_covariates = torch.stack(
@@ -295,26 +289,12 @@ def collate_epiforecaster_batch(
         S_targets = _promote_batch_float_tensor(_replace_non_finite(S_targets))
     if I_targets is not None:
         I_targets = _promote_batch_float_tensor(_replace_non_finite(I_targets))
+    if H_targets is not None:
+        H_targets = _promote_batch_float_tensor(_replace_non_finite(H_targets))
     if R_targets is not None:
         R_targets = _promote_batch_float_tensor(_replace_non_finite(R_targets))
     if D_targets is not None:
         D_targets = _promote_batch_float_tensor(_replace_non_finite(D_targets))
-    if S_target_masks is not None:
-        S_target_masks = _promote_batch_float_tensor(
-            _replace_non_finite(S_target_masks)
-        )
-    if I_target_masks is not None:
-        I_target_masks = _promote_batch_float_tensor(
-            _replace_non_finite(I_target_masks)
-        )
-    if R_target_masks is not None:
-        R_target_masks = _promote_batch_float_tensor(
-            _replace_non_finite(R_target_masks)
-        )
-    if D_target_masks is not None:
-        D_target_masks = _promote_batch_float_tensor(
-            _replace_non_finite(D_target_masks)
-        )
 
     # Store B and T on the batch for downstream reshaping
     T = batch[0]["mob_x"].shape[0] if B > 0 else 0
@@ -357,12 +337,9 @@ def collate_epiforecaster_batch(
         deaths_target_mask=deaths_target_masks,
         S_target=S_targets,
         I_target=I_targets,
+        H_target=H_targets,
         R_target=R_targets,
         D_target=D_targets,
-        S_target_mask=S_target_masks,
-        I_target_mask=I_target_masks,
-        R_target_mask=R_target_masks,
-        D_target_mask=D_target_masks,
     )
 
 

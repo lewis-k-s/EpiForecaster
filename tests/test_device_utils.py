@@ -51,10 +51,6 @@ def _make_batch() -> EpiBatch:
         I_target=None,
         R_target=None,
         D_target=None,
-        S_target_mask=None,
-        I_target_mask=None,
-        R_target_mask=None,
-        D_target_mask=None,
     )
 
 
@@ -93,7 +89,9 @@ def test_prepare_batch_for_device_injects_mobility_and_moves(monkeypatch) -> Non
         device: torch.device | str,
         non_blocking: bool = True,
     ) -> EpiBatch:
-        device_obj = device if isinstance(device, torch.device) else torch.device(device)
+        device_obj = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
         to_calls.append((self, device_obj, non_blocking))
         return original_to(self, device=device, non_blocking=non_blocking)
 
@@ -130,7 +128,9 @@ def test_iter_device_ready_batches_prepares_cpu_batches(monkeypatch) -> None:
         device: torch.device | str,
         non_blocking: bool = True,
     ) -> EpiBatch:
-        device_obj = device if isinstance(device, torch.device) else torch.device(device)
+        device_obj = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
         to_calls.append((self, device_obj, non_blocking))
         return original_to(self, device=device, non_blocking=non_blocking)
 
@@ -171,7 +171,9 @@ def test_prepare_batch_for_device_requires_epibatch_contract() -> None:
 
 
 @pytest.mark.device
-def test_epibatch_to_preserves_integer_indices_on_accelerator(accelerator_device) -> None:
+def test_epibatch_to_preserves_integer_indices_on_accelerator(
+    accelerator_device,
+) -> None:
     if accelerator_device.type == "cpu":
         pytest.skip("No accelerator available")
 

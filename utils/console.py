@@ -13,7 +13,7 @@ def format_component_gradnorm_status(
     """Format debug status line for component gradient norms."""
     return (
         f"Grad norms @ step {step}: "
-        f"SIRD={component_gradnorm_log_data.get('gradnorm_sird_physics', 0.0):.4f} | "
+        f"SIRHD={component_gradnorm_log_data.get('gradnorm_sird_physics', 0.0):.4f} | "
         f"Enc={component_gradnorm_log_data.get('gradnorm_backbone_encoder', 0.0):.4f} | "
         f"GNN={component_gradnorm_log_data.get('gradnorm_mobility_gnn', 0.0):.4f} | "
         f"Other={component_gradnorm_log_data.get('gradnorm_other', 0.0):.4f}"
@@ -56,7 +56,7 @@ def format_joint_loss_components_status(metrics: dict[str, Any]) -> str | None:
     components = [
         f"WW={metrics['loss_ww']:.4g} (w={metrics['loss_ww_weighted']:.4g})",
         f"Hosp={metrics['loss_hosp']:.4g} (w={metrics['loss_hosp_weighted']:.4g})",
-        "SIRD="
+        "SIRHD="
         f"{metrics['loss_sird_supervision']:.4g} "
         f"(w={metrics['loss_sird_supervision_weighted']:.4g})",
     ]

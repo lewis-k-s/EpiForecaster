@@ -159,6 +159,7 @@ def test_render_eval_per_head_plots_writes_expected_files(tmp_path: Path) -> Non
     )
 
     expected_names = {
+        "sparsity_vs_model_error",
         "perf_vs_population_hospitalizations",
         "perf_vs_population_wastewater",
         "perf_vs_population_cases",
@@ -611,10 +612,12 @@ def test_render_eval_per_head_plots_uses_four_examples_per_quartile_by_default(
         "Q4 (Worst MAE)",
     ]
     assert all(len(samples) == 4 for samples in grouped_samples.values())
-    assert captured_figures[0]["figure_title"] == f"{_format_target_label('hospitalizations')} (MAE)"
     assert (
-        captured_figures[0]["shared_xlabel"]
-        == "Time (days relative to forecast start)"
+        captured_figures[0]["figure_title"]
+        == f"{_format_target_label('hospitalizations')} (MAE)"
+    )
+    assert (
+        captured_figures[0]["shared_xlabel"] == "Time (days relative to forecast start)"
     )
 
 
@@ -741,8 +744,8 @@ def test_render_eval_per_head_plots_emits_latent_forecast_artifacts_when_availab
 
     assert "forecast_examples_quartiles_hospitalizations" in artifacts
     assert len(captured_calls) == 1
-    assert captured_calls[0]["overlay_target"] == "latent_i"
-    assert captured_calls[0]["overlay_label"] == "Latent I"
+    assert captured_calls[0]["overlay_target"] == "latent_h"
+    assert captured_calls[0]["overlay_label"] == "Latent H"
 
 
 def test_render_eval_per_head_plots_emits_joint_latent_quartile_artifacts(
@@ -893,22 +896,24 @@ def test_render_eval_per_head_plots_emits_joint_latent_quartile_artifacts(
 
     assert "forecast_examples_quartiles_joint_latent_s" in artifacts
     assert "forecast_examples_quartiles_joint_latent_i" in artifacts
+    assert "forecast_examples_quartiles_joint_latent_h" in artifacts
     assert "forecast_examples_quartiles_joint_latent_r" in artifacts
     assert "forecast_examples_quartiles_joint_latent_d" in artifacts
     joint_latent_calls = [
-        call
-        for call in captured_calls
-        if call.get("payload_collection") == "latents"
+        call for call in captured_calls if call.get("payload_collection") == "latents"
     ]
     assert {call["target"] for call in joint_latent_calls} == {
         "latent_s",
         "latent_i",
+        "latent_h",
         "latent_r",
         "latent_d",
     }
 
 
-def test_select_representative_window_specs_for_target_uses_median_and_tiebreaks() -> None:
+def test_select_representative_window_specs_for_target_uses_median_and_tiebreaks() -> (
+    None
+):
     target_df = pd.DataFrame(
         [
             {"target": "cases", "node_id": 7, "mae": 0.5},
@@ -1008,10 +1013,34 @@ def test_render_eval_per_head_plots_backfills_same_quartile_with_eligible_nodes(
     )
     pd.DataFrame(
         [
-            {"split": "test", "target": "cases", "node_id": 1, "window_start": 20, "abs_error": 0.2},
-            {"split": "test", "target": "cases", "node_id": 1, "window_start": 20, "abs_error": 0.2},
-            {"split": "test", "target": "cases", "node_id": 3, "window_start": 21, "abs_error": 0.3},
-            {"split": "test", "target": "cases", "node_id": 3, "window_start": 21, "abs_error": 0.3},
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 20,
+                "abs_error": 0.2,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 20,
+                "abs_error": 0.2,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 3,
+                "window_start": 21,
+                "abs_error": 0.3,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 3,
+                "window_start": 21,
+                "abs_error": 0.3,
+            },
         ]
     ).to_csv(tmp_path / "test_granular.csv", index=False)
 
@@ -1069,7 +1098,8 @@ def test_render_eval_per_head_plots_backfills_same_quartile_with_eligible_nodes(
     )
     monkeypatch.setattr(
         "dataviz.eval_head_plots.make_forecast_figure",
-        lambda **kwargs: captured_figures.append(kwargs["samples"]) or __import__("matplotlib.pyplot").pyplot.figure(),
+        lambda **kwargs: captured_figures.append(kwargs["samples"])
+        or __import__("matplotlib.pyplot").pyplot.figure(),
     )
 
     artifacts = render_eval_per_head_plots(
@@ -1129,12 +1159,48 @@ def test_render_eval_per_head_plots_regression_uses_non_last_representative_wind
     )
     pd.DataFrame(
         [
-            {"split": "test", "target": "cases", "node_id": 0, "window_start": 10, "abs_error": 0.1},
-            {"split": "test", "target": "cases", "node_id": 0, "window_start": 10, "abs_error": 0.3},
-            {"split": "test", "target": "cases", "node_id": 1, "window_start": 11, "abs_error": 0.2},
-            {"split": "test", "target": "cases", "node_id": 1, "window_start": 11, "abs_error": 0.2},
-            {"split": "test", "target": "cases", "node_id": 2, "window_start": 12, "abs_error": 0.3},
-            {"split": "test", "target": "cases", "node_id": 2, "window_start": 12, "abs_error": 0.3},
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 0,
+                "window_start": 10,
+                "abs_error": 0.1,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 0,
+                "window_start": 10,
+                "abs_error": 0.3,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 11,
+                "abs_error": 0.2,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 11,
+                "abs_error": 0.2,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 2,
+                "window_start": 12,
+                "abs_error": 0.3,
+            },
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 2,
+                "window_start": 12,
+                "abs_error": 0.3,
+            },
         ]
     ).to_csv(tmp_path / "test_granular.csv", index=False)
 
@@ -1192,7 +1258,8 @@ def test_render_eval_per_head_plots_regression_uses_non_last_representative_wind
     )
     monkeypatch.setattr(
         "dataviz.eval_head_plots.make_forecast_figure",
-        lambda **kwargs: captured_figures.append(kwargs["samples"]) or __import__("matplotlib.pyplot").pyplot.figure(),
+        lambda **kwargs: captured_figures.append(kwargs["samples"])
+        or __import__("matplotlib.pyplot").pyplot.figure(),
     )
 
     render_eval_per_head_plots(
@@ -1203,7 +1270,10 @@ def test_render_eval_per_head_plots_regression_uses_non_last_representative_wind
 
     grouped_samples = captured_figures[0]
     assert [sample["node_id"] for sample in grouped_samples["Q1 (Best MAE)"]] == [0, 1]
-    assert [sample["window_start"] for sample in grouped_samples["Q1 (Best MAE)"]] == [10, 11]
+    assert [sample["window_start"] for sample in grouped_samples["Q1 (Best MAE)"]] == [
+        10,
+        11,
+    ]
 
 
 def test_render_eval_per_head_plots_emits_history_quartile_artifacts(

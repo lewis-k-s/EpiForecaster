@@ -64,7 +64,7 @@ def get_loss_from_config(
 
 class JointInferenceLoss(nn.Module):
     """
-    Joint inference loss combining observation and latent SIRD supervision losses.
+    Joint inference loss combining observation and latent SIRHD supervision losses.
 
     This loss is designed for the joint inference framework where the model outputs
     latent SIR states and observation predictions rather than direct forecasts.
@@ -96,10 +96,11 @@ class JointInferenceLoss(nn.Module):
         "deaths": "deaths_min_observed",
     }
     _LATENT_COMPONENTS = (
-        ("latent_s", "S_trajectory", "S_target", "S_target_mask"),
-        ("latent_i", "I_trajectory", "I_target", "I_target_mask"),
-        ("latent_r", "R_trajectory", "R_target", "R_target_mask"),
-        ("latent_d", "D_trajectory", "D_target", "D_target_mask"),
+        ("latent_s", "S_trajectory", "S_target"),
+        ("latent_i", "I_trajectory", "I_target"),
+        ("latent_h", "H_trajectory", "H_target"),
+        ("latent_r", "R_trajectory", "R_target"),
+        ("latent_d", "D_trajectory", "D_target"),
     )
 
     def __init__(
@@ -297,9 +298,7 @@ class JointInferenceLoss(nn.Module):
         else:
             point_loss = abs_error**2
 
-        mean_loss = (point_loss * weights_f32).sum() / weights_f32.sum().clamp_min(
-            1e-8
-        )
+        mean_loss = (point_loss * weights_f32).sum() / weights_f32.sum().clamp_min(1e-8)
         if loss_type == "rmse":
             return torch.sqrt(mean_loss + _RMSE_EPS) - torch.sqrt(
                 torch.as_tensor(
@@ -398,18 +397,19 @@ class JointInferenceLoss(nn.Module):
                 - pred_hosp: [B, H+1] predicted hospitalizations (includes t=0 nowcast)
                 - pred_cases: [B, H+1] predicted reported cases (includes t=0 nowcast)
                 - pred_deaths: [B, H] predicted deaths (no nowcast needed)
-                - S_trajectory/I_trajectory/R_trajectory/D_trajectory: [B, H+1]
+                - S_trajectory/I_trajectory/H_trajectory/R_trajectory/D_trajectory: [B, H+1]
             targets: Dict containing target tensors:
                 - ww: [B, H] wastewater targets (optional)
                 - hosp: [B, H] hospitalization targets (optional)
                 - cases: [B, H] reported cases targets (optional)
                 - deaths: [B, H] deaths targets (optional)
-                - S_target/I_target/R_target/D_target: [B, H+1] latent targets (optional)
+                - S_target/I_target/H_target/R_target/D_target: [B, H+1] latent targets (optional)
             batch_data: Unused, retained for API compatibility.
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
-                - ww, hosp, cases, deaths, latent_s, latent_i, latent_r, latent_d, sird_supervision
+                - ww, hosp, cases, deaths, latent_s, latent_i, latent_h,
+                  latent_r, latent_d, sird_supervision
                 - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted,
                   sird_supervision_weighted
                 - total
@@ -427,6 +427,7 @@ class JointInferenceLoss(nn.Module):
         deaths_loss = zero_anchor
         latent_s_loss = zero_anchor
         latent_i_loss = zero_anchor
+        latent_h_loss = zero_anchor
         latent_r_loss = zero_anchor
         latent_d_loss = zero_anchor
         sird_supervision_loss = zero_anchor
@@ -495,13 +496,13 @@ class JointInferenceLoss(nn.Module):
         if self.w_sird_supervision > 0:
             latent_component_losses: list[torch.Tensor] = []
             latent_component_map: dict[str, torch.Tensor] = {}
-            for component_name, output_key, target_key, mask_key in self._LATENT_COMPONENTS:
+            for component_name, output_key, target_key in self._LATENT_COMPONENTS:
                 target = targets.get(target_key)
                 if target is None:
                     continue
                 supervision = self._build_supervision_weights(
                     target=target,
-                    observed_mask=targets.get(mask_key),
+                    observed_mask=None,
                     min_observed=0,
                     device=zero_anchor.device,
                 )
@@ -519,6 +520,7 @@ class JointInferenceLoss(nn.Module):
 
             latent_s_loss = latent_component_map.get("latent_s", zero_anchor)
             latent_i_loss = latent_component_map.get("latent_i", zero_anchor)
+            latent_h_loss = latent_component_map.get("latent_h", zero_anchor)
             latent_r_loss = latent_component_map.get("latent_r", zero_anchor)
             latent_d_loss = latent_component_map.get("latent_d", zero_anchor)
             if latent_component_losses:
@@ -531,6 +533,7 @@ class JointInferenceLoss(nn.Module):
             "deaths": deaths_loss,
             "latent_s": latent_s_loss,
             "latent_i": latent_i_loss,
+            "latent_h": latent_h_loss,
             "latent_r": latent_r_loss,
             "latent_d": latent_d_loss,
             "sird_supervision": sird_supervision_loss,
@@ -547,6 +550,7 @@ class JointInferenceLoss(nn.Module):
             "deaths": deaths_loss,
             "latent_s": latent_s_loss,
             "latent_i": latent_i_loss,
+            "latent_h": latent_h_loss,
             "latent_r": latent_r_loss,
             "latent_d": latent_d_loss,
             "sird_supervision": sird_supervision_loss,

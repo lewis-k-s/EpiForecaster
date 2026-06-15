@@ -48,6 +48,11 @@ from utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
+# HPO found little separation among observation objectives, with `mae` winning the
+# best endpoint trials. Keep the historical alternatives documented so this knob
+# can be widened again deliberately without spending compute by default.
+_OBSERVATION_LOSS_CHOICES = ("mae",)  # Previously explored: "mse", "rmse", "mae"
+
 # Global flag for signal handling
 _shutdown_requested = False
 
@@ -159,7 +164,7 @@ def suggest_epiforecaster_params(
     if sample_training_loss_objective:
         overrides["training.loss.joint.observation_loss"] = trial.suggest_categorical(
             "training.loss.joint.observation_loss",
-            _categorical_choices(("mse", "rmse", "mae")),
+            _categorical_choices(_OBSERVATION_LOSS_CHOICES),
         )
 
     overrides["training.learning_rate"] = trial.suggest_float(
@@ -570,7 +575,7 @@ def objective(
 @click.option(
     "--sample-training-loss-objective",
     is_flag=True,
-    help="Include training.loss.joint.observation_loss=mse|rmse|mae in the Optuna search space.",
+    help="Include training.loss.joint.observation_loss in the Optuna search space.",
 )
 def main(
     *,

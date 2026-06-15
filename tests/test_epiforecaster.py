@@ -80,16 +80,30 @@ class TestEpiForecaster:
         # Deaths uses death_flow which doesn't have nowcast
         assert out["pred_deaths"].shape == (batch_size, horizon)
         assert out["S_trajectory"].shape == (batch_size, horizon + 1)
+        assert out["I_trajectory"].shape == (batch_size, horizon + 1)
+        assert out["H_trajectory"].shape == (batch_size, horizon + 1)
+        assert out["R_trajectory"].shape == (batch_size, horizon + 1)
+        assert out["D_trajectory"].shape == (batch_size, horizon + 1)
+        assert out["hospitalization_flow"].shape == (batch_size, horizon)
+        assert out["hospitalization_rate_t"].shape == (batch_size, horizon)
+        assert out["hospital_recovery_t"].shape == (batch_size, horizon)
+        assert out["hospital_mortality_t"].shape == (batch_size, horizon)
 
-        # Check SIR constraints (approximate sum to 1)
-        # Note: S+I+R sum to 1.
-        # But prediction is trajectories.
+        # Check SIRHD constraints.
         # Initial states sum to 1
         assert torch.allclose(
             out["initial_states"].sum(dim=-1),
             torch.ones(batch_size, dtype=torch.float32),
             atol=1e-5,
         )
+        total = (
+            out["S_trajectory"]
+            + out["I_trajectory"]
+            + out["H_trajectory"]
+            + out["R_trajectory"]
+            + out["D_trajectory"]
+        )
+        assert torch.allclose(total, torch.ones_like(total), atol=1e-5)
 
     def test_forward_with_large_population_is_finite(self, basic_config):
         """Large raw population values should remain numerically stable."""
@@ -383,10 +397,6 @@ class TestEpiForecaster:
             I_target=None,
             R_target=None,
             D_target=None,
-            S_target_mask=None,
-            I_target_mask=None,
-            R_target_mask=None,
-            D_target_mask=None,
         )
         batch_data = batch_data.to(model.device)
 
@@ -453,10 +463,6 @@ class TestEpiForecaster:
             I_target=None,
             R_target=None,
             D_target=None,
-            S_target_mask=None,
-            I_target_mask=None,
-            R_target_mask=None,
-            D_target_mask=None,
         )
         batch_data = batch_data.to(model.device)
 
@@ -507,10 +513,6 @@ class TestEpiForecaster:
             I_target=None,
             R_target=None,
             D_target=None,
-            S_target_mask=None,
-            I_target_mask=None,
-            R_target_mask=None,
-            D_target_mask=None,
         )
         batch_data = batch_data.to(accelerator_device)
 

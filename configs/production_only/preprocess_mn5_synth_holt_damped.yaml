@@ -1,0 +1,14 @@
+# Synthetic preprocessing variant for the MN5 synthetic pretraining dataset.
+#
+# The training config `train_epifor_mn5_synth_pretrain.yaml` expects
+# data/processed/synthetic_full_holt_damped.zarr. Keep this config aligned with
+# that path and the full raw synthetic date range.
+
+base_config: "preprocess_mn5_synth.yaml"
+
+end_date: "2021-05-09"
+dataset_name: "synthetic_full_holt_damped"
+vaccination_file: null
+
+smoothing:
+  clinical_method: "holt_damped"

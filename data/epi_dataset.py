@@ -85,12 +85,9 @@ class EpiDatasetItem(TypedDict):
     deaths_target_mask: torch.Tensor  # [H] 1.0 if deaths target is observed
     S_target: torch.Tensor | None  # [H+1] latent susceptible fraction target
     I_target: torch.Tensor | None  # [H+1] latent infected fraction target
+    H_target: torch.Tensor | None  # [H+1] latent hospitalized fraction target
     R_target: torch.Tensor | None  # [H+1] latent recovered fraction target
     D_target: torch.Tensor | None  # [H+1] latent deceased fraction target
-    S_target_mask: torch.Tensor | None  # [H+1] latent susceptible target mask
-    I_target_mask: torch.Tensor | None  # [H+1] latent infected target mask
-    R_target_mask: torch.Tensor | None  # [H+1] latent recovered target mask
-    D_target_mask: torch.Tensor | None  # [H+1] latent deceased target mask
 
 
 class EpiDataset(Dataset):
@@ -220,18 +217,11 @@ class EpiDataset(Dataset):
         self.precomputed_deaths, self.precomputed_deaths_mask = (
             self._precompute_joint_target("deaths", per_100k=True)
         )
-        self.precomputed_S_target, self.precomputed_S_mask = (
-            self._precompute_latent_target("latent_S_true")
-        )
-        self.precomputed_I_target, self.precomputed_I_mask = (
-            self._precompute_latent_target("latent_I_true")
-        )
-        self.precomputed_R_target, self.precomputed_R_mask = (
-            self._precompute_latent_target("latent_R_true")
-        )
-        self.precomputed_D_target, self.precomputed_D_mask = (
-            self._precompute_latent_target("latent_D_true")
-        )
+        self.precomputed_S_target = self._precompute_latent_target("latent_S_true")
+        self.precomputed_I_target = self._precompute_latent_target("latent_I_true")
+        self.precomputed_H_target = self._precompute_latent_target("latent_H_true")
+        self.precomputed_R_target = self._precompute_latent_target("latent_R_true")
+        self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
 
         # Setup mobility preprocessor
         # Data is already log1p-transformed from preprocessing pipeline
@@ -806,23 +796,14 @@ class EpiDataset(Dataset):
         I_target = self._slice_latent_target(
             self.precomputed_I_target, range_end - 1, forecast_targets, target_idx
         )
+        H_target = self._slice_latent_target(
+            self.precomputed_H_target, range_end - 1, forecast_targets, target_idx
+        )
         R_target = self._slice_latent_target(
             self.precomputed_R_target, range_end - 1, forecast_targets, target_idx
         )
         D_target = self._slice_latent_target(
             self.precomputed_D_target, range_end - 1, forecast_targets, target_idx
-        )
-        S_target_mask = self._slice_latent_target(
-            self.precomputed_S_mask, range_end - 1, forecast_targets, target_idx
-        )
-        I_target_mask = self._slice_latent_target(
-            self.precomputed_I_mask, range_end - 1, forecast_targets, target_idx
-        )
-        R_target_mask = self._slice_latent_target(
-            self.precomputed_R_mask, range_end - 1, forecast_targets, target_idx
-        )
-        D_target_mask = self._slice_latent_target(
-            self.precomputed_D_mask, range_end - 1, forecast_targets, target_idx
         )
 
         assert mobility_history.shape == (L, self.num_nodes), (
@@ -966,12 +947,9 @@ class EpiDataset(Dataset):
             "deaths_target_mask": deaths_target_mask,
             "S_target": S_target,
             "I_target": I_target,
+            "H_target": H_target,
             "R_target": R_target,
             "D_target": D_target,
-            "S_target_mask": S_target_mask,
-            "I_target_mask": I_target_mask,
-            "R_target_mask": R_target_mask,
-            "D_target_mask": D_target_mask,
         }
 
     def _resolve_region_name_source(self) -> Path | None:
@@ -1229,25 +1207,28 @@ class EpiDataset(Dataset):
     def _precompute_latent_target(
         self,
         var_name: str,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Precompute latent trajectory supervision target in fraction space."""
+    ) -> torch.Tensor | None:
+        """Precompute dense synthetic latent trajectory target in fraction space."""
         ds = self._dataset
         if ds is None:
             raise RuntimeError(
                 "Dataset not loaded. Call load_canonical_dataset() first."
             )
 
-        values, mask = self._load_target_values_and_mask(var_name)
-        if values is None or mask is None:
-            logger.info("Latent target '%s' not found in dataset; disabling it.", var_name)
-            return None, None
+        if var_name not in ds.data_vars:
+            logger.info(
+                "Latent target '%s' not found in dataset; disabling it.", var_name
+            )
+            return None
 
-        mask = (mask > 0) & np.isfinite(values)
+        da = ds[var_name]
+        if da.ndim == 3:
+            da = da.squeeze(drop=True)
+        da = da.transpose(TEMPORAL_COORD, REGION_COORD)
+        values = da.values.astype(np.float32)
+
         values = np.where(np.isfinite(values), values, np.nan)
-        return (
-            torch.from_numpy(values.astype(np.float16)).to(torch.float16),
-            torch.from_numpy(mask.astype(np.float16)).to(torch.float16),
-        )
+        return torch.from_numpy(values.astype(np.float16)).to(torch.float16)
 
     @staticmethod
     def _slice_latent_target(

@@ -59,6 +59,10 @@ LATENT_PLOT_SPECS: dict[str, dict[str, str]] = {
         "model_output": "I_trajectory",
         "label": "Latent I",
     },
+    "latent_h": {
+        "model_output": "H_trajectory",
+        "label": "Latent H",
+    },
     "latent_r": {
         "model_output": "R_trajectory",
         "label": "Latent R",
@@ -1021,7 +1025,7 @@ def make_joint_latent_forecast_figure(
     context_post: int = 30,
     latent_names: list[str] | None = None,
 ):
-    """Build a single figure containing all available SIRD latent trajectories."""
+    """Build a single figure containing all available SIRHD latent trajectories."""
     if isinstance(samples, list):
         base_groups = {"All": samples}
     else:
@@ -1293,7 +1297,7 @@ def generate_forecast_plots(
         log_dir: Optional W&B run directory for eval metrics
         target_names: List of targets to plot (default: all)
         wandb_prefix: Prefix for W&B logged images
-        include_sird_latents: Save/log an additional joint SIRD latent forecast figure
+        include_sird_latents: Save/log an additional joint SIRHD latent forecast figure
 
     Returns:
         Dict with figure, all_samples, selected_nodes, node_groups, window_groups
@@ -1422,10 +1426,10 @@ def generate_forecast_plots(
     latent_output_path: Path | None = None
     if latent_fig is not None and output_path is not None:
         latent_output_path = output_path.with_name(
-            f"{output_path.stem}_sird_latents{output_path.suffix}"
+            f"{output_path.stem}_sirhd_latents{output_path.suffix}"
         )
         latent_fig.savefig(latent_output_path, dpi=200, bbox_inches="tight")
-        logger.info(f"[plot] Saved SIRD latent figure to: {latent_output_path}")
+        logger.info(f"[plot] Saved SIRHD latent figure to: {latent_output_path}")
 
     separate_figures: dict[str, Any] = {}
     if output_path is not None:
@@ -1453,7 +1457,7 @@ def generate_forecast_plots(
             if fig is not None:
                 log_payload[f"{wandb_prefix}/joint"] = wandb.Image(fig)
             if latent_fig is not None:
-                log_payload[f"{wandb_prefix}/sird_latents"] = wandb.Image(latent_fig)
+                log_payload[f"{wandb_prefix}/sirhd_latents"] = wandb.Image(latent_fig)
             if log_payload:
                 wandb.log(log_payload, step=0)
 

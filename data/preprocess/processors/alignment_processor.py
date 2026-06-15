@@ -86,9 +86,10 @@ class AlignmentProcessor:
             if len(source_dates) != len(target_values) or not np.array_equal(
                 source_dates, target_values
             ):
-                if allow_subset_in_strict and np.isin(
-                    source_dates, target_values
-                ).all():
+                if (
+                    allow_subset_in_strict
+                    and np.isin(source_dates, target_values).all()
+                ):
                     print(f"Expanding {label} dates to target dates (preserving NaNs)")
                     return data.reindex({TEMPORAL_COORD: target_dates})
                 raise AssertionError(f"{label} dates are not the same")
@@ -343,18 +344,14 @@ class AlignmentProcessor:
         else:
             vaccination_final = None
 
-        # Align latent SIRD targets if provided (synthetic-only path)
+        # Align dense latent SIRHD targets if provided (synthetic-only path).
+        # Synthetic latents are complete by contract; real data has no latents.
         if latent_sird_data is not None:
             latent_sird_final = latent_sird_data.reindex({REGION_COORD: common_regions})
             for var_name in list(latent_sird_final.data_vars):
-                if var_name.endswith("_mask"):
-                    latent_sird_final[var_name] = latent_sird_final[var_name].fillna(
-                        False
-                    )
-                else:
-                    latent_sird_final[var_name] = latent_sird_final[var_name].where(
-                        np.isfinite(latent_sird_final[var_name])
-                    )
+                latent_sird_final[var_name] = latent_sird_final[var_name].where(
+                    np.isfinite(latent_sird_final[var_name])
+                )
         else:
             latent_sird_final = None
 

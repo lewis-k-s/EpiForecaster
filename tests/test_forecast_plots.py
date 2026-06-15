@@ -77,10 +77,6 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
         I_target=None,
         R_target=None,
         D_target=None,
-        S_target_mask=None,
-        I_target_mask=None,
-        R_target_mask=None,
-        D_target_mask=None,
     )
 
     class _FakeDataLoader:
@@ -254,10 +250,6 @@ def test_collect_forecast_samples_for_window_specs_uses_exact_window(
         I_target=None,
         R_target=None,
         D_target=None,
-        S_target_mask=None,
-        I_target_mask=None,
-        R_target_mask=None,
-        D_target_mask=None,
     )
 
     class _FakeDataLoader:
@@ -371,7 +363,7 @@ def test_make_forecast_figure_supports_shared_labels() -> None:
     )
 
 
-def test_make_joint_latent_forecast_figure_plots_sird_rows() -> None:
+def test_make_joint_latent_forecast_figure_plots_sirhd_rows() -> None:
     sample = {
         "node_id": 1,
         "node_label": "Region 1",
@@ -401,6 +393,13 @@ def test_make_joint_latent_forecast_figure_plots_sird_rows() -> None:
                 "history": [],
                 "window_mae": None,
             },
+            "latent_h": {
+                "actual_context": [float("nan"), float("nan"), 0.03, 0.04],
+                "prediction": [0.03, 0.04],
+                "target": [float("nan"), float("nan")],
+                "history": [],
+                "window_mae": None,
+            },
         },
     }
 
@@ -414,3 +413,4 @@ def test_make_joint_latent_forecast_figure_plots_sird_rows() -> None:
     ylabels = [ax.get_ylabel() for ax in fig.axes if ax.get_ylabel()]
     assert any("Latent S" in label for label in ylabels)
     assert any("Latent I" in label for label in ylabels)
+    assert any("Latent H" in label for label in ylabels)

@@ -27,8 +27,8 @@ def test_physics_residual_not_trivially_zero_when_constraints_bind():
     assert residual.item() > 1e-3
 
 
-def test_joint_inference_latent_loss_zero_when_all_latent_masks_missing():
-    """Latent SIRD supervision must not apply where latent masks are all missing."""
+def test_joint_inference_latent_loss_zero_when_latents_absent():
+    """Latent SIRHD supervision is absent when no latent targets are provided."""
     loss_fn = JointInferenceLoss(w_sird_supervision=1.0)
 
     model_outputs = {
@@ -46,18 +46,14 @@ def test_joint_inference_latent_loss_zero_when_all_latent_masks_missing():
         "hosp": None,
         "cases": None,
         "deaths": None,
-        "S_target": torch.ones(2, 3),
-        "I_target": torch.ones(2, 3),
-        "R_target": torch.ones(2, 3),
-        "D_target": torch.ones(2, 3),
+        "S_target": None,
+        "I_target": None,
+        "R_target": None,
+        "D_target": None,
         "ww_mask": None,
         "hosp_mask": None,
         "cases_mask": None,
         "deaths_mask": None,
-        "S_target_mask": torch.zeros(2, 3),
-        "I_target_mask": torch.zeros(2, 3),
-        "R_target_mask": torch.zeros(2, 3),
-        "D_target_mask": torch.zeros(2, 3),
     }
 
     loss = loss_fn(model_outputs, targets)
@@ -86,8 +82,8 @@ def test_get_loss_from_config_passes_observation_loss() -> None:
     assert criterion.observation_loss == "mae"
 
 
-def test_joint_inference_latent_loss_respects_latent_mask():
-    """Latent SIRD supervision should average only masked-in positions."""
+def test_joint_inference_latent_loss_uses_dense_finite_targets():
+    """Synthetic latent supervision is dense and skips only non-finite targets."""
     loss_fn = JointInferenceLoss(w_sird_supervision=1.0)
 
     S_prediction = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
@@ -106,7 +102,9 @@ def test_joint_inference_latent_loss_respects_latent_mask():
         "hosp": None,
         "cases": None,
         "deaths": None,
-        "S_target": torch.zeros_like(S_prediction),
+        "S_target": torch.tensor(
+            [[0.0, float("nan"), 0.0], [float("nan"), 0.0, float("nan")]]
+        ),
         "I_target": None,
         "R_target": None,
         "D_target": None,
@@ -114,15 +112,48 @@ def test_joint_inference_latent_loss_respects_latent_mask():
         "hosp_mask": None,
         "cases_mask": None,
         "deaths_mask": None,
-        "S_target_mask": torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
-        "I_target_mask": None,
-        "R_target_mask": None,
-        "D_target_mask": None,
     }
 
-    # Expected: mean over selected positions -> (1^2 + 5^2) / 2 = 13.
+    # Expected: mean over finite positions -> (1^2 + 3^2 + 5^2) / 3.
     loss = loss_fn(model_outputs, targets)
-    assert torch.isclose(loss, torch.tensor(13.0))
+    assert torch.isclose(loss, torch.tensor(35.0 / 3.0))
+
+
+def test_joint_inference_latent_h_loss_uses_dense_target():
+    """Latent H supervision should use H targets when present."""
+    loss_fn = JointInferenceLoss(w_sird_supervision=1.0)
+
+    H_prediction = torch.tensor([[0.2, 0.4, 0.6]])
+    model_outputs = {
+        "pred_ww": torch.zeros_like(H_prediction),
+        "pred_hosp": torch.zeros_like(H_prediction),
+        "pred_cases": torch.zeros_like(H_prediction),
+        "pred_deaths": torch.zeros_like(H_prediction),
+        "S_trajectory": torch.zeros_like(H_prediction),
+        "I_trajectory": torch.zeros_like(H_prediction),
+        "H_trajectory": H_prediction,
+        "R_trajectory": torch.zeros_like(H_prediction),
+        "D_trajectory": torch.zeros_like(H_prediction),
+    }
+    targets = {
+        "ww": None,
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "S_target": None,
+        "I_target": None,
+        "H_target": torch.zeros_like(H_prediction),
+        "R_target": None,
+        "D_target": None,
+        "ww_mask": None,
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    # Expected: mean over all finite positions -> (0.2^2 + 0.4^2 + 0.6^2) / 3.
+    loss = loss_fn(model_outputs, targets)
+    assert torch.isclose(loss, torch.tensor((0.04 + 0.16 + 0.36) / 3.0))
 
 
 def test_joint_inference_loss_all_masked_keeps_grad_graph():
@@ -317,10 +348,6 @@ def test_joint_inference_compute_components_train_matches_default() -> None:
         "hosp_mask": torch.tensor([[1.0]]),
         "cases_mask": torch.tensor([[1.0]]),
         "deaths_mask": torch.tensor([[1.0]]),
-        "S_target_mask": torch.tensor([[1.0]]),
-        "I_target_mask": None,
-        "R_target_mask": None,
-        "D_target_mask": None,
     }
 
     components_default = loss_fn.compute_components(model_outputs, targets)
@@ -353,7 +380,9 @@ def test_joint_inference_obs_active_mask_respects_min_observed() -> None:
         "hosp": None,
         "cases": None,
         "deaths": None,
-        "ww_mask": torch.tensor([[1.0, 0.0]]),  # only one observed point (< min_observed)
+        "ww_mask": torch.tensor(
+            [[1.0, 0.0]]
+        ),  # only one observed point (< min_observed)
         "hosp_mask": None,
         "cases_mask": None,
         "deaths_mask": None,

@@ -76,7 +76,7 @@ _TARGET_TO_PLOT_NAME = {
     "deaths": "deaths",
 }
 _TARGET_TO_LATENT_OVERLAY = {
-    "hospitalizations": ("latent_i", "Latent I"),
+    "hospitalizations": ("latent_h", "Latent H"),
     "wastewater": ("latent_i", "Latent I"),
     "cases": ("latent_i", "Latent I"),
     "deaths": ("latent_d", "Latent D"),
@@ -197,7 +197,9 @@ def _load_baseline_delta_metrics(path: Path) -> pd.DataFrame:
         return df
 
     ordered_targets = [target for target in TARGET_ORDER if target in set(df["target"])]
-    df["target"] = pd.Categorical(df["target"], categories=ordered_targets, ordered=True)
+    df["target"] = pd.Categorical(
+        df["target"], categories=ordered_targets, ordered=True
+    )
     df["metric"] = pd.Categorical(
         df["metric"],
         categories=list(_BASELINE_COMPARISON_METRICS.keys()),
@@ -282,7 +284,7 @@ def _compute_canonical_sparsity(
         dataset.close()
 
 
-def _save_scatter_with_trend(
+def _save_scatter(
     *,
     plot_df: pd.DataFrame,
     x_col: str,
@@ -302,20 +304,78 @@ def _save_scatter_with_trend(
         ax=ax,
         legend=False,
     )
-    if len(plot_df) >= 2:
-        sns.regplot(
-            data=plot_df,
-            x=x_col,
-            y="mae",
-            scatter=False,
-            color="#222222",
-            line_kws={"linestyle": "--", "linewidth": 1.5},
-            ax=ax,
-        )
     ax.set_title(title)
     ax.set_xlabel(x_label)
     ax.set_ylabel("MAE")
     plt.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def _save_observation_density_error_panel(
+    *,
+    plot_df: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    targets = list(_ordered_targets(plot_df["target"].astype(str)))
+    if not targets:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, "No density/error data available", ha="center", va="center")
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
+
+    n_cols = min(2, len(targets))
+    n_rows = int(np.ceil(len(targets) / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(10.5, 5.8),
+        gridspec_kw={"wspace": 0.28, "hspace": 0.42},
+        squeeze=False,
+    )
+    for idx, (axis, target) in enumerate(zip(axes.flat, targets, strict=False)):
+        target_df = plot_df[plot_df["target"].astype(str) == target]
+        x_values = pd.to_numeric(
+            target_df["observation_density_pct"], errors="coerce"
+        ).dropna()
+        sns.scatterplot(
+            data=target_df,
+            x="observation_density_pct",
+            y="mae",
+            size="population",
+            sizes=(25, 180),
+            alpha=0.75,
+            color="#4C72B0",
+            ax=axis,
+            legend=False,
+        )
+        axis.set_title(_format_target_label(target))
+        if x_values.empty:
+            axis.set_xlim(0, 100)
+        else:
+            x_min = float(x_values.min())
+            x_max = float(x_values.max())
+            x_range = max(x_max - x_min, 1.0)
+            x_pad = max(x_range * 0.08, 1.0)
+            axis.set_xlim(max(0.0, x_min - x_pad), min(100.0, x_max + x_pad))
+        axis.set_xlabel("")
+        axis.set_ylabel("Full-model MAE" if idx % n_cols == 0 else "")
+
+    for axis in axes.flat[len(targets) :]:
+        axis.set_axis_off()
+
+    fig.supxlabel("Direct observation density (%)", y=0.04)
+    fig.subplots_adjust(
+        left=0.07,
+        right=0.99,
+        top=0.92,
+        bottom=0.18,
+        wspace=0.28,
+        hspace=0.42,
+    )
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     return output_path
@@ -368,7 +428,9 @@ def _select_representative_window_specs_for_target(
     if granular_df.empty:
         return {}
 
-    target_granular = granular_df[granular_df["target"].astype(str) == target_name].copy()
+    target_granular = granular_df[
+        granular_df["target"].astype(str) == target_name
+    ].copy()
     if target_granular.empty:
         return {}
 
@@ -390,7 +452,9 @@ def _select_representative_window_specs_for_target(
             continue
         median_mae = float(maes.median())
         ranked = node_group.assign(
-            median_distance=(pd.to_numeric(node_group["mae"], errors="coerce") - median_mae).abs()
+            median_distance=(
+                pd.to_numeric(node_group["mae"], errors="coerce") - median_mae
+            ).abs()
         ).sort_values(
             by=["median_distance", "observed_points", "mae", "window_start"],
             ascending=[True, False, True, True],
@@ -449,7 +513,8 @@ def _group_samples_by_region_quartile(
         target_names=[plot_target],
     )
     samples_by_key = {
-        (int(sample["node_id"]), int(sample["window_start"])): sample for sample in samples
+        (int(sample["node_id"]), int(sample["window_start"])): sample
+        for sample in samples
     }
     grouped_samples: dict[str, list[dict[str, Any]]] = {}
     for group_name, specs in grouped_specs.items():
@@ -481,7 +546,9 @@ def _select_history_window_specs_for_target(
     if granular_df.empty:
         return {}
 
-    target_granular = granular_df[granular_df["target"].astype(str) == target_name].copy()
+    target_granular = granular_df[
+        granular_df["target"].astype(str) == target_name
+    ].copy()
     if target_granular.empty:
         return {}
 
@@ -523,9 +590,9 @@ def _select_history_window_specs_for_target(
             if len(spaced_rows) > forecasts_per_region:
                 keep_idx = np.round(
                     np.linspace(
-                    0,
-                    len(spaced_rows) - 1,
-                    num=forecasts_per_region,
+                        0,
+                        len(spaced_rows) - 1,
+                        num=forecasts_per_region,
                     )
                 ).astype(int)
                 spaced_rows = [spaced_rows[idx] for idx in keep_idx]
@@ -602,7 +669,8 @@ def _render_forecast_history_quartile_plots(
             target_names=[plot_target],
         )
         samples_by_key = {
-            (int(sample["node_id"]), int(sample["window_start"])): sample for sample in samples
+            (int(sample["node_id"]), int(sample["window_start"])): sample
+            for sample in samples
         }
         grouped_samples: dict[str, list[dict[str, Any]]] = {}
         for group_name, specs in grouped_specs.items():
@@ -650,7 +718,10 @@ def _select_joint_window_specs_by_quartile(
         .agg(
             mae=("abs_error", "mean"),
             observed_points=("abs_error", "size"),
-            observed_targets=("target", lambda vals: tuple(sorted(set(vals.astype(str))))),
+            observed_targets=(
+                "target",
+                lambda vals: tuple(sorted(set(vals.astype(str)))),
+            ),
         )
         .reset_index()
     )
@@ -719,7 +790,8 @@ def _render_joint_latent_quartile_plots(
         target_names=["cases"],
     )
     samples_by_key = {
-        (int(sample["node_id"]), int(sample["window_start"])): sample for sample in samples
+        (int(sample["node_id"]), int(sample["window_start"])): sample
+        for sample in samples
     }
     grouped_samples: dict[str, list[dict[str, Any]]] = {}
     for group_name, specs in grouped_specs.items():
@@ -742,6 +814,7 @@ def _render_joint_latent_quartile_plots(
     latent_specs = {
         "latent_s": "Latent S",
         "latent_i": "Latent I",
+        "latent_h": "Latent H",
         "latent_r": "Latent R",
         "latent_d": "Latent D",
     }
@@ -762,7 +835,9 @@ def _render_joint_latent_quartile_plots(
         )
         if fig is None:
             continue
-        output_path = output_dir / f"forecast_examples_quartiles_joint_{latent_name}.png"
+        output_path = (
+            output_dir / f"forecast_examples_quartiles_joint_{latent_name}.png"
+        )
         fig.savefig(output_path, bbox_inches="tight")
         plt.close(fig)
         artifacts[f"forecast_examples_quartiles_joint_{latent_name}"] = output_path
@@ -847,7 +922,9 @@ def render_baseline_delta_plots(
 
     delta_df = _load_baseline_delta_metrics(csv_path)
     if delta_df.empty:
-        logger.info("Skipping baseline delta plots because %s has no MAE/R² rows", csv_path)
+        logger.info(
+            "Skipping baseline delta plots because %s has no MAE/R² rows", csv_path
+        )
         return {}
 
     split_prefix = csv_path.stem.removesuffix("_baseline_deltas")
@@ -880,16 +957,18 @@ def render_baseline_delta_plots(
         )
         model_rows["series"] = "Our model"
 
-        baseline_rows = metric_df[["target", "baseline_model", "baseline_value"]].rename(
-            columns={"baseline_value": "value"}
-        )
-        baseline_rows["series"] = baseline_rows["baseline_model"].astype(str).map(
-            baseline_labels
+        baseline_rows = metric_df[
+            ["target", "baseline_model", "baseline_value"]
+        ].rename(columns={"baseline_value": "value"})
+        baseline_rows["series"] = (
+            baseline_rows["baseline_model"].astype(str).map(baseline_labels)
         )
         baseline_rows = baseline_rows.drop(columns=["baseline_model"])
 
         plot_df = pd.concat([model_rows, baseline_rows], ignore_index=True)
-        plot_df["target_label"] = plot_df["target"].astype(str).map(_format_target_label)
+        plot_df["target_label"] = (
+            plot_df["target"].astype(str).map(_format_target_label)
+        )
         target_order = [
             _format_target_label(target)
             for target in _ordered_targets(metric_df["target"].astype(str))
@@ -906,8 +985,7 @@ def render_baseline_delta_plots(
             palette=palette,
             ax=axis,
         )
-        title_suffix = "(lower is better)" if metric_key == "mae" else "(higher is better)"
-        axis.set_title(f"{metric_label} {title_suffix}")
+        axis.set_title(metric_label)
         axis.set_xlabel("Target")
         axis.set_ylabel(metric_label)
         if metric_key == "r2":
@@ -928,7 +1006,9 @@ def render_baseline_delta_plots(
                 frameon=True,
             )
         plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
-        output_path = output_dir / f"{split_prefix}_baseline_comparison_{metric_key}.png"
+        output_path = (
+            output_dir / f"{split_prefix}_baseline_comparison_{metric_key}.png"
+        )
         fig.savefig(output_path, bbox_inches="tight")
         plt.close(fig)
         artifacts[f"baseline_comparison_{metric_key}"] = output_path
@@ -948,14 +1028,20 @@ def render_eval_per_head_plots(
     csv_path = Path(per_head_node_metrics_csv)
     output_dir = Path(output_dir) if output_dir is not None else csv_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
+    if forecast_window not in {"metrics", "last", "history", "both"}:
+        raise ValueError(
+            "forecast_window must be one of {'metrics', 'last', 'history', 'both'}"
+        )
 
     metrics_df = _load_per_head_node_metrics(csv_path)
     sidecar = _load_sidecar(csv_path)
-    granular_csv_path = _resolve_granular_metrics_csv_path(
-        per_head_node_metrics_csv=csv_path,
-        sidecar=sidecar,
-        granular_metrics_csv=granular_metrics_csv,
-    )
+    granular_csv_path = None
+    if forecast_window != "metrics":
+        granular_csv_path = _resolve_granular_metrics_csv_path(
+            per_head_node_metrics_csv=csv_path,
+            sidecar=sidecar,
+            granular_metrics_csv=granular_metrics_csv,
+        )
     dataset_path = Path(sidecar["dataset_path"])
     sparsity_df = _compute_canonical_sparsity(
         dataset_path=dataset_path,
@@ -968,24 +1054,33 @@ def render_eval_per_head_plots(
         validate="many_to_one",
     )
     joined["log10_population"] = np.log10(joined["population"].clip(lower=1.0))
+    joined["observation_density_pct"] = (100.0 - joined["sparsity_pct"]).clip(
+        lower=0.0,
+        upper=100.0,
+    )
     granular_df = pd.DataFrame(columns=GRANULAR_METRICS_REQUIRED_COLUMNS)
-    if granular_csv_path is None:
-        logger.warning(
-            "Skipping representative per-head forecast plots because no granular metrics CSV was found near %s",
-            csv_path,
-        )
-    elif not granular_csv_path.exists():
-        logger.warning(
-            "Skipping representative per-head forecast plots because granular metrics CSV does not exist: %s",
-            granular_csv_path,
-        )
-    else:
-        granular_df = _load_granular_metrics(
-            path=granular_csv_path,
-            split=str(sidecar.get("split", "test")),
-        )
+    if forecast_window != "metrics":
+        if granular_csv_path is None:
+            logger.warning(
+                "Skipping representative per-head forecast plots because no granular metrics CSV was found near %s",
+                csv_path,
+            )
+        elif not granular_csv_path.exists():
+            logger.warning(
+                "Skipping representative per-head forecast plots because granular metrics CSV does not exist: %s",
+                granular_csv_path,
+            )
+        else:
+            granular_df = _load_granular_metrics(
+                path=granular_csv_path,
+                split=str(sidecar.get("split", "test")),
+            )
 
     artifacts: dict[str, Path] = {}
+    artifacts["sparsity_vs_model_error"] = _save_observation_density_error_panel(
+        plot_df=joined.dropna(subset=["observation_density_pct", "mae"]),
+        output_path=output_dir / "sparsity_vs_model_error.png",
+    )
     for target in _ordered_targets(joined["target"].astype(str)):
         target_df = joined[joined["target"].astype(str) == target].copy()
         if target_df.empty:
@@ -993,25 +1088,21 @@ def render_eval_per_head_plots(
         target_label = _format_target_label(target)
         population_path = output_dir / f"perf_vs_population_{target}.png"
         sparsity_path = output_dir / f"perf_vs_sparsity_{target}.png"
-        artifacts[f"perf_vs_population_{target}"] = _save_scatter_with_trend(
+        artifacts[f"perf_vs_population_{target}"] = _save_scatter(
             plot_df=target_df.dropna(subset=["log10_population", "mae"]),
             x_col="log10_population",
             x_label="log10(Population)",
             title=f"{target_label}: MAE vs Population",
             output_path=population_path,
         )
-        artifacts[f"perf_vs_sparsity_{target}"] = _save_scatter_with_trend(
-            plot_df=target_df.dropna(subset=["sparsity_pct", "mae"]),
-            x_col="sparsity_pct",
-            x_label="Input sparsity (%)",
-            title=f"{target_label}: MAE vs Input Sparsity",
+        artifacts[f"perf_vs_sparsity_{target}"] = _save_scatter(
+            plot_df=target_df.dropna(subset=["observation_density_pct", "mae"]),
+            x_col="observation_density_pct",
+            x_label="Direct observation density (%)",
+            title=f"{target_label}: MAE vs Direct Observation Density",
             output_path=sparsity_path,
         )
 
-    if forecast_window not in {"last", "history", "both"}:
-        raise ValueError(
-            "forecast_window must be one of {'last', 'history', 'both'}"
-        )
     if forecast_window in {"last", "both"}:
         artifacts.update(
             _render_forecast_quartile_plots(

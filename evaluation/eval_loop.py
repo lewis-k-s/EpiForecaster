@@ -232,6 +232,7 @@ def evaluate_loader(
     loss_sird_supervision_weighted_sum = torch.tensor(0.0, device=device)
     loss_latent_s_sum = torch.tensor(0.0, device=device)
     loss_latent_i_sum = torch.tensor(0.0, device=device)
+    loss_latent_h_sum = torch.tensor(0.0, device=device)
     loss_latent_r_sum = torch.tensor(0.0, device=device)
     loss_latent_d_sum = torch.tensor(0.0, device=device)
 
@@ -333,6 +334,7 @@ def evaluate_loader(
                 loss_sird_supervision_sum += components["sird_supervision"].detach()
                 loss_latent_s_sum += components["latent_s"].detach()
                 loss_latent_i_sum += components["latent_i"].detach()
+                loss_latent_h_sum += components["latent_h"].detach()
                 loss_latent_r_sum += components["latent_r"].detach()
                 loss_latent_d_sum += components["latent_d"].detach()
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
@@ -695,6 +697,7 @@ def evaluate_loader(
         ).item(),
         "loss_latent_s": (loss_latent_s_sum / max(1, processed_batches)).item(),
         "loss_latent_i": (loss_latent_i_sum / max(1, processed_batches)).item(),
+        "loss_latent_h": (loss_latent_h_sum / max(1, processed_batches)).item(),
         "loss_latent_r": (loss_latent_r_sum / max(1, processed_batches)).item(),
         "loss_latent_d": (loss_latent_d_sum / max(1, processed_batches)).item(),
         "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
