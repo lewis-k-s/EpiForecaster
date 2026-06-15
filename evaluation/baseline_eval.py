@@ -445,8 +445,12 @@ def _future_temporal_covariates_from_batch(
     history_length = int(getattr(batch_data, "hosp_hist").shape[1])
     covariates = np.asarray(temporal_covariates, dtype=np.float64)
     if covariates.ndim != 2:
-        raise ValueError(f"Expected temporal covariates to be 2D, got {covariates.shape}")
-    future = np.zeros((len(window_starts), horizon, covariates.shape[1]), dtype=np.float64)
+        raise ValueError(
+            f"Expected temporal covariates to be 2D, got {covariates.shape}"
+        )
+    future = np.zeros(
+        (len(window_starts), horizon, covariates.shape[1]), dtype=np.float64
+    )
     for batch_index, window_start in enumerate(window_starts):
         start = int(window_start) + history_length
         end = start + horizon
@@ -613,7 +617,9 @@ def compare_model_metrics_against_baselines(
                     }
                 )
             for metric_name in ("mae", "rmse"):
-                lo_baseline_value = lo_baseline_by_target_metric.get((target, metric_name))
+                lo_baseline_value = lo_baseline_by_target_metric.get(
+                    (target, metric_name)
+                )
                 model_value = model_target_metrics[target].get(metric_name)
                 if lo_baseline_value is None or model_value is None:
                     continue
@@ -623,9 +629,9 @@ def compare_model_metrics_against_baselines(
                 )
                 if skill_value is None:
                     continue
-                eval_metrics[_build_skill_metric_key(target=target, metric_name=metric_name)] = (
-                    skill_value
-                )
+                eval_metrics[
+                    _build_skill_metric_key(target=target, metric_name=metric_name)
+                ] = skill_value
                 if model_name == "last_observed":
                     rows.append(
                         {
@@ -737,7 +743,9 @@ def _extract_same_slice_history(
 
     history_np = np.asarray(history.detach().cpu().numpy(), dtype=np.float64)
     if history_np.ndim != 3 or history_np.shape[2] < 2:
-        raise ValueError(f"Unexpected history shape for {spec.canonical_name}: {history_np.shape}")
+        raise ValueError(
+            f"Unexpected history shape for {spec.canonical_name}: {history_np.shape}"
+        )
     history_values = history_np[:, :, 0]
     history_mask = (history_np[:, :, 1] > 0).astype(np.float64)
     return history_values, history_mask
@@ -780,10 +788,16 @@ def _build_same_slice_granular_rows(
 ) -> list[dict[str, Any]]:
     pred = np.asarray(predictions, dtype=np.float64)
     target = (
-        torch.nan_to_num(targets.detach().float(), nan=0.0).cpu().numpy().astype(np.float64)
+        torch.nan_to_num(targets.detach().float(), nan=0.0)
+        .cpu()
+        .numpy()
+        .astype(np.float64)
     )
     observed_weights = (
-        torch.nan_to_num(weights.detach().float(), nan=0.0).cpu().numpy().astype(np.float64)
+        torch.nan_to_num(weights.detach().float(), nan=0.0)
+        .cpu()
+        .numpy()
+        .astype(np.float64)
     )
     with np.errstate(over="ignore", invalid="ignore"):
         error = pred - target
@@ -864,7 +878,9 @@ def _build_same_slice_granular_rows(
                     "window_start_date": window_start_date,
                     "horizon": horizon_index + 1,
                     "target_index": target_index,
-                    "target_date": _format_temporal_coord(temporal_coords, target_index),
+                    "target_date": _format_temporal_coord(
+                        temporal_coords, target_index
+                    ),
                     "observed": target_value,
                     "abs_error": abs_error_value,
                     "sq_error": sq_error_value,
@@ -1083,9 +1099,7 @@ def run_same_slice_baseline_evaluation(
                     )
                     selected_models = [pred.model_name for pred in target_results]
                     fit_statuses = [pred.fit_status for pred in target_results]
-                    fallback_reasons = [
-                        pred.fallback_reason for pred in target_results
-                    ]
+                    fallback_reasons = [pred.fallback_reason for pred in target_results]
                     completed_series += len(target_results)
                     failure_rows.extend(
                         _build_baseline_failure_rows(
@@ -1145,9 +1159,7 @@ def run_same_slice_baseline_evaluation(
                     )
                     selected_models = [pred.model_name for pred in target_results]
                     fit_statuses = [pred.fit_status for pred in target_results]
-                    fallback_reasons = [
-                        pred.fallback_reason for pred in target_results
-                    ]
+                    fallback_reasons = [pred.fallback_reason for pred in target_results]
                     completed_series += len(target_results)
                     failure_rows.extend(
                         _build_baseline_failure_rows(
@@ -1200,7 +1212,9 @@ def run_same_slice_baseline_evaluation(
                     spec=spec,
                 )
                 batch_size = history_values.shape[0]
-                predictions = np.zeros_like(target_tensor.detach().cpu().numpy(), dtype=np.float64)
+                predictions = np.zeros_like(
+                    target_tensor.detach().cpu().numpy(), dtype=np.float64
+                )
                 selected_models: list[str] = []
                 fit_statuses: list[str] = []
                 fallback_reasons: list[str] = []
@@ -1258,9 +1272,7 @@ def run_same_slice_baseline_evaluation(
             or (now - last_progress_log) >= _BASELINE_PROGRESS_LOG_TIME_INTERVAL_SEC
         )
         if should_log_progress:
-            batch_suffix = (
-                f"/{total_batches}" if total_batches is not None else ""
-            )
+            batch_suffix = f"/{total_batches}" if total_batches is not None else ""
             logger.info(
                 "[baseline_eval] Progress: batches=%d%s series=%d rows=%d current_model=%s current_target=%s elapsed=%.2fs last_batch=%.2fs",
                 processed_batches,
