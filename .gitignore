@@ -73,6 +73,9 @@ Thumbs.db
 .uv-cache/
 .cache/uv/
 
+# Scratch
+tmp/
+
 # agents
 .claude/
 
