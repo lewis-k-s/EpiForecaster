@@ -2,7 +2,7 @@ import logging
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import numpy as np
 import torch
@@ -36,6 +36,7 @@ from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 logger = logging.getLogger(__name__)
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
 _SPATIAL_KNN_CRS = "EPSG:25831"
+_STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
 
 StaticCovariates = dict[str, torch.Tensor]
 
@@ -315,6 +316,7 @@ class EpiDataset(Dataset):
 
         # Cache for adjacency matrices keyed by time step (CPU tensors only)
         self._adjacency_cache: dict[int, torch.Tensor] = {}
+        self.static_graph_adjacency: torch.Tensor | None = None
         self.spatial_knn_adjacency: torch.Tensor | None = None
 
         # Cache for global-to-local node index mapping keyed by time step
@@ -392,8 +394,8 @@ class EpiDataset(Dataset):
                 config=clinical_config,
                 var_name="vaccination_rate",
             )
-            self.precomputed_vaccination_hist = vaccination_preprocessor.preprocess_dataset(
-                self._dataset
+            self.precomputed_vaccination_hist = (
+                vaccination_preprocessor.preprocess_dataset(self._dataset)
             )
             self.precomputed_vaccination_hist[..., 0] = _replace_non_finite(
                 self.precomputed_vaccination_hist[..., 0]
@@ -490,8 +492,13 @@ class EpiDataset(Dataset):
             self._region_embedding_index_by_id = (
                 self._region_embedding_store.region_id_to_index
             )
-        if self.config.model.graph_adjacency_source == "spatial_knn":
-            self.spatial_knn_adjacency = self._build_spatial_knn_adjacency()
+        adjacency_source = self.config.model.graph_adjacency_source
+        if adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            self.static_graph_adjacency = self._build_static_graph_adjacency(
+                adjacency_source
+            )
+            if adjacency_source == "spatial_knn":
+                self.spatial_knn_adjacency = self.static_graph_adjacency
 
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
         # This moves expensive matrix operations from per-sample to startup time
@@ -997,12 +1004,22 @@ class EpiDataset(Dataset):
             mapping[str(region_id)] = str(region_name)
         return mapping
 
-    def _build_spatial_knn_adjacency(self) -> torch.Tensor:
-        """Build a static symmetric binary KNN graph from municipality centroids."""
+    def _build_static_graph_adjacency(self, adjacency_source: str) -> torch.Tensor:
+        if adjacency_source == "spatial_knn":
+            return self._build_spatial_knn_adjacency()
+        if adjacency_source == "spatial_queen":
+            return self._build_spatial_queen_adjacency()
+        raise ValueError(
+            f"Unsupported static graph adjacency source: {adjacency_source}"
+        )
+
+    def _load_ordered_regions_for_static_graph(
+        self, adjacency_source: str
+    ) -> tuple[Path, list[str], Any]:
         region_source = self._resolve_region_name_source()
         if region_source is None:
             raise ValueError(
-                "graph_adjacency_source='spatial_knn' requires a valid GeoJSON in "
+                f"graph_adjacency_source={adjacency_source!r} requires a valid GeoJSON in "
                 "data.regions_data_path or data/files/geo/fl_municipios_catalonia.geojson"
             )
 
@@ -1010,7 +1027,7 @@ class EpiDataset(Dataset):
             import geopandas as gpd
         except ImportError as exc:
             raise ImportError(
-                "geopandas is required for graph_adjacency_source='spatial_knn'"
+                f"geopandas is required for graph_adjacency_source={adjacency_source!r}"
             ) from exc
 
         regions = gpd.read_file(region_source)
@@ -1022,15 +1039,25 @@ class EpiDataset(Dataset):
         regions = regions.drop_duplicates(subset="id", keep="first").set_index("id")
 
         dataset_region_ids = [str(region_id) for region_id in self._region_ids]
-        missing = [region_id for region_id in dataset_region_ids if region_id not in regions.index]
+        missing = [
+            region_id
+            for region_id in dataset_region_ids
+            if region_id not in regions.index
+        ]
         if missing:
             preview = ", ".join(missing[:5])
             raise ValueError(
                 f"GeoJSON {region_source} is missing {len(missing)} dataset region_id "
-                f"values needed for spatial_knn adjacency: {preview}"
+                f"values needed for {adjacency_source} adjacency: {preview}"
             )
 
-        ordered = regions.loc[dataset_region_ids]
+        return region_source, dataset_region_ids, regions.loc[dataset_region_ids].copy()
+
+    def _build_spatial_knn_adjacency(self) -> torch.Tensor:
+        """Build a static symmetric binary KNN graph from municipality centroids."""
+        region_source, dataset_region_ids, ordered = (
+            self._load_ordered_regions_for_static_graph("spatial_knn")
+        )
         if ordered.crs is None:
             logger.warning(
                 "GeoJSON %s has no CRS metadata; assuming %s for spatial KNN",
@@ -1061,6 +1088,39 @@ class EpiDataset(Dataset):
         row_idx = np.repeat(np.arange(num_nodes), k)
         col_idx = nearest.reshape(-1)
         adjacency[row_idx, col_idx] = True
+        adjacency = adjacency | adjacency.T
+        adjacency.fill_diagonal_(False)
+        return adjacency
+
+    def _build_spatial_queen_adjacency(self) -> torch.Tensor:
+        """Build a static symmetric binary queen-contiguity graph from polygons."""
+        _, dataset_region_ids, ordered = self._load_ordered_regions_for_static_graph(
+            "spatial_queen"
+        )
+
+        try:
+            from libpysal import weights  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise ImportError(
+                "libpysal is required for graph_adjacency_source='spatial_queen'"
+            ) from exc
+
+        if ordered.geometry.is_empty.any():
+            raise ValueError(
+                "GeoJSON contains empty geometries; cannot build spatial_queen adjacency"
+            )
+
+        ordered = ordered.reset_index()
+        w = weights.Queen.from_dataframe(ordered, ids=dataset_region_ids)
+        id_to_idx = {region_id: idx for idx, region_id in enumerate(dataset_region_ids)}
+        adjacency = torch.zeros(
+            (len(dataset_region_ids), len(dataset_region_ids)), dtype=torch.bool
+        )
+        for src_id, neighbors in w.neighbors.items():
+            src_idx = id_to_idx[str(src_id)]
+            for dst_id in neighbors:
+                adjacency[src_idx, id_to_idx[str(dst_id)]] = True
+
         adjacency = adjacency | adjacency.T
         adjacency.fill_diagonal_(False)
         return adjacency
@@ -1418,10 +1478,13 @@ class EpiDataset(Dataset):
         if time_step in self._adjacency_cache:
             return self._adjacency_cache[time_step]
 
-        if self.config.model.graph_adjacency_source == "spatial_knn":
-            if self.spatial_knn_adjacency is None:
-                raise RuntimeError("spatial_knn adjacency has not been initialized")
-            adjacency = self.spatial_knn_adjacency.clone()
+        adjacency_source = self.config.model.graph_adjacency_source
+        if adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            if self.static_graph_adjacency is None:
+                raise RuntimeError(
+                    f"{adjacency_source} adjacency has not been initialized"
+                )
+            adjacency = self.static_graph_adjacency.clone()
         else:
             # Get mobility matrix for this time step from preloaded tensor
             mobility_matrix = self.preloaded_mobility[time_step]

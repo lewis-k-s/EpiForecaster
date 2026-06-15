@@ -6,6 +6,8 @@ import torch
 from data.epi_batch import EpiBatch
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
+STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
+
 
 def drop_nowcast(prediction: torch.Tensor, horizon: int | None = None) -> torch.Tensor:
     """
@@ -136,13 +138,15 @@ def inject_gpu_mobility(
     adjacency_source = (
         config.model.graph_adjacency_source if config is not None else "mobility"
     )
-    if adjacency_source == "spatial_knn":
-        if not hasattr(base_ds, "spatial_knn_adjacency"):
-            return
-        source_adjacency = base_ds.spatial_knn_adjacency
+    if adjacency_source in STATIC_GRAPH_ADJACENCY_SOURCES:
+        source_adjacency = getattr(base_ds, "static_graph_adjacency", None)
+        if source_adjacency is None and adjacency_source == "spatial_knn":
+            source_adjacency = getattr(base_ds, "spatial_knn_adjacency", None)
         if source_adjacency is None:
             return
-    elif not hasattr(base_ds, "preloaded_mobility") or base_ds.preloaded_mobility is None:
+    elif (
+        not hasattr(base_ds, "preloaded_mobility") or base_ds.preloaded_mobility is None
+    ):
         return
     else:
         source_adjacency = base_ds.preloaded_mobility
@@ -154,7 +158,7 @@ def inject_gpu_mobility(
     cache_key = (device, MODEL_PARAM_DTYPE, adjacency_source)
     if cache_key not in base_ds._gpu_mobility_cache:
         node_ids = torch.where(base_ds._get_graph_node_mask())[0]
-        if adjacency_source == "spatial_knn":
+        if adjacency_source in STATIC_GRAPH_ADJACENCY_SOURCES:
             sliced_mob = source_adjacency[node_ids.unsqueeze(-1), node_ids].to(
                 MODEL_PARAM_DTYPE
             )

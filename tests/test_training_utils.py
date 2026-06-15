@@ -23,10 +23,12 @@ class _DummyMobilityDataset(Dataset):
         preloaded_mobility: torch.Tensor,
         graph_adjacency_source: str = "mobility",
         spatial_knn_adjacency: torch.Tensor | None = None,
+        static_graph_adjacency: torch.Tensor | None = None,
     ):
         self.run_id = run_id
         self.preloaded_mobility = preloaded_mobility
         self.spatial_knn_adjacency = spatial_knn_adjacency
+        self.static_graph_adjacency = static_graph_adjacency
         self.config = SimpleNamespace(
             model=SimpleNamespace(
                 graph_adjacency_source=graph_adjacency_source,
@@ -128,6 +130,39 @@ def test_inject_gpu_mobility_uses_spatial_knn_adjacency_by_time_index() -> None:
 
 
 @pytest.mark.epiforecaster
+def test_inject_gpu_mobility_uses_spatial_queen_adjacency_by_time_index() -> None:
+    mobility = torch.zeros((3, 3, 3), dtype=torch.float32)
+    queen = torch.tensor(
+        [
+            [False, True, True],
+            [True, False, False],
+            [True, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    dataset = _DummyMobilityDataset(
+        run_id="real",
+        preloaded_mobility=mobility,
+        graph_adjacency_source="spatial_queen",
+        static_graph_adjacency=queen,
+    )
+
+    batch_data = SimpleNamespace(mob_batch=_MobBatch(global_t=[0, 2], run_id="real"))
+    inject_gpu_mobility(batch_data, dataset, torch.device("cpu"))
+
+    adj_dense = batch_data.mob_batch.adj_dense
+    assert adj_dense.shape == (2, 3, 3)
+    assert adj_dense.dtype == MODEL_PARAM_DTYPE
+    assert float(adj_dense[0, 0, 1]) == pytest.approx(1.0)
+    assert float(adj_dense[1, 0, 2]) == pytest.approx(1.0)
+    assert float(adj_dense[0, 1, 2]) == pytest.approx(0.0)
+    assert torch.allclose(
+        torch.diagonal(adj_dense, dim1=-2, dim2=-1),
+        torch.ones((2, 3), dtype=MODEL_PARAM_DTYPE),
+    )
+
+
+@pytest.mark.epiforecaster
 def test_inject_gpu_mobility_cache_key_includes_adjacency_source() -> None:
     mobility = torch.tensor([[[0.0, 5.0], [5.0, 0.0]]], dtype=torch.float32)
     spatial = torch.tensor([[False, False], [False, False]], dtype=torch.bool)
@@ -140,6 +175,7 @@ def test_inject_gpu_mobility_cache_key_includes_adjacency_source() -> None:
 
     dataset.config.model.graph_adjacency_source = "spatial_knn"
     dataset.spatial_knn_adjacency = spatial
+    dataset.static_graph_adjacency = spatial
     spatial_batch = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="real"))
     inject_gpu_mobility(spatial_batch, dataset, device)
 

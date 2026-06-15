@@ -7,7 +7,7 @@ import yaml
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 GNN_TYPES = ["gcn", "gat"]
-GRAPH_ADJACENCY_SOURCES = ["mobility", "spatial_knn"]
+GRAPH_ADJACENCY_SOURCES = ["mobility", "spatial_knn", "spatial_queen"]
 FORECASTER_HEAD_TYPES = ["transformer"]
 POSITIONAL_ENCODING_TYPES = ["sinusoidal", "learned"]
 
@@ -203,7 +203,9 @@ class CurriculumConfig:
                 f"run_sampling must be one of {valid_run_sampling}, got {self.run_sampling}"
             )
         if self.active_runs < -1 or self.active_runs == 0:
-            raise ValueError(f"active_runs must be >= -1 and != 0, got {self.active_runs}")
+            raise ValueError(
+                f"active_runs must be >= -1 and != 0, got {self.active_runs}"
+            )
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
 
@@ -607,6 +609,7 @@ class ModelConfig:
     # Source for the dense graph passed to the mobility GNN.
     # - "mobility": dynamic OD mobility adjacency (default/current behavior)
     # - "spatial_knn": static centroid-distance KNN graph for spatial ablations
+    # - "spatial_queen": static queen-contiguity graph for spatial ablations
     graph_adjacency_source: str = "mobility"
 
     # -- dimensionality --#

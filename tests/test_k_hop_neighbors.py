@@ -100,6 +100,44 @@ def _write_spatial_geojson(path: str, xs: list[float]) -> None:
         json.dump(payload, handle)
 
 
+def _write_queen_geojson(path: str) -> None:
+    bounds_by_id = {
+        0: (0.0, 0.0, 1.0, 1.0),
+        1: (1.0, 0.0, 2.0, 1.0),
+        2: (0.0, 1.0, 1.0, 2.0),
+        3: (1.0, 1.0, 2.0, 2.0),
+        4: (3.0, 3.0, 4.0, 4.0),
+    }
+    features = []
+    for region_id, (min_x, min_y, max_x, max_y) in bounds_by_id.items():
+        coords = [
+            [
+                [min_x, min_y],
+                [max_x, min_y],
+                [max_x, max_y],
+                [min_x, max_y],
+                [min_x, min_y],
+            ]
+        ]
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {"id": str(region_id), "name": f"Region {region_id}"},
+                "geometry": {"type": "Polygon", "coordinates": coords},
+            }
+        )
+    payload = {
+        "type": "FeatureCollection",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:EPSG::25831"},
+        },
+        "features": features,
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
 def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) -> None:
     """Write a dataset with chain connectivity: 0-1-2-3.
 
@@ -334,6 +372,58 @@ def test_spatial_knn_depth_two_includes_second_hop_neighbors(tmp_path):
         item["mob_x"][0, node_ids.index(2)],
         torch.zeros_like(item["mob_x"][0, 2]),
     )
+
+
+@pytest.mark.epiforecaster
+def test_spatial_queen_adjacency_includes_corner_touching_regions(tmp_path):
+    zarr_path = str(tmp_path / "queen.zarr")
+    geo_path = str(tmp_path / "regions.geojson")
+    _write_chain_dataset(zarr_path, num_nodes=5, periods=10)
+    _write_queen_geojson(geo_path)
+    config = _make_config(
+        zarr_path,
+        gnn_depth=1,
+        graph_adjacency_source="spatial_queen",
+        regions_data_path=geo_path,
+    )
+
+    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
+
+    adjacency = dataset.static_graph_adjacency
+    assert adjacency is not None
+    assert adjacency.dtype == torch.bool
+    assert torch.equal(adjacency, adjacency.T)
+    assert not adjacency.diagonal().any()
+    assert adjacency[0, 1]
+    assert adjacency[0, 2]
+    assert adjacency[0, 3]
+    assert not adjacency[0, 4]
+
+
+@pytest.mark.epiforecaster
+def test_spatial_queen_depth_one_masks_to_queen_neighbors(tmp_path):
+    zarr_path = str(tmp_path / "queen.zarr")
+    geo_path = str(tmp_path / "regions.geojson")
+    _write_chain_dataset(zarr_path, num_nodes=5, periods=10)
+    _write_queen_geojson(geo_path)
+    config = _make_config(
+        zarr_path,
+        gnn_depth=1,
+        graph_adjacency_source="spatial_queen",
+        regions_data_path=geo_path,
+    )
+
+    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
+    item = dataset[0]
+    node_ids = dataset._graph_node_ids.tolist()
+
+    assert node_ids == [0, 1, 2, 3]
+    assert 4 not in node_ids
+    for node_id in node_ids:
+        assert not torch.allclose(
+            item["mob_x"][0, node_ids.index(node_id)],
+            torch.zeros_like(item["mob_x"][0, node_ids.index(node_id)]),
+        )
 
 
 @pytest.mark.epiforecaster

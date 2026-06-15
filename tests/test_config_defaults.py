@@ -1,6 +1,11 @@
 import pytest
 
-from models.configs import DataConfig, JointLossConfig, ModelConfig, ObservationHeadConfig
+from models.configs import (
+    DataConfig,
+    JointLossConfig,
+    ModelConfig,
+    ObservationHeadConfig,
+)
 
 
 @pytest.mark.epiforecaster
@@ -91,6 +96,21 @@ def test_model_graph_adjacency_source_accepts_spatial_knn() -> None:
         graph_adjacency_source="spatial_knn",
     )
     assert cfg.graph_adjacency_source == "spatial_knn"
+
+
+@pytest.mark.epiforecaster
+def test_model_graph_adjacency_source_accepts_spatial_queen() -> None:
+    cfg = ModelConfig(
+        type={"cases": True, "mobility": True},
+        mobility_embedding_dim=4,
+        region_embedding_dim=4,
+        input_window_length=3,
+        forecast_horizon=1,
+        max_neighbors=2,
+        gnn_module="gcn",
+        graph_adjacency_source="spatial_queen",
+    )
+    assert cfg.graph_adjacency_source == "spatial_queen"
 
 
 @pytest.mark.epiforecaster
