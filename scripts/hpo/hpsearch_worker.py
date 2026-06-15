@@ -228,7 +228,7 @@ def suggest_epiforecaster_params(
 
     # --- mobility graph knobs (conditional) ---
     if base_cfg.model.type.mobility:
-        overrides["model.gnn_depth"] = trial.suggest_int("model.gnn_depth", 1, 4)
+        overrides["model.gnn_depth"] = trial.suggest_int("model.gnn_depth", 1, 2)
         overrides["model.gnn_module"] = trial.suggest_categorical(
             "model.gnn_module", _categorical_choices(("gcn", "gat"))
         )

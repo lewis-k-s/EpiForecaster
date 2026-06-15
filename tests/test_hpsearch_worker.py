@@ -295,7 +295,7 @@ class TestSuggestEpiforecasterParams:
         assert "model.gnn_depth" in overrides
         call = next(c for c in trial.suggest_calls if c[1] == "model.gnn_depth")
         assert call[0] == "int"
-        assert call[2] == (1, 4)
+        assert call[2] == (1, 2)
 
     def test_mobility_model_knobs_gnn_module(self) -> None:
         trial = _StubTrial()
