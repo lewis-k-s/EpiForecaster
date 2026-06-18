@@ -29,6 +29,8 @@ if sys_path not in __import__("sys").path:
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 from utils.plotting import (  # noqa: E402
     Colors,
+    Colormaps,
+    Palette,
     Style,
     format_date_axis,
     robust_bounds,
@@ -214,7 +216,7 @@ def plot_heatmap(
     sns.heatmap(
         heatmap_df.T,
         ax=ax,
-        cmap="viridis",
+        cmap=Colormaps.WASTEWATER,
         vmin=vmin,
         vmax=vmax,
         cbar_kws={"label": "log1p biomarker"},
@@ -445,10 +447,14 @@ def plot_per_region_boxplot(
 
     legend_elements = [
         Patch(
-            facecolor="tab:green", alpha=0.6, label=f"Highest coverage ({top_region})"
+            facecolor=Palette.SUPPORT["supported"],
+            alpha=0.6,
+            label=f"Highest coverage ({top_region})",
         ),
         Patch(
-            facecolor="tab:red", alpha=0.6, label=f"Lowest coverage ({bottom_region})"
+            facecolor=Palette.SUPPORT["edar"],
+            alpha=0.6,
+            label=f"Lowest coverage ({bottom_region})",
         ),
     ]
     ax.legend(handles=legend_elements, loc="lower right")
@@ -562,13 +568,9 @@ def plot_manuscript_support_summary(dataset_path: Path, output_path: Path) -> No
         constrained_layout=True,
     )
 
-    support_color = "#2a9d8f"
-    no_source_color = "#6c757d"
-    variant_colors = {
-        "N1": "#1f77b4",
-        "N2": "#e76f51",
-        "IP4": "#7a5195",
-    }
+    support_color = Palette.SUPPORT["supported"]
+    no_source_color = Palette.SUPPORT["no_source"]
+    variant_colors = Palette.BIOMARKER_VARIANT
 
     ax_top.barh(
         ["Municipalities"],
@@ -609,9 +611,14 @@ def plot_manuscript_support_summary(dataset_path: Path, output_path: Path) -> No
 
     labels = list(variant_support)
     counts = [variant_support[label] for label in labels]
-    colors = [variant_colors.get(label, "#4c78a8") for label in labels]
+    colors = [variant_colors.get(label, Palette.target("cases")) for label in labels]
     ax_bottom.bar(labels, counts, color=colors)
-    ax_bottom.axhline(source_regions, color="#333333", linewidth=1.2, linestyle="--")
+    ax_bottom.axhline(
+        source_regions,
+        color=Palette.NEUTRAL["dark"],
+        linewidth=1.2,
+        linestyle="--",
+    )
     ax_bottom.text(
         len(labels) - 0.15,
         source_regions + 4,
@@ -704,7 +711,7 @@ def plot_manuscript_variant_panel(
         ax_obs.fill_between(
             dates,
             daily_observed,
-            color="#495057",
+            color=Palette.NEUTRAL["muted"],
             alpha=0.16,
             linewidth=0,
             label="Daily direct-observation support",
@@ -733,7 +740,7 @@ def plot_manuscript_variant_panel(
     sns.heatmap(
         heatmap_df.T,
         ax=ax_heatmap,
-        cmap="mako",
+        cmap=Colormaps.WASTEWATER,
         vmin=0,
         vmax=vmax,
         cbar_kws={"label": "Processed concentration"},

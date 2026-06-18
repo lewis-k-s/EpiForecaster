@@ -7,8 +7,9 @@ from typing import Literal
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.figure import Figure
 from matplotlib.axes import Axes
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.figure import Figure
 
 logger = logging.getLogger(__name__)
 
@@ -20,11 +21,100 @@ logger = logging.getLogger(__name__)
 class Colors:
     """Named color constants for consistent theming."""
 
-    CASES = "#1f77b4"  # blue
-    BIOMARKER = "#ff7f0e"  # orange
-    MOBILITY = "#2ca02c"  # green
-    GLOBAL_MEAN = "black"
-    GLOBAL_MEDIAN = "tab:blue"
+    CASES = "#4C78A8"
+    BIOMARKER = "#2A9D8F"
+    MOBILITY = "#2A9D8F"
+    GLOBAL_MEAN = "#17324D"
+    GLOBAL_MEDIAN = "#4C78A8"
+
+
+class Palette:
+    """Shared categorical colors for manuscript and report plots."""
+
+    TARGET = {
+        "wastewater": "#2A9D8F",
+        "ww": "#2A9D8F",
+        "biomarkers": "#2A9D8F",
+        "cases": "#4C78A8",
+        "hospitalizations": "#F2A541",
+        "hosp": "#F2A541",
+        "deaths": "#C44E52",
+    }
+    TARGET_LABELS = {
+        "wastewater": "Wastewater",
+        "cases": "Cases",
+        "hospitalizations": "Hosp.",
+        "deaths": "Deaths",
+    }
+    BIOMARKER_VARIANT = {
+        "N1": "#4C78A8",
+        "N2": "#E76F51",
+        "IP4": "#7A5195",
+    }
+    SPLIT = {
+        "train": "#4C78A8",
+        "val": "#F2A541",
+        "test": "#7A5195",
+    }
+    BASELINE_SERIES = {
+        "Our model": "#17324D",
+        "exp smoothing": "#7FB3A9",
+        "last observed": "#F2A541",
+        "sarima": "#C44E52",
+        "var": "#7A5195",
+    }
+    SUPPORT = {
+        "no_source": "#6C757D",
+        "supported": "#2A9D8F",
+        "edar": "#C44E52",
+        "focus": "#F2A541",
+        "background": "#F7F7F2",
+        "boundary": "#C9CEC9",
+    }
+    NEUTRAL = {
+        "dark": "#17324D",
+        "text": "#263238",
+        "muted": "#5F6366",
+        "grid": "#DDE2E1",
+        "missing": "#D9D9D9",
+    }
+    METRIC = {
+        "mae": "#4C78A8",
+        "rmse": "#F2A541",
+    }
+    FORECAST = {
+        "observed": "#4C78A8",
+        "forecast": "#E76F51",
+        "overlay": "#C44E52",
+        "boundary": "#17324D",
+        "history_span": "#D9D9D9",
+    }
+
+    @classmethod
+    def target(cls, name: str, fallback: str = "#4C78A8") -> str:
+        """Return the canonical color for a surveillance target name."""
+        return cls.TARGET.get(str(name).lower(), fallback)
+
+    @classmethod
+    def target_palette(cls, names: list[str] | tuple[str, ...]) -> list[str]:
+        """Return canonical target colors in the requested order."""
+        return [cls.target(name) for name in names]
+
+
+class Colormaps:
+    """Shared colormaps for continuous manuscript quantities."""
+
+    WASTEWATER = LinearSegmentedColormap.from_list(
+        "epiforecaster_wastewater",
+        ["#F1FAFA", "#BFE7E0", "#6CC6B8", "#2A9D8F", "#1F5F77", "#17324D"],
+    )
+    SUPPORT = WASTEWATER
+    AGE = LinearSegmentedColormap.from_list(
+        "epiforecaster_age",
+        ["#FFF8EF", "#FDD9A0", "#F2A541", "#E76F51", "#9E2F3A"],
+    )
+    ERROR_DELTA = "RdYlGn_r"
+    R2_DELTA = "RdYlGn"
 
 
 class FigureSizes:

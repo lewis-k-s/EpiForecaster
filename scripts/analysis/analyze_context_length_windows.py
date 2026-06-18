@@ -21,6 +21,7 @@ import xarray as xr
 from data.dataset_factory import split_nodes_by_ratio
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from models.configs import EpiForecasterConfig
+from utils.plotting import Palette
 
 DEFAULT_CONTEXT_LENGTHS = (
     "14 28 42 60 84 112 140 168 196 224 252 280 308 336 364 392 420"
@@ -253,11 +254,7 @@ def write_counts_csv(counts: list[SplitCounts], output_csv: Path) -> None:
 def plot_counts(counts: list[SplitCounts], output_png: Path) -> None:
     output_png.parent.mkdir(parents=True, exist_ok=True)
 
-    split_colors = {
-        "train": "#2A6F97",
-        "val": "#D9822B",
-        "test": "#7A4EA3",
-    }
+    split_colors = Palette.SPLIT
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), sharex=True)
 
     for split in ("train", "val", "test"):
@@ -288,7 +285,7 @@ def plot_counts(counts: list[SplitCounts], output_png: Path) -> None:
         for axis in axes:
             axis.axvline(
                 zero_at,
-                color="#666666",
+                color=Palette.NEUTRAL["muted"],
                 linestyle="--",
                 linewidth=1.0,
                 alpha=0.8,
@@ -300,13 +297,13 @@ def plot_counts(counts: list[SplitCounts], output_png: Path) -> None:
             rotation=90,
             va="top",
             ha="right",
-            color="#4A4A4A",
+            color=Palette.NEUTRAL["muted"],
             transform=axes[0].get_xaxis_transform(),
         )
 
     for axis in axes:
         axis.set_xlabel("Historical context length (days)")
-        axis.grid(True, color="#D8D8D8", linewidth=0.8, alpha=0.8)
+        axis.grid(True, color=Palette.NEUTRAL["grid"], linewidth=0.8, alpha=0.8)
         axis.spines["top"].set_visible(False)
         axis.spines["right"].set_visible(False)
 

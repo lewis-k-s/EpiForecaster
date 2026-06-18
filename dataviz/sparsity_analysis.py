@@ -20,7 +20,7 @@ sys_path = str(Path(__file__).parent.parent)
 if sys_path not in __import__("sys").path:
     __import__("sys").path.append(sys_path)
 
-from utils.plotting import Style  # noqa: E402
+from utils.plotting import Palette, Style  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +171,14 @@ def plot_sparsity_vs_population(
         frequency: Reporting frequency note for title (e.g., "daily", "weekly")
     """
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.scatter(population, sparsity_pct, alpha=0.5, s=30)
+    ax.scatter(
+        population,
+        sparsity_pct,
+        alpha=0.55,
+        s=30,
+        color=Palette.target(var_name),
+        edgecolors="none",
+    )
 
     ax.set_xlabel("Population")
     ax.set_ylabel("Sparsity (%)")
@@ -180,7 +187,7 @@ def plot_sparsity_vs_population(
     title_var = var_name.capitalize()
     ax.set_title(f"{title_var} Sparsity vs Population ({frequency})")
     ax.set_xscale("log")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, color=Palette.NEUTRAL["grid"], alpha=0.7)
 
     plt.tight_layout()
     output_path = output_dir / f"{var_name}_sparsity_vs_population.png"

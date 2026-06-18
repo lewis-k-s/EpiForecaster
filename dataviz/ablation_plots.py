@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from utils.plotting import Colormaps, Palette
+
 logger = logging.getLogger(__name__)
 
 # Set default plotting style
@@ -28,12 +30,7 @@ plt.rcParams["font.size"] = 10
 
 
 TARGET_ORDER = ["wastewater", "cases", "hospitalizations", "deaths"]
-TARGET_LABELS = {
-    "wastewater": "Wastewater",
-    "cases": "Cases",
-    "hospitalizations": "Hosp.",
-    "deaths": "Deaths",
-}
+TARGET_LABELS = Palette.TARGET_LABELS
 METRIC_LABELS = {
     "mae": "MAE",
     "rmse": "RMSE",
@@ -88,8 +85,8 @@ MOBILITY_ABLATIONS = [
 PHYSICS_ABLATIONS = ["residual:off", "sir:off"]
 
 # Unified colormap for all heatmaps
-HEATMAP_CMAP = "RdYlGn_r"  # Red = worse (higher delta), Green = better (lower delta)
-R2_HEATMAP_CMAP = "RdYlGn"  # Red = worse (lower R²), Green = better (higher R²)
+HEATMAP_CMAP = Colormaps.ERROR_DELTA  # Red = worse, Green = better
+R2_HEATMAP_CMAP = Colormaps.R2_DELTA  # Red = worse, Green = better
 
 
 def _delta_colormap(metric: str) -> str:
@@ -220,7 +217,7 @@ def plot_ablation_comparison(
         y_positions = np.arange(n_ablations)
         bar_height = 0.15
 
-        colors = sns.color_palette("husl", n_targets)
+        colors = Palette.target_palette(target_order)
 
         for i, target in enumerate(target_order):
             means = pivot_mean[target].values
@@ -442,10 +439,27 @@ def plot_ablation_delta_histograms(
         if values.empty:
             ax.text(0.5, 0.5, "No data", ha="center", va="center")
         else:
-            sns.histplot(values, bins=bins, kde=True, ax=ax, color="#4C78A8")
+            sns.histplot(
+                values,
+                bins=bins,
+                kde=True,
+                ax=ax,
+                color=Palette.target(target),
+            )
             mean_val = float(values.mean())
-            ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.7)
-            ax.axvline(mean_val, color="#D62728", linewidth=1.4, alpha=0.9)
+            ax.axvline(
+                0.0,
+                color=Palette.NEUTRAL["dark"],
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.7,
+            )
+            ax.axvline(
+                mean_val,
+                color=Palette.SUPPORT["edar"],
+                linewidth=1.4,
+                alpha=0.9,
+            )
             ax.text(
                 0.98,
                 0.95,
@@ -607,7 +621,7 @@ def plot_ablation_summary_grid(
         y_positions = np.arange(n_ablations)
         bar_height = 0.18
 
-        colors = sns.color_palette("husl", n_targets)
+        colors = Palette.target_palette(target_order)
 
         for i, target in enumerate(target_order):
             means = pivot_mean[target].values

@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
 from utils.device import prepare_batch_for_device
+from utils.plotting import Palette
 
 if TYPE_CHECKING:
     from evaluation.selection import WindowSelectionSpec
@@ -865,6 +866,11 @@ def make_forecast_figure(
                 x="t",
                 y="value",
                 hue="series",
+                hue_order=["Actual", "Forecast"],
+                palette={
+                    "Actual": Palette.FORECAST["observed"],
+                    "Forecast": Palette.FORECAST["forecast"],
+                },
                 ax=ax,
                 legend=(j == 0 and i == 0),
             )
@@ -906,15 +912,25 @@ def make_forecast_figure(
                     x="t",
                     y="value",
                     ax=overlay_ax,
-                    color="#C44E52",
+                    color=Palette.FORECAST["overlay"],
                     linewidth=1.5,
                     legend=False,
                 )
                 overlay_ax.set_ylabel(overlay_name if j == ncols - 1 else "")
                 overlay_ax.grid(False)
 
-            ax.axvline(0, color="black", linestyle="--", alpha=0.5)
-            ax.axvspan(-input_window_length, 0, color="gray", alpha=0.15)
+            ax.axvline(
+                0,
+                color=Palette.FORECAST["boundary"],
+                linestyle="--",
+                alpha=0.5,
+            )
+            ax.axvspan(
+                -input_window_length,
+                0,
+                color=Palette.FORECAST["history_span"],
+                alpha=0.18,
+            )
 
             node_label = sample.get("node_label", "")
             start_time = sample.get("start_time", "")
@@ -1099,7 +1115,6 @@ def make_forecast_history_figure(
         return None
 
     import matplotlib.pyplot as plt
-    import seaborn as sns
 
     if isinstance(samples, list):
         groups = {"All": samples}
@@ -1143,8 +1158,8 @@ def make_forecast_history_figure(
         squeeze=False,
     )
 
-    forecast_color = sns.color_palette()[1]
-    actual_color = sns.color_palette()[0]
+    forecast_color = Palette.FORECAST["forecast"]
+    actual_color = Palette.FORECAST["observed"]
 
     for i, row_name in enumerate(row_names):
         row_nodes = grouped_nodes[row_name]

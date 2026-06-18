@@ -32,12 +32,26 @@ from matplotlib.figure import Figure
 from data.preprocess.config import REGION_COORD
 from models.configs import EpiForecasterConfig
 from utils.logging import setup_logging, suppress_zarr_warnings
+from utils.plotting import Colormaps, Palette
 
 suppress_zarr_warnings()
 logger = logging.getLogger(__name__)
 
 # Variables reported on weekly schedule (use 7-day window aggregation)
 WEEKLY_VARIABLES = frozenset({"hospitalizations", "biomarkers"})
+
+
+def _title_to_target_key(title: str) -> str:
+    normalized = title.lower()
+    if "case" in normalized:
+        return "cases"
+    if "hospital" in normalized:
+        return "hospitalizations"
+    if "death" in normalized:
+        return "deaths"
+    if "biomarker" in normalized or "wastewater" in normalized:
+        return "wastewater"
+    return normalized.split()[0] if normalized else ""
 
 
 def load_dataset_for_viz(config: EpiForecasterConfig) -> xr.Dataset | None:
@@ -266,7 +280,7 @@ def plot_age_heatmap(
     sns.heatmap(
         age_normalized,
         cbar_kws={"label": f"Age (days, max={age_max})"},
-        cmap="Reds",
+        cmap=Colormaps.AGE,
         vmin=0,
         vmax=1,
         xticklabels=30,
@@ -276,7 +290,13 @@ def plot_age_heatmap(
 
     # Add history/horizon separator
     if input_window_length is not None:
-        ax.axvline(input_window_length, color="blue", linestyle="--", linewidth=2, alpha=0.7)
+        ax.axvline(
+            input_window_length,
+            color=Palette.NEUTRAL["dark"],
+            linestyle="--",
+            linewidth=2,
+            alpha=0.7,
+        )
 
     ax.set_title(f"{title} - Data Age/Staleness", fontsize=10, fontweight="semibold")
     ax.set_xlabel("Time")
@@ -343,12 +363,13 @@ def make_age_sparsity_figure(
 
     # Panel 2: Sparsity distribution
     ax2 = fig.add_subplot(gs[1, 0])
+    target_color = Palette.target(_title_to_target_key(title))
     if not stats_df.empty:
         ax2.hist(
             stats_df["sparsity_pct"],
             bins=20,
-            color="steelblue",
-            edgecolor="black",
+            color=target_color,
+            edgecolor="white",
             alpha=0.7,
         )
         ax2.set_xlabel("Sparsity (%)")
@@ -360,7 +381,7 @@ def make_age_sparsity_figure(
         )
         ax2.axvline(
             stats_df["sparsity_pct"].median(),
-            color="red",
+            color=Palette.NEUTRAL["dark"],
             linestyle="--",
             label=f"Median: {stats_df['sparsity_pct'].median():.1f}%",
         )
@@ -379,7 +400,13 @@ def make_age_sparsity_figure(
     ax3 = fig.add_subplot(gs[1, 1])
     age_finite = age_values[np.isfinite(age_values)]
     if len(age_finite) > 0:
-        ax3.hist(age_finite, bins=20, color="coral", edgecolor="black", alpha=0.7)
+        ax3.hist(
+            age_finite,
+            bins=20,
+            color=Palette.SUPPORT["focus"],
+            edgecolor="white",
+            alpha=0.75,
+        )
         ax3.set_xlabel("Age (days)")
         ax3.set_ylabel("Count")
         ax3.set_title(f"{title} Age Distribution", fontsize=10, fontweight="semibold")

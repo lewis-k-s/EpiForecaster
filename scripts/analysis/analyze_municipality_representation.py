@@ -27,6 +27,7 @@ from scipy import stats as sp_stats
 from data.dataset_factory import split_nodes_by_ratio
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from models.configs import EpiForecasterConfig
+from utils.plotting import Palette
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,18 +35,14 @@ logger = logging.getLogger(__name__)
 WW_COMPONENTS = ("edar_biomarker_N1", "edar_biomarker_N2", "edar_biomarker_IP4")
 HEAD_NAMES = ("cases", "hospitalizations", "deaths", "wastewater")
 
-SPLIT_COLORS = {
-    "train": "#2A6F97",
-    "val": "#D9822B",
-    "test": "#7A4EA3",
-}
+SPLIT_COLORS = Palette.SPLIT
 
 HEAD_COLORS = {
-    "(any)": "#111111",
-    "cases": "#1f77b4",
-    "hospitalizations": "#ff7f0e",
-    "deaths": "#d62728",
-    "wastewater": "#2ca02c",
+    "(any)": Palette.NEUTRAL["dark"],
+    "cases": Palette.target("cases"),
+    "hospitalizations": Palette.target("hospitalizations"),
+    "deaths": Palette.target("deaths"),
+    "wastewater": Palette.target("wastewater"),
 }
 
 WEEKLY_HEADS = {"hospitalizations", "wastewater"}
@@ -685,9 +682,16 @@ def plot_population_vs_weight(
             over_rep[valid],
             alpha=0.5,
             s=22,
-            color="#2A6F97",
+            color=Palette.target("cases"),
         )
-        ax.axhline(1.0, color="red", linestyle="--", linewidth=0.8, alpha=0.6, label="Equal rep.")
+        ax.axhline(
+            1.0,
+            color=Palette.SUPPORT["edar"],
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.6,
+            label="Equal rep.",
+        )
         ax.set_xlabel("log10(population)")
         ax.set_ylabel("Over-representation ratio (w_eff / w_uniform)")
         ax.set_title("Population vs gradient influence")
@@ -1018,7 +1022,7 @@ def plot_exclusion_vs_scale(
         ax.plot(
             [p.scale for p in any_pts],
             [p.n_excluded for p in any_pts],
-            color="black",
+            color=Palette.NEUTRAL["dark"],
             marker="D",
             markersize=4,
             linewidth=2.0,
