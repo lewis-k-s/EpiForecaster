@@ -176,9 +176,10 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
     trainer.config = SimpleNamespace(
         output=SimpleNamespace(
             experiment_name="exp",
-            save_checkpoints=False,
+            save_checkpoints=True,
             save_best_only=False,
             checkpoint_frequency=1,
+            write_granular_eval=False,
         ),
         training=SimpleNamespace(
             profiler=SimpleNamespace(enabled=False, profile_epochs=[]),
@@ -208,13 +209,15 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
     trainer.best_val_series_metrics = {}
     trainer.cleanup_dataloaders = lambda: None
     trainer._train_epoch = lambda: 0.0
+    trainer._save_checkpoint = lambda *args, **kwargs: None
+    trainer._load_best_model_for_final_evaluation = lambda: tmp_path / "best_model.pt"
     trainer._log_epoch = lambda **_kwargs: None
     trainer._evaluate_split = lambda *_args, **_kwargs: (
         0.5,
         {"mae": 1.0, "rmse": 2.0, "r2": 0.2},
         {},
     )
-    trainer.test_epoch = lambda: (
+    trainer.test_epoch = lambda **_kwargs: (
         0.6,
         {"mae": 1.1, "rmse": 2.1, "r2": 0.3},
         {},

@@ -65,6 +65,7 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
             save_checkpoints=True,
             checkpoint_frequency=1,
             save_best_only=True,
+            write_granular_eval=False,
         ),
         training=SimpleNamespace(
             profiler=SimpleNamespace(enabled=False),
@@ -99,6 +100,7 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     trainer._shutdown_loader_iterator = lambda *args, **kwargs: None
     trainer._is_early_stopping_enabled = lambda: True
     trainer._save_checkpoint = lambda *args, **kwargs: None
+    trainer._load_best_model_for_final_evaluation = lambda: "best_model.pt"
     trainer.cleanup_dataloaders = lambda: None
     trainer._evaluate_split = lambda *args, **kwargs: (
         999.0,
@@ -111,7 +113,7 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
         },
         {},
     )
-    trainer.test_epoch = lambda: (
+    trainer.test_epoch = lambda **_kwargs: (
         888.0,
         {"mae": 2.0, "mae_hosp_log1p_per_100k": 3.0},
         {},
@@ -124,6 +126,16 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     assert results["best_val_loss"] == pytest.approx(2.0)
     assert results["best_val_joint_loss"] == pytest.approx(999.0)
     assert results["best_val_series_metrics"]["loss_ww"] == pytest.approx(10.0)
+
+
+def test_best_checkpoint_path_raises_when_best_model_missing(tmp_path) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.config = SimpleNamespace(output=SimpleNamespace(save_checkpoints=True))
+    trainer.checkpoint_dir = tmp_path / "checkpoints"
+    trainer.checkpoint_dir.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="best checkpoint is missing"):
+        trainer._best_checkpoint_path()
 
 
 class _HistogramTestModel(torch.nn.Module):

@@ -9,6 +9,7 @@ The trainer works with the EpiForecaster model.
 """
 
 import importlib
+import csv
 import logging
 import os
 import platform
@@ -1094,15 +1095,13 @@ class EpiForecasterTrainer:
 
             # Validation phase
             val_loss, val_metrics, _val_node_mae = self._evaluate_split(
-                self.val_loader, split_name="Val"
+                self.val_loader,
+                split_name="Val",
+                write_granular=False,
             )
             val_selection_score = compute_mean_target_mae(val_metrics)
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
-            )
-            self._write_main_model_aggregate_csvs(
-                split_name="val",
-                eval_metrics=val_metrics,
             )
 
             # Learning rate scheduling (if per-epoch)
@@ -1133,10 +1132,7 @@ class EpiForecasterTrainer:
                     if (v := val_metrics.get(k)) is not None
                 }
                 self.patience_counter = 0
-                if (
-                    self.config.output.save_checkpoints
-                    and self.config.output.save_best_only
-                ):
+                if self.config.output.save_checkpoints:
                     self._save_checkpoint(
                         epoch,
                         val_loss,
@@ -1208,9 +1204,33 @@ class EpiForecasterTrainer:
                 is_final=True,
             )
 
+        best_checkpoint_path = self._load_best_model_for_final_evaluation()
+
+        # Canonical final validation artifacts are produced from the selected
+        # best checkpoint, not from the live final epoch weights.
+        final_val_loss, final_val_metrics, _final_val_node_mae = self._evaluate_split(
+            self.val_loader,
+            split_name="Val",
+            write_granular=True,
+            checkpoint_path=best_checkpoint_path,
+        )
+        self._log_epoch(
+            split_name="Val",
+            loss=final_val_loss,
+            metrics=final_val_metrics,
+            epoch=self.current_epoch,
+        )
+        self._write_main_model_aggregate_csvs(
+            split_name="val",
+            eval_metrics=final_val_metrics,
+        )
+        self._shutdown_loader_iterator(self.val_loader)
+
         # Test phase
         test_start_time = time.time()
-        test_loss, test_metrics, _test_node_mae = self.test_epoch()
+        test_loss, test_metrics, _test_node_mae = self.test_epoch(
+            checkpoint_path=best_checkpoint_path,
+        )
         self._write_main_model_aggregate_csvs(
             split_name="test",
             eval_metrics=test_metrics,
@@ -1648,6 +1668,32 @@ class EpiForecasterTrainer:
         merged_payload.update(histogram_payload)
         return merged_payload
 
+    def _append_component_gradnorm_row(
+        self,
+        *,
+        step: int,
+        epoch: int,
+        grad_norm: torch.Tensor,
+        component_gradnorm_log_data: dict[str, float],
+    ) -> None:
+        if not component_gradnorm_log_data or self.experiment_dir is None:
+            return
+
+        path = self.experiment_dir / "component_gradnorm.csv"
+        row: dict[str, float | int] = {
+            "step": step,
+            "epoch": epoch,
+            "gradnorm_clipped_total": float(grad_norm.detach().cpu().item()),
+        }
+        row.update(component_gradnorm_log_data)
+
+        write_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
     def _format_gradnorm_controller_status(
         self, gradnorm_step_log_data: dict[str, torch.Tensor]
     ) -> tuple[str, dict[str, float]]:
@@ -1878,6 +1924,12 @@ class EpiForecasterTrainer:
                 if should_log_gradnorm_components(self.global_step, frequency):
                     grad_norm, component_gradnorm_log_data = (
                         self._compute_gradient_norms_and_clip(step=self.global_step)
+                    )
+                    self._append_component_gradnorm_row(
+                        step=self.global_step,
+                        epoch=self.current_epoch,
+                        grad_norm=grad_norm,
+                        component_gradnorm_log_data=component_gradnorm_log_data,
                     )
                     self._status(
                         format_component_gradnorm_status(
@@ -2149,19 +2201,67 @@ class EpiForecasterTrainer:
             wandb_prefix=f"forecasts_{split}",
         )
 
+    def _best_checkpoint_path(self) -> Path:
+        if not self.config.output.save_checkpoints:
+            raise RuntimeError(
+                "Canonical final evaluation requires output.save_checkpoints=true "
+                "so the selected best_model.pt is available."
+            )
+        if not hasattr(self, "checkpoint_dir"):
+            raise RuntimeError("checkpoint_dir is not initialized")
+        checkpoint_path = self.checkpoint_dir / "best_model.pt"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                "Selected best checkpoint is missing; expected "
+                f"{checkpoint_path}. Final evaluation refuses to use live final "
+                "weights because canonical artifacts must come from best_model.pt."
+            )
+        return checkpoint_path
+
+    def _load_best_model_for_final_evaluation(self) -> Path:
+        from utils.precision_policy import validate_old_checkpoint_compatible
+
+        checkpoint_path = self._best_checkpoint_path()
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        actual_dtype = next(iter(self.model.parameters())).dtype
+        if actual_dtype != torch.float32:
+            raise ValueError(
+                f"Best checkpoint dtype mismatch: model has {actual_dtype}, "
+                "but only float32 parameters are supported."
+            )
+
+        self._status(
+            f"Loaded best checkpoint for final evaluation: {checkpoint_path}",
+            logging.INFO,
+        )
+        return checkpoint_path
+
     def _evaluate_split(
-        self, loader: DataLoader, split_name: str
+        self,
+        loader: DataLoader,
+        split_name: str,
+        *,
+        write_granular: bool | None = None,
+        checkpoint_path: Path | None = None,
     ) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
         """Shared evaluation for validation and test splits with extra metrics.
 
         Returns:
             Tuple of (loss, metrics_dict, node_mae_dict)
         """
-        granular_csv_path = None
-        if self.config.output.write_granular_eval:
+        granular_output_path = None
+        should_write_granular = (
+            self.config.output.write_granular_eval
+            if write_granular is None
+            else write_granular and self.config.output.write_granular_eval
+        )
+        if should_write_granular:
             if self.experiment_dir is None:
                 raise RuntimeError("experiment_dir not set; call setup_logging() first")
-            granular_csv_path = (
+            granular_output_path = (
                 self.experiment_dir
                 / self.config.output.resolve_granular_eval_filename(split=split_name)
             )
@@ -2175,10 +2275,11 @@ class EpiForecasterTrainer:
             region_embeddings=self.region_embeddings,
             split_name=split_name,
             max_batches=self.config.training.max_batches,
-            granular_csv_path=granular_csv_path,
+            granular_output_path=granular_output_path,
+            granular_eval_format=self.config.output.granular_eval_format,
             granular_metadata={
                 "batch_size": loader.batch_size,
-                "checkpoint_path": None,
+                "checkpoint_path": checkpoint_path,
                 "config_path": self.experiment_dir / "config.yaml"
                 if self.experiment_dir is not None
                 else None,
@@ -2198,10 +2299,17 @@ class EpiForecasterTrainer:
 
         return eval_loss, eval_metrics, node_mae_dict
 
-    def test_epoch(self) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
+    def test_epoch(
+        self,
+        *,
+        checkpoint_path: Path | None = None,
+    ) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
         """Public test evaluation entrypoint."""
         test_loss, test_metrics, test_node_mae = self._evaluate_split(
-            self.test_loader, split_name="Test"
+            self.test_loader,
+            split_name="Test",
+            write_granular=True,
+            checkpoint_path=checkpoint_path,
         )
         self._log_epoch(
             split_name="Test",
