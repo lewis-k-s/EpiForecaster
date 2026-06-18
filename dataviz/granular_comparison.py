@@ -15,6 +15,7 @@ import pandas as pd
 import seaborn as sns
 
 from evaluation.granular_export import GRANULAR_FIELDNAMES, GRANULAR_KEY_COLUMNS
+from utils.plotting import Colormaps, Palette
 
 logger = logging.getLogger("granular_comparison")
 
@@ -34,14 +35,9 @@ _METADATA_COLUMNS = [
     "target_date",
 ]
 TARGET_ORDER = ["wastewater", "cases", "hospitalizations", "deaths"]
-TARGET_LABELS = {
-    "wastewater": "Wastewater",
-    "cases": "Cases",
-    "hospitalizations": "Hosp.",
-    "deaths": "Deaths",
-}
+TARGET_LABELS = Palette.TARGET_LABELS
 DEFAULT_KNOCKOUT_ABLATIONS = ["mobility:off", "regions:off", "context:off"]
-ERROR_DIVERGING_CMAP = "RdYlGn_r"
+ERROR_DIVERGING_CMAP = Colormaps.ERROR_DELTA
 DEFAULT_REGION_GEOJSON = Path("data/files/geo/fl_municipios_catalonia.geojson")
 ExcludedTargets = dict[str, dict[str, int]]
 ExcludedSeeds = dict[int, dict[str, int]]
@@ -80,8 +76,17 @@ def _value_colors(
     return [cmap(norm(float(value))) for value in values]
 
 
+def _read_granular_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".parquet":
+        df = pd.read_parquet(path)
+        if "region_id" in df.columns:
+            df["region_id"] = df["region_id"].fillna("").astype(str)
+        return df
+    return pd.read_csv(path, dtype={"region_id": str})
+
+
 def _load_granular_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, dtype={"region_id": str})
+    df = _read_granular_table(path)
     missing = [column for column in GRANULAR_FIELDNAMES if column not in df.columns]
     if missing:
         raise ValueError(f"{path} is missing required granular columns: {missing}")
@@ -493,7 +498,7 @@ def _save_rolling_time_plot(
             label=_format_target_label(str(target)),
             linewidth=2.0,
         )
-    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+    ax.axhline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
     ax.set_title("Rolling MAE delta vs baseline over time")
     ax.set_xlabel("Target date")
     ax.set_ylabel("MAE delta vs baseline")
@@ -517,7 +522,7 @@ def _save_horizon_curve(horizon_df: pd.DataFrame, output_path: Path) -> Path:
         ax=ax,
         hue_order=_ordered_targets(horizon_df["target"]),
     )
-    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+    ax.axhline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
     legend = ax.get_legend()
     if legend is not None:
         for text in legend.get_texts():
@@ -574,7 +579,7 @@ def _save_region_bars(
             palette=_value_colors(plot_df[value_col]),
             legend=False,
         )
-        axis.axvline(0.0, color="black", linewidth=1.0, alpha=0.6)
+        axis.axvline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
         axis.set_title(f"{_format_target_label(target)}: regional MAE delta ranking")
         axis.set_xlabel("MAE delta vs baseline")
         axis.set_ylabel("Region")
@@ -601,8 +606,8 @@ def _save_target_summary(target_df: pd.DataFrame, output_path: Path) -> Path:
         _format_target_label(target) for target in _ordered_targets(melted["target"])
     ]
     metric_palette = {
-        "MAE uplift": "#4C72B0",
-        "RMSE uplift": "#DD8452",
+        "MAE uplift": Palette.METRIC["mae"],
+        "RMSE uplift": Palette.METRIC["rmse"],
     }
 
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -615,7 +620,7 @@ def _save_target_summary(target_df: pd.DataFrame, output_path: Path) -> Path:
         palette=metric_palette,
         ax=ax,
     )
-    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+    ax.axhline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
     ax.set_title("Target-level uplift summary")
     ax.set_xlabel("Target")
     ax.set_ylabel("Uplift")
@@ -705,7 +710,7 @@ def _save_uplift_distribution(paired_df: pd.DataFrame, output_path: Path) -> Pat
         legend=False,
         ax=ax,
     )
-    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+    ax.axhline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
     ax.set_title("Per-example MAE delta vs baseline distribution")
     ax.set_xlabel("Target")
     ax.set_ylabel("MAE delta vs baseline")
@@ -734,7 +739,7 @@ def _save_region_scatter(region_df: pd.DataFrame, output_path: Path) -> Path:
         alpha=0.8,
         ax=ax,
     )
-    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+    ax.axhline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
     ax.set_title("Regional MAE delta vs baseline error")
     ax.set_xlabel("Baseline MAE")
     ax.set_ylabel("MAE delta vs baseline")
@@ -807,7 +812,7 @@ def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> 
                 y=value_col,
                 scatter=False,
                 ax=axis,
-                color="#333333",
+                color=Palette.NEUTRAL["dark"],
                 line_kws={"linestyle": "--", "linewidth": 1.5},
             )
             axis.annotate(
@@ -817,10 +822,10 @@ def _save_density_uplift_scatter(region_df: pd.DataFrame, output_path: Path) -> 
                 ha="right",
                 va="top",
                 fontsize=10,
-                color="#333333",
+                color=Palette.NEUTRAL["dark"],
             )
 
-        axis.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+        axis.axhline(0.0, color=Palette.NEUTRAL["dark"], linewidth=1.0, alpha=0.6)
         axis.set_title(f"{_format_target_label(target)}: density vs MAE delta")
         axis.set_xlabel("Sample count (density)")
         axis.set_ylabel("MAE delta vs baseline")
@@ -864,8 +869,8 @@ def _save_target_choropleths(
             cmap=ERROR_DIVERGING_CMAP,
             norm=norm,
             legend=False,
-            missing_kwds={"color": "#d9d9d9"},
-            edgecolor="#444444",
+            missing_kwds={"color": Palette.NEUTRAL["missing"]},
+            edgecolor=Palette.NEUTRAL["text"],
             linewidth=0.1,
             ax=axis,
         )
@@ -900,12 +905,17 @@ def _load_ablation_granular_data(
     if not experiment_dir.exists():
         raise FileNotFoundError(f"Ablation experiment not found: {experiment_dir}")
 
-    matches = sorted(experiment_dir.glob(f"*/{split}_granular.csv"))
+    matches = sorted(experiment_dir.glob(f"*/{split}_granular.parquet"))
+    if not matches:
+        matches = sorted(experiment_dir.glob(f"*/{split}_granular.csv"))
+    if not matches:
+        matches = sorted(experiment_dir.glob(f"*/{split}_granular_metrics.parquet"))
     if not matches:
         matches = sorted(experiment_dir.glob(f"*/{split}_granular_metrics.csv"))
     if not matches:
         raise FileNotFoundError(
-            f"No {split}_granular.csv or {split}_granular_metrics.csv found under {experiment_dir}"
+            "No granular eval artifact found under "
+            f"{experiment_dir} for split={split!r}"
         )
 
     logger.info(f"Loading {len(matches)} runs for ablation '{ablation_name}'")

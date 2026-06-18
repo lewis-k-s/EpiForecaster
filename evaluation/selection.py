@@ -148,7 +148,10 @@ def load_window_selection_specs_from_granular(
     granular_csv: Path,
     split: str | None = None,
 ) -> list[WindowSelectionSpec]:
-    granular_df = pd.read_csv(granular_csv)
+    if granular_csv.suffix.lower() == ".parquet":
+        granular_df = pd.read_parquet(granular_csv)
+    else:
+        granular_df = pd.read_csv(granular_csv)
     if granular_df.empty:
         return []
 
@@ -156,7 +159,7 @@ def load_window_selection_specs_from_granular(
     missing_cols = required_cols.difference(granular_df.columns)
     if missing_cols:
         raise ValueError(
-            f"Granular CSV is missing required columns: {sorted(missing_cols)}"
+            f"Granular artifact is missing required columns: {sorted(missing_cols)}"
         )
 
     if split is not None and "split" in granular_df.columns:

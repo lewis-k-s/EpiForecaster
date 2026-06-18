@@ -174,7 +174,7 @@ training:
       mask_input_hosp: false
       mask_input_cases: false
       mask_input_deaths: false
-  plot_forecasts: true
+  plot_forecasts: false
   num_forecast_samples: 3
   grad_norm_log_frequency: 500
   progress_log_frequency: 100
@@ -231,7 +231,7 @@ output:
   checkpoint_frequency: 10
   save_best_only: true
   write_granular_eval: true
-  granular_eval_filename: '{split}_granular.csv'
+  granular_eval_filename: '{split}_granular.parquet'
   wandb_project: epiforecaster
   wandb_entity: null
   wandb_group: ablation_cv_ablation_mobility_panel_20260606221310

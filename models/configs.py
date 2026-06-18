@@ -1079,12 +1079,22 @@ class OutputConfig:
     checkpoint_frequency: int = 10
     save_best_only: bool = True
     write_granular_eval: bool = False
-    granular_eval_filename: str = "{split}_granular.csv"
+    granular_eval_format: str = "parquet"
+    granular_eval_filename: str = "{split}_granular.parquet"
     wandb_project: str = "epiforecaster"
     wandb_entity: str | None = None
     wandb_group: str | None = None
     wandb_tags: list[str] = field(default_factory=list)
     wandb_mode: str = "online"
+
+    def __post_init__(self) -> None:
+        self.granular_eval_format = self.granular_eval_format.lower()
+        valid_formats = {"csv", "parquet"}
+        if self.granular_eval_format not in valid_formats:
+            raise ValueError(
+                "output.granular_eval_format must be one of "
+                f"{sorted(valid_formats)}, got {self.granular_eval_format!r}"
+            )
 
     def resolve_granular_eval_filename(self, *, split: str) -> str:
         """Resolve the configured granular eval filename for a split."""

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Re-evaluate ablation checkpoints with granular per-example output.
+"""Manual recovery tool for ablation granular per-example output.
+
+Normal ablation training writes canonical best-checkpoint granular artifacts directly.
+Use this script only to regenerate missing artifacts.
 
 NOTE: Run on the same cluster where ablations were trained (e.g., MN5).
 The checkpoints depend on the production dataset which is not available locally.
@@ -86,7 +89,7 @@ def main() -> int:
                 logger.warning("No checkpoint: %s", checkpoint)
                 continue
 
-            granular_csv = run_dir / f"{args.split}_granular_metrics.csv"
+            granular_csv = run_dir / f"{args.split}_granular_metrics.parquet"
             if granular_csv.exists():
                 logger.info("Skipping (exists): %s", granular_csv)
                 continue
@@ -97,7 +100,7 @@ def main() -> int:
                     checkpoint_path=checkpoint,
                     split=args.split,
                     device=args.device,
-                    granular_csv_path=granular_csv,
+                    granular_output_path=granular_csv,
                     overrides=overrides,
                 )
                 logger.info(

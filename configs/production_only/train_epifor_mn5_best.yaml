@@ -216,7 +216,7 @@ output:
   checkpoint_frequency: 10
   save_best_only: true
   write_granular_eval: false
-  granular_eval_filename: '{split}_granular.csv'
+  granular_eval_filename: '{split}_granular.parquet'
   wandb_project: epiforecaster
   wandb_entity: null
   wandb_group: null

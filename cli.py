@@ -316,7 +316,7 @@ cli.add_command(plot_cli, name="plot")
     "--granular-csv",
     type=click.Path(path_type=Path),
     default=None,
-    help="Optional CSV output path for granular per-example error rows.",
+    help="Optional legacy CSV output path for granular per-example error rows.",
 )
 @click.option(
     "--granular",
@@ -419,6 +419,7 @@ def eval_epiforecaster(
     try:
         per_head_node_metrics_csv: Path | None = None
         effective_overrides = list(override)
+        explicit_granular_csv = granular_csv is not None
         write_granular_eval = bool(granular or granular_csv is not None)
 
         if not any(item.startswith("output.write_granular_eval=") for item in override):
@@ -448,7 +449,7 @@ def eval_epiforecaster(
                 node_metrics_csv
             )
             if granular_csv is None and write_granular_eval:
-                granular_csv = base_dir / f"{split}_granular.csv"
+                granular_csv = base_dir / f"{split}_granular.parquet"
 
         # Resolve paths from experiment/run if provided
         if experiment and run:
@@ -480,7 +481,7 @@ def eval_epiforecaster(
             click.echo(f"  Plot: {output}")
             click.echo(f"  Node metrics CSV: {node_metrics_csv}")
             click.echo(f"  Per-head node metrics CSV: {per_head_node_metrics_csv}")
-            click.echo(f"  Granular CSV: {granular_csv}")
+            click.echo(f"  Granular output: {granular_csv}")
         elif checkpoint is not None and experiment is None and run is None:
             # User provided --checkpoint but not --experiment/--run
             from utils.run_discovery import (
@@ -541,7 +542,8 @@ def eval_epiforecaster(
             overrides=effective_overrides,
             node_metrics_csv_path=node_metrics_csv,
             per_head_node_metrics_csv_path=per_head_node_metrics_csv,
-            granular_csv_path=granular_csv,
+            granular_output_path=granular_csv,
+            granular_eval_format="csv" if explicit_granular_csv else None,
             batch_size=eval_batch_size,
             node_metrics_target=node_metric_target,
         )
@@ -561,8 +563,8 @@ def eval_epiforecaster(
 
             if granular_csv is None or not granular_csv.exists():
                 raise click.ClickException(
-                    f"{selection_mode_key} selection requires granular eval CSV; "
-                    "no granular CSV was produced for this eval."
+                    f"{selection_mode_key} selection requires granular eval rows; "
+                    "no granular output was produced for this eval."
                 )
             window_specs = load_window_selection_specs_from_granular(
                 granular_csv=granular_csv,
@@ -1057,7 +1059,7 @@ def plot_forecasts(
                 )
             if not granular_csv.exists():
                 raise click.ClickException(
-                    f"{strategy} selection requires granular CSV, not found: {granular_csv}"
+                    f"{strategy} selection requires granular eval rows, not found: {granular_csv}"
                 )
             click.echo(f"Loading granular selection candidates from: {granular_csv}")
             window_specs = load_window_selection_specs_from_granular(

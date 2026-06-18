@@ -120,7 +120,7 @@ def _assert_nested_node_mae_match(
         assert left[target] == pytest.approx(right[target])
 
 
-def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
+def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -137,7 +137,7 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
         device=torch.device("cpu"),
     )
 
-    granular_csv = tmp_path / "eval_granular.csv"
+    granular_output = tmp_path / "eval_granular.parquet"
     per_head_csv = tmp_path / "eval_node_metrics_per_head.csv"
     with caplog.at_level(logging.INFO):
         granular_loss, granular_metrics, granular_node_mae = evaluate_loader(
@@ -146,7 +146,8 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
             criterion=criterion,
             horizon=2,
             device=torch.device("cpu"),
-            granular_csv_path=granular_csv,
+            granular_output_path=granular_output,
+            granular_eval_format="parquet",
             per_head_node_metrics_csv_path=per_head_csv,
             granular_metadata={"max_batches": 50},
             log_every=1,
@@ -160,7 +161,8 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
         "stage=granular_write_complete" in record.message for record in caplog.records
     )
 
-    df = pd.read_csv(granular_csv, dtype={"region_id": str})
+    df = pd.read_parquet(granular_output)
+    df["region_id"] = df["region_id"].fillna("").astype(str)
     assert list(df.columns) == [
         "split",
         "target",
@@ -213,8 +215,9 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     assert fallback_row["region_id"] == "08002"
     assert fallback_row["region_label"] == "08002"
 
-    meta = pd.read_json(granular_csv.with_suffix(".csv.meta.json"), typ="series")
+    meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
     assert meta["schema_version"] == "1"
+    assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
     assert meta["region_name_source"] == "/tmp/regions.geojson"
@@ -263,6 +266,47 @@ def test_evaluate_loader_writes_granular_csv_without_changing_metrics(
     assert per_head_meta["split"] == "eval"
 
 
+def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
+    tmp_path: Path,
+) -> None:
+    model = _DummyModel()
+    batch = _make_batch()
+    loader = _DummyLoader([batch])
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0)
+    granular_csv = tmp_path / "eval_granular.csv"
+
+    evaluate_loader(
+        model=model,
+        loader=loader,
+        criterion=criterion,
+        horizon=2,
+        device=torch.device("cpu"),
+        granular_csv_path=granular_csv,
+        granular_eval_format="csv",
+    )
+
+    df = pd.read_csv(granular_csv, dtype={"region_id": str})
+    assert list(df.columns) == [
+        "split",
+        "target",
+        "node_id",
+        "region_id",
+        "region_label",
+        "window_start",
+        "window_start_date",
+        "horizon",
+        "target_index",
+        "target_date",
+        "observed",
+        "abs_error",
+        "sq_error",
+        "smape_num",
+        "smape_den",
+    ]
+    meta = pd.read_json(granular_csv.with_suffix(".csv.meta.json"), typ="series")
+    assert meta["granular_eval_format"] == "csv"
+
+
 class _ExplodingModel(_DummyModel):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         raise RuntimeError("boom")
@@ -307,7 +351,8 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         model=SimpleNamespace(forecast_horizon=2, input_window_length=3),
         output=SimpleNamespace(
             write_granular_eval=True,
-            resolve_granular_eval_filename=lambda *, split: f"{split}_granular.csv",
+            granular_eval_format="parquet",
+            resolve_granular_eval_filename=lambda *, split: f"{split}_granular.parquet",
             experiment_name="crossval-test",
         ),
         training=SimpleNamespace(
@@ -415,6 +460,11 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         captured["evaluate_kwargs"]["per_head_node_metrics_csv_path"]
         == tmp_path / "test_node_metrics_per_head.csv"
     )
+    assert (
+        captured["evaluate_kwargs"]["granular_output_path"]
+        == checkpoint_path.parent.parent / "test_granular.parquet"
+    )
+    assert captured["evaluate_kwargs"]["granular_eval_format"] == "parquet"
     assert captured["evaluate_kwargs"]["granular_metadata"]["eval_num_workers"] == 0
     assert (
         captured["evaluate_kwargs"]["granular_metadata"]["eval_prefetch_factor"] is None

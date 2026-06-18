@@ -56,8 +56,10 @@ def test_load_config_without_overrides():
 
     assert cfg.training.learning_rate == 0.0001
     assert cfg.output.write_granular_eval is True
+    assert cfg.output.granular_eval_format == "parquet"
     assert (
-        cfg.output.resolve_granular_eval_filename(split="test") == "test_granular.csv"
+        cfg.output.resolve_granular_eval_filename(split="test")
+        == "test_granular.parquet"
     )
     assert cfg.training.node_split_strategy == "stratified"
     assert cfg.training.node_split_population_bins == 5

@@ -29,6 +29,7 @@ from plotting.forecast_plots import (
     make_forecast_figure,
     make_forecast_history_figure,
 )
+from utils.plotting import Palette
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,9 @@ def _resolve_granular_metrics_csv_path(
 
     split = str(sidecar.get("split", "test")).strip() or "test"
     candidates = [
+        per_head_node_metrics_csv.parent / f"{split}_granular.parquet",
         per_head_node_metrics_csv.parent / f"{split}_granular.csv",
+        per_head_node_metrics_csv.parent / f"{split}_granular_metrics.parquet",
         per_head_node_metrics_csv.parent / f"{split}_granular_metrics.csv",
     ]
     for candidate in candidates:
@@ -151,7 +154,12 @@ def _load_granular_metrics(
     path: Path,
     split: str | None,
 ) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    if path.suffix.lower() == ".parquet":
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path, dtype={"region_id": str})
+    if "region_id" in df.columns:
+        df["region_id"] = df["region_id"].fillna("").astype(str)
     missing = [
         column
         for column in GRANULAR_METRICS_REQUIRED_COLUMNS
@@ -293,6 +301,8 @@ def _save_scatter(
     output_path: Path,
 ) -> Path:
     fig, ax = plt.subplots(figsize=(9, 6))
+    targets = plot_df["target"].dropna().astype(str).unique()
+    color = Palette.target(targets[0]) if len(targets) == 1 else Palette.NEUTRAL["muted"]
     sns.scatterplot(
         data=plot_df,
         x=x_col,
@@ -300,7 +310,7 @@ def _save_scatter(
         size="observed_count",
         sizes=(30, 240),
         alpha=0.75,
-        color="#4C72B0",
+        color=color,
         ax=ax,
         legend=False,
     )
@@ -348,7 +358,7 @@ def _save_observation_density_error_panel(
             size="population",
             sizes=(25, 180),
             alpha=0.75,
-            color="#4C72B0",
+            color=Palette.target(target),
             ax=axis,
             legend=False,
         )
@@ -936,13 +946,9 @@ def render_baseline_delta_plots(
     }
     hue_order = ["Our model", *[baseline_labels[name] for name in baseline_models]]
     palette = [
-        "#4C72B0",
-        "#DD8452",
-        "#55A868",
-        "#C44E52",
-        "#8172B3",
-        "#937860",
-    ][: len(hue_order)]
+        Palette.BASELINE_SERIES.get(label, Palette.target(label))
+        for label in hue_order
+    ]
 
     for metric_key, metric_label in _BASELINE_COMPARISON_METRICS.items():
         metric_df = delta_df[delta_df["metric"] == metric_key].copy()
@@ -989,7 +995,12 @@ def render_baseline_delta_plots(
         axis.set_xlabel("Target")
         axis.set_ylabel(metric_label)
         if metric_key == "r2":
-            axis.axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
+            axis.axhline(
+                0.0,
+                color=Palette.NEUTRAL["dark"],
+                linewidth=1.0,
+                alpha=0.5,
+            )
 
         handles, labels = axis.get_legend_handles_labels()
         legend = axis.get_legend()

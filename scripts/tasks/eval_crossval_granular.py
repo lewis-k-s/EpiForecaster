@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Explicit post-train granular evaluation for cross-val runs."""
+"""Manual recovery tool for post-train granular evaluation of cross-val runs.
+
+Normal training writes canonical best-checkpoint granular artifacts directly.
+Use this script only to regenerate missing artifacts.
+"""
 
 from __future__ import annotations
 
@@ -66,7 +70,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-run eval even if granular CSV already exists.",
+        help="Re-run eval even if granular artifact already exists.",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -109,9 +113,9 @@ def main() -> int:
             continue
 
         for split in args.splits:
-            granular_csv = current_run_dir / f"{split}_granular_metrics.csv"
+            granular_csv = current_run_dir / f"{split}_granular_metrics.parquet"
             if granular_csv.exists() and not args.force:
-                logger.info("Skipping existing granular CSV: %s", granular_csv)
+                logger.info("Skipping existing granular artifact: %s", granular_csv)
                 continue
 
             logger.info(

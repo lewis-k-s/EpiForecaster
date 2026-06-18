@@ -67,7 +67,7 @@ output:
   wandb_mode: offline
   wandb_tags: [mn5, real-only, balanced]
   write_granular_eval: true
-  granular_eval_filename: "{split}_granular.csv"
+  granular_eval_filename: "{split}_granular.parquet"
 
 training:
   compile: true

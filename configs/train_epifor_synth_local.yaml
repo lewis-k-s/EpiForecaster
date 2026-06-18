@@ -56,7 +56,7 @@ output:
   experiment_name: synth_local_analysis
   log_dir: outputs/training
   write_granular_eval: true
-  granular_eval_filename: "{split}_granular.csv"
+  granular_eval_filename: "{split}_granular.parquet"
 
 training:
   seed: 42

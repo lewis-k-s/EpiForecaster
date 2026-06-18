@@ -57,6 +57,20 @@ def parse_crossval_experiment_name(experiment_name: str) -> str | None:
     return campaign_id or None
 
 
+def resolve_granular_artifact(run_dir: Path, split: str) -> Path:
+    candidates = [
+        run_dir / f"{split}_granular.parquet",
+        run_dir / f"{split}_granular.csv",
+        run_dir / f"{split}_granular_metrics.parquet",
+        run_dir / f"{split}_granular_metrics.csv",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    # Return the canonical path so downstream errors point at the preferred name.
+    return candidates[0]
+
+
 def collect_crossval_runs(
     training_dir: Path,
     campaign_id: str,
@@ -296,7 +310,7 @@ def analyze_crossval_campaign(
             fold=run.fold,
             seed=run.seed,
             run_dir=run.run_dir,
-            granular_csv_path=run.run_dir / f"{split_key}_granular_metrics.csv",
+            granular_csv_path=resolve_granular_artifact(run.run_dir, split_key),
         )
         for run in runs
     ]

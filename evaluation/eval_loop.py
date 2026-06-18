@@ -20,6 +20,7 @@ from data.epi_dataset import EpiDataset
 from evaluation.granular_export import (
     GRANULAR_SCHEMA_VERSION,
     GranularEvalWriter,
+    infer_granular_eval_format,
     write_metadata_sidecar,
     write_granular_metadata_sidecar,
 )
@@ -172,7 +173,9 @@ def evaluate_loader(
     max_batches: int | None = None,
     node_metrics_csv_path: Path | None = None,
     per_head_node_metrics_csv_path: Path | None = None,
+    granular_output_path: Path | None = None,
     granular_csv_path: Path | None = None,
+    granular_eval_format: str | None = None,
     granular_metadata: dict[str, Any] | None = None,
     output_csv_path: Path | None = None,
     node_metrics_target: str = "hospitalizations",
@@ -193,8 +196,10 @@ def evaluate_loader(
         max_batches: Optional limit on number of batches to evaluate
         node_metrics_csv_path: Optional path to save per-node MAE metrics as CSV
         per_head_node_metrics_csv_path: Optional path to save per-head node metrics CSV
-        granular_csv_path: Optional path to save granular per-example error rows as CSV
-        granular_metadata: Optional metadata to write alongside the granular CSV
+        granular_output_path: Optional path to save granular per-example error rows
+        granular_csv_path: Deprecated alias for granular_output_path
+        granular_eval_format: Optional output format override ("parquet" or "csv")
+        granular_metadata: Optional metadata to write alongside granular output
         output_csv_path: Deprecated alias for node_metrics_csv_path
         node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
@@ -208,6 +213,8 @@ def evaluate_loader(
     logger.info(f"{split_name} evaluation started...")
     if node_metrics_csv_path is None:
         node_metrics_csv_path = output_csv_path
+    if granular_output_path is None:
+        granular_output_path = granular_csv_path
     if node_metrics_target not in _HEAD_CANONICAL_NAMES.values():
         raise ValueError(
             f"Unknown node_metrics_target {node_metrics_target!r}; expected one of "
@@ -245,9 +252,18 @@ def evaluate_loader(
     temporal_coords = getattr(dataset, "_temporal_coords", None)
     region_ids = getattr(dataset, "_region_ids", None)
     region_labels = getattr(dataset, "_region_labels", None)
+    resolved_granular_format = (
+        infer_granular_eval_format(granular_output_path, granular_eval_format)
+        if granular_output_path is not None
+        else None
+    )
     granular_writer = (
-        GranularEvalWriter(path=granular_csv_path, split_name=split_name)
-        if granular_csv_path is not None
+        GranularEvalWriter(
+            path=granular_output_path,
+            split_name=split_name,
+            output_format=resolved_granular_format,
+        )
+        if granular_output_path is not None
         else None
     )
 
@@ -616,10 +632,12 @@ def evaluate_loader(
             schema_version=PER_HEAD_NODE_METRICS_SCHEMA_VERSION,
         )
 
-    if granular_csv_path is not None:
+    if granular_output_path is not None:
         metadata = {
             "dataset_path": getattr(dataset, "aligned_data_path", None),
-            "granular_csv_path": granular_csv_path,
+            "granular_csv_path": granular_output_path,
+            "granular_eval_path": granular_output_path,
+            "granular_eval_format": resolved_granular_format,
             "observed_only": True,
             "region_name_source": getattr(dataset, "_region_name_source", None),
             "run_id": getattr(dataset, "run_id", None),
@@ -643,7 +661,7 @@ def evaluate_loader(
         if granular_metadata is not None:
             metadata.update(granular_metadata)
         write_granular_metadata_sidecar(
-            granular_csv_path,
+            granular_output_path,
             metadata,
         )
 
@@ -759,7 +777,9 @@ def eval_checkpoint(
     overrides: list[str] | None = None,
     node_metrics_csv_path: Path | None = None,
     per_head_node_metrics_csv_path: Path | None = None,
+    granular_output_path: Path | None = None,
     granular_csv_path: Path | None = None,
+    granular_eval_format: str | None = None,
     output_csv_path: Path | None = None,
     batch_size: int | None = None,
     num_workers: int | None = None,
@@ -779,7 +799,9 @@ def eval_checkpoint(
         overrides: Optional list of dotted-key config overrides (e.g., ["training.val_workers=4"])
         node_metrics_csv_path: Optional path to save node-level metrics CSV
         per_head_node_metrics_csv_path: Optional path to save per-head node metrics CSV
-        granular_csv_path: Optional path to save granular per-example error rows
+        granular_output_path: Optional path to save granular per-example error rows
+        granular_csv_path: Deprecated alias for granular_output_path
+        granular_eval_format: Optional output format override ("parquet" or "csv")
         output_csv_path: Deprecated alias for node_metrics_csv_path
         batch_size: Optional batch size override
         num_workers: Optional DataLoader worker override
@@ -795,6 +817,11 @@ def eval_checkpoint(
     # Extract training.device from overrides if present
     if node_metrics_csv_path is None:
         node_metrics_csv_path = output_csv_path
+    explicit_granular_output_path = (
+        granular_output_path is not None or granular_csv_path is not None
+    )
+    if granular_output_path is None:
+        granular_output_path = granular_csv_path
 
     resolved_device = device
     if overrides:
@@ -850,11 +877,14 @@ def eval_checkpoint(
         next(model.parameters()).device,
     )
 
-    if granular_csv_path is None and config.output.write_granular_eval:
-        granular_csv_path = (
+    resolved_granular_format = granular_eval_format
+    if granular_output_path is None and config.output.write_granular_eval:
+        granular_output_path = (
             checkpoint_path.parent.parent
             / config.output.resolve_granular_eval_filename(split=split)
         )
+    if resolved_granular_format is None and not explicit_granular_output_path:
+        resolved_granular_format = getattr(config.output, "granular_eval_format", None)
 
     criterion = get_loss_from_config(
         config.training.loss,
@@ -872,7 +902,8 @@ def eval_checkpoint(
             split_name=split.capitalize(),
             node_metrics_csv_path=node_metrics_csv_path,
             per_head_node_metrics_csv_path=per_head_node_metrics_csv_path,
-            granular_csv_path=granular_csv_path,
+            granular_output_path=granular_output_path,
+            granular_eval_format=resolved_granular_format,
             node_metrics_target=node_metrics_target,
             log_every=log_every,
             granular_metadata={

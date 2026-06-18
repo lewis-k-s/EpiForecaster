@@ -106,7 +106,7 @@ training:
     profile_epochs: [1]
     record_memory: false
     log_dir: auto
-  plot_forecasts: true
+  plot_forecasts: false
   num_forecast_samples: 3
   loss:
     name: "joint_inference"

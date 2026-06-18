@@ -61,6 +61,7 @@ model:
 output:
   experiment_name: mn5_epiforecaster_synth_pretrain
   log_dir: outputs/training
+  write_granular_eval: false
   wandb_mode: offline
   wandb_tags: [mn5, synth, pretrain]
 

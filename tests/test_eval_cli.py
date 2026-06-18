@@ -111,7 +111,7 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
     assert eval_kwargs["per_head_node_metrics_csv_path"] == (
         output_dir / "test_node_metrics_per_head.csv"
     )
-    assert eval_kwargs["granular_csv_path"] is None
+    assert eval_kwargs["granular_output_path"] is None
     assert eval_kwargs["node_metrics_target"] == "hospitalizations"
     assert "output.write_granular_eval=false" in eval_kwargs["overrides"]
 
@@ -198,7 +198,7 @@ def test_eval_cli_creates_missing_output_directory_for_all_artifacts(
     assert eval_kwargs["per_head_node_metrics_csv_path"] == (
         output_dir / "test_node_metrics_per_head.csv"
     )
-    assert eval_kwargs["granular_csv_path"] is None
+    assert eval_kwargs["granular_output_path"] is None
 
 
 def test_eval_cli_granular_flag_enables_auto_granular_output(
@@ -273,7 +273,8 @@ def test_eval_cli_granular_flag_enables_auto_granular_output(
     assert eval_kwargs["per_head_node_metrics_csv_path"] == (
         output_dir / "test_node_metrics_per_head.csv"
     )
-    assert eval_kwargs["granular_csv_path"] == output_dir / "test_granular.csv"
+    assert eval_kwargs["granular_output_path"] == output_dir / "test_granular.parquet"
+    assert eval_kwargs["granular_eval_format"] is None
     assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
 
 
@@ -571,7 +572,7 @@ def test_eval_cli_compare_evals_rejects_full_split(
     assert "--compare-evals is not supported with --split full" in result.output
 
 
-def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
+def test_eval_cli_granular_window_selection_uses_generated_granular_output(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -585,8 +586,8 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
         return None
 
     def _fake_eval_checkpoint(**kwargs):
-        granular_csv = kwargs["granular_csv_path"]
-        granular_csv.write_text(
+        granular_output = kwargs["granular_output_path"]
+        granular_output.write_text(
             "split,target,node_id,window_start,abs_error\n", encoding="utf-8"
         )
         return {
@@ -682,7 +683,7 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_csv(
     assert result.exit_code == 0, result.output
     assert (
         captured["load_window_specs_kwargs"]["granular_csv"]
-        == output_dir / "test_granular.csv"
+        == output_dir / "test_granular.parquet"
     )
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["node_groups"] is None
@@ -708,7 +709,9 @@ def test_plot_forecasts_window_quartile_uses_granular_csv(
             __import__("torch").nn.Linear(1, 1),
             SimpleNamespace(
                 output=SimpleNamespace(
-                    resolve_granular_eval_filename=lambda split: f"{split}_granular.csv"
+                    resolve_granular_eval_filename=lambda split: (
+                        f"{split}_granular.parquet"
+                    )
                 ),
                 training=SimpleNamespace(),
             ),
@@ -746,8 +749,8 @@ def test_plot_forecasts_window_quartile_uses_granular_csv(
         lambda **kwargs: captured.setdefault("generate_forecast_plots_kwargs", kwargs),
     )
 
-    granular_csv = checkpoint_path.parent.parent / "test_granular.csv"
-    granular_csv.write_text(
+    granular_output = checkpoint_path.parent.parent / "test_granular.parquet"
+    granular_output.write_text(
         "split,target,node_id,window_start,abs_error\n", encoding="utf-8"
     )
 
@@ -779,8 +782,8 @@ def test_plot_forecasts_window_worst_uses_granular_tail_selection(
     checkpoint_path = tmp_path / "run" / "checkpoints" / "best_model.pt"
     checkpoint_path.parent.mkdir(parents=True)
     checkpoint_path.write_bytes(b"dummy")
-    granular_csv = checkpoint_path.parent.parent / "test_granular.csv"
-    granular_csv.write_text(
+    granular_output = checkpoint_path.parent.parent / "test_granular.parquet"
+    granular_output.write_text(
         "split,target,node_id,window_start,abs_error\n",
         encoding="utf-8",
     )
@@ -792,7 +795,9 @@ def test_plot_forecasts_window_worst_uses_granular_tail_selection(
             __import__("torch").nn.Linear(1, 1),
             SimpleNamespace(
                 output=SimpleNamespace(
-                    resolve_granular_eval_filename=lambda split: f"{split}_granular.csv"
+                    resolve_granular_eval_filename=lambda split: (
+                        f"{split}_granular.parquet"
+                    )
                 ),
                 training=SimpleNamespace(),
             ),

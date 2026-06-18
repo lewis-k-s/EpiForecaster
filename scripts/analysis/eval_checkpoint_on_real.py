@@ -61,7 +61,7 @@ def main() -> int:
     parser.add_argument(
         "--granular",
         action="store_true",
-        help="Write per-example granular CSVs in addition to aggregate metrics.",
+        help="Write per-example granular artifacts in addition to aggregate metrics.",
     )
     parser.add_argument(
         "--override",
@@ -109,7 +109,7 @@ def main() -> int:
             node_metrics_csv_path=output_dir / f"{split}_node_metrics.csv",
             per_head_node_metrics_csv_path=output_dir
             / f"{split}_node_metrics_per_head.csv",
-            granular_csv_path=output_dir / f"{split}_granular_metrics.csv"
+            granular_output_path=output_dir / f"{split}_granular_metrics.parquet"
             if args.granular
             else None,
             batch_size=args.batch_size,
