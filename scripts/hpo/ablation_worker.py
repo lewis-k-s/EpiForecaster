@@ -71,6 +71,21 @@ TERMINAL_TRIAL_STATES = {
 }
 
 
+def resolve_ablation_plan(requested: str | None) -> dict[str, str]:
+    """Return the ordered ablation subset requested for this campaign."""
+    if requested is None or not requested.strip():
+        return dict(ABLATIONS)
+
+    names = [name.strip() for name in requested.replace(",", " ").split()]
+    unknown = [name for name in names if name not in ABLATIONS]
+    if unknown:
+        raise click.ClickException(
+            "Unknown ablation(s): "
+            f"{', '.join(unknown)}. Available: {', '.join(ABLATIONS)}"
+        )
+    return {name: ABLATIONS[name] for name in names}
+
+
 def _compute_worker_seed(base_seed: int) -> int:
     slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
     if slurm_task_id is None:
@@ -89,9 +104,11 @@ def _file_lock(path: Path) -> Iterable[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def build_trial_queue(seeds: list[int]) -> list[dict[str, int | str]]:
+def build_trial_queue(
+    seeds: list[int], ablations: dict[str, str] | None = None
+) -> list[dict[str, int | str]]:
     queue: list[dict[str, int | str]] = []
-    ordered_ablations = list(ABLATIONS.keys())
+    ordered_ablations = list((ablations or ABLATIONS).keys())
     for seed in seeds:
         for ablation_name in ordered_ablations:
             queue.append({"seed": int(seed), "ablation": ablation_name})
@@ -117,23 +134,31 @@ def trial_identity(trial: optuna.trial.FrozenTrial) -> tuple[int, str] | None:
     return None
 
 
-def _expected_trial_identities(seeds: list[int]) -> set[tuple[int, str]]:
-    return {(seed, ablation) for seed in seeds for ablation in ABLATIONS}
+def _expected_trial_identities(
+    seeds: list[int], ablations: dict[str, str] | None = None
+) -> set[tuple[int, str]]:
+    return {(seed, ablation) for seed in seeds for ablation in (ablations or ABLATIONS)}
 
 
 def initialize_study_queue(
     *,
     study: optuna.Study,
     seeds: list[int],
+    ablations: dict[str, str] | None = None,
     lock_path: Path,
+    requeue_running: bool = False,
 ) -> None:
-    expected = build_trial_queue(seeds)
+    ablations = ablations or ABLATIONS
+    expected = build_trial_queue(seeds, ablations)
     with _file_lock(lock_path):
-        existing = {
-            identity
-            for trial in study.trials
-            if (identity := trial_identity(trial)) is not None
-        }
+        existing = set()
+        for trial in study.trials:
+            identity = trial_identity(trial)
+            if identity is None:
+                continue
+            if requeue_running and trial.state == optuna.trial.TrialState.RUNNING:
+                continue
+            existing.add(identity)
         missing = [
             params
             for params in expected
@@ -144,15 +169,19 @@ def initialize_study_queue(
         if missing or not study.user_attrs.get(QUEUE_INITIALIZED_ATTR, False):
             study.set_user_attr(QUEUE_INITIALIZED_ATTR, True)
         logger.info(
-            "Study queue initialized: expected=%d existing=%d enqueued=%d",
+            "Study queue initialized: expected=%d existing=%d enqueued=%d requeue_running=%s",
             len(expected),
             len(existing),
             len(missing),
+            requeue_running,
         )
 
 
-def is_study_complete(study: optuna.Study, seeds: list[int]) -> bool:
-    expected = _expected_trial_identities(seeds)
+def is_study_complete(
+    study: optuna.Study, seeds: list[int], ablations: dict[str, str] | None = None
+) -> bool:
+    ablations = ablations or ABLATIONS
+    expected = _expected_trial_identities(seeds, ablations)
     terminal: set[tuple[int, str]] = set()
     baseline_by_seed: set[int] = set()
     candidates_by_seed: dict[int, set[str]] = {seed: set() for seed in seeds}
@@ -174,7 +203,7 @@ def is_study_complete(study: optuna.Study, seeds: list[int]) -> bool:
     if terminal != expected:
         return False
 
-    candidate_names = {name for name in ABLATIONS if name != "baseline"}
+    candidate_names = {name for name in ablations if name != "baseline"}
     for seed in seeds:
         if seed not in baseline_by_seed:
             return False
@@ -189,13 +218,15 @@ def maybe_run_analysis(
     study: optuna.Study,
     campaign_id: str,
     seeds: list[int],
+    ablations: dict[str, str] | None = None,
     coordination_lock_path: Path,
     runner: Callable[[str], None] | None = None,
 ) -> bool:
+    ablations = ablations or ABLATIONS
     with _file_lock(coordination_lock_path):
         if study.user_attrs.get(ANALYSIS_LAUNCHED_ATTR, False):
             return False
-        if not is_study_complete(study, seeds):
+        if not is_study_complete(study, seeds, ablations):
             return False
 
         analysis_runner = runner or _run_campaign_analysis
@@ -228,9 +259,11 @@ def objective(
     seeds: list[int],
     run_root: Path,
     campaign_id: str,
+    ablations: dict[str, str],
+    common_overrides: list[str] | None = None,
     smoketest: bool = False,
 ) -> float:
-    ablation_name = trial.suggest_categorical("ablation", list(ABLATIONS.keys()))
+    ablation_name = trial.suggest_categorical("ablation", list(ablations.keys()))
     seed = int(trial.suggest_categorical("seed", seeds))
     logger.info(
         "=== Trial %d started: ablation=%s seed=%d ===",
@@ -239,12 +272,13 @@ def objective(
         seed,
     )
 
-    overrides: list[str] = []
-    ablation_overrides = ABLATIONS[ablation_name]
+    overrides: list[str] = list(common_overrides or [])
+    ablation_overrides = ablations[ablation_name]
     if ablation_overrides:
         overrides.extend(ablation_overrides.split())
 
     overrides.append(f"training.seed={seed}")
+    overrides.append("training.plot_forecasts=false")
     overrides.append("output.write_granular_eval=true")
 
     experiment_name = f"mn5_ablation__{campaign_id}__{ablation_name}"
@@ -279,6 +313,21 @@ def objective(
 @click.option("--campaign-id", type=str, required=True)
 @click.option("--seeds", type=str, default="42 43 44 45 46", show_default=True)
 @click.option(
+    "--ablations",
+    type=str,
+    default=None,
+    help=(
+        "Whitespace- or comma-separated ablation names to run. "
+        "Defaults to the full registry."
+    ),
+)
+@click.option(
+    "--overrides",
+    type=str,
+    default="",
+    help="Whitespace-separated config overrides applied to every ablation trial.",
+)
+@click.option(
     "--run-root",
     type=click.Path(path_type=Path),
     default=Path("outputs/training"),
@@ -309,21 +358,35 @@ def objective(
     default=False,
     help="Run smoketest mode with max_batches=2 and epochs=1 for quick validation.",
 )
+@click.option(
+    "--requeue-running",
+    is_flag=True,
+    default=False,
+    help=(
+        "Treat existing RUNNING trials as stale and enqueue their identities again. "
+        "Use only when recovering a campaign after all previous workers have exited."
+    ),
+)
 def main(
     config: Path,
     study_name: str,
     journal_file: Path,
     campaign_id: str,
     seeds: str,
+    ablations: str | None,
+    overrides: str,
     run_root: Path,
     n_trials: int | None,
     timeout_s: int | None,
     seed: int,
     smoketest: bool,
+    requeue_running: bool,
 ) -> None:
     setup_logging()
 
     seed_list = [int(item) for item in seeds.split()]
+    ablation_plan = resolve_ablation_plan(ablations)
+    common_overrides = overrides.split() if overrides.strip() else []
     run_root.mkdir(parents=True, exist_ok=True)
 
     if journal_file is None:
@@ -345,15 +408,26 @@ def main(
     analysis_lock_path = journal_file.with_suffix(
         f"{journal_file.suffix}.analysis.lock"
     )
-    initialize_study_queue(study=study, seeds=seed_list, lock_path=queue_lock_path)
+    initialize_study_queue(
+        study=study,
+        seeds=seed_list,
+        ablations=ablation_plan,
+        lock_path=queue_lock_path,
+        requeue_running=requeue_running,
+    )
 
     logger.info("Ablation worker started for study '%s'", study_name)
     logger.info("Campaign ID: %s", campaign_id)
-    logger.info("Ablations: %d, Seeds: %d", len(ABLATIONS), len(seed_list))
-    logger.info("Total combinations: %d", len(ABLATIONS) * len(seed_list))
+    logger.info("Ablations: %d, Seeds: %d", len(ablation_plan), len(seed_list))
+    logger.info("Ablation names: %s", ", ".join(ablation_plan))
+    if common_overrides:
+        logger.info("Common overrides: %s", " ".join(common_overrides))
+    logger.info("Total combinations: %d", len(ablation_plan) * len(seed_list))
     logger.info("Starting trials: n_trials=%s, timeout_s=%s", n_trials, timeout_s)
     if smoketest:
         logger.info("SMOKETEST MODE: max_batches=2, epochs=1")
+    if requeue_running:
+        logger.info("Requeueing stale RUNNING trial identities")
 
     def _log_trial_complete(
         study: optuna.Study, trial: optuna.trial.FrozenTrial
@@ -370,6 +444,7 @@ def main(
                     study=study,
                     campaign_id=campaign_id,
                     seeds=seed_list,
+                    ablations=ablation_plan,
                     coordination_lock_path=analysis_lock_path,
                 )
             except Exception:
@@ -382,6 +457,8 @@ def main(
             seeds=seed_list,
             run_root=run_root,
             campaign_id=campaign_id,
+            ablations=ablation_plan,
+            common_overrides=common_overrides,
             smoketest=smoketest,
         ),
         n_trials=n_trials,
@@ -395,6 +472,7 @@ def main(
             study=study,
             campaign_id=campaign_id,
             seeds=seed_list,
+            ablations=ablation_plan,
             coordination_lock_path=analysis_lock_path,
         )
     except Exception:

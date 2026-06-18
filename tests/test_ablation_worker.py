@@ -97,6 +97,25 @@ def test_build_trial_queue_is_seed_major() -> None:
     assert all(entry["seed"] == 43 for entry in queue[expected_block_size:])
 
 
+def test_resolve_ablation_plan_supports_focused_subset() -> None:
+    plan = worker.resolve_ablation_plan("baseline,mobility:off context:off")
+
+    assert list(plan) == ["baseline", "mobility:off", "context:off"]
+    assert plan["mobility:off"] == "model.type.mobility=false"
+
+
+def test_build_trial_queue_accepts_ablation_subset() -> None:
+    plan = worker.resolve_ablation_plan("baseline mobility:off")
+    queue = worker.build_trial_queue([42, 43], plan)
+
+    assert queue == [
+        {"seed": 42, "ablation": "baseline"},
+        {"seed": 42, "ablation": "mobility:off"},
+        {"seed": 43, "ablation": "baseline"},
+        {"seed": 43, "ablation": "mobility:off"},
+    ]
+
+
 def test_initialize_study_queue_is_idempotent(tmp_path: Path) -> None:
     journal_file = tmp_path / "ablation.journal"
     storage = JournalStorage(JournalFileBackend(str(journal_file)))
@@ -121,6 +140,39 @@ def test_initialize_study_queue_is_idempotent(tmp_path: Path) -> None:
     assert study.user_attrs[worker.QUEUE_INITIALIZED_ATTR] is True
 
 
+def test_initialize_study_queue_can_requeue_running_trial(tmp_path: Path) -> None:
+    journal_file = tmp_path / "ablation.journal"
+    storage = JournalStorage(JournalFileBackend(str(journal_file)))
+    study = optuna.create_study(
+        study_name="ablation-stale-running",
+        storage=storage,
+        direction="minimize",
+        sampler=optuna.samplers.RandomSampler(seed=0),
+    )
+    plan = worker.resolve_ablation_plan("baseline")
+    _add_terminal_trial(
+        study,
+        seed=42,
+        ablation="baseline",
+        state=optuna.trial.TrialState.RUNNING,
+    )
+
+    worker.initialize_study_queue(
+        study=study,
+        seeds=[42],
+        ablations=plan,
+        lock_path=tmp_path / "queue.lock",
+        requeue_running=True,
+    )
+
+    identities = [
+        identity
+        for trial in study.trials
+        if (identity := worker.trial_identity(trial)) is not None
+    ]
+    assert identities.count((42, "baseline")) == 2
+
+
 def test_is_study_complete_requires_full_matrix() -> None:
     study = optuna.create_study(direction="minimize")
     for ablation in worker.ABLATIONS:
@@ -128,6 +180,16 @@ def test_is_study_complete_requires_full_matrix() -> None:
     _add_terminal_trial(study, seed=43, ablation="baseline")
 
     assert worker.is_study_complete(study, [42, 43]) is False
+
+
+def test_is_study_complete_accepts_ablation_subset() -> None:
+    study = optuna.create_study(direction="minimize")
+    plan = worker.resolve_ablation_plan("baseline mobility:off")
+    for seed in [42, 43]:
+        for ablation in plan:
+            _add_terminal_trial(study, seed=seed, ablation=ablation)
+
+    assert worker.is_study_complete(study, [42, 43], plan) is True
 
 
 def test_maybe_run_analysis_is_idempotent_once_full_matrix(tmp_path: Path) -> None:

@@ -17,6 +17,8 @@ CAMPAIGN_ID="${CAMPAIGN_ID:-ablation_${SLURM_ARRAY_JOB_ID:-local}}"
 STUDY_NAME="ablation_study_${CAMPAIGN_ID}"
 JOURNAL_FILE="${JOURNAL_FILE:-}"
 CV_SEEDS="${CV_SEEDS:-42 43 44 45 46}"
+ABLATIONS="${ABLATIONS:-}"
+OVERRIDES="${OVERRIDES:-}"
 N_TRIALS="${N_TRIALS:-}"
 # Worker timeout in seconds (auto-calculated from SLURM time limit minus 15min buffer).
 if [ -n "${SLURM_TIME_LIMIT:-}" ]; then
@@ -28,6 +30,7 @@ DRY_RUN="${DRY_RUN:-0}"
 DRY_RUN_TIMEOUT_SECS="${DRY_RUN_TIMEOUT_SECS:-600}"
 DRY_RUN_N_TRIALS="${DRY_RUN_N_TRIALS:-1}"
 SMOKETEST="${SMOKETEST:-0}"
+REQUEUE_RUNNING="${REQUEUE_RUNNING:-0}"
 
 # shellcheck disable=SC1091
 source "$PROJECT_ROOT/scripts/cluster/mn5_module_setup.sh"
@@ -41,6 +44,9 @@ echo "  Campaign: $CAMPAIGN_ID"
 echo "  Study: $STUDY_NAME"
 echo "  Journal: ${JOURNAL_FILE:-<default>}"
 echo "  Seeds: $CV_SEEDS"
+echo "  Ablations: ${ABLATIONS:-<full registry>}"
+echo "  Overrides: ${OVERRIDES:-<none>}"
+echo "  Requeue running: $REQUEUE_RUNNING"
 echo "  N_TRIALS: ${N_TRIALS:-<until-timeout>}"
 echo "  TIMEOUT_SECS: $TIMEOUT_SECS"
 
@@ -66,9 +72,22 @@ if [ -n "$N_TRIALS" ]; then
   ARGS+=(--n-trials "$N_TRIALS")
 fi
 
+if [ -n "$ABLATIONS" ]; then
+  ARGS+=(--ablations "$ABLATIONS")
+fi
+
+if [ -n "$OVERRIDES" ]; then
+  ARGS+=(--overrides "$OVERRIDES")
+fi
+
 if [ "$SMOKETEST" = "1" ]; then
   ARGS+=(--smoketest)
   echo "SMOKETEST enabled: max_batches=2, epochs=1"
+fi
+
+if [ "$REQUEUE_RUNNING" = "1" ]; then
+  ARGS+=(--requeue-running)
+  echo "REQUEUE_RUNNING enabled: stale RUNNING trials will be enqueued again"
 fi
 
 $UV_RUN python -m scripts.hpo.ablation_worker "${ARGS[@]}"
