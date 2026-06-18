@@ -350,23 +350,33 @@ def mask_ablated_inputs(
     mask_ww: bool = False,
     mask_hosp: bool = False,
     mask_deaths: bool = False,
+    include_clinical: bool = True,
+    clinical_input_dim: int = 9,
+    include_biomarkers: bool = False,
+    biomarkers_dim: int = 0,
 ) -> None:
     """
-    Apply zero-masking to input data series corresponding to disabled clinical heads.
+    Apply zero-masking to input data series corresponding to disabled heads.
 
     This ensures that when an observation head's loss is ablated, its input data
     is also zeroed out in the batch so it does not leak information to other heads
-    through the backbone representation.
+    through the backbone representation or neighborhood aggregation.
 
     Args:
         batch_data: The batch data dictionary. Modified in-place.
         mask_cases: If True, zero out 'CasesHist'.
-        mask_ww: If True, zero out 'BioNode'.
+        mask_ww: If True, zero out wastewater/biomarker inputs.
         mask_hosp: If True, zero out 'HospHist'.
         mask_deaths: If True, zero out 'DeathsHist'.
+        include_clinical: Whether the dense mobility node features contain clinical inputs.
+        clinical_input_dim: Width of the clinical input block in dense mobility features.
+        include_biomarkers: Whether dense mobility node features contain biomarker inputs.
+        biomarkers_dim: Width of the biomarker feature block, excluding derived ww value/mask.
     """
     if mask_ww and hasattr(batch_data, "bio_node") and batch_data.bio_node is not None:
         batch_data.bio_node = torch.zeros_like(batch_data.bio_node)
+        batch_data.ww_hist = torch.zeros_like(batch_data.ww_hist)
+        batch_data.ww_hist_mask = torch.zeros_like(batch_data.ww_hist_mask)
     if (
         mask_hosp
         and hasattr(batch_data, "hosp_hist")
@@ -385,3 +395,26 @@ def mask_ablated_inputs(
         and batch_data.deaths_hist is not None
     ):
         batch_data.deaths_hist = torch.zeros_like(batch_data.deaths_hist)
+
+    mob_batch = batch_data.mob_batch
+    if not hasattr(mob_batch, "x_dense") or mob_batch.x_dense is None:
+        return
+
+    x_dense = mob_batch.x_dense
+    offset = 0
+    if include_clinical:
+        clinical_end = min(offset + clinical_input_dim, x_dense.size(-1))
+        if mask_hosp and offset < clinical_end:
+            x_dense[..., offset : min(offset + 3, clinical_end)] = 0
+        if mask_deaths and offset + 3 < clinical_end:
+            x_dense[..., offset + 3 : min(offset + 6, clinical_end)] = 0
+        if mask_cases and offset + 6 < clinical_end:
+            x_dense[..., offset + 6 : clinical_end] = 0
+        offset = clinical_end
+
+    if include_biomarkers:
+        # Wastewater is represented by the EDAR biomarker block plus the derived
+        # joint wastewater value/mask appended after it.
+        ww_end = min(offset + biomarkers_dim + 2, x_dense.size(-1))
+        if mask_ww and offset < ww_end:
+            x_dense[..., offset:ww_end] = 0

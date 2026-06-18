@@ -3,7 +3,7 @@ import logging
 import torch
 import torch.nn as nn
 
-from data.epi_batch import EpiBatch
+from data.epi_batch import EpiBatch, mask_ablated_inputs
 import torch.nn.functional as F
 
 # type: ignore[import-not-found] (PyTorch Geometric has incomplete type stubs)
@@ -518,17 +518,17 @@ class EpiForecaster(nn.Module):
                 - model_outputs: Dict from forward() with predictions and latents
                 - targets_dict: Dict with target tensors for loss computation
         """
-        # Mask ablated inputs directly on the batch object
-        if mask_ww and batch_data.bio_node is not None:
-            batch_data.bio_node = torch.zeros_like(batch_data.bio_node)
-            batch_data.ww_hist = torch.zeros_like(batch_data.ww_hist)
-            batch_data.ww_hist_mask = torch.zeros_like(batch_data.ww_hist_mask)
-        if mask_hosp and batch_data.hosp_hist is not None:
-            batch_data.hosp_hist = torch.zeros_like(batch_data.hosp_hist)
-        if mask_cases and batch_data.cases_hist is not None:
-            batch_data.cases_hist = torch.zeros_like(batch_data.cases_hist)
-        if mask_deaths and batch_data.deaths_hist is not None:
-            batch_data.deaths_hist = torch.zeros_like(batch_data.deaths_hist)
+        mask_ablated_inputs(
+            batch_data,
+            mask_cases=mask_cases,
+            mask_ww=mask_ww,
+            mask_hosp=mask_hosp,
+            mask_deaths=mask_deaths,
+            include_clinical=self.variant_type.cases,
+            clinical_input_dim=self.temporal_input_dim,
+            include_biomarkers=self.variant_type.biomarkers,
+            biomarkers_dim=self.biomarkers_dim,
+        )
 
         mob_batch = batch_data.mob_batch
 

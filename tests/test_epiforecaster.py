@@ -512,6 +512,83 @@ class TestEpiForecaster:
         assert mob_batch.x_dense.dtype == expected_dtype
         assert mob_batch.adj_dense.dtype == expected_dtype
 
+    def test_forward_batch_masks_ablated_neighbor_series(self, basic_config):
+        """Input ablations must also remove the corresponding neighbor signals."""
+        config = basic_config.copy()
+        config["variant_type"] = ModelVariant(
+            cases=True,
+            biomarkers=True,
+            mobility=True,
+        )
+        config["biomarkers_dim"] = 5
+        config["gnn_hidden_dim"] = 8
+        config["mobility_embedding_dim"] = 8
+        model = EpiForecaster(**config)
+
+        B, T = 1, config["sequence_length"]
+        horizon = config["forecast_horizon"]
+        num_graphs = B * T
+        num_nodes = 3
+
+        mob_batch = Batch()
+        mob_batch.x_dense = torch.ones(
+            num_graphs,
+            num_nodes,
+            model.temporal_node_dim,
+            dtype=torch.float32,
+        )
+        mob_batch.adj_dense = torch.eye(num_nodes, dtype=torch.float32).expand(
+            num_graphs, -1, -1
+        )
+        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
+
+        batch_data = EpiBatch(
+            hosp_hist=torch.ones(B, T, 3),
+            deaths_hist=torch.ones(B, T, 3),
+            cases_hist=torch.ones(B, T, 3),
+            bio_node=torch.ones(B, T, config["biomarkers_dim"]),
+            mob_batch=mob_batch,
+            population=torch.full((B,), 1000.0, dtype=torch.float32),
+            b=B,
+            t=T,
+            target_node=torch.zeros(B, dtype=torch.long),
+            target_region_index=None,
+            window_start=torch.zeros(B, dtype=torch.long),
+            node_labels=["node_0"],
+            temporal_covariates=torch.zeros(B, T, 0),
+            vaccination_hist=torch.zeros(B, T, 3),
+            ww_hist=torch.ones(B, T),
+            ww_hist_mask=torch.ones(B, T),
+            hosp_target=torch.ones(B, horizon),
+            ww_target=torch.ones(B, horizon),
+            cases_target=torch.ones(B, horizon),
+            deaths_target=torch.ones(B, horizon),
+            hosp_target_mask=torch.ones(B, horizon),
+            ww_target_mask=torch.ones(B, horizon),
+            cases_target_mask=torch.ones(B, horizon),
+            deaths_target_mask=torch.ones(B, horizon),
+            S_target=None,
+            I_target=None,
+            R_target=None,
+            D_target=None,
+        )
+
+        model.forward_batch(
+            batch_data=batch_data,
+            mask_hosp=True,
+            mask_ww=True,
+        )
+
+        assert torch.count_nonzero(batch_data.hosp_hist) == 0
+        assert torch.count_nonzero(batch_data.bio_node) == 0
+        assert torch.count_nonzero(batch_data.ww_hist) == 0
+        assert torch.count_nonzero(batch_data.ww_hist_mask) == 0
+
+        graph_features = batch_data.mob_batch.x_dense
+        assert torch.count_nonzero(graph_features[..., 0:3]) == 0
+        assert torch.count_nonzero(graph_features[..., 3:9]) > 0
+        assert torch.count_nonzero(graph_features[..., 9:16]) == 0
+
     @pytest.mark.device
     def test_forward_batch_cross_device(self, basic_config, accelerator_device):
         """Test that forward_batch works after explicit device transfer."""
