@@ -18,7 +18,6 @@ from .observation_heads import (
     MAELoss,
     MSELoss,
     SheddingConvolution,
-    SMAPELoss,
     UnscaledMSELoss,
     WastewaterObservationHead,
 )
@@ -40,7 +39,6 @@ __all__ = [
     # Loss classes
     "MSELoss",
     "MAELoss",
-    "SMAPELoss",
     "UnscaledMSELoss",
     "CompositeObservationLoss",
 ]

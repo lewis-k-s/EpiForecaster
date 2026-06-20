@@ -20,7 +20,6 @@ from models.observation_heads import (
     MAELoss,
     MSELoss,
     SheddingConvolution,
-    SMAPELoss,
     UnscaledMSELoss,
     WastewaterObservationHead,
 )
@@ -1024,75 +1023,6 @@ class TestMAELoss:
         assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
-class TestSMAPELoss:
-    """Tests for SMAPELoss (unscaled space)."""
-
-    def test_basic_smape(self):
-        """Test basic sMAPE computation on unscaled values."""
-        loss_fn = SMAPELoss()
-        pred = torch.tensor([[100.0, 200.0]])
-        target = torch.tensor([[100.0, 300.0]])
-        # sMAPE = 2 * |pred - target| / (|pred| + |target|)
-        # For (100, 100): 0
-        # For (200, 300): 2 * 100 / 500 = 0.4
-        # Mean: 0.2
-
-        loss = loss_fn(pred, target)
-
-        # Without unscaling, just direct computation
-        expected = (0.0 + 2.0 * 100.0 / 500.0) / 2.0
-        assert loss.item() == pytest.approx(expected, abs=1e-5)
-
-    def test_smape_with_unscaling(self):
-        """Test sMAPE with target_mean/target_scale unscaling."""
-        loss_fn = SMAPELoss()
-        # Normalized predictions/targets
-        pred_norm = torch.tensor([[0.0, 1.0]])  # mean=100, scale=10 -> 100, 110
-        target_norm = torch.tensor([[0.0, 2.0]])  # mean=100, scale=10 -> 100, 120
-        target_mean = torch.tensor([[100.0]])
-        target_scale = torch.tensor([[10.0]])
-
-        loss = loss_fn(
-            pred_norm, target_norm, target_mean=target_mean, target_scale=target_scale
-        )
-
-        # Unscaled: pred=[100, 110], target=[100, 120]
-        # sMAPE at t=0: 0
-        # sMAPE at t=1: 2 * 10 / (110 + 120) = 20 / 230 ≈ 0.087
-        # Mean: ≈ 0.0435
-        expected = (0.0 + 2.0 * 10.0 / 230.0) / 2.0
-        assert loss.item() == pytest.approx(expected, abs=1e-5)
-
-    def test_smape_without_stats(self):
-        """Test sMAPE without target_mean/target_scale (falls back to normalized)."""
-        loss_fn = SMAPELoss()
-        pred = torch.tensor([[1.0, 2.0]])
-        target = torch.tensor([[1.0, 3.0]])
-
-        # No stats provided - computes on normalized values directly
-        loss = loss_fn(pred, target)
-
-        # sMAPE at t=0: 0
-        # sMAPE at t=1: 2 * 1 / (2 + 3) = 0.4
-        expected = (0.0 + 2.0 * 1.0 / 5.0) / 2.0
-        assert loss.item() == pytest.approx(expected, abs=1e-5)
-
-    def test_smape_with_mask(self):
-        """Test sMAPE with boolean mask."""
-        loss_fn = SMAPELoss()
-        pred = torch.tensor([[100.0, 200.0, 300.0]])
-        target = torch.tensor([[100.0, 300.0, 300.0]])
-        mask = torch.tensor([[True, False, True]])  # Mask out position 1
-
-        loss = loss_fn(pred, target, mask=mask)
-
-        # Only positions 0 and 2 contribute
-        # Position 0: sMAPE = 0
-        # Position 2: sMAPE = 0
-        # Mean: 0
-        assert loss.item() == pytest.approx(0.0, abs=1e-6)
-
-
 class TestUnscaledMSELoss:
     """Tests for UnscaledMSELoss."""
 
@@ -1261,7 +1191,7 @@ class TestCompositeObservationLoss:
     def test_composite_with_stats(self):
         """Test composite loss with per-head unscaling stats."""
         head_specs = {
-            "ww": (SMAPELoss(), 1.0),
+            "ww": (UnscaledMSELoss(), 1.0),
             "hosp": (UnscaledMSELoss(), 0.5),
         }
         loss_fn = CompositeObservationLoss(head_specs)
@@ -1282,8 +1212,8 @@ class TestCompositeObservationLoss:
         total_loss, per_head = loss_fn(preds, targets, stats=stats)
 
         # WW: unscaled pred=[100, 110], target=[100, 120]
-        # sMAPE at t=1: 2*10/(110+120) = 20/230 ≈ 0.087
-        expected_ww = 0.5 * 2.0 * 10.0 / 230.0  # mean over 2 timesteps
+        # MSE: (0^2 + 10^2) / 2 = 50
+        expected_ww = 50.0
 
         # Hosp: unscaled pred=[55, 60], target=[60, 70]
         # MSE at t=0: (55-60)^2 = 25, at t=1: (60-70)^2 = 100
@@ -1330,8 +1260,8 @@ class TestCompositeObservationLoss:
     def test_missing_stats_defaults_to_none(self):
         """Test that missing stats entries default to None (no unscaling)."""
         head_specs = {
-            "head_with_stats": (SMAPELoss(), 1.0),
-            "head_without_stats": (SMAPELoss(), 1.0),
+            "head_with_stats": (UnscaledMSELoss(), 1.0),
+            "head_without_stats": (UnscaledMSELoss(), 1.0),
         }
         loss_fn = CompositeObservationLoss(head_specs)
 
@@ -1350,7 +1280,7 @@ class TestCompositeObservationLoss:
 
         total_loss, per_head = loss_fn(preds, targets, stats=stats)
 
-        # Both should have sMAPE computed (one with unscaling, one without)
+        assert total_loss.item() > 0
         assert "head_with_stats" in per_head
         assert "head_without_stats" in per_head
 
@@ -1381,14 +1311,14 @@ class TestCompositeObservationLoss:
     def test_repr(self):
         """Test string representation."""
         head_specs = {
-            "ww": (SMAPELoss(), 1.0),
+            "ww": (UnscaledMSELoss(), 1.0),
             "hosp": (MSELoss(), 0.5),
         }
         loss_fn = CompositeObservationLoss(head_specs)
 
         repr_str = repr(loss_fn)
         assert "CompositeObservationLoss" in repr_str
-        assert "SMAPELoss" in repr_str
+        assert "UnscaledMSELoss" in repr_str
         assert "MSELoss" in repr_str
 
     @pytest.mark.device

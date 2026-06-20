@@ -21,7 +21,6 @@ def test_compute_masked_metrics_numpy_uses_sample_weights() -> None:
     assert np.isclose(metrics.effective_count, 1.5)
     assert np.isclose(metrics.mae, 2.0)
     assert np.isclose(metrics.rmse, 2.0)
-    assert np.isclose(metrics.smape, 2.0)
     assert np.isclose(metrics.r2, -3.5)
 
 
@@ -49,7 +48,6 @@ def test_torch_metric_accumulator_matches_weighted_numpy() -> None:
 
     assert np.isclose(torch_metrics.mae, numpy_metrics.mae)
     assert np.isclose(torch_metrics.rmse, numpy_metrics.rmse)
-    assert np.isclose(torch_metrics.smape, numpy_metrics.smape)
     assert np.isclose(torch_metrics.r2, numpy_metrics.r2)
     assert torch_metrics.observed_count == numpy_metrics.observed_count
     assert np.isclose(torch_metrics.effective_count, numpy_metrics.effective_count)

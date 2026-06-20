@@ -62,7 +62,7 @@ Mixes W&B payload logic, Console string formatting, and gradient mutations.
 Combines loss definitions, dataloader construction, model loading, evaluation loops, and plotting generation.
 
 - [x] **`evaluation/losses.py`**
-  - **Responsibility**: Extract `ForecastLoss`, `JointInferenceLoss`, `SMAPELoss`, `CompositeLoss`, and `get_loss_from_config`. This is core domain logic and takes up ~800 lines alone.
+  - **Responsibility**: Extract `ForecastLoss`, `JointInferenceLoss`, `CompositeLoss`, and `get_loss_from_config`. This is core domain logic and takes up ~800 lines alone.
 - [x] **`evaluation/loaders.py`**
   - **Responsibility**: Extract `load_model_from_checkpoint`, `build_loader_from_config`, and `split_nodes`. This isolates the data-loading layer for inference.
 - [x] **`evaluation/selection.py`**

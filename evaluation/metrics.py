@@ -44,7 +44,6 @@ def _compute_per_horizon_metrics_numpy(
 class MaskedMetricResult:
     mae: float
     rmse: float
-    smape: float
     r2: float
     observed_count: int
     effective_count: float
@@ -60,7 +59,6 @@ class TorchMaskedMetricAccumulator:
         self.horizon = horizon
         self.mae_sum = torch.tensor(0.0, device=device)
         self.mse_sum = torch.tensor(0.0, device=device)
-        self.smape_sum = torch.tensor(0.0, device=device)
         self.weight_sum = torch.tensor(0.0, device=device)
         self.target_weighted_sum = torch.tensor(0.0, device=device)
         self.target_weighted_sq_sum = torch.tensor(0.0, device=device)
@@ -124,9 +122,6 @@ class TorchMaskedMetricAccumulator:
         abs_diff = diff.abs()
         self.mae_sum += (abs_diff * mask).sum()
         self.mse_sum += ((diff**2) * mask).sum()
-        self.smape_sum += (
-            2 * abs_diff / (pred.abs() + target.abs() + _EPSILON) * mask
-        ).sum()
         self.weight_sum += mask.sum()
         self.target_weighted_sum += (target * mask).sum()
         self.target_weighted_sq_sum += ((target**2) * mask).sum()
@@ -144,7 +139,6 @@ class TorchMaskedMetricAccumulator:
             return MaskedMetricResult(
                 mae=float("nan"),
                 rmse=float("nan"),
-                smape=float("nan"),
                 r2=float("nan"),
                 observed_count=0,
                 effective_count=0.0,
@@ -155,7 +149,6 @@ class TorchMaskedMetricAccumulator:
         weight_sum = self.weight_sum.clamp_min(1e-8)
         mae = (self.mae_sum / weight_sum).item()
         rmse = math.sqrt((self.mse_sum / weight_sum).item())
-        smape = (self.smape_sum / weight_sum).item()
         ss_res = self.mse_sum.item()
         ss_tot = (
             self.target_weighted_sq_sum
@@ -175,7 +168,6 @@ class TorchMaskedMetricAccumulator:
         return MaskedMetricResult(
             mae=mae,
             rmse=rmse,
-            smape=smape,
             r2=r2,
             observed_count=int(self.observed_count),
             effective_count=float(self.weight_sum.item()),
@@ -229,7 +221,6 @@ def compute_masked_metrics_numpy(
         return MaskedMetricResult(
             mae=float("nan"),
             rmse=float("nan"),
-            smape=float("nan"),
             r2=float("nan"),
             observed_count=0,
             effective_count=0.0,
@@ -241,10 +232,6 @@ def compute_masked_metrics_numpy(
     abs_diff = np.abs(diff)
     mae = float((abs_diff * mask).sum() / max(_EPSILON, effective_count))
     rmse = float(np.sqrt(((diff**2) * mask).sum() / max(_EPSILON, effective_count)))
-    smape = float(
-        (2 * abs_diff / (np.abs(pred) + np.abs(target) + _EPSILON) * mask).sum()
-        / max(_EPSILON, effective_count)
-    )
     ss_res = float(((diff**2) * mask).sum())
     weighted_target_sum = float((target * mask).sum())
     weighted_target_sq_sum = float(((target**2) * mask).sum())
@@ -268,7 +255,6 @@ def compute_masked_metrics_numpy(
     return MaskedMetricResult(
         mae=mae,
         rmse=rmse,
-        smape=smape,
         r2=r2,
         observed_count=observed_count,
         effective_count=effective_count,

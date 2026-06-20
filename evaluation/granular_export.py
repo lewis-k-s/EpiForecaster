@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import torch
 
-_SMAPE_EPSILON = 1e-6
 GRANULAR_SCHEMA_VERSION = "1"
 GRANULAR_KEY_COLUMNS = ["split", "target", "node_id", "window_start", "horizon"]
 GRANULAR_FIELDNAMES = [
@@ -26,8 +25,6 @@ GRANULAR_FIELDNAMES = [
     "observed",
     "abs_error",
     "sq_error",
-    "smape_num",
-    "smape_den",
 ]
 
 _TARGET_NAMES = {
@@ -101,7 +98,16 @@ def infer_granular_eval_format(path: Path, configured: str | None = None) -> str
     if configured:
         normalized = configured.lower()
     else:
-        normalized = "csv" if path.suffix.lower() == ".csv" else "parquet"
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            normalized = "csv"
+        elif suffix in {"", ".parquet"}:
+            normalized = "parquet"
+        else:
+            raise ValueError(
+                "granular eval output path must end in .csv or .parquet when "
+                f"format is not configured, got {path}"
+            )
     if normalized not in {"csv", "parquet"}:
         raise ValueError(
             "granular eval format must be one of ['csv', 'parquet'], "
@@ -139,8 +145,6 @@ def _row_dicts_from_batch(
     observed_weights = torch.nan_to_num(weights.detach().float(), nan=0.0).cpu()
     abs_error = (pred - target).abs()
     sq_error = (pred - target) ** 2
-    smape_num = 2.0 * abs_error
-    smape_den = pred.abs() + target.abs() + _SMAPE_EPSILON
 
     batch_size, horizon_size = target.shape
     target_nodes = batch_data.target_node.detach().cpu().tolist()
@@ -186,8 +190,6 @@ def _row_dicts_from_batch(
                     "observed": float(target[batch_index, horizon_index].item()),
                     "abs_error": float(abs_error[batch_index, horizon_index].item()),
                     "sq_error": float(sq_error[batch_index, horizon_index].item()),
-                    "smape_num": float(smape_num[batch_index, horizon_index].item()),
-                    "smape_den": float(smape_den[batch_index, horizon_index].item()),
                 }
             )
     return rows
@@ -280,8 +282,6 @@ class _ParquetGranularEvalWriter:
                 ("observed", pa.float64()),
                 ("abs_error", pa.float64()),
                 ("sq_error", pa.float64()),
-                ("smape_num", pa.float64()),
-                ("smape_den", pa.float64()),
             ]
         )
 

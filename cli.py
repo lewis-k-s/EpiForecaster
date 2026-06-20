@@ -316,7 +316,10 @@ cli.add_command(plot_cli, name="plot")
     "--granular-csv",
     type=click.Path(path_type=Path),
     default=None,
-    help="Optional legacy CSV output path for granular per-example error rows.",
+    help=(
+        "Optional legacy path for granular per-example error rows; "
+        "format is inferred from suffix."
+    ),
 )
 @click.option(
     "--granular",
@@ -419,7 +422,6 @@ def eval_epiforecaster(
     try:
         per_head_node_metrics_csv: Path | None = None
         effective_overrides = list(override)
-        explicit_granular_csv = granular_csv is not None
         write_granular_eval = bool(granular or granular_csv is not None)
 
         if not any(item.startswith("output.write_granular_eval=") for item in override):
@@ -543,7 +545,7 @@ def eval_epiforecaster(
             node_metrics_csv_path=node_metrics_csv,
             per_head_node_metrics_csv_path=per_head_node_metrics_csv,
             granular_output_path=granular_csv,
-            granular_eval_format="csv" if explicit_granular_csv else None,
+            granular_eval_format=None,
             batch_size=eval_batch_size,
             node_metrics_target=node_metric_target,
         )
@@ -1158,13 +1160,13 @@ def _parse_nodes_option(nodes: str) -> tuple[str, int]:
     "--baseline",
     type=click.Path(path_type=Path, exists=True),
     required=True,
-    help="Baseline granular CSV.",
+    help="Baseline granular eval artifact (Parquet or CSV).",
 )
 @click.option(
     "--candidate",
     type=click.Path(path_type=Path, exists=True),
     required=True,
-    help="Candidate granular CSV.",
+    help="Candidate granular eval artifact (Parquet or CSV).",
 )
 @click.option(
     "--output-dir",
@@ -1177,7 +1179,7 @@ def _parse_nodes_option(nodes: str) -> tuple[str, int]:
     type=float,
     default=1.0,
     show_default=True,
-    help="Minimum required matched-row coverage for each input CSV.",
+    help="Minimum required matched-row coverage for each input artifact.",
 )
 @click.option(
     "--rolling-window",
@@ -1193,7 +1195,7 @@ def plot_granular_compare(
     min_join_coverage: float,
     rolling_window: int,
 ) -> None:
-    """Compare two granular eval CSVs and render paired uplift artifacts."""
+    """Compare two granular eval artifacts and render paired uplift artifacts."""
     try:
         from dataviz.granular_comparison import compare_granular_csvs
 

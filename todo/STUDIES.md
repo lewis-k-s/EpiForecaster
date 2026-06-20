@@ -12,7 +12,7 @@ Goal: produce credible evidence that the joint inference-observation model impro
   - [ ] rolling-origin backtest windows (e.g., 4-8 folds)
   - [ ] fixed forecast horizons: 1, 2, and 4 weeks
 - [ ] Lock reporting metrics:
-  - [ ] Forecast metrics per observed head: MAE, RMSE, MAPE/sMAPE, correlation
+  - [ ] Forecast metrics per observed head: MAE, RMSE, correlation
   - [ ] Probabilistic calibration if available: CRPS, PI coverage
   - [ ] Latent plausibility metrics: mass conservation error, smoothness/TV penalty, effective reproduction trend consistency
   - [ ] Robustness metrics in sparse regime: degradation from dense -> sparse periods

@@ -913,7 +913,7 @@ class ObservationLoss(nn.Module):
 
     Contract:
         - All losses must implement forward(pred, target, *, target_mean=None, target_scale=None, mask=None)
-        - Some losses (sMAPE, unscaled MSE) require unscaling; others (MSE, MAE) operate in normalized space
+        - Some losses require unscaling; others operate in normalized space
         - Masks are boolean tensors where True = keep, False = ignore
     """
 
@@ -1022,49 +1022,6 @@ class MAELoss(ObservationLoss):
         return self._apply_mask(loss_values, mask)
 
 
-class SMAPELoss(ObservationLoss):
-    """
-    Symmetric Mean Absolute Percentage Error on unscaled values.
-
-    Unscales predictions and targets using target_mean/target_scale before computing sMAPE.
-    This matches the evaluation metric used in epiforecaster_eval.py.
-    """
-
-    def __init__(self, epsilon: float = 1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        *,
-        target_mean: torch.Tensor | None = None,
-        target_scale: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Compute sMAPE on unscaled values.
-
-        Requires target_mean and target_scale for unscaling.
-        If not provided, computes sMAPE directly on normalized values.
-        """
-        target, mask, target_mean, target_scale = self._sync_to_pred_device(
-            pred, target, mask, target_mean, target_scale
-        )
-        if target_mean is not None and target_scale is not None:
-            pred_unscaled, target_unscaled = unscale_forecasts(
-                pred, target, target_mean, target_scale
-            )
-        else:
-            pred_unscaled, target_unscaled = pred, target
-
-        numerator = 2 * (pred_unscaled - target_unscaled).abs()
-        denominator = pred_unscaled.abs() + target_unscaled.abs() + self.epsilon
-        loss_values = numerator / denominator
-        return self._apply_mask(loss_values, mask)
-
-
 class UnscaledMSELoss(ObservationLoss):
     """
     MSE on unscaled (original scale) values.
@@ -1106,12 +1063,12 @@ class CompositeObservationLoss(nn.Module):
     """
     Composite loss across multiple observation heads.
 
-    Supports per-head loss types, weights, and optional unscaling for sMAPE/unscaled losses.
+    Supports per-head loss types, weights, and optional unscaling for losses.
     Handles missing targets (None) by skipping heads, and supports per-head masks.
 
     Example:
         head_specs = {
-            "wastewater": (SMAPELoss(), 1.0),  # sMAPE on unscaled values
+            "wastewater": (UnscaledMSELoss(), 1.0),
             "hospitalizations": (MSELoss(), 0.5),  # MSE in normalized space
         }
         loss_fn = CompositeObservationLoss(head_specs)
@@ -1121,7 +1078,7 @@ class CompositeObservationLoss(nn.Module):
             preds={"wastewater": ww_pred, "hospitalizations": hosp_pred},
             targets={"wastewater": ww_target, "hospitalizations": hosp_target},
             stats={
-                "wastewater": (ww_mean, ww_scale),  # For unscaling sMAPE
+                "wastewater": (ww_mean, ww_scale),
                 "hospitalizations": (hosp_mean, hosp_scale),
             },
             masks={"wastewater": ww_mask},  # Optional per-head mask

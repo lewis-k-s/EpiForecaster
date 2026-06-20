@@ -803,8 +803,6 @@ def _build_same_slice_granular_rows(
         error = pred - target
         abs_error = np.abs(error)
         sq_error = np.square(error)
-    smape_num = 2.0 * abs_error
-    smape_den = np.abs(pred) + np.abs(target) + 1.0e-6
 
     target_nodes = batch_data.target_node.detach().cpu().tolist()
     window_starts = batch_data.window_start.detach().cpu().tolist()
@@ -846,8 +844,6 @@ def _build_same_slice_granular_rows(
             target_value = float(target[batch_index, horizon_index])
             abs_error_value = float(abs_error[batch_index, horizon_index])
             sq_error_value = float(sq_error[batch_index, horizon_index])
-            smape_num_value = float(smape_num[batch_index, horizon_index])
-            smape_den_value = float(smape_den[batch_index, horizon_index])
             if not all(
                 np.isfinite(value)
                 for value in (
@@ -855,8 +851,6 @@ def _build_same_slice_granular_rows(
                     target_value,
                     abs_error_value,
                     sq_error_value,
-                    smape_num_value,
-                    smape_den_value,
                 )
             ):
                 continue
@@ -884,8 +878,6 @@ def _build_same_slice_granular_rows(
                     "observed": target_value,
                     "abs_error": abs_error_value,
                     "sq_error": sq_error_value,
-                    "smape_num": smape_num_value,
-                    "smape_den": smape_den_value,
                 }
             )
     return rows
@@ -1312,13 +1304,13 @@ def run_same_slice_baseline_evaluation(
                 int(row.count),
             )
 
-    baseline_granular = output_dir / "baseline_granular.csv"
+    baseline_granular = output_dir / "baseline_granular.parquet"
     baseline_aggregate_metrics = output_dir / "baseline_aggregate_metrics.csv"
     baseline_metadata = output_dir / "baseline_metadata.json"
     baseline_model_usage = output_dir / "baseline_model_usage.csv"
     baseline_failures = output_dir / "baseline_failures.csv"
 
-    granular_df.to_csv(baseline_granular, index=False)
+    granular_df.to_parquet(baseline_granular, index=False, compression="zstd")
     failure_df.to_csv(baseline_failures, index=False)
     aggregate_df.to_csv(baseline_aggregate_metrics, index=False)
     usage_source = pd.concat(

@@ -57,8 +57,6 @@ def _write_crossval_run(
                 "mae_iqr": 0.0,
                 "rmse_median": 2.0 + metric_offset,
                 "rmse_iqr": 0.0,
-                "smape_median": 3.0 + metric_offset,
-                "smape_iqr": 0.0,
                 "r2_median": 0.5 + metric_offset,
                 "r2_iqr": 0.0,
                 "observed_count_median": 10 + metric_offset,
@@ -72,8 +70,6 @@ def _write_crossval_run(
                 "mae_iqr": 0.0,
                 "rmse_median": 5.0 + metric_offset,
                 "rmse_iqr": 0.0,
-                "smape_median": 6.0 + metric_offset,
-                "smape_iqr": 0.0,
                 "r2_median": 0.2 + metric_offset,
                 "r2_iqr": 0.0,
                 "observed_count_median": 20 + metric_offset,
@@ -118,8 +114,6 @@ def _write_crossval_run(
                 "observed": 10.0,
                 "abs_error": 1.0 + metric_offset,
                 "sq_error": (1.0 + metric_offset) ** 2,
-                "smape_num": 2.0 + metric_offset,
-                "smape_den": 20.0,
             },
             {
                 "split": "test",
@@ -135,14 +129,12 @@ def _write_crossval_run(
                 "observed": 5.0,
                 "abs_error": 2.0 + metric_offset,
                 "sq_error": (2.0 + metric_offset) ** 2,
-                "smape_num": 4.0 + metric_offset,
-                "smape_den": 10.0,
             },
         ]
     )
-    granular_path = run_dir / "test_granular_metrics.csv"
-    granular_rows.to_csv(granular_path, index=False)
-    granular_path.with_suffix(".csv.meta.json").write_text(
+    granular_path = run_dir / "test_granular_metrics.parquet"
+    granular_rows.to_parquet(granular_path, index=False)
+    granular_path.with_suffix(".parquet.meta.json").write_text(
         json.dumps(
             {
                 "schema_version": "1",

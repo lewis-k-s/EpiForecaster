@@ -91,7 +91,6 @@ def _load_annotated_granular_df(
 
     df["fold"] = int(run.fold)
     df["seed"] = run.seed
-    df["smape"] = df["smape_num"] / df["smape_den"].clip(lower=1e-6)
     logger.info(
         "Loaded granular run: path=%s fold=%d seed=%s rows=%d memory_mb=%.2f",
         run.granular_csv_path,
@@ -111,7 +110,6 @@ def _build_fold_table(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
             observed_mean=("observed", "mean"),
             mae=("abs_error", "mean"),
             mse=("sq_error", "mean"),
-            smape=("smape", "mean"),
         )
         .reset_index()
     )
@@ -136,11 +134,6 @@ def _aggregate_fold_table(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFra
             mae_std=("mae", lambda s: float(s.std(ddof=1)) if len(s) > 1 else 0.0),
             rmse_mean=("rmse", "mean"),
             rmse_std=("rmse", lambda s: float(s.std(ddof=1)) if len(s) > 1 else 0.0),
-            smape_mean=("smape", "mean"),
-            smape_std=(
-                "smape",
-                lambda s: float(s.std(ddof=1)) if len(s) > 1 else 0.0,
-            ),
         )
         .reset_index()
     )

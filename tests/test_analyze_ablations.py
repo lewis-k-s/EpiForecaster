@@ -51,7 +51,6 @@ def _write_run(
                 "target": "cases",
                 "mae_median": 1.0 + metric_offset,
                 "rmse_median": 2.0 + metric_offset,
-                "smape_median": 3.0 + metric_offset,
                 "r2_median": 0.5 + metric_offset,
             }
         ]
@@ -146,7 +145,6 @@ def test_compute_baseline_deltas_includes_absolute_columns() -> None:
                 "target": "cases",
                 "mae_mean": 2.0,
                 "rmse_mean": 4.0,
-                "smape_mean": 10.0,
                 "r2_mean": 0.0,
             },
             {
@@ -154,7 +152,6 @@ def test_compute_baseline_deltas_includes_absolute_columns() -> None:
                 "target": "cases",
                 "mae_mean": 3.0,
                 "rmse_mean": 5.0,
-                "smape_mean": 12.0,
                 "r2_mean": 0.2,
             },
         ]
@@ -165,12 +162,10 @@ def test_compute_baseline_deltas_includes_absolute_columns() -> None:
 
     assert row["mae_delta_abs"] == pytest.approx(1.0)
     assert row["rmse_delta_abs"] == pytest.approx(1.0)
-    assert row["smape_delta_abs"] == pytest.approx(2.0)
     assert row["r2_delta_abs"] == pytest.approx(0.2)
 
     assert row["mae_delta_pct"] == pytest.approx(50.0)
     assert row["rmse_delta_pct"] == pytest.approx(25.0)
-    assert row["smape_delta_pct"] == pytest.approx(20.0)
     assert "r2_delta_pct" not in deltas.columns
 
 

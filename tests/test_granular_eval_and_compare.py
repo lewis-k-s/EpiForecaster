@@ -177,8 +177,6 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         "observed",
         "abs_error",
         "sq_error",
-        "smape_num",
-        "smape_den",
     ]
     assert len(df) == (
         granular_metrics["observed_count_hosp"]
@@ -300,8 +298,6 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
         "observed",
         "abs_error",
         "sq_error",
-        "smape_num",
-        "smape_den",
     ]
     meta = pd.read_json(granular_csv.with_suffix(".csv.meta.json"), typ="series")
     assert meta["granular_eval_format"] == "csv"
@@ -496,8 +492,6 @@ def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> Non
             "observed": 10.0,
             "abs_error": 2.0,
             "sq_error": 4.0,
-            "smape_num": 4.0,
-            "smape_den": 20.0,
         },
         {
             "split": "test",
@@ -513,8 +507,6 @@ def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> Non
             "observed": 12.0,
             "abs_error": 1.0,
             "sq_error": 1.0,
-            "smape_num": 2.0,
-            "smape_den": 24.0,
         },
     ]
     cand_rows = [
@@ -522,15 +514,11 @@ def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> Non
             **base_rows[0],
             "abs_error": 1.0,
             "sq_error": 1.0,
-            "smape_num": 2.0,
-            "smape_den": 20.0,
         },
         {
             **base_rows[1],
             "abs_error": 3.0,
             "sq_error": 9.0,
-            "smape_num": 6.0,
-            "smape_den": 24.0,
         },
     ]
 
@@ -597,8 +585,6 @@ def test_compare_granular_csvs_excludes_missing_targets(
             "observed": 10.0,
             "abs_error": 2.0,
             "sq_error": 4.0,
-            "smape_num": 4.0,
-            "smape_den": 20.0,
         },
         {
             "split": "test",
@@ -614,8 +600,6 @@ def test_compare_granular_csvs_excludes_missing_targets(
             "observed": 3.0,
             "abs_error": 1.0,
             "sq_error": 1.0,
-            "smape_num": 2.0,
-            "smape_den": 6.0,
         },
     ]
     candidate_rows = [
@@ -623,8 +607,6 @@ def test_compare_granular_csvs_excludes_missing_targets(
             **baseline_rows[0],
             "abs_error": 1.0,
             "sq_error": 1.0,
-            "smape_num": 2.0,
-            "smape_den": 20.0,
         }
     ]
 
@@ -675,8 +657,6 @@ def test_compare_granular_csvs_excludes_unmatched_seeds(
             "observed": 10.0,
             "abs_error": 2.0,
             "sq_error": 4.0,
-            "smape_num": 4.0,
-            "smape_den": 20.0,
             "seed": 1,
         },
         {
@@ -693,8 +673,6 @@ def test_compare_granular_csvs_excludes_unmatched_seeds(
             "observed": 10.0,
             "abs_error": 3.0,
             "sq_error": 9.0,
-            "smape_num": 6.0,
-            "smape_den": 20.0,
             "seed": 2,
         },
     ]
@@ -703,7 +681,6 @@ def test_compare_granular_csvs_excludes_unmatched_seeds(
             **baseline_rows[0],
             "abs_error": 1.0,
             "sq_error": 1.0,
-            "smape_num": 2.0,
         }
     ]
 
@@ -883,8 +860,6 @@ def test_compare_granular_csvs_fails_on_poor_join_coverage(tmp_path: Path) -> No
                 "observed": 10.0,
                 "abs_error": 2.0,
                 "sq_error": 4.0,
-                "smape_num": 4.0,
-                "smape_den": 20.0,
             },
             {
                 "split": "test",
@@ -900,8 +875,6 @@ def test_compare_granular_csvs_fails_on_poor_join_coverage(tmp_path: Path) -> No
                 "observed": 12.0,
                 "abs_error": 1.0,
                 "sq_error": 1.0,
-                "smape_num": 2.0,
-                "smape_den": 24.0,
             },
         ],
     )
@@ -922,8 +895,6 @@ def test_compare_granular_csvs_fails_on_poor_join_coverage(tmp_path: Path) -> No
                 "observed": 10.0,
                 "abs_error": 1.0,
                 "sq_error": 1.0,
-                "smape_num": 2.0,
-                "smape_den": 20.0,
             }
         ],
     )
@@ -957,8 +928,6 @@ def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> N
                 "observed": 10.0,
                 "abs_error": 2.0,
                 "sq_error": 4.0,
-                "smape_num": 4.0,
-                "smape_den": 20.0,
             }
         ],
     )
@@ -979,8 +948,6 @@ def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> N
                 "observed": 1.0,
                 "abs_error": 1.0,
                 "sq_error": 1.0,
-                "smape_num": 2.0,
-                "smape_den": 2.0,
             }
         ],
     )

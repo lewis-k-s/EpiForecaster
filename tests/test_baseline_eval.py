@@ -27,6 +27,13 @@ from evaluation.baseline_models import (
 from evaluation.metrics import compute_masked_metrics_numpy
 
 
+def _read_baseline_granular(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    if "region_id" in df.columns:
+        df["region_id"] = df["region_id"].fillna("").astype(str)
+    return df
+
+
 class _DummyDataConfig:
     def __init__(self, permits: dict[str, dict[str, int]] | None = None) -> None:
         self.run_id = "real"
@@ -566,7 +573,7 @@ def test_run_same_slice_baseline_evaluation_writes_eval_aligned_artifacts(
         split="test",
     )
 
-    granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    granular_df = _read_baseline_granular(artifacts["baseline_granular"])
     failures_df = pd.read_csv(artifacts["baseline_failures"])
     assert set(
         [
@@ -649,7 +656,7 @@ def test_run_same_slice_baseline_evaluation_writes_var_artifacts(
         split="test",
     )
 
-    granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    granular_df = _read_baseline_granular(artifacts["baseline_granular"])
     aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
     usage_df = pd.read_csv(artifacts["baseline_model_usage"])
     metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
@@ -705,7 +712,7 @@ def test_run_same_slice_baseline_evaluation_writes_varmax_artifacts(
         split="test",
     )
 
-    granular_df = pd.read_csv(artifacts["baseline_granular"], dtype={"region_id": str})
+    granular_df = _read_baseline_granular(artifacts["baseline_granular"])
     aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
     usage_df = pd.read_csv(artifacts["baseline_model_usage"])
     metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
@@ -793,7 +800,7 @@ def test_run_same_slice_baseline_evaluation_skips_unstable_granular_rows(
         split="test",
     )
 
-    granular_df = pd.read_csv(artifacts["baseline_granular"])
+    granular_df = _read_baseline_granular(artifacts["baseline_granular"])
     aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
     assert granular_df.empty
     assert aggregate_df.empty
@@ -828,13 +835,15 @@ def test_run_baseline_evaluation_delegates_to_same_slice_outputs(
         captured["kwargs"] = kwargs
         output_dir = kwargs["output_dir"]
         output_dir.mkdir(parents=True, exist_ok=True)
-        granular = output_dir / "baseline_granular.csv"
+        granular = output_dir / "baseline_granular.parquet"
         aggregate = output_dir / "baseline_aggregate_metrics.csv"
         usage = output_dir / "baseline_model_usage.csv"
         failures = output_dir / "baseline_failures.csv"
         metadata = output_dir / "baseline_metadata.json"
-        granular.write_text("model,target\n", encoding="utf-8")
-        aggregate.write_text("model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8")
+        pd.DataFrame(columns=["model", "target"]).to_parquet(granular, index=False)
+        aggregate.write_text(
+            "model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8"
+        )
         usage.write_text("model,selected_model,count\n", encoding="utf-8")
         failures.write_text("model,selected_model,target,error_reason\n", encoding="utf-8")
         metadata.write_text('{"comparison_scope":"same_eval_slice"}', encoding="utf-8")

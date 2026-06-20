@@ -1073,12 +1073,12 @@ def render_eval_per_head_plots(
     if forecast_window != "metrics":
         if granular_csv_path is None:
             logger.warning(
-                "Skipping representative per-head forecast plots because no granular metrics CSV was found near %s",
+                "Skipping representative per-head forecast plots because no granular metrics artifact was found near %s",
                 csv_path,
             )
         elif not granular_csv_path.exists():
             logger.warning(
-                "Skipping representative per-head forecast plots because granular metrics CSV does not exist: %s",
+                "Skipping representative per-head forecast plots because granular metrics artifact does not exist: %s",
                 granular_csv_path,
             )
         else:

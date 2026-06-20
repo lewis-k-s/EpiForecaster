@@ -23,7 +23,7 @@ def _write_granular_run(
 ) -> CrossvalGranularRun:
     run_dir = root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    granular_path = run_dir / f"{split}_granular_metrics.csv"
+    granular_path = run_dir / f"{split}_granular_metrics.parquet"
     rows = [
         {
             "split": split,
@@ -39,8 +39,6 @@ def _write_granular_run(
             "observed": 10.0,
             "abs_error": abs_error_h1,
             "sq_error": abs_error_h1**2,
-            "smape_num": abs_error_h1 * 2.0,
-            "smape_den": 20.0,
         },
         {
             "split": split,
@@ -56,16 +54,14 @@ def _write_granular_run(
             "observed": 12.0,
             "abs_error": abs_error_h2,
             "sq_error": abs_error_h2**2,
-            "smape_num": abs_error_h2 * 2.0,
-            "smape_den": 24.0,
         },
     ]
     if duplicate_first_row:
         rows.append(dict(rows[0]))
-    pd.DataFrame(rows).to_csv(granular_path, index=False)
+    pd.DataFrame(rows).to_parquet(granular_path, index=False)
 
     if write_sidecar:
-        granular_path.with_suffix(".csv.meta.json").write_text(
+        granular_path.with_suffix(".parquet.meta.json").write_text(
             json.dumps(
                 {
                     "schema_version": "1",

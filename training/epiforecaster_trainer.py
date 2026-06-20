@@ -430,7 +430,6 @@ class EpiForecasterTrainer:
             "val_loss": [],
             "val_mae": [],
             "val_rmse": [],
-            "val_smape": [],
             "val_r2": [],
             "learning_rate": [],
             "epoch_times": [],

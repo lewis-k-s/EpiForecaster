@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 EXPERIMENT_PREFIX_NEW = "mn5_ablation__"
 EXPERIMENT_REGEX_LEGACY = re.compile(r"^mn5_ablation_(.+)$")
-METRICS = ["mae_median", "rmse_median", "smape_median", "r2_median"]
+METRICS = ["mae_median", "rmse_median", "r2_median"]
 FINGERPRINT_EXCLUDE_PATHS = {
     ("training", "seed"),
     ("training", "crossval_fold_index"),
@@ -1040,7 +1040,7 @@ def main() -> int:
             else deltas_path
         )
         if not heatmap_df.empty:
-            for metric in ["mae", "rmse", "smape", "r2"]:
+            for metric in ["mae", "rmse", "r2"]:
                 try:
                     plot_ablation_deltas_heatmap(
                         heatmap_csv,
@@ -1092,7 +1092,7 @@ def main() -> int:
     print("=" * 80)
     print(f"\nAggregated metrics for {len(aggregated_df['model'].unique())} ablations")
     print(f"Targets: {', '.join(sorted(aggregated_df['target'].unique()))}")
-    print("\nMetrics: MAE, RMSE, sMAPE, R²")
+    print("\nMetrics: MAE, RMSE, R²")
     print(f"\nOutput directory: {args.output_dir}")
     print("\nFiles generated:")
     print(f"  - {aggregated_path.name}")

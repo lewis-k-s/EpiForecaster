@@ -26,7 +26,7 @@ plt.rcParams["font.size"] = 10
 plt.rcParams["axes.spines.top"] = False
 plt.rcParams["axes.spines.right"] = False
 
-_VALUE_COLUMNS = ["observed", "abs_error", "sq_error", "smape_num", "smape_den"]
+_VALUE_COLUMNS = ["observed", "abs_error", "sq_error"]
 _METADATA_COLUMNS = [
     "region_id",
     "region_label",
@@ -282,14 +282,6 @@ def _prepare_joined_frame(
                 merged[f"{value_column}_baseline"] - merged[f"{value_column}_candidate"]
             )
 
-    merged["smape_baseline"] = merged["smape_num_baseline"] / merged[
-        "smape_den_baseline"
-    ].clip(lower=1e-6)
-    merged["smape_candidate"] = merged["smape_num_candidate"] / merged[
-        "smape_den_candidate"
-    ].clip(lower=1e-6)
-    merged["smape_delta"] = merged["smape_candidate"] - merged["smape_baseline"]
-    merged["smape_uplift"] = merged["smape_baseline"] - merged["smape_candidate"]
     return merged, excluded_targets, excluded_seeds
 
 
@@ -301,14 +293,10 @@ def _aggregate_pairs(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
         "candidate_mae": ("abs_error_candidate", "mean"),
         "baseline_mse": ("sq_error_baseline", "mean"),
         "candidate_mse": ("sq_error_candidate", "mean"),
-        "baseline_smape": ("smape_baseline", "mean"),
-        "candidate_smape": ("smape_candidate", "mean"),
         "abs_error_delta_mean": ("abs_error_delta", "mean"),
         "abs_error_uplift_mean": ("abs_error_uplift", "mean"),
         "sq_error_delta_mean": ("sq_error_delta", "mean"),
         "sq_error_uplift_mean": ("sq_error_uplift", "mean"),
-        "smape_delta_mean": ("smape_delta", "mean"),
-        "smape_uplift_mean": ("smape_uplift", "mean"),
     }
     grouped = df.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
     grouped["baseline_rmse"] = grouped["baseline_mse"].clip(lower=0.0).map(math.sqrt)
@@ -1007,9 +995,6 @@ def compare_ablation_suite(
                     "baseline_rmse": row.baseline_rmse,
                     "candidate_rmse": row.candidate_rmse,
                     "rmse_uplift": row.rmse_uplift,
-                    "baseline_smape": row.baseline_smape,
-                    "candidate_smape": row.candidate_smape,
-                    "smape_uplift": row.smape_uplift_mean,
                 }
             )
     pd.DataFrame(summary_rows).to_csv(
@@ -1060,8 +1045,8 @@ def compare_granular_csvs(
     """Compare two sets of granular eval results, write paired tables, and render uplift plots.
 
     Args:
-        baseline_csv: Path to baseline granular metrics CSV or pre-loaded DataFrame
-        candidate_csv: Path to candidate granular metrics CSV or pre-loaded DataFrame
+        baseline_csv: Path to baseline granular metrics artifact or pre-loaded DataFrame
+        candidate_csv: Path to candidate granular metrics artifact or pre-loaded DataFrame
         output_dir: Directory to write outputs
         min_join_coverage: Minimum fraction of rows that must match on join
         rolling_window: Window size for rolling time plots
@@ -1181,13 +1166,13 @@ def compare_granular_csvs(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Render granular comparison artifacts for ablation eval CSVs",
+        description="Render granular comparison artifacts for ablation eval outputs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   uv run python -m dataviz.granular_comparison \
-      --baseline-csv outputs/.../baseline/test_granular_metrics.csv \
-      --candidate-csv outputs/.../mobility:off/test_granular_metrics.csv \
+      --baseline-csv outputs/.../baseline/test_granular_metrics.parquet \
+      --candidate-csv outputs/.../mobility:off/test_granular_metrics.parquet \
       --output-dir outputs/reports/granular_compare/mobility_off
 
   uv run python -m dataviz.granular_comparison \

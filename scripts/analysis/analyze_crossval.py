@@ -204,7 +204,6 @@ def build_target_fold_metrics(runs: list[CrossvalRun], split: str) -> pd.DataFra
                     "run_dir": str(run.run_dir),
                     "mae": row.mae_median,
                     "rmse": row.rmse_median,
-                    "smape": row.smape_median,
                     "r2": row.r2_median,
                     "observed_count": row.observed_count_median,
                 }
@@ -223,8 +222,6 @@ def aggregate_target_fold_metrics(fold_df: pd.DataFrame) -> pd.DataFrame:
                 "mae_std": _std_or_zero(group["mae"]),
                 "rmse_mean": float(group["rmse"].mean()),
                 "rmse_std": _std_or_zero(group["rmse"]),
-                "smape_mean": float(group["smape"].mean()),
-                "smape_std": _std_or_zero(group["smape"]),
                 "r2_mean": float(group["r2"].mean()),
                 "r2_std": _std_or_zero(group["r2"]),
                 "observed_count_mean": float(group["observed_count"].mean()),

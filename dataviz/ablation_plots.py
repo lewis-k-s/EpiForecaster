@@ -34,10 +34,9 @@ TARGET_LABELS = Palette.TARGET_LABELS
 METRIC_LABELS = {
     "mae": "MAE",
     "rmse": "RMSE",
-    "smape": "sMAPE",
     "r2": "R²",
 }
-DEFAULT_DELTA_METRICS = ["mae", "rmse", "smape", "r2"]
+DEFAULT_DELTA_METRICS = ["mae", "rmse", "r2"]
 PRIMARY_ABLATION_ORDER = [
     "mobility:off",
     "mobility:spatial_queen",

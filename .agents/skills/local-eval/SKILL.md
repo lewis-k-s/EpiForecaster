@@ -90,7 +90,7 @@ local-eval checkpoints/best_model.pt --eval-batch-size 8
 ## Output
 
 The evaluation produces:
-1. **Console output**: Evaluation metrics (loss, MAE, RMSE, sMAPE, R²)
+1. **Console output**: Evaluation metrics (loss, MAE, RMSE, R²)
 2. **Node metrics CSV**: Per-node MAE and sample counts
 3. **Forecast plots**: Quartile-based visualization of predictions
 
