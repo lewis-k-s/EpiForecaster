@@ -486,7 +486,8 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
         "exp_smoothing",
         "last_observed",
         "sarima",
-        "var",
+        "sarimax",
+        "varmax",
     ]
     assert baseline_kwargs["split"] == "test"
     assert (

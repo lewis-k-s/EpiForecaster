@@ -61,7 +61,9 @@ class Palette:
         "exp smoothing": "#7FB3A9",
         "last observed": "#F2A541",
         "sarima": "#C44E52",
+        "sarimax": "#8C564B",
         "var": "#7A5195",
+        "varmax": "#BCBD22",
     }
     SUPPORT = {
         "no_source": "#6C757D",

@@ -693,7 +693,13 @@ def eval_epiforecaster(
             artifacts = run_same_slice_baseline_evaluation(
                 config=eval_result["config"],
                 output_dir=baseline_output_dir,
-                models=["exp_smoothing", "last_observed", "sarima", "var"],
+                models=[
+                    "exp_smoothing",
+                    "last_observed",
+                    "sarima",
+                    "sarimax",
+                    "varmax",
+                ],
                 config_path=str(checkpoint.parent.parent / "config.yaml"),
                 split=split,
             )
@@ -752,7 +758,7 @@ def eval_epiforecaster(
 @click.option(
     "--models",
     type=click.Choice(
-        ["sarima", "exp_smoothing", "last_observed", "var", "varmax", "all"],
+        ["sarima", "sarimax", "exp_smoothing", "last_observed", "varmax", "all"],
         case_sensitive=False,
     ),
     default="sarima",
@@ -802,7 +808,7 @@ def eval_baselines(
         from evaluation.baseline_eval import run_baseline_evaluation
 
         selected_models = (
-            ["exp_smoothing", "last_observed", "sarima", "var"]
+            ["exp_smoothing", "last_observed", "sarima", "sarimax", "varmax"]
             if models.lower() == "all"
             else [models.lower()]
         )

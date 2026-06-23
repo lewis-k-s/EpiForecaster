@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Run baseline evaluation in production-style environments.
+"""Run same-slice baseline evaluation in production-style environments.
 
 This wrapper is intentionally thin:
-- Loads a training config
+- Loads a training config (also used as the evaluation config)
 - Applies optional data-path overrides
-- Runs baseline evaluation
+- Runs same-slice baseline evaluation
 - Prints produced artifacts
+
+All baselines are evaluated on the same target slices/masks as the neural model
+(``same_eval_slice`` comparison scope) and fall back to last-observed on fit
+failure so every method is scored on common support (see
+``baseline_metadata.json`` and ``primary_success_rate_mean`` in the aggregate
+metrics for the disclosed fallback rate).
 """
 
 from __future__ import annotations
@@ -17,10 +23,22 @@ from pathlib import Path
 from evaluation.baseline_eval import run_baseline_evaluation
 from models.configs import EpiForecasterConfig
 
+# Reported/default comparison: stable univariate references plus covariate-aware
+# SARIMAX/VARMAX. Covariate-free VAR remains available only when explicitly
+# requested through the lower-level evaluation API.
+_DEFAULT_MODELS = [
+    "exp_smoothing",
+    "last_observed",
+    "sarima",
+    "sarimax",
+    "varmax",
+]
+_ALL_ALIAS = "all"
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run EpiForecaster baseline evaluation (rolling-origin folds).",
+        description="Run EpiForecaster same-slice baseline evaluation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -39,7 +57,10 @@ def _parse_args() -> argparse.Namespace:
         "--models",
         nargs="+",
         default=["sarima"],
-        help="Baseline model families to run (e.g. sarima exp_smoothing var all).",
+        help=(
+            "Baseline model families to run (e.g. sarima sarimax varmax "
+            "exp_smoothing last_observed, or 'all')."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -48,21 +69,10 @@ def _parse_args() -> argparse.Namespace:
         help="Evaluation split.",
     )
     parser.add_argument(
-        "--rolling-folds",
-        type=int,
-        default=5,
-        help="Number of expanding rolling-origin folds.",
-    )
-    parser.add_argument(
         "--seasonal-period",
         type=int,
         default=7,
-        help="Seasonal period for seasonal-naive / SARIMA family.",
-    )
-    parser.add_argument(
-        "--disable-sparsity-bins",
-        action="store_true",
-        help="Disable sparsity-decile stratified reporting.",
+        help="Seasonal period for seasonal-naive / SARIMA-family baselines.",
     )
     parser.add_argument(
         "--dataset-path",
@@ -85,6 +95,12 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_models(models: list[str]) -> list[str]:
+    if any(m.lower() == _ALL_ALIAS for m in models):
+        return list(_DEFAULT_MODELS)
+    return models
+
+
 def main() -> int:
     args = _parse_args()
     logging.basicConfig(
@@ -95,8 +111,6 @@ def main() -> int:
 
     if not args.config.exists():
         raise FileNotFoundError(f"Config not found: {args.config}")
-    if args.rolling_folds <= 0:
-        raise ValueError("--rolling-folds must be > 0")
     if args.seasonal_period <= 0:
         raise ValueError("--seasonal-period must be > 0")
 
@@ -108,11 +122,12 @@ def main() -> int:
     if args.run_id is not None:
         cfg.data.run_id = args.run_id
 
+    selected_models = _resolve_models(args.models)
+
     logger.info("Running baseline eval")
     logger.info("  config: %s", args.config)
-    logger.info("  models: %s", args.models)
+    logger.info("  models: %s", ",".join(selected_models))
     logger.info("  split: %s", args.split)
-    logger.info("  rolling_folds: %d", args.rolling_folds)
     logger.info("  output_dir: %s", args.output_dir)
     logger.info("  dataset_path: %s", cfg.data.dataset_path)
     logger.info("  run_id: %s", cfg.data.run_id)
@@ -121,11 +136,9 @@ def main() -> int:
         config=cfg,
         config_path=str(args.config),
         output_dir=args.output_dir,
-        models=args.models,
+        models=selected_models,
         split=args.split,
-        rolling_folds=args.rolling_folds,
         seasonal_period=args.seasonal_period,
-        include_sparsity_bins=not args.disable_sparsity_bins,
     )
 
     print("Baseline evaluation completed.")

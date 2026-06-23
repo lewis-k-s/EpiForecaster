@@ -17,6 +17,7 @@ from evaluation.baseline_models import (
     predict_with_exponential_smoothing_fallback,
     predict_with_last_observed_fallback,
     predict_with_sarima_fallback,
+    predict_with_sarimax_fallback,
     predict_with_var_fallback,
     predict_with_varmax_fallback,
 )
@@ -81,14 +82,20 @@ _SUPPORTED_BASELINE_MODELS = [
     "exp_smoothing",
     "last_observed",
     "sarima",
+    "sarimax",
     "var",
     "varmax",
 ]
+# The reported/default comparison keeps the stable univariate references and
+# covariate-aware SARIMAX/VARMAX. Covariate-free VAR remains explicitly
+# supported for diagnostics, but is excluded from "all" because it is unstable
+# on the sparse same-slice benchmark support.
 _DEFAULT_ALL_BASELINE_MODELS = [
     "exp_smoothing",
     "last_observed",
     "sarima",
-    "var",
+    "sarimax",
+    "varmax",
 ]
 _SAME_SLICE_BASELINE_SCHEMA_VERSION = "1"
 _SAME_SLICE_COMPARISON_SCOPE = "same_eval_slice"
@@ -355,9 +362,12 @@ def _predict_univariate_baseline(
     horizon: int,
     global_train_median: float,
     seasonal_period: int,
-    exog_train: np.ndarray | None,
-    exog_future: np.ndarray | None,
 ) -> BaselinePredictionResult:
+    """Dispatch a covariate-free univariate baseline by family.
+
+    SARIMAX (the covariate-aware counterpart to SARIMA) is handled separately in
+    :func:`_predict_sarimax_baseline` because it needs per-series exog plumbing.
+    """
     if baseline_model == "last_observed":
         return predict_with_last_observed_fallback(
             train_values=train_values,
@@ -510,15 +520,13 @@ def _predict_varmax_baseline(
                 for target_name in _SAME_SLICE_TARGET_ORDER
             ]
         ).astype(np.float64)
-        future_mask = np.zeros((horizon, train_mask.shape[1]), dtype=np.float64)
-        exog_train = np.concatenate(
-            [train_mask, history_temporal_covariates[batch_index]],
-            axis=1,
-        )
-        exog_future = np.concatenate(
-            [future_mask, future_temporal_covariates[batch_index]],
-            axis=1,
-        )
+        # Exogenous inputs are the temporal (calendar/holiday/lockdown)
+        # covariates only. The own-target availability mask was previously
+        # prepended, but it is all-zeros in the forecast period (future
+        # availability is unknown) and redundant after imputation; dropping it
+        # keeps SARIMAX and VARMAX comparable on identical exogenous inputs.
+        exog_train = history_temporal_covariates[batch_index]
+        exog_future = future_temporal_covariates[batch_index]
         per_target_result = predict_with_varmax_fallback(
             train_values=train_values,
             train_mask=train_mask,
@@ -530,6 +538,60 @@ def _predict_varmax_baseline(
         )
         for target_name in _SAME_SLICE_TARGET_ORDER:
             results[target_name].append(per_target_result[target_name])
+    return results
+
+
+def _predict_sarimax_baseline(
+    *,
+    batch_data: Any,
+    horizon: int,
+    global_medians: dict[str, float],
+    seasonal_period: int,
+    temporal_covariates: np.ndarray,
+) -> dict[str, list[BaselinePredictionResult]]:
+    """Per-target SARIMAX with temporal covariates as exogenous regressors.
+
+    Mirrors :func:`_predict_varmax_baseline` exog assembly (temporal covariates
+    only) so the univariate-vs-multivariate contrast is isolated to the AR
+    structure, not to the covariate inputs.
+    """
+    history_values_by_target: dict[str, np.ndarray] = {}
+    history_masks_by_target: dict[str, np.ndarray] = {}
+    for target_name in _SAME_SLICE_TARGET_ORDER:
+        spec = _SAME_SLICE_TARGET_SPECS[target_name]
+        history_values, history_mask = _extract_same_slice_history(
+            batch_data,
+            spec=spec,
+        )
+        history_values_by_target[target_name] = history_values
+        history_masks_by_target[target_name] = history_mask
+
+    history_temporal_covariates = _torch_to_numpy_2d(
+        getattr(batch_data, "temporal_covariates")
+    )
+    future_temporal_covariates = _future_temporal_covariates_from_batch(
+        batch_data=batch_data,
+        temporal_covariates=temporal_covariates,
+        horizon=horizon,
+    )
+
+    batch_size = history_values_by_target[_SAME_SLICE_TARGET_ORDER[0]].shape[0]
+    results = {target_name: [] for target_name in _SAME_SLICE_TARGET_ORDER}
+
+    for batch_index in range(batch_size):
+        exog_train = history_temporal_covariates[batch_index]
+        exog_future = future_temporal_covariates[batch_index]
+        for target_name in _SAME_SLICE_TARGET_ORDER:
+            pred = predict_with_sarimax_fallback(
+                train_values=history_values_by_target[target_name][batch_index],
+                train_mask=history_masks_by_target[target_name][batch_index],
+                horizon=horizon,
+                global_train_median=global_medians[target_name],
+                seasonal_period=seasonal_period,
+                exog_train=exog_train,
+                exog_future=exog_future,
+            )
+            results[target_name].append(pred)
     return results
 
 
@@ -550,6 +612,154 @@ def run_baseline_evaluation(
         split=split,
         seasonal_period=seasonal_period,
     )
+
+
+_SUPERVISION_KEY_BY_TARGET = {
+    "hospitalizations": "hosp",
+    "wastewater": "ww",
+    "cases": "cases",
+    "deaths": "deaths",
+}
+_UNIVARIATE_BASELINE_MODELS = {"exp_smoothing", "last_observed", "sarima"}
+
+
+def _predict_univariate_batch_baseline(
+    *,
+    baseline_model: str,
+    batch_data: Any,
+    horizon: int,
+    global_medians: dict[str, float],
+    seasonal_period: int,
+) -> dict[str, list[BaselinePredictionResult]]:
+    """Run a covariate-free univariate baseline across all targets/batches."""
+    results: dict[str, list[BaselinePredictionResult]] = {
+        target_name: [] for target_name in _SAME_SLICE_TARGET_ORDER
+    }
+    for target_name in _SAME_SLICE_TARGET_ORDER:
+        spec = _SAME_SLICE_TARGET_SPECS[target_name]
+        history_values, history_mask = _extract_same_slice_history(
+            batch_data, spec=spec
+        )
+        batch_size = history_values.shape[0]
+        for batch_index in range(batch_size):
+            results[target_name].append(
+                _predict_univariate_baseline(
+                    baseline_model=baseline_model,
+                    train_values=history_values[batch_index],
+                    train_mask=history_mask[batch_index],
+                    horizon=horizon,
+                    global_train_median=global_medians[target_name],
+                    seasonal_period=seasonal_period,
+                )
+            )
+    return results
+
+
+def _collect_per_target_results(
+    *,
+    model_name: str,
+    batch_data: Any,
+    horizon: int,
+    global_medians: dict[str, float],
+    seasonal_period: int,
+    temporal_covariates: np.ndarray,
+) -> dict[str, list[BaselinePredictionResult]]:
+    """Dispatch a single baseline family to its batch-level predictor."""
+    if model_name == "var":
+        return _predict_var_baseline(
+            batch_data=batch_data,
+            horizon=horizon,
+            global_medians=global_medians,
+            seasonal_period=seasonal_period,
+        )
+    if model_name == "varmax":
+        return _predict_varmax_baseline(
+            batch_data=batch_data,
+            horizon=horizon,
+            global_medians=global_medians,
+            temporal_covariates=temporal_covariates,
+        )
+    if model_name == "sarimax":
+        return _predict_sarimax_baseline(
+            batch_data=batch_data,
+            horizon=horizon,
+            global_medians=global_medians,
+            seasonal_period=seasonal_period,
+            temporal_covariates=temporal_covariates,
+        )
+    if model_name in _UNIVARIATE_BASELINE_MODELS:
+        return _predict_univariate_batch_baseline(
+            baseline_model=model_name,
+            batch_data=batch_data,
+            horizon=horizon,
+            global_medians=global_medians,
+            seasonal_period=seasonal_period,
+        )
+    raise ValueError(f"Unsupported baseline model: {model_name}")
+
+
+def _emit_baseline_rows(
+    *,
+    model_name: str,
+    per_target_results: dict[str, list[BaselinePredictionResult]],
+    obs_supervision: dict[str, Any],
+    batch_data: Any,
+    granular_rows: list[dict[str, Any]],
+    failure_rows: list[dict[str, Any]],
+    temporal_coords: list[Any] | None,
+    region_ids: list[str] | None,
+    region_labels: list[str] | None,
+    split: str,
+) -> tuple[int, str]:
+    """Build granular + failure rows for every target from per-target results.
+
+    Shared across all baseline families so the comparison surface is identical.
+    Returns ``(completed_series, last_target_name)`` for progress logging.
+    """
+    completed = 0
+    last_target = ""
+    for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
+        last_target = target_name
+        supervision = obs_supervision[_SUPERVISION_KEY_BY_TARGET[target_name]]
+        target_tensor = supervision["target"]
+        weights = supervision["weights"]
+        if target_tensor is None or weights is None:
+            continue
+        target_results = per_target_results[target_name]
+        predictions = np.stack([pred.predictions for pred in target_results], axis=0)
+        selected_models = [pred.model_name for pred in target_results]
+        fit_statuses = [pred.fit_status for pred in target_results]
+        fallback_reasons = [pred.fallback_reason for pred in target_results]
+        completed += len(target_results)
+        failure_rows.extend(
+            _build_baseline_failure_rows(
+                batch_data=batch_data,
+                spec=spec,
+                results=target_results,
+                temporal_coords=temporal_coords,
+                region_ids=region_ids,
+                region_labels=region_labels,
+                model_name=model_name,
+            )
+        )
+        granular_rows.extend(
+            _build_same_slice_granular_rows(
+                batch_data=batch_data,
+                spec=spec,
+                predictions=predictions,
+                targets=target_tensor,
+                weights=weights,
+                temporal_coords=temporal_coords,
+                region_ids=region_ids,
+                region_labels=region_labels,
+                split=split,
+                model_name=model_name,
+                selected_model=selected_models,
+                fit_status=fit_statuses,
+                fallback_reason=fallback_reasons,
+            )
+        )
+    return completed, last_target
 
 
 def compare_model_metrics_against_baselines(
@@ -691,21 +901,31 @@ def _compute_metrics_from_granular_rows(rows: pd.DataFrame) -> dict[str, float]:
             "rmse": float("nan"),
             "r2": float("nan"),
             "observed_count": 0.0,
+            "primary_success_rate": float("nan"),
         }
 
     observed = pd.to_numeric(rows["observed"], errors="coerce")
     abs_error = pd.to_numeric(rows["abs_error"], errors="coerce")
     sq_error = pd.to_numeric(rows["sq_error"], errors="coerce")
+    # ``fit_status`` is only present for baseline granular rows; the model's own
+    # eval granular reuses this function and has no such column. When absent,
+    # primary_success_rate is undefined (the model always "succeeds").
+    if "fit_status" in rows.columns:
+        fit_status = rows["fit_status"].astype(str)
+    else:
+        fit_status = None
     valid = np.isfinite(observed) & np.isfinite(abs_error) & np.isfinite(sq_error)
     observed = observed[valid].astype(float)
     abs_error = abs_error[valid].astype(float)
     sq_error = sq_error[valid].astype(float)
+    fit_status_valid = fit_status[valid] if fit_status is not None else None
     if observed.empty:
         return {
             "mae": float("nan"),
             "rmse": float("nan"),
             "r2": float("nan"),
             "observed_count": 0.0,
+            "primary_success_rate": float("nan"),
         }
 
     weight_sum = float(len(observed))
@@ -716,11 +936,20 @@ def _compute_metrics_from_granular_rows(rows: pd.DataFrame) -> dict[str, float]:
     target_weighted_sq_sum = float((observed**2).sum())
     ss_tot = target_weighted_sq_sum - (target_weighted_sum**2) / max(weight_sum, 1.0)
     r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    # Fraction of scored cells where the primary method produced the forecast
+    # (i.e. did not fall back to last-observed / global median). Disclosed so the
+    # composite-method metrics are interpretable.
+    primary_success_rate = (
+        float((fit_status_valid == "fit_success").mean())
+        if fit_status_valid is not None
+        else float("nan")
+    )
     return {
         "mae": mae,
         "rmse": rmse,
         "r2": r2,
         "observed_count": weight_sum,
+        "primary_success_rate": primary_success_rate,
     }
 
 
@@ -939,6 +1168,7 @@ def _aggregate_same_slice_granular_rows(granular_df: pd.DataFrame) -> pd.DataFra
                 "rmse_mean",
                 "r2_mean",
                 "observed_count_mean",
+                "primary_success_rate_mean",
             ]
         )
 
@@ -953,6 +1183,7 @@ def _aggregate_same_slice_granular_rows(granular_df: pd.DataFrame) -> pd.DataFra
                 "rmse_mean": metrics["rmse"],
                 "r2_mean": metrics["r2"],
                 "observed_count_mean": metrics["observed_count"],
+                "primary_success_rate_mean": metrics["primary_success_rate"],
             }
         )
 
@@ -1060,202 +1291,39 @@ def run_same_slice_baseline_evaluation(
             targets_dict,
             device=torch.device("cpu"),
         )
+        # The forecast horizon is dictated by the supervision target tensor
+        # (the true eval slice length); config.model.forecast_horizon is only a
+        # fallback. This keeps predictions aligned with the target mask shape.
+        horizon = int(config.model.forecast_horizon)
+        for _supervision in obs_supervision.values():
+            _target_tensor = _supervision["target"]
+            if _target_tensor is not None and _target_tensor.ndim >= 2:
+                horizon = int(_target_tensor.shape[1])
+                break
 
         for model_name in resolved_models:
             current_model_name = model_name
-            if model_name == "var":
-                per_target_results = _predict_var_baseline(
-                    batch_data=batch_data,
-                    horizon=int(config.model.forecast_horizon),
-                    global_medians=global_medians,
-                    seasonal_period=seasonal_period,
-                )
-                for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
-                    current_target_name = target_name
-                    supervision_key = {
-                        "hospitalizations": "hosp",
-                        "wastewater": "ww",
-                        "cases": "cases",
-                        "deaths": "deaths",
-                    }[target_name]
-                    supervision = obs_supervision[supervision_key]
-                    target_tensor = supervision["target"]
-                    weights = supervision["weights"]
-                    if target_tensor is None or weights is None:
-                        continue
-
-                    target_results = per_target_results[target_name]
-                    predictions = np.stack(
-                        [pred.predictions for pred in target_results],
-                        axis=0,
-                    )
-                    selected_models = [pred.model_name for pred in target_results]
-                    fit_statuses = [pred.fit_status for pred in target_results]
-                    fallback_reasons = [pred.fallback_reason for pred in target_results]
-                    completed_series += len(target_results)
-                    failure_rows.extend(
-                        _build_baseline_failure_rows(
-                            batch_data=batch_data,
-                            spec=spec,
-                            results=target_results,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                            model_name=model_name,
-                        )
-                    )
-                    granular_rows.extend(
-                        _build_same_slice_granular_rows(
-                            batch_data=batch_data,
-                            spec=spec,
-                            predictions=predictions,
-                            targets=target_tensor,
-                            weights=weights,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                            split=split.lower(),
-                            model_name=model_name,
-                            selected_model=selected_models,
-                            fit_status=fit_statuses,
-                            fallback_reason=fallback_reasons,
-                        )
-                    )
-                continue
-
-            if model_name == "varmax":
-                per_target_results = _predict_varmax_baseline(
-                    batch_data=batch_data,
-                    horizon=int(config.model.forecast_horizon),
-                    global_medians=global_medians,
-                    temporal_covariates=dataset_temporal_covariates,
-                )
-                for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
-                    current_target_name = target_name
-                    supervision_key = {
-                        "hospitalizations": "hosp",
-                        "wastewater": "ww",
-                        "cases": "cases",
-                        "deaths": "deaths",
-                    }[target_name]
-                    supervision = obs_supervision[supervision_key]
-                    target_tensor = supervision["target"]
-                    weights = supervision["weights"]
-                    if target_tensor is None or weights is None:
-                        continue
-
-                    target_results = per_target_results[target_name]
-                    predictions = np.stack(
-                        [pred.predictions for pred in target_results],
-                        axis=0,
-                    )
-                    selected_models = [pred.model_name for pred in target_results]
-                    fit_statuses = [pred.fit_status for pred in target_results]
-                    fallback_reasons = [pred.fallback_reason for pred in target_results]
-                    completed_series += len(target_results)
-                    failure_rows.extend(
-                        _build_baseline_failure_rows(
-                            batch_data=batch_data,
-                            spec=spec,
-                            results=target_results,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                            model_name=model_name,
-                        )
-                    )
-                    granular_rows.extend(
-                        _build_same_slice_granular_rows(
-                            batch_data=batch_data,
-                            spec=spec,
-                            predictions=predictions,
-                            targets=target_tensor,
-                            weights=weights,
-                            temporal_coords=temporal_coords,
-                            region_ids=region_ids,
-                            region_labels=region_labels,
-                            split=split.lower(),
-                            model_name=model_name,
-                            selected_model=selected_models,
-                            fit_status=fit_statuses,
-                            fallback_reason=fallback_reasons,
-                        )
-                    )
-                continue
-
-            if model_name not in {"exp_smoothing", "last_observed", "sarima"}:
-                continue
-            for target_name, spec in _SAME_SLICE_TARGET_SPECS.items():
-                current_target_name = target_name
-                supervision_key = {
-                    "hospitalizations": "hosp",
-                    "wastewater": "ww",
-                    "cases": "cases",
-                    "deaths": "deaths",
-                }[target_name]
-                supervision = obs_supervision[supervision_key]
-                target_tensor = supervision["target"]
-                weights = supervision["weights"]
-                if target_tensor is None or weights is None:
-                    continue
-
-                history_values, history_mask = _extract_same_slice_history(
-                    batch_data,
-                    spec=spec,
-                )
-                batch_size = history_values.shape[0]
-                predictions = np.zeros_like(
-                    target_tensor.detach().cpu().numpy(), dtype=np.float64
-                )
-                selected_models: list[str] = []
-                fit_statuses: list[str] = []
-                fallback_reasons: list[str] = []
-                target_results: list[BaselinePredictionResult] = []
-                for batch_index in range(batch_size):
-                    pred = _predict_univariate_baseline(
-                        baseline_model=model_name,
-                        train_values=history_values[batch_index],
-                        train_mask=history_mask[batch_index],
-                        horizon=int(target_tensor.shape[1]),
-                        global_train_median=global_medians[target_name],
-                        seasonal_period=seasonal_period,
-                        exog_train=None,
-                        exog_future=None,
-                    )
-                    predictions[batch_index] = pred.predictions
-                    selected_models.append(pred.model_name)
-                    fit_statuses.append(pred.fit_status)
-                    fallback_reasons.append(pred.fallback_reason)
-                    target_results.append(pred)
-                completed_series += batch_size
-                failure_rows.extend(
-                    _build_baseline_failure_rows(
-                        batch_data=batch_data,
-                        spec=spec,
-                        results=target_results,
-                        temporal_coords=temporal_coords,
-                        region_ids=region_ids,
-                        region_labels=region_labels,
-                        model_name=model_name,
-                    )
-                )
-                granular_rows.extend(
-                    _build_same_slice_granular_rows(
-                        batch_data=batch_data,
-                        spec=spec,
-                        predictions=predictions,
-                        targets=target_tensor,
-                        weights=weights,
-                        temporal_coords=temporal_coords,
-                        region_ids=region_ids,
-                        region_labels=region_labels,
-                        split=split.lower(),
-                        model_name=model_name,
-                        selected_model=selected_models,
-                        fit_status=fit_statuses,
-                        fallback_reason=fallback_reasons,
-                    )
-                )
+            per_target_results = _collect_per_target_results(
+                model_name=model_name,
+                batch_data=batch_data,
+                horizon=horizon,
+                global_medians=global_medians,
+                seasonal_period=seasonal_period,
+                temporal_covariates=dataset_temporal_covariates,
+            )
+            completed_delta, current_target_name = _emit_baseline_rows(
+                model_name=model_name,
+                per_target_results=per_target_results,
+                obs_supervision=obs_supervision,
+                batch_data=batch_data,
+                granular_rows=granular_rows,
+                failure_rows=failure_rows,
+                temporal_coords=temporal_coords,
+                region_ids=region_ids,
+                region_labels=region_labels,
+                split=split.lower(),
+            )
+            completed_series += completed_delta
         processed_batches += 1
         now = time.perf_counter()
         should_log_progress = (

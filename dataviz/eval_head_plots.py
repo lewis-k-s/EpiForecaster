@@ -88,9 +88,10 @@ _BASELINE_COMPARISON_METRICS = {
 }
 _TARGET_PLOT_BASELINES = {
     "sarima",
+    "sarimax",
     "exp_smoothing",
     "last_observed",
-    "var",
+    "varmax",
 }
 
 
@@ -302,7 +303,9 @@ def _save_scatter(
 ) -> Path:
     fig, ax = plt.subplots(figsize=(9, 6))
     targets = plot_df["target"].dropna().astype(str).unique()
-    color = Palette.target(targets[0]) if len(targets) == 1 else Palette.NEUTRAL["muted"]
+    color = (
+        Palette.target(targets[0]) if len(targets) == 1 else Palette.NEUTRAL["muted"]
+    )
     sns.scatterplot(
         data=plot_df,
         x=x_col,
@@ -946,8 +949,7 @@ def render_baseline_delta_plots(
     }
     hue_order = ["Our model", *[baseline_labels[name] for name in baseline_models]]
     palette = [
-        Palette.BASELINE_SERIES.get(label, Palette.target(label))
-        for label in hue_order
+        Palette.BASELINE_SERIES.get(label, Palette.target(label)) for label in hue_order
     ]
 
     for metric_key, metric_label in _BASELINE_COMPARISON_METRICS.items():
