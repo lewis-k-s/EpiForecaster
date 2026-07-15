@@ -1,0 +1,6 @@
+outs:
+- md5: f3d97d9e1d9128436f8bf498220818eb.dir
+  size: 713532624
+  nfiles: 7673
+  hash: md5
+  path: mobility.zarr

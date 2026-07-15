@@ -193,6 +193,9 @@ markers = [
 ]
 
 [dependency-groups]
-dev = ["ipython>=8.12.0"]
+dev = [
+    "dvc>=3.67.1",
+    "ipython>=8.12.0",
+]
 
 # Build dependencies are handled by pip/uv automatically
