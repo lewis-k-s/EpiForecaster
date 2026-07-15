@@ -12,13 +12,16 @@ each workspace.
   epiforecaster-dvc/
     storage/                 # DVC NFS remote
     cache/                   # shared protected DVC cache
+    tooling/                 # isolated DVC virtual environment
   epiforecaster-runs/
     <run-id>/project/        # isolated code, data links, logs, and outputs
 ```
 
-The legacy `/home/bsc/bsc008913/EpiForecaster` checkout remains the shared
-Python environment during the pilot. It is not used as a code or output
-workspace by pilot jobs.
+The legacy `/home/bsc/bsc008913/EpiForecaster` checkout supplies the existing
+scientific Python environment during the pilot. DVC itself has an isolated
+environment under `epiforecaster-dvc/tooling`; the legacy environment is not
+modified, and the legacy checkout is not used as a code or output workspace by
+pilot jobs.
 
 ## Pilot datasets
 
@@ -33,11 +36,19 @@ variables.
 
 ## Setup
 
-Install the locked development environment locally and in the legacy MN5
-environment:
+Install the locked development environment locally:
 
 ```bash
 uv sync --frozen
+```
+
+On the MN5 login node, provision the isolated DVC CLI once:
+
+```bash
+uv venv /home/bsc/bsc008913/epiforecaster-dvc/tooling
+uv pip install \
+  --python /home/bsc/bsc008913/epiforecaster-dvc/tooling/bin/python \
+  'dvc==3.67.1'
 ```
 
 The committed DVC remote points at the NFS storage directory. Each isolated
