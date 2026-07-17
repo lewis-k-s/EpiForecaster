@@ -104,7 +104,7 @@ prepare_run() {
 
   rsync -az --delete \
     --exclude-from="$REPO_ROOT/.gitignore" \
-    --exclude=.git/ \
+    --exclude=.git \
     --exclude=.venv/ \
     --exclude=.cache/ \
     --exclude=.dvc/cache/ \

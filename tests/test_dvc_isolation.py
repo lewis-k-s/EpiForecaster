@@ -190,6 +190,8 @@ def test_mn5_prepare_builds_isolated_sync_and_dvc_pull(
     assert result.returncode == 0, result.stderr
     commands = command_log.read_text()
     assert "dt-test:/nfs/epiforecaster-runs/test-run/project/" in commands
+    assert "--exclude=.git " in commands
+    assert "--exclude=.git/" not in commands
     assert "git init -q" in commands
     assert "/nfs/env/bin/dvc" in commands
     assert "pull data/files/mobility.zarr.dvc" in commands
