@@ -8,10 +8,12 @@ each workspace.
 ## Remote layout
 
 ```text
+/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/
+  storage/                   # shared DVC NFS remote
+  cache/                     # shared protected DVC cache
+
 /home/bsc/bsc008913/
   epiforecaster-dvc/
-    storage/                 # DVC NFS remote
-    cache/                   # shared protected DVC cache
     tooling/                 # isolated DVC virtual environment
   epiforecaster-runs/
     <run-id>/project/        # isolated code, data links, logs, and outputs
@@ -42,11 +44,15 @@ Install the locked development environment locally:
 uv sync --frozen
 ```
 
-On the MN5 login node, provision the isolated DVC CLI once:
+Provision the isolated DVC CLI once. MN5 login nodes do not have outbound
+PyPI access, so resolve a Linux wheelhouse locally, transfer it through `dt`,
+and install from it offline:
 
 ```bash
-uv venv /home/bsc/bsc008913/epiforecaster-dvc/tooling
+python -m venv /home/bsc/bsc008913/epiforecaster-dvc/tooling
 uv pip install \
+  --offline \
+  --find-links /home/bsc/bsc008913/epiforecaster-dvc/wheelhouse \
   --python /home/bsc/bsc008913/epiforecaster-dvc/tooling/bin/python \
   'dvc==3.67.1'
 ```
@@ -56,7 +62,7 @@ remote workspace receives a local cache configuration during `prepare`:
 
 ```ini
 [cache]
-    dir = /home/bsc/bsc008913/epiforecaster-dvc/cache
+    dir = /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/cache
     shared = group
     type = symlink
 ```
