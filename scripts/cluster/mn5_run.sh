@@ -122,7 +122,9 @@ $(shell_quote "$REMOTE_DVC_BIN") config --local cache.dir $(shell_quote "$DVC_CA
 $(shell_quote "$REMOTE_DVC_BIN") config --local cache.shared group
 $(shell_quote "$REMOTE_DVC_BIN") config --local cache.type symlink
 $(shell_quote "$REMOTE_DVC_BIN") remote modify --local mn5-nfs url $(shell_quote "$DVC_REMOTE_PATH")
-$(shell_quote "$REMOTE_DVC_BIN") pull ${DVC_TARGETS[*]}
+touch $(shell_quote "$DVC_CACHE_PATH/.dvc-pull.lock")
+chmod 0664 $(shell_quote "$DVC_CACHE_PATH/.dvc-pull.lock")
+flock -x $(shell_quote "$DVC_CACHE_PATH/.dvc-pull.lock") $(shell_quote "$REMOTE_DVC_BIN") pull ${DVC_TARGETS[*]}
 $(shell_quote "$REMOTE_DVC_BIN") status ${DVC_TARGETS[*]}
 printf '%s\n' \
   $(shell_quote "run_id=$run_id") \

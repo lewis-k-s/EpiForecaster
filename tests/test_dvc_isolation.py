@@ -194,5 +194,7 @@ def test_mn5_prepare_builds_isolated_sync_and_dvc_pull(
     assert "--exclude=.git/" not in commands
     assert "git init -q" in commands
     assert "/nfs/env/bin/dvc" in commands
+    assert "flock -x" in commands
+    assert "/nfs/epiforecaster-dvc/cache/.dvc-pull.lock" in commands
     assert "pull data/files/mobility.zarr.dvc" in commands
     assert "data/processed/real_with_id.zarr.dvc" in commands

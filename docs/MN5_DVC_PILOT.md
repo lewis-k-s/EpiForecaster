@@ -5,6 +5,12 @@ stack for execution. Each local worktree is synced into a different remote
 project directory, while DVC materializes the same read-only cache objects in
 each workspace.
 
+First-time cache population is guarded by
+`cache/.dvc-pull.lock`. DVC protects cache objects as read-only, so two
+simultaneous writes of the same missing object can otherwise race on NFS. The
+lock covers `dvc pull` during preparation; it does not serialize submitted
+jobs or their isolated workspaces.
+
 ## Remote layout
 
 ```text
