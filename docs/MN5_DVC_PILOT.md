@@ -55,12 +55,26 @@ PyPI access, so resolve a Linux wheelhouse locally, transfer it through `dt`,
 and install from it offline:
 
 ```bash
-python -m venv /home/bsc/bsc008913/epiforecaster-dvc/tooling
+/home/bsc/bsc008913/EpiForecaster/.venv/bin/python -m venv \
+  /home/bsc/bsc008913/epiforecaster-dvc/tooling
 uv pip install \
   --offline \
   --find-links /home/bsc/bsc008913/epiforecaster-dvc/wheelhouse \
   --python /home/bsc/bsc008913/epiforecaster-dvc/tooling/bin/python \
   'dvc==3.67.1'
+```
+
+Create the shared project directories with setgid permissions and default
+group-write ACLs. Apply the ACL to every existing hash directory if the remote
+has already been populated:
+
+```bash
+mkdir -p \
+  /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/{storage,cache}
+chmod 2775 \
+  /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/{storage,cache}
+find /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/{storage,cache} \
+  -type d -exec setfacl -m g::rwx,m::rwx,d:g::rwx,d:m::rwx {} +
 ```
 
 The committed DVC remote points at the NFS storage directory. Each isolated
@@ -113,10 +127,22 @@ The verifier requires:
 - one workspace-local canary per processed Zarr directory;
 - no canary or smoke output belonging to the other run.
 
-## Pilot decision gate
+## Pilot result and decision
 
-Keep the current dispatch CLI if this test proves that DVC pull, cache linking,
-and run-directory isolation are reliable on MN5. Consider Snakemake only if the
-next requirement is DAG orchestration across preprocessing, training,
-evaluation, and dependent job arrays; it is not needed merely to version the
-datasets or isolate worktrees.
+The MN5 pilot passed on 2026-07-17. Runs `dvc-pilot-a` and `dvc-pilot-b`
+resolved to different project roots, pulled the exact raw and processed hashes,
+opened both stores with Xarray, and linked 7,673 and 3,587 files respectively
+into the project cache. Slurm jobs `43417409` and `43417417` both started at
+13:50:15, overlapped for five seconds on different QoS classes, and completed
+with exit code zero. The pair verifier found no cross-run canaries or outputs.
+
+The first concurrent cold-cache attempt exposed a race between DVC processes
+protecting the same newly downloaded object. The committed NFS lock is therefore
+required around shared-cache `dvc pull`; distinct workspaces and submitted jobs
+remain concurrent.
+
+Snakemake is not needed for this problem. DVC supplies dataset identity and the
+NFS object store, while `mn5_run.sh` supplies immutable code snapshots and
+per-run directories. Reconsider Snakemake only when preprocessing, training,
+evaluation, and dependent arrays need a declarative DAG with incremental
+re-execution; it would not add isolation or provenance beyond this design.
