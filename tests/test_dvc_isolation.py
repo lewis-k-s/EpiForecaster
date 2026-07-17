@@ -198,3 +198,9 @@ def test_mn5_prepare_builds_isolated_sync_and_dvc_pull(
     assert "/nfs/epiforecaster-dvc/cache/.dvc-pull.lock" in commands
     assert "pull data/files/mobility.zarr.dvc" in commands
     assert "data/processed/real_with_id.zarr.dvc" in commands
+    raw_document = yaml.safe_load(dvc_isolation_probe.RAW_DVC_PATH.read_text())
+    processed_document = yaml.safe_load(
+        dvc_isolation_probe.PROCESSED_DVC_PATH.read_text()
+    )
+    assert f"raw_dvc_md5={raw_document['outs'][0]['md5']}" in commands
+    assert f"processed_dvc_md5={processed_document['outs'][0]['md5']}" in commands

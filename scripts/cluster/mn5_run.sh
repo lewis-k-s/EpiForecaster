@@ -78,7 +78,10 @@ remote_bash() {
 
 dvc_md5() {
   local dvc_file="$1"
-  awk '$1 == "md5:" { print $2; exit }' "$dvc_file"
+  awk '
+    $1 == "-" && $2 == "md5:" { print $3; exit }
+    $1 == "md5:" { print $2; exit }
+  ' "$dvc_file"
 }
 
 prepare_run() {
