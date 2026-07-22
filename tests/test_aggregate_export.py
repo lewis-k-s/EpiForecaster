@@ -69,7 +69,9 @@ def test_build_main_model_target_aggregate_missing_metrics_are_nan() -> None:
     assert df["observed_count_iqr"].isna().all()
 
 
-def test_build_main_model_joint_observation_aggregate_excludes_sird_supervision() -> None:
+def test_build_main_model_joint_observation_aggregate_excludes_sird_supervision() -> (
+    None
+):
     eval_metrics = {
         "loss_ww": 1.0,
         "loss_hosp": 2.0,
@@ -199,6 +201,7 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
     trainer.trial = None
     trainer.pruning_start_epoch = 10
     trainer.scheduler = None
+    trainer.criterion = SimpleNamespace(observation_loss="mse")
     trainer.val_loader = object()
     trainer.test_loader = object()
     trainer.metric_artifacts = {}
