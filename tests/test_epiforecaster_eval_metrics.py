@@ -5,6 +5,7 @@ import torch
 from types import SimpleNamespace
 
 from evaluation.losses import JointInferenceLoss
+from evaluation.metrics import TorchDistributionMetricAccumulator
 from evaluation.epiforecaster_eval import evaluate_loader
 
 
@@ -27,6 +28,25 @@ class _DummyModel(torch.nn.Module):
 
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         return batch_data.model_outputs, batch_data.targets_dict
+
+
+def test_distribution_metric_accumulator_preserves_negative_nll() -> None:
+    accumulator = TorchDistributionMetricAccumulator(device=torch.device("cpu"))
+
+    batch_metrics = accumulator.update(
+        loc=torch.zeros((1, 1)),
+        scale=torch.full((1, 1), 0.1),
+        targets=torch.zeros((1, 1)),
+        observed_mask=torch.ones((1, 1)),
+    )
+    summary = accumulator.finalize()
+
+    expected = (
+        torch.log(torch.tensor(0.1)).item()
+        + 0.5 * torch.log(torch.tensor(2.0 * torch.pi)).item()
+    )
+    assert batch_metrics.nll.item() == pytest.approx(expected)
+    assert summary.nll == pytest.approx(expected)
 
 
 def test_evaluate_loader_emits_cases_and_deaths_metrics():
@@ -78,6 +98,15 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
     assert "rmse" not in metrics
     assert "r2" not in metrics
     assert metrics["mae_hosp_log1p_per_100k"] == 0.0
+    expected_exact_normal_crps = 2.0 / (2.0 * torch.pi) ** 0.5 - 1.0 / torch.pi**0.5
+    assert metrics["nll_hosp_log1p_per_100k"] == pytest.approx(
+        0.5 * torch.log(torch.tensor(2.0 * torch.pi)).item()
+    )
+    assert metrics["crps_hosp_log1p_per_100k"] == pytest.approx(
+        float(expected_exact_normal_crps)
+    )
+    assert metrics["coverage_80_hosp"] == pytest.approx(1.0)
+    assert len(metrics["coverage_80_hosp_per_h"]) == 2
     assert "mae_cases_log1p_per_100k" in metrics
     assert "mae_deaths_log1p_per_100k" in metrics
     assert metrics["observed_count_cases"] == 3
