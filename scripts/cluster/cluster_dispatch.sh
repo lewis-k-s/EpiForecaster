@@ -2,7 +2,7 @@
 
 # Generic Slurm cluster dispatch CLI.
 # Config-driven: source a .cluster/<name>.conf to set cluster identity,
-# mode registry, resource specs, and sync commands.
+# mode registry and resource specs.
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ fi
 
 if [ ! -f "$CONF" ]; then
   echo "Config not found: $CONF" >&2
-  echo "Hint: run 'bash syncto_mn5.sh' to sync the cluster config, or set CLUSTER_CONF to an absolute path." >&2
+  echo "Set CLUSTER_CONF to an existing cluster configuration path." >&2
   exit 1
 fi
 
