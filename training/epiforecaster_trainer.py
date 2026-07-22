@@ -1211,8 +1211,7 @@ class EpiForecasterTrainer:
         if not self.config.training.run_final_evaluation:
             best_checkpoint_path = self._best_checkpoint_path()
             self._status(
-                "Final evaluation deferred to the workflow: "
-                f"{best_checkpoint_path}"
+                f"Final evaluation deferred to the workflow: {best_checkpoint_path}"
             )
             if self.wandb_run is not None:
                 self.wandb_run.summary["best_val_loss"] = self.best_val_loss
@@ -1222,9 +1221,7 @@ class EpiForecasterTrainer:
                 self.wandb_run.summary["best_val_selection_metric"] = (
                     self.best_val_selection_metric
                 )
-                self.wandb_run.summary["best_val_joint_loss"] = (
-                    self.best_val_joint_loss
-                )
+                self.wandb_run.summary["best_val_joint_loss"] = self.best_val_joint_loss
                 self.wandb_run.finish()
             self.cleanup_dataloaders()
             return self.get_training_results()
