@@ -8,6 +8,7 @@ This module provides a streamlined command-line interface with only two main com
 This replaces the complex variant-specific CLI with configuration-driven training.
 """
 
+import json
 import logging
 import math
 import traceback
@@ -327,6 +328,12 @@ cli.add_command(plot_cli, name="plot")
     help="Enable granular per-example error export.",
 )
 @click.option(
+    "--summary-json",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional machine-readable evaluation summary output.",
+)
+@click.option(
     "--output-csv",
     "node_metrics_csv",
     type=click.Path(path_type=Path),
@@ -401,6 +408,7 @@ def eval_epiforecaster(
     node_metrics_csv: Path | None,
     granular_csv: Path | None,
     granular: bool,
+    summary_json: Path | None,
     log_dir: Path | None,
     override: tuple[str, ...],
     eval_batch_size: int | None,
@@ -661,6 +669,27 @@ def eval_epiforecaster(
         metrics = eval_result["eval_metrics"]
         summary = _format_eval_summary(loss, metrics)
         click.echo(f"\nEval summary ({split}):\n{summary}")
+        if summary_json is not None:
+            summary_json.parent.mkdir(parents=True, exist_ok=True)
+            summary_json.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "checkpoint": str(checkpoint.resolve()),
+                        "split": split,
+                        "eval_loss": _json_metric_value(float(loss)),
+                        "metrics": {
+                            str(name): _json_metric_value(value)
+                            for name, value in sorted(metrics.items())
+                        },
+                    },
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
         baseline_results_csv = compare_baselines
         if compare_evals:
@@ -745,6 +774,8 @@ def eval_epiforecaster(
             click.echo(f"Saved {plot_name} to: {plot_path}")
         if granular_csv is not None:
             click.echo(f"Saved granular metrics to: {granular_csv}")
+        if summary_json is not None:
+            click.echo(f"Saved evaluation summary to: {summary_json}")
         if wandb.run is not None:
             wandb.finish()
     except Exception as exc:
@@ -1247,6 +1278,26 @@ def _format_eval_summary(loss: float, metrics: dict) -> str:
     for name, value in rows:
         lines.append(f"{name:<6}  {value}")
     return "\n".join(lines)
+
+
+def _json_metric_value(value: object) -> object:
+    """Convert scalar or structured evaluation metrics to JSON-native values."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_metric_value(item) for item in value]
+
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return _json_metric_value(tolist())
+    item = getattr(value, "item", None)
+    if callable(item):
+        return _json_metric_value(item())
+    raise TypeError(f"Unsupported evaluation metric value: {type(value).__name__}")
 
 
 @train_cli.command("regions")

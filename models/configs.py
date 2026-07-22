@@ -788,6 +788,9 @@ class TrainingParams:
     pin_memory: bool = True
     eval_frequency: int = 5
     eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
+    # Run canonical validation/test evaluation after selecting the best checkpoint.
+    # Workflow-managed training disables this and evaluates in a separate DAG rule.
+    run_final_evaluation: bool = True
     # Loss configuration (single or composite)
     loss: LossConfig = field(default_factory=LossConfig)
     # forecast plotting during validation/test evaluation

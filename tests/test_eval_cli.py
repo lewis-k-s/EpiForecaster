@@ -1,96 +1,28 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from types import SimpleNamespace
 
+import pytest
 from click.testing import CliRunner
-from evaluation.selection import WindowSelectionSpec
 
 import cli as cli_module
+from evaluation.selection import WindowSelectionSpec
+from tests.eval_test_helpers import (
+    install_eval_cli_harness,
+    install_plot_forecast_harness,
+    make_checkpoint,
+    make_eval_result,
+)
 
 
-def test_eval_cli_uses_output_directory_for_all_artifacts(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    checkpoint_path = tmp_path / "best_model.pt"
-    checkpoint_path.write_bytes(b"dummy")
-    output_dir = tmp_path / "eval_outputs"
-    output_dir.mkdir()
-
-    captured: dict[str, object] = {}
-
-    def _fake_extract_run_from_checkpoint_path(_checkpoint: Path):
-        return None
-
-    def _fake_eval_checkpoint(**kwargs):
-        captured["eval_checkpoint_kwargs"] = kwargs
-        return {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=2)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1, 1: 0.2}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        }
-
-    def _fake_select_nodes_by_loss(**kwargs):
-        captured["select_nodes_kwargs"] = kwargs
-        return {"Q1 (Best MAE)": [0], "Q4 (Worst MAE)": [1]}
-
-    def _fake_generate_forecast_plots(**kwargs):
-        captured["generate_forecast_plots_kwargs"] = kwargs
-        return {
-            "selected_nodes": [0, 1],
-            "node_groups": {"Q1 (Best MAE)": [0], "Q4 (Worst MAE)": [1]},
-        }
-
-    def _fake_render_eval_per_head_plots(**kwargs):
-        captured["render_eval_per_head_plots_kwargs"] = kwargs
-        return {
-            "perf_vs_population_cases": kwargs["output_dir"]
-            / "perf_vs_population_cases.png"
-        }
-
-    def _fake_render_baseline_delta_plots(**kwargs):
-        captured["render_baseline_delta_plots_kwargs"] = kwargs
-        output_path = kwargs["output_dir"] / "test_baseline_comparison_sarima.png"
-        output_path.write_text("plot", encoding="utf-8")
-        return {"baseline_comparison_sarima": output_path}
-
-    monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        _fake_extract_run_from_checkpoint_path,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        _fake_eval_checkpoint,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        _fake_select_nodes_by_loss,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        _fake_generate_forecast_plots,
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        _fake_render_eval_per_head_plots,
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_baseline_delta_plots",
-        _fake_render_baseline_delta_plots,
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
+def _invoke_eval(
+    checkpoint_path: Path,
+    output_dir: Path,
+    *extra_args: str,
+    split: str = "test",
+):
+    return CliRunner().invoke(
         cli_module.cli,
         [
             "eval",
@@ -98,14 +30,44 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
             "--checkpoint",
             str(checkpoint_path),
             "--split",
-            "test",
+            split,
             "--output",
             str(output_dir),
+            *extra_args,
         ],
     )
 
-    assert result.exit_code == 0, result.output
 
+def test_eval_cli_uses_output_directory_for_all_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = make_checkpoint(tmp_path)
+    output_dir = tmp_path / "eval_outputs"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+    groups = {"Q1 (Best MAE)": [0], "Q4 (Worst MAE)": [1]}
+    install_eval_cli_harness(
+        monkeypatch,
+        captured,
+        eval_result=make_eval_result(num_forecast_samples=2, node_mae={0: 0.1, 1: 0.2}),
+        node_groups=groups,
+    )
+
+    def fake_render_baseline_delta_plots(**kwargs):
+        captured["render_baseline_delta_plots_kwargs"] = kwargs
+        output_path = kwargs["output_dir"] / "test_baseline_comparison_sarima.png"
+        output_path.write_text("plot", encoding="utf-8")
+        return {"baseline_comparison_sarima": output_path}
+
+    monkeypatch.setattr(
+        "dataviz.eval_head_plots.render_baseline_delta_plots",
+        fake_render_baseline_delta_plots,
+    )
+
+    result = _invoke_eval(checkpoint_path, output_dir)
+
+    assert result.exit_code == 0, result.output
     eval_kwargs = captured["eval_checkpoint_kwargs"]
     assert eval_kwargs["node_metrics_csv_path"] == output_dir / "test_node_metrics.csv"
     assert eval_kwargs["per_head_node_metrics_csv_path"] == (
@@ -117,7 +79,6 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
 
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["output_path"] == output_dir / "test_forecasts.png"
-
     per_head_kwargs = captured["render_eval_per_head_plots_kwargs"]
     assert per_head_kwargs["per_head_node_metrics_csv"] == (
         output_dir / "test_node_metrics_per_head.csv"
@@ -127,69 +88,14 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
 
 def test_eval_cli_creates_missing_output_directory_for_all_artifacts(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint_path = tmp_path / "best_model.pt"
-    checkpoint_path.write_bytes(b"dummy")
+    checkpoint_path = make_checkpoint(tmp_path)
     output_dir = tmp_path / "fresh_eval_outputs"
-
     captured: dict[str, object] = {}
+    install_eval_cli_harness(monkeypatch, captured)
 
-    def _fake_extract_run_from_checkpoint_path(_checkpoint: Path):
-        return None
-
-    def _fake_eval_checkpoint(**kwargs):
-        captured["eval_checkpoint_kwargs"] = kwargs
-        return {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        }
-
-    monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        _fake_extract_run_from_checkpoint_path,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        _fake_eval_checkpoint,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        lambda **kwargs: {"Q1 (Best MAE)": [0]},
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        lambda **kwargs: {},
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "eval",
-            "epiforecaster",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "test",
-            "--output",
-            str(output_dir),
-        ],
-    )
+    result = _invoke_eval(checkpoint_path, output_dir)
 
     assert result.exit_code == 0, result.output
     assert output_dir.is_dir()
@@ -203,69 +109,15 @@ def test_eval_cli_creates_missing_output_directory_for_all_artifacts(
 
 def test_eval_cli_granular_flag_enables_auto_granular_output(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint_path = tmp_path / "best_model.pt"
-    checkpoint_path.write_bytes(b"dummy")
+    checkpoint_path = make_checkpoint(tmp_path)
     output_dir = tmp_path / "eval_outputs"
     output_dir.mkdir()
-
     captured: dict[str, object] = {}
+    install_eval_cli_harness(monkeypatch, captured)
 
-    monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        lambda _checkpoint: None,
-    )
-
-    def _fake_eval_checkpoint(**kwargs):
-        captured["eval_checkpoint_kwargs"] = kwargs
-        return {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        }
-
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        _fake_eval_checkpoint,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        lambda **kwargs: {"Q1 (Best MAE)": [0]},
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        lambda **kwargs: {},
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "eval",
-            "epiforecaster",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "test",
-            "--output",
-            str(output_dir),
-            "--granular",
-        ],
-    )
+    result = _invoke_eval(checkpoint_path, output_dir, "--granular")
 
     assert result.exit_code == 0, result.output
     eval_kwargs = captured["eval_checkpoint_kwargs"]
@@ -278,70 +130,57 @@ def test_eval_cli_granular_flag_enables_auto_granular_output(
     assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
 
 
+def test_eval_cli_writes_machine_readable_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = make_checkpoint(tmp_path)
+    output_dir = tmp_path / "eval_outputs"
+    summary_path = output_dir / "test_summary.json"
+    captured: dict[str, object] = {}
+    eval_result = make_eval_result()
+    eval_result["eval_loss"] = float("nan")
+    eval_result["eval_metrics"]["mae_by_horizon"] = [0.2, float("nan")]
+    eval_result["eval_metrics"]["nested"] = {"unsupported": float("inf")}
+    install_eval_cli_harness(monkeypatch, captured, eval_result=eval_result)
+
+    result = _invoke_eval(
+        checkpoint_path,
+        output_dir,
+        "--summary-json",
+        str(summary_path),
+    )
+
+    assert result.exit_code == 0, result.output
+    summary = json.loads(summary_path.read_text())
+    assert summary == {
+        "schema_version": 1,
+        "checkpoint": str(checkpoint_path.resolve()),
+        "split": "test",
+        "eval_loss": None,
+        "metrics": {
+            "mae": 0.1,
+            "mae_cases_log1p_per_100k": 0.4,
+            "mae_deaths_log1p_per_100k": 0.5,
+            "mae_hosp_log1p_per_100k": 0.2,
+            "mae_by_horizon": [0.2, None],
+            "mae_ww_log1p_per_100k": 0.3,
+            "nested": {"unsupported": None},
+        },
+    }
+
+
 def test_eval_cli_full_split_is_accepted(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint_path = tmp_path / "best_model.pt"
-    checkpoint_path.write_bytes(b"dummy")
+    checkpoint_path = make_checkpoint(tmp_path)
     output_dir = tmp_path / "eval_outputs"
     output_dir.mkdir()
-
     captured: dict[str, object] = {}
+    install_eval_cli_harness(monkeypatch, captured)
 
-    monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        lambda _checkpoint: None,
-    )
-
-    def _fake_eval_checkpoint(**kwargs):
-        captured["eval_checkpoint_kwargs"] = kwargs
-        return {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        }
-
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        _fake_eval_checkpoint,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        lambda **kwargs: {"Q1 (Best MAE)": [0]},
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        lambda **kwargs: {},
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "eval",
-            "epiforecaster",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "full",
-            "--output",
-            str(output_dir),
-        ],
-    )
+    result = _invoke_eval(checkpoint_path, output_dir, split="full")
 
     assert result.exit_code == 0, result.output
     eval_kwargs = captured["eval_checkpoint_kwargs"]
@@ -354,52 +193,25 @@ def test_eval_cli_full_split_is_accepted(
 
 def test_eval_cli_compare_evals_runs_fresh_baselines(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint_path = tmp_path / "run" / "checkpoints" / "best_model.pt"
-    checkpoint_path.parent.mkdir(parents=True)
-    checkpoint_path.write_bytes(b"dummy")
+    checkpoint_path = make_checkpoint(tmp_path, nested=True)
     output_dir = tmp_path / "eval_outputs"
     output_dir.mkdir()
-
     captured: dict[str, object] = {}
+    install_eval_cli_harness(
+        monkeypatch,
+        captured,
+        eval_result=make_eval_result(num_forecast_samples=2, node_mae={0: 0.1, 1: 0.2}),
+    )
 
-    def _fake_extract_run_from_checkpoint_path(_checkpoint: Path):
-        return None
-
-    def _fake_eval_checkpoint(**kwargs):
-        captured["eval_checkpoint_kwargs"] = kwargs
-        return {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=2)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1, 1: 0.2}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        }
-
-    def _fake_select_nodes_by_loss(**kwargs):
-        return {"Q1 (Best MAE)": [0]}
-
-    def _fake_generate_forecast_plots(**kwargs):
-        return {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}}
-
-    def _fake_render_eval_per_head_plots(**kwargs):
-        return {}
-
-    def _fake_render_baseline_delta_plots(**kwargs):
+    def fake_render_baseline_delta_plots(**kwargs):
         captured["render_baseline_delta_plots_kwargs"] = kwargs
         output_path = kwargs["output_dir"] / "test_baseline_comparison_sarima.png"
         output_path.write_text("plot", encoding="utf-8")
         return {"baseline_comparison_sarima": output_path}
 
-    def _fake_run_same_slice_baseline_evaluation(**kwargs):
+    def fake_run_same_slice_baseline_evaluation(**kwargs):
         captured["run_same_slice_baseline_evaluation_kwargs"] = kwargs
         baseline_dir = kwargs["output_dir"]
         baseline_dir.mkdir(parents=True, exist_ok=True)
@@ -407,77 +219,43 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
         baseline_csv.write_text(
             "model,target,mae_mean,rmse_mean,r2_mean\n", encoding="utf-8"
         )
-        (baseline_dir / "baseline_metadata.json").write_text(
-            '{"comparison_scope":"same_eval_slice"}',
-            encoding="utf-8",
-        )
+        metadata = baseline_dir / "baseline_metadata.json"
+        metadata.write_text('{"comparison_scope":"same_eval_slice"}', encoding="utf-8")
         return {
             "baseline_aggregate_metrics": baseline_csv,
-            "baseline_metadata": baseline_dir / "baseline_metadata.json",
+            "baseline_metadata": metadata,
         }
 
-    def _fake_compare_model_metrics_against_baselines(**kwargs):
+    def fake_compare_model_metrics_against_baselines(**kwargs):
         captured["compare_kwargs"] = kwargs
         kwargs["output_csv"].write_text(
-            (
-                "target,baseline_model,metric,model_value,baseline_value\n"
-                "cases,sarima,mae,0.3,0.4\n"
-                "cases,sarima,r2,0.2,0.1\n"
-            ),
+            "target,baseline_model,metric,model_value,baseline_value\n"
+            "cases,sarima,mae,0.3,0.4\n"
+            "cases,sarima,r2,0.2,0.1\n",
             encoding="utf-8",
         )
         return kwargs["output_csv"]
 
     monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        _fake_extract_run_from_checkpoint_path,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        _fake_eval_checkpoint,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        _fake_select_nodes_by_loss,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        _fake_generate_forecast_plots,
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        _fake_render_eval_per_head_plots,
-    )
-    monkeypatch.setattr(
         "dataviz.eval_head_plots.render_baseline_delta_plots",
-        _fake_render_baseline_delta_plots,
+        fake_render_baseline_delta_plots,
     )
     monkeypatch.setattr(
         "evaluation.baseline_eval.run_same_slice_baseline_evaluation",
-        _fake_run_same_slice_baseline_evaluation,
+        fake_run_same_slice_baseline_evaluation,
     )
     monkeypatch.setattr(
         "evaluation.baseline_eval.compare_model_metrics_against_baselines",
-        _fake_compare_model_metrics_against_baselines,
+        fake_compare_model_metrics_against_baselines,
     )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "eval",
-            "epiforecaster",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "test",
-            "--output",
-            str(output_dir),
-            "--granular",
-            "--compare-evals",
-            "--compare-baselines",
-            str(tmp_path / "ignored.csv"),
-        ],
+    result = _invoke_eval(
+        checkpoint_path,
+        output_dir,
+        "--granular",
+        "--compare-evals",
+        "--compare-baselines",
+        str(tmp_path / "ignored.csv"),
     )
 
     assert result.exit_code == 0, result.output
@@ -490,18 +268,16 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
         "varmax",
     ]
     assert baseline_kwargs["split"] == "test"
-    assert (
-        baseline_kwargs["output_dir"] == output_dir / "test_baseline_eval_same_window"
+    assert baseline_kwargs["output_dir"] == (
+        output_dir / "test_baseline_eval_same_window"
     )
-
     compare_kwargs = captured["compare_kwargs"]
     assert compare_kwargs["baseline_results_csv"] == (
         output_dir / "test_baseline_eval_same_window" / "baseline_aggregate_metrics.csv"
     )
     baseline_plot_kwargs = captured["render_baseline_delta_plots_kwargs"]
-    assert (
-        baseline_plot_kwargs["baseline_deltas_csv"]
-        == output_dir / "test_baseline_deltas.csv"
+    assert baseline_plot_kwargs["baseline_deltas_csv"] == (
+        output_dir / "test_baseline_deltas.csv"
     )
     assert baseline_plot_kwargs["output_dir"] == output_dir
     assert (
@@ -512,62 +288,14 @@ def test_eval_cli_compare_evals_runs_fresh_baselines(
 
 def test_eval_cli_compare_evals_rejects_full_split(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint_path = tmp_path / "best_model.pt"
-    checkpoint_path.write_bytes(b"dummy")
+    checkpoint_path = make_checkpoint(tmp_path)
     output_dir = tmp_path / "eval_outputs"
     output_dir.mkdir()
+    install_eval_cli_harness(monkeypatch, {})
 
-    monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        lambda _checkpoint: None,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        lambda **kwargs: {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=1)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        },
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        lambda **kwargs: {"Q1 (Best MAE)": [0]},
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        lambda **kwargs: {"selected_nodes": [0], "node_groups": {"Q1 (Best MAE)": [0]}},
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        lambda **kwargs: {},
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "eval",
-            "epiforecaster",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "full",
-            "--output",
-            str(output_dir),
-            "--compare-evals",
-        ],
-    )
+    result = _invoke_eval(checkpoint_path, output_dir, "--compare-evals", split="full")
 
     assert result.exit_code != 0
     assert "--compare-evals is not supported with --split full" in result.output
@@ -575,38 +303,22 @@ def test_eval_cli_compare_evals_rejects_full_split(
 
 def test_eval_cli_granular_window_selection_uses_generated_granular_output(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint_path = tmp_path / "best_model.pt"
-    checkpoint_path.write_bytes(b"dummy")
+    checkpoint_path = make_checkpoint(tmp_path)
     output_dir = tmp_path / "eval_outputs"
     output_dir.mkdir()
     captured: dict[str, object] = {}
 
-    def _fake_extract_run_from_checkpoint_path(_checkpoint: Path):
-        return None
-
-    def _fake_eval_checkpoint(**kwargs):
-        granular_output = kwargs["granular_output_path"]
-        granular_output.write_text(
+    def fake_eval_checkpoint(**kwargs):
+        kwargs["granular_output_path"].write_text(
             "split,target,node_id,window_start,abs_error\n", encoding="utf-8"
         )
-        return {
-            "config": SimpleNamespace(training=SimpleNamespace(num_forecast_samples=2)),
-            "model": object(),
-            "loader": object(),
-            "node_mae": {"hospitalizations": {0: 0.1}},
-            "eval_loss": 0.5,
-            "eval_metrics": {
-                "mae": 0.1,
-                "mae_hosp_log1p_per_100k": 0.2,
-                "mae_ww_log1p_per_100k": 0.3,
-                "mae_cases_log1p_per_100k": 0.4,
-                "mae_deaths_log1p_per_100k": 0.5,
-            },
-        }
+        return make_eval_result(num_forecast_samples=2)
 
-    def _fake_load_window_selection_specs_from_granular(**kwargs):
+    install_eval_cli_harness(monkeypatch, captured, eval_callback=fake_eval_checkpoint)
+
+    def fake_load_window_selection_specs_from_granular(**kwargs):
         captured["load_window_specs_kwargs"] = kwargs
         return [
             WindowSelectionSpec(
@@ -618,11 +330,11 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_output(
             )
         ]
 
-    def _fake_select_windows_by_loss(**kwargs):
+    def fake_select_windows_by_loss(**kwargs):
         captured["select_windows_kwargs"] = kwargs
         return {"Q1 (Best MAE)": kwargs["window_specs"]}
 
-    def _fake_generate_forecast_plots(**kwargs):
+    def fake_generate_forecast_plots(**kwargs):
         captured["generate_forecast_plots_kwargs"] = kwargs
         return {
             "selected_nodes": [7],
@@ -631,229 +343,88 @@ def test_eval_cli_granular_window_selection_uses_generated_granular_output(
         }
 
     monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        _fake_extract_run_from_checkpoint_path,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.eval_checkpoint",
-        _fake_eval_checkpoint,
-    )
-    monkeypatch.setattr(
         "evaluation.selection.load_window_selection_specs_from_granular",
-        _fake_load_window_selection_specs_from_granular,
+        fake_load_window_selection_specs_from_granular,
     )
     monkeypatch.setattr(
-        "evaluation.selection.select_windows_by_loss",
-        _fake_select_windows_by_loss,
+        "evaluation.selection.select_windows_by_loss", fake_select_windows_by_loss
     )
     monkeypatch.setattr(
         "evaluation.epiforecaster_eval.generate_forecast_plots",
-        _fake_generate_forecast_plots,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.select_nodes_by_loss",
-        lambda **kwargs: {"unused": []},
+        fake_generate_forecast_plots,
     )
     monkeypatch.setattr(
         "evaluation.baseline_eval.compare_model_metrics_against_baselines",
         lambda **kwargs: kwargs["output_csv"],
     )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.render_eval_per_head_plots",
-        lambda **kwargs: {},
-    )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "eval",
-            "epiforecaster",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "test",
-            "--output",
-            str(output_dir),
-            "--granular",
-            "--selection-mode",
-            "granular_window_quartile",
-        ],
+    result = _invoke_eval(
+        checkpoint_path,
+        output_dir,
+        "--granular",
+        "--selection-mode",
+        "granular_window_quartile",
     )
 
     assert result.exit_code == 0, result.output
-    assert (
-        captured["load_window_specs_kwargs"]["granular_csv"]
-        == output_dir / "test_granular.parquet"
+    assert captured["load_window_specs_kwargs"]["granular_csv"] == (
+        output_dir / "test_granular.parquet"
     )
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["node_groups"] is None
     assert plot_kwargs["window_groups"]["Q1 (Best MAE)"][0].window_start == 11
 
 
-def test_plot_forecasts_window_quartile_uses_granular_csv(
+@pytest.mark.parametrize(
+    ("node_selector", "selection_function", "group_name", "include_latents"),
+    [
+        (
+            "window_quartile:1",
+            "select_windows_by_loss",
+            "Q1 (Best MAE)",
+            False,
+        ),
+        ("window_worst:1", "select_worst_windows_by_loss", "Worst MAE", True),
+    ],
+)
+def test_plot_forecasts_uses_granular_window_selection(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
+    node_selector: str,
+    selection_function: str,
+    group_name: str,
+    include_latents: bool,
 ) -> None:
-    checkpoint_path = tmp_path / "run" / "checkpoints" / "best_model.pt"
-    checkpoint_path.parent.mkdir(parents=True)
-    checkpoint_path.write_bytes(b"dummy")
-    captured: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        "utils.run_discovery.extract_run_from_checkpoint_path",
-        lambda _checkpoint: None,
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.load_model_from_checkpoint",
-        lambda checkpoint, device="auto", overrides=None: (
-            __import__("torch").nn.Linear(1, 1),
-            SimpleNamespace(
-                output=SimpleNamespace(
-                    resolve_granular_eval_filename=lambda split: (
-                        f"{split}_granular.parquet"
-                    )
-                ),
-                training=SimpleNamespace(),
-            ),
-            object(),
-        ),
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.build_loader_from_config",
-        lambda config, split, device="auto": (
-            SimpleNamespace(
-                dataset=type(
-                    "_Dataset",
-                    (),
-                    {
-                        "_valid_window_starts_by_node": {},
-                        "__len__": lambda self: 0,
-                    },
-                )()
-            ),
-            None,
-        ),
-    )
-    monkeypatch.setattr(
-        "evaluation.selection.load_window_selection_specs_from_granular",
-        lambda **kwargs: [
-            WindowSelectionSpec(3, 9, 0.2, ("cases",), 2),
-        ],
-    )
-    monkeypatch.setattr(
-        "evaluation.selection.select_windows_by_loss",
-        lambda **kwargs: {"Q1 (Best MAE)": kwargs["window_specs"]},
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        lambda **kwargs: captured.setdefault("generate_forecast_plots_kwargs", kwargs),
-    )
-
+    checkpoint_path = make_checkpoint(tmp_path, nested=True)
     granular_output = checkpoint_path.parent.parent / "test_granular.parquet"
     granular_output.write_text(
         "split,target,node_id,window_start,abs_error\n", encoding="utf-8"
     )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "plot",
-            "forecasts",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "test",
-            "--nodes",
-            "window_quartile:1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    plot_kwargs = captured["generate_forecast_plots_kwargs"]
-    assert plot_kwargs["node_groups"] is None
-    assert plot_kwargs["window_groups"]["Q1 (Best MAE)"][0].node_id == 3
-
-
-def test_plot_forecasts_window_worst_uses_granular_tail_selection(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    checkpoint_path = tmp_path / "run" / "checkpoints" / "best_model.pt"
-    checkpoint_path.parent.mkdir(parents=True)
-    checkpoint_path.write_bytes(b"dummy")
-    granular_output = checkpoint_path.parent.parent / "test_granular.parquet"
-    granular_output.write_text(
-        "split,target,node_id,window_start,abs_error\n",
-        encoding="utf-8",
-    )
     captured: dict[str, object] = {}
+    install_plot_forecast_harness(
+        monkeypatch,
+        captured,
+        selection_function=selection_function,
+        group_name=group_name,
+    )
+    args = [
+        "plot",
+        "forecasts",
+        "--checkpoint",
+        str(checkpoint_path),
+        "--split",
+        "test",
+        "--nodes",
+        node_selector,
+    ]
+    if include_latents:
+        args.append("--include-sird-latents")
 
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.load_model_from_checkpoint",
-        lambda checkpoint, device="auto", overrides=None: (
-            __import__("torch").nn.Linear(1, 1),
-            SimpleNamespace(
-                output=SimpleNamespace(
-                    resolve_granular_eval_filename=lambda split: (
-                        f"{split}_granular.parquet"
-                    )
-                ),
-                training=SimpleNamespace(),
-            ),
-            object(),
-        ),
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.build_loader_from_config",
-        lambda config, split, device="auto": (
-            SimpleNamespace(
-                dataset=type(
-                    "_Dataset",
-                    (),
-                    {
-                        "_valid_window_starts_by_node": {},
-                        "__len__": lambda self: 0,
-                    },
-                )()
-            ),
-            None,
-        ),
-    )
-    monkeypatch.setattr(
-        "evaluation.selection.load_window_selection_specs_from_granular",
-        lambda **kwargs: [
-            WindowSelectionSpec(3, 9, 0.2, ("cases",), 2),
-        ],
-    )
-    monkeypatch.setattr(
-        "evaluation.selection.select_worst_windows_by_loss",
-        lambda **kwargs: {"Worst MAE": kwargs["window_specs"]},
-    )
-    monkeypatch.setattr(
-        "evaluation.epiforecaster_eval.generate_forecast_plots",
-        lambda **kwargs: captured.setdefault("generate_forecast_plots_kwargs", kwargs),
-    )
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli_module.cli,
-        [
-            "plot",
-            "forecasts",
-            "--checkpoint",
-            str(checkpoint_path),
-            "--split",
-            "test",
-            "--nodes",
-            "window_worst:1",
-            "--include-sird-latents",
-        ],
-    )
+    result = CliRunner().invoke(cli_module.cli, args)
 
     assert result.exit_code == 0, result.output
     plot_kwargs = captured["generate_forecast_plots_kwargs"]
     assert plot_kwargs["node_groups"] is None
-    assert plot_kwargs["window_groups"]["Worst MAE"][0].node_id == 3
-    assert plot_kwargs["include_sird_latents"] is True
+    assert plot_kwargs["window_groups"][group_name][0].node_id == 3
+    if include_latents:
+        assert plot_kwargs["include_sird_latents"] is True

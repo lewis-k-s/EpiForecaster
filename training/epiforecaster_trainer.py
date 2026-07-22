@@ -139,6 +139,7 @@ class EpiForecasterTrainer:
         config: EpiForecasterConfig,
         trial: Any | None = None,
         pruning_start_epoch: int = 10,
+        model_id: str | None = None,
     ):
         """
         Initialize the unified trainer.
@@ -147,6 +148,10 @@ class EpiForecasterTrainer:
             config: Trainer configuration
             trial: Optional Optuna trial for intermediate pruning
             pruning_start_epoch: Epoch to start checking for pruning (default: 10)
+            model_id: Optional explicit experiment directory identity. This must
+                be supplied at construction time when callers require a stable
+                path because logging and checkpoint directories are initialized
+                during construction.
         """
         self.config = config
         self._device_hint = self._resolve_device_hint()
@@ -161,7 +166,7 @@ class EpiForecasterTrainer:
             random.seed(config.training.seed)
             np.random.seed(config.training.seed)
             torch.manual_seed(config.training.seed)
-        self.model_id = self._resolve_model_id()
+        self.model_id = model_id if model_id is not None else self._resolve_model_id()
         self.experiment_dir: Path | None = None
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
 
@@ -1202,6 +1207,27 @@ class EpiForecasterTrainer:
                 val_selection_score=self.best_val_selection_score,
                 is_final=True,
             )
+
+        if not self.config.training.run_final_evaluation:
+            best_checkpoint_path = self._best_checkpoint_path()
+            self._status(
+                "Final evaluation deferred to the workflow: "
+                f"{best_checkpoint_path}"
+            )
+            if self.wandb_run is not None:
+                self.wandb_run.summary["best_val_loss"] = self.best_val_loss
+                self.wandb_run.summary["best_val_selection_score"] = (
+                    self.best_val_selection_score
+                )
+                self.wandb_run.summary["best_val_selection_metric"] = (
+                    self.best_val_selection_metric
+                )
+                self.wandb_run.summary["best_val_joint_loss"] = (
+                    self.best_val_joint_loss
+                )
+                self.wandb_run.finish()
+            self.cleanup_dataloaders()
+            return self.get_training_results()
 
         best_checkpoint_path = self._load_best_model_for_final_evaluation()
 

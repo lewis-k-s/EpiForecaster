@@ -1,7 +1,8 @@
-import pytest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from training.epiforecaster_trainer import (
@@ -73,6 +74,7 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
             epochs=1,
             scheduler_type="none",
             plot_forecasts=False,
+            run_final_evaluation=False,
         ),
     )
     trainer.experiment_dir = None
@@ -100,7 +102,10 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     trainer._shutdown_loader_iterator = lambda *args, **kwargs: None
     trainer._is_early_stopping_enabled = lambda: True
     trainer._save_checkpoint = lambda *args, **kwargs: None
-    trainer._load_best_model_for_final_evaluation = lambda: "best_model.pt"
+    trainer._best_checkpoint_path = lambda: Path("best_model.pt")
+    trainer._load_best_model_for_final_evaluation = lambda: pytest.fail(
+        "workflow-managed training must not run final evaluation"
+    )
     trainer.cleanup_dataloaders = lambda: None
     trainer._evaluate_split = lambda *args, **kwargs: (
         999.0,
@@ -113,10 +118,8 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
         },
         {},
     )
-    trainer.test_epoch = lambda **_kwargs: (
-        888.0,
-        {"mae": 2.0, "mae_hosp_log1p_per_100k": 3.0},
-        {},
+    trainer.test_epoch = lambda **_kwargs: pytest.fail(
+        "workflow-managed training must not run the test split"
     )
 
     results = trainer.run()
@@ -223,11 +226,13 @@ class TestEpiForecasterTrainer:
         mock_dataset_cls.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
 
         # Initialize trainer
-        trainer = EpiForecasterTrainer(minimal_config)
+        trainer = EpiForecasterTrainer(minimal_config, model_id="trial-000007")
 
         assert isinstance(trainer.model, MagicMock)
         assert isinstance(trainer.optimizer, torch.optim.Adam)
         assert isinstance(trainer.criterion, JointInferenceLoss)
+        assert trainer.model_id == "trial-000007"
+        assert trainer.experiment_dir == Path("test_outputs/test_exp/trial-000007")
 
         # Check if model was initialized with correct config params
         mock_model_cls.assert_called_once()
@@ -628,9 +633,7 @@ def test_build_wandb_gradient_histogram_payload_returns_empty_when_disabled():
 
 def test_build_wandb_gradient_histogram_payload_respects_logging_cadence():
     model = _HistogramTestModel()
-    model.backbone.beta_projection.weight.grad = torch.ones(
-        (2, 2), dtype=torch.float32
-    )
+    model.backbone.beta_projection.weight.grad = torch.ones((2, 2), dtype=torch.float32)
 
     payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
         model=model,
