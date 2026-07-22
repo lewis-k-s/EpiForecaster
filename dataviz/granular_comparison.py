@@ -14,7 +14,11 @@ from matplotlib import colormaps, colors
 import pandas as pd
 import seaborn as sns
 
-from evaluation.granular_export import GRANULAR_FIELDNAMES, GRANULAR_KEY_COLUMNS
+from evaluation.granular_export import (
+    GRANULAR_FIELDNAMES,
+    GRANULAR_KEY_COLUMNS,
+    GRANULAR_REQUIRED_FIELDNAMES,
+)
 from utils.plotting import Colormaps, Palette
 
 logger = logging.getLogger("granular_comparison")
@@ -45,7 +49,9 @@ ExcludedSeeds = dict[int, dict[str, int]]
 
 def _require_column(df: pd.DataFrame, column: str) -> str:
     if column not in df.columns:
-        raise ValueError(f"Required column '{column}' not found in granular comparison data")
+        raise ValueError(
+            f"Required column '{column}' not found in granular comparison data"
+        )
     return column
 
 
@@ -87,9 +93,14 @@ def _read_granular_table(path: Path) -> pd.DataFrame:
 
 def _load_granular_csv(path: Path) -> pd.DataFrame:
     df = _read_granular_table(path)
-    missing = [column for column in GRANULAR_FIELDNAMES if column not in df.columns]
+    missing = [
+        column for column in GRANULAR_REQUIRED_FIELDNAMES if column not in df.columns
+    ]
     if missing:
         raise ValueError(f"{path} is missing required granular columns: {missing}")
+    for column in GRANULAR_FIELDNAMES:
+        if column not in df.columns:
+            df[column] = float("nan")
 
     # Check for sidecar metadata to get seed
     sidecar_path = path.with_suffix(f"{path.suffix}.meta.json")

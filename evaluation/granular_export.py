@@ -9,9 +9,10 @@ from typing import Any
 import numpy as np
 import torch
 
-GRANULAR_SCHEMA_VERSION = "1"
+GRANULAR_SCHEMA_VERSION = "2"
 GRANULAR_KEY_COLUMNS = ["split", "target", "node_id", "window_start", "horizon"]
-GRANULAR_FIELDNAMES = [
+GRANULAR_INTERVAL_LEVEL_NAMES = ("50", "80", "95")
+GRANULAR_REQUIRED_FIELDNAMES = [
     "split",
     "target",
     "node_id",
@@ -25,6 +26,33 @@ GRANULAR_FIELDNAMES = [
     "observed",
     "abs_error",
     "sq_error",
+]
+GRANULAR_FIELDNAMES = [
+    "split",
+    "target",
+    "node_id",
+    "region_id",
+    "region_label",
+    "window_start",
+    "window_start_date",
+    "horizon",
+    "target_index",
+    "target_date",
+    "observed",
+    "prediction",
+    "abs_error",
+    "sq_error",
+    "nll",
+    "crps",
+    "interval_low_50",
+    "interval_high_50",
+    "covered_50",
+    "interval_low_80",
+    "interval_high_80",
+    "covered_80",
+    "interval_low_95",
+    "interval_high_95",
+    "covered_95",
 ]
 
 _TARGET_NAMES = {
@@ -128,6 +156,9 @@ def _row_dicts_from_batch(
     temporal_coords: Sequence[Any] | None,
     region_ids: Sequence[str] | None,
     region_labels: Sequence[str] | None,
+    nll: torch.Tensor | None = None,
+    crps: torch.Tensor | None = None,
+    intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> list[dict[str, Any]]:
     canonical_target = _TARGET_NAMES[target_name]
     pred = torch.nan_to_num(
@@ -143,6 +174,15 @@ def _row_dicts_from_batch(
         neginf=0.0,
     ).cpu()
     observed_weights = torch.nan_to_num(weights.detach().float(), nan=0.0).cpu()
+    nll_cpu = nll.detach().float().cpu() if nll is not None else None
+    crps_cpu = crps.detach().float().cpu() if crps is not None else None
+    interval_cpu: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for level_name, bounds in (intervals or {}).items():
+        low, high = bounds
+        interval_cpu[str(level_name)] = (
+            low.detach().float().cpu(),
+            high.detach().float().cpu(),
+        )
     abs_error = (pred - target).abs()
     sq_error = (pred - target) ** 2
 
@@ -173,25 +213,49 @@ def _row_dicts_from_batch(
                 continue
 
             target_index = window_start + input_window_length + horizon_index
-            rows.append(
-                {
-                    "split": split_name,
-                    "target": canonical_target,
-                    "node_id": node_id,
-                    "region_id": region_id,
-                    "region_label": region_label,
-                    "window_start": window_start,
-                    "window_start_date": window_start_date,
-                    "horizon": horizon_index + 1,
-                    "target_index": target_index,
-                    "target_date": _format_temporal_coord(
-                        temporal_coords, target_index
-                    ),
-                    "observed": float(target[batch_index, horizon_index].item()),
-                    "abs_error": float(abs_error[batch_index, horizon_index].item()),
-                    "sq_error": float(sq_error[batch_index, horizon_index].item()),
-                }
-            )
+            observed_value = float(target[batch_index, horizon_index].item())
+            row = {
+                "split": split_name,
+                "target": canonical_target,
+                "node_id": node_id,
+                "region_id": region_id,
+                "region_label": region_label,
+                "window_start": window_start,
+                "window_start_date": window_start_date,
+                "horizon": horizon_index + 1,
+                "target_index": target_index,
+                "target_date": _format_temporal_coord(temporal_coords, target_index),
+                "observed": observed_value,
+                "prediction": float(pred[batch_index, horizon_index].item()),
+                "abs_error": float(abs_error[batch_index, horizon_index].item()),
+                "sq_error": float(sq_error[batch_index, horizon_index].item()),
+                "nll": float(nll_cpu[batch_index, horizon_index].item())
+                if nll_cpu is not None
+                else float("nan"),
+                "crps": float(crps_cpu[batch_index, horizon_index].item())
+                if crps_cpu is not None
+                else float("nan"),
+            }
+            for level_name in GRANULAR_INTERVAL_LEVEL_NAMES:
+                low_key = f"interval_low_{level_name}"
+                high_key = f"interval_high_{level_name}"
+                covered_key = f"covered_{level_name}"
+                if level_name in interval_cpu:
+                    low_tensor, high_tensor = interval_cpu[level_name]
+                    low = float(low_tensor[batch_index, horizon_index].item())
+                    high = float(high_tensor[batch_index, horizon_index].item())
+                    row[low_key] = low
+                    row[high_key] = high
+                    row[covered_key] = (
+                        float(low <= observed_value <= high)
+                        if is_observed
+                        else float("nan")
+                    )
+                else:
+                    row[low_key] = float("nan")
+                    row[high_key] = float("nan")
+                    row[covered_key] = float("nan")
+            rows.append(row)
     return rows
 
 
@@ -227,6 +291,9 @@ class _CsvGranularEvalWriter:
         temporal_coords: Sequence[Any] | None,
         region_ids: Sequence[str] | None,
         region_labels: Sequence[str] | None,
+        nll: torch.Tensor | None = None,
+        crps: torch.Tensor | None = None,
+        intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         for row in _row_dicts_from_batch(
             split_name=self.split_name,
@@ -239,6 +306,9 @@ class _CsvGranularEvalWriter:
             temporal_coords=temporal_coords,
             region_ids=region_ids,
             region_labels=region_labels,
+            nll=nll,
+            crps=crps,
+            intervals=intervals,
         ):
             self._writer.writerow(row)
 
@@ -280,8 +350,20 @@ class _ParquetGranularEvalWriter:
                 ("target_index", pa.int64()),
                 ("target_date", pa.string()),
                 ("observed", pa.float64()),
+                ("prediction", pa.float64()),
                 ("abs_error", pa.float64()),
                 ("sq_error", pa.float64()),
+                ("nll", pa.float64()),
+                ("crps", pa.float64()),
+                ("interval_low_50", pa.float64()),
+                ("interval_high_50", pa.float64()),
+                ("covered_50", pa.float64()),
+                ("interval_low_80", pa.float64()),
+                ("interval_high_80", pa.float64()),
+                ("covered_80", pa.float64()),
+                ("interval_low_95", pa.float64()),
+                ("interval_high_95", pa.float64()),
+                ("covered_95", pa.float64()),
             ]
         )
 
@@ -328,6 +410,9 @@ class _ParquetGranularEvalWriter:
         temporal_coords: Sequence[Any] | None,
         region_ids: Sequence[str] | None,
         region_labels: Sequence[str] | None,
+        nll: torch.Tensor | None = None,
+        crps: torch.Tensor | None = None,
+        intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> None:
         self._rows.extend(
             _row_dicts_from_batch(
@@ -341,6 +426,9 @@ class _ParquetGranularEvalWriter:
                 temporal_coords=temporal_coords,
                 region_ids=region_ids,
                 region_labels=region_labels,
+                nll=nll,
+                crps=crps,
+                intervals=intervals,
             )
         )
         if len(self._rows) >= self.row_group_size:
