@@ -94,6 +94,14 @@ _PER_SERIES_METRIC_KEYS = [
     "mae_hosp_log1p_per_100k",
     "mae_cases_log1p_per_100k",
     "mae_deaths_log1p_per_100k",
+    "nll_ww_log1p_per_100k",
+    "nll_hosp_log1p_per_100k",
+    "nll_cases_log1p_per_100k",
+    "nll_deaths_log1p_per_100k",
+    "crps_ww_log1p_per_100k",
+    "crps_hosp_log1p_per_100k",
+    "crps_cases_log1p_per_100k",
+    "crps_deaths_log1p_per_100k",
     "r2_ww_log1p_per_100k",
     "r2_hosp_log1p_per_100k",
     "r2_cases_log1p_per_100k",
@@ -105,7 +113,21 @@ _TARGET_MAE_METRIC_KEYS = [
     "mae_cases_log1p_per_100k",
     "mae_deaths_log1p_per_100k",
 ]
+_TARGET_CRPS_METRIC_KEYS = [
+    "crps_ww_log1p_per_100k",
+    "crps_hosp_log1p_per_100k",
+    "crps_cases_log1p_per_100k",
+    "crps_deaths_log1p_per_100k",
+]
+_TARGET_NLL_METRIC_KEYS = [
+    "nll_ww_log1p_per_100k",
+    "nll_hosp_log1p_per_100k",
+    "nll_cases_log1p_per_100k",
+    "nll_deaths_log1p_per_100k",
+]
 _SELECTION_METRIC_NAME = "mean_target_mae"
+_CRPS_SELECTION_METRIC_NAME = "mean_target_crps"
+_NLL_SELECTION_METRIC_NAME = "mean_target_nll"
 
 
 def compute_mean_target_mae(metrics: dict[str, Any]) -> float:
@@ -121,6 +143,57 @@ def compute_mean_target_mae(metrics: dict[str, Any]) -> float:
     if not values:
         return float("inf")
     return float(np.mean(values))
+
+
+def compute_mean_target_crps(metrics: dict[str, Any]) -> float:
+    """Compute the validation endpoint score from per-target CRPS."""
+    values: list[float] = []
+    for key in _TARGET_CRPS_METRIC_KEYS:
+        value = metrics.get(key)
+        if value is None:
+            continue
+        value_float = float(value)
+        if np.isfinite(value_float):
+            values.append(value_float)
+    if not values:
+        return float("inf")
+    return float(np.mean(values))
+
+
+def compute_mean_target_nll(metrics: dict[str, Any]) -> float:
+    """Compute the validation endpoint score from per-target NLL."""
+    values: list[float] = []
+    for key in _TARGET_NLL_METRIC_KEYS:
+        value = metrics.get(key)
+        if value is None:
+            continue
+        value_float = float(value)
+        if np.isfinite(value_float):
+            values.append(value_float)
+    if not values:
+        return float("inf")
+    return float(np.mean(values))
+
+
+def compute_validation_selection_score(
+    metrics: dict[str, Any],
+    *,
+    observation_loss: str,
+) -> tuple[float, str]:
+    """Choose the checkpoint-selection score for the current observation loss."""
+    selection_score = compute_mean_target_mae(metrics)
+    selection_metric = _SELECTION_METRIC_NAME
+    if observation_loss in {"nll", "crps"}:
+        crps_selection_score = compute_mean_target_crps(metrics)
+        if np.isfinite(crps_selection_score):
+            selection_score = crps_selection_score
+            selection_metric = _CRPS_SELECTION_METRIC_NAME
+        elif observation_loss == "nll":
+            nll_selection_score = compute_mean_target_nll(metrics)
+            if np.isfinite(nll_selection_score):
+                selection_score = nll_selection_score
+                selection_metric = _NLL_SELECTION_METRIC_NAME
+    return selection_score, selection_metric
 
 
 class EpiForecasterTrainer:
@@ -1122,7 +1195,13 @@ class EpiForecasterTrainer:
                 split_name="Val",
                 write_granular=False,
             )
-            val_selection_score = compute_mean_target_mae(val_metrics)
+            val_selection_score, val_selection_metric = (
+                compute_validation_selection_score(
+                    val_metrics,
+                    observation_loss=self.criterion.observation_loss,
+                )
+            )
+            self.best_val_selection_metric = val_selection_metric
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )

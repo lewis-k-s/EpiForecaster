@@ -7,7 +7,10 @@ import torch
 
 from training.epiforecaster_trainer import (
     EpiForecasterTrainer,
+    compute_mean_target_crps,
     compute_mean_target_mae,
+    compute_mean_target_nll,
+    compute_validation_selection_score,
 )
 from models.configs import (
     EpiForecasterConfig,
@@ -43,6 +46,82 @@ def test_compute_mean_target_mae_returns_inf_when_no_finite_targets() -> None:
     }
 
     assert compute_mean_target_mae(metrics) == float("inf")
+
+
+def test_compute_mean_target_crps_averages_finite_available_targets() -> None:
+    metrics = {
+        "crps_ww_log1p_per_100k": 0.5,
+        "crps_hosp_log1p_per_100k": 1.5,
+        "crps_cases_log1p_per_100k": float("nan"),
+        "crps_deaths_log1p_per_100k": None,
+        "mae_hosp_log1p_per_100k": 100.0,
+    }
+
+    assert compute_mean_target_crps(metrics) == pytest.approx(1.0)
+
+
+def test_compute_mean_target_nll_averages_finite_available_targets() -> None:
+    metrics = {
+        "nll_ww_log1p_per_100k": -0.5,
+        "nll_hosp_log1p_per_100k": 1.5,
+        "nll_cases_log1p_per_100k": float("nan"),
+        "nll_deaths_log1p_per_100k": None,
+    }
+
+    assert compute_mean_target_nll(metrics) == pytest.approx(0.5)
+
+
+def test_compute_validation_selection_score_prefers_crps_for_distributional_loss() -> (
+    None
+):
+    metrics = {
+        "mae_ww_log1p_per_100k": 10.0,
+        "mae_hosp_log1p_per_100k": 12.0,
+        "crps_ww_log1p_per_100k": 0.5,
+        "crps_hosp_log1p_per_100k": 1.5,
+    }
+
+    score, metric_name = compute_validation_selection_score(
+        metrics,
+        observation_loss="nll",
+    )
+
+    assert score == pytest.approx(1.0)
+    assert metric_name == "mean_target_crps"
+
+
+def test_compute_validation_selection_score_keeps_mae_for_point_loss() -> None:
+    metrics = {
+        "mae_ww_log1p_per_100k": 10.0,
+        "mae_hosp_log1p_per_100k": 12.0,
+        "crps_ww_log1p_per_100k": 0.5,
+        "crps_hosp_log1p_per_100k": 1.5,
+    }
+
+    score, metric_name = compute_validation_selection_score(
+        metrics,
+        observation_loss="mse",
+    )
+
+    assert score == pytest.approx(11.0)
+    assert metric_name == "mean_target_mae"
+
+
+def test_compute_validation_selection_score_uses_nll_when_crps_unavailable() -> None:
+    metrics = {
+        "mae_ww_log1p_per_100k": 10.0,
+        "nll_ww_log1p_per_100k": -0.5,
+        "nll_hosp_log1p_per_100k": 1.5,
+        "crps_ww_log1p_per_100k": float("nan"),
+    }
+
+    score, metric_name = compute_validation_selection_score(
+        metrics,
+        observation_loss="nll",
+    )
+
+    assert score == pytest.approx(0.5)
+    assert metric_name == "mean_target_nll"
 
 
 def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
@@ -90,6 +169,7 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     trainer.best_val_series_metrics = {}
     trainer.patience_counter = 0
     trainer.scheduler = None
+    trainer.criterion = SimpleNamespace(observation_loss="mse")
     trainer.trial = _Trial()
     trainer.pruning_start_epoch = 0
     trainer.val_loader = object()
