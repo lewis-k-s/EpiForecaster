@@ -41,6 +41,13 @@ class JointLossConfig:
     # Per-head observation objective. The same objective is used for
     # ww/hosp/cases/deaths before fixed or GradNorm observation weighting.
     observation_loss: str = "mse"
+    # Distribution used for probabilistic observation scoring and intervals.
+    # The observation heads emit loc/scale in the existing log1p(per-100k)
+    # target space; this setting controls how those parameters are scored.
+    distribution_family: str = "normal"
+    distribution_df: float = 5.0
+    distribution_scale_floor: float = 1.0e-3
+    interval_levels: list[float] = field(default_factory=lambda: [0.5, 0.8, 0.95])
     # Observation loss weighting policy:
     # - "none": fixed equal-split weighting across active observation targets
     # - "gradnorm": adaptive weights for ww/hosp/cases/deaths
@@ -72,8 +79,10 @@ class JointLossConfig:
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
         valid_probes = {"obs_context"}
-        valid_observation_losses = {"mse", "rmse", "mae"}
+        valid_observation_losses = {"mse", "rmse", "mae", "nll", "crps"}
+        valid_distribution_families = {"normal", "student_t"}
         self.observation_loss = self.observation_loss.lower()
+        self.distribution_family = self.distribution_family.lower()
         self.adaptive_scheme = self.adaptive_scheme.lower()
         self.gradnorm_probe = self.gradnorm_probe.lower()
         if self.observation_loss not in valid_observation_losses:
@@ -81,6 +90,17 @@ class JointLossConfig:
                 "observation_loss must be one of "
                 f"{sorted(valid_observation_losses)}, "
                 f"got {self.observation_loss!r}"
+            )
+        if self.distribution_family not in valid_distribution_families:
+            raise ValueError(
+                "distribution_family must be one of "
+                f"{sorted(valid_distribution_families)}, "
+                f"got {self.distribution_family!r}"
+            )
+        if self.observation_loss == "crps" and self.distribution_family != "normal":
+            raise ValueError(
+                "observation_loss='crps' currently requires "
+                "distribution_family='normal'"
             )
         if self.adaptive_scheme not in valid_schemes:
             raise ValueError(
@@ -100,9 +120,28 @@ class JointLossConfig:
             ("gradnorm_ema_decay", self.gradnorm_ema_decay),
             ("gradnorm_min_weight", self.gradnorm_min_weight),
             ("gradnorm_obs_weight_sum", self.gradnorm_obs_weight_sum),
+            ("distribution_df", self.distribution_df),
+            ("distribution_scale_floor", self.distribution_scale_floor),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
+        if self.distribution_family == "student_t" and self.distribution_df <= 2.0:
+            raise ValueError(
+                "distribution_df must be > 2 for student_t intervals, "
+                f"got {self.distribution_df}"
+            )
+        if self.distribution_scale_floor <= 0:
+            raise ValueError(
+                "distribution_scale_floor must be positive, "
+                f"got {self.distribution_scale_floor}"
+            )
+        if not self.interval_levels:
+            raise ValueError("interval_levels must not be empty")
+        for level in self.interval_levels:
+            if not 0.0 < float(level) < 1.0:
+                raise ValueError(
+                    f"interval_levels values must be in (0, 1), got {level}"
+                )
 
         if self.gradnorm_warmup_steps < 0:
             raise ValueError(
@@ -351,6 +390,9 @@ class ObservationHeadConfig:
     learnable_scale_hosp: bool = True
     learnable_scale_cases: bool = True
     learnable_scale_deaths: bool = True
+    # Predictive distribution scale in the existing log1p(per-100k) target space.
+    distribution_scale_init: float = 0.3
+    distribution_scale_floor: float = 1.0e-3
 
     # Residual connection settings
     residual_mode: str = "additive"  # "additive" | "modulation"
@@ -409,6 +451,16 @@ class ObservationHeadConfig:
         if self.obs_context_dim <= 0:
             raise ValueError(
                 f"obs_context_dim must be positive, got {self.obs_context_dim}"
+            )
+        if self.distribution_scale_init <= 0:
+            raise ValueError(
+                "distribution_scale_init must be positive, "
+                f"got {self.distribution_scale_init}"
+            )
+        if self.distribution_scale_floor <= 0:
+            raise ValueError(
+                "distribution_scale_floor must be positive, "
+                f"got {self.distribution_scale_floor}"
             )
 
         valid_modes = {"additive", "modulation"}

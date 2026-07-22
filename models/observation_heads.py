@@ -102,6 +102,24 @@ def _small_xavier_linear(layer: nn.Linear, gain: float = 0.1) -> None:
     nn.init.zeros_(layer.bias)
 
 
+def _inverse_softplus_scalar(value: float, eps: float = 1e-8) -> float:
+    """Scalar inverse softplus used for positive projection biases."""
+    return float(_inverse_softplus(model_scalar(value), eps=eps).item())
+
+
+def _init_distribution_scale_proj(
+    layer: nn.Linear,
+    *,
+    scale_init: float,
+    scale_floor: float,
+) -> None:
+    """Initialize a positive scale projection to emit ``scale_init`` at startup."""
+    margin = max(float(scale_init) - float(scale_floor), _KERNEL_EPS)
+    nn.init.zeros_(layer.weight)
+    with torch.no_grad():
+        layer.bias.fill_(_inverse_softplus_scalar(margin))
+
+
 class DelayKernel(nn.Module):
     """
     Causal delay kernel for clinical observations (cases, hospitalizations, deaths).
@@ -507,7 +525,10 @@ class MLPKernel(nn.Module):
     """
 
     def __init__(
-        self, kernel_length: int = 21, hidden_dim: int = 32, include_population: bool = False
+        self,
+        kernel_length: int = 21,
+        hidden_dim: int = 32,
+        include_population: bool = False,
     ):
         super().__init__()
         self.kernel_length = kernel_length
@@ -589,11 +610,18 @@ class ClinicalObservationHead(nn.Module):
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
         kernel_mlp: bool = False,
+        distribution_scale_init: float = 0.3,
+        distribution_scale_floor: float = 1.0e-3,
     ):
         super().__init__()
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
+        self.distribution_scale_floor = float(distribution_scale_floor)
+        if distribution_scale_init <= 0:
+            raise ValueError("distribution_scale_init must be positive")
+        if distribution_scale_floor <= 0:
+            raise ValueError("distribution_scale_floor must be positive")
 
         if kernel_mlp:
             self.delay_kernel = MLPKernel(kernel_length=kernel_length, hidden_dim=32)
@@ -625,6 +653,23 @@ class ClinicalObservationHead(nn.Module):
         else:
             self.residual_proj = None
             self.alpha = None
+
+        self.log_distribution_scale = nn.Parameter(
+            torch.log(
+                model_scalar(
+                    max(distribution_scale_init - distribution_scale_floor, _KERNEL_EPS)
+                )
+            )
+        )
+        if residual_dim > 0:
+            self.distribution_scale_proj = nn.Linear(residual_dim, 1)
+            _init_distribution_scale_proj(
+                self.distribution_scale_proj,
+                scale_init=distribution_scale_init,
+                scale_floor=distribution_scale_floor,
+            )
+        else:
+            self.distribution_scale_proj = None
 
         logger.info(
             f"Initialized ClinicalObservationHead: scale_init={scale_init}, "
@@ -703,6 +748,23 @@ class ClinicalObservationHead(nn.Module):
 
         return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
 
+    def forward_distribution(
+        self,
+        I_trajectory: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return predictive distribution parameters in log1p(per-100k) space."""
+        loc = self.forward(
+            I_trajectory=I_trajectory,
+            obs_context=obs_context,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )
+        scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
+        return {"loc": loc, "scale": scale}
+
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
@@ -719,6 +781,22 @@ class ClinicalObservationHead(nn.Module):
                 neginf=-1.0,
             )
         return self.alpha
+
+    def get_distribution_scale(
+        self,
+        *,
+        obs_context: torch.Tensor | None,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get positive predictive scale aligned to ``like``."""
+        if self.distribution_scale_proj is not None and obs_context is not None:
+            raw_scale = self.distribution_scale_proj(obs_context).squeeze(-1)
+            scale = F.softplus(raw_scale.float()) + self.distribution_scale_floor
+        else:
+            base = _safe_exp_from_log(self.log_distribution_scale).to(like.dtype)
+            scale = base + self.distribution_scale_floor
+            scale = scale.expand_as(like)
+        return scale.to(like.dtype)
 
     def __repr__(self) -> str:
         return (
@@ -762,11 +840,18 @@ class WastewaterObservationHead(nn.Module):
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
         kernel_mlp: bool = False,
+        distribution_scale_init: float = 0.3,
+        distribution_scale_floor: float = 1.0e-3,
     ):
         super().__init__()
 
         self.delta_forecasting = delta_forecasting
         self.anchor_mode = anchor_mode
+        self.distribution_scale_floor = float(distribution_scale_floor)
+        if distribution_scale_init <= 0:
+            raise ValueError("distribution_scale_init must be positive")
+        if distribution_scale_floor <= 0:
+            raise ValueError("distribution_scale_floor must be positive")
 
         if kernel_mlp:
             self.shedding_conv = MLPKernel(
@@ -801,6 +886,23 @@ class WastewaterObservationHead(nn.Module):
         else:
             self.residual_proj = None
             self.alpha = None
+
+        self.log_distribution_scale = nn.Parameter(
+            torch.log(
+                model_scalar(
+                    max(distribution_scale_init - distribution_scale_floor, _KERNEL_EPS)
+                )
+            )
+        )
+        if residual_dim > 0:
+            self.distribution_scale_proj = nn.Linear(residual_dim, 1)
+            _init_distribution_scale_proj(
+                self.distribution_scale_proj,
+                scale_init=distribution_scale_init,
+                scale_floor=distribution_scale_floor,
+            )
+        else:
+            self.distribution_scale_proj = None
 
         logger.info(
             f"Initialized WastewaterObservationHead: scale_init={scale_init}, "
@@ -883,6 +985,25 @@ class WastewaterObservationHead(nn.Module):
 
         return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
 
+    def forward_distribution(
+        self,
+        I_trajectory: torch.Tensor,
+        population: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return predictive distribution parameters in log1p(per-100k) space."""
+        loc = self.forward(
+            I_trajectory=I_trajectory,
+            population=population,
+            obs_context=obs_context,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )
+        scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
+        return {"loc": loc, "scale": scale}
+
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
         if self.learnable_scale:
@@ -899,6 +1020,22 @@ class WastewaterObservationHead(nn.Module):
                 neginf=-1.0,
             )
         return self.alpha
+
+    def get_distribution_scale(
+        self,
+        *,
+        obs_context: torch.Tensor | None,
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        """Get positive predictive scale aligned to ``like``."""
+        if self.distribution_scale_proj is not None and obs_context is not None:
+            raw_scale = self.distribution_scale_proj(obs_context).squeeze(-1)
+            scale = F.softplus(raw_scale.float()) + self.distribution_scale_floor
+        else:
+            base = _safe_exp_from_log(self.log_distribution_scale).to(like.dtype)
+            scale = base + self.distribution_scale_floor
+            scale = scale.expand_as(like)
+        return scale.to(like.dtype)
 
     def __repr__(self) -> str:
         return f"WastewaterObservationHead({self.shedding_conv})"

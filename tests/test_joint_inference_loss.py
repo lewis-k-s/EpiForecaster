@@ -1,5 +1,6 @@
 import pytest
 import torch
+import math
 
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from models.configs import LossConfig
@@ -512,6 +513,108 @@ def test_joint_inference_observation_loss_type(
 
     assert torch.isclose(components["ww"], torch.tensor(expected))
     assert torch.isclose(components["total"], torch.tensor(expected))
+
+
+def test_joint_inference_normal_nll_uses_distribution_params() -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss="nll",
+        obs_weight_sum=1.0,
+        w_sird_supervision=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.full((1, 3), 100.0),
+        "dist_ww_loc": torch.tensor([[-9.0, 0.0, 1.0]]),
+        "dist_ww_scale": torch.tensor([[1.0, 1.0, 2.0]]),
+    }
+    targets = {
+        "ww": torch.tensor([[0.0, 3.0]]),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones(1, 2),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    expected = (
+        0.5 * math.log(2.0 * math.pi)
+        + (0.5 + math.log(2.0) + 0.5 * math.log(2.0 * math.pi))
+    ) / 2.0
+    assert components["ww"].item() == pytest.approx(expected)
+    assert components["total"].item() == pytest.approx(expected)
+
+
+def test_joint_inference_normal_nll_preserves_negative_values_and_gradient() -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss="nll",
+        obs_weight_sum=1.0,
+        w_sird_supervision=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    scale = torch.full((1, 2), 0.1, requires_grad=True)
+    model_outputs = {
+        "pred_ww": torch.zeros((1, 2)),
+        "dist_ww_loc": torch.zeros((1, 2)),
+        "dist_ww_scale": scale,
+    }
+    targets = {
+        "ww": torch.zeros((1, 1)),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones((1, 1)),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+    components["total"].backward()
+
+    expected = math.log(0.1) + 0.5 * math.log(2.0 * math.pi)
+    assert components["ww"].item() == pytest.approx(expected)
+    assert scale.grad is not None
+    assert scale.grad[0, 1].item() == pytest.approx(10.0)
+
+
+def test_joint_inference_normal_crps_uses_distribution_params() -> None:
+    loss_fn = JointInferenceLoss(
+        observation_loss="crps",
+        obs_weight_sum=1.0,
+        w_sird_supervision=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+    )
+    model_outputs = {
+        "pred_ww": torch.full((1, 2), 100.0),
+        "dist_ww_loc": torch.tensor([[-9.0, 2.0]]),
+        "dist_ww_scale": torch.tensor([[1.0, 2.0]]),
+    }
+    targets = {
+        "ww": torch.tensor([[2.0]]),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.ones(1, 1),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    expected = 2.0 * (2.0 / math.sqrt(2.0 * math.pi) - 1.0 / math.sqrt(math.pi))
+    assert components["ww"].item() == pytest.approx(expected)
+    assert components["total"].item() == pytest.approx(expected)
 
 
 def test_joint_inference_rmse_observation_loss_is_zero_for_exact_match() -> None:

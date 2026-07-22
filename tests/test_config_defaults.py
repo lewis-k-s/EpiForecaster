@@ -16,6 +16,8 @@ def test_observation_heads_default_weekly_kernels_frozen() -> None:
     assert cfg.kernel_parameterization_ww == "simplex"
     assert cfg.kernel_parameterization_hosp == "simplex"
     assert cfg.anchor_mode == "last_valid_step"
+    assert cfg.distribution_scale_init == pytest.approx(0.3)
+    assert cfg.distribution_scale_floor == pytest.approx(1.0e-3)
 
 
 @pytest.mark.epiforecaster
@@ -48,8 +50,21 @@ def test_data_config_resolves_min_observed_from_missing_permit() -> None:
 def test_joint_loss_defaults_use_static_raw_observation_loss() -> None:
     cfg = JointLossConfig()
     assert cfg.observation_loss == "mse"
+    assert cfg.distribution_family == "normal"
+    assert cfg.distribution_df == pytest.approx(5.0)
+    assert cfg.distribution_scale_floor == pytest.approx(1.0e-3)
+    assert cfg.interval_levels == [0.5, 0.8, 0.95]
     assert cfg.adaptive_scheme == "none"
     assert cfg.w_sird_supervision == 0.05
+
+
+@pytest.mark.epiforecaster
+def test_joint_loss_distributional_validation() -> None:
+    cfg = JointLossConfig(observation_loss="nll", distribution_family="student_t")
+    assert cfg.distribution_family == "student_t"
+
+    with pytest.raises(ValueError, match="currently requires"):
+        JointLossConfig(observation_loss="crps", distribution_family="student_t")
 
 
 @pytest.mark.epiforecaster
