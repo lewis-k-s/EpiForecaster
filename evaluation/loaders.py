@@ -22,6 +22,7 @@ from data.epi_batch import collate_epiforecaster_batch
 from data.epi_dataset import EpiDataset
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
+from utils.checkpoint_compat import initialize_missing_distribution_parameters
 from utils.device import prefetch_enabled, resolve_device
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,17 @@ def load_model_from_checkpoint(
         state_dict=state_dict,
         model_state_dict=model.state_dict(),
     )
+    state_dict, initialized_distribution_keys = (
+        initialize_missing_distribution_parameters(
+            state_dict=state_dict,
+            model_state_dict=model.state_dict(),
+        )
+    )
+    if initialized_distribution_keys:
+        logger.info(
+            "Initialized %d distribution parameters missing from legacy checkpoint",
+            len(initialized_distribution_keys),
+        )
     model.load_state_dict(state_dict)
     model.to(resolve_device(device))
     return model, config, checkpoint
@@ -252,9 +264,7 @@ def build_loader_from_config(
         bool(config.training.pin_memory) if pin_memory is None else bool(pin_memory)
     ) and resolved_device.type == "cuda"
     resolved_prefetch = (
-        config.training.prefetch_factor
-        if prefetch_factor is None
-        else prefetch_factor
+        config.training.prefetch_factor if prefetch_factor is None else prefetch_factor
     )
 
     # Pre-load region embeddings to device to avoid repeated transfers
