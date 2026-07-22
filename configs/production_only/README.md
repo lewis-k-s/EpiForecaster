@@ -29,32 +29,36 @@
 
 ## Intended Usage
 
-These configs should only be run on the MN5 cluster via SLURM scripts:
+These configs should only be run through an immutable MN5 Snakemake workflow:
 
 ```bash
-# For training
-sbatch scripts/cluster/train_single_gpu.sbatch
+# Single training (default workflow target)
+bash scripts/workflow/mn5_workflow.sh prepare <run-id>
+bash scripts/workflow/mn5_workflow.sh run <run-id>
 
-# For synthetic pretraining with the regular single-GPU sbatch wrapper
-CONFIG=configs/production_only/train_epifor_mn5_synth_pretrain.yaml \
-sbatch scripts/cluster/train_single_gpu.sbatch
+# Compose training and evaluation in the same immutable run
+bash scripts/workflow/mn5_workflow.sh run <run-id> train_evaluate
 
-# Convenience wrapper for the same synth-pretrain submission
-scripts/cluster/submit_synth_pretrain.sh
+# HPO
+bash scripts/workflow/mn5_workflow.sh prepare <hpo-run-id> \
+  --config workflow/config/mn5.yaml
 
-# Submit synth pretraining, then fine-tune on real data after the pretrain job succeeds
-scripts/cluster/submit_pretrain_then_finetune.sh
-
-# For hyperparameter optimization
-sbatch scripts/cluster/hpsearch.sbatch
+# Ablation study
+bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
+  --config workflow/config/mn5_ablation.yaml
 ```
 
-The chained submission helper uses a fixed `EPIFORECASTER_MODEL_ID` for the
-pretrain run so the fine-tune job can point `training.init_checkpoint_path` at
-`.../checkpoints/best_model.pt` deterministically.
+The default target is single training. Use the public `train_evaluate` or
+`evaluate` target when evaluation is required. Use
+`--config workflow/config/mn5.yaml` for HPO or
+`--config workflow/config/mn5_ablation.yaml` for ablations. Direct production
+`train` and `eval` commands are implementation details of these Snakemake rules,
+not separate submission interfaces.
 
-The MN5 batch scripts share a common module bootstrap in `scripts/cluster/mn5_module_setup.sh`.
-That setup loads the GCC, CUDA, and CMake modules used by runtime jobs.
+To use another production training config, copy
+`workflow/config/mn5_train.yaml` and change `training.base_config`; the same
+source-aware training and evaluation rules and deterministic artifact contracts
+apply.
 
 ## Development Alternatives
 

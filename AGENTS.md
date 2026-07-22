@@ -56,6 +56,20 @@ uv run main --help  # entrypoint cli.py
 - Use fixtures for sample data; keep tests deterministic (seed RNGs).
 - Quick examples: `uv run pytest -k graph tests/`, `uv run pytest -q tests/`.
 
+### Core Testing Boundary
+
+- Strong automated coverage is required for the primary training and evaluation pipeline, from configuration and data ingestion through evaluation artifact generation. This includes:
+  - parsing YAML and CLI overrides into the canonical config dataclasses;
+  - data loading, preprocessing, masking, scaling, splitting, sampling, and batching;
+  - model construction and forward passes;
+  - every supported feature flag in both its enabled and disabled states, including interactions that materially change model inputs or outputs;
+  - training losses, optimization behavior, checkpoint save/load/resume contracts, and evaluation;
+  - evaluation metrics, aggregations, selections, metadata, and generation of every machine-readable evaluation output file.
+- The strongly tested core ends at the evaluation outputs. Plotting, rendering, report layout, and exploratory visualization code are outside the automated coverage target; do not add exhaustive plot tests or pursue coverage percentages for those modules.
+- Plotting and visualization code must consume canonical evaluation outputs. It must not independently re-derive metrics, indicators, masks, sparsity measures, window selections, aggregations, or other evaluation results.
+- If a visualization needs a new indicator or derived value, implement and test it in the evaluation pipeline, include it in the canonical evaluation outputs, and keep the plotting layer limited to loading and presentation.
+- Keep evaluation computation separate from plotting so the tested core can be executed without graphical dependencies. Exploratory analysis remains outside the core coverage target unless it is promoted into the canonical training or evaluation pipeline.
+
 Tests are organized with markers for selective execution:
 
 - `@pytest.mark.region`: Tests related to region2vec, region losses, spatial autocorrelation
