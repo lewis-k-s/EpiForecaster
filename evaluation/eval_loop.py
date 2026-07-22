@@ -26,7 +26,11 @@ from evaluation.granular_export import (
 )
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
-from evaluation.metrics import TorchMaskedMetricAccumulator
+from evaluation.metrics import (
+    ProbabilisticMetricResult,
+    TorchDistributionMetricAccumulator,
+    TorchMaskedMetricAccumulator,
+)
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
 from utils.device import (
@@ -161,6 +165,30 @@ def _format_eval_summary(loss: float, metrics: dict[str, Any]) -> str:
     return "\n".join(table)
 
 
+def _add_probabilistic_metrics(
+    *,
+    metrics: dict[str, Any],
+    head_name: str,
+    summary: ProbabilisticMetricResult,
+) -> None:
+    metrics[f"nll_{head_name}_log1p_per_100k"] = summary.nll
+    metrics[f"crps_{head_name}_log1p_per_100k"] = summary.crps
+    metrics[f"nll_{head_name}_per_h"] = summary.nll_per_h
+    metrics[f"crps_{head_name}_per_h"] = summary.crps_per_h
+    metrics[f"probabilistic_effective_count_{head_name}"] = summary.effective_count
+    for level_name, coverage in summary.coverage_by_level.items():
+        metrics[f"coverage_{level_name}_{head_name}"] = coverage
+        metrics[f"interval_width_{level_name}_{head_name}_log1p_per_100k"] = (
+            summary.interval_width_by_level[level_name]
+        )
+        metrics[f"coverage_{level_name}_{head_name}_per_h"] = (
+            summary.coverage_per_h_by_level[level_name]
+        )
+        metrics[f"interval_width_{level_name}_{head_name}_per_h"] = (
+            summary.interval_width_per_h_by_level[level_name]
+        )
+
+
 def evaluate_loader(
     *,
     model: torch.nn.Module,
@@ -224,9 +252,25 @@ def evaluate_loader(
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
     hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    ww_metrics = TorchMaskedMetricAccumulator(device=device, horizon=None)
-    cases_metrics = TorchMaskedMetricAccumulator(device=device, horizon=None)
-    deaths_metrics = TorchMaskedMetricAccumulator(device=device, horizon=None)
+    ww_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    cases_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    deaths_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    distribution_metric_kwargs = {
+        "device": device,
+        "horizon": horizon,
+        "distribution_family": criterion.distribution_family,
+        "distribution_df": criterion.distribution_df,
+        "scale_floor": criterion.distribution_scale_floor,
+        "interval_levels": criterion.interval_levels,
+    }
+    hosp_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
+    ww_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
+    cases_prob_metrics = TorchDistributionMetricAccumulator(
+        **distribution_metric_kwargs
+    )
+    deaths_prob_metrics = TorchDistributionMetricAccumulator(
+        **distribution_metric_kwargs
+    )
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
@@ -406,6 +450,18 @@ def evaluate_loader(
                         weights=weights,
                         accumulator=per_head_node_metrics,
                     )
+                    hosp_loc, hosp_scale = criterion._get_head_distribution_params(
+                        model_outputs,
+                        head_name="hosp",
+                        horizon=int(hosp_targets.shape[1]),
+                    )
+                    hosp_prob_batch = hosp_prob_metrics.update(
+                        loc=hosp_loc,
+                        scale=hosp_scale,
+                        targets=hosp_targets,
+                        observed_mask=hosp_mask,
+                        sample_weights=hosp_weights,
+                    )
 
                     if granular_writer is not None:
                         granular_writer.write_rows(
@@ -423,6 +479,9 @@ def evaluate_loader(
                         abs_diff,
                         weights,
                         target_nodes,
+                        hosp_loc,
+                        hosp_scale,
+                        hosp_prob_batch,
                     )
                 del pred_hosp, hosp_targets, hosp_mask, hosp_weights
 
@@ -449,6 +508,18 @@ def evaluate_loader(
                         weights=ww_effective_weights,
                         accumulator=per_head_node_metrics,
                     )
+                    ww_loc, ww_scale = criterion._get_head_distribution_params(
+                        model_outputs,
+                        head_name="ww",
+                        horizon=int(ww_targets.shape[1]),
+                    )
+                    ww_prob_batch = ww_prob_metrics.update(
+                        loc=ww_loc,
+                        scale=ww_scale,
+                        targets=ww_targets,
+                        observed_mask=ww_mask,
+                        sample_weights=ww_weights,
+                    )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -460,6 +531,14 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                    del (
+                        ww_diff,
+                        ww_abs_diff,
+                        ww_effective_weights,
+                        ww_loc,
+                        ww_scale,
+                        ww_prob_batch,
+                    )
                 del pred_ww, ww_targets, ww_mask, ww_weights
 
                 pred_cases = sliced_model_outputs.get("pred_cases")
@@ -487,6 +566,18 @@ def evaluate_loader(
                         weights=cases_effective_weights,
                         accumulator=per_head_node_metrics,
                     )
+                    cases_loc, cases_scale = criterion._get_head_distribution_params(
+                        model_outputs,
+                        head_name="cases",
+                        horizon=int(cases_targets.shape[1]),
+                    )
+                    cases_prob_batch = cases_prob_metrics.update(
+                        loc=cases_loc,
+                        scale=cases_scale,
+                        targets=cases_targets,
+                        observed_mask=cases_mask,
+                        sample_weights=cases_weights,
+                    )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -498,6 +589,14 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                    del (
+                        cases_diff,
+                        cases_abs_diff,
+                        cases_effective_weights,
+                        cases_loc,
+                        cases_scale,
+                        cases_prob_batch,
+                    )
                 del pred_cases, cases_targets, cases_mask, cases_weights
 
                 pred_deaths = sliced_model_outputs.get("pred_deaths")
@@ -525,6 +624,18 @@ def evaluate_loader(
                         weights=deaths_effective_weights,
                         accumulator=per_head_node_metrics,
                     )
+                    deaths_loc, deaths_scale = criterion._get_head_distribution_params(
+                        model_outputs,
+                        head_name="deaths",
+                        horizon=int(deaths_targets.shape[1]),
+                    )
+                    deaths_prob_batch = deaths_prob_metrics.update(
+                        loc=deaths_loc,
+                        scale=deaths_scale,
+                        targets=deaths_targets,
+                        observed_mask=deaths_mask,
+                        sample_weights=deaths_weights,
+                    )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -536,6 +647,14 @@ def evaluate_loader(
                             region_ids=region_ids,
                             region_labels=region_labels,
                         )
+                    del (
+                        deaths_diff,
+                        deaths_abs_diff,
+                        deaths_effective_weights,
+                        deaths_loc,
+                        deaths_scale,
+                        deaths_prob_batch,
+                    )
                 del pred_deaths, deaths_targets, deaths_mask, deaths_weights
                 current_stage = "granular_write_complete"
                 if should_log_batch:
@@ -572,6 +691,10 @@ def evaluate_loader(
     ww_summary = ww_metrics.finalize()
     cases_summary = cases_metrics.finalize()
     deaths_summary = deaths_metrics.finalize()
+    hosp_prob_summary = hosp_prob_metrics.finalize()
+    ww_prob_summary = ww_prob_metrics.finalize()
+    cases_prob_summary = cases_prob_metrics.finalize()
+    deaths_prob_summary = deaths_prob_metrics.finalize()
 
     node_mae_by_target: dict[str, dict[int, float]] = {}
     node_mae_count_by_target: dict[str, dict[int, int]] = {}
@@ -733,6 +856,26 @@ def evaluate_loader(
             loss_sird_supervision_weighted_sum / max(1, processed_batches)
         ).item(),
     }
+    _add_probabilistic_metrics(
+        metrics=metrics,
+        head_name="hosp",
+        summary=hosp_prob_summary,
+    )
+    _add_probabilistic_metrics(
+        metrics=metrics,
+        head_name="ww",
+        summary=ww_prob_summary,
+    )
+    _add_probabilistic_metrics(
+        metrics=metrics,
+        head_name="cases",
+        summary=cases_prob_summary,
+    )
+    _add_probabilistic_metrics(
+        metrics=metrics,
+        head_name="deaths",
+        summary=deaths_prob_summary,
+    )
 
     logger.info("EVAL COMPLETE")
     return mean_loss, metrics, node_mae_by_target
