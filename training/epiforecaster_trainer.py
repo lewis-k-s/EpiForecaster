@@ -77,6 +77,7 @@ from utils.console import (
     format_component_gradnorm_status,
     format_train_progress_status,
 )
+from utils.checkpoint_compat import initialize_missing_distribution_parameters
 from training.grad_utils import (
     compute_gradient_norms_and_clip,
     should_log_gradnorm_components,
@@ -981,7 +982,13 @@ class EpiForecasterTrainer:
         # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict, initialized_distribution_keys = (
+            initialize_missing_distribution_parameters(
+                state_dict=checkpoint["model_state_dict"],
+                model_state_dict=self.model.state_dict(),
+            )
+        )
+        self.model.load_state_dict(state_dict)
 
         # Assert resumed model is FP32
         actual_dtype = next(iter(self.model.parameters())).dtype
@@ -992,8 +999,14 @@ class EpiForecasterTrainer:
                 "Please retrain with current precision settings."
             )
 
-        if "optimizer_state_dict" in checkpoint:
+        if "optimizer_state_dict" in checkpoint and not initialized_distribution_keys:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif "optimizer_state_dict" in checkpoint:
+            self._status(
+                "Skipped legacy optimizer state because distribution parameters "
+                "were initialized from current defaults.",
+                logging.WARNING,
+            )
         gradnorm_controller = getattr(self, "gradnorm_controller", None)
         gradnorm_optimizer = getattr(self, "gradnorm_optimizer", None)
         if (
@@ -1050,7 +1063,13 @@ class EpiForecasterTrainer:
             raise ValueError("init_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict, _initialized_distribution_keys = (
+            initialize_missing_distribution_parameters(
+                state_dict=checkpoint["model_state_dict"],
+                model_state_dict=self.model.state_dict(),
+            )
+        )
+        self.model.load_state_dict(state_dict)
 
         actual_dtype = next(iter(self.model.parameters())).dtype
         if actual_dtype != torch.float32:
@@ -2466,7 +2485,13 @@ class EpiForecasterTrainer:
         checkpoint_path = self._best_checkpoint_path()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict, _initialized_distribution_keys = (
+            initialize_missing_distribution_parameters(
+                state_dict=checkpoint["model_state_dict"],
+                model_state_dict=self.model.state_dict(),
+            )
+        )
+        self.model.load_state_dict(state_dict)
 
         actual_dtype = next(iter(self.model.parameters())).dtype
         if actual_dtype != torch.float32:
