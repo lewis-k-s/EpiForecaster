@@ -174,8 +174,13 @@ def load_window_selection_specs_from_granular(
         granular_df["window_start"], errors="coerce"
     )
     granular_df["abs_error"] = pd.to_numeric(granular_df["abs_error"], errors="coerce")
+    score_column = "abs_error"
+    if "crps" in granular_df.columns:
+        granular_df["crps"] = pd.to_numeric(granular_df["crps"], errors="coerce")
+        if granular_df["crps"].notna().any():
+            score_column = "crps"
     granular_df = granular_df.dropna(
-        subset=["target", "node_id", "window_start", "abs_error"]
+        subset=["target", "node_id", "window_start", score_column]
     ).copy()
     if granular_df.empty:
         return []
@@ -183,8 +188,8 @@ def load_window_selection_specs_from_granular(
     per_target = (
         granular_df.groupby(["node_id", "window_start", "target"], dropna=False)
         .agg(
-            mae=("abs_error", "mean"),
-            observed_points=("abs_error", "size"),
+            score=(score_column, "mean"),
+            observed_points=(score_column, "size"),
         )
         .reset_index()
     )
@@ -195,7 +200,7 @@ def load_window_selection_specs_from_granular(
     for (node_id, window_start), group in per_target.groupby(
         ["node_id", "window_start"], dropna=False
     ):
-        scores = pd.to_numeric(group["mae"], errors="coerce").dropna()
+        scores = pd.to_numeric(group["score"], errors="coerce").dropna()
         if scores.empty:
             continue
         observed_targets = tuple(sorted(group["target"].astype(str).tolist()))

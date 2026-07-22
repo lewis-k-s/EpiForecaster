@@ -22,7 +22,16 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
     class _DummyDataset:
         def __init__(self) -> None:
             self.config = SimpleNamespace(
-                model=SimpleNamespace(input_window_length=3, forecast_horizon=2)
+                model=SimpleNamespace(input_window_length=3, forecast_horizon=2),
+                training=SimpleNamespace(
+                    loss=SimpleNamespace(
+                        joint=SimpleNamespace(
+                            distribution_family="normal",
+                            distribution_df=5.0,
+                            interval_levels=[0.5, 0.8, 0.95],
+                        )
+                    )
+                ),
             )
             self.precomputed_cases_hist = torch.zeros((10, 1), dtype=torch.float32)
             self.precomputed_hosp = torch.arange(10, dtype=torch.float32).reshape(10, 1)
@@ -94,6 +103,8 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
         def forward_batch(self, *, batch_data, region_embeddings=None):
             return {
                 "pred_hosp": torch.tensor([[7.5, 9.5]], dtype=torch.float32),
+                "dist_hosp_loc": torch.tensor([[7.5, 9.5]], dtype=torch.float32),
+                "dist_hosp_scale": torch.tensor([[1.0, 2.0]], dtype=torch.float32),
             }, {}
 
     monkeypatch.setattr(forecast_plots, "DataLoader", _FakeDataLoader)
@@ -116,8 +127,39 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
     hosp_payload = samples[0]["targets"]["hosp"]
     assert hosp_payload["target"].tolist() == [8.0, 9.0]
     assert hosp_payload["prediction"].tolist() == [7.5, 9.5]
+    assert "interval_low_80" in hosp_payload
+    assert "interval_high_95" in hosp_payload
     assert hosp_payload["window_mae"] == 0.5
     assert samples[0]["window_mae"] == 0.5
+
+
+def test_aligned_distribution_intervals_use_configured_family_and_levels() -> None:
+    model_outputs = {
+        "dist_hosp_loc": torch.zeros((1, 2)),
+        "dist_hosp_scale": torch.ones((1, 2)),
+    }
+
+    normal = forecast_plots._aligned_distribution_intervals(
+        model_outputs=model_outputs,
+        target_name="hosp",
+        batch_index=0,
+        target_length=2,
+        distribution_family="normal",
+        distribution_df=5.0,
+        interval_levels=[0.9],
+    )
+    student_t = forecast_plots._aligned_distribution_intervals(
+        model_outputs=model_outputs,
+        target_name="hosp",
+        batch_index=0,
+        target_length=2,
+        distribution_family="student_t",
+        distribution_df=5.0,
+        interval_levels=[0.9],
+    )
+
+    assert set(normal) == {"interval_low_90", "interval_high_90"}
+    assert student_t["interval_high_90"][0] > normal["interval_high_90"][0]
 
 
 def test_load_window_selection_specs_from_granular_aggregates_per_target_means(
@@ -169,6 +211,38 @@ def test_load_window_selection_specs_from_granular_aggregates_per_target_means(
     assert spec.observed_points == 3
 
 
+def test_load_window_selection_specs_prefers_crps_when_available(tmp_path) -> None:
+    granular_csv = tmp_path / "granular.csv"
+    pd.DataFrame(
+        [
+            {
+                "split": "test",
+                "target": "cases",
+                "node_id": 1,
+                "window_start": 10,
+                "abs_error": 100.0,
+                "crps": 1.0,
+            },
+            {
+                "split": "test",
+                "target": "hospitalizations",
+                "node_id": 1,
+                "window_start": 10,
+                "abs_error": 100.0,
+                "crps": 3.0,
+            },
+        ]
+    ).to_csv(granular_csv, index=False)
+
+    specs = load_window_selection_specs_from_granular(
+        granular_csv=granular_csv,
+        split="test",
+    )
+
+    assert len(specs) == 1
+    assert specs[0].score == 2.0
+
+
 def test_select_windows_by_loss_returns_window_specs() -> None:
     specs = [WindowSelectionSpec(i, 100 + i, float(i), ("cases",), 2) for i in range(8)]
     groups = select_windows_by_loss(window_specs=specs, samples_per_group=1)
@@ -204,7 +278,16 @@ def test_collect_forecast_samples_for_window_specs_uses_exact_window(
     class _DummyDataset:
         def __init__(self) -> None:
             self.config = SimpleNamespace(
-                model=SimpleNamespace(input_window_length=3, forecast_horizon=2)
+                model=SimpleNamespace(input_window_length=3, forecast_horizon=2),
+                training=SimpleNamespace(
+                    loss=SimpleNamespace(
+                        joint=SimpleNamespace(
+                            distribution_family="normal",
+                            distribution_df=5.0,
+                            interval_levels=[0.5, 0.8, 0.95],
+                        )
+                    )
+                ),
             )
             self.precomputed_cases_hist = torch.zeros((10, 1), dtype=torch.float32)
             self.precomputed_hosp = torch.arange(10, dtype=torch.float32).reshape(10, 1)
@@ -325,6 +408,45 @@ def test_make_forecast_figure_annotates_window_mae() -> None:
     assert fig is not None
     title = fig.axes[0].get_title()
     assert "MAE=0.500" in title
+
+
+def test_make_joint_forecast_figure_renders_distribution_intervals() -> None:
+    sample = {
+        "node_id": 1,
+        "node_label": "Region 1",
+        "actual_context": [1.0, 2.0, 3.0, 4.0],
+        "prediction": [3.0, 5.0],
+        "target": [3.0, 4.0],
+        "history": [1.0, 2.0],
+        "t_rel": [-2, -1, 0, 1],
+        "t0_idx_in_context": 2,
+        "start_time": "2024-01-01",
+        "window_start": 10,
+        "window_mae": 0.5,
+        "L": 2,
+        "H": 2,
+        "targets": {
+            "hosp": {
+                "actual_context": [1.0, 2.0, 3.0, 4.0],
+                "prediction": [3.0, 5.0],
+                "target": [3.0, 4.0],
+                "history": [1.0, 2.0],
+                "window_mae": 0.5,
+                "interval_low_90": [2.0, 4.0],
+                "interval_high_90": [4.0, 6.0],
+            }
+        },
+    }
+
+    fig = forecast_plots.make_joint_forecast_figure(
+        samples=[sample],
+        input_window_length=2,
+        forecast_horizon=2,
+        target_names=["hosp"],
+    )
+
+    assert fig is not None
+    assert fig.axes[0].collections
 
 
 def test_make_forecast_figure_supports_shared_labels() -> None:
