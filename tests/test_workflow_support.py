@@ -81,45 +81,63 @@ def _write_pointer(
     )
 
 
-def test_mn5_smoke_only_changes_workload_size_and_study_identity() -> None:
+def test_mn5_smoke_uses_short_single_gpu_debug_workload() -> None:
     production = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
     smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
 
-    def flattened(mapping: dict, prefix: tuple[str, ...] = ()) -> dict:
-        values = {}
-        for key, value in mapping.items():
-            path = (*prefix, str(key))
-            if isinstance(value, dict):
-                values.update(flattened(value, path))
-            else:
-                values[path] = value
-        return values
-
-    production_values = flattened(production)
-    smoke_values = flattened(smoke)
-    differing = {
-        path
-        for path in production_values.keys() | smoke_values.keys()
-        if production_values.get(path) != smoke_values.get(path)
-    }
-
-    assert differing == {
-        ("optuna", "study_name"),
-        ("optuna", "trials_per_worker"),
-        ("optuna", "timeout_s"),
-        ("optuna", "epochs"),
-        ("optuna", "max_batches"),
-        ("resources", "allocation", "runtime"),
-    }
-    assert (
-        smoke["optuna"]["trials_per_worker"] < production["optuna"]["trials_per_worker"]
-    )
-    assert smoke["optuna"]["timeout_s"] < production["optuna"]["timeout_s"]
-    assert smoke["optuna"]["epochs"] < production["optuna"]["epochs"]
+    assert smoke["workflow"] == production["workflow"]
+    assert smoke["dvc"] == production["dvc"]
+    assert smoke["promotion"] == production["promotion"]
+    assert smoke["optuna"]["base_config"] == production["optuna"]["base_config"]
+    assert smoke["optuna"]["workers"] == 1
+    assert smoke["optuna"]["trials_per_worker"] == 1
+    assert smoke["optuna"]["timeout_s"] == 300
+    assert smoke["optuna"]["epochs"] == 1
     assert smoke["optuna"]["max_batches"] == 1
+    assert "training.compile=false" in smoke["optuna"]["overrides"]
+    assert smoke["evaluation"]["overrides"] == [
+        "training.max_batches=1",
+        "training.compile=false",
+        "training.val_workers=1",
+        "training.test_workers=1",
+    ]
+    assert smoke["resources"]["allocation"] == {
+        "account": "bsc08",
+        "partition": "acc",
+        "qos": "acc_debug",
+        "nodes": 1,
+        "tasks": 1,
+        "cpus_per_task": 20,
+        "gres": "gpu:1",
+        "runtime": 20,
+    }
+
+
+def test_probabilistic_smoke_reuses_short_debug_shape_with_normal_nll() -> None:
+    smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
+    probabilistic = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
+    )
+
+    assert probabilistic["workflow"] == smoke["workflow"]
+    assert probabilistic["dvc"] == smoke["dvc"]
+    assert probabilistic["evaluation"] == smoke["evaluation"]
+    assert probabilistic["resources"] == smoke["resources"]
+    for field in (
+        "workers",
+        "trials_per_worker",
+        "timeout_s",
+        "epochs",
+        "max_batches",
+    ):
+        assert probabilistic["optuna"][field] == smoke["optuna"][field]
     assert (
-        smoke["resources"]["allocation"]["runtime"]
-        < production["resources"]["allocation"]["runtime"]
+        "training.loss.joint.observation_loss=nll"
+        in probabilistic["optuna"]["overrides"]
+    )
+    assert (
+        "training.loss.joint.distribution_family=normal"
+        in probabilistic["optuna"]["overrides"]
     )
 
 
@@ -224,16 +242,13 @@ def _write_published_run_contract(
     dispatch = state / "dispatch.tsv"
     dispatch.write_text("schema_version\t1\n")
     dispatch_sha256 = run_support.sha256_file(dispatch)
-    (state / "dispatch.tsv.sha256").write_text(
-        f"{dispatch_sha256}  dispatch.tsv\n"
-    )
+    (state / "dispatch.tsv.sha256").write_text(f"{dispatch_sha256}  dispatch.tsv\n")
     (state / "published.done").write_text(
         "\n".join(
             [
                 "schema_version=1",
                 f"run_id={config['run']['id']}",
-                "source_snapshot_sha256="
-                f"{config['source']['source_snapshot_sha256']}",
+                f"source_snapshot_sha256={config['source']['source_snapshot_sha256']}",
                 f"config_sha256={run_support.sha256_file(config_path)}",
                 f"tooling_key={config['workflow']['tooling_key']}",
                 "",
@@ -1842,7 +1857,7 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     calls = tmp_path / "sbatch.calls"
     sbatch = fake_bin / "sbatch"
     sbatch.write_text(
-        "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$CALLS_FILE\"\n"
+        '#!/bin/bash\nprintf \'%s\\n\' "$*" >>"$CALLS_FILE"\n'
         "printf '12345;cluster\\n'\n"
     )
     sbatch.chmod(0o755)
@@ -1945,9 +1960,7 @@ def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> N
     )
 
     assert result.returncode == 7
-    assert not (
-        scratch / "epiforecaster" / run_root.name / "local_batch_0"
-    ).exists()
+    assert not (scratch / "epiforecaster" / run_root.name / "local_batch_0").exists()
 
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
@@ -1990,9 +2003,10 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert '--gres="$GRES"' in remote_runner
     assert '"$TASKS"' in remote_runner
     assert '"$CPUS_PER_TASK"' in remote_runner
-    assert '"$@"' not in remote_runner.split("submit_run()", 1)[1].split(
-        "show_status()", 1
-    )[0]
+    assert (
+        '"$@"'
+        not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
+    )
     assert "--mem" not in coordinator
     squeue_state_probes = [
         line for line in remote_runner.splitlines() if 'state="$(squeue' in line
