@@ -1,0 +1,189 @@
+"""Modular, artifact-oriented EpiForecaster workflow for MN5."""
+
+from pathlib import Path
+import shlex
+import sys
+
+sys.path.insert(0, str(Path(config["run"]["source_root"])))
+
+from scripts.workflow.run_config import (
+    validate_mn5_allocation,
+    workflow_kind,
+    workflow_target,
+)
+from workflow.common import (
+    CONTAINER_RUN,
+    CONTAINER_SOURCE,
+    ablation_worker_arguments,
+    container_command,
+    dependency_sources,
+    hpo_worker_arguments,
+    launch_workers_command,
+    read_source_inventory,
+    slurm_step,
+    source_fingerprint,
+)
+
+
+RUN_ROOT = Path(config["run"]["root"])
+SOURCE_ROOT = Path(config["run"]["source_root"])
+WORKFLOW_KIND = workflow_kind(config)
+WORKFLOW_TARGET = workflow_target(config)
+SIF = str(config["container"]["sif"])
+DVC_REMOTE = str(config["dvc"]["remote"])
+DVC_CACHE = str(config["dvc"]["cache"])
+ALLOCATION = validate_mn5_allocation(config)
+TASKS = int(ALLOCATION["tasks"])
+CPUS_PER_TASK = int(ALLOCATION["cpus_per_task"])
+
+CONFIG_PATH = RUN_ROOT / "config.yaml"
+CONTAINER_CONFIG = CONTAINER_RUN / "config.yaml"
+SOURCE_FILE_LIST = RUN_ROOT / ".state/source-files.bin"
+HOST_PYTHON = Path(sys.executable)
+
+PREPARED = RUN_ROOT / ".state/prepared.done"
+MANIFEST = RUN_ROOT / "manifest.yaml"
+DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
+DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
+WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"
+WORKFLOW_COMPLETE = RUN_ROOT / ".state/workflow.done"
+DVC_POINTERS = [str(SOURCE_ROOT / str(target)) for target in config["dvc"]["targets"]]
+
+SOURCE_INVENTORY = read_source_inventory(RUN_ROOT)
+ACTIVE_STAGES = {
+    "train": ("data", "training", "evaluation"),
+    "evaluate": ("data", "evaluation"),
+    "hpo": ("data", "hpo", "selection", "evaluation", "promotion"),
+    "ablation": ("data", "ablation"),
+}[WORKFLOW_KIND]
+STAGE_SOURCES = {
+    stage: dependency_sources(SOURCE_ROOT, SOURCE_INVENTORY, config, stage)
+    for stage in ACTIVE_STAGES
+}
+STAGE_FINGERPRINTS = {
+    stage: source_fingerprint(SOURCE_ROOT, sources)
+    for stage, sources in STAGE_SOURCES.items()
+}
+DEPENDENCY_CONTRACTS = {
+    stage: RUN_ROOT / ".state/dependencies" / f"{stage}.json"
+    for stage in ACTIVE_STAGES
+}
+
+EVALUATION_DIR = RUN_ROOT / "outputs/evaluation"
+EVALUATION_SPLIT = str(config.get("evaluation", {}).get("split", "test"))
+EVALUATION_SUMMARY = EVALUATION_DIR / f"{EVALUATION_SPLIT}_summary.json"
+EVALUATION_NODE_METRICS = EVALUATION_DIR / f"{EVALUATION_SPLIT}_node_metrics.csv"
+EVALUATION_PER_HEAD_METRICS = (
+    EVALUATION_DIR / f"{EVALUATION_SPLIT}_node_metrics_per_head.csv"
+)
+EVALUATION_GRANULAR = EVALUATION_DIR / f"{EVALUATION_SPLIT}_granular.parquet"
+EVALUATION_MANIFEST = EVALUATION_DIR / "evaluation_manifest.json"
+EVALUATION_DONE = EVALUATION_DIR / ".done"
+EVALUATION_ARTIFACTS = [
+    str(EVALUATION_SUMMARY),
+    str(EVALUATION_NODE_METRICS),
+    str(EVALUATION_PER_HEAD_METRICS),
+]
+if bool(config.get("evaluation", {}).get("granular", False)):
+    EVALUATION_ARTIFACTS.append(str(EVALUATION_GRANULAR))
+
+if WORKFLOW_KIND == "train":
+    training = config["training"]
+    TRAINING_ROOT = (
+        RUN_ROOT
+        / "outputs/training"
+        / str(training["experiment_name"])
+        / str(training["model_id"])
+    )
+    TRAINING_CHECKPOINT = TRAINING_ROOT / "checkpoints/best_model.pt"
+    TRAINING_MANIFEST = TRAINING_ROOT / "training_manifest.json"
+    TRAINING_DONE = RUN_ROOT / ".state/training.done"
+    EVALUATION_CHECKPOINT = TRAINING_CHECKPOINT
+    EVALUATION_PREREQUISITES = [str(TRAINING_MANIFEST)]
+    EVALUATION_CONTAINER_CHECKPOINT = (
+        CONTAINER_RUN / EVALUATION_CHECKPOINT.relative_to(RUN_ROOT)
+    )
+    EVALUATION_INPUT_PATHS = ()
+    DEFAULT_TERMINAL = (
+        TRAINING_MANIFEST
+        if WORKFLOW_TARGET == "train"
+        else EVALUATION_MANIFEST
+    )
+elif WORKFLOW_KIND == "evaluate":
+    EVALUATION_CHECKPOINT = Path(str(config["evaluation"]["checkpoint"])).resolve(
+        strict=True
+    )
+    EVALUATION_PREREQUISITES = []
+    EVALUATION_CONTAINER_CHECKPOINT = EVALUATION_CHECKPOINT
+    EVALUATION_INPUT_PATHS = (EVALUATION_CHECKPOINT,)
+    DEFAULT_TERMINAL = EVALUATION_MANIFEST
+elif WORKFLOW_KIND == "hpo":
+    optuna_config = config["optuna"]
+    STUDY_NAME = str(optuna_config["study_name"])
+    STUDY_WORKERS = int(optuna_config["workers"])
+    WORKER_IDS = [f"{worker_id:03d}" for worker_id in range(STUDY_WORKERS)]
+    JOURNAL = RUN_ROOT / "optuna" / f"{STUDY_NAME}.journal"
+    CONTAINER_JOURNAL = CONTAINER_RUN / "optuna" / f"{STUDY_NAME}.journal"
+    STUDY_SUMMARY = RUN_ROOT / "optuna/study_summary.json"
+    BEST_CONFIG = RUN_ROOT / "optuna/best_config.yaml"
+    BEST_MODEL = RUN_ROOT / "outputs/best_model.pt"
+    SELECTION = RUN_ROOT / "outputs/selection.json"
+    PROMOTED = RUN_ROOT / ".state/promoted.done"
+    CHECKPOINTS_CLEANED = RUN_ROOT / ".state/checkpoints_cleaned.done"
+    PROMOTION_ROOT = str(config["promotion"]["root"])
+    EVALUATION_CHECKPOINT = BEST_MODEL
+    EVALUATION_PREREQUISITES = [str(SELECTION)]
+    EVALUATION_CONTAINER_CHECKPOINT = CONTAINER_RUN / BEST_MODEL.relative_to(RUN_ROOT)
+    EVALUATION_INPUT_PATHS = ()
+    DEFAULT_TERMINAL = CHECKPOINTS_CLEANED
+elif WORKFLOW_KIND == "ablation":
+    ablation_config = config["ablation"]
+    STUDY_NAME = str(ablation_config["study_name"])
+    STUDY_WORKERS = int(ablation_config["workers"])
+    WORKER_IDS = [f"{worker_id:03d}" for worker_id in range(STUDY_WORKERS)]
+    JOURNAL = RUN_ROOT / "optuna" / f"{STUDY_NAME}.journal"
+    CONTAINER_JOURNAL = CONTAINER_RUN / "optuna" / f"{STUDY_NAME}.journal"
+    ABLATION_OUTPUT_DIR = RUN_ROOT / "outputs/ablation_analysis"
+    ABLATION_MANIFEST = ABLATION_OUTPUT_DIR / "ablation_manifest.json"
+    ABLATION_REQUIRED = [
+        ABLATION_OUTPUT_DIR / "seed_coverage_report.csv",
+        ABLATION_OUTPUT_DIR / "ablation_run_context.csv",
+        ABLATION_OUTPUT_DIR / "ablation_metrics_aggregated.csv",
+    ]
+    ABLATION_DONE = RUN_ROOT / ".state/ablation.done"
+    DEFAULT_TERMINAL = ABLATION_MANIFEST
+
+
+def dependency_command(stage):
+    command = [
+        str(HOST_PYTHON),
+        "-m",
+        "scripts.workflow.run_support",
+        "dependencies",
+        "--config",
+        str(CONFIG_PATH),
+        "--source-root",
+        str(SOURCE_ROOT),
+        "--run-root",
+        str(RUN_ROOT),
+        "--stage",
+        stage,
+        "--output",
+        str(DEPENDENCY_CONTRACTS[stage]),
+    ]
+    for source in STAGE_SOURCES[stage]:
+        command.extend(["--source", source])
+    return shlex.join(command)
+
+
+rule all:
+    input:
+        str(WORKFLOW_COMPLETE)
+
+
+include: "rules/common.smk"
+include: "rules/training.smk"
+include: "rules/evaluation.smk"
+include: "rules/studies.smk"
+include: "rules/promotion.smk"
+include: "rules/targets.smk"

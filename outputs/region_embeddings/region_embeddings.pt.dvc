@@ -1,0 +1,5 @@
+outs:
+- md5: 5205439ed1bd8a079aa57aed37507654
+  size: 219372
+  hash: md5
+  path: region_embeddings.pt

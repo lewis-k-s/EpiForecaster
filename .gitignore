@@ -23,6 +23,7 @@ MANIFEST
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.snakemake/
 # we use pyproject.toml
 requirements.txt
 .cache
@@ -40,6 +41,11 @@ data/files/*.parquet
 data/files/*.h5
 data/processed/*.zarr
 outputs/
+!outputs/
+outputs/*
+!outputs/region_embeddings/
+outputs/region_embeddings/*
+!outputs/region_embeddings/region_embeddings.pt.dvc
 logs/
 test_outputs/
 test_output/

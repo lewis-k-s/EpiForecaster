@@ -192,59 +192,6 @@ def test_is_study_complete_accepts_ablation_subset() -> None:
     assert worker.is_study_complete(study, [42, 43], plan) is True
 
 
-def test_maybe_run_analysis_is_idempotent_once_full_matrix(tmp_path: Path) -> None:
-    study = optuna.create_study(direction="minimize")
-    for seed in [42]:
-        for ablation in worker.ABLATIONS:
-            _add_terminal_trial(study, seed=seed, ablation=ablation)
-
-    calls: list[str] = []
-
-    def _runner(campaign_id: str) -> None:
-        calls.append(campaign_id)
-
-    lock_path = tmp_path / "analysis.lock"
-    first = worker.maybe_run_analysis(
-        study=study,
-        campaign_id="camp-1",
-        seeds=[42],
-        coordination_lock_path=lock_path,
-        runner=_runner,
-    )
-    second = worker.maybe_run_analysis(
-        study=study,
-        campaign_id="camp-1",
-        seeds=[42],
-        coordination_lock_path=lock_path,
-        runner=_runner,
-    )
-
-    assert first is True
-    assert second is False
-    assert calls == ["camp-1"]
-    assert study.user_attrs[worker.ANALYSIS_LAUNCHED_ATTR] is True
-
-
-def test_maybe_run_analysis_skips_partial_campaign(tmp_path: Path) -> None:
-    study = optuna.create_study(direction="minimize")
-    for ablation in worker.ABLATIONS:
-        _add_terminal_trial(study, seed=42, ablation=ablation)
-    _add_terminal_trial(study, seed=43, ablation="baseline")
-
-    calls: list[str] = []
-    ran = worker.maybe_run_analysis(
-        study=study,
-        campaign_id="camp-partial",
-        seeds=[42, 43],
-        coordination_lock_path=tmp_path / "analysis.lock",
-        runner=lambda campaign_id: calls.append(campaign_id),
-    )
-
-    assert ran is False
-    assert calls == []
-    assert worker.ANALYSIS_LAUNCHED_ATTR not in study.user_attrs
-
-
 def test_main_passes_timeout_and_catch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -253,8 +200,6 @@ def test_main_passes_timeout_and_catch(
     monkeypatch.setattr(worker, "JournalStorage", lambda backend: object())
     monkeypatch.setattr(worker, "JournalFileBackend", lambda path: object())
     monkeypatch.setattr(worker.optuna, "create_study", lambda **kwargs: fake_study)
-    monkeypatch.setattr(worker, "maybe_run_analysis", lambda **kwargs: False)
-
     config_path = tmp_path / "config.yaml"
     config_path.write_text("training:\n  seed: 42\n", encoding="utf-8")
 

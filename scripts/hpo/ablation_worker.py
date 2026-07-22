@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import fcntl
 import logging
-import os
-import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,13 +19,13 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
 
 QUEUE_INITIALIZED_ATTR = "ablation_queue_initialized"
-ANALYSIS_LAUNCHED_ATTR = "ablation_analysis_launched"
 
 # Keep baseline first so each seed block starts with a matched baseline run.
 # Order: baseline → spatial/context → physics → loss → signal heads → kernels.
@@ -84,13 +82,6 @@ def resolve_ablation_plan(requested: str | None) -> dict[str, str]:
             f"{', '.join(unknown)}. Available: {', '.join(ABLATIONS)}"
         )
     return {name: ABLATIONS[name] for name in names}
-
-
-def _compute_worker_seed(base_seed: int) -> int:
-    slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
-    if slurm_task_id is None:
-        return base_seed
-    return base_seed + int(slurm_task_id)
 
 
 @contextmanager
@@ -213,45 +204,6 @@ def is_study_complete(
     return True
 
 
-def maybe_run_analysis(
-    *,
-    study: optuna.Study,
-    campaign_id: str,
-    seeds: list[int],
-    ablations: dict[str, str] | None = None,
-    coordination_lock_path: Path,
-    runner: Callable[[str], None] | None = None,
-) -> bool:
-    ablations = ablations or ABLATIONS
-    with _file_lock(coordination_lock_path):
-        if study.user_attrs.get(ANALYSIS_LAUNCHED_ATTR, False):
-            return False
-        if not is_study_complete(study, seeds, ablations):
-            return False
-
-        analysis_runner = runner or _run_campaign_analysis
-        analysis_runner(campaign_id)
-        study.set_user_attr(ANALYSIS_LAUNCHED_ATTR, True)
-        logger.info("Marked analysis launched for campaign '%s'", campaign_id)
-        return True
-
-
-def _run_campaign_analysis(campaign_id: str) -> None:
-    logger.info("Running ablation analysis for completed campaign '%s'", campaign_id)
-    subprocess.run(
-        [
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "scripts.analysis.analyze_ablations",
-            "--campaign-id",
-            campaign_id,
-        ],
-        check=True,
-    )
-
-
 def objective(
     trial: optuna.Trial,
     *,
@@ -295,8 +247,10 @@ def objective(
     cfg = EpiForecasterConfig.load(str(base_config_path), overrides=overrides)
     cfg.output.log_dir = str(run_root / campaign_id)
 
-    trainer = EpiForecasterTrainer(cfg)
-    trainer.model_id = f"ablation_t{trial.number}_s{seed}"
+    trainer = EpiForecasterTrainer(
+        cfg,
+        model_id=f"ablation_t{trial.number}_s{seed}",
+    )
 
     results = trainer.run()
     val_loss = float(results.get("best_val_loss", float("inf")))
@@ -405,9 +359,6 @@ def main(
     )
 
     queue_lock_path = journal_file.with_suffix(f"{journal_file.suffix}.queue.lock")
-    analysis_lock_path = journal_file.with_suffix(
-        f"{journal_file.suffix}.analysis.lock"
-    )
     initialize_study_queue(
         study=study,
         seeds=seed_list,
@@ -429,27 +380,6 @@ def main(
     if requeue_running:
         logger.info("Requeueing stale RUNNING trial identities")
 
-    def _log_trial_complete(
-        study: optuna.Study, trial: optuna.trial.FrozenTrial
-    ) -> None:
-        logger.info(
-            "Trial %d recorded (state=%s, value=%s)",
-            trial.number,
-            trial.state.name,
-            trial.value,
-        )
-        if trial.state in TERMINAL_TRIAL_STATES:
-            try:
-                maybe_run_analysis(
-                    study=study,
-                    campaign_id=campaign_id,
-                    seeds=seed_list,
-                    ablations=ablation_plan,
-                    coordination_lock_path=analysis_lock_path,
-                )
-            except Exception:
-                logger.exception("Post-trial analysis check failed")
-
     study.optimize(
         lambda current_trial: objective(
             current_trial,
@@ -463,20 +393,8 @@ def main(
         ),
         n_trials=n_trials,
         timeout=timeout_s,
-        callbacks=[_log_trial_complete],
         catch=(Exception,),
     )
-
-    try:
-        maybe_run_analysis(
-            study=study,
-            campaign_id=campaign_id,
-            seeds=seed_list,
-            ablations=ablation_plan,
-            coordination_lock_path=analysis_lock_path,
-        )
-    except Exception:
-        logger.exception("Final analysis check failed")
 
 
 if __name__ == "__main__":

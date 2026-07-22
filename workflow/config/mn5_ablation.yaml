@@ -1,0 +1,42 @@
+# Paired-seed Optuna ablation workflow. The worker count controls the number of
+# concurrent ranks; the study queue controls ablation/seed assignment.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: ablation
+  target: ablation
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.dvc
+    - data/processed/real_with_id.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+ablation:
+  study_name: epiforecaster_ablation_v1
+  campaign_id: epiforecaster_ablation_v1
+  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  workers: 4
+  seeds: [42, 43, 44, 45, 46]
+  ablations: null
+  overrides: []
+  # Full registry: 28 ablations x 5 seeds / 4 workers = 35 trials per worker.
+  trials_per_worker: 35
+  timeout_s: 17100
+  sampler_seed: 42
+  smoketest: false
+  requeue_running: false
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 4
+    cpus_per_task: 20
+    gres: gpu:4
+    runtime: 420

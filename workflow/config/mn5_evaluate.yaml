@@ -1,0 +1,34 @@
+# Evaluation-only workflow. Copy this template and set evaluation.checkpoint to
+# an absolute GPFS path before preparing the immutable run.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: evaluate
+  target: evaluate
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.dvc
+    - data/processed/real_with_id.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+evaluation:
+  checkpoint: null
+  split: test
+  granular: true
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 120
