@@ -141,6 +141,18 @@ def test_probabilistic_smoke_reuses_short_debug_shape_with_normal_nll() -> None:
     )
 
 
+def test_probabilistic_batch_smoke_only_changes_qos() -> None:
+    debug = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
+    )
+    batch = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke_batch.yaml").read_text()
+    )
+
+    debug["resources"]["allocation"]["qos"] = "acc_bscls"
+    assert batch == debug
+
+
 def test_single_training_smoke_composes_training_and_evaluation() -> None:
     smoke = yaml.safe_load(
         (REPO_ROOT / "workflow/config/mn5_train_smoke.yaml").read_text()
