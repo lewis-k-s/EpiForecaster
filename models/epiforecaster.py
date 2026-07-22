@@ -179,6 +179,8 @@ class EpiForecaster(nn.Module):
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_ww,
+            distribution_scale_init=observation_heads.distribution_scale_init,
+            distribution_scale_floor=observation_heads.distribution_scale_floor,
         )
 
         # Hospitalization head
@@ -193,6 +195,8 @@ class EpiForecaster(nn.Module):
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_hosp,
+            distribution_scale_init=observation_heads.distribution_scale_init,
+            distribution_scale_floor=observation_heads.distribution_scale_floor,
         )
 
         # Cases head (reported cases observation)
@@ -207,6 +211,8 @@ class EpiForecaster(nn.Module):
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_cases,
+            distribution_scale_init=observation_heads.distribution_scale_init,
+            distribution_scale_floor=observation_heads.distribution_scale_floor,
         )
 
         # Deaths head (mortality observation)
@@ -222,6 +228,8 @@ class EpiForecaster(nn.Module):
             delta_forecasting=False,  # Do not anchor deaths since death_flow lacks t=0 nowcast
             anchor_mode="disabled",
             kernel_mlp=observation_heads.kernel_mlp_deaths,
+            distribution_scale_init=observation_heads.distribution_scale_init,
+            distribution_scale_floor=observation_heads.distribution_scale_floor,
         )
 
         # Cast all parameters to the canonical model parameter dtype.
@@ -427,13 +435,14 @@ class EpiForecaster(nn.Module):
 
         # Wastewater prediction
         # SIR is modeled in fraction space (S+I+R=1), so population N=1.0
-        pred_ww = self.ww_head(
+        dist_ww = self.ww_head.forward_distribution(
             I_trajectory=I_traj,
             population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
             obs_context=obs_context_with_init,
             last_observed=ww_last,
             last_observed_mask=ww_last_mask,
         )  # [B, H+1]
+        pred_ww = dist_ww["loc"]
 
         # Hospitalization prediction. Observed hospitalizations are modeled as
         # reported admissions, so the clinical head consumes the I -> H flow.
@@ -444,29 +453,32 @@ class EpiForecaster(nn.Module):
             ],
             dim=1,
         )
-        pred_hosp = self.hosp_head(
+        dist_hosp = self.hosp_head.forward_distribution(
             I_trajectory=hospitalization_source,
             obs_context=obs_context_with_init,
             last_observed=hosp_last,
             last_observed_mask=hosp_last_mask,
         )  # [B, H+1]
+        pred_hosp = dist_hosp["loc"]
 
         # Cases prediction (reported cases observation)
-        pred_cases = self.cases_head(
+        dist_cases = self.cases_head.forward_distribution(
             I_trajectory=I_traj,
             obs_context=obs_context_with_init,
             last_observed=cases_last,
             last_observed_mask=cases_last_mask,
         )  # [B, H+1]
+        pred_cases = dist_cases["loc"]
 
         # Deaths prediction (mortality observation)
         # Input is death_flow (fraction dying)
         # Note: death_flow lacks t=0 nowcast, so we don't anchor it with delta_forecasting
-        pred_deaths = self.deaths_head(
+        dist_deaths = self.deaths_head.forward_distribution(
             I_trajectory=death_flow,
             obs_context=obs_context,
             last_observed=None,
         )  # [B, H]
+        pred_deaths = dist_deaths["loc"]
 
         # Note: Predictions include t=0 (nowcast) and are [B, H+1] or [B, H].
         # Trainer/eval should slice as needed.
@@ -488,6 +500,14 @@ class EpiForecaster(nn.Module):
             "pred_hosp": pred_hosp,
             "pred_cases": pred_cases,
             "pred_deaths": pred_deaths,
+            "dist_ww_loc": dist_ww["loc"],
+            "dist_ww_scale": dist_ww["scale"],
+            "dist_hosp_loc": dist_hosp["loc"],
+            "dist_hosp_scale": dist_hosp["scale"],
+            "dist_cases_loc": dist_cases["loc"],
+            "dist_cases_scale": dist_cases["scale"],
+            "dist_deaths_loc": dist_deaths["loc"],
+            "dist_deaths_scale": dist_deaths["scale"],
             "obs_context": obs_context,
             "initial_states": initial_states,
         }

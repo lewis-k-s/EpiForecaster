@@ -79,6 +79,11 @@ class TestEpiForecaster:
         assert out["pred_hosp"].shape == (batch_size, horizon + 1)
         # Deaths uses death_flow which doesn't have nowcast
         assert out["pred_deaths"].shape == (batch_size, horizon)
+        for head_name in ("ww", "hosp", "cases", "deaths"):
+            pred_key = f"pred_{head_name}"
+            assert out[f"dist_{head_name}_loc"].shape == out[pred_key].shape
+            assert out[f"dist_{head_name}_scale"].shape == out[pred_key].shape
+            assert torch.all(out[f"dist_{head_name}_scale"] > 0)
         assert out["S_trajectory"].shape == (batch_size, horizon + 1)
         assert out["I_trajectory"].shape == (batch_size, horizon + 1)
         assert out["H_trajectory"].shape == (batch_size, horizon + 1)
@@ -273,9 +278,9 @@ class TestEpiForecaster:
         mob_batch.adj_dense = torch.maximum(dense_adj, eye)
 
         mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
-        mob_batch.target_node = torch.tensor([1, 2], dtype=torch.long).repeat_interleave(
-            T
-        )
+        mob_batch.target_node = torch.tensor(
+            [1, 2], dtype=torch.long
+        ).repeat_interleave(T)
 
         target_nodes = torch.tensor([3, 9], dtype=torch.long)
         out = model(

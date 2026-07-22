@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -14,6 +15,8 @@ if TYPE_CHECKING:
 
 _LOSS_VALUE_CLAMP = 1.0e6
 _RMSE_EPS = 1.0e-8
+_LOG_TWO_PI = math.log(2.0 * math.pi)
+_INV_SQRT_PI = 1.0 / math.sqrt(math.pi)
 
 
 def get_loss_from_config(
@@ -57,6 +60,10 @@ def get_loss_from_config(
 
     return JointInferenceLoss(
         observation_loss=joint_cfg.observation_loss,
+        distribution_family=joint_cfg.distribution_family,
+        distribution_df=joint_cfg.distribution_df,
+        distribution_scale_floor=joint_cfg.distribution_scale_floor,
+        interval_levels=joint_cfg.interval_levels,
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
         w_sird_supervision=joint_cfg.w_sird_supervision,
         disable_ww=joint_cfg.disable_ww,
@@ -117,6 +124,18 @@ class JointInferenceLoss(nn.Module):
         "cases": "cases_min_history_observed",
         "deaths": "deaths_min_history_observed",
     }
+    _HEAD_PRED_KEY = {
+        "ww": "pred_ww",
+        "hosp": "pred_hosp",
+        "cases": "pred_cases",
+        "deaths": "pred_deaths",
+    }
+    _HEAD_HAS_NOWCAST = {
+        "ww": True,
+        "hosp": True,
+        "cases": True,
+        "deaths": False,
+    }
     _LATENT_COMPONENTS = (
         ("latent_s", "S_trajectory", "S_target"),
         ("latent_i", "I_trajectory", "I_target"),
@@ -128,6 +147,10 @@ class JointInferenceLoss(nn.Module):
     def __init__(
         self,
         observation_loss: str = "mse",
+        distribution_family: str = "normal",
+        distribution_df: float = 5.0,
+        distribution_scale_floor: float = 1.0e-3,
+        interval_levels: list[float] | tuple[float, ...] | None = None,
         obs_weight_sum: float = 0.95,
         w_sird_supervision: float = 0.0,
         w_sir: float | None = None,
@@ -151,6 +174,12 @@ class JointInferenceLoss(nn.Module):
     ):
         super().__init__()
         self.observation_loss = observation_loss.lower()
+        self.distribution_family = distribution_family.lower()
+        self.distribution_df = float(distribution_df)
+        self.distribution_scale_floor = float(distribution_scale_floor)
+        self.interval_levels = tuple(
+            float(v) for v in (interval_levels or (0.5, 0.8, 0.95))
+        )
         self.obs_weight_sum = float(obs_weight_sum)
         del sir_residual_clip
         if w_sir is not None and w_sird_supervision == 0.0:
@@ -176,11 +205,38 @@ class JointInferenceLoss(nn.Module):
             raise ValueError(
                 f"obs_weight_sum must be positive, got {self.obs_weight_sum}"
             )
-        if self.observation_loss not in {"mse", "rmse", "mae"}:
+        if self.observation_loss not in {"mse", "rmse", "mae", "nll", "crps"}:
             raise ValueError(
-                "observation_loss must be one of ['mae', 'mse', 'rmse'], "
+                "observation_loss must be one of "
+                "['crps', 'mae', 'mse', 'nll', 'rmse'], "
                 f"got {self.observation_loss!r}"
             )
+        if self.distribution_family not in {"normal", "student_t"}:
+            raise ValueError(
+                "distribution_family must be one of ['normal', 'student_t'], "
+                f"got {self.distribution_family!r}"
+            )
+        if self.observation_loss == "crps" and self.distribution_family != "normal":
+            raise ValueError(
+                "observation_loss='crps' currently requires "
+                "distribution_family='normal'"
+            )
+        if self.distribution_scale_floor <= 0:
+            raise ValueError(
+                "distribution_scale_floor must be positive, "
+                f"got {self.distribution_scale_floor}"
+            )
+        if self.distribution_family == "student_t" and self.distribution_df <= 2.0:
+            raise ValueError(
+                f"distribution_df must be > 2 for student_t, got {self.distribution_df}"
+            )
+        if not self.interval_levels:
+            raise ValueError("interval_levels must not be empty")
+        for level in self.interval_levels:
+            if not 0.0 < level < 1.0:
+                raise ValueError(
+                    f"interval_levels values must be in (0, 1), got {level}"
+                )
         if self.w_sird_supervision < 0:
             raise ValueError(
                 "w_sird_supervision must be non-negative, "
@@ -375,6 +431,162 @@ class JointInferenceLoss(nn.Module):
             loss_type=self.observation_loss,
         )
 
+    @staticmethod
+    def _sanitize_distribution_loc(loc: torch.Tensor) -> torch.Tensor:
+        return torch.nan_to_num(
+            loc.float(),
+            nan=0.0,
+            posinf=_LOSS_VALUE_CLAMP,
+            neginf=-_LOSS_VALUE_CLAMP,
+        ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+
+    def _sanitize_distribution_scale(self, scale: torch.Tensor) -> torch.Tensor:
+        return torch.nan_to_num(
+            scale.float(),
+            nan=self.distribution_scale_floor,
+            posinf=_LOSS_VALUE_CLAMP,
+            neginf=self.distribution_scale_floor,
+        ).clamp(min=self.distribution_scale_floor, max=_LOSS_VALUE_CLAMP)
+
+    @staticmethod
+    def _normal_crps(
+        *,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        z = (target - loc) / scale
+        cdf = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+        pdf = torch.exp(-0.5 * z**2) / math.sqrt(2.0 * math.pi)
+        crps = scale * (z * (2.0 * cdf - 1.0) + 2.0 * pdf - _INV_SQRT_PI)
+        return crps.clamp_min(0.0)
+
+    def _distribution_point_loss(
+        self,
+        *,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.observation_loss == "nll":
+            if self.distribution_family == "normal":
+                z = (target - loc) / scale
+                return 0.5 * z**2 + torch.log(scale) + 0.5 * _LOG_TWO_PI
+
+            df = torch.as_tensor(
+                self.distribution_df,
+                dtype=loc.dtype,
+                device=loc.device,
+            )
+            dist = torch.distributions.StudentT(df, loc=loc, scale=scale)
+            return -dist.log_prob(target)
+
+        if self.observation_loss == "crps":
+            return self._normal_crps(loc=loc, scale=scale, target=target)
+
+        raise ValueError(
+            "distribution loss requested for unsupported observation_loss "
+            f"{self.observation_loss!r}"
+        )
+
+    def _weighted_masked_distribution_loss_from_weights(
+        self,
+        *,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute masked NLL/CRPS from distribution parameters."""
+        loc_clean = self._sanitize_distribution_loc(loc)
+        scale_clean = self._sanitize_distribution_scale(scale)
+        target_f32 = target.float()
+        weights_f32 = weights.float()
+        active = weights_f32 > 0
+        target_clean = torch.nan_to_num(
+            target_f32,
+            nan=0.0,
+            posinf=_LOSS_VALUE_CLAMP,
+            neginf=-_LOSS_VALUE_CLAMP,
+        ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+
+        point_loss = self._distribution_point_loss(
+            loc=loc_clean,
+            scale=scale_clean,
+            target=target_clean,
+        )
+        if self.observation_loss == "nll":
+            point_loss = torch.nan_to_num(
+                point_loss,
+                nan=_LOSS_VALUE_CLAMP,
+                posinf=_LOSS_VALUE_CLAMP,
+                neginf=-_LOSS_VALUE_CLAMP,
+            ).clamp(min=-_LOSS_VALUE_CLAMP, max=_LOSS_VALUE_CLAMP)
+        else:
+            point_loss = torch.nan_to_num(
+                point_loss,
+                nan=_LOSS_VALUE_CLAMP,
+                posinf=_LOSS_VALUE_CLAMP,
+                neginf=0.0,
+            ).clamp(min=0.0, max=_LOSS_VALUE_CLAMP)
+        point_loss = torch.where(active, point_loss, torch.zeros_like(point_loss))
+        return (point_loss * weights_f32).sum() / weights_f32.sum().clamp_min(1e-8)
+
+    @classmethod
+    def _align_head_tensor(
+        cls,
+        tensor: torch.Tensor,
+        *,
+        head_name: str,
+        horizon: int,
+    ) -> torch.Tensor:
+        if cls._HEAD_HAS_NOWCAST[head_name]:
+            return drop_nowcast(tensor, horizon)
+        return tensor
+
+    def _get_head_distribution_params(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        *,
+        head_name: str,
+        horizon: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pred_key = self._HEAD_PRED_KEY[head_name]
+        loc = model_outputs.get(f"dist_{head_name}_loc", model_outputs[pred_key])
+        scale = model_outputs.get(f"dist_{head_name}_scale")
+        loc = self._align_head_tensor(loc, head_name=head_name, horizon=horizon)
+        if scale is None:
+            scale = torch.ones_like(loc)
+        else:
+            scale = self._align_head_tensor(scale, head_name=head_name, horizon=horizon)
+        return loc, scale
+
+    def _compute_head_observation_loss(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        *,
+        head_name: str,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        horizon = int(target.shape[1])
+        loc, scale = self._get_head_distribution_params(
+            model_outputs, head_name=head_name, horizon=horizon
+        )
+        if self.observation_loss in {"nll", "crps"}:
+            return self._weighted_masked_distribution_loss_from_weights(
+                loc=loc,
+                scale=scale,
+                target=target,
+                weights=weights,
+            )
+
+        return self._weighted_masked_observation_loss_from_weights(
+            prediction=loc,
+            target=target,
+            weights=weights,
+        )
+
     @classmethod
     def _weighted_masked_mse_from_weights(
         cls,
@@ -532,8 +744,9 @@ class JointInferenceLoss(nn.Module):
         ww_target = obs_supervision["ww"]["target"]
         ww_weights = obs_supervision["ww"]["weights"]
         if ww_target is not None and ww_weights is not None:
-            ww_base = self._weighted_masked_observation_loss_from_weights(
-                prediction=drop_nowcast(model_outputs["pred_ww"], ww_target.shape[1]),
+            ww_base = self._compute_head_observation_loss(
+                model_outputs,
+                head_name="ww",
                 target=ww_target,
                 weights=ww_weights,
             )
@@ -542,10 +755,9 @@ class JointInferenceLoss(nn.Module):
         hosp_target = obs_supervision["hosp"]["target"]
         hosp_weights = obs_supervision["hosp"]["weights"]
         if hosp_target is not None and hosp_weights is not None:
-            hosp_base = self._weighted_masked_observation_loss_from_weights(
-                prediction=drop_nowcast(
-                    model_outputs["pred_hosp"], hosp_target.shape[1]
-                ),
+            hosp_base = self._compute_head_observation_loss(
+                model_outputs,
+                head_name="hosp",
                 target=hosp_target,
                 weights=hosp_weights,
             )
@@ -554,10 +766,9 @@ class JointInferenceLoss(nn.Module):
         cases_target = obs_supervision["cases"]["target"]
         cases_weights = obs_supervision["cases"]["weights"]
         if cases_target is not None and cases_weights is not None:
-            cases_base = self._weighted_masked_observation_loss_from_weights(
-                prediction=drop_nowcast(
-                    model_outputs["pred_cases"], cases_target.shape[1]
-                ),
+            cases_base = self._compute_head_observation_loss(
+                model_outputs,
+                head_name="cases",
                 target=cases_target,
                 weights=cases_weights,
             )
@@ -566,8 +777,9 @@ class JointInferenceLoss(nn.Module):
         deaths_target = obs_supervision["deaths"]["target"]
         deaths_weights = obs_supervision["deaths"]["weights"]
         if deaths_target is not None and deaths_weights is not None:
-            deaths_base = self._weighted_masked_observation_loss_from_weights(
-                prediction=model_outputs["pred_deaths"],
+            deaths_base = self._compute_head_observation_loss(
+                model_outputs,
+                head_name="deaths",
                 target=deaths_target,
                 weights=deaths_weights,
             )
