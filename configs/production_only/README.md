@@ -15,17 +15,16 @@
 
 ### `train_epifor_mn5_synth_pretrain.yaml`
 - Production synthetic pretraining on processed synthetic data
-- Uses the same MN5 training surface as the real-data template
+- Invoked only through `workflow/config/mn5_synth_pretrain.yaml`
 - Enables direct latent `S/I/R/D` supervision for stage-1 pretraining
 
-### `train_epifor_mn5_synth.yaml`
-- Production training on synthetic data
-- Resources: CUDA GPU, reduced batch (8), 4 workers
-- Memory: ~40GB RAM minimum
-
 ### `preprocess_mn5_synth.yaml`
-- Preprocess synthetic data at MN5 scale
-- Memory limit: 100GB configured
+- Canonical MN5 synthetic preprocessing base
+- Reads the DVC-tracked raw synthetic Zarr on project GPFS
+
+### `preprocess_mn5_synth_holt_damped.yaml`
+- Produces the canonical processed pretraining dataset
+- Inherits the MN5 synthetic preprocessing base
 
 ## Intended Usage
 
@@ -36,8 +35,11 @@ These configs should only be run through an immutable MN5 Snakemake workflow:
 bash scripts/workflow/mn5_workflow.sh prepare <run-id>
 bash scripts/workflow/mn5_workflow.sh run <run-id>
 
-# Compose training and evaluation in the same immutable run
-bash scripts/workflow/mn5_workflow.sh run <run-id> train_evaluate
+# Compose training and evaluation in the same immutable run by setting
+# workflow.target: train_evaluate in a complete workflow config before prepare.
+bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
+  --config <train-evaluate-workflow-config.yaml>
+bash scripts/workflow/mn5_workflow.sh run <run-id>
 
 # HPO
 bash scripts/workflow/mn5_workflow.sh prepare <hpo-run-id> \
@@ -46,23 +48,27 @@ bash scripts/workflow/mn5_workflow.sh prepare <hpo-run-id> \
 # Ablation study
 bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
   --config workflow/config/mn5_ablation.yaml
+
+# Synthetic pretraining (after the processed DVC pointer is published)
+bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
+  --config workflow/config/mn5_synth_pretrain.yaml
 ```
 
-The default target is single training. Use the public `train_evaluate` or
-`evaluate` target when evaluation is required. Use
+The default target is single training. Pin `train_evaluate` or `evaluate` in a
+complete workflow config before preparation when evaluation is required. Use
 `--config workflow/config/mn5.yaml` for HPO or
 `--config workflow/config/mn5_ablation.yaml` for ablations. Direct production
 `train` and `eval` commands are implementation details of these Snakemake rules,
 not separate submission interfaces.
 
-To use another production training config, copy
-`workflow/config/mn5_train.yaml` and change `training.base_config`; the same
-source-aware training and evaluation rules and deterministic artifact contracts
-apply.
+The checked-in production model configs are deliberately limited to the
+canonical real-data model and canonical synthetic pretraining model. Historical
+experiment variants belong in immutable run manifests and overrides rather
+than additional evergreen YAML files.
 
-## Development Alternatives
+## Local Acceptance
 
-For local development, use the standard configs instead:
+Substantive EpiForecaster work uses the MN5 Snakemake interface. The sole local
+training config is a bounded parser/runtime acceptance check:
 
-- `configs/train_epifor_real_local.yaml` - Real-data training (local-scale)
-- `configs/train_epifor_synth_local.yaml` - Synthetic data training (local-scale)
+- `configs/train_epifor_smoke.yaml` - 10 training batches with one worker per loader

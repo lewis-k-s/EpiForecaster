@@ -9,7 +9,7 @@ Run:
 
 ```bash
 uv run python dataviz/adjacency_graph_comparison.py \
-  --config configs/train_epifor_real_local.yaml \
+  --config configs/train_epifor_smoke.yaml \
   --output-dir outputs/reports/adjacency_graph_comparison \
   --max-hops 2 \
   --neighbor-ceiling 20 \

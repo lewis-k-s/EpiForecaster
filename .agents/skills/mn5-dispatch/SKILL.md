@@ -1,16 +1,16 @@
 ---
 name: mn5-dispatch
-description: Prepare, submit, monitor, and inspect immutable EpiForecaster Snakemake workflows on MareNostrum 5. Use for single training, evaluation, HPO, and ablation work on MN5.
+description: Prepare, submit, monitor, and inspect immutable EpiForecaster Snakemake workflows on MareNostrum 5. Use for training, evaluation, cross-validation, HPO, and ablation work on MN5.
 allowed-tools: Bash, Read
 ---
 
 # MN5 Snakemake dispatch
 
 Use `scripts/workflow/mn5_workflow.sh` as the production interface for model
-training, evaluation, HPO, and ablations. It snapshots the current worktree,
-pins DVC and container identities, transfers through `dt`, and submits one
-mode-sized ACC allocation. Do not sync into or execute a mutable remote checkout
-for these workflows.
+training, evaluation, cross-validation, HPO, and ablations. It snapshots the
+current worktree, pins DVC and container identities, transfers through `dt`, and
+submits one mode-sized ACC allocation. Do not sync into or execute a mutable
+remote checkout for these workflows.
 
 Read `.cluster/mn5.conf`, `docs/MN5_SNAKEMAKE.md`, and the selected workflow
 config before dispatch. Never run a config under `configs/production_only/`
@@ -41,14 +41,17 @@ memory from CPU count, so no path may add `--mem` or `--mem-per-cpu`.
 | Workflow | Template | Tasks | GPUs | CPUs/task |
 | --- | --- | ---: | ---: | ---: |
 | Single training | `workflow/config/mn5_train.yaml` | 1 | 1 | 20 |
+| Synthetic pretraining | `workflow/config/mn5_synth_pretrain.yaml` | 1 | 1 | 20 |
 | Evaluation only | `workflow/config/mn5_evaluate.yaml` | 1 | 1 | 20 |
+| Cross-validation | `workflow/config/mn5_crossval.yaml` | configured folds | same | 20 |
 | HPO | `workflow/config/mn5.yaml` | configured workers | same | 20 |
 | Ablation | `workflow/config/mn5_ablation.yaml` | configured workers | same | 20 |
 
-Study workers share an Optuna journal on GPFS and run as ranks of one fail-fast
-`srun` step. HPO selection, evaluation, promotion, and losing-checkpoint cleanup
-are separate dependent rules inside the same allocation. Ablation analysis runs
-once after every worker and every expected seed/ablation trial is terminal.
+Study workers share an Optuna journal on GPFS and run as ranks of fail-fast
+`srun` steps. HPO selection, evaluation, promotion, and losing-checkpoint cleanup
+are separate dependent rules inside the same allocation. Cross-validation uses
+separate multi-rank training and evaluation rules before one finalizer. Ablation
+analysis runs once after every expected seed/ablation trial is terminal.
 
 ## Commands
 
@@ -62,22 +65,19 @@ bash scripts/workflow/mn5_workflow.sh run <run-id>
 bash scripts/workflow/mn5_workflow.sh status <run-id>
 ```
 
-Select HPO or ablation explicitly:
+Select cross-validation, HPO, or ablation explicitly:
 
 ```bash
+bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
+  --config workflow/config/mn5_crossval.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
   --config workflow/config/mn5.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
   --config workflow/config/mn5_ablation.yaml
 ```
 
-Use public Snakemake targets rather than internal implementation rules:
-
-```bash
-bash scripts/workflow/mn5_workflow.sh run <run-id> train
-bash scripts/workflow/mn5_workflow.sh run <run-id> evaluate
-bash scripts/workflow/mn5_workflow.sh run <run-id> train_evaluate
-```
+Pin the public target in `workflow.target` before preparation. The immutable
+run command accepts no target, override, or additional Snakemake arguments.
 
 For evaluation-only work, copy `workflow/config/mn5_evaluate.yaml`, set
 `evaluation.checkpoint` to an absolute GPFS checkpoint path, then provide the
@@ -91,10 +91,11 @@ bash scripts/workflow/mn5_workflow.sh unlock <run-id>
 bash scripts/workflow/mn5_workflow.sh run <run-id>
 ```
 
-Run IDs are atomically reserved and never overwritten. The default target
-pinned in the run config writes `.state/workflow.done`; direct public targets
-are complete when their declared artifact contracts exist. Re-running `run`
-while a coordinator is active is idempotent.
+Source is transferred to a hidden staging leaf, verified by the runner included
+in that exact snapshot, and then published under an atomically reserved run ID.
+Run IDs are never overwritten or reused. The target pinned in the run config
+writes `.state/workflow.done`; re-running `run` while a coordinator is active
+is idempotent.
 
 ## Monitoring
 
@@ -108,7 +109,7 @@ ssh wifi-acc 'sacct -j <job-id> --format=JobIDRaw,State,ExitCode,Elapsed -X'
 Inspect durable evidence separately through `dt` under:
 
 ```text
-/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/runs/<run-id>/
+/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/<run-id>/
 ```
 
 Check the coordinator stdout/stderr, rule logs, worker-rank logs, manifest,
@@ -133,5 +134,6 @@ Do not delete a run, journal, checkpoint, promotion, or shared DVC cache object
 without explicit user authorization. Do not run `dvc gc` while a run or
 promotion may still reference the cache.
 
-Preprocessing and unrelated legacy experimental chains are outside this model
-workflow interface; inspect their dedicated scripts before using them.
+Preprocessing is the upstream DVC-producing boundary. Model execution is
+supported only through the immutable workflow interface, with no direct model
+SBATCH, array, or standalone study-worker path.

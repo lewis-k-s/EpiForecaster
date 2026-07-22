@@ -71,6 +71,10 @@ manifest fingerprints the complete scientific source inventory plus the
 stage's relevant configuration fragment. This intentionally gives conservative
 invalidation: any scientific source change makes every stage stale, while
 documentation and tests remain outside the scientific source contract.
+The inventory is exclusion-based: all Python, shell, YAML, TOML, and Snakefile
+sources are included unless they live under an explicit non-runtime root such
+as `tests/`, `docs/`, or `tex/`. This prevents newly added packages or
+root-level modules from silently escaping invalidation.
 
 The source is mounted at `/workspace/source:ro` and placed on `PYTHONPATH`.
 This is source injection into the locked runtime, not a package installation or
@@ -84,6 +88,11 @@ configured pointer hashes into a per-run workspace using a shared locked cache.
 Each worker copies the small staged inputs to its own node-local directory and
 receives them as read-only overlays.
 
+Pointers under `dvc.provenance_targets` contribute their hashes to the run
+identity without materializing their payloads. This binds a processed training
+dataset to large upstream raw inputs without redundantly copying those inputs
+to node-local training scratch.
+
 Only the promotion stage receives write access to the promotion root. Scratch
 is disposable; journals, logs, checkpoints, selected artifacts, dependency
 contracts, and provenance are durable on GPFS.
@@ -92,15 +101,23 @@ contracts, and provenance are durable on GPFS.
 
 Snakemake and DVC are installed from the locked `workflow` dependency group in
 a content-addressed Python 3.11 environment. The tooling key depends on the
-group name, Python version, and `uv.lock` digest. A ready marker records the
-key, installed Snakemake version and location, lock hash, and uv version.
+group name, Python version, `uv.lock` digest, and the transferred tooling
+bootstrap. A ready marker records those identities, the installed Snakemake
+version and location, and the uv version.
 
 MN5 derives host memory from CPU count. Submission tooling therefore omits
 `--mem` and `--mem-per-cpu` and rejects workflow resources or extra Slurm flags
 that introduce explicit host-memory requests. EpiForecaster submits the
 containing allocation through its dispatcher and runs Snakemake with the local
-executor inside that allocation; no Snakemake Slurm executor participates in
-this path.
+executor inside that allocation. Scientific work is launched only as `srun`
+job steps within the existing allocation.
+
+Projects that instead have Snakemake submit individual rules to Slurm should
+consume the independently versioned
+[`lewis-k-s/snakemake-executor-plugin-slurm`](https://github.com/lewis-k-s/snakemake-executor-plugin-slurm)
+fork and pin an immutable release in their workflow dependency lock. The fork
+provides opt-in validation for CPU-derived-memory sites without coupling the
+executor package to EpiForecaster source, data, accounts, partitions, or paths.
 
 ## Remote endpoint boundary
 
@@ -148,6 +165,12 @@ The rank and GPU counts depend on the scientific workflow:
 | Optuna-managed HPO | configurable N | N | N | 20 |
 | Optuna-managed ablation | configurable N | N | N | 20 |
 
+This is intentionally an MN5-only primary interface. The model is too heavy for
+representative local execution, so the repository does not maintain a second
+local Snakemake binding. `configs/train_epifor_smoke.yaml` is limited to ten
+training batches with one worker per data loader and exists only for bounded
+configuration/runtime acceptance.
+
 Single training is a first-class public Snakemake target: it stages its DVC
 inputs, launches one training rank, and publishes a checkpoint plus
 `training_manifest.json`. Evaluation is a separate target with a hash-bearing
@@ -160,8 +183,10 @@ Increasing concurrency therefore occurs in complete rank units: one Slurm task,
 one GPU, and 20 CPUs per additional rank. Ordinary data-loader worker counts
 are separate training parameters and are not part of this allocation topology.
 
-Explicit host-memory directives are rejected. The dispatcher reads this config
-before submission and issues one matching `sbatch`. Multi-rank HPO and ablation
+Explicit host-memory directives are rejected. Preparation renders an immutable
+TSV dispatch record from this config. The snapshot-owned remote runner reads
+that record and issues one matching `sbatch`; no configuration values or target
+overrides are supplied at submission time. Multi-rank HPO and ablation
 launchers issue one `srun` whose task count matches the configured rank count,
 with one GPU per task. Selection, evaluation, promotion, cleanup, and ablation
 reduction remain dependent Snakemake stages inside that same allocation.
@@ -187,6 +212,7 @@ The run manifest records:
  runtime SIF SHA-256,
  workflow tooling key and Snakemake version,
  rendered workflow config SHA-256,
+ immutable dispatch-request SHA-256,
  workflow kind and public target,
  optional study identity)
 ```
@@ -194,18 +220,19 @@ The run manifest records:
 Stage-scoped dependency manifests live beside the run manifest under
 `.state/dependencies/` and are copied into promoted artifact bundles.
 
-Rank scratch identity includes Slurm job, array placeholder, step, and process
-rank. Trial checkpoints live in deterministic `trial-NNNNNN` directories and
-record their canonical path and SHA-256 in Optuna attributes. Only after all
-ranks complete does the DAG resolve `study.best_trial`, validate and copy that
-checkpoint, evaluate it, promote the declared artifacts, and finally delete
-losing checkpoint directories.
+Rank scratch identity includes the Slurm job, allocation task, step, and
+process rank. Trial checkpoints live in deterministic `trial-NNNNNN`
+directories and record their canonical path and SHA-256 in Optuna attributes.
+Only after all ranks complete does the DAG resolve `study.best_trial`, validate
+and copy that checkpoint, evaluate it, promote the declared artifacts, and
+finally delete losing checkpoint directories.
 
 ## Rebuild matrix
 
 | Change | New source bundle | New runtime SIF | New workflow tooling |
 | --- | ---: | ---: | ---: |
 | Python, Snakefile, wrapper, or scientific config | Yes | No | No |
+| Transferred tooling bootstrap | Yes | No | Yes |
 | DVC pointer changes | Yes | No | No |
 | Scientific dependency lock changes | Yes | Yes | Yes |
 | Snakemake/DVC workflow dependency changes | Yes | Only if runtime group changes | Yes |
@@ -223,9 +250,11 @@ losing checkpoint directories.
 | Ablation template | `workflow/config/mn5_ablation.yaml` |
 | Local Snakemake profile | `workflow/profiles/mn5/config.yaml` |
 | Snapshot and allocation validation | `scripts/workflow/run_config.py` |
-| Tooling, transfer, and submission | `scripts/workflow/mn5_workflow.sh` |
-| Configured multi-rank HPO/ablation launch | `scripts/workflow/launch_optuna_workers.sh` |
-| Rank execution and marker | `scripts/workflow/run_optuna_worker.sh` |
+| Local tooling preparation and transfer | `scripts/workflow/mn5_workflow.sh` |
+| Transferred tooling bootstrap | `scripts/workflow/remote_tooling.sh` |
+| Immutable publication, submission, status, and recovery | `scripts/workflow/remote_run.sh` |
+| Configured multi-rank study/cross-validation launch | `scripts/workflow/launch_parallel_workers.sh` |
+| Rank execution and marker | `scripts/workflow/run_parallel_worker.sh` |
 | Container isolation and scratch | `scripts/workflow/mn5_container_exec.sh` |
 | DVC and artifact contract writers | `scripts/workflow/run_support.py` |
 | Runtime build | `containers/runtime/` |

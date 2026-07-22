@@ -103,24 +103,13 @@ uv sync --extra dev
 pip install -e .
 ```
 
-### MN5 Module Setup
+### MN5 production workflow
 
-On MareNostrum 5, the batch scripts now source a shared module bootstrap at
-[`scripts/cluster/mn5_module_setup.sh`](scripts/cluster/mn5_module_setup.sh).
-It loads a consistent toolchain across training and evaluation jobs:
-
-- `EB/apps` and `EB/install`
-- `gcc/12.3.0`
-- `CUDA/12.1.1`
-- `cmake/4.1.2-gcc`
-
-If you are working interactively on MN5 before creating or syncing the virtualenv,
-load the same module stack first:
-
-```bash
-source scripts/cluster/mn5_module_setup.sh
-uv sync --extra dev
-```
+Training, evaluation, cross-validation, HPO, and ablation run through the
+immutable Snakemake/DVC interface in `scripts/workflow/mn5_workflow.sh`.
+It prepares a per-run source snapshot and submits one containing ACC allocation;
+there is no mutable remote checkout or direct model SBATCH interface. See
+`docs/MN5_SNAKEMAKE.md` and load the `mn5-dispatch` skill before remote work.
 
 The installation provides the standalone `preprocess`, `train`, `eval`, and
 `plot` entrypoints, plus the grouped `main` command.
@@ -179,6 +168,9 @@ uv run pytest -m "not region" -v         # All tests except region
 # Linting and formatting
 uv run ruff check .
 uv run ruff format .
+
+# Bash syntax, pinned shfmt, and ShellCheck when installed
+scripts/check_shell_quality.sh
 ```
 
 Tests are organized with pytest markers:

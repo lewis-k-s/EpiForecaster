@@ -1,7 +1,8 @@
 # MN5 workflow
 
-Snakemake is the production entry point for MN5 training, evaluation, HPO,
-ablation, and artifact promotion. Each workflow uses one preallocated ACC node.
+Snakemake is the production entry point for MN5 training, evaluation,
+cross-validation, HPO, ablation, and artifact promotion. Each workflow uses one
+preallocated ACC node.
 Snakemake runs as the batch process inside that allocation and launches the
 scientific work as one or more `srun` job steps.
 
@@ -24,12 +25,12 @@ Templates use `acc_bscls`; `acc_debug` is also accepted when its wall-time
 limits fit the run. No `--mem` or `--mem-per-cpu` directive is permitted
 because MN5 derives host memory from the CPU allocation.
 
-Single training and evaluation use `N=1`. HPO and ablation use the configured
-worker count, currently `N=4` in the production templates. `N` must be between
-one and the four GPUs available on the single ACC node.
+Single training and evaluation use `N=1`. Cross-validation, HPO, and ablation
+use their configured fold or worker count, currently `N=4` in production
+templates. `N` must be between one and the four GPUs on the ACC node.
 
 The batch shell owns the allocation and runs the lightweight Snakemake manager.
-A study worker rule launches:
+A parallel worker rule launches:
 
 ```text
 srun --nodes=1 --ntasks=N --ntasks-per-node=N \
@@ -37,8 +38,9 @@ srun --nodes=1 --ntasks=N --ntasks-per-node=N \
      --kill-on-bad-exit=1
 ```
 
-Each rank receives one GPU and 20 CPUs. `SLURM_PROCID` selects a stable worker
-ID; Optuna workers coordinate only through their journal on GPFS. They do not
+Each rank receives one GPU and 20 CPUs. `SLURM_PROCID` becomes an explicit
+logical worker ID. Optuna workers coordinate through their GPFS journal;
+cross-validation ranks own deterministic fold directories. Workers do not
 communicate with Snakemake while running. If one rank fails, Slurm terminates
 the worker step and the batch job fails.
 
@@ -53,36 +55,47 @@ terminal; workers never race to launch analysis.
 Durable state lives under project GPFS:
 
 ```text
-/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/
-  cache/                         # shared, locked DVC cache
-  storage/                       # content-addressed DVC remote
-  containers/                    # immutable SIFs
-  tooling/
-    cache/                       # shared uv cache
-    envs/<tooling-key>/          # immutable Snakemake environment
-    requests/<tooling-key>/      # lock inputs and ready marker
-  promoted/<run-id>/             # selected artifacts
-  runs/
-    by-slurm/<job-id>_0          # allocation lookup
-    <run-id>/
-      config.yaml                # immutable rendered config
-      manifest.yaml
-      .state/dependencies/       # full-source, stage-labeled contracts
-      source/                    # immutable worktree snapshot
-      optuna/
-      logs/
-      outputs/
+/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/
+  EpiForecaster-DVC/
+    cache/                         # shared, locked DVC cache
+    storage/                       # content-addressed DVC remote
+    containers/                    # immutable SIFs
+    tooling/
+      cache/                       # shared uv cache
+      envs/<tooling-key>/          # immutable Snakemake environment
+      requests/<tooling-key>/      # lock inputs and ready marker
+    promoted/<run-id>/             # selected artifacts
+    runs/
+      .reservations/<run-id>/       # permanent no-reuse receipt
+      .staging-<run-id>.<token>/    # unpublished transfer location
+      by-slurm/<job-id>_0          # allocation lookup
+      <run-id>/
+        config.yaml                # immutable rendered config
+        .state/dispatch.tsv        # immutable submission bindings
+        .state/published.done      # verified publication receipt
+        manifest.yaml
+        .state/dependencies/       # full-source, stage-labeled contracts
+        source/                    # immutable worktree snapshot
+        optuna/
+        logs/
+        outputs/
 ```
 
-Run IDs are reserved atomically before submission and are never overwritten.
+Remote EpiForecaster state belongs under this project root, not under `~/` on
+`dt` or MN5. Production workflows use only the `EpiForecaster-DVC/` subtree.
+
+Source is transferred into a unique hidden staging leaf. The runner contained
+in that exact source snapshot verifies the config, source inventory, SIF, and
+tooling before atomically reserving the run ID and publishing the final run.
+Permanent reservation receipts prevent deleted run IDs from being reused.
 The allocation identity is `<job-id>_0`. Container executions add Slurm step
 and process rank, yielding `<job-id>_0_<step-id>_<rank>` and preventing scratch
 collisions between concurrent ranks.
 
 The manifest records the workflow kind and public target, Git SHA, exact source
 snapshot SHA-256, DVC hashes, SIF SHA-256, workflow tooling key, Snakemake
-version and location, and rendered config SHA-256. Study workflows also record
-their study identity.
+version and location, rendered config SHA-256, and immutable dispatch-request
+SHA-256. Study workflows also record their study identity.
 
 Dirty worktrees are supported. Preparation copies tracked and non-ignored
 untracked files to an isolated snapshot, hashes and transfers those bytes via
@@ -98,7 +111,8 @@ rebuilding the SIF.
 
 The host-side coordinator environment contains only the locked `workflow`
 group (`snakemake` and `dvc`). Its key is derived from `uv.lock`, Python 3.11,
-and the dependency-group name. Prepare it idempotently on `wifi-acc` with:
+the dependency-group name, and the transferred tooling-bootstrap digest.
+Prepare it idempotently on `wifi-acc` with:
 
 ```bash
 bash scripts/workflow/mn5_workflow.sh tooling
@@ -116,7 +130,13 @@ hpo:             launch_optuna_workers -> select_best_trial
                  -> evaluate_model -> promote_best_model
                  -> cleanup_losing_checkpoints
 ablation:        launch_ablation_workers -> finalize_ablation
+crossval:        train_crossval_folds -> evaluate_crossval_folds
+                 -> finalize_crossval
 ```
+
+Synthetic pretraining uses the same `train` entity through
+`workflow/config/mn5_synth_pretrain.yaml`. Its processed Zarr is materialized
+for training, while the raw synthetic Zarr is a provenance-only DVC target.
 
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
@@ -125,14 +145,14 @@ composition when both stages are wanted. Training and HPO trials force
 rule. Ablation trials retain final test metrics because paired-seed aggregation
 consumes those per-trial artifacts.
 
-Each data, training, evaluation, HPO, ablation, selection, and promotion
-contract fingerprints the same complete scientific source inventory together
-with its relevant config fragment and SIF digest. This deliberately favors
-conservative invalidation and auditable provenance over inferring transitive
-Python dependencies: any scientific source change invalidates every stage
-contract, while documentation and tests remain excluded. Remote run snapshots
-remain immutable, so changed source is normally prepared as a new run rather
-than mutating an existing one.
+Each data, training, evaluation, cross-validation, HPO, ablation, selection,
+and promotion contract fingerprints the same complete scientific source
+inventory together with its relevant config fragment and SIF digest. This
+deliberately favors conservative invalidation and auditable provenance over
+inferring transitive Python dependencies: any scientific source change
+invalidates every stage contract, while documentation and tests remain
+excluded. Remote run snapshots remain immutable, so changed source is prepared
+as a new run rather than mutating an existing one.
 
 Training declares its checkpoint and `training_manifest.json`. Evaluation
 declares its summary JSON, node and per-head metric tables, optional granular
@@ -178,15 +198,9 @@ bash scripts/workflow/mn5_workflow.sh run <run-id>
 bash scripts/workflow/mn5_workflow.sh status <run-id>
 ```
 
-Use the public target layer rather than internal rule names. On a prepared
-training run, `train_evaluate` composes the two stages and `evaluate` pulls in
-training when its canonical checkpoint is absent:
-
-```bash
-bash scripts/workflow/mn5_workflow.sh run <run-id> train
-bash scripts/workflow/mn5_workflow.sh run <run-id> evaluate
-bash scripts/workflow/mn5_workflow.sh run <run-id> train_evaluate
-```
+The selected public target is immutable after preparation. Choose `train` or
+`train_evaluate` in the template's `workflow.target` before `prepare`; `run`
+does not accept targets, overrides, or arbitrary Snakemake arguments.
 
 Select study templates explicitly:
 
@@ -195,6 +209,10 @@ bash scripts/workflow/mn5_workflow.sh prepare <hpo-run-id> \
   --config workflow/config/mn5.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
   --config workflow/config/mn5_ablation.yaml
+bash scripts/workflow/mn5_workflow.sh prepare <crossval-run-id> \
+  --config workflow/config/mn5_crossval.yaml
+bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
+  --config workflow/config/mn5_synth_pretrain.yaml
 ```
 
 For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set
@@ -202,9 +220,12 @@ For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set
 complete config with `--config`. Preparation fails before transfer if the field
 is unset or relative.
 
-`run` reads the allocation fields from the immutable remote config and passes
-them to `sbatch`, overriding the script defaults. A launch lock, recorded job
-ID, and coordinator lifetime lock prevent duplicate submissions.
+The snapshot-owned `remote_run.sh` reads submission fields from the immutable
+dispatch record and passes them to `sbatch`, overriding the script defaults. A
+launch lock, recorded job ID, and coordinator lifetime lock prevent duplicate
+submissions. Dry-run, status, and unlock likewise use the runner contained in
+the prepared source rather than code streamed from a caller's current checkout.
+Runs without the current dispatch record and transferred runner are rejected.
 
 If the allocation terminates before completion, inspect `status`, unlock stale
 Snakemake state, and submit the same immutable run again:

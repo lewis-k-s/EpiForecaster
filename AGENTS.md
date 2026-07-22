@@ -86,16 +86,23 @@ uv run pytest --markers
 
 ## Training & Dataset Workflow
 
-For local training commands, config-driven development workflow, and the dataset pipeline, load the **`model-training`** skill.
+For config-driven training and the dataset pipeline, load the **`model-training`** skill.
 
 Key local entry points:
 
-- `uv run train (regions|epiforecaster) --config <yaml>` — local training
+- `uv run train regions --config configs/train_regions.yaml` — local Region2Vec training
+- `uv run train epiforecaster --config configs/train_epifor_smoke.yaml` — bounded local acceptance only
 - `uv run preprocess (regions|epiforecaster)` — data preparation
+
+Substantive EpiForecaster training and evaluation use the immutable MN5
+Snakemake workflow. Do not introduce additional local EpiForecaster training
+configs as alternate production interfaces.
 
 ### Remote MN5 Cluster Work
 
-All remote cluster operations — including `syncto_mn5.sh`, `syncback_mn5.sh`, `ssh mn5`, `cluster_dispatch.sh`, and sbatch job submission — are encapsulated in the **`mn5-dispatch`** skill. **Load that skill** before attempting any remote work. It configures the required permissions for rsync, SSH, and job dispatch commands.
+All remote model operations use `scripts/workflow/mn5_workflow.sh` and are
+encapsulated in the **`mn5-dispatch`** skill. **Load that skill** before remote
+preparation, transfer, submission, monitoring, or artifact inspection.
 
 > **WARNING**: Do not run configs in `configs/production_only/` locally. They require GPU cluster resources. See `configs/production_only/README.md`.
 
