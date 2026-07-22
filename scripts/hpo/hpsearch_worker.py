@@ -43,6 +43,16 @@ from typing import Any
 import click
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.trial_artifacts import (
+    BEST_MODEL_PATH_ATTR,
+    BEST_MODEL_SHA256_ATTR,
+    TRIAL_DIR_ATTR,
+    best_model_path,
+    sha256_file,
+    trial_directory,
+    trial_model_id,
+)
+from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
@@ -96,6 +106,7 @@ def _slurm_identity() -> dict[str, str]:
         "SLURM_JOB_ID",
         "SLURM_ARRAY_JOB_ID",
         "SLURM_ARRAY_TASK_ID",
+        "SLURM_STEP_ID",
         "SLURM_PROCID",
         "SLURM_LOCALID",
         "HOSTNAME",
@@ -103,23 +114,16 @@ def _slurm_identity() -> dict[str, str]:
     return {k: os.getenv(k, "") for k in keys if os.getenv(k)}
 
 
-def _compute_worker_seed(base_seed: int) -> int:
-    """Compute sampler seed offset by SLURM task ID for parallel worker diversity.
+def _worker_outcome_error(outcomes: list[tuple[int, str]]) -> str | None:
+    """Return an error when this worker did not finish its trials cleanly."""
+    if not outcomes:
+        return "HPO worker exited without recording a trial outcome"
 
-    When multiple workers start simultaneously with the same seed, they sample
-    identical hyperparameters until TPE has completed trials to learn from.
-    Offsetting by SLURM_ARRAY_TASK_ID ensures each worker has a unique seed.
+    failed = [str(number) for number, state in outcomes if state == "FAIL"]
+    if failed:
+        return f"HPO worker recorded failed trial(s): {', '.join(failed)}"
 
-    Args:
-        base_seed: The base seed from CLI --seed argument.
-
-    Returns:
-        Worker-specific seed (base_seed + SLURM_ARRAY_TASK_ID if set, else base_seed).
-    """
-    slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
-    if slurm_task_id is not None:
-        return base_seed + int(slurm_task_id)
-    return base_seed
+    return None
 
 
 def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
@@ -150,6 +154,7 @@ def suggest_epiforecaster_params(
     trial: Any,
     base_cfg: EpiForecasterConfig,
     sample_training_loss_objective: bool = False,
+    search_space: str = "default",
 ) -> dict[str, Any]:
     """Define the search space and return dotted-key overrides.
 
@@ -170,6 +175,9 @@ def suggest_epiforecaster_params(
     overrides["training.learning_rate"] = trial.suggest_float(
         "training.learning_rate", 1e-5, 3e-3, log=True
     )
+    if search_space == "lr_only":
+        return overrides
+
     overrides["training.weight_decay"] = trial.suggest_float(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
@@ -326,6 +334,7 @@ def objective(
     cli_overrides: list[str],
     pruning_start_epoch: int = 10,
     sample_training_loss_objective: bool = False,
+    search_space: str = "default",
 ) -> float:
     start_time = time.time()
     logger.info("=== Trial %d started ===", trial.number)
@@ -340,6 +349,7 @@ def objective(
         trial=trial,
         base_cfg=cfg,
         sample_training_loss_objective=sample_training_loss_objective,
+        search_space=search_space,
     )
 
     override_list = _overrides_to_dotlist(overrides)
@@ -366,21 +376,14 @@ def objective(
         overrides=override_list,
     )
 
-    # Make each run's artifacts unique.
+    # Make each trial's artifact directory deterministic and independent of the
+    # worker process or Slurm allocation that happens to execute it.
     slurm = _slurm_identity()
-    worker_tag = "-".join(
-        [
-            slurm.get("SLURM_ARRAY_JOB_ID", "") or slurm.get("SLURM_JOB_ID", ""),
-            slurm.get("SLURM_ARRAY_TASK_ID", ""),
-            slurm.get("SLURM_PROCID", ""),
-        ]
-    ).strip("-")
-    if not worker_tag:
-        worker_tag = "local"
-
     cfg.output.experiment_name = study_name
     if run_root is not None:
-        cfg.output.log_dir = str(run_root)
+        cfg.output.log_dir = str(run_root.resolve())
+    trials_root = Path(cfg.output.log_dir).resolve()
+    trial_dir = trial_directory(trials_root, study_name, int(trial.number))
 
     # Basic reproducibility hook.
     if seed is not None:
@@ -396,12 +399,25 @@ def objective(
     trial.set_user_attr("slurm", slurm)
     trial.set_user_attr("overrides", overrides)
     trial.set_user_attr("base_config_path", str(base_config_path))
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
 
     # Run training and return objective.
     # Pass trial to trainer for intermediate pruning support.
+    model_id = trial_model_id(int(trial.number))
     trainer = EpiForecasterTrainer(
-        cfg, trial=trial, pruning_start_epoch=pruning_start_epoch
+        cfg,
+        trial=trial,
+        pruning_start_epoch=pruning_start_epoch,
+        model_id=model_id,
     )
+    if trainer.experiment_dir is None:
+        raise RuntimeError("Trainer did not initialize its experiment directory")
+    actual_trial_dir = trainer.experiment_dir.resolve()
+    if actual_trial_dir != trial_dir:
+        raise RuntimeError(
+            "Trainer experiment directory does not match the deterministic "
+            f"Optuna trial directory: expected {trial_dir}, got {actual_trial_dir}"
+        )
 
     try:
         results = trainer.run()
@@ -431,6 +447,11 @@ def objective(
         series_metrics = results.get("best_val_series_metrics", {})
         for metric_key, metric_value in series_metrics.items():
             trial.set_user_attr(f"best_val_{metric_key}", metric_value)
+
+        checkpoint_path = best_model_path(trial_dir).resolve(strict=True)
+        checkpoint_sha256 = sha256_file(checkpoint_path)
+        trial.set_user_attr(BEST_MODEL_PATH_ATTR, str(checkpoint_path))
+        trial.set_user_attr(BEST_MODEL_SHA256_ATTR, checkpoint_sha256)
     except Exception as exc:
         # Check if this is an Optuna TrialPruned exception
         if hasattr(exc, "__class__") and exc.__class__.__name__ == "TrialPruned":
@@ -450,55 +471,35 @@ def objective(
     )
     logger.info("=== Trial %d finished ===", trial.number)
 
-    # Safely get best value (returns inf if no trials completed yet)
-    try:
-        best_so_far = trial.study.best_value
-    except ValueError:
-        best_so_far = float("inf")
-
-    if best_val == best_so_far:
-        logger.info(
-            "Trial %d is the new best trial! Best selection_score: %.6f (%s)",
-            trial.number,
-            best_val,
-            selection_metric,
-        )
-
-    # Persist a small JSON summary next to the run logs if desired.
-    try:
-        log_dir = (
-            Path(cfg.output.log_dir) / cfg.output.experiment_name / trainer.model_id
-        )
-        log_dir.mkdir(parents=True, exist_ok=True)
-        (log_dir / "optuna_trial.json").write_text(
-            json.dumps(
-                {
-                    "study": study_name,
-                    "trial_number": trial.number,
-                    "value": best_val,
-                    "selection_metric": selection_metric,
-                    "best_val_selection_score": best_val,
-                    "best_val_joint_loss": best_val_joint_loss,
-                    "training_loss_objective": training_loss_objective,
-                    "params": trial.params,
-                    "overrides": overrides,
-                    "series_metrics": series_metrics,
-                    "slurm": slurm,
-                    "config_effective": {
-                        "output.log_dir": cfg.output.log_dir,
-                        "output.experiment_name": cfg.output.experiment_name,
-                        "trainer.model_id": trainer.model_id,
-                    },
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    (trial_dir / "optuna_trial.json").write_text(
+        json.dumps(
+            {
+                "study": study_name,
+                "trial_number": trial.number,
+                "value": best_val,
+                "selection_metric": selection_metric,
+                "best_val_selection_score": best_val,
+                "best_val_joint_loss": best_val_joint_loss,
+                "training_loss_objective": training_loss_objective,
+                "params": trial.params,
+                "overrides": overrides,
+                "series_metrics": series_metrics,
+                "slurm": slurm,
+                TRIAL_DIR_ATTR: str(trial_dir),
+                BEST_MODEL_PATH_ATTR: str(checkpoint_path),
+                BEST_MODEL_SHA256_ATTR: checkpoint_sha256,
+                "config_effective": {
+                    "output.log_dir": cfg.output.log_dir,
+                    "output.experiment_name": cfg.output.experiment_name,
+                    "trainer.model_id": trainer.model_id,
                 },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
+            },
+            indent=2,
+            sort_keys=True,
         )
-    except Exception:
-        # Best-effort only; objective value is what matters.
-        logger.error("Failed to persist JSON summary")
-        pass
+        + "\n"
+    )
 
     return best_val
 
@@ -577,6 +578,13 @@ def objective(
     is_flag=True,
     help="Include training.loss.joint.observation_loss in the Optuna search space.",
 )
+@click.option(
+    "--search-space",
+    type=click.Choice(["default", "lr_only"], case_sensitive=False),
+    default="default",
+    show_default=True,
+    help="Named HPO search space to use.",
+)
 def main(
     *,
     config_path: Path,
@@ -592,6 +600,7 @@ def main(
     pruning_start_epoch: int,
     cli_overrides: tuple[str, ...],
     sample_training_loss_objective: bool,
+    search_space: str,
 ) -> None:
     """Run one HPO worker process."""
     setup_logging()
@@ -610,11 +619,11 @@ def main(
     run_root.mkdir(parents=True, exist_ok=True)
     journal_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Offset seed by SLURM task ID to ensure diversity across parallel workers
+    # Offset by the stable logical worker ID to ensure parallel sampler diversity.
     worker_seed = _compute_worker_seed(seed)
     if worker_seed != seed:
         logger.info(
-            "Offsetting seed by SLURM_ARRAY_TASK_ID: %d -> %d",
+            "Offsetting seed by HPO worker identity: %d -> %d",
             seed,
             worker_seed,
         )
@@ -682,17 +691,21 @@ def main(
     if any(slurm.values()):
         logger.info("SLURM identity: %s", slurm)
     logger.info("Starting trials: n_trials=%s, timeout_s=%s", n_trials, timeout_s)
-    logger.info(
-        "Sample training loss objective: %s", sample_training_loss_objective
-    )
+    logger.info("Sample training loss objective: %s", sample_training_loss_objective)
+    logger.info("Search space: %s", search_space)
 
-    def _log_trial_complete(study: Any, trial: Any) -> None:
+    worker_outcomes: list[tuple[int, str]] = []
+
+    def _record_trial_outcome(study: Any, trial: Any) -> None:
+        state = str(trial.state.name)
+        worker_outcomes.append((int(trial.number), state))
         logger.info(
-            "Trial %d recorded (value=%.6f). Completed %d/%s in study '%s'.",
+            "Trial %d recorded (state=%s, value=%.6f). "
+            "Study now contains %d trials in '%s'.",
             trial.number,
+            state,
             float(trial.value) if trial.value is not None else float("inf"),
             len(study.trials),
-            n_trials if n_trials is not None else "∞",
             study.study_name,
         )
 
@@ -711,12 +724,17 @@ def main(
             cli_overrides=base_overrides,
             pruning_start_epoch=pruning_start_epoch,
             sample_training_loss_objective=sample_training_loss_objective,
+            search_space=search_space.lower(),
         ),
         n_trials=n_trials,
         timeout=timeout_s,
-        callbacks=[_log_trial_complete],
+        callbacks=[_record_trial_outcome],
         catch=(Exception,),
     )
+
+    outcome_error = _worker_outcome_error(worker_outcomes)
+    if outcome_error is not None:
+        raise click.ClickException(outcome_error)
 
     logger.info(
         "Worker complete: %d trials completed in study '%s'",

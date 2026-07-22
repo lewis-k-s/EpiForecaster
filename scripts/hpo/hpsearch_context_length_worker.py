@@ -22,6 +22,7 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
@@ -51,13 +52,6 @@ def parse_int_list(raw: str, *, name: str) -> list[int]:
     if not values:
         raise click.BadParameter(f"{name} must contain at least one value")
     return values
-
-
-def _compute_worker_seed(base_seed: int) -> int:
-    slurm_task_id = os.getenv("SLURM_ARRAY_TASK_ID")
-    if slurm_task_id is None:
-        return base_seed
-    return base_seed + int(slurm_task_id)
 
 
 @contextmanager

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -12,9 +14,11 @@ from scripts.hpo.hpsearch_worker import (
     _compute_worker_seed,
     _decode_categorical_value,
     _overrides_to_dotlist,
+    _worker_outcome_error,
     objective,
     suggest_epiforecaster_params,
 )
+from scripts.hpo.trial_artifacts import sha256_file
 
 
 class _StubTrial:
@@ -57,6 +61,14 @@ class _StubTrial:
         value = self._categorical_values.get(name, choices[0])
         self.params[name] = value
         return value
+
+
+def test_worker_outcome_error_rejects_missing_and_failed_trials() -> None:
+    assert _worker_outcome_error([]) is not None
+    assert _worker_outcome_error([(2, "FAIL")]) == (
+        "HPO worker recorded failed trial(s): 2"
+    )
+    assert _worker_outcome_error([(0, "COMPLETE"), (1, "PRUNED")]) is None
 
 
 def _base_cfg_stub(**overrides: Any) -> SimpleNamespace:
@@ -243,6 +255,18 @@ class TestSuggestEpiforecasterParams:
         call = next(c for c in trial.suggest_calls if c[1] == "training.weight_decay")
         assert call[0] == "float"
 
+    def test_lr_only_search_space_samples_only_learning_rate(self) -> None:
+        trial = _StubTrial()
+        overrides = suggest_epiforecaster_params(
+            trial=trial,
+            base_cfg=_mobility_cfg_stub(),
+            search_space="lr_only",
+        )
+        assert overrides == {"training.learning_rate": pytest.approx(1e-5)}
+        assert trial.suggest_calls == [
+            ("float", "training.learning_rate", (1e-5, 3e-3, True))
+        ]
+
     def test_training_loss_objective_not_sampled_by_default(self) -> None:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
@@ -346,10 +370,7 @@ class TestSuggestEpiforecasterParams:
             k
             for k in overrides
             if k.startswith("training.loss.joint.w_")
-            and k
-            not in (
-                "training.loss.joint.w_sird_supervision",
-            )
+            and k not in ("training.loss.joint.w_sird_supervision",)
         ]
         assert loss_weight_overrides == []
 
@@ -418,13 +439,36 @@ def test_objective_returns_selection_score_and_records_joint_loss(
             return cfg
 
     class _FakeTrainer:
-        def __init__(self, config, trial=None, pruning_start_epoch=10):
+        def __init__(
+            self,
+            config,
+            trial=None,
+            pruning_start_epoch=10,
+            model_id=None,
+        ):
             captured["trainer_config"] = config
             captured["trainer_trial"] = trial
             captured["pruning_start_epoch"] = pruning_start_epoch
-            self.model_id = "trial_0"
+            captured["constructor_model_id"] = model_id
+            self.config = config
+            self.model_id = model_id
+            self.experiment_dir = (
+                Path(self.config.output.log_dir)
+                / self.config.output.experiment_name
+                / self.model_id
+            )
+            self.experiment_dir.mkdir(parents=True)
 
         def run(self):
+            captured["trainer_model_id"] = self.model_id
+            checkpoint = (
+                Path(self.config.output.log_dir)
+                / self.config.output.experiment_name
+                / self.model_id
+                / "checkpoints/best_model.pt"
+            )
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"deterministic checkpoint")
             return {
                 "best_val_selection_score": 0.25,
                 "best_val_selection_metric": "mean_target_mae",
@@ -436,12 +480,22 @@ def test_objective_returns_selection_score_and_records_joint_loss(
             }
 
     monkeypatch.setattr("scripts.hpo.hpsearch_worker.EpiForecasterConfig", _FakeConfig)
-    monkeypatch.setattr("scripts.hpo.hpsearch_worker.EpiForecasterTrainer", _FakeTrainer)
+    monkeypatch.setattr(
+        "scripts.hpo.hpsearch_worker.EpiForecasterTrainer", _FakeTrainer
+    )
+
+    def _fake_suggest_params(
+        *,
+        trial,
+        base_cfg,
+        sample_training_loss_objective=False,
+        search_space="default",
+    ):
+        return {"training.learning_rate": 1.0e-3}
+
     monkeypatch.setattr(
         "scripts.hpo.hpsearch_worker.suggest_epiforecaster_params",
-        lambda *, trial, base_cfg, sample_training_loss_objective=False: {
-            "training.learning_rate": 1.0e-3
-        },
+        _fake_suggest_params,
     )
 
     trial = _StubTrial()
@@ -456,6 +510,7 @@ def test_objective_returns_selection_score_and_records_joint_loss(
         cli_overrides=["training.loss.joint.observation_loss=mae"],
         pruning_start_epoch=3,
         sample_training_loss_objective=False,
+        search_space="default",
     )
 
     assert value == pytest.approx(0.25)
@@ -465,10 +520,21 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     assert trial.user_attrs["training_loss_objective"] == "mae"
     assert trial.user_attrs["best_val_mae_ww_log1p_per_100k"] == pytest.approx(0.2)
     assert captured["pruning_start_epoch"] == 3
+    assert captured["constructor_model_id"] == "trial-000000"
+    assert captured["trainer_model_id"] == "trial-000000"
 
-    summary_path = tmp_path / "study" / "trial_0" / "optuna_trial.json"
-    summary = __import__("json").loads(summary_path.read_text(encoding="utf-8"))
+    trial_dir = tmp_path / "study" / "trial-000000"
+    checkpoint = trial_dir / "checkpoints/best_model.pt"
+    checkpoint_sha256 = sha256_file(checkpoint)
+    assert trial.user_attrs["trial_dir"] == str(trial_dir)
+    assert trial.user_attrs["best_model_path"] == str(checkpoint)
+    assert trial.user_attrs["best_model_sha256"] == checkpoint_sha256
+
+    summary_path = trial_dir / "optuna_trial.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["value"] == pytest.approx(0.25)
     assert summary["best_val_selection_score"] == pytest.approx(0.25)
     assert summary["best_val_joint_loss"] == pytest.approx(1.75)
     assert summary["training_loss_objective"] == "mae"
+    assert summary["best_model_path"] == str(checkpoint)
+    assert summary["best_model_sha256"] == checkpoint_sha256

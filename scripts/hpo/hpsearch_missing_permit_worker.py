@@ -508,7 +508,7 @@ def main(
     worker_seed = _compute_worker_seed(seed)
     if worker_seed != seed:
         logger.info(
-            "Offsetting seed by SLURM_ARRAY_TASK_ID: %d -> %d",
+            "Offsetting seed by HPO worker identity: %d -> %d",
             seed,
             worker_seed,
         )
