@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -48,6 +49,7 @@ class BaselinePredictionResult:
     fit_status: str
     fallback_reason: str
     model_order: str
+    prediction_scale: np.ndarray | None = None
 
 
 def _prediction_abs_limit(
@@ -181,6 +183,7 @@ def _primary_success(
     order_repr: str,
     *,
     model_name: str,
+    prediction_scale: np.ndarray | None = None,
 ) -> BaselinePredictionResult:
     return BaselinePredictionResult(
         model_name=model_name,
@@ -188,6 +191,54 @@ def _primary_success(
         fit_status=_FIT_SUCCESS,
         fallback_reason="",
         model_order=order_repr,
+        prediction_scale=prediction_scale,
+    )
+
+
+def _empirical_residual_scale(
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+) -> float:
+    """Estimate a conservative one-step residual scale for normal baselines."""
+    y = _impute_univariate_for_fit(train_values=train_values, train_mask=train_mask)
+    if y is None or y.shape[0] < 2:
+        observed = np.asarray(train_values, dtype=np.float64)[
+            np.asarray(train_mask) > 0
+        ]
+        observed = observed[np.isfinite(observed)]
+        if observed.size >= 2:
+            scale = float(np.std(observed, ddof=1))
+        else:
+            scale = 1.0
+    else:
+        residuals = np.diff(np.asarray(y, dtype=np.float64))
+        residuals = residuals[np.isfinite(residuals)]
+        if residuals.size >= 2:
+            scale = float(np.std(residuals, ddof=1))
+        elif residuals.size == 1:
+            scale = float(abs(residuals[0]))
+        else:
+            scale = 1.0
+    return max(scale, 1.0e-3)
+
+
+def _with_empirical_normal_scale(
+    result: BaselinePredictionResult,
+    *,
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+    model_name: str,
+) -> BaselinePredictionResult:
+    scale = _empirical_residual_scale(train_values, train_mask)
+    return BaselinePredictionResult(
+        model_name=model_name
+        if result.fit_status == _FIT_SUCCESS
+        else result.model_name,
+        predictions=result.predictions,
+        fit_status=result.fit_status,
+        fallback_reason=result.fallback_reason,
+        model_order=result.model_order,
+        prediction_scale=np.full_like(result.predictions, scale, dtype=np.float64),
     )
 
 
@@ -225,27 +276,16 @@ def _fallback_to_last_observed(
     )
 
 
-def _sanitize_exog(exog: np.ndarray | None) -> np.ndarray | None:
-    if exog is None:
-        return None
-    return np.nan_to_num(
-        np.asarray(exog, dtype=np.float64),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-
-
-def _fit_best_sarimax(
+def _select_best_sarimax_fit(
     train_values: np.ndarray,
     train_mask: np.ndarray,
-    horizon: int,
     *,
     exog_train: np.ndarray | None = None,
     exog_future: np.ndarray | None = None,
+    horizon: int,
     orders: list[tuple[int, int, int]] | None = None,
     seasonal_orders: list[tuple[int, int, int, int]] | None = None,
-) -> tuple[np.ndarray, str] | None:
+) -> tuple[Any, str] | None:
     observed_count = int((train_mask > 0).sum())
     if observed_count < 8:
         return None
@@ -298,6 +338,43 @@ def _fit_best_sarimax(
 
     if best_fit is None:
         return None
+    return best_fit, best_order_repr
+
+
+def _sanitize_exog(exog: np.ndarray | None) -> np.ndarray | None:
+    if exog is None:
+        return None
+    return np.nan_to_num(
+        np.asarray(exog, dtype=np.float64),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+
+def _fit_best_sarimax(
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+    horizon: int,
+    *,
+    exog_train: np.ndarray | None = None,
+    exog_future: np.ndarray | None = None,
+    orders: list[tuple[int, int, int]] | None = None,
+    seasonal_orders: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[np.ndarray, str] | None:
+    selected = _select_best_sarimax_fit(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        exog_train=exog_train,
+        exog_future=exog_future,
+        orders=orders,
+        seasonal_orders=seasonal_orders,
+    )
+    if selected is None:
+        return None
+    best_fit, best_order_repr = selected
+    exog_future_fit = _sanitize_exog(exog_future)
 
     try:
         with warnings.catch_warnings():
@@ -309,6 +386,43 @@ def _fit_best_sarimax(
         if not _predictions_are_stable(preds, train_values, train_mask):
             return None
         return preds, best_order_repr
+    except Exception:
+        return None
+
+
+def _fit_best_sarimax_normal(
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+    horizon: int,
+    *,
+    exog_train: np.ndarray | None = None,
+    exog_future: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, str] | None:
+    selected = _select_best_sarimax_fit(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        exog_train=exog_train,
+        exog_future=exog_future,
+    )
+    if selected is None:
+        return None
+    best_fit, best_order_repr = selected
+    exog_future_fit = _sanitize_exog(exog_future)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            forecast = best_fit.get_forecast(steps=horizon, exog=exog_future_fit)
+            preds = np.asarray(forecast.predicted_mean, dtype=np.float64).reshape(-1)
+            scale = np.asarray(forecast.se_mean, dtype=np.float64).reshape(-1)
+        if preds.shape[0] != horizon or scale.shape[0] != horizon:
+            return None
+        empirical_scale = _empirical_residual_scale(train_values, train_mask)
+        scale = np.where(np.isfinite(scale) & (scale > 0), scale, empirical_scale)
+        scale = np.maximum(scale, 1.0e-3)
+        if not _predictions_are_stable(preds, train_values, train_mask):
+            return None
+        return preds, scale, best_order_repr
     except Exception:
         return None
 
@@ -606,6 +720,55 @@ def predict_with_sarimax_fallback(
         horizon=horizon,
         global_train_median=global_train_median,
         reason="sarimax_unavailable",
+    )
+
+
+def predict_with_sarimax_normal_fallback(
+    *,
+    train_values: np.ndarray,
+    train_mask: np.ndarray,
+    horizon: int,
+    global_train_median: float,
+    exog_train: np.ndarray | None = None,
+    exog_future: np.ndarray | None = None,
+) -> BaselinePredictionResult:
+    """SARIMAX mean forecast with normal predictive scale.
+
+    The primary scale comes from statsmodels forecast standard errors. If SARIMAX
+    cannot fit, this falls back to last-observed/global-median means with an
+    empirical one-step residual scale from the history window.
+    """
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+
+    fit = _fit_best_sarimax_normal(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        exog_train=exog_train,
+        exog_future=exog_future,
+    )
+    if fit is not None:
+        preds, scale, order_repr = fit
+        return _primary_success(
+            preds,
+            order_repr,
+            model_name="sarimax_normal",
+            prediction_scale=scale,
+        )
+
+    fallback = _fallback_to_last_observed(
+        train_values=train_values,
+        train_mask=train_mask,
+        horizon=horizon,
+        global_train_median=global_train_median,
+        reason="sarimax_normal_unavailable",
+    )
+    return _with_empirical_normal_scale(
+        fallback,
+        train_values=train_values,
+        train_mask=train_mask,
+        model_name="sarimax_normal",
     )
 
 

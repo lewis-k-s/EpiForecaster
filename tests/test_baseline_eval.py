@@ -560,9 +560,17 @@ def test_resolve_baseline_model_matrix() -> None:
         (["last_observed"], ["last_observed"]),
         (["var"], ["var"]),
         (["sarimax"], ["sarimax"]),
+        (["sarimax_normal"], ["sarimax_normal"]),
         (
             ["all"],
-            ["exp_smoothing", "last_observed", "sarima", "sarimax", "varmax"],
+            [
+                "exp_smoothing",
+                "last_observed",
+                "sarima",
+                "sarimax",
+                "sarimax_normal",
+                "varmax",
+            ],
         ),
         (["varmax"], ["varmax"]),
     ]
@@ -921,6 +929,57 @@ def test_run_same_slice_baseline_evaluation_writes_sarimax_artifacts(
     # SARIMAX exog is temporal covariates only (cov_dim=3 in the test batch).
     assert captured["exog_train"].shape == (3, 3)
     assert captured["exog_future"].shape == (2, 3)
+
+
+def test_run_same_slice_baseline_evaluation_writes_sarimax_normal_metrics(
+    tmp_path: Path,
+    monkeypatch,
+):
+    loader = _SameSliceLoader([_make_same_slice_batch()])
+
+    import evaluation.baseline_eval as baseline_eval
+    import evaluation.baseline_models as baseline_models
+
+    def _fit_sarimax_normal(horizon, exog_train=None, exog_future=None, **kwargs):
+        return (
+            np.ones(horizon, dtype=np.float64),
+            np.full(horizon, 0.5, dtype=np.float64),
+            "order=(1,0,0);seasonal_order=(0,0,0,7)",
+        )
+
+    monkeypatch.setattr(
+        baseline_eval,
+        "build_loader_from_config",
+        lambda **kwargs: (loader, None),
+    )
+    monkeypatch.setattr(
+        baseline_models,
+        "_fit_best_sarimax_normal",
+        _fit_sarimax_normal,
+    )
+
+    artifacts = run_same_slice_baseline_evaluation(
+        config=_DummyConfig(input_window_length=3, forecast_horizon=2),
+        output_dir=tmp_path / "same_slice_sarimax_normal",
+        models=["sarimax_normal"],
+        split="test",
+    )
+
+    granular_df = _read_baseline_granular(artifacts["baseline_granular"])
+    aggregate_df = pd.read_csv(artifacts["baseline_aggregate_metrics"])
+    metadata = json.loads(artifacts["baseline_metadata"].read_text(encoding="utf-8"))
+
+    assert set(granular_df["model"].unique()) == {"sarimax_normal"}
+    assert {"prediction_scale", "nll", "crps", "coverage_80"}.issubset(
+        granular_df.columns
+    )
+    assert granular_df["prediction_scale"].notna().all()
+    assert granular_df["nll"].notna().all()
+    assert granular_df["crps"].notna().all()
+    assert {"crps_mean", "nll_mean", "coverage_80_mean"}.issubset(aggregate_df.columns)
+    assert aggregate_df["crps_mean"].notna().all()
+    assert aggregate_df["nll_mean"].notna().all()
+    assert metadata["schema_version"] == "2"
 
 
 def test_run_same_slice_baseline_evaluation_skips_unstable_granular_rows(
