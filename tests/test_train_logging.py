@@ -105,13 +105,13 @@ def test_format_train_progress_status_appends_optional_loss_details() -> None:
         lr=1.0e-3,
         grad_norm=torch.tensor(2.0),
         samples_per_s=64.0,
-        loss_detail_suffix=" | SIRD: 0.1 (w=0.001)",
+        loss_detail_suffix=" | SIRHD: 0.1 (w=0.001)",
         gradnorm_status_suffix="",
     )
 
     assert "Epoch 2 | Step 10" in status
     assert "Loss: 1.25" in status
-    assert "| SIRD: 0.1 (w=0.001)" in status
+    assert "| SIRHD: 0.1 (w=0.001)" in status
 
 
 def test_format_joint_loss_components_status_requires_core_keys() -> None:
@@ -133,7 +133,7 @@ def test_format_joint_loss_components_status_requires_core_keys() -> None:
     assert components is not None
     assert "WW=1" in components
     assert "Hosp=2" in components
-    assert "SIRD=3" in components
+    assert "SIRHD=3" in components
     assert "Cases=4" in components
 
 

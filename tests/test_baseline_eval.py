@@ -191,17 +191,28 @@ def _make_same_slice_batch() -> SimpleNamespace:
     return batch
 
 
-def test_exp_smoothing_reports_failure_when_sparse(monkeypatch):
-    import evaluation.baseline_models as baseline_models
+@pytest.mark.parametrize(
+    ("predictor", "fit_attribute", "fallback_reason"),
+    [
+        (
+            predict_with_exponential_smoothing_fallback,
+            "_fit_best_exponential_smoothing",
+            "exp_smoothing_unavailable",
+        ),
+        (predict_with_sarima_fallback, None, "sarima_unavailable"),
+    ],
+    ids=["exp-smoothing", "sarima"],
+)
+def test_univariate_baseline_reports_failure_when_sparse(
+    monkeypatch, predictor, fit_attribute, fallback_reason
+):
+    if fit_attribute:
+        import evaluation.baseline_models as baseline_models
 
-    monkeypatch.setattr(
-        baseline_models,
-        "_fit_best_exponential_smoothing",
-        lambda **kwargs: None,
-    )
+        monkeypatch.setattr(baseline_models, fit_attribute, lambda **kwargs: None)
     train_values = np.array([1.0, 2.0, 3.0], dtype=np.float64)
     train_mask = np.zeros(3, dtype=np.float64)
-    result = predict_with_exponential_smoothing_fallback(
+    result = predictor(
         train_values=train_values,
         train_mask=train_mask,
         horizon=2,
@@ -210,7 +221,7 @@ def test_exp_smoothing_reports_failure_when_sparse(monkeypatch):
     )
     assert result.model_name == "global_median"
     assert result.fit_status == "fallback_global_median"
-    assert result.fallback_reason == "exp_smoothing_unavailable"
+    assert result.fallback_reason == fallback_reason
     assert np.allclose(result.predictions, np.array([2.5, 2.5], dtype=np.float64))
 
 
@@ -231,22 +242,6 @@ def test_exp_smoothing_fits_on_simple_seasonal_series():
     assert result.fit_status == "fit_success"
     assert result.predictions.shape == (4,)
     assert np.all(np.isfinite(result.predictions))
-
-
-def test_sarima_reports_failure_when_sparse() -> None:
-    train_values = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-    train_mask = np.zeros(3, dtype=np.float64)
-    result = predict_with_sarima_fallback(
-        train_values=train_values,
-        train_mask=train_mask,
-        horizon=2,
-        global_train_median=2.5,
-        seasonal_period=7,
-    )
-    assert result.model_name == "global_median"
-    assert result.fit_status == "fallback_global_median"
-    assert result.fallback_reason == "sarima_unavailable"
-    assert np.allclose(result.predictions, np.array([2.5, 2.5], dtype=np.float64))
 
 
 def test_last_observed_baseline_uses_latest_observed_value() -> None:
@@ -542,19 +537,23 @@ def test_var_reports_failures_when_var_unavailable(monkeypatch):
         assert np.all(np.isfinite(pred.predictions))
 
 
-def test_resolve_baseline_models_excludes_var_from_all() -> None:
-    assert _resolve_baseline_models(None) == ["sarima"]
-    assert _resolve_baseline_models(["last_observed"]) == ["last_observed"]
-    assert _resolve_baseline_models(["var"]) == ["var"]
-    assert _resolve_baseline_models(["sarimax"]) == ["sarimax"]
-    assert _resolve_baseline_models(["all"]) == [
-        "exp_smoothing",
-        "last_observed",
-        "sarima",
-        "sarimax",
-        "varmax",
+def test_resolve_baseline_model_matrix() -> None:
+    cases = [
+        (None, ["sarima"]),
+        (["last_observed"], ["last_observed"]),
+        (["var"], ["var"]),
+        (["sarimax"], ["sarimax"]),
+        (
+            ["all"],
+            ["exp_smoothing", "last_observed", "sarima", "sarimax", "varmax"],
+        ),
+        (["varmax"], ["varmax"]),
     ]
-    assert _resolve_baseline_models(["varmax"]) == ["varmax"]
+    for requested, expected in cases:
+        assert _resolve_baseline_models(requested) == expected
+
+
+def test_resolve_baseline_models_rejects_unknown_model() -> None:
     with pytest.raises(ValueError, match="Unsupported baseline model"):
         _resolve_baseline_models(["nope"])
 

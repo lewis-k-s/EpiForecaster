@@ -23,6 +23,7 @@ from models.observation_heads import (
     UnscaledMSELoss,
     WastewaterObservationHead,
 )
+from tests.model_test_helpers import make_observation_heads
 
 
 def _rand_tensor(*shape):
@@ -106,7 +107,9 @@ class TestDelayKernelBasics:
         kernel = DelayKernel(kernel_length=3, learnable=True, parameterization="free")
 
         with torch.no_grad():
-            kernel.kernel.copy_(torch.tensor([-0.5, 0.25, 1.5], dtype=kernel.kernel.dtype))
+            kernel.kernel.copy_(
+                torch.tensor([-0.5, 0.25, 1.5], dtype=kernel.kernel.dtype)
+            )
 
         weights = kernel.get_kernel_weights()
         expected = torch.tensor([-0.5, 0.25, 1.5], dtype=weights.dtype)
@@ -757,23 +760,12 @@ class TestIntegration:
         population = _ones_tensor(batch_size, time_steps)  # Normalized population (1.0)
 
         # Clinical observation (hospitalizations)
-        hosp_head = ClinicalObservationHead(
-            kernel_length=14,
-            gamma_shape=5.0,
-            gamma_scale=2.0,
-            scale_init=1.0,
-            learnable_kernel=False,
-            learnable_scale=False,
+        hosp_head, ww_head = make_observation_heads(
+            frozen=True, kernel_length=14, scale_init=1.0
         )
         hosp_obs = hosp_head(I_trajectory)
 
         # Wastewater observation
-        ww_head = WastewaterObservationHead(
-            kernel_length=14,
-            scale_init=1.0,
-            learnable_kernel=False,
-            learnable_scale=False,
-        )
         ww_obs = ww_head(I_trajectory, population)
 
         # Both should show the epidemic wave
@@ -795,12 +787,7 @@ class TestIntegration:
         time_steps = 20
 
         # Learnable parameters everywhere
-        hosp_head = ClinicalObservationHead(
-            kernel_length=7, learnable_kernel=True, learnable_scale=True
-        )
-        ww_head = WastewaterObservationHead(
-            kernel_length=7, learnable_kernel=True, learnable_scale=True
-        )
+        hosp_head, ww_head = make_observation_heads(kernel_length=7)
 
         # Infections and population as "inputs" from upstream model (fractions)
         I_trajectory = _rand_tensor(batch_size, time_steps) * 0.1
@@ -834,12 +821,7 @@ class TestEdgeCases:
 
     def test_zero_infections(self):
         """Test behavior with zero infections."""
-        hosp_head = ClinicalObservationHead(
-            learnable_kernel=False, learnable_scale=False
-        )
-        ww_head = WastewaterObservationHead(
-            learnable_kernel=False, learnable_scale=False
-        )
+        hosp_head, ww_head = make_observation_heads(frozen=True)
 
         batch_size = 1
         time_steps = 10
@@ -922,48 +904,55 @@ class TestEdgeCases:
         assert output.shape == (batch_size, time_steps)
 
 
-class TestMSELoss:
-    """Tests for MSELoss (normalized space)."""
+class TestNormalizedLosses:
+    """Tests for MSELoss and MAELoss in normalized space."""
 
-    def test_basic_mse(self):
-        """Test basic MSE computation."""
-        loss_fn = MSELoss()
+    @pytest.mark.parametrize(
+        ("loss_type", "target", "expected"),
+        [
+            (MSELoss, [1.0, 2.0, 4.0], 1.0 / 3.0),
+            (MAELoss, [1.0, 2.0, 5.0], 2.0 / 3.0),
+        ],
+        ids=["mse", "mae"],
+    )
+    def test_basic_loss(self, loss_type, target, expected):
         pred = torch.tensor([[1.0, 2.0, 3.0]])
-        target = torch.tensor([[1.0, 2.0, 4.0]])
+        loss = loss_type()(pred, torch.tensor([target]))
+        assert loss.item() == pytest.approx(expected, abs=1e-6)
 
-        loss = loss_fn(pred, target)
-
-        # Expected: (0^2 + 0^2 + 1^2) / 3 = 1/3
-        assert loss.item() == pytest.approx(1.0 / 3.0, abs=1e-6)
-
-    def test_mse_ignores_mean_scale(self):
-        """MSE should ignore target_mean/target_scale (operates in normalized space)."""
-        loss_fn = MSELoss()
+    @pytest.mark.parametrize(
+        ("loss_type", "target"),
+        [(MSELoss, 3.0), (MAELoss, 4.0)],
+        ids=["mse", "mae"],
+    )
+    def test_loss_ignores_mean_scale(self, loss_type, target):
+        loss_fn = loss_type()
         pred = torch.tensor([[1.0, 2.0]])
-        target = torch.tensor([[1.0, 3.0]])
-        target_mean = torch.tensor([[10.0]])
-        target_scale = torch.tensor([[2.0]])
+        target = torch.tensor([[1.0, target]])
+        stats = {
+            "target_mean": torch.tensor([[10.0]]),
+            "target_scale": torch.tensor([[2.0]]),
+        }
 
-        loss_with_stats = loss_fn(
-            pred, target, target_mean=target_mean, target_scale=target_scale
-        )
-        loss_without_stats = loss_fn(pred, target)
-
-        # Should be identical - MSE operates in normalized space
-        assert loss_with_stats.item() == pytest.approx(
-            loss_without_stats.item(), abs=1e-6
+        assert loss_fn(pred, target, **stats).item() == pytest.approx(
+            loss_fn(pred, target).item(), abs=1e-6
         )
 
-    def test_mse_with_mask(self):
-        """Test MSE with boolean mask."""
-        loss_fn = MSELoss()
+    @pytest.mark.parametrize(
+        ("loss_type", "target", "mask"),
+        [
+            (MSELoss, [1.0, 5.0, 3.0], [True, False, True]),
+            (MAELoss, [10.0, 2.0, 30.0], [False, True, False]),
+        ],
+        ids=["mse", "mae"],
+    )
+    def test_loss_with_mask(self, loss_type, target, mask):
         pred = torch.tensor([[1.0, 2.0, 3.0]])
-        target = torch.tensor([[1.0, 5.0, 3.0]])  # Error at position 1
-        mask = torch.tensor([[True, False, True]])  # Mask out position 1
-
-        loss = loss_fn(pred, target, mask=mask)
-
-        # Expected: (0^2 + masked + 0^2) / 2 = 0
+        loss = loss_type()(
+            pred,
+            torch.tensor([target]),
+            mask=torch.tensor([mask]),
+        )
         assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_mse_gradient_flow(self):
@@ -977,50 +966,6 @@ class TestMSELoss:
 
         assert pred.grad is not None
         assert not torch.all(pred.grad == 0)
-
-
-class TestMAELoss:
-    """Tests for MAELoss (normalized space)."""
-
-    def test_basic_mae(self):
-        """Test basic MAE computation."""
-        loss_fn = MAELoss()
-        pred = torch.tensor([[1.0, 2.0, 3.0]])
-        target = torch.tensor([[1.0, 2.0, 5.0]])
-
-        loss = loss_fn(pred, target)
-
-        # Expected: (0 + 0 + 2) / 3 = 2/3
-        assert loss.item() == pytest.approx(2.0 / 3.0, abs=1e-6)
-
-    def test_mae_ignores_mean_scale(self):
-        """MAE should ignore target_mean/target_scale."""
-        loss_fn = MAELoss()
-        pred = torch.tensor([[1.0, 2.0]])
-        target = torch.tensor([[1.0, 4.0]])
-        target_mean = torch.tensor([[10.0]])
-        target_scale = torch.tensor([[2.0]])
-
-        loss_with_stats = loss_fn(
-            pred, target, target_mean=target_mean, target_scale=target_scale
-        )
-        loss_without_stats = loss_fn(pred, target)
-
-        assert loss_with_stats.item() == pytest.approx(
-            loss_without_stats.item(), abs=1e-6
-        )
-
-    def test_mae_with_mask(self):
-        """Test MAE with boolean mask."""
-        loss_fn = MAELoss()
-        pred = torch.tensor([[1.0, 2.0, 3.0]])
-        target = torch.tensor([[10.0, 2.0, 30.0]])
-        mask = torch.tensor([[False, True, False]])  # Only keep position 1
-
-        loss = loss_fn(pred, target, mask=mask)
-
-        # Expected: masked + 0 + masked = 0
-        assert loss.item() == pytest.approx(0.0, abs=1e-6)
 
 
 class TestUnscaledMSELoss:

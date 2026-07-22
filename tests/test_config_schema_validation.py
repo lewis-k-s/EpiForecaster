@@ -13,8 +13,11 @@ EPIFORECASTER_TRAINING_CONFIGS = [
     "configs/train_epifor_curriculum.yaml",
     "configs/train_epifor_real_local.yaml",
     "configs/train_epifor_synth_local.yaml",
+    "configs/production_only/train_epifor_mn5_ablation_mobility_panel_base.yaml",
     "configs/production_only/train_epifor_mn5_best.yaml",
     "configs/production_only/train_epifor_mn5_full.yaml",
+    "configs/production_only/train_epifor_mn5_mobility_spatial_knn.yaml",
+    "configs/production_only/train_epifor_mn5_real_balanced.yaml",
     "configs/production_only/train_epifor_mn5_synth.yaml",
     "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
     "configs/production_only/train_epifor_sparsity_curriculum.yaml",
@@ -28,9 +31,11 @@ REGION2VEC_CONFIGS = [
 
 PREPROCESSING_CONFIGS = [
     "configs/preprocess_full.yaml",
+    "configs/preprocess_local_synth.yaml",
     "configs/preprocess_mn5_synth.yaml",
     "configs/preprocess_real_holt.yaml",
     "configs/production_only/preprocess_mn5_synth.yaml",
+    "configs/production_only/preprocess_mn5_synth_holt_damped.yaml",
     "configs/production_only/preprocess_mn5_synth_kalman_predict.yaml",
 ]
 

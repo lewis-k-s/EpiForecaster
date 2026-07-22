@@ -1,5 +1,3 @@
-from datetime import datetime
-
 import dask.array as da
 import numpy as np
 import pandas as pd
@@ -7,9 +5,9 @@ import pytest
 import warnings
 import xarray as xr
 
-from data.preprocess.config import PreprocessingConfig
 from data.preprocess.processors.synthetic_processor import SyntheticProcessor
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
+from tests.dataset_test_helpers import make_preprocessing_config
 
 
 def _write_minimal_synthetic_zarr(
@@ -140,43 +138,12 @@ def _make_config(
     include_temporal_covariates: bool = True,
     holiday_calendar_path=None,
 ):
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    dummy = data_dir / "dummy.txt"
-    dummy.write_text("ok")
-    if holiday_calendar_path is None:
-        holiday_calendar_path = data_dir / "holidays.csv"
-        holiday_calendar_path.write_text("date\n2020-01-01\n")
-
-    temporal_covariates = None
-    if include_temporal_covariates:
-        temporal_covariates = {
-            "include_day_of_week": True,
-            "include_holidays": True,
-            "holiday_calendar_file": str(holiday_calendar_path),
-        }
-
-    return PreprocessingConfig(
-        data_dir=str(data_dir),
-        synthetic_path=str(synthetic_path),
-        cases_file=str(dummy),
-        mobility_path=str(dummy),
-        wastewater_file=str(dummy),
-        population_file=str(dummy),
-        region_metadata_file=str(dummy),
-        start_date=datetime(2020, 1, 1),
-        end_date=datetime(2020, 1, 4),
-        forecast_horizon=1,
-        sequence_length=1,
-        output_path=str(tmp_path / "out"),
-        dataset_name="synthetic_test",
-        wastewater_flow_mode="concentration",
-        run_id_chunk_size=1,
-        chunk_size=10,
-        min_density_threshold=0.0,
-        validate_alignment=False,
-        generate_alignment_report=False,
-        temporal_covariates=temporal_covariates,
+    return make_preprocessing_config(
+        tmp_path,
+        synthetic_path=synthetic_path,
+        include_temporal_covariates=include_temporal_covariates,
+        holiday_calendar_path=holiday_calendar_path,
+        options={"run_id_chunk_size": 1, "chunk_size": 10},
     )
 
 

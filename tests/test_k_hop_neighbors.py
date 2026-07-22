@@ -8,64 +8,46 @@ feature masking works correctly with the full graph topology.
 import json
 
 import numpy as np
-import pandas as pd
 import pytest
 import torch
-import xarray as xr
 
 from data.epi_dataset import EpiDataset
-from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
-from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 from models.mobility_gnn import MobilityDenseEncoder
+from tests.dataset_test_helpers import (
+    make_epi_config,
+    make_tiny_epi_dataset,
+    write_zarr_dataset,
+)
 
 
 def _make_config(
-    dataset_path: str,
-    gnn_depth: int = 2,
-    sample_ordering: str = "node",
-    graph_adjacency_source: str = "mobility",
-    regions_data_path: str = "",
-) -> EpiForecasterConfig:
+    dataset_path,
+    gnn_depth=2,
+    sample_ordering="node",
+    graph_adjacency_source="mobility",
+    regions_data_path="",
+):
     """Create a minimal config for testing k-hop behavior."""
-    model = ModelConfig(
-        type={
-            "cases": True,
-            "regions": False,
-            "biomarkers": True,
-            "mobility": True,
-        },
-        mobility_embedding_dim=1,
-        region_embedding_dim=1,
-        input_window_length=3,
-        forecast_horizon=1,
-        max_neighbors=1,
-        gnn_depth=gnn_depth,
-        gnn_module="gcn",
-        gnn_hidden_dim=8,
-        population_dim=1,
-        graph_adjacency_source=graph_adjacency_source,
-    )
-    data_cfg = DataConfig(
-        dataset_path=str(dataset_path),
-        regions_data_path=regions_data_path,
-        mobility_threshold=0.0,
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
+    return make_epi_config(
+        dataset_path,
+        model_options={
+            "type": {
+                "cases": True,
+                "regions": False,
+                "biomarkers": True,
+                "mobility": True,
             },
-            "horizon": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
+            "forecast_horizon": 1,
+            "gnn_depth": gnn_depth,
+            "gnn_module": "gcn",
+            "gnn_hidden_dim": 8,
+            "graph_adjacency_source": graph_adjacency_source,
         },
-        sample_ordering=sample_ordering,
+        data_options={
+            "regions_data_path": regions_data_path,
+            "sample_ordering": sample_ordering,
+        },
     )
-    return EpiForecasterConfig(model=model, data=data_cfg)
 
 
 def _write_spatial_geojson(path: str, xs: list[float]) -> None:
@@ -144,84 +126,22 @@ def _write_chain_dataset(zarr_path: str, num_nodes: int = 4, periods: int = 10) 
     Each node i only connects to node i+1 (forward and backward edges).
     This creates a linear chain topology for testing k-hop behavior.
     """
-    dates = pd.date_range("2020-01-01", periods=periods, freq="D")
-    regions = np.arange(num_nodes, dtype=np.int64)
-    # Use padded run_id to match production data format
-    run_id = "real                                            "
-
-    # Constant cases for all nodes - need value, mask, and age channels
     cases = np.full((1, periods, num_nodes, 1), 100.0, dtype=np.float32)
-    cases_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
-    cases_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
-
-    # Biomarkers (required for dataset, even if not all are used)
-    # Need non-zero values for scaler fitting (zeros are excluded)
-    # Give all nodes non-zero values to support any target_node choice
-    biomarkers = np.ones((1, periods, num_nodes), dtype=np.float32)
-    biomarker_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
-    biomarker_censor = np.zeros((1, periods, num_nodes), dtype=np.float32)
-    biomarker_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
-
-    # Mobility: chain connectivity (0-1-2-3-...) - add run_id dimension
     mobility = np.zeros((1, periods, num_nodes, num_nodes), dtype=np.float32)
     for i in range(num_nodes - 1):
         mobility[0, :, i, i + 1] = 1.0  # Forward edge
         mobility[0, :, i + 1, i] = 1.0  # Backward edge
-
-    population = np.full(num_nodes, 1000.0, dtype=np.float32)
-
-    # Create clinical variables required by EpiDataset
     hosp = np.full((1, periods, num_nodes, 1), 10.0, dtype=np.float32)
-    hosp_mask = np.ones((1, periods, num_nodes), dtype=np.float32)
-    hosp_age = np.zeros((1, periods, num_nodes), dtype=np.float32)
-
-    ds = xr.Dataset(
-        data_vars={
-            "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
-            "cases_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_mask),
-            "cases_age": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_age),
-            "hospitalizations": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD, "feature"),
-                hosp,
-            ),
-            "hospitalizations_mask": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                hosp_mask,
-            ),
-            "hospitalizations_age": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                hosp_age,
-            ),
-            "deaths": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), hosp),
-            "deaths_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), hosp_mask),
-            "deaths_age": (("run_id", TEMPORAL_COORD, REGION_COORD), hosp_age),
-            "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                biomarker_mask,
-            ),
-            "edar_biomarker_N1_censor": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                biomarker_censor,
-            ),
-            "edar_biomarker_N1_age": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                biomarker_age,
-            ),
-            "mobility": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"),
-                mobility,
-            ),
-            "population": ((REGION_COORD,), population),
-        },
-        coords={
-            "run_id": [run_id],
-            TEMPORAL_COORD: dates,
-            REGION_COORD: regions,
-            "region_id_to": regions,
-        },
+    ds = make_tiny_epi_dataset(
+        periods=periods,
+        num_nodes=num_nodes,
+        cases=cases,
+        hospitalizations=hosp,
+        deaths=hosp.copy(),
+        mobility=mobility,
+        clinical_feature_dim=True,
     )
-    ds.to_zarr(zarr_path, mode="w", zarr_format=2)
+    write_zarr_dataset(ds, zarr_path)
 
 
 def _reconstruct_mob_graph(item, t: int, dataset):
@@ -604,84 +524,30 @@ def test_k_hop_masking_middle_node(tmp_path):
 
 
 @pytest.mark.epiforecaster
-def test_k_hop_masking_time_ordering(tmp_path):
-    """Test k-hop masking with sample_ordering='time'."""
-    zarr_path = tmp_path / "chain_time.zarr"
+@pytest.mark.parametrize("sample_ordering", ["time", "node"])
+def test_k_hop_masking_sample_ordering(tmp_path, sample_ordering):
+    """Both sample orderings retain the same one-hop feature mask."""
+    zarr_path = tmp_path / f"chain_{sample_ordering}.zarr"
     _write_chain_dataset(str(zarr_path), num_nodes=4, periods=10)
 
-    config = _make_config(str(zarr_path), gnn_depth=1, sample_ordering="time")
+    config = _make_config(str(zarr_path), gnn_depth=1, sample_ordering=sample_ordering)
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
-
-    # Get the first sample for target node 0
     item = dataset[0]
 
-    L = dataset.config.model.input_window_length
-    for t in range(L):
+    for t in range(dataset.config.model.input_window_length):
         mob_graph = _reconstruct_mob_graph(item, t, dataset)
-
-        global_to_local = {
-            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
-        }
-
-        # Node 0 (target): non-zero
-        local_0 = global_to_local[0]
+        global_to_local = _global_to_local_map(mob_graph)
         assert _verify_node_features_masked(
-            mob_graph, local_0, expected_masked=False
-        ), "Node 0 should have non-zero features with time ordering"
-
-        # Node 1 (1-hop): non-zero
+            mob_graph, global_to_local[0], expected_masked=False
+        ), f"Node 0 should be visible with {sample_ordering} ordering"
         if 1 in global_to_local:
-            local_1 = global_to_local[1]
             assert _verify_node_features_masked(
-                mob_graph, local_1, expected_masked=False
-            ), "Node 1 should have non-zero features with time ordering"
-
-        # Node 2 (2-hop): zero
+                mob_graph, global_to_local[1], expected_masked=False
+            ), f"Node 1 should be visible with {sample_ordering} ordering"
         if 2 in global_to_local:
-            local_2 = global_to_local[2]
             assert _verify_node_features_masked(
-                mob_graph, local_2, expected_masked=True
-            ), "Node 2 should have zero features with time ordering"
-
-
-@pytest.mark.epiforecaster
-def test_k_hop_masking_node_ordering(tmp_path):
-    """Test k-hop masking with sample_ordering='node'."""
-    zarr_path = tmp_path / "chain_node.zarr"
-    _write_chain_dataset(str(zarr_path), num_nodes=4, periods=10)
-
-    config = _make_config(str(zarr_path), gnn_depth=1, sample_ordering="node")
-    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
-
-    item = dataset[0]
-
-    L = dataset.config.model.input_window_length
-    for t in range(L):
-        mob_graph = _reconstruct_mob_graph(item, t, dataset)
-
-        global_to_local = {
-            int(g): i for i, g in enumerate(mob_graph["node_ids"].tolist())
-        }
-
-        # Node 0 (target): non-zero
-        local_0 = global_to_local[0]
-        assert _verify_node_features_masked(
-            mob_graph, local_0, expected_masked=False
-        ), "Node 0 should have non-zero features with node ordering"
-
-        # Node 1 (1-hop): non-zero
-        if 1 in global_to_local:
-            local_1 = global_to_local[1]
-            assert _verify_node_features_masked(
-                mob_graph, local_1, expected_masked=False
-            ), "Node 1 should have non-zero features with node ordering"
-
-        # Node 2 (2-hop): zero
-        if 2 in global_to_local:
-            local_2 = global_to_local[2]
-            assert _verify_node_features_masked(
-                mob_graph, local_2, expected_masked=True
-            ), "Node 2 should have zero features with node ordering"
+                mob_graph, global_to_local[2], expected_masked=True
+            ), f"Node 2 should be masked with {sample_ordering} ordering"
 
 
 @pytest.mark.epiforecaster

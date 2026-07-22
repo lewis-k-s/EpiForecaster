@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
+import logging
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
-import logging
-import math
-import json
 import pandas as pd
 import pytest
 import torch
@@ -15,6 +15,7 @@ import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
+from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
 
 class _DummyDataset:
@@ -469,45 +470,20 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
     assert captured["evaluate_kwargs"]["node_metrics_target"] == "hospitalizations"
 
 
-def _write_granular_fixture(path: Path, rows: list[dict[str, object]]) -> None:
-    pd.DataFrame(rows).to_csv(path, index=False)
-
-
 def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> None:
     baseline_csv = tmp_path / "baseline.csv"
     candidate_csv = tmp_path / "candidate.csv"
 
     base_rows = [
-        {
-            "split": "test",
-            "target": "cases",
-            "node_id": 1,
-            "region_id": "08001",
-            "region_label": "region-a",
-            "window_start": 0,
-            "window_start_date": "2024-01-01",
-            "horizon": 1,
-            "target_index": 3,
-            "target_date": "2024-01-04",
-            "observed": 10.0,
-            "abs_error": 2.0,
-            "sq_error": 4.0,
-        },
-        {
-            "split": "test",
-            "target": "cases",
-            "node_id": 1,
-            "region_id": "08001",
-            "region_label": "region-a",
-            "window_start": 0,
-            "window_start_date": "2024-01-01",
-            "horizon": 2,
-            "target_index": 4,
-            "target_date": "2024-01-05",
-            "observed": 12.0,
-            "abs_error": 1.0,
-            "sq_error": 1.0,
-        },
+        make_granular_row(),
+        make_granular_row(
+            horizon=2,
+            target_index=4,
+            target_date="2024-01-05",
+            observed=12.0,
+            abs_error=1.0,
+            sq_error=1.0,
+        ),
     ]
     cand_rows = [
         {
@@ -522,8 +498,8 @@ def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> Non
         },
     ]
 
-    _write_granular_fixture(baseline_csv, base_rows)
-    _write_granular_fixture(candidate_csv, cand_rows)
+    write_granular_fixture(baseline_csv, base_rows)
+    write_granular_fixture(candidate_csv, cand_rows)
 
     output_dir = tmp_path / "compare"
     artifacts = compare_granular_csvs(
@@ -571,36 +547,8 @@ def test_compare_granular_csvs_excludes_missing_targets(
     candidate_csv = tmp_path / "candidate.csv"
 
     baseline_rows = [
-        {
-            "split": "test",
-            "target": "cases",
-            "node_id": 1,
-            "region_id": "08001",
-            "region_label": "region-a",
-            "window_start": 0,
-            "window_start_date": "2024-01-01",
-            "horizon": 1,
-            "target_index": 3,
-            "target_date": "2024-01-04",
-            "observed": 10.0,
-            "abs_error": 2.0,
-            "sq_error": 4.0,
-        },
-        {
-            "split": "test",
-            "target": "deaths",
-            "node_id": 1,
-            "region_id": "08001",
-            "region_label": "region-a",
-            "window_start": 0,
-            "window_start_date": "2024-01-01",
-            "horizon": 1,
-            "target_index": 3,
-            "target_date": "2024-01-04",
-            "observed": 3.0,
-            "abs_error": 1.0,
-            "sq_error": 1.0,
-        },
+        make_granular_row(),
+        make_granular_row(target="deaths", observed=3.0, abs_error=1.0, sq_error=1.0),
     ]
     candidate_rows = [
         {
@@ -610,8 +558,8 @@ def test_compare_granular_csvs_excludes_missing_targets(
         }
     ]
 
-    _write_granular_fixture(baseline_csv, baseline_rows)
-    _write_granular_fixture(candidate_csv, candidate_rows)
+    write_granular_fixture(baseline_csv, baseline_rows)
+    write_granular_fixture(candidate_csv, candidate_rows)
 
     caplog.set_level(logging.WARNING, logger="granular_comparison")
     artifacts = compare_granular_csvs(
@@ -643,38 +591,8 @@ def test_compare_granular_csvs_excludes_unmatched_seeds(
     candidate_csv = tmp_path / "candidate.csv"
 
     baseline_rows = [
-        {
-            "split": "test",
-            "target": "cases",
-            "node_id": 1,
-            "region_id": "08001",
-            "region_label": "region-a",
-            "window_start": 0,
-            "window_start_date": "2024-01-01",
-            "horizon": 1,
-            "target_index": 3,
-            "target_date": "2024-01-04",
-            "observed": 10.0,
-            "abs_error": 2.0,
-            "sq_error": 4.0,
-            "seed": 1,
-        },
-        {
-            "split": "test",
-            "target": "cases",
-            "node_id": 1,
-            "region_id": "08001",
-            "region_label": "region-a",
-            "window_start": 0,
-            "window_start_date": "2024-01-01",
-            "horizon": 1,
-            "target_index": 3,
-            "target_date": "2024-01-04",
-            "observed": 10.0,
-            "abs_error": 3.0,
-            "sq_error": 9.0,
-            "seed": 2,
-        },
+        make_granular_row(seed=1),
+        make_granular_row(abs_error=3.0, sq_error=9.0, seed=2),
     ]
     candidate_rows = [
         {
@@ -684,8 +602,8 @@ def test_compare_granular_csvs_excludes_unmatched_seeds(
         }
     ]
 
-    _write_granular_fixture(baseline_csv, baseline_rows)
-    _write_granular_fixture(candidate_csv, candidate_rows)
+    write_granular_fixture(baseline_csv, baseline_rows)
+    write_granular_fixture(candidate_csv, candidate_rows)
 
     artifacts = compare_granular_csvs(
         baseline_csv=baseline_csv,
@@ -843,60 +761,23 @@ def test_compare_granular_csvs_fails_on_poor_join_coverage(tmp_path: Path) -> No
     baseline_csv = tmp_path / "baseline.csv"
     candidate_csv = tmp_path / "candidate.csv"
 
-    _write_granular_fixture(
+    write_granular_fixture(
         baseline_csv,
         [
-            {
-                "split": "test",
-                "target": "cases",
-                "node_id": 1,
-                "region_id": "08001",
-                "region_label": "region-a",
-                "window_start": 0,
-                "window_start_date": "2024-01-01",
-                "horizon": 1,
-                "target_index": 3,
-                "target_date": "2024-01-04",
-                "observed": 10.0,
-                "abs_error": 2.0,
-                "sq_error": 4.0,
-            },
-            {
-                "split": "test",
-                "target": "cases",
-                "node_id": 1,
-                "region_id": "08001",
-                "region_label": "region-a",
-                "window_start": 0,
-                "window_start_date": "2024-01-01",
-                "horizon": 2,
-                "target_index": 4,
-                "target_date": "2024-01-05",
-                "observed": 12.0,
-                "abs_error": 1.0,
-                "sq_error": 1.0,
-            },
+            make_granular_row(),
+            make_granular_row(
+                horizon=2,
+                target_index=4,
+                target_date="2024-01-05",
+                observed=12.0,
+                abs_error=1.0,
+                sq_error=1.0,
+            ),
         ],
     )
-    _write_granular_fixture(
+    write_granular_fixture(
         candidate_csv,
-        [
-            {
-                "split": "test",
-                "target": "cases",
-                "node_id": 1,
-                "region_id": "08001",
-                "region_label": "region-a",
-                "window_start": 0,
-                "window_start_date": "2024-01-01",
-                "horizon": 1,
-                "target_index": 3,
-                "target_date": "2024-01-04",
-                "observed": 10.0,
-                "abs_error": 1.0,
-                "sq_error": 1.0,
-            }
-        ],
+        [make_granular_row(abs_error=1.0, sq_error=1.0)],
     )
 
     with pytest.raises(ValueError, match="Granular join coverage below threshold"):
@@ -911,45 +792,13 @@ def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> N
     baseline_csv = tmp_path / "baseline.csv"
     candidate_csv = tmp_path / "candidate.csv"
 
-    _write_granular_fixture(
+    write_granular_fixture(
         baseline_csv,
-        [
-            {
-                "split": "test",
-                "target": "cases",
-                "node_id": 1,
-                "region_id": "08001",
-                "region_label": "region-a",
-                "window_start": 0,
-                "window_start_date": "2024-01-01",
-                "horizon": 1,
-                "target_index": 3,
-                "target_date": "2024-01-04",
-                "observed": 10.0,
-                "abs_error": 2.0,
-                "sq_error": 4.0,
-            }
-        ],
+        [make_granular_row()],
     )
-    _write_granular_fixture(
+    write_granular_fixture(
         candidate_csv,
-        [
-            {
-                "split": "test",
-                "target": "deaths",
-                "node_id": 1,
-                "region_id": "08001",
-                "region_label": "region-a",
-                "window_start": 0,
-                "window_start_date": "2024-01-01",
-                "horizon": 1,
-                "target_index": 3,
-                "target_date": "2024-01-04",
-                "observed": 1.0,
-                "abs_error": 1.0,
-                "sq_error": 1.0,
-            }
-        ],
+        [make_granular_row(target="deaths", observed=1.0, abs_error=1.0, sq_error=1.0)],
     )
 
     with pytest.raises(ValueError, match="requires at least one common target"):

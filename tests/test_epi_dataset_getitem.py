@@ -1,53 +1,21 @@
 import numpy as np
-import pandas as pd
 import pytest
 import torch
-import xarray as xr
-
 
 from data.epi_dataset import EpiDataset
-from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from data.region_embedding_store import RegionEmbeddingStore
-from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
+from tests.dataset_test_helpers import (
+    make_epi_config,
+    make_tiny_epi_dataset,
+    write_zarr_dataset,
+)
 
 
-def _make_config(
-    dataset_path: str,
-    sample_ordering: str = "node",
-) -> EpiForecasterConfig:
-    # Minimal config
-    model = ModelConfig(
-        type={"cases": True, "regions": False, "biomarkers": True, "mobility": False},
-        # Note: cases_dim and biomarkers_dim now have defaults (2 and 4)
-        # that match the dataset output dimensions
-        mobility_embedding_dim=1,
-        region_embedding_dim=1,
-        input_window_length=3,
-        forecast_horizon=2,
-        max_neighbors=1,
-        gnn_depth=1,
-        population_dim=1,
+def _make_config(dataset_path, sample_ordering="node"):
+    return make_epi_config(
+        dataset_path,
+        data_options={"sample_ordering": sample_ordering},
     )
-    data_cfg = DataConfig(
-        dataset_path=str(dataset_path),
-        mobility_threshold=0.0,
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
-            "horizon": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
-        },
-        sample_ordering=sample_ordering,
-    )
-    return EpiForecasterConfig(model=model, data=data_cfg)
 
 
 def _write_tiny_dataset(
@@ -55,104 +23,31 @@ def _write_tiny_dataset(
     periods: int = 10,
     mobility_time_mask: np.ndarray | None = None,
 ) -> None:
-    dates = pd.date_range("2020-01-01", periods=periods, freq="D")
-    regions = np.array([0, 1], dtype=np.int64)
-    # Use padded run_id to match production data format
-    run_id = "real                                            "
-
-    # Use 3D cases to test squeeze - add run_id dimension
-    # Both nodes need non-zero cases to be valid (all-zero sequences are filtered)
-    cases = np.zeros((1, periods, 2, 1), dtype=np.float32)
-    cases[0, :, 0, 0] = 100.0  # Node 0
-    cases[0, :, 1, 0] = 50.0  # Node 1
-
-    # Required mask and age channels for cases (now required by ClinicalSeriesPreprocessor)
-    cases_mask = np.ones((1, periods, 2), dtype=np.float32)
-    cases_age = np.ones(
-        (1, periods, 2), dtype=np.float32
-    )  # Age = 1 (fresh observations)
-
-    # Hospitalizations data (required by ClinicalSeriesPreprocessor)
-    hospitalizations = np.zeros((1, periods, 2), dtype=np.float32)
-    hospitalizations[0, :, 0] = 10.0  # Node 0
-    hospitalizations[0, :, 1] = 5.0  # Node 1
-    hosp_mask = np.ones((1, periods, 2), dtype=np.float32)
-    hosp_age = np.ones((1, periods, 2), dtype=np.float32)
-
-    # Deaths data (required by ClinicalSeriesPreprocessor)
-    deaths = np.zeros((1, periods, 2), dtype=np.float32)
-    deaths[0, :, 0] = 1.0  # Node 0
-    deaths[0, :, 1] = 0.5  # Node 1
-    deaths_mask = np.ones((1, periods, 2), dtype=np.float32)
-    deaths_age = np.ones((1, periods, 2), dtype=np.float32)
-
-    # Non-zero biomarkers for at least one node (zeros excluded from scaler fitting)
-    biomarkers = np.zeros((1, periods, 2), dtype=np.float32)
-    biomarkers[0, :, 0] = 1.0  # Node 0 has non-zero biomarkers
-
-    # Required mask, censor, and age channels for biomarkers
-    biomarker_mask = np.ones((1, periods, 2), dtype=np.float32)
-    biomarker_censor = np.zeros((1, periods, 2), dtype=np.float32)
-    biomarker_age = np.zeros((1, periods, 2), dtype=np.float32)
-
-    # Mobility: full connectivity - add run_id dimension
-    mobility = np.ones((1, periods, 2, 2), dtype=np.float32)
     if mobility_time_mask is None:
         mobility_time_mask = np.ones((1, periods), dtype=bool)
-
-    population = np.array([1000.0, 1000.0], dtype=np.float32)
-
-    ds = xr.Dataset(
-        data_vars={
-            "cases": (("run_id", TEMPORAL_COORD, REGION_COORD, "feature"), cases),
-            "cases_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_mask),
-            "cases_age": (("run_id", TEMPORAL_COORD, REGION_COORD), cases_age),
-            "hospitalizations": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                hospitalizations,
-            ),
-            "hospitalizations_mask": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                hosp_mask,
-            ),
-            "hospitalizations_age": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                hosp_age,
-            ),
-            "deaths": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths),
-            "deaths_mask": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths_mask),
-            "deaths_age": (("run_id", TEMPORAL_COORD, REGION_COORD), deaths_age),
-            "edar_biomarker_N1": (("run_id", TEMPORAL_COORD, REGION_COORD), biomarkers),
-            "edar_biomarker_N1_mask": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                biomarker_mask,
-            ),
-            "edar_biomarker_N1_censor": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                biomarker_censor,
-            ),
-            "edar_biomarker_N1_age": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD),
-                biomarker_age,
-            ),
-            "mobility": (
-                ("run_id", TEMPORAL_COORD, REGION_COORD, "region_id_to"),
-                mobility,
-            ),
-            "mobility_time_mask": (
-                ("run_id", TEMPORAL_COORD),
-                mobility_time_mask,
-            ),
-            "population": ((REGION_COORD,), population),
+    ds = make_tiny_epi_dataset(
+        periods=periods,
+        cases=np.broadcast_to(
+            np.array([100.0, 50.0], dtype=np.float32).reshape(1, 1, 2, 1),
+            (1, periods, 2, 1),
+        ).copy(),
+        cases_age=np.ones((1, periods, 2), dtype=np.float32),
+        hospitalizations=np.broadcast_to(
+            np.array([10.0, 5.0], dtype=np.float32), (1, periods, 2)
+        ).copy(),
+        hospitalizations_age=np.ones((1, periods, 2), dtype=np.float32),
+        deaths=np.broadcast_to(
+            np.array([1.0, 0.5], dtype=np.float32), (1, periods, 2)
+        ).copy(),
+        deaths_age=np.ones((1, periods, 2), dtype=np.float32),
+        biomarker_values={
+            "N1": np.broadcast_to(
+                np.array([1.0, 0.0], dtype=np.float32), (1, periods, 2)
+            ).copy()
         },
-        coords={
-            "run_id": [run_id],
-            TEMPORAL_COORD: dates,
-            REGION_COORD: regions,
-            "region_id_to": regions,
-        },
+        mobility_time_mask=mobility_time_mask,
     )
-    ds.to_zarr(zarr_path, mode="w", zarr_format=2)
+    write_zarr_dataset(ds, zarr_path)
 
 
 @pytest.mark.epiforecaster

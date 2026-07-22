@@ -18,49 +18,14 @@ def _make_dense_adj(
 class TestMobilityGNN:
     """Tests for MobilityDenseEncoder."""
 
-    def test_gnn_stack_forward(self, accelerator_device):
-        """Test full GNN stack on accelerator."""
+    @pytest.mark.parametrize("depth", [1, 2, 3])
+    def test_gnn_depths(self, accelerator_device, depth):
+        """Test supported GNN depths on accelerator."""
         gnn = MobilityDenseEncoder(
             in_dim=8,
             hidden_dim=16,
             out_dim=8,
-            depth=2,
-            module_type="gcn",
-        ).to(accelerator_device)
-
-        num_nodes = 10
-        x = torch.randn(1, num_nodes, 8, device=accelerator_device)
-        adj = _make_dense_adj(num_nodes, 20, accelerator_device)
-
-        out = gnn(x, adj)
-        assert out.shape == (1, num_nodes, 8)
-        assert out.device.type == accelerator_device.type
-
-    def test_gnn_single_layer(self, accelerator_device):
-        """Test single-layer GNN on accelerator."""
-        gnn = MobilityDenseEncoder(
-            in_dim=8,
-            hidden_dim=16,
-            out_dim=8,
-            depth=1,
-            module_type="gcn",
-        ).to(accelerator_device)
-
-        num_nodes = 10
-        x = torch.randn(1, num_nodes, 8, device=accelerator_device)
-        adj = _make_dense_adj(num_nodes, 20, accelerator_device)
-
-        out = gnn(x, adj)
-        assert out.shape == (1, num_nodes, 8)
-        assert out.device.type == accelerator_device.type
-
-    def test_gnn_depth_3(self, accelerator_device):
-        """Test 3-layer GNN on accelerator."""
-        gnn = MobilityDenseEncoder(
-            in_dim=8,
-            hidden_dim=16,
-            out_dim=8,
-            depth=3,
+            depth=depth,
             module_type="gcn",
         ).to(accelerator_device)
 
