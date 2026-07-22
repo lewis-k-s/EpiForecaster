@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import TEMPORAL_COORD
+from evaluation.metrics import interval_level_name, standard_interval_half_width
 from utils.device import prepare_batch_for_device
 from utils.plotting import Palette
 
@@ -133,6 +134,51 @@ def _align_prediction_to_target(
     return aligned
 
 
+def _aligned_distribution_intervals(
+    *,
+    model_outputs: dict[str, Any],
+    target_name: str,
+    batch_index: int,
+    target_length: int,
+    distribution_family: str,
+    distribution_df: float,
+    interval_levels: list[float] | tuple[float, ...],
+) -> dict[str, np.ndarray]:
+    loc_key = f"dist_{target_name}_loc"
+    scale_key = f"dist_{target_name}_scale"
+    if loc_key not in model_outputs or scale_key not in model_outputs:
+        return {}
+    loc_series = _align_prediction_to_target(
+        model_outputs[loc_key][batch_index],
+        target_length=target_length,
+    ).astype(np.float32)
+    scale_series = _align_prediction_to_target(
+        model_outputs[scale_key][batch_index],
+        target_length=target_length,
+    ).astype(np.float32)
+    intervals: dict[str, np.ndarray] = {}
+    for level in interval_levels:
+        level_name = interval_level_name(float(level))
+        half_width = (
+            standard_interval_half_width(
+                level=float(level),
+                distribution_family=distribution_family,
+                distribution_df=distribution_df,
+            )
+            * scale_series
+        )
+        intervals[f"interval_low_{level_name}"] = loc_series - half_width
+        intervals[f"interval_high_{level_name}"] = loc_series + half_width
+    return intervals
+
+
+def _interval_level_sort_key(level_name: str) -> float:
+    try:
+        return float(level_name.replace("p", "."))
+    except ValueError:
+        return 0.0
+
+
 def _dataset_series_window(
     series_tensor: torch.Tensor,
     *,
@@ -188,6 +234,19 @@ def _extract_series_payload(
         np.asarray(sample["prediction"]).reshape(-1),
         float(sample["window_mae"]) if sample.get("window_mae") is not None else None,
     )
+
+
+def _extract_payload_dict(
+    sample: dict[str, Any],
+    *,
+    target: str | None,
+    payload_collection: str,
+) -> dict[str, Any] | None:
+    payloads = sample.get(payload_collection)
+    if target is not None and isinstance(payloads, dict) and target in payloads:
+        payload = payloads[target]
+        return payload if isinstance(payload, dict) else None
+    return sample
 
 
 def _compute_window_mae(
@@ -287,6 +346,7 @@ def collect_forecast_samples_for_target_nodes(
     if dataset.num_windows() == 0:
         return []
     resolved_targets = _resolve_target_names(target_names)
+    distribution_config = dataset.config.training.loss.joint
 
     # Compute valid windows specifically for plotting using the requested mode
     dataset_name_map = {
@@ -451,6 +511,16 @@ def collect_forecast_samples_for_target_nodes(
                     node_idx=node_idx,
                 ).astype(np.float32)
 
+                interval_payload = _aligned_distribution_intervals(
+                    model_outputs=model_outputs,
+                    target_name=target_name,
+                    batch_index=i,
+                    target_length=target_series.shape[0],
+                    distribution_family=distribution_config.distribution_family,
+                    distribution_df=distribution_config.distribution_df,
+                    interval_levels=distribution_config.interval_levels,
+                )
+
                 target_payloads[target_name] = {
                     "actual_context": actual_context_full,
                     "prediction": np.asarray(pred_series, dtype=np.float32),
@@ -462,6 +532,7 @@ def collect_forecast_samples_for_target_nodes(
                         target_series,
                         target_mask,
                     ),
+                    **interval_payload,
                 }
 
             latent_outputs = _resolve_latent_series(model_outputs)
@@ -590,6 +661,7 @@ def collect_forecast_samples_for_window_specs(
         return []
 
     resolved_targets = _resolve_target_names(target_names)
+    distribution_config = dataset.config.training.loss.joint
     indices: list[int] = []
     start_indices: list[int] = []
     start_times: list[str] = []
@@ -699,6 +771,16 @@ def collect_forecast_samples_for_window_specs(
                     dataset_tensor,
                     node_idx=node_idx,
                 ).astype(np.float32)
+                interval_payload = _aligned_distribution_intervals(
+                    model_outputs=model_outputs,
+                    target_name=target_name,
+                    batch_index=i,
+                    target_length=target_series.shape[0],
+                    distribution_family=distribution_config.distribution_family,
+                    distribution_df=distribution_config.distribution_df,
+                    interval_levels=distribution_config.interval_levels,
+                )
+
                 target_payloads[target_name] = {
                     "actual_context": actual_context_full,
                     "prediction": np.asarray(pred_series, dtype=np.float32),
@@ -710,6 +792,7 @@ def collect_forecast_samples_for_window_specs(
                         target_series,
                         target_mask,
                     ),
+                    **interval_payload,
                 }
 
             latent_outputs = _resolve_latent_series(model_outputs)
@@ -850,6 +933,56 @@ def make_forecast_figure(
                 forecast_series_full[history_end_mask] = actual_context[
                     history_end_mask
                 ]
+
+            payload = _extract_payload_dict(
+                sample,
+                target=target,
+                payload_collection=payload_collection,
+            )
+            if payload is not None:
+                horizon_indices = np.where(horizon_mask)[0]
+                interval_level_names = sorted(
+                    (
+                        key.removeprefix("interval_low_")
+                        for key in payload
+                        if key.startswith("interval_low_")
+                        and f"interval_high_{key.removeprefix('interval_low_')}"
+                        in payload
+                    ),
+                    key=_interval_level_sort_key,
+                    reverse=True,
+                )
+                level_count = len(interval_level_names)
+                for level_index, level_name in enumerate(interval_level_names):
+                    alpha = 0.10 + 0.12 * level_index / max(1, level_count - 1)
+                    low_key = f"interval_low_{level_name}"
+                    high_key = f"interval_high_{level_name}"
+                    low_values = np.asarray(payload[low_key], dtype=np.float32).reshape(
+                        -1
+                    )
+                    high_values = np.asarray(
+                        payload[high_key], dtype=np.float32
+                    ).reshape(-1)
+                    interval_points = min(
+                        int(horizon_indices.shape[0]),
+                        int(low_values.shape[0]),
+                        int(high_values.shape[0]),
+                    )
+                    if interval_points <= 0:
+                        continue
+                    low_full = np.full(len(t_rel), np.nan, dtype=np.float32)
+                    high_full = np.full(len(t_rel), np.nan, dtype=np.float32)
+                    selected_indices = horizon_indices[:interval_points]
+                    low_full[selected_indices] = low_values[:interval_points]
+                    high_full[selected_indices] = high_values[:interval_points]
+                    ax.fill_between(
+                        t_rel,
+                        low_full,
+                        high_full,
+                        color=Palette.FORECAST["forecast"],
+                        alpha=alpha,
+                        linewidth=0,
+                    )
 
             df = pd.DataFrame(
                 {
@@ -1014,6 +1147,13 @@ def make_joint_forecast_figure(
                     row_sample["target"] = payload["target"]
                     row_sample["history"] = payload["history"]
                     row_sample["window_mae"] = payload.get("window_mae")
+                    row_sample.update(
+                        {
+                            key: value
+                            for key, value in payload.items()
+                            if key.startswith(("interval_low_", "interval_high_"))
+                        }
+                    )
                 materialized.append(row_sample)
             if materialized:
                 expanded_groups[f"{group_name} | {target_label}"] = materialized
