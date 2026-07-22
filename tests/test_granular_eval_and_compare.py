@@ -176,8 +176,20 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         "target_index",
         "target_date",
         "observed",
+        "prediction",
         "abs_error",
         "sq_error",
+        "nll",
+        "crps",
+        "interval_low_50",
+        "interval_high_50",
+        "covered_50",
+        "interval_low_80",
+        "interval_high_80",
+        "covered_80",
+        "interval_low_95",
+        "interval_high_95",
+        "covered_95",
     ]
     assert len(df) == (
         granular_metrics["observed_count_hosp"]
@@ -204,7 +216,11 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert hosp_row["target_index"] == 3
     assert hosp_row["target_date"] == "2024-01-04T00:00:00"
     assert hosp_row["observed"] == pytest.approx(1.0)
+    assert hosp_row["prediction"] == pytest.approx(1.0)
     assert hosp_row["abs_error"] == pytest.approx(0.0)
+    assert math.isfinite(hosp_row["nll"])
+    assert math.isfinite(hosp_row["crps"])
+    assert hosp_row["covered_80"] == pytest.approx(1.0)
 
     fallback_row = df[
         (df["target"] == "hospitalizations")
@@ -215,7 +231,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "1"
+    assert meta["schema_version"] == "2"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -297,8 +313,20 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
         "target_index",
         "target_date",
         "observed",
+        "prediction",
         "abs_error",
         "sq_error",
+        "nll",
+        "crps",
+        "interval_low_50",
+        "interval_high_50",
+        "covered_50",
+        "interval_low_80",
+        "interval_high_80",
+        "covered_80",
+        "interval_low_95",
+        "interval_high_95",
+        "covered_95",
     ]
     meta = pd.read_json(granular_csv.with_suffix(".csv.meta.json"), typ="series")
     assert meta["granular_eval_format"] == "csv"
