@@ -5,11 +5,13 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
+from scipy.special import ndtr
 
 from data.epi_dataset import EpiDataset
 from evaluation.baseline_models import (
@@ -18,6 +20,7 @@ from evaluation.baseline_models import (
     predict_with_last_observed_fallback,
     predict_with_sarima_fallback,
     predict_with_sarimax_fallback,
+    predict_with_sarimax_normal_fallback,
     predict_with_var_fallback,
     predict_with_varmax_fallback,
 )
@@ -83,6 +86,7 @@ _SUPPORTED_BASELINE_MODELS = [
     "last_observed",
     "sarima",
     "sarimax",
+    "sarimax_normal",
     "var",
     "varmax",
 ]
@@ -95,17 +99,31 @@ _DEFAULT_ALL_BASELINE_MODELS = [
     "last_observed",
     "sarima",
     "sarimax",
+    "sarimax_normal",
     "varmax",
 ]
-_SAME_SLICE_BASELINE_SCHEMA_VERSION = "1"
+_SAME_SLICE_BASELINE_SCHEMA_VERSION = "2"
 _SAME_SLICE_COMPARISON_SCOPE = "same_eval_slice"
 _MAX_SAFE_ABS_ERROR = float(np.sqrt(np.finfo(np.float64).max) / 4.0)
+_INV_SQRT_TWO_PI = 1.0 / np.sqrt(2.0 * np.pi)
+_INV_SQRT_PI = 1.0 / np.sqrt(np.pi)
+_NORMAL_INTERVAL = NormalDist()
+_PROB_INTERVAL_LEVELS = (0.5, 0.8, 0.95)
+_PROB_INTERVAL_LEVEL_NAMES = {
+    level: str(int(round(level * 100))) for level in _PROB_INTERVAL_LEVELS
+}
 _BASELINE_GRANULAR_FIELDNAMES = [
     "model",
     "selected_model",
     "fit_status",
     "fallback_reason",
     *GRANULAR_FIELDNAMES,
+    "prediction_scale",
+    *[
+        field
+        for level_name in _PROB_INTERVAL_LEVEL_NAMES.values()
+        for field in (f"coverage_{level_name}", f"interval_width_{level_name}")
+    ],
 ]
 _BASELINE_FAILURE_FIELDNAMES = [
     "model",
@@ -595,6 +613,53 @@ def _predict_sarimax_baseline(
     return results
 
 
+def _predict_sarimax_normal_baseline(
+    *,
+    batch_data: Any,
+    horizon: int,
+    global_medians: dict[str, float],
+    temporal_covariates: np.ndarray,
+) -> dict[str, list[BaselinePredictionResult]]:
+    """Per-target probabilistic SARIMAX with temporal covariates."""
+    history_values_by_target: dict[str, np.ndarray] = {}
+    history_masks_by_target: dict[str, np.ndarray] = {}
+    for target_name in _SAME_SLICE_TARGET_ORDER:
+        spec = _SAME_SLICE_TARGET_SPECS[target_name]
+        history_values, history_mask = _extract_same_slice_history(
+            batch_data,
+            spec=spec,
+        )
+        history_values_by_target[target_name] = history_values
+        history_masks_by_target[target_name] = history_mask
+
+    history_temporal_covariates = _torch_to_numpy_2d(
+        getattr(batch_data, "temporal_covariates")
+    )
+    future_temporal_covariates = _future_temporal_covariates_from_batch(
+        batch_data=batch_data,
+        temporal_covariates=temporal_covariates,
+        horizon=horizon,
+    )
+
+    batch_size = history_values_by_target[_SAME_SLICE_TARGET_ORDER[0]].shape[0]
+    results = {target_name: [] for target_name in _SAME_SLICE_TARGET_ORDER}
+
+    for batch_index in range(batch_size):
+        exog_train = history_temporal_covariates[batch_index]
+        exog_future = future_temporal_covariates[batch_index]
+        for target_name in _SAME_SLICE_TARGET_ORDER:
+            pred = predict_with_sarimax_normal_fallback(
+                train_values=history_values_by_target[target_name][batch_index],
+                train_mask=history_masks_by_target[target_name][batch_index],
+                horizon=horizon,
+                global_train_median=global_medians[target_name],
+                exog_train=exog_train,
+                exog_future=exog_future,
+            )
+            results[target_name].append(pred)
+    return results
+
+
 def run_baseline_evaluation(
     *,
     config: EpiForecasterConfig,
@@ -687,6 +752,13 @@ def _collect_per_target_results(
             seasonal_period=seasonal_period,
             temporal_covariates=temporal_covariates,
         )
+    if model_name == "sarimax_normal":
+        return _predict_sarimax_normal_baseline(
+            batch_data=batch_data,
+            horizon=horizon,
+            global_medians=global_medians,
+            temporal_covariates=temporal_covariates,
+        )
     if model_name in _UNIVARIATE_BASELINE_MODELS:
         return _predict_univariate_batch_baseline(
             baseline_model=model_name,
@@ -727,6 +799,20 @@ def _emit_baseline_rows(
             continue
         target_results = per_target_results[target_name]
         predictions = np.stack([pred.predictions for pred in target_results], axis=0)
+        prediction_scales = (
+            np.stack(
+                [
+                    np.asarray(pred.prediction_scale, dtype=np.float64)
+                    for pred in target_results
+                ],
+                axis=0,
+            )
+            if all(
+                getattr(pred, "prediction_scale", None) is not None
+                for pred in target_results
+            )
+            else None
+        )
         selected_models = [pred.model_name for pred in target_results]
         fit_statuses = [pred.fit_status for pred in target_results]
         fallback_reasons = [pred.fallback_reason for pred in target_results]
@@ -747,6 +833,7 @@ def _emit_baseline_rows(
                 batch_data=batch_data,
                 spec=spec,
                 predictions=predictions,
+                prediction_scales=prediction_scales,
                 targets=target_tensor,
                 weights=weights,
                 temporal_coords=temporal_coords,
@@ -775,21 +862,29 @@ def compare_model_metrics_against_baselines(
             "mae": eval_metrics.get("mae_hosp_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_hosp_log1p_per_100k"),
             "r2": eval_metrics.get("r2_hosp_log1p_per_100k"),
+            "crps": eval_metrics.get("crps_hosp_log1p_per_100k"),
+            "nll": eval_metrics.get("nll_hosp_log1p_per_100k"),
         },
         "wastewater": {
             "mae": eval_metrics.get("mae_ww_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_ww_log1p_per_100k"),
             "r2": eval_metrics.get("r2_ww_log1p_per_100k"),
+            "crps": eval_metrics.get("crps_ww_log1p_per_100k"),
+            "nll": eval_metrics.get("nll_ww_log1p_per_100k"),
         },
         "cases": {
             "mae": eval_metrics.get("mae_cases_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_cases_log1p_per_100k"),
             "r2": eval_metrics.get("r2_cases_log1p_per_100k"),
+            "crps": eval_metrics.get("crps_cases_log1p_per_100k"),
+            "nll": eval_metrics.get("nll_cases_log1p_per_100k"),
         },
         "deaths": {
             "mae": eval_metrics.get("mae_deaths_log1p_per_100k"),
             "rmse": eval_metrics.get("rmse_deaths_log1p_per_100k"),
             "r2": eval_metrics.get("r2_deaths_log1p_per_100k"),
+            "crps": eval_metrics.get("crps_deaths_log1p_per_100k"),
+            "nll": eval_metrics.get("nll_deaths_log1p_per_100k"),
         },
     }
     lo_baseline_by_target_metric: dict[tuple[str, str], float] = {}
@@ -810,10 +905,14 @@ def compare_model_metrics_against_baselines(
         target = str(baseline_row.get("target"))
         model_name = str(baseline_row["model"])
         if target in model_target_metrics:
-            for metric_name in ["mae", "rmse", "r2"]:
+            for metric_name in ["mae", "rmse", "r2", "crps", "nll"]:
                 baseline_value = baseline_row.get(f"{metric_name}_mean")
                 model_value = model_target_metrics[target].get(metric_name)
                 if baseline_value is None or model_value is None:
+                    continue
+                if not np.isfinite(float(baseline_value)) or not np.isfinite(
+                    float(model_value)
+                ):
                     continue
                 rows.append(
                     {
@@ -877,6 +976,78 @@ def _safe_skill_ratio(*, numerator: float, denominator: float) -> float | None:
     return float(numerator / denominator)
 
 
+def _normal_nll(
+    *,
+    prediction: np.ndarray,
+    scale: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    scale = np.maximum(np.asarray(scale, dtype=np.float64), 1.0e-6)
+    z = (
+        np.asarray(target, dtype=np.float64) - np.asarray(prediction, dtype=np.float64)
+    ) / scale
+    return 0.5 * (np.log(2.0 * np.pi) + 2.0 * np.log(scale) + np.square(z))
+
+
+def _normal_crps(
+    *,
+    prediction: np.ndarray,
+    scale: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    scale = np.maximum(np.asarray(scale, dtype=np.float64), 1.0e-6)
+    z = (
+        np.asarray(target, dtype=np.float64) - np.asarray(prediction, dtype=np.float64)
+    ) / scale
+    pdf = np.exp(-0.5 * np.square(z)) * _INV_SQRT_TWO_PI
+    cdf = ndtr(z)
+    crps = scale * (z * (2.0 * cdf - 1.0) + 2.0 * pdf - _INV_SQRT_PI)
+    return np.maximum(crps, 0.0)
+
+
+def _probabilistic_row_metrics(
+    *,
+    prediction: float,
+    scale: float | None,
+    target: float,
+) -> dict[str, float]:
+    row = {
+        "prediction_scale": float("nan"),
+        "nll": float("nan"),
+        "crps": float("nan"),
+    }
+    for level_name in _PROB_INTERVAL_LEVEL_NAMES.values():
+        row[f"coverage_{level_name}"] = float("nan")
+        row[f"interval_width_{level_name}"] = float("nan")
+
+    if scale is None or not np.isfinite(scale) or scale <= 0:
+        return row
+
+    scale_value = float(max(scale, 1.0e-6))
+    prediction_arr = np.asarray([prediction], dtype=np.float64)
+    scale_arr = np.asarray([scale_value], dtype=np.float64)
+    target_arr = np.asarray([target], dtype=np.float64)
+    row["prediction_scale"] = scale_value
+    row["nll"] = float(
+        _normal_nll(prediction=prediction_arr, scale=scale_arr, target=target_arr)[0]
+    )
+    row["crps"] = float(
+        _normal_crps(prediction=prediction_arr, scale=scale_arr, target=target_arr)[0]
+    )
+    for level, level_name in _PROB_INTERVAL_LEVEL_NAMES.items():
+        z = _NORMAL_INTERVAL.inv_cdf((1.0 + float(level)) / 2.0)
+        half_width = z * scale_value
+        low = prediction - half_width
+        high = prediction + half_width
+        covered = float(low <= target <= high)
+        row[f"interval_low_{level_name}"] = float(low)
+        row[f"interval_high_{level_name}"] = float(high)
+        row[f"covered_{level_name}"] = covered
+        row[f"coverage_{level_name}"] = covered
+        row[f"interval_width_{level_name}"] = float(2.0 * half_width)
+    return row
+
+
 def _normalize_baseline_target_metrics_csv(
     baseline_results_csv: Path,
 ) -> pd.DataFrame:
@@ -896,13 +1067,15 @@ def _normalize_baseline_target_metrics_csv(
 
 def _compute_metrics_from_granular_rows(rows: pd.DataFrame) -> dict[str, float]:
     if rows.empty:
-        return {
+        empty_metrics = {
             "mae": float("nan"),
             "rmse": float("nan"),
             "r2": float("nan"),
             "observed_count": 0.0,
             "primary_success_rate": float("nan"),
         }
+        empty_metrics.update(_empty_probabilistic_metrics())
+        return empty_metrics
 
     observed = pd.to_numeric(rows["observed"], errors="coerce")
     abs_error = pd.to_numeric(rows["abs_error"], errors="coerce")
@@ -920,13 +1093,15 @@ def _compute_metrics_from_granular_rows(rows: pd.DataFrame) -> dict[str, float]:
     sq_error = sq_error[valid].astype(float)
     fit_status_valid = fit_status[valid] if fit_status is not None else None
     if observed.empty:
-        return {
+        empty_metrics = {
             "mae": float("nan"),
             "rmse": float("nan"),
             "r2": float("nan"),
             "observed_count": 0.0,
             "primary_success_rate": float("nan"),
         }
+        empty_metrics.update(_empty_probabilistic_metrics())
+        return empty_metrics
 
     weight_sum = float(len(observed))
     mae = float(abs_error.sum() / weight_sum)
@@ -944,13 +1119,42 @@ def _compute_metrics_from_granular_rows(rows: pd.DataFrame) -> dict[str, float]:
         if fit_status_valid is not None
         else float("nan")
     )
-    return {
+    metrics = {
         "mae": mae,
         "rmse": rmse,
         "r2": r2,
         "observed_count": weight_sum,
         "primary_success_rate": primary_success_rate,
     }
+    metrics.update(_compute_probabilistic_metrics_from_rows(rows[valid]))
+    return metrics
+
+
+def _empty_probabilistic_metrics() -> dict[str, float]:
+    metrics = {
+        "crps": float("nan"),
+        "nll": float("nan"),
+        "prediction_scale": float("nan"),
+    }
+    for level_name in _PROB_INTERVAL_LEVEL_NAMES.values():
+        metrics[f"coverage_{level_name}"] = float("nan")
+        metrics[f"interval_width_{level_name}"] = float("nan")
+    return metrics
+
+
+def _compute_probabilistic_metrics_from_rows(rows: pd.DataFrame) -> dict[str, float]:
+    metrics = _empty_probabilistic_metrics()
+    if rows.empty or "crps" not in rows.columns:
+        return metrics
+
+    for metric_name in list(metrics):
+        if metric_name not in rows.columns:
+            continue
+        values = pd.to_numeric(rows[metric_name], errors="coerce")
+        values = values[np.isfinite(values)]
+        if not values.empty:
+            metrics[metric_name] = float(values.mean())
+    return metrics
 
 
 def _extract_same_slice_history(
@@ -1003,6 +1207,7 @@ def _build_same_slice_granular_rows(
     batch_data: Any,
     spec: SameSliceTargetSpec,
     predictions: np.ndarray,
+    prediction_scales: np.ndarray | None,
     targets: torch.Tensor,
     weights: torch.Tensor,
     temporal_coords: list[Any] | None,
@@ -1071,6 +1276,11 @@ def _build_same_slice_granular_rows(
                 continue
             pred_value = float(pred[batch_index, horizon_index])
             target_value = float(target[batch_index, horizon_index])
+            scale_value = (
+                float(prediction_scales[batch_index, horizon_index])
+                if prediction_scales is not None
+                else None
+            )
             abs_error_value = float(abs_error[batch_index, horizon_index])
             sq_error_value = float(sq_error[batch_index, horizon_index])
             if not all(
@@ -1086,29 +1296,34 @@ def _build_same_slice_granular_rows(
             if abs_error_value > _MAX_SAFE_ABS_ERROR:
                 continue
             target_index = window_start + input_window_length + horizon_index
-            rows.append(
-                {
-                    "model": model_name,
-                    "selected_model": selected_model_value,
-                    "fit_status": fit_status_value,
-                    "fallback_reason": fallback_reason_value,
-                    "split": split,
-                    "target": spec.canonical_name,
-                    "node_id": node_id,
-                    "region_id": region_id,
-                    "region_label": region_label,
-                    "window_start": window_start,
-                    "window_start_date": window_start_date,
-                    "horizon": horizon_index + 1,
-                    "target_index": target_index,
-                    "target_date": _format_temporal_coord(
-                        temporal_coords, target_index
-                    ),
-                    "observed": target_value,
-                    "abs_error": abs_error_value,
-                    "sq_error": sq_error_value,
-                }
+            row = {
+                "model": model_name,
+                "selected_model": selected_model_value,
+                "fit_status": fit_status_value,
+                "fallback_reason": fallback_reason_value,
+                "split": split,
+                "target": spec.canonical_name,
+                "node_id": node_id,
+                "region_id": region_id,
+                "region_label": region_label,
+                "window_start": window_start,
+                "window_start_date": window_start_date,
+                "horizon": horizon_index + 1,
+                "target_index": target_index,
+                "target_date": _format_temporal_coord(temporal_coords, target_index),
+                "observed": target_value,
+                "prediction": pred_value,
+                "abs_error": abs_error_value,
+                "sq_error": sq_error_value,
+            }
+            row.update(
+                _probabilistic_row_metrics(
+                    prediction=pred_value,
+                    scale=scale_value,
+                    target=target_value,
+                )
             )
+            rows.append(row)
     return rows
 
 
@@ -1167,6 +1382,17 @@ def _aggregate_same_slice_granular_rows(granular_df: pd.DataFrame) -> pd.DataFra
                 "mae_mean",
                 "rmse_mean",
                 "r2_mean",
+                "crps_mean",
+                "nll_mean",
+                "prediction_scale_mean",
+                *[
+                    column
+                    for level_name in _PROB_INTERVAL_LEVEL_NAMES.values()
+                    for column in (
+                        f"coverage_{level_name}_mean",
+                        f"interval_width_{level_name}_mean",
+                    )
+                ],
                 "observed_count_mean",
                 "primary_success_rate_mean",
             ]
@@ -1182,6 +1408,17 @@ def _aggregate_same_slice_granular_rows(granular_df: pd.DataFrame) -> pd.DataFra
                 "mae_mean": metrics["mae"],
                 "rmse_mean": metrics["rmse"],
                 "r2_mean": metrics["r2"],
+                "crps_mean": metrics["crps"],
+                "nll_mean": metrics["nll"],
+                "prediction_scale_mean": metrics["prediction_scale"],
+                **{
+                    f"{metric_name}_mean": metrics[metric_name]
+                    for level_name in _PROB_INTERVAL_LEVEL_NAMES.values()
+                    for metric_name in (
+                        f"coverage_{level_name}",
+                        f"interval_width_{level_name}",
+                    )
+                },
                 "observed_count_mean": metrics["observed_count"],
                 "primary_success_rate_mean": metrics["primary_success_rate"],
             }
