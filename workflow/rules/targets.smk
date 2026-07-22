@@ -38,3 +38,9 @@ elif WORKFLOW_KIND == "ablation":
     rule ablation:
         input:
             str(ABLATION_MANIFEST)
+
+
+elif WORKFLOW_KIND == "crossval":
+    rule crossval:
+        input:
+            str(CROSSVAL_MANIFEST)

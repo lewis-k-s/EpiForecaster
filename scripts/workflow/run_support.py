@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import csv
 import fcntl
 import hashlib
 import importlib.metadata
@@ -16,6 +18,7 @@ import sys
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+from statistics import fmean, stdev
 from typing import Any
 
 import yaml
@@ -69,6 +72,7 @@ def write_dependency_contract(
         "evaluation": ("evaluation",),
         "hpo": ("optuna",),
         "ablation": ("ablation",),
+        "crossval": ("crossval", "evaluation"),
         "selection": ("optuna",),
         "promotion": ("promotion", "dvc"),
     }
@@ -171,7 +175,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     for relative in (
         ".state",
         ".state/dependencies",
-        "optuna/workers",
+        ".state/workers",
         "logs",
         "outputs",
         "outputs/training",
@@ -180,7 +184,11 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         (run_root / relative).mkdir(parents=True, exist_ok=True)
 
     dvc_identities: dict[str, dict[str, Any]] = {}
-    for target in config["dvc"]["targets"]:
+    materialized_targets = [str(target) for target in config["dvc"]["targets"]]
+    provenance_targets = [
+        str(target) for target in config["dvc"].get("provenance_targets", [])
+    ]
+    for target in [*materialized_targets, *provenance_targets]:
         pointer = source_root / str(target)
         output = dvc_output(pointer)
         output_path = pointer.parent / str(output["path"])
@@ -189,9 +197,38 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             "size": output.get("size"),
             "nfiles": output.get("nfiles"),
             "output": str(output_path.relative_to(source_root)),
+            "role": (
+                "materialized" if str(target) in materialized_targets else "provenance"
+            ),
         }
 
     config_sha256 = sha256_file(config_path)
+    dispatch_path = run_root / ".state/dispatch.tsv"
+    dispatch_digest_path = run_root / ".state/dispatch.tsv.sha256"
+    publication_path = run_root / ".state/published.done"
+    for required in (dispatch_path, dispatch_digest_path, publication_path):
+        if not required.is_file() or required.is_symlink():
+            raise FileNotFoundError(f"Published run contract is missing: {required}")
+    dispatch_sha256 = sha256_file(dispatch_path)
+    recorded_dispatch_sha256 = dispatch_digest_path.read_text().split()[0]
+    if dispatch_sha256 != recorded_dispatch_sha256:
+        raise ValueError("Immutable dispatch request failed SHA-256 verification")
+
+    publication = dict(
+        line.split("=", 1)
+        for line in publication_path.read_text().splitlines()
+        if "=" in line
+    )
+    expected_publication = {
+        "schema_version": "1",
+        "run_id": str(config["run"]["id"]),
+        "source_snapshot_sha256": str(config["source"]["source_snapshot_sha256"]),
+        "config_sha256": config_sha256,
+        "tooling_key": str(config["workflow"]["tooling_key"]),
+    }
+    if publication != expected_publication:
+        raise ValueError("Publication receipt does not match the immutable run config")
+
     container_digest = _container_digest(config["container"])
     expected_snakemake_version = str(config["workflow"]["snakemake_version"])
     installed_snakemake_version = _package_version("snakemake")
@@ -207,6 +244,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     workflow_kind = str(config["workflow"]["kind"])
     workflow_target = str(config["workflow"].get("target", workflow_kind))
     study_config = config.get("optuna") or config.get("ablation")
+    crossval_config = config.get("crossval")
     identity = {
         "git_sha": config["source"]["git_sha"],
         "source_snapshot_sha256": config["source"]["source_snapshot_sha256"],
@@ -216,14 +254,22 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "container_digest": container_digest,
         "workflow_tooling_key": config["workflow"]["tooling_key"],
         "snakemake_config_sha256": config_sha256,
+        "dispatch_request_sha256": dispatch_sha256,
         "workflow_kind": workflow_kind,
         "workflow_target": workflow_target,
     }
     if isinstance(study_config, dict):
         identity["study_name"] = study_config["study_name"]
+    if isinstance(crossval_config, dict):
+        identity["crossval_campaign_id"] = crossval_config["campaign_id"]
     evaluation_input = None
     if workflow_kind == "evaluate":
         configured_checkpoint = Path(str(config["evaluation"]["checkpoint"]))
+        if configured_checkpoint.is_symlink():
+            raise ValueError(
+                "Evaluation input checkpoint must not be a symlink: "
+                f"{configured_checkpoint}"
+            )
         resolved_checkpoint = configured_checkpoint.resolve(strict=True)
         if not resolved_checkpoint.is_file():
             raise ValueError(
@@ -231,10 +277,32 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
                 f"{configured_checkpoint}"
             )
         checkpoint_sha256 = sha256_file(resolved_checkpoint)
+        pinned_checkpoint = run_root / "inputs/evaluation_checkpoint.pt"
+        pinned_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        if pinned_checkpoint.exists():
+            if pinned_checkpoint.is_symlink() or not pinned_checkpoint.is_file():
+                raise ValueError(
+                    "Pinned evaluation checkpoint must be a regular non-symlink "
+                    f"file: {pinned_checkpoint}"
+                )
+            if sha256_file(pinned_checkpoint) != checkpoint_sha256:
+                raise ValueError(
+                    "Pinned evaluation checkpoint conflicts with configured input: "
+                    f"{pinned_checkpoint}"
+                )
+        else:
+            temporary_checkpoint = pinned_checkpoint.with_suffix(".pt.partial")
+            shutil.copyfile(resolved_checkpoint, temporary_checkpoint)
+            if sha256_file(temporary_checkpoint) != checkpoint_sha256:
+                temporary_checkpoint.unlink(missing_ok=True)
+                raise ValueError("Evaluation checkpoint changed while being pinned")
+            temporary_checkpoint.chmod(0o444)
+            temporary_checkpoint.replace(pinned_checkpoint)
         identity["input_checkpoint_sha256"] = checkpoint_sha256
         evaluation_input = {
             "configured_checkpoint": str(configured_checkpoint),
             "resolved_checkpoint": str(resolved_checkpoint),
+            "pinned_checkpoint": str(pinned_checkpoint),
             "checkpoint_sha256": checkpoint_sha256,
         }
 
@@ -255,6 +323,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         },
         "workflow": {
             "config_sha256": config_sha256,
+            "dispatch_request_sha256": dispatch_sha256,
             "tooling_key": config["workflow"]["tooling_key"],
             "snakemake_bin": config["workflow"]["snakemake_bin"],
             "version": installed_snakemake_version,
@@ -267,7 +336,14 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         },
         "resources": config["resources"],
     }
-    for section in ("training", "evaluation", "optuna", "ablation", "promotion"):
+    for section in (
+        "training",
+        "evaluation",
+        "crossval",
+        "optuna",
+        "ablation",
+        "promotion",
+    ):
         if section in config:
             manifest[section] = config[section]
     if evaluation_input is not None:
@@ -374,6 +450,246 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         },
     )
     return marker
+
+
+def _crossval_fold_root(config: dict[str, Any], run_root: Path, fold: int) -> Path:
+    campaign_id = _safe_component(
+        config["crossval"]["campaign_id"], field="crossval.campaign_id"
+    )
+    return run_root / "outputs/crossval" / campaign_id / f"fold-{fold:03d}"
+
+
+def _crossval_fold_config(config: dict[str, Any], fold: int) -> dict[str, Any]:
+    options = config["crossval"]
+    folds = int(options["folds"])
+    if not 0 <= fold < folds:
+        raise ValueError(f"Cross-validation fold {fold} is outside [0, {folds})")
+    fold_config = copy.deepcopy(config)
+    fold_config["workflow"] = {"kind": "train", "target": "train_evaluate"}
+    fold_config["training"] = {
+        "base_config": str(options["base_config"]),
+        "experiment_name": "training",
+        "model_id": "model",
+        "max_batches": options.get("max_batches"),
+        "overrides": [
+            *[str(value) for value in options.get("overrides", [])],
+            "training.crossval_enabled=true",
+            "training.node_split_strategy=crossval",
+            f"training.crossval_num_folds={folds}",
+            f"training.crossval_fold_index={fold}",
+            f"training.crossval_holdout_role={options.get('holdout_role', 'test')}",
+            f"training.seed={int(options['seed'])}",
+        ],
+    }
+    fold_config["evaluation"] = copy.deepcopy(config["evaluation"])
+    return fold_config
+
+
+def train_crossval_fold(
+    config_path: Path,
+    source_root: Path,
+    run_root: Path,
+    fold: int,
+) -> Path:
+    """Train one deterministic cross-validation fold."""
+    config = load_yaml(config_path)
+    options = config["crossval"]
+    fold_config = _crossval_fold_config(config, fold)
+    fold_root = _crossval_fold_root(config, run_root, fold)
+    if fold_root.exists():
+        raise FileExistsError(f"Cross-validation fold already exists: {fold_root}")
+    fold_root.mkdir(parents=True)
+    fold_config_path = fold_root / "config.yaml"
+    write_yaml(fold_config_path, fold_config)
+
+    train_model(fold_config_path, source_root, fold_root)
+    checkpoint, model_root = training_artifact_paths(fold_config, fold_root)
+    training_manifest = model_root / "training_manifest.json"
+    fold_training_manifest = fold_root / "fold_training_manifest.json"
+    write_json(
+        fold_training_manifest,
+        {
+            "schema_version": 1,
+            "campaign_id": str(options["campaign_id"]),
+            "fold": fold,
+            "folds": int(options["folds"]),
+            "seed": int(options["seed"]),
+            "config": str(fold_config_path),
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "training_manifest": str(training_manifest),
+            "training_manifest_sha256": sha256_file(training_manifest),
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return fold_training_manifest
+
+
+def evaluate_crossval_fold(
+    config_path: Path,
+    run_root: Path,
+    fold: int,
+) -> Path:
+    """Evaluate the exact checkpoint emitted by one cross-validation fold."""
+    config = load_yaml(config_path)
+    options = config["crossval"]
+    _crossval_fold_config(config, fold)
+    fold_root = _crossval_fold_root(config, run_root, fold)
+    fold_config_path = fold_root / "config.yaml"
+    fold_config = load_yaml(fold_config_path)
+    checkpoint, _ = training_artifact_paths(fold_config, fold_root)
+    training_fold_manifest_path = fold_root / "fold_training_manifest.json"
+    training_fold_manifest = json.loads(training_fold_manifest_path.read_text())
+    if int(training_fold_manifest["fold"]) != fold:
+        raise ValueError(f"Cross-validation fold identity mismatch: {fold_root}")
+    if Path(str(training_fold_manifest["checkpoint"])) != checkpoint:
+        raise ValueError(f"Cross-validation checkpoint path mismatch: {fold_root}")
+    if sha256_file(checkpoint) != training_fold_manifest["checkpoint_sha256"]:
+        raise ValueError(f"Cross-validation checkpoint failed SHA-256: {checkpoint}")
+    training_manifest = Path(str(training_fold_manifest["training_manifest"])).resolve(
+        strict=True
+    )
+    if (
+        sha256_file(training_manifest)
+        != training_fold_manifest["training_manifest_sha256"]
+    ):
+        raise ValueError(
+            f"Cross-validation training manifest failed SHA-256: {training_manifest}"
+        )
+
+    evaluation_manifest = evaluate_configured_model(
+        fold_config_path,
+        fold_root,
+        checkpoint,
+    )
+    fold_manifest = fold_root / "fold_manifest.json"
+    write_json(
+        fold_manifest,
+        {
+            "schema_version": 1,
+            "campaign_id": str(options["campaign_id"]),
+            "fold": fold,
+            "folds": int(options["folds"]),
+            "seed": int(options["seed"]),
+            "config": str(fold_config_path),
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": sha256_file(checkpoint),
+            "training_fold_manifest": str(training_fold_manifest_path),
+            "training_fold_manifest_sha256": sha256_file(training_fold_manifest_path),
+            "evaluation_manifest": str(evaluation_manifest),
+            "evaluation_manifest_sha256": sha256_file(evaluation_manifest),
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return fold_manifest
+
+
+def _scalar_evaluation_metrics(summary: dict[str, Any]) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {"eval_loss": summary.get("eval_loss")}
+    for name, value in summary.get("metrics", {}).items():
+        if value is None or isinstance(value, (int, float)):
+            metrics[str(name)] = None if value is None else float(value)
+    return metrics
+
+
+def finalize_crossval(config_path: Path, run_root: Path) -> Path:
+    """Validate every fold and aggregate canonical evaluation summaries."""
+    config = load_yaml(config_path)
+    options = config["crossval"]
+    folds = int(options["folds"])
+    split = str(config["evaluation"]["split"])
+    output_dir = run_root / "outputs/crossval" / str(options["campaign_id"])
+    fold_rows: list[dict[str, Any]] = []
+    fold_records: list[dict[str, Any]] = []
+
+    for fold in range(folds):
+        fold_root = _crossval_fold_root(config, run_root, fold)
+        fold_manifest_path = fold_root / "fold_manifest.json"
+        fold_manifest = json.loads(fold_manifest_path.read_text())
+        if int(fold_manifest["fold"]) != fold:
+            raise ValueError(f"Cross-validation fold identity mismatch: {fold_root}")
+        for field in (
+            "checkpoint",
+            "training_fold_manifest",
+            "evaluation_manifest",
+        ):
+            artifact = Path(str(fold_manifest[field])).resolve(strict=True)
+            expected_hash = str(fold_manifest[f"{field}_sha256"])
+            if sha256_file(artifact) != expected_hash:
+                raise ValueError(f"Cross-validation {field} failed SHA-256: {artifact}")
+
+        summary_path = fold_root / "outputs/evaluation" / f"{split}_summary.json"
+        summary = json.loads(summary_path.read_text())
+        for metric, value in sorted(_scalar_evaluation_metrics(summary).items()):
+            fold_rows.append(
+                {
+                    "fold": fold,
+                    "seed": int(options["seed"]),
+                    "metric": metric,
+                    "value": value,
+                }
+            )
+        fold_records.append(
+            {
+                "fold": fold,
+                "fold_manifest": str(fold_manifest_path),
+                "fold_manifest_sha256": sha256_file(fold_manifest_path),
+                "evaluation_summary": str(summary_path),
+                "evaluation_summary_sha256": sha256_file(summary_path),
+            }
+        )
+
+    fold_metrics = output_dir / f"{split}_fold_metrics.csv"
+    with fold_metrics.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["fold", "seed", "metric", "value"])
+        writer.writeheader()
+        writer.writerows(fold_rows)
+
+    aggregate_rows: list[dict[str, Any]] = []
+    for metric in sorted({str(row["metric"]) for row in fold_rows}):
+        values = [
+            float(row["value"])
+            for row in fold_rows
+            if row["metric"] == metric and row["value"] is not None
+        ]
+        aggregate_rows.append(
+            {
+                "metric": metric,
+                "folds": len(values),
+                "mean": fmean(values) if values else None,
+                "std": stdev(values) if len(values) > 1 else 0.0 if values else None,
+            }
+        )
+    aggregate_metrics = output_dir / f"{split}_aggregate_metrics.csv"
+    with aggregate_metrics.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["metric", "folds", "mean", "std"])
+        writer.writeheader()
+        writer.writerows(aggregate_rows)
+
+    manifest = output_dir / "crossval_manifest.json"
+    write_json(
+        manifest,
+        {
+            "schema_version": 1,
+            "campaign_id": str(options["campaign_id"]),
+            "folds": fold_records,
+            "seed": int(options["seed"]),
+            "split": split,
+            "artifacts": [
+                {"path": str(fold_metrics), "sha256": sha256_file(fold_metrics)},
+                {
+                    "path": str(aggregate_metrics),
+                    "sha256": sha256_file(aggregate_metrics),
+                },
+            ],
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    write_json(
+        run_root / ".state/crossval.done",
+        {"manifest": str(manifest), "manifest_sha256": sha256_file(manifest)},
+    )
+    return manifest
 
 
 def _with_cache_lock(cache_path: Path):
@@ -664,6 +980,20 @@ def evaluate_configured_model(
         raise ValueError(
             f"Evaluation checkpoint must be a regular file: {checkpoint_path}"
         )
+    if str(config["workflow"]["kind"]) == "evaluate":
+        manifest = load_yaml(run_root / "manifest.yaml")
+        evaluation_input = manifest.get("evaluation_input")
+        if not isinstance(evaluation_input, dict):
+            raise ValueError("Run manifest is missing the pinned evaluation input")
+        expected_path = Path(str(evaluation_input["pinned_checkpoint"]))
+        if resolved_checkpoint != expected_path.resolve(strict=True):
+            raise ValueError(
+                "Evaluation-only workflow must consume its pinned checkpoint: "
+                f"expected {expected_path}, got {resolved_checkpoint}"
+            )
+        expected_sha256 = str(evaluation_input["checkpoint_sha256"])
+        if sha256_file(resolved_checkpoint) != expected_sha256:
+            raise ValueError("Pinned evaluation checkpoint failed SHA-256 validation")
     return evaluate_best(
         resolved_checkpoint,
         run_root / "outputs/evaluation",
@@ -908,6 +1238,94 @@ def cleanup_study_checkpoints(config_path: Path, run_root: Path) -> Path:
     return marker
 
 
+def _validated_regular_file(path: Path, root: Path, *, label: str) -> Path:
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink: {path}")
+    resolved = path.resolve(strict=True)
+    resolved.relative_to(root.resolve(strict=True))
+    if not resolved.is_file():
+        raise ValueError(f"{label} must be a regular file: {path}")
+    return resolved
+
+
+def _promotion_integrity(run_root: Path) -> dict[str, str]:
+    """Validate selected-model and evaluation evidence before publication."""
+    selection_path = _validated_regular_file(
+        run_root / "outputs/selection.json", run_root, label="Selection record"
+    )
+    selection = json.loads(selection_path.read_text())
+    selected_checkpoint = _validated_regular_file(
+        Path(str(selection["selected_checkpoint"])),
+        run_root,
+        label="Selected checkpoint",
+    )
+    expected_checkpoint = (run_root / "outputs/best_model.pt").resolve(strict=True)
+    if selected_checkpoint != expected_checkpoint:
+        raise ValueError(
+            "Selection record does not identify the canonical checkpoint: "
+            f"{selected_checkpoint}"
+        )
+    selected_sha256 = sha256_file(selected_checkpoint)
+    source_checkpoint = _validated_regular_file(
+        Path(str(selection["source_checkpoint"])),
+        run_root,
+        label="Source trial checkpoint",
+    )
+    source_sha256 = sha256_file(source_checkpoint)
+    recorded_hashes = {
+        str(selection["selected_checkpoint_sha256"]),
+        str(selection["source_checkpoint_sha256"]),
+    }
+    if recorded_hashes != {selected_sha256} or source_sha256 != selected_sha256:
+        raise ValueError("Selected checkpoint failed promotion SHA-256 validation")
+
+    evaluation_dir = (run_root / "outputs/evaluation").resolve(strict=True)
+    evaluation_manifest_path = _validated_regular_file(
+        evaluation_dir / "evaluation_manifest.json",
+        evaluation_dir,
+        label="Evaluation manifest",
+    )
+    evaluation_manifest = json.loads(evaluation_manifest_path.read_text())
+    if str(evaluation_manifest["checkpoint_sha256"]) != selected_sha256:
+        raise ValueError("Evaluation manifest does not match the selected checkpoint")
+    evaluated_checkpoint = Path(str(evaluation_manifest["checkpoint"]))
+    if evaluated_checkpoint.resolve(strict=True) != selected_checkpoint:
+        raise ValueError("Evaluation manifest names a different checkpoint")
+    artifacts = evaluation_manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError("Evaluation manifest contains no artifacts")
+
+    hashes = {"outputs/best_model.pt": selected_sha256}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise ValueError("Malformed evaluation artifact record")
+        relative = Path(str(artifact["path"]))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise ValueError(f"Unsafe evaluation artifact path: {relative}")
+        artifact_path = _validated_regular_file(
+            evaluation_dir / relative,
+            evaluation_dir,
+            label="Evaluation artifact",
+        )
+        observed = sha256_file(artifact_path)
+        if observed != str(artifact["sha256"]):
+            raise ValueError(
+                f"Evaluation artifact failed SHA-256 validation: {relative}"
+            )
+        hashes[f"outputs/evaluation/{relative.as_posix()}"] = observed
+    return hashes
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Promotion source tree contains a symlink: {path}")
+        if path.is_file():
+            hashes[path.relative_to(root).as_posix()] = sha256_file(path)
+    return hashes
+
+
 def promote_artifacts(config_path: Path, run_root: Path) -> Path:
     config = load_yaml(config_path)
     run_id = str(config["run"]["id"])
@@ -917,6 +1335,7 @@ def promote_artifacts(config_path: Path, run_root: Path) -> Path:
         raise FileExistsError(
             f"Promotion destination already exists and will not be overwritten: {destination}"
         )
+    integrity_hashes = _promotion_integrity(run_root)
     promotion_root.mkdir(parents=True, exist_ok=True)
     staging = promotion_root / f".{run_id}.staging-{os.getpid()}"
     artifacts = staging / "artifacts"
@@ -930,16 +1349,35 @@ def promote_artifacts(config_path: Path, run_root: Path) -> Path:
         run_root / "outputs/selection.json": artifacts / "selection.json",
     }
     for source, target in selected_files.items():
+        _validated_regular_file(source, run_root, label="Promotion artifact")
         shutil.copy2(source, target)
-    shutil.copy2(
-        run_root / ".state/data_manifest.json",
-        artifacts / "data_manifest.json",
+    data_manifest_source = _validated_regular_file(
+        run_root / ".state/data_manifest.json", run_root, label="Data manifest"
     )
-    shutil.copytree(
-        run_root / ".state/dependencies",
-        artifacts / "dependencies",
-    )
-    shutil.copytree(run_root / "outputs/evaluation", artifacts / "evaluation")
+    shutil.copy2(data_manifest_source, artifacts / "data_manifest.json")
+    dependencies_source = run_root / ".state/dependencies"
+    dependencies_hashes = _tree_hashes(dependencies_source)
+    evaluation_source = run_root / "outputs/evaluation"
+    evaluation_hashes = _tree_hashes(evaluation_source)
+    shutil.copytree(dependencies_source, artifacts / "dependencies")
+    shutil.copytree(evaluation_source, artifacts / "evaluation")
+
+    for source, target in selected_files.items():
+        if sha256_file(source) != sha256_file(target):
+            raise ValueError(f"Promotion staging copy changed artifact: {source}")
+    if sha256_file(data_manifest_source) != sha256_file(
+        artifacts / "data_manifest.json"
+    ):
+        raise ValueError("Promotion staging changed the data manifest")
+    if _tree_hashes(artifacts / "dependencies") != dependencies_hashes:
+        raise ValueError("Promotion staging changed dependency contracts")
+    if _tree_hashes(artifacts / "evaluation") != evaluation_hashes:
+        raise ValueError("Promotion staging changed evaluation artifacts")
+    if (
+        sha256_file(artifacts / "best_model.pt")
+        != integrity_hashes["outputs/best_model.pt"]
+    ):
+        raise ValueError("Promotion staging changed the selected checkpoint")
 
     remote = Path(str(config["dvc"]["remote"]))
     cache = Path(str(config["dvc"]["cache"]))
@@ -996,6 +1434,19 @@ def build_parser() -> argparse.ArgumentParser:
     train = subparsers.add_parser("train")
     runtime_paths(train)
 
+    crossval_train_fold = subparsers.add_parser("crossval-train-fold")
+    runtime_paths(crossval_train_fold)
+    crossval_train_fold.add_argument("--fold", type=int, required=True)
+
+    crossval_evaluate_fold = subparsers.add_parser("crossval-evaluate-fold")
+    crossval_evaluate_fold.add_argument("--config", type=Path, required=True)
+    crossval_evaluate_fold.add_argument("--run-root", type=Path, required=True)
+    crossval_evaluate_fold.add_argument("--fold", type=int, required=True)
+
+    finalize_crossval_parser = subparsers.add_parser("finalize-crossval")
+    finalize_crossval_parser.add_argument("--config", type=Path, required=True)
+    finalize_crossval_parser.add_argument("--run-root", type=Path, required=True)
+
     dependencies = subparsers.add_parser("dependencies")
     runtime_paths(dependencies)
     dependencies.add_argument("--stage", required=True)
@@ -1040,6 +1491,12 @@ def main() -> None:
         stage_dvc(args.config, args.source_root, args.run_root)
     elif args.command == "train":
         train_model(args.config, args.source_root, args.run_root)
+    elif args.command == "crossval-train-fold":
+        train_crossval_fold(args.config, args.source_root, args.run_root, args.fold)
+    elif args.command == "crossval-evaluate-fold":
+        evaluate_crossval_fold(args.config, args.run_root, args.fold)
+    elif args.command == "finalize-crossval":
+        finalize_crossval(args.config, args.run_root)
     elif args.command == "dependencies":
         write_dependency_contract(
             args.config,

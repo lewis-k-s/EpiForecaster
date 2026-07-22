@@ -16,9 +16,10 @@ from workflow.common import (
     CONTAINER_SOURCE,
     ablation_worker_arguments,
     container_command,
+    crossval_worker_arguments,
     dependency_sources,
     hpo_worker_arguments,
-    launch_workers_command,
+    launch_parallel_workers_command,
     read_source_inventory,
     slurm_step,
     source_fingerprint,
@@ -39,15 +40,27 @@ CPUS_PER_TASK = int(ALLOCATION["cpus_per_task"])
 CONFIG_PATH = RUN_ROOT / "config.yaml"
 CONTAINER_CONFIG = CONTAINER_RUN / "config.yaml"
 SOURCE_FILE_LIST = RUN_ROOT / ".state/source-files.bin"
+DISPATCH_REQUEST = RUN_ROOT / ".state/dispatch.tsv"
+PUBLISHED = RUN_ROOT / ".state/published.done"
 HOST_PYTHON = Path(sys.executable)
 
 PREPARED = RUN_ROOT / ".state/prepared.done"
 MANIFEST = RUN_ROOT / "manifest.yaml"
+PINNED_EVALUATION_CHECKPOINT = RUN_ROOT / "inputs/evaluation_checkpoint.pt"
+PREPARE_OUTPUTS = [str(PREPARED), str(MANIFEST)]
+if WORKFLOW_KIND == "evaluate":
+    PREPARE_OUTPUTS.append(str(PINNED_EVALUATION_CHECKPOINT))
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
 WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"
 WORKFLOW_COMPLETE = RUN_ROOT / ".state/workflow.done"
-DVC_POINTERS = [str(SOURCE_ROOT / str(target)) for target in config["dvc"]["targets"]]
+DVC_POINTERS = [
+    str(SOURCE_ROOT / str(target))
+    for target in [
+        *config["dvc"]["targets"],
+        *config["dvc"].get("provenance_targets", []),
+    ]
+]
 
 SOURCE_INVENTORY = read_source_inventory(RUN_ROOT)
 ACTIVE_STAGES = {
@@ -55,6 +68,7 @@ ACTIVE_STAGES = {
     "evaluate": ("data", "evaluation"),
     "hpo": ("data", "hpo", "selection", "evaluation", "promotion"),
     "ablation": ("data", "ablation"),
+    "crossval": ("data", "crossval", "evaluation"),
 }[WORKFLOW_KIND]
 STAGE_SOURCES = {
     stage: dependency_sources(SOURCE_ROOT, SOURCE_INVENTORY, config, stage)
@@ -110,12 +124,12 @@ if WORKFLOW_KIND == "train":
         else EVALUATION_MANIFEST
     )
 elif WORKFLOW_KIND == "evaluate":
-    EVALUATION_CHECKPOINT = Path(str(config["evaluation"]["checkpoint"])).resolve(
-        strict=True
-    )
+    EVALUATION_CHECKPOINT = PINNED_EVALUATION_CHECKPOINT
     EVALUATION_PREREQUISITES = []
-    EVALUATION_CONTAINER_CHECKPOINT = EVALUATION_CHECKPOINT
-    EVALUATION_INPUT_PATHS = (EVALUATION_CHECKPOINT,)
+    EVALUATION_CONTAINER_CHECKPOINT = (
+        CONTAINER_RUN / EVALUATION_CHECKPOINT.relative_to(RUN_ROOT)
+    )
+    EVALUATION_INPUT_PATHS = ()
     DEFAULT_TERMINAL = EVALUATION_MANIFEST
 elif WORKFLOW_KIND == "hpo":
     optuna_config = config["optuna"]
@@ -152,6 +166,23 @@ elif WORKFLOW_KIND == "ablation":
     ]
     ABLATION_DONE = RUN_ROOT / ".state/ablation.done"
     DEFAULT_TERMINAL = ABLATION_MANIFEST
+elif WORKFLOW_KIND == "crossval":
+    crossval_config = config["crossval"]
+    STUDY_WORKERS = int(crossval_config["folds"])
+    WORKER_IDS = [f"{worker_id:03d}" for worker_id in range(STUDY_WORKERS)]
+    CROSSVAL_OUTPUT_DIR = (
+        RUN_ROOT / "outputs/crossval" / str(crossval_config["campaign_id"])
+    )
+    CROSSVAL_FOLD_METRICS = (
+        CROSSVAL_OUTPUT_DIR / f"{EVALUATION_SPLIT}_fold_metrics.csv"
+    )
+    CROSSVAL_AGGREGATE_METRICS = (
+        CROSSVAL_OUTPUT_DIR / f"{EVALUATION_SPLIT}_aggregate_metrics.csv"
+    )
+    CROSSVAL_MANIFEST = CROSSVAL_OUTPUT_DIR / "crossval_manifest.json"
+    CROSSVAL_TRAINING_COMPLETE = RUN_ROOT / ".state/crossval_training_complete.done"
+    CROSSVAL_DONE = RUN_ROOT / ".state/crossval.done"
+    DEFAULT_TERMINAL = CROSSVAL_MANIFEST
 
 
 def dependency_command(stage):

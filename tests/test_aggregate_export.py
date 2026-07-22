@@ -183,11 +183,12 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
         ),
         training=SimpleNamespace(
             profiler=SimpleNamespace(enabled=False, profile_epochs=[]),
-            max_batches=None,
-            epochs=1,
-            early_stopping_patience=None,
-            plot_forecasts=False,
-        ),
+                max_batches=None,
+                epochs=1,
+                early_stopping_patience=None,
+                plot_forecasts=False,
+                run_final_evaluation=True,
+            ),
     )
     trainer.experiment_dir = tmp_path
     trainer.wandb_run = None

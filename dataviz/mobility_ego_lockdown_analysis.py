@@ -601,7 +601,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/train_epifor_real_local.yaml"),
+        default=Path("configs/train_epifor_smoke.yaml"),
         help="Training config path",
     )
     parser.add_argument(

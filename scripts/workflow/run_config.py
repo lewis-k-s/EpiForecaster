@@ -25,35 +25,35 @@ ALLOCATION_FIELDS = (
     "gres",
     "runtime",
 )
-WORKFLOW_KINDS = {"train", "evaluate", "hpo", "ablation"}
+DISPATCH_REQUEST_SCHEMA_VERSION = 1
+WORKFLOW_KINDS = {"train", "evaluate", "hpo", "ablation", "crossval"}
 WORKFLOW_TARGETS = {
     "train": {"train", "train_evaluate"},
     "evaluate": {"evaluate"},
     "hpo": {"hpo"},
     "ablation": {"ablation"},
+    "crossval": {"crossval"},
 }
-SCIENTIFIC_SOURCE_PREFIXES = (
-    "configs",
-    "data",
-    "evaluation",
-    "graph",
-    "models",
-    "plotting",
-    "scripts/analysis",
-    "scripts/hpo",
-    "scripts/workflow",
-    "training",
-    "utils",
-    "workflow",
-)
+SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
+    ".agents",
+    ".codex",
+    ".github",
+    "docs",
+    "outputs",
+    "reports",
+    "tests",
+    "tex",
+    "vendor",
+}
 SCIENTIFIC_SOURCE_FILES = {"cli.py", "pyproject.toml", "uv.lock"}
-SCIENTIFIC_SOURCE_SUFFIXES = {".py", ".sh", ".toml", ".yaml", ".yml"}
+SCIENTIFIC_SOURCE_SUFFIXES = {".py", ".sh", ".smk", ".toml", ".yaml", ".yml"}
 DEPENDENCY_STAGES = {
     "data",
     "training",
     "evaluation",
     "hpo",
     "ablation",
+    "crossval",
     "selection",
     "promotion",
 }
@@ -106,9 +106,12 @@ def dvc_payload_paths(
     targets = dvc_config.get("targets")
     if not isinstance(targets, list) or not targets:
         raise ValueError("Workflow config must define at least one dvc target")
+    provenance_targets = dvc_config.get("provenance_targets", [])
+    if not isinstance(provenance_targets, list):
+        raise ValueError("dvc.provenance_targets must be a list when provided")
 
     payloads: dict[Path, Path] = {}
-    for target_value in targets:
+    for target_value in [*targets, *provenance_targets]:
         target = _safe_relative_path(str(target_value), field="DVC target")
         pointer = source_root / target
         if not pointer.is_file() or pointer.is_symlink():
@@ -200,13 +203,13 @@ def scientific_source_files(paths: list[Path]) -> list[Path]:
     selected: list[Path] = []
     for path in paths:
         path_string = path.as_posix()
-        in_scientific_tree = any(
-            path_string == prefix or path_string.startswith(f"{prefix}/")
-            for prefix in SCIENTIFIC_SOURCE_PREFIXES
+        excluded = (
+            bool(path.parts) and path.parts[0] in SCIENTIFIC_SOURCE_EXCLUDED_ROOTS
         )
-        if path_string in SCIENTIFIC_SOURCE_FILES or (
-            in_scientific_tree
-            and (path.suffix in SCIENTIFIC_SOURCE_SUFFIXES or path.name == "Snakefile")
+        if not excluded and (
+            path_string in SCIENTIFIC_SOURCE_FILES
+            or path.suffix in SCIENTIFIC_SOURCE_SUFFIXES
+            or path.name == "Snakefile"
         ):
             selected.append(path)
     return sorted(set(selected), key=lambda path: path.as_posix())
@@ -233,6 +236,7 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         "evaluate": ("evaluation",),
         "hpo": ("optuna", "evaluation", "promotion"),
         "ablation": ("ablation",),
+        "crossval": ("crossval", "evaluation"),
     }[kind]
     for section in required_sections:
         if not isinstance(workflow_config.get(section), dict):
@@ -254,6 +258,17 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 "evaluation.checkpoint must be an absolute GPFS path for an "
                 "evaluation-only workflow"
             )
+    elif kind == "crossval":
+        crossval = workflow_config["crossval"]
+        for field in ("base_config", "campaign_id", "folds", "seed"):
+            if crossval.get(field) is None:
+                raise ValueError(f"crossval.{field} is required")
+        campaign_id = str(crossval["campaign_id"])
+        if Path(campaign_id).name != campaign_id or campaign_id in {".", ".."}:
+            raise ValueError("crossval.campaign_id must be one safe path component")
+        folds = crossval["folds"]
+        if not isinstance(folds, int) or isinstance(folds, bool) or not 2 <= folds <= 4:
+            raise ValueError("crossval.folds must be an integer between 2 and 4")
     return kind
 
 
@@ -285,6 +300,9 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     elif kind == "ablation":
         workload = workflow_config.get("ablation")
         workload_name = "ablation"
+    elif kind == "crossval":
+        workload = {"workers": workflow_config["crossval"].get("folds")}
+        workload_name = "crossval"
     else:
         workload = None
         workload_name = kind
@@ -398,6 +416,7 @@ def render_config(
     *,
     template_path: Path,
     output_path: Path,
+    dispatch_file_path: Path,
     file_list_path: Path,
     snapshot_root: Path,
     repo_root: Path,
@@ -460,11 +479,81 @@ def render_config(
     output_path.write_text(
         yaml.safe_dump(document, sort_keys=False, default_flow_style=False)
     )
+    write_dispatch_request(output_path, dispatch_file_path)
     file_list_path.parent.mkdir(parents=True, exist_ok=True)
     file_list_path.write_bytes(
         b"".join(os.fsencode(path.as_posix()) + b"\0" for path in identity["files"])
     )
     return document
+
+
+def _dispatch_field(value: object, *, field: str) -> str:
+    """Render one unambiguous TSV value for the remote Bash runner."""
+    rendered = str(value)
+    if not rendered or "\t" in rendered or "\n" in rendered or "\r" in rendered:
+        raise ValueError(f"Dispatch field {field} must be one non-empty TSV value")
+    return rendered
+
+
+def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, str]:
+    """Write the immutable, shell-safe bindings needed before Snakemake starts.
+
+    The effective YAML remains the scientific workflow request.  This compact
+    TSV record lets the transferred runner publish and submit that request
+    without parsing YAML in Bash or receiving config-derived values over SSH.
+    """
+    document = yaml.safe_load(config_path.read_text())
+    if not isinstance(document, dict):
+        raise ValueError(f"Workflow config must be a mapping: {config_path}")
+
+    allocation = validate_mn5_allocation(document)
+    run = document["run"]
+    source = document["source"]
+    container = document["container"]
+    workflow = document["workflow"]
+    run_id = str(run["id"])
+    run_root = Path(str(run["root"]))
+    source_root = Path(str(run["source_root"]))
+    snakemake_bin = Path(str(workflow["snakemake_bin"]))
+
+    if not run_root.is_absolute() or run_root.name != run_id:
+        raise ValueError("run.root must be absolute and end with run.id")
+    if source_root != run_root / "source":
+        raise ValueError("run.source_root must be the run-local source directory")
+    if not snakemake_bin.is_absolute():
+        raise ValueError("workflow.snakemake_bin must be absolute")
+
+    fields: list[tuple[str, object]] = [
+        ("schema_version", DISPATCH_REQUEST_SCHEMA_VERSION),
+        ("run_id", run_id),
+        ("run_root", run_root),
+        ("run_parent", run_root.parent),
+        ("source_root", source_root),
+        ("source_snapshot_sha256", source["source_snapshot_sha256"]),
+        ("config_sha256", hashlib.sha256(config_path.read_bytes()).hexdigest()),
+        ("container_sif", container["sif"]),
+        ("container_digest_file", container["digest_file"]),
+        ("tooling_key", workflow["tooling_key"]),
+        ("tooling_python", snakemake_bin.with_name("python")),
+        ("snakemake_bin", snakemake_bin),
+        ("snakemake_version", workflow["snakemake_version"]),
+        ("workflow_kind", workflow_kind(document)),
+        ("workflow_target", workflow_target(document)),
+        *[(field, allocation[field]) for field in ALLOCATION_FIELDS],
+    ]
+    request = {
+        field: _dispatch_field(value, field=field) for field, value in fields
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        "".join(f"{field}\t{value}\n" for field, value in request.items())
+    )
+    digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
+    output_path.with_suffix(output_path.suffix + ".sha256").write_text(
+        f"{digest}  {output_path.name}\n"
+    )
+    return request
 
 
 def verify_snapshot(config_path: Path, source_root: Path, file_list_path: Path) -> str:
@@ -504,6 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
     render = subparsers.add_parser("render")
     render.add_argument("--template", type=Path, required=True)
     render.add_argument("--output", type=Path, required=True)
+    render.add_argument("--dispatch-file", type=Path, required=True)
     render.add_argument("--file-list", type=Path, required=True)
     render.add_argument("--snapshot-root", type=Path, required=True)
     render.add_argument("--repo-root", type=Path, required=True)
@@ -532,6 +622,7 @@ def main() -> None:
         render_config(
             template_path=args.template,
             output_path=args.output,
+            dispatch_file_path=args.dispatch_file,
             file_list_path=args.file_list,
             snapshot_root=args.snapshot_root,
             repo_root=args.repo_root.resolve(),
@@ -551,7 +642,7 @@ def main() -> None:
         allocation = validate_mn5_allocation(document)
         print("\t".join(str(allocation[field]) for field in ALLOCATION_FIELDS))
     elif args.command == "verify":
-        verify_snapshot(args.config, args.source_root, args.file_list)
+        print(verify_snapshot(args.config, args.source_root, args.file_list))
 
 
 if __name__ == "__main__":

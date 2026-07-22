@@ -115,7 +115,7 @@ def slurm_step(command: str, cpus_per_task: int, *, gpu: bool = True) -> str:
     return f"{shlex.join(step)} {command}"
 
 
-def launch_workers_command(
+def launch_parallel_workers_command(
     arguments: list[object],
     *,
     run_root: Path,
@@ -123,10 +123,11 @@ def launch_workers_command(
     sif: str,
     workers: int,
     cpus_per_task: int,
+    worker_group: str,
 ) -> str:
     return shlex.join(
         [
-            str(source_root / "scripts/workflow/launch_optuna_workers.sh"),
+            str(source_root / "scripts/workflow/launch_parallel_workers.sh"),
             "--run-root",
             str(run_root),
             "--source-root",
@@ -137,10 +138,36 @@ def launch_workers_command(
             str(workers),
             "--cpus-per-task",
             str(cpus_per_task),
+            "--worker-group",
+            worker_group,
             "--",
             *[str(value) for value in arguments],
         ]
     )
+
+
+def crossval_worker_arguments(stage: str) -> list[object]:
+    commands = {
+        "training": "crossval-train-fold",
+        "evaluation": "crossval-evaluate-fold",
+    }
+    if stage not in commands:
+        raise ValueError(f"Unknown cross-validation worker stage: {stage}")
+    arguments: list[object] = [
+        "python",
+        "-m",
+        "scripts.workflow.run_support",
+        commands[stage],
+        "--config",
+        CONTAINER_RUN / "config.yaml",
+        "--run-root",
+        CONTAINER_RUN,
+        "--fold",
+        "{worker_id}",
+    ]
+    if stage == "training":
+        arguments[6:6] = ["--source-root", CONTAINER_SOURCE]
+    return arguments
 
 
 def hpo_worker_arguments(config: dict[str, Any]) -> list[object]:

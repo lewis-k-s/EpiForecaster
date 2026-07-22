@@ -7,7 +7,7 @@ from omegaconf import errors
 
 from models.configs import EpiForecasterConfig
 
-BASE_LOCAL_CONFIG = "configs/train_epifor_real_local.yaml"
+BASE_LOCAL_CONFIG = "configs/train_epifor_smoke.yaml"
 
 
 OVERRIDE_CASES = [
@@ -78,7 +78,7 @@ def test_load_config_without_overrides():
     cfg = EpiForecasterConfig.load(BASE_LOCAL_CONFIG)
 
     assert cfg.training.learning_rate == 0.0001
-    assert cfg.output.write_granular_eval is True
+    assert cfg.output.write_granular_eval is False
     assert cfg.output.granular_eval_format == "parquet"
     assert (
         cfg.output.resolve_granular_eval_filename(split="test")
@@ -86,6 +86,10 @@ def test_load_config_without_overrides():
     )
     assert cfg.training.node_split_strategy == "stratified"
     assert cfg.training.node_split_population_bins == 5
+    assert cfg.training.max_batches == 10
+    assert cfg.training.num_workers == 1
+    assert cfg.training.val_workers == 1
+    assert cfg.training.test_workers == 1
 
 
 @pytest.mark.epiforecaster

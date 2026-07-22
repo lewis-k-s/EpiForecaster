@@ -53,6 +53,7 @@ from scripts.hpo.trial_artifacts import (
     trial_model_id,
 )
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
+from scripts.hpo.worker_identity import logical_worker_id
 from training.epiforecaster_trainer import EpiForecasterTrainer
 from utils.logging import setup_logging
 
@@ -62,6 +63,7 @@ logger = logging.getLogger(__name__)
 # best endpoint trials. Keep the historical alternatives documented so this knob
 # can be widened again deliberately without spending compute by default.
 _OBSERVATION_LOSS_CHOICES = ("mae",)  # Previously explored: "mse", "rmse", "mae"
+LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
 
 # Global flag for signal handling
 _shutdown_requested = False
@@ -104,8 +106,6 @@ def _decode_categorical_value(value: Any) -> Any:
 def _slurm_identity() -> dict[str, str]:
     keys = [
         "SLURM_JOB_ID",
-        "SLURM_ARRAY_JOB_ID",
-        "SLURM_ARRAY_TASK_ID",
         "SLURM_STEP_ID",
         "SLURM_PROCID",
         "SLURM_LOCALID",
@@ -124,6 +124,32 @@ def _worker_outcome_error(outcomes: list[tuple[int, str]]) -> str | None:
         return f"HPO worker recorded failed trial(s): {', '.join(failed)}"
 
     return None
+
+
+def _remaining_worker_trials(study: Any, worker_id: int, target: int) -> int:
+    """Return a deterministic per-worker remainder or reject unsafe resume state."""
+    owned = [
+        trial
+        for trial in study.trials
+        if trial.user_attrs.get(LOGICAL_WORKER_ID_ATTR) == worker_id
+    ]
+    invalid = [
+        (int(trial.number), str(trial.state.name))
+        for trial in owned
+        if str(trial.state.name) in {"FAIL", "RUNNING", "WAITING"}
+    ]
+    if invalid:
+        rendered = ", ".join(f"{number}:{state}" for number, state in invalid)
+        raise RuntimeError(
+            f"HPO logical worker {worker_id} has unresolved trial state(s): {rendered}"
+        )
+    completed = sum(str(trial.state.name) in {"COMPLETE", "PRUNED"} for trial in owned)
+    if completed > target:
+        raise RuntimeError(
+            f"HPO logical worker {worker_id} already owns {completed} successful "
+            f"terminal trials, exceeding its target of {target}"
+        )
+    return target - completed
 
 
 def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
@@ -335,10 +361,12 @@ def objective(
     pruning_start_epoch: int = 10,
     sample_training_loss_objective: bool = False,
     search_space: str = "default",
+    worker_id: int = 0,
 ) -> float:
     start_time = time.time()
     logger.info("=== Trial %d started ===", trial.number)
     logger.info("Trial %d suggested params: %s", trial.number, trial.params)
+    trial.set_user_attr(LOGICAL_WORKER_ID_ATTR, worker_id)
 
     cfg = EpiForecasterConfig.from_file(str(base_config_path))
 
@@ -489,6 +517,7 @@ def objective(
                 TRIAL_DIR_ATTR: str(trial_dir),
                 BEST_MODEL_PATH_ATTR: str(checkpoint_path),
                 BEST_MODEL_SHA256_ATTR: checkpoint_sha256,
+                LOGICAL_WORKER_ID_ATTR: worker_id,
                 "config_effective": {
                     "output.log_dir": cfg.output.log_dir,
                     "output.experiment_name": cfg.output.experiment_name,
@@ -620,6 +649,7 @@ def main(
     journal_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Offset by the stable logical worker ID to ensure parallel sampler diversity.
+    worker_id = logical_worker_id()
     worker_seed = _compute_worker_seed(seed)
     if worker_seed != seed:
         logger.info(
@@ -690,7 +720,16 @@ def main(
     slurm = _slurm_identity()
     if any(slurm.values()):
         logger.info("SLURM identity: %s", slurm)
-    logger.info("Starting trials: n_trials=%s, timeout_s=%s", n_trials, timeout_s)
+    remaining_trials = n_trials
+    if n_trials is not None:
+        remaining_trials = _remaining_worker_trials(study, worker_id, n_trials)
+    logger.info(
+        "Starting trials: worker_id=%d, target=%s, remaining=%s, timeout_s=%s",
+        worker_id,
+        n_trials,
+        remaining_trials,
+        timeout_s,
+    )
     logger.info("Sample training loss objective: %s", sample_training_loss_objective)
     logger.info("Search space: %s", search_space)
 
@@ -712,29 +751,38 @@ def main(
     # Build override list from CLI (dotted keys, same as train CLI)
     base_overrides = list(cli_overrides)
 
-    study.optimize(
-        lambda t: objective(
-            t,
-            base_config_path=config_path,
-            study_name=study_name,
-            run_root=run_root,
-            fixed_epochs=epochs,
-            fixed_max_batches=max_batches,
-            seed=seed,
-            cli_overrides=base_overrides,
-            pruning_start_epoch=pruning_start_epoch,
-            sample_training_loss_objective=sample_training_loss_objective,
-            search_space=search_space.lower(),
-        ),
-        n_trials=n_trials,
-        timeout=timeout_s,
-        callbacks=[_record_trial_outcome],
-        catch=(Exception,),
-    )
+    if remaining_trials != 0:
+        study.optimize(
+            lambda t: objective(
+                t,
+                base_config_path=config_path,
+                study_name=study_name,
+                run_root=run_root,
+                fixed_epochs=epochs,
+                fixed_max_batches=max_batches,
+                seed=seed,
+                cli_overrides=base_overrides,
+                pruning_start_epoch=pruning_start_epoch,
+                sample_training_loss_objective=sample_training_loss_objective,
+                search_space=search_space.lower(),
+                worker_id=worker_id,
+            ),
+            n_trials=remaining_trials,
+            timeout=timeout_s,
+            callbacks=[_record_trial_outcome],
+            catch=(Exception,),
+        )
 
-    outcome_error = _worker_outcome_error(worker_outcomes)
-    if outcome_error is not None:
-        raise click.ClickException(outcome_error)
+        outcome_error = _worker_outcome_error(worker_outcomes)
+        if outcome_error is not None:
+            raise click.ClickException(outcome_error)
+    if n_trials is not None:
+        remaining_after = _remaining_worker_trials(study, worker_id, n_trials)
+        if remaining_after:
+            raise click.ClickException(
+                f"HPO logical worker {worker_id} stopped with {remaining_after} "
+                "required trial(s) remaining"
+            )
 
     logger.info(
         "Worker complete: %d trials completed in study '%s'",

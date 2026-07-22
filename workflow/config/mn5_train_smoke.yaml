@@ -19,18 +19,22 @@ training:
   base_config: configs/production_only/train_epifor_mn5_full.yaml
   experiment_name: single-smoke
   model_id: model
-  max_batches: 1
+  max_batches: 10
   overrides:
     - output.save_checkpoints=true
     - training.run_final_evaluation=false
     - training.compile=false
     - training.profiler.enabled=false
+    - training.num_workers=1
+    - training.val_workers=1
+    - training.test_workers=1
 
 evaluation:
   split: test
   granular: false
   overrides:
-    - training.val_workers=2
+    - training.val_workers=1
+    - training.test_workers=1
     - training.num_forecast_samples=1
 
 resources:

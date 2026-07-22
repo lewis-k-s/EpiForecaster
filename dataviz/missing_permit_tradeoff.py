@@ -172,7 +172,9 @@ def analyze_series(
     valid_counts = (vr_csum[segment:] - vr_csum[:-segment])[starts]
     eligible = valid_counts >= segment
     hist_obs = _window_counts(mask, input_window_length, starts)
-    target_obs_counts = _window_counts(mask[input_window_length:], forecast_horizon, starts)
+    target_obs_counts = _window_counts(
+        mask[input_window_length:], forecast_horizon, starts
+    )
 
     hist_missing = input_window_length - hist_obs
     target_missing = forecast_horizon - target_obs_counts
@@ -288,8 +290,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/train_epifor_full.yaml"),
-        help="Training config path (default: configs/train_epifor_full.yaml)",
+        default=Path("configs/train_epifor_smoke.yaml"),
+        help="Training config path (default: configs/train_epifor_smoke.yaml)",
     )
     parser.add_argument(
         "--output-dir",

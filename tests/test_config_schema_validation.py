@@ -10,19 +10,9 @@ from training.region2vec_trainer import RegionTrainerConfig
 
 # Config file lists by type
 EPIFORECASTER_TRAINING_CONFIGS = [
-    "configs/train_epifor_curriculum.yaml",
-    "configs/train_epifor_real_local.yaml",
-    "configs/train_epifor_synth_local.yaml",
-    "configs/production_only/train_epifor_mn5_ablation_mobility_panel_base.yaml",
-    "configs/production_only/train_epifor_mn5_best.yaml",
+    "configs/train_epifor_smoke.yaml",
     "configs/production_only/train_epifor_mn5_full.yaml",
-    "configs/production_only/train_epifor_mn5_mobility_spatial_knn.yaml",
-    "configs/production_only/train_epifor_mn5_real_balanced.yaml",
-    "configs/production_only/train_epifor_mn5_synth.yaml",
     "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
-    "configs/production_only/train_epifor_sparsity_curriculum.yaml",
-    "configs/production_only/train_epifor_supersparse.yaml",
-    "configs/production_only/train_epifor_mn5_small_constrained.yaml",
 ]
 
 REGION2VEC_CONFIGS = [
@@ -31,12 +21,8 @@ REGION2VEC_CONFIGS = [
 
 PREPROCESSING_CONFIGS = [
     "configs/preprocess_full.yaml",
-    "configs/preprocess_local_synth.yaml",
-    "configs/preprocess_mn5_synth.yaml",
-    "configs/preprocess_real_holt.yaml",
     "configs/production_only/preprocess_mn5_synth.yaml",
     "configs/production_only/preprocess_mn5_synth_holt_damped.yaml",
-    "configs/production_only/preprocess_mn5_synth_kalman_predict.yaml",
 ]
 
 
@@ -60,7 +46,7 @@ def test_epiforecaster_rejects_non_joint_loss_name():
         ValueError, match="only supports training.loss.name='joint_inference'"
     ):
         EpiForecasterConfig.load(
-            "configs/train_epifor_real_local.yaml",
+            "configs/train_epifor_smoke.yaml",
             overrides=["training.loss.name=mse"],
         )
 
@@ -103,12 +89,22 @@ def test_preprocessing_configs_parse(config_path):
 def test_all_config_files_accounted_for():
     """Ensure test lists match tracked config files in configs/ directory."""
     result = subprocess.run(
-        ["git", "ls-files", "configs/*.yaml", "configs/**/*.yaml"],
+        [
+            "git",
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "configs/*.yaml",
+            "configs/**/*.yaml",
+        ],
         check=True,
         capture_output=True,
         text=True,
     )
-    yaml_files = sorted(result.stdout.splitlines())
+    yaml_files = sorted(
+        path for path in result.stdout.splitlines() if Path(path).is_file()
+    )
 
     # Combine all test lists
     tested_files = (

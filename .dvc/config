@@ -3,4 +3,4 @@
     remote = mn5-nfs
     site_cache_dir = .dvc/tmp
 ['remote "mn5-nfs"']
-    url = /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster-DVC/storage
+    url = /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/storage

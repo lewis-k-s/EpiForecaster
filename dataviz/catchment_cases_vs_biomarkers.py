@@ -252,7 +252,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/preprocess_real_holt.yaml"),
+        default=Path("configs/preprocess_full.yaml"),
     )
     parser.add_argument(
         "--region-metadata",

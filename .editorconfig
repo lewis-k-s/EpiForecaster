@@ -1,0 +1,6 @@
+[*.{sh,bash,sbatch}]
+shell_variant = bash
+indent_style = space
+indent_size = 2
+switch_case_indent = true
+binary_next_line = true

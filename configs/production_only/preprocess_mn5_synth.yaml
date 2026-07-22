@@ -8,12 +8,12 @@
 
 # All synthetic data comes from the single bundled zarr
 data_dir: "data/files"
-synthetic_path: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.zarr"
+synthetic_path: "data/files/raw_synthetic_observations.zarr"
 # Individual paths are not used when synthetic_path is set, but required by config
-cases_file: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.zarr"
-mobility_path: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.zarr"
-wastewater_file: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.zarr"
-population_file: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.zarr"
+cases_file: "data/files/raw_synthetic_observations.zarr"
+mobility_path: "data/files/raw_synthetic_observations.zarr"
+wastewater_file: "data/files/raw_synthetic_observations.zarr"
+population_file: "data/files/raw_synthetic_observations.zarr"
 region_metadata_file: "data/files/edar_muni_edges.nc"
 
 # Optional: Hospitalizations and deaths data (also from synthetic zarr if available)

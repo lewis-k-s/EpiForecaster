@@ -1,9 +1,0 @@
-# Synthetic preprocessing variant retained for compatibility with historical
-# dataset naming around the Kalman/predict configuration.
-#
-# Note: synthetic preprocessing currently ignores the clinical smoothing choice,
-# so this file mainly preserves the historical dataset naming surface.
-
-base_config: "preprocess_mn5_synth.yaml"
-
-dataset_name: "synthetic_full_kalman_predict"

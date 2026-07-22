@@ -14,6 +14,7 @@ from scripts.hpo.hpsearch_worker import (
     _compute_worker_seed,
     _decode_categorical_value,
     _overrides_to_dotlist,
+    _remaining_worker_trials,
     _worker_outcome_error,
     objective,
     suggest_epiforecaster_params,
@@ -69,6 +70,42 @@ def test_worker_outcome_error_rejects_missing_and_failed_trials() -> None:
         "HPO worker recorded failed trial(s): 2"
     )
     assert _worker_outcome_error([(0, "COMPLETE"), (1, "PRUNED")]) is None
+
+
+def test_worker_trial_budget_resumes_only_its_completed_trials() -> None:
+    trials = [
+        SimpleNamespace(
+            number=0,
+            state=SimpleNamespace(name="COMPLETE"),
+            user_attrs={"epiforecaster_worker_id": 2},
+        ),
+        SimpleNamespace(
+            number=1,
+            state=SimpleNamespace(name="PRUNED"),
+            user_attrs={"epiforecaster_worker_id": 2},
+        ),
+        SimpleNamespace(
+            number=2,
+            state=SimpleNamespace(name="COMPLETE"),
+            user_attrs={"epiforecaster_worker_id": 1},
+        ),
+    ]
+    assert _remaining_worker_trials(SimpleNamespace(trials=trials), 2, 4) == 2
+
+
+@pytest.mark.parametrize("state", ["FAIL", "RUNNING", "WAITING"])
+def test_worker_trial_budget_rejects_unresolved_owned_trials(state: str) -> None:
+    study = SimpleNamespace(
+        trials=[
+            SimpleNamespace(
+                number=7,
+                state=SimpleNamespace(name=state),
+                user_attrs={"epiforecaster_worker_id": 3},
+            )
+        ]
+    )
+    with pytest.raises(RuntimeError, match=f"7:{state}"):
+        _remaining_worker_trials(study, 3, 1)
 
 
 def _base_cfg_stub(**overrides: Any) -> SimpleNamespace:
@@ -131,25 +168,25 @@ def _joint_loss_cfg_stub(**overrides: Any) -> SimpleNamespace:
 
 
 class TestComputeWorkerSeed:
-    def test_returns_base_seed_without_slurm_env(self) -> None:
+    def test_returns_base_seed_without_worker_identity(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             assert _compute_worker_seed(42) == 42
 
-    def test_offsets_by_slurm_array_task_id(self) -> None:
-        with patch.dict(os.environ, {"SLURM_ARRAY_TASK_ID": "3"}):
+    def test_offsets_by_logical_worker_id(self) -> None:
+        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "3"}):
             assert _compute_worker_seed(42) == 45
 
-    def test_offsets_by_zero_task_id(self) -> None:
-        with patch.dict(os.environ, {"SLURM_ARRAY_TASK_ID": "0"}):
+    def test_offsets_by_zero_worker_id(self) -> None:
+        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "0"}):
             assert _compute_worker_seed(42) == 42
 
-    def test_different_task_ids_produce_different_seeds(self) -> None:
+    def test_different_worker_ids_produce_different_seeds(self) -> None:
         base_seed = 100
-        with patch.dict(os.environ, {"SLURM_ARRAY_TASK_ID": "0"}):
+        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "0"}):
             seed_0 = _compute_worker_seed(base_seed)
-        with patch.dict(os.environ, {"SLURM_ARRAY_TASK_ID": "1"}):
+        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "1"}):
             seed_1 = _compute_worker_seed(base_seed)
-        with patch.dict(os.environ, {"SLURM_ARRAY_TASK_ID": "2"}):
+        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "2"}):
             seed_2 = _compute_worker_seed(base_seed)
 
         assert seed_0 == 100
@@ -511,6 +548,7 @@ def test_objective_returns_selection_score_and_records_joint_loss(
         pruning_start_epoch=3,
         sample_training_loss_objective=False,
         search_space="default",
+        worker_id=4,
     )
 
     assert value == pytest.approx(0.25)
@@ -529,6 +567,7 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     assert trial.user_attrs["trial_dir"] == str(trial_dir)
     assert trial.user_attrs["best_model_path"] == str(checkpoint)
     assert trial.user_attrs["best_model_sha256"] == checkpoint_sha256
+    assert trial.user_attrs["epiforecaster_worker_id"] == 4
 
     summary_path = trial_dir / "optuna_trial.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))

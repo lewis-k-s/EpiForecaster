@@ -1206,7 +1206,7 @@ class EpiForecasterConfig:
 
         Example:
             >>> cfg = EpiForecasterConfig.load(
-            ...     "configs/train_epifor_full.yaml",
+            ...     "configs/train_epifor_smoke.yaml",
             ...     overrides=["training.learning_rate=0.001"],
             ...     strict=True,
             ... )

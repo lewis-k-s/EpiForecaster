@@ -22,6 +22,15 @@ FETCH_SCRIPT="$SCRIPT_DIR/fetch_runtime_deps_on_wifi.sh"
 SBATCH_SCRIPT="$SCRIPT_DIR/build_sif.sbatch"
 VPN_HELPER="${WORKVPN_HELPER:-/Users/lewis/.codex/skills/workvpn/vpn}"
 
+# Reservation state is global because the EXIT trap runs after command failure.
+RESERVATION_ACTIVE=0
+RESERVATION_REQUEST_ROOT=""
+RESERVATION_TOKEN=""
+
+# -----------------------------------------------------------------------------
+# CLI and local helpers
+# -----------------------------------------------------------------------------
+
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [--dry-run]
@@ -36,10 +45,26 @@ shell_quote() {
   printf '%q' "$1"
 }
 
-remote_bash_on() {
+remote_function_on() {
   local host="$1"
-  local command="$2"
-  ssh "$host" "bash -c $(shell_quote "$command")"
+  local function_name="$2"
+  shift 2
+  local remote_command="bash -s --"
+  local argument
+
+  if ! declare -f "$function_name" >/dev/null; then
+    echo "Unknown remote function: $function_name" >&2
+    return 2
+  fi
+
+  for argument in "$@"; do
+    remote_command+=" $(shell_quote "$argument")"
+  done
+
+  {
+    declare -f "$function_name"
+    printf '\n%s "$@"\n' "$function_name"
+  } | ssh "$host" "$remote_command"
 }
 
 sha256_file() {
@@ -55,6 +80,167 @@ sha256_stream() {
     sha256sum | awk '{print $1}'
   else
     shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Remote programs
+# -----------------------------------------------------------------------------
+
+# Classify the current immutable artifact/request state without mutating a
+# partial artifact set. A verified artifact refreshes the discovery symlinks.
+remote_container_state() {
+  local final_sif="$1"
+  local request_root="$2"
+  local container_root="$3"
+  local dependency_key="$4"
+  local job_id state
+
+  if [ -f "$final_sif" ] \
+    && [ -f "$final_sif.sha256" ] \
+    && [ -f "$final_sif.build.txt" ] \
+    && [ -f "$final_sif.inspect.json" ] \
+    && [ -f "$request_root/build.done" ]; then
+    if cd "$container_root" \
+      && sha256sum -c "$(basename "$final_sif.sha256")" >/dev/null \
+      && grep -Fxq "dependency_key=$dependency_key" "$final_sif.build.txt"; then
+      ln -sfn "$(basename "$final_sif")" \
+        "$container_root/epiforecaster-runtime.sif"
+      ln -sfn "$(basename "$final_sif.sha256")" \
+        "$container_root/epiforecaster-runtime.sif.sha256"
+      printf ready
+      return 0
+    fi
+
+    printf invalid
+    return 0
+  fi
+
+  if [ -e "$final_sif" ] \
+    || [ -e "$final_sif.sha256" ] \
+    || [ -e "$final_sif.build.txt" ] \
+    || [ -e "$final_sif.inspect.json" ] \
+    || [ -e "$request_root/build.done" ]; then
+    printf invalid
+    return 0
+  fi
+
+  if [ -d "$request_root/dispatching" ]; then
+    printf preparing
+    return 0
+  fi
+
+  if [ -s "$request_root/job.id" ]; then
+    job_id="$(cat "$request_root/job.id")"
+    state="$(squeue -h -j "$job_id" -o '%T' 2>/dev/null | head -n 1 || true)"
+    if [ -n "$state" ]; then
+      printf 'job:%s:%s' "$job_id" "$state"
+      return 0
+    fi
+  fi
+
+  printf missing
+}
+
+# Reserve dependency preparation atomically and record its owner token.
+remote_reserve_dispatch() {
+  local request_root="$1"
+  local token="$2"
+
+  mkdir -p "$request_root"
+  if mkdir "$request_root/dispatching" 2>/dev/null; then
+    printf '%s\n' "$token" >"$request_root/dispatching/owner"
+    printf reserved
+  else
+    printf preparing
+  fi
+}
+
+# Remove a preparation reservation only when this dispatcher still owns it.
+remote_cleanup_dispatch() {
+  local request_root="$1"
+  local token="$2"
+  local owner="$request_root/dispatching/owner"
+
+  if [ -f "$owner" ] && [ "$(cat "$owner")" = "$token" ]; then
+    rm -rf -- "$request_root/dispatching"
+  fi
+}
+
+# Create one or more shared directories on the compute-visible filesystem.
+remote_create_directories() {
+  mkdir -p "$@"
+}
+
+# Run dependency materialization on the network-enabled login node.
+remote_fetch_dependencies() {
+  set -euo pipefail
+
+  local fetch_script="$1"
+  export BASE_IMAGE_REF="$2"
+  export DEPENDENCY_KEY="$3"
+  export UV_LOCK_SHA256="$4"
+  export BUILD_ROOT="$5"
+  export CONTAINER_ROOT="$6"
+  export UV_CACHE_ROOT="$7"
+
+  bash "$fetch_script"
+}
+
+# Print one remote file whose contents form part of the submission contract.
+remote_read_file() {
+  cat "$1"
+}
+
+# Submit at most one active offline build for this dependency identity.
+remote_submit_build() {
+  set -euo pipefail
+
+  local request_root="$1"
+  local base_sif="$2"
+  local base_image_ref="$3"
+  local prefix_root="$4"
+  local dependency_key="$5"
+  local lock_sha256="$6"
+  local container_root="$7"
+  local sbatch_script="$8"
+  local existing state job_id
+
+  [ -f "$request_root/deps.ready" ]
+  exec 9>"$request_root/submit.lock"
+  flock 9
+
+  if [ -s "$request_root/job.id" ]; then
+    existing="$(cat "$request_root/job.id")"
+    state="$(squeue -h -j "$existing" -o '%T' 2>/dev/null | head -n 1 || true)"
+    if [ -n "$state" ]; then
+      printf 'existing:%s:%s' "$existing" "$state"
+      return 0
+    fi
+  fi
+
+  job_id="$(
+    sbatch --parsable \
+      --chdir="$request_root" \
+      --output="$request_root/build-%j.out" \
+      --error="$request_root/build-%j.err" \
+      --export="ALL,BASE_SIF=$base_sif,BASE_IMAGE_REF=$base_image_ref,PREFIX_ROOT=$prefix_root,DEPENDENCY_KEY=$dependency_key,UV_LOCK_SHA256=$lock_sha256,CONTAINER_ROOT=$container_root,BUILD_ROOT=$request_root" \
+      "$sbatch_script"
+  )"
+  job_id="${job_id%%;*}"
+  printf '%s\n' "$job_id" >"$request_root/job.id"
+  printf 'submitted:%s' "$job_id"
+}
+
+# Best-effort EXIT cleanup for a token-owned preparation reservation.
+cleanup_reservation() {
+  if [ "$RESERVATION_ACTIVE" -eq 1 ]; then
+    remote_function_on \
+      "$COMPUTE_HOST" \
+      remote_cleanup_dispatch \
+      "$RESERVATION_REQUEST_ROOT" \
+      "$RESERVATION_TOKEN" \
+      >/dev/null 2>&1 || true
   fi
 }
 
@@ -101,38 +287,15 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-remote_state="$(remote_bash_on "$COMPUTE_HOST" "
-if test -f $(shell_quote "$final_sif") && \
-   test -f $(shell_quote "$final_sif.sha256") && \
-   test -f $(shell_quote "$final_sif.build.txt") && \
-   test -f $(shell_quote "$final_sif.inspect.json") && \
-   test -f $(shell_quote "$request_root/build.done"); then
-  if cd $(shell_quote "$REMOTE_CONTAINER_ROOT") && \
-     sha256sum -c $(shell_quote "$(basename "$final_sif.sha256")") >/dev/null && \
-     grep -Fxq $(shell_quote "dependency_key=$dependency_key") $(shell_quote "$final_sif.build.txt"); then
-    ln -sfn $(shell_quote "$(basename "$final_sif")") $(shell_quote "$REMOTE_CONTAINER_ROOT/epiforecaster-runtime.sif")
-    ln -sfn $(shell_quote "$(basename "$final_sif.sha256")") $(shell_quote "$REMOTE_CONTAINER_ROOT/epiforecaster-runtime.sif.sha256")
-    printf 'ready'
-    exit 0
-  fi
-  printf 'invalid'; exit 0
-fi
-if test -e $(shell_quote "$final_sif") || \
-   test -e $(shell_quote "$final_sif.sha256") || \
-   test -e $(shell_quote "$final_sif.build.txt") || \
-   test -e $(shell_quote "$final_sif.inspect.json") || \
-   test -e $(shell_quote "$request_root/build.done"); then
-  printf 'invalid'; exit 0
-fi
-if test -d $(shell_quote "$request_root/dispatching"); then
-  printf 'preparing'; exit 0
-fi
-if test -s $(shell_quote "$request_root/job.id"); then
-  job_id=\$(cat $(shell_quote "$request_root/job.id"))
-  state=\$(squeue -h -j \"\$job_id\" -o '%T' 2>/dev/null | head -n 1)
-  if test -n \"\$state\"; then printf 'job:%s:%s' \"\$job_id\" \"\$state\"; exit 0; fi
-fi
-printf 'missing'")"
+remote_state="$(
+  remote_function_on \
+    "$COMPUTE_HOST" \
+    remote_container_state \
+    "$final_sif" \
+    "$request_root" \
+    "$REMOTE_CONTAINER_ROOT" \
+    "$dependency_key"
+)"
 
 case "$remote_state" in
   ready)
@@ -156,33 +319,28 @@ case "$remote_state" in
 esac
 
 dispatch_token="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
-reservation_state="$(remote_bash_on "$COMPUTE_HOST" "
-mkdir -p $(shell_quote "$request_root")
-if mkdir $(shell_quote "$request_root/dispatching") 2>/dev/null; then
-  printf '%s\n' $(shell_quote "$dispatch_token") > $(shell_quote "$request_root/dispatching/owner")
-  printf reserved
-else
-  printf preparing
-fi")"
+reservation_state="$(
+  remote_function_on \
+    "$COMPUTE_HOST" \
+    remote_reserve_dispatch \
+    "$request_root" \
+    "$dispatch_token"
+)"
 if [ "$reservation_state" != "reserved" ]; then
   echo "Container dependencies are already being prepared: $request_root"
   exit 0
 fi
 
-reservation_active=1
-cleanup_reservation() {
-  if [ "$reservation_active" -eq 1 ]; then
-    remote_bash_on "$COMPUTE_HOST" "
-if test -f $(shell_quote "$request_root/dispatching/owner") && \
-   test \"\$(cat $(shell_quote "$request_root/dispatching/owner"))\" = $(shell_quote "$dispatch_token"); then
-  rm -rf -- $(shell_quote "$request_root/dispatching")
-fi" >/dev/null 2>&1 || true
-  fi
-}
+RESERVATION_ACTIVE=1
+RESERVATION_REQUEST_ROOT="$request_root"
+RESERVATION_TOKEN="$dispatch_token"
 trap cleanup_reservation EXIT
 
-remote_bash_on "$COMPUTE_HOST" \
-  "mkdir -p $(shell_quote "$request_root/context") $(shell_quote "$REMOTE_CONTAINER_ROOT")"
+remote_function_on \
+  "$COMPUTE_HOST" \
+  remote_create_directories \
+  "$request_root/context" \
+  "$REMOTE_CONTAINER_ROOT"
 rsync -a "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/uv.lock" \
   "$TRANSFER_HOST:$request_root/context/"
 if [ -f "$REPO_ROOT/README.md" ]; then
@@ -195,39 +353,43 @@ if [ -x "$VPN_HELPER" ]; then
   "$VPN_HELPER" wait 60
 fi
 
-fetch_command="set -euo pipefail
-export BASE_IMAGE_REF=$(shell_quote "$REMOTE_CONTAINER_BASE_IMAGE_REF")
-export DEPENDENCY_KEY=$(shell_quote "$dependency_key")
-export UV_LOCK_SHA256=$(shell_quote "$lock_sha256")
-export BUILD_ROOT=$(shell_quote "$request_root")
-export CONTAINER_ROOT=$(shell_quote "$REMOTE_CONTAINER_ROOT")
-export UV_CACHE_ROOT=$(shell_quote "$REMOTE_CONTAINER_DEP_CACHE")
-bash $(shell_quote "$request_root/fetch_runtime_deps_on_wifi.sh")"
-remote_bash_on "$CONTAINER_NETWORK_HOST" "$fetch_command"
+remote_function_on \
+  "$CONTAINER_NETWORK_HOST" \
+  remote_fetch_dependencies \
+  "$request_root/fetch_runtime_deps_on_wifi.sh" \
+  "$REMOTE_CONTAINER_BASE_IMAGE_REF" \
+  "$dependency_key" \
+  "$lock_sha256" \
+  "$request_root" \
+  "$REMOTE_CONTAINER_ROOT" \
+  "$REMOTE_CONTAINER_DEP_CACHE"
 
-base_sif="$(remote_bash_on "$COMPUTE_HOST" "cat $(shell_quote "$request_root/base-sif.path")")"
+base_sif="$(
+  remote_function_on \
+    "$COMPUTE_HOST" \
+    remote_read_file \
+    "$request_root/base-sif.path"
+)"
 prefix_root="$request_root/prefix"
-submit_command="set -euo pipefail
-test -f $(shell_quote "$request_root/deps.ready")
-exec 9>$(shell_quote "$request_root/submit.lock")
-flock 9
-if test -s $(shell_quote "$request_root/job.id"); then
-  existing=\$(cat $(shell_quote "$request_root/job.id"))
-  state=\$(squeue -h -j \"\$existing\" -o '%T' 2>/dev/null | head -n 1)
-  if test -n \"\$state\"; then printf 'existing:%s:%s' \"\$existing\" \"\$state\"; exit 0; fi
-fi
-job_id=\$(sbatch --parsable \\
-  --chdir=$(shell_quote "$request_root") \\
-  --output=$(shell_quote "$request_root/build-%j.out") \\
-  --error=$(shell_quote "$request_root/build-%j.err") \\
-  --export=ALL,BASE_SIF=$(shell_quote "$base_sif"),BASE_IMAGE_REF=$(shell_quote "$REMOTE_CONTAINER_BASE_IMAGE_REF"),PREFIX_ROOT=$(shell_quote "$prefix_root"),DEPENDENCY_KEY=$(shell_quote "$dependency_key"),UV_LOCK_SHA256=$(shell_quote "$lock_sha256"),CONTAINER_ROOT=$(shell_quote "$REMOTE_CONTAINER_ROOT"),BUILD_ROOT=$(shell_quote "$request_root") \\
-  $(shell_quote "$request_root/build_sif.sbatch"))
-job_id=\${job_id%%;*}
-printf '%s\n' \"\$job_id\" > $(shell_quote "$request_root/job.id")
-printf 'submitted:%s' \"\$job_id\""
-submission="$(remote_bash_on "$COMPUTE_HOST" "$submit_command")"
-remote_bash_on "$COMPUTE_HOST" "rm -rf -- $(shell_quote "$request_root/dispatching")"
-reservation_active=0
+submission="$(
+  remote_function_on \
+    "$COMPUTE_HOST" \
+    remote_submit_build \
+    "$request_root" \
+    "$base_sif" \
+    "$REMOTE_CONTAINER_BASE_IMAGE_REF" \
+    "$prefix_root" \
+    "$dependency_key" \
+    "$lock_sha256" \
+    "$REMOTE_CONTAINER_ROOT" \
+    "$request_root/build_sif.sbatch"
+)"
+remote_function_on \
+  "$COMPUTE_HOST" \
+  remote_cleanup_dispatch \
+  "$request_root" \
+  "$dispatch_token"
+RESERVATION_ACTIVE=0
 trap - EXIT
 
 case "$submission" in

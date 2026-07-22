@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tomllib
 from importlib.metadata import version
 from pathlib import Path
@@ -25,6 +27,31 @@ from scripts.workflow import run_config, run_support, tooling_identity
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _workflow_shell_source(tmp_path: Path) -> str:
+    """Return Bash that sources the dispatcher with an isolated test config."""
+    config = tmp_path / "mn5.conf"
+    config.write_text(
+        "\n".join(
+            [
+                "COMPUTE_HOST=fake-compute",
+                "TRANSFER_HOST=fake-transfer",
+                "CONTAINER_NETWORK_HOST=fake-network",
+                f"REMOTE_WORKFLOW_RUN_ROOT={tmp_path / 'remote-runs'}",
+                f"REMOTE_WORKFLOW_TOOLING_ROOT={tmp_path / 'tooling'}",
+                f"REMOTE_CONTAINER_SIF={tmp_path / 'runtime.sif'}",
+                f"DVC_REMOTE_PATH={tmp_path / 'dvc-remote'}",
+                f"DVC_CACHE_PATH={tmp_path / 'dvc-cache'}",
+            ]
+        )
+        + "\n"
+    )
+    dispatcher = REPO_ROOT / "scripts/workflow/mn5_workflow.sh"
+    return (
+        f"export CLUSTER_CONF={shlex.quote(str(config))}\n"
+        f"source {shlex.quote(str(dispatcher))}\n"
+    )
 
 
 def _write_pointer(
@@ -102,7 +129,10 @@ def test_single_training_smoke_composes_training_and_evaluation() -> None:
     )
 
     assert smoke["workflow"] == {"kind": "train", "target": "train_evaluate"}
-    assert smoke["training"]["max_batches"] == 1
+    assert smoke["training"]["max_batches"] == 10
+    assert "training.num_workers=1" in smoke["training"]["overrides"]
+    assert "training.val_workers=1" in smoke["training"]["overrides"]
+    assert "training.test_workers=1" in smoke["training"]["overrides"]
     assert "training.run_final_evaluation=false" in smoke["training"]["overrides"]
     assert "training.compile=false" in smoke["training"]["overrides"]
     assert smoke["evaluation"]["split"] == "test"
@@ -184,6 +214,35 @@ def _workflow_config(run_root: Path, source_root: Path) -> dict:
     }
 
 
+def _write_published_run_contract(
+    run_root: Path,
+    config_path: Path,
+    config: dict,
+) -> str:
+    state = run_root / ".state"
+    state.mkdir(parents=True, exist_ok=True)
+    dispatch = state / "dispatch.tsv"
+    dispatch.write_text("schema_version\t1\n")
+    dispatch_sha256 = run_support.sha256_file(dispatch)
+    (state / "dispatch.tsv.sha256").write_text(
+        f"{dispatch_sha256}  dispatch.tsv\n"
+    )
+    (state / "published.done").write_text(
+        "\n".join(
+            [
+                "schema_version=1",
+                f"run_id={config['run']['id']}",
+                "source_snapshot_sha256="
+                f"{config['source']['source_snapshot_sha256']}",
+                f"config_sha256={run_support.sha256_file(config_path)}",
+                f"tooling_key={config['workflow']['tooling_key']}",
+                "",
+            ]
+        )
+    )
+    return dispatch_sha256
+
+
 def test_source_snapshot_tracks_nonignored_worktree_files(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -238,6 +297,42 @@ def test_relocatable_bundle_keeps_dvc_pointer_but_excludes_payload(
     assert payloads == {Path("data/input.bin.dvc"): Path("data/input.bin")}
 
 
+def test_relocatable_bundle_includes_provenance_only_dvc_pointer(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / ".gitignore").write_text("data/raw.bin\ndata/processed.bin\n")
+    _write_pointer(
+        repo,
+        "data/raw.bin.dvc",
+        md5="raw-md5",
+        output_name="raw.bin",
+    )
+    _write_pointer(
+        repo,
+        "data/processed.bin.dvc",
+        md5="processed-md5",
+        output_name="processed.bin",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    config = {
+        "dvc": {
+            "targets": ["data/processed.bin.dvc"],
+            "provenance_targets": ["data/raw.bin.dvc"],
+        }
+    }
+
+    paths = run_config.source_files(repo)
+    payloads = run_config.validate_code_data_separation(repo, paths, config)
+
+    assert payloads == {
+        Path("data/processed.bin.dvc"): Path("data/processed.bin"),
+        Path("data/raw.bin.dvc"): Path("data/raw.bin"),
+    }
+
+
 def test_relocatable_bundle_rejects_tracked_dvc_payload(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -260,15 +355,47 @@ def test_relocatable_bundle_rejects_tracked_dvc_payload(tmp_path: Path) -> None:
         )
 
 
-def test_workflow_tooling_key_tracks_lockfile(tmp_path: Path) -> None:
+def test_workflow_tooling_key_tracks_lockfile_and_bootstrap(tmp_path: Path) -> None:
     lock = tmp_path / "uv.lock"
+    bootstrap = tmp_path / "remote_tooling.sh"
     lock.write_text("version = 1\n")
+    bootstrap.write_text("#!/bin/bash\n")
 
-    initial = tooling_identity.workflow_tooling_key(lock)
+    initial = tooling_identity.workflow_tooling_key(lock, bootstrap)
 
-    assert initial == tooling_identity.workflow_tooling_key(lock)
+    assert initial == tooling_identity.workflow_tooling_key(lock, bootstrap)
     lock.write_text("version = 2\n")
-    assert initial != tooling_identity.workflow_tooling_key(lock)
+    changed_lock = tooling_identity.workflow_tooling_key(lock, bootstrap)
+    assert initial != changed_lock
+    bootstrap.write_text("#!/bin/bash\nset -e\n")
+    assert changed_lock != tooling_identity.workflow_tooling_key(lock, bootstrap)
+
+
+def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/test-run"
+    source_root = run_root / "source"
+    config = _workflow_config(run_root, source_root)
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    config_path = tmp_path / "config.yaml"
+    dispatch_path = tmp_path / "dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    request = run_config.write_dispatch_request(config_path, dispatch_path)
+
+    assert request["run_id"] == "test-run"
+    assert request["run_root"] == str(run_root)
+    assert request["source_root"] == str(source_root)
+    assert request["workflow_kind"] == "hpo"
+    assert request["workflow_target"] == "hpo"
+    assert request["tasks"] == "4"
+    assert request["cpus_per_task"] == "20"
+    assert request["gres"] == "gpu:4"
+    assert request["config_sha256"] == run_support.sha256_file(config_path)
+    assert dispatch_path.with_suffix(".tsv.sha256").is_file()
+    assert "snakemake_arg" not in request
 
 
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
@@ -320,9 +447,17 @@ def test_prepare_run_writes_provenance_identity(tmp_path: Path) -> None:
         output_name="processed.zarr",
     )
     config = _workflow_config(run_root, source_root)
+    _write_pointer(
+        source_root,
+        "data/files/upstream.zarr.dvc",
+        md5="upstream.dir",
+        output_name="upstream.zarr",
+    )
+    config["dvc"]["provenance_targets"] = ["data/files/upstream.zarr.dvc"]
     config_path = run_root / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(config))
+    dispatch_sha256 = _write_published_run_contract(run_root, config_path, config)
     config_path.chmod(0o444)
     source_root.chmod(0o555)
 
@@ -337,11 +472,13 @@ def test_prepare_run_writes_provenance_identity(tmp_path: Path) -> None:
         "source_snapshot_sha256": "c" * 64,
         "dvc_hashes": {
             "data/files/raw.zarr.dvc": "raw.dir",
+            "data/files/upstream.zarr.dvc": "upstream.dir",
             "data/processed/processed.zarr.dvc": "processed.dir",
         },
         "container_digest": f"sha256:{'d' * 64}",
         "workflow_tooling_key": "workflow-key",
         "snakemake_config_sha256": run_support.sha256_file(config_path),
+        "dispatch_request_sha256": dispatch_sha256,
         "workflow_kind": "hpo",
         "workflow_target": "hpo",
         "study_name": "test-study",
@@ -349,9 +486,74 @@ def test_prepare_run_writes_provenance_identity(tmp_path: Path) -> None:
     assert manifest["workflow"]["version"] == version("snakemake")
     assert manifest["workflow"]["installed_location"]
     assert manifest["workflow"]["execution_mode"] == "single-node-preallocated"
+    assert manifest["dvc"]["targets"]["data/files/raw.zarr.dvc"]["role"] == (
+        "materialized"
+    )
+    assert manifest["dvc"]["targets"]["data/files/upstream.zarr.dvc"]["role"] == (
+        "provenance"
+    )
     assert (run_root / ".state/prepared.done").is_file()
     assert not manifest_path.stat().st_mode & 0o222
     assert not (run_root / ".state/prepared.done").stat().st_mode & 0o222
+
+
+def test_prepare_run_pins_evaluation_checkpoint_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/evaluate"
+    source_root = run_root / "source"
+    _write_pointer(
+        source_root,
+        "data/files/raw.zarr.dvc",
+        md5="raw.dir",
+        output_name="raw.zarr",
+    )
+    _write_pointer(
+        source_root,
+        "data/processed/processed.zarr.dvc",
+        md5="processed.dir",
+        output_name="processed.zarr",
+    )
+    external_checkpoint = tmp_path / "external/best_model.pt"
+    external_checkpoint.parent.mkdir()
+    external_checkpoint.write_bytes(b"original checkpoint")
+    config = _workflow_config(run_root, source_root)
+    config["workflow"].update({"kind": "evaluate", "target": "evaluate"})
+    config["evaluation"]["checkpoint"] = str(external_checkpoint)
+    config.pop("optuna")
+    config.pop("promotion")
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_published_run_contract(run_root, config_path, config)
+    config_path.chmod(0o444)
+    source_root.chmod(0o555)
+
+    try:
+        manifest_path = run_support.prepare_run(config_path, source_root, run_root)
+    finally:
+        source_root.chmod(0o755)
+
+    pinned = run_root / "inputs/evaluation_checkpoint.pt"
+    expected_hash = run_support.sha256_file(pinned)
+    manifest = yaml.safe_load(manifest_path.read_text())
+    assert pinned.read_bytes() == b"original checkpoint"
+    assert not pinned.stat().st_mode & 0o222
+    assert manifest["evaluation_input"]["pinned_checkpoint"] == str(pinned)
+    assert manifest["evaluation_input"]["checkpoint_sha256"] == expected_hash
+
+    external_checkpoint.write_bytes(b"later mutation")
+    captured: dict[str, Path] = {}
+
+    def fake_evaluate(checkpoint_path, output_dir, split, overrides, granular):
+        captured["checkpoint"] = checkpoint_path
+        return output_dir / "evaluation_manifest.json"
+
+    monkeypatch.setattr(run_support, "evaluate_best", fake_evaluate)
+    run_support.evaluate_configured_model(config_path, run_root, pinned)
+    assert captured["checkpoint"] == pinned
+    assert run_support.sha256_file(pinned) == expected_hash
 
 
 def test_production_workflow_tracks_required_region_embedding() -> None:
@@ -378,6 +580,8 @@ def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> No
 
     assert Path("workflow/Snakefile") in paths
     assert Path("scripts/workflow/mn5_container_exec.sh") in paths
+    assert Path("scripts/workflow/remote_run.sh") in paths
+    assert Path("scripts/workflow/remote_tooling.sh") in paths
     assert set(payloads) == {
         Path("data/files/mobility.zarr.dvc"),
         Path("data/processed/real_with_id.zarr.dvc"),
@@ -398,7 +602,7 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
     ).read_text()
-    launcher = (REPO_ROOT / "scripts/workflow/launch_optuna_workers.sh").read_text()
+    launcher = (REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh").read_text()
 
     assert profile["executor"] == "local"
     assert profile["jobs"] == 1
@@ -749,6 +953,130 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
     ]
 
 
+def test_finalize_crossval_validates_folds_and_aggregates_scalar_metrics(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = {
+        "crossval": {"campaign_id": "campaign-a", "folds": 2, "seed": 42},
+        "evaluation": {"split": "test"},
+    }
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+
+    for fold, mae in enumerate((0.2, 0.4)):
+        fold_root = run_root / "outputs/crossval/campaign-a" / f"fold-{fold:03d}"
+        checkpoint = (
+            fold_root / "outputs/training/training/model/checkpoints/best_model.pt"
+        )
+        training_manifest = fold_root / "fold_training_manifest.json"
+        evaluation_manifest = fold_root / "outputs/evaluation/evaluation_manifest.json"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(f"checkpoint-{fold}".encode())
+        run_support.write_json(training_manifest, {"fold": fold})
+        run_support.write_json(evaluation_manifest, {"fold": fold})
+        run_support.write_json(
+            fold_root / "outputs/evaluation/test_summary.json",
+            {
+                "eval_loss": mae + 0.1,
+                "metrics": {"mae": mae, "mae_by_horizon": [mae]},
+            },
+        )
+        run_support.write_json(
+            fold_root / "fold_manifest.json",
+            {
+                "fold": fold,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": run_support.sha256_file(checkpoint),
+                "training_fold_manifest": str(training_manifest),
+                "training_fold_manifest_sha256": run_support.sha256_file(
+                    training_manifest
+                ),
+                "evaluation_manifest": str(evaluation_manifest),
+                "evaluation_manifest_sha256": run_support.sha256_file(
+                    evaluation_manifest
+                ),
+            },
+        )
+
+    manifest_path = run_support.finalize_crossval(config_path, run_root)
+
+    aggregate = (
+        run_root / "outputs/crossval/campaign-a/test_aggregate_metrics.csv"
+    ).read_text()
+    assert "mae,2,0.30000000000000004" in aggregate
+    manifest = json.loads(manifest_path.read_text())
+    assert len(manifest["folds"]) == 2
+    assert (run_root / ".state/crossval.done").is_file()
+
+
+def test_crossval_fold_builds_isolated_train_evaluate_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    config = {
+        "crossval": {
+            "campaign_id": "campaign-a",
+            "base_config": "configs/production_only/train.yaml",
+            "folds": 3,
+            "seed": 17,
+            "holdout_role": "test",
+            "max_batches": 2,
+            "overrides": ["training.compile=false"],
+        },
+        "evaluation": {"split": "test", "granular": False, "overrides": []},
+    }
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    captured: dict[str, object] = {}
+
+    def fake_train(path: Path, source: Path, fold_root: Path) -> Path:
+        fold_config = run_support.load_yaml(path)
+        captured["config"] = fold_config
+        captured["source"] = source
+        checkpoint, model_root = run_support.training_artifact_paths(
+            fold_config, fold_root
+        )
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"fold checkpoint")
+        run_support.write_json(model_root / "training_manifest.json", {"ok": True})
+        return fold_root / ".state/training.done"
+
+    def fake_evaluate(path: Path, fold_root: Path, checkpoint: Path) -> Path:
+        captured["checkpoint"] = checkpoint
+        manifest = fold_root / "outputs/evaluation/evaluation_manifest.json"
+        run_support.write_json(manifest, {"ok": True})
+        return manifest
+
+    monkeypatch.setattr(run_support, "train_model", fake_train)
+    monkeypatch.setattr(run_support, "evaluate_configured_model", fake_evaluate)
+
+    training_manifest = run_support.train_crossval_fold(
+        config_path, source_root, run_root, fold=1
+    )
+    manifest = run_support.evaluate_crossval_fold(config_path, run_root, fold=1)
+
+    fold_config = captured["config"]
+    assert isinstance(fold_config, dict)
+    assert fold_config["workflow"] == {"kind": "train", "target": "train_evaluate"}
+    assert fold_config["training"]["model_id"] == "model"
+    assert "training.crossval_fold_index=1" in fold_config["training"]["overrides"]
+    assert "training.crossval_num_folds=3" in fold_config["training"]["overrides"]
+    assert captured["source"] == source_root
+    assert captured["checkpoint"] == (
+        run_root
+        / "outputs/crossval/campaign-a/fold-001"
+        / "outputs/training/training/model/checkpoints/best_model.pt"
+    )
+    assert json.loads(training_manifest.read_text())["fold"] == 1
+    assert json.loads(manifest.read_text())["fold"] == 1
+
+
 def _run_workflow_dry_run(
     config_path: Path,
     run_root: Path,
@@ -792,6 +1120,8 @@ def _write_source_inventory(run_root: Path) -> None:
             for path in run_config.source_files(REPO_ROOT)
         )
     )
+    (run_root / ".state/dispatch.tsv").write_text("test\tdispatch\n")
+    (run_root / ".state/published.done").write_text("run_id=test-run\n")
 
 
 def _use_repository_sources(config: dict) -> None:
@@ -832,6 +1162,15 @@ def _workflow_mode_config(kind: str, run_root: Path) -> dict:
         config["resources"] = template["resources"]
         config.pop("optuna")
         config.pop("evaluation")
+        config.pop("promotion")
+    elif kind == "crossval":
+        template = yaml.safe_load(
+            (REPO_ROOT / "workflow/config/mn5_crossval.yaml").read_text()
+        )
+        config["crossval"] = template["crossval"]
+        config["evaluation"] = template["evaluation"]
+        config["resources"] = template["resources"]
+        config.pop("optuna")
         config.pop("promotion")
     return config
 
@@ -952,7 +1291,34 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert re.search(r"^total\s+8$", result.stdout, re.MULTILINE)
 
 
-def test_evaluation_only_dag_binds_an_explicit_checkpoint(tmp_path: Path) -> None:
+def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_mode_config("crossval", run_root)
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "train_crossval_folds" in result.stdout
+    assert "evaluate_crossval_folds" in result.stdout
+    assert "finalize_crossval" in result.stdout
+    assert "--worker-group crossval-training" in result.stdout
+    assert "--worker-group crossval-evaluation" in result.stdout
+    assert "--workers 4" in result.stdout
+    assert (
+        "--fold '{worker_id}'" in result.stdout or "--fold {worker_id}" in result.stdout
+    )
+    assert "test_fold_metrics.csv" in result.stdout
+    assert "test_aggregate_metrics.csv" in result.stdout
+    assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
+
+
+def test_evaluation_only_dag_pins_checkpoint_inside_the_run(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("evaluate", run_root)
     checkpoint = Path(config["evaluation"]["checkpoint"])
@@ -967,7 +1333,9 @@ def test_evaluation_only_dag_binds_an_explicit_checkpoint(tmp_path: Path) -> Non
     assert result.returncode == 0, result.stdout + result.stderr
     assert "evaluate_model" in result.stdout
     assert "train_model" not in result.stdout
-    assert f"--input-path {checkpoint}" in result.stdout
+    pinned_checkpoint = run_root / "inputs/evaluation_checkpoint.pt"
+    assert str(pinned_checkpoint) in result.stdout
+    assert f"--input-path {checkpoint}" not in result.stdout
     assert "test_summary.json" in result.stdout
     assert "evaluation_manifest.json" in result.stdout
     assert re.search(r"^total\s+7$", result.stdout, re.MULTILINE)
@@ -976,21 +1344,28 @@ def test_evaluation_only_dag_binds_an_explicit_checkpoint(tmp_path: Path) -> Non
 def test_scientific_source_inventory_excludes_docs_and_tests() -> None:
     paths = [
         Path("cli.py"),
+        Path("constants.py"),
+        Path("dataviz/eval_head_plots.py"),
         Path("models/forecaster.py"),
         Path("training/trainer.py"),
         Path("workflow/Snakefile"),
         Path("workflow/config/mn5.yaml"),
+        Path("workflow/rules/training.smk"),
         Path("data/processed/data.zarr"),
         Path("docs/architecture.md"),
         Path("tests/test_model.py"),
+        Path("tex/paper.py"),
     ]
 
     assert run_config.scientific_source_files(paths) == [
         Path("cli.py"),
+        Path("constants.py"),
+        Path("dataviz/eval_head_plots.py"),
         Path("models/forecaster.py"),
         Path("training/trainer.py"),
         Path("workflow/Snakefile"),
         Path("workflow/config/mn5.yaml"),
+        Path("workflow/rules/training.smk"),
     ]
 
 
@@ -1162,6 +1537,80 @@ def test_promotion_refuses_to_overwrite_existing_run(tmp_path: Path) -> None:
         raise AssertionError("Promotion unexpectedly overwrote an existing run")
 
 
+def _write_promotion_evidence(run_root: Path) -> tuple[Path, Path]:
+    source_checkpoint = (
+        run_root / "optuna/trials/test-study/trial-000000/checkpoints/best_model.pt"
+    )
+    source_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    source_checkpoint.write_bytes(b"selected checkpoint")
+    checkpoint = run_root / "outputs/best_model.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"selected checkpoint")
+    checkpoint_hash = run_support.sha256_file(checkpoint)
+    run_support.write_json(
+        run_root / "outputs/selection.json",
+        {
+            "selected_checkpoint": str(checkpoint),
+            "selected_checkpoint_sha256": checkpoint_hash,
+            "source_checkpoint": str(source_checkpoint),
+            "source_checkpoint_sha256": checkpoint_hash,
+        },
+    )
+    evaluation_dir = run_root / "outputs/evaluation"
+    summary = evaluation_dir / "test_summary.json"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text('{"loss": 0.5}\n')
+    run_support.write_json(
+        evaluation_dir / "evaluation_manifest.json",
+        {
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": checkpoint_hash,
+            "artifacts": [
+                {
+                    "path": summary.name,
+                    "sha256": run_support.sha256_file(summary),
+                    "required": True,
+                }
+            ],
+        },
+    )
+    return checkpoint, summary
+
+
+def test_promotion_integrity_rejects_tampered_selected_checkpoint(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    checkpoint, _ = _write_promotion_evidence(run_root)
+    checkpoint.write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="promotion SHA-256"):
+        run_support._promotion_integrity(run_root)
+
+
+def test_promotion_integrity_rejects_tampered_evaluation_artifact(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    _, summary = _write_promotion_evidence(run_root)
+    summary.write_text('{"loss": 99}\n')
+
+    with pytest.raises(ValueError, match="Evaluation artifact failed"):
+        run_support._promotion_integrity(run_root)
+
+
+def test_promotion_integrity_accepts_selected_and_evaluated_hashes(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    checkpoint, summary = _write_promotion_evidence(run_root)
+
+    assert run_support._promotion_integrity(run_root) == {
+        "outputs/best_model.pt": run_support.sha256_file(checkpoint),
+        "outputs/evaluation/test_summary.json": run_support.sha256_file(summary),
+    }
+
+
 def test_selection_metadata_is_json_serializable(tmp_path: Path) -> None:
     metadata = tmp_path / "metadata.json"
     run_support.write_json(metadata, {"path": Path("checkpoint.pt")})
@@ -1245,52 +1694,308 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "UV_LINK_MODE=copy" in fetch
     assert '"$prefix_root/.venv/bin/python"' in fetch
     assert "sha256sum -c" in dispatcher
+    assert "remote_bash" not in dispatcher
+    assert 'declare -f "$function_name"' in dispatcher
+    assert "remote_container_state()" in dispatcher
+    assert "remote_submit_build()" in dispatcher
     key_material = dispatcher.split('dependency_key="$({', 1)[1].split(
         '} | sha256_stream)"', 1
     )[0]
     assert '"$REPO_ROOT/pyproject.toml"' not in key_material
     assert '"$REPO_ROOT/uv.lock"' in key_material
-    assert 'grep -Fxq $(shell_quote "dependency_key=$dependency_key")' in dispatcher
-    assert 'mkdir $(shell_quote "$request_root/dispatching")' in dispatcher
-    assert 'exec 9>$(shell_quote "$request_root/submit.lock")' in dispatcher
+    assert 'grep -Fxq "dependency_key=$dependency_key"' in dispatcher
+    assert 'mkdir "$request_root/dispatching"' in dispatcher
+    assert 'exec 9>"$request_root/submit.lock"' in dispatcher
+
+
+def _make_remote_run_staging(
+    tmp_path: Path,
+    *,
+    token: str,
+) -> tuple[Path, Path]:
+    """Create a faithful local staging bundle for the transferred runner."""
+    run_parent = tmp_path / "runs"
+    run_root = run_parent / "test-run"
+    staging = run_parent / f".staging-test-run.{token}"
+    source_root = staging / "source"
+    run_parent.mkdir(exist_ok=True)
+
+    for relative in (
+        "scripts/__init__.py",
+        "scripts/workflow/__init__.py",
+        "scripts/workflow/run_config.py",
+        "scripts/workflow/remote_run.sh",
+        "scripts/workflow/snakemake_coordinator.sbatch",
+    ):
+        destination = source_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / relative, destination)
+
+    source_paths = sorted(
+        (
+            path.relative_to(source_root)
+            for path in source_root.rglob("*")
+            if path.is_file() or path.is_symlink()
+        ),
+        key=lambda path: path.as_posix(),
+    )
+    source_digest = run_config.source_snapshot_sha256(source_root, source_paths)
+    state = staging / ".state"
+    state.mkdir()
+    (state / "source-files.bin").write_bytes(
+        b"".join(os.fsencode(path.as_posix()) + b"\0" for path in source_paths)
+    )
+
+    sif = tmp_path / "containers/runtime.sif"
+    sif.parent.mkdir(exist_ok=True)
+    sif.write_bytes(b"immutable runtime")
+    sif_digest = run_support.sha256_file(sif)
+    Path(f"{sif}.sha256").write_text(f"{sif_digest}  {sif.name}\n")
+
+    snakemake_bin = Path(sys.executable).parent / "snakemake"
+    tooling_python = snakemake_bin.with_name("python")
+    config = _workflow_config(run_root, run_root / "source")
+    config["source"]["source_snapshot_sha256"] = source_digest
+    config["source"]["source_file_count"] = len(source_paths)
+    config["container"] = {
+        "sif": str(sif),
+        "digest_file": f"{sif}.sha256",
+    }
+    config["workflow"]["snakemake_bin"] = str(snakemake_bin)
+    config["workflow"]["snakemake_version"] = version("snakemake")
+    config_path = staging / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    run_config.write_dispatch_request(config_path, state / "dispatch.tsv")
+
+    request = (state / "dispatch.tsv").read_text()
+    expected = f"tooling_python\t{tooling_python}\n"
+    assert expected in request
+    return staging, run_root
+
+
+def test_transferred_runner_publishes_once_and_reserves_run_id(
+    tmp_path: Path,
+) -> None:
+    staging, run_root = _make_remote_run_staging(tmp_path, token="owner")
+    runner = staging / "source/scripts/workflow/remote_run.sh"
+
+    result = subprocess.run(
+        [str(runner), "publish"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout == f"published:{run_root}"
+    assert not staging.exists()
+    assert (run_root / ".state/published.done").is_file()
+    assert (run_root / ".state/dispatch.tsv").is_file()
+    assert not (run_root / "config.yaml").stat().st_mode & 0o222
+    assert not (run_root / "source").stat().st_mode & 0o222
+    reservation = run_root.parent / ".reservations/test-run"
+    assert reservation.is_dir()
+    assert (reservation / "owner").read_text() == ".staging-test-run.owner\n"
+
+    competing, _ = _make_remote_run_staging(tmp_path, token="competitor")
+    duplicate = subprocess.run(
+        [str(competing / "source/scripts/workflow/remote_run.sh"), "publish"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert duplicate.returncode == 73
+    assert "already reserved" in duplicate.stderr
+    assert run_root.is_dir()
+
+
+def test_transferred_runner_rejects_tampered_config_before_reservation(
+    tmp_path: Path,
+) -> None:
+    staging, run_root = _make_remote_run_staging(tmp_path, token="tampered")
+    config_path = staging / "config.yaml"
+    config_path.write_text(config_path.read_text() + "tampered: true\n")
+
+    result = subprocess.run(
+        [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "config failed SHA-256" in result.stderr
+    assert not run_root.exists()
+    assert not (run_root.parent / ".reservations/test-run").exists()
+
+
+def test_transferred_runner_submission_is_idempotent_and_pinned(
+    tmp_path: Path,
+) -> None:
+    staging, run_root = _make_remote_run_staging(tmp_path, token="submit")
+    subprocess.run(
+        [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        check=True,
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "sbatch.calls"
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$CALLS_FILE\"\n"
+        "printf '12345;cluster\\n'\n"
+    )
+    sbatch.chmod(0o755)
+    squeue = fake_bin / "squeue"
+    squeue.write_text("#!/bin/bash\nprintf 'RUNNING\\n'\n")
+    squeue.chmod(0o755)
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CALLS_FILE": str(calls),
+    }
+    runner = run_root / "source/scripts/workflow/remote_run.sh"
+
+    first = subprocess.run(
+        [str(runner), "submit"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    second = subprocess.run(
+        [str(runner), "submit"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert first.stdout == "submitted:12345"
+    assert second.stdout == "active:12345:RUNNING"
+    call_lines = calls.read_text().splitlines()
+    assert len(call_lines) == 1
+    assert "--nodes=1" in call_lines[0]
+    assert "--ntasks=4" in call_lines[0]
+    assert "--cpus-per-task=20" in call_lines[0]
+    assert "--gres=gpu:4" in call_lines[0]
+    assert "--mem" not in call_lines[0]
+    assert "--cores" not in call_lines[0]
+    assert (run_root / ".state/coordinator.job_id").read_text() == "12345\n"
+    assert (run_root.parent / "by-slurm/12345_0").resolve() == run_root
+
+
+@pytest.mark.parametrize("command", ["run", "dry-run"])
+def test_dispatcher_rejects_submission_time_snakemake_arguments(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    program = _workflow_shell_source(tmp_path) + f"main {command} test-run --cores 4\n"
+
+    result = subprocess.run(
+        ["bash", "-c", program],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "Usage:" in result.stderr
+
+
+def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    fake_bin = tmp_path / "bin"
+    scratch = tmp_path / "scratch"
+    sif = tmp_path / "runtime.sif"
+    run_root.mkdir()
+    source_root.mkdir()
+    fake_bin.mkdir()
+    scratch.mkdir()
+    sif.touch()
+
+    singularity = fake_bin / "singularity"
+    singularity.write_text("#!/bin/bash\nexit 7\n")
+    singularity.chmod(0o755)
+    wrapper = REPO_ROOT / "scripts/workflow/mn5_container_exec.sh"
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "TMPDIR": str(scratch),
+    }
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(wrapper),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(sif),
+            "--",
+            "scientific-command",
+            "argument with spaces",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 7
+    assert not (
+        scratch / "epiforecaster" / run_root.name / "local_batch_0"
+    ).exists()
 
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     dispatcher = (REPO_ROOT / "scripts/workflow/mn5_workflow.sh").read_text()
     identity_helper = (REPO_ROOT / "scripts/workflow/tooling_identity.py").read_text()
+    remote_runner = (REPO_ROOT / "scripts/workflow/remote_run.sh").read_text()
+    tooling_runner = (REPO_ROOT / "scripts/workflow/remote_tooling.sh").read_text()
     container_exec = (REPO_ROOT / "scripts/workflow/mn5_container_exec.sh").read_text()
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
     ).read_text()
-    launcher = (REPO_ROOT / "scripts/workflow/launch_optuna_workers.sh").read_text()
-    worker = (REPO_ROOT / "scripts/workflow/run_optuna_worker.sh").read_text()
+    launcher = (REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh").read_text()
+    worker = (REPO_ROOT / "scripts/workflow/run_parallel_worker.sh").read_text()
 
-    assert 'if ! mkdir $(shell_quote "$root")' in dispatcher
-    assert "scripts.workflow.run_config verify" in dispatcher
-    assert "uv sync" in dispatcher
-    assert "--frozen" in dispatcher
-    assert "--only-group workflow" in dispatcher
+    assert "remote_bash" not in dispatcher
+    assert "declare -f" not in dispatcher
+    assert "remote_function" not in dispatcher
+    assert "remote_run.sh" in dispatcher
+    assert "remote_tooling.sh" in dispatcher
+    assert 'staging_root="$REMOTE_WORKFLOW_RUN_ROOT/.staging-' in dispatcher
+    assert "--dispatch-file" in dispatcher
+    assert "uv sync" not in dispatcher
+    assert "uv sync" in tooling_runner
+    assert "--frozen" in tooling_runner
+    assert "--only-group workflow" in tooling_runner
     assert "pyproject.toml=" not in identity_helper
     assert "uv.lock=" in identity_helper
+    assert "bootstrap=" in identity_helper
     assert "scripts.workflow.tooling_identity" in dispatcher
-    assert "snakemake_version=" in dispatcher
-    assert "snakemake_location=" in dispatcher
+    assert "snakemake_version=" in tooling_runner
     assert 'ssh_options+=(-o "HostName=$CONTAINER_NETWORK_HOSTNAME")' in dispatcher
     assert "executor_commit=" not in dispatcher
     assert "EXECUTOR_SUBMODULE" not in dispatcher
-    assert 'exec 9>$(shell_quote "$root/.state/coordinator.launch.lock")' in dispatcher
+    assert 'exec 9>"$RUN_ROOT/.state/coordinator.launch.lock"' in remote_runner
     assert "workflow/config/mn5_train.yaml" in dispatcher
-    assert "$root/.state/workflow.done" in dispatcher
-    assert "sbatch --parsable" in dispatcher
-    assert "scripts.workflow.run_config allocation" in dispatcher
-    assert '--ntasks=$(shell_quote "$tasks")' in dispatcher
-    assert '--cpus-per-task=$(shell_quote "$cpus_per_task")' in dispatcher
-    assert '--gres=$(shell_quote "$gres")' in dispatcher
-    assert '$(shell_quote "$tasks")' in dispatcher
-    assert '$(shell_quote "$cpus_per_task")' in dispatcher
+    assert "$RUN_ROOT/.state/workflow.done" in remote_runner
+    assert "sbatch --parsable" in remote_runner
+    assert '--ntasks="$TASKS"' in remote_runner
+    assert '--cpus-per-task="$CPUS_PER_TASK"' in remote_runner
+    assert '--gres="$GRES"' in remote_runner
+    assert '"$TASKS"' in remote_runner
+    assert '"$CPUS_PER_TASK"' in remote_runner
+    assert '"$@"' not in remote_runner.split("submit_run()", 1)[1].split(
+        "show_status()", 1
+    )[0]
     assert "--mem" not in coordinator
     squeue_state_probes = [
-        line for line in dispatcher.splitlines() if "state=\\$(squeue" in line
+        line for line in remote_runner.splitlines() if 'state="$(squeue' in line
     ]
     assert len(squeue_state_probes) == 3
     assert all("head -n 1 || true" in line for line in squeue_state_probes)
@@ -1299,7 +2004,7 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert '"$DVC_REMOTE:$DVC_REMOTE:ro"' in container_exec
     assert '"$DVC_REMOTE:$DVC_REMOTE:rw"' in container_exec
     assert (
-        'execution_id="${slurm_job_id}_${slurm_task_id}_${slurm_step_id}_${slurm_proc_id}"'
+        'execution_id="${slurm_job_id}_${slurm_step_id}_${slurm_proc_id}"'
         in container_exec
     )
     assert (
@@ -1307,7 +2012,7 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
         in container_exec
     )
     assert "trap - EXIT" in container_exec
-    assert 'chmod -R u+w "$scratch_root"' in container_exec
+    assert 'chmod -R u+w "$SCRATCH_ROOT"' in container_exec
     assert 'exit "$status"' in container_exec
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in coordinator
     assert "#SBATCH --ntasks=4" in coordinator
@@ -1316,5 +2021,5 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert '--ntasks="$WORKERS"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
-    assert 'worker_index="${SLURM_PROCID:' in worker
-    assert "EPIFORECASTER_WORKER_ID=$worker_index" in worker
+    assert 'WORKER_INDEX="${SLURM_PROCID:' in worker
+    assert "EPIFORECASTER_WORKER_ID=$WORKER_INDEX" in worker

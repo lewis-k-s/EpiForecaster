@@ -34,51 +34,133 @@ metadata_file="$final_sif.build.txt"
 inspect_file="$final_sif.inspect.json"
 success_marker="$BUILD_ROOT/build.done"
 
-if ! command -v module >/dev/null 2>&1; then
-  set +u
-  # shellcheck disable=SC1091
-  source /etc/profile.d/00-bsc.sh 2>/dev/null || true
-  # shellcheck disable=SC1091
-  source /etc/profile.d/01-module.sh 2>/dev/null || true
-  set -u
-fi
-module load EB/apps >/dev/null 2>&1 || true
-module load "${SINGULARITY_MODULE:-singularity/4.1.5}"
+# Load Singularity on compute nodes whose non-interactive shell lacks modules.
+load_singularity() {
+  if ! command -v module >/dev/null 2>&1; then
+    set +u
+    # shellcheck disable=SC1091
+    source /etc/profile.d/00-bsc.sh 2>/dev/null || true
+    # shellcheck disable=SC1091
+    source /etc/profile.d/01-module.sh 2>/dev/null || true
+    set -u
+  fi
+  module load EB/apps >/dev/null 2>&1 || true
+  module load "${SINGULARITY_MODULE:-singularity/4.1.5}"
+}
 
-test -f "$BASE_SIF"
-if [ ! -L "$PREFIX_ROOT/.venv/bin/python" ] && \
-  [ ! -f "$PREFIX_ROOT/.venv/bin/python" ]; then
-  echo "Prefetched environment has no Python launcher: $PREFIX_ROOT/.venv/bin/python" >&2
-  exit 1
-fi
-test -f "$BUILD_ROOT/deps.ready"
-recorded_key="$(awk -F= '$1 == "dependency_key" {print $2}' "$BUILD_ROOT/deps.ready")"
-if [ "$recorded_key" != "$DEPENDENCY_KEY" ]; then
-  echo "Prefetched dependency marker does not match this build" >&2
-  exit 1
-fi
+# Verify that the prefetched dependency identity matches this offline build.
+validate_prefetched_inputs() {
+  local recorded_key
 
-mkdir -p "$CONTAINER_ROOT" "$BUILD_ROOT"
-exec 9>"$CONTAINER_ROOT/.epiforecaster-runtime-$build_key.lock"
-flock 9
+  test -f "$BASE_SIF"
+  if [ ! -L "$PREFIX_ROOT/.venv/bin/python" ] \
+    && [ ! -f "$PREFIX_ROOT/.venv/bin/python" ]; then
+    echo "Prefetched environment has no Python launcher: $PREFIX_ROOT/.venv/bin/python" >&2
+    return 1
+  fi
 
+  test -f "$BUILD_ROOT/deps.ready"
+  recorded_key="$(awk -F= '$1 == "dependency_key" {print $2}' "$BUILD_ROOT/deps.ready")"
+  if [ "$recorded_key" != "$DEPENDENCY_KEY" ]; then
+    echo "Prefetched dependency marker does not match this build" >&2
+    return 1
+  fi
+}
+
+# Select node-local scratch, falling back to the durable request directory.
+select_scratch_root() {
+  local scratch_leaf scratch_parent scratch_candidate
+
+  scratch_leaf="epiforecaster-sif-${SLURM_JOB_ID:-$$}"
+  scratch_root=""
+  for scratch_parent in \
+    "${SLURM_TMPDIR:-}" \
+    "/scratch/tmp/${USER:-unknown}"; do
+    [ -n "$scratch_parent" ] || continue
+    scratch_candidate="${scratch_parent%/}/$scratch_leaf"
+    if mkdir -p "$scratch_candidate" 2>/dev/null; then
+      scratch_root="$scratch_candidate"
+      break
+    fi
+  done
+
+  if [ -z "$scratch_root" ]; then
+    scratch_root="$BUILD_ROOT/.scratch-${SLURM_JOB_ID:-$$}"
+    mkdir -p "$scratch_root"
+  fi
+  mkdir -p "$scratch_root/cache" "$scratch_root/tmp"
+}
+
+# Existing immutable outputs are reusable only when the complete set verifies.
 verify_existing() {
   local expected actual
-  test -f "$final_sif" && \
-    test -f "$digest_sidecar" && \
-    test -f "$metadata_file" && \
-    test -f "$inspect_file" && \
-    test -f "$success_marker" || return 1
+
+  test -f "$final_sif" \
+    && test -f "$digest_sidecar" \
+    && test -f "$metadata_file" \
+    && test -f "$inspect_file" \
+    && test -f "$success_marker" || return 1
   expected="$(awk 'NR == 1 {print $1}' "$digest_sidecar")"
   actual="$(sha256sum "$final_sif" | awk '{print $1}')"
   test "$actual" = "$expected"
 }
 
-if [ -e "$final_sif" ] || \
-  [ -e "$digest_sidecar" ] || \
-  [ -e "$metadata_file" ] || \
-  [ -e "$inspect_file" ] || \
-  [ -e "$success_marker" ]; then
+# Preserve the build status while removing writable scratch and partial outputs.
+cleanup() {
+  local status=$?
+
+  trap - EXIT
+  set +e
+  if [ -d "$scratch_root" ]; then
+    chmod -R u+w "$scratch_root" 2>/dev/null
+    rm -rf -- "$scratch_root"
+  fi
+  rm -f "$publish_tmp" "$sidecar_tmp" "$metadata_tmp" "$inspect_tmp"
+  exit "$status"
+}
+
+# Install stable launchers without relying on Singularity metadata regeneration.
+install_runtime_launchers() {
+  local python_command console_script script_name
+
+  for python_command in python python3; do
+    rm -f "$sandbox/usr/local/bin/$python_command"
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'exec /opt/epiforecaster/.venv/bin/python "$@"' > \
+      "$sandbox/usr/local/bin/$python_command"
+    chmod 0755 "$sandbox/usr/local/bin/$python_command"
+  done
+
+  for console_script in "$PREFIX_ROOT/.venv/bin/"*; do
+    script_name="${console_script##*/}"
+    case "$script_name" in
+      activate* | deactivate.bat | python | python3 | python3.11)
+        continue
+        ;;
+    esac
+    [ -x "$console_script" ] || continue
+    rm -f "$sandbox/usr/local/bin/$script_name"
+    printf '%s\n' \
+      '#!/bin/sh' \
+      "exec /opt/epiforecaster/.venv/bin/$script_name \"\$@\"" > \
+      "$sandbox/usr/local/bin/$script_name"
+    chmod 0755 "$sandbox/usr/local/bin/$script_name"
+  done
+}
+
+load_singularity
+validate_prefetched_inputs
+
+mkdir -p "$CONTAINER_ROOT" "$BUILD_ROOT"
+exec 9>"$CONTAINER_ROOT/.epiforecaster-runtime-$build_key.lock"
+flock 9
+
+if [ -e "$final_sif" ] \
+  || [ -e "$digest_sidecar" ] \
+  || [ -e "$metadata_file" ] \
+  || [ -e "$inspect_file" ] \
+  || [ -e "$success_marker" ]; then
   if ! verify_existing; then
     echo "Existing output is incomplete or failed verification: $final_sif" >&2
     exit 1
@@ -91,23 +173,7 @@ if [ -e "$final_sif" ] || \
   exit 0
 fi
 
-scratch_leaf="epiforecaster-sif-${SLURM_JOB_ID:-$$}"
-scratch_root=""
-for scratch_parent in \
-  "${SLURM_TMPDIR:-}" \
-  "/scratch/tmp/${USER:-unknown}"; do
-  [ -n "$scratch_parent" ] || continue
-  scratch_candidate="${scratch_parent%/}/$scratch_leaf"
-  if mkdir -p "$scratch_candidate" 2>/dev/null; then
-    scratch_root="$scratch_candidate"
-    break
-  fi
-done
-if [ -z "$scratch_root" ]; then
-  scratch_root="$BUILD_ROOT/.scratch-${SLURM_JOB_ID:-$$}"
-  mkdir -p "$scratch_root"
-fi
-mkdir -p "$scratch_root/cache" "$scratch_root/tmp"
+select_scratch_root
 
 sandbox="$scratch_root/rootfs"
 scratch_sif="$scratch_root/epiforecaster-runtime.sif"
@@ -115,14 +181,6 @@ publish_tmp="$CONTAINER_ROOT/.epiforecaster-runtime-$build_key-${SLURM_JOB_ID:-$
 sidecar_tmp="$digest_sidecar.${SLURM_JOB_ID:-$$}.tmp"
 metadata_tmp="$metadata_file.${SLURM_JOB_ID:-$$}.tmp"
 inspect_tmp="$inspect_file.${SLURM_JOB_ID:-$$}.tmp"
-cleanup() {
-  set +e
-  if [ -d "$scratch_root" ]; then
-    chmod -R u+w "$scratch_root" 2>/dev/null
-    rm -rf -- "$scratch_root"
-  fi
-  rm -f "$publish_tmp" "$sidecar_tmp" "$metadata_tmp" "$inspect_tmp"
-}
 trap cleanup EXIT
 
 export SINGULARITY_CACHEDIR="$scratch_root/cache"
@@ -142,29 +200,7 @@ chmod -R a+rX "$sandbox/opt/epiforecaster"
 # not provide the subuid mapping needed for a definition build with fakeroot.
 # Use ordinary filesystem launchers instead. The prefetched venv was created at
 # its final /opt path, so its console-script shebangs remain valid in the SIF.
-for python_command in python python3; do
-  rm -f "$sandbox/usr/local/bin/$python_command"
-  printf '%s\n' \
-    '#!/bin/sh' \
-    'exec /opt/epiforecaster/.venv/bin/python "$@"' > \
-    "$sandbox/usr/local/bin/$python_command"
-  chmod 0755 "$sandbox/usr/local/bin/$python_command"
-done
-for console_script in "$PREFIX_ROOT/.venv/bin/"*; do
-  script_name="${console_script##*/}"
-  case "$script_name" in
-    activate* | deactivate.bat | python | python3 | python3.11)
-      continue
-      ;;
-  esac
-  [ -x "$console_script" ] || continue
-  rm -f "$sandbox/usr/local/bin/$script_name"
-  printf '%s\n' \
-    '#!/bin/sh' \
-    "exec /opt/epiforecaster/.venv/bin/$script_name \"\$@\"" > \
-    "$sandbox/usr/local/bin/$script_name"
-  chmod 0755 "$sandbox/usr/local/bin/$script_name"
-done
+install_runtime_launchers
 singularity build --force "$scratch_sif" "$sandbox"
 
 container_arch="$(singularity exec --cleanenv "$scratch_sif" uname -m)"
@@ -186,7 +222,7 @@ singularity exec --cleanenv "$scratch_sif" dvc --version
 singularity exec --cleanenv --nv "$scratch_sif" nvidia-smi -L
 singularity exec --cleanenv --nv "$scratch_sif" python -c \
   'import json, torch; assert torch.cuda.is_available(); print(json.dumps({"torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(0)}))'
-singularity inspect --json "$scratch_sif" > "$inspect_tmp"
+singularity inspect --json "$scratch_sif" >"$inspect_tmp"
 
 sif_sha256="$(sha256sum "$scratch_sif" | awk '{print $1}')"
 cp "$scratch_sif" "$publish_tmp"
@@ -195,7 +231,7 @@ if [ "$(sha256sum "$publish_tmp" | awk '{print $1}')" != "$sif_sha256" ]; then
   exit 1
 fi
 chmod 0444 "$publish_tmp"
-printf '%s  %s\n' "$sif_sha256" "$(basename "$final_sif")" > "$sidecar_tmp"
+printf '%s  %s\n' "$sif_sha256" "$(basename "$final_sif")" >"$sidecar_tmp"
 printf '%s\n' \
   "dependency_key=$DEPENDENCY_KEY" \
   "base_image=$BASE_IMAGE_REF" \
@@ -204,7 +240,7 @@ printf '%s\n' \
   "singularity_version=$(singularity version)" \
   "host=$(hostname)" \
   "host_arch=$(uname -m)" \
-  "slurm_job_id=${SLURM_JOB_ID:-unknown}" > "$metadata_tmp"
+  "slurm_job_id=${SLURM_JOB_ID:-unknown}" >"$metadata_tmp"
 
 mv "$publish_tmp" "$final_sif"
 mv "$sidecar_tmp" "$digest_sidecar"

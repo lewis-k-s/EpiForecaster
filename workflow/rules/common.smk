@@ -5,10 +5,11 @@ rule prepare_run:
     input:
         config=str(CONFIG_PATH),
         inventory=str(SOURCE_FILE_LIST),
+        dispatch=str(DISPATCH_REQUEST),
+        published=str(PUBLISHED),
         dvc=DVC_POINTERS,
     output:
-        marker=str(PREPARED),
-        manifest=str(MANIFEST),
+        PREPARE_OUTPUTS
     log:
         str(RUN_ROOT / "logs/prepare_run.log")
     shell:

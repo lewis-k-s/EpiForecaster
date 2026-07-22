@@ -1,0 +1,41 @@
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: crossval
+  target: crossval
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.dvc
+    - data/processed/real_with_id.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+crossval:
+  campaign_id: epiforecaster-crossval-v1
+  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  folds: 4
+  seed: 42
+  holdout_role: test
+  max_batches: null
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+
+evaluation:
+  split: test
+  granular: true
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 4
+    cpus_per_task: 20
+    gres: gpu:4
+    runtime: 420

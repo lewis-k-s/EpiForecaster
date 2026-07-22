@@ -1,9 +1,0 @@
-# Real-data preprocessing variant with Holt-damped clinical filtering.
-
-base_config: "preprocess_full.yaml"
-
-end_date: "2025-11-10"
-temporal_alignment_mode: "outer"
-
-smoothing:
-  clinical_method: "holt_damped"

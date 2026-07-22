@@ -1,9 +1,8 @@
-# Local test config for SYNTHETIC data analysis
-# Mirrors the real local config, but targets the processed synthetic dataset
-# and enables direct latent SIRD supervision.
+# Bounded local acceptance config. Substantive EpiForecaster training runs on MN5
+# through the immutable Snakemake workflow.
 
 data:
-  dataset_path: data/processed/synthetic_full_holt_damped.zarr
+  dataset_path: data/processed/real_with_id.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
@@ -19,9 +18,7 @@ data:
       hospitalizations: 26
       deaths: 10
   window_stride: 1
-  sample_ordering: "time"
-  run_id: "0_Baseline"
-  run_id_chunk_size: 1
+  sample_ordering: time
 
 model:
   type:
@@ -35,7 +32,8 @@ model:
     include_day_of_week: true
     include_holidays: true
     include_lockdown_severity: true
-    gnn_module: "gcn"
+    include_vaccination: true
+    gnn_module: gcn
     input_window_length: 60
     forecast_horizon: 28
     max_neighbors: 20
@@ -53,29 +51,31 @@ model:
       residual_clip: 10000.0
 
 output:
-  experiment_name: synth_local_analysis
+  experiment_name: local_smoke
   log_dir: outputs/training
-  write_granular_eval: true
-  granular_eval_filename: "{split}_granular.parquet"
+  write_granular_eval: false
 
 training:
   seed: 42
-  device: "cpu"
+  device: cpu
   init_checkpoint_path: null
-  batch_size: 8
+  batch_size: 2
   gradient_accumulation_steps: 1
   gradient_clip_value: 5.0
-  warmup_steps: 50
-  early_stopping_patience: 3
+  warmup_steps: 0
+  early_stopping_patience: null
   nan_loss_patience: 3
   epochs: 1
+  max_batches: 10
   learning_rate: 0.0001
   weight_decay: 1.0e-05
-  num_workers: 0
-  val_workers: 0
-  prefetch_factor: null
-  split_strategy: "node"
-  node_split_strategy: "stratified"
+  num_workers: 1
+  val_workers: 1
+  test_workers: 1
+  persistent_workers: false
+  prefetch_factor: 1
+  split_strategy: node
+  node_split_strategy: stratified
   node_split_population_bins: 5
   val_split: 0.2
   test_split: 0.1
@@ -84,11 +84,11 @@ training:
   plot_forecasts: false
   enable_mixed_precision: false
   loss:
-    name: "joint_inference"
+    name: joint_inference
     joint:
-      adaptive_scheme: "none"
+      adaptive_scheme: none
       gradnorm_obs_weight_sum: 0.95
       gradnorm_update_every: 16
       gradnorm_ema_decay: 0.9
-      gradnorm_probe: "obs_context"
-      w_sird_supervision: 0.01
+      gradnorm_probe: obs_context
+      w_sird_supervision: 0.0
