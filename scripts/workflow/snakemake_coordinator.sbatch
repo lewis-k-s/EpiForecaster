@@ -109,8 +109,6 @@ container_args=(
   --bind /usr/lib64/slurm:/usr/lib64/slurm:ro
   --bind /usr/lib64/libmunge.so.2.0.1:/usr/lib64/libmunge.so.2.0.1:ro
   --bind /usr/lib64/libmunge.so.2:/usr/lib64/libmunge.so.2:ro
-  --bind /opt/.snoopy/lib:/opt/.snoopy/lib:ro
-  --bind /opt/EAR/current:/opt/EAR/current:ro
   --bind /etc/slurm:/etc/slurm:ro
   --bind /etc/passwd:/etc/passwd:ro
   --bind /etc/group:/etc/group:ro
@@ -123,6 +121,13 @@ container_args=(
   --env "SLURM_JOB_NUM_NODES=$ALLOCATED_NODES"
   --pwd "$RUN_ROOT"
 )
+
+# Site instrumentation is not installed on every ACC node image.
+for optional_host_path in /opt/.snoopy/lib /opt/EAR/current; do
+  if [ -e "$optional_host_path" ]; then
+    container_args+=(--bind "$optional_host_path:$optional_host_path:ro")
+  fi
+done
 
 # Clean environments do not automatically preserve the allocation identity
 # needed by the host srun client exposed above.

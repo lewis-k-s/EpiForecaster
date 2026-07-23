@@ -654,6 +654,11 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     assert '--cpus-per-task="$CPUS_PER_TASK"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
+    assert (
+        "for optional_host_path in /opt/.snoopy/lib /opt/EAR/current"
+        in coordinator
+    )
+    assert 'if [ -e "$optional_host_path" ]' in coordinator
     assert "--mem" not in coordinator
     assert "--mem" not in launcher
 
