@@ -6,17 +6,8 @@ data:
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_threshold: 10
-  missing_permit:
-    input:
-      biomarkers_joint: 53
-      cases: 20
-      hospitalizations: 53
-      deaths: 20
-    horizon:
-      biomarkers_joint: 26
-      cases: 10
-      hospitalizations: 26
-      deaths: 10
+  min_history_observed_fraction: 0.5
+  min_horizon_observed_fraction: 0.5
   window_stride: 1
   sample_ordering: time
 

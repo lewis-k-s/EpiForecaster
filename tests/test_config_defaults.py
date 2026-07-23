@@ -19,29 +19,40 @@ def test_observation_heads_default_weekly_kernels_frozen() -> None:
 
 
 @pytest.mark.epiforecaster
-def test_data_config_resolves_min_observed_from_missing_permit() -> None:
+def test_data_config_resolves_cadence_adjusted_observation_thresholds() -> None:
     cfg = DataConfig(
-        missing_permit={
-            "input": {
-                "cases": 20,
-                "hospitalizations": 53,
-                "deaths": 20,
-                "biomarkers_joint": 53,
-            },
-            "horizon": {
-                "cases": 10,
-                "hospitalizations": 26,
-                "deaths": 10,
-                "biomarkers_joint": 26,
-            },
-        }
+        min_history_observed_fraction=0.5,
+        min_horizon_observed_fraction=0.5,
     )
-    assert cfg.resolve_min_observed_map(forecast_horizon=28) == {
-        "cases": 18,
+    assert cfg.resolve_min_history_observed_map(input_window_length=60) == {
+        "cases": 30,
+        "hospitalizations": 5,
+        "deaths": 30,
+        "wastewater": 5,
+    }
+    assert cfg.resolve_min_horizon_observed_map(forecast_horizon=28) == {
+        "cases": 14,
         "hospitalizations": 2,
-        "deaths": 18,
+        "deaths": 14,
         "wastewater": 2,
     }
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("min_history_observed_fraction", -0.01),
+        ("min_history_observed_fraction", 1.01),
+        ("min_horizon_observed_fraction", -0.01),
+        ("min_horizon_observed_fraction", 1.01),
+    ],
+)
+def test_data_config_rejects_invalid_observed_fraction(
+    field_name: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        DataConfig(**{field_name: value})
 
 
 @pytest.mark.epiforecaster

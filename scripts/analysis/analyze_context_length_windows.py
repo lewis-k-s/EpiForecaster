@@ -3,7 +3,7 @@
 
 This diagnostic quantifies how the fixed real-data calendar and sparse
 observation masks constrain the number of supervised forecasting examples.
-It mirrors the window-start and missing-permit logic used by ``EpiDataset``
+It mirrors the cadence-adjusted observation-coverage logic used by ``EpiDataset``
 without constructing graph batches or running training.
 """
 
@@ -112,7 +112,7 @@ def _count_valid_windows(
     forecast_horizon: int,
     window_stride: int,
     max_lag: int,
-    missing_permit_map: dict[str, dict[str, int]],
+    min_observed_map: dict[str, dict[str, int]],
     total_time_steps: int,
 ) -> tuple[int, int, int]:
     segment_length = context_length + forecast_horizon
@@ -147,10 +147,8 @@ def _count_valid_windows(
         history_counts = history_counts[starts]
         target_counts = target_counts[starts]
 
-        input_permit = int(missing_permit_map["input"].get(target_name, 0))
-        horizon_permit = int(missing_permit_map["horizon"].get(target_name, 0))
-        history_threshold = max(0, context_length - input_permit)
-        target_threshold = max(0, forecast_horizon - horizon_permit)
+        history_threshold = int(min_observed_map["history"].get(target_name, 0))
+        target_threshold = int(min_observed_map["horizon"].get(target_name, 0))
         valid_mask |= (history_counts >= history_threshold) & (
             target_counts >= target_threshold
         )
@@ -199,8 +197,6 @@ def compute_counts(
     forecast_horizon = int(config.model.forecast_horizon)
     window_stride = int(config.data.window_stride)
     max_lag = max(config.data.mobility_lags, default=0)
-    missing_permit_map = config.data.resolve_missing_permit_map()
-
     split_nodes = {
         "train": train_nodes,
         "val": val_nodes,
@@ -208,6 +204,10 @@ def compute_counts(
     }
     counts: list[SplitCounts] = []
     for context_length in context_lengths:
+        min_observed_map = {
+            "history": config.data.resolve_min_history_observed_map(context_length),
+            "horizon": config.data.resolve_min_horizon_observed_map(forecast_horizon),
+        }
         for split, nodes in split_nodes.items():
             raw_windows, global_windows, node_windows = _count_valid_windows(
                 mask_by_target=mask_by_target,
@@ -216,7 +216,7 @@ def compute_counts(
                 forecast_horizon=forecast_horizon,
                 window_stride=window_stride,
                 max_lag=max_lag,
-                missing_permit_map=missing_permit_map,
+                min_observed_map=min_observed_map,
                 total_time_steps=total_time_steps,
             )
             counts.append(

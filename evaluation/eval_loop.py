@@ -340,6 +340,7 @@ def evaluate_loader(
                 metric_supervision = criterion.compute_observation_supervision(
                     targets_dict,
                     device=device,
+                    batch_data=batch_data,
                 )
                 loss = components["total"]
                 total_loss += loss.detach()
@@ -889,6 +890,7 @@ def eval_checkpoint(
     criterion = get_loss_from_config(
         config.training.loss,
         data_config=config.data,
+        input_window_length=config.model.input_window_length,
         forecast_horizon=config.model.forecast_horizon,
     )
     try:

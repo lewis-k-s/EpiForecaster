@@ -443,7 +443,12 @@ class EpiDataset(Dataset):
             config.model.input_window_length + config.model.forecast_horizon
         )
         self.window_stride = int(config.data.window_stride)
-        self.missing_permit_map = config.data.resolve_missing_permit_map()
+        self.min_history_observed_map = config.data.resolve_min_history_observed_map(
+            config.model.input_window_length
+        )
+        self.min_horizon_observed_map = config.data.resolve_min_horizon_observed_map(
+            config.model.forecast_horizon
+        )
         self.window_starts = self._compute_window_starts()
         self._valid_window_starts_by_node = self._compute_valid_window_starts()
         self.window_starts = self._collect_valid_window_starts()
@@ -1419,10 +1424,8 @@ class EpiDataset(Dataset):
             history_counts = history_counts[starts]
             target_counts = target_counts[starts]
 
-            input_permit = int(self.missing_permit_map["input"].get(target_name, 0))
-            horizon_permit = int(self.missing_permit_map["horizon"].get(target_name, 0))
-            history_threshold = max(0, L - input_permit)
-            target_threshold = max(0, H - horizon_permit)
+            history_threshold = int(self.min_history_observed_map.get(target_name, 0))
+            target_threshold = int(self.min_horizon_observed_map.get(target_name, 0))
             target_valid = (history_counts >= history_threshold) & (
                 target_counts >= target_threshold
             )

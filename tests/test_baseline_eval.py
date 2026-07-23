@@ -36,25 +36,38 @@ def _read_baseline_granular(path: Path) -> pd.DataFrame:
 
 
 class _DummyDataConfig:
-    def __init__(self, permits: dict[str, dict[str, int]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        history_fraction: float = 1.0,
+        horizon_fraction: float = 1.0,
+    ) -> None:
         self.run_id = "real"
-        self._permits = permits or {
-            "input": {
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-                "wastewater": 0,
-            },
-            "horizon": {
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-                "wastewater": 0,
-            },
+        self.min_history_observed_fraction = history_fraction
+        self.min_horizon_observed_fraction = horizon_fraction
+
+    @staticmethod
+    def _resolve(window_length: int, fraction: float) -> dict[str, int]:
+        return {
+            "cases": int(np.ceil(window_length * fraction)),
+            "hospitalizations": int(np.ceil(np.ceil(window_length / 7) * fraction)),
+            "deaths": int(np.ceil(window_length * fraction)),
+            "wastewater": int(np.ceil(np.ceil(window_length / 7) * fraction)),
         }
 
-    def resolve_missing_permit_map(self) -> dict[str, dict[str, int]]:
-        return self._permits
+    def resolve_min_history_observed_map(
+        self, input_window_length: int
+    ) -> dict[str, int]:
+        return self._resolve(
+            input_window_length,
+            self.min_history_observed_fraction,
+        )
+
+    def resolve_min_horizon_observed_map(self, forecast_horizon: int) -> dict[str, int]:
+        return self._resolve(
+            forecast_horizon,
+            self.min_horizon_observed_fraction,
+        )
 
 
 class _DummyModelConfig:
@@ -74,11 +87,15 @@ class _DummyConfig:
     def __init__(
         self,
         *,
-        permits: dict[str, dict[str, int]] | None = None,
+        history_fraction: float = 1.0,
+        horizon_fraction: float = 1.0,
         input_window_length: int = 4,
         forecast_horizon: int = 3,
     ) -> None:
-        self.data = _DummyDataConfig(permits=permits)
+        self.data = _DummyDataConfig(
+            history_fraction=history_fraction,
+            horizon_fraction=horizon_fraction,
+        )
         self.model = _DummyModelConfig(
             input_window_length=input_window_length,
             forecast_horizon=forecast_horizon,
@@ -1042,22 +1059,9 @@ def test_run_baseline_evaluation_weekly_heads_use_observed_cadence(
     tmp_path: Path,
     monkeypatch,
 ):
-    permits = {
-        "input": {
-            "cases": 0,
-            "hospitalizations": 21,
-            "deaths": 0,
-            "wastewater": 21,
-        },
-        "horizon": {
-            "cases": 0,
-            "hospitalizations": 21,
-            "deaths": 0,
-            "wastewater": 21,
-        },
-    }
     config = _DummyConfig(
-        permits=permits,
+        history_fraction=0.5,
+        horizon_fraction=0.5,
         input_window_length=28,
         forecast_horizon=28,
     )

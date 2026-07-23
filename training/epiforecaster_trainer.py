@@ -787,6 +787,7 @@ class EpiForecasterTrainer:
         return get_loss_from_config(
             self.config.training.loss,
             data_config=self.config.data,
+            input_window_length=self.config.model.input_window_length,
             forecast_horizon=self.config.model.forecast_horizon,
         )
 
@@ -1547,6 +1548,7 @@ class EpiForecasterTrainer:
         obs_supervision = self.criterion.compute_observation_supervision(
             self._build_targets_dict(batch_data),
             device=self.device,
+            batch_data=batch_data,
         )
         head_summary: dict[str, dict[str, float | int | bool]] = {}
         for head in GradNormController.task_names:

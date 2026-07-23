@@ -181,10 +181,20 @@ def load_or_compute_regression_results(
     history_len = int(config.model.input_window_length)
     horizon = int(config.model.forecast_horizon)
     window_len = history_len + horizon
-    missing_permit = int(config.data.missing_permit.input.get("cases", 0))
+    min_history_observed = config.data.resolve_min_history_observed_map(history_len)[
+        "cases"
+    ]
+    min_horizon_observed = config.data.resolve_min_horizon_observed_map(horizon)[
+        "cases"
+    ]
 
     starts, valid_mask = compute_valid_window_mask(
-        cases_da, history_len, horizon, window_stride, missing_permit
+        cases_da,
+        history_len,
+        horizon,
+        window_stride,
+        min_history_observed,
+        min_horizon_observed,
     )
 
     logger.info("Found %d valid windows", len(starts))
@@ -837,7 +847,9 @@ def main() -> None:
         logger.info("Saved regression results to %s", regression_path)
 
     # Aggregate regression statistics by window
-    window_len = int(config.model.input_window_length) + int(config.model.forecast_horizon)
+    window_len = int(config.model.input_window_length) + int(
+        config.model.forecast_horizon
+    )
     agg_df = aggregate_regression_by_window(results_df, window_len)
 
     # Save aggregated results

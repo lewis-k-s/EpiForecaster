@@ -131,7 +131,7 @@ def _count_valid_windows_per_node(
     forecast_horizon: int,
     window_stride: int,
     max_lag: int,
-    missing_permit_map: dict[str, dict[str, int]],
+    min_observed_map: dict[str, dict[str, int]],
     total_time_steps: int,
 ) -> dict[int, int]:
     segment_length = context_length + forecast_horizon
@@ -162,10 +162,8 @@ def _count_valid_windows_per_node(
         history_counts = history_counts[starts]
         target_counts = target_counts[starts]
 
-        input_permit = int(missing_permit_map["input"].get(head_name, 0))
-        horizon_permit = int(missing_permit_map["horizon"].get(head_name, 0))
-        history_threshold = max(0, context_length - input_permit)
-        target_threshold = max(0, forecast_horizon - horizon_permit)
+        history_threshold = int(min_observed_map["history"].get(head_name, 0))
+        target_threshold = int(min_observed_map["horizon"].get(head_name, 0))
         valid_mask |= (history_counts >= history_threshold) & (
             target_counts >= target_threshold
         )
@@ -181,7 +179,7 @@ def _count_valid_windows_per_head(
     forecast_horizon: int,
     window_stride: int,
     max_lag: int,
-    missing_permit_map: dict[str, dict[str, int]],
+    min_observed_map: dict[str, dict[str, int]],
     total_time_steps: int,
 ) -> dict[str, dict[int, int]]:
     result: dict[str, dict[int, int]] = {}
@@ -193,7 +191,7 @@ def _count_valid_windows_per_head(
             forecast_horizon=forecast_horizon,
             window_stride=window_stride,
             max_lag=max_lag,
-            missing_permit_map=missing_permit_map,
+            min_observed_map=min_observed_map,
             total_time_steps=total_time_steps,
         )
     return result
@@ -257,12 +255,16 @@ def _summary_stats(values: np.ndarray) -> dict[str, float]:
         "median": float(np.median(values)),
         "p75": float(np.percentile(values, 75)),
         "max": float(values.max()),
-        "max_min_ratio": float(values.max() / values.min()) if values.min() > 0 else float("inf"),
+        "max_min_ratio": float(values.max() / values.min())
+        if values.min() > 0
+        else float("inf"),
         "gini": _gini(values),
     }
 
 
-def compute_diagnostics(config: EpiForecasterConfig) -> tuple[
+def compute_diagnostics(
+    config: EpiForecasterConfig,
+) -> tuple[
     dict[str, dict[int, int]],
     dict[str, dict[str, dict[int, int]]],
     dict[int, MunicipalityDiagnostics],
@@ -295,7 +297,10 @@ def compute_diagnostics(config: EpiForecasterConfig) -> tuple[
     H = int(config.model.forecast_horizon)
     stride = int(config.data.window_stride)
     max_lag = max(config.data.mobility_lags, default=0)
-    missing_permit_map = config.data.resolve_missing_permit_map()
+    min_observed_map = {
+        "history": config.data.resolve_min_history_observed_map(L),
+        "horizon": config.data.resolve_min_horizon_observed_map(H),
+    }
 
     population = np.asarray(dataset["population"].values).astype(float)
 
@@ -303,7 +308,9 @@ def compute_diagnostics(config: EpiForecasterConfig) -> tuple[
     head_window_counts_by_split: dict[str, dict[str, dict[int, int]]] = {}
 
     for split_name, nodes in split_nodes_map.items():
-        logger.info("Computing window counts for %s (%d nodes)...", split_name, len(nodes))
+        logger.info(
+            "Computing window counts for %s (%d nodes)...", split_name, len(nodes)
+        )
 
         window_counts_by_split[split_name] = _count_valid_windows_per_node(
             mask_by_head=mask_by_head,
@@ -312,7 +319,7 @@ def compute_diagnostics(config: EpiForecasterConfig) -> tuple[
             forecast_horizon=H,
             window_stride=stride,
             max_lag=max_lag,
-            missing_permit_map=missing_permit_map,
+            min_observed_map=min_observed_map,
             total_time_steps=total_time_steps,
         )
 
@@ -323,13 +330,11 @@ def compute_diagnostics(config: EpiForecasterConfig) -> tuple[
             forecast_horizon=H,
             window_stride=stride,
             max_lag=max_lag,
-            missing_permit_map=missing_permit_map,
+            min_observed_map=min_observed_map,
             total_time_steps=total_time_steps,
         )
 
-    all_diagnostic_nodes = sorted(
-        set(train_nodes) | set(val_nodes) | set(test_nodes)
-    )
+    all_diagnostic_nodes = sorted(set(train_nodes) | set(val_nodes) | set(test_nodes))
     diagnostics: dict[int, MunicipalityDiagnostics] = {}
 
     for node_idx in all_diagnostic_nodes:
@@ -396,7 +401,10 @@ def print_summary_tables(
         if head_name not in head_window_counts_by_split.get("train", {}):
             continue
         counts = np.array(
-            [head_window_counts_by_split["train"][head_name].get(n, 0) for n in train_nodes]
+            [
+                head_window_counts_by_split["train"][head_name].get(n, 0)
+                for n in train_nodes
+            ]
         )
         s = _summary_stats(counts)
         print(
@@ -413,12 +421,16 @@ def print_quality_correlations(
     print("=" * 80)
 
     node_indices = sorted(diagnostics.keys())
-    train_windows = np.array([diagnostics[n].n_windows.get("train", 0) for n in node_indices])
+    train_windows = np.array(
+        [diagnostics[n].n_windows.get("train", 0) for n in node_indices]
+    )
     populations = np.array([diagnostics[n].population for n in node_indices])
 
     quality_metrics = ["obs_density", "temporal_coverage", "obs_regularity"]
 
-    print(f"\n{'Head':<16s} {'Quality metric':<22s} {'Pearson r':>10s} {'p-value':>10s} {'Spearman ρ':>11s} {'p-value':>10s}")
+    print(
+        f"\n{'Head':<16s} {'Quality metric':<22s} {'Pearson r':>10s} {'p-value':>10s} {'Spearman ρ':>11s} {'p-value':>10s}"
+    )
     print("-" * 82)
 
     for head_name in HEAD_NAMES:
@@ -522,11 +534,13 @@ def write_csv(
         "n_windows_test",
     ]
     for head_name in HEAD_NAMES:
-        fieldnames.extend([
-            f"density_{head_name}",
-            f"temporal_coverage_{head_name}",
-            f"regularity_{head_name}",
-        ])
+        fieldnames.extend(
+            [
+                f"density_{head_name}",
+                f"temporal_coverage_{head_name}",
+                f"regularity_{head_name}",
+            ]
+        )
 
     with output_csv.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -542,9 +556,13 @@ def write_csv(
             }
             for head_name in HEAD_NAMES:
                 row[f"density_{head_name}"] = f"{d.obs_density.get(head_name, 0.0):.4f}"
-                row[f"temporal_coverage_{head_name}"] = d.temporal_coverage.get(head_name, 0)
+                row[f"temporal_coverage_{head_name}"] = d.temporal_coverage.get(
+                    head_name, 0
+                )
                 reg = d.obs_regularity.get(head_name, float("inf"))
-                row[f"regularity_{head_name}"] = f"{reg:.4f}" if np.isfinite(reg) else "inf"
+                row[f"regularity_{head_name}"] = (
+                    f"{reg:.4f}" if np.isfinite(reg) else "inf"
+                )
             writer.writerow(row)
 
     logger.info("Wrote per-municipality CSV: %s", output_csv)
@@ -561,7 +579,13 @@ def plot_window_histogram(
     for ax, split_name in zip(axes, ("train", "val", "test")):
         nodes = split_nodes_map[split_name]
         counts = np.array([window_counts_by_split[split_name].get(n, 0) for n in nodes])
-        ax.hist(counts, bins=40, color=SPLIT_COLORS[split_name], edgecolor="white", alpha=0.85)
+        ax.hist(
+            counts,
+            bins=40,
+            color=SPLIT_COLORS[split_name],
+            edgecolor="white",
+            alpha=0.85,
+        )
         ax.set_title(f"{split_name} ({len(nodes)} munis)")
         ax.set_xlabel("Valid windows")
         ax.grid(True, alpha=0.3)
@@ -584,9 +608,7 @@ def plot_lorenz_curve(
 
     for split_name in ("train", "val", "test"):
         nodes = split_nodes_map[split_name]
-        counts = np.array(
-            [window_counts_by_split[split_name].get(n, 0) for n in nodes]
-        )
+        counts = np.array([window_counts_by_split[split_name].get(n, 0) for n in nodes])
         sorted_counts = np.sort(counts)
         total = sorted_counts.sum()
         if total == 0:
@@ -623,7 +645,9 @@ def plot_density_vs_windows(
     output_png.parent.mkdir(parents=True, exist_ok=True)
 
     train_nodes = set(split_nodes_map["train"])
-    train_diags = [diagnostics[n] for n in sorted(diagnostics.keys()) if n in train_nodes]
+    train_diags = [
+        diagnostics[n] for n in sorted(diagnostics.keys()) if n in train_nodes
+    ]
 
     if not train_diags:
         return
@@ -639,7 +663,9 @@ def plot_density_vs_windows(
         if mask.sum() < 3:
             continue
 
-        ax.scatter(density[mask], windows[mask], alpha=0.4, s=18, color=HEAD_COLORS[head_name])
+        ax.scatter(
+            density[mask], windows[mask], alpha=0.4, s=18, color=HEAD_COLORS[head_name]
+        )
         pr, _ = sp_stats.pearsonr(density[mask], windows[mask])
         sr, _ = sp_stats.spearmanr(density[mask], windows[mask])
         ax.set_title(f"{head_name}\nr={pr:.2f}, ρ={sr:.2f}", fontsize=10)
@@ -696,9 +722,7 @@ def plot_population_vs_weight(
         ax.set_ylabel("Over-representation ratio (w_eff / w_uniform)")
         ax.set_title("Population vs gradient influence")
 
-        pr, _ = sp_stats.pearsonr(
-            np.log10(populations[valid]), over_rep[valid]
-        )
+        pr, _ = sp_stats.pearsonr(np.log10(populations[valid]), over_rep[valid])
         ax.text(
             0.05,
             0.95,
@@ -716,21 +740,16 @@ def plot_population_vs_weight(
     logger.info("Wrote population vs weight scatter: %s", output_png)
 
 
-def _scale_permit_map(
+def _scale_min_observed_map(
     base_map: dict[str, dict[str, int]],
     scale: float,
-    L: int,
-    H: int,
 ) -> dict[str, dict[str, int]]:
     return {
         window_type: {
-            head: min(int(permit * scale), window_len)
-            for head, permit in permits.items()
+            head: int(np.ceil(min_observed * scale))
+            for head, min_observed in thresholds.items()
         }
-        for window_type, permits, window_len in [
-            ("input", base_map["input"], L),
-            ("horizon", base_map["horizon"], H),
-        ]
+        for window_type, thresholds in base_map.items()
     }
 
 
@@ -778,12 +797,15 @@ def compute_sweep(
     H = int(config.model.forecast_horizon)
     stride = int(config.data.window_stride)
     max_lag = max(config.data.mobility_lags, default=0)
-    base_permit_map = config.data.resolve_missing_permit_map()
+    base_min_observed_map = {
+        "history": config.data.resolve_min_history_observed_map(L),
+        "horizon": config.data.resolve_min_horizon_observed_map(H),
+    }
 
     sweep_points: list[SweepPoint] = []
 
     for scale in scales:
-        scaled_map = _scale_permit_map(base_permit_map, scale, L, H)
+        scaled_map = _scale_min_observed_map(base_min_observed_map, scale)
 
         per_head = _count_valid_windows_per_head(
             mask_by_head=mask_by_head,
@@ -792,7 +814,7 @@ def compute_sweep(
             forecast_horizon=H,
             window_stride=stride,
             max_lag=max_lag,
-            missing_permit_map=scaled_map,
+            min_observed_map=scaled_map,
             total_time_steps=total_time_steps,
         )
 
@@ -803,7 +825,7 @@ def compute_sweep(
             forecast_horizon=H,
             window_stride=stride,
             max_lag=max_lag,
-            missing_permit_map=scaled_map,
+            min_observed_map=scaled_map,
             total_time_steps=total_time_steps,
         )
         combined_arr = np.array([combined_counts.get(n, 0) for n in train_nodes])
@@ -830,8 +852,8 @@ def compute_sweep(
                 continue
             counts = np.array([per_head[head_name].get(n, 0) for n in train_nodes])
             total_windows = int(counts.sum())
-            head_min_input = L - scaled_map["input"].get(head_name, 0)
-            head_min_horizon = H - scaled_map["horizon"].get(head_name, 0)
+            head_min_input = scaled_map["history"].get(head_name, 0)
+            head_min_horizon = scaled_map["horizon"].get(head_name, 0)
             freq = HEAD_FREQ.get(head_name, "daily")
             perf_in = _perfect_obs(L, freq)
             perf_hz = _perfect_obs(H, freq)
@@ -858,7 +880,7 @@ def compute_sweep(
 
 def print_sweep_table(sweep_points: list[SweepPoint]) -> None:
     print("\n" + "=" * 118)
-    print("SWEEP: Missingness Permit Scale vs Representation Equity (TRAIN split)")
+    print("SWEEP: Observation Threshold Scale vs Representation Equity (TRAIN split)")
     print("=" * 118)
     print(
         f"\n{'scale':>6s}  {'head':<16s} {'freq':>7s}  {'Gini':>6s}  {'total':>8s}  "
@@ -917,26 +939,28 @@ def write_sweep_csv(sweep_points: list[SweepPoint], output_csv: Path) -> None:
         writer.writeheader()
         for pt in sweep_points:
             any_pt = any_by_scale.get(pt.scale)
-            writer.writerow({
-                "scale": pt.scale,
-                "head": pt.head,
-                "freq": pt.freq,
-                "total_windows": pt.total_windows,
-                "n_municipalities": pt.n_municipalities,
-                "n_excluded": pt.n_excluded,
-                "gini": pt.gini,
-                "mean_windows": pt.mean_windows,
-                "std_windows": pt.std_windows,
-                "min_obs_input": pt.min_obs_input,
-                "min_obs_horizon": pt.min_obs_horizon,
-                "coverage_input": f"{pt.coverage_input:.4f}",
-                "coverage_horizon": f"{pt.coverage_horizon:.4f}",
-                "any_total_windows": any_pt.total_windows if any_pt else "",
-                "any_n_excluded": any_pt.n_excluded if any_pt else "",
-                "any_gini": any_pt.gini if any_pt else "",
-                "any_mean_windows": any_pt.mean_windows if any_pt else "",
-                "any_std_windows": any_pt.std_windows if any_pt else "",
-            })
+            writer.writerow(
+                {
+                    "scale": pt.scale,
+                    "head": pt.head,
+                    "freq": pt.freq,
+                    "total_windows": pt.total_windows,
+                    "n_municipalities": pt.n_municipalities,
+                    "n_excluded": pt.n_excluded,
+                    "gini": pt.gini,
+                    "mean_windows": pt.mean_windows,
+                    "std_windows": pt.std_windows,
+                    "min_obs_input": pt.min_obs_input,
+                    "min_obs_horizon": pt.min_obs_horizon,
+                    "coverage_input": f"{pt.coverage_input:.4f}",
+                    "coverage_horizon": f"{pt.coverage_horizon:.4f}",
+                    "any_total_windows": any_pt.total_windows if any_pt else "",
+                    "any_n_excluded": any_pt.n_excluded if any_pt else "",
+                    "any_gini": any_pt.gini if any_pt else "",
+                    "any_mean_windows": any_pt.mean_windows if any_pt else "",
+                    "any_std_windows": any_pt.std_windows if any_pt else "",
+                }
+            )
     logger.info("Wrote sweep CSV: %s", output_csv)
 
 
@@ -954,7 +978,9 @@ def plot_gini_vs_windows(
             continue
         pts_sorted = sorted(pts, key=lambda p: p.scale)
         totals = [
-            p.total_windows for p in pts_sorted if p.total_windows > 0 and np.isfinite(p.gini)
+            p.total_windows
+            for p in pts_sorted
+            if p.total_windows > 0 and np.isfinite(p.gini)
         ]
         ginis = [
             p.gini for p in pts_sorted if p.total_windows > 0 and np.isfinite(p.gini)
@@ -984,7 +1010,9 @@ def plot_gini_vs_windows(
                 and pt.total_windows > 0
                 and np.isfinite(pt.gini)
             ):
-                scale_label = f"s={pt.scale:.2f}" if pt.scale == 0.98 else f"s={pt.scale:.1f}"
+                scale_label = (
+                    f"s={pt.scale:.2f}" if pt.scale == 0.98 else f"s={pt.scale:.1f}"
+                )
                 ax.annotate(
                     scale_label,
                     (pt.total_windows, pt.gini),
@@ -996,7 +1024,7 @@ def plot_gini_vs_windows(
 
     ax.set_xlabel("Total valid (node, window) pairs")
     ax.set_ylabel("Gini coefficient")
-    ax.set_title("Representation equity vs data support\n(missingness permit sweep)")
+    ax.set_title("Representation equity vs data support\n(observation threshold sweep)")
     ax.legend(frameon=False, title="Head")
     ax.grid(True, alpha=0.3)
     ax.set_ylim(bottom=-0.02)
@@ -1049,9 +1077,9 @@ def plot_exclusion_vs_scale(
             label=head_name,
         )
 
-    ax.set_xlabel("Missingness permit scale factor")
+    ax.set_xlabel("Minimum observation threshold scale factor")
     ax.set_ylabel("Municipalities with 0 windows (excluded)")
-    ax.set_title("Municipality exclusion vs permit strictness")
+    ax.set_title("Municipality exclusion vs observation threshold")
     ax.legend(frameon=False, title="Head")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1061,8 +1089,21 @@ def plot_exclusion_vs_scale(
 
 
 SWEEP_SCALES = [
-    0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
-    0.92, 0.94, 0.96, 0.98, 1.0,
+    0.0,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    0.92,
+    0.94,
+    0.96,
+    0.98,
+    1.0,
 ]
 
 
@@ -1091,7 +1132,7 @@ def main() -> None:
     parser.add_argument(
         "--sweep",
         action="store_true",
-        help="Run missingness permit sweep and produce tradeoff plots.",
+        help="Run observation-threshold sweep and produce tradeoff plots.",
     )
     args = parser.parse_args()
 

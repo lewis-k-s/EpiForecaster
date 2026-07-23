@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
+
 import torch
 import torch.nn as nn
 
@@ -19,6 +20,7 @@ def get_loss_from_config(
     loss_config: LossConfig | None,
     *,
     data_config: DataConfig | None = None,
+    input_window_length: int | None = None,
     forecast_horizon: int | None = None,
 ) -> JointInferenceLoss:
     """Build the only supported EpiForecaster loss: JointInferenceLoss."""
@@ -33,13 +35,23 @@ def get_loss_from_config(
             )
         joint_cfg = loss_config.joint
 
-    min_obs = {"cases": 0, "hospitalizations": 0, "deaths": 0, "wastewater": 0}
+    zero_min_obs = {
+        "cases": 0,
+        "hospitalizations": 0,
+        "deaths": 0,
+        "wastewater": 0,
+    }
+    min_history_obs = zero_min_obs
+    min_horizon_obs = zero_min_obs
     if (
         data_config is not None
+        and input_window_length is not None
         and forecast_horizon is not None
-        and hasattr(data_config, "resolve_min_observed_map")
     ):
-        min_obs = data_config.resolve_min_observed_map(
+        min_history_obs = data_config.resolve_min_history_observed_map(
+            input_window_length=int(input_window_length)
+        )
+        min_horizon_obs = data_config.resolve_min_horizon_observed_map(
             forecast_horizon=int(forecast_horizon)
         )
 
@@ -55,10 +67,14 @@ def get_loss_from_config(
         mask_input_hosp=joint_cfg.mask_input_hosp,
         mask_input_cases=joint_cfg.mask_input_cases,
         mask_input_deaths=joint_cfg.mask_input_deaths,
-        ww_min_observed=min_obs["wastewater"],
-        hosp_min_observed=min_obs["hospitalizations"],
-        cases_min_observed=min_obs["cases"],
-        deaths_min_observed=min_obs["deaths"],
+        ww_min_history_observed=min_history_obs["wastewater"],
+        hosp_min_history_observed=min_history_obs["hospitalizations"],
+        cases_min_history_observed=min_history_obs["cases"],
+        deaths_min_history_observed=min_history_obs["deaths"],
+        ww_min_observed=min_horizon_obs["wastewater"],
+        hosp_min_observed=min_horizon_obs["hospitalizations"],
+        cases_min_observed=min_horizon_obs["cases"],
+        deaths_min_observed=min_horizon_obs["deaths"],
     )
 
 
@@ -95,6 +111,12 @@ class JointInferenceLoss(nn.Module):
         "cases": "cases_min_observed",
         "deaths": "deaths_min_observed",
     }
+    _HEAD_MIN_HISTORY_OBS_ATTR = {
+        "ww": "ww_min_history_observed",
+        "hosp": "hosp_min_history_observed",
+        "cases": "cases_min_history_observed",
+        "deaths": "deaths_min_history_observed",
+    }
     _LATENT_COMPONENTS = (
         ("latent_s", "S_trajectory", "S_target"),
         ("latent_i", "I_trajectory", "I_target"),
@@ -118,6 +140,10 @@ class JointInferenceLoss(nn.Module):
         mask_input_hosp: bool = False,
         mask_input_cases: bool = False,
         mask_input_deaths: bool = False,
+        ww_min_history_observed: int = 0,
+        hosp_min_history_observed: int = 0,
+        cases_min_history_observed: int = 0,
+        deaths_min_history_observed: int = 0,
         ww_min_observed: int = 0,
         hosp_min_observed: int = 0,
         cases_min_observed: int = 0,
@@ -138,6 +164,10 @@ class JointInferenceLoss(nn.Module):
         self.mask_input_hosp = bool(mask_input_hosp)
         self.mask_input_cases = bool(mask_input_cases)
         self.mask_input_deaths = bool(mask_input_deaths)
+        self.ww_min_history_observed = int(ww_min_history_observed)
+        self.hosp_min_history_observed = int(hosp_min_history_observed)
+        self.cases_min_history_observed = int(cases_min_history_observed)
+        self.deaths_min_history_observed = int(deaths_min_history_observed)
         self.ww_min_observed = int(ww_min_observed)
         self.hosp_min_observed = int(hosp_min_observed)
         self.cases_min_observed = int(cases_min_observed)
@@ -224,7 +254,9 @@ class JointInferenceLoss(nn.Module):
         *,
         target: torch.Tensor,
         observed_mask: torch.Tensor | None,
-        min_observed: int,
+        history_observed_mask: torch.Tensor | None = None,
+        min_history_observed: int = 0,
+        min_horizon_observed: int = 0,
         device: torch.device,
     ) -> dict[str, torch.Tensor]:
         """Build effective per-point supervision weights for a head using strict hard masking."""
@@ -245,12 +277,34 @@ class JointInferenceLoss(nn.Module):
         # STRICT HARD MASK: Only supervise where observed_mask > 0.5
         observed_binary = (observed > 0.5).to(dtype=torch.float32) * finite_mask
 
-        if min_observed > 0:
+        if min_horizon_observed > 0:
             observed_counts = observed_binary.sum(dim=1, keepdim=True)
-            eligible = (observed_counts >= float(min_observed)).to(
+            eligible = (observed_counts >= float(min_horizon_observed)).to(
                 observed_binary.dtype
             )
             observed_binary = observed_binary * eligible
+
+        if min_history_observed > 0:
+            if history_observed_mask is None:
+                raise ValueError(
+                    "History observation mask is required when "
+                    "min_history_observed is positive"
+                )
+            history_mask = history_observed_mask.to(device=device).float()
+            history_binary = (
+                torch.nan_to_num(
+                    history_mask,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                )
+                > 0.5
+            ).to(observed_binary.dtype)
+            history_counts = history_binary.sum(dim=1, keepdim=True)
+            history_eligible = (history_counts >= float(min_history_observed)).to(
+                observed_binary.dtype
+            )
+            observed_binary = observed_binary * history_eligible
 
         n_eff = observed_binary.sum()
         return {
@@ -342,6 +396,7 @@ class JointInferenceLoss(nn.Module):
         targets: dict[str, torch.Tensor | None],
         *,
         device: torch.device,
+        batch_data: EpiBatch | None = None,
     ) -> dict[str, dict[str, torch.Tensor | None]]:
         """Single source of truth for per-head active status and effective weights."""
         out: dict[str, dict[str, torch.Tensor | None]] = {}
@@ -364,14 +419,38 @@ class JointInferenceLoss(nn.Module):
 
             mask_key = self._HEAD_MASK_KEY[head_name]
             min_observed_attr = self._HEAD_MIN_OBS_ATTR[head_name]
+            min_history_observed_attr = self._HEAD_MIN_HISTORY_OBS_ATTR[head_name]
             out[head_name] = self._build_supervision_weights(
                 target=target,
                 observed_mask=targets.get(mask_key),
-                min_observed=int(getattr(self, min_observed_attr)),
+                history_observed_mask=self._get_history_observed_mask(
+                    batch_data, head_name
+                ),
+                min_history_observed=int(getattr(self, min_history_observed_attr)),
+                min_horizon_observed=int(getattr(self, min_observed_attr)),
                 device=device,
             )
 
         return out
+
+    @staticmethod
+    def _get_history_observed_mask(
+        batch_data: EpiBatch | None,
+        head_name: str,
+    ) -> torch.Tensor | None:
+        if batch_data is None:
+            return None
+        if head_name == "ww":
+            return getattr(batch_data, "ww_hist_mask", None)
+
+        history = {
+            "hosp": getattr(batch_data, "hosp_hist", None),
+            "cases": getattr(batch_data, "cases_hist", None),
+            "deaths": getattr(batch_data, "deaths_hist", None),
+        }[head_name]
+        if history is None:
+            return None
+        return history[..., 1]
 
     def forward(
         self,
@@ -404,7 +483,7 @@ class JointInferenceLoss(nn.Module):
                 - cases: [B, H] reported cases targets (optional)
                 - deaths: [B, H] deaths targets (optional)
                 - S_target/I_target/H_target/R_target/D_target: [B, H+1] latent targets (optional)
-            batch_data: Unused, retained for API compatibility.
+            batch_data: Batch history masks used for per-head window eligibility.
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
@@ -434,6 +513,7 @@ class JointInferenceLoss(nn.Module):
         obs_supervision = self.compute_observation_supervision(
             targets,
             device=zero_anchor.device,
+            batch_data=batch_data,
         )
         obs_active_mask = torch.stack(
             [
@@ -503,7 +583,7 @@ class JointInferenceLoss(nn.Module):
                 supervision = self._build_supervision_weights(
                     target=target,
                     observed_mask=None,
-                    min_observed=0,
+                    min_horizon_observed=0,
                     device=zero_anchor.device,
                 )
                 latent_target = supervision["target"]

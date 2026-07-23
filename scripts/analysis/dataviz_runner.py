@@ -140,16 +140,18 @@ def get_train_run_id(train_config: Path) -> str:
         return "real"
 
 
-def supports_model_missing_permit(train_config: Path) -> bool:
-    """Return True if train config defines missing_permit (data or model section)."""
+def supports_observation_thresholds(train_config: Path) -> bool:
+    """Return whether the train config explicitly defines observation thresholds."""
     if not train_config.exists():
         return False
     try:
         with open(train_config) as f:
             config = yaml.safe_load(f) or {}
-        model_cfg = config.get("model", {})
         data_cfg = config.get("data", {})
-        return "missing_permit" in model_cfg or "missing_permit" in data_cfg
+        return {
+            "min_history_observed_fraction",
+            "min_horizon_observed_fraction",
+        }.issubset(data_cfg)
     except Exception:
         return False
 
@@ -225,7 +227,7 @@ Examples:
     hosp_csv, deaths_csv, mobility_path = get_preprocess_paths(args.preprocess_config)
     run_id = get_train_run_id(args.train_config)
     biomarker_compatible = not dataset_has_run_id_dimension(dataset_path)
-    regression_compatible = supports_model_missing_permit(args.train_config)
+    regression_compatible = supports_observation_thresholds(args.train_config)
 
     available_vars = check_dataset_variables(dataset_path)
     if dataset_path:

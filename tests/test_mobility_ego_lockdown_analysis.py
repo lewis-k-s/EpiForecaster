@@ -40,7 +40,7 @@ def test_compute_window_starts_uses_history_window_only() -> None:
     np.testing.assert_array_equal(starts, np.array([0, 2, 4, 6]))
 
 
-def test_compute_valid_history_mask_uses_missing_permit() -> None:
+def test_compute_valid_history_mask_uses_minimum_observed_count() -> None:
     cases_mask = np.array(
         [
             [True, True],
@@ -56,7 +56,7 @@ def test_compute_valid_history_mask_uses_missing_permit() -> None:
         cases_mask,
         starts,
         window_length=3,
-        missing_permit=1,
+        min_history_observed=2,
     )
 
     expected = np.array([[True, True], [True, True]], dtype=bool)

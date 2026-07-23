@@ -83,8 +83,10 @@ where:
 
 Observation heads use weighted masked reductions with three distinct controls:
 
-1.  **Hard eligibility (`missing_permit` -> `min_observed`)**: windows with too few observed
-    points for a head are excluded from supervision for that head.
+1.  **Hard eligibility (`min_*_observed_fraction`)**: each head is supervised only
+    when both its history and forecast window meet their minimum observed fraction.
+    Fractions are evaluated against expected reporting opportunities: daily for
+    cases/deaths and every seven days for hospitalizations/wastewater.
 2.  **Per-head weighted mean reduction**:
     $$ L_h = \frac{\sum_t w_t ( \hat{y}_t - y_t )^2}{\sum_t w_t + \epsilon} $$
 3.  **Optional confidence scaling by effective support (`n_eff`)**:

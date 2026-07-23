@@ -9,7 +9,12 @@ from tests.dataset_test_helpers import (
 )
 
 
-def _make_config(dataset_path, missing_permit=None):
+def _make_config(
+    dataset_path,
+    *,
+    history_fraction: float = 1.0,
+    horizon_fraction: float = 1.0,
+):
     return make_epi_config(
         dataset_path,
         model_options={
@@ -21,7 +26,8 @@ def _make_config(dataset_path, missing_permit=None):
         data_options={
             "mobility_threshold": 0.1,
             "window_stride": 1,
-            **({"missing_permit": missing_permit} if missing_permit else {}),
+            "min_history_observed_fraction": history_fraction,
+            "min_horizon_observed_fraction": horizon_fraction,
         },
     )
 
@@ -70,26 +76,14 @@ def _write_deaths_sparse_target_dataset(path) -> None:
 
 
 @pytest.mark.epiforecaster
-def test_missing_permit_allows_history_nan_but_excludes_target_nan(tmp_path):
+def test_observed_fractions_allow_half_observed_history_and_horizon(tmp_path):
     zarr_path = tmp_path / "tiny.zarr"
     _write_tiny_dataset(zarr_path)
 
     config = _make_config(
         str(zarr_path),
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 1,
-                "cases": 1,
-                "hospitalizations": 1,
-                "deaths": 1,
-            },
-            "horizon": {
-                "biomarkers_joint": 1,
-                "cases": 1,
-                "hospitalizations": 1,
-                "deaths": 1,
-            },
-        },
+        history_fraction=0.5,
+        horizon_fraction=0.5,
     )
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
@@ -100,7 +94,7 @@ def test_missing_permit_allows_history_nan_but_excludes_target_nan(tmp_path):
 
 
 @pytest.mark.epiforecaster
-def test_missing_permit_zero_filters_history_nan(tmp_path):
+def test_full_observation_requirement_filters_missing_history_or_horizon(tmp_path):
     zarr_path = tmp_path / "tiny.zarr"
     _write_tiny_dataset(zarr_path)
 
@@ -120,20 +114,8 @@ def test_window_filtering_uses_cases_mask_not_interpolated_values(tmp_path):
 
     config = _make_config(
         str(zarr_path),
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
-            "horizon": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
-        },
+        history_fraction=1.0,
+        horizon_fraction=1.0,
     )
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0])
 
@@ -145,20 +127,8 @@ def test_window_filtering_uses_cases_mask_not_interpolated_values(tmp_path):
 
     relaxed = _make_config(
         str(zarr_path),
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 1,
-                "cases": 1,
-                "hospitalizations": 1,
-                "deaths": 1,
-            },
-            "horizon": {
-                "biomarkers_joint": 1,
-                "cases": 1,
-                "hospitalizations": 1,
-                "deaths": 1,
-            },
-        },
+        history_fraction=0.5,
+        horizon_fraction=0.5,
     )
     relaxed_ds = EpiDataset(config=relaxed, target_nodes=[0], context_nodes=[0])
     assert relaxed_ds._valid_window_starts_by_node[0] == [0]
@@ -166,50 +136,30 @@ def test_window_filtering_uses_cases_mask_not_interpolated_values(tmp_path):
 
 
 @pytest.mark.epiforecaster
-def test_per_target_missing_permit_can_filter_deaths(tmp_path):
+def test_uniform_observed_fractions_filter_sparse_daily_target(tmp_path):
     zarr_path = tmp_path / "deaths_sparse_target.zarr"
     _write_deaths_sparse_target_dataset(zarr_path)
 
     base = _make_config(
         str(zarr_path),
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 2,
-            },
-            "horizon": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 2,
-            },
-        },
+        history_fraction=0.0,
+        horizon_fraction=0.0,
     )
     base_ds = EpiDataset(config=base, target_nodes=[0], context_nodes=[0])
-    # With relaxed deaths permit, both starts are available.
+    # Zero fractions admit windows even when every target mask is empty.
     assert base_ds._valid_window_starts_by_node[0] == [0, 1]
 
-    strict_deaths = _make_config(
+    half_observed = _make_config(
         str(zarr_path),
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
-            "horizon": {
-                "biomarkers_joint": 0,
-                "cases": 0,
-                "hospitalizations": 0,
-                "deaths": 0,
-            },
-        },
+        history_fraction=0.5,
+        horizon_fraction=0.5,
     )
-    strict_ds = EpiDataset(config=strict_deaths, target_nodes=[0], context_nodes=[0])
-    assert strict_ds._valid_window_starts_by_node[0] == []
+    half_observed_ds = EpiDataset(
+        config=half_observed,
+        target_nodes=[0],
+        context_nodes=[0],
+    )
+    assert half_observed_ds._valid_window_starts_by_node[0] == []
 
 
 def _write_ww_masked_mean_dataset(path) -> None:
@@ -256,20 +206,8 @@ def test_ww_target_uses_biomarker_masked_mean_and_any_variant_mask(tmp_path):
 
     config = _make_config(
         str(zarr_path),
-        missing_permit={
-            "input": {
-                "biomarkers_joint": 4,
-                "cases": 4,
-                "hospitalizations": 4,
-                "deaths": 4,
-            },
-            "horizon": {
-                "biomarkers_joint": 4,
-                "cases": 4,
-                "hospitalizations": 4,
-                "deaths": 4,
-            },
-        },
+        history_fraction=0.0,
+        horizon_fraction=0.0,
     )
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0])
 

@@ -11,21 +11,6 @@ from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 PADDED_REAL_RUN_ID = "real                                            "
 
 
-def zero_missing_permit() -> dict[str, dict[str, int]]:
-    return {
-        window: {
-            variable: 0
-            for variable in (
-                "biomarkers_joint",
-                "cases",
-                "hospitalizations",
-                "deaths",
-            )
-        }
-        for window in ("input", "horizon")
-    }
-
-
 def make_epi_config(
     dataset_path: str | Path,
     *,
@@ -52,7 +37,8 @@ def make_epi_config(
     data_kwargs = {
         "dataset_path": str(dataset_path),
         "mobility_threshold": 0.0,
-        "missing_permit": zero_missing_permit(),
+        "min_history_observed_fraction": 1.0,
+        "min_horizon_observed_fraction": 1.0,
     }
     data_kwargs.update(data_options or {})
     return EpiForecasterConfig(

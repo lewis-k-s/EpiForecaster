@@ -58,7 +58,7 @@ def compute_valid_window_mask(
     input_window_length: int,
     horizon: int,
     window_stride: int,
-    missing_permit: int,
+    min_history_observed: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute window starts and validity mask per node.
 
@@ -100,8 +100,7 @@ def compute_valid_window_mask(
     starts = np.arange(0, T - seg + 1, window_stride, dtype=np.int64)
     history_counts = history_counts[starts]
 
-    history_threshold = max(0, input_window_length - missing_permit)
-    history_ok = history_counts >= history_threshold
+    history_ok = history_counts >= min_history_observed
     valid_mask = history_ok
 
     return starts, valid_mask
@@ -336,11 +335,17 @@ def main() -> None:
     history_len = int(config.model.input_window_length)
     horizon = int(config.model.forecast_horizon)
     window_stride = int(config.data.window_stride)
-    missing_permit = int(config.data.missing_permit)
+    min_history_observed = config.data.resolve_min_history_observed_map(history_len)[
+        "cases"
+    ]
     window_len = history_len + horizon
 
     starts, valid_mask = compute_valid_window_mask(
-        cases_da, history_len, horizon, window_stride, missing_permit
+        cases_da,
+        history_len,
+        horizon,
+        window_stride,
+        min_history_observed,
     )
     count_starts, missing_counts = compute_missing_counts(
         cases_da, window_len, window_stride

@@ -116,9 +116,7 @@ def load_analysis_arrays(ds: xr.Dataset) -> dict[str, Any]:
         mask_da = ds["cases_mask"]
         if mask_da.ndim == 3:
             mask_da = mask_da.squeeze(drop=True)
-        cases_mask = (
-            mask_da.transpose(TEMPORAL_COORD, REGION_COORD).values.astype(bool)
-        )
+        cases_mask = mask_da.transpose(TEMPORAL_COORD, REGION_COORD).values.astype(bool)
     else:
         cases_mask = np.isfinite(cases)
     cases_mask &= np.isfinite(cases)
@@ -171,7 +169,9 @@ def compute_window_starts(
         raise ValueError("window_stride must be positive")
     if num_timesteps < window_length:
         return np.array([], dtype=np.int64)
-    return np.arange(0, num_timesteps - window_length + 1, window_stride, dtype=np.int64)
+    return np.arange(
+        0, num_timesteps - window_length + 1, window_stride, dtype=np.int64
+    )
 
 
 def build_ego_mask(
@@ -211,7 +211,7 @@ def compute_valid_history_mask(
     cases_mask: np.ndarray,
     starts: np.ndarray,
     window_length: int,
-    missing_permit: int,
+    min_history_observed: int,
 ) -> np.ndarray:
     """Compute per-window, per-target validity from case observation masks."""
     observed = np.asarray(cases_mask, dtype=np.int32)
@@ -221,8 +221,7 @@ def compute_valid_history_mask(
     )
     counts = cumsum[window_length:] - cumsum[:-window_length]
     counts = counts[starts]
-    threshold = max(0, window_length - int(missing_permit))
-    return counts >= threshold
+    return counts >= int(min_history_observed)
 
 
 def compute_mobility_reduction(
@@ -236,7 +235,9 @@ def compute_mobility_reduction(
     end = pd.Timestamp(datetime.fromisoformat(baseline_end))
     baseline_mask = (dates >= start) & (dates <= end)
     if baseline_mask.sum() == 0:
-        raise ValueError(f"No dates found in baseline period {baseline_start} to {baseline_end}")
+        raise ValueError(
+            f"No dates found in baseline period {baseline_start} to {baseline_end}"
+        )
 
     daily_totals = np.nansum(mobility.astype(np.float64), axis=(1, 2))
     daily = pd.Series(daily_totals, index=dates)
@@ -361,7 +362,7 @@ def run_ego_analysis(
     mobility_threshold: float,
     window_length: int,
     window_stride: int,
-    missing_permit: int,
+    min_history_observed: int,
     mobility_reduction: pd.Series,
     min_timepoints: int,
     max_windows: int | None = None,
@@ -375,7 +376,10 @@ def run_ego_analysis(
         return pd.DataFrame()
 
     valid_history = compute_valid_history_mask(
-        cases_mask, starts, window_length, missing_permit
+        cases_mask,
+        starts,
+        window_length,
+        min_history_observed,
     )
     logger.info("Building ego mask for mobility threshold %.3f", mobility_threshold)
     ego_mask = build_ego_mask(mobility, mobility_threshold, mobility_time_mask)
@@ -524,7 +528,7 @@ def write_report(
     output_dir: Path,
     config: EgoAnalysisConfig,
     window_length: int,
-    missing_permit: int,
+    min_history_observed: int,
     date_start: pd.Timestamp,
     date_end: pd.Timestamp,
 ) -> None:
@@ -535,7 +539,7 @@ def write_report(
         "n_targets": int(results["target_node"].nunique()) if not results.empty else 0,
         "window_length": int(window_length),
         "window_stride": int(config.window_stride),
-        "missing_permit_cases": int(missing_permit),
+        "min_history_observed_cases": int(min_history_observed),
         "mobility_threshold": float(config.mobility_threshold),
         "date_start": str(date_start.date()),
         "date_end": str(date_end.date()),
@@ -567,7 +571,7 @@ def write_report(
         "",
         f"- Window length: {metadata['window_length']}",
         f"- Window stride: {metadata['window_stride']}",
-        f"- Cases missing permit: {metadata['missing_permit_cases']}",
+        f"- Minimum observed case history: {metadata['min_history_observed_cases']}",
         f"- Mobility threshold: {metadata['mobility_threshold']:.3f}",
         "- Non-positive mobility thresholds use positive-flow edges (`mobility > 0`).",
     ]
@@ -673,7 +677,9 @@ def main() -> None:
         if runtime_config.window_length is not None
         else int(config.model.input_window_length)
     )
-    missing_permit = int(config.data.missing_permit.input.get("cases", 0))
+    min_history_observed = config.data.resolve_min_history_observed_map(window_length)[
+        "cases"
+    ]
 
     logger.info("Loading canonical arrays from %s", config.data.dataset_path)
     ds = open_canonical_dataset(config)
@@ -699,7 +705,7 @@ def main() -> None:
         mobility_threshold=runtime_config.mobility_threshold,
         window_length=window_length,
         window_stride=runtime_config.window_stride,
-        missing_permit=missing_permit,
+        min_history_observed=min_history_observed,
         mobility_reduction=mobility_reduction,
         min_timepoints=runtime_config.min_timepoints,
         max_windows=runtime_config.max_windows,
@@ -717,7 +723,7 @@ def main() -> None:
         output_dir=runtime_config.output_dir,
         config=runtime_config,
         window_length=window_length,
-        missing_permit=missing_permit,
+        min_history_observed=min_history_observed,
         date_start=arrays["dates"][0],
         date_end=arrays["dates"][-1],
     )

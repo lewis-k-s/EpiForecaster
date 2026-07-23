@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
-from models.configs import LossConfig
+from models.configs import DataConfig, LossConfig
 from models.sir_rollforward import SIRRollForward
 
 
@@ -80,6 +80,27 @@ def test_get_loss_from_config_passes_observation_loss() -> None:
     criterion = get_loss_from_config(loss_cfg)
 
     assert criterion.observation_loss == "mae"
+
+
+def test_get_loss_from_config_resolves_history_and_horizon_thresholds() -> None:
+    criterion = get_loss_from_config(
+        LossConfig(),
+        data_config=DataConfig(
+            min_history_observed_fraction=0.5,
+            min_horizon_observed_fraction=0.5,
+        ),
+        input_window_length=60,
+        forecast_horizon=28,
+    )
+
+    assert criterion.cases_min_history_observed == 30
+    assert criterion.hosp_min_history_observed == 5
+    assert criterion.deaths_min_history_observed == 30
+    assert criterion.ww_min_history_observed == 5
+    assert criterion.cases_min_observed == 14
+    assert criterion.hosp_min_observed == 2
+    assert criterion.deaths_min_observed == 14
+    assert criterion.ww_min_observed == 2
 
 
 def test_joint_inference_latent_loss_uses_dense_finite_targets():
@@ -581,3 +602,60 @@ def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:
     ).to(dtype=torch.bool)
     components = loss_fn.compute_components(model_outputs, targets)
     assert torch.equal(components["obs_active_mask"], expected_active)
+
+
+def test_ww_supervision_requires_history_and_horizon_coverage() -> None:
+    loss_fn = JointInferenceLoss(
+        w_sird_supervision=0.0,
+        disable_hosp=True,
+        disable_cases=True,
+        disable_deaths=True,
+        ww_min_history_observed=2,
+        ww_min_observed=2,
+    )
+    targets = {
+        "ww": torch.zeros(3, 3),
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "ww_mask": torch.tensor(
+            [
+                [1.0, 1.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ]
+        ),
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+    batch_data = type(
+        "BatchData",
+        (),
+        {
+            "ww_hist_mask": torch.tensor(
+                [
+                    [1.0, 0.0, 0.0],
+                    [1.0, 1.0, 1.0],
+                    [1.0, 1.0, 0.0],
+                ]
+            )
+        },
+    )()
+
+    supervision = loss_fn.compute_observation_supervision(
+        targets,
+        device=torch.device("cpu"),
+        batch_data=batch_data,
+    )
+
+    assert torch.equal(
+        supervision["ww"]["weights"],
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0],  # History fails.
+                [0.0, 0.0, 0.0],  # Horizon fails.
+                [1.0, 1.0, 0.0],  # Both windows qualify.
+            ]
+        ),
+    )

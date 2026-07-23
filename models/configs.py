@@ -1,3 +1,4 @@
+import math
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -10,6 +11,12 @@ GNN_TYPES = ["gcn", "gat"]
 GRAPH_ADJACENCY_SOURCES = ["mobility", "spatial_knn", "spatial_queen"]
 FORECASTER_HEAD_TYPES = ["transformer"]
 POSITIONAL_ENCODING_TYPES = ["sinusoidal", "learned"]
+TARGET_OBSERVATION_CADENCE_DAYS = {
+    "cases": 1,
+    "hospitalizations": 7,
+    "deaths": 1,
+    "wastewater": 7,
+}
 
 
 @dataclass
@@ -419,38 +426,6 @@ class ObservationHeadConfig:
 
 
 @dataclass
-class MissingPermitConfig:
-    """Missing value permit configuration for input and horizon windows."""
-
-    # Maximum allowed missing values in input window (by target)
-    # Each value must be in [0, input_window_length)
-    input: dict[str, int] = field(default_factory=dict)
-    # Maximum allowed missing values in forecast horizon (by target)
-    # Each value must be in [0, forecast_horizon)
-    horizon: dict[str, int] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        valid_targets = {
-            "biomarkers_joint",
-            "cases",
-            "hospitalizations",
-            "deaths",
-        }
-
-        for window_type, permits in [("input", self.input), ("horizon", self.horizon)]:
-            for name, permit in permits.items():
-                if name not in valid_targets:
-                    raise ValueError(
-                        f"missing_permit.{window_type} has unsupported key '{name}'. "
-                        f"Expected one of: {sorted(valid_targets)}"
-                    )
-                if int(permit) < 0:
-                    raise ValueError(
-                        f"missing_permit.{window_type}['{name}'] must be non-negative"
-                    )
-
-
-@dataclass
 class DataConfig:
     """Dataset configuration loaded from ``data`` YAML block."""
 
@@ -466,20 +441,10 @@ class DataConfig:
     use_valid_targets: bool = False
     # Sliding window stride for training samples
     window_stride: int = 1
-    # Maximum allowed missing values by target for input and horizon windows.
-    # Schema:
-    #   missing_permit:
-    #     input:
-    #       biomarkers_joint: 53
-    #       cases: 20
-    #       hospitalizations: 53
-    #       deaths: 20
-    #     horizon:
-    #       biomarkers_joint: 26
-    #       cases: 10
-    #       hospitalizations: 26
-    #       deaths: 10
-    missing_permit: MissingPermitConfig = field(default_factory=MissingPermitConfig)
+    # Minimum fraction of expected reporting opportunities that must be observed.
+    # Cases/deaths are daily; hospitalizations/wastewater use a seven-day cadence.
+    min_history_observed_fraction: float = 0.5
+    min_horizon_observed_fraction: float = 0.5
     # Dataset sample ordering: "node" (node-major) or "time" (time-major)
     sample_ordering: str = "node"
     # Mobility preprocessing configuration (data already log1p-transformed from pipeline)
@@ -510,13 +475,12 @@ class DataConfig:
                 "Specify at least one lag value (e.g., [1, 7, 14])."
             )
 
-        # Convert dict to MissingPermitConfig if needed
-        if isinstance(self.missing_permit, dict):
-            input_permits = self.missing_permit.get("input", {})
-            horizon_permits = self.missing_permit.get("horizon", {})
-            self.missing_permit = MissingPermitConfig(
-                input=input_permits, horizon=horizon_permits
-            )
+        for name, value in (
+            ("min_history_observed_fraction", self.min_history_observed_fraction),
+            ("min_horizon_observed_fraction", self.min_horizon_observed_fraction),
+        ):
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1, got {value}")
 
         if len(self.mobility_clip_range) != 2:
             raise ValueError("mobility_clip_range must be a tuple of (min, max)")
@@ -541,50 +505,36 @@ class DataConfig:
                 "This is required for valid_targets filtering with multi-run datasets."
             )
 
-    def resolve_missing_permit_map(self) -> dict[str, dict[str, int]]:
-        """Resolve per-target missing permits for input and horizon windows.
+    @staticmethod
+    def _resolve_min_observed_map(
+        window_length: int,
+        observed_fraction: float,
+    ) -> dict[str, int]:
+        if window_length <= 0:
+            raise ValueError(f"window_length must be positive, got {window_length}")
 
-        Returns dict with 'input' and 'horizon' keys, each mapping to:
-        - cases
-        - hospitalizations
-        - deaths
-        - wastewater
-        """
         return {
-            "input": {
-                "cases": int(self.missing_permit.input.get("cases", 0)),
-                "hospitalizations": int(
-                    self.missing_permit.input.get("hospitalizations", 0)
-                ),
-                "deaths": int(self.missing_permit.input.get("deaths", 0)),
-                "wastewater": int(self.missing_permit.input.get("biomarkers_joint", 0)),
-            },
-            "horizon": {
-                "cases": int(self.missing_permit.horizon.get("cases", 0)),
-                "hospitalizations": int(
-                    self.missing_permit.horizon.get("hospitalizations", 0)
-                ),
-                "deaths": int(self.missing_permit.horizon.get("deaths", 0)),
-                "wastewater": int(
-                    self.missing_permit.horizon.get("biomarkers_joint", 0)
-                ),
-            },
-        }
-
-    def resolve_min_observed_map(self, forecast_horizon: int) -> dict[str, int]:
-        """Resolve per-target minimum observed horizon steps for active supervision."""
-        if forecast_horizon <= 0:
-            raise ValueError(
-                f"forecast_horizon must be positive, got {forecast_horizon}"
+            target: math.ceil(
+                math.ceil(window_length / cadence_days) * observed_fraction
             )
-        horizon = int(forecast_horizon)
-        permits = self.resolve_missing_permit_map()["horizon"]
-        return {
-            "cases": max(0, horizon - int(permits["cases"])),
-            "hospitalizations": max(0, horizon - int(permits["hospitalizations"])),
-            "deaths": max(0, horizon - int(permits["deaths"])),
-            "wastewater": max(0, horizon - int(permits["wastewater"])),
+            for target, cadence_days in TARGET_OBSERVATION_CADENCE_DAYS.items()
         }
+
+    def resolve_min_history_observed_map(
+        self, input_window_length: int
+    ) -> dict[str, int]:
+        """Resolve history counts from the uniform fraction and target cadence."""
+        return self._resolve_min_observed_map(
+            input_window_length,
+            self.min_history_observed_fraction,
+        )
+
+    def resolve_min_horizon_observed_map(self, forecast_horizon: int) -> dict[str, int]:
+        """Resolve horizon counts from the uniform fraction and target cadence."""
+        return self._resolve_min_observed_map(
+            forecast_horizon,
+            self.min_horizon_observed_fraction,
+        )
 
 
 @dataclass

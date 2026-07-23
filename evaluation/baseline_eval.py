@@ -342,6 +342,7 @@ def _resolve_joint_observation_loss_spec(
     criterion = get_loss_from_config(
         loss_cfg,
         data_config=config.data,
+        input_window_length=config.model.input_window_length,
         forecast_horizon=horizon,
     )
 
@@ -1242,6 +1243,7 @@ def run_same_slice_baseline_evaluation(
     criterion = get_loss_from_config(
         config.training.loss,
         data_config=config.data,
+        input_window_length=config.model.input_window_length,
         forecast_horizon=config.model.forecast_horizon,
     )
     temporal_coords = list(getattr(dataset, "_temporal_coords", []))
@@ -1290,6 +1292,7 @@ def run_same_slice_baseline_evaluation(
         obs_supervision = criterion.compute_observation_supervision(
             targets_dict,
             device=torch.device("cpu"),
+            batch_data=batch_data,
         )
         # The forecast horizon is dictated by the supervision target tensor
         # (the true eval slice length); config.model.forecast_horizon is only a
