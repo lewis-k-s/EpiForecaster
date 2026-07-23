@@ -1747,6 +1747,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "remote_submit_build()" in dispatcher
     assert "remote_build_in_allocation()" in dispatcher
     assert '--jobid="$allocation_id"' in dispatcher
+    assert 'UV_CACHE_ROOT="/scratch/tmp/${USER:-unknown}/' in dispatcher
     key_material = dispatcher.split('dependency_key="$({', 1)[1].split(
         '} | sha256_stream)"', 1
     )[0]

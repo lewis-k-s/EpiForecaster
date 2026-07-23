@@ -16,7 +16,6 @@ TRANSFER_HOST="${TRANSFER_HOST:?TRANSFER_HOST must be configured}"
 CONTAINER_NETWORK_HOST="${CONTAINER_NETWORK_HOST:-wifi-acc}"
 REMOTE_CONTAINER_ROOT="${REMOTE_CONTAINER_ROOT:?REMOTE_CONTAINER_ROOT must be configured}"
 REMOTE_CONTAINER_BUILD_ROOT="${REMOTE_CONTAINER_BUILD_ROOT:-$REMOTE_WORKFLOW_PROJECT_ROOT/container-builds}"
-REMOTE_CONTAINER_DEP_CACHE="${REMOTE_CONTAINER_DEP_CACHE:-$REMOTE_CONTAINER_BUILD_ROOT/cache}"
 REMOTE_CONTAINER_BASE_IMAGE_REF="${REMOTE_CONTAINER_BASE_IMAGE_REF:?REMOTE_CONTAINER_BASE_IMAGE_REF must be configured}"
 FETCH_SCRIPT="$SCRIPT_DIR/fetch_runtime_deps_on_wifi.sh"
 SBATCH_SCRIPT="$SCRIPT_DIR/build_sif.sbatch"
@@ -184,7 +183,7 @@ remote_fetch_dependencies() {
   export UV_LOCK_SHA256="$4"
   export BUILD_ROOT="$5"
   export CONTAINER_ROOT="$6"
-  export UV_CACHE_ROOT="$7"
+  export UV_CACHE_ROOT="/scratch/tmp/${USER:-unknown}/epiforecaster-container-cache/$DEPENDENCY_KEY"
 
   bash "$fetch_script"
 }
@@ -416,8 +415,7 @@ remote_function_on \
   "$dependency_key" \
   "$lock_sha256" \
   "$request_root" \
-  "$REMOTE_CONTAINER_ROOT" \
-  "$REMOTE_CONTAINER_DEP_CACHE"
+  "$REMOTE_CONTAINER_ROOT"
 
 base_sif="$(
   remote_function_on \
