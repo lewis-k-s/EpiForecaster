@@ -100,10 +100,12 @@ contracts, and provenance are durable on GPFS.
 ## Tooling and MN5 submission policy
 
 Snakemake and DVC are installed from the locked `workflow` dependency group in
-the immutable SIF. The current dispatcher still uses its content-addressed
-host-side coordinator environment; cutting the coordinator over to the SIF
-requires an explicit, tested bind contract for MN5's Slurm client,
-configuration, plugins, identities, and Munge libraries.
+the immutable SIF. The remote runner and batch coordinator use that verified
+image directly. The coordinator exposes a minimal read-only host integration
+contract for MN5's `srun` client, Slurm libraries and configuration, user/group
+identity, Munge, and the Snoopy and EAR plugin trees. A nested `srun` step is
+therefore launched from the SIF without maintaining a second Python
+environment on GPFS.
 
 MN5 derives host memory from CPU count. Submission tooling therefore omits
 `--mem` and `--mem-per-cpu` and rejects workflow resources or extra Slurm flags
@@ -210,7 +212,7 @@ The run manifest records:
  source snapshot SHA-256,
  DVC pointer hashes,
  runtime SIF SHA-256,
- workflow tooling key and Snakemake version,
+ coordinator SIF identity and Snakemake version,
  rendered workflow config SHA-256,
  immutable dispatch-request SHA-256,
  workflow kind and public target,
@@ -229,14 +231,13 @@ finally delete losing checkpoint directories.
 
 ## Rebuild matrix
 
-| Change | New source bundle | New runtime SIF | New workflow tooling |
-| --- | ---: | ---: | ---: |
-| Python, Snakefile, wrapper, or scientific config | Yes | No | No |
-| Transferred tooling bootstrap | Yes | No | Yes |
-| DVC pointer changes | Yes | No | No |
-| Scientific dependency lock changes | Yes | Yes | Yes |
-| Snakemake/DVC workflow dependency changes | Yes | Yes | Yes |
-| Pinned base or container assembly changes | If bundled | Yes | No |
+| Change | New source bundle | New runtime SIF |
+| --- | ---: | ---: |
+| Python, Snakefile, wrapper, or scientific config | Yes | No |
+| DVC pointer changes | Yes | No |
+| Scientific dependency lock changes | Yes | Yes |
+| Snakemake/DVC workflow dependency changes | Yes | Yes |
+| Pinned base or container assembly changes | If bundled | Yes |
 
 ## Implementation map
 
@@ -250,9 +251,9 @@ finally delete losing checkpoint directories.
 | Ablation template | `workflow/config/mn5_ablation.yaml` |
 | Local Snakemake profile | `workflow/profiles/mn5/config.yaml` |
 | Snapshot and allocation validation | `scripts/workflow/run_config.py` |
-| Local tooling preparation and transfer | `scripts/workflow/mn5_workflow.sh` |
-| Transferred tooling bootstrap | `scripts/workflow/remote_tooling.sh` |
+| Local preparation and transfer | `scripts/workflow/mn5_workflow.sh` |
 | Immutable publication, submission, status, and recovery | `scripts/workflow/remote_run.sh` |
+| SIF-host Slurm coordinator boundary | `scripts/workflow/snakemake_coordinator.sbatch` |
 | Configured multi-rank study/cross-validation launch | `scripts/workflow/launch_parallel_workers.sh` |
 | Rank execution and marker | `scripts/workflow/run_parallel_worker.sh` |
 | Container isolation and scratch | `scripts/workflow/mn5_container_exec.sh` |

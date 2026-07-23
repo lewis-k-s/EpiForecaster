@@ -60,10 +60,6 @@ Durable state lives under project GPFS:
     cache/                         # shared, locked DVC cache
     storage/                       # content-addressed DVC remote
     containers/                    # immutable SIFs
-    tooling/
-      cache/                       # shared uv cache
-      envs/<tooling-key>/          # immutable Snakemake environment
-      requests/<tooling-key>/      # lock inputs and ready marker
     promoted/<run-id>/             # selected artifacts
     runs/
       .reservations/<run-id>/       # permanent no-reuse receipt
@@ -86,7 +82,8 @@ Remote EpiForecaster state belongs under this project root, not under `~/` on
 
 Source is transferred into a unique hidden staging leaf. The runner contained
 in that exact source snapshot verifies the config, source inventory, SIF, and
-tooling before atomically reserving the run ID and publishing the final run.
+containerized Snakemake version before atomically reserving the run ID and
+publishing the final run.
 Permanent reservation receipts prevent deleted run IDs from being reused.
 The allocation identity is `<job-id>_0`. Container executions add Slurm step
 and process rank, yielding `<job-id>_0_<step-id>_<rank>` and preventing scratch
@@ -111,15 +108,13 @@ without rebuilding the SIF. Packaging the coordinator dependencies in the SIF
 provides a sealed coordinator runtime, but using it as the batch control plane
 still requires explicit MN5 host-Slurm integration.
 
-The current dispatcher continues to use a host-side coordinator environment
-containing the locked `workflow` group (`snakemake` and `dvc`). Its key is
-derived from `uv.lock`, Python 3.11, the dependency-group name, and the
-transferred tooling-bootstrap digest.
-Prepare it idempotently on `wifi-acc` with:
-
-```bash
-bash scripts/workflow/mn5_workflow.sh tooling
-```
+The dispatcher, immutable remote runner, and batch coordinator execute their
+Python, DVC, and Snakemake commands from the same verified SIF. The coordinator
+binds only the MN5 host interfaces needed to launch job steps: the `srun`
+client, Slurm libraries and configuration, user/group identity, Munge, and the
+site Snoopy and EAR plugin trees. Scientific rules continue to enter the SIF
+through `mn5_container_exec.sh`; the coordinator itself does not request
+NVIDIA device injection.
 
 The top-level Snakefile includes domain rules from `workflow/rules/`. Every
 scientific stage consumes a content-addressed dependency contract and the DVC

@@ -1763,7 +1763,7 @@ def _make_remote_run_staging(
     tmp_path: Path,
     *,
     token: str,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, dict[str, str]]:
     """Create a faithful local staging bundle for the transferred runner."""
     run_parent = tmp_path / "runs"
     run_root = run_parent / "test-run"
@@ -1803,8 +1803,8 @@ def _make_remote_run_staging(
     sif_digest = run_support.sha256_file(sif)
     Path(f"{sif}.sha256").write_text(f"{sif_digest}  {sif.name}\n")
 
-    snakemake_bin = Path(sys.executable).parent / "snakemake"
-    tooling_python = snakemake_bin.with_name("python")
+    snakemake_bin = Path("/usr/local/bin/snakemake")
+    tooling_python = Path("/usr/local/bin/python")
     config = _workflow_config(run_root, run_root / "source")
     config["source"]["source_snapshot_sha256"] = source_digest
     config["source"]["source_file_count"] = len(source_paths)
@@ -1821,17 +1821,66 @@ def _make_remote_run_staging(
     request = (state / "dispatch.tsv").read_text()
     expected = f"tooling_python\t{tooling_python}\n"
     assert expected in request
-    return staging, run_root
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    singularity = fake_bin / "singularity"
+    singularity.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+test "$1" = exec
+shift
+working_directory=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cleanenv|--containall)
+      shift
+      ;;
+    --bind)
+      shift 2
+      ;;
+    --env)
+      export "$2"
+      shift 2
+      ;;
+    --pwd)
+      working_directory="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      break
+      ;;
+  esac
+done
+cd "$working_directory"
+case "$1" in
+  /usr/local/bin/python)
+    shift
+    exec {sys.executable} "$@"
+    ;;
+  /usr/local/bin/snakemake)
+    shift
+    exec {Path(sys.executable).parent / "snakemake"} "$@"
+    ;;
+esac
+exec "$@"
+"""
+    )
+    singularity.chmod(0o755)
+    env = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    return staging, run_root, env
 
 
 def test_transferred_runner_publishes_once_and_reserves_run_id(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="owner")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="owner")
     runner = staging / "source/scripts/workflow/remote_run.sh"
 
     result = subprocess.run(
         [str(runner), "publish"],
+        env=env,
         check=True,
         capture_output=True,
         text=True,
@@ -1847,9 +1896,10 @@ def test_transferred_runner_publishes_once_and_reserves_run_id(
     assert reservation.is_dir()
     assert (reservation / "owner").read_text() == ".staging-test-run.owner\n"
 
-    competing, _ = _make_remote_run_staging(tmp_path, token="competitor")
+    competing, _, env = _make_remote_run_staging(tmp_path, token="competitor")
     duplicate = subprocess.run(
         [str(competing / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -1862,12 +1912,13 @@ def test_transferred_runner_publishes_once_and_reserves_run_id(
 def test_transferred_runner_rejects_tampered_config_before_reservation(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="tampered")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="tampered")
     config_path = staging / "config.yaml"
     config_path.write_text(config_path.read_text() + "tampered: true\n")
 
     result = subprocess.run(
         [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -1882,14 +1933,15 @@ def test_transferred_runner_rejects_tampered_config_before_reservation(
 def test_transferred_runner_submission_is_idempotent_and_pinned(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="submit")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="submit")
     subprocess.run(
         [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=True,
     )
 
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(exist_ok=True)
     calls = tmp_path / "sbatch.calls"
     sbatch = fake_bin / "sbatch"
     sbatch.write_text(
@@ -1900,8 +1952,8 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     squeue = fake_bin / "squeue"
     squeue.write_text("#!/bin/bash\nprintf 'RUNNING\\n'\n")
     squeue.chmod(0o755)
-    env = os.environ | {
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    env = env | {
+        "PATH": f"{fake_bin}:{env['PATH']}",
         "CALLS_FILE": str(calls),
     }
     runner = run_root / "source/scripts/workflow/remote_run.sh"
@@ -2001,9 +2053,7 @@ def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> N
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     dispatcher = (REPO_ROOT / "scripts/workflow/mn5_workflow.sh").read_text()
-    identity_helper = (REPO_ROOT / "scripts/workflow/tooling_identity.py").read_text()
     remote_runner = (REPO_ROOT / "scripts/workflow/remote_run.sh").read_text()
-    tooling_runner = (REPO_ROOT / "scripts/workflow/remote_tooling.sh").read_text()
     container_exec = (REPO_ROOT / "scripts/workflow/mn5_container_exec.sh").read_text()
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
@@ -2015,19 +2065,14 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "declare -f" not in dispatcher
     assert "remote_function" not in dispatcher
     assert "remote_run.sh" in dispatcher
-    assert "remote_tooling.sh" in dispatcher
+    assert "remote_tooling.sh" not in dispatcher
     assert 'staging_root="$REMOTE_WORKFLOW_RUN_ROOT/.staging-' in dispatcher
     assert "--dispatch-file" in dispatcher
     assert "uv sync" not in dispatcher
-    assert "uv sync" in tooling_runner
-    assert "--frozen" in tooling_runner
-    assert "--only-group workflow" in tooling_runner
-    assert "pyproject.toml=" not in identity_helper
-    assert "uv.lock=" in identity_helper
-    assert "bootstrap=" in identity_helper
-    assert "scripts.workflow.tooling_identity" in dispatcher
-    assert "snakemake_version=" in tooling_runner
-    assert 'ssh_options+=(-o "HostName=$CONTAINER_NETWORK_HOSTNAME")' in dispatcher
+    assert "uv sync" not in remote_runner
+    assert "scripts.workflow.tooling_identity" not in dispatcher
+    assert 'REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"' in dispatcher
+    assert 'TOOLING_KEY="sif-sha256:$observed_sha"' in dispatcher
     assert "executor_commit=" not in dispatcher
     assert "EXECUTOR_SUBMODULE" not in dispatcher
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.launch.lock"' in remote_runner
@@ -2039,6 +2084,10 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert '--gres="$GRES"' in remote_runner
     assert '"$TASKS"' in remote_runner
     assert '"$CPUS_PER_TASK"' in remote_runner
+    assert '"$CONTAINER_SIF"' in remote_runner
+    assert '"$SNAKEMAKE_BIN"' not in remote_runner.split(
+        "sbatch --parsable", 1
+    )[1].split(')"', 1)[0]
     assert (
         '"$@"'
         not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
@@ -2065,6 +2114,9 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert 'chmod -R u+w "$SCRATCH_ROOT"' in container_exec
     assert 'exit "$status"' in container_exec
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in coordinator
+    assert "exec singularity" in coordinator
+    assert "/usr/bin/srun:/usr/bin/srun:ro" in coordinator
+    assert "/run/munge:/run/munge:ro" in coordinator
     assert "#SBATCH --ntasks=4" in coordinator
     assert "#SBATCH --cpus-per-task=20" in coordinator
     assert "#SBATCH --gres=gpu:4" in coordinator
