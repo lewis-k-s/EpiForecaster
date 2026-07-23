@@ -23,17 +23,16 @@ CONTAINER_SIF="${2:?container SIF is required}"
 EXPECTED_TASKS="${3:?expected task count is required}"
 EXPECTED_CPUS_PER_TASK="${4:?expected CPUs per task is required}"
 shift 4
+ALLOCATED_NODES=""
 
 # Reject mismatches between the sealed run config and the actual allocation.
 validate_allocation() {
-  local allocated_nodes
-
   test -d "$RUN_ROOT/source"
   test -r "$RUN_ROOT/config.yaml"
   test -f "$CONTAINER_SIF"
-  allocated_nodes="${SLURM_JOB_NUM_NODES:-${SLURM_STEP_NUM_NODES:-${SLURM_NNODES:-}}}"
+  ALLOCATED_NODES="${SLURM_JOB_NUM_NODES:-${SLURM_STEP_NUM_NODES:-${SLURM_NNODES:-}}}"
 
-  if [ "$allocated_nodes" != "1" ] \
+  if [ "$ALLOCATED_NODES" != "1" ] \
     || [ "${SLURM_NTASKS:-}" != "$EXPECTED_TASKS" ] \
     || [ "${SLURM_CPUS_PER_TASK:-}" != "$EXPECTED_CPUS_PER_TASK" ]; then
     echo "Expected one MN5 node with $EXPECTED_TASKS tasks and $EXPECTED_CPUS_PER_TASK CPUs per task" >&2
@@ -121,7 +120,7 @@ container_args=(
   --env "PYTHONPATH=$RUN_ROOT/source"
   --env "XDG_CACHE_HOME=$RUN_ROOT/.cache"
   --env "TMPDIR=/tmp"
-  --env "SLURM_JOB_NUM_NODES=$allocated_nodes"
+  --env "SLURM_JOB_NUM_NODES=$ALLOCATED_NODES"
   --pwd "$RUN_ROOT"
 )
 

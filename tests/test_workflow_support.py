@@ -2116,7 +2116,7 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in coordinator
     assert "exec singularity" in coordinator
     assert "SLURM_STEP_NUM_NODES" in coordinator
-    assert '--env "SLURM_JOB_NUM_NODES=$allocated_nodes"' in coordinator
+    assert '--env "SLURM_JOB_NUM_NODES=$ALLOCATED_NODES"' in coordinator
     assert "compgen -A variable SLURM_" not in coordinator
     assert "/usr/bin/srun:/usr/bin/srun:ro" in coordinator
     assert "/run/munge:/run/munge:ro" in coordinator
