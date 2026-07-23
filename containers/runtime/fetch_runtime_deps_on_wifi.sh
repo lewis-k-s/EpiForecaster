@@ -119,6 +119,7 @@ singularity exec --cleanenv \
   env \
   UV_PROJECT_ENVIRONMENT=/opt/epiforecaster/.venv \
   UV_CACHE_DIR=/var/cache/uv \
+  UV_CONCURRENT_INSTALLS=1 \
   UV_LINK_MODE=copy \
   UV_PYTHON_DOWNLOADS=never \
   uv sync \

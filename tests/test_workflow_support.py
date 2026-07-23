@@ -1737,6 +1737,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "--python /usr/local/bin/python3.11" in fetch
     assert "--group workflow" in fetch
     assert "--group runtime" not in fetch
+    assert "UV_CONCURRENT_INSTALLS=1" in fetch
     assert "UV_LINK_MODE=copy" in fetch
     assert '"$prefix_root/.venv/bin/python"' in fetch
     assert "sha256sum -c" in dispatcher
