@@ -100,9 +100,10 @@ contracts, and provenance are durable on GPFS.
 ## Tooling and MN5 submission policy
 
 Snakemake and DVC are installed from the locked `workflow` dependency group in
-the immutable SIF. Dispatch metadata remains content-addressed, while workflow
-execution does not depend on a large host-side Python environment on shared
-GPFS.
+the immutable SIF. The current dispatcher still uses its content-addressed
+host-side coordinator environment; cutting the coordinator over to the SIF
+requires an explicit, tested bind contract for MN5's Slurm client,
+configuration, plugins, identities, and Munge libraries.
 
 MN5 derives host memory from CPU count. Submission tooling therefore omits
 `--mem` and `--mem-per-cpu` and rejects workflow resources or extra Slurm flags

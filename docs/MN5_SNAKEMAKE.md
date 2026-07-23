@@ -108,11 +108,13 @@ The immutable SIF contains scientific dependencies, DVC, and Snakemake from
 the locked `workflow` dependency group. It excludes EpiForecaster source.
 Ordinary Python or Snakefile changes therefore create a new run snapshot
 without rebuilding the SIF. Packaging the coordinator dependencies in the SIF
-also avoids relying on a large mutable Python environment on shared GPFS.
+provides a sealed coordinator runtime, but using it as the batch control plane
+still requires explicit MN5 host-Slurm integration.
 
-The host-side coordinator environment contains only the locked `workflow`
-group (`snakemake` and `dvc`). Its key is derived from `uv.lock`, Python 3.11,
-the dependency-group name, and the transferred tooling-bootstrap digest.
+The current dispatcher continues to use a host-side coordinator environment
+containing the locked `workflow` group (`snakemake` and `dvc`). Its key is
+derived from `uv.lock`, Python 3.11, the dependency-group name, and the
+transferred tooling-bootstrap digest.
 Prepare it idempotently on `wifi-acc` with:
 
 ```bash
