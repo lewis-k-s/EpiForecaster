@@ -1714,6 +1714,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert 'exec /opt/epiforecaster/.venv/bin/python "$@"' in batch
     assert 'for console_script in "$PREFIX_ROOT/.venv/bin/"*' in batch
     assert '"exec /opt/epiforecaster/.venv/bin/$script_name' in batch
+    assert 'exec /opt/epiforecaster/.venv/bin/python -m dvc "$@"' in batch
     assert 'singularity build --force "$scratch_sif" "$sandbox"' in batch
     assert 'test "$(command -v python)" = /usr/local/bin/python' in batch
     assert 'assert sys.prefix == "/opt/epiforecaster/.venv"' in batch

@@ -147,6 +147,14 @@ install_runtime_launchers() {
       "$sandbox/usr/local/bin/$script_name"
     chmod 0755 "$sandbox/usr/local/bin/$script_name"
   done
+
+  # DVC 3.67.1 exposes a module entry point but may not install a `dvc`
+  # console script in a source-free uv environment.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /opt/epiforecaster/.venv/bin/python -m dvc "$@"' > \
+    "$sandbox/usr/local/bin/dvc"
+  chmod 0755 "$sandbox/usr/local/bin/dvc"
 }
 
 load_singularity
