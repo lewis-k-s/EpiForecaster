@@ -121,6 +121,7 @@ container_args=(
   --env "PYTHONPATH=$RUN_ROOT/source"
   --env "XDG_CACHE_HOME=$RUN_ROOT/.cache"
   --env "TMPDIR=/tmp"
+  --env "SLURM_JOB_NUM_NODES=$allocated_nodes"
   --pwd "$RUN_ROOT"
 )
 
@@ -129,7 +130,6 @@ container_args=(
 for variable_name in \
   SLURM_JOB_ID \
   SLURM_JOBID \
-  SLURM_JOB_NUM_NODES \
   SLURM_STEP_NUM_NODES \
   SLURM_NNODES \
   SLURM_JOB_NODELIST \
