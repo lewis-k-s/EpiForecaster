@@ -2115,6 +2115,7 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert 'exit "$status"' in container_exec
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in coordinator
     assert "exec singularity" in coordinator
+    assert "SLURM_STEP_NUM_NODES" in coordinator
     assert "/usr/bin/srun:/usr/bin/srun:ro" in coordinator
     assert "/run/munge:/run/munge:ro" in coordinator
     assert "#SBATCH --ntasks=4" in coordinator

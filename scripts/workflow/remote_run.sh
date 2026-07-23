@@ -208,7 +208,6 @@ container_exec() {
     --env "PYTHONDONTWRITEBYTECODE=1" \
     --env "PYTHONPATH=$ACTIVE_SOURCE_ROOT" \
     --env "XDG_CACHE_HOME=$BUNDLE_ROOT/.cache" \
-    --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
     --pwd "$working_directory" \
     "$CONTAINER_SIF" \
