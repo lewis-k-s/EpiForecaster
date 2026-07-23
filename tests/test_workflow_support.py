@@ -2116,8 +2116,12 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in coordinator
     assert "exec singularity" in coordinator
     assert "SLURM_STEP_NUM_NODES" in coordinator
+    assert "compgen -A variable SLURM_" not in coordinator
     assert "/usr/bin/srun:/usr/bin/srun:ro" in coordinator
     assert "/run/munge:/run/munge:ro" in coordinator
+    assert 'host_step: bool = False' in (
+        REPO_ROOT / "workflow/common.py"
+    ).read_text()
     assert "#SBATCH --ntasks=4" in coordinator
     assert "#SBATCH --cpus-per-task=20" in coordinator
     assert "#SBATCH --gres=gpu:4" in coordinator

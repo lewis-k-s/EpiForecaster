@@ -99,11 +99,13 @@ execution_id="${SLURM_JOB_ID:?SLURM_JOB_ID is required}_0"
 printf '%s\n' "$SLURM_JOB_ID" >"$RUN_ROOT/.state/coordinator.job_id"
 printf '%s\n' "$execution_id" >"$RUN_ROOT/.state/coordinator.execution_id"
 
+container_directory="$(dirname "$CONTAINER_SIF")"
 container_args=(
   exec
   --cleanenv
   --containall
   --bind "$RUN_ROOT:$RUN_ROOT:rw"
+  --bind "$container_directory:$container_directory:ro"
   --bind /usr/bin/srun:/usr/bin/srun:ro
   --bind /usr/lib64/slurm:/usr/lib64/slurm:ro
   --bind /usr/lib64/libmunge.so.2.0.1:/usr/lib64/libmunge.so.2.0.1:ro
@@ -124,9 +126,26 @@ container_args=(
 
 # Clean environments do not automatically preserve the allocation identity
 # needed by the host srun client exposed above.
-while IFS= read -r variable_name; do
-  container_args+=(--env "$variable_name=${!variable_name}")
-done < <(compgen -A variable SLURM_)
+for variable_name in \
+  SLURM_JOB_ID \
+  SLURM_JOBID \
+  SLURM_JOB_NUM_NODES \
+  SLURM_STEP_NUM_NODES \
+  SLURM_NNODES \
+  SLURM_JOB_NODELIST \
+  SLURM_NODELIST \
+  SLURM_JOB_PARTITION \
+  SLURM_JOB_CPUS_PER_NODE \
+  SLURM_CPUS_ON_NODE \
+  SLURM_NTASKS \
+  SLURM_CPUS_PER_TASK \
+  SLURM_MEM_PER_CPU \
+  SLURM_JOB_UID \
+  SLURM_JOB_GID; do
+  if [ -n "${!variable_name:-}" ]; then
+    container_args+=(--env "$variable_name=${!variable_name}")
+  fi
+done
 
 # Replace the batch shell so Snakemake's status is the Slurm job status.
 exec singularity "${container_args[@]}" "$CONTAINER_SIF" /usr/local/bin/snakemake \
