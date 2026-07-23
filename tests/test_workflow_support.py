@@ -1672,7 +1672,26 @@ def test_container_build_dispatch_dry_run_is_offline() -> None:
     assert "dependency key:" in result.stdout
 
 
-def test_runtime_dependency_group_excludes_coordinator_tooling() -> None:
+def test_container_build_dry_run_accepts_existing_allocation() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "containers/runtime/build_sif_on_mn5.sh"),
+            "--dry-run",
+            "--job-id",
+            "43720217",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "existing allocation: 43720217" in result.stdout
+
+
+def test_dependency_groups_keep_runtime_and_workflow_contracts_explicit() -> None:
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     groups = project["dependency-groups"]
 
@@ -1710,14 +1729,14 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "import dvc, geopandas, netCDF4" in batch
     assert "torch_geometric, xarray, zarr" in batch
     assert '"$scratch_sif" dvc --version' in batch
-    assert '"$scratch_sif" snakemake --version' not in batch
+    assert '"$scratch_sif" snakemake --version' in batch
     assert "singularity exec --cleanenv --nv" in batch
     assert "torch.cuda.is_available()" in batch
     assert "uv sync" in fetch
     assert "--frozen" in fetch
     assert "--python /usr/local/bin/python3.11" in fetch
-    assert "--group runtime" in fetch
-    assert "--group workflow" not in fetch
+    assert "--group workflow" in fetch
+    assert "--group runtime" not in fetch
     assert "UV_LINK_MODE=copy" in fetch
     assert '"$prefix_root/.venv/bin/python"' in fetch
     assert "sha256sum -c" in dispatcher
@@ -1725,6 +1744,8 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert 'declare -f "$function_name"' in dispatcher
     assert "remote_container_state()" in dispatcher
     assert "remote_submit_build()" in dispatcher
+    assert "remote_build_in_allocation()" in dispatcher
+    assert '--jobid="$allocation_id"' in dispatcher
     key_material = dispatcher.split('dependency_key="$({', 1)[1].split(
         '} | sha256_stream)"', 1
     )[0]

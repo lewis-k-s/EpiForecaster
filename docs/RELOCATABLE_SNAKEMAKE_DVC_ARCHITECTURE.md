@@ -5,7 +5,7 @@ This workflow separates four independently versioned layers:
 1. the scientific runtime SIF;
 2. the exact source snapshot from one worktree;
 3. content-addressed DVC payloads; and
-4. the small host-side Snakemake environment.
+4. the lightweight host-side dispatch metadata.
 
 The container supplies dependencies, the source bundle supplies behavior, and
 DVC supplies data. Several worktrees can therefore run concurrently without a
@@ -49,10 +49,10 @@ shares the allocation with the scientific ranks; it does not receive a GPU.
 
 ## Runtime image
 
-The SIF contains the slow-moving Linux, Python, native, scientific, and DVC
-dependencies. It does not contain project source, the Snakefile, selected
-training configs, or data payloads. The runtime dependency key is independent
-of ordinary source changes.
+The SIF contains the slow-moving Linux, Python, native, scientific, DVC, and
+Snakemake dependencies. It does not contain project source, the Snakefile,
+selected training configs, or data payloads. The runtime dependency key is
+independent of ordinary source changes.
 
 Dependency fetching occurs on `wifi-acc`; SIF assembly and GPU validation run
 offline in Slurm. Artifacts are published with immutable names, checksums, and
@@ -100,10 +100,9 @@ contracts, and provenance are durable on GPFS.
 ## Tooling and MN5 submission policy
 
 Snakemake and DVC are installed from the locked `workflow` dependency group in
-a content-addressed Python 3.11 environment. The tooling key depends on the
-group name, Python version, `uv.lock` digest, and the transferred tooling
-bootstrap. A ready marker records those identities, the installed Snakemake
-version and location, and the uv version.
+the immutable SIF. Dispatch metadata remains content-addressed, while workflow
+execution does not depend on a large host-side Python environment on shared
+GPFS.
 
 MN5 derives host memory from CPU count. Submission tooling therefore omits
 `--mem` and `--mem-per-cpu` and rejects workflow resources or extra Slurm flags
@@ -235,7 +234,7 @@ finally delete losing checkpoint directories.
 | Transferred tooling bootstrap | Yes | No | Yes |
 | DVC pointer changes | Yes | No | No |
 | Scientific dependency lock changes | Yes | Yes | Yes |
-| Snakemake/DVC workflow dependency changes | Yes | Only if runtime group changes | Yes |
+| Snakemake/DVC workflow dependency changes | Yes | Yes | Yes |
 | Pinned base or container assembly changes | If bundled | Yes | No |
 
 ## Implementation map

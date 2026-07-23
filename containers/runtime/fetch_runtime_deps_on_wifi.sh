@@ -126,13 +126,13 @@ singularity exec --cleanenv \
   --python /usr/local/bin/python3.11 \
   --no-install-project \
   --no-default-groups \
-  --group runtime
+  --group workflow
 
 singularity exec --cleanenv \
   --bind "$prefix_root:/opt/epiforecaster:ro" \
   "$base_sif" \
   /opt/epiforecaster/.venv/bin/python -c \
-  'import sys; assert sys.version_info[:2] == (3, 11); import dvc, geopandas, netCDF4, optuna, torch, torch_geometric, xarray, zarr; print("locked dependency imports: ok", sys.version, torch.__version__)'
+  'import sys; assert sys.version_info[:2] == (3, 11); import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("locked dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
 
 chmod -R a-w "$prefix_root"
 printf '%s\n' \

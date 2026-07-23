@@ -104,10 +104,11 @@ pointers travel with source; DVC payloads are rejected from the source bundle.
 
 ## Environments and data
 
-The immutable SIF contains scientific dependencies and DVC from the `runtime`
-dependency group. It excludes EpiForecaster source and Snakemake. Ordinary
-Python or Snakefile changes therefore create a new run snapshot without
-rebuilding the SIF.
+The immutable SIF contains scientific dependencies, DVC, and Snakemake from
+the locked `workflow` dependency group. It excludes EpiForecaster source.
+Ordinary Python or Snakefile changes therefore create a new run snapshot
+without rebuilding the SIF. Packaging the coordinator dependencies in the SIF
+also avoids relying on a large mutable Python environment on shared GPFS.
 
 The host-side coordinator environment contains only the locked `workflow`
 group (`snakemake` and `dvc`). Its key is derived from `uv.lock`, Python 3.11,
