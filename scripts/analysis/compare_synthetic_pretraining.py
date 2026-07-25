@@ -13,8 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 
 SCHEMA_VERSION = 1
+DATASET_ROLE_POINTERS = {
+    "real": "data/processed/real_with_id.zarr.dvc",
+    "synthetic": "data/processed/synthetic_full_holt_damped.zarr.dvc",
+}
 TARGET_HEADS = {
     "ww": "wastewater",
     "hosp": "hospitalizations",
@@ -33,6 +39,8 @@ LATENT_PATTERNS = (
 class RunSpec:
     stage: str
     dataset_role: str
+    evaluation_run_manifest: Path
+    evaluation_data_manifest: Path
     evaluation_summary: Path
     training_dynamics: Path
     training_dynamics_manifest: Path
@@ -60,6 +68,13 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError(f"Expected a JSON mapping in {path}")
+    return document
+
+
+def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError(f"Expected a YAML mapping in {path}")
     return document
 
 
@@ -96,6 +111,11 @@ def _parse_spec(spec_path: Path) -> tuple[list[RunSpec], list[ComparisonSpec]]:
         dataset_role = str(raw_run.get("dataset_role", "")).strip()
         if not stage or not dataset_role:
             raise ValueError(f"runs[{index}] requires stage and dataset_role")
+        if dataset_role not in DATASET_ROLE_POINTERS:
+            raise ValueError(
+                f"runs[{index}].dataset_role must be one of "
+                f"{sorted(DATASET_ROLE_POINTERS)}"
+            )
         if stage in seen_stages:
             raise ValueError(f"Duplicate stage in comparison spec: {stage}")
         seen_stages.add(stage)
@@ -103,6 +123,16 @@ def _parse_spec(spec_path: Path) -> tuple[list[RunSpec], list[ComparisonSpec]]:
             RunSpec(
                 stage=stage,
                 dataset_role=dataset_role,
+                evaluation_run_manifest=_resolve_input_path(
+                    base_dir,
+                    raw_run.get("evaluation_run_manifest"),
+                    field=f"runs[{index}].evaluation_run_manifest",
+                ),
+                evaluation_data_manifest=_resolve_input_path(
+                    base_dir,
+                    raw_run.get("evaluation_data_manifest"),
+                    field=f"runs[{index}].evaluation_data_manifest",
+                ),
                 evaluation_summary=_resolve_input_path(
                     base_dir,
                     raw_run.get("evaluation_summary"),
@@ -204,9 +234,91 @@ def _split_latent_metric(metric: str) -> tuple[str, str] | None:
     return None
 
 
+def _validate_evaluation_dataset(
+    run: RunSpec,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    run_manifest = _load_yaml_mapping(run.evaluation_run_manifest)
+    data_manifest = _load_mapping(run.evaluation_data_manifest)
+    if run_manifest.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported evaluation run manifest: {run.evaluation_run_manifest}"
+        )
+    if data_manifest.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported evaluation data manifest: {run.evaluation_data_manifest}"
+        )
+
+    dvc_targets = run_manifest.get("dvc", {}).get("targets")
+    if not isinstance(dvc_targets, dict):
+        raise ValueError(
+            f"Evaluation run manifest has no DVC targets for stage {run.stage}"
+        )
+    materialized_targets = {
+        str(pointer): record
+        for pointer, record in dvc_targets.items()
+        if isinstance(record, dict) and record.get("role") == "materialized"
+    }
+    staged_targets = data_manifest.get("targets")
+    if not isinstance(staged_targets, dict):
+        raise ValueError(
+            f"Evaluation data manifest has no staged targets for stage {run.stage}"
+        )
+    if set(staged_targets) != set(materialized_targets):
+        raise ValueError(
+            f"Evaluation staged-target set mismatch for stage {run.stage}"
+        )
+    for pointer, staged_record in staged_targets.items():
+        materialized_record = materialized_targets[pointer]
+        if not isinstance(staged_record, dict):
+            raise ValueError(
+                f"Evaluation staged target is malformed for stage {run.stage}: "
+                f"{pointer}"
+            )
+        if staged_record.get("md5") != materialized_record.get("md5"):
+            raise ValueError(
+                f"Evaluation DVC hash mismatch for stage {run.stage}: {pointer}"
+            )
+        if staged_record.get("output") != materialized_record.get("output"):
+            raise ValueError(
+                f"Evaluation DVC output mismatch for stage {run.stage}: {pointer}"
+            )
+
+    expected_dataset_pointer = DATASET_ROLE_POINTERS[run.dataset_role]
+    if expected_dataset_pointer not in staged_targets:
+        raise ValueError(
+            f"Stage {run.stage} declares dataset_role={run.dataset_role!r} but "
+            f"did not stage {expected_dataset_pointer}"
+        )
+    identity_dvc_hashes = run_manifest.get("identity", {}).get("dvc_hashes")
+    if not isinstance(identity_dvc_hashes, dict):
+        raise ValueError(
+            f"Evaluation run identity has no DVC hashes for stage {run.stage}"
+        )
+    for pointer, record in dvc_targets.items():
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"Evaluation DVC target is malformed for stage {run.stage}: {pointer}"
+            )
+        if identity_dvc_hashes.get(pointer) != record.get("md5"):
+            raise ValueError(
+                f"Evaluation identity DVC hash mismatch for stage {run.stage}: "
+                f"{pointer}"
+            )
+    return run_manifest, data_manifest
+
+
 def _validate_run_artifacts(
     run: RunSpec,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    evaluation_run_manifest, evaluation_data_manifest = (
+        _validate_evaluation_dataset(run)
+    )
     summary = _load_mapping(run.evaluation_summary)
     training_manifest = _load_mapping(run.training_manifest)
     provenance = _load_mapping(run.training_provenance)
@@ -360,7 +472,19 @@ def _validate_run_artifacts(
         raise ValueError(
             f"Training manifest dynamics row count mismatch for stage {run.stage}"
         )
-    return summary, provenance, evaluation_manifest
+    evaluation_input = evaluation_run_manifest.get("evaluation_input")
+    if isinstance(evaluation_input, dict):
+        if evaluation_input.get("checkpoint_sha256") != checkpoint_sha256:
+            raise ValueError(
+                f"Pinned evaluation checkpoint hash mismatch for stage {run.stage}"
+            )
+    return (
+        summary,
+        provenance,
+        evaluation_manifest,
+        evaluation_run_manifest,
+        evaluation_data_manifest,
+    )
 
 
 def _extract_evaluation_rows(
@@ -563,7 +687,13 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
     inventory_rows: list[dict[str, Any]] = []
 
     for run in runs:
-        summary, provenance, evaluation_manifest = _validate_run_artifacts(run)
+        (
+            summary,
+            provenance,
+            evaluation_manifest,
+            evaluation_run_manifest,
+            evaluation_data_manifest,
+        ) = _validate_run_artifacts(run)
         extracted = _extract_evaluation_rows(run, summary)
         evaluation_rows.extend(extracted[0])
         pathway_rows.extend(extracted[1])
@@ -571,15 +701,22 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
         structural_rows.extend(extracted[3])
         gradient_rows.extend(_extract_pathway_gradient_rows(run))
 
-        run_identity = provenance["run"]
-        dvc_targets = provenance["dvc"]["targets"]
+        training_run_identity = provenance["run"]
+        evaluation_run_identity = evaluation_run_manifest["identity"]
+        training_dvc_targets = provenance["dvc"]["targets"]
+        evaluation_dvc_targets = evaluation_run_manifest["dvc"]["targets"]
         inventory_rows.append(
             {
                 "stage": run.stage,
                 "dataset_role": run.dataset_role,
-                "run_id": run_identity.get("run_id"),
-                "git_sha": run_identity.get("git_sha"),
-                "source_snapshot_sha256": run_identity.get(
+                "training_run_id": training_run_identity.get("run_id"),
+                "training_git_sha": training_run_identity.get("git_sha"),
+                "training_source_snapshot_sha256": training_run_identity.get(
+                    "source_snapshot_sha256"
+                ),
+                "evaluation_run_id": evaluation_run_manifest.get("run_id"),
+                "evaluation_git_sha": evaluation_run_identity.get("git_sha"),
+                "evaluation_source_snapshot_sha256": evaluation_run_identity.get(
                     "source_snapshot_sha256"
                 ),
                 "checkpoint": summary.get("checkpoint"),
@@ -612,8 +749,21 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
                 "evaluation_manifest_sha256": _sha256_file(
                     run.evaluation_manifest
                 ),
-                "dvc_targets_json": json.dumps(
-                    dvc_targets, sort_keys=True, separators=(",", ":")
+                "evaluation_run_manifest": str(run.evaluation_run_manifest),
+                "evaluation_run_manifest_sha256": _sha256_file(
+                    run.evaluation_run_manifest
+                ),
+                "evaluation_data_manifest": str(run.evaluation_data_manifest),
+                "evaluation_data_manifest_sha256": _sha256_file(
+                    run.evaluation_data_manifest
+                ),
+                "training_dvc_targets_json": json.dumps(
+                    training_dvc_targets, sort_keys=True, separators=(",", ":")
+                ),
+                "evaluation_dvc_targets_json": json.dumps(
+                    evaluation_dvc_targets,
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ),
             }
         )
@@ -633,9 +783,12 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
             [
                 "stage",
                 "dataset_role",
-                "run_id",
-                "git_sha",
-                "source_snapshot_sha256",
+                "training_run_id",
+                "training_git_sha",
+                "training_source_snapshot_sha256",
+                "evaluation_run_id",
+                "evaluation_git_sha",
+                "evaluation_source_snapshot_sha256",
                 "checkpoint",
                 "checkpoint_sha256",
                 "evaluation_summary",
@@ -650,7 +803,12 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
                 "training_provenance_sha256",
                 "evaluation_manifest",
                 "evaluation_manifest_sha256",
-                "dvc_targets_json",
+                "evaluation_run_manifest",
+                "evaluation_run_manifest_sha256",
+                "evaluation_data_manifest",
+                "evaluation_data_manifest_sha256",
+                "training_dvc_targets_json",
+                "evaluation_dvc_targets_json",
             ],
         ),
         "evaluation_metrics.csv": (

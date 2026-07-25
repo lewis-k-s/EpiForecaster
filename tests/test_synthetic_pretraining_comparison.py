@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts.analysis.compare_synthetic_pretraining import generate_comparison
 
@@ -21,6 +22,13 @@ def _write_json(path: Path, document: dict) -> None:
     )
 
 
+def _write_yaml(path: Path, document: dict) -> None:
+    path.write_text(
+        yaml.safe_dump(document, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 def _write_run(
     root: Path,
     *,
@@ -31,6 +39,8 @@ def _write_run(
     run_dir = root / stage
     run_dir.mkdir()
     checkpoint = f"/workspace/{stage}/best_model.pt"
+    evaluation_run_manifest = run_dir / "manifest.yaml"
+    evaluation_data_manifest = run_dir / "data_manifest.json"
     summary = run_dir / "test_summary.json"
     dynamics = run_dir / "training_dynamics.jsonl"
     dynamics_manifest = run_dir / "training_dynamics_manifest.json"
@@ -38,6 +48,42 @@ def _write_run(
     provenance = run_dir / "training_provenance.json"
     evaluation_manifest = run_dir / "evaluation_manifest.json"
 
+    dataset_pointer = "data/processed/real_with_id.zarr.dvc"
+    dataset_output = "data/processed/real_with_id.zarr"
+    dvc_md5 = "c" * 32 + ".dir"
+    _write_yaml(
+        evaluation_run_manifest,
+        {
+            "schema_version": 1,
+            "run_id": f"run-{stage}",
+            "identity": {
+                "git_sha": "a" * 40,
+                "source_snapshot_sha256": "b" * 64,
+                "dvc_hashes": {dataset_pointer: dvc_md5},
+            },
+            "dvc": {
+                "targets": {
+                    dataset_pointer: {
+                        "md5": dvc_md5,
+                        "output": dataset_output,
+                        "role": "materialized",
+                    }
+                }
+            },
+        },
+    )
+    _write_json(
+        evaluation_data_manifest,
+        {
+            "schema_version": 1,
+            "targets": {
+                dataset_pointer: {
+                    "md5": dvc_md5,
+                    "output": dataset_output,
+                }
+            },
+        },
+    )
     _write_json(
         summary,
         {
@@ -120,8 +166,8 @@ def _write_run(
                 "reconciliation": "matched",
                 "targets": [
                     {
-                        "pointer": "data/processed/data.zarr.dvc",
-                        "dvc_md5": "c" * 32 + ".dir",
+                        "pointer": dataset_pointer,
+                        "dvc_md5": dvc_md5,
                         "role": "materialized",
                         "materialization": "confirmed",
                     }
@@ -166,6 +212,10 @@ def _write_run(
     return {
         "stage": stage,
         "dataset_role": "real",
+        "evaluation_run_manifest": str(evaluation_run_manifest.relative_to(root)),
+        "evaluation_data_manifest": str(
+            evaluation_data_manifest.relative_to(root)
+        ),
         "evaluation_summary": str(summary.relative_to(root)),
         "training_dynamics": str(dynamics.relative_to(root)),
         "training_dynamics_manifest": str(dynamics_manifest.relative_to(root)),
@@ -275,7 +325,12 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
 
     inventory = _read_csv(output_dir / "run_inventory.csv")
     assert inventory[0]["checkpoint_sha256"] == "d" * 64
-    assert "data/processed/data.zarr.dvc" in inventory[0]["dvc_targets_json"]
+    assert inventory[0]["training_run_id"] == "run-control"
+    assert inventory[0]["evaluation_run_id"] == "run-control"
+    assert (
+        "data/processed/real_with_id.zarr.dvc"
+        in inventory[0]["evaluation_dvc_targets_json"]
+    )
 
 
 def test_generate_comparison_rejects_mismatched_dynamics_hash(
@@ -343,5 +398,30 @@ def test_generate_comparison_rejects_wrong_training_checkpoint(
     with pytest.raises(
         ValueError,
         match="Training and evaluation checkpoint hashes differ",
+    ):
+        generate_comparison(spec, tmp_path / "comparison")
+
+
+def test_generate_comparison_rejects_wrong_dataset_role(tmp_path: Path) -> None:
+    control = _write_run(
+        tmp_path,
+        stage="control",
+        mae=2.0,
+        residual_fraction=0.4,
+    )
+    control["dataset_role"] = "synthetic"
+    spec = tmp_path / "comparison.json"
+    _write_json(
+        spec,
+        {
+            "schema_version": 1,
+            "runs": [control],
+            "comparisons": [],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="did not stage data/processed/synthetic_full_holt_damped.zarr.dvc",
     ):
         generate_comparison(spec, tmp_path / "comparison")
