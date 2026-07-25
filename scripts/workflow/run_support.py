@@ -270,6 +270,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         identity["study_name"] = study_config["study_name"]
     if isinstance(crossval_config, dict):
         identity["crossval_campaign_id"] = crossval_config["campaign_id"]
+
     def pin_checkpoint(
         configured_checkpoint: Path,
         pinned_checkpoint: Path,
@@ -312,6 +313,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             "configured_checkpoint": str(configured_checkpoint),
             "resolved_checkpoint": str(resolved_checkpoint),
             "pinned_checkpoint": str(pinned_checkpoint),
+            "pinned_checkpoint_relative": str(pinned_checkpoint.relative_to(run_root)),
             "checkpoint_sha256": checkpoint_sha256,
         }
 
@@ -1097,8 +1099,24 @@ def evaluate_configured_model(
         evaluation_input = manifest.get("evaluation_input")
         if not isinstance(evaluation_input, dict):
             raise ValueError("Run manifest is missing the pinned evaluation input")
-        expected_path = Path(str(evaluation_input["pinned_checkpoint"]))
-        if resolved_checkpoint != expected_path.resolve(strict=True):
+        expected_relative = Path(str(evaluation_input["pinned_checkpoint_relative"]))
+        if expected_relative.is_absolute() or ".." in expected_relative.parts:
+            raise ValueError(
+                "Pinned evaluation checkpoint must be run-relative: "
+                f"{expected_relative}"
+            )
+        expected_path = run_root / expected_relative
+        if expected_path.is_symlink():
+            raise ValueError(
+                "Pinned evaluation checkpoint must be a regular non-symlink file: "
+                f"{expected_path}"
+            )
+        expected_resolved = expected_path.resolve(strict=True)
+        if not expected_resolved.is_file():
+            raise ValueError(
+                f"Pinned evaluation checkpoint must be a regular file: {expected_path}"
+            )
+        if resolved_checkpoint != expected_resolved:
             raise ValueError(
                 "Evaluation-only workflow must consume its pinned checkpoint: "
                 f"expected {expected_path}, got {resolved_checkpoint}"

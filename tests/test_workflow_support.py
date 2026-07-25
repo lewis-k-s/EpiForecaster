@@ -561,6 +561,10 @@ def test_prepare_run_pins_evaluation_checkpoint_bytes(
     assert pinned.read_bytes() == b"original checkpoint"
     assert not pinned.stat().st_mode & 0o222
     assert manifest["evaluation_input"]["pinned_checkpoint"] == str(pinned)
+    assert (
+        manifest["evaluation_input"]["pinned_checkpoint_relative"]
+        == "inputs/evaluation_checkpoint.pt"
+    )
     assert manifest["evaluation_input"]["checkpoint_sha256"] == expected_hash
 
     external_checkpoint.write_bytes(b"later mutation")
@@ -574,6 +578,53 @@ def test_prepare_run_pins_evaluation_checkpoint_bytes(
     run_support.evaluate_configured_model(config_path, run_root, pinned)
     assert captured["checkpoint"] == pinned
     assert run_support.sha256_file(pinned) == expected_hash
+
+
+def test_evaluation_resolves_pinned_checkpoint_in_runtime_run_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "workspace/run"
+    pinned = run_root / "inputs/evaluation_checkpoint.pt"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_bytes(b"checkpoint")
+    config_path = run_root / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"kind": "evaluate"},
+                "evaluation": {
+                    "split": "test",
+                    "overrides": [],
+                    "granular": True,
+                },
+            }
+        )
+    )
+    (run_root / "manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "evaluation_input": {
+                    "pinned_checkpoint": (
+                        "/gpfs/project/runs/evaluate/inputs/evaluation_checkpoint.pt"
+                    ),
+                    "pinned_checkpoint_relative": "inputs/evaluation_checkpoint.pt",
+                    "checkpoint_sha256": run_support.sha256_file(pinned),
+                }
+            }
+        )
+    )
+    captured: dict[str, Path] = {}
+
+    def fake_evaluate(checkpoint_path, output_dir, split, overrides, granular):
+        captured["checkpoint"] = checkpoint_path
+        return output_dir / "evaluation_manifest.json"
+
+    monkeypatch.setattr(run_support, "evaluate_best", fake_evaluate)
+
+    run_support.evaluate_configured_model(config_path, run_root, pinned)
+
+    assert captured["checkpoint"] == pinned.resolve()
 
 
 def test_prepare_run_pins_training_initialization_checkpoint(
