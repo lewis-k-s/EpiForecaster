@@ -24,6 +24,10 @@ training:
   overrides:
     - output.save_checkpoints=true
     - training.run_final_evaluation=false
+    # One epoch is 419,825 examples (13,119 production batches). The compiled
+    # smoke measured ~18.4 minutes/epoch, so ten epochs form the first bounded
+    # pretraining cycle before deciding whether a longer continuation is useful.
+    - training.epochs=10
 
 evaluation:
   split: test
