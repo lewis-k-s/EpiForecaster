@@ -8,7 +8,7 @@ container: {}
 
 workflow:
   kind: train
-  target: train_evaluate
+  target: train
 
 dvc:
   targets:
