@@ -329,10 +329,17 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             "version": installed_snakemake_version,
             "installed_location": installed_snakemake_location,
             "execution_mode": config["workflow"]["execution_mode"],
+            "execution_adapter": os.environ.get(
+                "EPIFORECASTER_EXECUTION_MODE", "batch"
+            ),
+            "execution_attempt_id": os.environ.get(
+                "EPIFORECASTER_EXECUTION_ATTEMPT_ID"
+            ),
             "kind": workflow_kind,
             "target": workflow_target,
             "python_version": platform.python_version(),
             "initial_coordinator_job_id": os.environ.get("SLURM_JOB_ID"),
+            "initial_coordinator_step_id": os.environ.get("SLURM_STEP_ID"),
         },
         "resources": config["resources"],
     }
