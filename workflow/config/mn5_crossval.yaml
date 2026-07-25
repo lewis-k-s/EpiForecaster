@@ -13,10 +13,11 @@ dvc:
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 crossval:
-  campaign_id: epiforecaster-crossval-v1
+  campaign_id: epiforecaster-representative-10fold-v2
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  folds: 4
-  seed: 42
+  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  folds: 10
+  model_seed: 42
   holdout_role: test
   max_batches: null
   overrides:

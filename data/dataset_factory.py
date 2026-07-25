@@ -16,6 +16,7 @@ from data.curriculum_builder import (
     build_curriculum_datasets,
     discover_runs,
 )
+from data.crossval_manifest import load_crossval_fold_manifest
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
 from data.region_embedding_store import RegionEmbeddingStore
@@ -47,6 +48,7 @@ class NodeSplitMetadata:
 
     total_nodes: int
     valid_nodes: np.ndarray
+    region_ids: np.ndarray
     population_bins: np.ndarray | None = None
     wastewater_source: np.ndarray | None = None
     wastewater_source_name: str | None = None
@@ -238,7 +240,9 @@ def _resolve_biomarker_split_features(
     for mask_var in mask_vars:
         mask_values = np.asarray(aligned_dataset[mask_var].values)
         if mask_values.ndim == 3:
-            mask_values = mask_values.reshape(mask_values.shape[-2], mask_values.shape[-1])
+            mask_values = mask_values.reshape(
+                mask_values.shape[-2], mask_values.shape[-1]
+            )
         if mask_values.ndim != 2 or mask_values.shape[-1] != total_nodes:
             raise ValueError(
                 f"{mask_var} must be a 2D time-by-region array for biomarker-aware splits"
@@ -299,6 +303,9 @@ def _load_node_split_metadata(
     )
     try:
         total_nodes = int(aligned_dataset[REGION_COORD].size)
+        region_ids = np.asarray(aligned_dataset[REGION_COORD].values).astype(str)
+        if region_ids.shape != (total_nodes,):
+            raise ValueError("region_id must be a 1D coordinate for node splits")
         valid_mask = _load_valid_nodes(
             config=config,
             target_path=dataset_path,
@@ -358,6 +365,7 @@ def _load_node_split_metadata(
         return NodeSplitMetadata(
             total_nodes=total_nodes,
             valid_nodes=valid_nodes,
+            region_ids=region_ids,
             population_bins=population_bins,
             wastewater_source=wastewater_source,
             wastewater_source_name=wastewater_source_name,
@@ -558,9 +566,7 @@ def _split_nodes_crossval(
 
     shuffled_nodes = _shuffle_nodes(metadata.valid_nodes, rng)
     strata = _build_crossval_strata(metadata=metadata, shuffled_nodes=shuffled_nodes)
-    sparse_strata = [
-        key for key, nodes in strata.items() if 0 < len(nodes) < num_folds
-    ]
+    sparse_strata = [key for key, nodes in strata.items() if 0 < len(nodes) < num_folds]
     if sparse_strata:
         logger.warning(
             "Biomarker-aware crossval has %d sparse strata with fewer nodes than folds; "
@@ -573,6 +579,14 @@ def _split_nodes_crossval(
         start_offset = int(rng.integers(num_folds))
         for idx, node in enumerate(nodes):
             folds[(start_offset + idx) % num_folds].append(node)
+
+    while max(map(len, folds)) - min(map(len, folds)) > 1:
+        donor = max(range(num_folds), key=lambda index: (len(folds[index]), -index))
+        receiver = min(
+            range(num_folds),
+            key=lambda index: (len(folds[index]), index),
+        )
+        folds[receiver].append(folds[donor].pop())
 
     primary_holdout = fold_index
     secondary_holdout = (fold_index + 1) % num_folds
@@ -596,6 +610,46 @@ def _split_nodes_crossval(
     val_nodes = list(_shuffle_nodes(np.asarray(val_nodes, dtype=np.int64), rng))
     test_nodes = list(_shuffle_nodes(np.asarray(test_nodes, dtype=np.int64), rng))
     return train_nodes, val_nodes, test_nodes
+
+
+def _split_nodes_crossval_manifest(
+    *,
+    metadata: NodeSplitMetadata,
+    manifest_path: Path,
+    run_id: str,
+    num_folds: int,
+    fold_index: int,
+    holdout_role: str,
+) -> tuple[list[int], list[int], list[int]]:
+    """Resolve fold membership from a validated, exactly-once manifest."""
+    valid_region_ids = metadata.region_ids[metadata.valid_nodes].tolist()
+    manifest = load_crossval_fold_manifest(
+        manifest_path,
+        valid_region_ids=valid_region_ids,
+        expected_num_folds=num_folds,
+        expected_run_id=run_id,
+    )
+    region_index = {
+        region_id: index for index, region_id in enumerate(metadata.region_ids)
+    }
+    folds = [[region_index[region_id] for region_id in fold] for fold in manifest.folds]
+
+    primary_holdout = fold_index
+    secondary_holdout = (fold_index + 1) % num_folds
+    if holdout_role == "val":
+        val_fold = primary_holdout
+        test_fold = secondary_holdout
+    else:
+        test_fold = primary_holdout
+        val_fold = secondary_holdout
+
+    train_nodes = [
+        node
+        for index, fold in enumerate(folds)
+        if index not in {val_fold, test_fold}
+        for node in fold
+    ]
+    return train_nodes, list(folds[val_fold]), list(folds[test_fold])
 
 
 def _log_split_summary(
@@ -684,7 +738,7 @@ def split_nodes_by_ratio(
             "run_id must be provided either as argument or in config.data.run_id"
         )
 
-    rng = np.random.default_rng(config.training.seed)
+    split_rng = np.random.default_rng(config.training.split_seed)
     metadata = _load_node_split_metadata(
         config=config,
         dataset_path=target_path,
@@ -694,7 +748,7 @@ def split_nodes_by_ratio(
     if config.training.node_split_strategy == "stratified":
         train_nodes, val_nodes, test_nodes = _split_nodes_stratified(
             metadata=metadata,
-            rng=rng,
+            rng=split_rng,
             val_split=config.training.val_split,
             test_split=config.training.test_split,
         )
@@ -702,17 +756,27 @@ def split_nodes_by_ratio(
         config.training.node_split_strategy == "crossval"
         or config.training.crossval_enabled
     ):
-        train_nodes, val_nodes, test_nodes = _split_nodes_crossval(
-            metadata=metadata,
-            rng=rng,
-            num_folds=config.training.crossval_num_folds,
-            fold_index=config.training.crossval_fold_index,
-            holdout_role=config.training.crossval_holdout_role,
-        )
+        if config.training.crossval_manifest_path:
+            train_nodes, val_nodes, test_nodes = _split_nodes_crossval_manifest(
+                metadata=metadata,
+                manifest_path=Path(config.training.crossval_manifest_path),
+                run_id=effective_run_id,
+                num_folds=config.training.crossval_num_folds,
+                fold_index=config.training.crossval_fold_index,
+                holdout_role=config.training.crossval_holdout_role,
+            )
+        else:
+            train_nodes, val_nodes, test_nodes = _split_nodes_crossval(
+                metadata=metadata,
+                rng=split_rng,
+                num_folds=config.training.crossval_num_folds,
+                fold_index=config.training.crossval_fold_index,
+                holdout_role=config.training.crossval_holdout_role,
+            )
     else:
         train_nodes, val_nodes, test_nodes = _split_nodes_random(
             valid_nodes=metadata.valid_nodes,
-            rng=rng,
+            rng=split_rng,
             val_split=config.training.val_split,
             test_split=config.training.test_split,
         )

@@ -722,9 +722,14 @@ class TrainingParams:
     # Number of biomarker coverage quantile bins used for biomarker-aware node splits.
     node_split_biomarker_bins: int = 3
     # Fold-based cross-validation controls for node splits.
+    # split_seed owns generated fold membership independently of model RNG seed.
+    split_seed: int = 42
     crossval_enabled: bool = False
     crossval_num_folds: int = 5
     crossval_fold_index: int = 0
+    # Optional persisted exactly-once region membership. Production cross-validation
+    # should use a checked-in manifest rather than regenerating folds per model seed.
+    crossval_manifest_path: str | None = None
     # Which held-out fold the configured crossval_fold_index represents.
     # Validation always uses the next fold cyclically.
     crossval_holdout_role: str = "test"
@@ -876,6 +881,8 @@ class TrainingParams:
                 "crossval_num_folds must be greater than 1, "
                 f"got {self.crossval_num_folds}"
             )
+        if self.split_seed < 0:
+            raise ValueError(f"split_seed must be non-negative, got {self.split_seed}")
         if self.crossval_fold_index < 0:
             raise ValueError(
                 "crossval_fold_index must be non-negative, "

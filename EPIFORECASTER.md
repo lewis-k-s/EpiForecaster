@@ -151,6 +151,70 @@ temporal_covariates:
 
 The holiday calendar should be a CSV with a `date` column containing holiday dates (e.g., `2020-01-01`).
 
+### Mobility graph processing
+
+Canonical mobility values are stored as `log1p(raw_flow)`, but edge selection is
+configured in raw-flow units:
+
+```yaml
+data:
+  mobility_min_flow_raw: 10.0
+  mobility_weight_clip_max: 8.0
+```
+
+The dataset converts the raw threshold with `log1p`, selects finite positive
+non-self edges before transforming weights, and keeps retained weights in
+nonnegative log space with upper clipping. The resulting dynamic edge mask is
+shared by dense GNN adjacency, k-hop reachability, clinical context, imported
+risk weights, and GPU adjacency injection. Self-loops are added separately.
+
+For `spatial_queen` and `spatial_knn`, the selected static adjacency controls
+GNN weights, k-hop reachability, and clinical context. Imported risk remains
+mobility-derived.
+
+Generate machine-readable QC artifacts and plots with:
+
+```bash
+uv run python scripts/analysis/analyze_mobility_processing.py \
+  --config configs/production_only/train_epifor_mn5_full.yaml \
+  --output-dir outputs/reports/mobility_processing_qc
+uv run python -m dataviz.mobility_processing_qc \
+  --input-dir outputs/reports/mobility_processing_qc
+```
+
+### Representative cross-validation splits
+
+Production cross-validation uses the persisted, exactly-once 10-fold membership
+in
+`configs/crossval/representative_10fold_mobility_refined.json`. The manifest
+fixes fold identity independently of `training.seed`; `training.split_seed`
+only controls generated non-manifest splits. Manifest loading rejects version,
+fold-count, run-ID, dataset-region-hash, duplicate, missing, unknown, and
+unbalanced-fold mismatches.
+
+The checked-in folds start from the population, clinical coverage, geography,
+queen-degree, and mobility-mass-balanced representative split. Fifteen
+deterministic pair swaps reduce test-internal flow over the complete directed
+mobility network, penalize high-flow events, preserve the original balance
+envelope, and keep every target above 75% incoming-flow retention. No top-K
+filtering is used.
+
+Reproduce the machine-readable split analysis and plot with:
+
+```bash
+uv run python scripts/analysis/analyze_split_mobility_cut.py \
+  --dataset data/processed/real_with_id.zarr \
+  --config configs/production_only/train_epifor_mn5_full.yaml \
+  --full-coverage-manifest path/to/representative_10fold_manifest.json \
+  --output-dir outputs/reports/split_mobility_cut
+uv run python -m dataviz.split_mobility_cut \
+  --metrics outputs/reports/split_mobility_cut/split_mobility_metrics.csv \
+  --summary outputs/reports/split_mobility_cut/strategy_summary.csv \
+  --optimization-history outputs/reports/split_mobility_cut/optimization_history.csv \
+  --balance-audit outputs/reports/split_mobility_cut/balance_audit.csv \
+  --output outputs/reports/split_mobility_cut/split_mobility_cut.png
+```
+
 ## 6. Input/Output Signature
 
 **Forward Pass (`forward`)**:

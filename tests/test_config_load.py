@@ -40,6 +40,7 @@ OVERRIDE_CASES = [
         "training.crossval_enabled": True,
         "training.crossval_num_folds": 4,
         "training.crossval_fold_index": 2,
+        "training.split_seed": 7,
         "training.node_split_biomarker_bins": 2,
     },
 ]

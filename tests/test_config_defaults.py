@@ -2,9 +2,11 @@ import pytest
 
 from models.configs import (
     DataConfig,
+    EpiForecasterConfig,
     JointLossConfig,
     ModelConfig,
     ObservationHeadConfig,
+    TrainingParams,
 )
 
 
@@ -53,6 +55,50 @@ def test_data_config_rejects_invalid_observed_fraction(
 ) -> None:
     with pytest.raises(ValueError, match=field_name):
         DataConfig(**{field_name: value})
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("mobility_min_flow_raw", -0.01),
+        ("mobility_min_flow_raw", float("nan")),
+        ("mobility_weight_clip_max", 0.0),
+        ("mobility_weight_clip_max", float("inf")),
+        ("mobility_weight_clip_max", 65_505.0),
+    ],
+)
+def test_data_config_rejects_invalid_mobility_processing_values(
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        DataConfig(**{field_name: value})
+
+
+@pytest.mark.epiforecaster
+def test_training_config_rejects_negative_split_seed() -> None:
+    with pytest.raises(ValueError, match="split_seed"):
+        TrainingParams(split_seed=-1)
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    "obsolete_field",
+    ["mobility_threshold", "mobility_clip_range", "mobility_scale_epsilon"],
+)
+def test_from_dict_rejects_obsolete_mobility_fields(
+    obsolete_field: str,
+) -> None:
+    config = {
+        "model": {},
+        "data": {obsolete_field: 1.0},
+        "training": {},
+        "output": {},
+    }
+
+    with pytest.raises(ValueError, match="Obsolete mobility configuration"):
+        EpiForecasterConfig.from_dict(config)
 
 
 @pytest.mark.epiforecaster

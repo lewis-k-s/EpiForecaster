@@ -49,6 +49,7 @@ output:
 
 training:
   seed: 42
+  split_seed: 42
   device: cpu
   init_checkpoint_path: null
   batch_size: 2

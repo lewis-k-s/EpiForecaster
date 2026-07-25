@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import xarray as xr
 
+from data.crossval_manifest import hash_region_ids
 from data.dataset_factory import split_nodes_by_ratio
 from models.configs import (
     CurriculumConfig,
@@ -29,9 +31,11 @@ def _build_config(
     node_split_biomarker_bins: int = 3,
     use_valid_targets: bool = True,
     seed: int = 42,
+    split_seed: int = 42,
     crossval_enabled: bool = False,
     crossval_num_folds: int = 5,
     crossval_fold_index: int = 0,
+    crossval_manifest_path: Path | None = None,
 ) -> EpiForecasterConfig:
     return EpiForecasterConfig(
         model=ModelConfig(
@@ -54,6 +58,7 @@ def _build_config(
             epochs=1,
             batch_size=4,
             seed=seed,
+            split_seed=split_seed,
             val_split=0.2,
             test_split=0.1,
             split_strategy="node",
@@ -63,6 +68,11 @@ def _build_config(
             crossval_enabled=crossval_enabled,
             crossval_num_folds=crossval_num_folds,
             crossval_fold_index=crossval_fold_index,
+            crossval_manifest_path=(
+                str(crossval_manifest_path)
+                if crossval_manifest_path is not None
+                else None
+            ),
             loss=LossConfig(name="joint_inference"),
             curriculum=CurriculumConfig(enabled=False),
             enable_mixed_precision=False,
@@ -118,7 +128,9 @@ def _write_node_split_dataset(
     coords = {
         "run_id": np.array(["real"], dtype=object),
         "date": np.arange(date_count),
-        "region_id": np.array([f"{idx:03d}" for idx in range(total_nodes)], dtype=object),
+        "region_id": np.array(
+            [f"{idx:03d}" for idx in range(total_nodes)], dtype=object
+        ),
     }
     data_vars = {
         "cases": (("run_id", "date", "region_id"), cases),
@@ -251,6 +263,77 @@ def test_split_nodes_by_ratio_crossval_is_deterministic(tmp_path: Path) -> None:
 
 
 @pytest.mark.epiforecaster
+def test_crossval_fold_membership_uses_split_seed_not_model_seed(
+    tmp_path: Path,
+) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(tmp_path)
+    first = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        seed=17,
+        split_seed=9,
+        crossval_enabled=True,
+        crossval_num_folds=5,
+        crossval_fold_index=2,
+    )
+    second = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        seed=99,
+        split_seed=9,
+        crossval_enabled=True,
+        crossval_num_folds=5,
+        crossval_fold_index=2,
+    )
+
+    assert split_nodes_by_ratio(first) == split_nodes_by_ratio(second)
+
+
+@pytest.mark.epiforecaster
+def test_crossval_manifest_owns_exact_fold_membership(tmp_path: Path) -> None:
+    dataset_path, _strata_by_node, _valid_targets = _write_node_split_dataset(tmp_path)
+    region_ids = [f"{index:03d}" for index in range(100)]
+    folds = [region_ids[offset::5] for offset in range(5)]
+    manifest_path = tmp_path / "representative_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "num_folds": 5,
+                "run_id": "real",
+                "split_seed": 42,
+                "region_id_hash": hash_region_ids(region_ids),
+                "folds": [
+                    {"fold_index": index, "region_ids": fold}
+                    for index, fold in enumerate(folds)
+                ],
+            }
+        )
+    )
+    config = _build_config(
+        dataset_path,
+        node_split_strategy="crossval",
+        seed=123,
+        split_seed=999,
+        crossval_enabled=True,
+        crossval_num_folds=5,
+        crossval_fold_index=2,
+        crossval_manifest_path=manifest_path,
+    )
+
+    train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(config)
+
+    assert test_nodes == [int(region_id) for region_id in folds[2]]
+    assert val_nodes == [int(region_id) for region_id in folds[3]]
+    assert sorted(train_nodes) == sorted(
+        int(region_id)
+        for fold_index, fold in enumerate(folds)
+        if fold_index not in {2, 3}
+        for region_id in fold
+    )
+
+
+@pytest.mark.epiforecaster
 def test_split_nodes_by_ratio_crossval_distributes_all_nodes_across_folds(
     tmp_path: Path,
 ) -> None:
@@ -318,7 +401,9 @@ def test_split_nodes_by_ratio_crossval_balances_biomarker_coverage_bins(
         )
         _train_nodes, _val_nodes, test_nodes = split_nodes_by_ratio(config)
         test_bin_counts.append(
-            _coverage_bins_for_nodes(test_nodes, metadata.biomarker_observed_fraction_bin)
+            _coverage_bins_for_nodes(
+                test_nodes, metadata.biomarker_observed_fraction_bin
+            )
         )
 
     for coverage_bin in {0, 1, 2}:

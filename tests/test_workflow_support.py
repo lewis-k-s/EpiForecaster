@@ -959,8 +959,15 @@ def test_finalize_crossval_validates_folds_and_aggregates_scalar_metrics(
     tmp_path: Path,
 ) -> None:
     run_root = tmp_path / "run"
+    split_manifest = tmp_path / "split_manifest.json"
+    split_manifest.write_text("{}")
     config = {
-        "crossval": {"campaign_id": "campaign-a", "folds": 2, "seed": 42},
+        "crossval": {
+            "campaign_id": "campaign-a",
+            "folds": 2,
+            "model_seed": 42,
+            "split_manifest": str(split_manifest),
+        },
         "evaluation": {"split": "test"},
     }
     config_path = run_root / "config.yaml"
@@ -989,6 +996,8 @@ def test_finalize_crossval_validates_folds_and_aggregates_scalar_metrics(
             fold_root / "fold_manifest.json",
             {
                 "fold": fold,
+                "split_manifest": str(split_manifest),
+                "split_manifest_sha256": run_support.sha256_file(split_manifest),
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": run_support.sha256_file(checkpoint),
                 "training_fold_manifest": str(training_manifest),
@@ -1020,12 +1029,16 @@ def test_crossval_fold_builds_isolated_train_evaluate_config(
     run_root = tmp_path / "run"
     source_root = tmp_path / "source"
     source_root.mkdir()
+    split_manifest = source_root / "configs/crossval/manifest.json"
+    split_manifest.parent.mkdir(parents=True)
+    split_manifest.write_text("{}")
     config = {
         "crossval": {
             "campaign_id": "campaign-a",
             "base_config": "configs/production_only/train.yaml",
             "folds": 3,
-            "seed": 17,
+            "model_seed": 17,
+            "split_manifest": "configs/crossval/manifest.json",
             "holdout_role": "test",
             "max_batches": 2,
             "overrides": ["training.compile=false"],
@@ -1069,6 +1082,11 @@ def test_crossval_fold_builds_isolated_train_evaluate_config(
     assert fold_config["training"]["model_id"] == "model"
     assert "training.crossval_fold_index=1" in fold_config["training"]["overrides"]
     assert "training.crossval_num_folds=3" in fold_config["training"]["overrides"]
+    assert (
+        "training.crossval_manifest_path=configs/crossval/manifest.json"
+        in fold_config["training"]["overrides"]
+    )
+    assert "training.seed=17" in fold_config["training"]["overrides"]
     assert captured["source"] == source_root
     assert captured["checkpoint"] == (
         run_root
@@ -1311,7 +1329,7 @@ def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     assert "finalize_crossval" in result.stdout
     assert "--worker-group crossval-training" in result.stdout
     assert "--worker-group crossval-evaluation" in result.stdout
-    assert "--workers 4" in result.stdout
+    assert "--workers 10" in result.stdout
     assert (
         "--fold '{worker_id}'" in result.stdout or "--fold {worker_id}" in result.stdout
     )

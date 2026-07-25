@@ -485,7 +485,8 @@ def _crossval_fold_config(config: dict[str, Any], fold: int) -> dict[str, Any]:
             f"training.crossval_num_folds={folds}",
             f"training.crossval_fold_index={fold}",
             f"training.crossval_holdout_role={options.get('holdout_role', 'test')}",
-            f"training.seed={int(options['seed'])}",
+            f"training.crossval_manifest_path={options['split_manifest']}",
+            f"training.seed={int(options['model_seed'])}",
         ],
     }
     fold_config["evaluation"] = copy.deepcopy(config["evaluation"])
@@ -501,6 +502,11 @@ def train_crossval_fold(
     """Train one deterministic cross-validation fold."""
     config = load_yaml(config_path)
     options = config["crossval"]
+    split_manifest = source_root / str(options["split_manifest"])
+    if not split_manifest.is_file():
+        raise FileNotFoundError(
+            f"Cross-validation split manifest is missing: {split_manifest}"
+        )
     fold_config = _crossval_fold_config(config, fold)
     fold_root = _crossval_fold_root(config, run_root, fold)
     if fold_root.exists():
@@ -520,7 +526,9 @@ def train_crossval_fold(
             "campaign_id": str(options["campaign_id"]),
             "fold": fold,
             "folds": int(options["folds"]),
-            "seed": int(options["seed"]),
+            "model_seed": int(options["model_seed"]),
+            "split_manifest": str(split_manifest),
+            "split_manifest_sha256": sha256_file(split_manifest),
             "config": str(fold_config_path),
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": sha256_file(checkpoint),
@@ -553,6 +561,13 @@ def evaluate_crossval_fold(
         raise ValueError(f"Cross-validation checkpoint path mismatch: {fold_root}")
     if sha256_file(checkpoint) != training_fold_manifest["checkpoint_sha256"]:
         raise ValueError(f"Cross-validation checkpoint failed SHA-256: {checkpoint}")
+    split_manifest = Path(str(training_fold_manifest["split_manifest"])).resolve(
+        strict=True
+    )
+    if sha256_file(split_manifest) != training_fold_manifest["split_manifest_sha256"]:
+        raise ValueError(
+            f"Cross-validation split manifest failed SHA-256: {split_manifest}"
+        )
     training_manifest = Path(str(training_fold_manifest["training_manifest"])).resolve(
         strict=True
     )
@@ -577,7 +592,9 @@ def evaluate_crossval_fold(
             "campaign_id": str(options["campaign_id"]),
             "fold": fold,
             "folds": int(options["folds"]),
-            "seed": int(options["seed"]),
+            "model_seed": int(options["model_seed"]),
+            "split_manifest": str(split_manifest),
+            "split_manifest_sha256": sha256_file(split_manifest),
             "config": str(fold_config_path),
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": sha256_file(checkpoint),
@@ -631,7 +648,7 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
             fold_rows.append(
                 {
                     "fold": fold,
-                    "seed": int(options["seed"]),
+                    "model_seed": int(options["model_seed"]),
                     "metric": metric,
                     "value": value,
                 }
@@ -639,6 +656,8 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
         fold_records.append(
             {
                 "fold": fold,
+                "split_manifest": str(fold_manifest["split_manifest"]),
+                "split_manifest_sha256": str(fold_manifest["split_manifest_sha256"]),
                 "fold_manifest": str(fold_manifest_path),
                 "fold_manifest_sha256": sha256_file(fold_manifest_path),
                 "evaluation_summary": str(summary_path),
@@ -648,7 +667,10 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
 
     fold_metrics = output_dir / f"{split}_fold_metrics.csv"
     with fold_metrics.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["fold", "seed", "metric", "value"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["fold", "model_seed", "metric", "value"],
+        )
         writer.writeheader()
         writer.writerows(fold_rows)
 
@@ -673,6 +695,19 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
         writer.writeheader()
         writer.writerows(aggregate_rows)
 
+    split_manifest_identities = {
+        (
+            str(record["split_manifest"]),
+            str(record["split_manifest_sha256"]),
+        )
+        for record in fold_records
+    }
+    if len(split_manifest_identities) != 1:
+        raise ValueError(
+            "Cross-validation folds do not share one split manifest identity"
+        )
+    split_manifest_path, split_manifest_sha256 = split_manifest_identities.pop()
+
     manifest = output_dir / "crossval_manifest.json"
     write_json(
         manifest,
@@ -680,7 +715,9 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
             "schema_version": 1,
             "campaign_id": str(options["campaign_id"]),
             "folds": fold_records,
-            "seed": int(options["seed"]),
+            "model_seed": int(options["model_seed"]),
+            "split_manifest": split_manifest_path,
+            "split_manifest_sha256": split_manifest_sha256,
             "split": split,
             "artifacts": [
                 {"path": str(fold_metrics), "sha256": sha256_file(fold_metrics)},

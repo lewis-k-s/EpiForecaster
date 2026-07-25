@@ -59,6 +59,7 @@ training:
   compile_fullgraph: false
   compile_backward: true
   seed: 42
+  split_seed: 42
   device: "cuda"
   init_checkpoint_path: null
   batch_size: 32
