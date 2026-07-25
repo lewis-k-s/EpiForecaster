@@ -3,6 +3,7 @@ from pathlib import Path
 import yaml
 
 from models.configs import EpiForecasterConfig
+from scripts.workflow.run_config import validate_workflow_contract
 
 
 def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
@@ -55,3 +56,25 @@ def test_synthetic_pretrain_control_matches_real_training_contract() -> None:
     assert control["dvc"] == canonical["dvc"]
     assert control["evaluation"] == canonical["evaluation"]
     assert control["resources"] == canonical["resources"]
+
+
+def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> None:
+    workflow = yaml.safe_load(
+        Path("workflow/config/mn5_synth_control_evaluate.yaml").read_text()
+    )
+    overrides = workflow["evaluation"]["overrides"]
+    evaluation = EpiForecasterConfig.load(
+        Path("configs/production_only/train_epifor_mn5_full.yaml"),
+        overrides=overrides,
+    )
+
+    assert validate_workflow_contract(workflow) == "evaluate"
+    assert Path(workflow["evaluation"]["checkpoint"]).is_absolute()
+    assert workflow["evaluation"]["granular"] is True
+    assert evaluation.data.dataset_path == (
+        "data/processed/synthetic_full_holt_damped.zarr"
+    )
+    assert evaluation.data.mobility_min_flow_raw == 0.0
+    assert evaluation.data.run_id_chunk_size == 1
+    assert evaluation.training.curriculum.enabled is True
+    assert evaluation.training.loss.joint.w_sird_supervision == 0.01
