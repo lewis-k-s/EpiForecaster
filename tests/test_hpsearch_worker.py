@@ -312,21 +312,21 @@ class TestSuggestEpiforecasterParams:
 
     def test_training_loss_objective_sampled_when_requested(self) -> None:
         trial = _StubTrial(
-            categorical_values={"training.loss.joint.observation_loss": "mae"}
+            categorical_values={"training.loss.joint.observation_loss": "nll"}
         )
         overrides = suggest_epiforecaster_params(
             trial=trial,
             base_cfg=_base_cfg_stub(),
             sample_training_loss_objective=True,
         )
-        assert overrides["training.loss.joint.observation_loss"] == "mae"
+        assert overrides["training.loss.joint.observation_loss"] == "nll"
         call = next(
             c
             for c in trial.suggest_calls
             if c[1] == "training.loss.joint.observation_loss"
         )
         assert call[0] == "categorical"
-        assert call[2] == ("mae",)
+        assert call[2] == ("nll", "crps")
 
     def test_data_knobs_sample_ordering(self) -> None:
         trial = _StubTrial()

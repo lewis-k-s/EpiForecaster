@@ -91,6 +91,23 @@ def test_load_config_without_overrides():
     assert cfg.training.num_workers == 1
     assert cfg.training.val_workers == 1
     assert cfg.training.test_workers == 1
+    assert cfg.training.loss.joint.observation_loss == "nll"
+    assert cfg.training.loss.joint.distribution_family == "normal"
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "configs/production_only/train_epifor_mn5_full.yaml",
+        "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
+    ],
+)
+def test_production_training_configs_default_to_normal_nll(config_path: str) -> None:
+    cfg = EpiForecasterConfig.load(config_path)
+
+    assert cfg.training.loss.joint.observation_loss == "nll"
+    assert cfg.training.loss.joint.distribution_family == "normal"
 
 
 @pytest.mark.epiforecaster

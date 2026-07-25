@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # HPO found little separation among observation objectives, with `mae` winning the
 # best endpoint trials. Keep the historical alternatives documented so this knob
 # can be widened again deliberately without spending compute by default.
-_OBSERVATION_LOSS_CHOICES = ("mae",)  # Previously explored: "mse", "rmse", "mae"
+_OBSERVATION_LOSS_CHOICES = ("nll", "crps")
 
 
 def _record_training_dynamics_attrs(

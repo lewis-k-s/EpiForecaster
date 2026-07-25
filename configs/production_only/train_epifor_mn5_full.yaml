@@ -112,5 +112,5 @@ training:
   loss:
     name: "joint_inference"
     joint:
-      observation_loss: mae
+      observation_loss: nll
       w_sird_supervision: 0.0

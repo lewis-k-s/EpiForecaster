@@ -104,9 +104,9 @@ def test_from_dict_rejects_obsolete_mobility_fields(
 
 
 @pytest.mark.epiforecaster
-def test_joint_loss_defaults_use_static_raw_observation_loss() -> None:
+def test_joint_loss_defaults_use_normal_nll() -> None:
     cfg = JointLossConfig()
-    assert cfg.observation_loss == "mse"
+    assert cfg.observation_loss == "nll"
     assert cfg.distribution_family == "normal"
     assert cfg.distribution_df == pytest.approx(5.0)
     assert cfg.distribution_scale_floor == pytest.approx(1.0e-3)

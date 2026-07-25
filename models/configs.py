@@ -52,7 +52,7 @@ class JointLossConfig:
 
     # Per-head observation objective. The same objective is used for
     # ww/hosp/cases/deaths before fixed or GradNorm observation weighting.
-    observation_loss: str = "mse"
+    observation_loss: str = "nll"
     # Distribution used for probabilistic observation scoring and intervals.
     # The observation heads emit loc/scale in the existing log1p(per-100k)
     # target space; this setting controls how those parameters are scored.

@@ -64,7 +64,7 @@ def test_joint_inference_latent_loss_zero_when_latents_absent():
 def test_get_loss_from_config_default_is_joint_inference() -> None:
     criterion = get_loss_from_config(None)
     assert isinstance(criterion, JointInferenceLoss)
-    assert criterion.observation_loss == "mse"
+    assert criterion.observation_loss == "nll"
 
 
 def test_get_loss_from_config_rejects_non_joint_name() -> None:
