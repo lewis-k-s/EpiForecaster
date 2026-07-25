@@ -10,7 +10,9 @@ data:
   dataset_path: data/processed/synthetic_full_holt_damped.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
-  mobility_min_flow_raw: 10.0
+  # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.
+  # Keep positive flows; max_neighbors performs the intended graph sparsification.
+  mobility_min_flow_raw: 0.0
   mobility_weight_clip_max: 8.0
   min_history_observed_fraction: 0.5
   min_horizon_observed_fraction: 0.5
