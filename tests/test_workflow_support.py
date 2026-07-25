@@ -2119,6 +2119,9 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     assert "--gres=gpu:4" in call_lines[0]
     assert "--mem" not in call_lines[0]
     assert "--cores" not in call_lines[0]
+    assert str(
+        run_root / "source/scripts/workflow/snakemake_coordinator.sh"
+    ) in call_lines[0]
     assert (run_root / ".state/coordinator.job_id").read_text() == "12345\n"
     attempt_id = (run_root / ".state/active_execution").read_text().strip()
     attempt_root = run_root / ".state/executions" / attempt_id
@@ -2372,7 +2375,8 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "trap - EXIT" in container_exec
     assert 'chmod -R u+w "$SCRATCH_ROOT"' in container_exec
     assert 'exit "$status"' in container_exec
-    assert 'exec "$SCRIPT_DIR/snakemake_coordinator.sh" "$@"' in coordinator
+    assert 'exec "$COORDINATOR" "$@"' in coordinator
+    assert '"$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"' in remote_runner
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in shared_coordinator
     assert "EPIFORECASTER_EXECUTION_MODE" in shared_coordinator
     assert "#SBATCH --ntasks=4" in coordinator

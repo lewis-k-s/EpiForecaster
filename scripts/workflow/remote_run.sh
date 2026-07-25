@@ -516,6 +516,7 @@ submit_run() {
       --gres="$GRES" \
       --time="$RUNTIME" \
       "$coordinator" \
+      "$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh" \
       "$RUN_ROOT" \
       "$SNAKEMAKE_BIN" \
       "$TASKS" \

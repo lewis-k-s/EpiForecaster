@@ -10,8 +10,23 @@
 #SBATCH --time=07:00:00
 
 # Thin batch adapter for the shared allocation-internal coordinator.
+#
+# Slurm copies this file into its node-local spool before execution, so
+# BASH_SOURCE no longer has the source snapshot as its parent. The submitter
+# therefore passes the immutable shared coordinator path explicitly.
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-exec "$SCRIPT_DIR/snakemake_coordinator.sh" "$@"
+if [ "$#" -lt 1 ]; then
+  echo "Missing shared coordinator path" >&2
+  exit 2
+fi
+
+COORDINATOR="$1"
+shift
+if [[ "$COORDINATOR" != /* ]] || [ ! -x "$COORDINATOR" ]; then
+  echo "Shared coordinator must be an executable absolute path: $COORDINATOR" >&2
+  exit 2
+fi
+
+exec "$COORDINATOR" "$@"
