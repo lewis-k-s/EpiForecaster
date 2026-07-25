@@ -119,7 +119,7 @@ remote_exec_on() {
     remote_command+="$(shell_quote "$argument")"
   done
 
-  ssh "${ssh_options[@]}" "$host" "$remote_command"
+  ssh ${ssh_options[@]+"${ssh_options[@]}"} "$host" "$remote_command"
 }
 
 # Execute a transferred program on the authoritative compute endpoint.
