@@ -40,3 +40,18 @@ def test_synthetic_pretrain_production_emits_evaluation_diagnostics() -> None:
     assert config["workflow"]["target"] == "train_evaluate"
     assert config["evaluation"]["granular"] is True
     assert training.training.pathway_gradient_frequency == 500
+
+
+def test_synthetic_pretrain_control_matches_real_training_contract() -> None:
+    control = yaml.safe_load(
+        Path("workflow/config/mn5_synth_pretrain_control.yaml").read_text()
+    )
+    canonical = yaml.safe_load(Path("workflow/config/mn5_train.yaml").read_text())
+
+    assert control["workflow"]["target"] == "train_evaluate"
+    assert control["training"]["base_config"] == canonical["training"]["base_config"]
+    assert control["training"]["max_batches"] is None
+    assert control["training"]["overrides"] == canonical["training"]["overrides"]
+    assert control["dvc"] == canonical["dvc"]
+    assert control["evaluation"] == canonical["evaluation"]
+    assert control["resources"] == canonical["resources"]
