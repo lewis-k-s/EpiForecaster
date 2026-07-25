@@ -624,6 +624,52 @@ class TestClinicalObservationHead:
         baseline = head(I_trajectory)
         assert torch.allclose(output, baseline)
 
+    def test_distribution_exposes_exact_anchored_path_decomposition(self):
+        head = ClinicalObservationHead(
+            kernel_length=3,
+            learnable_kernel=False,
+            residual_dim=1,
+            alpha_init=1.0,
+            delta_forecasting=True,
+        )
+        assert head.residual_proj is not None
+        with torch.no_grad():
+            head.residual_proj.weight.fill_(1.0)
+            head.residual_proj.bias.zero_()
+
+        trajectory = torch.tensor([[0.001, 0.002, 0.004, 0.003]])
+        context = torch.tensor([[[0.0], [0.5], [-0.25], [1.0]]])
+        anchor = torch.tensor([2.0])
+        anchor_mask = torch.tensor([1.0])
+        distribution = head.forward_distribution(
+            trajectory,
+            obs_context=context,
+            last_observed=anchor,
+            last_observed_mask=anchor_mask,
+        )
+        residual_disabled = head(
+            trajectory,
+            obs_context=None,
+            last_observed=anchor,
+            last_observed_mask=anchor_mask,
+        )
+
+        assert torch.allclose(
+            distribution["loc"],
+            distribution["mechanistic_loc"] + distribution["residual_loc"],
+        )
+        assert distribution["residual_input"].shape == distribution["loc"].shape
+        assert torch.allclose(distribution["mechanistic_loc"], residual_disabled)
+        assert torch.allclose(
+            head(
+                trajectory,
+                obs_context=context,
+                last_observed=anchor,
+                last_observed_mask=anchor_mask,
+            ),
+            distribution["loc"],
+        )
+
 
 class TestWastewaterObservationHead:
     """Tests for WastewaterObservationHead wrapper."""
@@ -740,6 +786,46 @@ class TestWastewaterObservationHead:
         )
         baseline = head(I_trajectory, population)
         assert torch.allclose(output, baseline)
+
+    def test_distribution_exposes_exact_anchored_path_decomposition(self):
+        head = WastewaterObservationHead(
+            kernel_length=3,
+            learnable_kernel=False,
+            residual_dim=1,
+            alpha_init=1.0,
+            delta_forecasting=True,
+        )
+        assert head.residual_proj is not None
+        with torch.no_grad():
+            head.residual_proj.weight.fill_(1.0)
+            head.residual_proj.bias.zero_()
+
+        trajectory = torch.tensor([[0.001, 0.002, 0.004, 0.003]])
+        population = torch.ones_like(trajectory)
+        context = torch.tensor([[[0.0], [0.5], [-0.25], [1.0]]])
+        anchor = torch.tensor([2.0])
+        anchor_mask = torch.tensor([1.0])
+        distribution = head.forward_distribution(
+            trajectory,
+            population,
+            obs_context=context,
+            last_observed=anchor,
+            last_observed_mask=anchor_mask,
+        )
+        residual_disabled = head(
+            trajectory,
+            population,
+            obs_context=None,
+            last_observed=anchor,
+            last_observed_mask=anchor_mask,
+        )
+
+        assert torch.allclose(
+            distribution["loc"],
+            distribution["mechanistic_loc"] + distribution["residual_loc"],
+        )
+        assert distribution["residual_input"].shape == distribution["loc"].shape
+        assert torch.allclose(distribution["mechanistic_loc"], residual_disabled)
 
 
 class TestIntegration:

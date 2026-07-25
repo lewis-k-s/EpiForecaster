@@ -77,6 +77,61 @@ def _make_batch() -> SimpleNamespace:
                 [[1.0, 0.0], [1.0, 0.0]],
                 dtype=torch.float32,
             ),
+            "mechanistic_hosp": torch.tensor(
+                [[0.0, 0.75, 2.0], [0.0, 1.0, 2.5]],
+                dtype=torch.float32,
+            ),
+            "residual_hosp": torch.tensor(
+                [[0.0, 0.25, 0.5], [0.0, 0.5, 0.5]],
+                dtype=torch.float32,
+            ),
+            "mechanistic_ww": torch.tensor(
+                [[0.0, 0.3, 0.25], [0.0, 0.4, 0.45]],
+                dtype=torch.float32,
+            ),
+            "residual_ww": torch.tensor(
+                [[0.0, 0.1, 0.15], [0.0, 0.1, 0.05]],
+                dtype=torch.float32,
+            ),
+            "mechanistic_cases": torch.tensor(
+                [[0.0, 2.5, 3.5], [0.0, 4.0, 5.0]],
+                dtype=torch.float32,
+            ),
+            "residual_cases": torch.tensor(
+                [[0.0, 0.5, 0.5], [0.0, 1.0, 1.0]],
+                dtype=torch.float32,
+            ),
+            "mechanistic_deaths": torch.tensor(
+                [[0.75, 0.25], [0.8, 0.2]],
+                dtype=torch.float32,
+            ),
+            "residual_deaths": torch.tensor(
+                [[0.25, -0.25], [0.2, -0.2]],
+                dtype=torch.float32,
+            ),
+            "S_trajectory": torch.full((2, 3), 0.7, dtype=torch.float32),
+            "I_trajectory": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "H_trajectory": torch.full((2, 3), 0.05, dtype=torch.float32),
+            "R_trajectory": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "D_trajectory": torch.full((2, 3), 0.05, dtype=torch.float32),
+            "hospitalization_flow": torch.tensor(
+                [[0.02, 0.03], [0.04, 0.05]],
+                dtype=torch.float32,
+            ),
+            "death_flow": torch.zeros((2, 2), dtype=torch.float32),
+            "observation_source_hosp": torch.tensor(
+                [[0.0, 0.02, 0.03], [0.0, 0.04, 0.05]],
+                dtype=torch.float32,
+            ),
+            "observation_source_ww": torch.full(
+                (2, 3), 0.1, dtype=torch.float32
+            ),
+            "observation_source_cases": torch.full(
+                (2, 3), 0.1, dtype=torch.float32
+            ),
+            "observation_source_deaths": torch.zeros(
+                (2, 2), dtype=torch.float32
+            ),
             "physics_residual": torch.zeros((2, 2), dtype=torch.float32),
         },
         targets_dict={
@@ -177,6 +232,10 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         "target_date",
         "observed",
         "prediction",
+        "mechanistic_prediction",
+        "residual_contribution",
+        "relevant_latent_name",
+        "relevant_latent_value",
         "abs_error",
         "sq_error",
         "nll",
@@ -217,6 +276,10 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert hosp_row["target_date"] == "2024-01-04T00:00:00"
     assert hosp_row["observed"] == pytest.approx(1.0)
     assert hosp_row["prediction"] == pytest.approx(1.0)
+    assert hosp_row["mechanistic_prediction"] == pytest.approx(0.75)
+    assert hosp_row["residual_contribution"] == pytest.approx(0.25)
+    assert hosp_row["relevant_latent_name"] == "hospitalization_flow"
+    assert hosp_row["relevant_latent_value"] == pytest.approx(0.02)
     assert hosp_row["abs_error"] == pytest.approx(0.0)
     assert math.isfinite(hosp_row["nll"])
     assert math.isfinite(hosp_row["crps"])
@@ -231,7 +294,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "2"
+    assert meta["schema_version"] == "3"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -314,6 +377,10 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
         "target_date",
         "observed",
         "prediction",
+        "mechanistic_prediction",
+        "residual_contribution",
+        "relevant_latent_name",
+        "relevant_latent_value",
         "abs_error",
         "sq_error",
         "nll",

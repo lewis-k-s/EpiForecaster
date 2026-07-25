@@ -120,6 +120,62 @@ def _init_distribution_scale_proj(
         layer.bias.fill_(_inverse_softplus_scalar(margin))
 
 
+def _compose_observation_prediction(
+    *,
+    mechanistic_raw: torch.Tensor,
+    residual_raw: torch.Tensor,
+    delta_forecasting: bool,
+    anchor_mode: str,
+    last_observed: torch.Tensor | None,
+    last_observed_mask: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """Compose an exact mechanistic-plus-residual observation decomposition.
+
+    For anchored delta forecasts, the mechanistic output is the prediction obtained
+    with the residual path disabled. The residual contribution is defined as the
+    exact difference between the full and residual-disabled predictions, including
+    interactions with the non-negativity clamp.
+    """
+    full_raw = mechanistic_raw + residual_raw
+    full = full_raw
+    mechanistic = mechanistic_raw
+
+    if (
+        delta_forecasting
+        and anchor_mode != "disabled"
+        and last_observed is not None
+        and last_observed_mask is not None
+    ):
+        valid_mask = (last_observed_mask > 0.5).unsqueeze(1)
+        last_obs_safe = torch.nan_to_num(
+            last_observed,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).unsqueeze(1)
+        full_anchored = torch.clamp(
+            last_obs_safe + full_raw - full_raw[:, 0:1],
+            min=0.0,
+        )
+        mechanistic_anchored = torch.clamp(
+            last_obs_safe + mechanistic_raw - mechanistic_raw[:, 0:1],
+            min=0.0,
+        )
+        full = torch.where(valid_mask, full_anchored, full_raw)
+        mechanistic = torch.where(
+            valid_mask,
+            mechanistic_anchored,
+            mechanistic_raw,
+        )
+
+    residual = full - mechanistic
+    return {
+        "loc": full,
+        "mechanistic_loc": mechanistic,
+        "residual_loc": residual,
+    }
+
+
 class DelayKernel(nn.Module):
     """
     Causal delay kernel for clinical observations (cases, hospitalizations, deaths).
@@ -700,6 +756,21 @@ class ClinicalObservationHead(nn.Module):
         Formula:
             pred = log1p(I_delayed × 100,000 × scale) + alpha × residual(obs_context)
         """
+        return self.forward_components(
+            I_trajectory=I_trajectory,
+            obs_context=obs_context,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )["loc"]
+
+    def forward_components(
+        self,
+        I_trajectory: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return the full, mechanistic-only, and residual prediction components."""
         out_dtype = I_trajectory.dtype
         with _autocast_disabled_for(I_trajectory):
             delayed_infections = self.delay_kernel(I_trajectory.to(torch.float32))
@@ -714,39 +785,37 @@ class ClinicalObservationHead(nn.Module):
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            pred_log = torch.log1p(scaled)
+            mechanistic_raw = torch.log1p(scaled)
 
-        # Add residual from observation context if provided
+        residual_raw = torch.zeros_like(mechanistic_raw)
         if (
             self.use_residual
             and obs_context is not None
             and self.residual_proj is not None
         ):
             residual = self.residual_proj(obs_context).squeeze(-1)
-            if residual.dtype != pred_log.dtype:
-                residual = residual.to(pred_log.dtype)
+            if residual.dtype != mechanistic_raw.dtype:
+                residual = residual.to(mechanistic_raw.dtype)
             alpha = self.get_alpha()
             if alpha is not None:
-                if alpha.dtype != pred_log.dtype:
-                    alpha = alpha.to(pred_log.dtype)
-                pred_log = pred_log + alpha * residual
+                if alpha.dtype != mechanistic_raw.dtype:
+                    alpha = alpha.to(mechanistic_raw.dtype)
+                residual_raw = alpha * residual
 
-        if (
-            self.delta_forecasting
-            and self.anchor_mode != "disabled"
-            and last_observed is not None
-            and last_observed_mask is not None
-        ):
-            h0 = pred_log[:, 0:1]  # [B, 1]
-            delta = pred_log - h0
-            valid_mask = (last_observed_mask > 0.5).unsqueeze(1)  # [B, 1]
-            last_obs_safe = torch.nan_to_num(
-                last_observed, nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            anchored_pred = torch.clamp(last_obs_safe + delta, min=0.0)
-            pred_log = torch.where(valid_mask, anchored_pred, pred_log)
-
-        return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
+        components = _compose_observation_prediction(
+            mechanistic_raw=mechanistic_raw,
+            residual_raw=residual_raw,
+            delta_forecasting=self.delta_forecasting,
+            anchor_mode=self.anchor_mode,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )
+        output_components = {
+            key: value if value.dtype == out_dtype else value.to(out_dtype)
+            for key, value in components.items()
+        }
+        output_components["residual_input"] = residual_raw
+        return output_components
 
     def forward_distribution(
         self,
@@ -756,14 +825,15 @@ class ClinicalObservationHead(nn.Module):
         last_observed_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
-        loc = self.forward(
+        components = self.forward_components(
             I_trajectory=I_trajectory,
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
         )
+        loc = components["loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
-        return {"loc": loc, "scale": scale}
+        return {**components, "scale": scale}
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
@@ -936,6 +1006,23 @@ class WastewaterObservationHead(nn.Module):
             viral_load = conv(I, shedding_kernel) / population
             pred = log1p(viral_load × 100,000 × scale) + alpha × residual(obs_context)
         """
+        return self.forward_components(
+            I_trajectory=I_trajectory,
+            population=population,
+            obs_context=obs_context,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )["loc"]
+
+    def forward_components(
+        self,
+        I_trajectory: torch.Tensor,
+        population: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return the full, mechanistic-only, and residual prediction components."""
         out_dtype = I_trajectory.dtype
         viral_load = self.shedding_conv(I_trajectory.to(torch.float32), population)
 
@@ -951,39 +1038,37 @@ class WastewaterObservationHead(nn.Module):
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            pred_log = torch.log1p(scaled)
+            mechanistic_raw = torch.log1p(scaled)
 
-        # Add residual from observation context if provided
+        residual_raw = torch.zeros_like(mechanistic_raw)
         if (
             self.use_residual
             and obs_context is not None
             and self.residual_proj is not None
         ):
             residual = self.residual_proj(obs_context).squeeze(-1)
-            if residual.dtype != pred_log.dtype:
-                residual = residual.to(pred_log.dtype)
+            if residual.dtype != mechanistic_raw.dtype:
+                residual = residual.to(mechanistic_raw.dtype)
             alpha = self.get_alpha()
             if alpha is not None:
-                if alpha.dtype != pred_log.dtype:
-                    alpha = alpha.to(pred_log.dtype)
-                pred_log = pred_log + alpha * residual
+                if alpha.dtype != mechanistic_raw.dtype:
+                    alpha = alpha.to(mechanistic_raw.dtype)
+                residual_raw = alpha * residual
 
-        if (
-            self.delta_forecasting
-            and self.anchor_mode != "disabled"
-            and last_observed is not None
-            and last_observed_mask is not None
-        ):
-            h0 = pred_log[:, 0:1]  # [B, 1]
-            delta = pred_log - h0
-            valid_mask = (last_observed_mask > 0.5).unsqueeze(1)  # [B, 1]
-            last_obs_safe = torch.nan_to_num(
-                last_observed, nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            anchored_pred = torch.clamp(last_obs_safe + delta, min=0.0)
-            pred_log = torch.where(valid_mask, anchored_pred, pred_log)
-
-        return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
+        components = _compose_observation_prediction(
+            mechanistic_raw=mechanistic_raw,
+            residual_raw=residual_raw,
+            delta_forecasting=self.delta_forecasting,
+            anchor_mode=self.anchor_mode,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )
+        output_components = {
+            key: value if value.dtype == out_dtype else value.to(out_dtype)
+            for key, value in components.items()
+        }
+        output_components["residual_input"] = residual_raw
+        return output_components
 
     def forward_distribution(
         self,
@@ -994,15 +1079,16 @@ class WastewaterObservationHead(nn.Module):
         last_observed_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
-        loc = self.forward(
+        components = self.forward_components(
             I_trajectory=I_trajectory,
             population=population,
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
         )
+        loc = components["loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
-        return {"loc": loc, "scale": scale}
+        return {**components, "scale": scale}
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""

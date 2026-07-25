@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-GRANULAR_SCHEMA_VERSION = "2"
+GRANULAR_SCHEMA_VERSION = "3"
 GRANULAR_KEY_COLUMNS = ["split", "target", "node_id", "window_start", "horizon"]
 GRANULAR_INTERVAL_LEVEL_NAMES = ("50", "80", "95")
 GRANULAR_REQUIRED_FIELDNAMES = [
@@ -40,6 +40,10 @@ GRANULAR_FIELDNAMES = [
     "target_date",
     "observed",
     "prediction",
+    "mechanistic_prediction",
+    "residual_contribution",
+    "relevant_latent_name",
+    "relevant_latent_value",
     "abs_error",
     "sq_error",
     "nll",
@@ -159,6 +163,10 @@ def _row_dicts_from_batch(
     nll: torch.Tensor | None = None,
     crps: torch.Tensor | None = None,
     intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    mechanistic_predictions: torch.Tensor | None = None,
+    residual_contributions: torch.Tensor | None = None,
+    relevant_latent_name: str | None = None,
+    relevant_latent_values: torch.Tensor | None = None,
 ) -> list[dict[str, Any]]:
     canonical_target = _TARGET_NAMES[target_name]
     pred = torch.nan_to_num(
@@ -176,6 +184,21 @@ def _row_dicts_from_batch(
     observed_weights = torch.nan_to_num(weights.detach().float(), nan=0.0).cpu()
     nll_cpu = nll.detach().float().cpu() if nll is not None else None
     crps_cpu = crps.detach().float().cpu() if crps is not None else None
+    mechanistic_cpu = (
+        mechanistic_predictions.detach().float().cpu()
+        if mechanistic_predictions is not None
+        else None
+    )
+    residual_cpu = (
+        residual_contributions.detach().float().cpu()
+        if residual_contributions is not None
+        else None
+    )
+    relevant_latent_cpu = (
+        relevant_latent_values.detach().float().cpu()
+        if relevant_latent_values is not None
+        else None
+    )
     interval_cpu: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for level_name, bounds in (intervals or {}).items():
         low, high = bounds
@@ -227,6 +250,22 @@ def _row_dicts_from_batch(
                 "target_date": _format_temporal_coord(temporal_coords, target_index),
                 "observed": observed_value,
                 "prediction": float(pred[batch_index, horizon_index].item()),
+                "mechanistic_prediction": (
+                    float(mechanistic_cpu[batch_index, horizon_index].item())
+                    if mechanistic_cpu is not None
+                    else float("nan")
+                ),
+                "residual_contribution": (
+                    float(residual_cpu[batch_index, horizon_index].item())
+                    if residual_cpu is not None
+                    else float("nan")
+                ),
+                "relevant_latent_name": relevant_latent_name or "",
+                "relevant_latent_value": (
+                    float(relevant_latent_cpu[batch_index, horizon_index].item())
+                    if relevant_latent_cpu is not None
+                    else float("nan")
+                ),
                 "abs_error": float(abs_error[batch_index, horizon_index].item()),
                 "sq_error": float(sq_error[batch_index, horizon_index].item()),
                 "nll": float(nll_cpu[batch_index, horizon_index].item())
@@ -294,6 +333,10 @@ class _CsvGranularEvalWriter:
         nll: torch.Tensor | None = None,
         crps: torch.Tensor | None = None,
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        mechanistic_predictions: torch.Tensor | None = None,
+        residual_contributions: torch.Tensor | None = None,
+        relevant_latent_name: str | None = None,
+        relevant_latent_values: torch.Tensor | None = None,
     ) -> None:
         for row in _row_dicts_from_batch(
             split_name=self.split_name,
@@ -309,6 +352,10 @@ class _CsvGranularEvalWriter:
             nll=nll,
             crps=crps,
             intervals=intervals,
+            mechanistic_predictions=mechanistic_predictions,
+            residual_contributions=residual_contributions,
+            relevant_latent_name=relevant_latent_name,
+            relevant_latent_values=relevant_latent_values,
         ):
             self._writer.writerow(row)
 
@@ -351,6 +398,10 @@ class _ParquetGranularEvalWriter:
                 ("target_date", pa.string()),
                 ("observed", pa.float64()),
                 ("prediction", pa.float64()),
+                ("mechanistic_prediction", pa.float64()),
+                ("residual_contribution", pa.float64()),
+                ("relevant_latent_name", pa.string()),
+                ("relevant_latent_value", pa.float64()),
                 ("abs_error", pa.float64()),
                 ("sq_error", pa.float64()),
                 ("nll", pa.float64()),
@@ -413,6 +464,10 @@ class _ParquetGranularEvalWriter:
         nll: torch.Tensor | None = None,
         crps: torch.Tensor | None = None,
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
+        mechanistic_predictions: torch.Tensor | None = None,
+        residual_contributions: torch.Tensor | None = None,
+        relevant_latent_name: str | None = None,
+        relevant_latent_values: torch.Tensor | None = None,
     ) -> None:
         self._rows.extend(
             _row_dicts_from_batch(
@@ -429,6 +484,10 @@ class _ParquetGranularEvalWriter:
                 nll=nll,
                 crps=crps,
                 intervals=intervals,
+                mechanistic_predictions=mechanistic_predictions,
+                residual_contributions=residual_contributions,
+                relevant_latent_name=relevant_latent_name,
+                relevant_latent_values=relevant_latent_values,
             )
         )
         if len(self._rows) >= self.row_group_size:

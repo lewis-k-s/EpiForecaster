@@ -819,6 +819,9 @@ class TrainingParams:
         3  # Number of samples per category (best, worst, random)
     )
     grad_norm_log_frequency: int = 100
+    # Periodic eager probe of observation-loss gradients at the mechanistic source
+    # and residual-location input. Zero disables the diagnostic sidecar.
+    pathway_gradient_frequency: int = 0
     progress_log_frequency: int = (
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
@@ -987,6 +990,11 @@ class TrainingParams:
         if self.warmup_steps < 0:
             raise ValueError(
                 f"warmup_steps must be non-negative, got {self.warmup_steps}"
+            )
+        if self.pathway_gradient_frequency < 0:
+            raise ValueError(
+                "pathway_gradient_frequency must be non-negative, "
+                f"got {self.pathway_gradient_frequency}"
             )
         if self.min_learning_rate < 0:
             raise ValueError(

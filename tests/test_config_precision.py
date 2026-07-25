@@ -130,3 +130,11 @@ class TestPrecisionConfigValidation:
             match="model_diagnostics_frequency must be non-negative",
         ):
             TrainingParams(model_diagnostics_frequency=-1)
+
+    def test_negative_pathway_gradient_frequency_rejected(self):
+        """Pathway gradient frequency must be non-negative."""
+        with pytest.raises(
+            ValueError,
+            match="pathway_gradient_frequency must be non-negative",
+        ):
+            TrainingParams(pathway_gradient_frequency=-1)

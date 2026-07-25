@@ -44,6 +44,10 @@ from training.dataloader_factory import (
 )
 from training.gradnorm import GradNormController
 from training.optim_factory import create_optimizer, create_scheduler
+from training.pathway_gradients import (
+    compute_pathway_gradient_metrics,
+    should_probe_pathway_gradients,
+)
 from training.training_dynamics import TrainingDynamicsWriter
 from utils.device import (
     iter_device_ready_batches,
@@ -1821,6 +1825,54 @@ class EpiForecasterTrainer:
         )
         return log_data
 
+    def _pathway_gradient_sidecar(
+        self,
+        batch_data: EpiBatch,
+    ) -> dict[str, torch.Tensor | float]:
+        """Probe observation-loss gradients through mechanistic and residual paths."""
+        frequency = self.config.training.pathway_gradient_frequency
+        if not should_probe_pathway_gradients(self.global_step, frequency):
+            return {}
+
+        sidecar_start_time = time.time()
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.precision_policy.autocast_dtype,
+            enabled=self.precision_policy.autocast_enabled,
+        ):
+            model_outputs, targets_dict = self.model.forward_batch(
+                batch_data=batch_data,
+                region_embeddings=self.region_embeddings,
+                mask_cases=self.criterion.mask_input_cases,
+                mask_ww=self.criterion.mask_input_ww,
+                mask_hosp=self.criterion.mask_input_hosp,
+                mask_deaths=self.criterion.mask_input_deaths,
+            )
+            components = self.criterion.compute_components_train(
+                model_outputs,
+                targets_dict,
+                batch_data,
+            )
+
+        metrics: dict[str, torch.Tensor | float] = {
+            "pathgrad_sidecar_ran": torch.ones((), device=self.device),
+        }
+        head_names = ("ww", "hosp", "cases", "deaths")
+        for head_name in head_names:
+            metrics.update(
+                compute_pathway_gradient_metrics(
+                    head_name=head_name,
+                    loss=components[head_name],
+                    mechanistic_source=model_outputs[
+                        f"observation_source_{head_name}"
+                    ],
+                    residual_input=model_outputs[f"residual_input_{head_name}"],
+                    retain_graph=True,
+                )
+            )
+        metrics["pathgrad_sidecar_time_s"] = time.time() - sidecar_start_time
+        return metrics
+
     @staticmethod
     def _build_targets_dict(
         batch_data: EpiBatch,
@@ -2245,6 +2297,7 @@ class EpiForecasterTrainer:
                 gradnorm_step_log_data: dict[str, torch.Tensor] = {}
                 if self._gradnorm_enabled:
                     gradnorm_step_log_data = self._gradnorm_sidecar_update(batch_data)
+                pathway_gradient_log_data = self._pathway_gradient_sidecar(batch_data)
 
                 # Guard against non-finite losses/gradients to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -2373,7 +2426,11 @@ class EpiForecasterTrainer:
                     else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
-                log_this_step = should_log_step(self.global_step, 1, log_frequency)
+                log_this_step = should_log_step(
+                    self.global_step,
+                    1,
+                    log_frequency,
+                ) or bool(pathway_gradient_log_data)
 
                 log_data = build_train_step_log_data(
                     lr=lr,
@@ -2387,6 +2444,7 @@ class EpiForecasterTrainer:
                     gradient_snapshot_log_data=gradient_snapshot_log_data,
                     model_diagnostics_log_data=model_diagnostics_log_data,
                 )
+                log_data.update(pathway_gradient_log_data)
 
                 if log_this_step:
                     # Use detach() instead of item() - wandb handles tensor conversion

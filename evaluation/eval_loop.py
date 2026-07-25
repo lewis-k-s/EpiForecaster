@@ -31,6 +31,11 @@ from evaluation.metrics import (
     TorchDistributionMetricAccumulator,
     TorchMaskedMetricAccumulator,
 )
+from evaluation.pathway_metrics import (
+    PathwayMetricResult,
+    TorchLatentCoherenceAccumulator,
+    TorchPathwayMetricAccumulator,
+)
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
 from utils.device import (
@@ -61,6 +66,23 @@ _HEAD_CANONICAL_NAMES = {
     "cases": "cases",
     "deaths": "deaths",
 }
+_HEAD_RELEVANT_LATENT_NAMES = {
+    "hosp": "hospitalization_flow",
+    "ww": "I",
+    "cases": "I",
+    "deaths": "death_flow",
+}
+
+
+def _forecast_aligned_output(
+    model_outputs: dict[str, torch.Tensor],
+    key: str,
+    horizon: int,
+) -> torch.Tensor | None:
+    value = model_outputs.get(key)
+    if value is None:
+        return None
+    return drop_nowcast(value, horizon)
 
 
 def _accumulate_per_head_node_metrics(
@@ -189,6 +211,50 @@ def _add_probabilistic_metrics(
         )
 
 
+def _add_pathway_metrics(
+    *,
+    metrics: dict[str, Any],
+    head_name: str,
+    summary: PathwayMetricResult,
+    mechanistic_probabilistic_summary: ProbabilisticMetricResult,
+) -> None:
+    prefix = f"pathway_{head_name}"
+    metrics[f"{prefix}_observed_count"] = summary.observed_count
+    metrics[f"{prefix}_effective_count"] = summary.effective_count
+    metrics[f"{prefix}_mean_abs_mechanistic_log1p_per_100k"] = (
+        summary.mean_abs_mechanistic
+    )
+    metrics[f"{prefix}_mean_abs_residual_log1p_per_100k"] = (
+        summary.mean_abs_residual
+    )
+    metrics[f"{prefix}_residual_abs_fraction"] = summary.residual_abs_fraction
+    metrics[f"{prefix}_residual_to_mechanistic_abs_ratio"] = (
+        summary.residual_to_mechanistic_abs_ratio
+    )
+    metrics[f"{prefix}_mechanistic_variance"] = summary.mechanistic_variance
+    metrics[f"{prefix}_residual_variance"] = summary.residual_variance
+    metrics[f"{prefix}_full_variance"] = summary.full_variance
+    metrics[f"{prefix}_mechanistic_variance_share"] = (
+        summary.mechanistic_variance_share
+    )
+    metrics[f"{prefix}_residual_variance_share"] = summary.residual_variance_share
+    metrics[f"{prefix}_mechanistic_only_mae_log1p_per_100k"] = (
+        summary.mechanistic_only_mae
+    )
+    metrics[f"{prefix}_mechanistic_only_rmse_log1p_per_100k"] = (
+        summary.mechanistic_only_rmse
+    )
+    metrics[f"{prefix}_mechanistic_only_nll_log1p_per_100k"] = (
+        mechanistic_probabilistic_summary.nll
+    )
+    metrics[f"{prefix}_mechanistic_only_crps_log1p_per_100k"] = (
+        mechanistic_probabilistic_summary.crps
+    )
+    metrics[f"{prefix}_reconstruction_max_abs_error"] = (
+        summary.reconstruction_max_abs_error
+    )
+
+
 def evaluate_loader(
     *,
     model: torch.nn.Module,
@@ -271,6 +337,15 @@ def evaluate_loader(
     deaths_prob_metrics = TorchDistributionMetricAccumulator(
         **distribution_metric_kwargs
     )
+    pathway_metrics = {
+        head_name: TorchPathwayMetricAccumulator(device=device)
+        for head_name in _HEAD_CANONICAL_NAMES
+    }
+    mechanistic_prob_metrics = {
+        head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
+        for head_name in _HEAD_CANONICAL_NAMES
+    }
+    latent_metrics = TorchLatentCoherenceAccumulator(device=device)
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
@@ -405,6 +480,10 @@ def evaluate_loader(
                 loss_sird_supervision_weighted_sum += components[
                     "sird_supervision_weighted"
                 ].detach()
+                latent_metrics.update(
+                    model_outputs=model_outputs,
+                    targets=targets_dict,
+                )
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -462,6 +541,36 @@ def evaluate_loader(
                         observed_mask=hosp_mask,
                         sample_weights=hosp_weights,
                     )
+                    hosp_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_hosp",
+                        int(hosp_targets.shape[1]),
+                    )
+                    hosp_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_hosp",
+                        int(hosp_targets.shape[1]),
+                    )
+                    hosp_source = _forecast_aligned_output(
+                        model_outputs,
+                        "observation_source_hosp",
+                        int(hosp_targets.shape[1]),
+                    )
+                    if hosp_mechanistic is not None and hosp_residual is not None:
+                        pathway_metrics["hosp"].update(
+                            full=hosp_loc,
+                            mechanistic=hosp_mechanistic,
+                            residual=hosp_residual,
+                            targets=hosp_targets,
+                            weights=hosp_weights,
+                        )
+                        mechanistic_prob_metrics["hosp"].update(
+                            loc=hosp_mechanistic,
+                            scale=hosp_scale,
+                            targets=hosp_targets,
+                            observed_mask=hosp_mask,
+                            sample_weights=hosp_weights,
+                        )
 
                     if granular_writer is not None:
                         granular_writer.write_rows(
@@ -473,6 +582,10 @@ def evaluate_loader(
                             nll=hosp_prob_batch.nll,
                             crps=hosp_prob_batch.crps,
                             intervals=hosp_prob_batch.intervals,
+                            mechanistic_predictions=hosp_mechanistic,
+                            residual_contributions=hosp_residual,
+                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["hosp"],
+                            relevant_latent_values=hosp_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -485,6 +598,9 @@ def evaluate_loader(
                         hosp_loc,
                         hosp_scale,
                         hosp_prob_batch,
+                        hosp_mechanistic,
+                        hosp_residual,
+                        hosp_source,
                     )
                 del pred_hosp, hosp_targets, hosp_mask, hosp_weights
 
@@ -523,6 +639,36 @@ def evaluate_loader(
                         observed_mask=ww_mask,
                         sample_weights=ww_weights,
                     )
+                    ww_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_ww",
+                        int(ww_targets.shape[1]),
+                    )
+                    ww_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_ww",
+                        int(ww_targets.shape[1]),
+                    )
+                    ww_source = _forecast_aligned_output(
+                        model_outputs,
+                        "observation_source_ww",
+                        int(ww_targets.shape[1]),
+                    )
+                    if ww_mechanistic is not None and ww_residual is not None:
+                        pathway_metrics["ww"].update(
+                            full=ww_loc,
+                            mechanistic=ww_mechanistic,
+                            residual=ww_residual,
+                            targets=ww_targets,
+                            weights=ww_weights,
+                        )
+                        mechanistic_prob_metrics["ww"].update(
+                            loc=ww_mechanistic,
+                            scale=ww_scale,
+                            targets=ww_targets,
+                            observed_mask=ww_mask,
+                            sample_weights=ww_weights,
+                        )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -533,6 +679,10 @@ def evaluate_loader(
                             nll=ww_prob_batch.nll,
                             crps=ww_prob_batch.crps,
                             intervals=ww_prob_batch.intervals,
+                            mechanistic_predictions=ww_mechanistic,
+                            residual_contributions=ww_residual,
+                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["ww"],
+                            relevant_latent_values=ww_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -544,6 +694,9 @@ def evaluate_loader(
                         ww_loc,
                         ww_scale,
                         ww_prob_batch,
+                        ww_mechanistic,
+                        ww_residual,
+                        ww_source,
                     )
                 del pred_ww, ww_targets, ww_mask, ww_weights
 
@@ -584,6 +737,36 @@ def evaluate_loader(
                         observed_mask=cases_mask,
                         sample_weights=cases_weights,
                     )
+                    cases_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_cases",
+                        int(cases_targets.shape[1]),
+                    )
+                    cases_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_cases",
+                        int(cases_targets.shape[1]),
+                    )
+                    cases_source = _forecast_aligned_output(
+                        model_outputs,
+                        "observation_source_cases",
+                        int(cases_targets.shape[1]),
+                    )
+                    if cases_mechanistic is not None and cases_residual is not None:
+                        pathway_metrics["cases"].update(
+                            full=cases_loc,
+                            mechanistic=cases_mechanistic,
+                            residual=cases_residual,
+                            targets=cases_targets,
+                            weights=cases_weights,
+                        )
+                        mechanistic_prob_metrics["cases"].update(
+                            loc=cases_mechanistic,
+                            scale=cases_scale,
+                            targets=cases_targets,
+                            observed_mask=cases_mask,
+                            sample_weights=cases_weights,
+                        )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -594,6 +777,10 @@ def evaluate_loader(
                             nll=cases_prob_batch.nll,
                             crps=cases_prob_batch.crps,
                             intervals=cases_prob_batch.intervals,
+                            mechanistic_predictions=cases_mechanistic,
+                            residual_contributions=cases_residual,
+                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["cases"],
+                            relevant_latent_values=cases_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -605,6 +792,9 @@ def evaluate_loader(
                         cases_loc,
                         cases_scale,
                         cases_prob_batch,
+                        cases_mechanistic,
+                        cases_residual,
+                        cases_source,
                     )
                 del pred_cases, cases_targets, cases_mask, cases_weights
 
@@ -645,6 +835,36 @@ def evaluate_loader(
                         observed_mask=deaths_mask,
                         sample_weights=deaths_weights,
                     )
+                    deaths_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_deaths",
+                        int(deaths_targets.shape[1]),
+                    )
+                    deaths_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_deaths",
+                        int(deaths_targets.shape[1]),
+                    )
+                    deaths_source = _forecast_aligned_output(
+                        model_outputs,
+                        "observation_source_deaths",
+                        int(deaths_targets.shape[1]),
+                    )
+                    if deaths_mechanistic is not None and deaths_residual is not None:
+                        pathway_metrics["deaths"].update(
+                            full=deaths_loc,
+                            mechanistic=deaths_mechanistic,
+                            residual=deaths_residual,
+                            targets=deaths_targets,
+                            weights=deaths_weights,
+                        )
+                        mechanistic_prob_metrics["deaths"].update(
+                            loc=deaths_mechanistic,
+                            scale=deaths_scale,
+                            targets=deaths_targets,
+                            observed_mask=deaths_mask,
+                            sample_weights=deaths_weights,
+                        )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -655,6 +875,10 @@ def evaluate_loader(
                             nll=deaths_prob_batch.nll,
                             crps=deaths_prob_batch.crps,
                             intervals=deaths_prob_batch.intervals,
+                            mechanistic_predictions=deaths_mechanistic,
+                            residual_contributions=deaths_residual,
+                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["deaths"],
+                            relevant_latent_values=deaths_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -666,6 +890,9 @@ def evaluate_loader(
                         deaths_loc,
                         deaths_scale,
                         deaths_prob_batch,
+                        deaths_mechanistic,
+                        deaths_residual,
+                        deaths_source,
                     )
                 del pred_deaths, deaths_targets, deaths_mask, deaths_weights
                 current_stage = "granular_write_complete"
@@ -707,6 +934,15 @@ def evaluate_loader(
     ww_prob_summary = ww_prob_metrics.finalize()
     cases_prob_summary = cases_prob_metrics.finalize()
     deaths_prob_summary = deaths_prob_metrics.finalize()
+    pathway_summaries = {
+        head_name: accumulator.finalize()
+        for head_name, accumulator in pathway_metrics.items()
+    }
+    mechanistic_prob_summaries = {
+        head_name: accumulator.finalize()
+        for head_name, accumulator in mechanistic_prob_metrics.items()
+    }
+    latent_summary = latent_metrics.finalize()
 
     node_mae_by_target: dict[str, dict[int, float]] = {}
     node_mae_count_by_target: dict[str, dict[int, int]] = {}
@@ -888,6 +1124,14 @@ def evaluate_loader(
         head_name="deaths",
         summary=deaths_prob_summary,
     )
+    for head_name in _HEAD_CANONICAL_NAMES:
+        _add_pathway_metrics(
+            metrics=metrics,
+            head_name=head_name,
+            summary=pathway_summaries[head_name],
+            mechanistic_probabilistic_summary=mechanistic_prob_summaries[head_name],
+        )
+    metrics.update(latent_summary)
 
     logger.info("EVAL COMPLETE")
     return mean_loss, metrics, node_mae_by_target

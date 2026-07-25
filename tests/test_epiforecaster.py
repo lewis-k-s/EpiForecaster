@@ -83,13 +83,33 @@ class TestEpiForecaster:
             pred_key = f"pred_{head_name}"
             assert out[f"dist_{head_name}_loc"].shape == out[pred_key].shape
             assert out[f"dist_{head_name}_scale"].shape == out[pred_key].shape
+            assert out[f"mechanistic_{head_name}"].shape == out[pred_key].shape
+            assert out[f"residual_{head_name}"].shape == out[pred_key].shape
+            assert out[f"residual_input_{head_name}"].shape == out[pred_key].shape
+            assert torch.allclose(
+                out[pred_key],
+                out[f"mechanistic_{head_name}"] + out[f"residual_{head_name}"],
+                atol=1e-5,
+            )
             assert torch.all(out[f"dist_{head_name}_scale"] > 0)
+        source_grad, residual_grad = torch.autograd.grad(
+            out["pred_cases"].square().mean(),
+            (out["observation_source_cases"], out["residual_input_cases"]),
+            retain_graph=True,
+        )
+        assert torch.all(torch.isfinite(source_grad))
+        assert torch.all(torch.isfinite(residual_grad))
         assert out["S_trajectory"].shape == (batch_size, horizon + 1)
         assert out["I_trajectory"].shape == (batch_size, horizon + 1)
         assert out["H_trajectory"].shape == (batch_size, horizon + 1)
         assert out["R_trajectory"].shape == (batch_size, horizon + 1)
         assert out["D_trajectory"].shape == (batch_size, horizon + 1)
         assert out["hospitalization_flow"].shape == (batch_size, horizon)
+        assert out["death_flow"].shape == (batch_size, horizon)
+        assert out["observation_source_ww"].shape == (batch_size, horizon + 1)
+        assert out["observation_source_cases"].shape == (batch_size, horizon + 1)
+        assert out["observation_source_hosp"].shape == (batch_size, horizon + 1)
+        assert out["observation_source_deaths"].shape == (batch_size, horizon)
         assert out["hospitalization_rate_t"].shape == (batch_size, horizon)
         assert out["hospital_recovery_t"].shape == (batch_size, horizon)
         assert out["hospital_mortality_t"].shape == (batch_size, horizon)
