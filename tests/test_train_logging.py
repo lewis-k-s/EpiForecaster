@@ -245,7 +245,7 @@ def test_wandb_step_payload_filters_gradient_scalars_on_logged_steps() -> None:
             "loss_train_step": 1.0,
             "loss_train_sird_supervision": 0.1,
             "loss_train_sird_supervision_weighted": 0.001,
-            "gradnorm_clipped_total": 2.0,
+            "gradnorm_total_preclip": 2.0,
             "gradnorm_sidecar_ran": 1.0,
             "grad_snapshot_max_layer_norm": 9.0,
             "time_batch_s": 0.2,

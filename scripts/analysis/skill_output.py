@@ -128,12 +128,17 @@ class SkillOutputBuilder:
         )
 
 
-def format_output(output: SkillOutput, indent: int = 2) -> str:
+def format_output(output: SkillOutput, indent: int | None = 2) -> str:
     """Format skill output as JSON."""
-    return json.dumps(output.to_dict(), indent=indent)
+    separators = (",", ":") if indent is None else None
+    return json.dumps(output.to_dict(), indent=indent, separators=separators)
 
 
-def print_output(output: SkillOutput, indent: int = 2, file=sys.stdout) -> None:
+def print_output(
+    output: SkillOutput,
+    indent: int | None = 2,
+    file=sys.stdout,
+) -> None:
     """Print skill output to file (stdout by default)."""
     print(format_output(output, indent), file=file)
     if not output.ok:

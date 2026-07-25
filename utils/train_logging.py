@@ -37,7 +37,7 @@ def build_train_step_log_data(
     """Build per-step logging payload before progress-only metrics are added."""
     log_data: dict[str, float | torch.Tensor] = {
         build_eval_metric_key("learning_rate", "step"): lr,
-        "gradnorm_clipped_total": grad_norm,
+        "gradnorm_total_preclip": grad_norm,
         "time_batch_s": batch_time_s,
         "time_dataload_s": data_time_s,
         "time_step_s": batch_time_s,

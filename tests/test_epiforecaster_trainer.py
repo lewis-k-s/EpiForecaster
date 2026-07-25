@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -22,6 +24,50 @@ from models.configs import (
     CurriculumConfig,
 )
 from evaluation.losses import JointInferenceLoss
+
+
+def _mock_canonical_region_coordinate(
+    mock_dataset_class: MagicMock,
+    *,
+    total_regions: int = 10,
+) -> None:
+    aligned_dataset = MagicMock()
+    region_coordinate = MagicMock()
+    region_coordinate.size = total_regions
+    region_coordinate.values = np.asarray(
+        [f"{index:03d}" for index in range(total_regions)],
+        dtype=object,
+    )
+    aligned_dataset.__getitem__.side_effect = (
+        lambda key: region_coordinate if key == "region_id" else MagicMock()
+    )
+    aligned_dataset.__contains__.return_value = False
+    aligned_dataset.data_vars = {}
+    mock_dataset_class.load_canonical_dataset.return_value = aligned_dataset
+
+
+def test_persist_mobility_diagnostics_writes_all_splits(tmp_path) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.train_dataset = SimpleNamespace(
+        mobility_diagnostics={"run_id": "train", "positive_edge_count": 3}
+    )
+    trainer.val_dataset = SimpleNamespace(
+        mobility_diagnostics={"run_id": "validation", "positive_edge_count": 2}
+    )
+    trainer.test_dataset = SimpleNamespace(
+        mobility_diagnostics={"run_id": "test", "positive_edge_count": 1}
+    )
+
+    trainer._persist_mobility_diagnostics(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "mobility_initialization_diagnostics.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["train"][0]["positive_edge_count"] == 3
+    assert payload["validation"][0]["positive_edge_count"] == 2
+    assert payload["test"][0]["positive_edge_count"] == 1
 
 
 def test_compute_mean_target_mae_averages_finite_available_targets() -> None:
@@ -158,7 +204,7 @@ class _HistogramTestModel(torch.nn.Module):
 
 class TestEpiForecasterTrainer:
     @pytest.fixture
-    def minimal_config(self):
+    def minimal_config(self, tmp_path):
         return EpiForecasterConfig(
             model=ModelConfig(
                 type=ModelVariant(cases=True),
@@ -182,7 +228,7 @@ class TestEpiForecasterTrainer:
                 curriculum=CurriculumConfig(enabled=False),
                 enable_mixed_precision=False,
             ),
-            output=OutputConfig(log_dir="test_outputs", experiment_name="test_exp"),
+            output=OutputConfig(log_dir=str(tmp_path), experiment_name="test_exp"),
         )
 
     @patch("data.dataset_factory.EpiDataset")
@@ -218,12 +264,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_cls.return_value = mock_dataset_instance
 
         # Mock class method load_canonical_dataset to avoid disk IO
-        mock_dataset_cls.load_canonical_dataset.return_value = MagicMock()
-        mock_dataset_cls.load_canonical_dataset.return_value.__enter__.return_value = (
-            MagicMock()
-        )
-        mock_dataset_cls.load_canonical_dataset.return_value.__getitem__.return_value = MagicMock()
-        mock_dataset_cls.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset_cls)
 
         # Initialize trainer
         trainer = EpiForecasterTrainer(minimal_config, model_id="trial-000007")
@@ -232,7 +273,9 @@ class TestEpiForecasterTrainer:
         assert isinstance(trainer.optimizer, torch.optim.Adam)
         assert isinstance(trainer.criterion, JointInferenceLoss)
         assert trainer.model_id == "trial-000007"
-        assert trainer.experiment_dir == Path("test_outputs/test_exp/trial-000007")
+        assert trainer.experiment_dir == (
+            Path(minimal_config.output.log_dir) / "test_exp/trial-000007"
+        )
 
         # Check if model was initialized with correct config params
         mock_model_cls.assert_called_once()
@@ -262,7 +305,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance.cases_output_dim = 1
         mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset.return_value = mock_dataset_instance
-        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset)
 
         # Test joint inference loss
         minimal_config.training.loss.name = "joint_inference"
@@ -291,7 +334,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance.cases_output_dim = 1
         mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset.return_value = mock_dataset_instance
-        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset)
 
         # 1. Cosine
         minimal_config.training.scheduler_type = "cosine"
@@ -337,7 +380,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance.cases_output_dim = 1
         mock_dataset_instance.temporal_covariates_dim = 0
         mock_dataset.return_value = mock_dataset_instance
-        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset)
 
         # Setup fake checkpoint
         minimal_config.output.log_dir = str(tmp_path)
@@ -376,7 +419,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance.cases_output_dim = 1
         mock_dataset_instance.sparsity_level = 0.5  # Fix numeric comparison
         mock_dataset.return_value = mock_dataset_instance
-        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset)
 
         # Enable curriculum
         minimal_config.training.curriculum.enabled = True
@@ -527,7 +570,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance.__len__.return_value = 16
         mock_dataset_instance.target_nodes = [0, 1]
         mock_dataset.return_value = mock_dataset_instance
-        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset)
 
         minimal_config.training.compile_backward = True
         minimal_config.training.loss.joint.adaptive_scheme = "gradnorm"
@@ -565,7 +608,7 @@ class TestEpiForecasterTrainer:
         mock_dataset_instance.__len__.return_value = 16
         mock_dataset_instance.target_nodes = [0, 1]
         mock_dataset.return_value = mock_dataset_instance
-        mock_dataset.load_canonical_dataset.return_value.__getitem__.return_value.size = 10
+        _mock_canonical_region_coordinate(mock_dataset)
 
         minimal_config.output.log_dir = str(tmp_path)
         minimal_config.output.experiment_name = "gradnorm_ckpt"
@@ -694,7 +737,7 @@ def test_build_wandb_payload_filters_grad_scalars_and_merges_histograms(mock_his
         log_data={
             "loss_train_step": 1.0,
             "time_batch_s": 0.2,
-            "gradnorm_clipped_total": 2.0,
+            "gradnorm_total_preclip": 2.0,
             "grad_snapshot_max_layer_norm": 3.0,
             "gradnorm_sidecar_ran": 1.0,
         },
@@ -706,7 +749,7 @@ def test_build_wandb_payload_filters_grad_scalars_and_merges_histograms(mock_his
     assert payload is not None
     assert payload["loss_train_step"] == 1.0
     assert payload["time_batch_s"] == 0.2
-    assert "gradnorm_clipped_total" not in payload
+    assert "gradnorm_total_preclip" not in payload
     assert "grad_snapshot_max_layer_norm" not in payload
     assert "gradnorm_sidecar_ran" not in payload
     assert payload["grad_hist/backbone_beta_projection_bias"] == {"count": 2}
@@ -729,7 +772,7 @@ def test_build_wandb_payload_omits_histograms_when_frequency_is_zero():
 
     payload = trainer._build_wandb_payload(
         log_this_step=False,
-        log_data={"gradnorm_clipped_total": 2.0},
+        log_data={"gradnorm_total_preclip": 2.0},
         component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
         gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
         model_diagnostics_log_data={},

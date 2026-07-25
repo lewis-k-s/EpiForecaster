@@ -129,6 +129,7 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     torch.save(
         {
             "epoch": 4,
+            "global_step": 123,
             "model_state_dict": updated_state,
             "optimizer_state_dict": trainer.optimizer.state_dict(),
             "best_val_loss": 0.123,
@@ -139,6 +140,7 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
 
     trainer._resume_from_checkpoint()
     assert trainer.current_epoch == 5
+    assert trainer.global_step == 123
     assert trainer.best_val_loss == 0.123
     assert trainer.training_history["train_loss"] == [1.0]
     for key, value in trainer.model.state_dict().items():

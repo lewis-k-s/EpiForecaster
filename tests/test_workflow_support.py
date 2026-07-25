@@ -20,14 +20,33 @@ import yaml
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR,
+    TRAINING_DYNAMICS_STATUS_ATTR,
     TRIAL_DIR_ATTR,
     best_model_path,
     trial_directory,
 )
 from scripts.workflow import run_config, run_support, tooling_identity
+from training.training_dynamics import (
+    TrainingDynamicsWriter,
+    load_training_dynamics_identity,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _complete_training_dynamics(model_root: Path) -> dict[str, object]:
+    writer = TrainingDynamicsWriter(
+        model_root,
+        progress_log_frequency=10,
+        grad_norm_log_frequency=10,
+        mobility_enabled=True,
+    )
+    writer.append(step=0, epoch=0, values={"loss_train_step": 1.0})
+    writer.finalize("complete")
+    return load_training_dynamics_identity(model_root)
 
 
 def _workflow_shell_source(tmp_path: Path) -> str:
@@ -751,6 +770,19 @@ def _complete_trial(
         BEST_MODEL_SHA256_ATTR,
         run_support.sha256_file(checkpoint),
     )
+    training_dynamics = _complete_training_dynamics(trial_dir)
+    trial.set_user_attr(
+        TRAINING_DYNAMICS_MANIFEST_ATTR,
+        training_dynamics["manifest"],
+    )
+    trial.set_user_attr(
+        TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR,
+        training_dynamics["manifest_sha256"],
+    )
+    trial.set_user_attr(
+        TRAINING_DYNAMICS_STATUS_ATTR,
+        training_dynamics["status"],
+    )
     study.tell(trial, value)
     return trial_dir, checkpoint
 
@@ -1059,7 +1091,11 @@ def test_crossval_fold_builds_isolated_train_evaluate_config(
         )
         checkpoint.parent.mkdir(parents=True)
         checkpoint.write_bytes(b"fold checkpoint")
-        run_support.write_json(model_root / "training_manifest.json", {"ok": True})
+        training_dynamics = _complete_training_dynamics(model_root)
+        run_support.write_json(
+            model_root / "training_manifest.json",
+            {"ok": True, "training_dynamics": training_dynamics},
+        )
         return fold_root / ".state/training.done"
 
     def fake_evaluate(path: Path, fold_root: Path, checkpoint: Path) -> Path:
@@ -1484,6 +1520,7 @@ def test_train_model_records_deterministic_checkpoint(
         checkpoint, _ = run_support.training_artifact_paths(config, run_root)
         checkpoint.parent.mkdir(parents=True)
         checkpoint.write_bytes(b"trained")
+        _complete_training_dynamics(checkpoint.parents[1])
 
     monkeypatch.setattr(run_support, "_run", fake_run)
 

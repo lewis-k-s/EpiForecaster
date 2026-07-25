@@ -26,9 +26,17 @@ import yaml
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR,
+    TRAINING_DYNAMICS_STATUS_ATTR,
     TRIAL_DIR_ATTR,
     best_model_path,
     trial_directory,
+)
+from training.training_dynamics import (
+    DYNAMICS_ARTIFACT_NAME,
+    DYNAMICS_MANIFEST_NAME,
+    load_training_dynamics_identity,
 )
 
 
@@ -436,6 +444,7 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         raise FileNotFoundError(
             f"Training completed without the canonical checkpoint: {checkpoint}"
         )
+    training_dynamics = load_training_dynamics_identity(model_root)
 
     training_manifest = model_root / "training_manifest.json"
     training_record = {
@@ -445,6 +454,7 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "model_root": str(model_root),
         "base_config": str(base_config),
         "overrides": overrides,
+        "training_dynamics": training_dynamics,
         "completed_at": datetime.now(UTC).isoformat(),
     }
     write_json(training_manifest, training_record)
@@ -518,6 +528,7 @@ def train_crossval_fold(
     train_model(fold_config_path, source_root, fold_root)
     checkpoint, model_root = training_artifact_paths(fold_config, fold_root)
     training_manifest = model_root / "training_manifest.json"
+    training_record = json.loads(training_manifest.read_text())
     fold_training_manifest = fold_root / "fold_training_manifest.json"
     write_json(
         fold_training_manifest,
@@ -534,6 +545,7 @@ def train_crossval_fold(
             "checkpoint_sha256": sha256_file(checkpoint),
             "training_manifest": str(training_manifest),
             "training_manifest_sha256": sha256_file(training_manifest),
+            "training_dynamics": training_record["training_dynamics"],
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
@@ -863,6 +875,18 @@ def resolve_best_trial_artifacts(
         raise FileNotFoundError(
             f"Best trial directory is missing or unsafe: {expected_trial_dir}"
         )
+    training_dynamics = load_training_dynamics_identity(expected_trial_dir)
+    if (
+        best.user_attrs.get(TRAINING_DYNAMICS_MANIFEST_ATTR)
+        != training_dynamics["manifest"]
+        or best.user_attrs.get(TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR)
+        != training_dynamics["manifest_sha256"]
+        or best.user_attrs.get(TRAINING_DYNAMICS_STATUS_ATTR)
+        != training_dynamics["status"]
+    ):
+        raise ValueError(
+            f"Best trial {best.number} training dynamics identity mismatch"
+        )
 
     expected_checkpoint = best_model_path(expected_trial_dir)
     recorded_checkpoint = best.user_attrs.get(BEST_MODEL_PATH_ATTR)
@@ -911,6 +935,7 @@ def resolve_best_trial_artifacts(
         "selected_trial_dir": str(expected_trial_dir),
         "selected_checkpoint": str(resolved_checkpoint),
         "selected_checkpoint_sha256": observed_sha256,
+        "training_dynamics": training_dynamics,
         "best_config": str(best_config_path),
     }
     write_json(summary_path, summary)
@@ -920,6 +945,7 @@ def resolve_best_trial_artifacts(
         "trial_dir": expected_trial_dir,
         "checkpoint": resolved_checkpoint,
         "checkpoint_sha256": observed_sha256,
+        "training_dynamics": training_dynamics,
         "trial_config": trial_config_path,
         "summary": summary,
     }

@@ -282,6 +282,11 @@ def test_trainer_adaptive_step_and_sidecar_updates_weights() -> None:
     trainer.model.zero_grad(set_to_none=True)
     sidecar = EpiForecasterTrainer._gradnorm_sidecar_update(trainer, {})
     assert sidecar["gradnorm_sidecar_ran"] > 0
+    for task in GradNormController.task_names:
+        assert torch.isfinite(sidecar[f"gradnorm_w_{task}"])
+        assert torch.isfinite(sidecar[f"gradnorm_task_norm_{task}"])
+        assert torch.isfinite(sidecar[f"gradnorm_target_norm_{task}"])
+        assert torch.isfinite(sidecar[f"gradnorm_rate_{task}"])
     assert not torch.allclose(
         trainer.gradnorm_controller.log_weights.detach(),
         initial,
@@ -295,8 +300,11 @@ def test_gradnorm_sidecar_respects_update_cadence() -> None:
 
     sidecar = EpiForecasterTrainer._gradnorm_sidecar_update(trainer, {})
 
-    # Sidecar returns empty dict when cadence doesn't match (no sidecar metrics logged)
+    # Current controller state remains observable even when the sidecar does not run.
     assert sidecar.get("gradnorm_sidecar_ran", 0) == 0
+    assert all(
+        f"gradnorm_w_{task}" in sidecar for task in GradNormController.task_names
+    )
     assert torch.allclose(trainer.gradnorm_controller.log_weights.detach(), initial)
 
 

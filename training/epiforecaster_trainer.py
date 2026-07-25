@@ -9,7 +9,7 @@ The trainer works with the EpiForecaster model.
 """
 
 import importlib
-import csv
+import json
 import logging
 import os
 import platform
@@ -44,6 +44,7 @@ from training.dataloader_factory import (
 )
 from training.gradnorm import GradNormController
 from training.optim_factory import create_optimizer, create_scheduler
+from training.training_dynamics import TrainingDynamicsWriter
 from utils.device import (
     iter_device_ready_batches,
     setup_device_streams,
@@ -169,6 +170,7 @@ class EpiForecasterTrainer:
         self.model_id = model_id if model_id is not None else self._resolve_model_id()
         self.experiment_dir: Path | None = None
         self.wandb_run: wandb.sdk.wandb_run.Run | None = None
+        self.training_dynamics_writer: TrainingDynamicsWriter | None = None
 
         # Optuna pruning support
         self.trial = trial
@@ -496,6 +498,7 @@ class EpiForecasterTrainer:
         # Resume from checkpoint after all state is initialized
         if self.config.training.resume_checkpoint_path:
             self._resume_from_checkpoint()
+        self._setup_training_dynamics()
 
         self._status("=" * 60)
         self._status("EpiForecasterTrainer initialized:")
@@ -821,6 +824,7 @@ class EpiForecasterTrainer:
         )
         experiment_dir.mkdir(parents=True, exist_ok=True)
         self._persist_run_config(experiment_dir)
+        self._persist_mobility_diagnostics(experiment_dir)
 
         self.experiment_dir = experiment_dir
 
@@ -918,7 +922,7 @@ class EpiForecasterTrainer:
         profile_log_dir = self._resolve_profiler_log_dir()
         profile_log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Traces saved locally, use perf-analyze to inspect
+        # Traces remain available for low-level inspection with external viewers.
         tb_handler = tensorboard_trace_handler(str(profile_log_dir))
 
         return profile(
@@ -1011,6 +1015,9 @@ class EpiForecasterTrainer:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
         self.current_epoch = int(checkpoint.get("epoch", -1)) + 1
+        self.global_step = int(
+            checkpoint.get("global_step", getattr(self, "global_step", 0))
+        )
         current_best_selection = getattr(
             self, "best_val_selection_score", self.best_val_loss
         )
@@ -1056,8 +1063,144 @@ class EpiForecasterTrainer:
             logging.INFO,
         )
 
+    def _setup_training_dynamics(self) -> None:
+        if self.experiment_dir is None:
+            raise RuntimeError("experiment_dir not set; call setup_logging() first")
+        artifact_exists = (
+            self.experiment_dir / "training_dynamics.jsonl"
+        ).exists()
+        resume_existing = bool(
+            self.config.training.resume_checkpoint_path and artifact_exists
+        )
+        self.training_dynamics_writer = TrainingDynamicsWriter(
+            self.experiment_dir,
+            progress_log_frequency=self.config.training.progress_log_frequency,
+            grad_norm_log_frequency=self.config.training.grad_norm_log_frequency,
+            mobility_enabled=bool(self.config.model.type.mobility),
+            resume=resume_existing,
+        )
+
+    def _append_nonfinite_dynamics_record(
+        self,
+        *,
+        loss: torch.Tensor,
+        grad_norm: torch.Tensor,
+        batch_start_time: float,
+        data_time_s: float,
+        model_step_time_s: float,
+        component_gradnorm_log_data: dict[str, float],
+        gradnorm_step_log_data: dict[str, torch.Tensor],
+        gradient_snapshot_log_data: dict[str, float | int],
+        model_diagnostics_log_data: dict[str, float],
+    ) -> None:
+        """Persist the sampled observation that triggered non-finite handling."""
+        writer = self.training_dynamics_writer
+        if writer is None:
+            return
+        threshold = float(self.config.training.gradient_clip_value)
+        gradnorm_value = float(grad_norm.detach().cpu())
+        clip_factor = (
+            min(1.0, threshold / max(gradnorm_value, 1.0e-12))
+            if np.isfinite(gradnorm_value)
+            else float("nan")
+        )
+        values: dict[str, Any] = build_train_step_log_data(
+            lr=float(self.optimizer.param_groups[0]["lr"]),
+            grad_norm=grad_norm,
+            batch_time_s=time.time() - batch_start_time,
+            data_time_s=data_time_s,
+            model_step_time_s=model_step_time_s,
+            epoch=self.current_epoch,
+            component_gradnorm_log_data=component_gradnorm_log_data,
+            gradnorm_step_log_data=gradnorm_step_log_data,
+            gradient_snapshot_log_data=gradient_snapshot_log_data,
+            model_diagnostics_log_data=model_diagnostics_log_data,
+        )
+        values["loss_train_step"] = loss.detach()
+        values["train_step/sps"] = None
+        add_curriculum_metrics(
+            log_data=values,
+            curriculum_sampler=self.curriculum_sampler,
+            key_suffix="step",
+            include_synth_ratio=False,
+        )
+        normalized = {
+            key.replace("/", "_"): value
+            for key, value in values.items()
+            if key != "epoch"
+        }
+        normalized.update(
+            {
+                "gradient_clip_threshold": threshold,
+                "gradient_clip_factor": clip_factor,
+            }
+        )
+        writer.append(
+            step=self.global_step,
+            epoch=self.current_epoch,
+            values=normalized,
+        )
+
     def run(self) -> dict[str, Any]:
-        """Execute training loop."""
+        """Execute training and finalize its dynamics lifecycle."""
+        try:
+            result = self._run_training()
+        except Exception as exc:
+            status = (
+                "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
+            )
+            writer = getattr(self, "training_dynamics_writer", None)
+            if writer is not None:
+                writer.finalize(
+                    status,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    summary=EpiForecasterTrainer._training_dynamics_summary(self),
+                )
+            raise
+
+        status = (
+            "nonfinite_halt"
+            if getattr(self, "nan_loss_triggered", False)
+            else "complete"
+        )
+        writer = getattr(self, "training_dynamics_writer", None)
+        if writer is not None:
+            writer.finalize(
+                status,
+                summary=EpiForecasterTrainer._training_dynamics_summary(self),
+            )
+        return result
+
+    def _training_dynamics_summary(self) -> dict[str, Any]:
+        """Return lightweight terminal evidence without checkpoint deserialization."""
+        return {
+            "training_history": getattr(self, "training_history", {}),
+            "best_val_selection_score": getattr(
+                self,
+                "best_val_selection_score",
+                None,
+            ),
+            "best_val_selection_metric": getattr(
+                self,
+                "best_val_selection_metric",
+                None,
+            ),
+            "best_val_joint_loss": getattr(self, "best_val_joint_loss", None),
+            "best_val_series_metrics": getattr(
+                self,
+                "best_val_series_metrics",
+                {},
+            ),
+            "early_stopping_patience_counter": getattr(
+                self,
+                "patience_counter",
+                None,
+            ),
+        }
+
+    def _run_training(self) -> dict[str, Any]:
+        """Execute the model-training loop."""
         self._status(f"\n{'=' * 60}")
         self._status(f"STARTING TRAINING: {self.config.output.experiment_name}")
         self._status(f"{'=' * 60}")
@@ -1074,12 +1217,27 @@ class EpiForecasterTrainer:
         # Training loop
         # self._log_model_graph()
 
+        history_defaults = (
+            "train_loss",
+            "val_loss",
+            "val_mae",
+            "val_rmse",
+            "val_r2",
+            "learning_rate",
+            "epoch_times",
+        )
+        if not isinstance(getattr(self, "training_history", None), dict):
+            self.training_history = {}
+        for key in history_defaults:
+            self.training_history.setdefault(key, [])
+
         _prev_val_loss = float("inf")
         epochs_todo = (
             1 if self.config.training.max_batches else self.config.training.epochs
         )
         for epoch in range(self.current_epoch, epochs_todo):
             self.current_epoch = epoch
+            epoch_started_at = time.time()
 
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
@@ -1159,6 +1317,35 @@ class EpiForecasterTrainer:
                         should_stop = True
                 else:
                     self.patience_counter = 0
+
+            self.training_history["train_loss"].append(float(_train_loss))
+            self.training_history["val_loss"].append(float(val_loss))
+            self.training_history["val_mae"].append(float(val_selection_score))
+            self.training_history["val_rmse"].append(
+                (
+                    float(val_metrics["rmse"])
+                    if val_metrics.get("rmse") is not None
+                    else None
+                )
+            )
+            self.training_history["val_r2"].append(
+                (
+                    float(val_metrics["r2"])
+                    if val_metrics.get("r2") is not None
+                    else None
+                )
+            )
+            optimizer_groups = getattr(
+                getattr(self, "optimizer", None),
+                "param_groups",
+                [],
+            )
+            self.training_history["learning_rate"].append(
+                float(optimizer_groups[0]["lr"]) if optimizer_groups else None
+            )
+            self.training_history["epoch_times"].append(
+                float(time.time() - epoch_started_at)
+            )
 
             _prev_val_loss = val_loss
 
@@ -1438,6 +1625,11 @@ class EpiForecasterTrainer:
             return {}
 
         log_data = init_gradnorm_sidecar_log_data(self.device)
+        for index, task in enumerate(GradNormController.task_names):
+            log_data[f"gradnorm_w_{task}"] = self._gradnorm_cached_weights[index]
+            log_data[f"gradnorm_active_{task}"] = self._gradnorm_last_active_mask[
+                index
+            ].float()
 
         if self.global_step % self.gradnorm_controller.update_every != 0:
             return log_data
@@ -1511,6 +1703,17 @@ class EpiForecasterTrainer:
 
         self._gradnorm_cached_weights = self.gradnorm_controller.weights().detach()
         self.model.zero_grad(set_to_none=True)
+        for index, task in enumerate(GradNormController.task_names):
+            log_data[f"gradnorm_w_{task}"] = self._gradnorm_cached_weights[index]
+            log_data[f"gradnorm_active_{task}"] = obs_active_mask[index].float()
+            log_data[f"gradnorm_task_loss_{task}"] = obs_losses[index].detach()
+            log_data[f"gradnorm_task_norm_{task}"] = gradnorm_terms["grad_norms"][
+                index
+            ].detach()
+            log_data[f"gradnorm_target_norm_{task}"] = gradnorm_terms[
+                "target_grad_norms"
+            ][index].detach()
+            log_data[f"gradnorm_rate_{task}"] = gradnorm_terms["rates"][index].detach()
 
         mark_gradnorm_sidecar_complete(
             log_data,
@@ -1691,32 +1894,6 @@ class EpiForecasterTrainer:
             merged_payload = dict(payload)
         merged_payload.update(histogram_payload)
         return merged_payload
-
-    def _append_component_gradnorm_row(
-        self,
-        *,
-        step: int,
-        epoch: int,
-        grad_norm: torch.Tensor,
-        component_gradnorm_log_data: dict[str, float],
-    ) -> None:
-        if not component_gradnorm_log_data or self.experiment_dir is None:
-            return
-
-        path = self.experiment_dir / "component_gradnorm.csv"
-        row: dict[str, float | int] = {
-            "step": step,
-            "epoch": epoch,
-            "gradnorm_clipped_total": float(grad_norm.detach().cpu().item()),
-        }
-        row.update(component_gradnorm_log_data)
-
-        write_header = not path.exists()
-        with path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
 
     def _format_gradnorm_controller_status(
         self, gradnorm_step_log_data: dict[str, torch.Tensor]
@@ -1949,12 +2126,6 @@ class EpiForecasterTrainer:
                     grad_norm, component_gradnorm_log_data = (
                         self._compute_gradient_norms_and_clip(step=self.global_step)
                     )
-                    self._append_component_gradnorm_row(
-                        step=self.global_step,
-                        epoch=self.current_epoch,
-                        grad_norm=grad_norm,
-                        component_gradnorm_log_data=component_gradnorm_log_data,
-                    )
                     self._status(
                         format_component_gradnorm_status(
                             self.global_step,
@@ -1984,6 +2155,17 @@ class EpiForecasterTrainer:
                     # Detach and move to CPU before checking to avoid GPU sync stall
                     loss_cpu = loss.detach().cpu()
                     if not torch.isfinite(loss_cpu):
+                        self._append_nonfinite_dynamics_record(
+                            loss=loss,
+                            grad_norm=grad_norm,
+                            batch_start_time=batch_start_time,
+                            data_time_s=data_time_s,
+                            model_step_time_s=model_step_time_s,
+                            component_gradnorm_log_data=component_gradnorm_log_data,
+                            gradnorm_step_log_data=gradnorm_step_log_data,
+                            gradient_snapshot_log_data=gradient_snapshot_log_data,
+                            model_diagnostics_log_data=model_diagnostics_log_data,
+                        )
                         self.nan_loss_counter += 1
                         self._status(
                             "Non-finite training loss detected at "
@@ -2007,6 +2189,17 @@ class EpiForecasterTrainer:
                     # Check for non-finite grad norm on CPU (same frequency as loss check)
                     grad_norm_cpu = grad_norm.detach().cpu()
                     if not torch.isfinite(grad_norm_cpu):
+                        self._append_nonfinite_dynamics_record(
+                            loss=loss,
+                            grad_norm=grad_norm,
+                            batch_start_time=batch_start_time,
+                            data_time_s=data_time_s,
+                            model_step_time_s=model_step_time_s,
+                            component_gradnorm_log_data=component_gradnorm_log_data,
+                            gradnorm_step_log_data=gradnorm_step_log_data,
+                            gradient_snapshot_log_data=gradient_snapshot_log_data,
+                            model_diagnostics_log_data=model_diagnostics_log_data,
+                        )
                         self.nan_loss_counter += 1
                         self._status(
                             "Non-finite gradient norm detected during clipping at "
@@ -2139,13 +2332,38 @@ class EpiForecasterTrainer:
                     sps_samples_accum = 0
                     sps_time_accum = 0.0
 
-                    # Log curriculum metrics for loss-curve-critic analysis
+                    # Persist curriculum state with the canonical dynamics record.
                     add_curriculum_metrics(
                         log_data=log_data,
                         curriculum_sampler=self.curriculum_sampler,
                         key_suffix="step",
                         include_synth_ratio=False,
                     )
+                    gradient_clip_threshold = float(
+                        self.config.training.gradient_clip_value
+                    )
+                    gradnorm_total_preclip = float(grad_norm.detach().cpu().item())
+                    dynamics_values = {
+                        key.replace("/", "_"): value
+                        for key, value in log_data.items()
+                        if key != "epoch"
+                    }
+                    dynamics_values.update(
+                        {
+                            "gradient_clip_threshold": gradient_clip_threshold,
+                            "gradient_clip_factor": min(
+                                1.0,
+                                gradient_clip_threshold
+                                / max(gradnorm_total_preclip, 1.0e-12),
+                            ),
+                        }
+                    )
+                    if self.training_dynamics_writer is not None:
+                        self.training_dynamics_writer.append(
+                            step=self.global_step,
+                            epoch=self.current_epoch,
+                            values=dynamics_values,
+                        )
                 wandb_payload = self._build_wandb_payload(
                     log_this_step=log_this_step,
                     log_data=log_data,
@@ -2418,6 +2636,36 @@ class EpiForecasterTrainer:
         with open(config_path, "w") as f:
             yaml.safe_dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
+    def _persist_mobility_diagnostics(self, run_dir: Path) -> None:
+        """Persist initialization-time mobility graph statistics by split."""
+
+        def collect(dataset: Any) -> list[dict[str, Any]]:
+            datasets = (
+                list(dataset.datasets)
+                if isinstance(dataset, ConcatDataset)
+                else [dataset]
+            )
+            return [
+                diagnostics
+                for item in datasets
+                if isinstance(
+                    diagnostics := getattr(item, "mobility_diagnostics", None),
+                    dict,
+                )
+            ]
+
+        payload = {
+            "schema_version": 1,
+            "train": collect(self.train_dataset),
+            "validation": collect(self.val_dataset),
+            "test": collect(self.test_dataset),
+        }
+        diagnostics_path = run_dir / "mobility_initialization_diagnostics.json"
+        diagnostics_path.write_text(
+            json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     def _write_main_model_aggregate_csvs(
         self,
         split_name: str,
@@ -2502,6 +2750,7 @@ class EpiForecasterTrainer:
 
         checkpoint = {
             "epoch": epoch,
+            "global_step": self.global_step,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,

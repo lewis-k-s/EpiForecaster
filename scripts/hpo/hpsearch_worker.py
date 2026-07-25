@@ -46,6 +46,9 @@ from models.configs import EpiForecasterConfig
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR,
+    TRAINING_DYNAMICS_STATUS_ATTR,
     TRIAL_DIR_ATTR,
     best_model_path,
     sha256_file,
@@ -55,6 +58,7 @@ from scripts.hpo.trial_artifacts import (
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
 from scripts.hpo.worker_identity import logical_worker_id
 from training.epiforecaster_trainer import EpiForecasterTrainer
+from training.training_dynamics import load_training_dynamics_identity
 from utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -63,6 +67,26 @@ logger = logging.getLogger(__name__)
 # best endpoint trials. Keep the historical alternatives documented so this knob
 # can be widened again deliberately without spending compute by default.
 _OBSERVATION_LOSS_CHOICES = ("mae",)  # Previously explored: "mse", "rmse", "mae"
+
+
+def _record_training_dynamics_attrs(
+    trial: Any,
+    trial_dir: Path,
+) -> dict[str, Any]:
+    identity = load_training_dynamics_identity(trial_dir)
+    trial.set_user_attr(
+        TRAINING_DYNAMICS_MANIFEST_ATTR,
+        identity["manifest"],
+    )
+    trial.set_user_attr(
+        TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR,
+        identity["manifest_sha256"],
+    )
+    trial.set_user_attr(
+        TRAINING_DYNAMICS_STATUS_ATTR,
+        identity["status"],
+    )
+    return identity
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
 
 # Global flag for signal handling
@@ -448,6 +472,7 @@ def objective(
 
     try:
         results = trainer.run()
+        training_dynamics = _record_training_dynamics_attrs(trial, trial_dir)
         best_val = float(
             results.get(
                 "best_val_selection_score",
@@ -480,6 +505,7 @@ def objective(
         trial.set_user_attr(BEST_MODEL_PATH_ATTR, str(checkpoint_path))
         trial.set_user_attr(BEST_MODEL_SHA256_ATTR, checkpoint_sha256)
     except Exception as exc:
+        _record_training_dynamics_attrs(trial, trial_dir)
         # Check if this is an Optuna TrialPruned exception
         if hasattr(exc, "__class__") and exc.__class__.__name__ == "TrialPruned":
             logger.info("Trial %d pruned by Optuna", trial.number)
@@ -516,6 +542,7 @@ def objective(
                 TRIAL_DIR_ATTR: str(trial_dir),
                 BEST_MODEL_PATH_ATTR: str(checkpoint_path),
                 BEST_MODEL_SHA256_ATTR: checkpoint_sha256,
+                "training_dynamics": training_dynamics,
                 LOGICAL_WORKER_ID_ATTR: worker_id,
                 "config_effective": {
                     "output.log_dir": cfg.output.log_dir,

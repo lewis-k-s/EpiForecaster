@@ -9,6 +9,9 @@ from pathlib import Path
 TRIAL_DIR_ATTR = "trial_dir"
 BEST_MODEL_PATH_ATTR = "best_model_path"
 BEST_MODEL_SHA256_ATTR = "best_model_sha256"
+TRAINING_DYNAMICS_MANIFEST_ATTR = "training_dynamics_manifest"
+TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR = "training_dynamics_manifest_sha256"
+TRAINING_DYNAMICS_STATUS_ATTR = "training_dynamics_status"
 
 
 def trial_model_id(trial_number: int) -> str:

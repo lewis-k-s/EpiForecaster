@@ -19,6 +19,7 @@ from scripts.hpo.hpsearch_worker import (
     objective,
     suggest_epiforecaster_params,
 )
+from training.training_dynamics import TrainingDynamicsWriter
 from scripts.hpo.trial_artifacts import sha256_file
 
 
@@ -506,6 +507,18 @@ def test_objective_returns_selection_score_and_records_joint_loss(
             )
             checkpoint.parent.mkdir(parents=True)
             checkpoint.write_bytes(b"deterministic checkpoint")
+            writer = TrainingDynamicsWriter(
+                self.experiment_dir,
+                progress_log_frequency=10,
+                grad_norm_log_frequency=10,
+                mobility_enabled=True,
+            )
+            writer.append(
+                step=0,
+                epoch=0,
+                values={"loss_train_step": 1.0},
+            )
+            writer.finalize("complete")
             return {
                 "best_val_selection_score": 0.25,
                 "best_val_selection_metric": "mean_target_mae",
