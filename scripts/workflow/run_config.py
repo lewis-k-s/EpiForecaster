@@ -221,10 +221,24 @@ def stage_source_files(
     stage: str,
 ) -> list[Path]:
     """Return the complete scientific source contract for one DAG stage."""
-    del workflow_config
     if stage not in DEPENDENCY_STAGES:
         raise ValueError(f"Unknown dependency stage: {stage}")
-    return scientific_source_files(paths)
+    selected = set(scientific_source_files(paths))
+    if stage in {"crossval", "training", "evaluation"} and isinstance(
+        workflow_config.get("crossval"),
+        dict,
+    ):
+        manifest = _safe_relative_path(
+            str(workflow_config["crossval"]["split_manifest"]),
+            field="crossval.split_manifest",
+        )
+        if manifest not in paths:
+            raise FileNotFoundError(
+                "Cross-validation split manifest is absent from the source "
+                f"bundle: {manifest}"
+            )
+        selected.add(manifest)
+    return sorted(selected, key=lambda path: path.as_posix())
 
 
 def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
@@ -241,6 +255,20 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     for section in required_sections:
         if not isinstance(workflow_config.get(section), dict):
             raise ValueError(f"workflow.kind={kind!r} requires a {section} mapping")
+
+    provenance = workflow_config.get("provenance", {})
+    if not isinstance(provenance, dict):
+        raise ValueError("provenance must be a mapping when provided")
+    evidence_retention = provenance.get("training_evidence_retention", "run")
+    if evidence_retention not in {"run", "dvc"}:
+        raise ValueError(
+            "provenance.training_evidence_retention must be 'run' or 'dvc'"
+        )
+    if kind != "train" and evidence_retention == "dvc":
+        raise ValueError(
+            "DVC training-evidence retention is currently supported only for "
+            "workflow.kind='train'"
+        )
 
     if kind == "train":
         training = workflow_config["training"]
@@ -260,15 +288,35 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             )
     elif kind == "crossval":
         crossval = workflow_config["crossval"]
-        for field in ("base_config", "campaign_id", "folds", "seed"):
+        for field in (
+            "base_config",
+            "campaign_id",
+            "split_manifest",
+            "folds",
+            "model_seed",
+        ):
             if crossval.get(field) is None:
                 raise ValueError(f"crossval.{field} is required")
         campaign_id = str(crossval["campaign_id"])
         if Path(campaign_id).name != campaign_id or campaign_id in {".", ".."}:
             raise ValueError("crossval.campaign_id must be one safe path component")
+        split_manifest = Path(str(crossval["split_manifest"]))
+        if split_manifest.is_absolute() or ".." in split_manifest.parts:
+            raise ValueError("crossval.split_manifest must be a source-relative path")
+        model_seed = crossval["model_seed"]
+        if (
+            not isinstance(model_seed, int)
+            or isinstance(model_seed, bool)
+            or model_seed < 0
+        ):
+            raise ValueError("crossval.model_seed must be a non-negative integer")
         folds = crossval["folds"]
-        if not isinstance(folds, int) or isinstance(folds, bool) or not 2 <= folds <= 4:
-            raise ValueError("crossval.folds must be an integer between 2 and 4")
+        if (
+            not isinstance(folds, int)
+            or isinstance(folds, bool)
+            or not 2 <= folds <= 100
+        ):
+            raise ValueError("crossval.folds must be an integer between 2 and 100")
     return kind
 
 
@@ -301,7 +349,8 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         workload = workflow_config.get("ablation")
         workload_name = "ablation"
     elif kind == "crossval":
-        workload = {"workers": workflow_config["crossval"].get("folds")}
+        folds = workflow_config["crossval"].get("folds")
+        workload = {"workers": min(folds, 4) if isinstance(folds, int) else folds}
         workload_name = "crossval"
     else:
         workload = None
@@ -474,6 +523,8 @@ def render_config(
             "cache": str(dvc_cache),
         }
     )
+    document.setdefault("provenance", {})
+    document["provenance"].setdefault("training_evidence_retention", "run")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -541,9 +592,7 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
         ("workflow_target", workflow_target(document)),
         *[(field, allocation[field]) for field in ALLOCATION_FIELDS],
     ]
-    request = {
-        field: _dispatch_field(value, field=field) for field, value in fields
-    }
+    request = {field: _dispatch_field(value, field=field) for field, value in fields}
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(

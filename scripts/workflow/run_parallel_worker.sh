@@ -7,13 +7,14 @@ SOURCE_ROOT=""
 SIF=""
 CPUS=""
 WORKER_GROUP=""
+WORKER_OFFSET="0"
 SCIENTIFIC_COMMAND=()
 
 # Print the per-rank worker interface.
 usage() {
   cat <<EOF
 Usage: $(basename "$0") --run-root PATH --source-root PATH --sif PATH \
-  --cpus N --worker-group NAME -- COMMAND [ARG...]
+  --cpus N --worker-group NAME --worker-offset N -- COMMAND [ARG...]
 EOF
 }
 
@@ -39,6 +40,10 @@ parse_arguments() {
         ;;
       --worker-group)
         WORKER_GROUP="$2"
+        shift 2
+        ;;
+      --worker-offset)
+        WORKER_OFFSET="$2"
         shift 2
         ;;
       --)
@@ -67,6 +72,10 @@ validate_arguments() {
 
   if [[ ! "$WORKER_GROUP" =~ ^[a-z][a-z0-9_-]*$ ]]; then
     echo "Invalid worker group: $WORKER_GROUP" >&2
+    return 2
+  fi
+  if [[ ! "$WORKER_OFFSET" =~ ^[0-9]+$ ]]; then
+    echo "Worker offset must be a non-negative integer: $WORKER_OFFSET" >&2
     return 2
   fi
 }
@@ -112,6 +121,7 @@ main() {
   validate_arguments
 
   WORKER_INDEX="${SLURM_PROCID:?SLURM_PROCID is required for a parallel worker}"
+  WORKER_INDEX=$((WORKER_INDEX + WORKER_OFFSET))
   validate_worker_index
   printf -v worker_id '%03d' "$WORKER_INDEX"
   marker="$RUN_ROOT/.state/workers/$WORKER_GROUP/$worker_id.done"

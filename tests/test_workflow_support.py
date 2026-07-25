@@ -8,6 +8,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 from importlib.metadata import version
 from pathlib import Path
@@ -224,16 +225,13 @@ def _write_published_run_contract(
     dispatch = state / "dispatch.tsv"
     dispatch.write_text("schema_version\t1\n")
     dispatch_sha256 = run_support.sha256_file(dispatch)
-    (state / "dispatch.tsv.sha256").write_text(
-        f"{dispatch_sha256}  dispatch.tsv\n"
-    )
+    (state / "dispatch.tsv.sha256").write_text(f"{dispatch_sha256}  dispatch.tsv\n")
     (state / "published.done").write_text(
         "\n".join(
             [
                 "schema_version=1",
                 f"run_id={config['run']['id']}",
-                "source_snapshot_sha256="
-                f"{config['source']['source_snapshot_sha256']}",
+                f"source_snapshot_sha256={config['source']['source_snapshot_sha256']}",
                 f"config_sha256={run_support.sha256_file(config_path)}",
                 f"tooling_key={config['workflow']['tooling_key']}",
                 "",
@@ -486,6 +484,9 @@ def test_prepare_run_writes_provenance_identity(tmp_path: Path) -> None:
     assert manifest["workflow"]["version"] == version("snakemake")
     assert manifest["workflow"]["installed_location"]
     assert manifest["workflow"]["execution_mode"] == "single-node-preallocated"
+    assert manifest["workflow"]["execution_adapter"] == "batch"
+    assert manifest["workflow"]["execution_attempt_id"] is None
+    assert manifest["workflow"]["initial_coordinator_step_id"] is None
     assert manifest["dvc"]["targets"]["data/files/raw.zarr.dvc"]["role"] == (
         "materialized"
     )
@@ -623,7 +624,8 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     assert "#SBATCH --ntasks=4" in coordinator
     assert "#SBATCH --cpus-per-task=20" in coordinator
     assert "#SBATCH --gres=gpu:4" in coordinator
-    assert '--ntasks="$WORKERS"' in launcher
+    assert '--ntasks="$wave_workers"' in launcher
+    assert '--worker-offset "$worker_offset"' in launcher
     assert '--cpus-per-task="$CPUS_PER_TASK"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
@@ -1725,6 +1727,7 @@ def _make_remote_run_staging(
         "scripts/workflow/__init__.py",
         "scripts/workflow/run_config.py",
         "scripts/workflow/remote_run.sh",
+        "scripts/workflow/snakemake_coordinator.sh",
         "scripts/workflow/snakemake_coordinator.sbatch",
     ):
         destination = source_root / relative
@@ -1842,7 +1845,7 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     calls = tmp_path / "sbatch.calls"
     sbatch = fake_bin / "sbatch"
     sbatch.write_text(
-        "#!/bin/bash\nprintf '%s\\n' \"$*\" >>\"$CALLS_FILE\"\n"
+        '#!/bin/bash\nprintf \'%s\\n\' "$*" >>"$CALLS_FILE"\n'
         "printf '12345;cluster\\n'\n"
     )
     sbatch.chmod(0o755)
@@ -1881,7 +1884,125 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     assert "--mem" not in call_lines[0]
     assert "--cores" not in call_lines[0]
     assert (run_root / ".state/coordinator.job_id").read_text() == "12345\n"
-    assert (run_root.parent / "by-slurm/12345_0").resolve() == run_root
+    attempt_id = (run_root / ".state/active_execution").read_text().strip()
+    attempt_root = run_root / ".state/executions" / attempt_id
+    binding = attempt_root / "binding.tsv"
+    assert "mode\tbatch\n" in binding.read_text()
+    assert "allocation_job_id\t12345\n" in binding.read_text()
+    assert (
+        run_root.parent / "by-slurm" / "12345" / "test-run" / attempt_id
+    ).resolve() == run_root
+
+
+def test_transferred_runner_attaches_without_sbatch(
+    tmp_path: Path,
+) -> None:
+    staging, run_root = _make_remote_run_staging(tmp_path, token="attach")
+    subprocess.run(
+        [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        check=True,
+    )
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    srun_calls = tmp_path / "srun.calls"
+    forbidden_sbatch = fake_bin / "sbatch"
+    forbidden_sbatch.write_text("#!/bin/bash\nexit 99\n")
+    forbidden_sbatch.chmod(0o755)
+    scontrol = fake_bin / "scontrol"
+    scontrol.write_text(
+        "#!/bin/bash\n"
+        'printf "JobId=98765 JobState=RUNNING UserId=%s(1) Account=bsc08 '
+        "QOS=acc_interactive Partition=accinteractive NumNodes=1 NumTasks=4 "
+        "NumCPUs=80 AllocTRES=cpu=80,gres/gpu=4 "
+        'EndTime=2099-01-01T00:00:00\\n" "$USER"\n'
+    )
+    scontrol.chmod(0o755)
+    srun = fake_bin / "srun"
+    srun.write_text('#!/bin/bash\nprintf \'%s\\n\' "$*" >>"$SRUN_CALLS"\nexit 0\n')
+    srun.chmod(0o755)
+    fake_date = fake_bin / "date"
+    fake_date.write_text(
+        "#!/bin/bash\n"
+        'if [ "${1:-}" = "-d" ]; then printf "4070908800\\n"; '
+        'else exec /bin/date "$@"; fi\n'
+    )
+    fake_date.chmod(0o755)
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "SRUN_CALLS": str(srun_calls),
+    }
+    runner = run_root / "source/scripts/workflow/remote_run.sh"
+
+    result = subprocess.run(
+        [str(runner), "attach", "98765"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.startswith("attached:98765:")
+    attempt_id = result.stdout.strip().split(":", 2)[2]
+    attempt_root = run_root / ".state/executions" / attempt_id
+    for _ in range(100):
+        if (attempt_root / "completed.tsv").is_file():
+            break
+        time.sleep(0.02)
+    assert (attempt_root / "completed.tsv").is_file()
+    assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
+    assert "mode\texisting-allocation\n" in (attempt_root / "binding.tsv").read_text()
+    assert "--jobid=98765" in srun_calls.read_text()
+    assert "--external-launcher" in srun_calls.read_text()
+    assert not (tmp_path / "sbatch.calls").exists()
+    assert (
+        run_root.parent / "by-slurm" / "98765" / "test-run" / attempt_id
+    ).resolve() == run_root
+
+
+def test_external_launcher_coordinator_exports_validated_capacity(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    attempt_root = run_root / ".state/executions/attempt"
+    source_root = run_root / "source"
+    attempt_root.mkdir(parents=True)
+    source_root.mkdir()
+    (run_root / "config.yaml").write_text("{}\n")
+    capture = tmp_path / "capacity.txt"
+    snakemake = tmp_path / "snakemake"
+    snakemake.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_CPUS_PER_TASK" '
+        '>"$CAPTURE"\n'
+    )
+    snakemake.chmod(0o755)
+    coordinator = REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
+    env = os.environ | {
+        "CAPTURE": str(capture),
+        "SLURM_JOB_ID": "98765",
+        "SLURM_STEP_ID": "7",
+        "SLURM_NNODES": "1",
+        "SLURM_NTASKS": "1",
+    }
+
+    subprocess.run(
+        [
+            str(coordinator),
+            str(run_root),
+            str(snakemake),
+            "1",
+            "20",
+            "existing-allocation",
+            str(attempt_root),
+        ],
+        env=env,
+        check=True,
+    )
+
+    assert capture.read_text() == "1\t20\n"
+    assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
+    assert (attempt_root / "coordinator.step_id").read_text() == "7\n"
 
 
 @pytest.mark.parametrize("command", ["run", "dry-run"])
@@ -1945,9 +2066,7 @@ def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> N
     )
 
     assert result.returncode == 7
-    assert not (
-        scratch / "epiforecaster" / run_root.name / "local_batch_0"
-    ).exists()
+    assert not (scratch / "epiforecaster" / run_root.name / "local_batch_0").exists()
 
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
@@ -1958,6 +2077,9 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     container_exec = (REPO_ROOT / "scripts/workflow/mn5_container_exec.sh").read_text()
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
+    ).read_text()
+    shared_coordinator = (
+        REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
     ).read_text()
     launcher = (REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh").read_text()
     worker = (REPO_ROOT / "scripts/workflow/run_parallel_worker.sh").read_text()
@@ -1990,15 +2112,15 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert '--gres="$GRES"' in remote_runner
     assert '"$TASKS"' in remote_runner
     assert '"$CPUS_PER_TASK"' in remote_runner
-    assert '"$@"' not in remote_runner.split("submit_run()", 1)[1].split(
-        "show_status()", 1
-    )[0]
+    assert (
+        '"$@"'
+        not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
+    )
     assert "--mem" not in coordinator
-    squeue_state_probes = [
-        line for line in remote_runner.splitlines() if 'state="$(squeue' in line
-    ]
-    assert len(squeue_state_probes) == 3
-    assert all("head -n 1 || true" in line for line in squeue_state_probes)
+    assert "--external-launcher" in remote_runner
+    assert "attach-worker" in remote_runner
+    assert "acc_interactive" in remote_runner
+    assert "active_attempt_status" in remote_runner
     assert "--dvc-project-root" not in container_exec
     assert "--containall" in container_exec
     assert '"$DVC_REMOTE:$DVC_REMOTE:ro"' in container_exec
@@ -2014,11 +2136,14 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "trap - EXIT" in container_exec
     assert 'chmod -R u+w "$SCRATCH_ROOT"' in container_exec
     assert 'exit "$status"' in container_exec
-    assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in coordinator
+    assert 'exec "$SCRIPT_DIR/snakemake_coordinator.sh" "$@"' in coordinator
+    assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in shared_coordinator
+    assert "EPIFORECASTER_EXECUTION_MODE" in shared_coordinator
     assert "#SBATCH --ntasks=4" in coordinator
     assert "#SBATCH --cpus-per-task=20" in coordinator
     assert "#SBATCH --gres=gpu:4" in coordinator
-    assert '--ntasks="$WORKERS"' in launcher
+    assert '--ntasks="$wave_workers"' in launcher
+    assert '--worker-offset "$worker_offset"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
     assert 'WORKER_INDEX="${SLURM_PROCID:' in worker

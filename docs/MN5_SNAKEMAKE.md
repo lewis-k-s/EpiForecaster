@@ -2,9 +2,14 @@
 
 Snakemake is the production entry point for MN5 training, evaluation,
 cross-validation, HPO, ablation, and artifact promotion. Each workflow uses one
-preallocated ACC node.
-Snakemake runs as the batch process inside that allocation and launches the
-scientific work as one or more `srun` job steps.
+preallocated ACC node. Snakemake runs as an allocation-internal lightweight
+coordinator and launches scientific work as one or more `srun` job steps.
+
+The same immutable run supports two execution adapters: `run` requests a new
+batch allocation, while `run-interactive` attaches to a compatible active
+`acc_interactive` allocation through `srun --external-launcher`. Both adapters
+use the same snapshot-owned coordinator, DAG, containers, data contracts, logs,
+manifests, and scientific artifact rules.
 
 There are no nested `sbatch` submissions, no worker array, and no separate GPP
 coordinator allocation.
@@ -68,7 +73,8 @@ Durable state lives under project GPFS:
     runs/
       .reservations/<run-id>/       # permanent no-reuse receipt
       .staging-<run-id>.<token>/    # unpublished transfer location
-      by-slurm/<job-id>_0          # allocation lookup
+      by-slurm/<allocation-id>/<run-id>/<attempt-id>
+                                      # one-to-many allocation lookup
       <run-id>/
         config.yaml                # immutable rendered config
         .state/dispatch.tsv        # immutable submission bindings
@@ -167,13 +173,14 @@ for the Optuna journal, logs, checkpoints, outputs, and promotion records.
 
 ## Remote endpoints and queue visibility
 
-The transfer and compute aliases do not expose the same Slurm controller:
+Endpoint behavior is defined by the shared `mn5-cluster-usage` skill:
 
 - `dt` reaches the `bsc_transfer` controller. Use it for source/data transfer
   and for inspecting files already present on project GPFS.
-- `mn5`, `wifi`, and `wifi-acc` reach the `marenostrum5` compute scheduler.
-  Use these endpoints for `sbatch`, `squeue`, `sacct`, `scontrol show job`, and
-  `scancel`; `wifi-acc` is the VPN-only ACC endpoint.
+- `mn5` reaches the authoritative `marenostrum5` compute scheduler. Use it for
+  `sbatch`, `salloc`, `srun`, `squeue`, `sacct`, `scontrol`, and `scancel`.
+- `wifi` and `wifi-acc` are network-enabled dependency-preparation endpoints.
+  Do not submit batch or interactive work from them.
 
 Consequently, an empty `squeue` or `Invalid job id` on `dt` says nothing about
 an MN5 compute job. Shared visibility of GPFS logs does not imply shared Slurm
@@ -181,11 +188,11 @@ job visibility. Verify the endpoint when diagnosing this ambiguity:
 
 ```bash
 ssh dt "scontrol show config | grep -E '^ClusterName|^SlurmctldHost'"
-ssh wifi-acc "scontrol show config | grep -E '^ClusterName|^SlurmctldHost'"
+ssh mn5 "scontrol show config | grep -E '^ClusterName|^SlurmctldHost'"
 ```
 
-Monitor ACC scheduler state on `wifi-acc` (or another available MN5 compute
-login) and use `dt` only for filesystem evidence such as logs and markers.
+Monitor scheduler state on `mn5` and use `dt` only for filesystem evidence such
+as logs and markers.
 
 ## Prepare and submit
 
@@ -197,6 +204,18 @@ bash scripts/workflow/mn5_workflow.sh dry-run <run-id>
 bash scripts/workflow/mn5_workflow.sh run <run-id>
 bash scripts/workflow/mn5_workflow.sh status <run-id>
 ```
+
+To execute that same immutable run inside an existing allocation:
+
+```bash
+bash scripts/workflow/mn5_workflow.sh run-interactive \
+  <run-id> <allocation-job-id>
+```
+
+Omit the allocation ID only when exactly one compatible running
+`acc_interactive` allocation exists. The adapter verifies ownership, account,
+partition, QoS, nodes, tasks, CPUs, GPUs, and remaining wall time. It never
+calls `sbatch`.
 
 The selected public target is immutable after preparation. Choose `train` or
 `train_evaluate` in the template's `workflow.target` before `prepare`; `run`
@@ -220,12 +239,19 @@ For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set
 complete config with `--config`. Preparation fails before transfer if the field
 is unset or relative.
 
-The snapshot-owned `remote_run.sh` reads submission fields from the immutable
-dispatch record and passes them to `sbatch`, overriding the script defaults. A
-launch lock, recorded job ID, and coordinator lifetime lock prevent duplicate
-submissions. Dry-run, status, and unlock likewise use the runner contained in
-the prepared source rather than code streamed from a caller's current checkout.
-Runs without the current dispatch record and transferred runner are rejected.
+The snapshot-owned `remote_run.sh` reads resource fields from the immutable
+dispatch record. The batch adapter passes them to `sbatch`; the interactive
+adapter validates them against the existing allocation. A launch lock and
+coordinator lifetime lock prevent duplicate execution.
+
+Every attempt records its mode, allocation, observed resources, coordinator
+step, timestamps, logs, and exit status under
+`.state/executions/<attempt-id>/`. Status and unlock use the coordinator step
+or completion receipt for an interactive attempt; the parent allocation
+remaining `RUNNING` does not make a completed workflow appear active.
+MN5 `sacct` may display the external-launcher step with the allocation's full
+TRES and elapsed lifetime. Use its sibling scientific steps and the run-local
+execution receipts for workload accounting and completion.
 
 If the allocation terminates before completion, inspect `status`, unlock stale
 Snakemake state, and submit the same immutable run again:

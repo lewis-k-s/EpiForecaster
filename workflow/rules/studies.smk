@@ -146,7 +146,7 @@ elif WORKFLOW_KIND == "crossval":
             ),
             complete=str(CROSSVAL_TRAINING_COMPLETE),
         threads:
-            STUDY_WORKERS * CPUS_PER_TASK
+            TASKS * CPUS_PER_TASK
         log:
             str(RUN_ROOT / "logs/crossval-training-workers.log")
         params:
@@ -174,7 +174,7 @@ elif WORKFLOW_KIND == "crossval":
             ),
             complete=str(WORKERS_COMPLETE),
         threads:
-            STUDY_WORKERS * CPUS_PER_TASK
+            TASKS * CPUS_PER_TASK
         log:
             str(RUN_ROOT / "logs/crossval-evaluation-workers.log")
         params:

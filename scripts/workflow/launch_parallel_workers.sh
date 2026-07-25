@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-# One homogeneous srun step launches every independent workflow rank together.
+# Independent ranks run in deterministic waves over the allocated GPUs.
 RUN_ROOT=""
 SOURCE_ROOT=""
 SIF=""
@@ -72,8 +72,8 @@ validate_arguments() {
     return 2
   fi
 
-  if ! [[ "$WORKERS" =~ ^[1-4]$ ]] || [ "$CPUS_PER_TASK" != "20" ]; then
-    echo "MN5 parallel workflows require 1-4 workers with 20 CPUs each" >&2
+  if ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || [ "$CPUS_PER_TASK" != "20" ]; then
+    echo "MN5 parallel workflows require positive workers with 20 CPUs each" >&2
     return 2
   fi
 
@@ -83,15 +83,15 @@ validate_arguments() {
   fi
 }
 
-# Confirm that the containing allocation matches the homogeneous worker step.
+# Confirm that the containing allocation can host one 1-4 GPU worker wave.
 validate_allocation() {
   if [ "${SLURM_JOB_NUM_NODES:-}" != "1" ]; then
     echo "Expected one allocated ACC node, got ${SLURM_JOB_NUM_NODES:-unset}" >&2
     return 1
   fi
 
-  if [ "${SLURM_NTASKS:-}" != "$WORKERS" ]; then
-    echo "Expected SLURM_NTASKS=$WORKERS, got ${SLURM_NTASKS:-unset}" >&2
+  if ! [[ "${SLURM_NTASKS:-}" =~ ^[1-4]$ ]]; then
+    echo "Expected SLURM_NTASKS in [1,4], got ${SLURM_NTASKS:-unset}" >&2
     return 1
   fi
 
@@ -119,7 +119,7 @@ verify_worker_markers() {
 
 # Launch one gang-scheduled worker step and validate all rank receipts.
 main() {
-  local worker_script marker_root
+  local worker_script marker_root worker_offset remaining wave_workers
 
   parse_arguments "$@"
   validate_arguments
@@ -130,24 +130,36 @@ main() {
   test -x "$worker_script"
   mkdir -p "$RUN_ROOT/logs" "$marker_root"
 
-  srun \
-    --nodes=1 \
-    --ntasks="$WORKERS" \
-    --ntasks-per-node="$WORKERS" \
-    --cpus-per-task="$CPUS_PER_TASK" \
-    --gpus-per-task=1 \
-    --exact \
-    --kill-on-bad-exit=1 \
-    --open-mode=append \
-    --output="$RUN_ROOT/logs/$WORKER_GROUP-worker-%t.log" \
-    --error="$RUN_ROOT/logs/$WORKER_GROUP-worker-%t.log" \
-    "$worker_script" \
-    --run-root "$RUN_ROOT" \
-    --source-root "$SOURCE_ROOT" \
-    --sif "$SIF" \
-    --cpus "$CPUS_PER_TASK" \
-    --worker-group "$WORKER_GROUP" \
-    -- "${SCIENTIFIC_COMMAND[@]}"
+  worker_offset=0
+  while [ "$worker_offset" -lt "$WORKERS" ]; do
+    remaining=$((WORKERS - worker_offset))
+    wave_workers="${SLURM_NTASKS}"
+    if [ "$remaining" -lt "$wave_workers" ]; then
+      wave_workers="$remaining"
+    fi
+
+    srun \
+      --nodes=1 \
+      --ntasks="$wave_workers" \
+      --ntasks-per-node="$wave_workers" \
+      --cpus-per-task="$CPUS_PER_TASK" \
+      --gpus-per-task=1 \
+      --exact \
+      --kill-on-bad-exit=1 \
+      --open-mode=append \
+      --output="$RUN_ROOT/logs/$WORKER_GROUP-wave-$worker_offset-worker-%t.log" \
+      --error="$RUN_ROOT/logs/$WORKER_GROUP-wave-$worker_offset-worker-%t.log" \
+      "$worker_script" \
+      --run-root "$RUN_ROOT" \
+      --source-root "$SOURCE_ROOT" \
+      --sif "$SIF" \
+      --cpus "$CPUS_PER_TASK" \
+      --worker-group "$WORKER_GROUP" \
+      --worker-offset "$worker_offset" \
+      -- "${SCIENTIFIC_COMMAND[@]}"
+
+    worker_offset=$((worker_offset + wave_workers))
+  done
 
   verify_worker_markers "$marker_root"
 }

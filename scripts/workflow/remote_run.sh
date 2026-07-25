@@ -40,7 +40,7 @@ RUNTIME=""
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") publish|dry-run|submit|status|unlock
+Usage: $(basename "$0") publish|dry-run|submit|attach [allocation-job-id]|status|unlock
 
 The runner discovers config.yaml and .state/dispatch.tsv relative to its own
 immutable source snapshot. It accepts no config-derived command-line values.
@@ -334,9 +334,151 @@ dry_run() {
   run_snakemake --dry-run
 }
 
+binding_value() {
+  local binding="$1"
+  local key="$2"
+
+  awk -F '\t' -v key="$key" '$1 == key { print $2; exit }' "$binding"
+}
+
+job_field() {
+  local record="$1"
+  local key="$2"
+  local token
+
+  for token in $record; do
+    case "$token" in
+      "$key="*)
+        printf '%s' "${token#*=}"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+new_attempt() {
+  local mode="$1"
+  local attempt_id attempt_root
+
+  attempt_id="$(date -u +%Y%m%dT%H%M%SZ)-$mode-$$-$RANDOM"
+  attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
+  mkdir -p "$attempt_root"
+  printf '%s' "$attempt_id"
+}
+
+activate_attempt() {
+  local attempt_id="$1"
+  local temporary="$RUN_ROOT/.state/active_execution.$$"
+
+  printf '%s\n' "$attempt_id" >"$temporary"
+  mv "$temporary" "$RUN_ROOT/.state/active_execution"
+}
+
+write_attempt_binding() {
+  local attempt_id="$1"
+  local mode="$2"
+  local allocation_job_id="$3"
+  shift 3
+  local attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
+  local temporary="$attempt_root/binding.tsv.$$"
+
+  printf '%s\n' \
+    $'schema_version\t1' \
+    "attempt_id"$'\t'"$attempt_id" \
+    "mode"$'\t'"$mode" \
+    "allocation_job_id"$'\t'"$allocation_job_id" \
+    "requested_nodes"$'\t'"$NODES" \
+    "requested_tasks"$'\t'"$TASKS" \
+    "requested_cpus_per_task"$'\t'"$CPUS_PER_TASK" \
+    "requested_gres"$'\t'"$GRES" \
+    "requested_runtime_minutes"$'\t'"$RUNTIME" \
+    "created_at"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$@" >"$temporary"
+  mv "$temporary" "$attempt_root/binding.tsv"
+}
+
+record_launcher_completion() {
+  local attempt_root="$1"
+  local status="$2"
+  local receipt="$attempt_root/completed.tsv"
+  local temporary="$receipt.$$"
+
+  if [ -f "$receipt" ]; then
+    return 0
+  fi
+  printf '%s\n' \
+    $'schema_version\t1' \
+    "exit_code"$'\t'"$status" \
+    "completed_at"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >"$temporary"
+  mv "$temporary" "$receipt"
+}
+
+# Print one compact active response, or nothing when the latest attempt ended.
+active_attempt_status() {
+  local attempt_id attempt_root binding mode job_id step_id state launcher_pid
+
+  if [ ! -s "$RUN_ROOT/.state/active_execution" ]; then
+    return 0
+  fi
+  attempt_id="$(cat "$RUN_ROOT/.state/active_execution")"
+  if [[ ! "$attempt_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "Invalid active execution attempt ID: $attempt_id" >&2
+    return 1
+  fi
+  attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
+  binding="$attempt_root/binding.tsv"
+  if [ ! -f "$binding" ] || [ -f "$attempt_root/completed.tsv" ]; then
+    return 0
+  fi
+
+  mode="$(binding_value "$binding" mode)"
+  job_id="$(binding_value "$binding" allocation_job_id)"
+  if [ "$mode" = "batch" ]; then
+    state="$(squeue -h -j "$job_id" -o '%T' 2>/dev/null | head -n 1 || true)"
+    if [ -n "$state" ]; then
+      printf 'active:%s:%s' "$job_id" "$state"
+    fi
+    return 0
+  fi
+
+  if [ "$mode" != "existing-allocation" ]; then
+    echo "Unknown execution attempt mode: $mode" >&2
+    return 1
+  fi
+  if [ -s "$attempt_root/coordinator.step_id" ]; then
+    step_id="$(cat "$attempt_root/coordinator.step_id")"
+    state="$(
+      squeue -h --steps -j "$job_id" -o '%i' 2>/dev/null \
+        | awk -v id="$job_id.$step_id" '$1 == id { print "RUNNING"; exit }'
+    )"
+    if [ -n "$state" ]; then
+      printf 'active:%s:%s' "$job_id" "$state"
+      return 0
+    fi
+  fi
+  if [ -s "$attempt_root/launcher.pid" ]; then
+    launcher_pid="$(cat "$attempt_root/launcher.pid")"
+    if [[ "$launcher_pid" =~ ^[1-9][0-9]*$ ]] \
+      && kill -0 "$launcher_pid" 2>/dev/null; then
+      printf 'active:%s:LAUNCHING' "$job_id"
+    fi
+  fi
+}
+
+link_attempt_to_allocation() {
+  local job_id="$1"
+  local attempt_id="$2"
+  local lookup="$RUN_PARENT/by-slurm/$job_id/$RUN_ID"
+
+  mkdir -p "$lookup"
+  ln -s "$RUN_ROOT" "$lookup/$attempt_id"
+}
+
 # Submit at most one active coordinator using only the sealed dispatch request.
 submit_run() {
-  local coordinator previous state job_id result
+  local coordinator active job_id result attempt_id attempt_root
 
   require_published_run
   coordinator="$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sbatch"
@@ -350,17 +492,14 @@ submit_run() {
     return 0
   fi
 
-  if [ -s "$RUN_ROOT/.state/coordinator.job_id" ]; then
-    previous="$(cat "$RUN_ROOT/.state/coordinator.job_id")"
-    state="$(squeue -h -j "$previous" -o '%T' 2>/dev/null | head -n 1 || true)"
-    case "$state" in
-      PENDING | RUNNING | CONFIGURING | COMPLETING)
-        printf 'active:%s:%s' "$previous" "$state"
-        return 0
-        ;;
-    esac
+  active="$(active_attempt_status)"
+  if [ -n "$active" ]; then
+    printf '%s' "$active"
+    return 0
   fi
 
+  attempt_id="$(new_attempt batch)"
+  attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
   job_id="$(
     sbatch --parsable \
       --chdir="$RUN_ROOT" \
@@ -380,35 +519,198 @@ submit_run() {
       "$RUN_ROOT" \
       "$SNAKEMAKE_BIN" \
       "$TASKS" \
-      "$CPUS_PER_TASK"
+      "$CPUS_PER_TASK" \
+      batch \
+      "$attempt_root"
   )"
   job_id="${job_id%%;*}"
 
+  write_attempt_binding "$attempt_id" batch "$job_id"
+  activate_attempt "$attempt_id"
   printf '%s\n' "$job_id" >"$RUN_ROOT/.state/coordinator.job_id"
-  mkdir -p "$RUN_PARENT/by-slurm"
-  ln -s "$RUN_ROOT" "$RUN_PARENT/by-slurm/${job_id}_0"
+  link_attempt_to_allocation "$job_id" "$attempt_id"
   result="submitted:$job_id"
   printf '%s' "$result"
 }
 
-show_status() {
-  local job_id="" state
+discover_interactive_allocation() {
+  local -a candidates
 
-  require_published_location
-  if [ -f "$RUN_ROOT/.state/coordinator.job_id" ]; then
-    job_id="$(cat "$RUN_ROOT/.state/coordinator.job_id")"
+  mapfile -t candidates < <(
+    squeue -h -u "$USER" -t RUNNING -o '%i|%q' \
+      | awk -F '|' '$2 == "acc_interactive" { print $1 }'
+  )
+  if [ "${#candidates[@]}" -ne 1 ]; then
+    echo "Expected exactly one running acc_interactive allocation, found ${#candidates[@]}" >&2
+    return 1
+  fi
+  printf '%s' "${candidates[0]}"
+}
+
+validate_interactive_allocation() {
+  local job_id="$1"
+  local record state user_id account qos partition nodes tasks cpus alloc_tres
+  local gpu_count required_cpus end_time end_epoch now_epoch remaining_seconds
+
+  record="$(scontrol show job -o "$job_id")"
+  state="$(job_field "$record" JobState)"
+  user_id="$(job_field "$record" UserId)"
+  account="$(job_field "$record" Account)"
+  qos="$(job_field "$record" QOS)"
+  partition="$(job_field "$record" Partition)"
+  nodes="$(job_field "$record" NumNodes)"
+  tasks="$(job_field "$record" NumTasks)"
+  cpus="$(job_field "$record" NumCPUs)"
+  alloc_tres="$(job_field "$record" AllocTRES)"
+  end_time="$(job_field "$record" EndTime)"
+
+  user_id="${user_id%%(*}"
+  if [ "$state" != "RUNNING" ] \
+    || [ "$user_id" != "$USER" ] \
+    || [ "$account" != "$ACCOUNT" ] \
+    || [ "$qos" != "acc_interactive" ] \
+    || [[ "$partition" != acc* ]]; then
+    echo "Allocation $job_id is not a compatible running ACC interactive allocation" >&2
+    return 1
+  fi
+  if ! [[ "$nodes" =~ ^[1-9][0-9]*$ && "$tasks" =~ ^[1-9][0-9]*$ && "$cpus" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Allocation $job_id has malformed topology" >&2
+    return 1
+  fi
+  required_cpus=$((TASKS * CPUS_PER_TASK))
+  if [ "$nodes" -lt "$NODES" ] || [ "$tasks" -lt "$TASKS" ] || [ "$cpus" -lt "$required_cpus" ]; then
+    echo "Allocation $job_id cannot satisfy $NODES node, $TASKS task, $required_cpus CPU request" >&2
+    return 1
+  fi
+  gpu_count=0
+  if [[ "$alloc_tres" =~ gres/gpu=([0-9]+) ]]; then
+    gpu_count="${BASH_REMATCH[1]}"
+  fi
+  if [ "$gpu_count" -lt "$TASKS" ]; then
+    echo "Allocation $job_id has $gpu_count GPUs, expected at least $TASKS" >&2
+    return 1
   fi
 
-  if [ -n "$job_id" ]; then
-    state="$(squeue -h -j "$job_id" -o '%T' 2>/dev/null | head -n 1 || true)"
-    if [ -n "$state" ]; then
-      echo "coordinator=$state job_id=$job_id execution_id=${job_id}_0"
+  end_epoch="$(date -d "$end_time" +%s)"
+  now_epoch="$(date -u +%s)"
+  remaining_seconds=$((end_epoch - now_epoch))
+  if [ "$remaining_seconds" -lt $((RUNTIME * 60)) ]; then
+    echo "Allocation $job_id has insufficient remaining wall time for $RUNTIME minutes" >&2
+    return 1
+  fi
+
+  printf '%s\n' \
+    "observed_partition"$'\t'"$partition" \
+    "observed_qos"$'\t'"$qos" \
+    "observed_nodes"$'\t'"$nodes" \
+    "observed_tasks"$'\t'"$tasks" \
+    "observed_cpus"$'\t'"$cpus" \
+    "observed_gpus"$'\t'"$gpu_count" \
+    "observed_end_time"$'\t'"$end_time"
+}
+
+attach_worker() {
+  local job_id="$1"
+  local attempt_id="$2"
+  local attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
+  local coordinator="$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
+  local status
+
+  require_published_run
+  test -x "$coordinator"
+  test -f "$attempt_root/binding.tsv"
+
+  set +e
+  srun \
+    --jobid="$job_id" \
+    --external-launcher \
+    --open-mode=append \
+    --output="$attempt_root/coordinator.out" \
+    --error="$attempt_root/coordinator.err" \
+    "$coordinator" \
+    "$RUN_ROOT" \
+    "$SNAKEMAKE_BIN" \
+    "$TASKS" \
+    "$CPUS_PER_TASK" \
+    existing-allocation \
+    "$attempt_root"
+  status=$?
+  set -e
+  record_launcher_completion "$attempt_root" "$status"
+  return "$status"
+}
+
+attach_run() {
+  local job_id="${1:-}"
+  local active compatibility attempt_id attempt_root launcher_pid
+
+  require_published_run
+  exec 9>"$RUN_ROOT/.state/coordinator.launch.lock"
+  flock 9
+
+  if [ -f "$RUN_ROOT/.state/workflow.done" ]; then
+    printf complete
+    return 0
+  fi
+  active="$(active_attempt_status)"
+  if [ -n "$active" ]; then
+    printf '%s' "$active"
+    return 0
+  fi
+  if [ -z "$job_id" ]; then
+    job_id="$(discover_interactive_allocation)"
+  fi
+  if ! [[ "$job_id" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Invalid interactive allocation job ID: $job_id" >&2
+    return 2
+  fi
+  compatibility="$(validate_interactive_allocation "$job_id")"
+
+  attempt_id="$(new_attempt existing-allocation)"
+  attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
+  write_attempt_binding \
+    "$attempt_id" \
+    existing-allocation \
+    "$job_id" \
+    "$compatibility"
+  activate_attempt "$attempt_id"
+  link_attempt_to_allocation "$job_id" "$attempt_id"
+
+  nohup "$SCRIPT_PATH" attach-worker "$job_id" "$attempt_id" \
+    >"$attempt_root/launcher.out" \
+    2>"$attempt_root/launcher.err" \
+    </dev/null 9>&- &
+  launcher_pid=$!
+  printf '%s\n' "$launcher_pid" >"$attempt_root/launcher.pid"
+  printf 'attached:%s:%s' "$job_id" "$attempt_id"
+}
+
+show_status() {
+  local attempt_id="" attempt_root="" binding="" mode="" job_id="" active=""
+  local exit_code="" step_id=""
+
+  require_published_location
+  if [ -s "$RUN_ROOT/.state/active_execution" ]; then
+    attempt_id="$(cat "$RUN_ROOT/.state/active_execution")"
+    attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
+    binding="$attempt_root/binding.tsv"
+  fi
+
+  if [ -f "$binding" ]; then
+    mode="$(binding_value "$binding" mode)"
+    job_id="$(binding_value "$binding" allocation_job_id)"
+    active="$(active_attempt_status)"
+    if [ -n "$active" ]; then
+      echo "coordinator=${active##*:} allocation_job_id=$job_id mode=$mode attempt_id=$attempt_id"
+    elif [ -f "$attempt_root/completed.tsv" ]; then
+      exit_code="$(binding_value "$attempt_root/completed.tsv" exit_code)"
+      step_id="$(cat "$attempt_root/coordinator.step_id" 2>/dev/null || true)"
+      echo "coordinator=terminal exit_code=$exit_code allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
     else
-      sacct -n -X -j "$job_id" \
-        --format=JobIDRaw,State,ExitCode 2>/dev/null | head -n 1 || true
+      echo "coordinator=not-active allocation_job_id=$job_id mode=$mode attempt_id=$attempt_id"
     fi
   else
-    echo coordinator=not-submitted
+    echo coordinator=not-started
   fi
 
   if [ -f "$RUN_ROOT/.state/workflow.done" ]; then
@@ -417,23 +719,25 @@ show_status() {
     echo workflow=incomplete
   fi
 
-  if [ -n "$job_id" ]; then
+  if [ -n "$attempt_root" ]; then
+    tail -n 40 "$attempt_root/coordinator.out" 2>/dev/null || true
+    tail -n 40 "$attempt_root/coordinator.err" 2>/dev/null || true
+    tail -n 40 "$attempt_root/launcher.err" 2>/dev/null || true
+  fi
+  if [ "$mode" = "batch" ] && [ -n "$job_id" ]; then
     tail -n 40 "$RUN_ROOT/logs/snakemake-$job_id.out" 2>/dev/null || true
     tail -n 40 "$RUN_ROOT/logs/snakemake-$job_id.err" 2>/dev/null || true
   fi
 }
 
 unlock_run() {
-  local job_id state
+  local active
 
   require_published_run
-  if [ -s "$RUN_ROOT/.state/coordinator.job_id" ]; then
-    job_id="$(cat "$RUN_ROOT/.state/coordinator.job_id")"
-    state="$(squeue -h -j "$job_id" -o '%T' 2>/dev/null | head -n 1 || true)"
-    if [ -n "$state" ]; then
-      echo "Coordinator job $job_id is still $state" >&2
-      return 1
-    fi
+  active="$(active_attempt_status)"
+  if [ -n "$active" ]; then
+    echo "Coordinator is still active: $active" >&2
+    return 1
   fi
   run_snakemake --unlock
 }
@@ -441,7 +745,10 @@ unlock_run() {
 main() {
   local command="${1:-}"
 
-  if [ "$#" -ne 1 ]; then
+  if [ "$#" -gt 0 ]; then
+    shift
+  fi
+  if [ -z "$command" ]; then
     usage >&2
     return 2
   fi
@@ -449,11 +756,34 @@ main() {
   load_dispatch_request
   validate_dispatch_request
   case "$command" in
-    publish) publish_bundle ;;
-    dry-run) dry_run ;;
-    submit) submit_run ;;
-    status) show_status ;;
-    unlock) unlock_run ;;
+    publish)
+      [ "$#" -eq 0 ] || return 2
+      publish_bundle
+      ;;
+    dry-run)
+      [ "$#" -eq 0 ] || return 2
+      dry_run
+      ;;
+    submit)
+      [ "$#" -eq 0 ] || return 2
+      submit_run
+      ;;
+    attach)
+      [ "$#" -le 1 ] || return 2
+      attach_run "${1:-}"
+      ;;
+    attach-worker)
+      [ "$#" -eq 2 ] || return 2
+      attach_worker "$1" "$2"
+      ;;
+    status)
+      [ "$#" -eq 0 ] || return 2
+      show_status
+      ;;
+    unlock)
+      [ "$#" -eq 0 ] || return 2
+      unlock_run
+      ;;
     *)
       usage >&2
       return 2

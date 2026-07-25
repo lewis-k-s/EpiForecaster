@@ -18,7 +18,10 @@ flowchart LR
     WT["Local worktree"] -->|"snapshot, hash, transfer"| SRC["Immutable run source"]
     LOCK["Pinned base and uv.lock"] --> SIF["Immutable runtime SIF"]
     DVC["DVC remote and cache"] --> DATA["Run workspace and rank scratch"]
-    ALLOC["Homogeneous ACC allocation: N GPUs, N tasks, 20N CPUs"] --> SMK["Snakemake batch process"]
+    ADAPTER{"Execution adapter"} -->|"batch"| ALLOC["New homogeneous ACC allocation"]
+    ADAPTER -->|"existing allocation"| IALLOC["Compatible interactive ACC allocation"]
+    ALLOC --> SMK["Allocation-internal Snakemake coordinator"]
+    IALLOC --> SMK
     SMK --> STEP["Training or N-rank study srun"]
     STEP --> SELECT["Selection or reduction"]
     SELECT --> EVAL["Evaluation srun when required"]
@@ -26,12 +29,15 @@ flowchart LR
     SRC --> STEP
     SIF --> STEP
     DATA --> STEP
+    SRC --> ADAPTER
 ```
 
 The reusable scheduling unit is one homogeneous Slurm allocation on MN5's ACC
-partition. Snakemake remains the lightweight batch process inside that
-allocation and launches scientific work as Slurm job steps. Rank count is the
-concurrency parameter: each scientific rank receives one GPU and 20 CPUs.
+partition. A batch adapter may request a new allocation, or an interactive
+adapter may attach the same immutable run to a compatible active allocation.
+Snakemake remains the lightweight allocation-internal coordinator and launches
+scientific work as Slurm job steps. Rank count is the concurrency parameter:
+each scientific rank receives one GPU and 20 CPUs.
 
 A single training run uses one rank. Optuna-managed HPO and ablation studies
 use multiple independent ranks. Those ranks coordinate through an Optuna
@@ -44,7 +50,7 @@ cleanup artifacts.
 
 The same journal-coordinated pattern can span nodes, but the practical default
 is a single node. Rank count must therefore normally fit the GPUs available on
-one node. The Snakemake batch process has small control-plane CPU overhead and
+one node. The Snakemake coordinator has small control-plane CPU overhead and
 shares the allocation with the scientific ranks; it does not receive a GPU.
 
 ## Runtime image
@@ -125,16 +131,17 @@ Project GPFS is visible through the transfer service, but Slurm state is not
 globally visible across every SSH alias. `dt` is attached to the
 `bsc_transfer` Slurm controller; its `squeue`, `sacct`, and `scontrol show job`
 results cover transfer-cluster jobs only. MN5 compute jobs are owned by the
-`marenostrum5` controller reached through compute login aliases such as `mn5`,
-`wifi`, and `wifi-acc`.
+`marenostrum5` controller reached through a normal compute login such as `mn5`.
+The network-enabled `wifi` and `wifi-acc` aliases are dependency-preparation
+endpoints, not submission endpoints.
 
 This creates an important operational split:
 
 | Operation | Endpoint |
 | --- | --- |
 | Transfer source/data; inspect GPFS logs and artifacts | `dt` |
-| Submit, query, account, or cancel GPP compute work | `mn5` or `wifi` |
-| Fetch network dependencies and submit/query ACC work | `wifi-acc` |
+| Submit, query, account, cancel, allocate, or launch compute work | `mn5` |
+| Fetch network dependencies for GPP or ACC environments | `wifi` or `wifi-acc` |
 
 An empty `squeue`, empty `sacct`, or `Invalid job id` on `dt` must never be
 interpreted as evidence that an MN5 compute job is gone. Check the scheduler on
@@ -185,16 +192,18 @@ are separate training parameters and are not part of this allocation topology.
 
 Explicit host-memory directives are rejected. Preparation renders an immutable
 TSV dispatch record from this config. The snapshot-owned remote runner reads
-that record and issues one matching `sbatch`; no configuration values or target
-overrides are supplied at submission time. Multi-rank HPO and ablation
-launchers issue one `srun` whose task count matches the configured rank count,
-with one GPU per task. Selection, evaluation, promotion, cleanup, and ablation
-reduction remain dependent Snakemake stages inside that same allocation.
+that record and either issues one matching `sbatch` or validates a named
+existing allocation before attaching. No configuration values or target
+overrides are supplied at execution time. Multi-rank HPO and ablation launchers
+issue one `srun` whose task count matches the configured rank count, with one
+GPU per task. Selection, evaluation, promotion, cleanup, and ablation reduction
+remain dependent Snakemake stages inside that same allocation.
 
-The Snakemake manager is the batch process and has no separately reserved task
-or GPU. It remains resident while the scientific step consumes the requested
-task resources. Its small CPU overhead is accepted because these workflows are
-normally GPU-bound.
+The Snakemake manager is either the batch shell or an `--external-launcher`
+step and has no separately reserved scientific task or GPU. Scientific rules
+own explicit sibling `srun` steps. Execution attempts are recorded per run so
+one interactive allocation can be associated with multiple immutable runs
+without conflating their coordinator lifecycles.
 
 These relationships are an allocation contract, not a requirement for a
 general topology-validation subsystem. Implementations may validate obvious

@@ -44,6 +44,7 @@ Usage:
   $(basename "$0") prepare [run-id] [--config TEMPLATE]
   $(basename "$0") dry-run <run-id>
   $(basename "$0") run <run-id>
+  $(basename "$0") run-interactive <run-id> [allocation-job-id]
   $(basename "$0") status <run-id>
   $(basename "$0") unlock <run-id>
   $(basename "$0") path <run-id>
@@ -52,6 +53,7 @@ prepare snapshots this worktree into an atomically reserved project-GPFS run.
 The default template is workflow/config/mn5_train.yaml; use --config to select
 evaluation, cross-validation, HPO, or ablation.
 run submits the one-node ACC allocation declared by that immutable config.
+run-interactive attaches the same run to one compatible active allocation.
 EOF
 }
 
@@ -304,9 +306,10 @@ sync_run_bundle() {
 invoke_run_runner() {
   local bundle_root="$1"
   local command="$2"
+  shift 2
   local runner="$bundle_root/source/scripts/workflow/remote_run.sh"
 
-  remote_exec "$runner" "$command"
+  remote_exec "$runner" "$command" "$@"
 }
 
 # Assemble and publish one complete immutable run. Any failure after reservation
@@ -376,11 +379,12 @@ prepare_run() {
 operate_run() {
   local run_id="$1"
   local command="$2"
+  shift 2
   local root
 
   validate_run_id "$run_id"
   root="$(run_root "$run_id")"
-  invoke_run_runner "$root" "$command"
+  invoke_run_runner "$root" "$command" "$@"
 }
 
 # Ask Snakemake to construct the sealed run DAG without executing it.
@@ -401,6 +405,11 @@ report_coordinator_launch() {
       result="${result#active:}"
       echo "Snakemake coordinator is already active: ${result%%:*} (${result#*:})"
       ;;
+    attached:*)
+      result="${result#attached:}"
+      echo "Attached Snakemake coordinator to allocation ${result%%:*}"
+      echo "Execution attempt: ${result#*:}"
+      ;;
     complete)
       echo "Workflow is already complete: $run_id"
       ;;
@@ -419,6 +428,24 @@ start_run() {
   validate_run_id "$run_id"
   root="$(run_root "$run_id")"
   result="$(operate_run "$run_id" submit)"
+
+  report_coordinator_launch "$result" "$run_id"
+  echo "Run root: $root"
+}
+
+# Attach the prepared run to an existing compatible interactive allocation.
+start_interactive_run() {
+  local run_id="$1"
+  local allocation_job_id="${2:-}"
+  local root result
+
+  validate_run_id "$run_id"
+  root="$(run_root "$run_id")"
+  if [ -n "$allocation_job_id" ]; then
+    result="$(operate_run "$run_id" attach "$allocation_job_id")"
+  else
+    result="$(operate_run "$run_id" attach)"
+  fi
 
   report_coordinator_launch "$result" "$run_id"
   echo "Run root: $root"
@@ -507,6 +534,12 @@ main() {
         usage_error
       fi
       start_run "$1"
+      ;;
+    run-interactive)
+      if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+        usage_error
+      fi
+      start_interactive_run "$@"
       ;;
     status)
       if [ "$#" -ne 1 ]; then
