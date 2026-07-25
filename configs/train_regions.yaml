@@ -1,7 +1,7 @@
 # Example configuration for Region2Vec-style region embedding training.
 
 data:
-  zarr_path: "/Volumes/HUBSSD/code/EpiForecaster/outputs/region_graph/region_graph.zarr"
+  zarr_path: "outputs/region_graph/region_graph.zarr"
   normalize_features: true
 
 encoder:
