@@ -34,6 +34,7 @@ def _write_run(
     summary = run_dir / "test_summary.json"
     dynamics = run_dir / "training_dynamics.jsonl"
     dynamics_manifest = run_dir / "training_dynamics_manifest.json"
+    training_manifest = run_dir / "training_manifest.json"
     provenance = run_dir / "training_provenance.json"
     evaluation_manifest = run_dir / "evaluation_manifest.json"
 
@@ -89,6 +90,22 @@ def _write_run(
         },
     )
     _write_json(
+        training_manifest,
+        {
+            "schema_version": 1,
+            "checkpoint": checkpoint,
+            "checkpoint_sha256": "d" * 64,
+            "training_dynamics": {
+                "artifact": str(dynamics),
+                "artifact_sha256": _sha256(dynamics),
+                "manifest": str(dynamics_manifest),
+                "manifest_sha256": _sha256(dynamics_manifest),
+                "row_count": 2,
+                "status": "complete",
+            },
+        },
+    )
+    _write_json(
         provenance,
         {
             "schema_version": 1,
@@ -121,7 +138,12 @@ def _write_run(
                         "name": dynamics_manifest.name,
                         "sha256": _sha256(dynamics_manifest),
                         "bytes": dynamics_manifest.stat().st_size,
-                    }
+                    },
+                    {
+                        "name": training_manifest.name,
+                        "sha256": _sha256(training_manifest),
+                        "bytes": training_manifest.stat().st_size,
+                    },
                 ]
             },
         },
@@ -147,6 +169,7 @@ def _write_run(
         "evaluation_summary": str(summary.relative_to(root)),
         "training_dynamics": str(dynamics.relative_to(root)),
         "training_dynamics_manifest": str(dynamics_manifest.relative_to(root)),
+        "training_manifest": str(training_manifest.relative_to(root)),
         "training_provenance": str(provenance.relative_to(root)),
         "evaluation_manifest": str(evaluation_manifest.relative_to(root)),
     }
@@ -280,4 +303,45 @@ def test_generate_comparison_rejects_mismatched_dynamics_hash(
     )
 
     with pytest.raises(ValueError, match="Dynamics manifest hash mismatch"):
+        generate_comparison(spec, tmp_path / "comparison")
+
+
+def test_generate_comparison_rejects_wrong_training_checkpoint(
+    tmp_path: Path,
+) -> None:
+    control = _write_run(
+        tmp_path,
+        stage="control",
+        mae=2.0,
+        residual_fraction=0.4,
+    )
+    training_manifest_path = tmp_path / control["training_manifest"]
+    training_manifest = json.loads(training_manifest_path.read_text(encoding="utf-8"))
+    training_manifest["checkpoint_sha256"] = "e" * 64
+    _write_json(training_manifest_path, training_manifest)
+    provenance_path = tmp_path / control["training_provenance"]
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    training_evidence = provenance["training_evidence"]["artifacts"]
+    recorded_manifest = next(
+        artifact
+        for artifact in training_evidence
+        if artifact["name"] == training_manifest_path.name
+    )
+    recorded_manifest["sha256"] = _sha256(training_manifest_path)
+    recorded_manifest["bytes"] = training_manifest_path.stat().st_size
+    _write_json(provenance_path, provenance)
+    spec = tmp_path / "comparison.json"
+    _write_json(
+        spec,
+        {
+            "schema_version": 1,
+            "runs": [control],
+            "comparisons": [],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Training and evaluation checkpoint hashes differ",
+    ):
         generate_comparison(spec, tmp_path / "comparison")

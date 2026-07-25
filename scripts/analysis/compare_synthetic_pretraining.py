@@ -36,6 +36,7 @@ class RunSpec:
     evaluation_summary: Path
     training_dynamics: Path
     training_dynamics_manifest: Path
+    training_manifest: Path
     training_provenance: Path
     evaluation_manifest: Path
 
@@ -116,6 +117,11 @@ def _parse_spec(spec_path: Path) -> tuple[list[RunSpec], list[ComparisonSpec]]:
                     base_dir,
                     raw_run.get("training_dynamics_manifest"),
                     field=f"runs[{index}].training_dynamics_manifest",
+                ),
+                training_manifest=_resolve_input_path(
+                    base_dir,
+                    raw_run.get("training_manifest"),
+                    field=f"runs[{index}].training_manifest",
                 ),
                 training_provenance=_resolve_input_path(
                     base_dir,
@@ -202,6 +208,7 @@ def _validate_run_artifacts(
     run: RunSpec,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     summary = _load_mapping(run.evaluation_summary)
+    training_manifest = _load_mapping(run.training_manifest)
     provenance = _load_mapping(run.training_provenance)
     evaluation_manifest = _load_mapping(run.evaluation_manifest)
 
@@ -212,6 +219,10 @@ def _validate_run_artifacts(
     if provenance.get("schema_version") != 1 or provenance.get("status") != "resolved":
         raise ValueError(
             f"Training provenance is not resolved: {run.training_provenance}"
+        )
+    if training_manifest.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported training manifest: {run.training_manifest}"
         )
     if provenance.get("dvc", {}).get("reconciliation") != "matched":
         raise ValueError(
@@ -311,6 +322,44 @@ def _validate_run_artifacts(
         r"[0-9a-f]{64}", checkpoint_sha256
     ) is None:
         raise ValueError(f"Invalid checkpoint hash for stage {run.stage}")
+    if training_manifest.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ValueError(
+            f"Training and evaluation checkpoint hashes differ for stage {run.stage}"
+        )
+    training_manifest_sha256 = _sha256_file(run.training_manifest)
+    recorded_training_manifest = next(
+        (
+            artifact
+            for artifact in recorded_evidence
+            if isinstance(artifact, dict)
+            and artifact.get("name") == run.training_manifest.name
+        ),
+        None,
+    )
+    if recorded_training_manifest is None:
+        raise ValueError(
+            f"Training manifest is absent from provenance for stage {run.stage}"
+        )
+    if recorded_training_manifest.get("sha256") != training_manifest_sha256:
+        raise ValueError(
+            f"Training manifest provenance hash mismatch for stage {run.stage}"
+        )
+    recorded_training_dynamics = training_manifest.get("training_dynamics", {})
+    if recorded_training_dynamics.get("artifact_sha256") != dynamics_sha256:
+        raise ValueError(
+            f"Training manifest dynamics hash mismatch for stage {run.stage}"
+        )
+    if (
+        recorded_training_dynamics.get("manifest_sha256")
+        != dynamics_manifest_sha256
+    ):
+        raise ValueError(
+            f"Training manifest dynamics-manifest hash mismatch for stage {run.stage}"
+        )
+    if recorded_training_dynamics.get("row_count") != observed_row_count:
+        raise ValueError(
+            f"Training manifest dynamics row count mismatch for stage {run.stage}"
+        )
     return summary, provenance, evaluation_manifest
 
 
@@ -551,6 +600,10 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
                 "training_dynamics_manifest_sha256": _sha256_file(
                     run.training_dynamics_manifest
                 ),
+                "training_manifest": str(run.training_manifest),
+                "training_manifest_sha256": _sha256_file(
+                    run.training_manifest
+                ),
                 "training_provenance": str(run.training_provenance),
                 "training_provenance_sha256": _sha256_file(
                     run.training_provenance
@@ -591,6 +644,8 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
                 "training_dynamics_sha256",
                 "training_dynamics_manifest",
                 "training_dynamics_manifest_sha256",
+                "training_manifest",
+                "training_manifest_sha256",
                 "training_provenance",
                 "training_provenance_sha256",
                 "evaluation_manifest",
