@@ -1,0 +1,6 @@
+outs:
+- md5: 479481b2eb1f5634f396012d7f7a837e.dir
+  size: 6451138506
+  nfiles: 115613
+  hash: md5
+  path: synthetic_full_holt_damped.zarr

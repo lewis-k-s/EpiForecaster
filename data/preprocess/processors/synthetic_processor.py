@@ -495,7 +495,14 @@ class SyntheticProcessor:
 
         # Bucket: 0→0, (0,0.2]→1, (0.2,0.5]→2, >0.5→3
         kappa0_np = kappa0_aligned.values  # (run_id, date)
-        bucketed = np.digitize(kappa0_np, bins=[0.0, 0.2, 0.5]).astype(np.float32)
+        # ``right=True`` is required for the documented closed upper bounds:
+        # 0 -> 0, (0, 0.2] -> 1, (0.2, 0.5] -> 2, >0.5 -> 3.
+        # The default boundary convention incorrectly maps exactly zero to 1.
+        bucketed = np.digitize(
+            kappa0_np,
+            bins=np.asarray([0.0, 0.2, 0.5], dtype=kappa0_np.dtype),
+            right=True,
+        ).astype(np.float32)
 
         # Build lockdown severity DataArray (run_id, date, 1)
         lockdown_da = xr.DataArray(

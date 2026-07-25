@@ -1321,9 +1321,8 @@ class EpiDataset(Dataset):
     def static_covariates(self) -> StaticCovariates:
         "Returns static covariates for the dataset. (num_nodes, num_features)"
         population_cov = self.dataset.population
-        population_tensor = torch.from_numpy(population_cov.to_numpy()).to(
-            torch.float16
-        )
+        # Municipality populations can exceed float16's finite maximum (65,504).
+        population_tensor = torch.from_numpy(population_cov.to_numpy()).to(torch.float32)
         population_tensor = _replace_non_finite(population_tensor)
         assert population_tensor.shape == (self.num_nodes,), (
             f"Static covariates shape mismatch: expected ({self.num_nodes},), got {population_tensor.shape}"

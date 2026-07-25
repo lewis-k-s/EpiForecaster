@@ -264,6 +264,40 @@ def test_synthetic_processor_includes_temporal_covariates(tmp_path):
 
 
 @pytest.mark.epiforecaster
+def test_synthetic_kappa0_lockdown_buckets_include_zero_and_upper_bounds(tmp_path):
+    config = _make_config(tmp_path, synthetic_path=tmp_path / "raw_synth.zarr")
+    config.temporal_covariates.include_lockdown_severity = True
+    processor = SyntheticProcessor(config)
+
+    dates = pd.date_range("2020-01-01", periods=6, freq="D")
+    config.end_date = dates[-1].to_pydatetime()
+    base_covariates = xr.DataArray(
+        np.zeros((6, 3), dtype=np.float32),
+        dims=("date", "covariate"),
+        coords={
+            "date": dates,
+            "covariate": ["dow_sin", "dow_cos", "is_holiday"],
+        },
+    )
+    raw_ds = xr.Dataset(
+        {
+            "mobility_kappa0": xr.DataArray(
+                np.array([[0.0, 0.1, 0.2, 0.3, 0.5, 0.6]], dtype=np.float32),
+                dims=("run_id", "date"),
+                coords={"run_id": ["synth_a"], "date": dates},
+            )
+        }
+    )
+
+    result = processor._inject_kappa0_lockdown(base_covariates, raw_ds)
+
+    np.testing.assert_array_equal(
+        result.sel(covariate="lockdown_severity").values,
+        np.array([[0.0, 1.0, 1.0, 2.0, 2.0, 3.0]], dtype=np.float32),
+    )
+
+
+@pytest.mark.epiforecaster
 def test_synthetic_processor_requires_temporal_covariates_config(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     run_ids = np.array(["synth_a"], dtype="U50")

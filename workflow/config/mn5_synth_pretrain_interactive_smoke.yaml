@@ -1,0 +1,51 @@
+# Short, allocation-attached smoke cycle for the full synthetic corpus.
+# Per-run paths and provenance fields are injected by mn5_workflow.sh.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: train
+  target: train
+
+dvc:
+  targets:
+    - data/processed/synthetic_full_holt_damped.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+    - data/files/raw_synthetic_observations.zarr.dvc
+
+training:
+  base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml
+  experiment_name: synthetic-pretrain-interactive-smoke
+  model_id: model
+  max_batches: 2
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+    - training.epochs=1
+    - training.batch_size=4
+    - training.num_workers=2
+    - training.val_workers=2
+    - training.compile=false
+    - training.profiler.enabled=false
+    - training.progress_log_frequency=1
+    - training.grad_norm_log_frequency=1
+
+evaluation:
+  split: test
+  granular: false
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 30

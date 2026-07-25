@@ -109,6 +109,28 @@ class TestEpiDataset:
             assert "mob_t" in item
             assert item["mob_t"].shape == (L,)
 
+    def test_large_population_remains_finite_and_exact(
+        self, config, mock_xarray_dataset
+    ):
+        populations = np.array([1_686_208, 100_000, 65_505, 65_504, 26])
+        mock_xarray_dataset["population"] = (("region_id",), populations)
+
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0],
+                context_nodes=[0, 1],
+            )
+
+            population = ds.node_static_covariates["Pop"]
+            assert population.dtype == torch.float32
+            assert torch.isfinite(population).all()
+            torch.testing.assert_close(
+                population, torch.from_numpy(populations).float()
+            )
+
     def test_feature_masking(self, config, mock_xarray_dataset):
         with patch.object(
             EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
