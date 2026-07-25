@@ -52,6 +52,12 @@ TARGET_PLOT_SPECS: dict[str, dict[str, str]] = {
 }
 
 DEFAULT_PLOT_TARGETS = ["hosp", "ww", "cases", "deaths"]
+_CANONICAL_TARGET_NAMES = {
+    "hosp": "hospitalizations",
+    "ww": "wastewater",
+    "cases": "cases",
+    "deaths": "deaths",
+}
 LATENT_PLOT_SPECS: dict[str, dict[str, str]] = {
     "latent_s": {
         "model_output": "S_trajectory",
@@ -97,6 +103,70 @@ def _resolve_latent_series(
         if model_output in model_outputs:
             latents[latent_name] = model_outputs[model_output]
     return latents
+
+
+def attach_relevant_latents_from_granular(
+    *,
+    samples: list[dict[str, Any]],
+    granular_eval_path: Path,
+) -> int:
+    """Attach persisted target-specific observation sources to plot payloads."""
+    import pandas as pd
+
+    if granular_eval_path.suffix.lower() == ".parquet":
+        rows = pd.read_parquet(granular_eval_path)
+    else:
+        rows = pd.read_csv(granular_eval_path)
+    required = {
+        "target",
+        "node_id",
+        "window_start",
+        "horizon",
+        "relevant_latent_name",
+        "relevant_latent_value",
+    }
+    missing = sorted(required.difference(rows.columns))
+    if missing:
+        raise ValueError(
+            "Granular evaluation artifact cannot provide relevant latent overlays; "
+            f"missing columns: {missing}"
+        )
+
+    attached = 0
+    for sample in samples:
+        targets = sample.get("targets")
+        if not isinstance(targets, dict):
+            continue
+        node_id = int(sample["node_id"])
+        window_start = int(sample["window_start"])
+        horizon_size = int(sample["H"])
+        for target_name, target_payload in targets.items():
+            canonical_target = _CANONICAL_TARGET_NAMES[target_name]
+            selected = rows[
+                (rows["target"] == canonical_target)
+                & (rows["node_id"] == node_id)
+                & (rows["window_start"] == window_start)
+            ].sort_values("horizon")
+            if selected.empty:
+                continue
+            relevant_values = np.full(horizon_size, np.nan, dtype=np.float32)
+            for row in selected.itertuples(index=False):
+                horizon_index = int(row.horizon) - 1
+                if 0 <= horizon_index < horizon_size:
+                    relevant_values[horizon_index] = float(row.relevant_latent_value)
+            latent_names = [
+                str(value)
+                for value in selected["relevant_latent_name"].dropna().unique()
+                if str(value)
+            ]
+            if not latent_names:
+                continue
+            target_payload["relevant_latent"] = {
+                "prediction": relevant_values,
+                "label": latent_names[0],
+            }
+            attached += 1
+    return attached
 
 
 def _build_prediction_only_context(
@@ -867,6 +937,7 @@ def make_forecast_figure(
     overlay_target: str | None = None,
     overlay_payload_collection: str = "latents",
     overlay_label: str | None = None,
+    overlay_relevant_latent: bool = False,
 ):
     """
     Build a figure showing actual series vs forecasts with wider context.
@@ -1051,6 +1122,36 @@ def make_forecast_figure(
                 )
                 overlay_ax.set_ylabel(overlay_name if j == ncols - 1 else "")
                 overlay_ax.grid(False)
+            elif overlay_relevant_latent and isinstance(
+                sample.get("relevant_latent"), dict
+            ):
+                relevant_latent = sample["relevant_latent"]
+                overlay_prediction = np.asarray(
+                    relevant_latent["prediction"],
+                    dtype=np.float32,
+                ).reshape(-1)
+                overlay_series_full = np.full(len(t_rel), np.nan, dtype=np.float32)
+                overlay_indices = np.where(horizon_mask)[0]
+                overlay_points = min(
+                    int(overlay_indices.shape[0]),
+                    int(overlay_prediction.shape[0]),
+                )
+                overlay_series_full[overlay_indices[:overlay_points]] = (
+                    overlay_prediction[:overlay_points]
+                )
+                overlay_ax = ax.twinx()
+                overlay_ax.plot(
+                    t_rel,
+                    overlay_series_full,
+                    color=Palette.FORECAST["overlay"],
+                    linewidth=1.5,
+                    marker="o",
+                    markersize=2.5,
+                )
+                overlay_ax.set_ylabel(
+                    str(relevant_latent["label"]) if j == ncols - 1 else ""
+                )
+                overlay_ax.grid(False)
 
             ax.axvline(
                 0,
@@ -1119,6 +1220,7 @@ def make_joint_forecast_figure(
     context_pre: int = 30,
     context_post: int = 30,
     target_names: list[str] | None = None,
+    include_relevant_latent: bool = False,
 ):
     """Build a single figure containing all requested targets by group."""
     if isinstance(samples, list):
@@ -1147,6 +1249,8 @@ def make_joint_forecast_figure(
                     row_sample["target"] = payload["target"]
                     row_sample["history"] = payload["history"]
                     row_sample["window_mae"] = payload.get("window_mae")
+                    if "relevant_latent" in payload:
+                        row_sample["relevant_latent"] = payload["relevant_latent"]
                     row_sample.update(
                         {
                             key: value
@@ -1169,6 +1273,7 @@ def make_joint_forecast_figure(
         context_post=context_post,
         target=None,
         target_label=None,
+        overlay_relevant_latent=include_relevant_latent,
     )
 
 
@@ -1432,6 +1537,8 @@ def generate_forecast_plots(
     target_names: list[str] | None = None,
     wandb_prefix: str = "forecasts",
     include_sird_latents: bool = False,
+    include_relevant_latent: bool = False,
+    granular_eval_path: Path | None = None,
 ) -> dict[str, Any]:
     """
     Generate forecast plots for given node groups (generic).
@@ -1453,6 +1560,8 @@ def generate_forecast_plots(
         target_names: List of targets to plot (default: all)
         wandb_prefix: Prefix for W&B logged images
         include_sird_latents: Save/log an additional joint SIRHD latent forecast figure
+        include_relevant_latent: Overlay each target's persisted mechanistic source
+        granular_eval_path: Canonical granular evaluation artifact used by the overlay
 
     Returns:
         Dict with figure, all_samples, selected_nodes, node_groups, window_groups
@@ -1549,6 +1658,20 @@ def generate_forecast_plots(
                 group_name = node_to_group[node_id]
                 grouped_samples.setdefault(group_name, []).append(sample)
 
+    if include_relevant_latent:
+        if granular_eval_path is None:
+            raise ValueError(
+                "include_relevant_latent requires a canonical granular evaluation artifact"
+            )
+        attached_count = attach_relevant_latents_from_granular(
+            samples=samples,
+            granular_eval_path=granular_eval_path,
+        )
+        if attached_count == 0:
+            logger.warning(
+                "[plot] No persisted relevant-latent values matched selected examples"
+            )
+
     # Generate figure using existing generic function
     dataset = cast(EpiDataset, loader.dataset)
     config = dataset.config
@@ -1559,6 +1682,7 @@ def generate_forecast_plots(
         context_pre=context_pre,
         context_post=context_post,
         target_names=resolved_targets,
+        include_relevant_latent=include_relevant_latent,
     )
 
     latent_fig = (

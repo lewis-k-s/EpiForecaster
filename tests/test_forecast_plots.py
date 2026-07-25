@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 import torch
 from torch_geometric.data import Batch
 
-import plotting.forecast_plots as forecast_plots
 from data.epi_batch import EpiBatch
 from evaluation.selection import (
     WindowSelectionSpec,
@@ -14,6 +14,7 @@ from evaluation.selection import (
     select_worst_windows_by_loss,
     select_windows_by_loss,
 )
+import plotting.forecast_plots as forecast_plots
 
 
 def test_collect_forecast_samples_supports_epibatch_attribute_targets(
@@ -447,6 +448,60 @@ def test_make_joint_forecast_figure_renders_distribution_intervals() -> None:
 
     assert fig is not None
     assert fig.axes[0].collections
+
+
+def test_relevant_latent_overlay_uses_persisted_granular_rows(
+    tmp_path: Path,
+) -> None:
+    granular_path = tmp_path / "test_granular.csv"
+    granular_path.write_text(
+        "target,node_id,window_start,horizon,relevant_latent_name,"
+        "relevant_latent_value\n"
+        "hospitalizations,1,10,1,hospitalization_flow,0.02\n"
+        "hospitalizations,1,10,2,hospitalization_flow,0.03\n",
+        encoding="utf-8",
+    )
+    sample = {
+        "node_id": 1,
+        "node_label": "Region 1",
+        "actual_context": [1.0, 2.0, 3.0, 4.0],
+        "prediction": [3.0, 5.0],
+        "target": [3.0, 4.0],
+        "history": [1.0, 2.0],
+        "t_rel": [-2, -1, 0, 1],
+        "t0_idx_in_context": 2,
+        "start_time": "2024-01-01",
+        "window_start": 10,
+        "window_mae": 0.5,
+        "L": 2,
+        "H": 2,
+        "targets": {
+            "hosp": {
+                "actual_context": [1.0, 2.0, 3.0, 4.0],
+                "prediction": [3.0, 5.0],
+                "target": [3.0, 4.0],
+                "history": [1.0, 2.0],
+                "window_mae": 0.5,
+            }
+        },
+    }
+
+    attached = forecast_plots.attach_relevant_latents_from_granular(
+        samples=[sample],
+        granular_eval_path=granular_path,
+    )
+    fig = forecast_plots.make_joint_forecast_figure(
+        samples=[sample],
+        input_window_length=2,
+        forecast_horizon=2,
+        target_names=["hosp"],
+        include_relevant_latent=True,
+    )
+
+    assert attached == 1
+    assert fig is not None
+    assert len(fig.axes) == 2
+    assert fig.axes[1].get_ylabel() == "hospitalization_flow"
 
 
 def test_make_forecast_figure_supports_shared_labels() -> None:

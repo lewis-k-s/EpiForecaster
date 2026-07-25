@@ -130,6 +130,35 @@ def test_eval_cli_granular_flag_enables_auto_granular_output(
     assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
 
 
+def test_eval_cli_relevant_latent_toggle_enables_granular_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = make_checkpoint(tmp_path)
+    output_dir = tmp_path / "eval_outputs"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+    install_eval_cli_harness(monkeypatch, captured)
+
+    result = _invoke_eval(
+        checkpoint_path,
+        output_dir,
+        "--include-relevant-latent",
+    )
+
+    assert result.exit_code == 0, result.output
+    eval_kwargs = captured["eval_checkpoint_kwargs"]
+    assert eval_kwargs["granular_output_path"] == (
+        output_dir / "test_granular.parquet"
+    )
+    assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
+    plot_kwargs = captured["generate_forecast_plots_kwargs"]
+    assert plot_kwargs["include_relevant_latent"] is True
+    assert plot_kwargs["granular_eval_path"] == (
+        output_dir / "test_granular.parquet"
+    )
+
+
 def test_eval_cli_writes_machine_readable_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
