@@ -782,6 +782,9 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
     cache = Path(str(config["dvc"]["cache"]))
     _run(["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)], cwd=workspace)
     _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=workspace)
+    # Keep DVC's SQLite/index state off the quota-constrained cluster home.
+    # A relative path is resolved inside this run's isolated DVC workspace.
+    _run(["dvc", "config", "core.site_cache_dir", ".dvc/tmp"], cwd=workspace)
     _run(["dvc", "config", "cache.dir", str(cache)], cwd=workspace)
     _run(["dvc", "config", "cache.shared", "group"], cwd=workspace)
     _run(["dvc", "config", "cache.type", "symlink"], cwd=workspace)
