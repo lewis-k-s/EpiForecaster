@@ -1,727 +1,565 @@
-"""Analyze HPO journal hyperparameter search results.
-
-This script parses Optuna journal files and produces:
-- Summary statistics of completed trials
-- Best trials and their parameters
-- Parameter importance analysis
-- Parameter distribution plots (if matplotlib available)
-- Recommendations for search space refinement
-
-Usage:
-    uv run python scripts/analysis/analyze_hpsearch_journal.py outputs/hpsearch/epiforecaster_hpo_v1.journal
-"""
+"""Analyze Optuna studies through the supported JournalStorage API."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
 from pathlib import Path
+from statistics import fmean, median
 from typing import Any
 
-import numpy as np
+import optuna
+import yaml
+from optuna.importance import FanovaImportanceEvaluator, get_param_importances
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
+from optuna.trial import FrozenTrial, TrialState
 
 from scripts.analysis.skill_output import SkillOutputBuilder, print_output
+from scripts.hpo.trial_artifacts import (
+    TRAINING_DYNAMICS_MANIFEST_ATTR,
+    TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR,
+    TRAINING_DYNAMICS_STATUS_ATTR,
+)
+from training.training_dynamics import (
+    load_training_dynamics_identity,
+    sha256_file,
+)
 
-_NON_SERIES_BEST_ATTRS = {
-    "best_val_loss",
-    "best_val_selection_score",
-    "best_val_selection_metric",
-    "best_val_joint_loss",
-}
-
-
-@dataclass
-class Trial:
-    """Represents a single trial."""
-
-    number: int
-    params: dict[str, Any]
-    value: float | None
-    state: str  # "COMPLETE", "FAILED", "RUNNING", etc.
-    datetime_start: str | None = None
-    datetime_complete: str | None = None
-    user_attrs: dict[str, Any] = field(default_factory=dict)
+MIN_IMPORTANCE_COMPLETE_TRIALS = 20
+DEFAULT_TOP_TRIALS = 5
 
 
-@dataclass
-class StudySummary:
-    """Summary of a study."""
+def _load_yaml(path: Path) -> dict[str, Any]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError(f"Expected a YAML mapping: {path}")
+    return document
 
-    study_name: str
-    trials: list[Trial] = field(default_factory=list)
 
-    @property
-    def completed_trials(self) -> list[Trial]:
-        return [t for t in self.trials if t.state == "COMPLETE"]
+def _resolve_study_input(
+    *,
+    run_root: Path | None,
+    journal: Path | None,
+    study_name: str | None,
+) -> tuple[Path, str, Path | None]:
+    if (run_root is None) == (journal is None):
+        raise ValueError("Provide exactly one of --run-root or --journal")
 
-    @property
-    def best_trial(self) -> Trial | None:
-        completed = self.completed_trials
-        if not completed:
-            return None
-        return min(
-            completed, key=lambda t: t.value if t.value is not None else float("inf")
+    if run_root is not None:
+        root = run_root.resolve()
+        config_path = root / "config.yaml"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Immutable run config is missing: {config_path}")
+        config = _load_yaml(config_path)
+        if config.get("workflow", {}).get("kind") != "hpo":
+            raise ValueError(f"Run root is not an HPO workflow: {root}")
+        configured_name = str(config["optuna"]["study_name"])
+        if study_name is not None and study_name != configured_name:
+            raise ValueError(
+                "Explicit study name disagrees with the immutable run config: "
+                f"{study_name!r} != {configured_name!r}"
+            )
+        resolved_journal = root / "optuna" / f"{configured_name}.journal"
+        resolved_name = configured_name
+        resolved_root = root
+    else:
+        if not study_name:
+            raise ValueError("--study-name is required with --journal")
+        resolved_journal = journal.resolve()  # type: ignore[union-attr]
+        resolved_name = study_name
+        resolved_root = None
+
+    if not resolved_journal.is_file():
+        raise FileNotFoundError(f"Optuna journal is missing: {resolved_journal}")
+    return resolved_journal, resolved_name, resolved_root
+
+
+def _load_study(journal: Path, study_name: str) -> optuna.Study:
+    storage = JournalStorage(JournalFileBackend(str(journal)))
+    available = {summary.study_name for summary in optuna.get_all_study_summaries(storage)}
+    if study_name not in available:
+        raise ValueError(
+            f"Study {study_name!r} is not in {journal}; available={sorted(available)}"
         )
-
-    @property
-    def best_value(self) -> float | None:
-        if self.best_trial and self.best_trial.value is not None:
-            return self.best_trial.value
-        return None
+    return optuna.load_study(study_name=study_name, storage=storage)
 
 
-def parse_journal(path: Path) -> StudySummary:
-    """Parse a journal file.
-
-    The journal format is line-delimited JSON with op_codes:
-    - 0: REGISTER_STUDY
-    - 4: START_TRIAL
-    - 5: SET_UP_TRIAL_PARAM
-    - 6: FINISH_TRIAL
-    - 8: SET_TRIAL_USER_ATTR
-    """
-    study_name = "unknown"
-    trial_params: dict[int, dict[str, Any]] = defaultdict(dict)
-    trial_attrs: dict[int, dict[str, Any]] = defaultdict(dict)
-    trial_start_times: dict[int, str] = {}
-    trial_states: dict[int, int] = {}
-    trial_values: dict[int, float | None] = {}
-    trial_end_times: dict[int, str] = {}
-
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            op_code = entry.get("op_code")
-
-            if op_code == 0:  # REGISTER_STUDY
-                study_name = entry.get("study_name", "unknown")
-
-            elif op_code == 4:  # START_TRIAL
-                trial_id = entry.get("trial_id")
-                if trial_id is None:
-                    continue
-                trial_start_times[trial_id] = entry.get("datetime_start")
-                trial_states[trial_id] = 0  # RUNNING
-
-            elif op_code == 5:  # SET_UP_TRIAL_PARAM
-                trial_id = entry.get("trial_id")
-                if trial_id is None:
-                    continue
-                param_name = entry["param_name"]
-                distribution = json.loads(entry["distribution"])
-
-                # Decode categorical values that were JSON-encoded
-                param_value_internal = entry["param_value_internal"]
-                if distribution["name"] == "CategoricalDistribution":
-                    choices = distribution["attributes"]["choices"]
-                    # param_value_internal is an integer index into choices
-                    selected = choices[int(param_value_internal)]
-                    if isinstance(selected, str):
-                        # Check if it's a JSON-encoded string
-                        try:
-                            param_value = json.loads(selected)
-                        except (json.JSONDecodeError, TypeError):
-                            param_value = selected
-                    else:
-                        param_value = selected
-                else:
-                    param_value = param_value_internal
-
-                trial_params[trial_id][param_name] = param_value
-
-            elif op_code == 6:  # FINISH_TRIAL
-                trial_id = entry.get("trial_id")
-                if trial_id is None:
-                    continue
-                trial_states[trial_id] = entry["state"]
-                trial_values[trial_id] = (
-                    entry["values"][0] if entry.get("values") else None
-                )
-                trial_end_times[trial_id] = entry.get("datetime_complete")
-
-            elif op_code == 8:  # SET_TRIAL_USER_ATTR
-                trial_id = entry.get("trial_id")
-                if trial_id is None:
-                    continue
-                for key, value in entry.get("user_attr", {}).items():
-                    trial_attrs[trial_id][key] = value
-
-    # Convert to Trial objects
-    # Determine trial numbers by sorting by trial_id
-    sorted_trial_ids = sorted(trial_params.keys())
-    trials = []
-    for i, trial_id in enumerate(sorted_trial_ids):
-        state_code = trial_states.get(trial_id, 0)
-        state_map = {0: "RUNNING", 1: "COMPLETE", 2: "PRUNED", 3: "FAIL"}
-        state = state_map.get(state_code, "UNKNOWN")
-
-        trial = Trial(
-            number=i,
-            params=trial_params.get(trial_id, {}),
-            value=trial_values.get(trial_id),
-            state=state,
-            datetime_start=trial_start_times.get(trial_id),
-            datetime_complete=trial_end_times.get(trial_id),
-            user_attrs=trial_attrs.get(trial_id, {}),
-        )
-        trials.append(trial)
-
-    return StudySummary(study_name=study_name, trials=trials)
+def _trial_values(trial: FrozenTrial) -> list[float] | None:
+    if trial.values is not None:
+        return [float(value) for value in trial.values]
+    if trial.value is not None:
+        return [float(trial.value)]
+    return None
 
 
-def analyze_param_importance(summary: StudySummary) -> dict[str, float]:
-    """Compute simple parameter importance based on correlation with objective.
-
-    This is a simplified version using Spearman correlation.
-    For proper importance, use optuna.importance.get_param_importances().
-    """
-    completed = summary.completed_trials
-    if len(completed) < 2:
-        return {}
-
-    # Get all param names
-    param_names = set()
-    for t in completed:
-        param_names.update(t.params.keys())
-
-    importance = {}
-    for param in param_names:
-        # Get numeric values for this param
-        values = []
-        scores = []
-        for t in completed:
-            if param not in t.params or t.value is None:
-                continue
-            val = t.params[param]
-
-            # Convert to numeric if possible
-            if isinstance(val, (int, float)):
-                values.append(float(val))
-            elif isinstance(val, str | list | tuple):
-                # Use hash for categorical (strings, lists, tuples)
-                hashable = tuple(val) if isinstance(val, list) else val
-                values.append(hash(hashable))
-            else:
-                continue
-
-            scores.append(t.value)
-
-        if len(values) < 2:
-            continue
-
-        # Compute Spearman correlation
-        values_arr = np.array(values)
-        scores_arr = np.array(scores)
-
-        # Rank-based correlation
-        rank_x = np.argsort(np.argsort(values_arr))
-        rank_y = np.argsort(np.argsort(scores_arr))
-
-        corr = np.corrcoef(rank_x, rank_y)[0, 1]
-        if not np.isnan(corr):
-            importance[param] = abs(corr)
-
-    # Sort by importance
-    return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
-
-
-def format_summary(summary: StudySummary) -> dict[str, Any]:
-    """Format summary statistics."""
-    completed = summary.completed_trials
-    failed = [t for t in summary.trials if t.state == "FAIL"]
-    running = [t for t in summary.trials if t.state == "RUNNING"]
-
-    result = {
-        "study_name": summary.study_name,
-        "total_trials": len(summary.trials),
-        "completed": len(completed),
-        "failed": len(failed),
-        "running": len(running),
+def _serialize_trial(trial: FrozenTrial) -> dict[str, Any]:
+    duration_s = (
+        (trial.datetime_complete - trial.datetime_start).total_seconds()
+        if trial.datetime_start is not None and trial.datetime_complete is not None
+        else None
+    )
+    return {
+        "number": trial.number,
+        "state": trial.state.name,
+        "values": _trial_values(trial),
+        "params": dict(sorted(trial.params.items())),
+        "distributions": {
+            name: repr(distribution)
+            for name, distribution in sorted(trial.distributions.items())
+        },
+        "user_attrs": dict(sorted(trial.user_attrs.items())),
+        "datetime_start": (
+            trial.datetime_start.isoformat()
+            if trial.datetime_start is not None
+            else None
+        ),
+        "datetime_complete": (
+            trial.datetime_complete.isoformat()
+            if trial.datetime_complete is not None
+            else None
+        ),
+        "duration_s": duration_s,
     }
 
-    if completed:
-        result["objective_metric"] = next(
-            (
-                str(t.user_attrs["best_val_selection_metric"])
-                for t in completed
-                if t.user_attrs.get("best_val_selection_metric") is not None
-            ),
-            "best_val_loss",
-        )
-        values = [t.value for t in completed if t.value is not None]
-        if values:
-            result["objective_stats"] = {
-                "best": float(min(values)),
-                "median": float(np.median(values)),
-                "mean": float(np.mean(values)),
-                "std": float(np.std(values)),
-                "worst": float(max(values)),
-            }
 
+def _ranked_trials(study: optuna.Study, top_n: int) -> list[dict[str, Any]]:
+    if len(study.directions) == 1:
+        completed = [
+            trial
+            for trial in study.trials
+            if trial.state == TrialState.COMPLETE and trial.value is not None
+        ]
+        reverse = study.direction == optuna.study.StudyDirection.MAXIMIZE
+        ranked = sorted(
+            completed,
+            key=lambda trial: float(trial.value),
+            reverse=reverse,
+        )
+    else:
+        ranked = sorted(study.best_trials, key=lambda trial: trial.number)
+    return [_serialize_trial(trial) for trial in ranked[:top_n]]
+
+
+def _objective_summary(study: optuna.Study) -> dict[str, Any]:
+    completed = [
+        trial
+        for trial in study.trials
+        if trial.state == TrialState.COMPLETE and trial.values is not None
+    ]
+    objectives: list[dict[str, Any]] = []
+    for index, direction in enumerate(study.directions):
+        values = [
+            float(trial.values[index])
+            for trial in completed
+            if trial.values is not None
+            and index < len(trial.values)
+            and math.isfinite(float(trial.values[index]))
+        ]
+        objectives.append(
+            {
+                "index": index,
+                "direction": direction.name,
+                "count": len(values),
+                "best": (
+                    min(values)
+                    if direction == optuna.study.StudyDirection.MINIMIZE
+                    else max(values)
+                )
+                if values
+                else None,
+                "median": median(values) if values else None,
+                "mean": fmean(values) if values else None,
+                "worst": (
+                    max(values)
+                    if direction == optuna.study.StudyDirection.MINIMIZE
+                    else min(values)
+                )
+                if values
+                else None,
+            }
+        )
+    return {"objectives": objectives}
+
+
+def _parameter_summary(study: optuna.Study) -> dict[str, Any]:
+    completed = [
+        trial for trial in study.trials if trial.state == TrialState.COMPLETE
+    ]
+    values: dict[str, list[Any]] = defaultdict(list)
+    for trial in completed:
+        for name, value in trial.params.items():
+            values[name].append(value)
+
+    result: dict[str, Any] = {}
+    for name in sorted(values):
+        observed = values[name]
+        coverage = len(observed)
+        summary: dict[str, Any] = {
+            "completed_trial_coverage": coverage,
+            "completed_trial_fraction": (
+                coverage / len(completed) if completed else 0.0
+            ),
+        }
+        if all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in observed
+        ):
+            numeric = [float(value) for value in observed]
+            summary.update(
+                {
+                    "kind": "numeric",
+                    "min": min(numeric),
+                    "max": max(numeric),
+                    "median": median(numeric),
+                }
+            )
+        else:
+            counts = Counter(str(value) for value in observed)
+            summary.update(
+                {
+                    "kind": "categorical",
+                    "counts": dict(sorted(counts.items())),
+                }
+            )
+        result[name] = summary
     return result
 
 
-def print_summary(summary: StudySummary) -> None:
-    """Print a formatted summary of study."""
-    result = format_summary(summary)
-
-    print(f"\n{'=' * 60}")
-    print(f"Study: {result['study_name']}")
-    print(f"{'=' * 60}")
-    print(f"Total trials:     {result['total_trials']}")
-    print(f"Completed:        {result['completed']}")
-    print(f"Failed:           {result['failed']}")
-    print(f"Running:          {result['running']}")
-
-    if "objective_stats" in result:
-        stats = result["objective_stats"]
-        print(f"\nObjective ({result.get('objective_metric', 'best_val_loss')}):")
-        print(f"  Best:            {stats['best']:.6f}")
-        print(f"  Median:          {stats['median']:.6f}")
-        print(f"  Mean:            {stats['mean']:.6f}")
-        print(f"  Std:             {stats['std']:.6f}")
-        print(f"  Worst:           {stats['worst']:.6f}")
-
-    print(f"\n{'=' * 60}\n")
+def _relocate_run_path(path_value: str, run_root: Path | None) -> Path:
+    path = Path(path_value)
+    if run_root is not None and path.is_absolute():
+        try:
+            return run_root / path.relative_to("/workspace/run")
+        except ValueError:
+            pass
+    return path
 
 
-def format_best_trials(summary: StudySummary, n: int = 5) -> list[dict[str, Any]]:
-    """Format N best trials."""
-    completed = [t for t in summary.completed_trials if t.value is not None]
-    if not completed:
-        return []
-
-    # Sort by value (lower is better for loss)
-    def get_value(t: Trial) -> float:
-        assert t.value is not None
-        return t.value
-
-    sorted_trials = sorted(completed, key=get_value)[:n]
-
-    return [
-        {
-            "rank": i,
-            "trial_number": trial.number,
-            "value": float(trial.value) if trial.value is not None else None,
-            "params": trial.params,
-            "series_metrics": {
-                k: v
-                for k, v in trial.user_attrs.items()
-                if k.startswith("best_val_") and k not in _NON_SERIES_BEST_ATTRS
-            },
-        }
-        for i, trial in enumerate(sorted_trials, 1)
-    ]
-
-
-def print_best_trials(summary: StudySummary, n: int = 5) -> None:
-    """Print N best trials."""
-    trials = format_best_trials(summary, n)
-
-    if not trials:
-        print("No completed trials with values.")
-        return
-
-    print(f"\nTop {len(trials)} trials:")
-    print("-" * 60)
+def _dynamics_integrity(
+    trials: list[FrozenTrial],
+    *,
+    run_root: Path | None,
+) -> dict[str, Any]:
+    status_counts: Counter[str] = Counter()
+    available = 0
+    issues: list[dict[str, Any]] = []
     for trial in trials:
-        print(
-            f"\n#{trial['rank']} Trial {trial['trial_number']} (value: {trial['value']:.6f})"
+        manifest_value = trial.user_attrs.get(TRAINING_DYNAMICS_MANIFEST_ATTR)
+        digest_value = trial.user_attrs.get(
+            TRAINING_DYNAMICS_MANIFEST_SHA256_ATTR
         )
-        for param, value in sorted(trial["params"].items()):
-            print(f"  {param}: {value}")
-        series = trial.get("series_metrics", {})
-        if series:
-            print("  Per-series metrics:")
-            for k, v in sorted(series.items()):
-                label = k.removeprefix("best_val_")
-                print(f"    {label}: {v:.6f}")
-
-
-# Canonical ordering for per-series metric display
-_SERIES_DISPLAY_ORDER = [
-    "loss_ww",
-    "loss_hosp",
-    "loss_cases",
-    "loss_deaths",
-    "mae_ww_log1p_per_100k",
-    "mae_hosp_log1p_per_100k",
-    "mae_cases_log1p_per_100k",
-    "mae_deaths_log1p_per_100k",
-    "r2_ww_log1p_per_100k",
-    "r2_hosp_log1p_per_100k",
-    "r2_cases_log1p_per_100k",
-    "r2_deaths_log1p_per_100k",
-]
-
-
-def format_series_rankings(
-    summary: StudySummary, top_n: int = 3
-) -> dict[str, list[dict[str, Any]]]:
-    """Rank completed trials independently for each per-series metric.
-
-    Returns a dict keyed by metric name, each value a list of top-N entries:
-    {"rank", "trial_number", "series_value", "joint_value", "params"}.
-    """
-    completed = [t for t in summary.completed_trials if t.value is not None]
-    if not completed:
-        return {}
-
-    # Collect all per-series metric keys present across trials
-    series_keys: set[str] = set()
-    for t in completed:
-        for k in t.user_attrs:
-            if k.startswith("best_val_") and k != "best_val_loss":
-                if k in _NON_SERIES_BEST_ATTRS:
-                    continue
-                series_keys.add(k)
-
-    if not series_keys:
-        return {}
-
-    rankings: dict[str, list[dict[str, Any]]] = {}
-    for key in sorted(series_keys):
-        label = key.removeprefix("best_val_")
-        # Collect trials that have this metric
-        candidates: list[dict[str, Any]] = []
-        for t in completed:
-            val = t.user_attrs.get(key)
-            if val is not None:
-                candidates.append(
-                    {
-                        "trial_number": t.number,
-                        "series_value": float(val),
-                        "joint_value": float(t.value) if t.value is not None else None,
-                        "params": t.params,
-                    }
-                )
-        if not candidates:
+        status = trial.user_attrs.get(TRAINING_DYNAMICS_STATUS_ATTR)
+        if status is not None:
+            status_counts[str(status)] += 1
+        if not isinstance(manifest_value, str) or not manifest_value:
             continue
-
-        # For loss/mae metrics lower is better; for r2 higher is better
-        is_higher_better = key.startswith("best_val_r2_")
-        candidates.sort(
-            key=lambda x: x["series_value"], reverse=is_higher_better
-        )
-        rankings[label] = [
-            {"rank": i + 1, **entry}
-            for i, entry in enumerate(candidates[:top_n])
-        ]
-
-    return rankings
-
-
-def print_series_rankings(summary: StudySummary, top_n: int = 3) -> None:
-    """Print per-series metric rankings."""
-    rankings = format_series_rankings(summary, top_n=top_n)
-
-    if not rankings:
-        return
-
-    # Display in canonical order, falling back to alphabetical
-    ordered_keys = [k for k in _SERIES_DISPLAY_ORDER if k in rankings]
-    remaining = [k for k in sorted(rankings) if k not in ordered_keys]
-    display_order = ordered_keys + remaining
-
-    print(f"\n{'=' * 60}")
-    print("Per-Series Rankings (top-3 per metric)")
-    print(f"{'=' * 60}")
-
-    for label in display_order:
-        entries = rankings[label]
-        print(f"\n  {label}:")
-        for entry in entries:
-            joint_str = (
-                f"{entry['joint_value']:.6f}"
-                if entry["joint_value"] is not None
-                else "N/A"
+        available += 1
+        manifest = _relocate_run_path(manifest_value, run_root)
+        if not manifest.is_file():
+            issues.append(
+                {"trial_number": trial.number, "issue": "manifest_missing"}
             )
-            print(
-                f"    #{entry['rank']} Trial {entry['trial_number']}: "
-                f"{entry['series_value']:.6f}  (joint: {joint_str})"
-            )
-
-
-def format_param_distributions(summary: StudySummary) -> dict[str, dict[str, Any]]:
-    """Format distribution statistics for each parameter."""
-    completed = summary.completed_trials
-    if not completed:
-        return {}
-
-    # Group params by name
-    param_values: dict[str, list] = defaultdict(list)
-    for t in completed:
-        for param, value in t.params.items():
-            param_values[param].append(value)
-
-    distributions = {}
-
-    for param, values in sorted(param_values.items()):
-        first_val = values[0]
-        is_categorical = isinstance(first_val, str | list | tuple)
-        dist: dict[str, Any] = {
-            "param": param,
-            "type": "categorical" if is_categorical else "numeric",
-        }
-
-        # Count categorical values (strings, lists, tuples)
-        if is_categorical:
-            # Convert lists to tuples for hashing, then to string for display
-            hashable_values = [tuple(v) if isinstance(v, list) else v for v in values]
-            counts = Counter(hashable_values)
-            total = len(values)
-            dist["values"] = [
+            continue
+        try:
+            identity = load_training_dynamics_identity(manifest.parent)
+            if digest_value != identity["manifest_sha256"]:
+                raise ValueError("manifest_sha256_mismatch")
+            if status is not None and str(status) != identity["status"]:
+                raise ValueError("status_mismatch")
+        except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+            issues.append(
                 {
-                    "value": list(val) if isinstance(val, tuple) else val,
-                    "count": count,
-                    "percentage": 100 * count / total,
+                    "trial_number": trial.number,
+                    "issue": "invalid_training_dynamics",
+                    "detail": str(exc),
                 }
-                for val, count in sorted(
-                    counts.items(), key=lambda x: x[1], reverse=True
-                )
-            ]
-        else:
-            # Numeric values
-            numeric_vals = [float(v) for v in values]
-            dist["values"] = {
-                "min": float(min(numeric_vals)),
-                "max": float(max(numeric_vals)),
-                "mean": float(np.mean(numeric_vals)),
-                "median": float(np.median(numeric_vals)),
-                "p10": float(np.percentile(numeric_vals, 10)),
-                "p90": float(np.percentile(numeric_vals, 90)),
-            }
-
-        distributions[param] = dist
-
-    return distributions
+            )
+    return {
+        "available_count": available,
+        "status_counts": dict(sorted(status_counts.items())),
+        "issues": issues,
+    }
 
 
-def print_param_distributions(summary: StudySummary) -> None:
-    """Print distribution statistics for each parameter."""
-    distributions = format_param_distributions(summary)
+def _importance(
+    study: optuna.Study,
+    *,
+    enabled: bool,
+) -> tuple[dict[str, float] | None, list[str]]:
+    if not enabled:
+        return None, []
+    complete = [
+        trial for trial in study.trials if trial.state == TrialState.COMPLETE
+    ]
+    if len(study.directions) != 1:
+        return None, ["Importance is unavailable for multi-objective studies"]
+    if len(complete) < MIN_IMPORTANCE_COMPLETE_TRIALS:
+        return None, [
+            "Importance requires at least "
+            f"{MIN_IMPORTANCE_COMPLETE_TRIALS} completed trials; got {len(complete)}"
+        ]
+    common = set(complete[0].params)
+    for trial in complete[1:]:
+        common.intersection_update(trial.params)
+    if not common:
+        return None, ["No parameters are common to every completed trial"]
+    evaluator = FanovaImportanceEvaluator(seed=0)
+    importances = get_param_importances(
+        study,
+        evaluator=evaluator,
+        params=sorted(common),
+    )
+    return dict(sorted(importances.items(), key=lambda item: (-item[1], item[0]))), []
 
-    if not distributions:
-        return
 
-    print(f"\n{'=' * 60}")
-    print("Parameter Distributions")
-    print(f"{'=' * 60}")
-
-    for param, dist in sorted(distributions.items()):
-        print(f"\n{param}:")
-
-        if dist["type"] == "categorical":
-            for val_info in dist["values"]:
-                print(
-                    f"  {val_info['value']}: {val_info['count']} ({val_info['percentage']:.1f}%)"
-                )
-        else:
-            vals = dist["values"]
-            print(f"  min:     {vals['min']:g}")
-            print(f"  max:     {vals['max']:g}")
-            print(f"  mean:    {vals['mean']:g}")
-            print(f"  median:  {vals['median']:g}")
+def _load_json_if_present(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return document
 
 
-def format_recommendations(summary: StudySummary) -> list[dict[str, Any]]:
-    """Format recommendations for search space refinement."""
-    completed = summary.completed_trials
-    if len(completed) < 10:
-        return []
+def _reconcile_run_root(
+    run_root: Path,
+    study: optuna.Study,
+    state_counts: dict[str, int],
+) -> dict[str, Any]:
+    summary_path = run_root / "optuna/study_summary.json"
+    selection_path = run_root / "outputs/selection.json"
+    evaluation_path = run_root / "outputs/evaluation/evaluation_manifest.json"
+    receipt_paths = {
+        "study_summary": summary_path,
+        "selection": selection_path,
+        "evaluation": evaluation_path,
+        "promotion": run_root / ".state/promoted.done",
+        "cleanup": run_root / ".state/checkpoints_cleaned.done",
+        "workflow_done": run_root / ".state/workflow.done",
+    }
+    receipts = {
+        name: {
+            "path": str(path),
+            "exists": path.is_file(),
+            "sha256": sha256_file(path) if path.is_file() else None,
+        }
+        for name, path in receipt_paths.items()
+    }
 
-    recommendations = []
-
-    # Analyze each parameter
-    param_values: dict[str, list] = defaultdict(list)
-    for t in completed:
-        for param, value in t.params.items():
-            param_values[param].append(value)
-
-    # Separate numeric and categorical
-    for param, values in sorted(param_values.items()):
-        first_val = values[0]
-        is_numeric = isinstance(first_val, (int, float)) and not isinstance(
-            first_val, bool
+    issues: list[str] = []
+    summary = _load_json_if_present(summary_path)
+    selection = _load_json_if_present(selection_path)
+    evaluation = _load_json_if_present(evaluation_path)
+    promotion = _load_json_if_present(receipt_paths["promotion"])
+    cleanup = _load_json_if_present(receipt_paths["cleanup"])
+    workflow_done = _load_json_if_present(receipt_paths["workflow_done"])
+    config = _load_yaml(run_root / "config.yaml")
+    completed = [
+        trial
+        for trial in study.trials
+        if trial.state == TrialState.COMPLETE and trial.value is not None
+    ]
+    best_number = study.best_trial.number if completed else None
+    if summary is not None:
+        if summary.get("study_name") != study.study_name:
+            issues.append("Study summary name does not match JournalStorage")
+        if int(summary.get("trial_count", -1)) != len(study.trials):
+            issues.append("Study summary trial count does not match JournalStorage")
+        if summary.get("state_counts") != state_counts:
+            issues.append("Study summary state counts do not match JournalStorage")
+        if summary.get("best_trial", {}).get("number") != best_number:
+            issues.append("Study summary best trial does not match JournalStorage")
+    if selection is not None and selection.get("best_trial", {}).get("number") != best_number:
+        issues.append("Selection best trial does not match JournalStorage")
+    if selection is not None:
+        checkpoint = _relocate_run_path(
+            str(selection.get("selected_checkpoint", "")),
+            run_root,
         )
-
-        if is_numeric:
-            vals = [float(v) for v in values]
-            p10, p90 = np.percentile(vals, [10, 90])
-
-            rec = {
-                "param": param,
-                "type": "numeric",
-                "current_range": [min(vals), max(vals)],
-                "p80_interval": [p10, p90],
-            }
-
-            # Suggest narrowed range
-            if p90 - p10 < max(vals) - min(vals):
-                rec["suggestion"] = "narrow_range"
-                rec["suggested_range"] = [p10, p90]
-
-            recommendations.append(rec)
-
-        # For categorical (strings, lists, tuples), check if any values are unused
+        expected = selection.get("selected_checkpoint_sha256")
+        if not checkpoint.is_file() or expected != sha256_file(checkpoint):
+            issues.append("Selected checkpoint is missing or failed SHA-256")
+        if evaluation is not None:
+            evaluated_checkpoint = _relocate_run_path(
+                str(evaluation.get("checkpoint", "")),
+                run_root,
+            )
+            if evaluation.get("checkpoint_sha256") != expected:
+                issues.append("Evaluation checkpoint hash does not match selection")
+            if evaluated_checkpoint.resolve() != checkpoint.resolve():
+                issues.append("Evaluation checkpoint path does not match selection")
+    if evaluation is not None and selection is None:
+        issues.append("Evaluation exists without a selection receipt")
+    if cleanup is not None:
+        if selection is None:
+            issues.append("Cleanup exists without a selection receipt")
         else:
-            hashable_values = [tuple(v) if isinstance(v, list) else v for v in values]
-            counts = Counter(hashable_values)
-            total = len(values)
-            unused = [k for k, v in counts.items() if v / total < 0.05]
-
-            rec = {
-                "param": param,
-                "type": "categorical",
-                "value_counts": {str(k): v for k, v in counts.items()},
-            }
-
-            if unused:
-                rec["suggestion"] = "remove_unused"
-                rec["unused_values"] = [
-                    list(u) if isinstance(u, tuple) else u for u in unused
-                ]
-
-            recommendations.append(rec)
-
-    return recommendations
-
-
-def print_recommendations(summary: StudySummary) -> None:
-    """Print recommendations for search space refinement."""
-    recommendations = format_recommendations(summary)
-
-    if not recommendations:
-        print("\nRecommendations: run more trials for analysis")
-        return
-
-    print(f"\n{'=' * 60}")
-    print("Recommendations for Search Space Refinement")
-    print(f"{'=' * 60}")
-
-    for rec in recommendations:
-        if rec["type"] == "numeric":
-            print(f"\n{rec['param']}:")
-            print(
-                f"  Current range: [{rec['current_range'][0]:g}, {rec['current_range'][1]:g}]"
+            cleanup_checkpoint = _relocate_run_path(
+                str(cleanup.get("selected_checkpoint", "")),
+                run_root,
             )
-            print(
-                f"  80% interval:  [{rec['p80_interval'][0]:g}, {rec['p80_interval'][1]:g}]"
+            selected_checkpoint = _relocate_run_path(
+                str(selection.get("selected_checkpoint", "")),
+                run_root,
             )
+            if (
+                cleanup_checkpoint.resolve() != selected_checkpoint.resolve()
+                or cleanup.get("selected_checkpoint_sha256")
+                != selection.get("selected_checkpoint_sha256")
+            ):
+                issues.append("Cleanup receipt does not match selection")
+        if promotion is None:
+            issues.append("Cleanup exists without a promotion receipt")
+    if promotion is not None:
+        configured_run_id = config.get("run", {}).get("id")
+        if configured_run_id is not None and promotion.get("run_id") != configured_run_id:
+            issues.append("Promotion receipt run ID does not match config")
+        for required in ("destination", "dvc_pointer", "manifest_identity"):
+            if required not in promotion:
+                issues.append(f"Promotion receipt is missing {required}")
+    workflow_valid = False
+    if workflow_done is not None:
+        expected_kind = config.get("workflow", {}).get("kind")
+        expected_target = config.get("workflow", {}).get("target", expected_kind)
+        if workflow_done.get("workflow_kind") != expected_kind:
+            issues.append("Workflow completion kind does not match config")
+        elif workflow_done.get("workflow_target") != expected_target:
+            issues.append("Workflow completion target does not match config")
+        else:
+            terminal = _relocate_run_path(
+                str(workflow_done.get("terminal_artifact", "")),
+                run_root,
+            )
+            if not terminal.is_file():
+                issues.append("Workflow completion terminal artifact is missing")
+            else:
+                workflow_valid = True
 
-            if rec.get("suggestion") == "narrow_range":
-                print(
-                    f"  -> Suggest narrowing to: [{rec['suggested_range'][0]:g}, {rec['suggested_range'][1]:g}]"
-                )
+    if workflow_valid and not issues:
+        status = "complete"
+    elif any(
+        receipt["exists"] for receipt in receipts.values()
+    ):
+        status = "partial"
+    else:
+        status = "live"
+    return {"status": status, "receipts": receipts, "issues": issues}
 
-        elif rec["type"] == "categorical":
-            if rec.get("suggestion") == "remove_unused":
-                print(f"\n{rec['param']}:")
-                print(f"  Rarely used values: {rec['unused_values']}")
+
+def analyze_hpsearch(
+    *,
+    run_root: Path | None,
+    journal: Path | None,
+    study_name: str | None,
+    top_n: int,
+    importance: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    if top_n < 1:
+        raise ValueError("--top must be at least 1")
+    journal_path, resolved_name, resolved_root = _resolve_study_input(
+        run_root=run_root,
+        journal=journal,
+        study_name=study_name,
+    )
+    study = _load_study(journal_path, resolved_name)
+    state_counts = dict(
+        sorted(Counter(trial.state.name for trial in study.trials).items())
+    )
+    importances, warnings = _importance(study, enabled=importance)
+    run = (
+        _reconcile_run_root(resolved_root, study, state_counts)
+        if resolved_root is not None
+        else {"status": "standalone", "receipts": {}, "issues": []}
+    )
+    data = {
+        "study": {
+            "name": study.study_name,
+            "journal": str(journal_path),
+            "directions": [direction.name for direction in study.directions],
+            "trial_count": len(study.trials),
+            "state_counts": state_counts,
+        },
+        "run": run,
+        "objectives": _objective_summary(study),
+        "trials": [_serialize_trial(trial) for trial in study.trials],
+        "top_trials": _ranked_trials(study, top_n),
+        "parameters": _parameter_summary(study),
+        "training_dynamics": _dynamics_integrity(
+            study.trials,
+            run_root=resolved_root,
+        ),
+        "importance": importances,
+    }
+    warnings.extend(
+        "Trial "
+        f"{issue['trial_number']} training dynamics: {issue['issue']}"
+        + (f" ({issue['detail']})" if issue.get("detail") else "")
+        for issue in data["training_dynamics"]["issues"]
+    )
+    return data, warnings
 
 
-def print_importance(summary: StudySummary) -> None:
-    """Print parameter importance analysis."""
-    importance = analyze_param_importance(summary)
-
-    if not importance:
-        print("\nParameter importance: insufficient data")
-        return
-
-    print(f"\n{'=' * 60}")
-    print("Parameter Importance (abs(Spearman correlation))")
-    print(f"{'=' * 60}")
-    for param, imp in importance.items():
-        print(f"  {param}: {imp:.3f}")
+def _print_text(data: dict[str, Any], warnings: list[str]) -> None:
+    study = data["study"]
+    print(f"HPO STUDY: {study['name']}")
+    print(f"Run status: {data['run']['status']}")
+    print(f"Trials: {study['trial_count']} {study['state_counts']}")
+    for trial in data["top_trials"]:
+        print(f"Trial {trial['number']}: values={trial['values']}")
+    for warning in warnings:
+        print(f"Warning: {warning}")
+    for issue in data["run"]["issues"]:
+        print(f"Integrity issue: {issue}")
+    for issue in data["training_dynamics"]["issues"]:
+        print(
+            "Dynamics integrity issue: "
+            f"trial={issue['trial_number']} {issue['issue']}"
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze HPO journal hyperparameter search results"
+        description="Analyze an Optuna HPO study through JournalStorage"
     )
-    parser.add_argument(
-        "journal",
-        type=Path,
-        help="Path to journal file",
-    )
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=5,
-        help="Number of top trials to show (default: 5)",
-    )
-    parser.add_argument(
-        "--importance",
-        action="store_true",
-        help="Compute and show parameter importance",
-    )
-    parser.add_argument(
-        "--text",
-        action="store_true",
-        help="Output as human-readable text (default: JSON)",
-    )
-    parser.add_argument(
-        "--compact", action="store_true", help="Output compact JSON (no indentation)"
-    )
-
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--run-root", type=Path)
+    source.add_argument("--journal", type=Path)
+    parser.add_argument("--study-name")
+    parser.add_argument("--top", type=int, default=DEFAULT_TOP_TRIALS)
+    parser.add_argument("--importance", action="store_true")
+    parser.add_argument("--text", action="store_true")
+    parser.add_argument("--compact", action="store_true")
     args = parser.parse_args()
 
-    builder = SkillOutputBuilder(
-        skill_name="hpsearch-analyze",
-        input_path=str(args.journal),
-    )
-
+    input_path = args.run_root or args.journal
+    builder = SkillOutputBuilder("hpsearch-analyze", input_path=str(input_path))
     try:
-        summary = parse_journal(args.journal)
-
-        data = {
-            "summary": format_summary(summary),
-            "best_trials": format_best_trials(summary, n=args.top),
-            "series_rankings": format_series_rankings(summary),
-            "param_distributions": format_param_distributions(summary),
-            "recommendations": format_recommendations(summary),
-        }
-
-        if args.importance:
-            importance = analyze_param_importance(summary)
-            data["importance"] = importance
-
-        output = builder.success(data)
-
-        if args.text:
-            print_summary(summary)
-            print_best_trials(summary, n=args.top)
-            print_series_rankings(summary)
-            print_param_distributions(summary)
-
-            if args.importance:
-                print_importance(summary)
-
-            print_recommendations(summary)
-        else:
-            indent = 0 if args.compact else 2
-            print_output(output, indent=indent)
-
-    except FileNotFoundError:
-        print_output(
-            builder.error(
-                "FileNotFoundError", f"Journal file not found: {args.journal}"
-            )
+        data, warnings = analyze_hpsearch(
+            run_root=args.run_root,
+            journal=args.journal,
+            study_name=args.study_name,
+            top_n=args.top,
+            importance=args.importance,
         )
-    except json.JSONDecodeError as e:
-        print_output(builder.error("JSONDecodeError", f"Invalid journal format: {e}"))
-    except Exception as e:
-        print_output(builder.error(type(e).__name__, str(e), {"traceback": str(e)}))
+        for warning in warnings:
+            builder.add_warning(warning)
+        for issue in data["run"]["issues"]:
+            builder.add_warning(issue)
+        if args.text:
+            _print_text(data, [*warnings, *data["run"]["issues"]])
+        else:
+            print_output(
+                builder.success(data),
+                indent=None if args.compact else 2,
+            )
+    except Exception as exc:
+        print_output(
+            builder.error(type(exc).__name__, str(exc)),
+            indent=None if args.compact else 2,
+        )
 
 
 if __name__ == "__main__":

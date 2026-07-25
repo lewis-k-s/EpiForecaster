@@ -82,6 +82,7 @@ step-breakdown = "scripts.analysis.breakdown_step:main"
 loss-curve-critic = "scripts.analysis.analyze_loss_curve:main"
 gradnorm-analyze = "scripts.analysis.analyze_gradnorm:main"
 dead-code-analyze = "scripts.analysis.dead_code_analyze:main"
+hpsearch-analyze = "scripts.analysis.analyze_hpsearch_journal:main"
 # Data visualization runner
 dataviz = "scripts.analysis.dataviz_runner:main"
 hpsearch-pareto-plot = "scripts.hpo.plot_hpsearch_pareto:main"
