@@ -279,6 +279,11 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             value = str(training[field])
             if Path(value).name != value or value in {".", ".."}:
                 raise ValueError(f"training.{field} must be one safe path component")
+        init_checkpoint = training.get("init_checkpoint")
+        if init_checkpoint is not None and not Path(str(init_checkpoint)).is_absolute():
+            raise ValueError(
+                "training.init_checkpoint must be an absolute GPFS path when provided"
+            )
     elif kind == "evaluate":
         checkpoint = workflow_config["evaluation"].get("checkpoint")
         if checkpoint is None or not Path(str(checkpoint)).is_absolute():

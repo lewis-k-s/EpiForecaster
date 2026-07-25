@@ -7,7 +7,7 @@ container: {}
 
 workflow:
   kind: train
-  target: train
+  target: train_evaluate
 
 dvc:
   targets:
@@ -27,7 +27,7 @@ training:
 
 evaluation:
   split: test
-  granular: false
+  granular: true
   overrides:
     - training.val_workers=2
 

@@ -54,9 +54,12 @@ HOST_PYTHON = Path(sys.executable)
 PREPARED = RUN_ROOT / ".state/prepared.done"
 MANIFEST = RUN_ROOT / "manifest.yaml"
 PINNED_EVALUATION_CHECKPOINT = RUN_ROOT / "inputs/evaluation_checkpoint.pt"
+PINNED_TRAINING_INIT_CHECKPOINT = RUN_ROOT / "inputs/training_init_checkpoint.pt"
 PREPARE_OUTPUTS = [str(PREPARED), str(MANIFEST)]
 if WORKFLOW_KIND == "evaluate":
     PREPARE_OUTPUTS.append(str(PINNED_EVALUATION_CHECKPOINT))
+if WORKFLOW_KIND == "train" and config["training"].get("init_checkpoint") is not None:
+    PREPARE_OUTPUTS.append(str(PINNED_TRAINING_INIT_CHECKPOINT))
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
 WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"

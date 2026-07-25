@@ -270,49 +270,70 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         identity["study_name"] = study_config["study_name"]
     if isinstance(crossval_config, dict):
         identity["crossval_campaign_id"] = crossval_config["campaign_id"]
-    evaluation_input = None
-    if workflow_kind == "evaluate":
-        configured_checkpoint = Path(str(config["evaluation"]["checkpoint"]))
+    def pin_checkpoint(
+        configured_checkpoint: Path,
+        pinned_checkpoint: Path,
+        *,
+        label: str,
+    ) -> dict[str, str]:
         if configured_checkpoint.is_symlink():
             raise ValueError(
-                "Evaluation input checkpoint must not be a symlink: "
+                f"{label} input checkpoint must not be a symlink: "
                 f"{configured_checkpoint}"
             )
         resolved_checkpoint = configured_checkpoint.resolve(strict=True)
         if not resolved_checkpoint.is_file():
             raise ValueError(
-                "Evaluation input checkpoint must resolve to a regular file: "
+                f"{label} input checkpoint must resolve to a regular file: "
                 f"{configured_checkpoint}"
             )
         checkpoint_sha256 = sha256_file(resolved_checkpoint)
-        pinned_checkpoint = run_root / "inputs/evaluation_checkpoint.pt"
         pinned_checkpoint.parent.mkdir(parents=True, exist_ok=True)
         if pinned_checkpoint.exists():
             if pinned_checkpoint.is_symlink() or not pinned_checkpoint.is_file():
                 raise ValueError(
-                    "Pinned evaluation checkpoint must be a regular non-symlink "
-                    f"file: {pinned_checkpoint}"
+                    f"Pinned {label.lower()} checkpoint must be a regular "
+                    f"non-symlink file: {pinned_checkpoint}"
                 )
             if sha256_file(pinned_checkpoint) != checkpoint_sha256:
                 raise ValueError(
-                    "Pinned evaluation checkpoint conflicts with configured input: "
-                    f"{pinned_checkpoint}"
+                    f"Pinned {label.lower()} checkpoint conflicts with configured "
+                    f"input: {pinned_checkpoint}"
                 )
         else:
             temporary_checkpoint = pinned_checkpoint.with_suffix(".pt.partial")
             shutil.copyfile(resolved_checkpoint, temporary_checkpoint)
             if sha256_file(temporary_checkpoint) != checkpoint_sha256:
                 temporary_checkpoint.unlink(missing_ok=True)
-                raise ValueError("Evaluation checkpoint changed while being pinned")
+                raise ValueError(f"{label} checkpoint changed while being pinned")
             temporary_checkpoint.chmod(0o444)
             temporary_checkpoint.replace(pinned_checkpoint)
-        identity["input_checkpoint_sha256"] = checkpoint_sha256
-        evaluation_input = {
+        return {
             "configured_checkpoint": str(configured_checkpoint),
             "resolved_checkpoint": str(resolved_checkpoint),
             "pinned_checkpoint": str(pinned_checkpoint),
             "checkpoint_sha256": checkpoint_sha256,
         }
+
+    training_input = None
+    if workflow_kind == "train":
+        configured_init_checkpoint = config["training"].get("init_checkpoint")
+        if configured_init_checkpoint is not None:
+            training_input = pin_checkpoint(
+                Path(str(configured_init_checkpoint)),
+                run_root / "inputs/training_init_checkpoint.pt",
+                label="Training initialization",
+            )
+            identity["init_checkpoint_sha256"] = training_input["checkpoint_sha256"]
+
+    evaluation_input = None
+    if workflow_kind == "evaluate":
+        evaluation_input = pin_checkpoint(
+            Path(str(config["evaluation"]["checkpoint"])),
+            run_root / "inputs/evaluation_checkpoint.pt",
+            label="Evaluation",
+        )
+        identity["input_checkpoint_sha256"] = evaluation_input["checkpoint_sha256"]
 
     manifest = {
         "schema_version": 1,
@@ -364,6 +385,8 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             manifest[section] = config[section]
     if evaluation_input is not None:
         manifest["evaluation_input"] = evaluation_input
+    if training_input is not None:
+        manifest["training_input"] = training_input
     manifest_path = run_root / "manifest.yaml"
     write_yaml(manifest_path, manifest)
     prepared_path = run_root / ".state/prepared.done"
@@ -435,6 +458,21 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "output.save_checkpoints=true",
         "training.run_final_evaluation=false",
     ]
+    if training.get("init_checkpoint") is not None:
+        pinned_init_checkpoint = run_root / "inputs/training_init_checkpoint.pt"
+        manifest = load_yaml(run_root / "manifest.yaml")
+        expected_sha256 = str(manifest["training_input"]["checkpoint_sha256"])
+        if (
+            not pinned_init_checkpoint.is_file()
+            or pinned_init_checkpoint.is_symlink()
+            or sha256_file(pinned_init_checkpoint) != expected_sha256
+        ):
+            raise ValueError(
+                "Pinned training initialization checkpoint failed validation"
+            )
+        overrides.append(
+            f"training.init_checkpoint_path={pinned_init_checkpoint}"
+        )
     for override in overrides:
         command.extend(["--override", override])
 

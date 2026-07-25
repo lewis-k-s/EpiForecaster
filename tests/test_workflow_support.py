@@ -576,6 +576,59 @@ def test_prepare_run_pins_evaluation_checkpoint_bytes(
     assert run_support.sha256_file(pinned) == expected_hash
 
 
+def test_prepare_run_pins_training_initialization_checkpoint(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/fine-tune"
+    source_root = run_root / "source"
+    _write_pointer(
+        source_root,
+        "data/files/raw.zarr.dvc",
+        md5="raw.dir",
+        output_name="raw.zarr",
+    )
+    _write_pointer(
+        source_root,
+        "data/processed/processed.zarr.dvc",
+        md5="processed.dir",
+        output_name="processed.zarr",
+    )
+    external_checkpoint = tmp_path / "pretrain/best_model.pt"
+    external_checkpoint.parent.mkdir()
+    external_checkpoint.write_bytes(b"pretrained checkpoint")
+    config = _workflow_config(run_root, source_root)
+    config["workflow"].update({"kind": "train", "target": "train_evaluate"})
+    config["training"] = {
+        "base_config": "configs/production_only/train_epifor_mn5_full.yaml",
+        "experiment_name": "fine-tune",
+        "model_id": "model",
+        "init_checkpoint": str(external_checkpoint),
+        "overrides": [],
+    }
+    config.pop("optuna")
+    config.pop("promotion")
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_published_run_contract(run_root, config_path, config)
+    config_path.chmod(0o444)
+    source_root.chmod(0o555)
+
+    try:
+        manifest_path = run_support.prepare_run(config_path, source_root, run_root)
+    finally:
+        source_root.chmod(0o755)
+
+    pinned = run_root / "inputs/training_init_checkpoint.pt"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    assert pinned.read_bytes() == b"pretrained checkpoint"
+    assert not pinned.stat().st_mode & 0o222
+    assert manifest["training_input"]["pinned_checkpoint"] == str(pinned)
+    assert manifest["identity"]["init_checkpoint_sha256"] == (
+        run_support.sha256_file(pinned)
+    )
+
+
 def test_production_workflow_tracks_required_region_embedding() -> None:
     workflow = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
     training = yaml.safe_load(
@@ -1625,6 +1678,56 @@ def test_train_model_records_deterministic_checkpoint(
         "--max-batches",
         "2",
     ]
+
+
+def test_train_model_uses_validated_pinned_initialization_checkpoint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    base_config = source_root / "configs/train.yaml"
+    base_config.parent.mkdir(parents=True)
+    base_config.write_text("env: test\n")
+    pinned = run_root / "inputs/training_init_checkpoint.pt"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_bytes(b"pretrained")
+    config = {
+        "training": {
+            "base_config": "configs/train.yaml",
+            "experiment_name": "fine-tune",
+            "model_id": "model",
+            "init_checkpoint": "/gpfs/pretrain/best_model.pt",
+            "overrides": [],
+        }
+    }
+    config_path = run_root / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    (run_root / "manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "training_input": {
+                    "checkpoint_sha256": run_support.sha256_file(pinned)
+                }
+            }
+        )
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(command, *, cwd=None, env=None):
+        captured["command"] = command
+        checkpoint, _ = run_support.training_artifact_paths(config, run_root)
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"fine-tuned")
+        _complete_training_dynamics(checkpoint.parents[1])
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+
+    run_support.train_model(config_path, source_root, run_root)
+
+    command = captured["command"]
+    expected_override = f"training.init_checkpoint_path={pinned}"
+    assert expected_override in command
 
 
 @pytest.mark.parametrize(

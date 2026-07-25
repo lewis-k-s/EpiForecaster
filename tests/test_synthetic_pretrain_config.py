@@ -24,3 +24,19 @@ def test_synthetic_pretrain_interactive_smoke_disables_all_compilation() -> None
     overrides = set(config["training"]["overrides"])
     assert "training.compile=false" in overrides
     assert "training.compile_backward=false" in overrides
+    assert "training.pathway_gradient_frequency=1" in overrides
+    assert config["workflow"]["target"] == "train_evaluate"
+    assert config["evaluation"]["granular"] is True
+
+
+def test_synthetic_pretrain_production_emits_evaluation_diagnostics() -> None:
+    config = yaml.safe_load(
+        Path("workflow/config/mn5_synth_pretrain.yaml").read_text()
+    )
+    training = EpiForecasterConfig.load(
+        Path("configs/production_only/train_epifor_mn5_synth_pretrain.yaml")
+    )
+
+    assert config["workflow"]["target"] == "train_evaluate"
+    assert config["evaluation"]["granular"] is True
+    assert training.training.pathway_gradient_frequency == 500
