@@ -358,6 +358,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "optuna",
         "ablation",
         "promotion",
+        "provenance",
     ):
         if section in config:
             manifest[section] = config[section]
@@ -1396,6 +1397,125 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     return hashes
 
 
+def retain_training_evidence(
+    config_path: Path,
+    run_root: Path,
+    model_root: Path,
+) -> Path:
+    """Publish one compact, explicitly retained DVC training-evidence pack."""
+    config = load_yaml(config_path)
+    resolved_run = run_root.resolve(strict=True)
+    resolved_model = model_root.resolve(strict=True)
+    resolved_model.relative_to(resolved_run)
+    training = config["training"]
+    experiment_name = _safe_component(
+        training["experiment_name"], field="training.experiment_name"
+    )
+    model_id = _safe_component(training["model_id"], field="training.model_id")
+    destination = (
+        run_root / "evidence/training" / experiment_name / model_id
+    )
+    if destination.exists():
+        raise FileExistsError(
+            "Training evidence destination already exists and will not be "
+            f"overwritten: {destination}"
+        )
+
+    required = (
+        DYNAMICS_ARTIFACT_NAME,
+        DYNAMICS_MANIFEST_NAME,
+        "training_manifest.json",
+        "training_provenance.json",
+    )
+    selected = [
+        _validated_regular_file(
+            model_root / name,
+            run_root,
+            label="Training evidence",
+        )
+        for name in required
+    ]
+    selected.extend(
+        _validated_regular_file(path, run_root, label="Profiler trace")
+        for path in sorted(model_root.glob("*.pt.trace.json"))
+    )
+    artifact_hashes = {
+        path.name: {
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in selected
+    }
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / f".{model_id}.staging-{os.getpid()}"
+    artifacts = staging / "artifacts"
+    artifacts.mkdir(parents=True)
+    try:
+        for source in selected:
+            shutil.copy2(source, artifacts / source.name)
+        write_json(
+            artifacts / "evidence_manifest.json",
+            {
+                "schema_version": 1,
+                "run_id": config["run"]["id"],
+                "experiment_name": experiment_name,
+                "model_id": model_id,
+                "artifacts": artifact_hashes,
+            },
+        )
+
+        remote = Path(str(config["dvc"]["remote"]))
+        cache = Path(str(config["dvc"]["cache"]))
+        _run(["dvc", "init", "--no-scm"], cwd=staging)
+        _run(
+            ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
+            cwd=staging,
+        )
+        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=staging)
+        _run(["dvc", "config", "cache.dir", str(cache)], cwd=staging)
+        _run(["dvc", "config", "cache.shared", "group"], cwd=staging)
+        _run(["dvc", "config", "cache.type", "symlink"], cwd=staging)
+        lock_handle = _with_cache_lock(cache)
+        try:
+            _run(["dvc", "add", "artifacts"], cwd=staging)
+            _run(["dvc", "push", "artifacts.dvc"], cwd=staging)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+
+        pointer = staging / "artifacts.dvc"
+        pointer_identity = dvc_output(pointer)
+        if artifacts.is_symlink():
+            artifacts.unlink()
+        else:
+            shutil.rmtree(artifacts)
+        retention = {
+            "schema_version": 1,
+            "run_id": config["run"]["id"],
+            "retention_class": "dvc_retained",
+            "dvc_pointer": "artifacts.dvc",
+            "dvc_md5": pointer_identity["md5"],
+            "artifacts": artifact_hashes,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        write_json(staging / "retention.json", retention)
+        staging.rename(destination)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    retention_path = destination / "retention.json"
+    write_json(
+        run_root / ".state/training_evidence_retained.done",
+        {
+            "retention": str(retention_path),
+            "retention_sha256": sha256_file(retention_path),
+        },
+    )
+    return retention_path
+
+
 def promote_artifacts(config_path: Path, run_root: Path) -> Path:
     config = load_yaml(config_path)
     run_id = str(config["run"]["id"])
@@ -1537,6 +1657,11 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--config", type=Path, required=True)
     promote.add_argument("--run-root", type=Path, required=True)
 
+    retain_evidence = subparsers.add_parser("retain-training-evidence")
+    retain_evidence.add_argument("--config", type=Path, required=True)
+    retain_evidence.add_argument("--run-root", type=Path, required=True)
+    retain_evidence.add_argument("--model-root", type=Path, required=True)
+
     cleanup = subparsers.add_parser("cleanup-study")
     cleanup.add_argument("--config", type=Path, required=True)
     cleanup.add_argument("--run-root", type=Path, required=True)
@@ -1581,6 +1706,12 @@ def main() -> None:
         select_best_trial(args.config, args.run_root, args.journal)
     elif args.command == "promote":
         promote_artifacts(args.config, args.run_root)
+    elif args.command == "retain-training-evidence":
+        retain_training_evidence(
+            args.config,
+            args.run_root,
+            args.model_root,
+        )
     elif args.command == "cleanup-study":
         cleanup_study_checkpoints(args.config, args.run_root)
     elif args.command == "finalize-ablation":

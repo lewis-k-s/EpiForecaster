@@ -33,6 +33,13 @@ WORKFLOW_TARGET = workflow_target(config)
 SIF = str(config["container"]["sif"])
 DVC_REMOTE = str(config["dvc"]["remote"])
 DVC_CACHE = str(config["dvc"]["cache"])
+TRAINING_EVIDENCE_RETENTION = str(
+    config.get("provenance", {}).get("training_evidence_retention", "run")
+)
+if TRAINING_EVIDENCE_RETENTION not in {"run", "dvc"}:
+    raise ValueError(
+        "provenance.training_evidence_retention must be 'run' or 'dvc'"
+    )
 ALLOCATION = validate_mn5_allocation(config)
 TASKS = int(ALLOCATION["tasks"])
 CPUS_PER_TASK = int(ALLOCATION["cpus_per_task"])
@@ -111,15 +118,28 @@ if WORKFLOW_KIND == "train":
     )
     TRAINING_CHECKPOINT = TRAINING_ROOT / "checkpoints/best_model.pt"
     TRAINING_MANIFEST = TRAINING_ROOT / "training_manifest.json"
+    TRAINING_PROVENANCE = TRAINING_ROOT / "training_provenance.json"
+    TRAINING_EVIDENCE_RECORD = (
+        RUN_ROOT
+        / "evidence/training"
+        / str(training["experiment_name"])
+        / str(training["model_id"])
+        / "retention.json"
+    )
+    TRAINING_EVIDENCE_TERMINAL = (
+        TRAINING_EVIDENCE_RECORD
+        if TRAINING_EVIDENCE_RETENTION == "dvc"
+        else TRAINING_PROVENANCE
+    )
     TRAINING_DONE = RUN_ROOT / ".state/training.done"
     EVALUATION_CHECKPOINT = TRAINING_CHECKPOINT
-    EVALUATION_PREREQUISITES = [str(TRAINING_MANIFEST)]
+    EVALUATION_PREREQUISITES = [str(TRAINING_EVIDENCE_TERMINAL)]
     EVALUATION_CONTAINER_CHECKPOINT = (
         CONTAINER_RUN / EVALUATION_CHECKPOINT.relative_to(RUN_ROOT)
     )
     EVALUATION_INPUT_PATHS = ()
     DEFAULT_TERMINAL = (
-        TRAINING_MANIFEST
+        TRAINING_EVIDENCE_TERMINAL
         if WORKFLOW_TARGET == "train"
         else EVALUATION_MANIFEST
     )

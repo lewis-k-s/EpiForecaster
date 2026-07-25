@@ -1180,6 +1180,80 @@ def _write_source_inventory(run_root: Path) -> None:
     (run_root / ".state/published.done").write_text("run_id=test-run\n")
 
 
+def test_retain_training_evidence_publishes_one_dvc_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    model_root = run_root / "outputs/training/single/model"
+    _complete_training_dynamics(model_root)
+    (model_root / "training_manifest.json").write_text('{"schema_version": 1}\n')
+    (model_root / "training_provenance.json").write_text(
+        '{"schema_version": 1}\n'
+    )
+    (model_root / "worker.pt.trace.json").write_text('{"traceEvents": []}\n')
+    remote = tmp_path / "remote"
+    cache = tmp_path / "cache"
+    remote.mkdir()
+    cache.mkdir()
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "run": {"id": "run-1"},
+                "training": {
+                    "experiment_name": "single",
+                    "model_id": "model",
+                },
+                "dvc": {
+                    "remote": str(remote),
+                    "cache": str(cache),
+                },
+            }
+        )
+    )
+
+    def fake_run(command: list[str], *, cwd=None, env=None) -> None:
+        del env
+        if command[:3] == ["dvc", "add", "artifacts"]:
+            assert cwd is not None
+            Path(cwd, "artifacts.dvc").write_text(
+                yaml.safe_dump(
+                    {
+                        "outs": [
+                            {
+                                "md5": "evidence.dir",
+                                "path": "artifacts",
+                            }
+                        ]
+                    }
+                )
+            )
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+
+    retention_path = run_support.retain_training_evidence(
+        config_path,
+        run_root,
+        model_root,
+    )
+
+    retention = json.loads(retention_path.read_text())
+    assert retention["retention_class"] == "dvc_retained"
+    assert retention["dvc_md5"] == "evidence.dir"
+    assert set(retention["artifacts"]) == {
+        "training_dynamics.jsonl",
+        "training_dynamics_manifest.json",
+        "training_manifest.json",
+        "training_provenance.json",
+        "worker.pt.trace.json",
+    }
+    assert (retention_path.parent / "artifacts.dvc").is_file()
+    assert not (retention_path.parent / "artifacts").exists()
+    assert (run_root / ".state/training_evidence_retained.done").is_file()
+
+
 def _use_repository_sources(config: dict) -> None:
     production = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
     config["run"]["source_root"] = str(REPO_ROOT)
@@ -1269,6 +1343,8 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
 
     assert train_result.returncode == 0, train_result.stdout + train_result.stderr
     assert "train_model" in train_result.stdout
+    assert "export_training_provenance" in train_result.stdout
+    assert "training_provenance.json" in train_result.stdout
     assert "evaluate_model" not in train_result.stdout
     assert not re.search(
         r"^launch_optuna_workers\s+\d", train_result.stdout, re.MULTILINE
@@ -1280,7 +1356,7 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     assert str(REPO_ROOT / "configs/production_only/train_epifor_mn5_full.yaml") in (
         train_result.stdout
     )
-    assert re.search(r"^total\s+7$", train_result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+8$", train_result.stdout, re.MULTILINE)
 
     composed_result = _run_workflow_dry_run(
         config_path,
@@ -1292,6 +1368,7 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
         composed_result.stdout + composed_result.stderr
     )
     assert "train_model" in composed_result.stdout
+    assert "export_training_provenance" in composed_result.stdout
     assert "evaluate_model" in composed_result.stdout
     assert "test_summary.json" in composed_result.stdout
     assert "evaluation_manifest.json" in composed_result.stdout
@@ -1318,11 +1395,12 @@ def test_single_training_smoke_default_dag_reaches_evaluation(
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "train_model" in result.stdout
+    assert "export_training_provenance" in result.stdout
     assert "evaluate_model" in result.stdout
     assert "test_summary.json" in result.stdout
     assert "evaluation_manifest.json" in result.stdout
     assert "complete_workflow" in result.stdout
-    assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
 
 
 def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(

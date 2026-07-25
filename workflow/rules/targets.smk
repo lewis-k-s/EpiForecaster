@@ -4,7 +4,7 @@
 if WORKFLOW_KIND == "train":
     rule train:
         input:
-            str(TRAINING_MANIFEST)
+            str(TRAINING_EVIDENCE_TERMINAL)
 
 
     rule evaluate:
