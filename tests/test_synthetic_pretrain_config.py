@@ -78,3 +78,23 @@ def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> 
     assert evaluation.data.run_id_chunk_size == 1
     assert evaluation.training.curriculum.enabled is True
     assert evaluation.training.loss.joint.w_sird_supervision == 0.01
+
+
+def test_batch_mixing_smoke_shuffles_single_time_major_batches() -> None:
+    workflow = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_synth_pretrain_batch_mixing_smoke.yaml"
+        ).read_text()
+    )
+    training = EpiForecasterConfig.load(
+        Path("configs/production_only/train_epifor_mn5_synth_pretrain.yaml"),
+        overrides=workflow["training"]["overrides"],
+    )
+
+    assert validate_workflow_contract(workflow) == "train"
+    assert workflow["workflow"]["target"] == "train"
+    assert workflow["training"]["max_batches"] == 1000
+    assert training.training.batch_size == 32
+    assert training.data.sample_ordering == "time"
+    assert training.training.curriculum.chunk_size == 32
+    assert training.training.progress_log_frequency == 20

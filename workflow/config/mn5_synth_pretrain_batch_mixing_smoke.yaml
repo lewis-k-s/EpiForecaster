@@ -1,0 +1,54 @@
+# Production-shaped diagnostic for the time-major synthetic curriculum.
+#
+# With chunk_size=512, each time-major chunk contains sixteen consecutive
+# batches from one narrow window regime. The validated synthetic runs share the
+# same sparsity cadence, so this smoke shuffles one full batch per chunk to test
+# whether cross-window batch mixing stabilizes NLL and clipping before another
+# full pretraining cycle.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: train
+  target: train
+
+dvc:
+  targets:
+    - data/processed/synthetic_full_holt_damped.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+    - data/files/raw_synthetic_observations.zarr.dvc
+
+training:
+  base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml
+  experiment_name: synthetic-pretrain-batch-mixing-smoke
+  model_id: model
+  max_batches: 1000
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+    - training.epochs=1
+    - training.curriculum.chunk_size=32
+    - training.profiler.enabled=false
+    - training.progress_log_frequency=20
+    - training.grad_norm_log_frequency=100
+    - training.pathway_gradient_frequency=100
+
+evaluation:
+  split: test
+  granular: true
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 30
