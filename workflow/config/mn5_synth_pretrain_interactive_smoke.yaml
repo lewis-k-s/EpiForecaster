@@ -29,6 +29,7 @@ training:
     - training.num_workers=2
     - training.val_workers=2
     - training.compile=false
+    - training.compile_backward=false
     - training.profiler.enabled=false
     - training.progress_log_frequency=1
     - training.grad_norm_log_frequency=1
