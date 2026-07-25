@@ -366,7 +366,7 @@ def main() -> None:
     mobility_threshold = (
         float(args.mobility_threshold)
         if args.mobility_threshold is not None
-        else float(config.data.mobility_threshold)
+        else float(np.log1p(config.data.mobility_min_flow_raw))
     )
 
     # Save original starts and valid_mask before filtering for density computation

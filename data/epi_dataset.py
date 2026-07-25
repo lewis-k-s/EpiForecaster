@@ -225,18 +225,12 @@ class EpiDataset(Dataset):
         self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
 
         # Setup mobility preprocessor
-        # Data is already log1p-transformed from preprocessing pipeline
         if mobility_preprocessor is None:
             mp_config = MobilityPreprocessorConfig(
-                clip_range=config.data.mobility_clip_range,
-                scale_epsilon=config.data.mobility_scale_epsilon,
+                min_flow_raw=config.data.mobility_min_flow_raw,
+                weight_clip_max=config.data.mobility_weight_clip_max,
             )
             self.mobility_preprocessor = MobilityPreprocessor(mp_config)
-
-            # Fit scaler on train nodes only
-            all_region_ids = self._dataset[REGION_COORD].values
-            train_region_ids = [all_region_ids[n] for n in target_nodes]
-            self.mobility_preprocessor.fit_scaler(self._dataset, train_region_ids)
         else:
             self.mobility_preprocessor = mobility_preprocessor
 
@@ -250,6 +244,17 @@ class EpiDataset(Dataset):
             # Reuse shared tensors from another dataset (e.g., train -> val/test)
             self.preloaded_mobility = preloaded_mobility
             self.mobility_mask = mobility_mask
+            for time_step in range(self.preloaded_mobility.shape[0]):
+                weights_t = self.preloaded_mobility[time_step]
+                mask_t = self.mobility_mask[time_step]
+                if torch.any(weights_t[~mask_t] != 0):
+                    raise ValueError(
+                        "Shared mobility weights must be zero outside mobility_mask"
+                    )
+                if not torch.isfinite(weights_t).all() or torch.any(weights_t < 0):
+                    raise ValueError(
+                        "Shared mobility weights must be finite and nonnegative"
+                    )
             logger.info(
                 f"Reusing shared mobility tensor: {self.preloaded_mobility.shape}, "
                 f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
@@ -260,27 +265,29 @@ class EpiDataset(Dataset):
             # Ensure proper dimension ordering: Time, Origin, Destination
             mobility_da = self.mobility_preprocessor._ensure_time_first(mobility_da)
 
-            # Load all values into memory
-            mobility_np = mobility_da.values
+            # Select edges in raw-flow units while values are still in canonical
+            # stored log1p space. The same mask controls all dynamic consumers.
+            stored_log_flow = mobility_da.values
+            mobility_mask_np = self.mobility_preprocessor.build_edge_mask(
+                stored_log_flow
+            )
+            if "mobility_time_mask" in self._dataset:
+                time_mask_np = self._dataset["mobility_time_mask"].values.astype(bool)
+                while time_mask_np.ndim < mobility_mask_np.ndim:
+                    time_mask_np = np.expand_dims(time_mask_np, axis=-1)
+                mobility_mask_np &= time_mask_np
 
-            # Apply preprocessing/scaling once
-            mobility_np = self.mobility_preprocessor.transform_values(mobility_np)
+            mobility_np = self.mobility_preprocessor.transform_edge_weights(
+                stored_log_flow,
+                mobility_mask_np,
+            )
 
             # Convert to torch tensor (float16 for memory efficiency)
             self.preloaded_mobility = torch.from_numpy(mobility_np).to(
                 dtype_utils.STORAGE_DTYPES["continuous"]
             )
             self.preloaded_mobility = _replace_non_finite(self.preloaded_mobility)
-
-            # Optimization: Precompute mobility mask to avoid repeated comparisons in __getitem__
-            mobility_threshold = float(config.data.mobility_threshold)
-            self.mobility_mask = self.preloaded_mobility >= mobility_threshold
-            if "mobility_time_mask" in self._dataset:
-                time_mask_np = self._dataset["mobility_time_mask"].values.astype(bool)
-                time_mask = torch.from_numpy(time_mask_np).to(torch.bool)
-                while time_mask.ndim < self.mobility_mask.ndim:
-                    time_mask = time_mask.unsqueeze(-1)
-                self.mobility_mask &= time_mask
+            self.mobility_mask = torch.from_numpy(mobility_mask_np).to(torch.bool)
 
             logger.info(
                 f"Mobility preloaded: {self.preloaded_mobility.shape}, "
@@ -504,6 +511,7 @@ class EpiDataset(Dataset):
             )
             if adjacency_source == "spatial_knn":
                 self.spatial_knn_adjacency = self.static_graph_adjacency
+        self.mobility_diagnostics = self._build_mobility_diagnostics()
 
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
         # This moves expensive matrix operations from per-sample to startup time
@@ -719,7 +727,11 @@ class EpiDataset(Dataset):
 
         # Get mobility history from preloaded tensor
         mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
-        neigh_mask = self.mobility_mask[range_start:range_end, :, target_idx]
+        neigh_mask = self._get_clinical_neighbor_mask(
+            range_start=range_start,
+            range_end=range_end,
+            target_idx=target_idx,
+        )
 
         # Use pre-extracted run_id to avoid zarr access in workers
         run_id = self._run_id_value
@@ -1489,15 +1501,160 @@ class EpiDataset(Dataset):
                 )
             adjacency = self.static_graph_adjacency.clone()
         else:
-            # Get mobility matrix for this time step from preloaded tensor
-            mobility_matrix = self.preloaded_mobility[time_step]
-            adjacency = mobility_matrix > 0
+            # Canonical mobility is [origin, destination], while dense graph rows
+            # represent receiving nodes. Transpose without changing edge selection.
+            adjacency = self.mobility_mask[time_step].T.clone()
         if self.context_mask is not None:
             mask = self.context_mask
             adjacency = adjacency & mask[:, None] & mask[None, :]
 
         self._adjacency_cache[time_step] = adjacency
         return adjacency
+
+    def _get_clinical_neighbor_mask(
+        self,
+        *,
+        range_start: int,
+        range_end: int,
+        target_idx: int,
+    ) -> torch.Tensor:
+        """Return the same incoming-neighbor mask used by the selected graph."""
+        adjacency_source = self.config.model.graph_adjacency_source
+        if adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            if self.static_graph_adjacency is None:
+                raise RuntimeError(
+                    f"{adjacency_source} adjacency has not been initialized"
+                )
+            incoming = self.static_graph_adjacency[:, target_idx]
+            return incoming.unsqueeze(0).expand(range_end - range_start, -1).clone()
+        return self.mobility_mask[range_start:range_end, :, target_idx].clone()
+
+    def _build_mobility_diagnostics(self) -> dict[str, Any]:
+        """Summarize the effective graph and record mask provenance."""
+        node_mask = self.context_mask
+        node_ids = torch.where(node_mask)[0]
+        adjacency_source = self.config.model.graph_adjacency_source
+        time_step_count = self.preloaded_mobility.shape[0]
+        clip_max = float(self.config.data.mobility_weight_clip_max)
+        dynamic_edge_count = 0
+        clipped_edge_count = 0
+        dynamic_non_finite_count = 0
+        dynamic_negative_count = 0
+        outside_mask_count = 0
+        dynamic_incoming_degrees: list[torch.Tensor] = []
+
+        for time_step in range(time_step_count):
+            dynamic_mask_t = self.mobility_mask[time_step][
+                node_ids.unsqueeze(-1),
+                node_ids,
+            ]
+            dynamic_weights_t = self.preloaded_mobility[time_step][
+                node_ids.unsqueeze(-1),
+                node_ids,
+            ]
+            dynamic_edge_count += int(dynamic_mask_t.sum().item())
+            clipped_edge_count += int(
+                (dynamic_weights_t[dynamic_mask_t] >= clip_max).sum().item()
+            )
+            dynamic_non_finite_count += int(
+                (~torch.isfinite(dynamic_weights_t)).sum().item()
+            )
+            dynamic_negative_count += int((dynamic_weights_t < 0).sum().item())
+            outside_mask_count += int(
+                ((dynamic_weights_t != 0) & ~dynamic_mask_t).sum().item()
+            )
+            dynamic_incoming_degrees.append(dynamic_mask_t.sum(dim=0).to(torch.float32))
+
+        if adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            if self.static_graph_adjacency is None:
+                raise RuntimeError(
+                    f"{adjacency_source} adjacency has not been initialized"
+                )
+            effective_mask_2d = self.static_graph_adjacency[
+                node_ids.unsqueeze(-1), node_ids
+            ]
+            incoming_degree = (
+                effective_mask_2d.sum(dim=0).to(torch.float32).repeat(time_step_count)
+            )
+            positive_edge_count = int(effective_mask_2d.sum().item() * time_step_count)
+            effective_non_finite_count = 0
+            effective_negative_count = 0
+            self_loop_count = int(
+                effective_mask_2d.diagonal().sum().item() * time_step_count
+            )
+            graph_mask_source = adjacency_source
+            clinical_mask_source = adjacency_source
+            gpu_weight_source = adjacency_source
+        else:
+            incoming_degree = torch.cat(dynamic_incoming_degrees)
+            positive_edge_count = dynamic_edge_count
+            effective_non_finite_count = dynamic_non_finite_count
+            effective_negative_count = dynamic_negative_count
+            self_loop_count = sum(
+                int(
+                    self.mobility_mask[time_step][
+                        node_ids,
+                        node_ids,
+                    ]
+                    .sum()
+                    .item()
+                )
+                for time_step in range(time_step_count)
+            )
+            graph_mask_source = "mobility_edge_mask"
+            clinical_mask_source = "mobility_edge_mask"
+            gpu_weight_source = "masked_log1p_mobility_weights"
+
+        possible_edges = (
+            time_step_count * int(node_ids.numel()) * max(int(node_ids.numel()) - 1, 0)
+        )
+
+        percentiles = {}
+        for label, quantile in (("p10", 0.10), ("p50", 0.50), ("p90", 0.90)):
+            percentiles[label] = (
+                float(torch.quantile(incoming_degree, quantile).item())
+                if incoming_degree.numel()
+                else 0.0
+            )
+
+        diagnostics: dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": str(self.run_id),
+            "graph_adjacency_source": adjacency_source,
+            "node_count": int(node_ids.numel()),
+            "time_step_count": int(time_step_count),
+            "mobility_min_flow_raw": float(self.config.data.mobility_min_flow_raw),
+            "mobility_min_flow_stored_log1p": (
+                self.mobility_preprocessor.stored_log_threshold
+            ),
+            "mobility_weight_clip_max": clip_max,
+            "positive_edge_count": positive_edge_count,
+            "positive_edge_density": (
+                positive_edge_count / possible_edges if possible_edges else 0.0
+            ),
+            "mean_incoming_degree": (
+                float(incoming_degree.mean().item()) if incoming_degree.numel() else 0.0
+            ),
+            "incoming_degree_percentiles": percentiles,
+            "dynamic_selected_edge_count": dynamic_edge_count,
+            "dynamic_clipped_edge_count": clipped_edge_count,
+            "dynamic_clipped_edge_fraction": (
+                clipped_edge_count / dynamic_edge_count if dynamic_edge_count else 0.0
+            ),
+            "non_finite_weight_count": int(effective_non_finite_count),
+            "negative_weight_count": int(effective_negative_count),
+            "nonzero_weight_outside_dynamic_mask_count": outside_mask_count,
+            "self_loops_in_edge_mask_count": self_loop_count,
+            "mask_sources": {
+                "gnn_weights": gpu_weight_source,
+                "k_hop_topology": graph_mask_source,
+                "clinical_context": clinical_mask_source,
+                "imported_risk": "masked_log1p_mobility_weights",
+                "gpu_adjacency": gpu_weight_source,
+            },
+        }
+        logger.info("Mobility initialization diagnostics: %s", diagnostics)
+        return diagnostics
 
     def _get_global_to_local(self) -> torch.Tensor:
         """Compute global to local node index mapping (static, computed once).

@@ -36,7 +36,7 @@ def make_epi_config(
 
     data_kwargs = {
         "dataset_path": str(dataset_path),
-        "mobility_threshold": 0.0,
+        "mobility_min_flow_raw": 0.0,
         "min_history_observed_fraction": 1.0,
         "min_horizon_observed_fraction": 1.0,
     }

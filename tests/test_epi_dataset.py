@@ -61,7 +61,9 @@ class TestEpiDataset:
     def config(self):
         return EpiForecasterConfig(
             data=DataConfig(
-                dataset_path="dummy.zarr", run_id="real", mobility_threshold=0.0
+                dataset_path="dummy.zarr",
+                run_id="real",
+                mobility_min_flow_raw=0.0,
             ),
             model=ModelConfig(
                 type=ModelVariant(cases=True, mobility=True),

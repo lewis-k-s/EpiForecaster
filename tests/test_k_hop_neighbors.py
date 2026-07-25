@@ -345,6 +345,19 @@ def test_spatial_queen_depth_one_masks_to_queen_neighbors(tmp_path):
             torch.zeros_like(item["mob_x"][0, node_ids.index(node_id)]),
         )
 
+    clinical_mask = dataset._get_clinical_neighbor_mask(
+        range_start=0,
+        range_end=config.model.input_window_length,
+        target_idx=0,
+    )
+    expected = dataset.static_graph_adjacency[:, 0]
+    assert torch.equal(
+        clinical_mask,
+        expected.unsqueeze(0).expand_as(clinical_mask),
+    )
+    assert clinical_mask[:, 2].all()
+    assert not dataset.mobility_mask[:, 2, 0].any()
+
 
 @pytest.mark.epiforecaster
 def test_k_hop_masking_gnn_depth_0(tmp_path):

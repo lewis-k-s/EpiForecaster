@@ -206,7 +206,8 @@ def test_build_neighborhood_context_report_labels_aggregation_methods(
         }
         config["data"] = {
             "dataset_path": "data/processed/real_with_id.zarr",
-            "mobility_threshold": 0.0,
+            "mobility_min_flow_raw": 0.0,
+            "mobility_weight_clip_max": 8.0,
             "mobility_lags": [],
         }
         (run_dir / "config.yaml").write_text(

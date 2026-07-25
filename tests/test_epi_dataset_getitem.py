@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import torch
+from types import SimpleNamespace
 
 from data.epi_dataset import EpiDataset
 from data.region_embedding_store import RegionEmbeddingStore
@@ -9,6 +10,7 @@ from tests.dataset_test_helpers import (
     make_tiny_epi_dataset,
     write_zarr_dataset,
 )
+from utils.training_utils import inject_gpu_mobility
 
 
 def _make_config(dataset_path, sample_ordering="node"):
@@ -62,14 +64,14 @@ def test_getitem_preserves_target_history_when_self_edge_missing(tmp_path):
     _write_tiny_dataset(str(zarr_path), periods=8)
 
     config = _make_config(str(zarr_path))
-    config.data.mobility_threshold = 0.5  # require positive flow
+    config.data.mobility_min_flow_raw = 0.5
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
     # Remove all self-mobility so target self-edge is below threshold
     dataset.preloaded_mobility[:, 0, 0] = 0.0
     dataset.preloaded_mobility[:, 1, 1] = 0.0
-    dataset.mobility_mask = dataset.preloaded_mobility >= config.data.mobility_threshold
-    dataset.mobility_mask_float = dataset.mobility_mask.to(torch.float32)
+    dataset.mobility_mask[:, 0, 0] = False
+    dataset.mobility_mask[:, 1, 1] = False
 
     item = dataset[0]  # target node 0, first window
     cases_hist = item["cases_hist"]  # (L, 3), channels [value, mask, age]
@@ -94,11 +96,83 @@ def test_mobility_time_mask_blocks_edges_when_threshold_zero(tmp_path):
     )
 
     config = _make_config(str(zarr_path))
-    config.data.mobility_threshold = 0.0
+    config.data.mobility_min_flow_raw = 0.0
     dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
 
-    assert torch.all(dataset.mobility_mask[:4])
+    off_diagonal = ~torch.eye(2, dtype=torch.bool)
+    assert torch.all(dataset.mobility_mask[:4, off_diagonal])
+    assert not torch.any(torch.diagonal(dataset.mobility_mask[:4], dim1=-2, dim2=-1))
     assert not torch.any(dataset.mobility_mask[4:])
+    assert not torch.any(dataset.preloaded_mobility[4:])
+    assert not torch.any(dataset._get_adjacency_at_time(5))
+
+
+@pytest.mark.epiforecaster
+def test_dynamic_mask_is_shared_by_clinical_topology_and_gpu_adjacency(
+    tmp_path,
+) -> None:
+    periods = 8
+    raw_flow = np.zeros((1, periods, 3, 3), dtype=np.float32)
+    raw_flow[:, :, 0, 1] = 9.0
+    raw_flow[:, :, 2, 1] = 10.0
+    raw_flow[:, :, 1, 2] = 11.0
+    cases = np.broadcast_to(
+        np.array([100.0, 200.0, 300.0], dtype=np.float32).reshape(1, 1, 3, 1),
+        (1, periods, 3, 1),
+    ).copy()
+    dataset_path = tmp_path / "known_od.zarr"
+    canonical = make_tiny_epi_dataset(
+        periods=periods,
+        num_nodes=3,
+        cases=cases,
+        mobility=np.log1p(raw_flow),
+    )
+    write_zarr_dataset(canonical, dataset_path)
+    config = make_epi_config(
+        dataset_path,
+        data_options={"mobility_min_flow_raw": 10.0},
+    )
+    dataset = EpiDataset(
+        config=config,
+        target_nodes=[1],
+        context_nodes=[0, 1, 2],
+    )
+
+    expected_od_mask = dataset.mobility_mask[0]
+    assert not expected_od_mask[0, 1]
+    assert expected_od_mask[2, 1]
+    assert expected_od_mask[1, 2]
+    assert torch.equal(dataset._get_adjacency_at_time(0), expected_od_mask.T)
+
+    clinical_mask = dataset._get_clinical_neighbor_mask(
+        range_start=0,
+        range_end=config.model.input_window_length,
+        target_idx=1,
+    )
+    assert torch.equal(
+        clinical_mask,
+        dataset.mobility_mask[: config.model.input_window_length, :, 1],
+    )
+
+    mob_batch = SimpleNamespace(
+        global_t=torch.tensor([0]),
+        run_id="real",
+        target_node=torch.tensor([0]),
+    )
+    batch = SimpleNamespace(mob_batch=mob_batch)
+    inject_gpu_mobility(batch, dataset, torch.device("cpu"))
+
+    node_ids = torch.where(dataset._get_graph_node_mask())[0]
+    expected_weights = dataset.preloaded_mobility[
+        0,
+        node_ids.unsqueeze(-1),
+        node_ids,
+    ].T.float()
+    expected_weights = torch.maximum(
+        expected_weights,
+        torch.eye(len(node_ids)),
+    )
+    assert torch.allclose(batch.mob_batch.adj_dense[0].float(), expected_weights)
 
 
 @pytest.mark.epiforecaster

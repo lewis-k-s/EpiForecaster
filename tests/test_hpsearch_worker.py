@@ -333,10 +333,10 @@ class TestSuggestEpiforecasterParams:
         assert "data.sample_ordering" in overrides
         assert overrides["data.sample_ordering"] in ("node", "time")
 
-    def test_data_knobs_mobility_threshold(self) -> None:
+    def test_data_knobs_mobility_min_flow_raw(self) -> None:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        assert "data.mobility_threshold" in overrides
+        assert "data.mobility_min_flow_raw" in overrides
 
     def test_full_worker_does_not_suggest_missing_permit(self) -> None:
         trial = _StubTrial()

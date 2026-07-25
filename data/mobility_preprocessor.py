@@ -1,174 +1,106 @@
 from dataclasses import dataclass
-import logging
 
 import numpy as np
 import xarray as xr
 
-from .preprocess.config import REGION_COORD, TEMPORAL_COORD
-
-logger = logging.getLogger(__name__)
+from .preprocess.config import TEMPORAL_COORD
 
 
-def _compute_quantiles_via_sort(
-    values: np.ndarray, quantiles: list[float]
-) -> list[float]:
-    """Compute quantiles via sorting to avoid float16 overflow in np.percentile.
-
-    np.percentile internally computes (n-1) * q which overflows float16
-    for large arrays (256M+ values). Sorting stays in the input dtype,
-    and index calculation uses Python int (unlimited precision).
-
-    Args:
-        values: 1D array of finite values (any dtype including float16)
-        quantiles: List of quantile values in [0, 1] (e.g., [0.25, 0.5, 0.75])
-
-    Returns:
-        List of quantile values as Python floats
-    """
-    if len(values) == 0:
-        raise ValueError("Cannot compute quantiles of empty array")
-
-    sorted_vals = np.sort(values)
-    n = len(sorted_vals)
-
-    results = []
-    for q in quantiles:
-        idx = int((n - 1) * q)
-        idx = max(0, min(idx, n - 1))  # Clamp to valid range
-        results.append(float(sorted_vals[idx]))
-
-    return results
-
-
-@dataclass
-class MobilityScalerParams:
-    """Fitted scaler parameters for train-only mobility scaling.
-
-    Stores robust scaling parameters (median/IQR) computed from training data.
-    """
-
-    center: float
-    scale: float
-    is_fitted: bool = False
-
-
-@dataclass
+@dataclass(frozen=True)
 class MobilityPreprocessorConfig:
-    """Configuration for mobility preprocessing.
+    """Configuration for selecting and weighting mobility edges."""
 
-    Note: log1p transform is applied in the preprocessing pipeline, not here.
-    This preprocessor only applies robust scaling to already-log-transformed values.
-    """
+    min_flow_raw: float = 10.0
+    weight_clip_max: float = 8.0
 
-    clip_range: tuple[float, float] = (-8.0, 8.0)
-    scale_epsilon: float = 1e-6
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.min_flow_raw) or self.min_flow_raw < 0:
+            raise ValueError("min_flow_raw must be finite and non-negative")
+        if (
+            not np.isfinite(self.weight_clip_max)
+            or self.weight_clip_max <= 0
+            or self.weight_clip_max > np.finfo(np.float16).max
+        ):
+            raise ValueError(
+                "weight_clip_max must be finite, positive, and representable in float16"
+            )
 
 
 class MobilityPreprocessor:
-    """Handles mobility normalization with train-only robust scaling.
+    """Select mobility edges in raw-flow units and build nonnegative weights.
 
-    Values are already log1p-transformed from the preprocessing pipeline.
-    This preprocessor applies robust scaling (median/IQR normalization) only.
+    The canonical Zarr stores ``log1p(raw_flow)``. Edge selection therefore uses
+    ``log1p(min_flow_raw)`` directly in stored space, before upper clipping.
+    Retained weights remain in stored log space; there is no centering.
     """
 
     def __init__(self, config: MobilityPreprocessorConfig | None = None) -> None:
         self.config = config or MobilityPreprocessorConfig()
-        self.scaler_params: MobilityScalerParams | None = None
 
-    def fit_scaler(self, dataset: xr.Dataset, train_nodes: list[int]) -> None:
-        """Fit robust scaler on train nodes only (all timesteps).
+    @property
+    def stored_log_threshold(self) -> float:
+        """Return the exact stored-space equivalent of the raw-flow threshold."""
+        return float(np.log1p(self.config.min_flow_raw))
 
-        Args:
-            dataset: xarray Dataset containing mobility variable (already log1p-transformed)
-            train_nodes: List of region indices or region IDs for training split
-        """
-        mobility_da = dataset.mobility
-        mobility_train = self._select_train_mobility(mobility_da, train_nodes, dataset)
-
-        values = mobility_train.values
-        finite_values = values[np.isfinite(values)].astype(np.float32)
-        if len(finite_values) == 0:
-            logger.warning(
-                "No finite mobility values in train nodes. Using default scaler (center=0, scale=1). "
-                "This is expected if using broken synthetic data for testing."
-            )
-            self.scaler_params = MobilityScalerParams(
-                center=0.0, scale=1.0, is_fitted=True
-            )
-            return
-
-        # Values are already log1p-transformed from preprocessing pipeline
-        # Fit scaler directly on log-transformed values
-        center = np.median(finite_values)
-        q75 = np.percentile(finite_values, 75)
-        q25 = np.percentile(finite_values, 25)
-        scale = np.maximum(q75 - q25, 1.0)
-
-        self.scaler_params = MobilityScalerParams(
-            center=float(center), scale=float(scale), is_fitted=True
+    def build_edge_mask(
+        self,
+        stored_log_flow: np.ndarray,
+        min_flow_raw: float | None = None,
+    ) -> np.ndarray:
+        """Select positive, finite, non-self edges before weight transformation."""
+        threshold_raw = (
+            self.config.min_flow_raw if min_flow_raw is None else float(min_flow_raw)
         )
+        if not np.isfinite(threshold_raw) or threshold_raw < 0:
+            raise ValueError("min_flow_raw must be finite and non-negative")
 
-    def set_scaler_params(self, params: MobilityScalerParams) -> None:
-        """Set pre-fitted scaler params (for val/test datasets)."""
-        self.scaler_params = params
+        values = np.asarray(stored_log_flow)
+        threshold_log = np.log1p(threshold_raw)
+        edge_mask = np.isfinite(values) & (values > 0.0) & (values >= threshold_log)
+        if values.ndim >= 2 and values.shape[-2] == values.shape[-1]:
+            diagonal = np.arange(values.shape[-1])
+            edge_mask[..., diagonal, diagonal] = False
+        return edge_mask
+
+    def transform_edge_weights(
+        self,
+        stored_log_flow: np.ndarray,
+        edge_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Upper-clip retained log-space weights and keep all other edges zero."""
+        values = np.asarray(stored_log_flow)
+        mask = np.asarray(edge_mask, dtype=bool)
+        if values.shape != mask.shape:
+            raise ValueError(
+                "stored_log_flow and edge_mask must have identical shapes, got "
+                f"{values.shape} and {mask.shape}"
+            )
+
+        finite_nonnegative = np.nan_to_num(
+            values.astype(np.float32, copy=False),
+            nan=0.0,
+            posinf=self.config.weight_clip_max,
+            neginf=0.0,
+        )
+        finite_nonnegative = np.clip(
+            finite_nonnegative,
+            0.0,
+            self.config.weight_clip_max,
+        )
+        weights = np.where(mask, finite_nonnegative, 0.0).astype(np.float32)
+        if not np.isfinite(weights).all() or np.any(weights < 0):
+            raise ValueError(
+                "Mobility weight transform must produce finite nonnegative values"
+            )
+        return weights
 
     def preprocess_dataset(self, dataset: xr.Dataset) -> np.ndarray:
-        """Vectorized preprocessing of the entire dataset.
-
-        Returns:
-            np.ndarray: Shape (time, nodes, nodes) containing normalized mobility.
-        """
+        """Select and transform a full canonical mobility tensor."""
         mobility_da = dataset.mobility
         mobility_da = self._ensure_time_first(mobility_da)
-        return self.transform_values(mobility_da.values)
-
-    def transform_values(self, values: np.ndarray) -> np.ndarray:
-        """Apply robust scaling to a mobility array (already log1p-transformed).
-
-        Args:
-            values: Mobility array with log1p-transformed values
-
-        Returns:
-            Robust-scaled mobility array
-        """
-        out = values.astype(np.float32, copy=True)
-
-        # Values are already log1p-transformed from preprocessing pipeline
-        # Apply robust scaling only
-        if self.scaler_params and self.scaler_params.is_fitted:
-            scale = max(self.scaler_params.scale, self.config.scale_epsilon)
-            out = (out - self.scaler_params.center) / scale
-            out = np.clip(out, *self.config.clip_range)
-
-        return np.nan_to_num(out, nan=0.0).astype(np.float32)
-
-    def _select_train_mobility(
-        self, mobility_da: xr.DataArray, train_nodes: list[int], dataset: xr.Dataset
-    ) -> xr.DataArray:
-        spatial_dims = [d for d in mobility_da.dims if d != TEMPORAL_COORD]
-        if len(spatial_dims) != 2:
-            raise ValueError(
-                f"Expected mobility array with 2 spatial dims, got {mobility_da.dims}"
-            )
-        origin_dim, dest_dim = spatial_dims
-
-        region_ids = dataset[REGION_COORD].values
-        region_id_index = {rid: i for i, rid in enumerate(region_ids)}
-        region_id_set = set(region_id_index.keys())
-
-        if all(node in region_id_set for node in train_nodes):
-            train_ids = list(train_nodes)
-            train_indices = [region_id_index[rid] for rid in train_ids]
-        else:
-            train_indices = list(train_nodes)
-            train_ids = [region_ids[i] for i in train_indices]
-
-        try:
-            return mobility_da.sel({origin_dim: train_ids, dest_dim: train_ids})
-        except (KeyError, ValueError):
-            return mobility_da.isel(
-                {origin_dim: train_indices, dest_dim: train_indices}
-            )
+        values = mobility_da.values
+        edge_mask = self.build_edge_mask(values)
+        return self.transform_edge_weights(values, edge_mask)
 
     def _ensure_time_first(self, mobility_da: xr.DataArray) -> xr.DataArray:
         if TEMPORAL_COORD in mobility_da.dims:

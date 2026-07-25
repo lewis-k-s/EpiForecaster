@@ -9,6 +9,11 @@ from omegaconf import MISSING, DictConfig, OmegaConf
 
 GNN_TYPES = ["gcn", "gat"]
 GRAPH_ADJACENCY_SOURCES = ["mobility", "spatial_knn", "spatial_queen"]
+OBSOLETE_MOBILITY_DATA_FIELDS = {
+    "mobility_threshold",
+    "mobility_clip_range",
+    "mobility_scale_epsilon",
+}
 FORECASTER_HEAD_TYPES = ["transformer"]
 POSITIONAL_ENCODING_TYPES = ["sinusoidal", "learned"]
 TARGET_OBSERVATION_CADENCE_DAYS = {
@@ -435,8 +440,10 @@ class DataConfig:
     regions_data_path: str = ""
     # .pt file containing region2vec encoder model weights
     region2vec_path: str = ""
-    # Minimum incoming mobility flow to include a node in the neighborhood mask.
-    mobility_threshold: float = 0.0
+    # Edge selection uses raw-flow units against canonical log1p-stored mobility.
+    mobility_min_flow_raw: float = 10.0
+    # Retained adjacency weights stay in log1p(raw-flow) space and are upper-clipped.
+    mobility_weight_clip_max: float = 8.0
     # Use valid_targets mask from dataset to filter target nodes
     use_valid_targets: bool = False
     # Sliding window stride for training samples
@@ -447,9 +454,6 @@ class DataConfig:
     min_horizon_observed_fraction: float = 0.5
     # Dataset sample ordering: "node" (node-major) or "time" (time-major)
     sample_ordering: str = "node"
-    # Mobility preprocessing configuration (data already log1p-transformed from pipeline)
-    mobility_clip_range: tuple[float, float] = (-8.0, 8.0)
-    mobility_scale_epsilon: float = 1e-6
     # Lags for mobility-weighted case features (e.g. [1, 7, 14])
     mobility_lags: list[int] = field(default_factory=list)
     # Whether to use mobility-weighted lagged case features (imported risk)
@@ -482,11 +486,20 @@ class DataConfig:
             if not 0.0 <= float(value) <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1, got {value}")
 
-        if len(self.mobility_clip_range) != 2:
-            raise ValueError("mobility_clip_range must be a tuple of (min, max)")
-
-        if self.mobility_scale_epsilon <= 0:
-            raise ValueError("mobility_scale_epsilon must be positive")
+        if (
+            not math.isfinite(float(self.mobility_min_flow_raw))
+            or self.mobility_min_flow_raw < 0
+        ):
+            raise ValueError("mobility_min_flow_raw must be finite and non-negative")
+        if (
+            not math.isfinite(float(self.mobility_weight_clip_max))
+            or self.mobility_weight_clip_max <= 0
+            or self.mobility_weight_clip_max > 65_504
+        ):
+            raise ValueError(
+                "mobility_weight_clip_max must be finite, positive, and "
+                "representable in float16"
+            )
 
         valid_orderings = {"node", "time"}
         if self.sample_ordering not in valid_orderings:
@@ -1085,6 +1098,17 @@ class EpiForecasterConfig:
     env: str | None = None
 
     @classmethod
+    def _reject_obsolete_mobility_fields(cls, data_dict: dict) -> None:
+        obsolete = sorted(OBSOLETE_MOBILITY_DATA_FIELDS.intersection(data_dict))
+        if obsolete:
+            fields_text = ", ".join(obsolete)
+            raise ValueError(
+                "Obsolete mobility configuration field(s): "
+                f"{fields_text}. Use data.mobility_min_flow_raw and "
+                "data.mobility_weight_clip_max."
+            )
+
+    @classmethod
     def from_file(cls, config_path: str) -> "EpiForecasterConfig":
         """Load configuration from YAML file located at ``config_path``."""
         return cls.load(config_path)
@@ -1113,6 +1137,7 @@ class EpiForecasterConfig:
         # Use OmegaConf.to_container to get a proper dict with nested objects converted
         merged_dict = OmegaConf.to_container(merged_cfg)
         assert merged_dict is not None and isinstance(merged_dict, dict)
+        cls._reject_obsolete_mobility_fields(merged_dict["data"])
 
         # Filter out fields with init=False (computed/derived fields)
         def _filter_init_fields(dataclass_cls: type, field_dict: dict) -> dict:
@@ -1182,6 +1207,7 @@ class EpiForecasterConfig:
             "output": raw.get("output", {}) or {},
             "env": raw.get("env"),
         }
+        cls._reject_obsolete_mobility_fields(cfg_dict["data"])
 
         schema = OmegaConf.structured(cls)
         file_cfg = OmegaConf.create(cfg_dict)
@@ -1222,6 +1248,8 @@ class EpiForecasterConfig:
             # Get the set of field names that have init=True
             init_fields = {f.name for f in fields(config_class) if f.init}
             return {k: v for k, v in data_dict.items() if k in init_fields}
+
+        cls._reject_obsolete_mobility_fields(config_dict["data"])
 
         # Reconstruct nested dataclass for curriculum
         training_dict = config_dict["training"].copy()

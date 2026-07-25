@@ -21,12 +21,14 @@ class _DummyMobilityDataset(Dataset):
         *,
         run_id: str,
         preloaded_mobility: torch.Tensor,
+        mobility_mask: torch.Tensor | None = None,
         graph_adjacency_source: str = "mobility",
         spatial_knn_adjacency: torch.Tensor | None = None,
         static_graph_adjacency: torch.Tensor | None = None,
     ):
         self.run_id = run_id
         self.preloaded_mobility = preloaded_mobility
+        self.mobility_mask = mobility_mask
         self.spatial_knn_adjacency = spatial_knn_adjacency
         self.static_graph_adjacency = static_graph_adjacency
         self.config = SimpleNamespace(
@@ -94,6 +96,30 @@ def test_inject_gpu_mobility_reuses_cached_tensor_without_crashing() -> None:
     assert second_adj.dtype == MODEL_PARAM_DTYPE
     assert hasattr(dataset, "_gpu_mobility_cache")
     assert len(dataset._gpu_mobility_cache) == 1
+
+
+@pytest.mark.epiforecaster
+def test_inject_gpu_mobility_applies_mask_and_orients_edges_as_incoming() -> None:
+    mobility = torch.tensor(
+        [[[0.0, 2.0], [7.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    mobility_mask = torch.tensor(
+        [[[False, False], [True, False]]],
+        dtype=torch.bool,
+    )
+    dataset = _DummyMobilityDataset(
+        run_id="real",
+        preloaded_mobility=mobility,
+        mobility_mask=mobility_mask,
+    )
+    batch_data = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="real"))
+
+    inject_gpu_mobility(batch_data, dataset, torch.device("cpu"))
+
+    adjacency = batch_data.mob_batch.adj_dense[0]
+    assert float(adjacency[0, 1]) == pytest.approx(7.0)
+    assert float(adjacency[1, 0]) == pytest.approx(0.0)
 
 
 @pytest.mark.epiforecaster

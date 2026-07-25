@@ -170,6 +170,13 @@ def inject_gpu_mobility(
             sliced_mob = source_adjacency[:, node_ids.unsqueeze(-1), node_ids].to(
                 MODEL_PARAM_DTYPE
             )
+            mobility_mask = getattr(base_ds, "mobility_mask", None)
+            if mobility_mask is not None:
+                sliced_mask = mobility_mask[:, node_ids.unsqueeze(-1), node_ids]
+                sliced_mob = sliced_mob.masked_fill(~sliced_mask, 0.0)
+            # Canonical OD weights are [origin, destination]. Dense GNN rows are
+            # destinations receiving messages from source columns.
+            sliced_mob = sliced_mob.transpose(-1, -2)
 
         # Transfer to GPU
         gpu_mob = sliced_mob.to(device, non_blocking=True)

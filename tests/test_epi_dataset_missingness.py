@@ -24,7 +24,7 @@ def _make_config(
             "region2vec_path": "",
         },
         data_options={
-            "mobility_threshold": 0.1,
+            "mobility_min_flow_raw": 0.1,
             "window_stride": 1,
             "min_history_observed_fraction": history_fraction,
             "min_horizon_observed_fraction": horizon_fraction,

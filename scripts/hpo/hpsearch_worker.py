@@ -239,10 +239,9 @@ def suggest_epiforecaster_params(
         _categorical_choices(("node", "time")),
     )
 
-    # Neighborhood mask uses RAW mobility (not normalized). Using a categorical grid is
-    # safer than continuous until we confirm the mobility unit scale in your dataset.
-    overrides["data.mobility_threshold"] = trial.suggest_categorical(
-        "data.mobility_threshold",
+    # Edge selection is defined in raw-flow units before log-space upper clipping.
+    overrides["data.mobility_min_flow_raw"] = trial.suggest_categorical(
+        "data.mobility_min_flow_raw",
         _categorical_choices((0.0, 1.0, 5.0, 10.0, 20.0, 50.0)),
     )
 

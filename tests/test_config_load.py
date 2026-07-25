@@ -11,7 +11,7 @@ BASE_LOCAL_CONFIG = "configs/train_epifor_smoke.yaml"
 
 
 OVERRIDE_CASES = [
-    {"training.learning_rate": 0.0005, "data.mobility_threshold": 2.5},
+    {"training.learning_rate": 0.0005, "data.mobility_min_flow_raw": 2.5},
     {
         "model.type.cases": True,
         "model.type.regions": False,
