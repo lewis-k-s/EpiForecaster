@@ -46,7 +46,6 @@ dependencies = [
   "bottleneck>=1.6.0",
   "pyarrow>=22.0.0",
   "fastparquet>=2024.11.0",
-  "torch-tb-profiler>=0.4.3",
   "statsmodels>=0.14.6",
   "optuna>=4.7.0",
   "optuna-dashboard>=0.20.0",
@@ -63,12 +62,10 @@ dev = [
   "types-pyyaml>=6.0.12.20250915",
   "pandas-stubs>=2.0.0",
   "scipy-stubs>=1.11.0",
-  "vulture>=2.14",
   "ipython>=9.6.0",
   "ipykernel>=7.0.1",
 ]
 notebook = ["jupyter>=1.0.0", "ipykernel>=6.23.0", "notebook>=7.0.0"]
-profiling = ["memory-profiler>=0.60.0", "line-profiler>=4.0.0"]
 
 [project.scripts]
 main = "cli:cli"
@@ -77,11 +74,8 @@ train = "cli:train_cli"
 eval = "cli:eval_cli"
 plot = "cli:plot_cli"
 # Analysis CLI tools
-perf-analyze = "scripts.analysis.analyze_trace:main"
-step-breakdown = "scripts.analysis.breakdown_step:main"
-loss-curve-critic = "scripts.analysis.analyze_loss_curve:main"
-gradnorm-analyze = "scripts.analysis.analyze_gradnorm:main"
-dead-code-analyze = "scripts.analysis.dead_code_analyze:main"
+training-dynamics-analyze = "scripts.analysis.analyze_training_dynamics:main"
+training-provenance-query = "scripts.analysis.query_run_provenance:main"
 hpsearch-analyze = "scripts.analysis.analyze_hpsearch_journal:main"
 # Data visualization runner
 dataviz = "scripts.analysis.dataviz_runner:main"

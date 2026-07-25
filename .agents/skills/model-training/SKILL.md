@@ -1,68 +1,79 @@
 ---
 name: model-training
-description: Configure EpiForecaster and Region2Vec training, including the MN5 Snakemake production interface and bounded local acceptance checks.
-allowed-tools: Bash, Read
+description: Configure EpiForecaster and Region2Vec training, validate bounded local acceptance runs, and route substantive training, evaluation, cross-validation, HPO, ablation, and synthetic pretraining through the immutable MN5 Snakemake interface.
 ---
 
 # Model Training
 
-## Execution policy
+## Execution boundary
 
-Substantive EpiForecaster training, evaluation, HPO, and ablations run through
-the immutable MN5 Snakemake workflow. Load the `mn5-dispatch` skill before any
-remote preparation, transfer, submission, monitoring, or result inspection.
-Do not invoke production configs directly or add alternate local production
-interfaces.
+Substantive EpiForecaster work uses `scripts/workflow/mn5_workflow.sh`. Load the
+globally installed `mn5-dispatch` skill before remote preparation, transfer,
+submission, monitoring, or artifact inspection. Stop if it is unavailable; do
+not recreate dispatch commands or restore a repository-local duplicate.
 
-Region2Vec remains available locally:
+Canonical/general-purpose templates:
 
-```bash
-uv run train regions --config configs/train_regions.yaml
-```
+| Template | Kind | Target | Purpose |
+| --- | --- | --- | --- |
+| `mn5_train.yaml` | `train` | `train` | single training |
+| `mn5_train_smoke.yaml` | `train` | `train_evaluate` | bounded train/evaluate acceptance |
+| `mn5_evaluate.yaml` | `evaluate` | `evaluate` | pinned-checkpoint evaluation |
+| `mn5_crossval.yaml` | `crossval` | `crossval` | persisted-fold cross-validation |
+| `mn5.yaml` | `hpo` | `hpo` | HPO |
+| `mn5_smoke.yaml` | `hpo` | `hpo` | bounded HPO acceptance |
+| `mn5_ablation.yaml` | `ablation` | `ablation` | ablation study |
+| `mn5_synth_pretrain.yaml` | `train` | `train` | synthetic pretraining |
 
-The only local EpiForecaster config is a bounded acceptance check:
+Targets are pinned before immutable preparation. Do not run configs under
+`configs/production_only/` locally.
+Treat any specialized or one-off workflow template outside this matrix as an
+explicit reproduction/profiling interface and inspect it before use.
 
-```bash
-uv run train epiforecaster --config configs/train_epifor_smoke.yaml
-```
+## Local acceptance
 
-It is fixed to one epoch, at most ten training batches, batch size two, and one
-worker for each train, validation, and test loader. It is not evidence that a
-production model can run locally.
-
-## Configuration
-
-EpiForecaster YAML is defined by `EpiForecasterConfig` and its nested dataclasses
-in `models/configs.py`. Prefer checked-in templates plus repeatable dot-path
-overrides:
-
-```bash
-uv run train epiforecaster --config configs/train_epifor_smoke.yaml \
-  --override model.type.mobility=false
-```
-
-Production workflow templates live under `workflow/config/` and point to model
-configs under `configs/production_only/`. The public workflow entities are
-single training, evaluation, composed train-evaluate, cross-validation, HPO,
-ablation, and synthetic pretraining. Synthetic pretraining uses
-`workflow/config/mn5_synth_pretrain.yaml`; its raw synthetic pointer contributes
-provenance without being staged into every training job.
-Training and evaluation remain separate DAG stages with hash-bearing manifests.
-
-## Data pipeline
-
-The canonical data flow is raw inputs, preprocessing, DVC-tracked Zarr outputs,
-then workflow staging. A dataset is not a production workflow input until its
-DVC pointer is checked in. Inspect Zarr only with `xarray.open_zarr()`.
+The local EpiForecaster command is acceptance-only:
 
 ```bash
-uv run preprocess epiforecaster --config configs/preprocess_full.yaml
-uv run preprocess regions \
-  --geojson data/files/geo/fl_municipios_catalonia.geojson \
-  --population data/files/fl_population_por_municipis.csv \
-  --output outputs/region_graph/region_graph.zarr
+uv run --no-sync train epiforecaster \
+  --config configs/train_epifor_smoke.yaml
 ```
 
-Do not run `configs/production_only/` locally. For MN5 commands and the exact
-prepare/run/status/log workflow, defer to the `mn5-dispatch` skill rather than
-duplicating dispatch instructions here.
+`--max-batches` may tighten its bound but must not expand it into a production
+interface.
+
+Region2Vec has a separate local interface. Inspect it before substantive work:
+
+```bash
+uv run --no-sync train regions \
+  --config configs/train_regions.yaml \
+  --dry-run
+```
+
+Full Region2Vec training is potentially expensive and requires explicit user
+authorization.
+
+## Data and provenance
+
+Production preparation requires every materialized input's checked-in DVC
+pointer and cache object. Distinguish:
+
+- materialized epidemiological and mobility Zarr inputs;
+- materialized Region2Vec weights;
+- provenance-only raw synthetic inputs;
+- generated outputs that are not production-ready until their DVC pointer is
+  published.
+
+Synthetic pretraining is unavailable while
+`data/processed/synthetic_full_holt_damped.zarr.dvc` is absent. Report that gate;
+do not create or publish the pointer implicitly.
+
+Preprocessing is a potentially expensive mutation. In particular,
+`configs/preprocess_full.yaml` overwrites its configured canonical Zarr. Inspect
+worktree/DVC state and obtain explicit authorization before running it. Inspect
+Zarr only with `xarray.open_zarr()`.
+
+Every EpiForecaster training run, HPO trial, and cross-validation fold writes
+canonical `training_dynamics.jsonl` plus its manifest. Use
+`training-dynamics-analyze` for dynamics evidence and `hpsearch-analyze` for
+Optuna study evidence.

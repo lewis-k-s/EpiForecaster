@@ -81,6 +81,7 @@ Thumbs.db
 
 # Scratch
 tmp/
+.tmp/
 
 # agents
 .claude/

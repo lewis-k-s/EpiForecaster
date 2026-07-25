@@ -82,42 +82,6 @@ def discover_runs(
     return runs
 
 
-def resolve_trace_paths(
-    *,
-    experiment_name: str,
-    run_id: str,
-    outputs_root: Path = DEFAULT_OUTPUTS_ROOT,
-) -> list[Path]:
-    """Resolve profiler trace paths from experiment/run.
-
-    Args:
-        experiment_name: Name of the experiment
-        run_id: Run ID (e.g., 'run_1767364191170741000')
-        outputs_root: Root outputs directory
-
-    Returns:
-        List of trace JSON paths.
-
-    Raises:
-        FileNotFoundError: If run or traces do not exist
-    """
-    run_dir = outputs_root / "training" / experiment_name / run_id
-    if not run_dir.is_dir():
-        available = list_available_runs(
-            outputs_root=outputs_root, experiment_name=experiment_name
-        )
-        raise FileNotFoundError(f"Run directory not found: {run_dir}\n{available}")
-
-    trace_paths = list(run_dir.glob("**/*.pt.trace.json"))
-    if not trace_paths:
-        trace_paths = list(run_dir.glob("**/*trace*.json"))
-
-    if not trace_paths:
-        raise FileNotFoundError(f"No trace JSON files found under {run_dir}")
-
-    return sorted(trace_paths)
-
-
 def resolve_checkpoint_path(
     *,
     experiment_name: str,

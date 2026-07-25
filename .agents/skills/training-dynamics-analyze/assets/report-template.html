@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5d687d;
+      --line: #dce2ec;
+      --surface: #ffffff;
+      --soft: #f4f7fb;
+      --accent: #2457d6;
+      --warning: #9a5b00;
+      --danger: #b42318;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--soft);
+      color: var(--ink);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 32px auto;
+    }
+    header, section {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      margin-bottom: 18px;
+      padding: 24px;
+    }
+    h1, h2, h3 { line-height: 1.2; margin-top: 0; }
+    h1 { font-size: clamp(2rem, 4vw, 3.2rem); margin-bottom: 8px; }
+    h2 { font-size: 1.35rem; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+    h3 { font-size: 1.05rem; margin-top: 22px; }
+    p, li { max-width: 86ch; }
+    .eyebrow {
+      color: var(--accent);
+      font-size: .78rem;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .muted, figcaption { color: var(--muted); }
+    .meta, .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      background: var(--soft);
+      border-radius: 10px;
+      padding: 14px;
+    }
+    .card .label { color: var(--muted); font-size: .8rem; }
+    .card .value { font-size: 1.25rem; font-weight: 700; }
+    .callout {
+      border-left: 4px solid var(--accent);
+      background: #eef3ff;
+      padding: 14px 16px;
+    }
+    .warning { border-left-color: var(--warning); background: #fff7e6; }
+    .danger { border-left-color: var(--danger); background: #fff1f0; }
+    figure { margin: 24px 0; }
+    figure img { display: block; width: 100%; height: auto; border: 1px solid var(--line); }
+    figcaption { margin-top: 8px; font-size: .88rem; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; }
+    th { background: var(--soft); font-size: .82rem; }
+    code { overflow-wrap: anywhere; }
+    details { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 18px; }
+    @media print {
+      body { background: #fff; }
+      main { width: 100%; margin: 0; }
+      header, section { break-inside: avoid; border-color: #bbb; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">{{EYEBROW}}</div>
+      <h1>{{TITLE}}</h1>
+      <p class="muted">{{SUBTITLE}}</p>
+      {{RUN_META}}
+    </header>
+    <section id="assessment">
+      <h2>Executive assessment</h2>
+      {{EXECUTIVE_ASSESSMENT}}
+    </section>
+    <section id="evidence">
+      <h2>Evidence coverage</h2>
+      {{EVIDENCE_COVERAGE}}
+    </section>
+    <section id="loss">
+      <h2>Loss behavior</h2>
+      {{LOSS_CONTENT}}
+    </section>
+    <section id="gradients">
+      <h2>Gradient behavior</h2>
+      {{GRADIENT_CONTENT}}
+    </section>
+    <section id="performance">
+      <h2>Timing and profiler</h2>
+      {{PERFORMANCE_CONTENT}}
+    </section>
+    <section id="findings">
+      <h2>Cross-evidence findings</h2>
+      {{FINDINGS_CONTENT}}
+    </section>
+    <section id="limitations">
+      <h2>Limitations</h2>
+      {{LIMITATIONS_CONTENT}}
+    </section>
+    <section id="next-checks">
+      <h2>Next checks</h2>
+      {{NEXT_CHECKS_CONTENT}}
+    </section>
+    <section id="provenance">
+      <h2>Provenance</h2>
+      {{PROVENANCE_CONTENT}}
+    </section>
+  </main>
+</body>
+</html>

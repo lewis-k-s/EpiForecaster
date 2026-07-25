@@ -20,20 +20,6 @@ GRAD_SNAPSHOT_HEAD_FIELDS: tuple[str, ...] = (
     "zero_when_inactive_rate",
 )
 
-TENSORBOARD_SCALARS: dict[str, str] = {
-    "loss_train": "Loss/Train_step",
-    "learning_rate_step": "Learning_Rate/step",
-    "gradnorm_total_preclip": "GradNorm/Total_PreClip",
-    "gradnorm_mobility_gnn": "GradNorm/MobilityGNN",
-    "gradnorm_backbone": "GradNorm/Backbone",
-    "gradnorm_other": "GradNorm/Other",
-    "gradnorm_clipped_total": "GradNorm/Clipped_Total",
-    "time_dataload_s": "Time/DataLoad_s",
-    "epoch": "epoch",
-    "train_sparsity": "Train/Sparsity",
-}
-
-
 def build_loss_key(
     *,
     split: str | None = None,

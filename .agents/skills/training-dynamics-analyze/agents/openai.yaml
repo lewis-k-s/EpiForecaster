@@ -1,0 +1,4 @@
+interface:
+  display_name: "Training Dynamics Analysis"
+  short_description: "Author provenance-backed training reports"
+  default_prompt: "Use $training-dynamics-analyze to generate tables, plots, and DVC-aware provenance for this exact training entity, then author an evidence-backed HTML report."

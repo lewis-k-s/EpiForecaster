@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from utils.log_keys import (
-    TENSORBOARD_SCALARS,
     build_curriculum_metric_key,
     build_eval_metric_key,
     build_grad_snapshot_head_key,
@@ -36,8 +35,3 @@ def test_infer_observation_head_from_name_handles_wrapped_and_unwrapped_names() 
     assert infer_observation_head_from_name("ww_head.scale") == "ww"
     assert infer_observation_head_from_name("_orig_mod.hosp_head.alpha") == "hosp"
     assert infer_observation_head_from_name("backbone.obs_context_projection.0.weight") is None
-
-
-def test_tensorboard_scalars_are_single_canonical_tags() -> None:
-    assert TENSORBOARD_SCALARS["loss_train"] == "Loss/Train_step"
-    assert TENSORBOARD_SCALARS["gradnorm_backbone"] == "GradNorm/Backbone"
