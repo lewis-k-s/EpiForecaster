@@ -42,6 +42,7 @@ LATENT_PATTERNS = (
 class RunSpec:
     stage: str
     dataset_role: str
+    training_run_manifest: Path
     evaluation_run_manifest: Path
     evaluation_data_manifest: Path
     evaluation_summary: Path
@@ -57,6 +58,7 @@ class ComparisonSpec:
     name: str
     baseline: str
     candidate: str
+    training_contract: str
 
 
 def _sha256_file(path: Path) -> str:
@@ -126,6 +128,11 @@ def _parse_spec(spec_path: Path) -> tuple[list[RunSpec], list[ComparisonSpec]]:
             RunSpec(
                 stage=stage,
                 dataset_role=dataset_role,
+                training_run_manifest=_resolve_input_path(
+                    base_dir,
+                    raw_run.get("training_run_manifest"),
+                    field=f"runs[{index}].training_run_manifest",
+                ),
                 evaluation_run_manifest=_resolve_input_path(
                     base_dir,
                     raw_run.get("evaluation_run_manifest"),
@@ -181,10 +188,27 @@ def _parse_spec(spec_path: Path) -> tuple[list[RunSpec], list[ComparisonSpec]]:
             name=str(raw_comparison.get("name", "")).strip(),
             baseline=str(raw_comparison.get("baseline", "")).strip(),
             candidate=str(raw_comparison.get("candidate", "")).strip(),
+            training_contract=str(
+                raw_comparison.get("training_contract", "")
+            ).strip(),
         )
-        if not comparison.name or not comparison.baseline or not comparison.candidate:
+        if (
+            not comparison.name
+            or not comparison.baseline
+            or not comparison.candidate
+            or not comparison.training_contract
+        ):
             raise ValueError(
-                f"comparisons[{index}] requires name, baseline, and candidate"
+                f"comparisons[{index}] requires name, baseline, candidate, "
+                "and training_contract"
+            )
+        if comparison.training_contract not in {
+            "descriptive",
+            "matched_except_initialization",
+        }:
+            raise ValueError(
+                f"comparisons[{index}].training_contract must be "
+                "'descriptive' or 'matched_except_initialization'"
             )
         if comparison.name in seen_names:
             raise ValueError(f"Duplicate comparison name: {comparison.name}")
@@ -310,9 +334,94 @@ def _validate_evaluation_dataset(
     return run_manifest, data_manifest
 
 
+def _validate_training_run_manifest(
+    run: RunSpec,
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    run_manifest = _load_yaml_mapping(run.training_run_manifest)
+    if run_manifest.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported training run manifest: {run.training_run_manifest}"
+        )
+    if run_manifest.get("run_id") != provenance.get("run", {}).get("run_id"):
+        raise ValueError(
+            f"Training run ID mismatch for stage {run.stage}"
+        )
+
+    identity = run_manifest.get("identity")
+    provenance_run = provenance.get("run")
+    if not isinstance(identity, dict) or not isinstance(provenance_run, dict):
+        raise ValueError(
+            f"Training identity is missing for stage {run.stage}"
+        )
+    for field in (
+        "git_sha",
+        "source_snapshot_sha256",
+        "container_digest",
+    ):
+        if identity.get(field) != provenance_run.get(field):
+            raise ValueError(
+                f"Training {field} mismatch for stage {run.stage}"
+            )
+
+    manifest_targets = run_manifest.get("dvc", {}).get("targets")
+    provenance_targets = provenance.get("dvc", {}).get("targets")
+    if not isinstance(manifest_targets, dict) or not isinstance(
+        provenance_targets, list
+    ):
+        raise ValueError(
+            f"Training DVC identity is missing for stage {run.stage}"
+        )
+    manifest_dvc = {
+        str(pointer): (
+            record.get("md5"),
+            record.get("role"),
+        )
+        for pointer, record in manifest_targets.items()
+        if isinstance(record, dict)
+    }
+    provenance_dvc = {
+        str(record.get("pointer")): (
+            record.get("dvc_md5"),
+            record.get("role"),
+        )
+        for record in provenance_targets
+        if isinstance(record, dict)
+    }
+    if manifest_dvc != provenance_dvc:
+        raise ValueError(
+            f"Training DVC manifest/provenance mismatch for stage {run.stage}"
+        )
+
+    configured_init = run_manifest.get("training", {}).get("init_checkpoint")
+    training_input = run_manifest.get("training_input")
+    identity_init_sha256 = identity.get("init_checkpoint_sha256")
+    if configured_init is None:
+        if training_input is not None or identity_init_sha256 is not None:
+            raise ValueError(
+                f"Unexpected training initialization identity for stage {run.stage}"
+            )
+    else:
+        if not isinstance(training_input, dict):
+            raise ValueError(
+                f"Training initialization identity is missing for stage {run.stage}"
+            )
+        checkpoint_sha256 = training_input.get("checkpoint_sha256")
+        if (
+            not isinstance(checkpoint_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256) is None
+            or identity_init_sha256 != checkpoint_sha256
+        ):
+            raise ValueError(
+                f"Training initialization hash is invalid for stage {run.stage}"
+            )
+    return run_manifest
+
+
 def _validate_run_artifacts(
     run: RunSpec,
 ) -> tuple[
+    dict[str, Any],
     dict[str, Any],
     dict[str, Any],
     dict[str, Any],
@@ -343,6 +452,7 @@ def _validate_run_artifacts(
         raise ValueError(
             f"DVC provenance is not reconciled: {run.training_provenance}"
         )
+    training_run_manifest = _validate_training_run_manifest(run, provenance)
     if evaluation_manifest.get("schema_version") != 1:
         raise ValueError(
             f"Unsupported evaluation manifest: {run.evaluation_manifest}"
@@ -485,9 +595,71 @@ def _validate_run_artifacts(
         summary,
         provenance,
         evaluation_manifest,
+        training_run_manifest,
         evaluation_run_manifest,
         evaluation_data_manifest,
     )
+
+
+def _validate_matched_training_contract(
+    comparison: ComparisonSpec,
+    *,
+    runs_by_stage: dict[str, RunSpec],
+    training_run_manifests: dict[str, dict[str, Any]],
+) -> None:
+    if comparison.training_contract == "descriptive":
+        return
+
+    baseline = training_run_manifests[comparison.baseline]
+    candidate = training_run_manifests[comparison.candidate]
+    for field in (
+        "git_sha",
+        "source_snapshot_sha256",
+        "container_digest",
+    ):
+        if baseline["identity"].get(field) != candidate["identity"].get(field):
+            raise ValueError(
+                f"Comparison {comparison.name} has mismatched training {field}"
+            )
+
+    baseline_training = dict(baseline["training"])
+    candidate_training = dict(candidate["training"])
+    baseline_init = baseline_training.pop("init_checkpoint", None)
+    candidate_init = candidate_training.pop("init_checkpoint", None)
+    baseline_training.pop("require_init_checkpoint", None)
+    candidate_training.pop("require_init_checkpoint", None)
+    baseline_training.pop("experiment_name", None)
+    candidate_training.pop("experiment_name", None)
+    if baseline_training != candidate_training:
+        raise ValueError(
+            f"Comparison {comparison.name} has mismatched training configuration"
+        )
+    if baseline_init is not None:
+        raise ValueError(
+            f"Comparison {comparison.name} baseline must be from scratch"
+        )
+    if candidate_init is None:
+        raise ValueError(
+            f"Comparison {comparison.name} candidate must pin initialization"
+        )
+
+    for section in ("dvc", "evaluation", "resources"):
+        if baseline.get(section) != candidate.get(section):
+            raise ValueError(
+                f"Comparison {comparison.name} has mismatched training {section}"
+            )
+    if baseline.get("workflow") != candidate.get("workflow"):
+        raise ValueError(
+            f"Comparison {comparison.name} has mismatched workflow target"
+        )
+
+    baseline_run = runs_by_stage[comparison.baseline]
+    candidate_run = runs_by_stage[comparison.candidate]
+    if baseline_run.dataset_role != candidate_run.dataset_role:
+        raise ValueError(
+            f"Comparison {comparison.name} crosses dataset roles: "
+            f"{baseline_run.dataset_role} vs {candidate_run.dataset_role}"
+        )
 
 
 def _extract_evaluation_rows(
@@ -652,6 +824,7 @@ def _comparison_rows(
                 rows.append(
                     {
                         "comparison": comparison.name,
+                        "training_contract": comparison.training_contract,
                         "table": table_name,
                         "dataset_role": baseline_run.dataset_role,
                         "split": split,
@@ -688,15 +861,18 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
     structural_rows: list[dict[str, Any]] = []
     gradient_rows: list[dict[str, Any]] = []
     inventory_rows: list[dict[str, Any]] = []
+    training_run_manifests: dict[str, dict[str, Any]] = {}
 
     for run in runs:
         (
             summary,
             provenance,
             evaluation_manifest,
+            training_run_manifest,
             evaluation_run_manifest,
             evaluation_data_manifest,
         ) = _validate_run_artifacts(run)
+        training_run_manifests[run.stage] = training_run_manifest
         extracted = _extract_evaluation_rows(run, summary)
         evaluation_rows.extend(extracted[0])
         pathway_rows.extend(extracted[1])
@@ -725,6 +901,13 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
                 "checkpoint": summary.get("checkpoint"),
                 "checkpoint_sha256": evaluation_manifest.get(
                     "checkpoint_sha256"
+                ),
+                "init_checkpoint_sha256": training_run_manifest.get(
+                    "identity", {}
+                ).get("init_checkpoint_sha256"),
+                "training_run_manifest": str(run.training_run_manifest),
+                "training_run_manifest_sha256": _sha256_file(
+                    run.training_run_manifest
                 ),
                 "evaluation_summary": str(run.evaluation_summary),
                 "evaluation_summary_sha256": _sha256_file(
@@ -775,6 +958,13 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
         "evaluation": evaluation_rows,
         "pathway": pathway_rows,
     }
+    runs_by_stage = {run.stage: run for run in runs}
+    for comparison in comparisons:
+        _validate_matched_training_contract(
+            comparison,
+            runs_by_stage=runs_by_stage,
+            training_run_manifests=training_run_manifests,
+        )
     comparison_rows = _comparison_rows(
         comparisons,
         runs,
@@ -794,6 +984,9 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
                 "evaluation_source_snapshot_sha256",
                 "checkpoint",
                 "checkpoint_sha256",
+                "init_checkpoint_sha256",
+                "training_run_manifest",
+                "training_run_manifest_sha256",
                 "evaluation_summary",
                 "evaluation_summary_sha256",
                 "training_dynamics",
@@ -846,6 +1039,7 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
             comparison_rows,
             [
                 "comparison",
+                "training_contract",
                 "table",
                 "dataset_role",
                 "split",
@@ -879,6 +1073,10 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
         "spec_sha256": _sha256_file(resolved_spec),
         "stages": [run.stage for run in runs],
         "comparisons": [comparison.name for comparison in comparisons],
+        "comparison_contracts": {
+            comparison.name: comparison.training_contract
+            for comparison in comparisons
+        },
         "artifacts": artifact_rows,
     }
     manifest_path = output_dir / "comparison_manifest.json"

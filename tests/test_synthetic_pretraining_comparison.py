@@ -35,10 +35,12 @@ def _write_run(
     stage: str,
     mae: float,
     residual_fraction: float,
+    initialized: bool = False,
 ) -> dict[str, str]:
     run_dir = root / stage
     run_dir.mkdir()
     checkpoint = f"/workspace/{stage}/best_model.pt"
+    training_run_manifest = run_dir / "training_run_manifest.yaml"
     evaluation_run_manifest = run_dir / "manifest.yaml"
     evaluation_data_manifest = run_dir / "data_manifest.json"
     summary = run_dir / "test_summary.json"
@@ -51,6 +53,74 @@ def _write_run(
     dataset_pointer = "data/processed/real_with_id.zarr.dvc"
     dataset_output = "data/processed/real_with_id.zarr"
     dvc_md5 = "c" * 32 + ".dir"
+    identity = {
+        "git_sha": "a" * 40,
+        "source_snapshot_sha256": "b" * 64,
+        "container_digest": f"sha256:{'e' * 64}",
+        "dvc_hashes": {dataset_pointer: dvc_md5},
+    }
+    training = {
+        "base_config": "configs/production_only/train_epifor_mn5_full.yaml",
+        "experiment_name": stage,
+        "model_id": "model",
+        "max_batches": None,
+        "overrides": [
+            "output.save_checkpoints=true",
+            "training.run_final_evaluation=false",
+        ],
+    }
+    training_input = None
+    if initialized:
+        init_sha256 = "f" * 64
+        init_checkpoint = f"/gpfs/pretraining/{stage}/best_model.pt"
+        identity["init_checkpoint_sha256"] = init_sha256
+        training["require_init_checkpoint"] = True
+        training["init_checkpoint"] = init_checkpoint
+        training_input = {
+            "configured_checkpoint": init_checkpoint,
+            "checkpoint_sha256": init_sha256,
+        }
+    _write_yaml(
+        training_run_manifest,
+        {
+            "schema_version": 1,
+            "run_id": f"run-{stage}",
+            "identity": identity,
+            "workflow": {"kind": "train", "target": "train_evaluate"},
+            "dvc": {
+                "targets": {
+                    dataset_pointer: {
+                        "md5": dvc_md5,
+                        "output": dataset_output,
+                        "role": "materialized",
+                    }
+                }
+            },
+            "training": training,
+            "evaluation": {
+                "split": "test",
+                "granular": True,
+                "overrides": ["training.val_workers=2"],
+            },
+            "resources": {
+                "allocation": {
+                    "account": "bsc08",
+                    "partition": "acc",
+                    "qos": "acc_bscls",
+                    "nodes": 1,
+                    "tasks": 1,
+                    "cpus_per_task": 20,
+                    "gres": "gpu:1",
+                    "runtime": 420,
+                }
+            },
+            **(
+                {"training_input": training_input}
+                if training_input is not None
+                else {}
+            ),
+        },
+    )
     _write_yaml(
         evaluation_run_manifest,
         {
@@ -59,6 +129,7 @@ def _write_run(
             "identity": {
                 "git_sha": "a" * 40,
                 "source_snapshot_sha256": "b" * 64,
+                "container_digest": f"sha256:{'e' * 64}",
                 "dvc_hashes": {dataset_pointer: dvc_md5},
             },
             "dvc": {
@@ -160,6 +231,7 @@ def _write_run(
                 "run_id": f"run-{stage}",
                 "git_sha": "a" * 40,
                 "source_snapshot_sha256": "b" * 64,
+                "container_digest": f"sha256:{'e' * 64}",
             },
             "dvc": {
                 "status": "available",
@@ -212,6 +284,7 @@ def _write_run(
     return {
         "stage": stage,
         "dataset_role": "real",
+        "training_run_manifest": str(training_run_manifest.relative_to(root)),
         "evaluation_run_manifest": str(evaluation_run_manifest.relative_to(root)),
         "evaluation_data_manifest": str(
             evaluation_data_manifest.relative_to(root)
@@ -242,6 +315,7 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
         stage="fine_tune",
         mae=1.5,
         residual_fraction=0.25,
+        initialized=True,
     )
     spec = tmp_path / "comparison.json"
     _write_json(
@@ -254,6 +328,7 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
                     "name": "pretraining_effect",
                     "baseline": "control",
                     "candidate": "fine_tune",
+                    "training_contract": "matched_except_initialization",
                 }
             ],
         },
@@ -263,6 +338,9 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
     manifest = generate_comparison(spec, output_dir)
 
     assert manifest["stages"] == ["control", "fine_tune"]
+    assert manifest["comparison_contracts"] == {
+        "pretraining_effect": "matched_except_initialization"
+    }
     assert {artifact["path"] for artifact in manifest["artifacts"]} == {
         "comparison_deltas.csv",
         "evaluation_metrics.csv",
@@ -330,10 +408,107 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
     assert inventory[0]["checkpoint_sha256"] == "d" * 64
     assert inventory[0]["training_run_id"] == "run-control"
     assert inventory[0]["evaluation_run_id"] == "run-control"
+    assert inventory[0]["init_checkpoint_sha256"] == ""
+    assert inventory[1]["init_checkpoint_sha256"] == "f" * 64
     assert (
         "data/processed/real_with_id.zarr.dvc"
         in inventory[0]["evaluation_dvc_targets_json"]
     )
+    assert {
+        row["training_contract"] for row in delta_rows
+    } == {"matched_except_initialization"}
+
+
+def test_generate_comparison_rejects_unmatched_training_source(
+    tmp_path: Path,
+) -> None:
+    control = _write_run(
+        tmp_path,
+        stage="control",
+        mae=2.0,
+        residual_fraction=0.4,
+    )
+    fine_tune = _write_run(
+        tmp_path,
+        stage="fine_tune",
+        mae=1.5,
+        residual_fraction=0.25,
+        initialized=True,
+    )
+    candidate_manifest_path = tmp_path / fine_tune["training_run_manifest"]
+    candidate_manifest = yaml.safe_load(
+        candidate_manifest_path.read_text(encoding="utf-8")
+    )
+    candidate_manifest["identity"]["source_snapshot_sha256"] = "9" * 64
+    _write_yaml(candidate_manifest_path, candidate_manifest)
+    candidate_provenance_path = tmp_path / fine_tune["training_provenance"]
+    candidate_provenance = json.loads(
+        candidate_provenance_path.read_text(encoding="utf-8")
+    )
+    candidate_provenance["run"]["source_snapshot_sha256"] = "9" * 64
+    _write_json(candidate_provenance_path, candidate_provenance)
+
+    spec = tmp_path / "comparison.json"
+    _write_json(
+        spec,
+        {
+            "schema_version": 1,
+            "runs": [control, fine_tune],
+            "comparisons": [
+                {
+                    "name": "pretraining_effect",
+                    "baseline": "control",
+                    "candidate": "fine_tune",
+                    "training_contract": "matched_except_initialization",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="mismatched training source_snapshot_sha256",
+    ):
+        generate_comparison(spec, tmp_path / "comparison")
+
+
+def test_generate_comparison_rejects_uninitialized_matched_candidate(
+    tmp_path: Path,
+) -> None:
+    control = _write_run(
+        tmp_path,
+        stage="control",
+        mae=2.0,
+        residual_fraction=0.4,
+    )
+    candidate = _write_run(
+        tmp_path,
+        stage="candidate",
+        mae=1.5,
+        residual_fraction=0.25,
+    )
+    spec = tmp_path / "comparison.json"
+    _write_json(
+        spec,
+        {
+            "schema_version": 1,
+            "runs": [control, candidate],
+            "comparisons": [
+                {
+                    "name": "pretraining_effect",
+                    "baseline": "control",
+                    "candidate": "candidate",
+                    "training_contract": "matched_except_initialization",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="candidate must pin initialization",
+    ):
+        generate_comparison(spec, tmp_path / "comparison")
 
 
 def test_generate_comparison_rejects_mismatched_dynamics_hash(
