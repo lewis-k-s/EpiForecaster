@@ -2681,6 +2681,9 @@ class EpiForecasterTrainer:
             max_batches=self.config.training.max_batches,
             granular_output_path=granular_output_path,
             granular_eval_format=self.config.output.granular_eval_format,
+            relevant_source_mapping=(
+                self.config.model.observation_heads.relevant_source_mapping()
+            ),
             granular_metadata={
                 "batch_size": loader.batch_size,
                 "checkpoint_path": checkpoint_path,

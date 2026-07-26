@@ -292,7 +292,13 @@ class _TorchLatentPairAccumulator:
 
 
 class TorchLatentCoherenceAccumulator:
-    """Accumulate latent truth agreement and structural SIRHD diagnostics."""
+    """Accumulate latent truth agreement and structural SIRHD diagnostics.
+
+    The model's five predicted S/I/H/R/D states form its internal population
+    partition. Exported supervision may be only a subset of a richer upstream
+    compartment model, so model mass and exported-target mass are reported as
+    distinct quantities.
+    """
 
     _LATENT_KEYS = {
         "s": ("S_trajectory", "S_target"),
@@ -307,9 +313,22 @@ class TorchLatentCoherenceAccumulator:
             name: _TorchLatentPairAccumulator(device=device)
             for name in self._LATENT_KEYS
         }
-        self.mass_error_sum = torch.tensor(0.0, device=device)
-        self.mass_error_max = torch.tensor(0.0, device=device)
-        self.mass_count = torch.tensor(0.0, device=device)
+        self.model_mass_error_sum = torch.tensor(0.0, device=device)
+        self.model_mass_error_max = torch.tensor(0.0, device=device)
+        self.model_mass_count = torch.tensor(0.0, device=device)
+        self.target_exported_mass_sum = torch.tensor(0.0, device=device)
+        self.target_exported_mass_min = torch.tensor(
+            float("inf"), device=device
+        )
+        self.target_exported_mass_max = torch.tensor(
+            float("-inf"), device=device
+        )
+        self.target_exported_mass_gap_sum = torch.tensor(0.0, device=device)
+        self.target_exported_mass_count = torch.tensor(0.0, device=device)
+        self.model_target_exported_mass_error_sum = torch.tensor(
+            0.0, device=device
+        )
+        self.model_target_exported_mass_count = torch.tensor(0.0, device=device)
         self.death_transition_error_sum = torch.tensor(0.0, device=device)
         self.death_transition_count = torch.tensor(0.0, device=device)
         self.death_monotonic_violation_count = torch.tensor(0.0, device=device)
@@ -348,20 +367,65 @@ class TorchLatentCoherenceAccumulator:
             model_outputs[prediction_key].float()
             for prediction_key, _target_key in self._LATENT_KEYS.values()
         ]
-        mass_finite = torch.stack(
+        model_mass_finite = torch.stack(
             [torch.isfinite(trajectory) for trajectory in trajectories]
         ).all(dim=0)
-        mass = torch.stack([_clean(trajectory) for trajectory in trajectories]).sum(
-            dim=0
-        )
-        if mass_finite.any():
-            mass_error = (mass[mass_finite] - 1.0).abs()
-            self.mass_error_sum += mass_error.sum()
-            self.mass_error_max = torch.maximum(
-                self.mass_error_max,
-                mass_error.max(),
+        model_mass = torch.stack(
+            [_clean(trajectory) for trajectory in trajectories]
+        ).sum(dim=0)
+        if model_mass_finite.any():
+            model_mass_error = (model_mass[model_mass_finite] - 1.0).abs()
+            self.model_mass_error_sum += model_mass_error.sum()
+            self.model_mass_error_max = torch.maximum(
+                self.model_mass_error_max,
+                model_mass_error.max(),
             )
-            self.mass_count += mass_finite.sum()
+            self.model_mass_count += model_mass_finite.sum()
+
+        target_trajectories = [
+            targets.get(target_key)
+            for _prediction_key, target_key in self._LATENT_KEYS.values()
+        ]
+        if all(
+            isinstance(target, torch.Tensor) for target in target_trajectories
+        ):
+            target_tensors = [
+                target.float()
+                for target in target_trajectories
+                if isinstance(target, torch.Tensor)
+            ]
+            target_mass_finite = torch.stack(
+                [torch.isfinite(target) for target in target_tensors]
+            ).all(dim=0)
+            target_mass = torch.stack(
+                [_clean(target) for target in target_tensors]
+            ).sum(dim=0)
+            if target_mass_finite.any():
+                finite_target_mass = target_mass[target_mass_finite]
+                self.target_exported_mass_sum += finite_target_mass.sum()
+                self.target_exported_mass_min = torch.minimum(
+                    self.target_exported_mass_min,
+                    finite_target_mass.min(),
+                )
+                self.target_exported_mass_max = torch.maximum(
+                    self.target_exported_mass_max,
+                    finite_target_mass.max(),
+                )
+                self.target_exported_mass_gap_sum += (
+                    finite_target_mass - 1.0
+                ).abs().sum()
+                self.target_exported_mass_count += target_mass_finite.sum()
+
+            model_target_finite = model_mass_finite & target_mass_finite
+            if model_target_finite.any():
+                model_target_error = (
+                    model_mass[model_target_finite]
+                    - target_mass[model_target_finite]
+                ).abs()
+                self.model_target_exported_mass_error_sum += (
+                    model_target_error.sum()
+                )
+                self.model_target_exported_mass_count += model_target_finite.sum()
 
         death_trajectory = model_outputs["D_trajectory"].float()
         death_flow_tensor = model_outputs.get("death_flow")
@@ -426,14 +490,62 @@ class TorchLatentCoherenceAccumulator:
                 }
             )
 
-        mass_count = float(self.mass_count.item())
-        metrics["latent_mass_conservation_mae"] = (
-            float((self.mass_error_sum / self.mass_count).item())
-            if mass_count > 0
+        model_mass_count = float(self.model_mass_count.item())
+        metrics["latent_model_sirhd_mass_error_from_one_mae"] = (
+            float(
+                (self.model_mass_error_sum / self.model_mass_count).item()
+            )
+            if model_mass_count > 0
             else float("nan")
         )
-        metrics["latent_mass_conservation_max_abs_error"] = (
-            float(self.mass_error_max.item()) if mass_count > 0 else float("nan")
+        metrics["latent_model_sirhd_mass_error_from_one_max"] = (
+            float(self.model_mass_error_max.item())
+            if model_mass_count > 0
+            else float("nan")
+        )
+        target_mass_count = float(self.target_exported_mass_count.item())
+        metrics["latent_target_exported_sirhd_mass_mean"] = (
+            float(
+                (
+                    self.target_exported_mass_sum
+                    / self.target_exported_mass_count
+                ).item()
+            )
+            if target_mass_count > 0
+            else float("nan")
+        )
+        metrics["latent_target_exported_sirhd_mass_min"] = (
+            float(self.target_exported_mass_min.item())
+            if target_mass_count > 0
+            else float("nan")
+        )
+        metrics["latent_target_exported_sirhd_mass_max"] = (
+            float(self.target_exported_mass_max.item())
+            if target_mass_count > 0
+            else float("nan")
+        )
+        metrics["latent_target_exported_sirhd_mass_gap_from_one_mae"] = (
+            float(
+                (
+                    self.target_exported_mass_gap_sum
+                    / self.target_exported_mass_count
+                ).item()
+            )
+            if target_mass_count > 0
+            else float("nan")
+        )
+        model_target_mass_count = float(
+            self.model_target_exported_mass_count.item()
+        )
+        metrics["latent_model_vs_target_exported_sirhd_mass_mae"] = (
+            float(
+                (
+                    self.model_target_exported_mass_error_sum
+                    / self.model_target_exported_mass_count
+                ).item()
+            )
+            if model_target_mass_count > 0
+            else float("nan")
         )
         metrics["latent_death_transition_mae"] = (
             float(

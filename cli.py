@@ -1103,6 +1103,9 @@ def plot_forecasts(
                 region_embeddings=region_embeddings,
                 split_name=split.capitalize(),
                 node_metrics_target=node_metric_target,
+                relevant_source_mapping=(
+                    config.model.observation_heads.relevant_source_mapping()
+                ),
             )
 
         if strategy == "random":

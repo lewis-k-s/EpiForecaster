@@ -65,7 +65,13 @@ def test_latent_metrics_capture_truth_agreement_and_structural_coherence() -> No
     assert metrics["latent_mae_s_fraction"] == pytest.approx(0.0)
     assert metrics["latent_rmse_i_fraction"] == pytest.approx(0.0)
     assert metrics["latent_pearson_d"] == pytest.approx(1.0)
-    assert metrics["latent_mass_conservation_mae"] == pytest.approx(0.0)
+    assert metrics["latent_model_sirhd_mass_error_from_one_mae"] == pytest.approx(
+        0.0
+    )
+    assert metrics["latent_target_exported_sirhd_mass_mean"] == pytest.approx(1.0)
+    assert metrics[
+        "latent_model_vs_target_exported_sirhd_mass_mae"
+    ] == pytest.approx(0.0)
     assert metrics["latent_death_transition_mae"] == pytest.approx(0.0, abs=1.0e-8)
     assert metrics["latent_death_monotonic_violation_fraction"] == pytest.approx(0.0)
     assert metrics["latent_hospitalization_flow_negative_fraction"] == pytest.approx(
@@ -73,6 +79,36 @@ def test_latent_metrics_capture_truth_agreement_and_structural_coherence() -> No
     )
     assert metrics["latent_death_flow_negative_fraction"] == pytest.approx(0.0)
     assert metrics["latent_physics_residual_mae"] == pytest.approx(0.01)
+
+
+def test_latent_metrics_do_not_treat_incomplete_export_as_model_mass_failure() -> None:
+    trajectories = {
+        "S_trajectory": torch.tensor([[0.7, 0.6]]),
+        "I_trajectory": torch.tensor([[0.1, 0.15]]),
+        "H_trajectory": torch.tensor([[0.05, 0.05]]),
+        "R_trajectory": torch.tensor([[0.1, 0.13]]),
+        "D_trajectory": torch.tensor([[0.05, 0.07]]),
+        "hospitalization_flow": torch.tensor([[0.01]]),
+        "death_flow": torch.tensor([[0.02]]),
+    }
+    targets = {
+        f"{name}_target": trajectories[f"{name}_trajectory"] * 0.9
+        for name in ("S", "I", "H", "R", "D")
+    }
+    accumulator = TorchLatentCoherenceAccumulator(device=torch.device("cpu"))
+    accumulator.update(model_outputs=trajectories, targets=targets)
+    metrics = accumulator.finalize()
+
+    assert metrics["latent_model_sirhd_mass_error_from_one_mae"] == pytest.approx(
+        0.0
+    )
+    assert metrics["latent_target_exported_sirhd_mass_mean"] == pytest.approx(0.9)
+    assert metrics[
+        "latent_target_exported_sirhd_mass_gap_from_one_mae"
+    ] == pytest.approx(0.1)
+    assert metrics[
+        "latent_model_vs_target_exported_sirhd_mass_mae"
+    ] == pytest.approx(0.1)
 
 
 def test_pathway_gradient_metrics_distinguish_intermediate_routes() -> None:

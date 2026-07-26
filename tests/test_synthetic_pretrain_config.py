@@ -25,6 +25,12 @@ def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
     assert config.data.mobility_min_flow_raw == 0.0
     assert config.model.max_neighbors == 20
     assert config.data.dataset_path == CORRECTED_PROCESSED_PATH
+    assert config.model.observation_heads.relevant_source_mapping() == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
 
 
 @pytest.mark.parametrize(

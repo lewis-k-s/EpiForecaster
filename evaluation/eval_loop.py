@@ -66,12 +66,50 @@ _HEAD_CANONICAL_NAMES = {
     "cases": "cases",
     "deaths": "deaths",
 }
-_HEAD_RELEVANT_LATENT_NAMES = {
+_DEFAULT_RELEVANT_SOURCE_MAPPING = {
     "hosp": "hospitalization_flow",
     "ww": "I",
     "cases": "I",
     "deaths": "death_flow",
 }
+_RELEVANT_SOURCE_OUTPUT_KEYS = {
+    "hospitalization_flow": "hospitalization_flow",
+    "H": "H_trajectory",
+    "I": "I_trajectory",
+    "death_flow": "death_flow",
+    "D": "D_trajectory",
+}
+_ALLOWED_RELEVANT_SOURCES = {
+    "hosp": {"hospitalization_flow", "H"},
+    "ww": {"I"},
+    "cases": {"I"},
+    "deaths": {"death_flow", "D"},
+}
+
+
+def _resolve_relevant_source_mapping(
+    relevant_source_mapping: dict[str, str] | None,
+) -> dict[str, str]:
+    if relevant_source_mapping is None:
+        return dict(_DEFAULT_RELEVANT_SOURCE_MAPPING)
+
+    expected_heads = set(_HEAD_CANONICAL_NAMES)
+    actual_heads = set(relevant_source_mapping)
+    if actual_heads != expected_heads:
+        raise ValueError(
+            "relevant_source_mapping must define exactly "
+            f"{sorted(expected_heads)}, got {sorted(actual_heads)}"
+        )
+
+    resolved = dict(relevant_source_mapping)
+    for head_name, source_name in resolved.items():
+        allowed_sources = _ALLOWED_RELEVANT_SOURCES[head_name]
+        if source_name not in allowed_sources:
+            raise ValueError(
+                f"Relevant source for {head_name!r} must be one of "
+                f"{sorted(allowed_sources)}, got {source_name!r}"
+            )
+    return resolved
 
 
 def _forecast_aligned_output(
@@ -271,6 +309,7 @@ def evaluate_loader(
     granular_csv_path: Path | None = None,
     granular_eval_format: str | None = None,
     granular_metadata: dict[str, Any] | None = None,
+    relevant_source_mapping: dict[str, str] | None = None,
     output_csv_path: Path | None = None,
     node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
@@ -294,6 +333,9 @@ def evaluate_loader(
         granular_csv_path: Deprecated alias for granular_output_path
         granular_eval_format: Optional output format override ("parquet" or "csv")
         granular_metadata: Optional metadata to write alongside granular output
+        relevant_source_mapping: Exact target-to-mechanistic-source mapping used
+            for persisted qualitative plot overlays. This does not alter the
+            observation-head pathway attribution.
         output_csv_path: Deprecated alias for node_metrics_csv_path
         node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
@@ -314,6 +356,9 @@ def evaluate_loader(
             f"Unknown node_metrics_target {node_metrics_target!r}; expected one of "
             f"{tuple(_HEAD_CANONICAL_NAMES.values())}."
         )
+    resolved_relevant_sources = _resolve_relevant_source_mapping(
+        relevant_source_mapping
+    )
 
     # Device-local accumulators - avoid sync until end
     total_loss = torch.tensor(0.0, device=device)
@@ -551,9 +596,10 @@ def evaluate_loader(
                         "residual_hosp",
                         int(hosp_targets.shape[1]),
                     )
-                    hosp_source = _forecast_aligned_output(
+                    hosp_relevant_source_name = resolved_relevant_sources["hosp"]
+                    hosp_relevant_source = _forecast_aligned_output(
                         model_outputs,
-                        "observation_source_hosp",
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[hosp_relevant_source_name],
                         int(hosp_targets.shape[1]),
                     )
                     if hosp_mechanistic is not None and hosp_residual is not None:
@@ -584,8 +630,8 @@ def evaluate_loader(
                             intervals=hosp_prob_batch.intervals,
                             mechanistic_predictions=hosp_mechanistic,
                             residual_contributions=hosp_residual,
-                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["hosp"],
-                            relevant_latent_values=hosp_source,
+                            relevant_latent_name=hosp_relevant_source_name,
+                            relevant_latent_values=hosp_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -600,7 +646,7 @@ def evaluate_loader(
                         hosp_prob_batch,
                         hosp_mechanistic,
                         hosp_residual,
-                        hosp_source,
+                        hosp_relevant_source,
                     )
                 del pred_hosp, hosp_targets, hosp_mask, hosp_weights
 
@@ -649,9 +695,10 @@ def evaluate_loader(
                         "residual_ww",
                         int(ww_targets.shape[1]),
                     )
-                    ww_source = _forecast_aligned_output(
+                    ww_relevant_source_name = resolved_relevant_sources["ww"]
+                    ww_relevant_source = _forecast_aligned_output(
                         model_outputs,
-                        "observation_source_ww",
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[ww_relevant_source_name],
                         int(ww_targets.shape[1]),
                     )
                     if ww_mechanistic is not None and ww_residual is not None:
@@ -681,8 +728,8 @@ def evaluate_loader(
                             intervals=ww_prob_batch.intervals,
                             mechanistic_predictions=ww_mechanistic,
                             residual_contributions=ww_residual,
-                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["ww"],
-                            relevant_latent_values=ww_source,
+                            relevant_latent_name=ww_relevant_source_name,
+                            relevant_latent_values=ww_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -696,7 +743,7 @@ def evaluate_loader(
                         ww_prob_batch,
                         ww_mechanistic,
                         ww_residual,
-                        ww_source,
+                        ww_relevant_source,
                     )
                 del pred_ww, ww_targets, ww_mask, ww_weights
 
@@ -747,9 +794,10 @@ def evaluate_loader(
                         "residual_cases",
                         int(cases_targets.shape[1]),
                     )
-                    cases_source = _forecast_aligned_output(
+                    cases_relevant_source_name = resolved_relevant_sources["cases"]
+                    cases_relevant_source = _forecast_aligned_output(
                         model_outputs,
-                        "observation_source_cases",
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[cases_relevant_source_name],
                         int(cases_targets.shape[1]),
                     )
                     if cases_mechanistic is not None and cases_residual is not None:
@@ -779,8 +827,8 @@ def evaluate_loader(
                             intervals=cases_prob_batch.intervals,
                             mechanistic_predictions=cases_mechanistic,
                             residual_contributions=cases_residual,
-                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["cases"],
-                            relevant_latent_values=cases_source,
+                            relevant_latent_name=cases_relevant_source_name,
+                            relevant_latent_values=cases_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -794,7 +842,7 @@ def evaluate_loader(
                         cases_prob_batch,
                         cases_mechanistic,
                         cases_residual,
-                        cases_source,
+                        cases_relevant_source,
                     )
                 del pred_cases, cases_targets, cases_mask, cases_weights
 
@@ -845,9 +893,10 @@ def evaluate_loader(
                         "residual_deaths",
                         int(deaths_targets.shape[1]),
                     )
-                    deaths_source = _forecast_aligned_output(
+                    deaths_relevant_source_name = resolved_relevant_sources["deaths"]
+                    deaths_relevant_source = _forecast_aligned_output(
                         model_outputs,
-                        "observation_source_deaths",
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[deaths_relevant_source_name],
                         int(deaths_targets.shape[1]),
                     )
                     if deaths_mechanistic is not None and deaths_residual is not None:
@@ -877,8 +926,8 @@ def evaluate_loader(
                             intervals=deaths_prob_batch.intervals,
                             mechanistic_predictions=deaths_mechanistic,
                             residual_contributions=deaths_residual,
-                            relevant_latent_name=_HEAD_RELEVANT_LATENT_NAMES["deaths"],
-                            relevant_latent_values=deaths_source,
+                            relevant_latent_name=deaths_relevant_source_name,
+                            relevant_latent_values=deaths_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -892,7 +941,7 @@ def evaluate_loader(
                         deaths_prob_batch,
                         deaths_mechanistic,
                         deaths_residual,
-                        deaths_source,
+                        deaths_relevant_source,
                     )
                 del pred_deaths, deaths_targets, deaths_mask, deaths_weights
                 current_stage = "granular_write_complete"
@@ -998,6 +1047,7 @@ def evaluate_loader(
         }
         if granular_metadata is not None:
             per_head_metadata.update(granular_metadata)
+        per_head_metadata["relevant_source_mapping"] = resolved_relevant_sources
         write_metadata_sidecar(
             per_head_node_metrics_csv_path,
             per_head_metadata,
@@ -1032,6 +1082,7 @@ def evaluate_loader(
         }
         if granular_metadata is not None:
             metadata.update(granular_metadata)
+        metadata["relevant_source_mapping"] = resolved_relevant_sources
         write_granular_metadata_sidecar(
             granular_output_path,
             metadata,
@@ -1334,6 +1385,9 @@ def eval_checkpoint(
                 "eval_prefetch_factor": loader.prefetch_factor,
                 "eval_pin_memory": bool(loader.pin_memory),
             },
+            relevant_source_mapping=(
+                config.model.observation_heads.relevant_source_mapping()
+            ),
         )
     except Exception:
         logger.exception("[eval] Metrics evaluation failed")

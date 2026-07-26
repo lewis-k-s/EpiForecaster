@@ -420,6 +420,23 @@ class ObservationHeadConfig:
     delta_forecasting: bool = False
     anchor_mode: str = "last_valid_step"
 
+    # Mechanistic source persisted for target-aligned qualitative plots. This is
+    # intentionally separate from the source consumed by each observation head:
+    # changing a plot overlay must not change the model or pathway attribution.
+    relevant_source_hosp: str = "hospitalization_flow"
+    relevant_source_ww: str = "I"
+    relevant_source_cases: str = "I"
+    relevant_source_deaths: str = "death_flow"
+
+    def relevant_source_mapping(self) -> dict[str, str]:
+        """Return the canonical target-to-mechanistic-source plot mapping."""
+        return {
+            "hosp": self.relevant_source_hosp,
+            "ww": self.relevant_source_ww,
+            "cases": self.relevant_source_cases,
+            "deaths": self.relevant_source_deaths,
+        }
+
     def __post_init__(self) -> None:
         for name, value in [
             ("kernel_length_ww", self.kernel_length_ww),
@@ -474,6 +491,20 @@ class ObservationHeadConfig:
                 "distribution_scale_floor must be positive, "
                 f"got {self.distribution_scale_floor}"
             )
+
+        valid_relevant_sources = {
+            "hosp": {"hospitalization_flow", "H"},
+            "ww": {"I"},
+            "cases": {"I"},
+            "deaths": {"death_flow", "D"},
+        }
+        for head_name, source_name in self.relevant_source_mapping().items():
+            if source_name not in valid_relevant_sources[head_name]:
+                raise ValueError(
+                    f"relevant_source_{head_name} must be one of "
+                    f"{sorted(valid_relevant_sources[head_name])}, "
+                    f"got {source_name!r}"
+                )
 
         valid_modes = {"additive", "modulation"}
         if self.residual_mode not in valid_modes:

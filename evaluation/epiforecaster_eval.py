@@ -118,6 +118,9 @@ def evaluate_checkpoint_topk_forecasts(
             split_name=split.capitalize(),
             node_metrics_csv_path=eval_csv_path,
             node_metrics_target=node_metrics_target,
+            relevant_source_mapping=(
+                config.model.observation_heads.relevant_source_mapping()
+            ),
         )
     except Exception as exc:  # pragma: no cover - evaluation best-effort
         logger.warning(f"[eval] Metrics evaluation failed: {exc}")

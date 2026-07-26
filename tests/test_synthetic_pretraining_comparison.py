@@ -99,7 +99,7 @@ def _write_run(
                 "pathway_hosp_reconstruction_max_abs_error": 0.0,
                 "latent_pearson_i": 0.25,
                 "latent_mae_i_fraction": 0.1,
-                "latent_mass_conservation_mae": 1.0e-8,
+                "latent_model_sirhd_mass_error_from_one_mae": 1.0e-8,
                 "loss_latent_i": 0.2,
             },
         },
@@ -295,7 +295,10 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
         ("I", "pearson"),
     }
     structural_rows = _read_csv(output_dir / "latent_structure_metrics.csv")
-    assert structural_rows[0]["metric"] == "latent_mass_conservation_mae"
+    assert (
+        structural_rows[0]["metric"]
+        == "latent_model_sirhd_mass_error_from_one_mae"
+    )
 
     gradient_rows = _read_csv(output_dir / "pathway_gradients.csv")
     assert any(

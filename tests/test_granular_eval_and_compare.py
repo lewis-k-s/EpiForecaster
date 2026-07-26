@@ -15,6 +15,7 @@ import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
+from models.configs import ObservationHeadConfig
 from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
 
@@ -305,6 +306,12 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert "node_split_population_bins" in meta.index
     assert "val_split" in meta.index
     assert "test_split" in meta.index
+    assert meta["relevant_source_mapping"] == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
 
     per_head_df = pd.read_csv(per_head_csv, dtype={"region_id": str})
     assert list(per_head_df.columns) == [
@@ -342,6 +349,56 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert per_head_meta["dataset_path"] == "/tmp/dummy-dataset.zarr"
     assert per_head_meta["run_id"] == "real"
     assert per_head_meta["split"] == "eval"
+    assert per_head_meta["relevant_source_mapping"] == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
+
+
+def test_evaluate_loader_uses_configured_compartment_plot_sources(
+    tmp_path: Path,
+) -> None:
+    granular_csv = tmp_path / "configured_sources.csv"
+    evaluate_loader(
+        model=_DummyModel(),
+        loader=_DummyLoader([_make_batch()]),
+        criterion=JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0),
+        horizon=2,
+        device=torch.device("cpu"),
+        granular_output_path=granular_csv,
+        granular_eval_format="csv",
+        relevant_source_mapping={
+            "hosp": "H",
+            "ww": "I",
+            "cases": "I",
+            "deaths": "D",
+        },
+    )
+
+    rows = pd.read_csv(granular_csv)
+    hosp_row = rows[
+        (rows["target"] == "hospitalizations") & (rows["horizon"] == 1)
+    ].iloc[0]
+    assert hosp_row["relevant_latent_name"] == "H"
+    assert hosp_row["relevant_latent_value"] == pytest.approx(0.05)
+
+    deaths_row = rows[
+        (rows["target"] == "deaths") & (rows["horizon"] == 1)
+    ].iloc[0]
+    assert deaths_row["relevant_latent_name"] == "D"
+    assert deaths_row["relevant_latent_value"] == pytest.approx(0.05)
+
+    metadata = json.loads(
+        granular_csv.with_suffix(".csv.meta.json").read_text(encoding="utf-8")
+    )
+    assert metadata["relevant_source_mapping"] == {
+        "hosp": "H",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "D",
+    }
 
 
 def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
@@ -440,7 +497,11 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         data=SimpleNamespace(
             dataset_path=Path("/tmp/dummy-dataset.zarr"), window_stride=7
         ),
-        model=SimpleNamespace(forecast_horizon=2, input_window_length=3),
+        model=SimpleNamespace(
+            forecast_horizon=2,
+            input_window_length=3,
+            observation_heads=ObservationHeadConfig(),
+        ),
         output=SimpleNamespace(
             write_granular_eval=True,
             granular_eval_format="parquet",
@@ -563,6 +624,12 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
     )
     assert captured["evaluate_kwargs"]["granular_metadata"]["eval_pin_memory"] is False
     assert captured["evaluate_kwargs"]["node_metrics_target"] == "hospitalizations"
+    assert captured["evaluate_kwargs"]["relevant_source_mapping"] == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
 
 
 def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> None:

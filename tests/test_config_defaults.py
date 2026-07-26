@@ -20,6 +20,44 @@ def test_observation_heads_default_weekly_kernels_frozen() -> None:
     assert cfg.anchor_mode == "last_valid_step"
     assert cfg.distribution_scale_init == pytest.approx(0.3)
     assert cfg.distribution_scale_floor == pytest.approx(1.0e-3)
+    assert cfg.relevant_source_mapping() == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
+
+
+@pytest.mark.epiforecaster
+def test_observation_heads_allow_compartment_plot_sources() -> None:
+    cfg = ObservationHeadConfig(
+        relevant_source_hosp="H",
+        relevant_source_deaths="D",
+    )
+    assert cfg.relevant_source_mapping() == {
+        "hosp": "H",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "D",
+    }
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("relevant_source_hosp", "D"),
+        ("relevant_source_ww", "H"),
+        ("relevant_source_cases", "hospitalization_flow"),
+        ("relevant_source_deaths", "H"),
+    ],
+)
+def test_observation_heads_reject_incompatible_plot_sources(
+    field_name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        ObservationHeadConfig(**{field_name: value})
 
 
 @pytest.mark.epiforecaster

@@ -51,6 +51,10 @@ model:
       residual_clip: 10000.0
     observation_heads:
       delta_forecasting: true
+      relevant_source_hosp: hospitalization_flow
+      relevant_source_ww: I
+      relevant_source_cases: I
+      relevant_source_deaths: death_flow
 
 output:
   experiment_name: mn5_epiforecaster_sirhd_reporting_v1_pretrain
