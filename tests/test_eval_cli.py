@@ -47,10 +47,14 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
     output_dir.mkdir()
     captured: dict[str, object] = {}
     groups = {"Q1 (Best MAE)": [0], "Q4 (Worst MAE)": [1]}
+    eval_result = make_eval_result(
+        num_forecast_samples=2,
+        node_mae={0: 0.1, 1: 0.2},
+    )
     install_eval_cli_harness(
         monkeypatch,
         captured,
-        eval_result=make_eval_result(num_forecast_samples=2, node_mae={0: 0.1, 1: 0.2}),
+        eval_result=eval_result,
         node_groups=groups,
     )
 
@@ -84,6 +88,9 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
         output_dir / "test_node_metrics_per_head.csv"
     )
     assert per_head_kwargs["output_dir"] == output_dir
+    assert per_head_kwargs["model"] is eval_result["model"]
+    assert per_head_kwargs["config"] is eval_result["config"]
+    assert per_head_kwargs["loader"] is eval_result["loader"]
 
 
 def test_eval_cli_creates_missing_output_directory_for_all_artifacts(

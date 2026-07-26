@@ -714,6 +714,7 @@ def collect_forecast_samples_for_window_specs(
     context_pre: int = 30,
     context_post: int = 30,
     target_names: list[str] | None = None,
+    sample_batch_size: int = 4,
 ) -> list[dict[str, Any]]:
     import os
 
@@ -729,6 +730,23 @@ def collect_forecast_samples_for_window_specs(
 
     if not window_specs:
         return []
+    if sample_batch_size < 1:
+        raise ValueError("sample_batch_size must be at least 1")
+    if len(window_specs) > sample_batch_size:
+        samples: list[dict[str, Any]] = []
+        for offset in range(0, len(window_specs), sample_batch_size):
+            samples.extend(
+                collect_forecast_samples_for_window_specs(
+                    window_specs=window_specs[offset : offset + sample_batch_size],
+                    model=model,
+                    loader=loader,
+                    context_pre=context_pre,
+                    context_post=context_post,
+                    target_names=target_names,
+                    sample_batch_size=sample_batch_size,
+                )
+            )
+        return samples
 
     resolved_targets = _resolve_target_names(target_names)
     distribution_config = dataset.config.training.loss.joint

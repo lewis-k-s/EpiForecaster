@@ -17,6 +17,42 @@ from evaluation.selection import (
 import plotting.forecast_plots as forecast_plots
 
 
+def test_exact_window_collection_chunks_plot_inference_batches(monkeypatch) -> None:
+    specs = [
+        WindowSelectionSpec(
+            node_id=index,
+            window_start=index,
+            score=float(index),
+            observed_targets=("cases",),
+            observed_points=1,
+        )
+        for index in range(5)
+    ]
+    chunk_sizes: list[int] = []
+
+    def fake_collect(**kwargs):
+        chunk_sizes.append(len(kwargs["window_specs"]))
+        return list(kwargs["window_specs"])
+
+    original_collect = forecast_plots.collect_forecast_samples_for_window_specs
+    monkeypatch.setattr(forecast_plots, "EpiDataset", object)
+    monkeypatch.setattr(
+        forecast_plots,
+        "collect_forecast_samples_for_window_specs",
+        fake_collect,
+    )
+
+    collected = original_collect(
+        window_specs=specs,
+        model=object(),
+        loader=SimpleNamespace(dataset=object()),
+        sample_batch_size=2,
+    )
+
+    assert chunk_sizes == [2, 2, 1]
+    assert collected == specs
+
+
 def test_collect_forecast_samples_supports_epibatch_attribute_targets(
     monkeypatch,
 ) -> None:

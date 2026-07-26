@@ -673,6 +673,9 @@ def eval_epiforecaster(
                     per_head_node_metrics_csv=per_head_node_metrics_csv,
                     output_dir=per_head_node_metrics_csv.parent,
                     samples_per_quartile=4,
+                    model=eval_result["model"],
+                    config=eval_result["config"],
+                    loader=eval_result["loader"],
                 )
             except Exception as e:
                 click.echo(f"Warning: Per-head eval plotting failed: {e}")

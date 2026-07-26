@@ -118,6 +118,26 @@ def test_compute_canonical_sparsity_uses_run_filter_and_combined_ww_rule(
     assert ww_region_b["sparsity_pct"] == pytest.approx(50.0)
 
 
+def test_compute_canonical_sparsity_strips_padded_run_ids(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "aligned.zarr"
+    _write_test_dataset(dataset_path)
+    dataset = xr.open_zarr(dataset_path).assign_coords(
+        run_id=np.array(["0_Baseline   ", "1_Baseline   "])
+    )
+    padded_path = tmp_path / "padded.zarr"
+    dataset.to_zarr(padded_path)
+
+    sparsity_df = _compute_canonical_sparsity(
+        dataset_path=padded_path,
+        run_id="0_Baseline",
+    )
+
+    cases_region_a = sparsity_df[
+        (sparsity_df["target"] == "cases") & (sparsity_df["region_id"] == "08001")
+    ].iloc[0]
+    assert cases_region_a["sparsity_pct"] == pytest.approx(50.0)
+
+
 def test_render_eval_per_head_plots_writes_expected_files(tmp_path: Path) -> None:
     dataset_path = tmp_path / "aligned.zarr"
     _write_test_dataset(dataset_path)

@@ -241,6 +241,15 @@ def _select_run(dataset: xr.Dataset, run_id: Any) -> xr.Dataset:
             return dataset.sel(run_id=candidate)
         except Exception:
             continue
+    requested = str(run_id).strip()
+    available = np.asarray(dataset["run_id"].values)
+    matching = [
+        index
+        for index, candidate in enumerate(available)
+        if str(candidate).strip() == requested
+    ]
+    if len(matching) == 1:
+        return dataset.isel(run_id=matching[0])
     logger.warning(
         "Could not select run_id=%s from dataset; using full dataset", run_id
     )
@@ -633,6 +642,9 @@ def _render_forecast_history_quartile_plots(
     output_dir: Path,
     samples_per_quartile: int,
     forecasts_per_region: int,
+    model: Any,
+    config: Any,
+    loader: Any,
 ) -> dict[str, Path]:
     checkpoint_path_raw = sidecar.get("checkpoint_path")
     if not checkpoint_path_raw:
@@ -642,17 +654,6 @@ def _render_forecast_history_quartile_plots(
         return {}
     if granular_df.empty:
         return {}
-
-    checkpoint_path = Path(checkpoint_path_raw)
-    model, config, _checkpoint = load_model_from_checkpoint(
-        checkpoint_path,
-        device="auto",
-    )
-    loader, _region_embeddings = build_loader_from_config(
-        config,
-        split=str(sidecar.get("split", "test")),
-        device="auto",
-    )
 
     forecast_horizon = int(config.model.forecast_horizon)
     artifacts: dict[str, Path] = {}
@@ -768,6 +769,9 @@ def _render_joint_latent_quartile_plots(
     sidecar: dict[str, Any],
     output_dir: Path,
     samples_per_quartile: int,
+    model: Any,
+    config: Any,
+    loader: Any,
 ) -> dict[str, Path]:
     checkpoint_path_raw = sidecar.get("checkpoint_path")
     if not checkpoint_path_raw or granular_df.empty:
@@ -781,17 +785,6 @@ def _render_joint_latent_quartile_plots(
     )
     if not grouped_specs:
         return {}
-
-    checkpoint_path = Path(checkpoint_path_raw)
-    model, config, _checkpoint = load_model_from_checkpoint(
-        checkpoint_path,
-        device="auto",
-    )
-    loader, _region_embeddings = build_loader_from_config(
-        config,
-        split=str(sidecar.get("split", "test")),
-        device="auto",
-    )
 
     ordered_specs = [spec for specs in grouped_specs.values() for spec in specs]
     samples = collect_forecast_samples_for_window_specs(
@@ -865,6 +858,9 @@ def _render_forecast_quartile_plots(
     sidecar: dict[str, Any],
     output_dir: Path,
     samples_per_quartile: int,
+    model: Any,
+    config: Any,
+    loader: Any,
 ) -> dict[str, Path]:
     checkpoint_path_raw = sidecar.get("checkpoint_path")
     if not checkpoint_path_raw:
@@ -872,17 +868,6 @@ def _render_forecast_quartile_plots(
             "Skipping forecast example plots because checkpoint_path is absent from sidecar"
         )
         return {}
-
-    checkpoint_path = Path(checkpoint_path_raw)
-    model, config, _checkpoint = load_model_from_checkpoint(
-        checkpoint_path,
-        device="auto",
-    )
-    loader, _region_embeddings = build_loader_from_config(
-        config,
-        split=str(sidecar.get("split", "test")),
-        device="auto",
-    )
 
     artifacts: dict[str, Path] = {}
     for target in _ordered_targets(metrics_df["target"].astype(str)):
@@ -1037,6 +1022,9 @@ def render_eval_per_head_plots(
     granular_metrics_csv: str | Path | None = None,
     forecast_window: str = "both",
     history_forecasts_per_region: int = 6,
+    model: Any | None = None,
+    config: Any | None = None,
+    loader: Any | None = None,
 ) -> dict[str, Path]:
     csv_path = Path(per_head_node_metrics_csv)
     output_dir = Path(output_dir) if output_dir is not None else csv_path.parent
@@ -1088,6 +1076,25 @@ def render_eval_per_head_plots(
                 path=granular_csv_path,
                 split=str(sidecar.get("split", "test")),
             )
+    if not granular_df.empty:
+        supplied_runtime = (model is not None, config is not None, loader is not None)
+        if any(supplied_runtime) and not all(supplied_runtime):
+            raise ValueError("model, config, and loader must be supplied together")
+        if not all(supplied_runtime):
+            checkpoint_path_raw = sidecar.get("checkpoint_path")
+            if not checkpoint_path_raw:
+                raise ValueError(
+                    "checkpoint_path is required when no plotting runtime is supplied"
+                )
+            model, config, _checkpoint = load_model_from_checkpoint(
+                Path(checkpoint_path_raw),
+                device="auto",
+            )
+            loader, _region_embeddings = build_loader_from_config(
+                config,
+                split=str(sidecar.get("split", "test")),
+                device="auto",
+            )
 
     artifacts: dict[str, Path] = {}
     artifacts["sparsity_vs_model_error"] = _save_observation_density_error_panel(
@@ -1116,7 +1123,7 @@ def render_eval_per_head_plots(
             output_path=sparsity_path,
         )
 
-    if forecast_window in {"last", "both"}:
+    if forecast_window in {"last", "both"} and not granular_df.empty:
         artifacts.update(
             _render_forecast_quartile_plots(
                 metrics_df=metrics_df,
@@ -1124,9 +1131,12 @@ def render_eval_per_head_plots(
                 sidecar=sidecar,
                 output_dir=output_dir,
                 samples_per_quartile=samples_per_quartile,
+                model=model,
+                config=config,
+                loader=loader,
             )
         )
-    if forecast_window in {"history", "both"}:
+    if forecast_window in {"history", "both"} and not granular_df.empty:
         artifacts.update(
             _render_forecast_history_quartile_plots(
                 metrics_df=metrics_df,
@@ -1135,15 +1145,22 @@ def render_eval_per_head_plots(
                 output_dir=output_dir,
                 samples_per_quartile=samples_per_quartile,
                 forecasts_per_region=history_forecasts_per_region,
+                model=model,
+                config=config,
+                loader=loader,
             )
         )
-    artifacts.update(
-        _render_joint_latent_quartile_plots(
-            granular_df=granular_df,
-            sidecar=sidecar,
-            output_dir=output_dir,
-            samples_per_quartile=samples_per_quartile,
+    if not granular_df.empty:
+        artifacts.update(
+            _render_joint_latent_quartile_plots(
+                granular_df=granular_df,
+                sidecar=sidecar,
+                output_dir=output_dir,
+                samples_per_quartile=samples_per_quartile,
+                model=model,
+                config=config,
+                loader=loader,
+            )
         )
-    )
 
     return artifacts
