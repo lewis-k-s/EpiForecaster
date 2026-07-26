@@ -89,6 +89,63 @@ class TestEpiDataset:
             assert ds.num_nodes == 5
             assert len(ds) > 0
 
+    def test_supervision_targets_preserve_small_positive_float32_values(
+        self, config, mock_xarray_dataset
+    ):
+        dataset = mock_xarray_dataset.copy(deep=True)
+        tiny = np.full(
+            dataset["cases"].shape,
+            1e-12,
+            dtype=np.float32,
+        )
+        for name in ("cases", "hospitalizations", "deaths"):
+            dataset[name] = (("date", "region_id"), tiny.copy())
+        for name in (
+            "edar_biomarker_N1",
+            "edar_biomarker_N2",
+            "edar_biomarker_IP4",
+        ):
+            dataset[name] = (("date", "region_id"), tiny.copy())
+            dataset[f"{name}_mask"] = (
+                ("date", "region_id"),
+                np.ones_like(tiny, dtype=bool),
+            )
+            dataset[f"{name}_censor"] = (
+                ("date", "region_id"),
+                np.zeros_like(tiny, dtype=np.uint8),
+            )
+            dataset[f"{name}_age"] = (
+                ("date", "region_id"),
+                np.ones_like(tiny, dtype=np.uint8),
+            )
+        for name in (
+            "latent_S_true",
+            "latent_I_true",
+            "latent_H_true",
+            "latent_R_true",
+            "latent_D_true",
+        ):
+            dataset[name] = (("date", "region_id"), tiny.copy())
+
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=dataset
+        ):
+            epi_dataset = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1, 2],
+            )
+
+        assert epi_dataset.precomputed_cases_target.dtype == torch.float32
+        assert epi_dataset.precomputed_hosp.dtype == torch.float32
+        assert epi_dataset.precomputed_deaths.dtype == torch.float32
+        assert epi_dataset.precomputed_ww.dtype == torch.float32
+        assert epi_dataset.precomputed_I_target is not None
+        assert epi_dataset.precomputed_I_target.dtype == torch.float32
+        assert bool((epi_dataset.precomputed_cases_target > 0).all())
+        assert bool((epi_dataset.precomputed_ww > 0).all())
+        assert bool((epi_dataset.precomputed_I_target > 0).all())
+
     def test_getitem_shapes(self, config, mock_xarray_dataset):
         with patch.object(
             EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset

@@ -299,6 +299,7 @@ class TestPipelineStorage:
         assert cases_chunks[0] == (2, 2, 1)
         assert cases_chunks[1] == (10, 10)
         assert cases_chunks[2] == (5, 5)
+        assert saved_ds.cases.dtype == np.float16
         
         mobility_chunks = saved_ds.mobility.chunks
         assert mobility_chunks[0] == (2, 2, 1) # run_id
@@ -321,8 +322,64 @@ class TestPipelineStorage:
         assert "generator_source_commit: abc123" in source_provenance_yaml
         assert "raw_corpus_full_tree_sha256: deadbeef" in source_provenance_yaml
 
+    def test_float32_storage_preserves_small_positive_supervision(
+        self, mock_config, tmp_path
+    ):
+        mock_config.continuous_storage_dtype = "float32"
+        mock_config.output_path = str(tmp_path)
+        mock_config.dataset_name = "float32_supervision"
+
+        dataset = xr.Dataset(
+            {
+                "cases": (
+                    ("run_id", "date", "region_id"),
+                    np.array([[[1e-12], [2e-12]]], dtype=np.float64),
+                ),
+                "cases_mask": (
+                    ("run_id", "date", "region_id"),
+                    np.ones((1, 2, 1), dtype=bool),
+                ),
+                "latent_I_true": (
+                    ("run_id", "date", "region_id"),
+                    np.array([[[1e-12], [2e-12]]], dtype=np.float32),
+                ),
+                "population": (
+                    ("run_id", "region_id"),
+                    np.array([[1000]], dtype=np.int32),
+                ),
+            },
+            coords={
+                "run_id": ["synthetic"],
+                "date": np.arange(2),
+                "region_id": ["001"],
+            },
+        )
+        pipeline = OfflinePreprocessingPipeline(mock_config)
+        pipeline._log_postwrite_summary = Mock()
+
+        saved_path = pipeline._save_aligned_dataset(dataset)
+
+        saved = xr.open_zarr(saved_path)
+        try:
+            assert saved.attrs["continuous_storage_dtype"] == "float32"
+            assert saved["cases"].dtype == np.float32
+            assert saved["latent_I_true"].dtype == np.float32
+            assert bool((saved["cases"] > 0).all())
+            assert bool((saved["latent_I_true"] > 0).all())
+        finally:
+            saved.close()
+
 
 class TestPreprocessingConfigValidation:
+    def test_invalid_continuous_storage_dtype_raises(self, mock_config):
+        mock_config.continuous_storage_dtype = "float64"
+
+        with pytest.raises(
+            ValueError,
+            match="continuous_storage_dtype must be one of",
+        ):
+            mock_config._validate_processing_options()
+
     def test_missing_holiday_calendar_file_raises(self, tmp_path):
         """Holiday calendar must exist when holidays are enabled."""
         (tmp_path / "cases.csv").touch()

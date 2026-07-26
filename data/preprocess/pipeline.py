@@ -506,6 +506,7 @@ class OfflinePreprocessingPipeline:
             "smoothing_clinical_method": self.config.smoothing.clinical_method,
             "smoothing_wastewater_method": self.config.smoothing.wastewater_method,
             "smoothing_missing_policy": self.config.smoothing.missing_policy,
+            "continuous_storage_dtype": self.config.continuous_storage_dtype,
             "preprocessing_config_yaml": self._serialize_config_yaml(),
             "source_provenance_yaml": yaml.safe_dump(
                 self.config.source_provenance,
@@ -514,8 +515,8 @@ class OfflinePreprocessingPipeline:
             ),
         }
 
-        # Convert float64 to float16 to reduce storage and memory usage
-        # Uses centralized dtype constants from utils/dtypes.py
+        # Convert continuous variables to the configured storage precision.
+        continuous_dtype = self.config.continuous_storage_dtype
         print("Optimizing dtypes for storage efficiency...")
         converted_dict = {}
         for var_name, var in rechunked_dataset.data_vars.items():
@@ -546,26 +547,26 @@ class OfflinePreprocessingPipeline:
             elif var_name == "population":
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["population"])
                 print(f"  {var_name}: {old_dtype} -> int32")
-            # Temporal covariates: float32 -> float16 for consistency
+            # Temporal covariates use the configured continuous precision.
             elif var_name == "temporal_covariates" and var.dtype == np.float32:
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: float32 -> float16")
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: float32 -> {continuous_dtype}")
             elif var_name == "vaccination_rate" and var.dtype in (
                 np.float32,
                 np.float64,
             ):
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: {old_dtype} -> float16")
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
             elif var_name.startswith("latent_") and var.dtype in (
                 np.float32,
                 np.float64,
             ):
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: {old_dtype} -> float16")
-            # Generic float64 -> float16 (continuous values) - check LAST
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
+            # Generic float64 continuous values - check LAST
             elif var.dtype == np.float64:
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: float64 -> float16")
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: float64 -> {continuous_dtype}")
 
             converted_dict[var_name] = new_var
         rechunked_dataset = xr.Dataset(

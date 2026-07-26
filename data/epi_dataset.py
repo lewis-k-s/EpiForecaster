@@ -1207,27 +1207,26 @@ class EpiDataset(Dataset):
                 "No wastewater variable or EDAR components found; using all-missing WW target."
             )
             T = len(ds[TEMPORAL_COORD])
-            zeros = torch.zeros((T, self.num_nodes), dtype=torch.float16)
-            return zeros, zeros
+            values = torch.zeros((T, self.num_nodes), dtype=torch.float32)
+            mask = torch.zeros((T, self.num_nodes), dtype=torch.float16)
+            return values, mask
 
         stacked_values = np.stack(component_tensors, axis=0)  # (C, T, N)
-        stacked_masks = np.stack(component_masks, axis=0).astype(
-            np.float16
-        )  # (C, T, N)
+        stacked_masks = np.stack(component_masks, axis=0).astype(bool)
 
         valid = (stacked_masks > 0.0) & np.isfinite(stacked_values)
-        valid_count = valid.sum(axis=0).astype(np.float16)
+        valid_count = valid.sum(axis=0)
         weighted_sum = np.where(valid, stacked_values, 0.0).sum(axis=0)
         combined_values = np.divide(
             weighted_sum,
             np.where(valid_count > 0.0, valid_count, 1.0),
-        ).astype(np.float16)
+        ).astype(np.float32)
         combined_mask = np.any(valid, axis=0)
 
         # Values are already log1p-transformed from preprocessing pipeline
         # Preserve missingness in WW targets when no observed variant is available.
         combined_values = np.where(combined_mask, combined_values, np.nan).astype(
-            np.float16
+            np.float32
         )
 
         logger.info(
@@ -1269,7 +1268,7 @@ class EpiDataset(Dataset):
             )
             T = len(ds[TEMPORAL_COORD])
             return (
-                torch.zeros((T, self.num_nodes), dtype=torch.float16),
+                torch.zeros((T, self.num_nodes), dtype=torch.float32),
                 torch.zeros((T, self.num_nodes), dtype=torch.float16),
             )
 
@@ -1279,7 +1278,7 @@ class EpiDataset(Dataset):
         values = np.where(np.isfinite(values), values, np.nan)
         mask_t = torch.from_numpy(mask.astype(np.float16)).to(torch.float16)
 
-        return torch.from_numpy(values.astype(np.float16)).to(torch.float16), mask_t
+        return torch.from_numpy(values.astype(np.float32)), mask_t
 
     def _precompute_latent_target(
         self,
@@ -1305,7 +1304,7 @@ class EpiDataset(Dataset):
         values = da.values.astype(np.float32)
 
         values = np.where(np.isfinite(values), values, np.nan)
-        return torch.from_numpy(values.astype(np.float16)).to(torch.float16)
+        return torch.from_numpy(values.astype(np.float32))
 
     @staticmethod
     def _slice_latent_target(

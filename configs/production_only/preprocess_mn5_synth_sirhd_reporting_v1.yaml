@@ -15,6 +15,7 @@ population_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4
 end_date: "2021-05-09"
 dataset_name: "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped"
 vaccination_file: null
+continuous_storage_dtype: "float32"
 
 smoothing:
   clinical_method: "holt_damped"

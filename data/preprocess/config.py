@@ -150,6 +150,7 @@ class PreprocessingConfig:
         output_path: Directory path for processed dataset
         dataset_name: Human-readable name for the dataset
         compression: Compression algorithm for Zarr storage
+        continuous_storage_dtype: Storage dtype for continuous output variables
         chunk_sizes: Custom chunk sizes for Zarr arrays
 
         num_workers: Number of parallel workers for processing
@@ -209,6 +210,7 @@ class PreprocessingConfig:
 
     # Output configuration
     compression: str = "blosc"
+    continuous_storage_dtype: str = "float16"
     chunk_sizes: dict[str, list[int]] | None = None
 
     # Alignment and validation options
@@ -389,6 +391,13 @@ class PreprocessingConfig:
 
         if self.memory_limit_gb <= 0:
             raise ValueError("memory_limit_gb must be positive")
+
+        valid_storage_dtypes = {"float16", "float32"}
+        if self.continuous_storage_dtype not in valid_storage_dtypes:
+            raise ValueError(
+                "continuous_storage_dtype must be one of "
+                f"{sorted(valid_storage_dtypes)}"
+            )
 
     def _validate_graph_options(self):
         """Validate graph construction options."""
