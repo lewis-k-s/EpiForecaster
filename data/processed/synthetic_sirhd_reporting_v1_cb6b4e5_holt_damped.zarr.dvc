@@ -1,0 +1,6 @@
+outs:
+- md5: 2eb591ae43fe4f505120603965427404.dir
+  size: 6554203611
+  nfiles: 114053
+  hash: md5
+  path: synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr
