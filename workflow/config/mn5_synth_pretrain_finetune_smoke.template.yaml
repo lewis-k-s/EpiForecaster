@@ -1,0 +1,59 @@
+# Matched initialized real-data smoke for the reporting-v1 pretraining study.
+# Copy this template, replace training.init_checkpoint with the absolute GPFS
+# checkpoint produced by the corrected-corpus pretraining smoke, then prepare a
+# new immutable run. The fail-closed flag prevents a null checkpoint from
+# silently becoming another from-scratch control.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: train
+  target: train_evaluate
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.dvc
+    - data/processed/real_with_id.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+training:
+  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  experiment_name: synthetic-pretraining-finetune-reporting-v1-smoke
+  model_id: model
+  max_batches: 10
+  require_init_checkpoint: true
+  init_checkpoint: null
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+    - training.compile=false
+    - training.compile_backward=false
+    - training.profiler.enabled=false
+    - training.num_workers=2
+    - training.val_workers=2
+    - training.test_workers=2
+    - training.progress_log_frequency=1
+    - training.grad_norm_log_frequency=1
+    - training.pathway_gradient_frequency=1
+
+evaluation:
+  split: test
+  granular: true
+  overrides:
+    - training.num_workers=2
+    - training.val_workers=2
+    - training.test_workers=2
+    - training.num_forecast_samples=1
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 30

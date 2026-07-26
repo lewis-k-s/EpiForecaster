@@ -71,6 +71,24 @@ bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
   --config workflow/config/mn5_synth_pretrain.yaml
 ```
 
+The reporting-v1 pretraining study uses fail-closed templates for initialized
+fine-tuning. Copy
+`workflow/config/mn5_synth_pretrain_finetune_smoke.template.yaml` for the
+bounded real-data smoke, or
+`workflow/config/mn5_synth_pretrain_finetune.template.yaml` for the substantive
+treatment. Set `training.init_checkpoint` to the absolute GPFS checkpoint from
+the accepted corrected-corpus pretraining run before immutable preparation.
+The workflow validator rejects either template while that field is null, so it
+cannot silently execute as a second from-scratch control.
+
+Use `workflow/config/mn5_synth_pretrain_control_smoke.yaml` as the exactly
+matched from-scratch smoke. For corrected-corpus cross-evaluation of a control,
+pretrained, or fine-tuned checkpoint, copy
+`workflow/config/mn5_sirhd_reporting_v1_checkpoint_evaluate.template.yaml` and
+set its absolute `evaluation.checkpoint`. Preparation pins and hashes both
+training initialization and evaluation checkpoints into their new immutable
+run roots.
+
 The default target is single training. Pin `train_evaluate` or `evaluate` in a
 complete workflow config before preparation when evaluation is required. Use
 `--config workflow/config/mn5.yaml` for HPO or

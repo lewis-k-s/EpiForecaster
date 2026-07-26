@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,96 @@ def test_synthetic_pretrain_control_matches_real_training_contract() -> None:
     assert control["dvc"] == canonical["dvc"]
     assert control["evaluation"] == canonical["evaluation"]
     assert control["resources"] == canonical["resources"]
+
+
+def test_reporting_v1_finetune_matches_from_scratch_control() -> None:
+    control = yaml.safe_load(
+        Path("workflow/config/mn5_synth_pretrain_control.yaml").read_text()
+    )
+    fine_tune = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_synth_pretrain_finetune.template.yaml"
+        ).read_text()
+    )
+
+    assert fine_tune["workflow"] == control["workflow"]
+    assert fine_tune["dvc"] == control["dvc"]
+    assert fine_tune["evaluation"] == control["evaluation"]
+    assert fine_tune["resources"] == control["resources"]
+    for field in ("base_config", "model_id", "max_batches", "overrides"):
+        assert fine_tune["training"][field] == control["training"][field]
+    assert fine_tune["training"]["require_init_checkpoint"] is True
+    assert fine_tune["training"]["init_checkpoint"] is None
+
+    with pytest.raises(
+        ValueError,
+        match="training.init_checkpoint is required",
+    ):
+        validate_workflow_contract(fine_tune)
+
+    rendered = deepcopy(fine_tune)
+    rendered["training"]["init_checkpoint"] = (
+        "/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/"
+        "EpiForecaster-DVC/runs/pretrain/outputs/training/pretrain/model/"
+        "checkpoints/best_model.pt"
+    )
+    assert validate_workflow_contract(rendered) == "train"
+
+
+def test_reporting_v1_finetune_smoke_matches_from_scratch_smoke() -> None:
+    control = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_synth_pretrain_control_smoke.yaml"
+        ).read_text()
+    )
+    fine_tune = yaml.safe_load(
+        Path(
+            "workflow/config/"
+            "mn5_synth_pretrain_finetune_smoke.template.yaml"
+        ).read_text()
+    )
+
+    assert validate_workflow_contract(control) == "train"
+    assert fine_tune["workflow"] == control["workflow"]
+    assert fine_tune["dvc"] == control["dvc"]
+    assert fine_tune["evaluation"] == control["evaluation"]
+    assert fine_tune["resources"] == control["resources"]
+    for field in ("base_config", "model_id", "max_batches", "overrides"):
+        assert fine_tune["training"][field] == control["training"][field]
+    assert fine_tune["training"]["require_init_checkpoint"] is True
+    assert fine_tune["training"]["init_checkpoint"] is None
+
+    with pytest.raises(
+        ValueError,
+        match="training.init_checkpoint is required",
+    ):
+        validate_workflow_contract(fine_tune)
+
+
+def test_reporting_v1_checkpoint_evaluation_template_fails_closed() -> None:
+    template = yaml.safe_load(
+        Path(
+            "workflow/config/"
+            "mn5_sirhd_reporting_v1_checkpoint_evaluate.template.yaml"
+        ).read_text()
+    )
+
+    assert template["evaluation"]["checkpoint"] is None
+    assert CORRECTED_PROCESSED_POINTER in template["dvc"]["targets"]
+    assert template["dvc"]["provenance_targets"] == [CORRECTED_RAW_POINTER]
+    with pytest.raises(
+        ValueError,
+        match="evaluation.checkpoint must be an absolute GPFS path",
+    ):
+        validate_workflow_contract(template)
+
+    rendered = deepcopy(template)
+    rendered["evaluation"]["checkpoint"] = (
+        "/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/"
+        "EpiForecaster-DVC/runs/model/outputs/training/model/checkpoints/"
+        "best_model.pt"
+    )
+    assert validate_workflow_contract(rendered) == "evaluate"
 
 
 def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> None:

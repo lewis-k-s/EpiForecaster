@@ -1,0 +1,42 @@
+# Corrected-corpus held-out evaluation template for any pinned study checkpoint.
+# Copy the template and set evaluation.checkpoint to an absolute GPFS path.
+# Preparation copies and hashes that checkpoint into the immutable evaluation
+# run, so later mutation of the source checkpoint cannot change the result.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: evaluate
+  target: evaluate
+
+dvc:
+  targets:
+    - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
+
+evaluation:
+  checkpoint: null
+  split: test
+  granular: true
+  overrides:
+    - data.dataset_path=data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr
+    - data.mobility_min_flow_raw=0.0
+    - data.run_id_chunk_size=1
+    - training.curriculum.enabled=true
+    - training.loss.joint.w_sird_supervision=0.01
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 420

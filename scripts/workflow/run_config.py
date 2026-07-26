@@ -284,6 +284,13 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             raise ValueError(
                 "training.init_checkpoint must be an absolute GPFS path when provided"
             )
+        require_init_checkpoint = training.get("require_init_checkpoint", False)
+        if not isinstance(require_init_checkpoint, bool):
+            raise ValueError("training.require_init_checkpoint must be a boolean")
+        if require_init_checkpoint and init_checkpoint is None:
+            raise ValueError(
+                "training.init_checkpoint is required by this workflow template"
+            )
     elif kind == "evaluate":
         checkpoint = workflow_config["evaluation"].get("checkpoint")
         if checkpoint is None or not Path(str(checkpoint)).is_absolute():

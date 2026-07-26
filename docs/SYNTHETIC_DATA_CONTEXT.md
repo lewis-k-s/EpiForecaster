@@ -2,6 +2,52 @@
 
 This document explains the synthetic data structure for downstream forecasters who will load, understand, and use the synthetic zarr datasets.
 
+## Controlled SIRHD reporting-v1 corpus
+
+The current latent-supervised pretraining experiment does **not** use the
+legacy general-purpose corpus described in the remainder of this document. Its
+versioned inputs are:
+
+- raw:
+  `data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr`
+  (`10d13dace7243bded69c7b04defb7bdf.dir`);
+- processed:
+  `data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr`
+  (`2eb591ae43fe4f505120603965427404.dir`);
+- generator source commit:
+  `cb6b4e5ed7dcf3b1a0b23a15ac5a2377e09857c1`.
+
+The reporting-v1 contract is:
+
+- Clinical observations are continuous expected reported counts. They are
+  calibrated in downstream `log1p(count / population * 100000)` space, then
+  stored back in raw count units without rounding or integerization.
+- Missingness is represented only by explicit masks and NaNs. Clinical
+  no-event zeros are missing in this controlled corpus.
+- Mechanistic compartments remain continuous float32 population states.
+- Wastewater remains raw concentration and receives exactly one downstream
+  `log1p`.
+- Complete mechanistic truth is preserved separately from the observation
+  layer. EpiForecaster's exported S/I/H/R/D supervision is useful for
+  synthetic pretraining but may be an incomplete partition of the richer
+  upstream compartment model.
+- Reporting delays and spikiness are disabled. This baseline isolates the
+  corrected observation layer; a future discrete Poisson or negative-binomial
+  reporting variant must be separately seeded and versioned.
+
+The corpus contains the same 20 deterministic baseline mechanistic
+trajectories with no intervention changes. Only the observation/reporting
+layer differs from the superseded corpus. Latent truth may be used as a
+supervision target during the explicitly synthetic pretraining stage; it must
+not be treated as an observed real-data feature. Model SIRHD mass constraints
+and the mass represented by the exported target subset are therefore reported
+as separate diagnostics.
+
+The sections below document the legacy/general generator family. Statements
+about intervention scenarios, reporting delays, discrete observation noise,
+censoring, or ground truth being evaluation-only must not be applied to the
+controlled reporting-v1 pretraining corpus.
+
 ## Overview
 
 The synthetic data generation pipeline creates **counterfactual "twin" scenarios** to benchmark mobility intervention strategies. For each epidemiological profile (fixed R0, incubation period, infectious period), we run multiple scenarios that differ *only* in their intervention strategy (Baseline vs. Global_Timed vs. Local_Static) at varying strengths.
@@ -429,11 +475,15 @@ The `contribution_ratio` in EMAP represents **wastewater flow fractions**, not p
 
 ## Reference Implementation
 
-For the source of truth on output structure, see:
+For the source of truth on the legacy/general output structure, see:
 - `python/process_synthetic_outputs.py` - Main processing script
 
-For detailed pipeline documentation:
+For the legacy/general pipeline documentation:
 - `CONTEXT_SYNTHETIC_GEN.md` - Architecture and usage guide
+
+For reporting-v1, the immutable generator source snapshot and handoff manifest
+recorded with the raw corpus are authoritative. Do not infer its semantics from
+legacy filenames or from a mutable local EpiSim checkout.
 
 ## Troubleshooting
 
