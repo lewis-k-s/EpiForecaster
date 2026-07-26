@@ -472,6 +472,59 @@ def test_generate_comparison_rejects_unmatched_training_source(
         generate_comparison(spec, tmp_path / "comparison")
 
 
+def test_generate_comparison_ignores_per_run_workflow_receipt_fields(
+    tmp_path: Path,
+) -> None:
+    control = _write_run(
+        tmp_path,
+        stage="control",
+        mae=2.0,
+        residual_fraction=0.4,
+    )
+    fine_tune = _write_run(
+        tmp_path,
+        stage="fine_tune",
+        mae=1.5,
+        residual_fraction=0.25,
+        initialized=True,
+    )
+    for run, attempt in ((control, "attempt-control"), (fine_tune, "attempt-fine")):
+        manifest_path = tmp_path / run["training_run_manifest"]
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        manifest["workflow"].update(
+            {
+                "config_sha256": attempt,
+                "dispatch_request_sha256": attempt,
+                "execution_attempt_id": attempt,
+                "initial_coordinator_job_id": attempt,
+            }
+        )
+        _write_yaml(manifest_path, manifest)
+
+    spec = tmp_path / "comparison.json"
+    _write_json(
+        spec,
+        {
+            "schema_version": 1,
+            "runs": [control, fine_tune],
+            "comparisons": [
+                {
+                    "name": "pretraining_effect",
+                    "baseline": "control",
+                    "candidate": "fine_tune",
+                    "training_contract": "matched_except_initialization",
+                }
+            ],
+        },
+    )
+
+    manifest = generate_comparison(spec, tmp_path / "comparison")
+
+    assert manifest["comparison_contracts"] == {
+        "pretraining_effect": "matched_except_initialization"
+    }
+
+
 def test_generate_comparison_rejects_uninitialized_matched_candidate(
     tmp_path: Path,
 ) -> None:

@@ -648,10 +648,32 @@ def _validate_matched_training_contract(
             raise ValueError(
                 f"Comparison {comparison.name} has mismatched training {section}"
             )
-    if baseline.get("workflow") != candidate.get("workflow"):
+    baseline_workflow = baseline.get("workflow")
+    candidate_workflow = candidate.get("workflow")
+    if not isinstance(baseline_workflow, dict) or not isinstance(
+        candidate_workflow, dict
+    ):
         raise ValueError(
-            f"Comparison {comparison.name} has mismatched workflow target"
+            f"Comparison {comparison.name} has missing workflow identity"
         )
+    # Immutable runs necessarily have distinct dispatch/config hashes, attempt
+    # IDs, and scheduler job IDs. Match the execution contract instead of those
+    # per-run receipt fields.
+    for field in (
+        "tooling_key",
+        "snakemake_bin",
+        "version",
+        "installed_location",
+        "execution_mode",
+        "execution_adapter",
+        "kind",
+        "target",
+        "python_version",
+    ):
+        if baseline_workflow.get(field) != candidate_workflow.get(field):
+            raise ValueError(
+                f"Comparison {comparison.name} has mismatched workflow {field}"
+            )
 
     baseline_run = runs_by_stage[comparison.baseline]
     candidate_run = runs_by_stage[comparison.candidate]
