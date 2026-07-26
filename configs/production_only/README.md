@@ -30,6 +30,14 @@
 - Produces the versioned corrected SIRHD reporting corpus
 - Preserves the legacy raw and processed DVC artifacts under separate names
 - Must be bound to the hash-verified `cb6b4e5` raw Zarr in its immutable run
+- Keeps clinical observations as continuous expected reported counts: calibration
+  is defined in `log1p(count / population * 100000)` space, then stored in raw
+  count units and transformed downstream without rounding or integerization
+- Represents missingness only through masks and NaNs, keeps mechanistic
+  population states in float32, and stores wastewater as raw concentration for
+  exactly one downstream `log1p`
+- Uses float32 processed supervision so small positive clinical expectations and
+  latent fractions cannot underflow back to zero
 
 ## Intended Usage
 
