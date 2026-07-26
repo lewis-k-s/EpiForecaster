@@ -1,10 +1,13 @@
-# Production-shaped diagnostic for the time-major synthetic curriculum.
+# HISTORICAL SUPERSEDED-CORPUS DIAGNOSTIC — DO NOT LAUNCH FOR REPORTING-V1.
+#
+# Production-shaped diagnostic for the old time-major synthetic curriculum.
 #
 # With chunk_size=512, each time-major chunk contains sixteen consecutive
 # batches from one narrow window regime. The validated synthetic runs share the
-# same sparsity cadence, so this smoke shuffles one full batch per chunk to test
-# whether cross-window batch mixing stabilizes NLL and clipping before another
-# full pretraining cycle.
+# same sparsity cadence, so this smoke shuffled one full batch per chunk to test
+# whether cross-window batch mixing stabilized NLL and clipping. The corrected
+# reporting-v1 masks are independently seeded and this rationale no longer
+# defines the next experiment.
 
 run: {}
 source: {}

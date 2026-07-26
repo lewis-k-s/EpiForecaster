@@ -19,7 +19,10 @@ import yaml
 SCHEMA_VERSION = 1
 DATASET_ROLE_POINTERS = {
     "real": "data/processed/real_with_id.zarr.dvc",
-    "synthetic": "data/processed/synthetic_full_holt_damped.zarr.dvc",
+    "synthetic": (
+        "data/processed/"
+        "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr.dvc"
+    ),
 }
 TARGET_HEADS = {
     "ww": "wastewater",

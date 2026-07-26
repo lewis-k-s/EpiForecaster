@@ -1,4 +1,7 @@
-# Synthetic held-out cross-evaluation of the matched real-data control.
+# HISTORICAL SUPERSEDED-CORPUS EVALUATION — PRESERVE FOR BASELINE EVIDENCE.
+#
+# Synthetic held-out cross-evaluation of the matched real-data control on the
+# old synthetic_full_holt_damped corpus.
 #
 # The evaluation checkpoint is copied into the immutable run during prepare.
 # Enabling the synthetic-only curriculum dataset path reproduces the same

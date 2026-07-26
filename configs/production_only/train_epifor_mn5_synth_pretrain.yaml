@@ -1,13 +1,13 @@
 env: "mn5"
 
-# Production synthetic pretraining config.
-# Mirrors the MN5 full training template but targets the processed synthetic
-# dataset and enables direct latent SIRD supervision for stage-1 pretraining.
+# Production synthetic pretraining config for the corrected continuous
+# SIRHD reporting-v1 corpus. Mirrors the MN5 full training template and enables
+# direct latent SIRHD supervision for stage-1 pretraining.
 # Stage-2 fine-tuning should use train_epifor_mn5_full.yaml with
 # training.init_checkpoint_path set to the best checkpoint from this run.
 
 data:
-  dataset_path: data/processed/synthetic_full_holt_damped.zarr
+  dataset_path: data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.
@@ -53,11 +53,11 @@ model:
       delta_forecasting: true
 
 output:
-  experiment_name: mn5_epiforecaster_synth_pretrain
+  experiment_name: mn5_epiforecaster_sirhd_reporting_v1_pretrain
   log_dir: outputs/training
   write_granular_eval: false
   wandb_mode: offline
-  wandb_tags: [mn5, synth, pretrain]
+  wandb_tags: [mn5, synth, pretrain, sirhd-reporting-v1, continuous-observations]
 
 training:
   compile: true

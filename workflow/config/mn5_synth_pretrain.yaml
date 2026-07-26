@@ -1,5 +1,6 @@
-# Canonical synthetic-pretraining MN5 workflow. Per-run paths and provenance
-# fields are injected by scripts/workflow/mn5_workflow.sh.
+# Canonical synthetic-pretraining MN5 workflow for the corrected continuous
+# SIRHD reporting-v1 corpus. Per-run paths and provenance fields are injected
+# by scripts/workflow/mn5_workflow.sh.
 
 run: {}
 source: {}
@@ -11,14 +12,14 @@ workflow:
 
 dvc:
   targets:
-    - data/processed/synthetic_full_holt_damped.zarr.dvc
+    - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
-    - data/files/raw_synthetic_observations.zarr.dvc
+    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
 
 training:
   base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml
-  experiment_name: synthetic-pretrain
+  experiment_name: synthetic-pretrain-sirhd-reporting-v1
   model_id: model
   max_batches: null
   overrides:

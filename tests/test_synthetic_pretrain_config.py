@@ -1,9 +1,20 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from models.configs import EpiForecasterConfig
 from scripts.workflow.run_config import validate_workflow_contract
+
+
+CORRECTED_PROCESSED_PATH = (
+    "data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr"
+)
+CORRECTED_PROCESSED_POINTER = f"{CORRECTED_PROCESSED_PATH}.dvc"
+CORRECTED_RAW_POINTER = (
+    "data/files/"
+    "raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc"
+)
 
 
 def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
@@ -13,6 +24,24 @@ def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
 
     assert config.data.mobility_min_flow_raw == 0.0
     assert config.model.max_neighbors == 20
+    assert config.data.dataset_path == CORRECTED_PROCESSED_PATH
+
+
+@pytest.mark.parametrize(
+    "workflow_path",
+    [
+        "workflow/config/mn5_synth_pretrain.yaml",
+        "workflow/config/mn5_synth_pretrain_interactive_smoke.yaml",
+        "workflow/config/mn5_synth_pretrain_compiled_smoke.yaml",
+    ],
+)
+def test_live_synthetic_pretraining_workflows_use_corrected_corpus(
+    workflow_path: str,
+) -> None:
+    workflow = yaml.safe_load(Path(workflow_path).read_text())
+
+    assert CORRECTED_PROCESSED_POINTER in workflow["dvc"]["targets"]
+    assert workflow["dvc"]["provenance_targets"] == [CORRECTED_RAW_POINTER]
 
 
 def test_synthetic_pretrain_interactive_smoke_disables_all_compilation() -> None:
@@ -60,7 +89,9 @@ def test_synthetic_pretrain_control_matches_real_training_contract() -> None:
 
 def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> None:
     workflow = yaml.safe_load(
-        Path("workflow/config/mn5_synth_control_evaluate.yaml").read_text()
+        Path(
+            "workflow/config/mn5_sirhd_reporting_v1_control_evaluate.yaml"
+        ).read_text()
     )
     overrides = workflow["evaluation"]["overrides"]
     evaluation = EpiForecasterConfig.load(
@@ -71,13 +102,23 @@ def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> 
     assert validate_workflow_contract(workflow) == "evaluate"
     assert Path(workflow["evaluation"]["checkpoint"]).is_absolute()
     assert workflow["evaluation"]["granular"] is True
-    assert evaluation.data.dataset_path == (
-        "data/processed/synthetic_full_holt_damped.zarr"
-    )
+    assert evaluation.data.dataset_path == CORRECTED_PROCESSED_PATH
     assert evaluation.data.mobility_min_flow_raw == 0.0
     assert evaluation.data.run_id_chunk_size == 1
     assert evaluation.training.curriculum.enabled is True
     assert evaluation.training.loss.joint.w_sird_supervision == 0.01
+
+
+def test_old_batch_mixing_smoke_remains_historical() -> None:
+    path = Path("workflow/config/mn5_synth_pretrain_batch_mixing_smoke.yaml")
+    text = path.read_text()
+    workflow = yaml.safe_load(text)
+
+    assert "HISTORICAL SUPERSEDED-CORPUS DIAGNOSTIC" in text
+    assert (
+        "data/processed/synthetic_full_holt_damped.zarr.dvc"
+        in workflow["dvc"]["targets"]
+    )
 
 
 def test_batch_mixing_smoke_shuffles_single_time_major_batches() -> None:

@@ -1,6 +1,7 @@
-# Production-shaped, allocation-attached smoke cycle for synthetic pretraining.
-# It retains the canonical batch size and torch.compile settings while bounding
-# training to enough steps to exercise compilation and pathway probes.
+# Production-shaped, allocation-attached smoke cycle for corrected continuous
+# SIRHD reporting-v1 pretraining. It retains the canonical batch size and
+# torch.compile settings while bounding training to enough steps to exercise
+# compilation and pathway probes.
 
 run: {}
 source: {}
@@ -12,14 +13,14 @@ workflow:
 
 dvc:
   targets:
-    - data/processed/synthetic_full_holt_damped.zarr.dvc
+    - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
-    - data/files/raw_synthetic_observations.zarr.dvc
+    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
 
 training:
   base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml
-  experiment_name: synthetic-pretrain-compiled-smoke
+  experiment_name: synthetic-pretrain-sirhd-reporting-v1-compiled-smoke
   model_id: model
   max_batches: 20
   overrides:
