@@ -277,6 +277,10 @@ class TestPipelineStorage:
         mock_config.mobility_chunk_size = 5
         mock_config.output_path = str(tmp_path)
         mock_config.dataset_name = "test_chunk_schema"
+        mock_config.source_provenance = {
+            "generator_source_commit": "abc123",
+            "raw_corpus_full_tree_sha256": "deadbeef",
+        }
         
         # Mock _log_postwrite_summary to avoid opening the saved file again
         pipeline._log_postwrite_summary = Mock()
@@ -313,6 +317,9 @@ class TestPipelineStorage:
         assert isinstance(config_yaml, str)
         assert "dataset_name: test_chunk_schema" in config_yaml
         assert "smoothing:" in config_yaml
+        source_provenance_yaml = saved_ds.attrs["source_provenance_yaml"]
+        assert "generator_source_commit: abc123" in source_provenance_yaml
+        assert "raw_corpus_full_tree_sha256: deadbeef" in source_provenance_yaml
 
 
 class TestPreprocessingConfigValidation:

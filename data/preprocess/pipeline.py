@@ -507,6 +507,11 @@ class OfflinePreprocessingPipeline:
             "smoothing_wastewater_method": self.config.smoothing.wastewater_method,
             "smoothing_missing_policy": self.config.smoothing.missing_policy,
             "preprocessing_config_yaml": self._serialize_config_yaml(),
+            "source_provenance_yaml": yaml.safe_dump(
+                self.config.source_provenance,
+                default_flow_style=False,
+                sort_keys=True,
+            ),
         }
 
         # Convert float64 to float16 to reduce storage and memory usage

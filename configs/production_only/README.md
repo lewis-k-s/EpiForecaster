@@ -26,9 +26,18 @@
 - Produces the canonical processed pretraining dataset
 - Inherits the MN5 synthetic preprocessing base
 
+### `preprocess_mn5_synth_sirhd_reporting_v1.yaml`
+- Produces the versioned corrected SIRHD reporting corpus
+- Preserves the legacy raw and processed DVC artifacts under separate names
+- Must be bound to the hash-verified `cb6b4e5` raw Zarr in its immutable run
+
 ## Intended Usage
 
-These configs should only be run through an immutable MN5 Snakemake workflow:
+Training and evaluation configs run through the immutable MN5 Snakemake
+workflow. Preprocessing is the upstream DVC-producing boundary: run it from an
+immutable source bundle in a versioned MN5 run root, validate the generated
+Zarr, and publish a new DVC pointer without modifying the source bundle or an
+existing artifact.
 
 ```bash
 # Single training (default workflow target)

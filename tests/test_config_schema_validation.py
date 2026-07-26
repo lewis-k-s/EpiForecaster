@@ -23,6 +23,7 @@ PREPROCESSING_CONFIGS = [
     "configs/preprocess_full.yaml",
     "configs/production_only/preprocess_mn5_synth.yaml",
     "configs/production_only/preprocess_mn5_synth_holt_damped.yaml",
+    "configs/production_only/preprocess_mn5_synth_sirhd_reporting_v1.yaml",
 ]
 
 
@@ -84,6 +85,25 @@ def test_preprocessing_configs_parse(config_path):
 
     datetime.fromisoformat(config_dict["start_date"])
     datetime.fromisoformat(config_dict["end_date"])
+
+
+def test_corrected_sirhd_preprocessing_has_versioned_artifact_identity():
+    config = PreprocessingConfig._load_config_dict(
+        Path(
+            "configs/production_only/"
+            "preprocess_mn5_synth_sirhd_reporting_v1.yaml"
+        ),
+        seen_paths=set(),
+    )
+
+    assert config["env"] == "mn5"
+    assert config["synthetic_path"] == (
+        "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
+    )
+    assert config["dataset_name"] == (
+        "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped"
+    )
+    assert config["smoothing"]["clinical_method"] == "holt_damped"
 
 
 def test_all_config_files_accounted_for():

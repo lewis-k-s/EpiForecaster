@@ -159,6 +159,7 @@ class PreprocessingConfig:
         graph_options: Graph construction options
         validation_options: Validation and quality control options
         smoothing: Causal smoothing method and robustness controls
+        source_provenance: Immutable upstream source and corpus identities
     """
 
     # Required fields (no defaults)
@@ -253,6 +254,7 @@ class PreprocessingConfig:
 
     temporal_covariates: TemporalCovariatesConfig | None = None
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
+    source_provenance: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -262,6 +264,8 @@ class PreprocessingConfig:
             )
         if isinstance(self.smoothing, dict):
             self.smoothing = SmoothingConfig(**self.smoothing)
+        if not isinstance(self.source_provenance, dict):
+            raise ValueError("source_provenance must be a dictionary")
         self._validate_paths()
         self._validate_temporal_parameters()
         self._validate_processing_options()
