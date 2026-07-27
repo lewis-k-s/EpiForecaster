@@ -62,53 +62,88 @@ Differentiable layers mapping latent states to observable metrics.
 
 The model is trained end-to-end using a composite loss function:
 
-$$ L_{total} = L_{obs} + w_{sir} L_{SIR} $$
+$$
+L_{\mathrm{total}}
+=
+\sum_{h \in A} \alpha_h L_h
++ w_{\mathrm{SIRHD}} L_{\mathrm{SIRHD}},
+$$
 
-where:
+where \(A\) is the set of observation heads with eligible targets in the
+current batch. The observation weights \(\alpha_h\) sum to
+`gradnorm_obs_weight_sum`.
 
-*   **Training observation term (`L_obs`)**: adaptive GradNorm weighting over
-    `L_WW`, `L_Hosp`, `L_Cases`, `L_Deaths` (or fixed equal split when
-    `adaptive_scheme=none`).
-    GradNorm uses the shared observation context probe (`obs_context`) and updates
-    controller weights periodically (`gradnorm_update_every`, default 16) with EMA
-    smoothing (`gradnorm_ema_decay`, default 0.9) to preserve training throughput.
-*   **Evaluation observation term**: fixed equal-split weighting over active
-    observation targets with sum `gradnorm_obs_weight_sum` for stable
-    early-stopping comparisons.
+### Probabilistic observation objectives
 
-*   **Observation Losses ($L_{WW}, L_{Hosp}, \dots$)**: Minimize error between predictions and ground truth data. Per-target masks allow training even when some signals are missing (e.g., missing wastewater data).
-*   **SIRHD latent supervision ($L_{SIRHD}$)**: A regularization term for synthetic runs that supervises available latent compartment trajectories, preventing the model from "breaking physics" to fit noise.
+Each observation head emits a predictive location \(\mu\) and positive scale
+\(\sigma\) in `log1p(per-100k)` target space. Production training uses Normal
+negative log likelihood:
 
-### Observation Supervision and `n_eff`
+$$
+L_{\mathrm{NLL}}(y,\mu,\sigma)
+=
+\frac{1}{2}\left(\frac{y-\mu}{\sigma}\right)^2
++ \log \sigma
++ \frac{1}{2}\log(2\pi).
+$$
 
-Observation heads use weighted masked reductions with three distinct controls:
+Normal continuous ranked probability score is also available as a training
+objective:
 
-1.  **Hard eligibility (`min_*_observed_fraction`)**: each head is supervised only
-    when both its history and forecast window meet their minimum observed fraction.
-    Fractions are evaluated against expected reporting opportunities: daily for
-    cases/deaths and every seven days for hospitalizations/wastewater.
-2.  **Per-head weighted mean reduction**:
-    $$ L_h = \frac{\sum_t w_t ( \hat{y}_t - y_t )^2}{\sum_t w_t + \epsilon} $$
-3.  **Optional confidence scaling by effective support (`n_eff`)**:
-    $$ n_{eff,h} = \sum_t w_t,\quad
-    s_h = \min(1, n_{eff,h}/r_h)^{p},\quad
-    L_h^{scaled} = s_h \cdot L_h $$
-    where `p = obs_n_eff_power`, `r_h` is head-specific reference
-    (`*_n_eff_reference`, then `obs_n_eff_reference`, then 1.0 fallback).
+$$
+L_{\mathrm{CRPS}}(y,\mu,\sigma)
+=
+\sigma\left[
+z\left(2\Phi(z)-1\right)
++ 2\phi(z)
+- \frac{1}{\sqrt{\pi}}
+\right],
+\qquad z=\frac{y-\mu}{\sigma}.
+$$
 
-Current production policy is to **fully mask imputed points out of loss**:
+Both are proper scoring rules. NLL is more sensitive to tail misses and
+overconfident scales; CRPS remains in target-space units and is less dominated
+by individual tail events. Checkpoint selection uses the equal-target mean
+validation CRPS (`mean_target_crps`) when it is available. NLL training falls
+back to mean target NLL when CRPS is unavailable; the general fallback is mean
+target MAE.
 
-*   `w_t = 1.0` for observed points
-*   `w_t = 0.0` for imputed/missing points
+CRPS is currently implemented only for the Normal family. Scores are evaluated
+in `log1p(per-100k)` space and therefore are not raw-incidence CRPS.
 
-With this policy, `n_eff` is effectively the count of truly observed supervised points
-(after gating), and the `power` term controls how aggressively low-support batches are
-down-weighted:
+### Observation weighting and supervision
 
-*   `p = 0`: disabled
-*   `p = 1`: linear count-based scaling
-*   `0 < p < 1`: gentler than linear
-*   `p > 1`: harsher than linear
+Per-target masks fully exclude imputed points:
+
+* `w_t = 1.0` for observed points;
+* `w_t = 0.0` for imputed or missing points.
+
+Each head is supervised only when its history and forecast window meet the
+configured observed-fraction thresholds. Fractions are evaluated against
+expected reporting opportunities: daily for cases/deaths and every seven days
+for hospitalizations/wastewater. The per-head score is
+
+$$
+L_h
+=
+\frac{\sum_t w_t\, S(y_t,\mu_t,\sigma_t)}
+     {\sum_t w_t + \epsilon},
+$$
+
+where \(S\) is the configured point or probabilistic score.
+
+With `adaptive_scheme=none`, active heads receive a fixed equal split.
+GradNorm is available only with non-negative observation objectives because its
+relative training-rate calculation assumes non-negative task losses. The
+paired ablation registry therefore compares:
+
+* `baseline`: Normal NLL with fixed weighting;
+* `loss:crps`: Normal CRPS with fixed weighting;
+* `gradnorm:crps`: Normal CRPS with adaptive GradNorm weighting.
+
+Synthetic runs may additionally provide dense SIRHD compartment targets.
+`w_sird_supervision` controls this regularizer and it automatically contributes
+zero when latent targets are absent.
 
 ## 4. Model Variants
 

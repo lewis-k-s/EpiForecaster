@@ -39,8 +39,8 @@ ABLATIONS: dict[str, str] = {
     "context:spatial_queen": "model.type.regions=false model.graph_adjacency_source=spatial_queen",
     # "context:spatial_knn": "model.type.regions=false model.graph_adjacency_source=spatial_knn",
     "residual:off": "model.observation_heads.residual_scale=0.0",
-    "sir:off": "training.loss.joint.w_sird_supervision=0.0",
-    "gradnorm:on": "training.loss.joint.adaptive_scheme=gradnorm",
+    "loss:crps": "training.loss.joint.observation_loss=crps",
+    "gradnorm:crps": "training.loss.joint.observation_loss=crps training.loss.joint.adaptive_scheme=gradnorm",
     "sig:ww:aux": "training.loss.joint.disable_ww=true",
     "sig:ww:proxy": "training.loss.joint.mask_input_ww=true",
     "sig:ww:off": "training.loss.joint.disable_ww=true training.loss.joint.mask_input_ww=true",
@@ -253,9 +253,17 @@ def objective(
     )
 
     results = trainer.run()
-    val_loss = float(results.get("best_val_loss", float("inf")))
-    logger.info("=== Trial %d finished: loss=%.6f ===", trial.number, val_loss)
-    return val_loss
+    selection_score = float(results["best_val_selection_score"])
+    selection_metric = str(results["best_val_selection_metric"])
+    trial.set_user_attr("best_val_selection_score", selection_score)
+    trial.set_user_attr("best_val_selection_metric", selection_metric)
+    logger.info(
+        "=== Trial %d finished: %s=%.6f ===",
+        trial.number,
+        selection_metric,
+        selection_score,
+    )
+    return selection_score
 
 
 @click.command()
