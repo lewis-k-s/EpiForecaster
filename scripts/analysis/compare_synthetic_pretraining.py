@@ -830,12 +830,20 @@ def _comparison_rows(
             )
         for table_name, records in table_rows.items():
             baseline = {
-                (row["split"], row.get("target", "all"), row["metric"]): row["value"]
+                (
+                    row["split"],
+                    row.get("target", row.get("latent", "all")),
+                    row["metric"],
+                ): row["value"]
                 for row in records
                 if row["stage"] == comparison.baseline
             }
             candidate = {
-                (row["split"], row.get("target", "all"), row["metric"]): row["value"]
+                (
+                    row["split"],
+                    row.get("target", row.get("latent", "all")),
+                    row["metric"],
+                ): row["value"]
                 for row in records
                 if row["stage"] == comparison.candidate
             }
@@ -979,6 +987,8 @@ def generate_comparison(spec_path: Path, output_dir: Path) -> dict[str, Any]:
     table_rows = {
         "evaluation": evaluation_rows,
         "pathway": pathway_rows,
+        "latent": latent_rows,
+        "latent_structure": structural_rows,
     }
     runs_by_stage = {run.stage: run for run in runs}
     for comparison in comparisons:

@@ -403,6 +403,22 @@ def test_generate_comparison_emits_provenance_checked_tables(tmp_path: Path) -> 
         and row["metric"] == "residual_abs_fraction"
     )
     assert float(residual_delta["candidate_minus_baseline"]) == pytest.approx(-0.15)
+    latent_delta = next(
+        row
+        for row in delta_rows
+        if row["table"] == "latent"
+        and row["target"] == "I"
+        and row["metric"] == "pearson"
+    )
+    assert float(latent_delta["candidate_minus_baseline"]) == pytest.approx(0.0)
+    structure_delta = next(
+        row
+        for row in delta_rows
+        if row["table"] == "latent_structure"
+        and row["target"] == "all"
+        and row["metric"] == "latent_model_sirhd_mass_error_from_one_mae"
+    )
+    assert float(structure_delta["candidate_minus_baseline"]) == pytest.approx(0.0)
 
     inventory = _read_csv(output_dir / "run_inventory.csv")
     assert inventory[0]["checkpoint_sha256"] == "d" * 64
