@@ -113,10 +113,13 @@ def test_terminal_manifest_persists_json_safe_epoch_summary(tmp_path) -> None:
             "training_history": {
                 "train_loss": [1.0],
                 "val_loss": [1.2],
-                "val_mae": [0.4],
+                "val_selection_score": [0.4],
+                "val_selection_metric": ["mean_target_crps"],
                 "learning_rate": [0.001],
                 "epoch_times": [3.0],
             },
+            "best_val_selection_score": 0.4,
+            "best_val_selection_metric": "mean_target_crps",
             "best_val_joint_loss": 1.2,
             "unavailable": math.inf,
         },
@@ -128,6 +131,13 @@ def test_terminal_manifest_persists_json_safe_epoch_summary(tmp_path) -> None:
     assert analysis["validation"]["status"] == "analyzed"
     assert analysis["validation"]["best_epoch"] == 0
     assert analysis["validation"]["best_val_joint_loss"] == pytest.approx(1.2)
+    assert analysis["validation"]["series"][0]["val_selection_score"] == pytest.approx(
+        0.4
+    )
+    assert (
+        analysis["validation"]["series"][0]["val_selection_metric"]
+        == "mean_target_crps"
+    )
 
 
 def test_writer_refuses_overwrite_and_out_of_order_resume(tmp_path) -> None:

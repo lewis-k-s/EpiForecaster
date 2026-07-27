@@ -360,6 +360,7 @@ def _resolve_joint_observation_loss_spec(
     criterion = get_loss_from_config(
         loss_cfg,
         data_config=config.data,
+        observation_heads_config=config.model.observation_heads,
         input_window_length=config.model.input_window_length,
         forecast_horizon=horizon,
     )
@@ -1480,6 +1481,7 @@ def run_same_slice_baseline_evaluation(
     criterion = get_loss_from_config(
         config.training.loss,
         data_config=config.data,
+        observation_heads_config=config.model.observation_heads,
         input_window_length=config.model.input_window_length,
         forecast_horizon=config.model.forecast_horizon,
     )

@@ -373,7 +373,11 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         data=SimpleNamespace(
             dataset_path=Path("/tmp/dummy-dataset.zarr"), window_stride=7
         ),
-        model=SimpleNamespace(forecast_horizon=2, input_window_length=3),
+        model=SimpleNamespace(
+            forecast_horizon=2,
+            input_window_length=3,
+            observation_heads=SimpleNamespace(distribution_scale_floor=1.0e-3),
+        ),
         output=SimpleNamespace(
             write_granular_eval=True,
             granular_eval_format="parquet",
