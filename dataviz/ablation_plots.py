@@ -46,7 +46,8 @@ PRIMARY_ABLATION_ORDER = [
     "context:spatial_queen",
     "context:spatial_knn",
     "residual:off",
-    "sir:off",
+    "loss:crps",
+    "gradnorm:crps",
 ]
 HEAD_ABLATION_RE = re.compile(r"^sig:(ww|cases|hosp|deaths):(aux|off|proxy)$")
 HEAD_ORDER = {"ww": 0, "cases": 1, "hosp": 2, "deaths": 3}
@@ -81,8 +82,6 @@ MOBILITY_ABLATIONS = [
     "context:spatial_queen",
     "context:spatial_knn",
 ]
-PHYSICS_ABLATIONS = ["residual:off", "sir:off"]
-
 # Unified colormap for all heatmaps
 HEATMAP_CMAP = Colormaps.ERROR_DELTA  # Red = worse, Green = better
 R2_HEATMAP_CMAP = Colormaps.R2_DELTA  # Red = worse, Green = better
@@ -117,11 +116,9 @@ def _prepare_model_order(
                 HEAD_VARIANT_ORDER.get(variant, len(HEAD_VARIANT_ORDER)),
                 model,
             )
-        if model in {"gradnorm:on", "gradnorm:off"}:
-            return (2, 0 if model == "gradnorm:on" else 1, 0, model)
         if model in KERNEL_ABLATION_RANK:
-            return (3, KERNEL_ABLATION_RANK[model], 0, model)
-        return (4, 0, 0, model)
+            return (2, KERNEL_ABLATION_RANK[model], 0, model)
+        return (3, 0, 0, model)
 
     models = sorted(df["model"].unique(), key=sort_key)
     return models
