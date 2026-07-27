@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn as nn
 
-from models.configs import DataConfig, JointLossConfig, LossConfig
+from models.configs import (
+    DataConfig,
+    JointLossConfig,
+    LossConfig,
+    ObservationHeadConfig,
+)
 from utils.device import sync_to_device
 from utils.training_utils import drop_nowcast
 
@@ -22,11 +27,16 @@ _INV_SQRT_PI = 1.0 / math.sqrt(math.pi)
 def get_loss_from_config(
     loss_config: LossConfig | None,
     *,
+    observation_heads_config: ObservationHeadConfig,
     data_config: DataConfig | None = None,
     input_window_length: int | None = None,
     forecast_horizon: int | None = None,
 ) -> JointInferenceLoss:
-    """Build the only supported EpiForecaster loss: JointInferenceLoss."""
+    """Build the only supported EpiForecaster loss: JointInferenceLoss.
+
+    Predictive-scale parameterization belongs to the model observation heads, so
+    their scale floor is also the canonical floor used for scoring.
+    """
     if loss_config is None:
         joint_cfg = JointLossConfig()
     else:
@@ -37,6 +47,12 @@ def get_loss_from_config(
                 f"EpiForecaster, got {loss_config.name!r}."
             )
         joint_cfg = loss_config.joint
+    if joint_cfg.adaptive_scheme == "gradnorm" and joint_cfg.observation_loss == "nll":
+        raise ValueError(
+            "adaptive_scheme='gradnorm' requires a non-negative observation "
+            "loss; observation_loss='nll' is signed. Use fixed weighting or "
+            "a non-negative objective such as 'crps'."
+        )
 
     zero_min_obs = {
         "cases": 0,
@@ -62,7 +78,7 @@ def get_loss_from_config(
         observation_loss=joint_cfg.observation_loss,
         distribution_family=joint_cfg.distribution_family,
         distribution_df=joint_cfg.distribution_df,
-        distribution_scale_floor=joint_cfg.distribution_scale_floor,
+        distribution_scale_floor=observation_heads_config.distribution_scale_floor,
         interval_levels=joint_cfg.interval_levels,
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
         w_sird_supervision=joint_cfg.w_sird_supervision,

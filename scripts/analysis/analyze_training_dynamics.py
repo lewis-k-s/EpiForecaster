@@ -516,7 +516,12 @@ def _validation_analysis(manifest: dict[str, Any] | None) -> dict[str, Any]:
     history = summary.get("training_history", {})
     validation = history.get("val_loss", [])
     training = history.get("train_loss", [])
-    selection = history.get("val_mae", [])
+    selection = history.get(
+        "val_selection_score",
+        history.get("val_mae", []),
+    )
+    selection_metrics = history.get("val_selection_metric", [])
+    default_selection_metric = summary.get("best_val_selection_metric")
     if not validation:
         return {
             "status": "not_available",
@@ -529,6 +534,11 @@ def _validation_analysis(manifest: dict[str, Any] | None) -> dict[str, Any]:
             "val_joint_loss": value,
             "val_selection_score": (
                 selection[index] if index < len(selection) else None
+            ),
+            "val_selection_metric": (
+                selection_metrics[index]
+                if index < len(selection_metrics)
+                else default_selection_metric
             ),
             "learning_rate": (
                 history.get("learning_rate", [])[index]

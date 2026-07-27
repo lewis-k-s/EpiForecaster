@@ -109,7 +109,6 @@ def test_joint_loss_defaults_use_normal_nll() -> None:
     assert cfg.observation_loss == "nll"
     assert cfg.distribution_family == "normal"
     assert cfg.distribution_df == pytest.approx(5.0)
-    assert cfg.distribution_scale_floor == pytest.approx(1.0e-3)
     assert cfg.interval_levels == [0.5, 0.8, 0.95]
     assert cfg.adaptive_scheme == "none"
     assert cfg.w_sird_supervision == 0.05
@@ -122,6 +121,15 @@ def test_joint_loss_distributional_validation() -> None:
 
     with pytest.raises(ValueError, match="currently requires"):
         JointLossConfig(observation_loss="crps", distribution_family="student_t")
+
+
+@pytest.mark.epiforecaster
+def test_joint_loss_rejects_gradnorm_with_signed_nll() -> None:
+    with pytest.raises(ValueError, match="requires a non-negative observation loss"):
+        JointLossConfig(observation_loss="nll", adaptive_scheme="gradnorm")
+
+    cfg = JointLossConfig(observation_loss="crps", adaptive_scheme="gradnorm")
+    assert cfg.adaptive_scheme == "gradnorm"
 
 
 @pytest.mark.epiforecaster

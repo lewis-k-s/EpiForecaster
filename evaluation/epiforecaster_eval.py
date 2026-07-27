@@ -105,6 +105,7 @@ def evaluate_checkpoint_topk_forecasts(
         criterion = get_loss_from_config(
             config.training.loss,
             data_config=config.data,
+            observation_heads_config=config.model.observation_heads,
             input_window_length=config.model.input_window_length,
             forecast_horizon=config.model.forecast_horizon,
         )

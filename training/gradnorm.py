@@ -115,6 +115,21 @@ class GradNormController(nn.Module):
     def current_weights(self, active_mask: torch.Tensor | None = None) -> torch.Tensor:
         return self.weights(active_mask)
 
+    @staticmethod
+    def _validate_active_losses(
+        losses: torch.Tensor,
+        *,
+        active_mask: torch.Tensor,
+    ) -> None:
+        active_losses = losses.detach().float()[active_mask]
+        if not torch.all(torch.isfinite(active_losses)).item():
+            raise ValueError("GradNorm requires finite active task losses")
+        if torch.any(active_losses < 0).item():
+            raise ValueError(
+                "GradNorm requires non-negative active task losses; signed NLL "
+                "must use fixed weighting or a non-negative balancing statistic"
+            )
+
     def maybe_init_l0(
         self,
         losses: torch.Tensor,
@@ -127,6 +142,7 @@ class GradNormController(nn.Module):
 
         losses_detached = losses.detach().float()
         active_mask = active_mask.to(device=losses_detached.device, dtype=torch.bool)
+        self._validate_active_losses(losses_detached, active_mask=active_mask)
         needs_init = active_mask & (~self.l0_initialized)
         if not needs_init.any().item():
             return False
@@ -226,6 +242,7 @@ class GradNormController(nn.Module):
                 "ema_grad_norms": zeros,
             }
 
+        self._validate_active_losses(losses_f32, active_mask=active_mask)
         if not torch.all(self.l0_initialized[active_mask]).item():
             raise RuntimeError("GradNorm L0 not initialized for active tasks")
 

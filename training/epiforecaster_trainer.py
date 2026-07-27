@@ -197,6 +197,28 @@ def compute_validation_selection_score(
     return selection_score, selection_metric
 
 
+def normalize_training_history(
+    history: dict[str, Any],
+    *,
+    default_selection_metric: str,
+) -> dict[str, Any]:
+    """Migrate legacy selection history to explicit score/metric series."""
+    normalized = dict(history)
+    legacy_selection = normalized.pop("val_mae", None)
+    if "val_selection_score" not in normalized:
+        normalized["val_selection_score"] = list(legacy_selection or [])
+
+    selection_scores = normalized["val_selection_score"]
+    selection_metrics = list(normalized.get("val_selection_metric", []))
+    if len(selection_metrics) < len(selection_scores):
+        selection_metrics.extend(
+            [default_selection_metric]
+            * (len(selection_scores) - len(selection_metrics))
+        )
+    normalized["val_selection_metric"] = selection_metrics
+    return normalized
+
+
 class EpiForecasterTrainer:
     """
     Single trainer handling all variants via configuration.
@@ -509,7 +531,8 @@ class EpiForecasterTrainer:
         self.training_history = {
             "train_loss": [],
             "val_loss": [],
-            "val_mae": [],
+            "val_selection_score": [],
+            "val_selection_metric": [],
             "val_rmse": [],
             "val_r2": [],
             "learning_rate": [],
@@ -864,6 +887,7 @@ class EpiForecasterTrainer:
         return get_loss_from_config(
             self.config.training.loss,
             data_config=self.config.data,
+            observation_heads_config=self.config.model.observation_heads,
             input_window_length=self.config.model.input_window_length,
             forecast_horizon=self.config.model.forecast_horizon,
         )
@@ -1123,8 +1147,9 @@ class EpiForecasterTrainer:
             ),
         )
         self.best_val_series_metrics = checkpoint.get("best_val_series_metrics", {})
-        self.training_history = checkpoint.get(
-            "training_history", self.training_history
+        self.training_history = normalize_training_history(
+            checkpoint.get("training_history", self.training_history),
+            default_selection_metric=self.best_val_selection_metric,
         )
         self._status(f"Resumed from checkpoint: {checkpoint_path}")
 
@@ -1312,7 +1337,8 @@ class EpiForecasterTrainer:
         history_defaults = (
             "train_loss",
             "val_loss",
-            "val_mae",
+            "val_selection_score",
+            "val_selection_metric",
             "val_rmse",
             "val_r2",
             "learning_rate",
@@ -1320,6 +1346,10 @@ class EpiForecasterTrainer:
         )
         if not isinstance(getattr(self, "training_history", None), dict):
             self.training_history = {}
+        self.training_history = normalize_training_history(
+            self.training_history,
+            default_selection_metric=self.best_val_selection_metric,
+        )
         for key in history_defaults:
             self.training_history.setdefault(key, [])
 
@@ -1360,7 +1390,6 @@ class EpiForecasterTrainer:
                     observation_loss=self.criterion.observation_loss,
                 )
             )
-            self.best_val_selection_metric = val_selection_metric
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
@@ -1378,6 +1407,7 @@ class EpiForecasterTrainer:
                     epoch,
                     val_loss,
                     val_selection_score=val_selection_score,
+                    val_selection_metric=val_selection_metric,
                 )
 
             # Early stopping (disabled if patience is None)
@@ -1385,6 +1415,7 @@ class EpiForecasterTrainer:
             early_stopping_enabled = self._is_early_stopping_enabled()
             if val_selection_score < self.best_val_selection_score:
                 self.best_val_selection_score = val_selection_score
+                self.best_val_selection_metric = val_selection_metric
                 self.best_val_loss = val_selection_score
                 self.best_val_joint_loss = val_loss
                 self.best_val_series_metrics = {
@@ -1398,6 +1429,7 @@ class EpiForecasterTrainer:
                         epoch,
                         val_loss,
                         val_selection_score=val_selection_score,
+                        val_selection_metric=val_selection_metric,
                         is_best=True,
                     )
             else:
@@ -1418,7 +1450,10 @@ class EpiForecasterTrainer:
 
             self.training_history["train_loss"].append(float(_train_loss))
             self.training_history["val_loss"].append(float(val_loss))
-            self.training_history["val_mae"].append(float(val_selection_score))
+            self.training_history["val_selection_score"].append(
+                float(val_selection_score)
+            )
+            self.training_history["val_selection_metric"].append(val_selection_metric)
             self.training_history["val_rmse"].append(
                 (
                     float(val_metrics["rmse"])
@@ -1491,6 +1526,7 @@ class EpiForecasterTrainer:
                 self.current_epoch,
                 self.best_val_joint_loss,
                 val_selection_score=self.best_val_selection_score,
+                val_selection_metric=self.best_val_selection_metric,
                 is_final=True,
             )
 
@@ -2843,6 +2879,7 @@ class EpiForecasterTrainer:
         epoch: int,
         val_loss: float,
         val_selection_score: float | None = None,
+        val_selection_metric: str | None = None,
         is_best: bool = False,
         is_final: bool = False,
     ):
@@ -2851,6 +2888,8 @@ class EpiForecasterTrainer:
 
         if val_selection_score is None:
             val_selection_score = self.best_val_selection_score
+        if val_selection_metric is None:
+            val_selection_metric = self.best_val_selection_metric
 
         checkpoint = {
             "epoch": epoch,
@@ -2859,6 +2898,7 @@ class EpiForecasterTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "val_loss": val_loss,
             "val_selection_score": val_selection_score,
+            "val_selection_metric": val_selection_metric,
             "best_val_loss": self.best_val_loss,
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
