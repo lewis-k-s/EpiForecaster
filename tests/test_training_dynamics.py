@@ -476,6 +476,20 @@ def test_analysis_bundle_writes_tables_plots_and_refuses_overwrite(tmp_path) -> 
         write_analysis_bundle(analysis, output_dir)
 
 
+def test_training_dynamics_value_axis_scales() -> None:
+    from scripts.analysis.analyze_training_dynamics import _value_axis_scale
+
+    assert _value_axis_scale([2.0, 0.5], signed=True) == ("log", {})
+    assert _value_axis_scale([0.5, -0.2], signed=True) == (
+        "symlog",
+        {"linthresh": 1e-2},
+    )
+    assert _value_axis_scale([100.0, 0.5], signed=False) == (
+        "log",
+        {"nonpositive": "clip"},
+    )
+
+
 def test_provenance_query_reconciles_dvc_and_survives_portable_copy(
     tmp_path,
 ) -> None:
