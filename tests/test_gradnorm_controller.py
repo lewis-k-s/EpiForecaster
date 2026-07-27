@@ -64,6 +64,15 @@ def test_gradnorm_terms_are_finite_with_probe_and_ema() -> None:
     assert torch.all(torch.isfinite(terms["ema_grad_norms"][active]))
 
 
+def test_gradnorm_rejects_signed_task_losses() -> None:
+    controller = GradNormController(warmup_steps=0)
+    losses = torch.tensor([-0.5, 0.2, 0.3, 0.4])
+    active = torch.ones(4, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="requires non-negative active task losses"):
+        controller.maybe_init_l0(losses, step=0, active_mask=active)
+
+
 class _StepModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()

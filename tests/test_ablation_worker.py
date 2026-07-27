@@ -68,7 +68,11 @@ def test_ablation_names_are_valid() -> None:
         "model.observation_heads.kernel_mlp_cases=true"
         in worker.ABLATIONS["kernel:all:mlp"]
     )
-    assert worker.ABLATIONS["gradnorm:on"] == (
+    assert worker.ABLATIONS["loss:crps"] == (
+        "training.loss.joint.observation_loss=crps"
+    )
+    assert worker.ABLATIONS["gradnorm:crps"] == (
+        "training.loss.joint.observation_loss=crps "
         "training.loss.joint.adaptive_scheme=gradnorm"
     )
     assert worker.ABLATIONS["mobility:spatial_queen"] == (
@@ -79,7 +83,8 @@ def test_ablation_names_are_valid() -> None:
     )
     assert "mobility:spatial_knn" not in worker.ABLATIONS
     assert "context:spatial_knn" not in worker.ABLATIONS
-    assert "gradnorm:off" not in worker.ABLATIONS
+    assert "sir:off" not in worker.ABLATIONS
+    assert "gradnorm:on" not in worker.ABLATIONS
     assert "model.type.regions=false" not in worker.ABLATIONS
 
 

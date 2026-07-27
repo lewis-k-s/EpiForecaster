@@ -76,6 +76,7 @@ class _DummyModelConfig:
     ) -> None:
         self.input_window_length = input_window_length
         self.forecast_horizon = forecast_horizon
+        self.observation_heads = SimpleNamespace(distribution_scale_floor=1.0e-3)
 
 
 class _DummyTrainingConfig:

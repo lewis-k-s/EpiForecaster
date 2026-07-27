@@ -133,7 +133,10 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
             "model_state_dict": updated_state,
             "optimizer_state_dict": trainer.optimizer.state_dict(),
             "best_val_loss": 0.123,
-            "training_history": {"train_loss": [1.0]},
+            "training_history": {
+                "train_loss": [1.0],
+                "val_mae": [0.3],
+            },
         },
         checkpoint_path,
     )
@@ -143,6 +146,9 @@ def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
     assert trainer.global_step == 123
     assert trainer.best_val_loss == 0.123
     assert trainer.training_history["train_loss"] == [1.0]
+    assert trainer.training_history["val_selection_score"] == [0.3]
+    assert trainer.training_history["val_selection_metric"] == ["mean_target_mae"]
+    assert "val_mae" not in trainer.training_history
     for key, value in trainer.model.state_dict().items():
         assert torch.allclose(value, updated_state[key])
 

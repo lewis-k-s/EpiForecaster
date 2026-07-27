@@ -13,6 +13,7 @@ from training.epiforecaster_trainer import (
     compute_mean_target_mae,
     compute_mean_target_nll,
     compute_validation_selection_score,
+    normalize_training_history,
 )
 from models.configs import (
     EpiForecasterConfig,
@@ -170,6 +171,20 @@ def test_compute_validation_selection_score_uses_nll_when_crps_unavailable() -> 
     assert metric_name == "mean_target_nll"
 
 
+def test_normalize_training_history_migrates_legacy_selection_series() -> None:
+    history = normalize_training_history(
+        {
+            "train_loss": [1.0],
+            "val_mae": [0.4],
+        },
+        default_selection_metric="mean_target_mae",
+    )
+
+    assert "val_mae" not in history
+    assert history["val_selection_score"] == [0.4]
+    assert history["val_selection_metric"] == ["mean_target_mae"]
+
+
 def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
     reports: list[tuple[float, int]] = []
@@ -255,6 +270,9 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     assert results["best_val_loss"] == pytest.approx(2.0)
     assert results["best_val_joint_loss"] == pytest.approx(999.0)
     assert results["best_val_series_metrics"]["loss_ww"] == pytest.approx(10.0)
+    assert trainer.training_history["val_selection_score"] == [2.0]
+    assert trainer.training_history["val_selection_metric"] == ["mean_target_mae"]
+    assert "val_mae" not in trainer.training_history
 
 
 def test_best_checkpoint_path_raises_when_best_model_missing(tmp_path) -> None:
@@ -653,6 +671,7 @@ class TestEpiForecasterTrainer:
         _mock_canonical_region_coordinate(mock_dataset)
 
         minimal_config.training.compile_backward = True
+        minimal_config.training.loss.joint.observation_loss = "crps"
         minimal_config.training.loss.joint.adaptive_scheme = "gradnorm"
         trainer = EpiForecasterTrainer(minimal_config)
         assert trainer._compiled_training_step is not None
@@ -692,6 +711,7 @@ class TestEpiForecasterTrainer:
 
         minimal_config.output.log_dir = str(tmp_path)
         minimal_config.output.experiment_name = "gradnorm_ckpt"
+        minimal_config.training.loss.joint.observation_loss = "crps"
         minimal_config.training.loss.joint.adaptive_scheme = "gradnorm"
         trainer = EpiForecasterTrainer(minimal_config)
         trainer._save_checkpoint(epoch=0, val_loss=1.0, is_best=False, is_final=False)
@@ -701,6 +721,7 @@ class TestEpiForecasterTrainer:
         checkpoint = torch.load(ckpt_files[0], map_location="cpu", weights_only=False)
         assert "gradnorm_controller_state_dict" in checkpoint
         assert "gradnorm_optimizer_state_dict" in checkpoint
+        assert checkpoint["val_selection_metric"] == "mean_target_mae"
 
 
 @patch("training.epiforecaster_trainer.wandb.Histogram")

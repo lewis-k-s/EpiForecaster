@@ -58,7 +58,6 @@ class JointLossConfig:
     # target space; this setting controls how those parameters are scored.
     distribution_family: str = "normal"
     distribution_df: float = 5.0
-    distribution_scale_floor: float = 1.0e-3
     interval_levels: list[float] = field(default_factory=lambda: [0.5, 0.8, 0.95])
     # Observation loss weighting policy:
     # - "none": fixed equal-split weighting across active observation targets
@@ -119,6 +118,12 @@ class JointLossConfig:
                 f"adaptive_scheme must be one of {sorted(valid_schemes)}, "
                 f"got {self.adaptive_scheme!r}"
             )
+        if self.adaptive_scheme == "gradnorm" and self.observation_loss == "nll":
+            raise ValueError(
+                "adaptive_scheme='gradnorm' requires a non-negative observation "
+                "loss; observation_loss='nll' is signed. Use fixed weighting or "
+                "a non-negative objective such as 'crps'."
+            )
         if self.gradnorm_probe not in valid_probes:
             raise ValueError(
                 f"gradnorm_probe must be one of {sorted(valid_probes)}, "
@@ -133,7 +138,6 @@ class JointLossConfig:
             ("gradnorm_min_weight", self.gradnorm_min_weight),
             ("gradnorm_obs_weight_sum", self.gradnorm_obs_weight_sum),
             ("distribution_df", self.distribution_df),
-            ("distribution_scale_floor", self.distribution_scale_floor),
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
@@ -141,11 +145,6 @@ class JointLossConfig:
             raise ValueError(
                 "distribution_df must be > 2 for student_t intervals, "
                 f"got {self.distribution_df}"
-            )
-        if self.distribution_scale_floor <= 0:
-            raise ValueError(
-                "distribution_scale_floor must be positive, "
-                f"got {self.distribution_scale_floor}"
             )
         if not self.interval_levels:
             raise ValueError("interval_levels must not be empty")

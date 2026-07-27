@@ -3,7 +3,7 @@ import torch
 import math
 
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
-from models.configs import DataConfig, LossConfig
+from models.configs import DataConfig, LossConfig, ObservationHeadConfig
 from models.sir_rollforward import SIRRollForward
 
 
@@ -62,7 +62,10 @@ def test_joint_inference_latent_loss_zero_when_latents_absent():
 
 
 def test_get_loss_from_config_default_is_joint_inference() -> None:
-    criterion = get_loss_from_config(None)
+    criterion = get_loss_from_config(
+        None,
+        observation_heads_config=ObservationHeadConfig(),
+    )
     assert isinstance(criterion, JointInferenceLoss)
     assert criterion.observation_loss == "nll"
 
@@ -71,21 +74,48 @@ def test_get_loss_from_config_rejects_non_joint_name() -> None:
     loss_cfg = LossConfig(name="joint_inference")
     loss_cfg.name = "mse"
     with pytest.raises(ValueError, match="Only training.loss.name='joint_inference'"):
-        _ = get_loss_from_config(loss_cfg)
+        _ = get_loss_from_config(
+            loss_cfg,
+            observation_heads_config=ObservationHeadConfig(),
+        )
 
 
 def test_get_loss_from_config_passes_observation_loss() -> None:
     loss_cfg = LossConfig(name="joint_inference")
     loss_cfg.joint.observation_loss = "mae"
 
-    criterion = get_loss_from_config(loss_cfg)
+    criterion = get_loss_from_config(
+        loss_cfg,
+        observation_heads_config=ObservationHeadConfig(),
+    )
 
     assert criterion.observation_loss == "mae"
+
+
+def test_get_loss_from_config_uses_observation_head_scale_floor() -> None:
+    criterion = get_loss_from_config(
+        LossConfig(),
+        observation_heads_config=ObservationHeadConfig(distribution_scale_floor=0.25),
+    )
+
+    assert criterion.distribution_scale_floor == pytest.approx(0.25)
+
+
+def test_get_loss_from_config_rejects_mutated_signed_nll_gradnorm() -> None:
+    loss_cfg = LossConfig()
+    loss_cfg.joint.adaptive_scheme = "gradnorm"
+
+    with pytest.raises(ValueError, match="requires a non-negative observation loss"):
+        get_loss_from_config(
+            loss_cfg,
+            observation_heads_config=ObservationHeadConfig(),
+        )
 
 
 def test_get_loss_from_config_resolves_history_and_horizon_thresholds() -> None:
     criterion = get_loss_from_config(
         LossConfig(),
+        observation_heads_config=ObservationHeadConfig(),
         data_config=DataConfig(
             min_history_observed_fraction=0.5,
             min_horizon_observed_fraction=0.5,
