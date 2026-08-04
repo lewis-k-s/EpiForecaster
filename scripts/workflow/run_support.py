@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,10 @@ from scripts.hpo.trial_artifacts import (
     TRIAL_DIR_ATTR,
     best_model_path,
     trial_directory,
+)
+from scripts.workflow.run_config import (
+    preprocessing_dataset_name,
+    validate_workflow_contract,
 )
 from training.training_dynamics import (
     DYNAMICS_ARTIFACT_NAME,
@@ -83,6 +88,7 @@ def write_dependency_contract(
         "crossval": ("crossval", "evaluation"),
         "selection": ("optuna",),
         "promotion": ("promotion", "dvc"),
+        "preprocessing": ("preprocessing", "dvc"),
     }
     if stage not in stage_sections:
         raise ValueError(f"Unknown dependency stage: {stage}")
@@ -167,6 +173,7 @@ def _container_digest(container: dict[str, Any]) -> str:
 
 def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     config = load_yaml(config_path)
+    validate_workflow_contract(config)
     configured_run = Path(str(config["run"]["root"]))
     configured_source = Path(str(config["run"]["source_root"]))
     if configured_run != run_root or configured_source != source_root:
@@ -188,6 +195,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "outputs",
         "outputs/training",
         "outputs/evaluation",
+        "outputs/preprocessing",
     ):
         (run_root / relative).mkdir(parents=True, exist_ok=True)
 
@@ -377,6 +385,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     for section in (
         "training",
         "evaluation",
+        "preprocessing",
         "crossval",
         "optuna",
         "ablation",
@@ -472,9 +481,7 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
             raise ValueError(
                 "Pinned training initialization checkpoint failed validation"
             )
-        overrides.append(
-            f"training.init_checkpoint_path={pinned_init_checkpoint}"
-        )
+        overrides.append(f"training.init_checkpoint_path={pinned_init_checkpoint}")
     for override in overrides:
         command.extend(["--override", override])
 
@@ -874,6 +881,396 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         {"data_manifest": str(data_manifest), **data_record},
     )
     return output_paths
+
+
+def _load_preprocessing_document(
+    config_path: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    """Load a source-owned preprocessing config and its local base configs."""
+    resolved = config_path.resolve(strict=True)
+    source = source_root.resolve(strict=True)
+    resolved.relative_to(source)
+    document = load_yaml(resolved)
+    base_config = document.pop("base_config", None)
+    if base_config is None:
+        return document
+    base_path = Path(str(base_config))
+    if base_path.is_absolute() or ".." in base_path.parts:
+        raise ValueError(
+            "Preprocessing base_config must stay inside the source snapshot"
+        )
+    parent = _load_preprocessing_document(resolved.parent / base_path, source_root)
+    return _deep_merge(parent, document)
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _processed_dataset_qa(
+    dataset: Any,
+    workflow_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the declared processed-data contract with labeled arrays."""
+    import numpy as np
+
+    preprocessing = workflow_config["preprocessing"]
+    if not dataset.data_vars:
+        raise ValueError("Processed Zarr contains no data variables")
+    empty_dimensions = {
+        name: int(size) for name, size in dataset.sizes.items() if int(size) <= 0
+    }
+    if empty_dimensions:
+        raise ValueError(f"Processed Zarr has empty dimensions: {empty_dimensions}")
+
+    expected_run_count = preprocessing.get("expected_run_count")
+    if expected_run_count is not None:
+        actual_run_count = int(dataset.sizes.get("run_id", 0))
+        if actual_run_count != int(expected_run_count):
+            raise ValueError(
+                "Processed Zarr run count differs from the workflow contract: "
+                f"{actual_run_count} != {expected_run_count}"
+            )
+
+    required_variables = [
+        str(value) for value in preprocessing.get("required_variables", [])
+    ]
+    missing = sorted(set(required_variables) - set(dataset.data_vars))
+    if missing:
+        raise ValueError(f"Processed Zarr is missing required variables: {missing}")
+
+    float32_variables = [
+        str(value) for value in preprocessing.get("float32_variables", [])
+    ]
+    wrong_dtypes = {
+        name: str(dataset[name].dtype)
+        for name in float32_variables
+        if name in dataset and dataset[name].dtype != np.dtype("float32")
+    }
+    if wrong_dtypes:
+        raise ValueError(
+            f"Processed continuous variables are not float32: {wrong_dtypes}"
+        )
+
+    nonnegative_variables = [
+        str(value) for value in preprocessing.get("nonnegative_variables", [])
+    ]
+    variable_qa: dict[str, dict[str, Any]] = {}
+    for name in sorted(set(float32_variables) | set(nonnegative_variables)):
+        if name not in dataset:
+            continue
+        values = np.asarray(dataset[name].values)
+        finite = np.isfinite(values)
+        finite_count = int(finite.sum())
+        nonfinite_count = int(values.size - finite_count)
+        negative_count = int((values[finite] < 0).sum())
+        if name in nonnegative_variables and (nonfinite_count or negative_count):
+            raise ValueError(
+                f"Processed variable {name!r} has {nonfinite_count} non-finite "
+                f"and {negative_count} negative values"
+            )
+        variable_qa[name] = {
+            "dtype": str(values.dtype),
+            "finite_count": finite_count,
+            "nonfinite_count": nonfinite_count,
+            "negative_count": negative_count,
+            "positive_count": int((values[finite] > 0).sum()),
+        }
+
+    flow_alignment: dict[str, Any] | None = None
+    if {"latent_D_true", "latent_death_flow_true"} <= set(dataset.data_vars):
+        cumulative_difference = dataset["latent_D_true"].diff("date")
+        destination_flow = dataset["latent_death_flow_true"].sel(
+            date=cumulative_difference["date"]
+        )
+        difference_values = np.asarray(cumulative_difference.values)
+        flow_values = np.asarray(destination_flow.values)
+        comparable = np.isfinite(difference_values) & np.isfinite(flow_values)
+        absolute_error = np.abs(difference_values[comparable] - flow_values[comparable])
+        max_absolute_error = float(absolute_error.max()) if absolute_error.size else 0.0
+        if not np.allclose(
+            difference_values[comparable],
+            flow_values[comparable],
+            rtol=1e-5,
+            atol=1e-8,
+        ):
+            raise ValueError(
+                "Processed latent death flow is not destination-aligned with "
+                f"latent_D_true.diff(date); max error={max_absolute_error:.8g}"
+            )
+        flow_alignment = {
+            "comparison_count": int(comparable.sum()),
+            "max_absolute_error": max_absolute_error,
+            "rtol": 1e-5,
+            "atol": 1e-8,
+        }
+
+    preservation_json = dataset.attrs.get("positive_clinical_preservation_json")
+    positive_preservation = (
+        json.loads(str(preservation_json)) if preservation_json is not None else None
+    )
+    if positive_preservation is not None:
+        for name, record in positive_preservation.items():
+            if int(record["zeroed_raw_positive_count"]) != 0:
+                raise ValueError(
+                    f"Processed {name!r} lost positive raw observations according "
+                    "to persisted preprocessing evidence"
+                )
+            if int(record["processed_positive_count"]) < int(
+                record["raw_positive_count"]
+            ):
+                raise ValueError(
+                    f"Processed {name!r} has fewer positive values than the raw "
+                    "positive count"
+                )
+
+    return {
+        "dimensions": {name: int(size) for name, size in dataset.sizes.items()},
+        "data_variables": sorted(dataset.data_vars),
+        "variable_qa": variable_qa,
+        "latent_death_flow_alignment": flow_alignment,
+        "positive_clinical_preservation": positive_preservation,
+    }
+
+
+def _handoff_provenance_qa(
+    source_root: Path,
+    workflow_config: dict[str, Any],
+    effective_config: dict[str, Any],
+    dataset: Any,
+) -> dict[str, Any] | None:
+    """Validate and retain the generator handoff identity and seed record."""
+    handoff_value = workflow_config["preprocessing"].get("handoff_manifest")
+    if handoff_value is None:
+        return None
+    relative = Path(str(handoff_value))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("preprocessing.handoff_manifest must be source-relative")
+    handoff_path = (source_root / relative).resolve(strict=True)
+    handoff_path.relative_to(source_root.resolve(strict=True))
+    handoff = json.loads(handoff_path.read_text())
+    if handoff.get("qa_passed") is not True:
+        raise ValueError("Synthetic generator handoff QA did not pass")
+    handoff_sha256 = sha256_file(handoff_path)
+    expected_sha256 = effective_config.get("source_provenance", {}).get(
+        "handoff_manifest_sha256"
+    )
+    if expected_sha256 and handoff_sha256 != str(expected_sha256):
+        raise ValueError(
+            "Synthetic generator handoff manifest SHA-256 does not match the "
+            "preprocessing source contract"
+        )
+    expected_run_ids = [str(value) for value in handoff.get("run_ids", [])]
+    observed_run_ids = [str(value) for value in dataset["run_id"].values]
+    if sorted(expected_run_ids) != sorted(observed_run_ids):
+        raise ValueError(
+            "Processed run IDs differ from the synthetic generator handoff"
+        )
+    seeds = handoff.get("seeds")
+    if not isinstance(seeds, dict) or not seeds:
+        raise ValueError("Synthetic generator handoff has no seed record")
+    for name, values in seeds.items():
+        if not isinstance(values, list) or len(values) != len(expected_run_ids):
+            raise ValueError(
+                f"Synthetic generator seed vector {name!r} does not match run count"
+            )
+    seed_by_run = {
+        name: dict(zip(expected_run_ids, values, strict=True))
+        for name, values in seeds.items()
+    }
+    return {
+        "path": relative.as_posix(),
+        "sha256": handoff_sha256,
+        "qa_passed": True,
+        "run_ids": expected_run_ids,
+        "seeds": seeds,
+        "seed_by_run": seed_by_run,
+        "corpus_full_tree_sha256": handoff.get("corpus_full_tree_sha256"),
+        "corpus_metadata_tree_sha256": handoff.get("corpus_metadata_tree_sha256"),
+        "reporting_config_sha256": handoff.get("reporting_config_sha256"),
+    }
+
+
+def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> Path:
+    """Build and QA a processed dataset inside one immutable run root."""
+    config = load_yaml(config_path)
+    validate_workflow_contract(config)
+    preprocessing = config["preprocessing"]
+    source_config = source_root / Path(str(preprocessing["base_config"]))
+    effective = _load_preprocessing_document(source_config, source_root)
+    output_root = run_root / "outputs/preprocessing"
+    effective["output_path"] = str(output_root)
+    effective_config = output_root / "effective_config.yaml"
+    output_marker = output_root / ".preprocessed.done"
+    qa_path = output_root / "qa.json"
+    if output_root.exists() and any(output_root.iterdir()):
+        existing = sorted(path.name for path in output_root.iterdir())
+        raise FileExistsError(
+            f"Preprocessing output root is not empty for this immutable run: {existing}"
+        )
+    write_yaml(effective_config, effective)
+
+    from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
+
+    pipeline_config = PreprocessingConfig.from_file(effective_config)
+    dataset_path = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
+        strict=True
+    )
+    dataset_path.relative_to(output_root.resolve(strict=True))
+    if dataset_path.is_symlink() or not dataset_path.is_dir():
+        raise ValueError(
+            f"Preprocessing output must be a regular Zarr directory: {dataset_path}"
+        )
+
+    import xarray as xr
+
+    dataset = xr.open_zarr(dataset_path, consolidated=None)
+    try:
+        qa_record = {
+            "schema_version": 2,
+            "dataset": str(dataset_path),
+            "dataset_relative": str(dataset_path.relative_to(run_root)),
+            **_processed_dataset_qa(dataset, config),
+            "generator_handoff": _handoff_provenance_qa(
+                source_root,
+                config,
+                effective,
+                dataset,
+            ),
+            "effective_config": str(effective_config),
+            "effective_config_sha256": sha256_file(effective_config),
+            "source_config": str(source_config.relative_to(source_root)),
+            "source_config_sha256": sha256_file(source_config),
+            "completed_at": datetime.now(UTC).isoformat(),
+        }
+    finally:
+        dataset.close()
+    write_json(qa_path, qa_record)
+    write_json(
+        output_marker,
+        {
+            "dataset": str(dataset_path),
+            "dataset_tree_sha256": _tree_digest(dataset_path),
+            "qa": str(qa_path),
+            "qa_sha256": sha256_file(qa_path),
+        },
+    )
+    return output_marker
+
+
+def _tree_digest(root: Path) -> str:
+    """Hash a regular-file tree without following links."""
+    digest = hashlib.sha256()
+    for relative, checksum in _tree_hashes(root).items():
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(checksum.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
+    """Publish a QA-passed dataset as a run-owned DVC pointer."""
+    config = load_yaml(config_path)
+    dataset_name = preprocessing_dataset_name(config)
+    dataset_pointer = f"{dataset_name}.zarr.dvc"
+    publication_payload = f"{dataset_name}.zarr"
+    output_root = run_root / "outputs/preprocessing"
+    marker_path = output_root / ".preprocessed.done"
+    marker = json.loads(marker_path.read_text())
+    dataset = Path(str(marker["dataset"])).resolve(strict=True)
+    dataset.relative_to(output_root.resolve(strict=True))
+    if dataset.is_symlink() or not dataset.is_dir():
+        raise ValueError("Preprocessed dataset must be a non-symlink directory")
+    if _tree_digest(dataset) != str(marker["dataset_tree_sha256"]):
+        raise ValueError("Preprocessed dataset changed after QA")
+    qa_path = Path(str(marker["qa"])).resolve(strict=True)
+    if sha256_file(qa_path) != str(marker["qa_sha256"]):
+        raise ValueError("Preprocessing QA record changed before publication")
+
+    destination = output_root / "publication"
+    if destination.exists():
+        if (
+            destination.is_symlink()
+            or not destination.is_dir()
+            or any(destination.iterdir())
+        ):
+            raise FileExistsError(
+                "Preprocessing publication already exists for this run"
+            )
+        destination.rmdir()
+    scratch_staging = Path(
+        tempfile.mkdtemp(prefix=f"epiforecaster-publication-{os.getpid()}-")
+    )
+    payload = scratch_staging / publication_payload
+    commit_staging = output_root / f".publication.commit-{os.getpid()}"
+    try:
+        shutil.copytree(dataset, payload, symlinks=True)
+        if _tree_digest(payload) != str(marker["dataset_tree_sha256"]):
+            raise ValueError("Publication staging changed the processed dataset")
+        remote = Path(str(config["dvc"]["remote"]))
+        cache = Path(str(config["dvc"]["cache"]))
+        _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)
+        _run(
+            ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
+            cwd=scratch_staging,
+        )
+        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=scratch_staging)
+        _run(["dvc", "config", "cache.dir", str(cache)], cwd=scratch_staging)
+        _run(["dvc", "config", "cache.shared", "group"], cwd=scratch_staging)
+        _run(["dvc", "config", "cache.type", "symlink"], cwd=scratch_staging)
+        lock_handle = _with_cache_lock(cache)
+        try:
+            _run(["dvc", "add", publication_payload], cwd=scratch_staging)
+            _run(["dvc", "push", dataset_pointer], cwd=scratch_staging)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        pointer = scratch_staging / dataset_pointer
+        pointer_identity = dvc_output(pointer)
+        receipt = {
+            "schema_version": 1,
+            "run_id": str(config["run"]["id"]),
+            "source_git_sha": str(config["source"]["git_sha"]),
+            "source_snapshot_sha256": str(config["source"]["source_snapshot_sha256"]),
+            "config_sha256": sha256_file(config_path),
+            "container_sif": str(config["container"]["sif"]),
+            "container_digest": _container_digest(config["container"]),
+            "input_dvc_hashes": {
+                target: str(record["md5"])
+                for target, record in json.loads(
+                    (run_root / ".state/data_manifest.json").read_text()
+                )["targets"].items()
+            },
+            "dvc_pointer": dataset_pointer,
+            "dvc_md5": str(pointer_identity["md5"]),
+            "dataset_tree_sha256": str(marker["dataset_tree_sha256"]),
+            "qa": str(qa_path),
+            "qa_sha256": str(marker["qa_sha256"]),
+            "published_at": datetime.now(UTC).isoformat(),
+        }
+        commit_staging.mkdir()
+        shutil.copy2(pointer, commit_staging / dataset_pointer)
+        write_json(commit_staging / "receipt.json", receipt)
+        commit_staging.rename(destination)
+    except Exception:
+        shutil.rmtree(commit_staging, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(scratch_staging, ignore_errors=True)
+    receipt_path = destination / "receipt.json"
+    write_json(
+        run_root / ".state/preprocessed_published.done",
+        {"receipt": str(receipt_path), "receipt_sha256": sha256_file(receipt_path)},
+    )
+    return receipt_path
 
 
 def resolve_best_trial_artifacts(
@@ -1471,9 +1868,7 @@ def retain_training_evidence(
         training["experiment_name"], field="training.experiment_name"
     )
     model_id = _safe_component(training["model_id"], field="training.model_id")
-    destination = (
-        run_root / "evidence/training" / experiment_name / model_id
-    )
+    destination = run_root / "evidence/training" / experiment_name / model_id
     if destination.exists():
         raise FileExistsError(
             "Training evidence destination already exists and will not be "
@@ -1683,6 +2078,13 @@ def build_parser() -> argparse.ArgumentParser:
     train = subparsers.add_parser("train")
     runtime_paths(train)
 
+    preprocess = subparsers.add_parser("preprocess")
+    runtime_paths(preprocess)
+
+    publish_preprocessed = subparsers.add_parser("publish-preprocessed")
+    publish_preprocessed.add_argument("--config", type=Path, required=True)
+    publish_preprocessed.add_argument("--run-root", type=Path, required=True)
+
     crossval_train_fold = subparsers.add_parser("crossval-train-fold")
     runtime_paths(crossval_train_fold)
     crossval_train_fold.add_argument("--fold", type=int, required=True)
@@ -1745,6 +2147,10 @@ def main() -> None:
         stage_dvc(args.config, args.source_root, args.run_root)
     elif args.command == "train":
         train_model(args.config, args.source_root, args.run_root)
+    elif args.command == "preprocess":
+        run_preprocessing(args.config, args.source_root, args.run_root)
+    elif args.command == "publish-preprocessed":
+        publish_preprocessed_dataset(args.config, args.run_root)
     elif args.command == "crossval-train-fold":
         train_crossval_fold(args.config, args.source_root, args.run_root, args.fold)
     elif args.command == "crossval-evaluate-fold":

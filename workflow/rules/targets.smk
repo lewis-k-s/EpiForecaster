@@ -44,3 +44,9 @@ elif WORKFLOW_KIND == "crossval":
     rule crossval:
         input:
             str(CROSSVAL_MANIFEST)
+
+
+elif WORKFLOW_KIND == "preprocess":
+    rule preprocess:
+        input:
+            str(PREPROCESSING_RECEIPT)

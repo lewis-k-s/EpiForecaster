@@ -26,13 +26,21 @@ ALLOCATION_FIELDS = (
     "runtime",
 )
 DISPATCH_REQUEST_SCHEMA_VERSION = 1
-WORKFLOW_KINDS = {"train", "evaluate", "hpo", "ablation", "crossval"}
+WORKFLOW_KINDS = {
+    "train",
+    "evaluate",
+    "hpo",
+    "ablation",
+    "crossval",
+    "preprocess",
+}
 WORKFLOW_TARGETS = {
     "train": {"train", "train_evaluate"},
     "evaluate": {"evaluate"},
     "hpo": {"hpo"},
     "ablation": {"ablation"},
     "crossval": {"crossval"},
+    "preprocess": {"preprocess"},
 }
 SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
     ".agents",
@@ -56,6 +64,7 @@ DEPENDENCY_STAGES = {
     "crossval",
     "selection",
     "promotion",
+    "preprocessing",
 }
 
 
@@ -198,6 +207,20 @@ def workflow_target(workflow_config: dict[str, Any]) -> str:
     return str(target)
 
 
+def preprocessing_dataset_name(workflow_config: dict[str, Any]) -> str:
+    """Return the safe output dataset stem for a preprocessing run."""
+    if workflow_kind(workflow_config) != "preprocess":
+        raise ValueError("preprocessing.dataset_name is valid only for preprocess runs")
+    preprocessing = workflow_config["preprocessing"]
+    value = str(preprocessing.get("dataset_name", ""))
+    path = Path(value)
+    if not value or path.name != value or value in {".", ".."} or path.suffix:
+        raise ValueError(
+            "preprocessing.dataset_name must be one safe filename stem without a suffix"
+        )
+    return value
+
+
 def scientific_source_files(paths: list[Path]) -> list[Path]:
     """Select source files whose changes invalidate scientific DAG rules."""
     selected: list[Path] = []
@@ -251,10 +274,29 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         "hpo": ("optuna", "evaluation", "promotion"),
         "ablation": ("ablation",),
         "crossval": ("crossval", "evaluation"),
+        "preprocess": ("preprocessing",),
     }[kind]
     for section in required_sections:
         if not isinstance(workflow_config.get(section), dict):
             raise ValueError(f"workflow.kind={kind!r} requires a {section} mapping")
+
+    if kind == "preprocess":
+        preprocessing = workflow_config["preprocessing"]
+        base_config = Path(str(preprocessing.get("base_config", "")))
+        if (
+            not base_config.parts
+            or base_config.is_absolute()
+            or ".." in base_config.parts
+        ):
+            raise ValueError("preprocessing.base_config must be a source-relative path")
+        preprocessing_dataset_name(workflow_config)
+        handoff_manifest = preprocessing.get("handoff_manifest")
+        if handoff_manifest is not None:
+            handoff_path = Path(str(handoff_manifest))
+            if handoff_path.is_absolute() or ".." in handoff_path.parts:
+                raise ValueError(
+                    "preprocessing.handoff_manifest must be a source-relative path"
+                )
 
     provenance = workflow_config.get("provenance", {})
     if not isinstance(provenance, dict):

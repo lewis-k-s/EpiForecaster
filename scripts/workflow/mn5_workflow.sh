@@ -51,7 +51,7 @@ Usage:
 
 prepare snapshots this worktree into an atomically reserved project-GPFS run.
 The default template is workflow/config/mn5_train.yaml; use --config to select
-evaluation, cross-validation, HPO, or ablation.
+evaluation, preprocessing, cross-validation, HPO, or ablation.
 run submits the one-node ACC allocation declared by that immutable config.
 run-interactive attaches the same run to one compatible active allocation.
 EOF

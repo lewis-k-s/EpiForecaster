@@ -9,6 +9,7 @@ process.
 
 from dataclasses import asdict
 from datetime import datetime
+import json
 from pathlib import Path
 
 import numpy as np
@@ -575,9 +576,12 @@ class OfflinePreprocessingPipeline:
             attrs=dataset_attrs,
         )
         if self.config.synthetic_path:
-            self._validate_positive_clinical_preservation(
+            positive_preservation = self._validate_positive_clinical_preservation(
                 raw_aligned=aligned_dataset,
                 processed=rechunked_dataset,
+            )
+            rechunked_dataset.attrs["positive_clinical_preservation_json"] = json.dumps(
+                positive_preservation, sort_keys=True
             )
 
         # Clear conflicting encodings from data variables and coordinates.
@@ -623,8 +627,9 @@ class OfflinePreprocessingPipeline:
         *,
         raw_aligned: xr.Dataset,
         processed: xr.Dataset,
-    ) -> None:
+    ) -> dict[str, dict[str, int]]:
         """Require positive synthetic clinical observations to stay positive."""
+        evidence: dict[str, dict[str, int]] = {}
         for variable in ("cases", "hospitalizations", "deaths"):
             if variable not in raw_aligned or variable not in processed:
                 continue
@@ -642,10 +647,19 @@ class OfflinePreprocessingPipeline:
                     f"'{variable}' observations did not remain positive after "
                     "preprocessing."
                 )
+            processed_positive_count = int(
+                (np.isfinite(output) & (output > 0)).sum().compute().item()
+            )
+            evidence[variable] = {
+                "raw_positive_count": positive_count,
+                "processed_positive_count": processed_positive_count,
+                "zeroed_raw_positive_count": invalid_count,
+            }
             print(
                 f"  ✓ Positive preservation: {variable} "
                 f"({positive_count} positive observations)"
             )
+        return evidence
 
     def _serialize_config_yaml(self) -> str:
         """Serialize full preprocessing config as YAML for dataset provenance."""

@@ -11,11 +11,15 @@ cases_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.za
 mobility_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
 wastewater_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
 population_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
+region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
 
 end_date: "2021-05-09"
 dataset_name: "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2"
 vaccination_file: null
 continuous_storage_dtype: "float32"
+
+temporal_covariates:
+  holiday_calendar_file: "data/files/catalonia_preprocessing_inputs_v1/catalonia_holidays.csv"
 
 smoothing:
   clinical_method: "holt_damped"
@@ -28,4 +32,6 @@ source_provenance:
   raw_zmetadata_sha256: "dfc535a9c1a3378378afeb0d5a9794640a5ae10fb896a079f82a5989e51a725f"
   reporting_config_sha256: "1fd4608c63b43c1e007da56de8365e8334a5330ad1098fbe6b95bd27a7fa1ab2"
   handoff_manifest_sha256: "ecdc3658e070f73c077b865c1679909a3c8b81c727df154ae24e0a6889310f13"
+  handoff_qa_dvc_md5: "59af8a3b0f88cb52a841127b68c12c89.dir"
   reporting_profile: "sirhd_pretraining_reporting_v1"
+  metadata_input_dvc_md5: "47c8130c5a5ec33a8a662d0982e4de2a.dir"

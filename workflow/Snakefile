@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
 from scripts.workflow.run_config import (
+    preprocessing_dataset_name,
     validate_mn5_allocation,
     workflow_kind,
     workflow_target,
@@ -79,6 +80,7 @@ ACTIVE_STAGES = {
     "hpo": ("data", "hpo", "selection", "evaluation", "promotion"),
     "ablation": ("data", "ablation"),
     "crossval": ("data", "crossval", "evaluation"),
+    "preprocess": ("data", "preprocessing"),
 }[WORKFLOW_KIND]
 STAGE_SOURCES = {
     stage: dependency_sources(SOURCE_ROOT, SOURCE_INVENTORY, config, stage)
@@ -206,6 +208,18 @@ elif WORKFLOW_KIND == "crossval":
     CROSSVAL_TRAINING_COMPLETE = RUN_ROOT / ".state/crossval_training_complete.done"
     CROSSVAL_DONE = RUN_ROOT / ".state/crossval.done"
     DEFAULT_TERMINAL = CROSSVAL_MANIFEST
+elif WORKFLOW_KIND == "preprocess":
+    PREPROCESSING_DATASET_NAME = preprocessing_dataset_name(config)
+    PREPROCESSING_ROOT = RUN_ROOT / "outputs/preprocessing"
+    PREPROCESSING_EFFECTIVE_CONFIG = PREPROCESSING_ROOT / "effective_config.yaml"
+    PREPROCESSING_QA = PREPROCESSING_ROOT / "qa.json"
+    PREPROCESSING_DONE = PREPROCESSING_ROOT / ".preprocessed.done"
+    PREPROCESSING_POINTER = (
+        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.zarr.dvc"
+    )
+    PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
+    PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
+    DEFAULT_TERMINAL = PREPROCESSING_RECEIPT
 
 
 def dependency_command(stage):
@@ -240,4 +254,5 @@ include: "rules/training.smk"
 include: "rules/evaluation.smk"
 include: "rules/studies.smk"
 include: "rules/promotion.smk"
+include: "rules/preprocessing.smk"
 include: "rules/targets.smk"

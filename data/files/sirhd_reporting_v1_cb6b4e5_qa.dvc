@@ -1,0 +1,15 @@
+md5: 41e168a8a78c55be62532560e42dcf61
+frozen: true
+deps:
+- md5: 59af8a3b0f88cb52a841127b68c12c89.dir
+  size: 6201666
+  nfiles: 8
+  hash: md5
+  path:
+    /gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/sirhd_reporting_v1_cb6b4e5_20260726_20run/qa
+outs:
+- md5: 59af8a3b0f88cb52a841127b68c12c89.dir
+  size: 6201666
+  nfiles: 8
+  hash: md5
+  path: sirhd_reporting_v1_cb6b4e5_qa

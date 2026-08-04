@@ -1,3 +1,5 @@
+import json
+
 import dask.array as da
 import numpy as np
 import pandas as pd
@@ -665,6 +667,9 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     case_mask = ds["cases_mask"].values
     assert case_values.dtype == np.float32
     assert np.all(case_values[case_mask] > 0)
+    preservation = json.loads(ds.attrs["positive_clinical_preservation_json"])
+    assert preservation["cases"]["raw_positive_count"] > 0
+    assert preservation["cases"]["zeroed_raw_positive_count"] == 0
     ds.close()
 
 

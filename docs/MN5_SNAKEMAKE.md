@@ -1,7 +1,7 @@
 # MN5 workflow
 
-Snakemake is the production entry point for MN5 training, evaluation,
-cross-validation, HPO, ablation, and artifact promotion. Each workflow uses one
+Snakemake is the production entry point for MN5 preprocessing, training,
+evaluation, cross-validation, HPO, ablation, and artifact promotion. Each workflow uses one
 preallocated ACC node. Snakemake runs as an allocation-internal lightweight
 coordinator and launches scientific work as one or more `srun` job steps.
 
@@ -138,11 +138,18 @@ hpo:             launch_optuna_workers -> select_best_trial
 ablation:        launch_ablation_workers -> finalize_ablation
 crossval:        train_crossval_folds -> evaluate_crossval_folds
                  -> finalize_crossval
+preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
 Synthetic pretraining uses the same `train` entity through
 `workflow/config/mn5_synth_pretrain.yaml`. Its processed Zarr is materialized
 for training, while the raw synthetic Zarr is a provenance-only DVC target.
+
+The corrected 20-run corpus uses
+`workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml`. The immutable
+run owns the processed Zarr, QA record, generated DVC pointer, and publication
+receipt. Promote the pointer to the source repository only after these records
+pass review.
 
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
@@ -232,6 +239,8 @@ bash scripts/workflow/mn5_workflow.sh prepare <crossval-run-id> \
   --config workflow/config/mn5_crossval.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
   --config workflow/config/mn5_synth_pretrain.yaml
+bash scripts/workflow/mn5_workflow.sh prepare <preprocess-run-id> \
+  --config workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml
 ```
 
 For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set
