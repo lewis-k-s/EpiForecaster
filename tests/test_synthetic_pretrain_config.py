@@ -9,12 +9,12 @@ from scripts.workflow.run_config import validate_workflow_contract
 
 
 CORRECTED_PROCESSED_PATH = (
-    "data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr"
+    "data/processed/"
+    "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.zarr"
 )
 CORRECTED_PROCESSED_POINTER = f"{CORRECTED_PROCESSED_PATH}.dvc"
 CORRECTED_RAW_POINTER = (
-    "data/files/"
-    "raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc"
+    "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc"
 )
 
 
@@ -32,6 +32,31 @@ def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
         "cases": "I",
         "deaths": "death_flow",
     }
+
+
+def test_latent_rescaling_study_arms_change_only_identity_and_scaling() -> None:
+    paths = {
+        mode: Path(f"workflow/config/mn5_latent_rescaling_{mode}_mse.yaml")
+        for mode in ("unscaled", "std", "asinh")
+    }
+    documents = {
+        mode: yaml.safe_load(path.read_text(encoding="utf-8"))
+        for mode, path in paths.items()
+    }
+
+    expected_modes = {"unscaled": "none", "std": "std", "asinh": "asinh"}
+    normalized = {}
+    for arm, document in documents.items():
+        assert document["training"]["max_batches"] is None
+        assert "training.epochs=1" in document["training"]["overrides"]
+        scaling_override = f"training.loss.joint.latent.scaling={expected_modes[arm]}"
+        assert scaling_override in document["training"]["overrides"]
+        copy = deepcopy(document)
+        copy["training"]["experiment_name"] = "ARM"
+        copy["training"]["overrides"].remove(scaling_override)
+        normalized[arm] = copy
+
+    assert normalized["unscaled"] == normalized["std"] == normalized["asinh"]
 
 
 @pytest.mark.parametrize(
@@ -53,9 +78,7 @@ def test_live_synthetic_pretraining_workflows_use_corrected_corpus(
 
 def test_synthetic_pretrain_interactive_smoke_disables_all_compilation() -> None:
     config = yaml.safe_load(
-        Path(
-            "workflow/config/mn5_synth_pretrain_interactive_smoke.yaml"
-        ).read_text()
+        Path("workflow/config/mn5_synth_pretrain_interactive_smoke.yaml").read_text()
     )
 
     overrides = set(config["training"]["overrides"])
@@ -67,9 +90,7 @@ def test_synthetic_pretrain_interactive_smoke_disables_all_compilation() -> None
 
 
 def test_synthetic_pretrain_production_emits_evaluation_diagnostics() -> None:
-    config = yaml.safe_load(
-        Path("workflow/config/mn5_synth_pretrain.yaml").read_text()
-    )
+    config = yaml.safe_load(Path("workflow/config/mn5_synth_pretrain.yaml").read_text())
     training = EpiForecasterConfig.load(
         Path("configs/production_only/train_epifor_mn5_synth_pretrain.yaml")
     )
@@ -99,9 +120,7 @@ def test_reporting_v1_finetune_matches_from_scratch_control() -> None:
         Path("workflow/config/mn5_synth_pretrain_control.yaml").read_text()
     )
     fine_tune = yaml.safe_load(
-        Path(
-            "workflow/config/mn5_synth_pretrain_finetune.template.yaml"
-        ).read_text()
+        Path("workflow/config/mn5_synth_pretrain_finetune.template.yaml").read_text()
     )
 
     assert fine_tune["workflow"] == control["workflow"]
@@ -130,14 +149,11 @@ def test_reporting_v1_finetune_matches_from_scratch_control() -> None:
 
 def test_reporting_v1_finetune_smoke_matches_from_scratch_smoke() -> None:
     control = yaml.safe_load(
-        Path(
-            "workflow/config/mn5_synth_pretrain_control_smoke.yaml"
-        ).read_text()
+        Path("workflow/config/mn5_synth_pretrain_control_smoke.yaml").read_text()
     )
     fine_tune = yaml.safe_load(
         Path(
-            "workflow/config/"
-            "mn5_synth_pretrain_finetune_smoke.template.yaml"
+            "workflow/config/mn5_synth_pretrain_finetune_smoke.template.yaml"
         ).read_text()
     )
 
@@ -161,8 +177,7 @@ def test_reporting_v1_finetune_smoke_matches_from_scratch_smoke() -> None:
 def test_reporting_v1_checkpoint_evaluation_template_fails_closed() -> None:
     template = yaml.safe_load(
         Path(
-            "workflow/config/"
-            "mn5_sirhd_reporting_v1_checkpoint_evaluate.template.yaml"
+            "workflow/config/mn5_sirhd_reporting_v1_checkpoint_evaluate.template.yaml"
         ).read_text()
     )
 
@@ -186,9 +201,7 @@ def test_reporting_v1_checkpoint_evaluation_template_fails_closed() -> None:
 
 def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> None:
     workflow = yaml.safe_load(
-        Path(
-            "workflow/config/mn5_sirhd_reporting_v1_control_evaluate.yaml"
-        ).read_text()
+        Path("workflow/config/mn5_sirhd_reporting_v1_control_evaluate.yaml").read_text()
     )
     overrides = workflow["evaluation"]["overrides"]
     evaluation = EpiForecasterConfig.load(
@@ -203,7 +216,7 @@ def test_control_synthetic_cross_evaluation_uses_pretraining_data_contract() -> 
     assert evaluation.data.mobility_min_flow_raw == 0.0
     assert evaluation.data.run_id_chunk_size == 1
     assert evaluation.training.curriculum.enabled is True
-    assert evaluation.training.loss.joint.w_sird_supervision == 0.01
+    assert evaluation.training.loss.joint.latent.total_weight == 0.0
 
 
 def test_old_batch_mixing_smoke_remains_historical() -> None:
@@ -220,9 +233,7 @@ def test_old_batch_mixing_smoke_remains_historical() -> None:
 
 def test_batch_mixing_smoke_shuffles_single_time_major_batches() -> None:
     workflow = yaml.safe_load(
-        Path(
-            "workflow/config/mn5_synth_pretrain_batch_mixing_smoke.yaml"
-        ).read_text()
+        Path("workflow/config/mn5_synth_pretrain_batch_mixing_smoke.yaml").read_text()
     )
     training = EpiForecasterConfig.load(
         Path("configs/production_only/train_epifor_mn5_synth_pretrain.yaml"),

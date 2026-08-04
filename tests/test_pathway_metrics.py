@@ -10,6 +10,8 @@ from evaluation.pathway_metrics import (
     TorchPathwayMetricAccumulator,
 )
 from training.pathway_gradients import (
+    compute_latent_parameter_gradient_metrics,
+    compute_latent_variation_metrics,
     compute_pathway_gradient_metrics,
     should_probe_pathway_gradients,
 )
@@ -58,6 +60,7 @@ def test_latent_metrics_capture_truth_agreement_and_structural_coherence() -> No
         f"{name}_target": trajectories[f"{name}_trajectory"].clone()
         for name in ("S", "I", "H", "R", "D")
     }
+    targets["death_flow_target"] = trajectories["death_flow"].clone()
     accumulator = TorchLatentCoherenceAccumulator(device=torch.device("cpu"))
     accumulator.update(model_outputs=trajectories, targets=targets)
     metrics = accumulator.finalize()
@@ -65,13 +68,17 @@ def test_latent_metrics_capture_truth_agreement_and_structural_coherence() -> No
     assert metrics["latent_mae_s_fraction"] == pytest.approx(0.0)
     assert metrics["latent_rmse_i_fraction"] == pytest.approx(0.0)
     assert metrics["latent_pearson_d"] == pytest.approx(1.0)
-    assert metrics["latent_model_sirhd_mass_error_from_one_mae"] == pytest.approx(
+    assert metrics["latent_prediction_target_std_ratio_i"] == pytest.approx(1.0)
+    assert metrics["latent_mean_window_spearman_i"] == pytest.approx(1.0)
+    assert metrics["latent_window_spearman_eligible_count_i"] == 1
+    assert metrics["latent_mae_i_horizon_02_fraction"] == pytest.approx(0.0)
+    assert metrics["latent_rmse_death_flow_fraction"] == pytest.approx(0.0)
+    assert metrics["latent_rmse_death_flow_horizon_01_fraction"] == pytest.approx(0.0)
+    assert metrics["latent_model_sirhd_mass_error_from_one_mae"] == pytest.approx(0.0)
+    assert metrics["latent_target_exported_sirhd_mass_mean"] == pytest.approx(1.0)
+    assert metrics["latent_model_vs_target_exported_sirhd_mass_mae"] == pytest.approx(
         0.0
     )
-    assert metrics["latent_target_exported_sirhd_mass_mean"] == pytest.approx(1.0)
-    assert metrics[
-        "latent_model_vs_target_exported_sirhd_mass_mae"
-    ] == pytest.approx(0.0)
     assert metrics["latent_death_transition_mae"] == pytest.approx(0.0, abs=1.0e-8)
     assert metrics["latent_death_monotonic_violation_fraction"] == pytest.approx(0.0)
     assert metrics["latent_hospitalization_flow_negative_fraction"] == pytest.approx(
@@ -99,16 +106,14 @@ def test_latent_metrics_do_not_treat_incomplete_export_as_model_mass_failure() -
     accumulator.update(model_outputs=trajectories, targets=targets)
     metrics = accumulator.finalize()
 
-    assert metrics["latent_model_sirhd_mass_error_from_one_mae"] == pytest.approx(
-        0.0
-    )
+    assert metrics["latent_model_sirhd_mass_error_from_one_mae"] == pytest.approx(0.0)
     assert metrics["latent_target_exported_sirhd_mass_mean"] == pytest.approx(0.9)
     assert metrics[
         "latent_target_exported_sirhd_mass_gap_from_one_mae"
     ] == pytest.approx(0.1)
-    assert metrics[
-        "latent_model_vs_target_exported_sirhd_mass_mae"
-    ] == pytest.approx(0.1)
+    assert metrics["latent_model_vs_target_exported_sirhd_mass_mae"] == pytest.approx(
+        0.1
+    )
 
 
 def test_pathway_gradient_metrics_distinguish_intermediate_routes() -> None:
@@ -132,3 +137,91 @@ def test_pathway_gradient_metrics_distinguish_intermediate_routes() -> None:
     assert should_probe_pathway_gradients(step=100, frequency=100)
     assert not should_probe_pathway_gradients(step=99, frequency=100)
     assert not should_probe_pathway_gradients(step=100, frequency=0)
+
+
+def test_latent_parameter_gradient_metrics_report_conflict_and_clipping() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    obs_loss = (parameter - 1.0).square()
+    latent_loss = (parameter + 1.0).square()
+    components = {
+        "obs_total": obs_loss,
+        "total": obs_loss + 0.5 * latent_loss,
+        "sird_supervision_weighted": 0.5 * latent_loss,
+    }
+    for task in ("s", "i", "h", "r", "death_flow"):
+        components[f"latent_{task}_raw"] = latent_loss
+        components[f"latent_{task}"] = latent_loss
+        components[f"latent_{task}_weighted"] = latent_loss / 5.0
+
+    metrics = compute_latent_parameter_gradient_metrics(
+        components=components,
+        selected_parameters=[parameter],
+        all_parameters=[parameter],
+        latent_total_weight=0.5,
+        clip_value=0.5,
+        actual_update_global_norm_preclip=torch.tensor(2.0),
+    )
+
+    assert metrics["latentgrad_sidecar_total_global_norm_preclip"].item() == (
+        pytest.approx(1.0)
+    )
+    assert metrics["latentgrad_actual_update_clip_scale"].item() == pytest.approx(0.25)
+    assert metrics["latentgrad_actual_update_global_norm_postclip"].item() == (
+        pytest.approx(0.5)
+    )
+    assert metrics["latentgrad_i_shared_grad_norm_preclip"].item() == pytest.approx(0.2)
+    assert metrics[
+        "latentgrad_i_shared_grad_norm_counterfactual_postclip"
+    ].item() == pytest.approx(0.05)
+    assert metrics["latentgrad_i_shared_grad_cosine_obs"].item() == pytest.approx(-1.0)
+    assert metrics[
+        "latentgrad_combined_to_obs_grad_norm_ratio"
+    ].item() == pytest.approx(0.5)
+    assert metrics["latentgrad_cosine_i_h"].item() == pytest.approx(1.0)
+    assert parameter.grad is None
+
+
+def test_latent_variation_metrics_report_prediction_target_std_ratio() -> None:
+    outputs = {
+        "I_trajectory": torch.tensor([[0.0, 2.0]]),
+    }
+    targets = {
+        "I_target": torch.tensor([[0.0, 1.0]]),
+    }
+
+    metrics = compute_latent_variation_metrics(
+        model_outputs=outputs,
+        targets=targets,
+    )
+
+    assert metrics["latentgrad_i_prediction_std"].item() == pytest.approx(1.0)
+    assert metrics["latentgrad_i_target_std"].item() == pytest.approx(0.5)
+    assert metrics["latentgrad_i_prediction_target_std_ratio"].item() == pytest.approx(
+        2.0
+    )
+
+
+def test_latent_parameter_gradient_cosine_is_nan_for_starved_task() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    obs_loss = (parameter - 1.0).square()
+    zero_latent = parameter.square()
+    components = {
+        "obs_total": obs_loss,
+        "total": obs_loss,
+        "sird_supervision_weighted": zero_latent,
+    }
+    for task in ("s", "i", "h", "r", "death_flow"):
+        components[f"latent_{task}_raw"] = zero_latent
+        components[f"latent_{task}"] = zero_latent
+        components[f"latent_{task}_weighted"] = zero_latent
+
+    metrics = compute_latent_parameter_gradient_metrics(
+        components=components,
+        selected_parameters=[parameter],
+        all_parameters=[parameter],
+        latent_total_weight=1.0,
+        clip_value=1.0,
+        actual_update_global_norm_preclip=torch.tensor(2.0),
+    )
+
+    assert torch.isnan(metrics["latentgrad_i_shared_grad_cosine_obs"])

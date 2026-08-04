@@ -1,0 +1,45 @@
+# One-complete-epoch matched arm: fixed training-split standard-deviation scaling.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: train
+  target: train_evaluate
+
+dvc:
+  targets:
+    - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
+
+training:
+  base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml
+  experiment_name: latent-rescaling-v1-std-mse
+  model_id: model
+  max_batches: null
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+    - training.epochs=1
+    - training.profiler.enabled=false
+    - training.loss.joint.latent.scaling=std
+
+evaluation:
+  split: test
+  granular: true
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 120

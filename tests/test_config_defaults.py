@@ -4,6 +4,7 @@ from models.configs import (
     DataConfig,
     EpiForecasterConfig,
     JointLossConfig,
+    LatentSupervisionConfig,
     ModelConfig,
     ObservationHeadConfig,
     TrainingParams,
@@ -149,7 +150,39 @@ def test_joint_loss_defaults_use_normal_nll() -> None:
     assert cfg.distribution_df == pytest.approx(5.0)
     assert cfg.interval_levels == [0.5, 0.8, 0.95]
     assert cfg.adaptive_scheme == "none"
-    assert cfg.w_sird_supervision == 0.05
+    assert cfg.latent.total_weight == 0.0
+    assert cfg.latent.scaling == "none"
+    assert cfg.latent.component_weights == {
+        "s": 0.2,
+        "i": 0.2,
+        "h": 0.2,
+        "r": 0.2,
+        "death_flow": 0.2,
+    }
+
+
+@pytest.mark.epiforecaster
+def test_latent_supervision_config_validates_scaling_contract() -> None:
+    with pytest.raises(ValueError, match="must sum to 1.0"):
+        LatentSupervisionConfig(
+            component_weights={
+                "s": 1.0,
+                "i": 1.0,
+                "h": 1.0,
+                "r": 1.0,
+                "death_flow": 1.0,
+            }
+        )
+    with pytest.raises(ValueError, match="finite and positive"):
+        LatentSupervisionConfig(
+            scale_floors={
+                "s": 0.0,
+                "i": 1.0e-8,
+                "h": 1.0e-8,
+                "r": 1.0e-8,
+                "death_flow": 1.0e-8,
+            }
+        )
 
 
 @pytest.mark.epiforecaster

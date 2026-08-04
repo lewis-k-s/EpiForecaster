@@ -16,7 +16,7 @@
 ### `train_epifor_mn5_synth_pretrain.yaml`
 - Production synthetic pretraining on processed synthetic data
 - Invoked only through `workflow/config/mn5_synth_pretrain.yaml`
-- Enables direct latent `S/I/R/D` supervision for stage-1 pretraining
+- Enables direct latent `S/I/H/R/death_flow` supervision for stage-1 pretraining
 
 ### `preprocess_mn5_synth.yaml`
 - Canonical MN5 synthetic preprocessing base

@@ -89,6 +89,7 @@ class EpiDatasetItem(TypedDict):
     H_target: torch.Tensor | None  # [H+1] latent hospitalized fraction target
     R_target: torch.Tensor | None  # [H+1] latent recovered fraction target
     D_target: torch.Tensor | None  # [H+1] latent deceased fraction target
+    death_flow_target: torch.Tensor | None  # [H] destination-dated death flow
 
 
 class EpiDataset(Dataset):
@@ -223,6 +224,9 @@ class EpiDataset(Dataset):
         self.precomputed_H_target = self._precompute_latent_target("latent_H_true")
         self.precomputed_R_target = self._precompute_latent_target("latent_R_true")
         self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
+        self.precomputed_death_flow_target = self._precompute_latent_target(
+            "latent_death_flow_true"
+        )
 
         # Setup mobility preprocessor
         if mobility_preprocessor is None:
@@ -829,6 +833,14 @@ class EpiDataset(Dataset):
         D_target = self._slice_latent_target(
             self.precomputed_D_target, range_end - 1, forecast_targets, target_idx
         )
+        if D_target is not None:
+            D_target = D_target - D_target[0]
+        death_flow_target = self._slice_latent_target(
+            self.precomputed_death_flow_target,
+            range_end,
+            forecast_targets,
+            target_idx,
+        )
 
         assert mobility_history.shape == (L, self.num_nodes), (
             f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
@@ -974,6 +986,7 @@ class EpiDataset(Dataset):
             "H_target": H_target,
             "R_target": R_target,
             "D_target": D_target,
+            "death_flow_target": death_flow_target,
         }
 
     def _resolve_region_name_source(self) -> Path | None:

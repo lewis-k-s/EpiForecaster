@@ -85,4 +85,5 @@ training:
       gradnorm_update_every: 16
       gradnorm_ema_decay: 0.9
       gradnorm_probe: obs_context
-      w_sird_supervision: 0.0
+      latent:
+        total_weight: 0.0

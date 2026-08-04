@@ -7,7 +7,7 @@ env: "mn5"
 # training.init_checkpoint_path set to the best checkpoint from this run.
 
 data:
-  dataset_path: data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr
+  dataset_path: data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.
@@ -116,7 +116,10 @@ training:
     name: "joint_inference"
     joint:
       observation_loss: nll
-      w_sird_supervision: 0.01
+      latent:
+        total_weight: 0.01
+        scaling: "none"
+        require_complete_targets: true
 
   curriculum:
     enabled: true

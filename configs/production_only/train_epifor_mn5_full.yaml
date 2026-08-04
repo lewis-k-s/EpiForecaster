@@ -114,4 +114,5 @@ training:
     name: "joint_inference"
     joint:
       observation_loss: nll
-      w_sird_supervision: 0.0
+      latent:
+        total_weight: 0.0

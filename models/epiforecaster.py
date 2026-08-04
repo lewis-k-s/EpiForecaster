@@ -485,6 +485,7 @@ class EpiForecaster(nn.Module):
 
         return {
             "beta_t": beta_t,
+            "gamma_t": gamma_t,
             "mortality_t": mortality_t,
             "hospitalization_rate_t": hospitalization_rate_t,
             "hospital_recovery_t": hospital_recovery_t,
@@ -606,6 +607,7 @@ class EpiForecaster(nn.Module):
             "H_target": batch_data.H_target,
             "R_target": batch_data.R_target,
             "D_target": batch_data.D_target,
+            "death_flow_target": batch_data.death_flow_target,
             "ww_mask": batch_data.ww_target_mask,
             "hosp_mask": batch_data.hosp_target_mask,
             "cases_mask": batch_data.cases_target_mask,

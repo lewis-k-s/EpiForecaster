@@ -46,6 +46,77 @@ class ProfilerConfig:
     with_stack: bool = False
 
 
+_LATENT_TASKS = ("s", "i", "h", "r", "death_flow")
+
+
+@dataclass
+class LatentSupervisionConfig:
+    """Configuration for synthetic mechanistic latent supervision."""
+
+    total_weight: float = 0.0
+    scaling: str = "none"
+    component_weights: dict[str, float] = field(
+        default_factory=lambda: {name: 0.2 for name in _LATENT_TASKS}
+    )
+    scale_floors: dict[str, float] = field(
+        default_factory=lambda: {name: 1.0e-8 for name in _LATENT_TASKS}
+    )
+    require_complete_targets: bool = True
+
+    def __post_init__(self) -> None:
+        self.scaling = self.scaling.lower()
+        valid_scaling = {"none", "std", "asinh"}
+        if self.scaling not in valid_scaling:
+            raise ValueError(
+                f"latent.scaling must be one of {sorted(valid_scaling)}, "
+                f"got {self.scaling!r}"
+            )
+        if not math.isfinite(self.total_weight) or self.total_weight < 0:
+            raise ValueError(
+                "latent.total_weight must be finite and non-negative, "
+                f"got {self.total_weight}"
+            )
+
+        expected_tasks = set(_LATENT_TASKS)
+        if set(self.component_weights) != expected_tasks:
+            raise ValueError(
+                "latent.component_weights must contain exactly "
+                f"{sorted(expected_tasks)}, got {sorted(self.component_weights)}"
+            )
+        if set(self.scale_floors) != expected_tasks:
+            raise ValueError(
+                "latent.scale_floors must contain exactly "
+                f"{sorted(expected_tasks)}, got {sorted(self.scale_floors)}"
+            )
+
+        normalized_weights = {
+            name: float(value) for name, value in self.component_weights.items()
+        }
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in normalized_weights.values()
+        ):
+            raise ValueError(
+                "latent.component_weights values must be finite and non-negative"
+            )
+        weight_sum = sum(normalized_weights.values())
+        if not math.isclose(weight_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-8):
+            raise ValueError(
+                f"latent.component_weights values must sum to 1.0, got {weight_sum}"
+            )
+        self.component_weights = normalized_weights
+
+        normalized_floors = {
+            name: float(value) for name, value in self.scale_floors.items()
+        }
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in normalized_floors.values()
+        ):
+            raise ValueError("latent.scale_floors values must be finite and positive")
+        self.scale_floors = normalized_floors
+
+
 @dataclass
 class JointLossConfig:
     """Loss weights for joint inference training."""
@@ -73,9 +144,7 @@ class JointLossConfig:
     gradnorm_probe: str = "obs_context"
     gradnorm_min_weight: float = 1.0e-3
     gradnorm_obs_weight_sum: float = 0.95
-    # Fixed weight for synthetic latent S/I/R/D supervision.
-    # Latent supervision auto-disables when latent targets are absent.
-    w_sird_supervision: float = 0.05
+    latent: LatentSupervisionConfig = field(default_factory=LatentSupervisionConfig)
     # Optional target-level ablation toggles for observation losses.
     disable_ww: bool = False
     disable_hosp: bool = False
@@ -96,6 +165,8 @@ class JointLossConfig:
         self.distribution_family = self.distribution_family.lower()
         self.adaptive_scheme = self.adaptive_scheme.lower()
         self.gradnorm_probe = self.gradnorm_probe.lower()
+        if isinstance(self.latent, (dict, DictConfig)):
+            self.latent = LatentSupervisionConfig(**dict(self.latent))
         if self.observation_loss not in valid_observation_losses:
             raise ValueError(
                 "observation_loss must be one of "
@@ -131,7 +202,6 @@ class JointLossConfig:
             )
 
         for name, value in [
-            ("w_sird_supervision", self.w_sird_supervision),
             ("gradnorm_alpha", self.gradnorm_alpha),
             ("gradnorm_weight_lr", self.gradnorm_weight_lr),
             ("gradnorm_ema_decay", self.gradnorm_ema_decay),

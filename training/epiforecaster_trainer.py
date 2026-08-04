@@ -9,6 +9,7 @@ The trainer works with the EpiForecaster model.
 """
 
 import importlib
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from data.dataset_factory import build_datasets
 from data.epi_batch import EpiBatch
+from data.latent_supervision import LatentScaleState, fit_latent_scale_state
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.eval_loop import evaluate_loader
 from evaluation.losses import JointInferenceLoss
@@ -45,6 +47,8 @@ from training.dataloader_factory import (
 from training.gradnorm import GradNormController
 from training.optim_factory import create_optimizer, create_scheduler
 from training.pathway_gradients import (
+    compute_latent_parameter_gradient_metrics,
+    compute_latent_variation_metrics,
     compute_pathway_gradient_metrics,
     should_probe_pathway_gradients,
 )
@@ -288,6 +292,7 @@ class EpiForecasterTrainer:
         self.test_dataset = dataset_splits.test
         self.real_run_id = dataset_splits.real_run_id
         self.synth_run_ids = dataset_splits.synth_run_ids
+        self.latent_scale_state = self._fit_latent_scale_state()
 
         # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
         if isinstance(self.train_dataset, ConcatDataset):
@@ -674,7 +679,8 @@ class EpiForecasterTrainer:
         self._status(
             f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
         )
-        self._status(f"    - SIRHD supervision weight: {loss_cfg.w_sird_supervision}")
+        self._status(f"    - Latent supervision weight: {loss_cfg.latent.total_weight}")
+        self._status(f"    - Latent scaling: {loss_cfg.latent.scaling}")
         self._status("    - n_eff: diagnostic only; no loss scaling")
         if self._gradnorm_enabled:
             self._status(
@@ -884,12 +890,46 @@ class EpiForecasterTrainer:
             warmup_batches=self.config.training.warmup_steps,
         )
 
+    def _fit_latent_scale_state(self) -> LatentScaleState | None:
+        """Fit fixed latent scales from the training split when requested."""
+        latent_config = self.config.training.loss.joint.latent
+        if latent_config.total_weight <= 0:
+            return None
+
+        dataset_identity = str(
+            getattr(
+                self,
+                "_original_dataset_path",
+                self.config.data.dataset_path,
+            )
+        )
+        state = fit_latent_scale_state(
+            self.train_dataset,
+            floors=latent_config.scale_floors,
+            dataset_identity=dataset_identity,
+        )
+        self._status(
+            "Fitted latent supervision scales from the training split: "
+            f"mode={latent_config.scaling}, hash={state.state_hash}",
+            logging.INFO,
+        )
+        return state
+
     def _create_criterion(self) -> JointInferenceLoss:
         """Create loss criterion."""
         from evaluation.losses import get_loss_from_config
 
+        latent_scales = (
+            None
+            if self.latent_scale_state is None
+            else {
+                name: float(value)
+                for name, value in self.latent_scale_state.scales.items()
+            }
+        )
         return get_loss_from_config(
             self.config.training.loss,
+            latent_scales=latent_scales,
             data_config=self.config.data,
             observation_heads_config=self.config.model.observation_heads,
             input_window_length=self.config.model.input_window_length,
@@ -927,6 +967,8 @@ class EpiForecasterTrainer:
         experiment_dir.mkdir(parents=True, exist_ok=True)
         self._persist_run_config(experiment_dir)
         self._persist_mobility_diagnostics(experiment_dir)
+        self._persist_latent_scale_state(experiment_dir)
+        self._persist_latent_gradient_probe(experiment_dir)
 
         self.experiment_dir = experiment_dir
 
@@ -1079,6 +1121,7 @@ class EpiForecasterTrainer:
         if checkpoint_path is None:
             raise ValueError("resume_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self._validate_checkpoint_latent_scale_state(checkpoint)
 
         # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
@@ -1157,6 +1200,25 @@ class EpiForecasterTrainer:
         )
         self._status(f"Resumed from checkpoint: {checkpoint_path}")
 
+    def _validate_checkpoint_latent_scale_state(
+        self, checkpoint: dict[str, Any]
+    ) -> None:
+        """Reject resume or final evaluation with a different fitted scale state."""
+        latent_scale_state = getattr(self, "latent_scale_state", None)
+        expected_state = (
+            None if latent_scale_state is None else latent_scale_state.to_dict()
+        )
+        expected_hash = (
+            None if latent_scale_state is None else latent_scale_state.state_hash
+        )
+        checkpoint_state = checkpoint.get("latent_scale_state")
+        checkpoint_hash = checkpoint.get("latent_scale_state_hash")
+        if checkpoint_state != expected_state or checkpoint_hash != expected_hash:
+            raise ValueError(
+                "Checkpoint latent scale state does not match the current training "
+                "split and latent supervision configuration."
+            )
+
     def _initialize_model_from_checkpoint(self) -> None:
         from utils.precision_policy import validate_old_checkpoint_compatible
 
@@ -1187,9 +1249,7 @@ class EpiForecasterTrainer:
     def _setup_training_dynamics(self) -> None:
         if self.experiment_dir is None:
             raise RuntimeError("experiment_dir not set; call setup_logging() first")
-        artifact_exists = (
-            self.experiment_dir / "training_dynamics.jsonl"
-        ).exists()
+        artifact_exists = (self.experiment_dir / "training_dynamics.jsonl").exists()
         resume_existing = bool(
             self.config.training.resume_checkpoint_path and artifact_exists
         )
@@ -1267,9 +1327,7 @@ class EpiForecasterTrainer:
         try:
             result = self._run_training()
         except Exception as exc:
-            status = (
-                "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
-            )
+            status = "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
             writer = getattr(self, "training_dynamics_writer", None)
             if writer is not None:
                 writer.finalize(
@@ -1864,6 +1922,8 @@ class EpiForecasterTrainer:
     def _pathway_gradient_sidecar(
         self,
         batch_data: EpiBatch,
+        *,
+        actual_update_global_norm_preclip: torch.Tensor,
     ) -> dict[str, torch.Tensor | float]:
         """Probe observation-loss gradients through mechanistic and residual paths."""
         frequency = self.config.training.pathway_gradient_frequency
@@ -1899,13 +1959,31 @@ class EpiForecasterTrainer:
                 compute_pathway_gradient_metrics(
                     head_name=head_name,
                     loss=components[head_name],
-                    mechanistic_source=model_outputs[
-                        f"observation_source_{head_name}"
-                    ],
+                    mechanistic_source=model_outputs[f"observation_source_{head_name}"],
                     residual_input=model_outputs[f"residual_input_{head_name}"],
                     retain_graph=True,
                 )
             )
+        metrics.update(
+            compute_latent_variation_metrics(
+                model_outputs=model_outputs,
+                targets=targets_dict,
+            )
+        )
+        metrics.update(
+            compute_latent_parameter_gradient_metrics(
+                components=components,
+                selected_parameters=self._grad_norm_groups["sird"],
+                all_parameters=[
+                    parameter
+                    for parameter in self.model.parameters()
+                    if parameter.requires_grad
+                ],
+                latent_total_weight=self.criterion.latent_total_weight,
+                clip_value=self.config.training.gradient_clip_value,
+                actual_update_global_norm_preclip=(actual_update_global_norm_preclip),
+            )
+        )
         metrics["pathgrad_sidecar_time_s"] = time.time() - sidecar_start_time
         return metrics
 
@@ -1924,6 +2002,7 @@ class EpiForecasterTrainer:
             "H_target": batch_data.H_target,
             "R_target": batch_data.R_target,
             "D_target": batch_data.D_target,
+            "death_flow_target": batch_data.death_flow_target,
             "ww_mask": batch_data.ww_target_mask,
             "hosp_mask": batch_data.hosp_target_mask,
             "cases_mask": batch_data.cases_target_mask,
@@ -2097,11 +2176,17 @@ class EpiForecasterTrainer:
         self, batch_data: EpiBatch
     ) -> tuple[str, dict[str, float]]:
         """Build optional SIRHD loss detail text and metrics for step logging."""
-        if self.criterion.w_sird_supervision <= 0:
+        if self.criterion.latent_total_weight <= 0:
             return "", {}
         if all(
             getattr(batch_data, key, None) is None
-            for key in ("S_target", "I_target", "H_target", "R_target", "D_target")
+            for key in (
+                "S_target",
+                "I_target",
+                "H_target",
+                "R_target",
+                "death_flow_target",
+            )
         ):
             return "", {}
 
@@ -2127,16 +2212,26 @@ class EpiForecasterTrainer:
 
         sird_raw = float(components["sird_supervision"])
         sird_weighted = float(components["sird_supervision_weighted"])
+        metrics = {
+            build_loss_key(split="train", component="sird_supervision"): sird_raw,
+            build_loss_key(
+                split="train",
+                component="sird_supervision",
+                weighted=True,
+            ): sird_weighted,
+        }
+        for task in ("s", "i", "h", "r", "death_flow"):
+            component = f"latent_{task}"
+            metrics[f"loss_train_{component}_raw"] = float(
+                components[f"{component}_raw"]
+            )
+            metrics[f"loss_train_{component}_scaled"] = float(components[component])
+            metrics[f"loss_train_{component}_total_weighted"] = float(
+                self.criterion.latent_total_weight * components[f"{component}_weighted"]
+            )
         return (
             f" | SIRHD: {sird_raw:.4g} (w={sird_weighted:.4g})",
-            {
-                build_loss_key(split="train", component="sird_supervision"): sird_raw,
-                build_loss_key(
-                    split="train",
-                    component="sird_supervision",
-                    weighted=True,
-                ): sird_weighted,
-            },
+            metrics,
         )
 
     def _train_epoch(self) -> float:
@@ -2326,6 +2421,11 @@ class EpiForecasterTrainer:
                         foreach=True,
                     )
 
+                pathway_gradient_log_data = self._pathway_gradient_sidecar(
+                    batch_data,
+                    actual_update_global_norm_preclip=grad_norm,
+                )
+
                 # Optimizer step and gradient zeroing (common to both paths)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -2333,7 +2433,6 @@ class EpiForecasterTrainer:
                 gradnorm_step_log_data: dict[str, torch.Tensor] = {}
                 if self._gradnorm_enabled:
                     gradnorm_step_log_data = self._gradnorm_sidecar_update(batch_data)
-                pathway_gradient_log_data = self._pathway_gradient_sidecar(batch_data)
 
                 # Guard against non-finite losses/gradients to prevent corrupt optimizer state.
                 # Only check at progress_log_frequency intervals to reduce GPU-CPU syncs
@@ -2657,6 +2756,7 @@ class EpiForecasterTrainer:
 
         checkpoint_path = self._best_checkpoint_path()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self._validate_checkpoint_latent_scale_state(checkpoint)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
         state_dict, _initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
@@ -2787,6 +2887,7 @@ class EpiForecasterTrainer:
                 f"observation_head_{head}": [] for head in GradNormController.task_names
             },
         }
+        self._latent_gradient_probe_names: list[str] = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -2797,6 +2898,7 @@ class EpiForecasterTrainer:
                 self._grad_norm_groups["mobility_gnn"].append(param)
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
+                self._latent_gradient_probe_names.append(name)
             elif observation_head_name is not None:
                 self._grad_norm_groups[
                     f"observation_head_{observation_head_name}"
@@ -2864,6 +2966,90 @@ class EpiForecasterTrainer:
         diagnostics_path = run_dir / "mobility_initialization_diagnostics.json"
         diagnostics_path.write_text(
             json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _persist_latent_scale_state(self, run_dir: Path) -> None:
+        """Persist fitted scales and their training membership identity."""
+        if self.latent_scale_state is None:
+            return
+        config_payload = self._get_config_for_save()
+        config_encoded = json.dumps(
+            config_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        dataset_path = Path(str(config_payload["data"]["dataset_path"]))
+        dvc_pointer_path = Path(f"{dataset_path}.dvc")
+        dvc_pointer_sha256 = None
+        if dvc_pointer_path.is_file():
+            dvc_pointer_sha256 = hashlib.sha256(
+                dvc_pointer_path.read_bytes()
+            ).hexdigest()
+        payload = {
+            "state_hash": self.latent_scale_state.state_hash,
+            "algorithm": "unique_train_node_date_population_std_float64_v1",
+            "units": {
+                "s": "population_fraction",
+                "i": "population_fraction",
+                "h": "population_fraction",
+                "r": "population_fraction",
+                "death_flow": "population_fraction_per_model_step",
+            },
+            "split_seed": self.config.training.split_seed,
+            "dataset_path": str(dataset_path),
+            "dataset_dvc_pointer": (
+                str(dvc_pointer_path) if dvc_pointer_path.is_file() else None
+            ),
+            "dataset_dvc_pointer_sha256": dvc_pointer_sha256,
+            "config_sha256": hashlib.sha256(config_encoded.encode("utf-8")).hexdigest(),
+            **self.latent_scale_state.to_dict(),
+        }
+        receipt_encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        payload["receipt_hash"] = hashlib.sha256(
+            receipt_encoded.encode("utf-8")
+        ).hexdigest()
+        scale_path = run_dir / "latent_scale_receipt.json"
+        if scale_path.exists():
+            existing = json.loads(scale_path.read_text(encoding="utf-8"))
+            if existing != payload:
+                raise ValueError(
+                    "Existing latent scale state does not match the current "
+                    f"training split: {scale_path}"
+                )
+            return
+        scale_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def _persist_latent_gradient_probe(self, run_dir: Path) -> None:
+        """Persist the exact X0 and rate parameter subset used by telemetry."""
+        names = sorted(self._latent_gradient_probe_names)
+        encoded = json.dumps(names, separators=(",", ":"), ensure_ascii=True)
+        payload = {
+            "schema_version": 1,
+            "selection": "x0_and_rate_projection_parameters",
+            "parameter_names": names,
+            "parameter_name_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        }
+        probe_path = run_dir / "latent_gradient_probe.json"
+        if probe_path.exists():
+            existing = json.loads(probe_path.read_text(encoding="utf-8"))
+            if existing != payload:
+                raise ValueError(
+                    "Existing latent gradient probe does not match the current model: "
+                    f"{probe_path}"
+                )
+            return
+        probe_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
 
@@ -2968,6 +3154,16 @@ class EpiForecasterTrainer:
             "config": self._get_config_for_save(),
             "training_history": self.training_history,
             "precision_signature": create_precision_signature(self.precision_policy),
+            "latent_scale_state": (
+                None
+                if self.latent_scale_state is None
+                else self.latent_scale_state.to_dict()
+            ),
+            "latent_scale_state_hash": (
+                None
+                if self.latent_scale_state is None
+                else self.latent_scale_state.state_hash
+            ),
         }
 
         if self.scheduler:

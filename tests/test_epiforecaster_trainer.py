@@ -28,6 +28,22 @@ from models.configs import (
     CurriculumConfig,
 )
 from evaluation.losses import JointInferenceLoss
+from data.latent_supervision import LATENT_SCALE_TASKS, LatentScaleState
+
+
+def _latent_scale_state() -> LatentScaleState:
+    return LatentScaleState(
+        schema_version=1,
+        scales={name: np.float32(0.5) for name in LATENT_SCALE_TASKS},
+        std={name: 0.5 for name in LATENT_SCALE_TASKS},
+        count={name: 10 for name in LATENT_SCALE_TASKS},
+        zero_count={name: 0 for name in LATENT_SCALE_TASKS},
+        floors={name: 1.0e-8 for name in LATENT_SCALE_TASKS},
+        run_ids=("synthetic-a",),
+        target_node_hash="nodes",
+        supervised_date_hash="dates",
+        membership_hash="membership",
+    )
 
 
 def _mock_canonical_region_coordinate(
@@ -72,6 +88,62 @@ def test_persist_mobility_diagnostics_writes_all_splits(tmp_path) -> None:
     assert payload["train"][0]["positive_edge_count"] == 3
     assert payload["validation"][0]["positive_edge_count"] == 2
     assert payload["test"][0]["positive_edge_count"] == 1
+
+
+def test_persist_latent_scale_state_refuses_identity_change(tmp_path) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.latent_scale_state = _latent_scale_state()
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(split_seed=42),
+        to_dict=lambda: {
+            "data": {"dataset_path": str(tmp_path / "dataset.zarr")},
+            "training": {"split_seed": 42},
+        },
+    )
+
+    trainer._persist_latent_scale_state(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "latent_scale_receipt.json").read_text(encoding="utf-8")
+    )
+    assert payload["state_hash"] == trainer.latent_scale_state.state_hash
+    assert len(payload["receipt_hash"]) == 64
+    payload["scales"]["i"] = 1.0
+    (tmp_path / "latent_scale_receipt.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        trainer._persist_latent_scale_state(tmp_path)
+
+
+def test_checkpoint_latent_scale_state_must_match_current_fit() -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.latent_scale_state = _latent_scale_state()
+    checkpoint = {
+        "latent_scale_state": trainer.latent_scale_state.to_dict(),
+        "latent_scale_state_hash": trainer.latent_scale_state.state_hash,
+    }
+
+    trainer._validate_checkpoint_latent_scale_state(checkpoint)
+
+    checkpoint["latent_scale_state_hash"] = "wrong"
+    with pytest.raises(ValueError, match="does not match"):
+        trainer._validate_checkpoint_latent_scale_state(checkpoint)
+
+
+def test_persist_latent_gradient_probe_records_sorted_parameter_identity(
+    tmp_path,
+) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer._latent_gradient_probe_names = ["rate.z", "initial_states.a"]
+
+    trainer._persist_latent_gradient_probe(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "latent_gradient_probe.json").read_text(encoding="utf-8")
+    )
+    assert payload["parameter_names"] == ["initial_states.a", "rate.z"]
+    assert len(payload["parameter_name_hash"]) == 64
 
 
 def test_compute_mean_target_mae_averages_finite_available_targets() -> None:

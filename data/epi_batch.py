@@ -46,6 +46,7 @@ class EpiBatch:
     R_target: torch.Tensor | None  # (B, H+1)
     D_target: torch.Tensor | None  # (B, H+1)
     H_target: torch.Tensor | None = None  # (B, H+1)
+    death_flow_target: torch.Tensor | None = None  # (B, H)
 
     def to(
         self,
@@ -248,6 +249,7 @@ def collate_epiforecaster_batch(
     H_targets = _stack_optional_batch_tensor(batch, "H_target")
     R_targets = _stack_optional_batch_tensor(batch, "R_target")
     D_targets = _stack_optional_batch_tensor(batch, "D_target")
+    death_flow_targets = _stack_optional_batch_tensor(batch, "death_flow_target")
 
     # Stack temporal covariates
     temporal_covariates = torch.stack(
@@ -295,6 +297,10 @@ def collate_epiforecaster_batch(
         R_targets = _promote_batch_float_tensor(_replace_non_finite(R_targets))
     if D_targets is not None:
         D_targets = _promote_batch_float_tensor(_replace_non_finite(D_targets))
+    if death_flow_targets is not None:
+        death_flow_targets = _promote_batch_float_tensor(
+            _replace_non_finite(death_flow_targets)
+        )
 
     # Store B and T on the batch for downstream reshaping
     T = batch[0]["mob_x"].shape[0] if B > 0 else 0
@@ -340,6 +346,7 @@ def collate_epiforecaster_batch(
         H_target=H_targets,
         R_target=R_targets,
         D_target=D_targets,
+        death_flow_target=death_flow_targets,
     )
 
 

@@ -110,6 +110,8 @@ class TestEpiForecaster:
         assert out["observation_source_cases"].shape == (batch_size, horizon + 1)
         assert out["observation_source_hosp"].shape == (batch_size, horizon + 1)
         assert out["observation_source_deaths"].shape == (batch_size, horizon)
+        assert out["beta_t"].shape == (batch_size, horizon)
+        assert out["gamma_t"].shape == (batch_size, horizon)
         assert out["hospitalization_rate_t"].shape == (batch_size, horizon)
         assert out["hospital_recovery_t"].shape == (batch_size, horizon)
         assert out["hospital_mortality_t"].shape == (batch_size, horizon)

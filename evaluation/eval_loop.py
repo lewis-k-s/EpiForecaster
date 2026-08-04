@@ -17,6 +17,7 @@ import wandb
 from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
+from data.latent_supervision import latent_scales_from_checkpoint
 from evaluation.granular_export import (
     GRANULAR_SCHEMA_VERSION,
     GranularEvalWriter,
@@ -25,6 +26,7 @@ from evaluation.granular_export import (
     write_granular_metadata_sidecar,
 )
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
+from evaluation.latent_diagnostics import build_latent_diagnostic_protocols
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from evaluation.metrics import (
     ProbabilisticMetricResult,
@@ -34,6 +36,7 @@ from evaluation.metrics import (
 from evaluation.pathway_metrics import (
     PathwayMetricResult,
     TorchLatentCoherenceAccumulator,
+    TorchLatentProtocolAccumulator,
     TorchPathwayMetricAccumulator,
 )
 from models.configs import EpiForecasterConfig
@@ -262,9 +265,7 @@ def _add_pathway_metrics(
     metrics[f"{prefix}_mean_abs_mechanistic_log1p_per_100k"] = (
         summary.mean_abs_mechanistic
     )
-    metrics[f"{prefix}_mean_abs_residual_log1p_per_100k"] = (
-        summary.mean_abs_residual
-    )
+    metrics[f"{prefix}_mean_abs_residual_log1p_per_100k"] = summary.mean_abs_residual
     metrics[f"{prefix}_residual_abs_fraction"] = summary.residual_abs_fraction
     metrics[f"{prefix}_residual_to_mechanistic_abs_ratio"] = (
         summary.residual_to_mechanistic_abs_ratio
@@ -272,9 +273,7 @@ def _add_pathway_metrics(
     metrics[f"{prefix}_mechanistic_variance"] = summary.mechanistic_variance
     metrics[f"{prefix}_residual_variance"] = summary.residual_variance
     metrics[f"{prefix}_full_variance"] = summary.full_variance
-    metrics[f"{prefix}_mechanistic_variance_share"] = (
-        summary.mechanistic_variance_share
-    )
+    metrics[f"{prefix}_mechanistic_variance_share"] = summary.mechanistic_variance_share
     metrics[f"{prefix}_residual_variance_share"] = summary.residual_variance_share
     metrics[f"{prefix}_mechanistic_only_mae_log1p_per_100k"] = (
         summary.mechanistic_only_mae
@@ -391,6 +390,10 @@ def evaluate_loader(
         for head_name in _HEAD_CANONICAL_NAMES
     }
     latent_metrics = TorchLatentCoherenceAccumulator(device=device)
+    latent_diagnostic_metrics = {
+        protocol: TorchLatentProtocolAccumulator(protocol=protocol, device=device)
+        for protocol in ("oracle_x0", "teacher_forced_one_step")
+    }
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
@@ -405,7 +408,14 @@ def evaluate_loader(
     loss_latent_i_sum = torch.tensor(0.0, device=device)
     loss_latent_h_sum = torch.tensor(0.0, device=device)
     loss_latent_r_sum = torch.tensor(0.0, device=device)
-    loss_latent_d_sum = torch.tensor(0.0, device=device)
+    loss_latent_death_flow_sum = torch.tensor(0.0, device=device)
+    latent_loss_tasks = ("s", "i", "h", "r", "death_flow")
+    loss_latent_raw_sums = {
+        task: torch.tensor(0.0, device=device) for task in latent_loss_tasks
+    }
+    loss_latent_component_weighted_sums = {
+        task: torch.tensor(0.0, device=device) for task in latent_loss_tasks
+    }
 
     per_head_node_metrics: dict[str, dict[int, dict[str, float]]] = {}
 
@@ -517,7 +527,14 @@ def evaluate_loader(
                 loss_latent_i_sum += components["latent_i"].detach()
                 loss_latent_h_sum += components["latent_h"].detach()
                 loss_latent_r_sum += components["latent_r"].detach()
-                loss_latent_d_sum += components["latent_d"].detach()
+                loss_latent_death_flow_sum += components["latent_death_flow"].detach()
+                for task in latent_loss_tasks:
+                    loss_latent_raw_sums[task] += components[
+                        f"latent_{task}_raw"
+                    ].detach()
+                    loss_latent_component_weighted_sums[task] += components[
+                        f"latent_{task}_weighted"
+                    ].detach()
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
                 loss_hosp_weighted_sum += components["hosp_weighted"].detach()
                 loss_cases_weighted_sum += components["cases_weighted"].detach()
@@ -529,6 +546,18 @@ def evaluate_loader(
                     model_outputs=model_outputs,
                     targets=targets_dict,
                 )
+                for protocol, (
+                    diagnostic_predictions,
+                    diagnostic_targets,
+                ) in build_latent_diagnostic_protocols(
+                    model=forward_model,
+                    model_outputs=model_outputs,
+                    targets=targets_dict,
+                ).items():
+                    latent_diagnostic_metrics[protocol].update(
+                        predictions=diagnostic_predictions,
+                        targets=diagnostic_targets,
+                    )
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -992,6 +1021,11 @@ def evaluate_loader(
         for head_name, accumulator in mechanistic_prob_metrics.items()
     }
     latent_summary = latent_metrics.finalize()
+    latent_diagnostic_summary = {
+        key: value
+        for accumulator in latent_diagnostic_metrics.values()
+        for key, value in accumulator.finalize().items()
+    }
 
     node_mae_by_target: dict[str, dict[int, float]] = {}
     node_mae_count_by_target: dict[str, dict[int, int]] = {}
@@ -1140,7 +1174,9 @@ def evaluate_loader(
         "loss_latent_i": (loss_latent_i_sum / max(1, processed_batches)).item(),
         "loss_latent_h": (loss_latent_h_sum / max(1, processed_batches)).item(),
         "loss_latent_r": (loss_latent_r_sum / max(1, processed_batches)).item(),
-        "loss_latent_d": (loss_latent_d_sum / max(1, processed_batches)).item(),
+        "loss_latent_death_flow": (
+            loss_latent_death_flow_sum / max(1, processed_batches)
+        ).item(),
         "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
         "loss_hosp_weighted": (
             loss_hosp_weighted_sum / max(1, processed_batches)
@@ -1155,6 +1191,18 @@ def evaluate_loader(
             loss_sird_supervision_weighted_sum / max(1, processed_batches)
         ).item(),
     }
+    for task in latent_loss_tasks:
+        metrics[f"loss_latent_{task}_raw"] = (
+            loss_latent_raw_sums[task] / max(1, processed_batches)
+        ).item()
+        metrics[f"loss_latent_{task}_component_weighted"] = (
+            loss_latent_component_weighted_sums[task] / max(1, processed_batches)
+        ).item()
+        metrics[f"loss_latent_{task}_total_weighted"] = (
+            criterion.latent_total_weight
+            * loss_latent_component_weighted_sums[task]
+            / max(1, processed_batches)
+        ).item()
     _add_probabilistic_metrics(
         metrics=metrics,
         head_name="hosp",
@@ -1183,6 +1231,7 @@ def evaluate_loader(
             mechanistic_probabilistic_summary=mechanistic_prob_summaries[head_name],
         )
     metrics.update(latent_summary)
+    metrics.update(latent_diagnostic_summary)
 
     logger.info("EVAL COMPLETE")
     return mean_loss, metrics, node_mae_by_target
@@ -1339,6 +1388,7 @@ def eval_checkpoint(
 
     criterion = get_loss_from_config(
         config.training.loss,
+        latent_scales=latent_scales_from_checkpoint(checkpoint),
         data_config=config.data,
         observation_heads_config=config.model.observation_heads,
         input_window_length=config.model.input_window_length,

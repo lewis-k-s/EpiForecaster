@@ -142,8 +142,12 @@ paired ablation registry therefore compares:
 * `gradnorm:crps`: Normal CRPS with adaptive GradNorm weighting.
 
 Synthetic runs may additionally provide dense SIRHD compartment targets.
-`w_sird_supervision` controls this regularizer and it automatically contributes
-zero when latent targets are absent.
+`training.loss.joint.latent.total_weight` controls this regularizer. The five
+tasks are S, I, H, R, and destination-dated death flow. The configured latent
+mode can use raw fraction-space MSE, fixed training-split standard-deviation
+scaling, or fixed `asinh` scaling for I, H, and death flow. Synthetic
+pretraining can require all five finite, nonnegative targets; other runs use a
+zero latent weight.
 
 ## 4. Model Variants
 

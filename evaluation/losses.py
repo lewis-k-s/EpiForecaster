@@ -28,6 +28,7 @@ def get_loss_from_config(
     loss_config: LossConfig | None,
     *,
     observation_heads_config: ObservationHeadConfig,
+    latent_scales: dict[str, float] | None = None,
     data_config: DataConfig | None = None,
     input_window_length: int | None = None,
     forecast_horizon: int | None = None,
@@ -81,7 +82,11 @@ def get_loss_from_config(
         distribution_scale_floor=observation_heads_config.distribution_scale_floor,
         interval_levels=joint_cfg.interval_levels,
         obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
-        w_sird_supervision=joint_cfg.w_sird_supervision,
+        latent_total_weight=joint_cfg.latent.total_weight,
+        latent_scaling=joint_cfg.latent.scaling,
+        latent_component_weights=joint_cfg.latent.component_weights,
+        latent_scales=latent_scales,
+        latent_require_complete_targets=joint_cfg.latent.require_complete_targets,
         disable_ww=joint_cfg.disable_ww,
         disable_hosp=joint_cfg.disable_hosp,
         disable_cases=joint_cfg.disable_cases,
@@ -153,12 +158,18 @@ class JointInferenceLoss(nn.Module):
         "deaths": False,
     }
     _LATENT_COMPONENTS = (
-        ("latent_s", "S_trajectory", "S_target"),
-        ("latent_i", "I_trajectory", "I_target"),
-        ("latent_h", "H_trajectory", "H_target"),
-        ("latent_r", "R_trajectory", "R_target"),
-        ("latent_d", "D_trajectory", "D_target"),
+        ("latent_s", "s", "S_trajectory", "S_target"),
+        ("latent_i", "i", "I_trajectory", "I_target"),
+        ("latent_h", "h", "H_trajectory", "H_target"),
+        ("latent_r", "r", "R_trajectory", "R_target"),
+        (
+            "latent_death_flow",
+            "death_flow",
+            "death_flow",
+            "death_flow_target",
+        ),
     )
+    _LATENT_TASKS = ("s", "i", "h", "r", "death_flow")
 
     def __init__(
         self,
@@ -168,8 +179,11 @@ class JointInferenceLoss(nn.Module):
         distribution_scale_floor: float = 1.0e-3,
         interval_levels: list[float] | tuple[float, ...] | None = None,
         obs_weight_sum: float = 0.95,
-        w_sird_supervision: float = 0.0,
-        w_sir: float | None = None,
+        latent_total_weight: float = 0.0,
+        latent_scaling: str = "none",
+        latent_component_weights: dict[str, float] | None = None,
+        latent_scales: dict[str, float] | None = None,
+        latent_require_complete_targets: bool = False,
         sir_residual_clip: float | None = None,
         disable_ww: bool = False,
         disable_hosp: bool = False,
@@ -198,9 +212,20 @@ class JointInferenceLoss(nn.Module):
         )
         self.obs_weight_sum = float(obs_weight_sum)
         del sir_residual_clip
-        if w_sir is not None and w_sird_supervision == 0.0:
-            w_sird_supervision = float(w_sir)
-        self.w_sird_supervision = float(w_sird_supervision)
+        self.latent_total_weight = float(latent_total_weight)
+        self.latent_scaling = latent_scaling.lower()
+        self.latent_require_complete_targets = bool(latent_require_complete_targets)
+        self.latent_component_weights = {
+            name: float(value)
+            for name, value in (
+                latent_component_weights or {name: 0.2 for name in self._LATENT_TASKS}
+            ).items()
+        }
+        self.latent_scales = (
+            None
+            if latent_scales is None
+            else {name: float(value) for name, value in latent_scales.items()}
+        )
         self.disable_ww = bool(disable_ww)
         self.disable_hosp = bool(disable_hosp)
         self.disable_cases = bool(disable_cases)
@@ -253,11 +278,45 @@ class JointInferenceLoss(nn.Module):
                 raise ValueError(
                     f"interval_levels values must be in (0, 1), got {level}"
                 )
-        if self.w_sird_supervision < 0:
+        if not math.isfinite(self.latent_total_weight) or self.latent_total_weight < 0:
             raise ValueError(
-                "w_sird_supervision must be non-negative, "
-                f"got {self.w_sird_supervision}"
+                "latent_total_weight must be finite and non-negative, "
+                f"got {self.latent_total_weight}"
             )
+        if self.latent_scaling not in {"none", "std", "asinh"}:
+            raise ValueError(
+                "latent_scaling must be one of ['asinh', 'none', 'std'], "
+                f"got {self.latent_scaling!r}"
+            )
+        expected_latent_tasks = set(self._LATENT_TASKS)
+        if set(self.latent_component_weights) != expected_latent_tasks:
+            raise ValueError(
+                "latent_component_weights must contain exactly "
+                f"{sorted(expected_latent_tasks)}"
+            )
+        latent_weight_sum = sum(self.latent_component_weights.values())
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in self.latent_component_weights.values()
+        ) or not math.isclose(latent_weight_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-8):
+            raise ValueError(
+                "latent_component_weights must be finite, non-negative, and sum to 1.0"
+            )
+        if self.latent_total_weight > 0 and self.latent_scaling != "none":
+            if self.latent_scales is None:
+                raise ValueError(
+                    f"latent_scales are required for latent_scaling={self.latent_scaling!r}"
+                )
+            if set(self.latent_scales) != expected_latent_tasks:
+                raise ValueError(
+                    "latent_scales must contain exactly "
+                    f"{sorted(expected_latent_tasks)}"
+                )
+            if any(
+                not math.isfinite(value) or value <= 0
+                for value in self.latent_scales.values()
+            ):
+                raise ValueError("latent_scales values must be finite and positive")
 
     @staticmethod
     def fixed_obs_weights(
@@ -307,7 +366,7 @@ class JointInferenceLoss(nn.Module):
         obs_weighted = obs_weights * obs_losses
         obs_total = obs_weighted.sum()
         sird_supervision_weighted = (
-            self.w_sird_supervision * components["sird_supervision"]
+            self.latent_total_weight * components["sird_supervision"]
         )
         total = obs_total + sird_supervision_weighted
         return {
@@ -619,6 +678,31 @@ class JointInferenceLoss(nn.Module):
             loss_type="mse",
         )
 
+    def _transform_latent_pair(
+        self,
+        *,
+        task_name: str,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Transform one latent prediction-target pair in FP32."""
+        prediction_f32 = prediction.float()
+        target_f32 = target.float()
+        if self.latent_scaling == "none":
+            return prediction_f32, target_f32
+
+        assert self.latent_scales is not None
+        scale = torch.as_tensor(
+            self.latent_scales[task_name],
+            dtype=torch.float32,
+            device=prediction_f32.device,
+        )
+        prediction_scaled = prediction_f32 / scale
+        target_scaled = target_f32 / scale
+        if self.latent_scaling == "std" or task_name in {"s", "r"}:
+            return prediction_scaled, target_scaled
+        return torch.asinh(prediction_scaled), torch.asinh(target_scaled)
+
     def compute_observation_supervision(
         self,
         targets: dict[str, torch.Tensor | None],
@@ -710,13 +794,14 @@ class JointInferenceLoss(nn.Module):
                 - hosp: [B, H] hospitalization targets (optional)
                 - cases: [B, H] reported cases targets (optional)
                 - deaths: [B, H] deaths targets (optional)
-                - S_target/I_target/H_target/R_target/D_target: [B, H+1] latent targets (optional)
+                - S_target/I_target/H_target/R_target: [B, H+1] state targets (optional)
+                - death_flow_target: [B, H] destination-dated flow target (optional)
             batch_data: Batch history masks used for per-head window eligibility.
 
         Returns:
             Dict with unweighted and weighted component losses plus total:
                 - ww, hosp, cases, deaths, latent_s, latent_i, latent_h,
-                  latent_r, latent_d, sird_supervision
+                  latent_r, latent_death_flow, sird_supervision
                 - ww_weighted, hosp_weighted, cases_weighted, deaths_weighted,
                   sird_supervision_weighted
                 - total
@@ -732,11 +817,13 @@ class JointInferenceLoss(nn.Module):
         hosp_loss = zero_anchor
         cases_loss = zero_anchor
         deaths_loss = zero_anchor
-        latent_s_loss = zero_anchor
-        latent_i_loss = zero_anchor
-        latent_h_loss = zero_anchor
-        latent_r_loss = zero_anchor
-        latent_d_loss = zero_anchor
+        latent_losses = {
+            component_name: zero_anchor
+            for component_name, _task_name, _output_key, _target_key in self._LATENT_COMPONENTS
+        }
+        latent_raw_losses = dict(latent_losses)
+        latent_weighted_losses = dict(latent_losses)
+        sird_supervision_raw_loss = zero_anchor
         sird_supervision_loss = zero_anchor
         obs_supervision = self.compute_observation_supervision(
             targets,
@@ -801,10 +888,46 @@ class JointInferenceLoss(nn.Module):
             )
             deaths_loss = deaths_base
 
-        if self.w_sird_supervision > 0:
-            latent_component_losses: list[torch.Tensor] = []
-            latent_component_map: dict[str, torch.Tensor] = {}
-            for component_name, output_key, target_key in self._LATENT_COMPONENTS:
+        if self.latent_total_weight > 0:
+            missing_targets = [
+                target_key
+                for _component_name, _task_name, _output_key, target_key in self._LATENT_COMPONENTS
+                if targets.get(target_key) is None
+            ]
+            if self.latent_require_complete_targets and missing_targets:
+                raise ValueError(
+                    "Complete latent supervision requires all five targets; "
+                    f"missing {missing_targets}"
+                )
+            if self.latent_require_complete_targets:
+                invalid_targets = []
+                for (
+                    _component_name,
+                    _task_name,
+                    _output_key,
+                    target_key,
+                ) in self._LATENT_COMPONENTS:
+                    target = targets[target_key]
+                    assert isinstance(target, torch.Tensor)
+                    target_f32 = target.float()
+                    if (
+                        not torch.isfinite(target_f32).all()
+                        or not (target_f32 >= 0).all()
+                    ):
+                        invalid_targets.append(target_key)
+                if invalid_targets:
+                    raise ValueError(
+                        "Complete latent supervision targets must be finite and "
+                        f"nonnegative; invalid {invalid_targets}"
+                    )
+
+            active_components: list[tuple[str, str]] = []
+            for (
+                component_name,
+                task_name,
+                output_key,
+                target_key,
+            ) in self._LATENT_COMPONENTS:
                 target = targets.get(target_key)
                 if target is None:
                     continue
@@ -818,32 +941,59 @@ class JointInferenceLoss(nn.Module):
                 latent_weights = supervision["weights"]
                 if latent_target is None or latent_weights is None:
                     continue
-                latent_loss = self._weighted_masked_mse_from_weights(
+                raw_loss = self._weighted_masked_mse_from_weights(
                     prediction=model_outputs[output_key],
                     target=latent_target,
                     weights=latent_weights,
                 )
-                latent_component_losses.append(latent_loss)
-                latent_component_map[component_name] = latent_loss
+                transformed_prediction, transformed_target = (
+                    self._transform_latent_pair(
+                        task_name=task_name,
+                        prediction=model_outputs[output_key],
+                        target=latent_target,
+                    )
+                )
+                transformed_loss = self._weighted_masked_mse_from_weights(
+                    prediction=transformed_prediction,
+                    target=transformed_target,
+                    weights=latent_weights,
+                )
+                latent_raw_losses[component_name] = raw_loss
+                latent_losses[component_name] = transformed_loss
+                active_components.append((component_name, task_name))
 
-            latent_s_loss = latent_component_map.get("latent_s", zero_anchor)
-            latent_i_loss = latent_component_map.get("latent_i", zero_anchor)
-            latent_h_loss = latent_component_map.get("latent_h", zero_anchor)
-            latent_r_loss = latent_component_map.get("latent_r", zero_anchor)
-            latent_d_loss = latent_component_map.get("latent_d", zero_anchor)
-            if latent_component_losses:
-                sird_supervision_loss = torch.stack(latent_component_losses).mean()
+            active_weight_sum = sum(
+                self.latent_component_weights[task_name]
+                for _component_name, task_name in active_components
+            )
+            if active_weight_sum > 0:
+                for component_name, task_name in active_components:
+                    normalized_weight = (
+                        self.latent_component_weights[task_name] / active_weight_sum
+                    )
+                    latent_weighted_losses[component_name] = (
+                        normalized_weight * latent_losses[component_name]
+                    )
+                    sird_supervision_raw_loss = (
+                        sird_supervision_raw_loss
+                        + normalized_weight * latent_raw_losses[component_name]
+                    )
+                    sird_supervision_loss = (
+                        sird_supervision_loss + latent_weighted_losses[component_name]
+                    )
 
         components = {
             "ww": ww_loss,
             "hosp": hosp_loss,
             "cases": cases_loss,
             "deaths": deaths_loss,
-            "latent_s": latent_s_loss,
-            "latent_i": latent_i_loss,
-            "latent_h": latent_h_loss,
-            "latent_r": latent_r_loss,
-            "latent_d": latent_d_loss,
+            **latent_losses,
+            **{f"{name}_raw": value for name, value in latent_raw_losses.items()},
+            **{
+                f"{name}_weighted": value
+                for name, value in latent_weighted_losses.items()
+            },
+            "sird_supervision_raw": sird_supervision_raw_loss,
             "sird_supervision": sird_supervision_loss,
         }
         totals = self.compose_total_loss(
@@ -856,11 +1006,13 @@ class JointInferenceLoss(nn.Module):
             "hosp": hosp_loss,
             "cases": cases_loss,
             "deaths": deaths_loss,
-            "latent_s": latent_s_loss,
-            "latent_i": latent_i_loss,
-            "latent_h": latent_h_loss,
-            "latent_r": latent_r_loss,
-            "latent_d": latent_d_loss,
+            **latent_losses,
+            **{f"{name}_raw": value for name, value in latent_raw_losses.items()},
+            **{
+                f"{name}_weighted": value
+                for name, value in latent_weighted_losses.items()
+            },
+            "sird_supervision_raw": sird_supervision_raw_loss,
             "sird_supervision": sird_supervision_loss,
             "ww_weighted": totals["ww_weighted"],
             "hosp_weighted": totals["hosp_weighted"],

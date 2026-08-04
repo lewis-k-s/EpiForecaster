@@ -101,7 +101,7 @@ def test_corrected_sirhd_preprocessing_has_versioned_artifact_identity():
         "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
     )
     assert config["dataset_name"] == (
-        "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped"
+        "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2"
     )
     assert config["smoothing"]["clinical_method"] == "holt_damped"
     assert config["continuous_storage_dtype"] == "float32"

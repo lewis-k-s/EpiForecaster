@@ -31,7 +31,7 @@ evaluation:
     - data.mobility_min_flow_raw=0.0
     - data.run_id_chunk_size=1
     - training.curriculum.enabled=true
-    - training.loss.joint.w_sird_supervision=0.01
+    - training.loss.joint.latent.total_weight=0.0
     - training.val_workers=2
 
 resources:

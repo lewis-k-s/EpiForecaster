@@ -574,6 +574,11 @@ class OfflinePreprocessingPipeline:
             coords=rechunked_dataset.coords,
             attrs=dataset_attrs,
         )
+        if self.config.synthetic_path:
+            self._validate_positive_clinical_preservation(
+                raw_aligned=aligned_dataset,
+                processed=rechunked_dataset,
+            )
 
         # Clear conflicting encodings from data variables and coordinates.
         # This is the canonical cleanup point — after dtype conversion rebuilds the
@@ -612,6 +617,35 @@ class OfflinePreprocessingPipeline:
         self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
+
+    @staticmethod
+    def _validate_positive_clinical_preservation(
+        *,
+        raw_aligned: xr.Dataset,
+        processed: xr.Dataset,
+    ) -> None:
+        """Require positive synthetic clinical observations to stay positive."""
+        for variable in ("cases", "hospitalizations", "deaths"):
+            if variable not in raw_aligned or variable not in processed:
+                continue
+            raw = raw_aligned[variable]
+            positive = np.isfinite(raw) & (raw > 0)
+            positive_count = int(positive.sum().compute().item())
+            if positive_count == 0:
+                continue
+            output = processed[variable]
+            invalid = positive & (~np.isfinite(output) | (output <= 0))
+            invalid_count = int(invalid.sum().compute().item())
+            if invalid_count > 0:
+                raise ValueError(
+                    f"{invalid_count} of {positive_count} positive raw synthetic "
+                    f"'{variable}' observations did not remain positive after "
+                    "preprocessing."
+                )
+            print(
+                f"  ✓ Positive preservation: {variable} "
+                f"({positive_count} positive observations)"
+            )
 
     def _serialize_config_yaml(self) -> str:
         """Serialize full preprocessing config as YAML for dataset provenance."""

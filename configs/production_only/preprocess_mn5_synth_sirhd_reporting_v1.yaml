@@ -13,7 +13,7 @@ wastewater_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4
 population_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
 
 end_date: "2021-05-09"
-dataset_name: "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped"
+dataset_name: "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2"
 vaccination_file: null
 continuous_storage_dtype: "float32"
 

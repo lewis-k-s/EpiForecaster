@@ -97,8 +97,12 @@ The full training loss also includes optional non-observation terms:
 
 ```text
 L_total = L_obs
-        + w_sird_supervision * L_sird_supervision
+        + latent.total_weight * L_latent
 ```
+
+`L_latent` is the explicit weighted sum of S, I, H, R, and destination-dated
+death-flow objectives. Its transform mode and task weights are configured under
+`training.loss.joint.latent`.
 
 ## GradNorm Loss Mode
 

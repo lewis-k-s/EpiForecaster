@@ -1069,10 +1069,11 @@ def plot_forecasts(
             select_worst_windows_by_loss,
         )
         from evaluation.losses import get_loss_from_config
+        from data.latent_supervision import latent_scales_from_checkpoint
 
         click.echo(f"Loading checkpoint: {checkpoint}")
         overrides = list(override) if override else None
-        model, config, _ckpt = load_model_from_checkpoint(
+        model, config, loaded_checkpoint = load_model_from_checkpoint(
             checkpoint, device=device, overrides=overrides
         )
         click.echo(
@@ -1093,6 +1094,7 @@ def plot_forecasts(
             click.echo(f"Running mini-eval for {strategy} selection...")
             criterion = get_loss_from_config(
                 config.training.loss,
+                latent_scales=latent_scales_from_checkpoint(loaded_checkpoint),
                 data_config=config.data,
                 observation_heads_config=config.model.observation_heads,
                 input_window_length=config.model.input_window_length,
