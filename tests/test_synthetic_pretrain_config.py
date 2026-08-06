@@ -9,8 +9,7 @@ from scripts.workflow.run_config import validate_workflow_contract
 
 
 CORRECTED_PROCESSED_PATH = (
-    "data/processed/"
-    "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.zarr"
+    "data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.nc"
 )
 CORRECTED_PROCESSED_POINTER = f"{CORRECTED_PROCESSED_PATH}.dvc"
 CORRECTED_RAW_POINTER = (

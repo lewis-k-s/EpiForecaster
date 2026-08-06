@@ -509,7 +509,7 @@ class PreprocessingConfig:
 
     def get_dataset_filename(self) -> str:
         """Generate standardized filename for the processed dataset."""
-        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.zarr"
+        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.nc"
 
     def get_output_dataset_path(self) -> Path:
         """Get full path for the output dataset."""

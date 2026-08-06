@@ -216,6 +216,7 @@ class SyntheticProcessor:
                 chunks=chunks,  # type: ignore[arg-type]
             )
             self._clear_source_zarr_encodings(ds)
+            ds = self._strip_run_id_padding(ds)
             return ds
         except ValueError as e:
             if "conflicting sizes" not in str(e):
@@ -251,6 +252,7 @@ class SyntheticProcessor:
                 chunks=chunks,  # type: ignore[arg-type]
             )
             self._clear_source_zarr_encodings(ds)
+            ds = self._strip_run_id_padding(ds)
 
             # Re-add dropped LoD variables with corrected run_id coords
             if run_id_size is not None:
@@ -281,6 +283,21 @@ class SyntheticProcessor:
             print(ds)
             print()
             return ds
+
+    @staticmethod
+    def _strip_run_id_padding(dataset: xr.Dataset) -> xr.Dataset:
+        """Strip whitespace padding from ``run_id`` fixed-width string coordinates.
+
+        Synthetic zarr stores ``run_id`` as ``<U50`` (right-padded to 50 chars).
+        The generator handoff manifest stores clean stripped strings.  Stripping
+        at the earliest entry point lets clean values propagate through the
+        entire pipeline and pass provenance QA.
+        """
+        if "run_id" in dataset.coords:
+            raw = dataset["run_id"].values.astype("U")
+            stripped = np.char.strip(raw)
+            dataset = dataset.assign_coords(run_id=stripped)
+        return dataset
 
     def _clear_source_zarr_encodings(self, dataset: xr.Dataset) -> None:
         """Remove inherited source chunk/compressor encodings from opened Zarr vars."""

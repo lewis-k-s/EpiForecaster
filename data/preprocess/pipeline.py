@@ -11,6 +11,7 @@ from dataclasses import asdict
 from datetime import datetime
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import xarray as xr
@@ -432,7 +433,7 @@ class OfflinePreprocessingPipeline:
         """Save aligned dataset to processed dir."""
         print("Saving aligned dataset to processed dir...")
         aligned_dataset_path = Path(self.config.output_path) / (
-            self.config.dataset_name + ".zarr"
+            self.config.dataset_name + ".nc"
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -502,8 +503,8 @@ class OfflinePreprocessingPipeline:
         # Metadata attrs are assigned after dtype conversion because we rebuild the
         # Dataset object there and would otherwise drop attrs.
         dataset_attrs = {
-            "log_transformed": True,
-            "population_norm": True,
+            "log_transformed": 1,
+            "population_norm": 1,
             "smoothing_clinical_method": self.config.smoothing.clinical_method,
             "smoothing_wastewater_method": self.config.smoothing.wastewater_method,
             "smoothing_missing_policy": self.config.smoothing.missing_policy,
@@ -584,39 +585,49 @@ class OfflinePreprocessingPipeline:
                 positive_preservation, sort_keys=True
             )
 
-        # Clear conflicting encodings from data variables and coordinates.
-        # This is the canonical cleanup point — after dtype conversion rebuilds the
-        # Dataset, source-Zarr v3 encodings may still linger on variables/coords.
-        v3_encoding_keys = {
-            "chunks",  # old chunk sizes conflict with rechunking
-            "preferred_chunks",
-            "compressors",  # v3 uses tuple of codecs
-            "compressor",  # clear both styles
-            "filters",  # v3 uses tuple of filters
-            "serializer",  # v3-specific
-            "object_codec",  # v3-specific
-            "shards",  # v3-specific
+        # Convert boolean variables to int8 for NetCDF4 compatibility.
+        # NetCDF4 has no native boolean type; xarray reads int8 masks back
+        # and consumers cast to torch.bool when building tensors.
+        bool_vars = {
+            name: var.astype(np.int8)
+            for name, var in rechunked_dataset.data_vars.items()
+            if var.dtype == np.bool_
         }
-        for var_name in rechunked_dataset.data_vars:
-            var = rechunked_dataset.data_vars[var_name]
-            for key in v3_encoding_keys:
-                var.encoding.pop(key, None)
+        if bool_vars:
+            rechunked_dataset = rechunked_dataset.assign(bool_vars)
+            print(f"  Converted {len(bool_vars)} boolean variables to int8 for NetCDF")
 
-        for coord_name in rechunked_dataset.coords:
-            coord = rechunked_dataset.coords[coord_name]
-            for key in v3_encoding_keys:
-                coord.encoding.pop(key, None)
+        # Build NetCDF encoding: preserve chunking layout and apply zlib
+        # compression.  Each variable gets chunksizes matching the dask
+        # chunking computed above, plus lossless zlib level 4.
+        encoding: dict[str, dict[str, Any]] = {}
+        for var_name, var in rechunked_dataset.data_vars.items():
+            chunksizes = []
+            for dim in var.dims:
+                dim_size = var.sizes[dim]
+                if dim == "run_id":
+                    chunksizes.append(min(self.config.run_id_chunk_size, dim_size))
+                elif dim == "date":
+                    chunksizes.append(min(self.config.date_chunk_size, dim_size))
+                elif dim in ("origin", "destination", "region_id"):
+                    chunksizes.append(min(self.config.mobility_chunk_size, dim_size))
+                else:
+                    chunksizes.append(dim_size)
+            entry: dict[str, Any] = {
+                "chunksizes": tuple(chunksizes),
+                "zlib": True,
+                "complevel": 4,
+            }
+            # Integer types must not pair with zlib/fletcher in netCDF4
+            if var.dtype.kind in ("i", "u"):
+                entry = {"chunksizes": tuple(chunksizes)}
+            encoding[var_name] = entry
 
-        # Save with uniform chunking, using Zarr v2 for NFS stability
-        # align_chunks=True allows xarray to handle chunk alignment when source
-        # and target chunk sizes differ (e.g., when reading from Zarr with different chunks)
-        rechunked_dataset.to_zarr(
+        rechunked_dataset.to_netcdf(
             aligned_dataset_path,
             mode="w",
-            zarr_format=2,  # Use v2 for better NFS compatibility
-            align_chunks=True,  # True to handle chunk alignment automatically
-            safe_chunks=True,  # True to prevent data corruption from partial chunks
-            consolidated=True,  # True for better metadata performance
+            encoding=encoding,
+            engine="h5netcdf",
         )
         self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
@@ -730,7 +741,7 @@ class OfflinePreprocessingPipeline:
 
     def _log_postwrite_summary(self, dataset_path: Path) -> None:
         """Verify the saved dataset is valid (e.g., mobility not all NaN)."""
-        ds = xr.open_zarr(dataset_path)
+        ds = xr.open_dataset(dataset_path, engine="h5netcdf")
         try:
             if "mobility" in ds:
                 # Check a sample to ensure data was preserved (not all NaN)

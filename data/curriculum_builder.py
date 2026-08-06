@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-import xarray as xr
 from torch.utils.data import ConcatDataset
 
 from data.epi_dataset import EpiDataset
@@ -74,7 +73,9 @@ def load_sparsity_mapping(dataset_path: Path) -> dict[str, float]:
         return {}
 
     try:
-        ds = xr.open_zarr(str(dataset_path), chunks=None)  # type: ignore[arg-type]
+        from data.epi_dataset import open_processed_dataset
+
+        ds = open_processed_dataset(dataset_path, chunks=None)  # type: ignore[arg-type]
         if "synthetic_sparsity_level" not in ds:
             logger.warning(
                 f"Variable 'synthetic_sparsity_level' not found in {dataset_path}. "

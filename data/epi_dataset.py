@@ -34,6 +34,21 @@ from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
 from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def open_processed_dataset(path: Path | str, **kwargs: Any) -> xr.Dataset:
+    """Open a processed dataset, detecting Zarr directory vs NetCDF file.
+
+    Legacy processed outputs are Zarr directories; new outputs are single
+    NetCDF4 files.  This helper dispatches to the correct xarray backend
+    so callers do not need to know the on-disk format.
+    """
+    p = Path(path)
+    if p.is_dir() or p.suffix == ".zarr":
+        return xr.open_zarr(str(p), **kwargs)
+    return xr.open_dataset(str(p), engine="h5netcdf", **kwargs)
+
+
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
 _SPATIAL_KNN_CRS = "EPSG:25831"
 _STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
@@ -588,7 +603,7 @@ class EpiDataset(Dataset):
             return self._dataset
 
         # Reload dataset after unpickling
-        ds = xr.open_zarr(self.aligned_data_path)
+        ds = open_processed_dataset(self.aligned_data_path)
         # Re-apply run_id filter (critical for DataLoader workers)
         effective_run_id = (
             self.run_id if self.run_id is not None else self.config.data.run_id
@@ -1334,7 +1349,9 @@ class EpiDataset(Dataset):
         "Returns static covariates for the dataset. (num_nodes, num_features)"
         population_cov = self.dataset.population
         # Municipality populations can exceed float16's finite maximum (65,504).
-        population_tensor = torch.from_numpy(population_cov.to_numpy()).to(torch.float32)
+        population_tensor = torch.from_numpy(population_cov.to_numpy()).to(
+            torch.float32
+        )
         population_tensor = _replace_non_finite(population_tensor)
         assert population_tensor.shape == (self.num_nodes,), (
             f"Static covariates shape mismatch: expected ({self.num_nodes},), got {population_tensor.shape}"
@@ -1821,7 +1838,7 @@ class EpiDataset(Dataset):
         # Always chunk by run_id to prevent loading entire dataset into memory
         chunks = {"run_id": run_id_chunk_size}
 
-        dataset = xr.open_zarr(aligned_data_path, chunks=chunks, zarr_format=2)
+        dataset = open_processed_dataset(aligned_data_path, chunks=chunks)
 
         # Validate run_id exists in dataset
         if "run_id" not in dataset.coords and "run_id" not in dataset.dims:
@@ -1864,7 +1881,7 @@ class EpiDataset(Dataset):
             ValueError: If the dataset does not have a run_id dimension or coordinate.
         """
         # Use chunking to prevent loading all data
-        dataset = xr.open_zarr(aligned_data_path, chunks={"run_id": 1}, zarr_format=2)
+        dataset = open_processed_dataset(aligned_data_path, chunks={"run_id": 1})
 
         try:
             if "run_id" not in dataset.coords and "run_id" not in dataset.dims:

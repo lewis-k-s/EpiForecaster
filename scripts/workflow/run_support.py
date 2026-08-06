@@ -923,19 +923,19 @@ def _processed_dataset_qa(
 
     preprocessing = workflow_config["preprocessing"]
     if not dataset.data_vars:
-        raise ValueError("Processed Zarr contains no data variables")
+        raise ValueError("Processed dataset contains no data variables")
     empty_dimensions = {
         name: int(size) for name, size in dataset.sizes.items() if int(size) <= 0
     }
     if empty_dimensions:
-        raise ValueError(f"Processed Zarr has empty dimensions: {empty_dimensions}")
+        raise ValueError(f"Processed dataset has empty dimensions: {empty_dimensions}")
 
     expected_run_count = preprocessing.get("expected_run_count")
     if expected_run_count is not None:
         actual_run_count = int(dataset.sizes.get("run_id", 0))
         if actual_run_count != int(expected_run_count):
             raise ValueError(
-                "Processed Zarr run count differs from the workflow contract: "
+                "Processed dataset run count differs from the workflow contract: "
                 f"{actual_run_count} != {expected_run_count}"
             )
 
@@ -944,7 +944,7 @@ def _processed_dataset_qa(
     ]
     missing = sorted(set(required_variables) - set(dataset.data_vars))
     if missing:
-        raise ValueError(f"Processed Zarr is missing required variables: {missing}")
+        raise ValueError(f"Processed dataset is missing required variables: {missing}")
 
     float32_variables = [
         str(value) for value in preprocessing.get("float32_variables", [])
@@ -1124,14 +1124,14 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
         strict=True
     )
     dataset_path.relative_to(output_root.resolve(strict=True))
-    if dataset_path.is_symlink() or not dataset_path.is_dir():
+    if dataset_path.is_symlink() or not dataset_path.is_file():
         raise ValueError(
-            f"Preprocessing output must be a regular Zarr directory: {dataset_path}"
+            f"Preprocessing output must be a regular NetCDF file: {dataset_path}"
         )
 
     import xarray as xr
 
-    dataset = xr.open_zarr(dataset_path, consolidated=None)
+    dataset = xr.open_dataset(dataset_path, engine="h5netcdf")
     try:
         qa_record = {
             "schema_version": 2,
@@ -1157,7 +1157,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
         output_marker,
         {
             "dataset": str(dataset_path),
-            "dataset_tree_sha256": _tree_digest(dataset_path),
+            "dataset_sha256": sha256_file(dataset_path),
             "qa": str(qa_path),
             "qa_sha256": sha256_file(qa_path),
         },
@@ -1180,16 +1180,16 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     """Publish a QA-passed dataset as a run-owned DVC pointer."""
     config = load_yaml(config_path)
     dataset_name = preprocessing_dataset_name(config)
-    dataset_pointer = f"{dataset_name}.zarr.dvc"
-    publication_payload = f"{dataset_name}.zarr"
+    dataset_pointer = f"{dataset_name}.nc.dvc"
+    publication_payload = f"{dataset_name}.nc"
     output_root = run_root / "outputs/preprocessing"
     marker_path = output_root / ".preprocessed.done"
     marker = json.loads(marker_path.read_text())
     dataset = Path(str(marker["dataset"])).resolve(strict=True)
     dataset.relative_to(output_root.resolve(strict=True))
-    if dataset.is_symlink() or not dataset.is_dir():
-        raise ValueError("Preprocessed dataset must be a non-symlink directory")
-    if _tree_digest(dataset) != str(marker["dataset_tree_sha256"]):
+    if dataset.is_symlink() or not dataset.is_file():
+        raise ValueError("Preprocessed dataset must be a non-symlink NetCDF file")
+    if sha256_file(dataset) != str(marker["dataset_sha256"]):
         raise ValueError("Preprocessed dataset changed after QA")
     qa_path = Path(str(marker["qa"])).resolve(strict=True)
     if sha256_file(qa_path) != str(marker["qa_sha256"]):
@@ -1212,8 +1212,8 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     payload = scratch_staging / publication_payload
     commit_staging = output_root / f".publication.commit-{os.getpid()}"
     try:
-        shutil.copytree(dataset, payload, symlinks=True)
-        if _tree_digest(payload) != str(marker["dataset_tree_sha256"]):
+        shutil.copy2(dataset, payload)
+        if sha256_file(payload) != str(marker["dataset_sha256"]):
             raise ValueError("Publication staging changed the processed dataset")
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
@@ -1251,7 +1251,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
             },
             "dvc_pointer": dataset_pointer,
             "dvc_md5": str(pointer_identity["md5"]),
-            "dataset_tree_sha256": str(marker["dataset_tree_sha256"]),
+            "dataset_sha256": str(marker["dataset_sha256"]),
             "qa": str(qa_path),
             "qa_sha256": str(marker["qa_sha256"]),
             "published_at": datetime.now(UTC).isoformat(),

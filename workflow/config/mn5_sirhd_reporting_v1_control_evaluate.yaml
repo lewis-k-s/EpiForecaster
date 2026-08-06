@@ -16,7 +16,7 @@ workflow:
 
 dvc:
   targets:
-    - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.zarr.dvc
+    - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.nc.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
     - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
@@ -26,7 +26,7 @@ evaluation:
   split: test
   granular: true
   overrides:
-    - data.dataset_path=data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.zarr
+    - data.dataset_path=data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.nc
     - data.mobility_min_flow_raw=0.0
     - data.run_id_chunk_size=1
     - training.curriculum.enabled=true

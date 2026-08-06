@@ -111,7 +111,7 @@ def test_run_preprocessing_rejects_partial_output(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     output_root = run_root / "outputs/preprocessing"
     output_root.mkdir(parents=True)
-    (output_root / "synthetic_smoke.zarr").mkdir()
+    (output_root / "synthetic_smoke.nc").touch()
     config = _preprocess_workflow()
     config.update(
         {
@@ -179,18 +179,18 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     source_pointer.write_text(
         yaml.safe_dump({"outs": [{"md5": "raw.dir", "path": "raw.zarr"}]})
     )
-    dataset = run_root / "outputs/preprocessing/dataset.zarr"
-    dataset.mkdir(parents=True)
-    (dataset / ".zgroup").write_text('{"zarr_format": 2}\n')
+    dataset = run_root / "outputs/preprocessing/dataset.nc"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_bytes(b"fake-netcdf-payload")
     qa = run_root / "outputs/preprocessing/qa.json"
     qa.write_text("{}\n")
-    tree_hash = run_support._tree_digest(dataset)
+    file_hash = run_support.sha256_file(dataset)
     marker = run_root / "outputs/preprocessing/.preprocessed.done"
     marker.write_text(
         json.dumps(
             {
                 "dataset": str(dataset),
-                "dataset_tree_sha256": tree_hash,
+                "dataset_sha256": file_hash,
                 "qa": str(qa),
                 "qa_sha256": run_support.sha256_file(qa),
             }
@@ -235,23 +235,23 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
         )
     )
     (run_root / "outputs/preprocessing/publication").mkdir()
-    original_copytree = shutil.copytree
-    observed_copy_function: list[object] = []
+    original_copy2 = shutil.copy2
+    observed_copy_calls: list[object] = []
 
-    def observe_copytree(*args: object, **kwargs: object) -> Path:
-        observed_copy_function.append(kwargs.get("copy_function"))
-        return original_copytree(*args, **kwargs)
+    def observe_copy2(*args: object, **kwargs: object) -> Path:
+        observed_copy_calls.append(args[0])
+        return original_copy2(*args, **kwargs)
 
-    monkeypatch.setattr(run_support.shutil, "copytree", observe_copytree)
+    monkeypatch.setattr(run_support.shutil, "copy2", observe_copy2)
 
     def fake_run(command: list[str], *, cwd: Path | None = None, **_: object) -> None:
         assert cwd is not None
         if command[1:3] == ["init", "--no-scm"]:
             (cwd / ".dvc").mkdir()
-        elif command[1:3] == ["add", "synthetic_smoke.zarr"]:
-            (cwd / "synthetic_smoke.zarr.dvc").write_text(
+        elif command[1:3] == ["add", "synthetic_smoke.nc"]:
+            (cwd / "synthetic_smoke.nc.dvc").write_text(
                 yaml.safe_dump(
-                    {"outs": [{"md5": "published.dir", "path": "synthetic_smoke.zarr"}]}
+                    {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.nc"}]}
                 )
             )
 
@@ -260,12 +260,12 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     receipt_path = run_support.publish_preprocessed_dataset(config_path, run_root)
 
     receipt = json.loads(receipt_path.read_text())
-    assert receipt["dvc_md5"] == "published.dir"
+    assert receipt["dvc_md5"] == "published.md5"
     assert receipt["input_dvc_hashes"] == {"data/files/raw.zarr.dvc": "raw.dir"}
-    assert (receipt_path.parent / "synthetic_smoke.zarr.dvc").is_file()
-    assert not (receipt_path.parent / "synthetic_smoke.zarr").exists()
+    assert (receipt_path.parent / "synthetic_smoke.nc.dvc").is_file()
+    assert not (receipt_path.parent / "synthetic_smoke.nc").exists()
     assert (run_root / ".state/preprocessed_published.done").is_file()
-    assert observed_copy_function == [None]
+    assert len(observed_copy_calls) >= 1
 
 
 def test_publish_preprocessed_dataset_rejects_nonempty_publication(
@@ -273,9 +273,9 @@ def test_publish_preprocessed_dataset_rejects_nonempty_publication(
 ) -> None:
     run_root = tmp_path / "run"
     output_root = run_root / "outputs/preprocessing"
-    dataset = output_root / "dataset.zarr"
-    dataset.mkdir(parents=True)
-    (dataset / ".zgroup").write_text('{"zarr_format": 2}\n')
+    dataset = output_root / "dataset.nc"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_bytes(b"fake-netcdf-payload")
     qa = output_root / "qa.json"
     qa.write_text("{}\n")
     marker = output_root / ".preprocessed.done"
@@ -283,7 +283,7 @@ def test_publish_preprocessed_dataset_rejects_nonempty_publication(
         json.dumps(
             {
                 "dataset": str(dataset),
-                "dataset_tree_sha256": run_support._tree_digest(dataset),
+                "dataset_sha256": run_support.sha256_file(dataset),
                 "qa": str(qa),
                 "qa_sha256": run_support.sha256_file(qa),
             }

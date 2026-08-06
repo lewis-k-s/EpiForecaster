@@ -215,7 +215,7 @@ elif WORKFLOW_KIND == "preprocess":
     PREPROCESSING_QA = PREPROCESSING_ROOT / "qa.json"
     PREPROCESSING_DONE = PREPROCESSING_ROOT / ".preprocessed.done"
     PREPROCESSING_POINTER = (
-        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.zarr.dvc"
+        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.nc.dvc"
     )
     PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
     PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
