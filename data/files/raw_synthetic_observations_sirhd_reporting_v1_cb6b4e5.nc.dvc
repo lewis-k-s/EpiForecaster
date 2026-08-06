@@ -6,10 +6,10 @@ deps:
   nfiles: 22986
   hash: md5
   path:
-    /gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/sirhd_reporting_v1_cb6b4e5_20260726_20run/raw_synthetic_observations.zarr
+    /gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/sirhd_reporting_v1_cb6b4e5_20260726_20run/raw_synthetic_observations.nc
 outs:
 - md5: 10d13dace7243bded69c7b04defb7bdf.dir
   size: 4098223944
   nfiles: 22986
   hash: md5
-  path: raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr
+  path: raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc

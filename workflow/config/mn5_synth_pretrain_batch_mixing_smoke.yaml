@@ -22,7 +22,7 @@ dvc:
     - data/processed/synthetic_full_holt_damped.zarr.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
-    - data/files/raw_synthetic_observations.zarr.dvc
+    - data/files/raw_synthetic_observations.nc.dvc
 
 training:
   base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml

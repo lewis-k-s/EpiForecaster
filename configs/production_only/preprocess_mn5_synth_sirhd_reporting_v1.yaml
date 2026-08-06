@@ -1,16 +1,16 @@
 # Corrected SIRHD reporting corpus for synthetic latent-supervision pretraining.
 #
 # This is a new immutable dataset identity. It does not replace
-# synthetic_full_holt_damped.zarr or its DVC pointer.
+# synthetic_full_holt_damped.zarr or its DVC pointer (legacy zarr output).
 
 base_config: "preprocess_mn5_synth.yaml"
 
 env: "mn5"
-synthetic_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
-cases_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
-mobility_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
-wastewater_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
-population_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr"
+synthetic_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+cases_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+mobility_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+wastewater_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+population_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
 region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
 
 end_date: "2021-05-09"

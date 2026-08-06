@@ -110,7 +110,7 @@ class SyntheticProcessor:
         Load and extract synthetic data from bundled zarr.
 
         Args:
-            synthetic_path: Path to raw_synthetic_observations.zarr
+            synthetic_path: Path to raw_synthetic_observations (.nc or .zarr)
             run_filter: Optional list of run_ids to include. If None, includes all runs.
 
         Returns:
@@ -123,7 +123,7 @@ class SyntheticProcessor:
         resolved_store_path = self._resolve_synthetic_store_path(synthetic_path)
         print(f"Resolved synthetic zarr group: {resolved_store_path}")
 
-        ds = self._open_synthetic_zarr(resolved_store_path)
+        ds = self._open_synthetic_data(resolved_store_path)
         print(ds)
         print()
 
@@ -177,11 +177,16 @@ class SyntheticProcessor:
         return result
 
     def _resolve_synthetic_store_path(self, synthetic_path: str) -> str:
-        """Resolve wrapper directories that contain the actual Zarr group."""
+        """Resolve wrapper directories that contain the actual data store."""
         path = Path(synthetic_path)
         if not path.exists():
-            raise FileNotFoundError(f"Synthetic zarr path does not exist: {path}")
+            raise FileNotFoundError(f"Synthetic data path does not exist: {path}")
 
+        # Direct NetCDF file
+        if path.is_file() and path.suffix == ".nc":
+            return str(path)
+
+        # Direct Zarr directory
         if (path / ".zgroup").exists() or (path / ".zattrs").exists():
             return str(path)
 
@@ -196,26 +201,31 @@ class SyntheticProcessor:
             return str(nested_candidates[0])
         if len(nested_candidates) > 1:
             raise ValueError(
-                "Synthetic zarr wrapper contains multiple nested zarr groups; "
+                "Synthetic data wrapper contains multiple nested zarr groups; "
                 f"cannot choose automatically: {[c.name for c in nested_candidates]}"
             )
         return str(path)
 
-    def _open_synthetic_zarr(self, resolved_path: str) -> xr.Dataset:
-        """Open synthetic zarr, handling inconsistent run_id dimensions.
+    def _open_synthetic_data(self, resolved_path: str) -> xr.Dataset:
+        """Open synthetic data (NetCDF or Zarr), handling inconsistent run_id
+        dimensions.
 
-        Some synthetic zarrs have variables with conflicting run_id sizes
+        Some synthetic datasets have variables with conflicting run_id sizes
         (e.g., LoD arrays with run_id=2 while others have run_id=8).
         This method detects such conflicts, drops the conflicting variables,
         and re-loads them with corrected coordinates.
         """
+        is_netcdf = Path(resolved_path).suffix == ".nc"
         chunks = {"run_id": self.config.run_id_chunk_size}
         try:
-            ds = xr.open_zarr(
-                resolved_path,
-                chunks=chunks,  # type: ignore[arg-type]
-            )
-            self._clear_source_zarr_encodings(ds)
+            if is_netcdf:
+                ds = xr.open_dataset(resolved_path, engine="netcdf4", chunks=chunks)
+            else:
+                ds = xr.open_zarr(
+                    resolved_path,
+                    chunks=chunks,  # type: ignore[arg-type]
+                )
+                self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
             return ds
         except ValueError as e:
@@ -246,12 +256,20 @@ class SyntheticProcessor:
                 f"  Note: dropping {len(conflicting_vars)} variables with "
                 f"conflicting run_id size: {conflicting_vars}"
             )
-            ds = xr.open_zarr(
-                resolved_path,
-                drop_variables=conflicting_vars,
-                chunks=chunks,  # type: ignore[arg-type]
-            )
-            self._clear_source_zarr_encodings(ds)
+            if is_netcdf:
+                ds = xr.open_dataset(
+                    resolved_path,
+                    engine="netcdf4",
+                    chunks=chunks,
+                    drop_variables=conflicting_vars,
+                )
+            else:
+                ds = xr.open_zarr(
+                    resolved_path,
+                    drop_variables=conflicting_vars,
+                    chunks=chunks,  # type: ignore[arg-type]
+                )
+                self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
 
             # Re-add dropped LoD variables with corrected run_id coords

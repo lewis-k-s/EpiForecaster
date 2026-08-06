@@ -20,7 +20,7 @@ dvc:
     - data/processed/synthetic_full_holt_damped.zarr.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
-    - data/files/raw_synthetic_observations.zarr.dvc
+    - data/files/raw_synthetic_observations.nc.dvc
 
 evaluation:
   checkpoint: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/synth-control-seed42-dfadab4-20260725T214049Z/outputs/training/synthetic-pretraining-control/model/checkpoints/best_model.pt

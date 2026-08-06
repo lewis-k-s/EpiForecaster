@@ -43,11 +43,18 @@ class MobilityProcessor:
 
     def _open_dataset(self, mobility_path: str) -> xr.Dataset:
         print("Opening OD dataset...")
-        # Open zarr with chunking on run_id dimension only
-        ds = xr.open_zarr(  # type: ignore[arg-type]
-            str(mobility_path),
-            chunks={"run_id": self.config.run_id_chunk_size},
-        )
+        path = Path(mobility_path)
+        if path.suffix == ".nc":
+            ds = xr.open_dataset(
+                str(path),
+                engine="netcdf4",
+                chunks={"run_id": self.config.run_id_chunk_size},
+            )
+        else:
+            ds = xr.open_zarr(  # type: ignore[arg-type]
+                str(path),
+                chunks={"run_id": self.config.run_id_chunk_size},
+            )
 
         # Detect and reconstruct synthetic data format (factorized mobility)
         # Synthetic data stores: mobility_base + mobility_kappa0 instead of full tensor

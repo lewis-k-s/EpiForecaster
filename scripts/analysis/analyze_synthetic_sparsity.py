@@ -12,7 +12,7 @@ Usage:
     python scripts/analysis/analyze_synthetic_sparsity.py [--path PATH]
 
 Args:
-    path: Path to raw_synthetic_observations.zarr (default: data/files/raw_synthetic_observations.zarr)
+    path: Path to raw_synthetic_observations.zarr (default: data/files/raw_synthetic_observations.nc)
 """
 
 import argparse
@@ -23,7 +23,7 @@ import xarray as xr
 
 
 def analyze_synthetic_sparsity(
-    zarr_path: str = "data/files/raw_synthetic_observations.zarr",
+    zarr_path: str = "data/files/raw_synthetic_observations.nc",
 ) -> dict[str, pd.DataFrame]:
     """Analyze sparsity in synthetic data.
 
@@ -279,7 +279,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--path",
         type=str,
-        default="data/files/raw_synthetic_observations.zarr",
+        default="data/files/raw_synthetic_observations.nc",
         help="Path to raw_synthetic_observations.zarr",
     )
     args = parser.parse_args()

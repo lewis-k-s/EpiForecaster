@@ -13,7 +13,7 @@ dvc:
     - data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.nc.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
-    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
+    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc.dvc
 
 training:
   base_config: configs/production_only/train_epifor_mn5_synth_pretrain.yaml

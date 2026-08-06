@@ -565,10 +565,11 @@ class OfflinePreprocessingPipeline:
             ):
                 new_var = var.astype(continuous_dtype)
                 print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
-            # Generic float64 continuous values - check LAST
-            elif var.dtype == np.float64:
+            # Generic float values not caught above (float16 from raw zarr
+            # mobility, float64 from log1p) — convert to storage precision.
+            elif var.dtype in (np.float16, np.float64):
                 new_var = var.astype(continuous_dtype)
-                print(f"  {var_name}: float64 -> {continuous_dtype}")
+                print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
 
             converted_dict[var_name] = new_var
         rechunked_dataset = xr.Dataset(
@@ -596,6 +597,22 @@ class OfflinePreprocessingPipeline:
         if bool_vars:
             rechunked_dataset = rechunked_dataset.assign(bool_vars)
             print(f"  Converted {len(bool_vars)} boolean variables to int8 for NetCDF")
+
+        # NetCDF4 does not support float16. If the configured storage dtype is
+        # float16 (legacy zarr default), upcast all continuous variables to
+        # float32 before writing.
+        if continuous_dtype == "float16":
+            continuous_dtype = np.float32
+            upcast_vars = {
+                name: var.astype(np.float32)
+                for name, var in rechunked_dataset.data_vars.items()
+                if var.dtype == np.float16
+            }
+            if upcast_vars:
+                rechunked_dataset = rechunked_dataset.assign(upcast_vars)
+                print(
+                    f"  Upcast {len(upcast_vars)} float16 variables to float32 for NetCDF"
+                )
 
         # Build NetCDF encoding: preserve chunking layout and apply zlib
         # compression.  Each variable gets chunksizes matching the dask
@@ -627,7 +644,7 @@ class OfflinePreprocessingPipeline:
             aligned_dataset_path,
             mode="w",
             encoding=encoding,
-            engine="h5netcdf",
+            engine="netcdf4",
         )
         self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
@@ -741,7 +758,7 @@ class OfflinePreprocessingPipeline:
 
     def _log_postwrite_summary(self, dataset_path: Path) -> None:
         """Verify the saved dataset is valid (e.g., mobility not all NaN)."""
-        ds = xr.open_dataset(dataset_path, engine="h5netcdf")
+        ds = xr.open_dataset(dataset_path, engine="netcdf4")
         try:
             if "mobility" in ds:
                 # Check a sample to ensure data was preserved (not all NaN)

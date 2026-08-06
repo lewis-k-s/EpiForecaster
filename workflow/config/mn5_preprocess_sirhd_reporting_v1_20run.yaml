@@ -12,7 +12,7 @@ workflow:
 
 dvc:
   targets:
-    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc
+    - data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc.dvc
     - data/files/catalonia_preprocessing_inputs_v1.dvc
     - data/files/sirhd_reporting_v1_cb6b4e5_qa.dvc
   provenance_targets: []

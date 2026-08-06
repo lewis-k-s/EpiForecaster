@@ -290,14 +290,14 @@ class TestPipelineStorage:
         saved_path = pipeline._save_aligned_dataset(ds)
 
         # Re-open and check on-disk chunksizes from encoding
-        saved_ds = xr.open_dataset(saved_path, engine="h5netcdf")
+        saved_ds = xr.open_dataset(saved_path, engine="netcdf4")
 
         # Check 'cases' chunksizes (on-disk HDF5 chunk layout)
         cases_chunks = saved_ds.cases.encoding["chunksizes"]
         assert cases_chunks[0] == 2  # run_id
         assert cases_chunks[1] == 10  # date
         assert cases_chunks[2] == 5  # region_id (<= mobility_chunk_size)
-        assert saved_ds.cases.dtype == np.float16
+        assert saved_ds.cases.dtype == np.float32  # upcast from float16 for NetCDF
 
         mobility_chunks = saved_ds.mobility.encoding["chunksizes"]
         assert mobility_chunks[0] == 2  # run_id
@@ -357,7 +357,7 @@ class TestPipelineStorage:
 
         saved_path = pipeline._save_aligned_dataset(dataset)
 
-        saved = xr.open_dataset(saved_path, engine="h5netcdf")
+        saved = xr.open_dataset(saved_path, engine="netcdf4")
         try:
             assert saved.attrs["continuous_storage_dtype"] == "float32"
             assert saved["cases"].dtype == np.float32

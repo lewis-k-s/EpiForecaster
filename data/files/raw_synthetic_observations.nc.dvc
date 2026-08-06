@@ -6,10 +6,10 @@ deps:
   nfiles: 4484
   hash: md5
   path:
-    /gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.zarr
+    /gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/synthetic_catalonia/raw_synthetic_observations.nc
 outs:
 - md5: f9e6ba39ba64967dd2ccd8aee37a21c6.dir
   size: 3812042717
   nfiles: 4484
   hash: md5
-  path: raw_synthetic_observations.zarr
+  path: raw_synthetic_observations.nc

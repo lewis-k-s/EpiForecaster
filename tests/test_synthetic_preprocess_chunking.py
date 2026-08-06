@@ -603,7 +603,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_dataset(output_path, engine="h5netcdf")
+    saved = xr.open_dataset(output_path, engine="netcdf4")
 
     chunks = saved["edar_biomarker_N1_mask"].encoding.get("chunksizes")
     assert chunks is not None
@@ -644,7 +644,7 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
     output_path = pipeline.run()
 
-    ds = xr.open_dataset(output_path, engine="h5netcdf")
+    ds = xr.open_dataset(output_path, engine="netcdf4")
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
@@ -717,7 +717,7 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_dataset(output_path, engine="h5netcdf")
+    saved = xr.open_dataset(output_path, engine="netcdf4")
 
     saved_mob = saved["mobility"].isel(
         run_id=0, date=0, origin=slice(0, 2), destination=slice(0, 2)

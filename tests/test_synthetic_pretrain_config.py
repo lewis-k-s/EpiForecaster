@@ -13,7 +13,7 @@ CORRECTED_PROCESSED_PATH = (
 )
 CORRECTED_PROCESSED_POINTER = f"{CORRECTED_PROCESSED_PATH}.dvc"
 CORRECTED_RAW_POINTER = (
-    "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.zarr.dvc"
+    "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc.dvc"
 )
 
 

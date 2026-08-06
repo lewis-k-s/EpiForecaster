@@ -1131,7 +1131,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
 
     import xarray as xr
 
-    dataset = xr.open_dataset(dataset_path, engine="h5netcdf")
+    dataset = xr.open_dataset(dataset_path, engine="netcdf4")
     try:
         qa_record = {
             "schema_version": 2,
