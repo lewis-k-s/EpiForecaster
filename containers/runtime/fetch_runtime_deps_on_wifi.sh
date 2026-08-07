@@ -11,7 +11,7 @@ DEPENDENCY_KEY="${DEPENDENCY_KEY:?DEPENDENCY_KEY must be set}"
 UV_LOCK_SHA256="${UV_LOCK_SHA256:?UV_LOCK_SHA256 must be set}"
 BUILD_ROOT="${BUILD_ROOT:?BUILD_ROOT must be set}"
 CONTAINER_ROOT="${CONTAINER_ROOT:?CONTAINER_ROOT must be set}"
-UV_CACHE_ROOT="${UV_CACHE_ROOT:-$BUILD_ROOT/uv-cache}"
+UV_CACHE_ROOT="${UV_CACHE_ROOT:-/scratch/tmp/${USER:-unknown}/epiforecaster-container-cache/$DEPENDENCY_KEY}"
 
 if [[ ! "$BASE_IMAGE_REF" =~ @sha256:([0-9a-f]{64})$ ]]; then
   echo "BASE_IMAGE_REF must be pinned to an amd64 manifest digest" >&2
@@ -85,9 +85,8 @@ load_singularity
 mkdir -p "$base_root" "$cache_root" "$temporary_root"
 exec 9>"$base_root/.uv-python311-bookworm-$base_key.lock"
 flock 9
-exec 8>"$cache_root/.uv-sync.lock"
 export SINGULARITY_CACHEDIR="$cache_root/singularity"
-export SINGULARITY_LOCALCACHEDIR="/scratch/tmp/$USER/epiforecaster-$DEPENDENCY_KEY"
+export SINGULARITY_LOCALCACHEDIR="$cache_root/singularity-local"
 export SINGULARITY_TMPDIR="$temporary_root"
 export TMPDIR="$temporary_root"
 mkdir -p \
@@ -108,7 +107,6 @@ fi
 test -f "$context_root/pyproject.toml"
 test -f "$context_root/uv.lock"
 mkdir -p "$prefix_root/.venv" "$cache_root/uv"
-flock 8
 
 singularity exec --cleanenv \
   --bind "$context_root:/workspace/source:ro" \
@@ -119,6 +117,7 @@ singularity exec --cleanenv \
   env \
   UV_PROJECT_ENVIRONMENT=/opt/epiforecaster/.venv \
   UV_CACHE_DIR=/var/cache/uv \
+  UV_CONCURRENT_INSTALLS=1 \
   UV_LINK_MODE=copy \
   UV_PYTHON_DOWNLOADS=never \
   uv sync \

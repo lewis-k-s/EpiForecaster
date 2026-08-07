@@ -9,7 +9,7 @@ set -euo pipefail
 REQUIRED_SHFMT_VERSION="v3.13.1"
 
 MAINTAINED_SHELL_FILES=(
-  containers/runtime/build_sif.sbatch
+  containers/runtime/assemble_sif_on_mn5.sbatch
   containers/runtime/build_sif_on_mn5.sh
   containers/runtime/fetch_runtime_deps_on_wifi.sh
   scripts/check_shell_quality.sh
@@ -26,7 +26,7 @@ MAINTAINED_SHELL_FILES=(
 )
 
 FORMATTED_BASH_FILES=(
-  containers/runtime/build_sif.sbatch
+  containers/runtime/assemble_sif_on_mn5.sbatch
   containers/runtime/build_sif_on_mn5.sh
   containers/runtime/fetch_runtime_deps_on_wifi.sh
   scripts/check_shell_quality.sh

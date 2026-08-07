@@ -9,8 +9,8 @@
 #SBATCH --cpus-per-task=20
 #SBATCH --time=01:00:00
 
-# Assemble a native SIF from the network-prefetched base and locked Python
-# environment. This job performs no network access.
+# Assemble a native SIF on an MN5 compute node from the network-prefetched base
+# and locked Python environment. This internal job performs no network access.
 
 set -euo pipefail
 umask 0027
