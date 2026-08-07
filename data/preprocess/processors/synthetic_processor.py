@@ -227,6 +227,7 @@ class SyntheticProcessor:
                 )
                 self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
+            ds = self._normalize_mobility_dims(ds)
             return ds
         except ValueError as e:
             if "conflicting sizes" not in str(e):
@@ -271,6 +272,7 @@ class SyntheticProcessor:
                 )
                 self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
+            ds = self._normalize_mobility_dims(ds)
 
             # Re-add dropped LoD variables with corrected run_id coords
             if run_id_size is not None:
@@ -307,6 +309,7 @@ class SyntheticProcessor:
         """Strip whitespace padding from ``run_id`` fixed-width string coordinates.
 
         Synthetic zarr stores ``run_id`` as ``<U50`` (right-padded to 50 chars).
+        NetCDF4 uses vlen strings that may also carry trailing spaces.
         The generator handoff manifest stores clean stripped strings.  Stripping
         at the earliest entry point lets clean values propagate through the
         entire pipeline and pass provenance QA.
@@ -315,6 +318,24 @@ class SyntheticProcessor:
             raw = dataset["run_id"].values.astype("U")
             stripped = np.char.strip(raw)
             dataset = dataset.assign_coords(run_id=stripped)
+        return dataset
+
+    @staticmethod
+    def _normalize_mobility_dims(dataset: xr.Dataset) -> xr.Dataset:
+        """Rename NetCDF mobility dimension names to the canonical forms.
+
+        Upstream NetCDF output uses ``in_region_id``/``out_region_id`` for the
+        OD matrix spatial dims, while legacy zarr used ``origin``/``target``.
+        Rename to ``origin``/``target`` so downstream extraction works
+        identically regardless of source format.
+        """
+        rename_map: dict[str, str] = {}
+        if "in_region_id" in dataset.dims and "origin" not in dataset.dims:
+            rename_map["in_region_id"] = "origin"
+        if "out_region_id" in dataset.dims and "target" not in dataset.dims:
+            rename_map["out_region_id"] = "target"
+        if rename_map:
+            dataset = dataset.rename(rename_map)
         return dataset
 
     def _clear_source_zarr_encodings(self, dataset: xr.Dataset) -> None:

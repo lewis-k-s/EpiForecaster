@@ -24,6 +24,7 @@ PREPROCESSING_CONFIGS = [
     "configs/production_only/preprocess_mn5_synth.yaml",
     "configs/production_only/preprocess_mn5_synth_holt_damped.yaml",
     "configs/production_only/preprocess_mn5_synth_sirhd_reporting_v1.yaml",
+    "configs/production_only/preprocess_mn5_synth_netcdf_smoke.yaml",
 ]
 
 
