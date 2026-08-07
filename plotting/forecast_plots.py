@@ -975,6 +975,8 @@ def make_forecast_figure(
     import matplotlib.pyplot as plt
     import pandas as pd
     import seaborn as sns
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     if isinstance(samples, list):
         groups = {"All": samples}
@@ -988,6 +990,8 @@ def make_forecast_figure(
     row_names = list(groups.keys())
     nrows = len(row_names)
     ncols = max(len(v) for v in groups.values())
+    interval_levels_seen: set[str] = set()
+    mechanistic_source_labels: set[str] = set()
 
     fig, axes = plt.subplots(
         nrows=nrows,
@@ -1042,6 +1046,7 @@ def make_forecast_figure(
                     reverse=True,
                 )
                 level_count = len(interval_level_names)
+                interval_levels_seen.update(interval_level_names)
                 for level_index, level_name in enumerate(interval_level_names):
                     alpha = 0.10 + 0.12 * level_index / max(1, level_count - 1)
                     low_key = f"interval_low_{level_name}"
@@ -1094,7 +1099,7 @@ def make_forecast_figure(
                     "Forecast": Palette.FORECAST["forecast"],
                 },
                 ax=ax,
-                legend=(j == 0 and i == 0),
+                legend=False,
             )
 
             payloads = sample.get(overlay_payload_collection)
@@ -1123,6 +1128,7 @@ def make_forecast_figure(
 
                 overlay_ax = ax.twinx()
                 overlay_name = overlay_label or overlay_target
+                mechanistic_source_labels.add(str(overlay_name))
                 overlay_df = pd.DataFrame(
                     {
                         "t": t_rel,
@@ -1158,6 +1164,7 @@ def make_forecast_figure(
                     overlay_prediction[:overlay_points]
                 )
                 overlay_ax = ax.twinx()
+                mechanistic_source_labels.add(str(relevant_latent["label"]))
                 overlay_ax.plot(
                     t_rel,
                     overlay_series_full,
@@ -1218,15 +1225,88 @@ def make_forecast_figure(
             axes[i, j].set_visible(False)
 
     if figure_title is not None:
-        fig.suptitle(figure_title)
+        fig.suptitle(figure_title, y=0.995)
 
     if shared_xlabel is not None:
         fig.supxlabel(shared_xlabel)
 
-    if figure_title is not None or shared_xlabel is not None:
-        fig.tight_layout(rect=(0, 0.03, 1, 0.97))
-    else:
-        fig.tight_layout()
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            color=Palette.FORECAST["observed"],
+            linewidth=2,
+            label="Actual target",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color=Palette.FORECAST["forecast"],
+            linewidth=2,
+            label="Forecast mean",
+        ),
+    ]
+    if interval_levels_seen:
+        formatted_levels = ", ".join(
+            f"{level}%"
+            for level in sorted(interval_levels_seen, key=_interval_level_sort_key)
+        )
+        legend_handles.append(
+            Patch(
+                facecolor=Palette.FORECAST["forecast"],
+                alpha=0.20,
+                edgecolor="none",
+                label=f"Forecast intervals ({formatted_levels})",
+            )
+        )
+    if mechanistic_source_labels:
+        if len(mechanistic_source_labels) == 1:
+            source_label = (
+                f"Mechanistic source: {next(iter(mechanistic_source_labels))}"
+            )
+        else:
+            source_label = "Relevant mechanistic source (right axis)"
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=Palette.FORECAST["overlay"],
+                linewidth=1.5,
+                marker="o",
+                markersize=3,
+                label=source_label,
+            )
+        )
+    legend_handles.extend(
+        [
+            Patch(
+                facecolor=Palette.FORECAST["history_span"],
+                alpha=0.35,
+                edgecolor="none",
+                label="Input window",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color=Palette.FORECAST["boundary"],
+                linestyle="--",
+                alpha=0.5,
+                label="Forecast start",
+            ),
+        ]
+    )
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.965 if figure_title is not None else 0.995),
+        ncol=min(3, len(legend_handles)),
+        frameon=True,
+        framealpha=0.95,
+    )
+
+    layout_bottom = 0.03 if shared_xlabel is not None else 0
+    layout_top = 0.89 if figure_title is not None else 0.92
+    fig.tight_layout(rect=(0, layout_bottom, 1, layout_top))
     return fig
 
 

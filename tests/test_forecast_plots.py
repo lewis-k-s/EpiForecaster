@@ -484,6 +484,8 @@ def test_make_joint_forecast_figure_renders_distribution_intervals() -> None:
 
     assert fig is not None
     assert fig.axes[0].collections
+    legend_labels = [text.get_text() for text in fig.legends[0].get_texts()]
+    assert "Forecast intervals (90%)" in legend_labels
 
 
 def test_relevant_latent_overlay_uses_persisted_granular_rows(
@@ -538,6 +540,14 @@ def test_relevant_latent_overlay_uses_persisted_granular_rows(
     assert fig is not None
     assert len(fig.axes) == 2
     assert fig.axes[1].get_ylabel() == "hospitalization_flow"
+    legend_labels = [text.get_text() for text in fig.legends[0].get_texts()]
+    assert legend_labels == [
+        "Actual target",
+        "Forecast mean",
+        "Mechanistic source: hospitalization_flow",
+        "Input window",
+        "Forecast start",
+    ]
 
 
 def test_make_forecast_figure_supports_shared_labels() -> None:
