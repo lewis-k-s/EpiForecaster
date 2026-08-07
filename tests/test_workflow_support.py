@@ -1507,6 +1507,38 @@ def test_single_training_smoke_default_dag_reaches_evaluation(
     assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
 
 
+def test_profiled_training_dag_retains_one_dvc_evidence_pack(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_mode_config("train", run_root)
+    profiled = yaml.safe_load(
+        (
+            REPO_ROOT
+            / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
+        ).read_text()
+    )
+    config["workflow"] = profiled["workflow"]
+    config["training"] = profiled["training"]
+    config["evaluation"] = profiled["evaluation"]
+    config["provenance"] = profiled["provenance"]
+    config["resources"] = profiled["resources"]
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "export_training_provenance" in result.stdout
+    assert "retain_training_evidence" in result.stdout
+    assert "dvc push artifacts.dvc" not in result.stdout
+    assert "retain-training-evidence" in result.stdout
+    assert "retention.json" in result.stdout
+    assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
+
+
 def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     tmp_path: Path,
 ) -> None:
@@ -1945,7 +1977,9 @@ def test_runtime_dependency_group_excludes_coordinator_tooling() -> None:
 
 
 def test_container_build_is_source_independent_and_batch_validated() -> None:
-    batch = (REPO_ROOT / "containers/runtime/build_sif.sbatch").read_text()
+    batch = (
+        REPO_ROOT / "containers/runtime/assemble_sif_on_mn5.sbatch"
+    ).read_text()
     dispatcher = (REPO_ROOT / "containers/runtime/build_sif_on_mn5.sh").read_text()
     fetch = (REPO_ROOT / "containers/runtime/fetch_runtime_deps_on_wifi.sh").read_text()
 
@@ -1980,7 +2014,9 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "--python /usr/local/bin/python3.11" in fetch
     assert "--group runtime" in fetch
     assert "--group workflow" not in fetch
+    assert "UV_CONCURRENT_INSTALLS=1" in fetch
     assert "UV_LINK_MODE=copy" in fetch
+    assert 'UV_CACHE_ROOT="${UV_CACHE_ROOT:-/scratch/tmp/' in fetch
     assert '"$prefix_root/.venv/bin/python"' in fetch
     assert "sha256sum -c" in dispatcher
     assert "remote_bash" not in dispatcher
@@ -1995,6 +2031,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert 'grep -Fxq "dependency_key=$dependency_key"' in dispatcher
     assert 'mkdir "$request_root/dispatching"' in dispatcher
     assert 'exec 9>"$request_root/submit.lock"' in dispatcher
+    assert "build_sif.sbatch" not in dispatcher
 
 
 def _make_remote_run_staging(
