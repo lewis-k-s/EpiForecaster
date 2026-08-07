@@ -48,6 +48,10 @@ fail the whole step. Finalization then runs as a later step in the same
 allocation, decomposed into declared selection, evaluation, promotion, and
 cleanup artifacts.
 
+The current workflow has no MPI or distributed-data-parallel execution layer.
+Do not introduce an MPI runtime contract unless a future scientific workload
+requires one explicitly.
+
 The same journal-coordinated pattern can span nodes, but the practical default
 is a single node. Rank count must therefore normally fit the GPUs available on
 one node. The Snakemake coordinator has small control-plane CPU overhead and
@@ -63,6 +67,11 @@ of ordinary source changes.
 Dependency fetching occurs on `wifi-acc`; SIF assembly and GPU validation run
 offline in Slurm. Artifacts are published with immutable names, checksums, and
 metadata.
+
+Runtime jobs execute the verified immutable SIF directly from shared GPFS.
+Temporary files and selected DVC inputs may stage to node-local scratch, but the
+SIF itself is not copied there. Node-local SIF staging remains deferred until a
+benchmark demonstrates an end-to-end benefit.
 
 ## Source bundle
 

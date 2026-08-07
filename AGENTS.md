@@ -101,10 +101,38 @@ configs as alternate production interfaces.
 ### Remote MN5 Cluster Work
 
 All remote model operations use `scripts/workflow/mn5_workflow.sh` and are
-encapsulated in the **`mn5-dispatch`** skill. **Load that skill** before remote
-preparation, transfer, submission, monitoring, or artifact inspection.
+governed by the **`mn5-cluster-usage`** skill. **Load that skill** before remote
+preparation, transfer, submission, monitoring, or artifact inspection; it
+defines endpoint and allocation policy, while this repository's launcher and
+`docs/MN5_SNAKEMAKE.md` define the immutable workflow contract.
 
 > **WARNING**: Do not run configs in `configs/production_only/` locally. They require GPU cluster resources. See `configs/production_only/README.md`.
+
+### Immutable Deployment and Artifact Model
+
+Do not assume a GPFS project or run directory is a Git checkout. Cluster
+execution separates:
+
+1. the authoritative local Git checkout where source changes are developed;
+2. an immutable deployed source bundle used by a particular cluster run;
+3. a versioned run root containing configuration, manifests, logs, seeds, and
+   execution state;
+4. generated scientific artifacts such as checkpoints and Zarr datasets; and
+5. downstream DVC pointers and materializations.
+
+For an existing run, treat its manifest and deployed-bundle hashes as the
+authority for the code and inputs that produced its artifacts. A local checkout
+is authoritative for new development, but it must not be assumed to match an
+old deployment merely because paths or filenames agree. Reconcile Git commit,
+source-bundle hash, configuration, container or environment identity, seeds,
+input identities, and artifact hashes where available. If the run lacks enough
+metadata to establish this identity, report a provenance limitation rather
+than inferring one.
+
+Never patch or overwrite an immutable deployed bundle, run root, or generated
+artifact in place. Make changes in a Git branch, validate them, then create a
+new immutable bundle and versioned run. Preserve the existing run and record
+the new code, configuration, environment, seed, input, and output identities.
 
 ## Paper Workflow
 

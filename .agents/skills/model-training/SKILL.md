@@ -7,10 +7,10 @@ description: Configure EpiForecaster and Region2Vec training, validate bounded l
 
 ## Execution boundary
 
-Substantive EpiForecaster work uses `scripts/workflow/mn5_workflow.sh`. Load the
-globally installed `mn5-dispatch` skill before remote preparation, transfer,
-submission, monitoring, or artifact inspection. Stop if it is unavailable; do
-not recreate dispatch commands or restore a repository-local duplicate.
+Substantive EpiForecaster work uses `scripts/workflow/mn5_workflow.sh`. Load
+`mn5-cluster-usage` before remote preparation, transfer, submission, monitoring,
+or artifact inspection. It defines the live MN5 endpoint and allocation policy;
+this skill and `docs/MN5_SNAKEMAKE.md` define the immutable workflow interface.
 
 Canonical/general-purpose templates:
 

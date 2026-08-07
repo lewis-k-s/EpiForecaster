@@ -312,6 +312,8 @@ configure_singularity_arguments() {
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     SINGULARITY_ARGS+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
   fi
+  # Execute the verified immutable SIF directly from shared GPFS. Node-local
+  # image staging is deferred until its end-to-end cost is benchmarked.
   SINGULARITY_ARGS+=(--pwd /workspace/source "$SIF")
 }
 
