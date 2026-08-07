@@ -1,12 +1,3 @@
-md5: 1bd3de372b9373502c96bc4dca7493e7
-frozen: true
-deps:
-- md5: 1bd3de372b9373502c96bc4dca7493e7
-  size: 193299074
-  nfiles: 1
-  hash: md5
-  path:
-    /gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim/runs/epiforecaster_sirhd_v1_netcdf_dense_315365a_20260729_smoke_5run_v2/epiforecaster_sirhd_v1_training.nc
 outs:
 - md5: 1bd3de372b9373502c96bc4dca7493e7
   size: 193299074
