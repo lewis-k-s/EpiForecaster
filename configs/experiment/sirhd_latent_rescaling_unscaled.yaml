@@ -1,0 +1,111 @@
+# Matched SIRHD latent-rescaling arm.
+# The only scientific difference among these arm configs is latent scaling;
+# the workflow sets max_batches only for bounded interactive acceptance.
+env: mn5
+data:
+  dataset_path: data/processed/synthetic_netcdf_smoke_2run.nc
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
+  use_valid_targets: true
+  mobility_min_flow_raw: 0.0
+  mobility_weight_clip_max: 8.0
+  min_history_observed_fraction: 0.5
+  min_horizon_observed_fraction: 0.5
+  window_stride: 14
+  sample_ordering: time
+  run_id_chunk_size: 1
+model:
+  strict: false
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 32
+    region_embedding_dim: 64
+    gnn_module: gcn
+    include_day_of_week: true
+    include_holidays: true
+    include_lockdown_severity: true
+    input_window_length: 60
+    forecast_horizon: 28
+    max_neighbors: 20
+    gnn_depth: 2
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
+    observation_heads:
+      delta_forecasting: true
+      relevant_source_hosp: hospitalization_flow
+      relevant_source_ww: I
+      relevant_source_cases: I
+      relevant_source_deaths: death_flow
+output:
+  experiment_name: sirhd-latent-rescaling-unscaled
+  log_dir: outputs/training
+  write_granular_eval: true
+  wandb_mode: disabled
+  wandb_tags:
+  - smoke
+  - netcdf
+  - sirhd
+  - latent-rescaling-v1
+  - unscaled
+training:
+  compile: false
+  seed: 42
+  split_seed: 42
+  device: cuda
+  init_checkpoint_path: null
+  batch_size: 16
+  shuffle_train_batches: true
+  gradient_accumulation_steps: 1
+  gradient_clip_value: 5.0
+  early_stopping_patience: 3
+  nan_loss_patience: 3
+  epochs: 3
+  learning_rate: 0.001
+  weight_decay: 1.0e-05
+  warmup_steps: 50
+  num_workers: 2
+  val_workers: 1
+  prefetch_factor: 2
+  pin_memory: true
+  progress_log_frequency: 20
+  grad_norm_log_frequency: 100
+  pathway_gradient_frequency: 100
+  gradient_snapshot_frequency: 0
+  gradient_vanishing_threshold: 1.0e-08
+  gradient_exploding_threshold: 1.0e2
+  split_strategy: node
+  val_split: 0.2
+  test_split: 0.1
+  profiler:
+    enabled: false
+  plot_forecasts: false
+  num_forecast_samples: 0
+  loss:
+    name: joint_inference
+    joint:
+      observation_loss: nll
+      latent:
+        total_weight: 0.01
+        scaling: none
+        require_complete_targets: true
+  curriculum:
+    enabled: true
+    active_runs: -1
+    chunk_size: 512
+    run_sampling: round_robin
+    schedule:
+    - start_epoch: 0
+      end_epoch: 3
+      synth_ratio: 1.0
