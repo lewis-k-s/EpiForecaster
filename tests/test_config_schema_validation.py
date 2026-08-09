@@ -13,6 +13,7 @@ EPIFORECASTER_TRAINING_CONFIGS = [
     "configs/train_epifor_smoke.yaml",
     "configs/production_only/train_epifor_mn5_full.yaml",
     "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
+    "configs/production_only/train_epifor_smoke_netcdf.yaml",
 ]
 
 REGION2VEC_CONFIGS = [

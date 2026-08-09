@@ -12,14 +12,14 @@ workflow:
 
 dvc:
   targets:
-    - data/files/epiforecaster_sirhd_v1_netcdf_dense_315365a_smoke_5run.nc.dvc
+    - data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc.dvc
     - data/files/catalonia_preprocessing_inputs_v1.dvc
   provenance_targets: []
 
 training:
   base_config: configs/production_only/train_epifor_smoke_netcdf.yaml
-  dataset_dvc_target: data/files/epiforecaster_sirhd_v1_netcdf_dense_315365a_smoke_5run.nc.dvc
-  dataset_path: data/files/epiforecaster_sirhd_v1_netcdf_dense_315365a_smoke_5run.nc
+  dataset_dvc_target: data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc.dvc
+  dataset_path: data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc
 
 resources:
   allocation:

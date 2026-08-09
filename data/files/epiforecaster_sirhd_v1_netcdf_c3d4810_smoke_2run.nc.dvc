@@ -1,0 +1,13 @@
+md5: 8a7232de26294d1ca85a2bd6c31774f8
+frozen: true
+deps:
+- path: 
+    data/datasets/epiforecaster_sirhd_v1_netcdf_c3d4810_20260729_smoke_2run/epiforecaster_sirhd_v1_training.nc
+  repo:
+    url: ../EpiSim.jl
+    rev_lock: 3d6f34b56a5d44c3459c4b80945d8571614c6284
+outs:
+- md5: 533141146a86ce6cfbf33a3bfd3143a2
+  size: 61437439
+  hash: md5
+  path: epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc

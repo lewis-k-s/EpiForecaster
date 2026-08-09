@@ -10,14 +10,14 @@ workflow:
 
 dvc:
   targets:
-    - data/files/epiforecaster_sirhd_v1_netcdf_dense_315365a_smoke_5run.nc.dvc
+    - data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc.dvc
     - data/files/catalonia_preprocessing_inputs_v1.dvc
   provenance_targets: []
 
 preprocessing:
   base_config: configs/production_only/preprocess_mn5_synth_netcdf_smoke.yaml
-  dataset_name: synthetic_netcdf_smoke_5run
-  expected_run_count: 5
+  dataset_name: synthetic_netcdf_smoke_2run
+  expected_run_count: 2
   required_variables:
     - cases
     - hospitalizations

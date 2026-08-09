@@ -4,7 +4,7 @@ env: "mn5"
 # NetCDF4 5-run smoke corpus.
 
 data:
-  dataset_path: data/processed/synthetic_netcdf_smoke_5run.nc
+  dataset_path: data/processed/synthetic_netcdf_smoke_2run.nc
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   mobility_min_flow_raw: 0.0
