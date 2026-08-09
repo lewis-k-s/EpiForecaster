@@ -142,6 +142,26 @@ def dvc_output(pointer_path: Path) -> dict[str, Any]:
     return output
 
 
+def is_dvc_import(pointer_path: Path) -> bool:
+    """Return whether a DVC pointer has a Git-backed import dependency."""
+    document = load_yaml(pointer_path)
+    dependencies = document.get("deps", [])
+    return any(
+        isinstance(dependency, dict)
+        and isinstance(dependency.get("repo"), dict)
+        for dependency in dependencies
+    )
+
+
+def md5_file(path: Path) -> str:
+    """Return the content MD5 for a DVC-tracked regular file."""
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -813,6 +833,7 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         _run(["dvc", "init", "--no-scm"], cwd=workspace)
 
     targets: list[str] = []
+    imported_targets: list[tuple[str, Path, dict[str, Any]]] = []
     output_paths: list[Path] = []
     for target_value in config["dvc"]["targets"]:
         target = Path(str(target_value))
@@ -823,7 +844,10 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         output = dvc_output(source_pointer)
         output_relative = target.parent / str(output["path"])
         output_paths.append(output_relative)
-        targets.append(target.as_posix())
+        target_name = target.as_posix()
+        targets.append(target_name)
+        if is_dvc_import(source_pointer):
+            imported_targets.append((target_name, output_relative, output))
 
     remote = Path(str(config["dvc"]["remote"]))
     cache = Path(str(config["dvc"]["cache"]))
@@ -842,11 +866,30 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
     finally:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
-    _run(["dvc", "status", *targets], cwd=workspace)
+    status_targets = [
+        target for target in targets if target not in {item[0] for item in imported_targets}
+    ]
+    if status_targets:
+        _run(["dvc", "status", *status_targets], cwd=workspace)
 
     for output_path in output_paths:
         if not (workspace / output_path).exists():
             raise FileNotFoundError(f"DVC output was not materialized: {output_path}")
+
+    for target, output_path, output in imported_targets:
+        expected_md5 = str(output["md5"])
+        materialized = workspace / output_path
+        if expected_md5.endswith(".dir") or not materialized.is_file():
+            raise ValueError(
+                "Git-backed DVC imports must materialize one regular file for "
+                f"offline validation: {target}"
+            )
+        actual_md5 = md5_file(materialized)
+        if actual_md5 != expected_md5:
+            raise ValueError(
+                f"Imported DVC output MD5 mismatch for {target}: "
+                f"{actual_md5} != {expected_md5}"
+            )
 
     bind_roots = sorted({path.parent for path in output_paths})
     for bind_root in bind_roots:
