@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import dask
 import numpy as np
 import xarray as xr
 import yaml
@@ -640,12 +641,16 @@ class OfflinePreprocessingPipeline:
                 entry = {"chunksizes": tuple(chunksizes)}
             encoding[var_name] = entry
 
-        rechunked_dataset.to_netcdf(
-            aligned_dataset_path,
-            mode="w",
-            encoding=encoding,
-            engine="netcdf4",
-        )
+        # NetCDF4 input and output share a non-thread-safe HDF5 backend.  A
+        # threaded Dask write can deadlock while it reads raw NetCDF chunks and
+        # writes the processed file.  Serialize this boundary explicitly.
+        with dask.config.set(scheduler="single-threaded"):
+            rechunked_dataset.to_netcdf(
+                aligned_dataset_path,
+                mode="w",
+                encoding=encoding,
+                engine="netcdf4",
+            )
         self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
