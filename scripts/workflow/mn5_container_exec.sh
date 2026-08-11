@@ -224,6 +224,13 @@ configure_shared_binds() {
     "$SCRATCH_ROOT/tmp:/tmp:rw"
   )
 
+  # Publication receipts read the immutable SIF digest from inside the
+  # contained runtime. The SIF itself is an execution input, not a bind, so
+  # expose its immutable sidecar explicitly.
+  if [ -f "${SIF}.sha256" ]; then
+    BINDS+=("${SIF}.sha256:${SIF}.sha256:ro")
+  fi
+
   for input_path in "${INPUT_PATHS[@]}"; do
     if [ ! -e "$input_path" ] || [ -L "$input_path" ]; then
       echo "Workflow input must exist and must not be a symlink: $input_path" >&2
