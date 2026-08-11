@@ -1,0 +1,5 @@
+outs:
+- md5: 1e64949ee8ee5a83bc17b36cc06ceeaa
+  size: 132164429
+  hash: md5
+  path: synthetic_netcdf_smoke_2run.nc
