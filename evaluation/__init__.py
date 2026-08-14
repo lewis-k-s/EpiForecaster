@@ -22,14 +22,26 @@ from evaluation.selection import (
     VALID_NODE_METRIC_TARGETS,
 )
 
-# High-level evaluation pipelines
-from evaluation.epiforecaster_eval import (
-    evaluate_checkpoint_topk_forecasts,
-    plot_forecasts_from_csv,
-)
 
-# Re-export from plotting for backwards compatibility
-from plotting.forecast_plots import generate_forecast_plots
+# High-level pipeline and plotting imports are lazy.  Plotting imports
+# ``evaluation.metrics`` and must not re-enter this package while initializing.
+def __getattr__(name: str):
+    if name in {"evaluate_checkpoint_topk_forecasts", "plot_forecasts_from_csv"}:
+        from evaluation.epiforecaster_eval import (
+            evaluate_checkpoint_topk_forecasts,
+            plot_forecasts_from_csv,
+        )
+
+        return {
+            "evaluate_checkpoint_topk_forecasts": evaluate_checkpoint_topk_forecasts,
+            "plot_forecasts_from_csv": plot_forecasts_from_csv,
+        }[name]
+    if name == "generate_forecast_plots":
+        from plotting.forecast_plots import generate_forecast_plots
+
+        return generate_forecast_plots
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Loaders
