@@ -139,7 +139,6 @@ class JointLossConfig:
             ("gradnorm_min_weight", self.gradnorm_min_weight),
             ("gradnorm_obs_weight_sum", self.gradnorm_obs_weight_sum),
             ("distribution_df", self.distribution_df),
-
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")

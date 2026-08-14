@@ -239,6 +239,7 @@ def test_make_forecast_history_figure_marks_sparse_wastewater_observations() -> 
     observed_offsets = fig.axes[0].collections[0].get_offsets()
     assert observed_offsets.tolist() == [[1.0, 1.0], [3.0, 2.0]]
 
+
 def test_load_window_selection_specs_from_granular_aggregates_per_target_means(
     tmp_path,
 ) -> None:

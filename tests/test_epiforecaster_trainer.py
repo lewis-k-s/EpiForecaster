@@ -184,6 +184,7 @@ def test_normalize_training_history_migrates_legacy_selection_series() -> None:
     assert history["val_selection_score"] == [0.4]
     assert history["val_selection_metric"] == ["mean_target_mae"]
 
+
 def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
     trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
     reports: list[tuple[float, int]] = []

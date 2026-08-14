@@ -224,13 +224,15 @@ configure_shared_binds() {
     "$SCRATCH_ROOT/tmp:/tmp:rw"
   )
 
-  for input_path in "${INPUT_PATHS[@]}"; do
-    if [ ! -e "$input_path" ] || [ -L "$input_path" ]; then
-      echo "Workflow input must exist and must not be a symlink: $input_path" >&2
-      return 1
-    fi
-    BINDS+=("$input_path:$input_path:ro")
-  done
+  if [ "${#INPUT_PATHS[@]}" -gt 0 ]; then
+    for input_path in "${INPUT_PATHS[@]}"; do
+      if [ ! -e "$input_path" ] || [ -L "$input_path" ]; then
+        echo "Workflow input must exist and must not be a symlink: $input_path" >&2
+        return 1
+      fi
+      BINDS+=("$input_path:$input_path:ro")
+    done
+  fi
 
   case "$DVC_MODE" in
     pull)

@@ -652,6 +652,9 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
     ).read_text()
+    shared_coordinator = (
+        REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
+    ).read_text()
     launcher = (REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh").read_text()
 
     assert profile["executor"] == "local"
@@ -678,11 +681,8 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     assert '--cpus-per-task="$CPUS_PER_TASK"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
-    assert (
-        "for optional_host_path in /opt/.snoopy/lib /opt/EAR/current"
-        in coordinator
-    )
-    assert 'if [ -e "$optional_host_path" ]' in coordinator
+    assert 'exec "$SCRIPT_DIR/snakemake_coordinator.sh" "$@"' in coordinator
+    assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in shared_coordinator
     assert "--mem" not in coordinator
     assert "--mem" not in launcher
 
@@ -1223,9 +1223,7 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
     model_root = run_root / "outputs/training/single/model"
     _complete_training_dynamics(model_root)
     (model_root / "training_manifest.json").write_text('{"schema_version": 1}\n')
-    (model_root / "training_provenance.json").write_text(
-        '{"schema_version": 1}\n'
-    )
+    (model_root / "training_provenance.json").write_text('{"schema_version": 1}\n')
     (model_root / "worker.pt.trace.json").write_text('{"traceEvents": []}\n')
     remote = tmp_path / "remote"
     cache = tmp_path / "cache"
@@ -2141,14 +2139,15 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
 def test_transferred_runner_attaches_without_sbatch(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="attach")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="attach")
     subprocess.run(
         [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=True,
     )
 
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(exist_ok=True)
     srun_calls = tmp_path / "srun.calls"
     forbidden_sbatch = fake_bin / "sbatch"
     forbidden_sbatch.write_text("#!/bin/bash\nexit 99\n")
@@ -2172,8 +2171,8 @@ def test_transferred_runner_attaches_without_sbatch(
         'else exec /bin/date "$@"; fi\n'
     )
     fake_date.chmod(0o755)
-    env = os.environ | {
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    env = env | {
+        "PATH": f"{fake_bin}:{env['PATH']}",
         "SRUN_CALLS": str(srun_calls),
     }
     runner = run_root / "source/scripts/workflow/remote_run.sh"

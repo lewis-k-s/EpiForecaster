@@ -218,6 +218,7 @@ def normalize_training_history(
     normalized["val_selection_metric"] = selection_metrics
     return normalized
 
+
 class EpiForecasterTrainer:
     """
     Single trainer handling all variants via configuration.
@@ -1182,9 +1183,7 @@ class EpiForecasterTrainer:
     def _setup_training_dynamics(self) -> None:
         if self.experiment_dir is None:
             raise RuntimeError("experiment_dir not set; call setup_logging() first")
-        artifact_exists = (
-            self.experiment_dir / "training_dynamics.jsonl"
-        ).exists()
+        artifact_exists = (self.experiment_dir / "training_dynamics.jsonl").exists()
         resume_existing = bool(
             self.config.training.resume_checkpoint_path and artifact_exists
         )
@@ -1262,9 +1261,7 @@ class EpiForecasterTrainer:
         try:
             result = self._run_training()
         except Exception as exc:
-            status = (
-                "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
-            )
+            status = "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
             writer = getattr(self, "training_dynamics_writer", None)
             if writer is not None:
                 writer.finalize(
