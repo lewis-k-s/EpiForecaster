@@ -129,6 +129,7 @@ def test_collect_forecast_samples_supports_epibatch_attribute_targets(
     assert hosp_payload["prediction"].tolist() == [7.5, 9.5]
     assert "interval_low_80" in hosp_payload
     assert "interval_high_95" in hosp_payload
+    assert hosp_payload["forecast_std"].tolist() == [1.0, 2.0]
     assert hosp_payload["window_mae"] == 0.5
     assert samples[0]["window_mae"] == 0.5
 
@@ -158,8 +159,85 @@ def test_aligned_distribution_intervals_use_configured_family_and_levels() -> No
         interval_levels=[0.9],
     )
 
-    assert set(normal) == {"interval_low_90", "interval_high_90"}
+    assert set(normal) == {"forecast_std", "interval_low_90", "interval_high_90"}
+    assert normal["forecast_std"].tolist() == [1.0, 1.0]
+    assert student_t["forecast_std"][0] > normal["forecast_std"][0]
     assert student_t["interval_high_90"][0] > normal["interval_high_90"][0]
+
+
+def test_make_forecast_history_figure_renders_standard_deviation_band() -> None:
+    sample = {
+        "node_id": 1,
+        "node_label": "Region 1",
+        "actual_context": [1.0, 2.0],
+        "prediction": [2.5, 3.0],
+        "target": [2.0, 3.0],
+        "history": [1.0, 2.0],
+        "window_start": 0,
+        "window_mae": 0.25,
+        "H": 2,
+        "t0": 2,
+        "series_t": [0, 1, 2, 3],
+        "targets": {
+            "hosp": {
+                "actual_context": [1.0, 2.0],
+                "prediction": [2.5, 3.0],
+                "target": [2.0, 3.0],
+                "history": [1.0, 2.0],
+                "full_series": [1.0, 2.0, 2.0, 3.0],
+                "window_mae": 0.25,
+                "forecast_std": [0.25, 0.5],
+            }
+        },
+    }
+
+    fig = forecast_plots.make_forecast_history_figure(
+        samples=[sample],
+        input_window_length=2,
+        forecast_horizon=2,
+        target="hosp",
+    )
+
+    assert fig is not None
+    assert fig.axes[0].collections
+    assert "Forecast ±1 SD" in fig.axes[0].get_legend_handles_labels()[1]
+
+
+def test_make_forecast_history_figure_marks_sparse_wastewater_observations() -> None:
+    sample = {
+        "node_id": 1,
+        "node_label": "Region 1",
+        "actual_context": [1.0, 2.0],
+        "prediction": [2.5, 3.0],
+        "target": [2.0, 3.0],
+        "history": [1.0, 2.0],
+        "window_start": 0,
+        "window_mae": 0.25,
+        "H": 2,
+        "t0": 2,
+        "series_t": [0, 1, 2, 3],
+        "targets": {
+            "ww": {
+                "actual_context": [1.0, 2.0],
+                "prediction": [2.5, 3.0],
+                "target": [2.0, 3.0],
+                "history": [1.0, 2.0],
+                "full_series": [float("nan"), 1.0, float("nan"), 2.0],
+                "window_mae": 0.25,
+            }
+        },
+    }
+
+    fig = forecast_plots.make_forecast_history_figure(
+        samples=[sample],
+        input_window_length=2,
+        forecast_horizon=2,
+        target="ww",
+    )
+
+    assert fig is not None
+    observed_offsets = fig.axes[0].collections[0].get_offsets()
+    assert observed_offsets.tolist() == [[1.0, 1.0], [3.0, 2.0]]
 
 
 def test_load_window_selection_specs_from_granular_aggregates_per_target_means(

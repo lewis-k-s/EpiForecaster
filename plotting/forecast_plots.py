@@ -156,7 +156,15 @@ def _aligned_distribution_intervals(
         model_outputs[scale_key][batch_index],
         target_length=target_length,
     ).astype(np.float32)
-    intervals: dict[str, np.ndarray] = {}
+    if distribution_family == "normal":
+        std_multiplier = 1.0
+    elif distribution_df > 2.0:
+        std_multiplier = float(np.sqrt(distribution_df / (distribution_df - 2.0)))
+    else:
+        std_multiplier = float("nan")
+    intervals: dict[str, np.ndarray] = {
+        "forecast_std": scale_series * std_multiplier,
+    }
     for level in interval_levels:
         level_name = interval_level_name(float(level))
         half_width = (
@@ -1340,9 +1348,25 @@ def make_forecast_history_figure(
                 )
             ).reshape(-1)
 
-            ax.plot(
-                series_t, full_series, color=actual_color, linewidth=1.5, label="Actual"
-            )
+            if target == "ww":
+                observed = np.isfinite(full_series)
+                ax.scatter(
+                    series_t[observed],
+                    full_series[observed],
+                    color=actual_color,
+                    s=12,
+                    alpha=0.8,
+                    label="Actual",
+                    zorder=3,
+                )
+            else:
+                ax.plot(
+                    series_t,
+                    full_series,
+                    color=actual_color,
+                    linewidth=1.5,
+                    label="Actual",
+                )
 
             mae_values = [
                 float(sample["window_mae"])
@@ -1366,6 +1390,29 @@ def make_forecast_history_figure(
                 pred_values = pred_series[: pred_t.shape[0]]
                 if pred_t.size == 0:
                     continue
+                payload = _extract_payload_dict(
+                    sample,
+                    target=target,
+                    payload_collection=payload_collection,
+                )
+                if payload is not None and "forecast_std" in payload:
+                    forecast_std = np.asarray(
+                        payload["forecast_std"], dtype=np.float32
+                    ).reshape(-1)
+                    std_points = min(
+                        int(pred_t.shape[0]),
+                        int(forecast_std.shape[0]),
+                    )
+                    if std_points > 0:
+                        ax.fill_between(
+                            pred_t[:std_points],
+                            pred_values[:std_points] - forecast_std[:std_points],
+                            pred_values[:std_points] + forecast_std[:std_points],
+                            color=forecast_color,
+                            alpha=0.16,
+                            linewidth=0,
+                            label="Forecast ±1 SD" if forecast_idx == 0 else None,
+                        )
                 ax.plot(
                     pred_t,
                     pred_values,
