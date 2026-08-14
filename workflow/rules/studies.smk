@@ -64,6 +64,7 @@ if WORKFLOW_KIND == "hpo":
                 dvc_remote=DVC_REMOTE,
                 dvc_cache=DVC_CACHE,
                 cpus=CPUS_PER_TASK,
+                host_step=True,
             )
         shell:
             "{params.command} > {log:q} 2>&1"
@@ -130,6 +131,7 @@ elif WORKFLOW_KIND == "ablation":
                 dvc_remote=DVC_REMOTE,
                 dvc_cache=DVC_CACHE,
                 cpus=CPUS_PER_TASK,
+                host_step=True,
             )
         shell:
             "{params.command} > {log:q} 2>&1"
@@ -220,6 +222,7 @@ elif WORKFLOW_KIND == "crossval":
                 dvc_remote=DVC_REMOTE,
                 dvc_cache=DVC_CACHE,
                 cpus=CPUS_PER_TASK,
+                host_step=True,
             )
         shell:
             "{params.command} > {log:q} 2>&1"

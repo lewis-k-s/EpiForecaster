@@ -64,6 +64,7 @@ def container_command(
     cpus: int | None = None,
     promotion_root: str | None = None,
     input_paths: tuple[Path, ...] = (),
+    host_step: bool = False,
 ) -> str:
     command = [
         str(source_root / "scripts/workflow/mn5_container_exec.sh"),
@@ -98,7 +99,12 @@ def container_command(
     if cpus is not None:
         command.extend(["--cpus", str(cpus)])
     command.extend(["--", *[str(value) for value in arguments]])
-    return shlex.join(command)
+    rendered = shlex.join(command)
+    if host_step:
+        if cpus is None:
+            raise ValueError("A host container step requires an explicit CPU count")
+        return slurm_step(rendered, cpus, gpu=False)
+    return rendered
 
 
 def slurm_step(command: str, cpus_per_task: int, *, gpu: bool = True) -> str:

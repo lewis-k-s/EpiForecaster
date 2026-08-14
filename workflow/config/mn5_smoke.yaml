@@ -18,9 +18,9 @@ dvc:
 optuna:
   study_name: epiforecaster_hpo_smoke_v1
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  workers: 4
+  workers: 1
   trials_per_worker: 1
-  timeout_s: 900
+  timeout_s: 300
   epochs: 1
   max_batches: 1
   seed: 42
@@ -30,12 +30,16 @@ optuna:
   sample_training_loss_objective: false
   overrides:
     - training.run_final_evaluation=false
+    - training.compile=false
 
 evaluation:
   split: test
   granular: true
   overrides:
-    - training.val_workers=2
+    - training.max_batches=1
+    - training.compile=false
+    - training.val_workers=1
+    - training.test_workers=1
 
 promotion:
   root: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/promoted
@@ -44,9 +48,9 @@ resources:
   allocation:
     account: bsc08
     partition: acc
-    qos: acc_bscls
+    qos: acc_debug
     nodes: 1
-    tasks: 4
+    tasks: 1
     cpus_per_task: 20
-    gres: gpu:4
-    runtime: 60
+    gres: gpu:1
+    runtime: 20

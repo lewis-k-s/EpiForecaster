@@ -218,7 +218,6 @@ def normalize_training_history(
     normalized["val_selection_metric"] = selection_metrics
     return normalized
 
-
 class EpiForecasterTrainer:
     """
     Single trainer handling all variants via configuration.
@@ -1390,6 +1389,7 @@ class EpiForecasterTrainer:
                     observation_loss=self.criterion.observation_loss,
                 )
             )
+
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )

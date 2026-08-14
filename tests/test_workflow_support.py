@@ -101,46 +101,76 @@ def _write_pointer(
     )
 
 
-def test_mn5_smoke_only_changes_workload_size_and_study_identity() -> None:
+def test_mn5_smoke_uses_short_single_gpu_debug_workload() -> None:
     production = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
     smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
 
-    def flattened(mapping: dict, prefix: tuple[str, ...] = ()) -> dict:
-        values = {}
-        for key, value in mapping.items():
-            path = (*prefix, str(key))
-            if isinstance(value, dict):
-                values.update(flattened(value, path))
-            else:
-                values[path] = value
-        return values
-
-    production_values = flattened(production)
-    smoke_values = flattened(smoke)
-    differing = {
-        path
-        for path in production_values.keys() | smoke_values.keys()
-        if production_values.get(path) != smoke_values.get(path)
-    }
-
-    assert differing == {
-        ("optuna", "study_name"),
-        ("optuna", "trials_per_worker"),
-        ("optuna", "timeout_s"),
-        ("optuna", "epochs"),
-        ("optuna", "max_batches"),
-        ("resources", "allocation", "runtime"),
-    }
-    assert (
-        smoke["optuna"]["trials_per_worker"] < production["optuna"]["trials_per_worker"]
-    )
-    assert smoke["optuna"]["timeout_s"] < production["optuna"]["timeout_s"]
-    assert smoke["optuna"]["epochs"] < production["optuna"]["epochs"]
+    assert smoke["workflow"] == production["workflow"]
+    assert smoke["dvc"] == production["dvc"]
+    assert smoke["promotion"] == production["promotion"]
+    assert smoke["optuna"]["base_config"] == production["optuna"]["base_config"]
+    assert smoke["optuna"]["workers"] == 1
+    assert smoke["optuna"]["trials_per_worker"] == 1
+    assert smoke["optuna"]["timeout_s"] == 300
+    assert smoke["optuna"]["epochs"] == 1
     assert smoke["optuna"]["max_batches"] == 1
-    assert (
-        smoke["resources"]["allocation"]["runtime"]
-        < production["resources"]["allocation"]["runtime"]
+    assert "training.compile=false" in smoke["optuna"]["overrides"]
+    assert smoke["evaluation"]["overrides"] == [
+        "training.max_batches=1",
+        "training.compile=false",
+        "training.val_workers=1",
+        "training.test_workers=1",
+    ]
+    assert smoke["resources"]["allocation"] == {
+        "account": "bsc08",
+        "partition": "acc",
+        "qos": "acc_debug",
+        "nodes": 1,
+        "tasks": 1,
+        "cpus_per_task": 20,
+        "gres": "gpu:1",
+        "runtime": 20,
+    }
+
+
+def test_probabilistic_smoke_reuses_short_debug_shape_with_normal_nll() -> None:
+    smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
+    probabilistic = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
     )
+
+    assert probabilistic["workflow"] == smoke["workflow"]
+    assert probabilistic["dvc"] == smoke["dvc"]
+    assert probabilistic["evaluation"] == smoke["evaluation"]
+    assert probabilistic["resources"] == smoke["resources"]
+    for field in (
+        "workers",
+        "trials_per_worker",
+        "timeout_s",
+        "epochs",
+        "max_batches",
+    ):
+        assert probabilistic["optuna"][field] == smoke["optuna"][field]
+    assert (
+        "training.loss.joint.observation_loss=nll"
+        in probabilistic["optuna"]["overrides"]
+    )
+    assert (
+        "training.loss.joint.distribution_family=normal"
+        in probabilistic["optuna"]["overrides"]
+    )
+
+
+def test_probabilistic_batch_smoke_only_changes_qos() -> None:
+    debug = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
+    )
+    batch = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke_batch.yaml").read_text()
+    )
+
+    debug["resources"]["allocation"]["qos"] = "acc_bscls"
+    assert batch == debug
 
 
 def test_single_training_smoke_composes_training_and_evaluation() -> None:
@@ -648,6 +678,11 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     assert '--cpus-per-task="$CPUS_PER_TASK"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
+    assert (
+        "for optional_host_path in /opt/.snoopy/lib /opt/EAR/current"
+        in coordinator
+    )
+    assert 'if [ -e "$optional_host_path" ]' in coordinator
     assert "--mem" not in coordinator
     assert "--mem" not in launcher
 
@@ -1780,7 +1815,26 @@ def test_container_build_dispatch_dry_run_is_offline() -> None:
     assert "dependency key:" in result.stdout
 
 
-def test_runtime_dependency_group_excludes_coordinator_tooling() -> None:
+def test_container_build_dry_run_accepts_existing_allocation() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "containers/runtime/build_sif_on_mn5.sh"),
+            "--dry-run",
+            "--job-id",
+            "43720217",
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "existing allocation: 43720217" in result.stdout
+
+
+def test_dependency_groups_keep_runtime_and_workflow_contracts_explicit() -> None:
     project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     groups = project["dependency-groups"]
 
@@ -1803,6 +1857,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert 'exec /opt/epiforecaster/.venv/bin/python "$@"' in batch
     assert 'for console_script in "$PREFIX_ROOT/.venv/bin/"*' in batch
     assert '"exec /opt/epiforecaster/.venv/bin/$script_name' in batch
+    assert 'exec /opt/epiforecaster/.venv/bin/python -m dvc "$@"' in batch
     assert 'singularity build --force "$scratch_sif" "$sandbox"' in batch
     assert 'test "$(command -v python)" = /usr/local/bin/python' in batch
     assert 'assert sys.prefix == "/opt/epiforecaster/.venv"' in batch
@@ -1818,14 +1873,15 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "import dvc, geopandas, netCDF4" in batch
     assert "torch_geometric, xarray, zarr" in batch
     assert '"$scratch_sif" dvc --version' in batch
-    assert '"$scratch_sif" snakemake --version' not in batch
+    assert '"$scratch_sif" snakemake --version' in batch
     assert "singularity exec --cleanenv --nv" in batch
     assert "torch.cuda.is_available()" in batch
     assert "uv sync" in fetch
     assert "--frozen" in fetch
     assert "--python /usr/local/bin/python3.11" in fetch
-    assert "--group runtime" in fetch
-    assert "--group workflow" not in fetch
+    assert "--group workflow" in fetch
+    assert "--group runtime" not in fetch
+    assert "UV_CONCURRENT_INSTALLS=1" in fetch
     assert "UV_LINK_MODE=copy" in fetch
     assert '"$prefix_root/.venv/bin/python"' in fetch
     assert "sha256sum -c" in dispatcher
@@ -1833,6 +1889,9 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert 'declare -f "$function_name"' in dispatcher
     assert "remote_container_state()" in dispatcher
     assert "remote_submit_build()" in dispatcher
+    assert "remote_build_in_allocation()" in dispatcher
+    assert '--jobid="$allocation_id"' in dispatcher
+    assert 'UV_CACHE_ROOT="/scratch/tmp/${USER:-unknown}/' in dispatcher
     key_material = dispatcher.split('dependency_key="$({', 1)[1].split(
         '} | sha256_stream)"', 1
     )[0]
@@ -1847,7 +1906,7 @@ def _make_remote_run_staging(
     tmp_path: Path,
     *,
     token: str,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path, dict[str, str]]:
     """Create a faithful local staging bundle for the transferred runner."""
     run_parent = tmp_path / "runs"
     run_root = run_parent / "test-run"
@@ -1888,8 +1947,8 @@ def _make_remote_run_staging(
     sif_digest = run_support.sha256_file(sif)
     Path(f"{sif}.sha256").write_text(f"{sif_digest}  {sif.name}\n")
 
-    snakemake_bin = Path(sys.executable).parent / "snakemake"
-    tooling_python = snakemake_bin.with_name("python")
+    snakemake_bin = Path("/usr/local/bin/snakemake")
+    tooling_python = Path("/usr/local/bin/python")
     config = _workflow_config(run_root, run_root / "source")
     config["source"]["source_snapshot_sha256"] = source_digest
     config["source"]["source_file_count"] = len(source_paths)
@@ -1906,17 +1965,66 @@ def _make_remote_run_staging(
     request = (state / "dispatch.tsv").read_text()
     expected = f"tooling_python\t{tooling_python}\n"
     assert expected in request
-    return staging, run_root
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    singularity = fake_bin / "singularity"
+    singularity.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+test "$1" = exec
+shift
+working_directory=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cleanenv|--containall)
+      shift
+      ;;
+    --bind)
+      shift 2
+      ;;
+    --env)
+      export "$2"
+      shift 2
+      ;;
+    --pwd)
+      working_directory="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      break
+      ;;
+  esac
+done
+cd "$working_directory"
+case "$1" in
+  /usr/local/bin/python)
+    shift
+    exec {sys.executable} "$@"
+    ;;
+  /usr/local/bin/snakemake)
+    shift
+    exec {Path(sys.executable).parent / "snakemake"} "$@"
+    ;;
+esac
+exec "$@"
+"""
+    )
+    singularity.chmod(0o755)
+    env = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    return staging, run_root, env
 
 
 def test_transferred_runner_publishes_once_and_reserves_run_id(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="owner")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="owner")
     runner = staging / "source/scripts/workflow/remote_run.sh"
 
     result = subprocess.run(
         [str(runner), "publish"],
+        env=env,
         check=True,
         capture_output=True,
         text=True,
@@ -1932,9 +2040,10 @@ def test_transferred_runner_publishes_once_and_reserves_run_id(
     assert reservation.is_dir()
     assert (reservation / "owner").read_text() == ".staging-test-run.owner\n"
 
-    competing, _ = _make_remote_run_staging(tmp_path, token="competitor")
+    competing, _, env = _make_remote_run_staging(tmp_path, token="competitor")
     duplicate = subprocess.run(
         [str(competing / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -1947,12 +2056,13 @@ def test_transferred_runner_publishes_once_and_reserves_run_id(
 def test_transferred_runner_rejects_tampered_config_before_reservation(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="tampered")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="tampered")
     config_path = staging / "config.yaml"
     config_path.write_text(config_path.read_text() + "tampered: true\n")
 
     result = subprocess.run(
         [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=False,
         capture_output=True,
         text=True,
@@ -1967,14 +2077,15 @@ def test_transferred_runner_rejects_tampered_config_before_reservation(
 def test_transferred_runner_submission_is_idempotent_and_pinned(
     tmp_path: Path,
 ) -> None:
-    staging, run_root = _make_remote_run_staging(tmp_path, token="submit")
+    staging, run_root, env = _make_remote_run_staging(tmp_path, token="submit")
     subprocess.run(
         [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
         check=True,
     )
 
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(exist_ok=True)
     calls = tmp_path / "sbatch.calls"
     sbatch = fake_bin / "sbatch"
     sbatch.write_text(
@@ -1985,8 +2096,8 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     squeue = fake_bin / "squeue"
     squeue.write_text("#!/bin/bash\nprintf 'RUNNING\\n'\n")
     squeue.chmod(0o755)
-    env = os.environ | {
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    env = env | {
+        "PATH": f"{fake_bin}:{env['PATH']}",
         "CALLS_FILE": str(calls),
     }
     runner = run_root / "source/scripts/workflow/remote_run.sh"
@@ -2204,9 +2315,7 @@ def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> N
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     dispatcher = (REPO_ROOT / "scripts/workflow/mn5_workflow.sh").read_text()
-    identity_helper = (REPO_ROOT / "scripts/workflow/tooling_identity.py").read_text()
     remote_runner = (REPO_ROOT / "scripts/workflow/remote_run.sh").read_text()
-    tooling_runner = (REPO_ROOT / "scripts/workflow/remote_tooling.sh").read_text()
     container_exec = (REPO_ROOT / "scripts/workflow/mn5_container_exec.sh").read_text()
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
@@ -2221,19 +2330,14 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "declare -f" not in dispatcher
     assert "remote_function" not in dispatcher
     assert "remote_run.sh" in dispatcher
-    assert "remote_tooling.sh" in dispatcher
+    assert "remote_tooling.sh" not in dispatcher
     assert 'staging_root="$REMOTE_WORKFLOW_RUN_ROOT/.staging-' in dispatcher
     assert "--dispatch-file" in dispatcher
     assert "uv sync" not in dispatcher
-    assert "uv sync" in tooling_runner
-    assert "--frozen" in tooling_runner
-    assert "--only-group workflow" in tooling_runner
-    assert "pyproject.toml=" not in identity_helper
-    assert "uv.lock=" in identity_helper
-    assert "bootstrap=" in identity_helper
-    assert "scripts.workflow.tooling_identity" in dispatcher
-    assert "snakemake_version=" in tooling_runner
-    assert 'ssh_options+=(-o "HostName=$CONTAINER_NETWORK_HOSTNAME")' in dispatcher
+    assert "uv sync" not in remote_runner
+    assert "scripts.workflow.tooling_identity" not in dispatcher
+    assert 'REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"' in dispatcher
+    assert 'TOOLING_KEY="sif-sha256:$observed_sha"' in dispatcher
     assert "executor_commit=" not in dispatcher
     assert "EXECUTOR_SUBMODULE" not in dispatcher
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.launch.lock"' in remote_runner
@@ -2245,6 +2349,7 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert '--gres="$GRES"' in remote_runner
     assert '"$TASKS"' in remote_runner
     assert '"$CPUS_PER_TASK"' in remote_runner
+
     assert (
         '"$@"'
         not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
