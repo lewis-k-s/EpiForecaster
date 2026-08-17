@@ -342,6 +342,130 @@ class CurriculumConfig:
 
 
 @dataclass
+class ResidualSchedulePhaseConfig:
+    """Configuration for one observation-residual log-location budget phase."""
+
+    start_epoch: int
+    end_epoch: int
+    # Maximum |residual log location| as a fraction of |mechanistic log location|.
+    # Clinical locations use log1p(per-100k) units.
+    max_log_location_fraction: float
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("start_epoch", self.start_epoch),
+            ("end_epoch", self.end_epoch),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer epoch, got {value!r}")
+        if self.start_epoch < 0:
+            raise ValueError(f"start_epoch ({self.start_epoch}) must be non-negative")
+        if self.start_epoch >= self.end_epoch:
+            raise ValueError(
+                f"start_epoch ({self.start_epoch}) must be less than end_epoch "
+                f"({self.end_epoch})"
+            )
+        if isinstance(self.max_log_location_fraction, bool) or not math.isfinite(
+            self.max_log_location_fraction
+        ):
+            raise ValueError(
+                "max_log_location_fraction must be a finite value, got "
+                f"{self.max_log_location_fraction!r}"
+            )
+        if not 0.0 <= self.max_log_location_fraction <= 1.0:
+            raise ValueError(
+                "max_log_location_fraction must be in [0, 1], got "
+                f"{self.max_log_location_fraction}"
+            )
+
+
+@dataclass
+class ResidualScheduleConfig:
+    """Observation-residual log-location budget from ``training.residual_schedule``.
+
+    This schedule is independent of the data curriculum: it controls the
+    absolute residual log-location each observation head may add as a fraction
+    of its absolute mechanistic log-location, per training epoch. Clinical
+    locations are in log1p(per-100k) units.
+    ``max_log_location_fraction=0.0`` is an exact residual lockout that keeps
+    the mechanistic path fully active.
+    """
+
+    enabled: bool = False
+    schedule: list[ResidualSchedulePhaseConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        hydrated: list[ResidualSchedulePhaseConfig] = []
+        for phase in self.schedule:
+            if isinstance(phase, (dict, DictConfig)):
+                hydrated.append(ResidualSchedulePhaseConfig(**dict(phase)))
+            else:
+                hydrated.append(phase)
+        self.schedule = hydrated
+
+        if not self.enabled:
+            if self.schedule:
+                raise ValueError(
+                    "residual_schedule.schedule must be empty when "
+                    "residual_schedule.enabled is false"
+                )
+            return
+
+        if not self.schedule:
+            raise ValueError(
+                "residual_schedule.schedule must not be empty when "
+                "residual_schedule.enabled is true"
+            )
+        if self.schedule[0].start_epoch != 0:
+            raise ValueError(
+                "The first residual schedule phase must start at epoch 0, "
+                f"got start_epoch={self.schedule[0].start_epoch}"
+            )
+        # Phase indices are checkpoint provenance. Phases form a single,
+        # contiguous partition beginning at epoch 0; the final phase remains
+        # active for every subsequent epoch.
+        for index, (previous, current) in enumerate(
+            zip(self.schedule, self.schedule[1:], strict=False),
+            start=1,
+        ):
+            if current.start_epoch != previous.end_epoch:
+                raise ValueError(
+                    "Residual schedule phases must be contiguous: phase "
+                    f"{index} starts at epoch {current.start_epoch}, but phase "
+                    f"{index - 1} ends at epoch {previous.end_epoch}"
+                )
+
+
+def resolve_residual_schedule_phase(
+    schedule: ResidualScheduleConfig,
+    epoch: int,
+) -> tuple[int | None, ResidualSchedulePhaseConfig | None]:
+    """Resolve the active residual log-location budget phase for ``epoch``.
+
+    Returns ``(phase_index, phase)``. A disabled schedule resolves to
+    ``(None, None)``. Enabled phases are contiguous from epoch 0, and the
+    final phase persists after its ``end_epoch``.
+    """
+    if epoch < 0:
+        raise ValueError(f"epoch must be non-negative, got {epoch}")
+    if not schedule.enabled:
+        return None, None
+
+    active_index: int | None = None
+    for index, phase in enumerate(schedule.schedule):
+        if phase.start_epoch <= epoch:
+            active_index = index
+        if phase.start_epoch <= epoch < phase.end_epoch:
+            return index, phase
+    if active_index is None:
+        raise ValueError(
+            "Residual schedule does not cover epoch "
+            f"{epoch}; the first phase must start at epoch 0"
+        )
+    return active_index, schedule.schedule[active_index]
+
+
+@dataclass
 class ModelVariant:
     cases: bool = field(default=True)
     regions: bool = field(default=False)
@@ -463,6 +587,20 @@ class ObservationHeadConfig:
     kernel_parameterization_hosp: str = "simplex"
     kernel_parameterization_cases: str = "simplex"
     kernel_parameterization_deaths: str = "simplex"
+    # Gamma(shape, scale) prior for the deaths delay kernel. This initializes
+    # its simplex weights by default and initializes the explicit two-parameter
+    # Gamma family when selected.
+    kernel_gamma_shape_deaths: float = 12.25
+    kernel_gamma_scale_deaths: float = 0.5714285714285714
+    # Gamma(shape, scale) prior for the hospitalization delay kernel.
+    # Gamma(5, 2) is the long-standing ClinicalObservationHead initializer
+    # (mean delay 10 days); this field makes that implicit prior explicit.
+    kernel_gamma_shape_hosp: float = 5.0
+    kernel_gamma_scale_hosp: float = 2.0
+    # Gamma(shape, scale) prior for the cases delay kernel, matching the same
+    # shared ClinicalObservationHead initializer.
+    kernel_gamma_shape_cases: float = 5.0
+    kernel_gamma_scale_cases: float = 2.0
     kernel_mlp_ww: bool = False
     kernel_mlp_hosp: bool = False
     kernel_mlp_cases: bool = False
@@ -481,6 +619,9 @@ class ObservationHeadConfig:
     residual_hidden_dim: int = 32
     residual_layers: int = 2
     residual_dropout: float = 0.1
+    # Heads in this set have no direct observation-context residual path. The
+    # mechanistic signal and its learnable delay/scale remain active.
+    residual_disabled_heads: list[str] = field(default_factory=list)
 
     # Observation context dimension
     obs_context_dim: int = 96
@@ -515,20 +656,57 @@ class ObservationHeadConfig:
         ]:
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
-        for name, value in [
-            ("kernel_parameterization_ww", self.kernel_parameterization_ww),
-            ("kernel_parameterization_hosp", self.kernel_parameterization_hosp),
-            ("kernel_parameterization_cases", self.kernel_parameterization_cases),
-            ("kernel_parameterization_deaths", self.kernel_parameterization_deaths),
+        # Wastewater routes through SheddingConvolution, which has no Gamma
+        # mode; the clinical heads route through DelayKernel, which does.
+        for name, value, allowed in [
+            (
+                "kernel_parameterization_ww",
+                self.kernel_parameterization_ww,
+                {"simplex", "free"},
+            ),
+            (
+                "kernel_parameterization_hosp",
+                self.kernel_parameterization_hosp,
+                {"simplex", "free", "gamma"},
+            ),
+            (
+                "kernel_parameterization_cases",
+                self.kernel_parameterization_cases,
+                {"simplex", "free", "gamma"},
+            ),
+            (
+                "kernel_parameterization_deaths",
+                self.kernel_parameterization_deaths,
+                {"simplex", "free", "gamma"},
+            ),
         ]:
-            if value not in {"simplex", "free"}:
+            if value not in allowed:
                 raise ValueError(
-                    f"{name} must be one of {{'simplex', 'free'}}, got {value!r}"
+                    f"{name} must be one of {sorted(allowed)}, got {value!r}"
                 )
+        for name, value in [
+            ("kernel_gamma_shape_hosp", self.kernel_gamma_shape_hosp),
+            ("kernel_gamma_scale_hosp", self.kernel_gamma_scale_hosp),
+            ("kernel_gamma_shape_cases", self.kernel_gamma_shape_cases),
+            ("kernel_gamma_scale_cases", self.kernel_gamma_scale_cases),
+            ("kernel_gamma_shape_deaths", self.kernel_gamma_shape_deaths),
+            ("kernel_gamma_scale_deaths", self.kernel_gamma_scale_deaths),
+        ]:
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
         if self.residual_scale < 0:
             raise ValueError(
                 f"residual_scale must be non-negative, got {self.residual_scale}"
             )
+        invalid_residual_heads = set(self.residual_disabled_heads).difference(
+            {"ww", "hosp", "cases", "deaths"}
+        )
+        if invalid_residual_heads:
+            raise ValueError(
+                "residual_disabled_heads must contain only 'ww', 'hosp', 'cases', "
+                f"or 'deaths', got {sorted(invalid_residual_heads)!r}"
+            )
+
         if self.residual_hidden_dim <= 0:
             raise ValueError(
                 f"residual_hidden_dim must be positive, got {self.residual_hidden_dim}"
@@ -893,6 +1071,10 @@ class TrainingParams:
     # When enabled, uses mixed synthetic/real data sampling
     # When disabled, uses single run_id from data config
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    # Observation-residual budget schedule (independent of the data curriculum).
+    residual_schedule: ResidualScheduleConfig = field(
+        default_factory=ResidualScheduleConfig
+    )
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 4
@@ -996,6 +1178,9 @@ class TrainingParams:
         if isinstance(self.curriculum, (dict, DictConfig)):
             curriculum_dict = cast(dict[str, Any], self.curriculum)
             self.curriculum = CurriculumConfig(**curriculum_dict)
+        if isinstance(self.residual_schedule, (dict, DictConfig)):
+            residual_schedule_dict = cast(dict[str, Any], self.residual_schedule)
+            self.residual_schedule = ResidualScheduleConfig(**residual_schedule_dict)
         if isinstance(self.profiler, (dict, DictConfig)):
             profiler_dict = cast(dict[str, Any], self.profiler)
             self.profiler = ProfilerConfig(**profiler_dict)
@@ -1423,6 +1608,10 @@ class EpiForecasterConfig:
         if "curriculum" in training_dict:
             training_dict["curriculum"] = CurriculumConfig(
                 **training_dict["curriculum"]
+            )
+        if "residual_schedule" in training_dict:
+            training_dict["residual_schedule"] = ResidualScheduleConfig(
+                **training_dict["residual_schedule"]
             )
 
         return cls(

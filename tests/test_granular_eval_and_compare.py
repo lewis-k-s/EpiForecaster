@@ -16,6 +16,7 @@ from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
 from models.configs import ObservationHeadConfig
+from models.observation_heads import ClinicalObservationHead
 from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
 
@@ -124,15 +125,9 @@ def _make_batch() -> SimpleNamespace:
                 [[0.0, 0.02, 0.03], [0.0, 0.04, 0.05]],
                 dtype=torch.float32,
             ),
-            "observation_source_ww": torch.full(
-                (2, 3), 0.1, dtype=torch.float32
-            ),
-            "observation_source_cases": torch.full(
-                (2, 3), 0.1, dtype=torch.float32
-            ),
-            "observation_source_deaths": torch.zeros(
-                (2, 2), dtype=torch.float32
-            ),
+            "observation_source_ww": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "observation_source_cases": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "observation_source_deaths": torch.zeros((2, 2), dtype=torch.float32),
             "physics_residual": torch.zeros((2, 2), dtype=torch.float32),
         },
         targets_dict={
@@ -193,6 +188,45 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         horizon=2,
         device=torch.device("cpu"),
     )
+    assert baseline_metrics["observation_latent_hosp_observed_count"] == 4
+    for pathway in ("full", "mechanistic_only"):
+        prefix = f"observation_latent_hosp_{pathway}"
+        assert baseline_metrics[f"{prefix}_mean_window_spearman"] == pytest.approx(1.0)
+        assert baseline_metrics[f"{prefix}_window_spearman_total_count"] == 2
+        assert baseline_metrics[f"{prefix}_window_spearman_candidate_count"] == 2
+        assert baseline_metrics[f"{prefix}_window_spearman_eligible_count"] == 2
+        assert baseline_metrics[f"{prefix}_window_spearman_candidate_fraction"] == (
+            pytest.approx(1.0)
+        )
+        assert baseline_metrics[f"{prefix}_window_spearman_eligible_fraction"] == (
+            pytest.approx(1.0)
+        )
+        assert baseline_metrics[
+            f"{prefix}_window_spearman_eligible_given_candidate_fraction"
+        ] == pytest.approx(1.0)
+    assert "observation_latent_hosp_mean_window_spearman" not in baseline_metrics
+    assert (
+        "observation_latent_hosp_mean_window_mechanistic_spearman"
+        not in baseline_metrics
+    )
+    zero_eligible_prefix = "observation_latent_ww_full"
+    assert math.isnan(baseline_metrics[f"{zero_eligible_prefix}_mean_window_spearman"])
+    assert baseline_metrics[f"{zero_eligible_prefix}_window_spearman_total_count"] == 2
+    assert (
+        baseline_metrics[f"{zero_eligible_prefix}_window_spearman_candidate_count"] == 1
+    )
+    assert (
+        baseline_metrics[f"{zero_eligible_prefix}_window_spearman_eligible_count"] == 0
+    )
+    assert baseline_metrics[
+        f"{zero_eligible_prefix}_window_spearman_candidate_fraction"
+    ] == pytest.approx(0.5)
+    assert baseline_metrics[
+        f"{zero_eligible_prefix}_window_spearman_eligible_fraction"
+    ] == pytest.approx(0.0)
+    assert baseline_metrics[
+        f"{zero_eligible_prefix}_window_spearman_eligible_given_candidate_fraction"
+    ] == pytest.approx(0.0)
 
     granular_output = tmp_path / "eval_granular.parquet"
     per_head_csv = tmp_path / "eval_node_metrics_per_head.csv"
@@ -384,9 +418,7 @@ def test_evaluate_loader_uses_configured_compartment_plot_sources(
     assert hosp_row["relevant_latent_name"] == "H"
     assert hosp_row["relevant_latent_value"] == pytest.approx(0.05)
 
-    deaths_row = rows[
-        (rows["target"] == "deaths") & (rows["horizon"] == 1)
-    ].iloc[0]
+    deaths_row = rows[(rows["target"] == "deaths") & (rows["horizon"] == 1)].iloc[0]
     assert deaths_row["relevant_latent_name"] == "D"
     assert deaths_row["relevant_latent_value"] == pytest.approx(0.05)
 
@@ -969,3 +1001,131 @@ def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> N
             candidate_csv=candidate_csv,
             output_dir=tmp_path / "compare",
         )
+
+
+class _KernelMetricModel(torch.nn.Module):
+    """Dummy model carrying real clinical heads for kernel diagnostics."""
+
+    def __init__(self, heads: dict[str, ClinicalObservationHead]) -> None:
+        super().__init__()
+        for name, head in heads.items():
+            setattr(self, f"{name}_head", head)
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return batch_data.model_outputs, batch_data.targets_dict
+
+
+class _CompiledWrapper(torch.nn.Module):
+    """Stand-in for torch.compile's OptimizedModule (_orig_mod attribute)."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self._orig_mod = model
+
+    def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return self._orig_mod.forward_batch(
+            batch_data, region_embeddings=region_embeddings, **kwargs
+        )
+
+
+def _campaign_heads() -> dict[str, ClinicalObservationHead]:
+    return {
+        "hosp": ClinicalObservationHead(
+            kernel_length=21,
+            gamma_shape=5.0,
+            gamma_scale=2.0,
+            learnable_kernel=False,
+            kernel_parameterization="gamma",
+        ),
+        "cases": ClinicalObservationHead(
+            kernel_length=14,
+            learnable_kernel=True,
+            kernel_parameterization="simplex",
+        ),
+        "deaths": ClinicalObservationHead(
+            kernel_length=21,
+            gamma_shape=12.25,
+            gamma_scale=4.0 / 7.0,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+        ),
+    }
+
+
+def test_add_delay_kernel_metrics_fixed_simplex_and_gamma() -> None:
+    from evaluation.eval_loop import _add_delay_kernel_metrics
+
+    metrics: dict[str, object] = {}
+    _add_delay_kernel_metrics(
+        metrics=metrics, model=_KernelMetricModel(_campaign_heads())
+    )
+
+    # Frozen Gamma hospitalization kernel: zero kernel DOF plus Gamma state.
+    assert metrics["kernel_hosp_trainable_parameter_count"] == 0
+    assert metrics["kernel_hosp_mean_delay_days"] == pytest.approx(10.0, abs=1.0)
+    assert metrics["kernel_hosp_delay_std_days"] > 0.0
+    assert metrics["kernel_hosp_gamma_shape"] == pytest.approx(5.0)
+    assert metrics["kernel_hosp_gamma_scale"] == pytest.approx(2.0)
+    for bound in (
+        "shape_lower",
+        "shape_upper",
+        "scale_lower",
+        "scale_upper",
+    ):
+        assert metrics[f"kernel_hosp_gamma_{bound}_bound_hit"] == 0
+
+    # Learnable simplex cases kernel: one DOF per lag, no Gamma keys.
+    assert metrics["kernel_cases_trainable_parameter_count"] == 14
+    assert metrics["kernel_cases_mean_delay_days"] > 0.0
+    assert metrics["kernel_cases_delay_std_days"] >= 0.0
+    assert not any(key.startswith("kernel_cases_gamma") for key in metrics)
+
+    # Learnable Gamma deaths kernel: two raw coordinates and finite summary
+    # diagnostics under the open-interior bounded transform.
+    assert metrics["kernel_deaths_trainable_parameter_count"] == 2
+    assert math.isfinite(metrics["kernel_deaths_gamma_shape"])
+    assert math.isfinite(metrics["kernel_deaths_gamma_scale"])
+    assert math.isfinite(metrics["kernel_deaths_mean_delay_days"])
+    assert math.isfinite(metrics["kernel_deaths_delay_std_days"])
+    assert metrics["kernel_deaths_gamma_shape"] == pytest.approx(12.25)
+    assert metrics["kernel_deaths_gamma_scale"] == pytest.approx(4.0 / 7.0)
+    assert not any(
+        metrics[f"kernel_deaths_gamma_{bound}_bound_hit"]
+        for bound in ("shape_lower", "shape_upper", "scale_lower", "scale_upper")
+    )
+
+    # No wastewater delay metrics: SheddingConvolution is out of scope.
+    assert not any(key.startswith("kernel_ww") for key in metrics)
+
+
+def test_add_delay_kernel_metrics_unwraps_compiled_models() -> None:
+    from evaluation.eval_loop import _add_delay_kernel_metrics
+
+    metrics: dict[str, object] = {}
+    _add_delay_kernel_metrics(
+        metrics=metrics,
+        model=_CompiledWrapper(
+            _KernelMetricModel({"cases": _campaign_heads()["cases"]})
+        ),
+    )
+    assert metrics["kernel_cases_trainable_parameter_count"] == 14
+    assert not any(key.startswith("kernel_hosp") for key in metrics)
+
+
+def test_evaluate_loader_emits_delay_kernel_metrics(tmp_path: Path) -> None:
+    model = _KernelMetricModel(_campaign_heads())
+    loader = _DummyLoader([_make_batch()])
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0)
+
+    _, metrics, _ = evaluate_loader(
+        model=model,
+        loader=loader,
+        criterion=criterion,
+        horizon=2,
+        device=torch.device("cpu"),
+    )
+    assert metrics["kernel_hosp_gamma_shape"] == pytest.approx(5.0)
+    assert metrics["kernel_hosp_trainable_parameter_count"] == 0
+    assert metrics["kernel_cases_trainable_parameter_count"] == 14
+    assert metrics["kernel_deaths_gamma_shape"] == pytest.approx(12.25)

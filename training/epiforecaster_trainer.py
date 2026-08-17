@@ -38,7 +38,7 @@ from data.latent_supervision import LatentScaleState, fit_latent_scale_state
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.eval_loop import evaluate_loader
 from evaluation.losses import JointInferenceLoss
-from models.configs import EpiForecasterConfig
+from models.configs import EpiForecasterConfig, resolve_residual_schedule_phase
 from models.epiforecaster import EpiForecaster
 from training.dataloader_factory import (
     build_dataloaders,
@@ -411,6 +411,9 @@ class EpiForecasterTrainer:
             self.region_embeddings = self.region_embeddings.to(self.device)
 
         self.model.to(self.device)
+        # Raw model reference for runtime controls that must bypass the
+        # torch.compile OptimizedModule wrapper.
+        self._residual_schedule_model = self.model
 
         # Apply torch.compile *before* loading checkpoints so that
         # compiled-checkpoint keys (_orig_mod.) match the live model.
@@ -554,6 +557,8 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx: int | None = None
         self._lr_warmup_remaining: int = 0
         self._lr_warmup_target_lr: float = 0.0  # Target LR to restore after warmup
+        # Active observation-residual budget phase provenance (None = disabled)
+        self._active_residual_schedule_state: dict[str, Any] | None = None
 
         # Initialize gradient debugger (zero overhead when disabled)
         grad_debug_dir = self.config.training.gradient_debug_log_dir
@@ -653,11 +658,13 @@ class EpiForecasterTrainer:
                 )
             )
             self._status(
-                "    - Deaths:     kernel=%s, learnable=%s, mode=%s"
+                "    - Deaths:     kernel=%s, learnable=%s, mode=%s, gamma=(%s, %s)"
                 % (
                     heads.kernel_length_deaths,
                     heads.learnable_kernel_deaths,
                     heads.kernel_parameterization_deaths,
+                    heads.kernel_gamma_shape_deaths,
+                    heads.kernel_gamma_scale_deaths,
                 )
             )
             self._status(
@@ -1122,6 +1129,7 @@ class EpiForecasterTrainer:
             raise ValueError("resume_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         self._validate_checkpoint_latent_scale_state(checkpoint)
+        self._validate_checkpoint_residual_schedule_state(checkpoint)
 
         # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
@@ -1735,6 +1743,143 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx = current_idx
         return transition
 
+    def _apply_residual_schedule_for_epoch(self, epoch: int) -> None:
+        """Apply the configured observation-residual budget for ``epoch``.
+
+        Must be called once per epoch before the first batch. Disabled
+        schedules restore the unrestricted legacy residual path.
+        """
+        phase_index, phase = resolve_residual_schedule_phase(
+            self.config.training.residual_schedule,
+            epoch,
+        )
+        effective_max_log_location_fraction: float | None = (
+            None if phase is None else float(phase.max_log_location_fraction)
+        )
+        self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
+            effective_max_log_location_fraction
+        )
+        self._active_residual_schedule_state = {
+            "enabled": phase is not None,
+            "phase_index": phase_index,
+            "phase_start_epoch": None if phase is None else phase.start_epoch,
+            "phase_end_epoch": None if phase is None else phase.end_epoch,
+            "effective_max_log_location_fraction": (
+                effective_max_log_location_fraction
+            ),
+        }
+        if phase is not None:
+            phase_epochs = f"{phase.start_epoch}-{phase.end_epoch - 1}"
+            if phase_index == len(self.config.training.residual_schedule.schedule) - 1:
+                phase_epochs += " and onward"
+            self._status(
+                f"Residual schedule phase {phase_index} (epochs {phase_epochs}): "
+                "residual log-location budget "
+                f"{effective_max_log_location_fraction:.2f} of mechanistic "
+                "log location",
+                logging.INFO,
+            )
+
+    def _validate_checkpoint_residual_schedule_state(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> None:
+        """Reject resume when the residual schedule disagrees with the checkpoint.
+
+        The schedule is scientific behavior: changing it across a resume
+        would silently change the residual policy that produced the checkpoint
+        weights. Legacy checkpoints without any schedule state may only resume
+        into a disabled schedule.
+        """
+        saved_config = checkpoint.get("config")
+        saved_training = (
+            saved_config.get("training", {}) if isinstance(saved_config, dict) else None
+        )
+        saved_schedule = (
+            saved_training.get("residual_schedule")
+            if isinstance(saved_training, dict)
+            else None
+        )
+        current_schedule = {
+            "enabled": self.config.training.residual_schedule.enabled,
+            "schedule": [
+                {
+                    "start_epoch": phase.start_epoch,
+                    "end_epoch": phase.end_epoch,
+                    "max_log_location_fraction": phase.max_log_location_fraction,
+                }
+                for phase in self.config.training.residual_schedule.schedule
+            ],
+        }
+        # A checkpoint without a schedule block predates this feature. It is
+        # valid only when it also has no schedule provenance and resumes into
+        # the unrestricted legacy path.
+        legacy_checkpoint = saved_schedule is None
+        saved_state = checkpoint.get("residual_schedule_state")
+        if legacy_checkpoint:
+            if saved_state is not None:
+                raise ValueError(
+                    "Legacy checkpoint carries residual schedule provenance "
+                    f"without a residual schedule: {saved_state!r}"
+                )
+            if current_schedule["enabled"]:
+                raise ValueError(
+                    "Legacy checkpoint without residual schedule state may only "
+                    "resume into a disabled residual schedule."
+                )
+            return
+        if saved_schedule != current_schedule:
+            raise ValueError(
+                "Checkpoint residual schedule does not match the configured "
+                f"schedule: checkpoint={saved_schedule!r}, "
+                f"configured={current_schedule!r}"
+            )
+        if not self.config.training.residual_schedule.enabled:
+            canonical_disabled = {
+                "enabled": False,
+                "phase_index": None,
+                "phase_start_epoch": None,
+                "phase_end_epoch": None,
+                "effective_max_log_location_fraction": None,
+            }
+            if saved_state is not None and saved_state != canonical_disabled:
+                raise ValueError(
+                    "Checkpoint carries a disabled residual schedule with "
+                    f"contradictory provenance: {saved_state!r}"
+                )
+            return
+        if saved_state is None:
+            raise ValueError(
+                "Residual schedule is enabled but the checkpoint carries no "
+                "residual_schedule_state provenance; refusing to resume."
+            )
+        saved_epoch = int(checkpoint.get("epoch", -1))
+        expected_index, expected_phase = resolve_residual_schedule_phase(
+            self.config.training.residual_schedule,
+            saved_epoch,
+        )
+        expected_state = {
+            "enabled": expected_phase is not None,
+            "phase_index": expected_index,
+            "phase_start_epoch": (
+                None if expected_phase is None else expected_phase.start_epoch
+            ),
+            "phase_end_epoch": (
+                None if expected_phase is None else expected_phase.end_epoch
+            ),
+            "effective_max_log_location_fraction": (
+                None
+                if expected_phase is None
+                else float(expected_phase.max_log_location_fraction)
+            ),
+        }
+        if saved_state != expected_state:
+            raise ValueError(
+                "Checkpoint residual schedule provenance is inconsistent with "
+                f"the saved epoch {saved_epoch}: checkpoint={saved_state!r}, "
+                f"expected={expected_state!r}"
+            )
+
     def _training_step_impl(self, batch_data: EpiBatch) -> torch.Tensor:
         """Pure training step: forward + backward only.
 
@@ -2238,6 +2383,10 @@ class EpiForecasterTrainer:
         """Train for one epoch."""
         self.model.train()
 
+        # Apply the observation-residual budget once per epoch, before any
+        # batch. Orthogonal to the data curriculum and its LR-transition logic.
+        self._apply_residual_schedule_for_epoch(self.current_epoch)
+
         # Update Curriculum
         if self.curriculum_sampler is not None:
             self.curriculum_sampler.set_curriculum(self.current_epoch)
@@ -2634,7 +2783,7 @@ class EpiForecasterTrainer:
                         self.config.training.gradient_clip_value
                     )
                     gradnorm_total_preclip = float(grad_norm.detach().cpu().item())
-                    dynamics_values = {
+                    dynamics_values: dict[str, Any] = {
                         key.replace("/", "_"): value
                         for key, value in log_data.items()
                         if key != "epoch"
@@ -2646,6 +2795,38 @@ class EpiForecasterTrainer:
                                 1.0,
                                 gradient_clip_threshold
                                 / max(gradnorm_total_preclip, 1.0e-12),
+                            ),
+                        }
+                    )
+                    dynamics_values.update(
+                        {
+                            "residual_schedule_enabled": bool(
+                                self._active_residual_schedule_state is not None
+                                and self._active_residual_schedule_state["enabled"]
+                            ),
+                            "residual_schedule_phase_index": (
+                                self._active_residual_schedule_state["phase_index"]
+                                if self._active_residual_schedule_state is not None
+                                else None
+                            ),
+                            "residual_schedule_phase_start_epoch": (
+                                self._active_residual_schedule_state[
+                                    "phase_start_epoch"
+                                ]
+                                if self._active_residual_schedule_state is not None
+                                else None
+                            ),
+                            "residual_schedule_phase_end_epoch": (
+                                self._active_residual_schedule_state["phase_end_epoch"]
+                                if self._active_residual_schedule_state is not None
+                                else None
+                            ),
+                            "residual_schedule_effective_max_log_location_fraction": (
+                                self._active_residual_schedule_state[
+                                    "effective_max_log_location_fraction"
+                                ]
+                                if self._active_residual_schedule_state is not None
+                                else None
                             ),
                         }
                     )
@@ -2757,6 +2938,16 @@ class EpiForecasterTrainer:
         checkpoint_path = self._best_checkpoint_path()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         self._validate_checkpoint_latent_scale_state(checkpoint)
+        # The best checkpoint may come from an earlier residual-schedule
+        # phase than the final epoch; the budget buffer is non-persistent,
+        # so restore it from checkpoint provenance before evaluating.
+        self._validate_checkpoint_residual_schedule_state(checkpoint)
+        residual_state = checkpoint.get("residual_schedule_state")
+        if residual_state is not None:
+            self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
+                residual_state["effective_max_log_location_fraction"]
+            )
+            self._active_residual_schedule_state = dict(residual_state)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
         state_dict, _initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
@@ -3152,6 +3343,7 @@ class EpiForecasterTrainer:
             "best_val_joint_loss": self.best_val_joint_loss,
             "best_val_series_metrics": self.best_val_series_metrics,
             "config": self._get_config_for_save(),
+            "residual_schedule_state": self._active_residual_schedule_state,
             "training_history": self.training_history,
             "precision_signature": create_precision_signature(self.precision_policy),
             "latent_scale_state": (

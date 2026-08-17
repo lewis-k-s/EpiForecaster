@@ -175,6 +175,7 @@ class EpiForecaster(nn.Module):
             kernel_parameterization=observation_heads.kernel_parameterization_ww,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            residual_enabled="ww" not in observation_heads.residual_disabled_heads,
             strict=self.strict,
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
@@ -186,12 +187,15 @@ class EpiForecaster(nn.Module):
         # Hospitalization head
         self.hosp_head = ClinicalObservationHead(
             kernel_length=observation_heads.kernel_length_hosp,
+            gamma_shape=observation_heads.kernel_gamma_shape_hosp,
+            gamma_scale=observation_heads.kernel_gamma_scale_hosp,
             scale_init=0.05,  # ~5% hospitalization rate
             learnable_scale=observation_heads.learnable_scale_hosp,
             learnable_kernel=observation_heads.learnable_kernel_hosp,
             kernel_parameterization=observation_heads.kernel_parameterization_hosp,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            residual_enabled="hosp" not in observation_heads.residual_disabled_heads,
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_hosp,
@@ -202,12 +206,15 @@ class EpiForecaster(nn.Module):
         # Cases head (reported cases observation)
         self.cases_head = ClinicalObservationHead(
             kernel_length=observation_heads.kernel_length_cases,
+            gamma_shape=observation_heads.kernel_gamma_shape_cases,
+            gamma_scale=observation_heads.kernel_gamma_scale_cases,
             scale_init=0.3,  # ~30% ascertainment/reporting rate
             learnable_scale=observation_heads.learnable_scale_cases,
             learnable_kernel=observation_heads.learnable_kernel_cases,
             kernel_parameterization=observation_heads.kernel_parameterization_cases,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            residual_enabled="cases" not in observation_heads.residual_disabled_heads,
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_cases,
@@ -219,12 +226,15 @@ class EpiForecaster(nn.Module):
         # Input is death_flow (fraction dying), so scale is reporting rate (start at 0.5)
         self.deaths_head = ClinicalObservationHead(
             kernel_length=observation_heads.kernel_length_deaths,
+            gamma_shape=observation_heads.kernel_gamma_shape_deaths,
+            gamma_scale=observation_heads.kernel_gamma_scale_deaths,
             scale_init=0.5,
             learnable_scale=observation_heads.learnable_scale_deaths,
             learnable_kernel=observation_heads.learnable_kernel_deaths,
             kernel_parameterization=observation_heads.kernel_parameterization_deaths,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
+            residual_enabled="deaths" not in observation_heads.residual_disabled_heads,
             delta_forecasting=False,  # Do not anchor deaths since death_flow lacks t=0 nowcast
             anchor_mode="disabled",
             kernel_mlp=observation_heads.kernel_mlp_deaths,
@@ -242,6 +252,26 @@ class EpiForecaster(nn.Module):
             f"regions={self.variant_type.regions}, mobility={self.variant_type.mobility}, "
             f"dtype={self.dtype}, total_params={total_params:,}"
         )
+
+    def set_observation_residual_max_log_location_fraction(
+        self,
+        max_log_location_fraction: float | None,
+    ) -> None:
+        """Set the runtime residual log-location budget on all observation heads.
+
+        ``None`` restores the unrestricted legacy residual, ``0.0`` is an
+        exact lockout, and values in ``(0, 1]`` cap each head's residual
+        contribution relative to its mechanistic log-location magnitude.
+        Statically disabled heads keep their exact zero contribution regardless
+        of this value.
+        """
+        for head in (
+            self.ww_head,
+            self.hosp_head,
+            self.cases_head,
+            self.deaths_head,
+        ):
+            head.set_residual_max_log_location_fraction(max_log_location_fraction)
 
     def forward(
         self,

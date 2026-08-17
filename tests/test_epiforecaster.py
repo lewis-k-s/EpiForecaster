@@ -56,6 +56,73 @@ class TestEpiForecaster:
         assert isinstance(model, EpiForecaster)
         assert model.dtype == MODEL_PARAM_DTYPE
 
+    def test_clinical_gamma_priors_reach_delay_kernels(self, basic_config):
+        """Configured hosp/cases Gamma priors wire into their DelayKernels."""
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            kernel_gamma_shape_hosp=6.5,
+            kernel_gamma_scale_hosp=1.7,
+            kernel_gamma_shape_cases=4.0,
+            kernel_gamma_scale_cases=2.5,
+            learnable_kernel_hosp=True,
+            kernel_parameterization_hosp="gamma",
+            learnable_kernel_cases=True,
+            kernel_parameterization_cases="gamma",
+            learnable_kernel_deaths=True,
+            kernel_parameterization_deaths="gamma",
+        )
+        model = EpiForecaster(**basic_config)
+        assert model.hosp_head.delay_kernel.get_gamma_parameters() == (
+            pytest.approx(6.5),
+            pytest.approx(1.7),
+        )
+        assert model.cases_head.delay_kernel.get_gamma_parameters() == (
+            pytest.approx(4.0),
+            pytest.approx(2.5),
+        )
+        # Deaths keeps its own configured prior.
+        assert model.deaths_head.delay_kernel.get_gamma_parameters() == (
+            pytest.approx(12.25),
+            pytest.approx(4.0 / 7.0),
+        )
+
+    def test_default_clinical_heads_use_legacy_simplex_kernels(self, basic_config):
+        """Default clinical heads construct their established simplex kernels."""
+        model = EpiForecaster(**basic_config)
+        for head in (model.hosp_head, model.cases_head, model.deaths_head):
+            assert head.delay_kernel.parameterization == "simplex"
+        for head in (model.hosp_head, model.cases_head):
+            kernel = head.delay_kernel
+            assert kernel.gamma_shape == pytest.approx(5.0)
+            assert kernel.gamma_scale == pytest.approx(2.0)
+
+    def test_init_can_disable_an_observation_residual(self, basic_config):
+        baseline_config = basic_config.copy()
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            residual_disabled_heads=["ww"]
+        )
+
+        torch.manual_seed(7)
+        baseline = EpiForecaster(**baseline_config)
+        torch.manual_seed(7)
+        model = EpiForecaster(**basic_config)
+
+        # Static ablation retains the projection structure but never activates
+        # its residual location contribution.
+        assert model.ww_head._residual_location_enabled is False
+        assert model.ww_head.use_residual is True
+        assert model.ww_head.residual_proj is not None
+        assert model.ww_head.alpha is not None
+        assert model.ww_head.alpha.requires_grad is False
+        assert model.ww_head.alpha.item() == 0.0
+        assert model.hosp_head._residual_location_enabled is True
+        for name, parameter in baseline.state_dict().items():
+            if not name.startswith("ww_head."):
+                assert torch.equal(parameter, model.state_dict()[name])
+
+    def test_init_rejects_unknown_disabled_residual_head(self):
+        with pytest.raises(ValueError, match="residual_disabled_heads"):
+            ObservationHeadConfig(residual_disabled_heads=["invalid"])
+
     def test_forward_basic(self, basic_config, dummy_batch):
         """Test forward pass with minimal features (cases only)."""
         model = EpiForecaster(**basic_config)

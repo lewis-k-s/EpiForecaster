@@ -30,6 +30,44 @@ def test_observation_heads_default_weekly_kernels_frozen() -> None:
 
 
 @pytest.mark.epiforecaster
+def test_observation_heads_default_clinical_simplex_kernels() -> None:
+    """Every clinical head retains its legacy simplex kernel by default."""
+    cfg = ObservationHeadConfig()
+    assert cfg.learnable_kernel_hosp is False
+    assert cfg.learnable_kernel_cases is True
+    assert cfg.learnable_kernel_deaths is True
+    assert cfg.kernel_parameterization_hosp == "simplex"
+    assert cfg.kernel_parameterization_cases == "simplex"
+    assert cfg.kernel_parameterization_deaths == "simplex"
+    # Each head keeps a Gamma prior available for an explicit Gamma override.
+    assert cfg.kernel_gamma_shape_deaths == pytest.approx(12.25)
+    assert cfg.kernel_gamma_scale_deaths == pytest.approx(4.0 / 7.0)
+
+
+@pytest.mark.epiforecaster
+def test_observation_heads_default_clinical_gamma_priors() -> None:
+    """Hospitalization/cases expose the implicit Gamma(5, 2) initializer."""
+    cfg = ObservationHeadConfig()
+    assert cfg.kernel_gamma_shape_hosp == pytest.approx(5.0)
+    assert cfg.kernel_gamma_scale_hosp == pytest.approx(2.0)
+    assert cfg.kernel_gamma_shape_cases == pytest.approx(5.0)
+    assert cfg.kernel_gamma_scale_cases == pytest.approx(2.0)
+    # Current cases/hospitalization kernel behavior is unchanged.
+    assert cfg.learnable_kernel_hosp is False
+    assert cfg.kernel_parameterization_hosp == "simplex"
+    assert cfg.learnable_kernel_cases is True
+    assert cfg.kernel_parameterization_cases == "simplex"
+    # Prior implies mean delay 10 days, std sqrt(5) * 2 days.
+    assert cfg.kernel_gamma_shape_hosp * cfg.kernel_gamma_scale_hosp == pytest.approx(
+        10.0
+    )
+    assert (
+        cfg.kernel_gamma_shape_hosp** 0.5 * cfg.kernel_gamma_scale_hosp
+        == pytest.approx(4.47213595499958)
+    )
+
+
+@pytest.mark.epiforecaster
 def test_observation_heads_allow_compartment_plot_sources() -> None:
     cfg = ObservationHeadConfig(
         relevant_source_hosp="H",

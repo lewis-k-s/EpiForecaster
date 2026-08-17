@@ -219,6 +219,89 @@ class LatentMetricResult:
     nonnegative_violation_fraction: float
 
 
+@dataclass(frozen=True)
+class WindowSpearmanMetricResult:
+    """Coverage and mean rank agreement for a family of forecast windows."""
+
+    mean: float
+    total_count: int
+    candidate_count: int
+    eligible_count: int
+    candidate_fraction: float
+    eligible_fraction: float
+    eligible_given_candidate_fraction: float
+
+
+class _TorchWindowSpearmanAccumulator:
+    """Accumulate masked, tie-aware Spearman values."""
+
+    def __init__(self, *, device: torch.device) -> None:
+        self.sum = torch.tensor(0.0, device=device)
+        self.count = torch.tensor(0.0, device=device)
+        self.total_window_count = torch.tensor(0, device=device, dtype=torch.long)
+        self.candidate_window_count = torch.tensor(0, device=device, dtype=torch.long)
+
+    def update(
+        self,
+        *,
+        prediction: torch.Tensor,
+        reference: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> None:
+        if prediction.shape != reference.shape or prediction.shape != valid.shape:
+            raise ValueError(
+                "Prediction, reference, and validity mask must have identical shapes."
+            )
+        prediction_rows = prediction.float().reshape(-1, prediction.shape[-1])
+        reference_rows = reference.float().reshape(-1, reference.shape[-1])
+        valid_rows = valid.reshape(-1, valid.shape[-1])
+        self.total_window_count += prediction_rows.shape[0]
+        for prediction_row, reference_row, valid_row in zip(
+            prediction_rows,
+            reference_rows,
+            valid_rows,
+            strict=True,
+        ):
+            if int(valid_row.sum().item()) < 2:
+                continue
+            self.candidate_window_count += 1
+            prediction_valid = prediction_row[valid_row]
+            reference_valid = reference_row[valid_row]
+            prediction_ranks = _average_tie_ranks(prediction_valid)
+            reference_ranks = _average_tie_ranks(reference_valid)
+            prediction_centered = prediction_ranks - prediction_ranks.mean()
+            reference_centered = reference_ranks - reference_ranks.mean()
+            denominator = torch.sqrt(
+                prediction_centered.square().sum() * reference_centered.square().sum()
+            )
+            if float(denominator.item()) <= _EPSILON:
+                continue
+            self.sum += (prediction_centered * reference_centered).sum() / denominator
+            self.count += 1
+
+    def finalize(self) -> WindowSpearmanMetricResult:
+        total_count = int(self.total_window_count.item())
+        candidate_count = int(self.candidate_window_count.item())
+        eligible_count = int(self.count.item())
+        return WindowSpearmanMetricResult(
+            mean=(
+                float((self.sum / self.count).item())
+                if eligible_count > 0
+                else float("nan")
+            ),
+            total_count=total_count,
+            candidate_count=candidate_count,
+            eligible_count=eligible_count,
+            candidate_fraction=(
+                candidate_count / total_count if total_count > 0 else 0.0
+            ),
+            eligible_fraction=eligible_count / total_count if total_count > 0 else 0.0,
+            eligible_given_candidate_fraction=(
+                eligible_count / candidate_count if candidate_count > 0 else 0.0
+            ),
+        )
+
+
 class _TorchLatentPairAccumulator:
     def __init__(self, *, device: torch.device) -> None:
         self.count = torch.tensor(0.0, device=device)
@@ -234,8 +317,7 @@ class _TorchLatentPairAccumulator:
         self.horizon_abs_error_sum: torch.Tensor | None = None
         self.horizon_sq_error_sum: torch.Tensor | None = None
         self.horizon_count: torch.Tensor | None = None
-        self.window_spearman_sum = torch.tensor(0.0, device=device)
-        self.window_spearman_count = torch.tensor(0.0, device=device)
+        self.window_spearman = _TorchWindowSpearmanAccumulator(device=device)
 
     def update(
         self,
@@ -289,29 +371,11 @@ class _TorchLatentPairAccumulator:
         self.horizon_abs_error_sum += horizon_abs_error
         self.horizon_sq_error_sum += horizon_sq_error
 
-        prediction_rows = pred_f32.reshape(-1, pred_f32.shape[-1])
-        target_rows = target_f32.reshape(-1, target_f32.shape[-1])
-        for prediction_row, target_row in zip(
-            prediction_rows, target_rows, strict=True
-        ):
-            row_finite = torch.isfinite(prediction_row) & torch.isfinite(target_row)
-            if int(row_finite.sum().item()) < 2:
-                continue
-            prediction_valid = prediction_row[row_finite]
-            target_valid = target_row[row_finite]
-            prediction_ranks = _average_tie_ranks(prediction_valid)
-            target_ranks = _average_tie_ranks(target_valid)
-            prediction_centered = prediction_ranks - prediction_ranks.mean()
-            target_centered = target_ranks - target_ranks.mean()
-            denominator = torch.sqrt(
-                prediction_centered.square().sum() * target_centered.square().sum()
-            )
-            if float(denominator.item()) <= _EPSILON:
-                continue
-            self.window_spearman_sum += (
-                prediction_centered * target_centered
-            ).sum() / denominator
-            self.window_spearman_count += 1
+        self.window_spearman.update(
+            prediction=pred_f32,
+            reference=target_f32,
+            valid=finite,
+        )
 
     def finalize(self) -> LatentMetricResult:
         pred_finite_count = float(self.pred_finite_count.item())
@@ -370,7 +434,7 @@ class _TorchLatentPairAccumulator:
             torch.sqrt(self.horizon_sq_error_sum / self.horizon_count.clamp_min(1)),
             torch.full_like(self.horizon_count, float("nan")),
         )
-        spearman_count = int(self.window_spearman_count.item())
+        window_spearman = self.window_spearman.finalize()
         return LatentMetricResult(
             count=count,
             mae=mae,
@@ -380,15 +444,83 @@ class _TorchLatentPairAccumulator:
             prediction_std=prediction_std,
             target_std=target_std,
             prediction_target_std_ratio=_safe_ratio(prediction_std, target_std),
-            mean_window_spearman=(
-                float((self.window_spearman_sum / self.window_spearman_count).item())
-                if spearman_count > 0
-                else float("nan")
-            ),
-            window_spearman_eligible_count=spearman_count,
+            mean_window_spearman=window_spearman.mean,
+            window_spearman_eligible_count=window_spearman.eligible_count,
             horizon_mae=tuple(float(value) for value in horizon_mae_tensor.tolist()),
             horizon_rmse=tuple(float(value) for value in horizon_rmse_tensor.tolist()),
             nonnegative_violation_fraction=negative_fraction,
+        )
+
+
+@dataclass(frozen=True)
+class ObservationLatentMetricResult:
+    observed_count: int
+    full_window_spearman: WindowSpearmanMetricResult
+    mechanistic_only_window_spearman: WindowSpearmanMetricResult
+
+
+class TorchObservationLatentCoherenceAccumulator:
+    """Measure full and mechanistic-only forecast movement against latent sources."""
+
+    def __init__(self, *, device: torch.device) -> None:
+        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
+        self.full_window_spearman = _TorchWindowSpearmanAccumulator(device=device)
+        self.mechanistic_only_window_spearman = _TorchWindowSpearmanAccumulator(
+            device=device
+        )
+
+    def update(
+        self,
+        *,
+        full_prediction: torch.Tensor,
+        relevant_latent: torch.Tensor | None,
+        weights: torch.Tensor,
+        mechanistic_projection: torch.Tensor | None = None,
+    ) -> None:
+        if relevant_latent is None:
+            return
+        if (
+            full_prediction.shape != relevant_latent.shape
+            or full_prediction.shape != weights.shape
+        ):
+            raise ValueError(
+                "Full prediction, relevant latent, and weights must have identical "
+                "shapes."
+            )
+        full_prediction_f32 = full_prediction.float()
+        latent_f32 = relevant_latent.float()
+        weights_f32 = weights.float()
+        observed = (
+            torch.isfinite(latent_f32) & torch.isfinite(weights_f32) & (weights_f32 > 0)
+        )
+        full_valid = observed & torch.isfinite(full_prediction_f32)
+        self.observed_count += observed.sum()
+        self.full_window_spearman.update(
+            prediction=full_prediction_f32,
+            reference=latent_f32,
+            valid=full_valid,
+        )
+        if mechanistic_projection is not None:
+            if mechanistic_projection.shape != full_prediction.shape:
+                raise ValueError(
+                    "Mechanistic projection and full prediction must have identical "
+                    "shapes."
+                )
+            mechanistic_f32 = mechanistic_projection.float()
+            mechanistic_valid = observed & torch.isfinite(mechanistic_f32)
+            self.mechanistic_only_window_spearman.update(
+                prediction=mechanistic_f32,
+                reference=latent_f32,
+                valid=mechanistic_valid,
+            )
+
+    def finalize(self) -> ObservationLatentMetricResult:
+        return ObservationLatentMetricResult(
+            observed_count=int(self.observed_count.item()),
+            full_window_spearman=self.full_window_spearman.finalize(),
+            mechanistic_only_window_spearman=(
+                self.mechanistic_only_window_spearman.finalize()
+            ),
         )
 
 

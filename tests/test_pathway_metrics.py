@@ -7,6 +7,7 @@ import torch
 
 from evaluation.pathway_metrics import (
     TorchLatentCoherenceAccumulator,
+    TorchObservationLatentCoherenceAccumulator,
     TorchPathwayMetricAccumulator,
 )
 from training.pathway_gradients import (
@@ -43,6 +44,103 @@ def test_pathway_metrics_quantify_residual_routing_and_mechanistic_ablation() ->
     assert result.mechanistic_only_mae == pytest.approx(1.5)
     assert result.mechanistic_only_rmse == pytest.approx(math.sqrt(2.5))
     assert result.reconstruction_max_abs_error == pytest.approx(0.0)
+
+
+def test_observation_latent_coherence_tracks_full_and_mechanistic_windows_independently() -> (
+    None
+):
+    accumulator = TorchObservationLatentCoherenceAccumulator(device=torch.device("cpu"))
+    accumulator.update(
+        full_prediction=torch.tensor(
+            [[1.0, 3.0, 2.0, 4.0], [4.0, float("nan"), 2.0, 1.0]]
+        ),
+        relevant_latent=torch.tensor(
+            [[10.0, 30.0, 20.0, 40.0], [40.0, 30.0, 20.0, 10.0]]
+        ),
+        weights=torch.tensor([[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0]]),
+        mechanistic_projection=torch.tensor(
+            [[1.0, 3.0, 2.0, 4.0], [4.0, 3.0, 2.0, 1.0]]
+        ),
+    )
+    result = accumulator.finalize()
+
+    assert result.observed_count == 6
+    assert result.full_window_spearman.mean == pytest.approx(1.0)
+    assert result.full_window_spearman.total_count == 2
+    assert result.full_window_spearman.candidate_count == 1
+    assert result.full_window_spearman.eligible_count == 1
+    assert result.full_window_spearman.candidate_fraction == pytest.approx(0.5)
+    assert result.full_window_spearman.eligible_fraction == pytest.approx(0.5)
+    assert (
+        result.full_window_spearman.eligible_given_candidate_fraction
+        == pytest.approx(1.0)
+    )
+    assert result.mechanistic_only_window_spearman.mean == pytest.approx(1.0)
+    assert result.mechanistic_only_window_spearman.total_count == 2
+    assert result.mechanistic_only_window_spearman.candidate_count == 2
+    assert result.mechanistic_only_window_spearman.eligible_count == 2
+    assert result.mechanistic_only_window_spearman.candidate_fraction == pytest.approx(
+        1.0
+    )
+    assert result.mechanistic_only_window_spearman.eligible_fraction == pytest.approx(
+        1.0
+    )
+    assert (
+        result.mechanistic_only_window_spearman.eligible_given_candidate_fraction
+        == pytest.approx(1.0)
+    )
+
+
+def test_observation_latent_coherence_handles_ties_and_separate_eligibility() -> None:
+    accumulator = TorchObservationLatentCoherenceAccumulator(device=torch.device("cpu"))
+    accumulator.update(
+        full_prediction=torch.tensor([[1.0, 1.0, 2.0, 3.0]]),
+        relevant_latent=torch.tensor([[10.0, 10.0, 20.0, 30.0]]),
+        weights=torch.ones((1, 4)),
+        mechanistic_projection=torch.ones((1, 4)),
+    )
+    result = accumulator.finalize()
+
+    assert result.full_window_spearman.mean == pytest.approx(1.0)
+    assert result.full_window_spearman.candidate_count == 1
+    assert result.full_window_spearman.eligible_count == 1
+    assert math.isnan(result.mechanistic_only_window_spearman.mean)
+    assert result.mechanistic_only_window_spearman.total_count == 1
+    assert result.mechanistic_only_window_spearman.candidate_count == 1
+    assert result.mechanistic_only_window_spearman.eligible_count == 0
+    assert result.mechanistic_only_window_spearman.candidate_fraction == pytest.approx(
+        1.0
+    )
+    assert result.mechanistic_only_window_spearman.eligible_fraction == pytest.approx(
+        0.0
+    )
+    assert (
+        result.mechanistic_only_window_spearman.eligible_given_candidate_fraction
+        == pytest.approx(0.0)
+    )
+
+
+def test_observation_latent_coherence_serializes_no_candidate_windows() -> None:
+    accumulator = TorchObservationLatentCoherenceAccumulator(device=torch.device("cpu"))
+    accumulator.update(
+        full_prediction=torch.tensor([[1.0, 2.0, 3.0]]),
+        relevant_latent=torch.tensor([[10.0, 20.0, 30.0]]),
+        weights=torch.tensor([[1.0, 0.0, 0.0]]),
+        mechanistic_projection=torch.tensor([[1.0, 2.0, 3.0]]),
+    )
+    result = accumulator.finalize()
+
+    for summary in (
+        result.full_window_spearman,
+        result.mechanistic_only_window_spearman,
+    ):
+        assert math.isnan(summary.mean)
+        assert summary.total_count == 1
+        assert summary.candidate_count == 0
+        assert summary.eligible_count == 0
+        assert summary.candidate_fraction == pytest.approx(0.0)
+        assert summary.eligible_fraction == pytest.approx(0.0)
+        assert summary.eligible_given_candidate_fraction == pytest.approx(0.0)
 
 
 def test_latent_metrics_capture_truth_agreement_and_structural_coherence() -> None:

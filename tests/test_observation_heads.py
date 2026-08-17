@@ -13,7 +13,12 @@ Tests cover:
 import pytest
 import torch
 
+
 from models.observation_heads import (
+    _GAMMA_SCALE_MAX,
+    _GAMMA_SCALE_MIN,
+    _GAMMA_SHAPE_MAX,
+    _GAMMA_SHAPE_MIN,
     ClinicalObservationHead,
     CompositeObservationLoss,
     DelayKernel,
@@ -120,7 +125,7 @@ class TestDelayKernelBasics:
         """Mean delay is only well-defined for normalized positive kernels."""
         kernel = DelayKernel(kernel_length=5, learnable=True, parameterization="free")
 
-        with pytest.raises(ValueError, match="only defined for simplex kernels"):
+        with pytest.raises(ValueError, match="only defined for normalized kernels"):
             kernel.get_mean_delay()
 
 
@@ -242,6 +247,175 @@ class TestDelayKernelGradients:
         loss.backward()
         assert kernel.kernel.grad is not None
         assert torch.isfinite(kernel.kernel.grad).all()
+
+
+class TestDelayKernelGamma:
+    """Two-parameter learnable Gamma delay kernel."""
+
+    _MATCHED_SHAPE = 12.25
+    _MATCHED_SCALE = 4.0 / 7.0
+
+    def test_gamma_learns_exactly_two_parameters(self):
+        kernel = DelayKernel(
+            kernel_length=21,
+            gamma_shape=self._MATCHED_SHAPE,
+            gamma_scale=self._MATCHED_SCALE,
+            learnable=True,
+            parameterization="gamma",
+        )
+
+        named = dict(kernel.named_parameters())
+        assert set(named) == {"gamma_shape_raw", "gamma_scale_raw"}
+        assert named["gamma_shape_raw"].numel() == 1
+        assert named["gamma_scale_raw"].numel() == 1
+
+    def test_gamma_kernel_normalized_and_generator_matched(self):
+        kernel = DelayKernel(
+            kernel_length=21,
+            gamma_shape=self._MATCHED_SHAPE,
+            gamma_scale=self._MATCHED_SCALE,
+            learnable=True,
+            parameterization="gamma",
+        )
+
+        weights = kernel.get_kernel_weights()
+        assert torch.allclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+        assert (weights >= 0).all()
+
+        shape, scale = kernel.get_gamma_parameters()
+        assert shape == pytest.approx(self._MATCHED_SHAPE)
+        assert scale == pytest.approx(self._MATCHED_SCALE)
+
+        # Truncated discrete Gamma(12.25, 4/7) over lags 0..20 has mean ~7.
+        mean_delay = kernel.get_mean_delay()
+        assert 6.5 < mean_delay < 7.5
+        std_delay = kernel.get_delay_std()
+        assert 1.5 < std_delay < 2.5
+
+    def test_gamma_frozen_buffer_matches_learnable_initialization(self):
+        frozen = DelayKernel(
+            kernel_length=21,
+            gamma_shape=self._MATCHED_SHAPE,
+            gamma_scale=self._MATCHED_SCALE,
+            learnable=False,
+            parameterization="gamma",
+        )
+        learnable = DelayKernel(
+            kernel_length=21,
+            gamma_shape=self._MATCHED_SHAPE,
+            gamma_scale=self._MATCHED_SCALE,
+            learnable=True,
+            parameterization="gamma",
+        )
+
+        assert not isinstance(frozen.kernel, torch.nn.Parameter)
+        assert torch.allclose(
+            frozen.get_kernel_weights(), learnable.get_kernel_weights()
+        )
+        assert frozen.get_gamma_parameters() == (
+            pytest.approx(self._MATCHED_SHAPE),
+            pytest.approx(self._MATCHED_SCALE),
+        )
+
+    def test_gamma_causality_no_future_leakage(self):
+        kernel = DelayKernel(kernel_length=5, learnable=True, parameterization="gamma")
+
+        base = _rand_tensor(1, 12)
+        perturbed = base.clone()
+        perturbed[0, -1] += 10.0
+
+        out_base = kernel(base)
+        out_perturbed = kernel(perturbed)
+
+        assert out_base.shape == base.shape
+        assert torch.allclose(out_base[0, :-1], out_perturbed[0, :-1])
+
+    def test_gamma_gradient_flows_to_both_parameters(self):
+        kernel = DelayKernel(kernel_length=7, learnable=True, parameterization="gamma")
+
+        I_trajectory = _rand_tensor(2, 10).requires_grad_(True)
+        output = kernel(I_trajectory)
+        loss = output.sum()
+        loss.backward()
+
+        assert kernel.gamma_shape_raw.grad is not None
+        assert kernel.gamma_scale_raw.grad is not None
+        assert torch.isfinite(kernel.gamma_shape_raw.grad).all()
+        assert torch.isfinite(kernel.gamma_scale_raw.grad).all()
+        assert I_trajectory.grad is not None
+
+    def test_gamma_smooth_bounds_remain_open_at_extreme_coordinates(self):
+        kernel = DelayKernel(kernel_length=21, learnable=True, parameterization="gamma")
+        with torch.no_grad():
+            kernel.gamma_shape_raw.fill_(12.0)
+            kernel.gamma_scale_raw.fill_(-12.0)
+
+        shape, scale = kernel.get_gamma_parameters()
+        assert _GAMMA_SHAPE_MIN < shape < _GAMMA_SHAPE_MAX
+        assert _GAMMA_SCALE_MIN < scale < _GAMMA_SCALE_MAX
+        weights = kernel.get_kernel_weights()
+        assert torch.allclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+
+    def test_gamma_sanitizes_non_finite_parameters(self):
+        kernel = DelayKernel(kernel_length=7, learnable=True, parameterization="gamma")
+        with torch.no_grad():
+            kernel.gamma_shape_raw.fill_(float("nan"))
+            kernel.gamma_scale_raw.fill_(float("inf"))
+
+        I_trajectory = _rand_tensor(2, 10).requires_grad_(True)
+        output = kernel(I_trajectory)
+        assert torch.isfinite(output).all()
+
+        loss = output.sum()
+        loss.backward()
+        assert torch.isfinite(kernel.gamma_shape_raw.grad).all()
+        assert torch.isfinite(kernel.gamma_scale_raw.grad).all()
+
+    @pytest.mark.parametrize("raw_value", [-12.0, 12.0])
+    def test_gamma_gradients_remain_nonzero_near_both_limits(self, raw_value):
+        kernel = DelayKernel(kernel_length=21, learnable=True, parameterization="gamma")
+        with torch.no_grad():
+            kernel.gamma_shape_raw.fill_(raw_value)
+            kernel.gamma_scale_raw.fill_(raw_value)
+
+        positions = torch.arange(21, dtype=torch.float32)
+        loss = (kernel.get_kernel_weights() * positions.square()).sum()
+        loss.backward()
+
+        for parameter in (kernel.gamma_shape_raw, kernel.gamma_scale_raw):
+            assert parameter.grad is not None
+            assert torch.isfinite(parameter.grad).all()
+            assert parameter.grad.abs().item() > 0.0
+
+    def test_gamma_get_parameters_rejects_other_parameterizations(self):
+        kernel = DelayKernel(kernel_length=5, learnable=True)
+
+        with pytest.raises(ValueError, match="only defined for gamma kernels"):
+            kernel.get_gamma_parameters()
+
+    def test_gamma_boundary_hits_report_open_interval_proximity(self):
+        cases = [
+            ("gamma_shape_raw", -12.0, "shape_lower"),
+            ("gamma_shape_raw", 12.0, "shape_upper"),
+            ("gamma_scale_raw", -12.0, "scale_lower"),
+            ("gamma_scale_raw", 12.0, "scale_upper"),
+        ]
+        for raw_name, raw_value, expected_key in cases:
+            kernel = DelayKernel(
+                kernel_length=7, learnable=True, parameterization="gamma"
+            )
+            with torch.no_grad():
+                getattr(kernel, raw_name).fill_(raw_value)
+            hits = kernel.get_gamma_boundary_hits(atol=1.0e-5)
+            assert hits[expected_key] is True, (raw_name, expected_key)
+            assert sum(hits.values()) == 1
+
+    def test_gamma_boundary_hits_rejects_other_parameterizations(self):
+        kernel = DelayKernel(
+            kernel_length=7, learnable=True, parameterization="simplex"
+        )
+        with pytest.raises(ValueError, match="only defined for gamma kernels"):
+            kernel.get_gamma_boundary_hits()
 
 
 class TestSheddingConvolutionBasics:
