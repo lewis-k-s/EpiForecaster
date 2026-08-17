@@ -1,0 +1,135 @@
+schema_version: 1
+campaign_id: epiforecaster_ablation_v1
+stage: ablation
+hypothesis: Paired interventions isolate each declared architectural, loss, signal, and delay-kernel choice from the fixed production baseline.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: baseline
+fixed_overrides: {}
+conditions:
+  - name: baseline
+    hypothesis: The production configuration is the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: mobility:off
+    hypothesis: Mobility message passing improves forecasting.
+    overrides: {model: {type: {mobility: false}}}
+    allowed_difference_paths: [model.type.mobility]
+  - name: mobility:spatial_queen
+    hypothesis: Dynamic mobility neighborhoods outperform static queen adjacency.
+    overrides: {model: {graph_adjacency_source: spatial_queen}}
+    allowed_difference_paths: [model.graph_adjacency_source]
+  - name: regions:off
+    hypothesis: Region embeddings contribute predictive context.
+    overrides: {model: {type: {regions: false}}}
+    allowed_difference_paths: [model.type.regions]
+  - name: context:off
+    hypothesis: Mobility and region context jointly improve forecasts.
+    overrides: {model: {type: {mobility: false, regions: false}}}
+    allowed_difference_paths: [model.type.mobility, model.type.regions]
+  - name: context:spatial_queen
+    hypothesis: Queen adjacency remains useful without region embeddings.
+    overrides: {model: {type: {regions: false}, graph_adjacency_source: spatial_queen}}
+    allowed_difference_paths: [model.type.regions, model.graph_adjacency_source]
+  - name: residual:off
+    hypothesis: Observation residual flexibility improves fit beyond mechanistic dynamics.
+    overrides: {model: {observation_heads: {residual_scale: 0.0}}}
+    allowed_difference_paths: [model.observation_heads.residual_scale]
+  - name: loss:crps
+    hypothesis: CRPS changes the calibration-accuracy trade-off relative to the baseline loss.
+    overrides: {training: {loss: {joint: {observation_loss: crps}}}}
+    allowed_difference_paths: [training.loss.joint.observation_loss]
+  - name: gradnorm:crps
+    hypothesis: GradNorm improves balancing under CRPS.
+    overrides: {training: {loss: {joint: {observation_loss: crps, adaptive_scheme: gradnorm}}}}
+    allowed_difference_paths: [training.loss.joint.observation_loss, training.loss.joint.adaptive_scheme]
+  - name: sig:ww:aux
+    hypothesis: Wastewater auxiliary supervision improves shared representations.
+    overrides: {training: {loss: {joint: {disable_ww: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_ww]
+  - name: sig:ww:proxy
+    hypothesis: Wastewater proxy input improves shared representations.
+    overrides: {training: {loss: {joint: {mask_input_ww: true}}}}
+    allowed_difference_paths: [training.loss.joint.mask_input_ww]
+  - name: sig:ww:off
+    hypothesis: Wastewater signal availability improves forecasts.
+    overrides: {training: {loss: {joint: {disable_ww: true, mask_input_ww: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_ww, training.loss.joint.mask_input_ww]
+  - name: sig:cases:aux
+    hypothesis: Case auxiliary supervision improves shared representations.
+    overrides: {training: {loss: {joint: {disable_cases: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_cases]
+  - name: sig:cases:proxy
+    hypothesis: Case proxy input improves shared representations.
+    overrides: {training: {loss: {joint: {mask_input_cases: true}}}}
+    allowed_difference_paths: [training.loss.joint.mask_input_cases]
+  - name: sig:cases:off
+    hypothesis: Case signal availability improves forecasts.
+    overrides: {training: {loss: {joint: {disable_cases: true, mask_input_cases: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_cases, training.loss.joint.mask_input_cases]
+  - name: sig:hosp:aux
+    hypothesis: Hospital auxiliary supervision improves shared representations.
+    overrides: {training: {loss: {joint: {disable_hosp: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_hosp]
+  - name: sig:hosp:proxy
+    hypothesis: Hospital proxy input improves shared representations.
+    overrides: {training: {loss: {joint: {mask_input_hosp: true}}}}
+    allowed_difference_paths: [training.loss.joint.mask_input_hosp]
+  - name: sig:hosp:off
+    hypothesis: Hospital signal availability improves forecasts.
+    overrides: {training: {loss: {joint: {disable_hosp: true, mask_input_hosp: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_hosp, training.loss.joint.mask_input_hosp]
+  - name: sig:deaths:aux
+    hypothesis: Death auxiliary supervision improves shared representations.
+    overrides: {training: {loss: {joint: {disable_deaths: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_deaths]
+  - name: sig:deaths:proxy
+    hypothesis: Death proxy input improves shared representations.
+    overrides: {training: {loss: {joint: {mask_input_deaths: true}}}}
+    allowed_difference_paths: [training.loss.joint.mask_input_deaths]
+  - name: sig:deaths:off
+    hypothesis: Death signal availability improves forecasts.
+    overrides: {training: {loss: {joint: {disable_deaths: true, mask_input_deaths: true}}}}
+    allowed_difference_paths: [training.loss.joint.disable_deaths, training.loss.joint.mask_input_deaths]
+  - name: kernel:fixed
+    hypothesis: Learning clinical delay kernels improves over fixed clinical kernels.
+    overrides: {model: {observation_heads: {learnable_kernel_hosp: false, learnable_kernel_cases: false, learnable_kernel_deaths: false}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_hosp, model.observation_heads.learnable_kernel_cases, model.observation_heads.learnable_kernel_deaths]
+  - name: kernel:ww:free
+    hypothesis: A free wastewater kernel is preferable to its baseline parameterization.
+    overrides: {model: {observation_heads: {learnable_kernel_ww: true, kernel_parameterization_ww: free}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_ww, model.observation_heads.kernel_parameterization_ww]
+  - name: kernel:hosp:free
+    hypothesis: A free hospital kernel is preferable to its baseline parameterization.
+    overrides: {model: {observation_heads: {learnable_kernel_hosp: true, kernel_parameterization_hosp: free}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_hosp, model.observation_heads.kernel_parameterization_hosp]
+  - name: kernel:cases:free
+    hypothesis: A free case kernel is preferable to its baseline parameterization.
+    overrides: {model: {observation_heads: {learnable_kernel_cases: true, kernel_parameterization_cases: free}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_cases, model.observation_heads.kernel_parameterization_cases]
+  - name: kernel:deaths:free
+    hypothesis: A free death kernel is preferable to its baseline parameterization.
+    overrides: {model: {observation_heads: {learnable_kernel_deaths: true, kernel_parameterization_deaths: free}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_deaths, model.observation_heads.kernel_parameterization_deaths]
+  - name: kernel:all:free
+    hypothesis: Fully free kernels test the aggregate delay-kernel parameterization.
+    overrides: {model: {observation_heads: {learnable_kernel_ww: true, learnable_kernel_hosp: true, learnable_kernel_cases: true, learnable_kernel_deaths: true, kernel_parameterization_ww: free, kernel_parameterization_hosp: free, kernel_parameterization_cases: free, kernel_parameterization_deaths: free}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_ww, model.observation_heads.learnable_kernel_hosp, model.observation_heads.learnable_kernel_cases, model.observation_heads.learnable_kernel_deaths, model.observation_heads.kernel_parameterization_ww, model.observation_heads.kernel_parameterization_hosp, model.observation_heads.kernel_parameterization_cases, model.observation_heads.kernel_parameterization_deaths]
+  - name: kernel:all:mlp
+    hypothesis: MLP kernel parameterization improves delay flexibility.
+    overrides: {model: {observation_heads: {kernel_mlp_ww: true, kernel_mlp_hosp: true, kernel_mlp_cases: true, kernel_mlp_deaths: true}}}
+    allowed_difference_paths: [model.observation_heads.kernel_mlp_ww, model.observation_heads.kernel_mlp_hosp, model.observation_heads.kernel_mlp_cases, model.observation_heads.kernel_mlp_deaths]
+paired_model_seeds: [42, 43, 44, 45, 46]
+metrics:
+  primary: {name: mae_median, direction: minimize}
+  secondary: [rmse_median, r2_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true

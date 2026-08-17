@@ -1,0 +1,44 @@
+schema_version: 1
+campaign_id: epiforecaster_ablation_smoke_v1
+stage: ablation_smoke
+hypothesis: The bounded paired matrix verifies campaign compilation, persisted-fold routing, and JournalStorage coordination without claiming production estimates.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: baseline
+fixed_overrides:
+  training:
+    epochs: 1
+    max_batches: 2
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+conditions:
+  - name: baseline
+    hypothesis: The bounded production baseline supplies the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: residual:off
+    hypothesis: The smoke path preserves a structured one-field ablation intervention.
+    overrides:
+      model:
+        observation_heads:
+          residual_scale: 0.0
+    allowed_difference_paths: [model.observation_heads.residual_scale]
+paired_model_seeds: [42, 43]
+cross_validation:
+  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  fold_indices: [0, 1]
+metrics:
+  primary: {name: mae_median, direction: minimize}
+  secondary: [rmse_median, r2_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: false  # Bounded batches can yield zero-eligible targets.
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true

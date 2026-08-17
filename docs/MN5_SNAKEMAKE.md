@@ -52,8 +52,11 @@ the worker step and the batch job fails.
 After every HPO worker marker exists, separate DAG stages resolve
 `study.best_trial`, validate and copy its exact checkpoint, evaluate it, promote
 the declared artifacts, and finally delete losing checkpoint directories.
-Ablation analysis likewise runs once after the complete seed/ablation matrix is
-terminal; workers never race to launch analysis.
+Ablation workers compile a checked-in declarative campaign into a deterministic
+`condition × fold × paired-model-seed` queue.  Optuna's JournalStorage is
+strictly durable coordination: it performs no TPE or design sampling. Analysis
+runs only after the exact declared identity matrix is terminal and provenance
+matched; it uses run-level aggregate metrics and never pools granular windows.
 
 ## Storage and identity
 
@@ -157,6 +160,45 @@ composition when both stages are wanted. Training and HPO trials force
 `training.run_final_evaluation=false`; evaluation is owned by the downstream
 rule. Ablation trials retain final test metrics because paired-seed aggregation
 consumes those per-trial artifacts.
+
+### Declarative ablation campaigns
+
+`configs/campaigns/ablation_default_v1.yaml` is the versioned scientific
+authority for the production ablation matrix. It names the baseline, hypotheses,
+fixed structured overrides, the allowed hydrated-config difference paths for every
+condition, paired model seeds, metrics, budget policy, and completeness and
+provenance requirements. `workflow/config/mn5_ablation.yaml` only supplies
+execution resources, study name, and that campaign path.
+
+Before work is queued, every condition is hydrated through
+`EpiForecasterConfig`, including model-parameter promotion and explicit defaults.
+Conditions with the same hydrated configuration are rejected, as are differences
+outside their declared paths. `equal_budget_policy.paths` is a non-empty list of
+resolved configuration paths (currently `training.epochs` and
+`training.max_batches`) whose values must be identical for every condition.
+
+The checked-in `configs/campaigns/ablation_smoke_v1.yaml` and
+`workflow/config/mn5_ablation_smoke.yaml` define a bounded two-condition,
+two-seed, two-persisted-fold smoke design. It produces eight identities and is
+for local/ACC acceptance only, not a production estimate. Both campaigns are
+expanded in memory; the workflow never generates per-run YAML files. A campaign
+with fold indices must declare an existing persisted split manifest, and
+undeclared resolved-config drift fails before a worker starts training.
+
+Optuna values always minimize the validation-selection coordination value and
+record its actual metric name and value on the trial. They are not the campaign
+primary endpoint: the analyzer alone applies the campaign-declared held-out
+primary metric and direction to aggregate artifacts. Recovery marks stale
+`RUNNING` attempts terminal before enqueuing a replacement. Failed or pruned
+historical attempts are retained, but completion requires no nonterminal attempt,
+exactly one `COMPLETE` trial, and exactly one canonical output per scientific
+identity.
+
+Each output sidecar must agree with its persisted config: `fold` is `null`
+unless cross-validation is enabled. Every canonical output has a non-empty
+aggregate metric table with `target` and the campaign primary metric; those
+run-level aggregate rows, rather than granular windows, are the sole inputs to
+campaign endpoint aggregation.
 
 Each data, training, evaluation, cross-validation, HPO, ablation, selection,
 and promotion contract fingerprints the same complete scientific source

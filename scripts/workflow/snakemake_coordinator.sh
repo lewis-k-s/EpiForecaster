@@ -50,15 +50,16 @@ validate_allocation() {
       return 2
     fi
   else
-    if [ "${SLURM_NNODES:-}" != "1" ] \
-      || [ "${SLURM_NTASKS:-}" != "$EXPECTED_TASKS" ]; then
-      echo "External launcher does not expose the validated one-node, $EXPECTED_TASKS-task allocation" >&2
+    if [ "${SLURM_NNODES:-}" != "1" ]; then
+      echo "External launcher does not expose the validated one-node allocation" >&2
       return 2
     fi
-    # The special external-launcher step omits these batch-shell variables.
-    # The snapshot-owned adapter has already validated the containing
-    # allocation through scontrol, so publish its sealed capacity to rules.
+    # The special external-launcher step is one lightweight coordinator task;
+    # it does not expose the parent allocation's scientific task count or CPU
+    # shape. The snapshot-owned adapter already validated and sealed that
+    # capacity through scontrol, so publish it to child workflow rules.
     export SLURM_JOB_NUM_NODES=1
+    export SLURM_NTASKS="$EXPECTED_TASKS"
     export SLURM_CPUS_PER_TASK="$EXPECTED_CPUS_PER_TASK"
   fi
 }

@@ -28,6 +28,7 @@ from scripts.hpo.trial_artifacts import (
     trial_directory,
 )
 from scripts.workflow import run_config, run_support, tooling_identity
+from workflow.common import slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
     load_training_dynamics_identity,
@@ -164,6 +165,34 @@ def test_single_training_smoke_composes_training_and_evaluation() -> None:
         "tasks": 1,
         "cpus_per_task": 20,
         "gres": "gpu:1",
+        "runtime": 60,
+    }
+
+
+def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
+    smoke = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml").read_text()
+    )
+
+    assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
+    assert smoke["ablation"] == {
+        "study_name": "epiforecaster_ablation_smoke_v1",
+        "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
+        "workers": 2,
+        "trials_per_worker": 4,
+        "timeout_s": 3300,
+        "sampler_seed": 42,
+        "smoketest": True,
+        "requeue_running": False,
+    }
+    assert smoke["resources"]["allocation"] == {
+        "account": "bsc08",
+        "partition": "acc",
+        "qos": "acc_bscls",
+        "nodes": 1,
+        "tasks": 2,
+        "cpus_per_task": 20,
+        "gres": "gpu:2",
         "runtime": 60,
     }
 
@@ -1034,15 +1063,63 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
         storage=storage,
         direction="minimize",
     )
-    ablations = ["baseline", "mobility:off"]
+    base_config = Path("configs/train_epifor_smoke.yaml").resolve()
+    campaign_path = tmp_path / "campaign.yaml"
+    campaign_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "campaign-a",
+                "stage": "ablation",
+                "hypothesis": "paired conditions",
+                "base_config": str(base_config),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    },
+                    {
+                        "name": "mobility:off",
+                        "hypothesis": "intervention",
+                        "overrides": {"model": {"type": {"mobility": False}}},
+                        "allowed_difference_paths": ["model.type.mobility"],
+                    },
+                ],
+                "paired_model_seeds": [42],
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            }
+        )
+    )
+    conditions = ["baseline", "mobility:off"]
     distributions = {
-        "ablation": optuna.distributions.CategoricalDistribution(ablations),
+        "condition": optuna.distributions.CategoricalDistribution(conditions),
         "seed": optuna.distributions.CategoricalDistribution([42]),
     }
-    for ablation in ablations:
+    for condition in conditions:
         study.add_trial(
             optuna.trial.create_trial(
-                params={"ablation": ablation, "seed": 42},
+                params={"condition": condition, "seed": 42},
                 distributions=distributions,
                 value=1.0,
             )
@@ -1050,12 +1127,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
 
     run_root = tmp_path / "run"
     config = {
-        "ablation": {
-            "study_name": "ablation-study",
-            "campaign_id": "campaign-a",
-            "seeds": [42],
-            "ablations": "baseline mobility:off",
-        }
+        "ablation": {"study_name": "ablation-study", "campaign": str(campaign_path)}
     }
     config_path = run_root / "config.yaml"
     config_path.parent.mkdir(parents=True)
@@ -1079,6 +1151,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
     manifest = json.loads(
         (run_root / "outputs/ablation_analysis/ablation_manifest.json").read_text()
     )
+    assert manifest["campaign_sha256"]
     assert [artifact["path"] for artifact in manifest["artifacts"]] == [
         "ablation_metrics_aggregated.csv",
         "ablation_run_context.csv",
@@ -1089,6 +1162,12 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
         "-m",
         "scripts.analysis.analyze_ablations",
     ]
+    assert captured["command"][captured["command"].index("--campaign") + 1] == str(
+        campaign_path.resolve()
+    )
+    assert captured["command"][captured["command"].index("--journal") + 1] == str(
+        journal
+    )
 
 
 def test_finalize_crossval_validates_folds_and_aggregates_scalar_metrics(
@@ -1292,9 +1371,7 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
     model_root = run_root / "outputs/training/single/model"
     _complete_training_dynamics(model_root)
     (model_root / "training_manifest.json").write_text('{"schema_version": 1}\n')
-    (model_root / "training_provenance.json").write_text(
-        '{"schema_version": 1}\n'
-    )
+    (model_root / "training_provenance.json").write_text('{"schema_version": 1}\n')
     (model_root / "worker.pt.trace.json").write_text('{"traceEvents": []}\n')
     remote = tmp_path / "remote"
     cache = tmp_path / "cache"
@@ -1514,8 +1591,7 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
     config = _workflow_mode_config("train", run_root)
     profiled = yaml.safe_load(
         (
-            REPO_ROOT
-            / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
+            REPO_ROOT / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
         ).read_text()
     )
     config["workflow"] = profiled["workflow"]
@@ -1788,11 +1864,7 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     config_path.write_text(yaml.safe_dump(config))
     (run_root / "manifest.yaml").write_text(
         yaml.safe_dump(
-            {
-                "training_input": {
-                    "checkpoint_sha256": run_support.sha256_file(pinned)
-                }
-            }
+            {"training_input": {"checkpoint_sha256": run_support.sha256_file(pinned)}}
         )
     )
     captured: dict[str, object] = {}
@@ -1977,9 +2049,7 @@ def test_runtime_dependency_group_excludes_coordinator_tooling() -> None:
 
 
 def test_container_build_is_source_independent_and_batch_validated() -> None:
-    batch = (
-        REPO_ROOT / "containers/runtime/assemble_sif_on_mn5.sbatch"
-    ).read_text()
+    batch = (REPO_ROOT / "containers/runtime/assemble_sif_on_mn5.sbatch").read_text()
     dispatcher = (REPO_ROOT / "containers/runtime/build_sif_on_mn5.sh").read_text()
     fetch = (REPO_ROOT / "containers/runtime/fetch_runtime_deps_on_wifi.sh").read_text()
 
@@ -2207,9 +2277,10 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     assert "--gres=gpu:4" in call_lines[0]
     assert "--mem" not in call_lines[0]
     assert "--cores" not in call_lines[0]
-    assert str(
-        run_root / "source/scripts/workflow/snakemake_coordinator.sh"
-    ) in call_lines[0]
+    assert (
+        str(run_root / "source/scripts/workflow/snakemake_coordinator.sh")
+        in call_lines[0]
+    )
     assert (run_root / ".state/coordinator.job_id").read_text() == "12345\n"
     attempt_id = (run_root / ".state/active_execution").read_text().strip()
     attempt_root = run_root / ".state/executions" / attempt_id
@@ -2300,8 +2371,8 @@ def test_external_launcher_coordinator_exports_validated_capacity(
     snakemake = tmp_path / "snakemake"
     snakemake.write_text(
         "#!/bin/bash\n"
-        'printf "%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_CPUS_PER_TASK" '
-        '>"$CAPTURE"\n'
+        'printf "%s\\t%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_NTASKS" '
+        '"$SLURM_CPUS_PER_TASK" >"$CAPTURE"\n'
     )
     snakemake.chmod(0o755)
     coordinator = REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
@@ -2318,7 +2389,7 @@ def test_external_launcher_coordinator_exports_validated_capacity(
             str(coordinator),
             str(run_root),
             str(snakemake),
-            "1",
+            "2",
             "20",
             "existing-allocation",
             str(attempt_root),
@@ -2327,9 +2398,22 @@ def test_external_launcher_coordinator_exports_validated_capacity(
         check=True,
     )
 
-    assert capture.read_text() == "1\t20\n"
+    assert capture.read_text() == "1\t2\t20\n"
     assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
     assert (attempt_root / "coordinator.step_id").read_text() == "7\n"
+
+
+def test_slurm_step_disables_cpu_binding_for_existing_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EPIFORECASTER_EXECUTION_MODE", raising=False)
+    batch_step = slurm_step("echo batch", 20)
+
+    monkeypatch.setenv("EPIFORECASTER_EXECUTION_MODE", "existing-allocation")
+    interactive_step = slurm_step("echo interactive", 20)
+
+    assert "--cpu-bind=none" not in batch_step
+    assert "--cpu-bind=none" in interactive_step
 
 
 @pytest.mark.parametrize("command", ["run", "dry-run"])

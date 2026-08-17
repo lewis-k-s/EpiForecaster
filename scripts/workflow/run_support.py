@@ -147,8 +147,7 @@ def is_dvc_import(pointer_path: Path) -> bool:
     document = load_yaml(pointer_path)
     dependencies = document.get("deps", [])
     return any(
-        isinstance(dependency, dict)
-        and isinstance(dependency.get("repo"), dict)
+        isinstance(dependency, dict) and isinstance(dependency.get("repo"), dict)
         for dependency in dependencies
     )
 
@@ -867,7 +866,9 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
     status_targets = [
-        target for target in targets if target not in {item[0] for item in imported_targets}
+        target
+        for target in targets
+        if target not in {item[0] for item in imported_targets}
     ]
     if status_targets:
         _run(["dvc", "status", *status_targets], cwd=workspace)
@@ -1583,7 +1584,7 @@ def finalize_ablation(
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend
 
-    from scripts.hpo.ablation_worker import is_study_complete, resolve_ablation_plan
+    from scripts.hpo.ablation_worker import is_study_complete, load_campaign
 
     config = load_yaml(config_path)
     ablation = config["ablation"]
@@ -1591,17 +1592,15 @@ def finalize_ablation(
         study_name=str(ablation["study_name"]),
         storage=JournalStorage(JournalFileBackend(str(journal_path))),
     )
-    seeds = [int(seed) for seed in ablation["seeds"]]
-    requested = ablation.get("ablations")
-    plan = resolve_ablation_plan(None if requested is None else str(requested))
-    if not is_study_complete(study, seeds, plan):
+    campaign = load_campaign(Path(str(ablation["campaign"])))
+    if not is_study_complete(study, campaign):
         state_counts = Counter(trial.state.name for trial in study.trials)
         raise RuntimeError(
-            "Ablation workers exited before the complete seed/ablation matrix was "
+            "Ablation workers exited before the complete campaign identity matrix was "
             f"terminal: {dict(sorted(state_counts.items()))}"
         )
 
-    campaign_id = str(ablation["campaign_id"])
+    campaign_id = campaign.campaign_id
     training_dir = run_root / "outputs/training" / campaign_id
     output_dir = run_root / "outputs/ablation_analysis"
     command = [
@@ -1612,15 +1611,13 @@ def finalize_ablation(
         str(training_dir),
         "--output-dir",
         str(output_dir),
-        "--campaign-id",
-        campaign_id,
-        "--seed-coverage",
-        "strict",
-        "--expected-seeds",
-        ",".join(str(seed) for seed in seeds),
+        "--campaign",
+        str(campaign.path),
+        "--journal",
+        str(journal_path),
+        "--study-name",
+        study.study_name,
     ]
-    if requested is not None:
-        command.extend(["--include-ablations", ",".join(plan)])
     _run(command)
 
     required_artifacts = [
@@ -1646,6 +1643,7 @@ def finalize_ablation(
             "schema_version": 1,
             "study_name": study.study_name,
             "campaign_id": campaign_id,
+            "campaign_sha256": campaign.sha256,
             "journal": str(journal_path),
             "trial_count": len(study.trials),
             "artifacts": [
@@ -1665,6 +1663,7 @@ def finalize_ablation(
         {
             "ablation_manifest": str(ablation_manifest),
             "study_name": study.study_name,
+            "campaign_sha256": campaign.sha256,
             "trial_count": len(study.trials),
             "completed_at": datetime.now(UTC).isoformat(),
         },

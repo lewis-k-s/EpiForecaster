@@ -154,7 +154,7 @@ the new code, configuration, environment, seed, input, and output identities.
 - `git checkout` is denied by permissions. Use `git switch` for branch switching and `git restore` for discarding file changes instead.
 - Do not chain git commands with `&&` (e.g. `git add ... && git commit ...`). The permissions system matches against the full command string, so chaining breaks pattern matching. Use separate bash calls instead.
 - New features and refactors are assumed to be 'cutover' implementations, not preserving backwards compatibility with previous behavior, unless specified otherwise.
-- Prefer `uv run` for execution and CLI commands over ad-hoc commands; update `pyproject.toml` if adding deps.
+- Prefer `uv run` for project test suites, CLI commands, scripts, and workflow execution; update `pyproject.toml` if adding deps.
 - Do not modify `data/` inputs or commit large `outputs/`. Place generated artifacts in `outputs/` and ignore by default.
 - Keep patches minimal and consistent with existing style; avoid unrelated refactors. If heavy compute is required, add flags and default to lightweight settings.
 - Use configuration-driven development: copy and modify templates from the `configs/` directory or provide CLI level overrides with dot-path syntax like `--override model.strict=true` rather than hardcoding parameters.

@@ -1,0 +1,37 @@
+# Bounded declarative-campaign acceptance workflow. Per-run paths and provenance
+# fields are injected by scripts/workflow/mn5_workflow.sh.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: ablation
+  target: ablation
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.dvc
+    - data/processed/real_with_id.zarr.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+ablation:
+  study_name: epiforecaster_ablation_smoke_v1
+  campaign: configs/campaigns/ablation_smoke_v1.yaml
+  workers: 2
+  trials_per_worker: 4
+  timeout_s: 3300
+  sampler_seed: 42
+  smoketest: true
+  requeue_running: false
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 2
+    cpus_per_task: 20
+    gres: gpu:2
+    runtime: 60

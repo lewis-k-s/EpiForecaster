@@ -110,6 +110,8 @@ def slurm_step(command: str, cpus_per_task: int, *, gpu: bool = True) -> str:
         "--exact",
         "--kill-on-bad-exit=1",
     ]
+    if os.environ.get("EPIFORECASTER_EXECUTION_MODE") == "existing-allocation":
+        step.append("--cpu-bind=none")
     if gpu:
         step.append("--gpus-per-task=1")
     return f"{shlex.join(step)} {command}"
@@ -217,16 +219,12 @@ def ablation_worker_arguments(config: dict[str, Any]) -> list[object]:
         "python",
         "-m",
         "scripts.hpo.ablation_worker",
-        "--config",
-        CONTAINER_SOURCE / str(options["base_config"]),
+        "--campaign",
+        CONTAINER_SOURCE / str(options["campaign"]),
         "--study-name",
         study_name,
         "--journal-file",
         CONTAINER_RUN / "optuna" / f"{study_name}.journal",
-        "--campaign-id",
-        options["campaign_id"],
-        "--seeds",
-        " ".join(str(seed) for seed in options["seeds"]),
         "--run-root",
         CONTAINER_RUN / "outputs/training",
         "--timeout-s",
@@ -234,12 +232,6 @@ def ablation_worker_arguments(config: dict[str, Any]) -> list[object]:
         "--seed",
         int(options["sampler_seed"]),
     ]
-    if options.get("ablations") is not None:
-        arguments.extend(["--ablations", str(options["ablations"])])
-    if options.get("overrides"):
-        arguments.extend(
-            ["--overrides", " ".join(str(value) for value in options["overrides"])]
-        )
     if options.get("trials_per_worker") is not None:
         arguments.extend(["--n-trials", int(options["trials_per_worker"])])
     if options.get("smoketest", False):

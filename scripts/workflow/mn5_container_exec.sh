@@ -231,13 +231,15 @@ configure_shared_binds() {
     BINDS+=("${SIF}.sha256:${SIF}.sha256:ro")
   fi
 
-  for input_path in "${INPUT_PATHS[@]}"; do
-    if [ ! -e "$input_path" ] || [ -L "$input_path" ]; then
-      echo "Workflow input must exist and must not be a symlink: $input_path" >&2
-      return 1
-    fi
-    BINDS+=("$input_path:$input_path:ro")
-  done
+  if [ "${#INPUT_PATHS[@]}" -gt 0 ]; then
+    for input_path in "${INPUT_PATHS[@]}"; do
+      if [ ! -e "$input_path" ] || [ -L "$input_path" ]; then
+        echo "Workflow input must exist and must not be a symlink: $input_path" >&2
+        return 1
+      fi
+      BINDS+=("$input_path:$input_path:ro")
+    done
+  fi
 
   case "$DVC_MODE" in
     pull)
@@ -335,7 +337,12 @@ main() {
   configure_shared_binds
   stage_dvc_inputs
   configure_singularity_arguments
-  singularity "${SINGULARITY_ARGS[@]}" "${SCIENTIFIC_COMMAND[@]}"
+  if singularity "${SINGULARITY_ARGS[@]}" "${SCIENTIFIC_COMMAND[@]}"; then
+    return 0
+  else
+    local scientific_status=$?
+    return "$scientific_status"
+  fi
 }
 
 main "$@"
