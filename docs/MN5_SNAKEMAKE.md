@@ -220,29 +220,6 @@ Each worker then copies those inputs into rank-specific node-local scratch and
 mounts them read-only over the immutable source tree. GPFS remains authoritative
 for the Optuna journal, logs, checkpoints, outputs, and promotion records.
 
-## Remote endpoints and queue visibility
-
-Endpoint behavior is defined by the shared `mn5-cluster-usage` skill:
-
-- `dt` reaches the `bsc_transfer` controller. Use it for source/data transfer
-  and for inspecting files already present on project GPFS.
-- `mn5` reaches the authoritative `marenostrum5` compute scheduler. Use it for
-  `sbatch`, `salloc`, `srun`, `squeue`, `sacct`, `scontrol`, and `scancel`.
-- `wifi` and `wifi-acc` are network-enabled dependency-preparation endpoints.
-  Do not submit batch or interactive work from them.
-
-Consequently, an empty `squeue` or `Invalid job id` on `dt` says nothing about
-an MN5 compute job. Shared visibility of GPFS logs does not imply shared Slurm
-job visibility. Verify the endpoint when diagnosing this ambiguity:
-
-```bash
-ssh dt "scontrol show config | grep -E '^ClusterName|^SlurmctldHost'"
-ssh mn5 "scontrol show config | grep -E '^ClusterName|^SlurmctldHost'"
-```
-
-Monitor scheduler state on `mn5` and use `dt` only for filesystem evidence such
-as logs and markers.
-
 ## Prepare and submit
 
 Single training is the default:

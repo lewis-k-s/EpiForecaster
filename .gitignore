@@ -86,8 +86,7 @@ tmp/
 # agents
 .claude/
 
-# No leaking cluster details
-# docs/marenostrum5_hardware.md
+# Cluster-local notes
 PROD_RUN.md
 .opencode
 .codex/
