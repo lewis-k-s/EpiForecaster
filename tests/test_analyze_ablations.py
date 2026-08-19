@@ -638,12 +638,32 @@ def test_campaign_outputs_reject_empty_or_missing_required_metric_columns(
     with pytest.raises(ValueError, match="target"):
         validate_campaign_outputs(campaign, runs)
 
-    pd.DataFrame({"target": ["wastewater"], "mae_median": [float("nan")]}).to_csv(
+    pd.DataFrame(
+        {
+            "target": ["wastewater"],
+            "mae_median": [float("nan")],
+            "observed_count_median": [1.0],
+        }
+    ).to_csv(
         run_dir / "test_main_model_aggregate_metrics.csv",
         index=False,
     )
     with pytest.raises(ValueError, match="nonfinite primary metric"):
         validate_campaign_outputs(campaign, runs)
+    with pytest.raises(ValueError, match="nonfinite primary metric"):
+        validate_campaign_outputs(campaign, runs, smoketest=True)
+
+    pd.DataFrame(
+        {
+            "target": ["wastewater"],
+            "mae_median": [float("nan")],
+            "observed_count_median": [0.0],
+        }
+    ).to_csv(
+        run_dir / "test_main_model_aggregate_metrics.csv",
+        index=False,
+    )
+    validate_campaign_outputs(campaign, runs, smoketest=True)
 
     campaign_document = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
     campaign_document["completeness_requirements"]["require_finite_primary_metric"] = (

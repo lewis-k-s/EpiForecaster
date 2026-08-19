@@ -17,6 +17,8 @@ import torch
 from models.observation_heads import (
     _GAMMA_SCALE_MAX,
     _GAMMA_SCALE_MIN,
+    _GAMMA_SCALE_WW_MAX,
+    _GAMMA_SCALE_WW_MIN,
     _GAMMA_SHAPE_MAX,
     _GAMMA_SHAPE_MIN,
     ClinicalObservationHead,
@@ -27,6 +29,7 @@ from models.observation_heads import (
     SheddingConvolution,
     UnscaledMSELoss,
     WastewaterObservationHead,
+    _inverse_bounded_sigmoid,
 )
 from tests.model_test_helpers import make_observation_heads
 
@@ -308,7 +311,8 @@ class TestDelayKernelGamma:
             parameterization="gamma",
         )
 
-        assert not isinstance(frozen.kernel, torch.nn.Parameter)
+        assert not hasattr(frozen, "kernel")
+        assert "gamma_kernel" in frozen.state_dict()
         assert torch.allclose(
             frozen.get_kernel_weights(), learnable.get_kernel_weights()
         )
@@ -316,6 +320,23 @@ class TestDelayKernelGamma:
             pytest.approx(self._MATCHED_SHAPE),
             pytest.approx(self._MATCHED_SCALE),
         )
+
+    def test_frozen_gamma_rejects_simplex_checkpoint_state(self):
+        simplex = DelayKernel(
+            kernel_length=21,
+            learnable=False,
+            parameterization="simplex",
+        )
+        gamma = DelayKernel(
+            kernel_length=21,
+            gamma_shape=self._MATCHED_SHAPE,
+            gamma_scale=self._MATCHED_SCALE,
+            learnable=False,
+            parameterization="gamma",
+        )
+
+        with pytest.raises(RuntimeError, match="Missing key"):
+            gamma.load_state_dict(simplex.state_dict())
 
     def test_gamma_causality_no_future_leakage(self):
         kernel = DelayKernel(kernel_length=5, learnable=True, parameterization="gamma")
@@ -609,6 +630,238 @@ class TestSheddingConvolutionDilution:
         assert 0.6 < ratio_output / ratio_pop < 2.0
 
 
+class TestSheddingConvolutionGamma:
+    """Two-parameter learnable Gamma shedding kernel."""
+
+    _LIT_SHAPE = 2.0
+    _LIT_SCALE = 6.0
+
+    def test_gamma_learns_exactly_two_kernel_parameters(self):
+        conv = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+            learnable_scale=False,
+        )
+
+        named = {
+            name: parameter
+            for name, parameter in conv.named_parameters()
+            if name.startswith("gamma_")
+        }
+        assert set(named) == {"gamma_shape_raw", "gamma_scale_raw"}
+        assert all(parameter.numel() == 1 for parameter in named.values())
+
+    def test_gamma_kernel_normalized_and_prior_matched(self):
+        conv = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+            learnable_scale=False,
+        )
+
+        weights = conv.get_kernel_weights()
+        assert torch.allclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+        assert (weights >= 0).all()
+
+        shape, scale = conv.get_gamma_parameters()
+        assert shape == pytest.approx(self._LIT_SHAPE)
+        assert scale == pytest.approx(self._LIT_SCALE)
+
+        # Literature anchor: mean 12 d, CV 0.7 → std 8.4 d.
+        assert conv.get_mean_delay() == pytest.approx(12.0, abs=1.5)
+        assert conv.get_delay_std() == pytest.approx(8.4, abs=2.0)
+
+    def test_gamma_frozen_buffer_matches_learnable_initialization(self):
+        frozen = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=False,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+        )
+        learnable = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+        )
+
+        assert not hasattr(frozen, "gamma_shape_raw")
+        assert not hasattr(frozen, "kernel")
+        assert "gamma_kernel" in frozen.state_dict()
+        assert torch.allclose(
+            frozen.get_kernel_weights(), learnable.get_kernel_weights()
+        )
+        assert frozen.get_gamma_parameters() == pytest.approx(
+            learnable.get_gamma_parameters(), rel=1e-5
+        )
+
+    def test_frozen_gamma_rejects_simplex_checkpoint_state(self):
+        simplex = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=False,
+            kernel_parameterization="simplex",
+        )
+        gamma = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=False,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+        )
+
+        with pytest.raises(RuntimeError, match="Missing key"):
+            gamma.load_state_dict(simplex.state_dict())
+
+    def test_gamma_forward_preserves_dilution_scaling(self):
+        conv = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+            learnable_scale=False,
+        )
+
+        I_trajectory = _rand_tensor(2, 40) * 0.1
+        small_pop = _ones_tensor(2, 40) * 1000.0
+        large_pop = _ones_tensor(2, 40) * 100000.0
+
+        output_small = conv(I_trajectory, small_pop)
+        output_large = conv(I_trajectory, large_pop)
+
+        assert torch.isfinite(output_small).all()
+        assert torch.allclose(
+            output_small / output_large,
+            torch.full_like(output_small, 100.0),
+            rtol=1e-3,
+        )
+
+    def test_gamma_gradient_flows_to_both_parameters(self):
+        conv = SheddingConvolution(
+            kernel_length=21,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            gamma_shape=self._LIT_SHAPE,
+            gamma_scale=self._LIT_SCALE,
+            learnable_scale=False,
+        )
+
+        I_trajectory = _rand_tensor(2, 30).requires_grad_(True)
+        population = _ones_tensor(2, 30) * 10000.0
+        output = conv(I_trajectory, population)
+        output.sum().backward()
+
+        assert conv.gamma_shape_raw.grad is not None
+        assert conv.gamma_scale_raw.grad is not None
+        assert torch.isfinite(conv.gamma_shape_raw.grad).all()
+        assert torch.isfinite(conv.gamma_scale_raw.grad).all()
+        assert I_trajectory.grad is not None
+        assert torch.isfinite(I_trajectory.grad).all()
+
+    def test_gamma_smooth_bounds_remain_open_at_extreme_coordinates(self):
+        conv = SheddingConvolution(
+            kernel_length=35,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            learnable_scale=False,
+        )
+        with torch.no_grad():
+            conv.gamma_shape_raw.fill_(20.0)
+            conv.gamma_scale_raw.fill_(20.0)
+
+        shape, scale = conv.get_gamma_parameters()
+        assert _GAMMA_SHAPE_MIN < shape < _GAMMA_SHAPE_MAX
+        assert _GAMMA_SCALE_WW_MIN < scale < _GAMMA_SCALE_WW_MAX
+        weights = conv.get_kernel_weights()
+        assert torch.allclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+        assert torch.isfinite(conv(_rand_tensor(1, 40), _ones_tensor(1, 40))).all()
+        output = conv(_rand_tensor(1, 40), _ones_tensor(1, 40))
+        output.sum().backward()
+        assert conv.gamma_shape_raw.grad is not None
+        assert conv.gamma_shape_raw.grad.abs().item() > 0.0
+        assert conv.gamma_scale_raw.grad is not None
+        assert conv.gamma_scale_raw.grad.abs().item() > 0.0
+
+    def test_gamma_causality_no_future_leakage(self):
+        conv = SheddingConvolution(
+            kernel_length=5,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            learnable_scale=False,
+        )
+
+        base = _rand_tensor(1, 12)
+        perturbed = base.clone()
+        perturbed[0, -1] += 10.0
+        population = _ones_tensor(1, 12) * 1000.0
+
+        assert torch.allclose(
+            conv(base, population)[0, :-1], conv(perturbed, population)[0, :-1]
+        )
+
+    def test_gamma_sanitizes_non_finite_parameters(self):
+        conv = SheddingConvolution(
+            kernel_length=7,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            learnable_scale=False,
+        )
+        with torch.no_grad():
+            conv.gamma_shape_raw.fill_(float("nan"))
+            conv.gamma_scale_raw.fill_(float("inf"))
+
+        weights = conv.get_kernel_weights()
+        assert torch.isfinite(weights).all()
+        assert torch.allclose(weights.sum(), torch.tensor(1.0), atol=1e-6)
+
+    def test_gamma_get_parameters_rejects_other_parameterizations(self):
+        conv = SheddingConvolution(kernel_length=5, learnable_kernel=True)
+
+        with pytest.raises(ValueError, match="only defined for gamma kernels"):
+            conv.get_gamma_parameters()
+
+    def test_gamma_boundary_hits_use_wastewater_scale_box(self):
+        conv = SheddingConvolution(
+            kernel_length=21,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+            learnable_scale=False,
+        )
+
+        # A clinical-scale prior is far inside the wider wastewater scale box.
+        with torch.no_grad():
+            conv.gamma_scale_raw.fill_(
+                _inverse_bounded_sigmoid(1.0, lower=0.2, upper=15.0)
+            )
+        assert not any(conv.get_gamma_boundary_hits(atol=1.0e-5).values())
+
+        cases = [
+            ("gamma_shape_raw", -12.0, "shape_lower"),
+            ("gamma_shape_raw", 12.0, "shape_upper"),
+            ("gamma_scale_raw", -12.0, "scale_lower"),
+            ("gamma_scale_raw", 12.0, "scale_upper"),
+        ]
+        for raw_name, raw_value, expected_key in cases:
+            kernel = SheddingConvolution(
+                kernel_length=21,
+                learnable_kernel=True,
+                kernel_parameterization="gamma",
+                learnable_scale=False,
+            )
+            with torch.no_grad():
+                getattr(kernel, raw_name).fill_(raw_value)
+            hits = kernel.get_gamma_boundary_hits(atol=1.0e-5)
+            assert hits[expected_key] is True, (raw_name, expected_key)
+            assert sum(hits.values()) == 1
+
+
 class TestSheddingConvolutionGradients:
     """Tests for gradient flow in shedding convolution."""
 
@@ -867,6 +1120,17 @@ class TestWastewaterObservationHead:
         output = head(I_trajectory, population)
 
         assert output.shape == (batch_size, time_steps)
+
+    def test_mlp_kernel_accepts_history_length_population(self):
+        """Static MLP population features must not require the forecast length."""
+        head = WastewaterObservationHead(kernel_mlp=True)
+        infections = _rand_tensor(3, 29) * 0.1
+        population_history = _ones_tensor(3, 32, 1) * 10000.0
+
+        output = head(infections, population_history)
+
+        assert output.shape == infections.shape
+        assert torch.isfinite(output).all()
 
     def test_scale_effect(self):
         """Test that scale parameter affects output magnitude."""

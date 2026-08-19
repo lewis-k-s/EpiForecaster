@@ -6,7 +6,7 @@ import pytest
 from data.preprocess.config import PreprocessingConfig
 from models.configs import EpiForecasterConfig, ObservationHeadConfig
 from training.region2vec_trainer import RegionTrainerConfig
-from scripts.hpo.ablation_worker import load_campaign
+from scripts.hpo.ablation_worker import build_trial_queue, load_campaign
 
 
 # Config file lists by type
@@ -49,6 +49,71 @@ def test_ablation_campaign_configs_parse(campaign_path):
         "training.epochs",
         "training.max_batches",
     )
+
+
+def test_default_ablation_campaign_declares_full_and_smoke_coverage_matrices():
+    campaign = load_campaign(Path("configs/campaigns/ablation_default_v1.yaml"))
+
+    assert campaign.selected_fold_indices(smoketest=False) == tuple(range(10))
+    assert campaign.selected_fold_indices(smoketest=True) == (0, 1)
+    assert len(build_trial_queue(campaign)) == 1400
+    assert len(build_trial_queue(campaign, smoketest=True)) == 280
+    assert campaign.smoke_overrides == {
+        "training": {
+            "compile": False,
+            "num_workers": 1,
+            "val_workers": 1,
+            "test_workers": 1,
+        }
+    }
+
+
+def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
+    """Delay-family ablations stay normalized and diagnosable."""
+    campaign = load_campaign(Path("configs/campaigns/ablation_default_v1.yaml"))
+    conditions = campaign.conditions_by_name
+
+    assert {
+        "kernel:ww:gamma",
+        "kernel:hosp:gamma",
+        "kernel:cases:gamma",
+        "kernel:deaths:gamma",
+        "kernel:clinical:gamma",
+    }.issubset(conditions)
+    assert not {
+        "kernel:ww:free",
+        "kernel:hosp:free",
+        "kernel:cases:free",
+        "kernel:deaths:free",
+        "kernel:all:free",
+    }.intersection(conditions)
+    assert conditions["kernel:hosp:gamma"].overrides == {
+        "model": {
+            "observation_heads": {
+                "learnable_kernel_hosp": True,
+                "kernel_parameterization_hosp": "gamma",
+            }
+        }
+    }
+    assert conditions["kernel:clinical:gamma"].overrides == {
+        "model": {
+            "observation_heads": {
+                "learnable_kernel_hosp": True,
+                "kernel_parameterization_hosp": "gamma",
+                "kernel_parameterization_cases": "gamma",
+                "kernel_parameterization_deaths": "gamma",
+            }
+        }
+    }
+    assert conditions["kernel:ww:gamma"].overrides == {
+        "model": {
+            "observation_heads": {
+                "learnable_kernel_ww": True,
+                "kernel_parameterization_ww": "gamma",
+                "kernel_length_ww": 35,
+            }
+        }
+    }
 
 
 @pytest.mark.epiforecaster
@@ -170,6 +235,8 @@ def test_all_config_files_accounted_for():
 @pytest.mark.parametrize(
     "field",
     [
+        "kernel_gamma_shape_ww",
+        "kernel_gamma_scale_ww",
         "kernel_gamma_shape_hosp",
         "kernel_gamma_scale_hosp",
         "kernel_gamma_shape_cases",
@@ -178,17 +245,36 @@ def test_all_config_files_accounted_for():
         "kernel_gamma_scale_deaths",
     ],
 )
-def test_observation_heads_reject_nonpositive_gamma_priors(field, value):
-    """All clinical Gamma prior fields must be strictly positive."""
-    with pytest.raises(ValueError, match=f"{field} must be positive"):
+def test_observation_heads_reject_out_of_box_gamma_priors(field, value):
+    """All Gamma priors must be finite and strictly inside their model boxes."""
+    with pytest.raises(ValueError, match=f"{field} must be finite and strictly inside"):
         ObservationHeadConfig(**{field: value})
 
 
 @pytest.mark.epiforecaster
-def test_observation_heads_reject_wastewater_gamma_parameterization():
-    """Wastewater routes through SheddingConvolution, which rejects Gamma."""
-    with pytest.raises(ValueError, match="kernel_parameterization_ww"):
-        ObservationHeadConfig(kernel_parameterization_ww="gamma")
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kernel_gamma_shape_ww", 30.0),
+        ("kernel_gamma_scale_ww", 0.2),
+        ("kernel_gamma_scale_ww", 15.0),
+        ("kernel_gamma_scale_ww", 16.0),
+        ("kernel_gamma_scale_ww", float("nan")),
+    ],
+)
+def test_observation_heads_reject_wastewater_gamma_priors_outside_bounds(field, value):
+    """WW Gamma priors must fit the same open box used by its kernel."""
+    with pytest.raises(ValueError, match=f"{field} must be finite and strictly inside"):
+        ObservationHeadConfig(**{field: value})
+
+
+@pytest.mark.epiforecaster
+def test_observation_heads_accept_wastewater_gamma_parameterization():
+    """Wastewater routes through SheddingConvolution, which supports Gamma."""
+    cfg = ObservationHeadConfig(kernel_parameterization_ww="gamma")
+    assert cfg.kernel_parameterization_ww == "gamma"
+    assert cfg.kernel_gamma_shape_ww == pytest.approx(2.0)
+    assert cfg.kernel_gamma_scale_ww == pytest.approx(6.0)
 
 
 @pytest.mark.epiforecaster

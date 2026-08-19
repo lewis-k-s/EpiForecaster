@@ -44,7 +44,7 @@ from evaluation.pathway_metrics import (
 )
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
-from models.observation_heads import DelayKernel
+from models.observation_heads import DelayKernel, SheddingConvolution
 from utils.device import (
     iter_device_ready_batches,
     prefetch_enabled,
@@ -338,20 +338,25 @@ def _add_delay_kernel_metrics(
     metrics: dict[str, Any],
     model: torch.nn.Module,
 ) -> None:
-    """Add final delay-kernel state diagnostics for clinical heads.
+    """Add final kernel-state diagnostics for the observation heads.
 
     Run-level model-state metrics for ``test_summary.json``; the granular row
-    schema is unaffected. Wastewater is excluded because it routes through
-    ``SheddingConvolution`` instead of ``DelayKernel``.
+    schema is unaffected. Clinical heads route through ``DelayKernel`` and the
+    wastewater head through ``SheddingConvolution``; both expose the same
+    normalized-kernel and Gamma diagnostics.
     """
     model = getattr(model, "_orig_mod", model)
+    kernels: dict[str, DelayKernel | SheddingConvolution] = {}
     for head_name in ("hosp", "cases", "deaths"):
-        head = getattr(model, f"{head_name}_head", None)
-        if head is None:
-            continue
-        kernel = getattr(head, "delay_kernel", None)
-        if not isinstance(kernel, DelayKernel):
-            continue
+        kernel = getattr(
+            getattr(model, f"{head_name}_head", None), "delay_kernel", None
+        )
+        if isinstance(kernel, DelayKernel):
+            kernels[head_name] = kernel
+    ww_kernel = getattr(getattr(model, "ww_head", None), "shedding_conv", None)
+    if isinstance(ww_kernel, SheddingConvolution):
+        kernels["ww"] = ww_kernel
+    for head_name, kernel in kernels.items():
         if kernel.parameterization not in {"simplex", "gamma"}:
             continue
         trainable_count = sum(

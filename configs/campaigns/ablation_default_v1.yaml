@@ -5,6 +5,12 @@ hypothesis: Paired interventions isolate each declared architectural, loss, sign
 base_config: configs/production_only/train_epifor_mn5_full.yaml
 baseline_condition: baseline
 fixed_overrides: {}
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
 conditions:
   - name: baseline
     hypothesis: The production configuration is the paired reference.
@@ -91,34 +97,38 @@ conditions:
     overrides: {training: {loss: {joint: {disable_deaths: true, mask_input_deaths: true}}}}
     allowed_difference_paths: [training.loss.joint.disable_deaths, training.loss.joint.mask_input_deaths]
   - name: kernel:fixed
-    hypothesis: Learning clinical delay kernels improves over fixed clinical kernels.
-    overrides: {model: {observation_heads: {learnable_kernel_hosp: false, learnable_kernel_cases: false, learnable_kernel_deaths: false}}}
-    allowed_difference_paths: [model.observation_heads.learnable_kernel_hosp, model.observation_heads.learnable_kernel_cases, model.observation_heads.learnable_kernel_deaths]
-  - name: kernel:ww:free
-    hypothesis: A free wastewater kernel is preferable to its baseline parameterization.
-    overrides: {model: {observation_heads: {learnable_kernel_ww: true, kernel_parameterization_ww: free}}}
-    allowed_difference_paths: [model.observation_heads.learnable_kernel_ww, model.observation_heads.kernel_parameterization_ww]
-  - name: kernel:hosp:free
-    hypothesis: A free hospital kernel is preferable to its baseline parameterization.
-    overrides: {model: {observation_heads: {learnable_kernel_hosp: true, kernel_parameterization_hosp: free}}}
+    hypothesis: Learning the baseline cases and deaths delay kernels improves forecasting.
+    overrides: {model: {observation_heads: {learnable_kernel_cases: false, learnable_kernel_deaths: false}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_cases, model.observation_heads.learnable_kernel_deaths]
+  - name: kernel:ww:gamma
+    hypothesis: A bounded Gamma shedding kernel with literature-scale support improves over the frozen simplex kernel.
+    overrides: {model: {observation_heads: {learnable_kernel_ww: true, kernel_parameterization_ww: gamma, kernel_length_ww: 35}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_ww, model.observation_heads.kernel_parameterization_ww, model.observation_heads.kernel_length_ww]
+  - name: kernel:hosp:gamma
+    hypothesis: A bounded Gamma hospitalization delay improves over the frozen simplex kernel.
+    overrides: {model: {observation_heads: {learnable_kernel_hosp: true, kernel_parameterization_hosp: gamma}}}
     allowed_difference_paths: [model.observation_heads.learnable_kernel_hosp, model.observation_heads.kernel_parameterization_hosp]
-  - name: kernel:cases:free
-    hypothesis: A free case kernel is preferable to its baseline parameterization.
-    overrides: {model: {observation_heads: {learnable_kernel_cases: true, kernel_parameterization_cases: free}}}
-    allowed_difference_paths: [model.observation_heads.learnable_kernel_cases, model.observation_heads.kernel_parameterization_cases]
-  - name: kernel:deaths:free
-    hypothesis: A free death kernel is preferable to its baseline parameterization.
-    overrides: {model: {observation_heads: {learnable_kernel_deaths: true, kernel_parameterization_deaths: free}}}
-    allowed_difference_paths: [model.observation_heads.learnable_kernel_deaths, model.observation_heads.kernel_parameterization_deaths]
-  - name: kernel:all:free
-    hypothesis: Fully free kernels test the aggregate delay-kernel parameterization.
-    overrides: {model: {observation_heads: {learnable_kernel_ww: true, learnable_kernel_hosp: true, learnable_kernel_cases: true, learnable_kernel_deaths: true, kernel_parameterization_ww: free, kernel_parameterization_hosp: free, kernel_parameterization_cases: free, kernel_parameterization_deaths: free}}}
-    allowed_difference_paths: [model.observation_heads.learnable_kernel_ww, model.observation_heads.learnable_kernel_hosp, model.observation_heads.learnable_kernel_cases, model.observation_heads.learnable_kernel_deaths, model.observation_heads.kernel_parameterization_ww, model.observation_heads.kernel_parameterization_hosp, model.observation_heads.kernel_parameterization_cases, model.observation_heads.kernel_parameterization_deaths]
+  - name: kernel:cases:gamma
+    hypothesis: A bounded Gamma reporting delay improves over the learnable simplex kernel.
+    overrides: {model: {observation_heads: {kernel_parameterization_cases: gamma}}}
+    allowed_difference_paths: [model.observation_heads.kernel_parameterization_cases]
+  - name: kernel:deaths:gamma
+    hypothesis: A bounded Gamma death-reporting delay improves over the learnable simplex kernel.
+    overrides: {model: {observation_heads: {kernel_parameterization_deaths: gamma}}}
+    allowed_difference_paths: [model.observation_heads.kernel_parameterization_deaths]
+  - name: kernel:clinical:gamma
+    hypothesis: Bounded Gamma clinical delays improve over the baseline clinical simplex kernels.
+    overrides: {model: {observation_heads: {learnable_kernel_hosp: true, kernel_parameterization_hosp: gamma, kernel_parameterization_cases: gamma, kernel_parameterization_deaths: gamma}}}
+    allowed_difference_paths: [model.observation_heads.learnable_kernel_hosp, model.observation_heads.kernel_parameterization_hosp, model.observation_heads.kernel_parameterization_cases, model.observation_heads.kernel_parameterization_deaths]
   - name: kernel:all:mlp
     hypothesis: MLP kernel parameterization improves delay flexibility.
     overrides: {model: {observation_heads: {kernel_mlp_ww: true, kernel_mlp_hosp: true, kernel_mlp_cases: true, kernel_mlp_deaths: true}}}
     allowed_difference_paths: [model.observation_heads.kernel_mlp_ww, model.observation_heads.kernel_mlp_hosp, model.observation_heads.kernel_mlp_cases, model.observation_heads.kernel_mlp_deaths]
 paired_model_seeds: [42, 43, 44, 45, 46]
+cross_validation:
+  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  smoke_fold_indices: [0, 1]
 metrics:
   primary: {name: mae_median, direction: minimize}
   secondary: [rmse_median, r2_median]

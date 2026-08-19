@@ -27,7 +27,11 @@ from models.configs import (
     resolve_residual_schedule_phase,
 )
 from models.epiforecaster import EpiForecaster
-from utils.checkpoint_compat import initialize_missing_distribution_parameters
+from utils.checkpoint_compat import (
+    initialize_missing_distribution_parameters,
+    initialize_missing_frozen_gamma_metadata,
+    migrate_legacy_frozen_clinical_gamma_keys,
+)
 from utils.device import prefetch_enabled, resolve_device
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,7 @@ def load_model_from_checkpoint(
         )
 
     config_raw = checkpoint["config"]
+    saved_config = config_raw
 
     # Handle backwards compatibility: old checkpoints have pickled EpiForecasterConfig,
     # new checkpoints have plain dicts (robust to config class changes)
@@ -170,6 +175,21 @@ def load_model_from_checkpoint(
     state_dict = _pad_legacy_mobility_input_weights(
         state_dict=state_dict,
         model_state_dict=model.state_dict(),
+    )
+    state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+        state_dict=state_dict,
+        model_state_dict=model.state_dict(),
+        saved_config=saved_config,
+    )
+    if migrated_gamma_keys:
+        logger.info(
+            "Migrated %d legacy frozen clinical Gamma kernel keys",
+            len(migrated_gamma_keys),
+        )
+    state_dict, _initialized_gamma_metadata = initialize_missing_frozen_gamma_metadata(
+        state_dict=state_dict,
+        model_state_dict=model.state_dict(),
+        saved_config=saved_config,
     )
     state_dict, initialized_distribution_keys = (
         initialize_missing_distribution_parameters(

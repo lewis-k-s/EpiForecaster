@@ -587,6 +587,11 @@ class ObservationHeadConfig:
     kernel_parameterization_hosp: str = "simplex"
     kernel_parameterization_cases: str = "simplex"
     kernel_parameterization_deaths: str = "simplex"
+    # Gamma(shape, scale) prior for the wastewater shedding kernel. The
+    # SARS-CoV-2 shedding literature anchors near mean 12 d with CV 0.7,
+    # i.e. shape ~2.04 and scale ~6.09 d.
+    kernel_gamma_shape_ww: float = 2.0
+    kernel_gamma_scale_ww: float = 6.0
     # Gamma(shape, scale) prior for the deaths delay kernel. This initializes
     # its simplex weights by default and initializes the explicit two-parameter
     # Gamma family when selected.
@@ -656,13 +661,13 @@ class ObservationHeadConfig:
         ]:
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
-        # Wastewater routes through SheddingConvolution, which has no Gamma
-        # mode; the clinical heads route through DelayKernel, which does.
+        # Wastewater routes through SheddingConvolution and the clinical heads
+        # through DelayKernel; both support the bounded Gamma family.
         for name, value, allowed in [
             (
                 "kernel_parameterization_ww",
                 self.kernel_parameterization_ww,
-                {"simplex", "free"},
+                {"simplex", "free", "gamma"},
             ),
             (
                 "kernel_parameterization_hosp",
@@ -684,16 +689,24 @@ class ObservationHeadConfig:
                 raise ValueError(
                     f"{name} must be one of {sorted(allowed)}, got {value!r}"
                 )
-        for name, value in [
-            ("kernel_gamma_shape_hosp", self.kernel_gamma_shape_hosp),
-            ("kernel_gamma_scale_hosp", self.kernel_gamma_scale_hosp),
-            ("kernel_gamma_shape_cases", self.kernel_gamma_shape_cases),
-            ("kernel_gamma_scale_cases", self.kernel_gamma_scale_cases),
-            ("kernel_gamma_shape_deaths", self.kernel_gamma_shape_deaths),
-            ("kernel_gamma_scale_deaths", self.kernel_gamma_scale_deaths),
+        # These boxes mirror the smooth open-interval Gamma transforms in
+        # observation_heads.py. Validate priors at config load so frozen Gamma
+        # kernels cannot bypass their declared scientific family.
+        for name, value, lower, upper in [
+            ("kernel_gamma_shape_ww", self.kernel_gamma_shape_ww, 1.0, 30.0),
+            ("kernel_gamma_scale_ww", self.kernel_gamma_scale_ww, 0.2, 15.0),
+            ("kernel_gamma_shape_hosp", self.kernel_gamma_shape_hosp, 1.0, 30.0),
+            ("kernel_gamma_scale_hosp", self.kernel_gamma_scale_hosp, 0.1, 5.0),
+            ("kernel_gamma_shape_cases", self.kernel_gamma_shape_cases, 1.0, 30.0),
+            ("kernel_gamma_scale_cases", self.kernel_gamma_scale_cases, 0.1, 5.0),
+            ("kernel_gamma_shape_deaths", self.kernel_gamma_shape_deaths, 1.0, 30.0),
+            ("kernel_gamma_scale_deaths", self.kernel_gamma_scale_deaths, 0.1, 5.0),
         ]:
-            if value <= 0:
-                raise ValueError(f"{name} must be positive, got {value}")
+            if not math.isfinite(value) or not lower < value < upper:
+                raise ValueError(
+                    f"{name} must be finite and strictly inside ({lower}, {upper}), "
+                    f"got {value}"
+                )
         if self.residual_scale < 0:
             raise ValueError(
                 f"residual_scale must be non-negative, got {self.residual_scale}"

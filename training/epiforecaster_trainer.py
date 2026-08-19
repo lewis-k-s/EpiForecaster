@@ -85,7 +85,11 @@ from utils.console import (
     format_component_gradnorm_status,
     format_train_progress_status,
 )
-from utils.checkpoint_compat import initialize_missing_distribution_parameters
+from utils.checkpoint_compat import (
+    initialize_missing_distribution_parameters,
+    initialize_missing_frozen_gamma_metadata,
+    migrate_legacy_frozen_clinical_gamma_keys,
+)
 from training.grad_utils import (
     compute_gradient_norms_and_clip,
     should_log_gradnorm_components,
@@ -1134,10 +1138,28 @@ class EpiForecasterTrainer:
         # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
 
+        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+            state_dict=checkpoint["model_state_dict"],
+            model_state_dict=self.model.state_dict(),
+            saved_config=checkpoint.get("config"),
+        )
+        if migrated_gamma_keys:
+            self._status(
+                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
+                "kernel keys.",
+                logging.INFO,
+            )
         state_dict, initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
-                state_dict=checkpoint["model_state_dict"],
+                state_dict=state_dict,
                 model_state_dict=self.model.state_dict(),
+            )
+        )
+        state_dict, _initialized_gamma_metadata = (
+            initialize_missing_frozen_gamma_metadata(
+                state_dict=state_dict,
+                model_state_dict=self.model.state_dict(),
+                saved_config=checkpoint.get("config"),
             )
         )
         self.model.load_state_dict(state_dict)
@@ -1235,10 +1257,28 @@ class EpiForecasterTrainer:
             raise ValueError("init_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+            state_dict=checkpoint["model_state_dict"],
+            model_state_dict=self.model.state_dict(),
+            saved_config=checkpoint.get("config"),
+        )
+        if migrated_gamma_keys:
+            self._status(
+                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
+                "kernel keys.",
+                logging.INFO,
+            )
         state_dict, _initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
-                state_dict=checkpoint["model_state_dict"],
+                state_dict=state_dict,
                 model_state_dict=self.model.state_dict(),
+            )
+        )
+        state_dict, _initialized_gamma_metadata = (
+            initialize_missing_frozen_gamma_metadata(
+                state_dict=state_dict,
+                model_state_dict=self.model.state_dict(),
+                saved_config=checkpoint.get("config"),
             )
         )
         self.model.load_state_dict(state_dict)
@@ -2937,6 +2977,7 @@ class EpiForecasterTrainer:
 
         checkpoint_path = self._best_checkpoint_path()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
         self._validate_checkpoint_latent_scale_state(checkpoint)
         # The best checkpoint may come from an earlier residual-schedule
         # phase than the final epoch; the budget buffer is non-persistent,
@@ -2947,12 +2988,28 @@ class EpiForecasterTrainer:
             self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
                 residual_state["effective_max_log_location_fraction"]
             )
-            self._active_residual_schedule_state = dict(residual_state)
-        validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+            state_dict=checkpoint["model_state_dict"],
+            model_state_dict=self.model.state_dict(),
+            saved_config=checkpoint.get("config"),
+        )
+        if migrated_gamma_keys:
+            self._status(
+                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
+                "kernel keys.",
+                logging.INFO,
+            )
         state_dict, _initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
-                state_dict=checkpoint["model_state_dict"],
+                state_dict=state_dict,
                 model_state_dict=self.model.state_dict(),
+            )
+        )
+        state_dict, _initialized_gamma_metadata = (
+            initialize_missing_frozen_gamma_metadata(
+                state_dict=state_dict,
+                model_state_dict=self.model.state_dict(),
+                saved_config=checkpoint.get("config"),
             )
         )
         self.model.load_state_dict(state_dict)

@@ -173,6 +173,8 @@ class EpiForecaster(nn.Module):
             learnable_scale=observation_heads.learnable_scale_ww,
             learnable_kernel=observation_heads.learnable_kernel_ww,
             kernel_parameterization=observation_heads.kernel_parameterization_ww,
+            gamma_shape=observation_heads.kernel_gamma_shape_ww,
+            gamma_scale=observation_heads.kernel_gamma_scale_ww,
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
             residual_enabled="ww" not in observation_heads.residual_disabled_heads,

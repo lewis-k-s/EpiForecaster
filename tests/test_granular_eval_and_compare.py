@@ -16,7 +16,7 @@ from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
 from models.configs import ObservationHeadConfig
-from models.observation_heads import ClinicalObservationHead
+from models.observation_heads import ClinicalObservationHead, WastewaterObservationHead
 from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
 
@@ -1004,9 +1004,9 @@ def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> N
 
 
 class _KernelMetricModel(torch.nn.Module):
-    """Dummy model carrying real clinical heads for kernel diagnostics."""
+    """Dummy model carrying real observation heads for kernel diagnostics."""
 
-    def __init__(self, heads: dict[str, ClinicalObservationHead]) -> None:
+    def __init__(self, heads: dict[str, torch.nn.Module]) -> None:
         super().__init__()
         for name, head in heads.items():
             setattr(self, f"{name}_head", head)
@@ -1095,8 +1095,36 @@ def test_add_delay_kernel_metrics_fixed_simplex_and_gamma() -> None:
         for bound in ("shape_lower", "shape_upper", "scale_lower", "scale_upper")
     )
 
-    # No wastewater delay metrics: SheddingConvolution is out of scope.
+    # No wastewater kernel metrics: the WW head was absent from this model.
     assert not any(key.startswith("kernel_ww") for key in metrics)
+
+
+def test_add_delay_kernel_metrics_reports_wastewater_gamma() -> None:
+    from evaluation.eval_loop import _add_delay_kernel_metrics
+
+    ww_head = WastewaterObservationHead(
+        kernel_length=35,
+        learnable_kernel=True,
+        kernel_parameterization="gamma",
+        gamma_shape=2.0,
+        gamma_scale=6.0,
+        residual_dim=0,
+    )
+    metrics: dict[str, object] = {}
+    _add_delay_kernel_metrics(
+        metrics=metrics, model=_KernelMetricModel({"ww": ww_head})
+    )
+
+    assert metrics["kernel_ww_trainable_parameter_count"] == 2
+    assert metrics["kernel_ww_gamma_shape"] == pytest.approx(2.0)
+    assert metrics["kernel_ww_gamma_scale"] == pytest.approx(6.0)
+    # Literature-anchored prior: mean 12 d, CV 0.7 → std 8.4 d.
+    assert metrics["kernel_ww_mean_delay_days"] == pytest.approx(12.0, abs=1.5)
+    assert metrics["kernel_ww_delay_std_days"] == pytest.approx(8.4, abs=2.0)
+    assert not any(
+        metrics[f"kernel_ww_gamma_{bound}_bound_hit"]
+        for bound in ("shape_lower", "shape_upper", "scale_lower", "scale_upper")
+    )
 
 
 def test_add_delay_kernel_metrics_unwraps_compiled_models() -> None:

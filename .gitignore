@@ -85,8 +85,9 @@ tmp/
 
 # agents
 .claude/
+.opencode
+.codex/
+WATCHDOG.yml
 
 # Cluster-local notes
 PROD_RUN.md
-.opencode
-.codex/

@@ -197,6 +197,33 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
     }
 
 
+def test_coverage_smoke_exercises_default_campaign_subset() -> None:
+    smoke = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml").read_text()
+    )
+
+    assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
+    assert smoke["ablation"] == {
+        "study_name": "epiforecaster_ablation_default_smoke_v1",
+        "campaign": "configs/campaigns/ablation_default_v1.yaml",
+        "workers": 2,
+        "timeout_s": 6000,
+        "sampler_seed": 42,
+        "smoketest": True,
+        "requeue_running": False,
+    }
+    assert smoke["resources"]["allocation"] == {
+        "account": "bsc08",
+        "partition": "acc",
+        "qos": "acc_bscls",
+        "nodes": 1,
+        "tasks": 2,
+        "cpus_per_task": 20,
+        "gres": "gpu:2",
+        "runtime": 110,
+    }
+
+
 def _workflow_config(run_root: Path, source_root: Path) -> dict:
     resources = {
         "allocation": {

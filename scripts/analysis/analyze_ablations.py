@@ -696,13 +696,14 @@ def validate_campaign_trials(
     *,
     journal_path: Path,
     study_name: str,
+    smoketest: bool = False,
 ) -> None:
-    """Require one completed trial per identity while retaining terminal history."""
+    """Require one completed trial per declared production or smoke identity."""
     study = optuna.load_study(
         study_name=study_name,
         storage=JournalStorage(JournalFileBackend(str(journal_path))),
     )
-    expected = expected_trial_identities(campaign)
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
     observed: dict[tuple[str, int, int | None], list[optuna.trial.FrozenTrial]] = {}
     errors: list[str] = []
     for trial in study.trials:
@@ -771,6 +772,7 @@ def _aggregate_metric_table_errors(
     primary_metric: str,
     label: str,
     require_finite_primary_metric: bool,
+    allow_nonfinite_zero_support: bool = False,
 ) -> list[str]:
     if metrics is None:
         return [f"{label}: missing aggregate metric table"]
@@ -786,7 +788,16 @@ def _aggregate_metric_table_errors(
         ]
     if require_finite_primary_metric:
         primary_values = pd.to_numeric(metrics[primary_metric], errors="coerce")
-        if not np.isfinite(primary_values.to_numpy(dtype=float)).all():
+        nonfinite = ~np.isfinite(primary_values.to_numpy(dtype=float))
+        if nonfinite.any() and allow_nonfinite_zero_support:
+            if "observed_count_median" not in metrics.columns:
+                return [f"{label}: nonfinite primary metric {primary_metric!r}"]
+            observed_counts = pd.to_numeric(
+                metrics["observed_count_median"], errors="coerce"
+            )
+            zero_support = observed_counts.to_numpy(dtype=float) == 0.0
+            nonfinite = nonfinite & ~zero_support
+        if nonfinite.any():
             return [f"{label}: nonfinite primary metric {primary_metric!r}"]
     return []
 
@@ -794,9 +805,11 @@ def _aggregate_metric_table_errors(
 def validate_campaign_outputs(
     campaign: AblationCampaign,
     ablation_runs: dict[str, list[AblationRun]],
+    *,
+    smoketest: bool = False,
 ) -> None:
-    """Require exactly one finite aggregate-metric output for every expected identity."""
-    expected = expected_trial_identities(campaign)
+    """Require exactly one aggregate-metric output for every declared identity."""
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
     observed: dict[tuple[str, int, int | None], list[AblationRun]] = {}
     errors: list[str] = []
     for condition, runs in ablation_runs.items():
@@ -831,6 +844,7 @@ def validate_campaign_outputs(
                     require_finite_primary_metric=campaign.completeness_requirements[
                         "require_finite_primary_metric"
                     ],
+                    allow_nonfinite_zero_support=smoketest,
                 )
             )
     missing = expected - observed.keys()
@@ -888,6 +902,11 @@ def main() -> int:
         type=str,
         default="mn5_ablation__*__*",
         help="Glob pattern for ablation experiment directories",
+    )
+    parser.add_argument(
+        "--smoketest",
+        action="store_true",
+        help="Validate the declaration-owned bounded smoke identity matrix.",
     )
     parser.add_argument(
         "-v",
@@ -949,8 +968,13 @@ def main() -> int:
             declaration,
             journal_path=args.journal,
             study_name=args.study_name,
+            smoketest=args.smoketest,
         )
-        validate_campaign_outputs(declaration, ablation_runs)
+        validate_campaign_outputs(
+            declaration,
+            ablation_runs,
+            smoketest=args.smoketest,
+        )
     except (ValueError, KeyError, optuna.exceptions.OptunaError) as exc:
         logger.error("%s", exc)
         return 1

@@ -1588,12 +1588,13 @@ def finalize_ablation(
 
     config = load_yaml(config_path)
     ablation = config["ablation"]
+    smoketest = bool(ablation.get("smoketest", False))
     study = optuna.load_study(
         study_name=str(ablation["study_name"]),
         storage=JournalStorage(JournalFileBackend(str(journal_path))),
     )
     campaign = load_campaign(Path(str(ablation["campaign"])))
-    if not is_study_complete(study, campaign):
+    if not is_study_complete(study, campaign, smoketest=smoketest):
         state_counts = Counter(trial.state.name for trial in study.trials)
         raise RuntimeError(
             "Ablation workers exited before the complete campaign identity matrix was "
@@ -1618,6 +1619,8 @@ def finalize_ablation(
         "--study-name",
         study.study_name,
     ]
+    if smoketest:
+        command.append("--smoketest")
     _run(command)
 
     required_artifacts = [

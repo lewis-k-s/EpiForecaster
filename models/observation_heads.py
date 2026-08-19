@@ -41,6 +41,12 @@ _GAMMA_SHAPE_MIN = 1.0
 _GAMMA_SHAPE_MAX = 30.0
 _GAMMA_SCALE_MIN = 0.1
 _GAMMA_SCALE_MAX = 5.0
+# Wastewater shedding priors need a longer scale box than clinical reporting
+# delays: the SARS-CoV-2 shedding literature anchors near a mean of 12 days
+# with CV ~0.7 (shape ~2, scale ~6). Shape shares the clinical [1, 30] box so
+# the shedding density stays zero at the moment of infection.
+_GAMMA_SCALE_WW_MIN = 0.2
+_GAMMA_SCALE_WW_MAX = 15.0
 _GAMMA_RAW_SANITIZE_LIMIT = 15.0
 
 
@@ -116,13 +122,21 @@ def _inverse_softplus_scalar(value: float, eps: float = 1e-8) -> float:
 
 
 def _sanitize_gamma_raw(raw: torch.Tensor) -> torch.Tensor:
-    """Replace non-finite Gamma coordinates before the smooth bound transform."""
-    return torch.nan_to_num(
+    """Bound Gamma coordinates while retaining finite-coordinate recovery gradients."""
+    finite_raw = torch.nan_to_num(
         raw.float(),
         nan=0.0,
         posinf=_GAMMA_RAW_SANITIZE_LIMIT,
         neginf=-_GAMMA_RAW_SANITIZE_LIMIT,
     )
+    bounded_raw = finite_raw.clamp(
+        min=-_GAMMA_RAW_SANITIZE_LIMIT,
+        max=_GAMMA_RAW_SANITIZE_LIMIT,
+    )
+    # Keep forward values in the range where sigmoid is representable in
+    # float32. The straight-through derivative lets optimization recover a
+    # finite coordinate that was loaded beyond this safety limit.
+    return finite_raw + (bounded_raw - finite_raw).detach()
 
 
 def _bounded_sigmoid(raw: torch.Tensor, *, lower: float, upper: float) -> torch.Tensor:
@@ -139,6 +153,55 @@ def _inverse_bounded_sigmoid(value: float, *, lower: float, upper: float) -> flo
         )
     fraction = (value - lower) / (upper - lower)
     return math.log(fraction) - math.log1p(-fraction)
+
+
+def _normalized_gamma_pdf_kernel(
+    shape: torch.Tensor, scale: torch.Tensor, length: int
+) -> torch.Tensor:
+    """Compute the normalized Gamma PDF kernel at integer lags ``0..length-1``.
+
+    Differentiable with respect to ``shape`` and ``scale`` so the
+    two-parameter Gamma kernel trains end to end.
+    """
+    x = torch.arange(length, device=shape.device, dtype=torch.float32)
+
+    # Gamma PDF: x^(shape-1) * exp(-x/scale) / (scale^shape * Gamma(shape))
+    # Softmax normalizes its log PDF without a hard cutoff, preserving
+    # gradients when the finite support catches only a distribution tail.
+    log_gamma_pdf = (
+        (shape - 1) * torch.log(x + _KERNEL_EPS)  # avoid log(0)
+        - x / scale  # exp(-x/scale)
+        - shape * torch.log(scale)  # scale^shape
+        - torch.lgamma(shape)  # Gamma(shape)
+    )
+    return torch.softmax(
+        torch.nan_to_num(
+            log_gamma_pdf,
+            nan=0.0,
+            posinf=_EXP_CLAMP_MAX,
+            neginf=_EXP_CLAMP_MIN,
+        ),
+        dim=0,
+    )
+
+
+def _gamma_boundary_hit_flags(
+    shape: float,
+    scale: float,
+    *,
+    shape_bounds: tuple[float, float],
+    scale_bounds: tuple[float, float],
+    atol: float,
+) -> dict[str, bool]:
+    """Report Gamma boundary proximity in normalized open-interval coordinates."""
+    shape_coordinate = (shape - shape_bounds[0]) / (shape_bounds[1] - shape_bounds[0])
+    scale_coordinate = (scale - scale_bounds[0]) / (scale_bounds[1] - scale_bounds[0])
+    return {
+        "shape_lower": shape_coordinate <= atol,
+        "shape_upper": shape_coordinate >= 1.0 - atol,
+        "scale_lower": scale_coordinate <= atol,
+        "scale_upper": scale_coordinate >= 1.0 - atol,
+    }
 
 
 def _init_distribution_scale_proj(
@@ -393,6 +456,10 @@ class DelayKernel(nn.Module):
                 else:
                     kernel_param = kernel_weights
                 self.kernel = nn.Parameter(kernel_param)
+            elif self.parameterization == "gamma":
+                self.register_buffer("gamma_kernel", kernel_weights)
+                self.register_buffer("gamma_shape_value", model_scalar(gamma_shape))
+                self.register_buffer("gamma_scale_value", model_scalar(gamma_scale))
             else:
                 self.register_buffer("kernel", kernel_weights)
 
@@ -411,31 +478,8 @@ class DelayKernel(nn.Module):
     def _compute_gamma_kernel(
         self, shape: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        """Compute the normalized Gamma PDF kernel at integer lags.
-
-        Differentiable with respect to ``shape`` and ``scale`` so the
-        two-parameter Gamma kernel trains end to end.
-        """
-        x = torch.arange(self.kernel_length, device=shape.device, dtype=torch.float32)
-
-        # Gamma PDF: x^(shape-1) * exp(-x/scale) / (scale^shape * Gamma(shape))
-        # Softmax normalizes its log PDF without a hard cutoff, preserving
-        # gradients when the finite support catches only a distribution tail.
-        log_gamma_pdf = (
-            (shape - 1) * torch.log(x + _KERNEL_EPS)  # avoid log(0)
-            - x / scale  # exp(-x/scale)
-            - shape * torch.log(scale)  # scale^shape
-            - torch.lgamma(shape)  # Gamma(shape)
-        )
-        return torch.softmax(
-            torch.nan_to_num(
-                log_gamma_pdf,
-                nan=0.0,
-                posinf=_EXP_CLAMP_MAX,
-                neginf=_EXP_CLAMP_MIN,
-            ),
-            dim=0,
-        )
+        """Compute the normalized Gamma PDF kernel at integer lags."""
+        return _normalized_gamma_pdf_kernel(shape, scale, self.kernel_length)
 
     def _current_gamma_parameters(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return finite Gamma parameters strictly inside their epidemiological bounds."""
@@ -480,6 +524,8 @@ class DelayKernel(nn.Module):
                 kernel_weights = _safe_normalize(kernel_weights)
             elif self.learnable:
                 kernel_weights = _sanitize_free_kernel_weights(self.kernel)
+            elif self.parameterization == "gamma":
+                kernel_weights = self.gamma_kernel
             else:
                 kernel_weights = self.kernel
             flipped_kernel = torch.flip(kernel_weights, dims=[0])
@@ -511,6 +557,9 @@ class DelayKernel(nn.Module):
         elif self.learnable:
             kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             output_dtype = self.kernel.dtype
+        elif self.parameterization == "gamma":
+            kernel_weights = self.gamma_kernel
+            output_dtype = kernel_weights.dtype
         else:
             kernel_weights = self.kernel
             output_dtype = kernel_weights.dtype
@@ -540,6 +589,11 @@ class DelayKernel(nn.Module):
         if self.parameterization != "gamma":
             raise ValueError("gamma parameters are only defined for gamma kernels")
         if not self.learnable:
+            if hasattr(self, "gamma_shape_value"):
+                return (
+                    float(self.gamma_shape_value.item()),
+                    float(self.gamma_scale_value.item()),
+                )
             return float(self.gamma_shape), float(self.gamma_scale)
         shape, scale = self._current_gamma_parameters()
         return float(shape.item()), float(scale.item())
@@ -558,18 +612,13 @@ class DelayKernel(nn.Module):
         if not math.isfinite(atol) or not 0.0 <= atol < 0.5:
             raise ValueError(f"atol must be finite and in [0, 0.5), got {atol}")
         shape, scale = self.get_gamma_parameters()
-        shape_coordinate = (shape - _GAMMA_SHAPE_MIN) / (
-            _GAMMA_SHAPE_MAX - _GAMMA_SHAPE_MIN
+        return _gamma_boundary_hit_flags(
+            shape,
+            scale,
+            shape_bounds=(_GAMMA_SHAPE_MIN, _GAMMA_SHAPE_MAX),
+            scale_bounds=(_GAMMA_SCALE_MIN, _GAMMA_SCALE_MAX),
+            atol=atol,
         )
-        scale_coordinate = (scale - _GAMMA_SCALE_MIN) / (
-            _GAMMA_SCALE_MAX - _GAMMA_SCALE_MIN
-        )
-        return {
-            "shape_lower": shape_coordinate <= atol,
-            "shape_upper": shape_coordinate >= 1.0 - atol,
-            "scale_lower": scale_coordinate <= atol,
-            "scale_upper": scale_coordinate >= 1.0 - atol,
-        }
 
     def __repr__(self) -> str:
         return (
@@ -606,7 +655,12 @@ class SheddingConvolution(nn.Module):
         learnable_kernel: If True, shedding profile is trainable
         learnable_scale: If True, sensitivity scale is trainable
         kernel_parameterization: "simplex" for positive normalized kernels,
-            "free" for unconstrained signed kernels with gamma priming
+            "free" for unconstrained signed kernels with gamma priming,
+            "gamma" for a bounded two-parameter Gamma(shape, scale) shedding
+            distribution renormalized over the kernel support at every pass
+        gamma_shape: Shape prior for the "gamma" shedding family
+        gamma_scale: Scale prior (days) for the "gamma" shedding family; the
+            wastewater box admits longer scales than the clinical delay box
     """
 
     def __init__(
@@ -617,31 +671,67 @@ class SheddingConvolution(nn.Module):
         learnable_scale: bool = True,
         kernel_parameterization: str = "simplex",
         strict: bool = True,
+        gamma_shape: float = 2.0,
+        gamma_scale: float = 6.0,
     ):
         super().__init__()
         self.kernel_length = kernel_length
+        self.gamma_shape = gamma_shape
+        self.gamma_scale = gamma_scale
         self.learnable_kernel = learnable_kernel
         self.learnable_scale = learnable_scale
-        self.kernel_parameterization = kernel_parameterization
+        self.parameterization = kernel_parameterization
         self.strict = strict
 
-        if self.kernel_parameterization not in {"simplex", "free"}:
+        if self.parameterization not in {"simplex", "free", "gamma"}:
             raise ValueError(
-                "kernel_parameterization must be one of {'simplex', 'free'}, "
-                f"got {self.kernel_parameterization!r}"
+                "kernel_parameterization must be one of "
+                "{'simplex', 'free', 'gamma'}, "
+                f"got {self.parameterization!r}"
             )
 
-        # Initialize shedding kernel with biologically-informed profile
-        kernel_weights = self._init_shedding_kernel(kernel_length)
-
-        if learnable_kernel:
-            if self.kernel_parameterization == "simplex":
-                kernel_param = _inverse_softplus(kernel_weights)
-            else:
-                kernel_param = kernel_weights
-            self.kernel = nn.Parameter(kernel_param)
+        if learnable_kernel and self.parameterization == "gamma":
+            # Two raw coordinates transform smoothly into the bounded shedding
+            # Gamma family. The logit inverse preserves the configured prior.
+            self.gamma_shape_raw = nn.Parameter(
+                model_scalar(
+                    _inverse_bounded_sigmoid(
+                        gamma_shape,
+                        lower=_GAMMA_SHAPE_MIN,
+                        upper=_GAMMA_SHAPE_MAX,
+                    )
+                )
+            )
+            self.gamma_scale_raw = nn.Parameter(
+                model_scalar(
+                    _inverse_bounded_sigmoid(
+                        gamma_scale,
+                        lower=_GAMMA_SCALE_WW_MIN,
+                        upper=_GAMMA_SCALE_WW_MAX,
+                    )
+                )
+            )
         else:
-            self.register_buffer("kernel", kernel_weights)
+            if self.parameterization == "gamma":
+                kernel_weights = _normalized_gamma_pdf_kernel(
+                    model_scalar(gamma_shape), model_scalar(gamma_scale), kernel_length
+                )
+            else:
+                # Initialize shedding kernel with biologically-informed profile
+                kernel_weights = self._init_shedding_kernel(kernel_length)
+
+            if learnable_kernel:
+                if self.parameterization == "simplex":
+                    kernel_param = _inverse_softplus(kernel_weights)
+                else:
+                    kernel_param = kernel_weights
+                self.kernel = nn.Parameter(kernel_param)
+            elif self.parameterization == "gamma":
+                self.register_buffer("gamma_kernel", kernel_weights)
+                self.register_buffer("gamma_shape_value", model_scalar(gamma_shape))
+                self.register_buffer("gamma_scale_value", model_scalar(gamma_scale))
+            else:
+                self.register_buffer("kernel", kernel_weights)
 
         # Sensitivity scale (absorbs FlowPerCapita and measurement characteristics)
         if sensitivity_scale <= 0:
@@ -737,11 +827,16 @@ class SheddingConvolution(nn.Module):
                 population = population.unsqueeze(1).expand(-1, time_steps)
 
         with _autocast_disabled_for(I_trajectory):
-            if self.learnable_kernel and self.kernel_parameterization == "simplex":
+            if self.learnable_kernel and self.parameterization == "gamma":
+                shape, scale = self._current_gamma_parameters()
+                kernel_weights = self._compute_gamma_kernel(shape, scale)
+            elif self.learnable_kernel and self.parameterization == "simplex":
                 kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
                 kernel_weights = _safe_normalize(kernel_weights)
             elif self.learnable_kernel:
                 kernel_weights = _sanitize_free_kernel_weights(self.kernel)
+            elif self.parameterization == "gamma":
+                kernel_weights = self.gamma_kernel
             else:
                 kernel_weights = self.kernel
             flipped_kernel = torch.flip(kernel_weights, dims=[0])
@@ -750,7 +845,6 @@ class SheddingConvolution(nn.Module):
                 I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
             ).unsqueeze(1)
             kernel_reshaped = flipped_kernel.view(1, 1, -1)
-
             total_shedding = F.conv1d(
                 I_reshaped,
                 kernel_reshaped,
@@ -771,19 +865,94 @@ class SheddingConvolution(nn.Module):
 
         return viral_concentration.to(I_trajectory.dtype)
 
+    def _compute_gamma_kernel(
+        self, shape: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the normalized Gamma PDF kernel at integer lags."""
+        return _normalized_gamma_pdf_kernel(shape, scale, self.kernel_length)
+
+    def _current_gamma_parameters(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return finite Gamma parameters strictly inside the shedding bounds."""
+        shape = _bounded_sigmoid(
+            self.gamma_shape_raw,
+            lower=_GAMMA_SHAPE_MIN,
+            upper=_GAMMA_SHAPE_MAX,
+        )
+        scale = _bounded_sigmoid(
+            self.gamma_scale_raw,
+            lower=_GAMMA_SCALE_WW_MIN,
+            upper=_GAMMA_SCALE_WW_MAX,
+        )
+        return shape, scale
+
     def get_kernel_weights(self) -> torch.Tensor:
         """Get current shedding kernel weights in forward-space order."""
-        if self.learnable_kernel and self.kernel_parameterization == "simplex":
+        if self.learnable_kernel and self.parameterization == "gamma":
+            shape, scale = self._current_gamma_parameters()
+            kernel_weights = self._compute_gamma_kernel(shape, scale)
+            output_dtype = self.gamma_shape_raw.dtype
+        elif self.learnable_kernel and self.parameterization == "simplex":
             kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
             kernel_weights = _safe_normalize(kernel_weights)
             output_dtype = self.kernel.dtype
         elif self.learnable_kernel:
             kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             output_dtype = self.kernel.dtype
+        elif self.parameterization == "gamma":
+            kernel_weights = self.gamma_kernel
+            output_dtype = kernel_weights.dtype
         else:
             kernel_weights = self.kernel
             output_dtype = kernel_weights.dtype
         return kernel_weights.to(output_dtype)
+
+    def get_mean_delay(self) -> float:
+        """Compute mean shedding delay in days."""
+        if self.parameterization not in {"simplex", "gamma"}:
+            raise ValueError("mean delay is only defined for normalized kernels")
+        weights = self.get_kernel_weights()
+        positions = torch.arange(
+            len(weights), device=weights.device, dtype=torch.float32
+        )
+        return (weights.float() * positions).sum().item()
+
+    def get_delay_std(self) -> float:
+        """Compute the shedding delay standard deviation in days."""
+        if self.parameterization not in {"simplex", "gamma"}:
+            raise ValueError("delay std is only defined for normalized kernels")
+        weights = self.get_kernel_weights().float()
+        positions = torch.arange(len(weights), device=weights.device)
+        mean = (weights * positions).sum()
+        return (weights * (positions - mean).square()).sum().sqrt().item()
+
+    def get_gamma_parameters(self) -> tuple[float, float]:
+        """Return the current (shape, scale) of a gamma-parameterized kernel."""
+        if self.parameterization != "gamma":
+            raise ValueError("gamma parameters are only defined for gamma kernels")
+        if not self.learnable_kernel:
+            if hasattr(self, "gamma_shape_value"):
+                return (
+                    float(self.gamma_shape_value.item()),
+                    float(self.gamma_scale_value.item()),
+                )
+            return float(self.gamma_shape), float(self.gamma_scale)
+        shape, scale = self._current_gamma_parameters()
+        return float(shape.item()), float(scale.item())
+
+    def get_gamma_boundary_hits(self, *, atol: float = 1.0e-6) -> dict[str, bool]:
+        """Report Gamma boundary proximity in normalized open-interval coordinates."""
+        if self.parameterization != "gamma":
+            raise ValueError("boundary hits are only defined for gamma kernels")
+        if not math.isfinite(atol) or not 0.0 <= atol < 0.5:
+            raise ValueError(f"atol must be finite and in [0, 0.5), got {atol}")
+        shape, scale = self.get_gamma_parameters()
+        return _gamma_boundary_hit_flags(
+            shape,
+            scale,
+            shape_bounds=(_GAMMA_SHAPE_MIN, _GAMMA_SHAPE_MAX),
+            scale_bounds=(_GAMMA_SCALE_WW_MIN, _GAMMA_SCALE_WW_MAX),
+            atol=atol,
+        )
 
     def get_sensitivity_scale(self) -> torch.Tensor:
         """Get positive sensitivity scale."""
@@ -803,7 +972,7 @@ class SheddingConvolution(nn.Module):
             f"SheddingConvolution(length={self.kernel_length}, "
             f"sensitivity_scale={self.get_sensitivity_scale().item():.4f}, "
             f"learnable_kernel={self.learnable_kernel}, learnable_scale={self.learnable_scale}, "
-            f"kernel_parameterization={self.kernel_parameterization})"
+            f"kernel_parameterization={self.parameterization})"
         )
 
 
@@ -842,15 +1011,19 @@ class MLPKernel(nn.Module):
     ) -> torch.Tensor:
         B, T = I_trajectory.shape
         with _autocast_disabled_for(I_trajectory):
-            padded = F.pad(I_trajectory.float(), (self.kernel_length - 1, 0))  # causal
+            padded = F.pad(I_trajectory.float(), (self.kernel_length - 1, 0))
             windows = padded.unfold(1, self.kernel_length, 1)  # [B, T, K]
             if self.include_population and population is not None:
-                pop = population.float()
-                if pop.ndim == 2:
-                    pop = pop[:, :1]  # [B, 1] – same pop for all timesteps
-                pop = pop.unsqueeze(-1).expand(B, T, -1)  # [B, T, 1]
+                if population.shape[0] != B:
+                    raise ValueError(
+                        "population batch dimension must match I_trajectory: "
+                        f"{population.shape[0]} != {B}"
+                    )
+                pop = population.float().reshape(B, -1)[:, :1]
+                pop = pop.unsqueeze(-1).expand(B, T, -1)
                 windows = torch.cat([windows, pop], dim=-1)
-            return self.mlp(windows).squeeze(-1).to(I_trajectory.dtype)  # [B, T]
+            output = self.mlp(windows).squeeze(-1)
+        return output.to(I_trajectory.dtype)  # [B, T]
 
 
 class ClinicalObservationHead(nn.Module):
@@ -1184,6 +1357,8 @@ class WastewaterObservationHead(nn.Module):
         scale_init: float = 1.0,
         learnable_kernel: bool = True,
         kernel_parameterization: str = "simplex",
+        gamma_shape: float = 2.0,
+        gamma_scale: float = 6.0,
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
@@ -1215,6 +1390,8 @@ class WastewaterObservationHead(nn.Module):
                 sensitivity_scale=1.0,  # Fixed, we'll handle scaling separately
                 learnable_kernel=learnable_kernel,
                 kernel_parameterization=kernel_parameterization,
+                gamma_shape=gamma_shape,
+                gamma_scale=gamma_scale,
                 learnable_scale=False,  # We handle scale separately
                 strict=strict,
             )

@@ -66,10 +66,12 @@ class AblationCampaign:
     base_config: Path
     baseline_condition: str
     fixed_overrides: dict[str, Any]
+    smoke_overrides: dict[str, Any]
     conditions: tuple[CampaignCondition, ...]
     paired_model_seeds: tuple[int, ...]
     split_manifest: Path | None
     fold_indices: tuple[int, ...]
+    smoke_fold_indices: tuple[int, ...]
     primary_metric: str
     primary_direction: str
     secondary_metrics: tuple[str, ...]
@@ -87,6 +89,12 @@ class AblationCampaign:
     @property
     def conditions_by_name(self) -> dict[str, CampaignCondition]:
         return {condition.name: condition for condition in self.conditions}
+
+    def selected_fold_indices(self, *, smoketest: bool) -> tuple[int, ...]:
+        """Return all production folds or the declaration-owned smoke subset."""
+        if smoketest and self.smoke_fold_indices:
+            return self.smoke_fold_indices
+        return self.fold_indices
 
 
 def _canonical_json(value: Any) -> str:
@@ -346,6 +354,9 @@ def load_campaign(path: Path) -> AblationCampaign:
     fixed_overrides = _promote_model_params(
         _mapping(root["fixed_overrides"], field="fixed_overrides")
     )
+    smoke_overrides = _promote_model_params(
+        _mapping(root.get("smoke_overrides", {}), field="smoke_overrides")
+    )
     raw_conditions = root["conditions"]
     if not isinstance(raw_conditions, list) or not raw_conditions:
         raise ValueError("conditions must be a non-empty list")
@@ -388,6 +399,7 @@ def load_campaign(path: Path) -> AblationCampaign:
     if len(set(seeds)) != len(seeds):
         raise ValueError("paired_model_seeds must be unique")
     split_manifest: Path | None = None
+    smoke_fold_indices: tuple[int, ...] = ()
     fold_indices: tuple[int, ...] = ()
     crossval_num_folds: int | None = None
     if root.get("cross_validation") is not None:
@@ -403,6 +415,21 @@ def load_campaign(path: Path) -> AblationCampaign:
         fold_indices = tuple(folds_raw)
         if len(set(fold_indices)) != len(fold_indices):
             raise ValueError("cross_validation.fold_indices must be unique")
+        smoke_folds_raw = cv.get("smoke_fold_indices", [])
+        if not isinstance(smoke_folds_raw, list) or any(
+            not isinstance(fold, int) or isinstance(fold, bool) or fold < 0
+            for fold in smoke_folds_raw
+        ):
+            raise ValueError(
+                "cross_validation.smoke_fold_indices must be non-negative integers"
+            )
+        smoke_fold_indices = tuple(smoke_folds_raw)
+        if len(set(smoke_fold_indices)) != len(smoke_fold_indices):
+            raise ValueError("cross_validation.smoke_fold_indices must be unique")
+        if set(smoke_fold_indices).difference(fold_indices):
+            raise ValueError(
+                "cross_validation.smoke_fold_indices must be a subset of fold_indices"
+            )
         manifest_raw = cv.get("split_manifest")
         if fold_indices and not isinstance(manifest_raw, str):
             raise ValueError(
@@ -485,7 +512,9 @@ def load_campaign(path: Path) -> AblationCampaign:
         baseline_condition=_string(
             root["baseline_condition"], field="baseline_condition"
         ),
+        smoke_fold_indices=smoke_fold_indices,
         fixed_overrides=fixed_overrides,
+        smoke_overrides=smoke_overrides,
         conditions=tuple(conditions),
         paired_model_seeds=seeds,
         split_manifest=split_manifest,
@@ -532,9 +561,13 @@ def _as_cli_overrides(
     return overrides
 
 
-def build_trial_queue(campaign: AblationCampaign) -> list[dict[str, int | str]]:
+def build_trial_queue(
+    campaign: AblationCampaign, *, smoketest: bool = False
+) -> list[dict[str, int | str]]:
     """Compile stable condition × fold × paired-model-seed identities."""
-    folds: tuple[int | None, ...] = campaign.fold_indices or (None,)
+    folds: tuple[int | None, ...] = campaign.selected_fold_indices(
+        smoketest=smoketest
+    ) or (None,)
     queue: list[dict[str, int | str]] = []
     for condition in campaign.conditions:
         for fold in folds:
@@ -573,11 +606,11 @@ def trial_identity(
 
 
 def expected_trial_identities(
-    campaign: AblationCampaign,
+    campaign: AblationCampaign, *, smoketest: bool = False
 ) -> set[tuple[str, int, int | None]]:
     return {
         identity
-        for params in build_trial_queue(campaign)
+        for params in build_trial_queue(campaign, smoketest=smoketest)
         if (identity := _trial_identity(params)) is not None
     }
 
@@ -603,11 +636,12 @@ def initialize_study_queue(
     study: optuna.Study,
     campaign: AblationCampaign,
     lock_path: Path,
+    smoketest: bool = False,
     requeue_running: bool = False,
 ) -> None:
     """Fill uncompleted identities, optionally replacing stale running attempts."""
-    expected_params = build_trial_queue(campaign)
-    expected = expected_trial_identities(campaign)
+    expected_params = build_trial_queue(campaign, smoketest=smoketest)
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
     with _file_lock(lock_path):
         recorded_hash = study.user_attrs.get("campaign_sha256")
         if recorded_hash is not None and recorded_hash != campaign.sha256:
@@ -651,9 +685,11 @@ def initialize_study_queue(
         study.set_user_attr("campaign_id", campaign.campaign_id)
 
 
-def is_study_complete(study: optuna.Study, campaign: AblationCampaign) -> bool:
+def is_study_complete(
+    study: optuna.Study, campaign: AblationCampaign, *, smoketest: bool = False
+) -> bool:
     """Require one successful attempt per identity and no live campaign attempts."""
-    expected = expected_trial_identities(campaign)
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
     complete_counts: dict[tuple[str, int, int | None], int] = {}
     for trial in study.trials:
         identity = trial_identity(trial)
@@ -677,7 +713,7 @@ def run_queued_trials(
     smoketest: bool,
 ) -> None:
     """Reserve and execute only precompiled JournalStorage queue entries."""
-    expected = expected_trial_identities(campaign)
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
     started = time.monotonic()
     completed = 0
     while n_trials is None or completed < n_trials:
@@ -769,6 +805,8 @@ def objective(
             f"training.crossval_fold_index={fold}",
             f"training.crossval_manifest_path={campaign.split_manifest}",
         ]
+    if smoketest:
+        overrides += _as_cli_overrides(campaign.smoke_overrides)
     experiment_name = f"mn5_ablation__{campaign.campaign_id}__{condition_name}"
     tags = [
         "mn5",
@@ -875,6 +913,7 @@ def main(
         study=study,
         campaign=declaration,
         lock_path=queue_lock_path,
+        smoketest=smoketest,
         requeue_running=requeue_running,
     )
     run_queued_trials(

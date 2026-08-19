@@ -34,6 +34,7 @@ def _write_campaign(
     tmp_path: Path,
     *,
     folds: list[int] | None = None,
+    smoke_folds: list[int] | None = None,
     allowed_paths: list[str] | None = None,
 ) -> Path:
     base = Path("configs/train_epifor_smoke.yaml").resolve()
@@ -44,6 +45,7 @@ def _write_campaign(
         "hypothesis": "Structured conditions are paired.",
         "base_config": str(base),
         "baseline_condition": "baseline",
+        "smoke_overrides": {"training": {"compile": False}},
         "fixed_overrides": {"training": {"epochs": 1}},
         "conditions": [
             {
@@ -85,10 +87,13 @@ def _write_campaign(
             json.dumps({"num_folds": max(folds) + 1, "folds": []}) + "\n",
             encoding="utf-8",
         )
-        campaign["cross_validation"] = {
+        cross_validation: dict[str, object] = {
             "split_manifest": str(manifest),
             "fold_indices": folds,
         }
+        if smoke_folds is not None:
+            cross_validation["smoke_fold_indices"] = smoke_folds
+        campaign["cross_validation"] = cross_validation
     path = tmp_path / "campaign.yaml"
     path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
     return path
@@ -113,6 +118,17 @@ def test_structured_campaign_compiles_condition_fold_seed_matrix(
         {"condition": "mobility:off", "seed": 43, "fold": 1},
     ]
     assert len(worker.expected_trial_identities(campaign)) == 8
+
+
+def test_smoketest_queue_uses_declaration_owned_fold_subset(tmp_path: Path) -> None:
+    campaign = worker.load_campaign(
+        _write_campaign(tmp_path, folds=[0, 1, 2], smoke_folds=[0, 2])
+    )
+
+    assert campaign.selected_fold_indices(smoketest=False) == (0, 1, 2)
+    assert campaign.selected_fold_indices(smoketest=True) == (0, 2)
+    assert len(worker.expected_trial_identities(campaign)) == 12
+    assert len(worker.expected_trial_identities(campaign, smoketest=True)) == 8
 
 
 def test_folded_objective_enables_manifest_backed_cross_validation(
@@ -150,11 +166,12 @@ def test_folded_objective_enables_manifest_backed_cross_validation(
     monkeypatch.setattr(worker.EpiForecasterConfig, "load", staticmethod(load_config))
     monkeypatch.setattr(worker, "EpiForecasterTrainer", Trainer)
 
-    worker.objective(Trial(), campaign=campaign, run_root=tmp_path)
+    worker.objective(Trial(), campaign=campaign, run_root=tmp_path, smoketest=True)
 
     assert "training.crossval_enabled=true" in captured["overrides"]
     assert "training.crossval_num_folds=2" in captured["overrides"]
     assert "training.crossval_fold_index=1" in captured["overrides"]
+    assert "training.compile=false" in captured["overrides"]
     wandb_tags_override = next(
         value
         for value in captured["overrides"]
