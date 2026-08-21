@@ -1,5 +1,5 @@
-# Bounded all-arm acceptance for the production ablation declaration. The campaign
-# owns its full 10-fold matrix and its two-fold smoke subset; this config changes
+# Bounded all-arm acceptance for the reduced production matrix. The campaign owns
+# three coverage-selected folds and its two-fold smoke subset; this config changes
 # execution resources only.
 
 run: {}

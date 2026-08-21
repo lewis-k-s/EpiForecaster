@@ -124,11 +124,14 @@ conditions:
     hypothesis: MLP kernel parameterization improves delay flexibility.
     overrides: {model: {observation_heads: {kernel_mlp_ww: true, kernel_mlp_hosp: true, kernel_mlp_cases: true, kernel_mlp_deaths: true}}}
     allowed_difference_paths: [model.observation_heads.kernel_mlp_ww, model.observation_heads.kernel_mlp_hosp, model.observation_heads.kernel_mlp_cases, model.observation_heads.kernel_mlp_deaths]
-paired_model_seeds: [42, 43, 44, 45, 46]
+# Paired stochastic-training replicates: shared across all conditions within a fold.
+paired_model_seeds: [42, 43]
 cross_validation:
   split_manifest: configs/crossval/representative_10fold_mobility_refined.json
-  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-  smoke_fold_indices: [0, 1]
+  # Three folds selected for aggregate regional coverage: 33 Barcelona, 7 Girona,
+  # 4 Lleida, and 4 Tarragona held-out regions; 48 total.
+  fold_indices: [1, 4, 5]
+  smoke_fold_indices: [1, 4]
 metrics:
   primary: {name: mae_median, direction: minimize}
   secondary: [rmse_median, r2_median]

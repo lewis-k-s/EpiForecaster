@@ -51,13 +51,14 @@ def test_ablation_campaign_configs_parse(campaign_path):
     )
 
 
-def test_default_ablation_campaign_declares_full_and_smoke_coverage_matrices():
+def test_default_ablation_campaign_declares_reduced_coverage_matrix():
     campaign = load_campaign(Path("configs/campaigns/ablation_default_v1.yaml"))
 
-    assert campaign.selected_fold_indices(smoketest=False) == tuple(range(10))
-    assert campaign.selected_fold_indices(smoketest=True) == (0, 1)
-    assert len(build_trial_queue(campaign)) == 1400
-    assert len(build_trial_queue(campaign, smoketest=True)) == 280
+    assert campaign.selected_fold_indices(smoketest=False) == (1, 4, 5)
+    assert campaign.selected_fold_indices(smoketest=True) == (1, 4)
+    assert campaign.paired_model_seeds == (42, 43)
+    assert len(build_trial_queue(campaign)) == 168
+    assert len(build_trial_queue(campaign, smoketest=True)) == 112
     assert campaign.smoke_overrides == {
         "training": {
             "compile": False,

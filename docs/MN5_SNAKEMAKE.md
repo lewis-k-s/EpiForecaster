@@ -178,17 +178,26 @@ outside their declared paths. `equal_budget_policy.paths` is a non-empty list of
 resolved configuration paths (currently `training.epochs` and
 `training.max_batches`) whose values must be identical for every condition.
 
-`ablation_default_v1.yaml` evaluates all ten persisted folds in production, so every
-region receives exactly one held-out assignment per paired model seed. Its declared
-`smoke_fold_indices` are a strict subset of those folds. The checked-in
+`ablation_default_v1.yaml` uses the persisted ten-fold manifest but evaluates three
+coverage-selected folds (`[1, 4, 5]`) and two paired model seeds (`[42, 43]`) by
+default. The selected folds hold out 48 regions: 33 Barcelona, 7 Girona, 4 Lleida,
+and 4 Tarragona. This keeps geographic coverage while reducing the production matrix
+to `28 conditions × 3 folds × 2 seeds = 168` identities. The same model seed is used
+for every condition within each fold, so paired contrasts control initialization,
+DataLoader-order, and other stochastic-training variation. `training.split_seed` does
+not change these persisted fold memberships.
+
+The default matrix is a screening study. Its results can justify a follow-up that
+expands the declared fold or seed replicates. `smoke_fold_indices` (`[1, 4]`) are a
+strict subset of the production folds. The checked-in
 `workflow/config/mn5_ablation_coverage_smoke.yaml` runs every default condition and
-paired model seed over that bounded subset with small batches; it is an ACC
-integration acceptance check, not a production estimate. Bounded smoke validation
-still requires the exact identity matrix, terminal trials, and provenance, but permits
-an undefined primary row when a target has zero observed opportunities. The smaller
+paired model seed over that bounded subset with small batches; it is an ACC integration
+acceptance check, not a production estimate. Bounded smoke validation still requires
+the exact identity matrix, terminal trials, and provenance, but permits an undefined
+primary row when a target has zero observed opportunities. The smaller
 `ablation_smoke_v1.yaml` remains the eight-identity infrastructure smoke. Both
-campaigns are expanded in memory; the workflow never generates per-run YAML files.
-A campaign with fold indices must declare an existing persisted split manifest, and
+campaigns are expanded in memory; the workflow never generates per-run YAML files. A
+campaign with fold indices must declare an existing persisted split manifest, and
 undeclared resolved-config drift fails before a worker starts training.
 
 Optuna values always minimize the validation-selection coordination value and
