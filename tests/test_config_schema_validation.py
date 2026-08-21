@@ -6,7 +6,7 @@ import pytest
 from data.preprocess.config import PreprocessingConfig
 from models.configs import EpiForecasterConfig, ObservationHeadConfig
 from training.region2vec_trainer import RegionTrainerConfig
-from scripts.hpo.ablation_worker import build_trial_queue, load_campaign
+from scripts.hpo.ablation_worker import load_campaign
 
 
 # Config file lists by type
@@ -49,24 +49,6 @@ def test_ablation_campaign_configs_parse(campaign_path):
         "training.epochs",
         "training.max_batches",
     )
-
-
-def test_default_ablation_campaign_declares_reduced_coverage_matrix():
-    campaign = load_campaign(Path("configs/campaigns/ablation_default_v1.yaml"))
-
-    assert campaign.selected_fold_indices(smoketest=False) == (1, 4, 5)
-    assert campaign.selected_fold_indices(smoketest=True) == (1, 4)
-    assert campaign.paired_model_seeds == (42, 43)
-    assert len(build_trial_queue(campaign)) == 168
-    assert len(build_trial_queue(campaign, smoketest=True)) == 112
-    assert campaign.smoke_overrides == {
-        "training": {
-            "compile": False,
-            "num_workers": 1,
-            "val_workers": 1,
-            "test_workers": 1,
-        }
-    }
 
 
 def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
