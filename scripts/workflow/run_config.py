@@ -340,6 +340,24 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 "evaluation.checkpoint must be an absolute GPFS path for an "
                 "evaluation-only workflow"
             )
+    elif kind == "ablation":
+        ablation = workflow_config["ablation"]
+        closeout_signal_seconds = ablation.get("closeout_signal_seconds")
+        if (
+            not isinstance(closeout_signal_seconds, int)
+            or isinstance(closeout_signal_seconds, bool)
+            or closeout_signal_seconds < 60
+        ):
+            raise ValueError(
+                "ablation.closeout_signal_seconds must be an integer of at least 60"
+            )
+        timeout_s = ablation.get("timeout_s")
+        if (
+            not isinstance(timeout_s, int)
+            or isinstance(timeout_s, bool)
+            or timeout_s <= 0
+        ):
+            raise ValueError("ablation.timeout_s must be a positive integer")
     elif kind == "crossval":
         crossval = workflow_config["crossval"]
         for field in (
@@ -439,6 +457,14 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     runtime = allocation.get("runtime")
     if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
         mismatches["runtime"] = (runtime, "positive integer minutes")
+    if kind == "ablation":
+        ablation = workflow_config["ablation"]
+        expected_timeout_s = runtime * 60 - ablation["closeout_signal_seconds"]
+        if ablation["timeout_s"] != expected_timeout_s:
+            raise ValueError(
+                "ablation.timeout_s must equal resources.allocation.runtime "
+                "minus ablation.closeout_signal_seconds"
+            )
     if mismatches:
         details = ", ".join(
             f"{key}={actual!r} (expected {expected_value!r})"
@@ -645,6 +671,12 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
         ("workflow_kind", workflow_kind(document)),
         ("workflow_target", workflow_target(document)),
         *[(field, allocation[field]) for field in ALLOCATION_FIELDS],
+        (
+            "closeout_signal_seconds",
+            document["ablation"]["closeout_signal_seconds"]
+            if workflow_kind(document) == "ablation"
+            else 0,
+        ),
     ]
     request = {field: _dispatch_field(value, field=field) for field, value in fields}
 

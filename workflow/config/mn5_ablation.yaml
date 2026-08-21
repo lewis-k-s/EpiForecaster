@@ -19,8 +19,9 @@ ablation:
   study_name: epiforecaster_ablation_v1
   campaign: configs/campaigns/ablation_default_v1.yaml
   workers: 4
-  # Four workers need the full 1,400-identity matrix; retain one hour for finalization.
-  timeout_s: 165600
+  # One-hour Slurm close-out is reserved for active trials and finalization.
+  closeout_signal_seconds: 3600
+  timeout_s: 21600
   sampler_seed: 42
   smoketest: false
   requeue_running: false
@@ -34,4 +35,4 @@ resources:
     tasks: 4
     cpus_per_task: 20
     gres: gpu:4
-    runtime: 2880
+    runtime: 420

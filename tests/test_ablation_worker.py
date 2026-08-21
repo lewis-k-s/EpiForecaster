@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from types import SimpleNamespace
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
 
 import optuna
 import pytest
@@ -372,3 +373,53 @@ def test_stale_attempt_terminalization_uses_study_tell() -> None:
     worker._mark_running_attempt_failed(Study(), 17)
 
     assert calls == [(17, optuna.trial.TrialState.FAIL)]
+
+
+def test_closeout_finishes_claimed_trial_without_claiming_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = worker.load_campaign(_write_campaign(tmp_path))
+
+    class QueueStudy(_FakeStudy):
+        def ask(self):  # noqa: ANN201
+            trial = next(
+                trial
+                for trial in self.trials
+                if trial.state == optuna.trial.TrialState.WAITING
+            )
+            trial.number = self.trials.index(trial)
+            trial.system_attrs = {"fixed_params": trial.params}
+            trial.state = optuna.trial.TrialState.RUNNING
+            return trial
+
+        def tell(self, trial, value=None, state=None):  # noqa: ANN001
+            del value
+            trial.state = state or optuna.trial.TrialState.COMPLETE
+
+    study = QueueStudy()
+    lock_path = tmp_path / "queue.lock"
+    worker.initialize_study_queue(study=study, campaign=campaign, lock_path=lock_path)
+    closeout_requested = Event()
+
+    def finish_current_trial(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        closeout_requested.set()
+        return 1.0
+
+    monkeypatch.setattr(worker, "objective", finish_current_trial)
+
+    continuation_required = worker.run_queued_trials(
+        study=study,
+        campaign=campaign,
+        lock_path=lock_path,
+        run_root=tmp_path,
+        n_trials=None,
+        timeout_s=None,
+        smoketest=False,
+        closeout_requested=closeout_requested,
+    )
+
+    assert continuation_required
+    states = [trial.state for trial in study.trials]
+    assert states.count(optuna.trial.TrialState.COMPLETE) == 1
+    assert states.count(optuna.trial.TrialState.WAITING) == len(states) - 1

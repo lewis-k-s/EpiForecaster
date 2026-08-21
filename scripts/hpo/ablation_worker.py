@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import time
 import json
 import logging
-from collections.abc import Iterable, Mapping
+import signal
+import time
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import click
@@ -37,6 +39,8 @@ TERMINAL_TRIAL_STATES = {
     optuna.trial.TrialState.FAIL,
     optuna.trial.TrialState.PRUNED,
 }
+
+CLOSEOUT_EXIT_CODE = 75
 
 
 @dataclass(frozen=True)
@@ -616,7 +620,7 @@ def expected_trial_identities(
 
 
 @contextmanager
-def _file_lock(path: Path) -> Iterable[None]:
+def _file_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -702,6 +706,35 @@ def is_study_complete(
     )
 
 
+def _has_waiting_trials(
+    study: optuna.Study,
+    expected: set[tuple[str, int, int | None]],
+) -> bool:
+    return any(
+        trial.state == optuna.trial.TrialState.WAITING
+        and trial_identity(trial) in expected
+        for trial in study.trials
+    )
+
+
+@contextmanager
+def closeout_signal_event() -> Iterator[Event]:
+    """Expose Slurm's pre-time-limit signal as a stop-claiming request."""
+    closeout_requested = Event()
+    previous_handler = signal.getsignal(signal.SIGUSR1)
+
+    def request_closeout(signum: int, frame: object) -> None:
+        del signum, frame
+        closeout_requested.set()
+        logger.warning("Received Slurm pre-time-limit signal; stopping new claims")
+
+    signal.signal(signal.SIGUSR1, request_closeout)
+    try:
+        yield closeout_requested
+    finally:
+        signal.signal(signal.SIGUSR1, previous_handler)
+
+
 def run_queued_trials(
     *,
     study: optuna.Study,
@@ -711,14 +744,19 @@ def run_queued_trials(
     n_trials: int | None,
     timeout_s: int | None,
     smoketest: bool,
-) -> None:
-    """Reserve and execute only precompiled JournalStorage queue entries."""
+    closeout_requested: Event | None = None,
+) -> bool:
+    """Execute queued entries and report whether another allocation is required."""
     expected = expected_trial_identities(campaign, smoketest=smoketest)
     started = time.monotonic()
     completed = 0
     while n_trials is None or completed < n_trials:
-        if timeout_s is not None and time.monotonic() - started >= timeout_s:
-            return
+        stop_claiming = (
+            closeout_requested is not None and closeout_requested.is_set()
+        ) or (timeout_s is not None and time.monotonic() - started >= timeout_s)
+        if stop_claiming:
+            with _file_lock(lock_path):
+                return _has_waiting_trials(study, expected)
         with _file_lock(lock_path):
             waiting = [
                 trial
@@ -727,7 +765,7 @@ def run_queued_trials(
                 and trial_identity(trial) in expected
             ]
             if not waiting:
-                return
+                return False
             trial = study.ask()
             identity = _trial_identity(trial.system_attrs.get("fixed_params", {}))
             if identity not in expected:
@@ -749,6 +787,8 @@ def run_queued_trials(
         else:
             study.tell(trial, value)
         completed += 1
+    with _file_lock(lock_path):
+        return _has_waiting_trials(study, expected)
 
 
 def _set_campaign_trial_attrs(
@@ -916,15 +956,22 @@ def main(
         smoketest=smoketest,
         requeue_running=requeue_running,
     )
-    run_queued_trials(
-        study=study,
-        campaign=declaration,
-        lock_path=queue_lock_path,
-        run_root=run_root,
-        n_trials=n_trials,
-        timeout_s=timeout_s,
-        smoketest=smoketest,
-    )
+    with closeout_signal_event() as closeout_requested:
+        continuation_required = run_queued_trials(
+            study=study,
+            campaign=declaration,
+            lock_path=queue_lock_path,
+            run_root=run_root,
+            n_trials=n_trials,
+            timeout_s=timeout_s,
+            smoketest=smoketest,
+            closeout_requested=closeout_requested,
+        )
+    if continuation_required:
+        logger.warning(
+            "Ablation worker stopped before the queue drained; continuation is required"
+        )
+        raise click.exceptions.Exit(CLOSEOUT_EXIT_CODE)
 
 
 if __name__ == "__main__":

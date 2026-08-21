@@ -180,6 +180,7 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
         "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
         "workers": 2,
         "trials_per_worker": 4,
+        "closeout_signal_seconds": 300,
         "timeout_s": 3300,
         "sampler_seed": 42,
         "smoketest": True,
@@ -207,6 +208,7 @@ def test_coverage_smoke_exercises_default_campaign_subset() -> None:
         "study_name": "epiforecaster_ablation_default_smoke_v1",
         "campaign": "configs/campaigns/ablation_default_v1.yaml",
         "workers": 2,
+        "closeout_signal_seconds": 600,
         "timeout_s": 6000,
         "sampler_seed": 42,
         "smoketest": True,
@@ -222,6 +224,22 @@ def test_coverage_smoke_exercises_default_campaign_subset() -> None:
         "gres": "gpu:2",
         "runtime": 110,
     }
+
+
+def test_ablation_timeout_reserves_the_declared_slurm_closeout() -> None:
+    config = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_ablation.yaml").read_text()
+    )
+
+    assert run_config.validate_mn5_allocation(config)["runtime"] == 420
+    assert config["ablation"]["timeout_s"] == (
+        config["resources"]["allocation"]["runtime"] * 60
+        - config["ablation"]["closeout_signal_seconds"]
+    )
+
+    config["ablation"]["timeout_s"] -= 1
+    with pytest.raises(ValueError, match="closeout_signal_seconds"):
+        run_config.validate_mn5_allocation(config)
 
 
 def _workflow_config(run_root: Path, source_root: Path) -> dict:
@@ -469,6 +487,31 @@ def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     assert request["config_sha256"] == run_support.sha256_file(config_path)
     assert dispatch_path.with_suffix(".tsv.sha256").is_file()
     assert "snakemake_arg" not in request
+
+
+def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/test-run"
+    source_root = run_root / "source"
+    config = _workflow_config(run_root, source_root)
+    config["workflow"]["kind"] = "ablation"
+    config["ablation"] = {
+        "study_name": "test-ablation",
+        "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
+        "workers": 4,
+        "timeout_s": 3000,
+        "closeout_signal_seconds": 600,
+    }
+    config_path = tmp_path / "ablation-config.yaml"
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    dispatch_path = tmp_path / "ablation-dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    request = run_config.write_dispatch_request(config_path, dispatch_path)
+
+    assert request["closeout_signal_seconds"] == "600"
 
 
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
@@ -2545,11 +2588,11 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "workflow/config/mn5_train.yaml" in dispatcher
     assert "$RUN_ROOT/.state/workflow.done" in remote_runner
     assert "sbatch --parsable" in remote_runner
-    assert '--ntasks="$TASKS"' in remote_runner
-    assert '--cpus-per-task="$CPUS_PER_TASK"' in remote_runner
-    assert '--gres="$GRES"' in remote_runner
+    assert '"--ntasks=$TASKS"' in remote_runner
+    assert '"--cpus-per-task=$CPUS_PER_TASK"' in remote_runner
+    assert '"--gres=$GRES"' in remote_runner
+    assert '"--signal=USR1@$CLOSEOUT_SIGNAL_SECONDS"' in remote_runner
     assert '"$TASKS"' in remote_runner
-    assert '"$CPUS_PER_TASK"' in remote_runner
     assert (
         '"$@"'
         not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
@@ -2587,3 +2630,55 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "--kill-on-bad-exit=1" in launcher
     assert 'WORKER_INDEX="${SLURM_PROCID:' in worker
     assert "EPIFORECASTER_WORKER_ID=$WORKER_INDEX" in worker
+
+
+def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    workflow_root = source_root / "scripts/workflow"
+    workflow_root.mkdir(parents=True)
+    worker_script = workflow_root / "run_parallel_worker.sh"
+    shutil.copy2(
+        REPO_ROOT / "scripts/workflow/run_parallel_worker.sh",
+        worker_script,
+    )
+    container_exec = workflow_root / "mn5_container_exec.sh"
+    container_exec.write_text('#!/bin/bash\nexit "$FAKE_STATUS"\n')
+    container_exec.chmod(0o755)
+    run_root = tmp_path / "run"
+    marker_root = run_root / ".state/workers/ablation"
+    marker_root.mkdir(parents=True)
+
+    result = subprocess.run(
+        [
+            str(worker_script),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(tmp_path / "runtime.sif"),
+            "--cpus",
+            "20",
+            "--worker-group",
+            "ablation",
+            "--worker-offset",
+            "0",
+            "--",
+            "echo",
+            "unused",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "FAKE_STATUS": "75",
+            "SLURM_JOB_ID": "12345",
+            "SLURM_STEP_ID": "0",
+            "SLURM_PROCID": "0",
+        },
+    )
+
+    assert result.returncode == 0
+    assert not (marker_root / "000.done").exists()
+    assert "outcome=continuation" in (marker_root / "000.partial").read_text()

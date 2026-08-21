@@ -37,6 +37,7 @@ TASKS=""
 CPUS_PER_TASK=""
 GRES=""
 RUNTIME=""
+CLOSEOUT_SIGNAL_SECONDS=""
 
 usage() {
   cat <<EOF
@@ -96,6 +97,7 @@ load_dispatch_request() {
       cpus_per_task) CPUS_PER_TASK="$value" ;;
       gres) GRES="$value" ;;
       runtime) RUNTIME="$value" ;;
+      closeout_signal_seconds) CLOSEOUT_SIGNAL_SECONDS="$value" ;;
       *)
         echo "Unknown dispatch request field: $field" >&2
         return 1
@@ -113,7 +115,7 @@ validate_dispatch_request() {
     SOURCE_SNAPSHOT_SHA256 CONFIG_SHA256 CONTAINER_SIF \
     CONTAINER_DIGEST_FILE TOOLING_KEY TOOLING_PYTHON SNAKEMAKE_BIN \
     SNAKEMAKE_VERSION WORKFLOW_KIND WORKFLOW_TARGET ACCOUNT PARTITION QOS \
-    NODES TASKS CPUS_PER_TASK GRES RUNTIME; do
+    NODES TASKS CPUS_PER_TASK GRES RUNTIME CLOSEOUT_SIGNAL_SECONDS; do
     if [ -z "${!field}" ]; then
       echo "Dispatch request is missing $field" >&2
       return 1
@@ -143,6 +145,10 @@ validate_dispatch_request() {
     || [ "$CPUS_PER_TASK" != "20" ] \
     || [ "$GRES" != "gpu:$TASKS" ]; then
     echo "Dispatch request violates the MN5 single-node allocation contract" >&2
+    return 1
+  fi
+  if ! [[ "$CLOSEOUT_SIGNAL_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "Dispatch request contains an invalid close-out signal duration" >&2
     return 1
   fi
 }
@@ -500,30 +506,35 @@ submit_run() {
 
   attempt_id="$(new_attempt batch)"
   attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
-  job_id="$(
-    sbatch --parsable \
-      --chdir="$RUN_ROOT" \
-      --output="$RUN_ROOT/logs/snakemake-%j.out" \
-      --error="$RUN_ROOT/logs/snakemake-%j.err" \
-      --open-mode=append \
-      --account="$ACCOUNT" \
-      --partition="$PARTITION" \
-      --qos="$QOS" \
-      --nodes="$NODES" \
-      --ntasks="$TASKS" \
-      --ntasks-per-node="$TASKS" \
-      --cpus-per-task="$CPUS_PER_TASK" \
-      --gres="$GRES" \
-      --time="$RUNTIME" \
-      "$coordinator" \
-      "$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh" \
-      "$RUN_ROOT" \
-      "$SNAKEMAKE_BIN" \
-      "$TASKS" \
-      "$CPUS_PER_TASK" \
-      batch \
-      "$attempt_root"
-  )"
+  local -a submit_arguments=(
+    "--chdir=$RUN_ROOT"
+    "--output=$RUN_ROOT/logs/snakemake-%j.out"
+    "--error=$RUN_ROOT/logs/snakemake-%j.err"
+    "--open-mode=append"
+    "--account=$ACCOUNT"
+    "--partition=$PARTITION"
+    "--qos=$QOS"
+    "--nodes=$NODES"
+    "--ntasks=$TASKS"
+    "--ntasks-per-node=$TASKS"
+    "--cpus-per-task=$CPUS_PER_TASK"
+    "--gres=$GRES"
+    "--time=$RUNTIME"
+  )
+  if [ "$CLOSEOUT_SIGNAL_SECONDS" -gt 0 ]; then
+    submit_arguments+=("--signal=USR1@$CLOSEOUT_SIGNAL_SECONDS")
+  fi
+  submit_arguments+=(
+    "$coordinator"
+    "$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
+    "$RUN_ROOT"
+    "$SNAKEMAKE_BIN"
+    "$TASKS"
+    "$CPUS_PER_TASK"
+    batch
+    "$attempt_root"
+  )
+  job_id="$(sbatch --parsable "${submit_arguments[@]}")"
   job_id="${job_id%%;*}"
 
   write_attempt_binding "$attempt_id" batch "$job_id"

@@ -20,6 +20,7 @@ ablation:
   study_name: epiforecaster_ablation_default_smoke_v1
   campaign: configs/campaigns/ablation_default_v1.yaml
   workers: 2
+  closeout_signal_seconds: 600
   timeout_s: 6000
   sampler_seed: 42
   smoketest: true

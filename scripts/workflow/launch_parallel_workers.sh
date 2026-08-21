@@ -101,19 +101,26 @@ validate_allocation() {
   fi
 }
 
-# Require every rank to publish its durable completion marker.
-verify_worker_markers() {
+# Require every rank to publish a durable completion or continuation receipt.
+verify_worker_receipts() {
   local marker_root="$1"
-  local worker_index worker_id marker
+  local worker_index worker_id complete_marker continuation_marker
 
+  CONTINUATION_REQUIRED=0
   for ((worker_index = 0; worker_index < WORKERS; worker_index++)); do
     printf -v worker_id '%03d' "$worker_index"
-    marker="$marker_root/$worker_id.done"
+    complete_marker="$marker_root/$worker_id.done"
+    continuation_marker="$marker_root/$worker_id.partial"
 
-    if [ ! -s "$marker" ]; then
-      echo "Worker $WORKER_GROUP/$worker_id exited without a marker: $marker" >&2
-      return 1
+    if [ -s "$complete_marker" ]; then
+      continue
     fi
+    if [ -s "$continuation_marker" ]; then
+      CONTINUATION_REQUIRED=1
+      continue
+    fi
+    echo "Worker $WORKER_GROUP/$worker_id exited without a receipt" >&2
+    return 1
   done
 }
 
@@ -161,8 +168,12 @@ main() {
     worker_offset=$((worker_offset + wave_workers))
   done
 
-  verify_worker_markers "$marker_root"
+  verify_worker_receipts "$marker_root"
+  if [ "$CONTINUATION_REQUIRED" -eq 1 ]; then
+    echo "Ablation worker close-out completed; continuation is required" >&2
+    return 75
+  fi
 }
 
-SCIENTIFIC_COMMAND=()
+CONTINUATION_REQUIRED=0
 main "$@"

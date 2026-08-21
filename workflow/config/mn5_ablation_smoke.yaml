@@ -20,6 +20,7 @@ ablation:
   campaign: configs/campaigns/ablation_smoke_v1.yaml
   workers: 2
   trials_per_worker: 4
+  closeout_signal_seconds: 300
   timeout_s: 3300
   sampler_seed: 42
   smoketest: true
