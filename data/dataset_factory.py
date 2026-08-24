@@ -240,9 +240,12 @@ def _resolve_biomarker_split_features(
     for mask_var in mask_vars:
         mask_values = np.asarray(aligned_dataset[mask_var].values)
         if mask_values.ndim == 3:
-            mask_values = mask_values.reshape(
-                mask_values.shape[-2], mask_values.shape[-1]
-            )
+            if mask_values.shape[0] != 1:
+                raise ValueError(
+                    f"{mask_var} must be (T, N) or (1, T, N) for biomarker-aware "
+                    f"splits; got leading dimension {mask_values.shape[0]}"
+                )
+            mask_values = mask_values[0]
         if mask_values.ndim != 2 or mask_values.shape[-1] != total_nodes:
             raise ValueError(
                 f"{mask_var} must be a 2D time-by-region array for biomarker-aware splits"

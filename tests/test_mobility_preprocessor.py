@@ -77,3 +77,12 @@ def test_preprocessor_config_rejects_invalid_values(
 ) -> None:
     with pytest.raises(ValueError, match=field_name):
         MobilityPreprocessorConfig(**{field_name: value})
+
+
+@pytest.mark.epiforecaster
+def test_imported_risk_rejects_multiple_case_channels_without_lags() -> None:
+    cases = np.zeros((3, 2, 2), dtype=np.float32)
+    mobility = np.zeros((3, 2, 2), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="trailing dimension 2"):
+        MobilityPreprocessor.compute_imported_risk(cases, mobility, lags=[])

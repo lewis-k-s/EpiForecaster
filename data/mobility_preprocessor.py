@@ -136,18 +136,20 @@ class MobilityPreprocessor:
         Returns:
             Array of shape (T, N, len(lags)) containing imported risk features.
         """
-        if not lags:
-            if cases.ndim == 2:
-                T, N = cases.shape
-            else:
-                T, N, _ = cases.shape
-            return np.zeros((T, N, 0), dtype=np.float32)
-
-        # Ensure cases is (T, N, 1)
+        # Ensure cases is (T, N, 1); reject extra trailing channels up front so
+        # every return path (including the empty-lag one) enforces the contract.
         if cases.ndim == 2:
             cases = cases[..., None]
 
-        T, N, _ = cases.shape
+        T, N, channels = cases.shape
+        if channels != 1:
+            raise ValueError(
+                "cases must be (T, N) or (T, N, 1) for imported risk; "
+                f"got trailing dimension {channels}"
+            )
+
+        if not lags:
+            return np.zeros((T, N, 0), dtype=np.float32)
 
         # Normalize mobility (incoming flow normalization)
         # Sum over origins (axis -2) for each destination
