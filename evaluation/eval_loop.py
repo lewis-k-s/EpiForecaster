@@ -132,20 +132,18 @@ def _forecast_aligned_output(
 
 def _accumulate_per_head_node_metrics(
     *,
+    accumulator: dict[str, dict[int, dict[str, float]]],
     target_name: str,
     target_nodes: torch.Tensor,
     diff: torch.Tensor,
     abs_diff: torch.Tensor,
     weights: torch.Tensor,
-    accumulator: dict[str, dict[int, dict[str, float]]],
 ) -> None:
-    canonical_target = _HEAD_CANONICAL_NAMES[target_name]
-    target_stats = accumulator.setdefault(canonical_target, {})
+    target_stats = accumulator.setdefault(target_name, {})
     target_node_ids = target_nodes.detach().cpu().tolist()
     per_sample_abs_sum = (abs_diff * weights).sum(dim=1).detach().cpu().tolist()
     per_sample_sq_sum = ((diff**2) * weights).sum(dim=1).detach().cpu().tolist()
     per_sample_count = (weights > 0).sum(dim=1).detach().cpu().tolist()
-
     for node_id, abs_sum, sq_sum, observed_count in zip(
         target_node_ids,
         per_sample_abs_sum,
@@ -516,7 +514,6 @@ def evaluate_loader(
     }
 
     per_head_node_metrics: dict[str, dict[int, dict[str, float]]] = {}
-
     num_batches = len(loader)
     eval_iter = loader
     effective_log_every = max(1, log_every)
@@ -694,12 +691,12 @@ def evaluate_loader(
                     target_nodes = batch_data.target_node
 
                     _accumulate_per_head_node_metrics(
-                        target_name="hosp",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["hosp"],
                         target_nodes=target_nodes,
                         diff=_unused_diff,
                         abs_diff=abs_diff,
                         weights=weights,
-                        accumulator=per_head_node_metrics,
                     )
                     hosp_loc, hosp_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -799,12 +796,12 @@ def evaluate_loader(
                         sample_weights=ww_weights,
                     )
                     _accumulate_per_head_node_metrics(
-                        target_name="ww",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["ww"],
                         target_nodes=batch_data.target_node,
                         diff=ww_diff,
                         abs_diff=ww_abs_diff,
                         weights=ww_effective_weights,
-                        accumulator=per_head_node_metrics,
                     )
                     ww_loc, ww_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -904,12 +901,12 @@ def evaluate_loader(
                         )
                     )
                     _accumulate_per_head_node_metrics(
-                        target_name="cases",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["cases"],
                         target_nodes=batch_data.target_node,
                         diff=cases_diff,
                         abs_diff=cases_abs_diff,
                         weights=cases_effective_weights,
-                        accumulator=per_head_node_metrics,
                     )
                     cases_loc, cases_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -1009,12 +1006,12 @@ def evaluate_loader(
                         )
                     )
                     _accumulate_per_head_node_metrics(
-                        target_name="deaths",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["deaths"],
                         target_nodes=batch_data.target_node,
                         diff=deaths_diff,
                         abs_diff=deaths_abs_diff,
                         weights=deaths_effective_weights,
-                        accumulator=per_head_node_metrics,
                     )
                     deaths_loc, deaths_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -1124,7 +1121,6 @@ def evaluate_loader(
         if model_was_training:
             model.train()
 
-    # Final sync - transfer metrics to CPU once
     mean_loss = (total_loss / max(1, processed_batches)).item()
     hosp_summary = hosp_metrics.finalize()
     ww_summary = ww_metrics.finalize()

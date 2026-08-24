@@ -13,20 +13,20 @@ def test_latent_diagnostic_protocols_recover_exact_known_rollout():
     rollforward = SIRRollForward()
     model = SimpleNamespace(sir_rollforward=rollforward)
     rates = {
-        "beta_t": torch.tensor([[0.2, 0.25]]),
-        "gamma_t": torch.tensor([[0.1, 0.1]]),
-        "mortality_t": torch.zeros(1, 2),
-        "hospitalization_rate_t": torch.tensor([[0.02, 0.02]]),
-        "hospital_recovery_t": torch.tensor([[0.05, 0.05]]),
-        "hospital_mortality_t": torch.zeros(1, 2),
+        "beta_t": torch.tensor([[0.2, 0.25], [0.15, 0.18]]),
+        "gamma_t": torch.tensor([[0.1, 0.1], [0.08, 0.09]]),
+        "mortality_t": torch.zeros(2, 2),
+        "hospitalization_rate_t": torch.tensor([[0.02, 0.02], [0.03, 0.025]]),
+        "hospital_recovery_t": torch.tensor([[0.05, 0.05], [0.04, 0.045]]),
+        "hospital_mortality_t": torch.zeros(2, 2),
     }
     truth = rollforward(
         **rates,
-        S0=torch.tensor([0.9]),
-        I0=torch.tensor([0.08]),
-        H0=torch.tensor([0.01]),
-        R0=torch.tensor([0.01]),
-        population=torch.ones(1),
+        S0=torch.tensor([0.9, 0.8]),
+        I0=torch.tensor([0.08, 0.15]),
+        H0=torch.tensor([0.01, 0.02]),
+        R0=torch.tensor([0.01, 0.03]),
+        population=torch.ones(2),
     )
     targets = {
         "S_target": truth["S_trajectory"],

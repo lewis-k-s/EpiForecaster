@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from einops import rearrange
 
 from models.epiforecaster import EpiForecaster
 
@@ -78,31 +79,35 @@ def build_latent_diagnostic_protocols(
     }
     oracle_targets["death_flow_target"] = death_flow_target
 
-    flat_count = batch_size * horizon
+    # Treat each (sample, horizon) pair as a one-step batch item.
     teacher = rollforward(
-        beta_t=beta.reshape(flat_count, 1),
-        gamma_t=model_outputs["gamma_t"].float().reshape(flat_count, 1),
-        mortality_t=model_outputs["mortality_t"].float().reshape(flat_count, 1),
-        hospitalization_rate_t=model_outputs["hospitalization_rate_t"]
-        .float()
-        .reshape(flat_count, 1),
-        hospital_recovery_t=model_outputs["hospital_recovery_t"]
-        .float()
-        .reshape(flat_count, 1),
-        hospital_mortality_t=model_outputs["hospital_mortality_t"]
-        .float()
-        .reshape(flat_count, 1),
-        S0=state_tensors["s"][:, :-1].reshape(flat_count),
-        I0=state_tensors["i"][:, :-1].reshape(flat_count),
-        H0=state_tensors["h"][:, :-1].reshape(flat_count),
-        R0=state_tensors["r"][:, :-1].reshape(flat_count),
-        population=torch.ones(flat_count, device=beta.device, dtype=torch.float32),
+        beta_t=rearrange(beta, "b h -> (b h) 1"),
+        gamma_t=rearrange(model_outputs["gamma_t"].float(), "b h -> (b h) 1"),
+        mortality_t=rearrange(model_outputs["mortality_t"].float(), "b h -> (b h) 1"),
+        hospitalization_rate_t=rearrange(
+            model_outputs["hospitalization_rate_t"].float(), "b h -> (b h) 1"
+        ),
+        hospital_recovery_t=rearrange(
+            model_outputs["hospital_recovery_t"].float(), "b h -> (b h) 1"
+        ),
+        hospital_mortality_t=rearrange(
+            model_outputs["hospital_mortality_t"].float(), "b h -> (b h) 1"
+        ),
+        S0=rearrange(state_tensors["s"][:, :-1], "b h -> (b h)"),
+        I0=rearrange(state_tensors["i"][:, :-1], "b h -> (b h)"),
+        H0=rearrange(state_tensors["h"][:, :-1], "b h -> (b h)"),
+        R0=rearrange(state_tensors["r"][:, :-1], "b h -> (b h)"),
+        population=torch.ones(
+            batch_size * horizon, device=beta.device, dtype=torch.float32
+        ),
     )
     teacher_outputs = {
-        output_key: teacher[output_key][:, 1].reshape(batch_size, horizon)
+        output_key: rearrange(teacher[output_key][:, 1], "(b h) -> b h", b=batch_size)
         for output_key, _target_key in _STATE_TASKS.values()
     }
-    teacher_outputs["death_flow"] = teacher["death_flow"].reshape(batch_size, horizon)
+    teacher_outputs["death_flow"] = rearrange(
+        teacher["death_flow"], "(b h) 1 -> b h", b=batch_size
+    )
     teacher_targets = {
         target_key: state_tensors[name][:, 1:]
         for name, (_output_key, target_key) in _STATE_TASKS.items()
