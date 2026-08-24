@@ -1,0 +1,365 @@
+---
+title: "Deterministic mobility-aware regional cross-validation split"
+subtitle: "Refined representative 10-fold audit"
+author: "EpiForecaster"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    fig-align: center
+    theme: cosmo
+    css: split_mobility_cut.css
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+---
+
+## TL;DR
+
+- 161 valid regions appear in the test role exactly once across 10 folds.
+- The deterministic refinement accepted 15 constrained swaps.
+- It reduced the mobility objective by 40.6%, while all targets retained at least 80.7% of incoming mobility context.
+- Case burden is well balanced. Deaths, wastewater, and absolute population load remain less uniform because Barcelona is indivisible.
+
+## Setup
+
+```{python}
+#| label: setup
+#| include: false
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def repository_root(start: Path) -> Path:
+    """Find the project root when Quarto executes from a document directory."""
+    for candidate in (start, *start.parents):
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    raise FileNotFoundError("Could not find the EpiForecaster project root")
+
+
+ROOT = repository_root(Path.cwd())
+SPLIT_DIR = ROOT / "outputs/reports/split_mobility_cut_refined_20260723"
+REPRESENTATIVITY_DIR = ROOT / "outputs/reports/split_representativity_refined_20260724"
+NOTEBOOK_OUTPUT_DIR = ROOT / "outputs/reports/split_mobility_cut_notebook"
+NOTEBOOK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(NOTEBOOK_OUTPUT_DIR / "matplotlib"))
+
+import matplotlib.pyplot as plt
+from IPython.display import Image, display
+
+
+BLUE = "#4E79A7"
+ORANGE = "#F2A541"
+TEAL = "#2A9D8F"
+PURPLE = "#7A5195"
+INK = "#24313D"
+GRID = "#D9DEE3"
+
+strategy_summary = pd.read_csv(SPLIT_DIR / "strategy_summary.csv")
+fold_metrics = pd.read_csv(SPLIT_DIR / "split_mobility_metrics.csv")
+history = pd.read_csv(SPLIT_DIR / "optimization_history.csv")
+balance_summary = pd.read_csv(REPRESENTATIVITY_DIR / "metric_summary.csv")
+
+with (SPLIT_DIR / "analysis_summary.json").open(encoding="utf-8") as stream:
+    audit = json.load(stream)
+```
+
+## Split map
+
+The purple municipalities are the test fold, orange municipalities are validation, and blue municipalities are training. Grey municipalities are outside the valid-target universe.
+
+```{python}
+#| label: split-map
+#| fig-cap: "Spatial membership of each refined cross-validation fold."
+#| out-width: "100%"
+#| fig-width: 16
+#| fig-height: 9
+from dataviz.split_choropleth import plot_split_choropleth
+
+map_path = NOTEBOOK_OUTPUT_DIR / "refined_10fold_choropleth.png"
+plot_split_choropleth(
+    membership_path=SPLIT_DIR / "split_membership.csv",
+    geojson_path=ROOT / "data/files/geo/fl_municipios_catalonia.geojson",
+    strategy="Refined representative 10-fold",
+    output_path=map_path,
+)
+display(Image(filename=str(map_path)))
+```
+
+## Objective and constraints
+
+\[
+\mathcal{L} = f_{\mathrm{internal}}
++ 0.25 f_{\mathrm{high-flow}}
++ 0.50 f_{\mathrm{worst-fold}}
++ 10\,\mathrm{mean}_i\left[\max(0, 0.75-r_i)^2\right]
+\]
+
+| Term | Meaning |
+|---|---|
+| \(f_{\mathrm{internal}}\) | All mean mobility flow unavailable inside test folds |
+| \(f_{\mathrm{high-flow}}\) | Internal mass for flows at or above the 99.5th percentile |
+| \(f_{\mathrm{worst-fold}}\) | Largest single-fold internal-flow fraction |
+| \(r_i\) | Incoming mobility context retained for target region \(i\) |
+
+Hard constraints: every target must retain at least 70% incoming context; every balancing feature must remain within the original representative-split envelope.
+
+```{python}
+#| label: objective-plots
+#| fig-cap: "Retention penalty and the observed objective decomposition during deterministic refinement."
+#| out-width: "100%"
+#| fig-width: 13
+#| fig-height: 5
+retention = np.linspace(0.40, 1.00, 400)
+penalty = 10.0 * np.maximum(0.0, 0.75 - retention) ** 2
+
+objective_terms = history.assign(
+    internal=history["total_test_internal_flow_fraction"],
+    high_flow=0.25 * history["high_flow_event_internal_fraction"],
+    worst_fold=0.50 * history["worst_fold_internal_flow_fraction"],
+)
+objective_terms["retention_shortfall"] = (
+    objective_terms["objective_score"]
+    - objective_terms[["internal", "high_flow", "worst_fold"]].sum(axis=1)
+).clip(lower=0.0)
+
+figure, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+
+axes[0].plot(retention * 100, penalty, color=PURPLE, linewidth=2.8)
+axes[0].axvline(70, color=INK, linestyle="--", linewidth=1.4, label="Hard floor")
+axes[0].axvline(75, color=ORANGE, linestyle=":", linewidth=2.0, label="Ideal floor")
+axes[0].set(
+    title="Retention-shortfall penalty",
+    xlabel="Incoming mobility context retained (%)",
+    ylabel="Objective contribution",
+    xlim=(40, 100),
+)
+axes[0].legend(frameon=False)
+
+term_columns = ["internal", "high_flow", "worst_fold", "retention_shortfall"]
+term_labels = ["Internal flow", "High-flow penalty", "Worst-fold penalty", "Retention shortfall"]
+term_colors = [BLUE, ORANGE, TEAL, PURPLE]
+axes[1].stackplot(
+    objective_terms["iteration"],
+    *(objective_terms[column] for column in term_columns),
+    labels=term_labels,
+    colors=term_colors,
+    alpha=0.88,
+)
+axes[1].plot(
+    objective_terms["iteration"],
+    objective_terms["objective_score"],
+    color=INK,
+    linewidth=2.2,
+    marker="o",
+    markersize=3,
+    label="Total objective",
+)
+axes[1].set(
+    title="Objective terms across accepted swaps",
+    xlabel="Accepted constrained swap",
+    ylabel="Objective value",
+)
+axes[1].legend(frameon=False, fontsize=8, loc="upper right")
+
+for axis in axes:
+    axis.grid(axis="y", color=GRID, alpha=0.8)
+    axis.spines[["top", "right"]].set_visible(False)
+```
+
+```{python}
+#| label: objective-receipt
+#| echo: false
+initial = history.iloc[0]
+final = history.iloc[-1]
+objective_change = 100 * (final.objective_score / initial.objective_score - 1)
+
+pd.DataFrame(
+    {
+        "quantity": [
+            "accepted swaps",
+            "objective",
+            "worst target retained flow",
+            "worst-fold internal flow",
+            "high-flow internal fraction",
+        ],
+        "initial": [
+            0,
+            initial.objective_score,
+            initial.minimum_target_retained_flow,
+            initial.worst_fold_internal_flow_fraction,
+            initial.high_flow_event_internal_fraction,
+        ],
+        "refined": [
+            int(final.iteration),
+            final.objective_score,
+            final.minimum_target_retained_flow,
+            final.worst_fold_internal_flow_fraction,
+            final.high_flow_event_internal_fraction,
+        ],
+    }
+).assign(
+    change=lambda frame: [
+        "15",
+        f"{objective_change:.1f}%",
+        f"{100 * (final.minimum_target_retained_flow - initial.minimum_target_retained_flow):+.1f} pp",
+        f"{100 * (final.worst_fold_internal_flow_fraction - initial.worst_fold_internal_flow_fraction):+.1f} pp",
+        f"{100 * (final.high_flow_event_internal_fraction - initial.high_flow_event_internal_fraction):+.1f} pp",
+    ]
+)
+```
+
+## Mobility split quality
+
+```{python}
+#| label: mobility-quality
+#| fig-cap: "Coverage and retained mobility context for the baseline and refined representative splits."
+#| out-width: "100%"
+#| fig-width: 13
+#| fig-height: 5
+selected = strategy_summary[
+    strategy_summary["strategy"].isin(
+        ["Independent stratified seeds", "Representative 10-fold", "Refined representative 10-fold"]
+    )
+].copy()
+selected["short_name"] = ["Independent\nseeds", "Representative\n10-fold", "Refined\n10-fold"]
+colors = [BLUE, ORANGE, TEAL]
+positions = np.arange(len(selected))
+
+figure, axes = plt.subplots(1, 3, figsize=(13, 5), constrained_layout=True)
+
+axes[0].bar(positions, 100 * selected["test_region_coverage"], color=colors)
+for position, (_, row) in enumerate(selected.iterrows()):
+    axes[0].text(
+        position,
+        100 * row.test_region_coverage + 2,
+        f"{int(row.unique_test_regions)}/{int(row.valid_region_count)}",
+        ha="center",
+        fontweight="semibold",
+    )
+axes[0].set(
+    title="Exactly-once test coverage",
+    ylabel="Valid target regions covered (%)",
+    ylim=(0, 110),
+)
+axes[0].set_xticks(positions, labels=selected["short_name"])
+
+for column, marker, label in (
+    ("mean_incoming_flow_retained", "o", "Mean target"),
+    ("worst_target_incoming_flow_retained", "D", "Worst target"),
+):
+    axes[1].plot(
+        positions,
+        100 * selected[column],
+        color=INK,
+        marker=marker,
+        linewidth=1.6,
+        label=label,
+    )
+axes[1].axhline(70, color=INK, linestyle="--", linewidth=1.2, label="Hard floor")
+axes[1].axhline(75, color=ORANGE, linestyle=":", linewidth=1.8, label="Ideal floor")
+axes[1].set(
+    title="Incoming mobility context retained",
+    ylabel="Retained flow (%)",
+    ylim=(0, 105),
+)
+axes[1].set_xticks(positions, labels=selected["short_name"])
+axes[1].legend(frameon=False, fontsize=8, loc="lower left")
+
+for column, marker, label in (
+    ("mean_test_internal_flow_fraction", "o", "Mean test-fold flow"),
+    ("mean_high_flow_event_internal_fraction", "D", "High-flow events"),
+):
+    axes[2].plot(
+        positions,
+        100 * selected[column],
+        color=INK,
+        marker=marker,
+        linewidth=1.6,
+        label=label,
+    )
+axes[2].set(
+    title="Mobility isolated inside test folds",
+    ylabel="Complete-network flow (%)",
+    ylim=(0, 1.3),
+)
+axes[2].set_xticks(positions, labels=selected["short_name"])
+axes[2].legend(frameon=False, fontsize=8)
+
+for axis in axes:
+    axis.grid(axis="y", color=GRID, alpha=0.8)
+    axis.spines[["top", "right"]].set_visible(False)
+```
+
+## Target-series representativity
+
+```{python}
+#| label: representativity-heatmap
+#| fig-cap: "Test-fold representativity against the 161-region valid-target universe."
+#| out-width: "100%"
+#| fig-width: 14
+#| fig-height: 11.5
+from dataviz.split_representativity import plot_split_representativity
+
+representativity_path = NOTEBOOK_OUTPUT_DIR / "test_fold_representativity.png"
+plot_split_representativity(
+    balance_path=REPRESENTATIVITY_DIR / "test_fold_balance.csv",
+    output_path=representativity_path,
+)
+display(Image(filename=str(representativity_path)))
+```
+
+```{python}
+#| label: representativity-summary
+#| echo: false
+balance_summary.loc[
+    balance_summary["metric"].isin(
+        [
+            "cases_mean_observed_raw",
+            "hospitalizations_mean_observed_raw",
+            "deaths_mean_observed_raw",
+            "wastewater_mean_observed_raw",
+            "population",
+            "population_density_per_km2",
+        ]
+    ),
+    ["metric_label", "max_abs_standardized_difference", "max_ks_statistic"],
+].rename(
+    columns={
+        "metric_label": "metric",
+        "max_abs_standardized_difference": "max |standardized difference|",
+        "max_ks_statistic": "max KS distance",
+    }
+).sort_values("max |standardized difference|")
+```
+
+## Provenance
+
+```{python}
+#| label: provenance
+#| echo: false
+pd.DataFrame(
+    {
+        "input": ["dataset", "base manifest", "region geometry", "high-flow threshold"],
+        "value": [
+            audit["dataset"],
+            audit["base_manifest"],
+            "data/files/geo/fl_municipios_catalonia.geojson",
+            f"{audit['high_flow_event_threshold_raw']:.2f} raw trips",
+        ],
+    }
+)
+```
+
+Source data are the persisted split audit and the canonical `real` dataset. Re-render after any change to split membership, mobility preprocessing, or the valid-target universe.
