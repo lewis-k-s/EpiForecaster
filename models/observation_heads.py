@@ -155,6 +155,22 @@ def _inverse_bounded_sigmoid(value: float, *, lower: float, upper: float) -> flo
     return math.log(fraction) - math.log1p(-fraction)
 
 
+def _causal_conv1d(
+    trajectory: torch.Tensor, kernel_weights: torch.Tensor
+) -> torch.Tensor:
+    """Causal convolution [B, T] × [K] → [B, T] float32."""
+    time_steps = trajectory.size(1)
+    flipped = torch.flip(kernel_weights, dims=[0])
+    out = F.conv1d(
+        torch.nan_to_num(trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0).unsqueeze(
+            1
+        ),
+        flipped.view(1, 1, -1),
+        padding=kernel_weights.numel() - 1,
+    )
+    return out[:, :, :time_steps].squeeze(1)
+
+
 def _normalized_gamma_pdf_kernel(
     shape: torch.Tensor, scale: torch.Tensor, length: int
 ) -> torch.Tensor:
@@ -528,20 +544,7 @@ class DelayKernel(nn.Module):
                 kernel_weights = self.gamma_kernel
             else:
                 kernel_weights = self.kernel
-            flipped_kernel = torch.flip(kernel_weights, dims=[0])
-
-            I_reshaped = torch.nan_to_num(
-                I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            kernel_reshaped = flipped_kernel.view(1, 1, -1)
-
-            output = F.conv1d(
-                I_reshaped,
-                kernel_reshaped,
-                padding=self.kernel_length - 1,
-                groups=1,
-            )
-            output = output[:, :, :time_steps].squeeze(1)
+            output = _causal_conv1d(I_trajectory, kernel_weights)
         return output.to(I_trajectory.dtype)
 
     def get_kernel_weights(self) -> torch.Tensor:
@@ -839,19 +842,7 @@ class SheddingConvolution(nn.Module):
                 kernel_weights = self.gamma_kernel
             else:
                 kernel_weights = self.kernel
-            flipped_kernel = torch.flip(kernel_weights, dims=[0])
-
-            I_reshaped = torch.nan_to_num(
-                I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            kernel_reshaped = flipped_kernel.view(1, 1, -1)
-            total_shedding = F.conv1d(
-                I_reshaped,
-                kernel_reshaped,
-                padding=self.kernel_length - 1,
-                groups=1,
-            )
-            total_shedding = total_shedding[:, :, :time_steps].squeeze(1)
+            total_shedding = _causal_conv1d(I_trajectory, kernel_weights)
 
             population_f32 = population.float().clamp_min(_KERNEL_EPS)
             viral_concentration = total_shedding / population_f32
@@ -977,14 +968,7 @@ class SheddingConvolution(nn.Module):
 
 
 class MLPKernel(nn.Module):
-    """Pointwise MLP replacing the causal delay/shedding kernel convolution.
-
-    Instead of a fixed-shape kernel applied via ``F.conv1d``, this module
-    extracts a sliding window of the input trajectory and passes each window
-    through a small MLP (Linear → GELU → Linear).  The final layer is
-    zero-initialised for conservative startup (matching the residual-path
-    pattern used elsewhere).
-    """
+    """MLP over causal [B, T, K] windows with optional static population."""
 
     def __init__(
         self,
