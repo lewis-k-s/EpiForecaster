@@ -75,7 +75,6 @@ def get_autocast_dtype_for_device(device: torch.device | str) -> torch.dtype:
         return AUTOCAST_DTYPE_GPU
 
 
-# Legacy constant for backward compatibility - defaults to GPU dtype
 MODEL_DTYPE = MODEL_DTYPE_GPU
 AUTOCAST_DTYPE = AUTOCAST_DTYPE_GPU
 
@@ -270,11 +269,12 @@ def prepare_batch_for_device(
     device: torch.device,
     non_blocking: bool = True,
 ) -> "EpiBatch":
-    """Inject mobility and move a dtype-normalized batch to the target device."""
+    """Inject mobility and dense context features, then move the batch."""
     if dataset is not None:
-        from utils.training_utils import inject_gpu_mobility
+        from utils.training_utils import inject_context_features, inject_gpu_mobility
 
         inject_gpu_mobility(batch_data, dataset, device)
+        inject_context_features(batch_data, dataset, device)
 
     return batch_data.to(
         device=device,

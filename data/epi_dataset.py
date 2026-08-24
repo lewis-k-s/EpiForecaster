@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
 
+from einops import rearrange, repeat
 import numpy as np
 import torch
 import xarray as xr
@@ -76,10 +77,8 @@ class EpiDatasetItem(TypedDict):
     hosp_hist: torch.Tensor  # [L, 3] Hospitalization history
     deaths_hist: torch.Tensor  # [L, 3] Deaths history
     cases_hist: torch.Tensor  # [L, 3] Reported cases history
-    # mob: list[Data]  <-- REMOVED
-    mob_x: torch.Tensor
-    mob_edge_index: list[torch.Tensor]
-    mob_edge_weight: list[torch.Tensor]
+    # Dense mobility features are assembled batch-side from prebuilt context
+    # tables (see data/context_assembly.py); items carry placement info only.
     mob_target_node_idx: torch.Tensor  # Local index of target node as 0-dim tensor
     population: torch.Tensor
     run_id: int | str | None
@@ -389,7 +388,8 @@ class EpiDataset(Dataset):
             self.biomarker_preprocessor = biomarker_preprocessor
 
         # Precompute biomarkers for the entire dataset
-        # This returns a (TotalTime, NumNodes, 3 * variants) tensor
+        # This returns a (TotalTime, NumNodes, 4 * variants) tensor: per variant
+        # the channels are [value, mask, censor, age], concatenated on the last axis.
         if self.biomarker_variants:
             self.precomputed_biomarkers = torch.from_numpy(
                 self.biomarker_preprocessor.preprocess_dataset(self._dataset)
@@ -574,9 +574,101 @@ class EpiDataset(Dataset):
                 dtype=torch.long,
             )
 
+        self._build_context_tables()
+
         # Close dataset and clear reference to avoid pickling issues
         self._dataset.close()
         self._dataset = None
+
+    def _build_context_tables(self) -> None:
+        """Prebuild context tables consumed by ``data.context_assembly``."""
+        node_ids = self._graph_node_ids  # (N_ctx,) k-hop closure around targets
+        targets = torch.tensor(self.target_nodes, dtype=torch.long)  # (n_targets,)
+        positions = torch.searchsorted(node_ids, targets)  # (n_targets,) ctx slots
+        self.target_local_positions = positions
+        # Map a context-node position to its slot in the per-target tables so
+        # assembly can translate batch-side local target positions.
+        self.context_target_slot_by_position = torch.full(
+            (node_ids.numel(),), -1, dtype=torch.long
+        )
+        self.context_target_slot_by_position[positions] = torch.arange(
+            targets.numel(), dtype=torch.long
+        )
+        target_count = targets.numel()
+        total_time = len(self._temporal_coords)
+
+        if self.config.model.type.cases:
+            clinical = torch.cat(
+                [
+                    self.precomputed_hosp_hist,
+                    self.precomputed_deaths_hist,
+                    self.precomputed_cases_hist,
+                ],
+                dim=-1,
+            )
+            if self.use_imported_risk and self.lagged_risk is not None:
+                clinical = torch.cat([clinical, self.lagged_risk], dim=-1)
+            # context_feature_clinical: (T, N_ctx, F_clin)
+            self.context_feature_clinical = clinical[:, node_ids].contiguous()
+        else:
+            self.context_feature_clinical = None
+
+        if self.config.model.type.biomarkers:
+            # context_feature_bio: (T, N_ctx, F_bio)
+            # context_feature_ww: (T, N_ctx, 2) = [value, mask]
+            self.context_feature_bio = self.precomputed_biomarkers[
+                :, node_ids
+            ].contiguous()
+            self.context_feature_ww = torch.stack(
+                [self.precomputed_ww, self.precomputed_ww_mask], dim=-1
+            )[:, node_ids].contiguous()
+            self.context_bio_start = self.biomarker_data_start[node_ids].contiguous()
+        else:
+            self.context_feature_bio = None
+            self.context_feature_ww = None
+            self.context_bio_start = None
+
+        adjacency_source = self.config.model.graph_adjacency_source
+        if adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            # Time-invariant incoming adjacency: (N_all, T_n) -> (T_n, N_ctx),
+            # tiled across timesteps. Table layout: (time, target_slot, ctx_pos).
+            static_incoming = self.static_graph_adjacency.index_select(1, targets)
+            neighbor = static_incoming.t()[:, node_ids]
+            neighbor_table = repeat(
+                neighbor, "tgt pos -> time tgt pos", time=total_time
+            )
+        else:
+            # Dynamic mobility mask (T, N_all, N_all): edges into each target,
+            # restricted to context-node sources, reordered to the same
+            # (time, target_slot, ctx_pos) layout.
+            neighbor_table = rearrange(
+                self.mobility_mask.index_select(2, targets).index_select(1, node_ids),
+                "time pos tgt -> time tgt pos",
+            ).contiguous()
+        if self.context_mask is not None:
+            neighbor_table = neighbor_table & self.context_mask[node_ids]
+        time_index = torch.arange(total_time).unsqueeze(-1)
+        target_index = torch.arange(target_count).unsqueeze(0)
+        # Targets observe themselves regardless of adjacency source.
+        neighbor_table[time_index, target_index, positions.unsqueeze(0)] = True
+        self.context_neigh_table = neighbor_table
+
+        if self._precomputed_k_hop_masks:
+            # Stack per-timestep (N_all, N_all) reachability masks (dict keyed
+            # by timestep), restrict columns to context nodes ->
+            # (T, T_n, N_ctx), matching the neighbor table layout.
+            k_hop = torch.stack(
+                [
+                    mask.index_select(0, targets)
+                    for mask in self._precomputed_k_hop_masks.values()
+                ],
+                dim=0,
+            )
+            k_hop = k_hop.index_select(2, node_ids)
+            k_hop[time_index, target_index, positions.unsqueeze(0)] = True
+            self.context_khop_table = k_hop.contiguous()
+        else:
+            self.context_khop_table = None
 
     def _get_biomarker_variants(self) -> list[str]:
         """Get biomarker variant names present in the dataset.
@@ -716,13 +808,12 @@ class EpiDataset(Dataset):
         return len(self._index_map)
 
     def __getitem__(self, idx: int) -> EpiDatasetItem:
-        """Return a single target node over one time window.
+        """Return one ``(target_node, window_start)`` sample.
 
-        Each item is keyed by (target_node, window_start). The mobility slice is
-        converted to a PyG ego-graph per time step containing the target node
-        and its incoming neighbors.
+        Items carry only placement info and per-target series; dense mobility
+        context features are assembled batch-side from the prebuilt tables in
+        ``data/context_assembly.py``.
         """
-
         L = self.config.model.input_window_length
         H = self.config.model.forecast_horizon
 
@@ -744,75 +835,40 @@ class EpiDataset(Dataset):
         if forecast_targets > T:
             raise IndexError("Requested window exceeds available time steps")
 
-        # Get mobility history from preloaded tensor
-        mobility_history = self.preloaded_mobility[range_start:range_end, :, target_idx]
-        neigh_mask = self._get_clinical_neighbor_mask(
-            range_start=range_start,
-            range_end=range_end,
-            target_idx=target_idx,
-        )
-
         # Use pre-extracted run_id to avoid zarr access in workers
         run_id = self._run_id_value
 
-        # Clinical Series Processing - extract 3-channel history windows
-        # Each is (L, N, 3) with [value, mask, age] channels
-        hosp_history = self.precomputed_hosp_hist[range_start:range_end]  # (L, N, 3)
-        deaths_history = self.precomputed_deaths_hist[
-            range_start:range_end
-        ]  # (L, N, 3)
-        cases_history = self.precomputed_cases_hist[range_start:range_end]  # (L, N, 3)
-
-        if self.context_mask is not None:
-            # self.context_mask is a tensor
-            neigh_mask = neigh_mask & self.context_mask[None, :]
-
-        # Force target node to be included (always, regardless of context_mask)
-        neigh_mask[:, target_idx] = True
-
-        # Apply neighborhood mask to clinical histories
-        neigh_mask_t = neigh_mask.unsqueeze(-1).to(torch.float16)
-        hosp_history = hosp_history * neigh_mask_t
-        deaths_history = deaths_history * neigh_mask_t
-        cases_history = cases_history * neigh_mask_t
-
-        # Concatenate lagged risk features if available
-        # Lag features are value-only (no mask/age channels) for efficiency
+        # Clinical Series Processing - extract 3-channel history windows for
+        # the target node ([value, mask, age] channels)
+        hosp_hist = self.precomputed_hosp_hist[range_start:range_end, target_idx]
+        deaths_hist = self.precomputed_deaths_hist[range_start:range_end, target_idx]
+        cases_hist = self.precomputed_cases_hist[range_start:range_end, target_idx]
         if self.use_imported_risk and self.lagged_risk is not None:
-            # Slice lagged risk for the current window [range_start:range_end]
-            # (L, N, Lags) - value channels only, no mask/age
-            risk_slice = self.lagged_risk[range_start:range_end]
+            # Lag channels are value-only.
+            cases_hist = torch.cat(
+                [
+                    cases_hist,
+                    self.lagged_risk[range_start:range_end, target_idx],
+                ],
+                dim=-1,
+            )
+        # Biomarker node channels plus the target's availability flag derived
+        # from its data-start offset (-1 sentinel means no data)
+        range_end_idx = range_end - 1
+        target_data_start = int(self.biomarker_data_start[target_idx])
+        target_has_data = torch.tensor(
+            [target_data_start >= 0 and range_end_idx >= target_data_start],
+            dtype=torch.float16,
+        )
+        bio_node = torch.cat(
+            [
+                self.precomputed_biomarkers[range_start:range_end, target_idx],
+                target_has_data.expand(L, 1),
+            ],
+            dim=-1,
+        )
 
-            # Apply neighborhood mask (broadcasts to all lag channels)
-            risk_slice = risk_slice * neigh_mask_t
-
-            # Concat to cases history: (L, N, 3) + (L, N, Lags) -> (L, N, 3+Lags)
-            # Cases keep their 3 channels (value, mask, age); lags are value-only
-            cases_history = torch.cat([cases_history, risk_slice], dim=-1)
-
-        # Encode all regions in context using biomarker encoding
-        # Optimized: Use precomputed biomarkers + dynamic has_data based on data start offset
-
-        # 1. Get precomputed bio history (value, mask, age per variant)
-        # Note: self.precomputed_biomarkers is a CPU tensor
-        bio_slice = self.precomputed_biomarkers[range_start:range_end]
-
-        # 2. Get availability mask based on data start offset -> (N,)
-        # has_data = 1.0 if current time >= region's data start, else 0.0
-        # Use -1 sentinel for regions with no data
-        range_end_idx = range_end - 1  # Last index of history window
-        has_data = (range_end_idx >= self.biomarker_data_start).to(torch.float16)
-        # Regions with sentinel -1 never have data
-        has_data[self.biomarker_data_start < 0] = 0.0
-
-        # 3. Broadcast to (L, N, 1)
-        has_data_3d = has_data.view(1, self.num_nodes, 1).expand(L, -1, -1)
-
-        # 4. Concatenate -> (L, N, 4)
-        biomarker_history = torch.cat([bio_slice, has_data_3d], dim=-1)
-
-        # Extract joint inference targets (hospitalizations and wastewater in log1p per-100k)
-        # These are already precomputed in __init__
+        # Extract joint inference targets (log1p per-100k); precomputed in init
         ww_hist = self.precomputed_ww[range_start:range_end, target_idx]
         ww_hist_mask = self.precomputed_ww_mask[range_start:range_end, target_idx]
         hosp_target = self.precomputed_hosp[range_end:forecast_targets, target_idx]
@@ -833,6 +889,7 @@ class EpiDataset(Dataset):
         deaths_target_mask = self.precomputed_deaths_mask[
             range_end:forecast_targets, target_idx
         ]
+        # H+1 latent states start at the final history step; observed flows start after it.
         S_target = self._slice_latent_target(
             self.precomputed_S_target, range_end - 1, forecast_targets, target_idx
         )
@@ -857,101 +914,17 @@ class EpiDataset(Dataset):
             target_idx,
         )
 
-        assert mobility_history.shape == (L, self.num_nodes), (
-            f"Mob history shape mismatch: expected ({L}, {self.num_nodes}), got {mobility_history.shape}"
-        )
-        # Clinical series: always 3 channels (value, mask, age)
-        # Only cases_hist gets lag features concatenated
-        assert hosp_history.shape == (L, self.num_nodes, 3), (
-            f"Hosp history shape mismatch: expected ({L}, {self.num_nodes}, 3), "
-            f"got {hosp_history.shape}"
-        )
-        assert deaths_history.shape == (L, self.num_nodes, 3), (
-            f"Deaths history shape mismatch: expected ({L}, {self.num_nodes}, 3), "
-            f"got {deaths_history.shape}"
-        )
-        expected_cases_dim = 3 + (
-            len(self.mobility_lags) if self.use_imported_risk else 0
-        )
-        assert cases_history.shape == (L, self.num_nodes, expected_cases_dim), (
-            f"Cases history shape mismatch: expected ({L}, {self.num_nodes}, {expected_cases_dim}), "
-            f"got {cases_history.shape}"
-        )
-        expected_bio_dim = self.biomarkers_output_dim
-        assert biomarker_history.shape == (L, self.num_nodes, expected_bio_dim), (
-            "Biomarker history shape mismatch - expected (T, N, B)"
-        )
-
-        mob_x_list: list[torch.Tensor] = []
-
-        # Find local index of target node (constant across window)
-        # Use tensor to defer GPU->CPU sync until actually needed
+        # Local index of the target inside the graph context node set
         global_to_local = self._get_global_to_local_at_time(range_start)
         local_target_idx_tensor = global_to_local[target_idx]
-        # Extract Python int once for indexing operations inside the loop
-        local_target_idx = int(local_target_idx_tensor.item())
 
-        # Determine node IDs in the context mask
         if self._graph_node_ids is None:
             raise RuntimeError("Graph node ids not initialized")
-        node_ids = self._graph_node_ids
         mob_real_node_idx = (
             self._graph_region_indices
             if self._graph_region_indices is not None
-            else node_ids
+            else self._graph_node_ids
         )
-
-        for t in range(L):
-            global_t = range_start + t
-
-            # Build node features for this time step
-            hosp_t = hosp_history[t]  # (N, 3)
-            deaths_t = deaths_history[t]  # (N, 3)
-            cases_t = cases_history[t]  # (N, 3)
-            bio_t = biomarker_history[t]  # (N, B)
-
-            # Build feature tensor for all nodes in context
-            feat = []
-            if self.config.model.type.cases:
-                # Concatenate all clinical series: hosp + deaths + cases
-                feat.append(hosp_t[node_ids])
-                feat.append(deaths_t[node_ids])
-                feat.append(cases_t[node_ids])
-            if self.config.model.type.biomarkers:
-                feat.append(bio_t[node_ids])
-                ww_val = self.precomputed_ww[global_t, node_ids].unsqueeze(-1)
-                ww_msk = self.precomputed_ww_mask[global_t, node_ids].unsqueeze(-1)
-                feat.append(ww_val)
-                feat.append(ww_msk)
-            x = torch.cat(feat, dim=-1)  # (num_nodes, feat_dim)
-
-            # Apply k-hop feature masking based on target node
-            # Use precomputed masks to avoid expensive CPU matrix operations
-            if (
-                self.config.model.gnn_depth > 0
-                and global_t in self._precomputed_k_hop_masks
-            ):
-                # Get precomputed k-hop mask for this timestep (N, N) boolean
-                k_hop_mask_full = self._precomputed_k_hop_masks[global_t]
-                # Extract mask for target node: (N,) boolean
-                k_hop_mask = k_hop_mask_full[target_idx]
-
-                # Map global mask to local indices and ensure target is included
-                # NOTE: k_hop_mask excludes the target node (diagonal is False),
-                # so we need to ensure the target node is NOT masked
-                local_k_hop_mask = k_hop_mask[node_ids].clone()
-                local_k_hop_mask[local_target_idx] = True
-                # Zero out features for nodes outside k-hop (including target would be wrong)
-                # Using torch.where instead of boolean indexing for better GPU performance
-                x_masked = torch.where(
-                    local_k_hop_mask.unsqueeze(-1).expand_as(x), x, torch.zeros_like(x)
-                )
-            else:
-                # No masking (all nodes contribute) or no precomputed mask
-                x_masked = x
-
-            # --- OPTIMIZED BATCHING CHANGE ---
-            mob_x_list.append(x_masked)
 
         population = self.node_static_covariates["Pop"][target_idx]
 
@@ -974,12 +947,10 @@ class EpiDataset(Dataset):
             "target_node": target_idx,
             "target_region_index": target_region_index,
             "window_start": range_start,
-            "hosp_hist": hosp_history[:, target_idx, :],  # (L, 3)
-            "deaths_hist": deaths_history[:, target_idx, :],  # (L, 3)
-            "cases_hist": cases_history[:, target_idx, :],  # (L, 3)
-            "bio_node": biomarker_history[:, target_idx, :],
-            "mob_x": torch.stack(mob_x_list),  # (L, N_ctx, F)
-            "mob_t": torch.arange(range_start, range_start + L, dtype=torch.long),
+            "hosp_hist": hosp_hist,  # (L, 3)
+            "deaths_hist": deaths_hist,  # (L, 3)
+            "cases_hist": cases_hist,  # (L, 3)
+            "bio_node": bio_node,  # (L, B + 1)
             "mob_target_node_idx": local_target_idx_tensor,
             "mob_real_node_idx": mob_real_node_idx,
             "population": population,
@@ -1776,7 +1747,8 @@ class EpiDataset(Dataset):
             # Get adjacency for this timestep
             adjacency = self._get_adjacency_at_time(time_step)
 
-            # Compute k-hop reachability via matrix multiplication
+            # Rows receive from source columns; each boolean product adds one hop.
+            # O(T * depth * N^3), paid once at init.
             reach = adjacency.clone()
             if gnn_depth > 1:
                 adj_f = adjacency.to(torch.float32)

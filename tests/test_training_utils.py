@@ -212,8 +212,8 @@ def test_inject_gpu_mobility_cache_key_includes_adjacency_source() -> None:
 @pytest.mark.epiforecaster
 def test_optimized_collate_graphs_attaches_homogeneous_run_id() -> None:
     item = {
-        "mob_x": torch.ones(2, 2, 1, dtype=torch.float32),
-        "mob_t": torch.tensor([0, 1], dtype=torch.long),
+        "window_start": 3,
+        "temporal_covariates": torch.zeros(2, 0),
         "mob_target_node_idx": 0,
         "run_id": "synth_2",
     }

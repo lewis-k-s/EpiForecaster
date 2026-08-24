@@ -14,6 +14,7 @@ import torch
 from data.epi_dataset import EpiDataset
 from models.mobility_gnn import MobilityDenseEncoder
 from tests.dataset_test_helpers import (
+    context_features_for_item,
     make_epi_config,
     make_tiny_epi_dataset,
     write_zarr_dataset,
@@ -148,7 +149,7 @@ def _reconstruct_mob_graph(item, t: int, dataset):
     """Reconstruct mobility graph with dense adjacency.
 
     Args:
-        item: EpiDatasetItem with mob_x, mob_t, etc.
+        item: EpiDatasetItem (placement info; features come from tables)
         t: Time step index within the history window
         dataset: EpiDataset instance to get node_ids mapping
 
@@ -160,10 +161,10 @@ def _reconstruct_mob_graph(item, t: int, dataset):
             - target_node: Local index of target node
             - num_nodes: Number of nodes
     """
-    mob_x_t = item["mob_x"][t]  # (N_ctx, F)
+    mob_x_t = context_features_for_item(dataset, item)[t]  # (N_ctx, F)
 
     window_start = item.get("window_start", 0)
-    global_t = item["mob_t"][t] if "mob_t" in item else window_start + t
+    global_t = int(window_start) + t
     global_to_local = dataset._get_global_to_local_at_time(global_t)
 
     node_mask = global_to_local >= 0
@@ -257,16 +258,17 @@ def test_spatial_knn_depth_one_masks_to_direct_neighbors(tmp_path):
 
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
     item = dataset[0]
+    features = context_features_for_item(dataset, item)
     node_ids = dataset._graph_node_ids.tolist()
 
     assert node_ids == [0, 1]
     assert not torch.allclose(
-        item["mob_x"][0, node_ids.index(0)],
-        torch.zeros_like(item["mob_x"][0, 0]),
+        features[0, node_ids.index(0)],
+        torch.zeros_like(features[0, 0]),
     )
     assert not torch.allclose(
-        item["mob_x"][0, node_ids.index(1)],
-        torch.zeros_like(item["mob_x"][0, 1]),
+        features[0, node_ids.index(1)],
+        torch.zeros_like(features[0, 1]),
     )
 
 
@@ -285,12 +287,13 @@ def test_spatial_knn_depth_two_includes_second_hop_neighbors(tmp_path):
 
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
     item = dataset[0]
+    features = context_features_for_item(dataset, item)
     node_ids = dataset._graph_node_ids.tolist()
 
     assert node_ids == [0, 1, 2]
     assert not torch.allclose(
-        item["mob_x"][0, node_ids.index(2)],
-        torch.zeros_like(item["mob_x"][0, 2]),
+        features[0, node_ids.index(2)],
+        torch.zeros_like(features[0, 2]),
     )
 
 
@@ -332,17 +335,17 @@ def test_spatial_queen_depth_one_masks_to_queen_neighbors(tmp_path):
         graph_adjacency_source="spatial_queen",
         regions_data_path=geo_path,
     )
-
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
     item = dataset[0]
+    features = context_features_for_item(dataset, item)
     node_ids = dataset._graph_node_ids.tolist()
 
     assert node_ids == [0, 1, 2, 3]
     assert 4 not in node_ids
     for node_id in node_ids:
         assert not torch.allclose(
-            item["mob_x"][0, node_ids.index(node_id)],
-            torch.zeros_like(item["mob_x"][0, node_ids.index(node_id)]),
+            features[0, node_ids.index(node_id)],
+            torch.zeros_like(features[0, node_ids.index(node_id)]),
         )
 
     clinical_mask = dataset._get_clinical_neighbor_mask(

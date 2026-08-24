@@ -129,31 +129,32 @@ def _stack_optional_batch_tensor(
 
 def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     """
-    Optimized dense batch construction for dynamic mobility graphs.
+    Optimized dense batch container for dynamic mobility graphs.
 
-    Args:
-        batch: List of EpiDatasetItem (must contain mob_x, mob_t, mob_target_node_idx)
+    Items no longer carry per-sample ``mob_x``; dense features are assembled
+    batch-side on the target device from the dataset's prebuilt context tables
+    (see ``utils.training_utils.inject_context_features``). This collate only
+    builds placement tensors:
 
-    Returns:
-        A PyG Batch-like container with:
-        - x_dense: [B*T, N, F]
-        - global_t: [B*T]
-        - target_node: [B*T]
+    - global_t: [B*T] global time index per graph
+    - target_node: [B*T] local target position inside the context node set
     """
     B = len(batch)
     if B == 0:
         return Batch()
 
-    # Fixed-size dense contract per item: mob_x is (L, N, F)
-    L, num_nodes, _ = batch[0]["mob_x"].shape
+    # Fixed-size temporal contract per item: temporal_covariates is (L, cov)
+    L = int(batch[0]["temporal_covariates"].shape[0])
+    # Graph g=b*L+t; flatten times and repeat targets in sample-major order.
+    # Global time indices [B*L].
+    window_starts = torch.tensor(
+        [item["window_start"] for item in batch], dtype=torch.long
+    )
+    global_t_dense = (
+        window_starts.unsqueeze(-1) + torch.arange(L, dtype=torch.long).unsqueeze(0)
+    ).reshape(-1)
 
-    # 1) Dense node features [B*T, N, F]
-    x_dense = torch.cat([item["mob_x"] for item in batch], dim=0)
-
-    # 2) Global T indices [B*T]
-    global_t_dense = torch.cat([item["mob_t"] for item in batch], dim=0)
-
-    # 3) Target node index per graph [B*T]
+    # Local target positions [B*L] in the same order.
     target_nodes_stacked = torch.stack(
         [
             item["mob_target_node_idx"]
@@ -162,7 +163,7 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
             for item in batch
         ]
     ).long()
-    target_node_tensor = target_nodes_stacked.repeat_interleave(L).to(x_dense.device)
+    target_node_tensor = target_nodes_stacked.repeat_interleave(L)
 
     # Extract run_id provenance if the batch is homogeneous (expected with chunked samplers).
     run_ids = [item.get("run_id") for item in batch]
@@ -184,9 +185,8 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
                     f"same cached tensor for all samples; sample {item_idx} differs."
                 )
 
-    # 5) Batch-like container
+    # 3) Batch-like container
     mob_batch = Batch()
-    mob_batch.x_dense = x_dense
     mob_batch.global_t = global_t_dense
     mob_batch.target_node = target_node_tensor
     if mob_real_node_idx is not None:
@@ -263,9 +263,6 @@ def collate_epiforecaster_batch(
 
     # 2. Batch Temporal Graphs (Optimized Manual Batching)
     mob_batch = optimized_collate_graphs(batch)
-    if hasattr(mob_batch, "x_dense") and mob_batch.x_dense is not None:
-        mob_batch.x_dense = _replace_non_finite(mob_batch.x_dense)
-        mob_batch.x_dense = _promote_batch_float_tensor(mob_batch.x_dense)
 
     hosp_hist = _promote_batch_float_tensor(_replace_non_finite(hosp_hist))
     deaths_hist = _promote_batch_float_tensor(_replace_non_finite(deaths_hist))
@@ -302,11 +299,8 @@ def collate_epiforecaster_batch(
             _replace_non_finite(death_flow_targets)
         )
 
-    # Store B and T on the batch for downstream reshaping
-    T = batch[0]["mob_x"].shape[0] if B > 0 else 0
-    mob_batch.B = torch.tensor([B], dtype=torch.long)  # type: ignore[attr-defined]
-    mob_batch.T = torch.tensor([T], dtype=torch.long)  # type: ignore[attr-defined]
-
+    # (b, t) on EpiBatch are the single source for downstream reshaping.
+    T = int(temporal_covariates.shape[1]) if B > 0 else 0
     target_region_indices = [item["target_region_index"] for item in batch]
     if require_region_index and any(idx is None for idx in target_region_indices):
         raise ValueError(

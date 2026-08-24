@@ -7,6 +7,7 @@ from models.configs import EpiForecasterConfig, DataConfig, ModelConfig, ModelVa
 from data.epi_dataset import EpiDataset
 from data.epi_batch import collate_epiforecaster_batch
 from utils.precision_policy import MODEL_PARAM_DTYPE
+from tests.dataset_test_helpers import context_features_for_item
 
 
 class TestEpiDataset:
@@ -127,9 +128,7 @@ class TestEpiDataset:
         ):
             dataset[name] = (("date", "region_id"), tiny.copy())
 
-        with patch.object(
-            EpiDataset, "load_canonical_dataset", return_value=dataset
-        ):
+        with patch.object(EpiDataset, "load_canonical_dataset", return_value=dataset):
             epi_dataset = EpiDataset(
                 config=config,
                 target_nodes=[0, 1],
@@ -161,10 +160,11 @@ class TestEpiDataset:
             L = config.model.input_window_length
 
             assert item["hosp_hist"].shape == (L, 3)
-            assert item["mob_x"].shape[2] >= 9
-
-            assert "mob_t" in item
-            assert item["mob_t"].shape == (L,)
+            features = context_features_for_item(ds, item)
+            assert features.shape[0] == L
+            assert features.shape[2] >= 9
+            assert int(item["window_start"]) >= 0
+            assert ds.context_feature_ww is None
 
     def test_large_population_remains_finite_and_exact(
         self, config, mock_xarray_dataset
@@ -201,7 +201,8 @@ class TestEpiDataset:
             assert len(ds._precomputed_k_hop_masks) > 0
 
             item = ds[0]
-            assert item["mob_x"].shape[1] == ds.num_nodes
+            features = context_features_for_item(ds, item)
+            assert features.shape[1] == ds._graph_node_ids.numel()
 
     def test_invalid_window(self, config, mock_xarray_dataset):
         with patch.object(
@@ -244,7 +245,7 @@ class TestEpiDataset:
             assert torch.isfinite(item["cases_hist"][..., 0]).all()
             assert torch.isfinite(item["bio_node"][..., 0::4]).all()
             assert torch.isfinite(item["temporal_covariates"]).all()
-            assert torch.isfinite(item["mob_x"]).all()
+            assert torch.isfinite(context_features_for_item(ds, item)).all()
 
     def test_collate_sanitizes_non_finite_value_channels(
         self, config, mock_xarray_dataset
@@ -265,7 +266,9 @@ class TestEpiDataset:
             item_a["cases_hist"][0, 0] = float("-inf")
             item_a["bio_node"][0, 0] = float("nan")
             item_a["temporal_covariates"][0, 0] = float("nan")
-            item_a["mob_x"][0, 0, 0] = float("inf")
+
+            # Dense features are assembled lazily; dirty table values must be
+            ds.context_feature_clinical[0, 0, 0] = float("inf")
 
             batch = collate_epiforecaster_batch(
                 [item_a, item_b], require_region_index=False
@@ -276,6 +279,10 @@ class TestEpiDataset:
             assert torch.isfinite(batch.cases_hist).all()
             assert torch.isfinite(batch.bio_node).all()
             assert torch.isfinite(batch.temporal_covariates).all()
+
+            from utils.training_utils import inject_context_features
+
+            inject_context_features(batch, ds, torch.device("cpu"))
             assert torch.isfinite(batch.mob_batch.x_dense).all()
             assert batch.hosp_hist.dtype == MODEL_PARAM_DTYPE
             assert batch.deaths_hist.dtype == MODEL_PARAM_DTYPE
@@ -295,9 +302,7 @@ class TestEpiDataset:
             assert batch.deaths_target_mask.dtype == MODEL_PARAM_DTYPE
             assert batch.mob_batch.x_dense.dtype == MODEL_PARAM_DTYPE
 
-    def test_collate_reuses_shared_mob_real_node_idx(
-        self, config, mock_xarray_dataset
-    ):
+    def test_collate_reuses_shared_mob_real_node_idx(self, config, mock_xarray_dataset):
         with patch.object(
             EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
         ):

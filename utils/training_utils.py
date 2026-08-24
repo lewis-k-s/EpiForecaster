@@ -89,6 +89,38 @@ def should_log_step(
     return batch_step % accumulation_steps == 0
 
 
+def _resolve_base_dataset(
+    dataset: torch.utils.data.Dataset | None,
+    batch_run_id: str | int | None,
+) -> torch.utils.data.Dataset | None:
+    """Resolve the active sub-dataset behind optional ConcatDataset wrappers."""
+    base_ds = dataset
+    if (
+        base_ds is not None
+        and hasattr(base_ds, "datasets")
+        and hasattr(base_ds, "cumulative_sizes")
+    ):
+        base_ds = base_ds.datasets[0]
+        if batch_run_id is not None:
+            run_id = str(batch_run_id).strip()
+            if run_id:
+                if not hasattr(dataset, "_run_id_to_dataset_index"):
+                    run_id_to_dataset_index = {}
+                    for i, sub_dataset in enumerate(dataset.datasets):
+                        sub_run_id = getattr(sub_dataset, "run_id", None)
+                        if sub_run_id is None:
+                            continue
+                        sub_run_id = str(sub_run_id).strip()
+                        if sub_run_id and sub_run_id not in run_id_to_dataset_index:
+                            run_id_to_dataset_index[sub_run_id] = i
+                    dataset._run_id_to_dataset_index = run_id_to_dataset_index
+
+                dataset_index = dataset._run_id_to_dataset_index.get(run_id)
+                if dataset_index is not None:
+                    base_ds = dataset.datasets[dataset_index]
+    return base_ds
+
+
 def inject_gpu_mobility(
     batch_data: EpiBatch,
     dataset: torch.utils.data.Dataset,
@@ -109,30 +141,7 @@ def inject_gpu_mobility(
     if mob_batch is None or not hasattr(mob_batch, "global_t"):
         return
 
-    # Handle ConcatDataset wrappers safely: resolve the active sub-dataset
-    # from batch run_id provenance when available.
-    base_ds = dataset
-    if hasattr(dataset, "datasets") and hasattr(dataset, "cumulative_sizes"):
-        base_ds = dataset.datasets[0]
-
-        batch_run_id = getattr(mob_batch, "run_id", None)
-        if batch_run_id is not None:
-            run_id = str(batch_run_id).strip()
-            if run_id:
-                if not hasattr(dataset, "_run_id_to_dataset_index"):
-                    run_id_to_dataset_index = {}
-                    for i, sub_dataset in enumerate(dataset.datasets):
-                        sub_run_id = getattr(sub_dataset, "run_id", None)
-                        if sub_run_id is None:
-                            continue
-                        sub_run_id = str(sub_run_id).strip()
-                        if sub_run_id and sub_run_id not in run_id_to_dataset_index:
-                            run_id_to_dataset_index[sub_run_id] = i
-                    dataset._run_id_to_dataset_index = run_id_to_dataset_index
-
-                dataset_index = dataset._run_id_to_dataset_index.get(run_id)
-                if dataset_index is not None:
-                    base_ds = dataset.datasets[dataset_index]
+    base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
 
     config = getattr(base_ds, "config", None)
     adjacency_source = (
@@ -155,10 +164,14 @@ def inject_gpu_mobility(
     if not hasattr(base_ds, "_gpu_mobility_cache"):
         base_ds._gpu_mobility_cache = {}
 
+    # The cache below is built once per (device, dtype, adjacency source);
+    # only the gpu_mob[global_t] gather at the end runs per batch.
     cache_key = (device, MODEL_PARAM_DTYPE, adjacency_source)
     if cache_key not in base_ds._gpu_mobility_cache:
         node_ids = torch.where(base_ds._get_graph_node_mask())[0]
         if adjacency_source in STATIC_GRAPH_ADJACENCY_SOURCES:
+            # Static adjacency: one [N_ctx, N_ctx] matrix tiled across all
+            # timesteps; no OD transpose needed (time-invariant, symmetric use).
             sliced_mob = source_adjacency[node_ids.unsqueeze(-1), node_ids].to(
                 MODEL_PARAM_DTYPE
             )
@@ -215,6 +228,34 @@ def inject_gpu_mobility(
 
     # Reconstruct adj_dense inside the batch!
     mob_batch.adj_dense = gpu_mob[global_t_gpu]
+
+
+def inject_context_features(
+    batch_data: EpiBatch,
+    dataset: torch.utils.data.Dataset | None,
+    device: torch.device,
+) -> None:
+    """Assemble [S*L, N_ctx, F] features after collation on CUDA or CPU."""
+    from data.context_assembly import assemble_context_features
+
+    mob_batch = batch_data.mob_batch
+    if mob_batch is None or not hasattr(mob_batch, "global_t"):
+        return
+
+    base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
+    if base_ds is None or (
+        getattr(base_ds, "context_feature_ww", None) is None
+        and getattr(base_ds, "context_feature_clinical", None) is None
+    ):
+        return
+
+    assembly_device = device if device.type == "cuda" else torch.device("cpu")
+    mob_batch.x_dense = assemble_context_features(
+        base_ds,
+        batch_data.window_start,
+        mob_batch.target_node,
+        assembly_device,
+    )
 
 
 def ensure_mobility_adj_dense_ready(
