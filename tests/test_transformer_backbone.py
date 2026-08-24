@@ -1,10 +1,16 @@
 import pytest
 import torch
 from models.transformer_backbone import (
+    PositionalEncoding,
     TransformerBackbone,
     MultiHorizonForecaster,
     create_transformer_backbone,
 )
+
+
+def test_sinusoidal_positional_encoding_rejects_odd_width() -> None:
+    with pytest.raises(ValueError, match="d_model must be even"):
+        PositionalEncoding(d_model=7)
 
 
 class TestTransformerBackbone:

@@ -61,6 +61,10 @@ class PositionalEncoding(nn.Module):
             device: Target device for tensor placement
         """
         super().__init__()
+        if d_model % 2 != 0:
+            raise ValueError(
+                f"d_model must be even for sinusoidal PositionalEncoding; got {d_model}"
+            )
         self.device = device or torch.device("cpu")
         self.dropout = nn.Dropout(dropout)
 
@@ -77,7 +81,8 @@ class PositionalEncoding(nn.Module):
 
         pe[:, 0::2] = torch.sin(position * div_term)  # Even dimensions
         pe[:, 1::2] = torch.cos(position * div_term)  # Odd dimensions
-
+        # Buffer kept in the legacy [max_len, 1, d_model] layout for checkpoint
+        # state_dict compatibility; forward transposes back to [1, T, D].
         pe = pe.unsqueeze(0).transpose(0, 1)  # [max_len, 1, d_model]
         self.register_buffer("pe", pe)
         self.pe: torch.Tensor  # Type annotation for type checking
@@ -577,7 +582,7 @@ class TransformerBackbone(nn.Module):
 
         initial_states_logits = self.initial_states_projection(
             final_hidden
-        )  # [batch_size, 3]
+        )  # [batch_size, 4] — S0, I0, H0, R0 logits
 
         # Observation context: per-timestep features
         # Use all encoded positions, project each to obs_context_dim
