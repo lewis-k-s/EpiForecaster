@@ -9,6 +9,7 @@ from evaluation.pathway_metrics import (
     TorchLatentCoherenceAccumulator,
     TorchObservationLatentCoherenceAccumulator,
     TorchPathwayMetricAccumulator,
+    _TorchWindowSpearmanAccumulator,
 )
 from training.pathway_gradients import (
     compute_latent_parameter_gradient_metrics,
@@ -323,3 +324,126 @@ def test_latent_parameter_gradient_cosine_is_nan_for_starved_task() -> None:
     )
 
     assert torch.isnan(metrics["latentgrad_i_shared_grad_cosine_obs"])
+
+
+def _legacy_window_spearman_update(
+    *,
+    prediction: torch.Tensor,
+    reference: torch.Tensor,
+    valid: torch.Tensor,
+    running_sum: torch.Tensor,
+) -> tuple[int, int]:
+    """Run the pre-vectorization row loop as an exact test oracle."""
+    candidate_count = 0
+    eligible_count = 0
+    prediction_rows = prediction.float().reshape(-1, prediction.shape[-1])
+    reference_rows = reference.float().reshape(-1, reference.shape[-1])
+    valid_rows = valid.reshape(-1, valid.shape[-1])
+    for prediction_row, reference_row, valid_row in zip(
+        prediction_rows,
+        reference_rows,
+        valid_rows,
+        strict=True,
+    ):
+        if int(valid_row.sum().item()) < 2:
+            continue
+        candidate_count += 1
+        prediction_valid = prediction_row[valid_row]
+        reference_valid = reference_row[valid_row]
+
+        def average_tie_ranks(values: torch.Tensor) -> torch.Tensor:
+            sorted_values, order = torch.sort(values.float())
+            _unique, inverse, counts = torch.unique_consecutive(
+                sorted_values,
+                return_inverse=True,
+                return_counts=True,
+            )
+            starts = torch.cumsum(counts, dim=0) - counts
+            average = starts.float() + (counts.float() - 1.0) / 2.0
+            sorted_ranks = average[inverse]
+            ranks = torch.empty_like(sorted_ranks)
+            ranks[order] = sorted_ranks
+            return ranks
+
+        prediction_ranks = average_tie_ranks(prediction_valid)
+        reference_ranks = average_tie_ranks(reference_valid)
+        prediction_centered = prediction_ranks - prediction_ranks.mean()
+        reference_centered = reference_ranks - reference_ranks.mean()
+        denominator = torch.sqrt(
+            prediction_centered.square().sum() * reference_centered.square().sum()
+        )
+        if float(denominator.item()) <= 1.0e-12:
+            continue
+        running_sum += (prediction_centered * reference_centered).sum() / denominator
+        eligible_count += 1
+    return candidate_count, eligible_count
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param(torch.device("cpu"), id="cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            id="cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is unavailable",
+            ),
+        ),
+    ],
+)
+def test_window_spearman_matches_row_loop_bitwise(device: torch.device) -> None:
+    generator = torch.Generator().manual_seed(20260824)
+    accumulator = _TorchWindowSpearmanAccumulator(device=device)
+    legacy_sum = torch.tensor(0.0, device=device)
+    total_count = 0
+    candidate_count = 0
+    eligible_count = 0
+    for batch_index in range(8):
+        prediction = torch.randint(
+            -2,
+            5,
+            (32, 28),
+            generator=generator,
+        ).float()
+        reference = torch.randint(
+            -2,
+            5,
+            (32, 28),
+            generator=generator,
+        ).float()
+        valid = torch.rand((32, 28), generator=generator) > 0.35
+        if batch_index == 0:
+            valid[0] = False
+            valid[1, 0] = True
+            prediction[2] = 1.0
+        prediction = prediction.to(device)
+        reference = reference.to(device)
+        valid = valid.to(device)
+        batch_candidates, batch_eligible = _legacy_window_spearman_update(
+            prediction=prediction,
+            reference=reference,
+            valid=valid,
+            running_sum=legacy_sum,
+        )
+        accumulator.update(
+            prediction=prediction,
+            reference=reference,
+            valid=valid,
+        )
+        total_count += prediction.shape[0]
+        candidate_count += batch_candidates
+        eligible_count += batch_eligible
+
+    assert torch.equal(accumulator.sum, legacy_sum)
+    result = accumulator.finalize()
+    expected_mean = (
+        float((legacy_sum / eligible_count).item())
+        if eligible_count > 0
+        else float("nan")
+    )
+    assert result.mean == expected_mean
+    assert result.total_count == total_count
+    assert result.candidate_count == candidate_count
+    assert result.eligible_count == eligible_count

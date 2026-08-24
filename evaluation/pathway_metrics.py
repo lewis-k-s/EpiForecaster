@@ -24,20 +24,19 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
-def _average_tie_ranks(values: torch.Tensor) -> torch.Tensor:
-    """Return zero-based average ranks with exact tie handling."""
-    sorted_values, order = torch.sort(values.float())
-    _unique, inverse, counts = torch.unique_consecutive(
-        sorted_values,
-        return_inverse=True,
-        return_counts=True,
-    )
-    starts = torch.cumsum(counts, dim=0) - counts
-    average = starts.float() + (counts.float() - 1.0) / 2.0
-    sorted_ranks = average[inverse]
-    ranks = torch.empty_like(sorted_ranks)
-    ranks[order] = sorted_ranks
-    return ranks
+def _masked_average_tie_ranks(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    """Return masked ``(..., H)`` average ranks via an O(H²) pair grid."""
+    target_valid = valid.unsqueeze(-1)
+    comparator_valid = valid.unsqueeze(-2)
+    active_pairs = target_valid & comparator_valid
+    target = values.unsqueeze(-1)
+    comparator = values.unsqueeze(-2)
+    less_count = (active_pairs & (comparator < target)).sum(dim=-1)
+    tie_count = (active_pairs & (comparator == target)).sum(dim=-1)
+    return less_count.float() + (tie_count.float() - 1.0) / 2.0
 
 
 @dataclass
@@ -64,7 +63,7 @@ class TorchPathwayMetricAccumulator:
     def __init__(self, *, device: torch.device) -> None:
         self.device = device
         self.weight_sum = torch.tensor(0.0, device=device)
-        self.observed_count = 0
+        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
         self.abs_mechanistic_sum = torch.tensor(0.0, device=device)
         self.abs_residual_sum = torch.tensor(0.0, device=device)
         self.mechanistic_error_abs_sum = torch.tensor(0.0, device=device)
@@ -106,7 +105,7 @@ class TorchPathwayMetricAccumulator:
         targets_clean = _clean(targets)
 
         self.weight_sum += effective_weights.sum()
-        self.observed_count += int((effective_weights > 0).sum().item())
+        self.observed_count += (effective_weights > 0).sum()
         self.abs_mechanistic_sum += (mechanistic_clean.abs() * effective_weights).sum()
         self.abs_residual_sum += (residual_clean.abs() * effective_weights).sum()
         mechanistic_error = mechanistic_clean - targets_clean
@@ -118,14 +117,16 @@ class TorchPathwayMetricAccumulator:
         ).sum()
 
         active = effective_weights > 0
-        if active.any():
-            reconstruction_error = (
-                full_clean - mechanistic_clean - residual_clean
-            ).abs()
-            self.reconstruction_max_abs_error = torch.maximum(
-                self.reconstruction_max_abs_error,
-                reconstruction_error[active].max(),
-            )
+        reconstruction_error = (full_clean - mechanistic_clean - residual_clean).abs()
+        batch_reconstruction_max = torch.where(
+            active,
+            reconstruction_error,
+            self.reconstruction_max_abs_error,
+        ).max()
+        self.reconstruction_max_abs_error = torch.maximum(
+            self.reconstruction_max_abs_error,
+            batch_reconstruction_max,
+        )
 
         for name, value in (
             ("full", full_clean),
@@ -167,7 +168,7 @@ class TorchPathwayMetricAccumulator:
             variances[name] = float(variance.clamp_min(0.0).item())
 
         return PathwayMetricResult(
-            observed_count=self.observed_count,
+            observed_count=int(self.observed_count.item()),
             effective_count=effective_count,
             mean_abs_mechanistic=mean_abs_mechanistic,
             mean_abs_residual=mean_abs_residual,
@@ -252,32 +253,87 @@ class _TorchWindowSpearmanAccumulator:
             raise ValueError(
                 "Prediction, reference, and validity mask must have identical shapes."
             )
+        # Flatten all leading dimensions; rank each horizon row independently.
         prediction_rows = prediction.float().reshape(-1, prediction.shape[-1])
         reference_rows = reference.float().reshape(-1, reference.shape[-1])
-        valid_rows = valid.reshape(-1, valid.shape[-1])
+        valid_rows = valid.reshape(-1, valid.shape[-1]).bool()
+        valid_count = valid_rows.sum(dim=-1)
+        candidate = valid_count >= 2
+
+        row_count, horizon = prediction_rows.shape
+        # Sort invalid sentinel indices last, then gather compact valid rows.
+        column_index = torch.arange(
+            horizon,
+            device=prediction_rows.device,
+        ).expand(row_count, horizon)
+        compacted_index = (
+            torch.where(valid_rows, column_index, horizon)
+            .sort(dim=-1)
+            .values.clamp_max(horizon - 1)
+        )
+        compacted_valid = column_index < valid_count.unsqueeze(-1)
+        prediction_compact = prediction_rows.gather(dim=-1, index=compacted_index)
+        reference_compact = reference_rows.gather(dim=-1, index=compacted_index)
+        prediction_ranks = _masked_average_tie_ranks(
+            prediction_compact,
+            compacted_valid,
+        )
+        reference_ranks = _masked_average_tie_ranks(
+            reference_compact,
+            compacted_valid,
+        )
+
+        correlations = torch.zeros(
+            row_count,
+            device=prediction_rows.device,
+            dtype=prediction_rows.dtype,
+        )
+        eligible = torch.zeros(
+            row_count,
+            device=prediction_rows.device,
+            dtype=torch.bool,
+        )
+        window_sizes = [
+            int(window_size)
+            for window_size in valid_count.unique().detach().cpu().tolist()
+            if int(window_size) >= 2
+        ]
+        for window_size in window_sizes:
+            prediction_window = prediction_ranks[:, :window_size]
+            reference_window = reference_ranks[:, :window_size]
+            prediction_centered = prediction_window - prediction_window.mean(
+                dim=-1, keepdim=True
+            )
+            reference_centered = reference_window - reference_window.mean(
+                dim=-1, keepdim=True
+            )
+            denominator = torch.sqrt(
+                prediction_centered.square().sum(dim=-1)
+                * reference_centered.square().sum(dim=-1)
+            )
+            window_eligible = (valid_count == window_size) & (denominator > _EPSILON)
+            window_correlation = (prediction_centered * reference_centered).sum(
+                dim=-1
+            ) / denominator.clamp_min(_EPSILON)
+            correlations = torch.where(
+                window_eligible,
+                window_correlation,
+                correlations,
+            )
+            eligible |= window_eligible
+
         self.total_window_count += prediction_rows.shape[0]
-        for prediction_row, reference_row, valid_row in zip(
-            prediction_rows,
-            reference_rows,
-            valid_rows,
+        self.candidate_window_count += candidate.sum()
+        self.count += eligible.sum()
+        zero = torch.zeros((), device=correlations.device, dtype=correlations.dtype)
+        for correlation, row_eligible in zip(
+            correlations,
+            eligible,
             strict=True,
         ):
-            if int(valid_row.sum().item()) < 2:
-                continue
-            self.candidate_window_count += 1
-            prediction_valid = prediction_row[valid_row]
-            reference_valid = reference_row[valid_row]
-            prediction_ranks = _average_tie_ranks(prediction_valid)
-            reference_ranks = _average_tie_ranks(reference_valid)
-            prediction_centered = prediction_ranks - prediction_ranks.mean()
-            reference_centered = reference_ranks - reference_ranks.mean()
-            denominator = torch.sqrt(
-                prediction_centered.square().sum() * reference_centered.square().sum()
-            )
-            if float(denominator.item()) <= _EPSILON:
-                continue
-            self.sum += (prediction_centered * reference_centered).sum() / denominator
-            self.count += 1
+            # Preserve the legacy row-wise float32 addition order without
+            # synchronizing Python on each eligibility predicate.
+            self.sum += torch.where(row_eligible, correlation, zero)
 
     def finalize(self) -> WindowSpearmanMetricResult:
         total_count = int(self.total_window_count.item())

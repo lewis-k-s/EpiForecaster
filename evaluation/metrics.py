@@ -111,7 +111,7 @@ def standard_interval_half_width(
 
 
 class TorchMaskedMetricAccumulator:
-    """Accumulate masked regression metrics on-device and finalize once."""
+    """Accumulate masked metrics; per-horizon mode requires [B, H]."""
 
     def __init__(self, *, device: torch.device, horizon: int | None = None):
         self.device = device
@@ -121,7 +121,7 @@ class TorchMaskedMetricAccumulator:
         self.weight_sum = torch.tensor(0.0, device=device)
         self.target_weighted_sum = torch.tensor(0.0, device=device)
         self.target_weighted_sq_sum = torch.tensor(0.0, device=device)
-        self.observed_count = 0
+        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
         self.per_h_mae_sum = (
             torch.zeros(horizon, device=device) if horizon is not None else None
         )
@@ -179,19 +179,22 @@ class TorchMaskedMetricAccumulator:
 
         diff = pred - target
         abs_diff = diff.abs()
-        self.mae_sum += (abs_diff * mask).sum()
-        self.mse_sum += ((diff**2) * mask).sum()
-        self.weight_sum += mask.sum()
+        weighted_abs_error = abs_diff * mask
+        weighted_sq_error = (diff**2) * mask
+        mask_sum = mask.sum()
+        self.mae_sum += weighted_abs_error.sum()
+        self.mse_sum += weighted_sq_error.sum()
+        self.weight_sum += mask_sum
         self.target_weighted_sum += (target * mask).sum()
         self.target_weighted_sq_sum += ((target**2) * mask).sum()
-        self.observed_count += int((mask > 0).sum().item())
+        self.observed_count += (mask > 0).sum()
 
         if self.horizon is not None:
             assert self.per_h_mae_sum is not None
             assert self.per_h_mse_sum is not None
             assert self.per_h_count_sum is not None
-            self.per_h_mae_sum += (abs_diff * mask).sum(dim=0)
-            self.per_h_mse_sum += ((diff**2) * mask).sum(dim=0)
+            self.per_h_mae_sum += weighted_abs_error.sum(dim=0)
+            self.per_h_mse_sum += weighted_sq_error.sum(dim=0)
             self.per_h_count_sum += mask.sum(dim=0)
 
         return diff, abs_diff, mask
@@ -233,7 +236,7 @@ class TorchMaskedMetricAccumulator:
             mae=mae,
             rmse=rmse,
             r2=r2,
-            observed_count=int(self.observed_count),
+            observed_count=int(self.observed_count.item()),
             effective_count=float(self.weight_sum.item()),
             mae_per_h=mae_per_h,
             rmse_per_h=rmse_per_h,
@@ -293,7 +296,7 @@ class TorchDistributionMetricAccumulator:
         self.nll_weight_sum = torch.tensor(0.0, device=device)
         self.crps_sum = torch.tensor(0.0, device=device)
         self.crps_weight_sum = torch.tensor(0.0, device=device)
-        self.observed_count = 0
+        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
         self.per_h_nll_sum = (
             torch.zeros(horizon, device=device) if horizon is not None else None
         )
@@ -419,9 +422,12 @@ class TorchDistributionMetricAccumulator:
             posinf=_VALUE_CLAMP,
             neginf=-_VALUE_CLAMP,
         ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        self.nll_sum += (nll * mask).sum()
-        self.nll_weight_sum += mask.sum()
-        self.observed_count += int((mask > 0).sum().item())
+        weighted_nll = nll * mask
+        mask_sum = mask.sum()
+        mask_per_h = mask.sum(dim=0) if self.horizon is not None else None
+        self.nll_sum += weighted_nll.sum()
+        self.nll_weight_sum += mask_sum
+        self.observed_count += (mask > 0).sum()
 
         if self.distribution_family == "normal":
             crps = torch.nan_to_num(
@@ -430,21 +436,23 @@ class TorchDistributionMetricAccumulator:
                 posinf=_VALUE_CLAMP,
                 neginf=0.0,
             ).clamp(min=0.0, max=_VALUE_CLAMP)
-            self.crps_sum += (crps * mask).sum()
-            self.crps_weight_sum += mask.sum()
+            weighted_crps = crps * mask
+            self.crps_sum += weighted_crps.sum()
+            self.crps_weight_sum += mask_sum
         else:
             crps = torch.full_like(nll, float("nan"))
 
         if self.horizon is not None:
             assert self.per_h_nll_sum is not None
             assert self.per_h_nll_count is not None
-            self.per_h_nll_sum += (nll * mask).sum(dim=0)
-            self.per_h_nll_count += mask.sum(dim=0)
+            assert mask_per_h is not None
+            self.per_h_nll_sum += weighted_nll.sum(dim=0)
+            self.per_h_nll_count += mask_per_h
             if self.distribution_family == "normal":
                 assert self.per_h_crps_sum is not None
                 assert self.per_h_crps_count is not None
-                self.per_h_crps_sum += (crps * mask).sum(dim=0)
-                self.per_h_crps_count += mask.sum(dim=0)
+                self.per_h_crps_sum += weighted_crps.sum(dim=0)
+                self.per_h_crps_count += mask_per_h
 
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for level_name in self.level_names:
@@ -458,13 +466,16 @@ class TorchDistributionMetricAccumulator:
                 dtype=mask.dtype
             )
             width = (high - low).clamp_min(0.0)
-            self.coverage_sum[level_name] += (covered * mask).sum()
-            self.interval_width_sum[level_name] += (width * mask).sum()
-            self.interval_weight_sum[level_name] += mask.sum()
+            weighted_covered = covered * mask
+            weighted_width = width * mask
+            self.coverage_sum[level_name] += weighted_covered.sum()
+            self.interval_width_sum[level_name] += weighted_width.sum()
+            self.interval_weight_sum[level_name] += mask_sum
             if self.horizon is not None:
-                self.per_h_coverage_sum[level_name] += (covered * mask).sum(dim=0)
-                self.per_h_interval_width_sum[level_name] += (width * mask).sum(dim=0)
-                self.per_h_interval_count[level_name] += mask.sum(dim=0)
+                assert mask_per_h is not None
+                self.per_h_coverage_sum[level_name] += weighted_covered.sum(dim=0)
+                self.per_h_interval_width_sum[level_name] += weighted_width.sum(dim=0)
+                self.per_h_interval_count[level_name] += mask_per_h
 
         return ProbabilisticBatchMetrics(
             nll=nll,
@@ -530,7 +541,7 @@ class TorchDistributionMetricAccumulator:
                 numerator=self.crps_sum,
                 denominator=self.crps_weight_sum,
             ),
-            observed_count=int(self.observed_count),
+            observed_count=int(self.observed_count.item()),
             effective_count=float(self.nll_weight_sum.item()),
             nll_per_h=self._per_h_from_sums(
                 numerator=self.per_h_nll_sum,
