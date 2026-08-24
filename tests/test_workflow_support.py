@@ -28,7 +28,7 @@ from scripts.hpo.trial_artifacts import (
     trial_directory,
 )
 from scripts.workflow import run_config, run_support, tooling_identity
-from workflow.common import slurm_step
+from workflow.common import container_command, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
     load_training_dynamics_identity,
@@ -2548,6 +2548,102 @@ def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> N
 
     assert result.returncode == 7
     assert not (scratch / "epiforecaster" / run_root.name / "local_batch_0").exists()
+
+
+def test_run_scoped_dvc_push_uses_parent_workspace_bind(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    remote = tmp_path / "remote"
+    cache = tmp_path / "cache"
+    run_root.mkdir()
+    source_root.mkdir()
+    remote.mkdir()
+    cache.mkdir()
+
+    command = container_command(
+        ["python", "-m", "scripts.workflow.run_support", "retain-training-evidence"],
+        run_root=run_root,
+        source_root=source_root,
+        sif=str(tmp_path / "runtime.sif"),
+        dvc_remote=str(remote),
+        dvc_cache=str(cache),
+        dvc_mode="push",
+        promotion_root=str(run_root / "evidence"),
+    )
+
+    assert "--promotion-root" not in shlex.split(command)
+
+    global_promotion_command = container_command(
+        ["python", "-m", "scripts.workflow.run_support", "promote"],
+        run_root=run_root,
+        source_root=source_root,
+        sif=str(tmp_path / "runtime.sif"),
+        dvc_remote=str(remote),
+        dvc_cache=str(cache),
+        dvc_mode="push",
+        promotion_root=str(tmp_path / "promoted"),
+    )
+
+    global_parts = shlex.split(global_promotion_command)
+    promotion_index = global_parts.index("--promotion-root")
+    assert global_parts[promotion_index + 1] == str(tmp_path / "promoted")
+
+
+def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    remote = tmp_path / "remote"
+    cache = tmp_path / "cache"
+    fake_bin = tmp_path / "bin"
+    scratch = tmp_path / "scratch"
+    capture = tmp_path / "singularity-arguments.txt"
+    sif = tmp_path / "runtime.sif"
+    for directory in (run_root, source_root, remote, cache, fake_bin, scratch):
+        directory.mkdir()
+    sif.touch()
+
+    singularity = fake_bin / "singularity"
+    singularity.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE"\n')
+    singularity.chmod(0o755)
+    wrapper = REPO_ROOT / "scripts/workflow/mn5_container_exec.sh"
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "TMPDIR": str(scratch),
+        "CAPTURE": str(capture),
+    }
+
+    subprocess.run(
+        [
+            "bash",
+            str(wrapper),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(sif),
+            "--dvc-mode",
+            "push",
+            "--dvc-remote",
+            str(remote),
+            "--dvc-cache",
+            str(cache),
+            "--",
+            "scientific-command",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    binds = [
+        line
+        for line in capture.read_text().splitlines()
+        if line.startswith(f"{run_root}:")
+    ]
+    assert binds == [f"{run_root}:/workspace/run:rw"]
 
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:

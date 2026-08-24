@@ -85,10 +85,11 @@ def container_command(
                 dvc_cache,
             ]
         )
-        if dvc_mode == "push":
-            if promotion_root is None:
-                raise ValueError("DVC push requires a promotion root")
-            command.extend(["--promotion-root", promotion_root])
+        if dvc_mode == "push" and promotion_root is not None:
+            resolved_run_root = run_root.resolve()
+            resolved_promotion_root = Path(promotion_root).resolve()
+            if not resolved_promotion_root.is_relative_to(resolved_run_root):
+                command.extend(["--promotion-root", promotion_root])
     for input_path in input_paths:
         command.extend(["--input-path", str(input_path)])
     if stage_data:

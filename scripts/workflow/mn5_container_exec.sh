@@ -113,10 +113,8 @@ validate_arguments() {
       fi
       ;;
     push)
-      if [ -z "$DVC_REMOTE" ] \
-        || [ -z "$DVC_CACHE" ] \
-        || [ -z "$PROMOTION_ROOT" ]; then
-        echo "DVC push mode requires remote, cache, and promotion paths" >&2
+      if [ -z "$DVC_REMOTE" ] || [ -z "$DVC_CACHE" ]; then
+        echo "DVC push mode requires remote and cache paths" >&2
         return 2
       fi
       ;;
@@ -250,12 +248,11 @@ configure_shared_binds() {
     push)
       test -d "$DVC_REMOTE"
       test -d "$DVC_CACHE"
-      mkdir -p "$PROMOTION_ROOT"
-      BINDS+=(
-        "$DVC_REMOTE:$DVC_REMOTE:rw"
-        "$DVC_CACHE:$DVC_CACHE:rw"
-        "$PROMOTION_ROOT:$PROMOTION_ROOT:rw"
-      )
+      BINDS+=("$DVC_REMOTE:$DVC_REMOTE:rw" "$DVC_CACHE:$DVC_CACHE:rw")
+      if [ -n "$PROMOTION_ROOT" ]; then
+        mkdir -p "$PROMOTION_ROOT"
+        BINDS+=("$PROMOTION_ROOT:$PROMOTION_ROOT:rw")
+      fi
       ;;
   esac
 }
