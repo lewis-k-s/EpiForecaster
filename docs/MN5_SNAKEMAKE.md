@@ -1,18 +1,23 @@
 # MN5 workflow
 
-Snakemake is the production entry point for MN5 preprocessing, training,
-evaluation, cross-validation, HPO, ablation, and artifact promotion. Each workflow uses one
-preallocated ACC node. Snakemake runs as an allocation-internal lightweight
-coordinator and launches scientific work as one or more `srun` job steps.
+This document defines the project-specific immutable-run contract. For MN5
+endpoint selection, dependency preparation, allocation sizing, interactive use,
+and scheduler observation, load and follow the `mn5-cluster-usage` skill.
 
-The same immutable run supports two execution adapters: `run` requests a new
-batch allocation, while `run-interactive` attaches to a compatible active
+Snakemake is the production entry point for MN5 preprocessing, training,
+evaluation, cross-validation, HPO, ablation, and artifact promotion. Each
+workflow uses one ACC-node allocation. Snakemake runs as an
+allocation-internal lightweight coordinator and launches scientific work as
+one or more `srun` job steps.
+
+The same immutable run supports two execution adapters: `run` requests a batch
+allocation, while `run-interactive` attaches to a compatible active
 `acc_interactive` allocation through `srun --external-launcher`. Both adapters
 use the same snapshot-owned coordinator, DAG, containers, data contracts, logs,
 manifests, and scientific artifact rules.
 
-There are no nested `sbatch` submissions, no worker array, and no separate GPP
-coordinator allocation.
+The workflow does not use nested `sbatch` submissions, worker arrays, or a
+separate GPP coordinator allocation.
 
 ## Allocation contract
 
@@ -200,6 +205,17 @@ campaigns are expanded in memory; the workflow never generates per-run YAML file
 campaign with fold indices must declare an existing persisted split manifest, and
 undeclared resolved-config drift fails before a worker starts training.
 
+### Ablation allocation closeout
+
+An ablation config declares `closeout_signal_seconds`. The batch launcher
+requests `SIGUSR1` that many seconds before its wall time ends. On this signal,
+a worker stops claiming new identities, completes its active trial when
+possible, and records a durable `partial` receipt for remaining work. The
+parallel launcher then exits with a controlled incomplete status. Snakemake
+does not write `workers_complete.done` or run campaign analysis for that
+allocation. Submit the same immutable run again to continue its exact identity
+matrix; existing terminal trials are retained.
+
 Optuna values always minimize the validation-selection coordination value and
 record its actual metric name and value on the trial. They are not the campaign
 primary endpoint: the analyzer alone applies the campaign-declared held-out
@@ -246,17 +262,17 @@ bash scripts/workflow/mn5_workflow.sh run <run-id>
 bash scripts/workflow/mn5_workflow.sh status <run-id>
 ```
 
-To execute that same immutable run inside an existing allocation:
+Use `run-interactive` only after the cluster skill has selected a compatible
+active allocation:
 
 ```bash
 bash scripts/workflow/mn5_workflow.sh run-interactive \
   <run-id> <allocation-job-id>
 ```
 
-Omit the allocation ID only when exactly one compatible running
-`acc_interactive` allocation exists. The adapter verifies ownership, account,
-partition, QoS, nodes, tasks, CPUs, GPUs, and remaining wall time. It never
-calls `sbatch`.
+Omit the allocation ID only when exactly one compatible `acc_interactive`
+allocation is active. The adapter attaches the immutable workflow to that
+allocation and never calls `sbatch`.
 
 The selected public target is immutable after preparation. Choose `train` or
 `train_evaluate` in the template's `workflow.target` before `prepare`; `run`
