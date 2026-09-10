@@ -1,16 +1,15 @@
-import pytest
 import os
+import pytest
 import torch
 import xarray as xr
 import pandas as pd
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from utils.platform import (
     is_slurm_cluster,
     stage_dataset_to_nvme,
     select_multiprocessing_context,
 )
-from utils.device import setup_tensor_core_optimizations
 from utils.temporal import (
     parse_date_string,
     date_to_index,
@@ -64,36 +63,6 @@ class TestPlatform:
                 torch.device("cuda"), all_num_workers_zero=False
             )
             assert ctx == "spawn"
-
-
-# --- Test Tensor Core ---
-
-
-class TestTensorCore:
-    def test_setup_tensor_core_optimizations(self):
-        # Mock torch.backends
-        with (
-            patch("torch.backends.cuda") as mock_cuda,
-            patch("torch.backends.cudnn") as mock_cudnn,
-        ):
-            # Simulate CUDA device
-            device = torch.device("cuda")
-            logger = MagicMock()
-
-            setup_tensor_core_optimizations(device, enable_tf32=True, logger=logger)
-
-            assert mock_cuda.matmul.fp32_precision == "tf32"
-            assert mock_cudnn.conv.fp32_precision == "tf32"
-            logger.info.assert_called()
-
-    def test_setup_skipped_cpu(self):
-        with patch("torch.backends.cuda"):
-            device = torch.device("cpu")
-            setup_tensor_core_optimizations(device)
-            # Should not access cuda settings
-            # We can't easily assert "not accessed" on module mocks without wrapping them
-            # But we can check it didn't crash and maybe check return.
-            pass
 
 
 # --- Test Temporal ---

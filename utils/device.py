@@ -10,14 +10,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from data.epi_batch import EpiBatch
-
-PrecisionMode = Literal["tf32", "ieee"]
 
 
 @dataclass(frozen=True)
@@ -362,12 +360,11 @@ def setup_tensor_core_optimizations(
         _log(logger, "Tensor Core optimizations skipped (non-CUDA device)")
         return
 
-    # Use new PyTorch 2.9+ API for TF32 control
-    # See: https://docs.pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices
-    precision_mode: PrecisionMode = "tf32" if enable_tf32 else "ieee"
-
-    torch.backends.cuda.matmul.fp32_precision = precision_mode  # type: ignore[attr-defined]
-    torch.backends.cudnn.conv.fp32_precision = precision_mode  # type: ignore[attr-defined]
+    # PyTorch 2.9 Inductor reads the legacy matmul flag while compiling. Setting
+    # the new fp32_precision setting makes that read fail with a mixed-API error.
+    # Keep both CUDA backends on the legacy API until the locked runtime changes.
+    torch.backends.cuda.matmul.allow_tf32 = enable_tf32
+    torch.backends.cudnn.allow_tf32 = enable_tf32
 
     if enable_tf32:
         _log(logger, "TF32 optimizations enabled")
