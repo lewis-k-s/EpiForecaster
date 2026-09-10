@@ -231,29 +231,8 @@ def suggest_epiforecaster_params(
     overrides["training.weight_decay"] = trial.suggest_float(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
-    # NOTE: batch_size is NOT swept - fixed at base config value (32 works well).
-    # Previously we swept batch/grad_accum combos, but gradient_accumulation_steps
-    # is now hardcoded to 1 in the trainer and batch_size 32 has proven optimal.
-    # Leaving commented for reference:
-    # valid_batch_grad_combos: list[tuple[int, int]] = [
-    #     (8, 1),  # effective 8
-    #     (8, 2),  # effective 16
-    #     (8, 4),  # effective 32
-    #     (16, 1),  # effective 16
-    #     (16, 2),  # effective 32
-    #     (32, 1),  # effective 32
-    # ]
-    # combo = trial.suggest_categorical(
-    #     "training.batch_grad_combo",
-    #     _categorical_choices(valid_batch_grad_combos),
-    # )
-    # batch_size, grad_accum = _parse_batch_grad_combo(combo)
-    # overrides["training.batch_size"] = batch_size
-    # overrides["training.gradient_accumulation_steps"] = grad_accum
-    # # Early stopping affects compute/overfit tradeoff; keep it moderate.
-    # overrides["training.early_stopping_patience"] = trial.suggest_int(
-    #     "training.early_stopping_patience", 5, 20
-    # )
+    # NOTE: batch_size is NOT swept - fixed at base config value (32 works well);
+    # gradient_accumulation_steps is hardcoded to 1 in the trainer.
 
     # --- data knobs (high leverage; affect effective signal/noise) ---
 

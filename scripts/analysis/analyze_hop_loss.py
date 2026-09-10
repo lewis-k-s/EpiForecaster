@@ -1095,7 +1095,7 @@ def main() -> None:
 
     logger.info(f"Analysis complete! {len(plot_paths)} plots generated.")
 
-    # Save results if requested (legacy support)
+    # Save results if requested
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)

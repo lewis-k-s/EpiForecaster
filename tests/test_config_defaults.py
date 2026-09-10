@@ -31,7 +31,7 @@ def test_observation_heads_default_weekly_kernels_frozen() -> None:
 
 @pytest.mark.epiforecaster
 def test_observation_heads_default_clinical_simplex_kernels() -> None:
-    """Every clinical head retains its legacy simplex kernel by default."""
+    """Every clinical head uses a simplex kernel by default."""
     cfg = ObservationHeadConfig()
     assert cfg.learnable_kernel_hosp is False
     assert cfg.learnable_kernel_cases is True

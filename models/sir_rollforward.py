@@ -413,7 +413,7 @@ class SIRRollForward(nn.Module):
         dH_actual = (H_next - H_t) / self.dt if H_t is not None else None
 
         # Compute expected derivatives. When H/rate inputs are omitted, this
-        # reduces to the historical SIRD helper behavior.
+        # reduces to plain SIRD dynamics.
         beta_SI_over_N = beta_t * S_t * I_t / N
         recovery_flow = gamma_t * I_t
         direct_death_flow = mortality_t * I_t

@@ -906,9 +906,7 @@ class ModelConfig:
     input_window_length: int
     forecast_horizon: int
 
-    # DEPRECATED: Now uses full graphs with k-hop feature masking
-    # max_neighbors is kept for config compatibility but not used
-    # Neighborhood size is determined by gnn_depth
+    # Unused: kept for config compatibility; gnn_depth determines neighborhood size.
     max_neighbors: int
 
     # -- graph params --#
@@ -1056,7 +1054,7 @@ class TrainingParams:
     # Split strategy: "node" (default, region holdouts) or "time" (temporal splits)
     split_strategy: str = "node"
     # Node split strategy when split_strategy="node".
-    # - "random": seeded shuffle across valid regions (legacy behavior)
+    # - "random": seeded shuffle across valid regions
     # - "stratified": preserve population and wastewater-source representation
     # - "crossval": fold-based biomarker-aware held-out regions
     node_split_strategy: str = "random"

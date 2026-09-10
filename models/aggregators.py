@@ -292,7 +292,8 @@ class AttentionAggregator(MessagePassing):
             )
             attention_scores = attention_scores + edge_scores
 
-        # Apply softmax attention (per target node)
+        # Apply softmax attention: normalizes scores over each target node's
+        # incoming edges (dim 0) while independently retaining the head axis.
         attention_weights = softmax(
             attention_scores, edge_index_i, dim=0
         )  # [num_edges, num_heads]

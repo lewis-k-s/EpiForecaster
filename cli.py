@@ -318,7 +318,7 @@ cli.add_command(plot_cli, name="plot")
     type=click.Path(path_type=Path),
     default=None,
     help=(
-        "Optional legacy path for granular per-example error rows; "
+        "Optional path for granular per-example error rows; "
         "format is inferred from suffix."
     ),
 )

@@ -352,8 +352,8 @@ def indices_for_target_nodes_in_window(
     Compute dataset indices for given target nodes in a particular window.
 
     If a dataset is provided, look up indices using its window mapping (which
-    accounts for missingness filtering). Otherwise, fall back to the legacy
-    assumption that every node has every window.
+    accounts for missingness filtering). Otherwise, assume every node has
+    every window.
     """
     indices: list[int] = []
     if dataset is not None:
