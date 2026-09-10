@@ -1,6 +1,7 @@
 import logging
 
 import torch
+from einops import rearrange
 import torch.nn as nn
 
 from data.epi_batch import EpiBatch, mask_ablated_inputs
@@ -796,7 +797,7 @@ class EpiForecaster(nn.Module):
         T: int,
         target_nodes: torch.Tensor,
     ) -> torch.Tensor:
-        """Gather embeddings for target nodes from dense [G, N, D] node embeddings."""
+        """Gather [G, N, D] targets; G=B*T in sample-major collate order."""
         if node_emb.ndim != 3:
             raise ValueError(
                 f"Expected dense node embeddings [G, N, D], got shape {tuple(node_emb.shape)}"
@@ -814,6 +815,7 @@ class EpiForecaster(nn.Module):
             target_local = mob_batch.target_node.reshape(-1).to(
                 node_emb.device, dtype=torch.long
             )
+        # Fallback: recover per-graph targets by matching real node ids.
         elif (
             hasattr(mob_batch, "mob_real_node_idx")
             and mob_batch.mob_real_node_idx is not None
@@ -849,10 +851,10 @@ class EpiForecaster(nn.Module):
                     f"Max allowed: {max_local_idx}, Min found: {target_local.min().item()}, "
                     f"Max found: {target_local.max().item()}"
                 )
-
         graph_ids = torch.arange(num_graphs, device=node_emb.device)
+        # Paired indexing selects target_local[g] from graph g.
         target_embeddings = node_emb[graph_ids, target_local]
-        return target_embeddings.view(B, T, self.mobility_embedding_dim)
+        return rearrange(target_embeddings, "(b t) d -> b t d", b=B, t=T)
 
     def to(self, *args, **kwargs):
         """Override to update cached device/dtype when model is moved."""
