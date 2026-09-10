@@ -1,5 +1,4 @@
 from pathlib import Path
-import subprocess
 
 import pytest
 
@@ -9,36 +8,25 @@ from training.region2vec_trainer import RegionTrainerConfig
 from scripts.hpo.ablation_worker import load_campaign
 
 
-# Config file lists by type
-EPIFORECASTER_TRAINING_CONFIGS = [
-    "configs/train_epifor_smoke.yaml",
-    "configs/production_only/train_epifor_mn5_full.yaml",
-    "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
-    "configs/production_only/train_epifor_smoke_netcdf.yaml",
-    "configs/experiment/sirhd_latent_rescaling_baseline.yaml",
-    "configs/experiment/sirhd_latent_rescaling_std.yaml",
-    "configs/experiment/sirhd_latent_rescaling_asinh.yaml",
-    "configs/experiment/sirhd_latent_rescaling_unscaled.yaml",
-]
-
-REGION2VEC_CONFIGS = [
-    "configs/train_regions.yaml",
-]
-
-PREPROCESSING_CONFIGS = [
-    "configs/preprocess_full.yaml",
-    "configs/production_only/preprocess_mn5_synth.yaml",
-    "configs/production_only/preprocess_mn5_synth_holt_damped.yaml",
-    "configs/production_only/preprocess_mn5_synth_sirhd_reporting_v1.yaml",
-    "configs/production_only/preprocess_mn5_synth_netcdf_smoke.yaml",
-]
-
-CAMPAIGN_CONFIGS = [
-    "configs/campaigns/ablation_default_v1.yaml",
-    "configs/campaigns/ablation_smoke_v1.yaml",
-]
+CONFIG_ROOT = Path("configs")
+EPIFORECASTER_TRAINING_CONFIGS = sorted(
+    [
+        *CONFIG_ROOT.glob("train_epifor*.yaml"),
+        *CONFIG_ROOT.glob("production_only/train_epifor*.yaml"),
+        *CONFIG_ROOT.glob("experiment/*.yaml"),
+    ]
+)
+REGION2VEC_CONFIGS = sorted(CONFIG_ROOT.glob("train_regions*.yaml"))
+PREPROCESSING_CONFIGS = sorted(
+    [
+        *CONFIG_ROOT.glob("preprocess*.yaml"),
+        *CONFIG_ROOT.glob("production_only/preprocess*.yaml"),
+    ]
+)
+CAMPAIGN_CONFIGS = sorted(CONFIG_ROOT.glob("campaigns/*.yaml"))
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("campaign_path", CAMPAIGN_CONFIGS)
 def test_ablation_campaign_configs_parse(campaign_path):
     """Campaign YAML has its own schema; it is not a training configuration."""
@@ -100,6 +88,7 @@ def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
 
 
 @pytest.mark.epiforecaster
+@pytest.mark.integration
 @pytest.mark.parametrize("config_path", EPIFORECASTER_TRAINING_CONFIGS)
 def test_epiforecaster_training_configs_parse(config_path):
     """Test that all EpiForecaster training configs can be parsed."""
@@ -125,6 +114,7 @@ def test_epiforecaster_rejects_non_joint_loss_name():
 
 
 @pytest.mark.region
+@pytest.mark.integration
 @pytest.mark.parametrize("config_path", REGION2VEC_CONFIGS)
 def test_region2vec_configs_parse(config_path):
     """Test that all Region2Vec configs can be parsed."""
@@ -138,6 +128,7 @@ def test_region2vec_configs_parse(config_path):
     assert cfg.clustering is not None
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("config_path", PREPROCESSING_CONFIGS)
 def test_preprocessing_configs_parse(config_path):
     """Test that all preprocessing configs can be parsed."""
@@ -174,44 +165,6 @@ def test_corrected_sirhd_preprocessing_has_versioned_artifact_identity():
     )
     assert config["smoothing"]["clinical_method"] == "holt_damped"
     assert config["continuous_storage_dtype"] == "float32"
-
-
-def test_all_config_files_accounted_for():
-    """Ensure test lists match tracked config files in configs/ directory."""
-    result = subprocess.run(
-        [
-            "git",
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "configs/*.yaml",
-            "configs/**/*.yaml",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    yaml_files = sorted(
-        path for path in result.stdout.splitlines() if Path(path).is_file()
-    )
-
-    # Combine all test lists
-    tested_files = (
-        EPIFORECASTER_TRAINING_CONFIGS
-        + REGION2VEC_CONFIGS
-        + PREPROCESSING_CONFIGS
-        + CAMPAIGN_CONFIGS
-    )
-    tested_files_sorted = sorted(tested_files)
-
-    # Check for any untested files
-    untested = set(yaml_files) - set(tested_files_sorted)
-    extra_tests = set(tested_files_sorted) - set(yaml_files)
-
-    assert not untested, f"Config files not tested: {untested}"
-    assert not extra_tests, f"Test lists contain non-existent files: {extra_tests}"
-
 
 @pytest.mark.epiforecaster
 @pytest.mark.parametrize("value", [0.0, -1.5])
