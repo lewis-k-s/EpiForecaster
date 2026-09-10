@@ -204,6 +204,30 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
 
 
 @pytest.mark.epiforecaster
+def test_synthetic_processor_opens_zarr_directory_with_nc_suffix(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.nc"
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+    edar_ids = np.array(["e1"], dtype="U10")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=run_ids,
+        dates=dates,
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+
+    dataset = SyntheticProcessor(
+        _make_config(tmp_path, synthetic_path)
+    )._open_synthetic_data(str(synthetic_path))
+    try:
+        assert dataset.sizes["run_id"] == 1
+    finally:
+        dataset.close()
+
+
+@pytest.mark.epiforecaster
 def test_synthetic_processor_normalizes_continuous_death_flow(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     run_ids = np.array(["synth_a"], dtype="U50")

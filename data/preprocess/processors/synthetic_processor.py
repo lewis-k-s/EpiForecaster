@@ -215,7 +215,7 @@ class SyntheticProcessor:
         This method detects such conflicts, drops the conflicting variables,
         and re-loads them with corrected coordinates.
         """
-        is_netcdf = Path(resolved_path).suffix == ".nc"
+        is_netcdf = Path(resolved_path).is_file()
         chunks = {"run_id": self.config.run_id_chunk_size}
         try:
             if is_netcdf:
