@@ -32,11 +32,13 @@ RESERVATION_TOKEN=""
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [--dry-run]
+Usage: $(basename "$0") [--dry-run] [--job-id <running-allocation-id>]
 
 The dependency identity is derived from the pinned base image, uv.lock, and
 the fetch/build scripts. Dependencies are synchronized with
---frozen on $CONTAINER_NETWORK_HOST before an offline MN5 Slurm build starts.
+--frozen on $CONTAINER_NETWORK_HOST before an offline MN5 build starts.
+With --job-id, the build runs synchronously as an overlapping step in that
+existing allocation instead of submitting a new batch job.
 EOF
 }
 
@@ -181,6 +183,7 @@ remote_fetch_dependencies() {
   export UV_LOCK_SHA256="$4"
   export BUILD_ROOT="$5"
   export CONTAINER_ROOT="$6"
+  export UV_CACHE_ROOT="/scratch/tmp/${USER:-unknown}/epiforecaster-container-cache/$DEPENDENCY_KEY"
 
   bash "$fetch_script"
 }
@@ -230,6 +233,42 @@ remote_submit_build() {
   printf 'submitted:%s' "$job_id"
 }
 
+# Build synchronously inside one existing allocation supplied by the operator.
+remote_build_in_allocation() {
+  set -euo pipefail
+
+  local allocation_id="$1"
+  local request_root="$2"
+  local base_sif="$3"
+  local base_image_ref="$4"
+  local prefix_root="$5"
+  local dependency_key="$6"
+  local lock_sha256="$7"
+  local container_root="$8"
+  local sbatch_script="$9"
+  local state
+
+  [ -f "$request_root/deps.ready" ]
+  state="$(squeue -h -j "$allocation_id" -o '%T' 2>/dev/null | head -n 1)"
+  if [ "$state" != "RUNNING" ]; then
+    echo "Allocation $allocation_id is not running: ${state:-unknown}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$allocation_id" >"$request_root/allocation.id"
+  srun \
+    --jobid="$allocation_id" \
+    --overlap \
+    --nodes=1 \
+    --ntasks=1 \
+    --cpus-per-task=20 \
+    --gpus-per-task=1 \
+    --export="ALL,BASE_SIF=$base_sif,BASE_IMAGE_REF=$base_image_ref,PREFIX_ROOT=$prefix_root,DEPENDENCY_KEY=$dependency_key,UV_LOCK_SHA256=$lock_sha256,CONTAINER_ROOT=$container_root,BUILD_ROOT=$request_root" \
+    bash "$sbatch_script" \
+    >"$request_root/build-$allocation_id.out" \
+    2>"$request_root/build-$allocation_id.err"
+}
+
 # Best-effort EXIT cleanup for a token-owned preparation reservation.
 cleanup_reservation() {
   if [ "$RESERVATION_ACTIVE" -eq 1 ]; then
@@ -243,12 +282,26 @@ cleanup_reservation() {
 }
 
 dry_run=0
-if [ "${1:-}" = "--dry-run" ]; then
-  dry_run=1
-  shift
-fi
-if [ "$#" -ne 0 ]; then
-  usage >&2
+interactive_job_id=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --job-id)
+      interactive_job_id="${2:?--job-id requires an allocation ID}"
+      shift 2
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+if [ -n "$interactive_job_id" ] \
+  && [[ ! "$interactive_job_id" =~ ^[0-9]+$ ]]; then
+  echo "Invalid allocation ID: $interactive_job_id" >&2
   exit 2
 fi
 
@@ -282,6 +335,9 @@ if [ "$dry_run" -eq 1 ]; then
   echo "  network fetch host: $CONTAINER_NETWORK_HOST"
   echo "  request: $request_root"
   echo "  output: $final_sif"
+  if [ -n "$interactive_job_id" ]; then
+    echo "  existing allocation: $interactive_job_id"
+  fi
   exit 0
 fi
 
@@ -369,6 +425,47 @@ base_sif="$(
     "$request_root/base-sif.path"
 )"
 prefix_root="$request_root/prefix"
+if [ -n "$interactive_job_id" ]; then
+  remote_function_on \
+    "$COMPUTE_HOST" \
+    remote_build_in_allocation \
+    "$interactive_job_id" \
+    "$request_root" \
+    "$base_sif" \
+    "$REMOTE_CONTAINER_BASE_IMAGE_REF" \
+    "$prefix_root" \
+    "$dependency_key" \
+    "$lock_sha256" \
+    "$REMOTE_CONTAINER_ROOT" \
+    "$request_root/assemble_sif_on_mn5.sbatch"
+  remote_function_on \
+    "$COMPUTE_HOST" \
+    remote_cleanup_dispatch \
+    "$request_root" \
+    "$dispatch_token"
+  RESERVATION_ACTIVE=0
+  trap - EXIT
+
+  remote_state="$(
+    remote_function_on \
+      "$COMPUTE_HOST" \
+      remote_container_state \
+      "$final_sif" \
+      "$request_root" \
+      "$REMOTE_CONTAINER_ROOT" \
+      "$dependency_key"
+  )"
+  if [ "$remote_state" != "ready" ]; then
+    echo "Container build did not publish a verified SIF: $remote_state" >&2
+    exit 1
+  fi
+  echo "Built MN5 container in allocation $interactive_job_id"
+  echo "  dependency key: $dependency_key"
+  echo "  locked dependencies: $prefix_root"
+  echo "  SIF: $final_sif"
+  exit 0
+fi
+
 submission="$(
   remote_function_on \
     "$COMPUTE_HOST" \

@@ -160,19 +160,78 @@ verify_config() {
   fi
 }
 
+load_singularity() {
+  local profile_script candidate loaded=0
+
+  if ! command -v module >/dev/null 2>&1; then
+    set +u
+    for profile_script in \
+      /etc/profile.d/00-bsc.sh \
+      /etc/profile.d/01-module.sh \
+      /apps/modules/LMOD/8.7/lmod/8.7/init/profile; do
+      if [ -r "$profile_script" ]; then
+        # shellcheck disable=SC1090
+        source "$profile_script"
+      fi
+      if command -v module >/dev/null 2>&1; then
+        break
+      fi
+    done
+    set -u
+  fi
+
+  if command -v singularity >/dev/null 2>&1; then
+    return 0
+  fi
+
+  module load EB/apps >/dev/null 2>&1 || true
+  for candidate in \
+    "${SINGULARITY_MODULE:-singularity/4.1.5}" \
+    "Singularity/4.1.5" \
+    "SingularityCE/4.1.5"; do
+    if module load "$candidate" >/dev/null 2>&1; then
+      loaded=1
+      break
+    fi
+  done
+
+  if [ "$loaded" -ne 1 ]; then
+    echo "Unable to load Singularity 4.1.5 module" >&2
+    return 1
+  fi
+}
+
+container_exec() {
+  local working_directory="$1"
+  shift
+
+  load_singularity
+  singularity exec \
+    --cleanenv \
+    --containall \
+    --bind "$BUNDLE_ROOT:$BUNDLE_ROOT:rw" \
+    --env "PATH=/opt/epiforecaster/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    --env "PYTHONDONTWRITEBYTECODE=1" \
+    --env "PYTHONPATH=$ACTIVE_SOURCE_ROOT" \
+    --env "XDG_CACHE_HOME=$BUNDLE_ROOT/.cache" \
+    --env "TMPDIR=/tmp" \
+    --pwd "$working_directory" \
+    "$CONTAINER_SIF" \
+    "$@"
+}
+
 verify_source() {
   local observed
 
-  test -x "$TOOLING_PYTHON"
-  observed="$({
-    cd "$ACTIVE_SOURCE_ROOT"
-    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$ACTIVE_SOURCE_ROOT" \
-      "$TOOLING_PYTHON" \
+  observed="$(
+    container_exec \
+      "$ACTIVE_SOURCE_ROOT" \
+      /usr/local/bin/python \
       -m scripts.workflow.run_config verify \
-      --config "$CONFIG_PATH" \
-      --source-root "$ACTIVE_SOURCE_ROOT" \
-      --file-list "$SOURCE_FILE_LIST"
-  })"
+        --config "$CONFIG_PATH" \
+        --source-root "$ACTIVE_SOURCE_ROOT" \
+        --file-list "$SOURCE_FILE_LIST"
+  )"
   if [ "$observed" != "$SOURCE_SNAPSHOT_SHA256" ]; then
     echo "Source snapshot identity does not match dispatch request" >&2
     return 1
@@ -196,9 +255,9 @@ verify_container() {
 verify_tooling() {
   local installed_version
 
-  test -x "$TOOLING_PYTHON"
-  test -x "$SNAKEMAKE_BIN"
-  installed_version="$($SNAKEMAKE_BIN --version)"
+  installed_version="$(
+    container_exec "$ACTIVE_SOURCE_ROOT" "$SNAKEMAKE_BIN" --version
+  )"
   if [ "$installed_version" != "$SNAKEMAKE_VERSION" ]; then
     echo "Snakemake version mismatch: $installed_version" >&2
     return 1
@@ -321,12 +380,7 @@ require_published_run() {
 }
 
 run_snakemake() {
-  cd "$RUN_ROOT"
-  export PYTHONDONTWRITEBYTECODE=1
-  export PYTHONPATH="$SOURCE_ROOT"
-  export XDG_CACHE_HOME="$RUN_ROOT/.cache"
-
-  "$SNAKEMAKE_BIN" \
+  container_exec "$RUN_ROOT" "$SNAKEMAKE_BIN" \
     --snakefile "$SOURCE_ROOT/workflow/Snakefile" \
     --configfile "$RUN_ROOT/config.yaml" \
     --workflow-profile "$SOURCE_ROOT/workflow/profiles/mn5" \

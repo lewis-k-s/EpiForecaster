@@ -14,22 +14,14 @@ source "$CONF"
 
 COMPUTE_HOST="${COMPUTE_HOST:?COMPUTE_HOST must be configured}"
 TRANSFER_HOST="${TRANSFER_HOST:?TRANSFER_HOST must be configured}"
-CONTAINER_NETWORK_HOST="${CONTAINER_NETWORK_HOST:-wifi-acc}"
-CONTAINER_NETWORK_HOSTNAME="${CONTAINER_NETWORK_HOSTNAME:-}"
 REMOTE_WORKFLOW_RUN_ROOT="${REMOTE_WORKFLOW_RUN_ROOT:?REMOTE_WORKFLOW_RUN_ROOT must be configured}"
-REMOTE_WORKFLOW_TOOLING_ROOT="${REMOTE_WORKFLOW_TOOLING_ROOT:?REMOTE_WORKFLOW_TOOLING_ROOT must be configured}"
 REMOTE_CONTAINER_SIF="${REMOTE_CONTAINER_SIF:?REMOTE_CONTAINER_SIF must be configured}"
 DVC_REMOTE_PATH="${DVC_REMOTE_PATH:?DVC_REMOTE_PATH must be configured}"
 DVC_CACHE_PATH="${DVC_CACHE_PATH:?DVC_CACHE_PATH must be configured}"
 TEMPLATE="${WORKFLOW_CONFIG_TEMPLATE:-$REPO_ROOT/workflow/config/mn5_train.yaml}"
-VPN_HELPER="${WORKVPN_HELPER:-/Users/lewis/.codex/skills/workvpn/vpn}"
 SNAKEMAKE_EXPECTED_VERSION="9.23.1"
 TOOLING_KEY=""
-REMOTE_TOOLING_REQUEST=""
-REMOTE_TOOLING_ENV=""
-REMOTE_SNAKEMAKE_BIN=""
-REMOTE_TOOLING_RUNNER=""
-TOOLING_BOOTSTRAP="$REPO_ROOT/scripts/workflow/remote_tooling.sh"
+REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"
 
 # -----------------------------------------------------------------------------
 # Command-line help and validation
@@ -40,7 +32,6 @@ TOOLING_BOOTSTRAP="$REPO_ROOT/scripts/workflow/remote_tooling.sh"
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") tooling
   $(basename "$0") prepare [run-id] [--config TEMPLATE]
   $(basename "$0") dry-run <run-id>
   $(basename "$0") run <run-id>
@@ -100,16 +91,10 @@ remote_exec_on() {
   shift
   local remote_command=""
   local argument
-  local -a ssh_options=()
 
   if [ "$#" -eq 0 ]; then
     echo "remote_exec_on requires a remote executable" >&2
     return 2
-  fi
-
-  if [ "$host" = "$CONTAINER_NETWORK_HOST" ] \
-    && [ -n "$CONTAINER_NETWORK_HOSTNAME" ]; then
-    ssh_options+=(-o "HostName=$CONTAINER_NETWORK_HOSTNAME")
   fi
 
   for argument in "$@"; do
@@ -137,127 +122,31 @@ sha256_file() {
 }
 
 # -----------------------------------------------------------------------------
-# Locked Snakemake tooling
-# -----------------------------------------------------------------------------
-
-# Derive the content-addressed tooling paths once per dispatcher invocation.
-set_tooling_identity() {
-  if [ -n "$TOOLING_KEY" ]; then
-    return 0
-  fi
-
-  TOOLING_KEY="$(
-    PYTHONDONTWRITEBYTECODE=1 python3 \
-      -m scripts.workflow.tooling_identity \
-      --lock-file "$REPO_ROOT/uv.lock" \
-      --bootstrap "$TOOLING_BOOTSTRAP"
-  )"
-  REMOTE_TOOLING_REQUEST="$REMOTE_WORKFLOW_TOOLING_ROOT/requests/$TOOLING_KEY"
-  REMOTE_TOOLING_ENV="$REMOTE_WORKFLOW_TOOLING_ROOT/envs/$TOOLING_KEY"
-  REMOTE_SNAKEMAKE_BIN="$REMOTE_TOOLING_ENV/bin/snakemake"
-  REMOTE_TOOLING_RUNNER="$REMOTE_TOOLING_REQUEST/remote_tooling.sh"
-}
-
-# Report whether the transferred tooling request and installed environment agree.
-remote_tooling_state() {
-  remote_exec "$REMOTE_TOOLING_RUNNER" probe
-}
-
-# Copy the locked dependency context and its ordinary remote bootstrap script.
-# Scientific source remains separate in each immutable run bundle.
-sync_tooling_context() {
-  local tmp_base tmp_dir request_file tab
-
-  tab=$'\t'
-  remote_exec_on \
-    "$TRANSFER_HOST" \
-    mkdir -p \
-    "$REMOTE_TOOLING_REQUEST" \
-    "$REMOTE_WORKFLOW_TOOLING_ROOT/envs" \
-    "$REMOTE_WORKFLOW_TOOLING_ROOT/cache" \
-    "$REMOTE_WORKFLOW_TOOLING_ROOT/python"
-
-  tmp_base="${HUBDIR:-/Volumes/HUBSSD}/tmp/epiforecaster-tooling"
-  mkdir -p "$tmp_base"
-  tmp_dir="$(mktemp -d "$tmp_base/request.XXXXXX")"
-  request_file="$tmp_dir/request.tsv"
-  mkdir -p "$tmp_dir/context"
-  cp "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/uv.lock" "$tmp_dir/context/"
-  cp "$TOOLING_BOOTSTRAP" "$tmp_dir/remote_tooling.sh"
-
-  if [ -f "$REPO_ROOT/README.md" ]; then
-    cp "$REPO_ROOT/README.md" "$tmp_dir/context/"
-  fi
-
-  printf '%s\n' \
-    "tooling_key${tab}$TOOLING_KEY" \
-    "environment${tab}$REMOTE_TOOLING_ENV" \
-    "cache_root${tab}$REMOTE_WORKFLOW_TOOLING_ROOT/cache" \
-    "python_root${tab}$REMOTE_WORKFLOW_TOOLING_ROOT/python" \
-    "expected_version${tab}$SNAKEMAKE_EXPECTED_VERSION" \
-    "pyproject_sha256${tab}$(sha256_file "$REPO_ROOT/pyproject.toml")" \
-    "uv_lock_sha256${tab}$(sha256_file "$REPO_ROOT/uv.lock")" \
-    "bootstrap_sha256${tab}$(sha256_file "$TOOLING_BOOTSTRAP")" \
-    >"$request_file"
-
-  rsync -a "$tmp_dir/" "$TRANSFER_HOST:$REMOTE_TOOLING_REQUEST/"
-  rm -rf -- "$tmp_dir"
-}
-
-# Install and seal one content-addressed coordinator environment by executing
-# the transferred bootstrap on the network-enabled host.
-install_remote_tooling() {
-  remote_exec_on \
-    "$CONTAINER_NETWORK_HOST" \
-    "$REMOTE_TOOLING_RUNNER" \
-    install
-}
-
-# Ensure the exact locked coordinator environment exists before preparing or
-# operating a run. Ordinary scientific source changes do not rebuild it.
-ensure_tooling() {
-  local remote_state
-
-  set_tooling_identity
-  uv lock --check --project "$REPO_ROOT" >/dev/null
-  sync_tooling_context
-
-  remote_state="$(remote_tooling_state)"
-
-  if [ "$remote_state" = "ready" ]; then
-    echo "Locked Snakemake tooling is ready: $REMOTE_TOOLING_ENV"
-    return 0
-  fi
-
-  if [ -x "$VPN_HELPER" ]; then
-    "$VPN_HELPER" wait 60
-  fi
-
-  install_remote_tooling
-
-  remote_state="$(remote_tooling_state)"
-  if [ "$remote_state" != "ready" ]; then
-    echo "Remote tooling failed provenance verification: $REMOTE_TOOLING_ENV" >&2
-    return 1
-  fi
-
-  echo "Locked Snakemake tooling prepared: $REMOTE_TOOLING_ENV"
-}
-
-# -----------------------------------------------------------------------------
-# Immutable run preparation
+# Immutable coordinator runtime
 # -----------------------------------------------------------------------------
 
 # Resolve the configured discovery link to its immutable SIF artifact.
 resolve_remote_container() {
-  remote_exec "$REMOTE_TOOLING_RUNNER" resolve-container "$REMOTE_CONTAINER_SIF"
+  remote_exec readlink -f "$REMOTE_CONTAINER_SIF"
 }
 
 # Independently verify an immutable scientific runtime image and its checksum.
 verify_remote_container() {
   local resolved_sif="$1"
+  local recorded_name recorded_sha observed_sha sidecar
 
-  remote_exec "$REMOTE_TOOLING_RUNNER" verify-container "$resolved_sif"
+  sidecar="${resolved_sif}.sha256"
+  read -r recorded_sha recorded_name <<<"$(remote_exec cat "$sidecar")"
+  recorded_name="${recorded_name#\*}"
+  observed_sha="$(remote_exec sha256sum "$resolved_sif")"
+  observed_sha="${observed_sha%% *}"
+
+  if [ "$recorded_sha" != "$observed_sha" ] \
+    || [ "$recorded_name" != "$(basename "$resolved_sif")" ]; then
+    echo "Container failed immutable checksum verification: $resolved_sif" >&2
+    return 1
+  fi
+  TOOLING_KEY="sif-sha256:$observed_sha"
 }
 
 # Render the effective config, source snapshot, and byte inventory directly
@@ -325,7 +214,6 @@ prepare_run() {
   validate_run_id "$run_id"
   root="$(run_root "$run_id")"
 
-  ensure_tooling
   resolved_sif="$(resolve_remote_container)"
   verify_remote_container "$resolved_sif"
 
@@ -367,7 +255,7 @@ prepare_run() {
   echo "Prepared immutable MN5 workflow run"
   echo "  run_id: $run_id"
   echo "  run_root: $root"
-  echo "  tooling_key: $TOOLING_KEY"
+  echo "  coordinator_runtime: $TOOLING_KEY"
   echo "  container: $resolved_sif"
 }
 
@@ -514,12 +402,6 @@ main() {
   fi
 
   case "$command" in
-    tooling)
-      if [ "$#" -ne 0 ]; then
-        usage_error
-      fi
-      ensure_tooling
-      ;;
     prepare)
       prepare_command "$@"
       ;;

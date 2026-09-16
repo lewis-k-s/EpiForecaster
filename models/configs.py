@@ -129,6 +129,7 @@ class JointLossConfig:
     # target space; this setting controls how those parameters are scored.
     distribution_family: str = "normal"
     distribution_df: float = 5.0
+
     interval_levels: list[float] = field(default_factory=lambda: [0.5, 0.8, 0.95])
     # Observation loss weighting policy:
     # - "none": fixed equal-split weighting across active observation targets
@@ -216,6 +217,7 @@ class JointLossConfig:
                 "distribution_df must be > 2 for student_t intervals, "
                 f"got {self.distribution_df}"
             )
+
         if not self.interval_levels:
             raise ValueError("interval_levels must not be empty")
         for level in self.interval_levels:

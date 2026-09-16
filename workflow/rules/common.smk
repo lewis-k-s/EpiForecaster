@@ -69,6 +69,8 @@ rule stage_data:
             dvc_remote=DVC_REMOTE,
             dvc_cache=DVC_CACHE,
             dvc_mode="pull",
+            cpus=1,
+            host_step=True,
         )
     shell:
         "{params.command} > {log:q} 2>&1"

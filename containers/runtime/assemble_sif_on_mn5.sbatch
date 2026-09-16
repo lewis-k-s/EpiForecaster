@@ -147,6 +147,14 @@ install_runtime_launchers() {
       "$sandbox/usr/local/bin/$script_name"
     chmod 0755 "$sandbox/usr/local/bin/$script_name"
   done
+
+  # DVC 3.67.1 exposes a module entry point but may not install a `dvc`
+  # console script in a source-free uv environment.
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'exec /opt/epiforecaster/.venv/bin/python -m dvc "$@"' > \
+    "$sandbox/usr/local/bin/dvc"
+  chmod 0755 "$sandbox/usr/local/bin/dvc"
 }
 
 load_singularity
@@ -216,9 +224,10 @@ singularity exec --cleanenv "$scratch_sif" sh -c '
   test "$(command -v dvc)" = /usr/local/bin/dvc
 '
 singularity exec --cleanenv "$scratch_sif" python -c \
-  'import sys; assert sys.version_info[:2] == (3, 11); assert sys.prefix == "/opt/epiforecaster/.venv"; import dvc, geopandas, netCDF4, optuna, torch, torch_geometric, xarray, zarr; print("dependency imports: ok", sys.version, torch.__version__)'
+  'import sys; assert sys.version_info[:2] == (3, 11); assert sys.prefix == "/opt/epiforecaster/.venv"; import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
 singularity exec --cleanenv "$scratch_sif" git --version
 singularity exec --cleanenv "$scratch_sif" dvc --version
+singularity exec --cleanenv "$scratch_sif" snakemake --version
 singularity exec --cleanenv --nv "$scratch_sif" nvidia-smi -L
 singularity exec --cleanenv --nv "$scratch_sif" python -c \
   'import json, torch; assert torch.cuda.is_available(); print(json.dumps({"torch": torch.__version__, "cuda": torch.version.cuda, "device": torch.cuda.get_device_name(0)}))'
