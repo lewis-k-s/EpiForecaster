@@ -9,7 +9,7 @@ from training.region2vec_trainer import (
     Region2VecTrainer,
     RegionTrainerConfig,
 )
-from evaluation.region_losses import CommunityOrientedLoss
+from evaluation.region_losses import CommunityOrientedLoss, SpatialOnlyLoss
 
 
 class TestRegion2VecTrainer:
@@ -67,8 +67,11 @@ class TestRegion2VecTrainer:
 
             assert trainer.num_nodes == 10
             assert trainer.feature_dim == 4
+            assert trainer.config.data.use_mobility_flows is True
+            assert trainer.flow_source == "mobility"
             assert isinstance(trainer.optimizer, torch.optim.Adam)
             assert isinstance(trainer.primary_loss, CommunityOrientedLoss)
+            mock_ds.get_flow_matrix.assert_called_once_with()
             mock_model_cls.assert_called_once_with(
                 input_dim=4,
                 hidden_dim=16,
@@ -82,6 +85,38 @@ class TestRegion2VecTrainer:
                 residual=False,
                 normalize=True,
             )
+
+    def test_initialization_without_mobility_flows(self, trainer_config):
+        """The spatial-only mode must not load available mobility flows."""
+        trainer_config.data.use_mobility_flows = False
+        trainer_config.loss.loss_type = "spatial"
+        with (
+            patch("data.region_graph_dataset.RegionGraphDataset") as mock_dataset_cls,
+            patch("training.region2vec_trainer.Region2Vec") as mock_model_cls,
+            patch("training.region2vec_trainer.wandb"),
+        ):
+            mock_ds = MagicMock()
+            mock_ds.get_all_features.return_value = torch.randn(10, 4)
+            mock_ds.get_edge_index.return_value = torch.randint(0, 10, (2, 20))
+            mock_ds.get_region_ids.return_value = list(range(10))
+            mock_ds.flow_source = "mobility"
+            mock_dataset_cls.return_value = mock_ds
+
+            mock_model_instance = MagicMock()
+            mock_model_instance.parameters.return_value = [
+                torch.nn.Parameter(torch.randn(1))
+            ]
+            mock_model_instance.to.return_value = mock_model_instance
+            mock_model_cls.return_value = mock_model_instance
+
+            trainer = Region2VecTrainer(trainer_config)
+
+            mock_ds.get_flow_matrix.assert_not_called()
+            assert trainer.flow_matrix is None
+            assert trainer.flow_source == "disabled"
+            assert trainer.pair_sampler.flow_matrix is None
+            assert isinstance(trainer.primary_loss, SpatialOnlyLoss)
+            assert trainer.describe()["mobility_flows"] == "disabled"
 
     def test_encoder_config_validation(self):
         with pytest.raises(ValueError, match="encoder.activation"):

@@ -46,6 +46,9 @@ outputs/*
 !outputs/region_embeddings/
 outputs/region_embeddings/*
 !outputs/region_embeddings/region_embeddings.pt.dvc
+!outputs/region_embeddings_no_mobility/
+outputs/region_embeddings_no_mobility/*
+!outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc
 logs/
 test_outputs/
 test_output/

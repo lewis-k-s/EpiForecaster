@@ -14,6 +14,10 @@ Let the dataset describe $N$ regions. Each preprocessing run must emit:
 
 The `RegionGraphPreprocessor` already performs these steps: it loads GeoJSON, joins population CSV, assembles the six-feature vector, produces contiguity edges, averages mobility flows over the configured temporal window (falling back to adjacency-implied flows if mobility data are missing), and writes the Zarr group at `outputs/region_graph/region_graph.zarr`. This satisfies the data spec.
 
+Region training can ignore a stored mobility matrix by setting
+`data.use_mobility_flows: false`. This mode does not load `flows`, requires
+`loss.loss_type: spatial`, and learns from intrinsic features and contiguity only.
+
 ## Encoder (Region2Vec Backbone)
 We adopt a two-layer GCN over the normalized adjacency $\tilde{A}=A+I$ with $\tilde{D}_{ii}=\sum_j \tilde{A}_{ij}$:
 $$

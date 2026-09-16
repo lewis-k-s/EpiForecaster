@@ -690,8 +690,8 @@ class SpatialOnlyLoss(nn.Module):
                 neighbors[1:], distances[i][1:], strict=False
             ):  # Skip self
                 positive_pairs.append([i, j])
-                # Use inverse distance as weight (closer = stronger positive)
-                weight = 1.0 / (dist + 1e-8)
+                # Keep closer pairs more important without an unbounded weight.
+                weight = 1.0 / (1.0 + dist)
                 positive_weights.append(weight)
 
         if not positive_pairs:
@@ -762,15 +762,14 @@ class SpatialOnlyLoss(nn.Module):
         pos_similarities = F.cosine_similarity(pos_emb_i, pos_emb_j, dim=1)
         neg_similarities = F.cosine_similarity(neg_emb_i, neg_emb_j, dim=1)
 
-        # Apply temperature scaling
-        pos_similarities = pos_similarities / self.temperature
-        neg_similarities = neg_similarities / self.temperature
-
-        # Weighted positive loss (attraction)
-        pos_loss = -pos_similarities * positive_weights
+        # Weighted positive loss (attraction). The previous negative cosine
+        # term was unbounded below when combined with inverse-distance weights.
+        pos_loss = (1.0 - pos_similarities) * positive_weights / self.temperature
 
         # Weighted negative loss (repulsion with margin)
-        neg_loss = F.relu(neg_similarities + self.margin) * negative_weights
+        neg_loss = (
+            F.relu(neg_similarities + self.margin) * negative_weights / self.temperature
+        )
 
         # Combine losses
         total_loss = (pos_loss.mean() + neg_loss.mean()) * self.knn_positive_weight
