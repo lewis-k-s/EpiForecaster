@@ -19,6 +19,12 @@ write_completion() {
   local temporary="$receipt.$$"
 
   trap - EXIT
+  local cache_script="$RUN_ROOT/source/scripts/workflow/node_input_cache.sh"
+  if [ -f "$cache_script" ] && command -v srun >/dev/null 2>&1; then
+    srun --nodes=1 --ntasks=1 --cpus-per-task=1 --exact \
+      bash "$cache_script" clean "$RUN_ROOT" \
+      || echo "Warning: allocation input cache cleanup failed" >&2
+  fi
   if [ ! -f "$receipt" ]; then
     printf '%s\n' \
       $'schema_version\t1' \
@@ -101,4 +107,7 @@ export XDG_CACHE_HOME="$RUN_ROOT/.cache"
   --workflow-profile "$RUN_ROOT/source/workflow/profiles/mn5" \
   --directory "$RUN_ROOT" \
   --runtime-source-cache-path "$RUN_ROOT/.snakemake/source-cache" \
+  --cores "$((EXPECTED_TASKS * EXPECTED_CPUS_PER_TASK))" \
+  --jobs "$EXPECTED_TASKS" \
+  --resources "gpu=$EXPECTED_TASKS" \
   "$@"

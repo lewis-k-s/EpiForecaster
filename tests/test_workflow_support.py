@@ -861,7 +861,8 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     launcher = (REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh").read_text()
 
     assert profile["executor"] == "local"
-    assert profile["jobs"] == 1
+    assert profile["jobs"] == 4
+    assert profile["resources"]["gpu"] == 4
     assert profile["cores"] == 80
     assert not any(key.startswith("slurm-") for key in profile)
     allocation = workflow["resources"]["allocation"]
@@ -1612,7 +1613,7 @@ def test_snakefile_builds_expected_dag(tmp_path: Path) -> None:
     assert "--gpus-per-task=1" in result.stdout
     assert "training.run_final_evaluation=false" in result.stdout
     assert "complete_workflow" in result.stdout
-    assert re.search(r"^total\s+14$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+15$", result.stdout, re.MULTILINE)
 
 
 def test_single_training_dag_has_distinct_train_and_evaluate_entities(
@@ -1739,7 +1740,7 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert "ablation_manifest.json" in result.stdout
     assert "seed_coverage_report.csv" in result.stdout
     assert "--workers 4" in result.stdout
-    assert re.search(r"^total\s+8$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
 
 
 def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
@@ -1755,18 +1756,19 @@ def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "train_crossval_folds" in result.stdout
-    assert "evaluate_crossval_folds" in result.stdout
+    assert "train_crossval_fold" in result.stdout
+    assert "evaluate_crossval_fold" in result.stdout
     assert "finalize_crossval" in result.stdout
-    assert "--worker-group crossval-training" in result.stdout
-    assert "--worker-group crossval-evaluation" in result.stdout
-    assert "--workers 10" in result.stdout
-    assert (
-        "--fold '{worker_id}'" in result.stdout or "--fold {worker_id}" in result.stdout
-    )
+    assert "--worker-group crossval-training" not in result.stdout
+    assert "--workers 10" not in result.stdout
+    assert "--fold 000" in result.stdout
+    assert "--fold 009" in result.stdout
+    assert "fold_training_manifest.json" in result.stdout
+    assert "best_model.pt" in result.stdout
+    assert "gpu=1" in result.stdout
     assert "test_fold_metrics.csv" in result.stdout
     assert "test_aggregate_metrics.csv" in result.stdout
-    assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+28$", result.stdout, re.MULTILINE)
 
 
 def test_evaluation_only_dag_pins_checkpoint_inside_the_run(tmp_path: Path) -> None:
@@ -2554,6 +2556,7 @@ def test_external_launcher_coordinator_exports_validated_capacity(
         "#!/bin/bash\n"
         'printf "%s\\t%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_NTASKS" '
         '"$SLURM_CPUS_PER_TASK" >"$CAPTURE"\n'
+        'printf "%s\\n" "$@" >"$CAPTURE.args"\n'
     )
     snakemake.chmod(0o755)
     coordinator = REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
@@ -2580,6 +2583,10 @@ def test_external_launcher_coordinator_exports_validated_capacity(
     )
 
     assert capture.read_text() == "1\t2\t20\n"
+    arguments = Path(f"{capture}.args").read_text().splitlines()
+    assert arguments[arguments.index("--cores") + 1] == "40"
+    assert arguments[arguments.index("--jobs") + 1] == "2"
+    assert arguments[arguments.index("--resources") + 1] == "gpu=2"
     assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
     assert (attempt_root / "coordinator.step_id").read_text() == "7\n"
 

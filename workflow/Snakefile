@@ -205,13 +205,18 @@ elif WORKFLOW_KIND == "crossval":
         CROSSVAL_OUTPUT_DIR / f"{EVALUATION_SPLIT}_aggregate_metrics.csv"
     )
     CROSSVAL_MANIFEST = CROSSVAL_OUTPUT_DIR / "crossval_manifest.json"
-    CROSSVAL_TRAINING_COMPLETE = RUN_ROOT / ".state/crossval_training_complete.done"
+    CROSSVAL_FOLD_ROOT = CROSSVAL_OUTPUT_DIR / "fold-{fold}"
+    CROSSVAL_EVALUATION_ARTIFACTS = [
+        str(CROSSVAL_FOLD_ROOT / "outputs/evaluation" / Path(path).name)
+        for path in EVALUATION_ARTIFACTS
+    ]
     CROSSVAL_DONE = RUN_ROOT / ".state/crossval.done"
     DEFAULT_TERMINAL = CROSSVAL_MANIFEST
 elif WORKFLOW_KIND == "preprocess":
     PREPROCESSING_DATASET_NAME = preprocessing_dataset_name(config)
     PREPROCESSING_ROOT = RUN_ROOT / "outputs/preprocessing"
     PREPROCESSING_EFFECTIVE_CONFIG = PREPROCESSING_ROOT / "effective_config.yaml"
+    PREPROCESSING_DATASET = PREPROCESSING_ROOT / f"{PREPROCESSING_DATASET_NAME}.nc"
     PREPROCESSING_QA = PREPROCESSING_ROOT / "qa.json"
     PREPROCESSING_DONE = PREPROCESSING_ROOT / ".preprocessed.done"
     PREPROCESSING_POINTER = (
@@ -220,6 +225,27 @@ elif WORKFLOW_KIND == "preprocess":
     PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
     PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
     DEFAULT_TERMINAL = PREPROCESSING_RECEIPT
+
+
+def crossval_fold_command(stage, fold):
+    arguments = [
+        str(value).replace("{worker_id}", fold)
+        for value in crossval_worker_arguments(stage)
+    ]
+    return slurm_step(
+        container_command(
+            arguments,
+            run_root=RUN_ROOT,
+            source_root=SOURCE_ROOT,
+            sif=SIF,
+            dvc_remote=DVC_REMOTE,
+            dvc_cache=DVC_CACHE,
+            stage_data=True,
+            nv=True,
+            cpus=CPUS_PER_TASK,
+        ),
+        CPUS_PER_TASK,
+    )
 
 
 def dependency_command(stage):

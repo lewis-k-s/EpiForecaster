@@ -257,34 +257,16 @@ configure_shared_binds() {
   esac
 }
 
-# Overlay each materialized DVC root from rank-local scratch as read-only data.
+# Use one read-only copy per allocation, shared across ranks and stages.
 stage_dvc_inputs() {
-  local bind_roots_file dvc_workspace bind_root staged
-
   if [ "$STAGE_DATA" -ne 1 ]; then
     return 0
   fi
-
-  bind_roots_file="$RUN_ROOT/.state/dvc_bind_roots.txt"
-  dvc_workspace="$RUN_ROOT/.state/dvc-workspace"
-  test -f "$bind_roots_file"
-  test -d "$dvc_workspace"
-
-  while IFS= read -r bind_root; do
-    [ -n "$bind_root" ] || continue
-    if [ ! -d "$SOURCE_ROOT/$bind_root" ]; then
-      echo "DVC bind root is absent from source snapshot: $bind_root" >&2
-      return 1
-    fi
-
-    staged="$SCRATCH_ROOT/staged/$bind_root"
-    mkdir -p "$staged"
-    rsync -a "$SOURCE_ROOT/$bind_root/" "$staged/"
-    rsync -aL "$dvc_workspace/$bind_root/" "$staged/"
-    BINDS+=("$staged:/workspace/source/$bind_root:ro")
-  done <"$bind_roots_file"
-
-  echo "Staged DVC inputs at $SCRATCH_ROOT/staged"
+  test -f "$RUN_ROOT/.state/dvc_bind_roots.txt"
+  test -d "$RUN_ROOT/.state/dvc-workspace"
+  # shellcheck source=scripts/workflow/node_input_cache.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/node_input_cache.sh"
+  stage_shared_input_cache
 }
 
 # Construct the container invocation as an argument array without shell eval.
@@ -327,6 +309,18 @@ configure_singularity_arguments() {
 main() {
   parse_arguments "$@"
   validate_arguments
+  if [ "$STAGE_DATA" -eq 1 ] && [ "${EPIFORECASTER_INPUT_CACHE_LEASED:-}" != "$RUN_ROOT" ]; then
+    # Hold the lease in a parent process for the whole scientific step.
+    # shellcheck source=scripts/workflow/node_input_cache.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/node_input_cache.sh"
+    local cache_root
+    cache_root="$(node_cache_run_root "$RUN_ROOT")"
+    mkdir -p "$cache_root"
+    flock -s "$cache_root/.usage.lock" \
+      env "EPIFORECASTER_INPUT_CACHE_LEASED=$RUN_ROOT" \
+      bash "${BASH_SOURCE[0]}" "$@"
+    return $?
+  fi
   load_singularity
   create_scratch
   trap cleanup EXIT

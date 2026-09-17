@@ -103,36 +103,6 @@ def test_processed_dataset_qa_validates_destination_dated_flow() -> None:
     }
 
 
-def test_run_preprocessing_rejects_partial_output(tmp_path: Path) -> None:
-    source_root = tmp_path / "source"
-    source_config = source_root / "configs/production_only/preprocess.yaml"
-    source_config.parent.mkdir(parents=True)
-    source_config.write_text("dataset_name: synthetic_smoke\n")
-    run_root = tmp_path / "run"
-    output_root = run_root / "outputs/preprocessing"
-    output_root.mkdir(parents=True)
-    (output_root / "synthetic_smoke.nc").touch()
-    config = _preprocess_workflow()
-    config.update(
-        {
-            "run": {
-                "id": "run",
-                "root": str(run_root),
-                "source_root": str(source_root),
-            }
-        }
-    )
-    config_path = run_root / "config.yaml"
-    config_path.write_text(yaml.safe_dump(config))
-
-    try:
-        run_support.run_preprocessing(config_path, source_root, run_root)
-    except FileExistsError as error:
-        assert "not empty" in str(error)
-    else:
-        raise AssertionError("Partial preprocessing output was overwritten")
-
-
 def test_handoff_provenance_qa_retains_run_ids_and_seeds(tmp_path: Path) -> None:
     source_root = tmp_path / "source"
     handoff_path = source_root / "data/files/qa/handoff_manifest.json"

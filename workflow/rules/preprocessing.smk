@@ -7,6 +7,7 @@ if WORKFLOW_KIND == "preprocess":
             data=str(DATA_MANIFEST),
             dependencies=str(DEPENDENCY_CONTRACTS["preprocessing"]),
         output:
+            dataset=str(PREPROCESSING_DATASET),
             config=str(PREPROCESSING_EFFECTIVE_CONFIG),
             qa=str(PREPROCESSING_QA),
             marker=str(PREPROCESSING_DONE),
@@ -46,6 +47,7 @@ if WORKFLOW_KIND == "preprocess":
 
     rule publish_preprocessed:
         input:
+            dataset=str(PREPROCESSING_DATASET),
             marker=str(PREPROCESSING_DONE),
             qa=str(PREPROCESSING_QA),
         output:

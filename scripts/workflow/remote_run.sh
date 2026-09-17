@@ -386,6 +386,9 @@ run_snakemake() {
     --workflow-profile "$SOURCE_ROOT/workflow/profiles/mn5" \
     --directory "$RUN_ROOT" \
     --runtime-source-cache-path "$RUN_ROOT/.snakemake/source-cache" \
+    --cores "$((TASKS * CPUS_PER_TASK))" \
+    --jobs "$TASKS" \
+    --resources "gpu=$TASKS" \
     "$@"
 }
 

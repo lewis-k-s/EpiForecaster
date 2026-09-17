@@ -14,6 +14,8 @@ if WORKFLOW_KIND in {"train", "evaluate", "hpo"}:
             marker=str(EVALUATION_DONE),
         threads:
             CPUS_PER_TASK
+        resources:
+            gpu=1
         log:
             str(RUN_ROOT / "logs/evaluate_model.log")
         params:

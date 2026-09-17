@@ -24,6 +24,7 @@ from typing import Any
 
 import yaml
 
+from scripts.workflow.attempts import complete_attempt, new_attempt, restore_attempt
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
@@ -586,19 +587,30 @@ def train_crossval_fold(
         )
     fold_config = _crossval_fold_config(config, fold)
     fold_root = _crossval_fold_root(config, run_root, fold)
-    if fold_root.exists():
-        raise FileExistsError(f"Cross-validation fold already exists: {fold_root}")
-    fold_root.mkdir(parents=True)
+    attempts = run_root / ".state/attempts/crossval" / f"fold-{fold:03d}/training"
+    identity = {
+        "config_sha256": sha256_file(config_path),
+        "split_sha256": sha256_file(split_manifest),
+        "fold": fold,
+    }
+    fold_training_manifest = fold_root / "fold_training_manifest.json"
+    if restore_attempt(attempts, identity, run_root):
+        return fold_training_manifest
+    attempt = new_attempt(attempts)
+    attempt_config = attempt / "config.yaml"
+    write_yaml(attempt_config, fold_config)
+    train_model(attempt_config, source_root, attempt)
+    attempt_checkpoint, attempt_model_root = training_artifact_paths(
+        fold_config, attempt
+    )
+    attempt_training_manifest = attempt_model_root / "training_manifest.json"
+    training_record = json.loads(attempt_training_manifest.read_text())
     fold_config_path = fold_root / "config.yaml"
-    write_yaml(fold_config_path, fold_config)
-
-    train_model(fold_config_path, source_root, fold_root)
     checkpoint, model_root = training_artifact_paths(fold_config, fold_root)
     training_manifest = model_root / "training_manifest.json"
-    training_record = json.loads(training_manifest.read_text())
-    fold_training_manifest = fold_root / "fold_training_manifest.json"
+    attempt_manifest = attempt / "fold_training_manifest.json"
     write_json(
-        fold_training_manifest,
+        attempt_manifest,
         {
             "schema_version": 1,
             "campaign_id": str(options["campaign_id"]),
@@ -609,12 +621,23 @@ def train_crossval_fold(
             "split_manifest_sha256": sha256_file(split_manifest),
             "config": str(fold_config_path),
             "checkpoint": str(checkpoint),
-            "checkpoint_sha256": sha256_file(checkpoint),
+            "checkpoint_sha256": sha256_file(attempt_checkpoint),
             "training_manifest": str(training_manifest),
-            "training_manifest_sha256": sha256_file(training_manifest),
+            "training_manifest_sha256": sha256_file(attempt_training_manifest),
             "training_dynamics": training_record["training_dynamics"],
             "completed_at": datetime.now(UTC).isoformat(),
         },
+    )
+    complete_attempt(
+        attempt,
+        identity,
+        {
+            checkpoint: attempt_checkpoint,
+            training_manifest: attempt_training_manifest,
+            fold_config_path: attempt_config,
+            fold_training_manifest: attempt_manifest,
+        },
+        run_root,
     )
     return fold_training_manifest
 
@@ -658,14 +681,25 @@ def evaluate_crossval_fold(
             f"Cross-validation training manifest failed SHA-256: {training_manifest}"
         )
 
-    evaluation_manifest = evaluate_configured_model(
+    attempts = run_root / ".state/attempts/crossval" / f"fold-{fold:03d}/evaluation"
+    identity = {
+        "config_sha256": sha256_file(config_path),
+        "training_sha256": sha256_file(training_fold_manifest_path),
+        "fold": fold,
+    }
+    fold_manifest = fold_root / "fold_manifest.json"
+    if restore_attempt(attempts, identity, run_root):
+        return fold_manifest
+    attempt = new_attempt(attempts)
+    attempt_evaluation_manifest = evaluate_configured_model(
         fold_config_path,
-        fold_root,
+        attempt,
         checkpoint,
     )
-    fold_manifest = fold_root / "fold_manifest.json"
+    evaluation_manifest = fold_root / "outputs/evaluation/evaluation_manifest.json"
+    attempt_manifest = attempt / "fold_manifest.json"
     write_json(
-        fold_manifest,
+        attempt_manifest,
         {
             "schema_version": 1,
             "campaign_id": str(options["campaign_id"]),
@@ -680,10 +714,17 @@ def evaluate_crossval_fold(
             "training_fold_manifest": str(training_fold_manifest_path),
             "training_fold_manifest_sha256": sha256_file(training_fold_manifest_path),
             "evaluation_manifest": str(evaluation_manifest),
-            "evaluation_manifest_sha256": sha256_file(evaluation_manifest),
+            "evaluation_manifest_sha256": sha256_file(attempt_evaluation_manifest),
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
+    artifacts = {
+        fold_root / path.relative_to(attempt): path
+        for path in (attempt / "outputs/evaluation").rglob("*")
+        if path.is_file()
+    }
+    artifacts[fold_manifest] = attempt_manifest
+    complete_attempt(attempt, identity, artifacts, run_root)
     return fold_manifest
 
 
@@ -1150,32 +1191,36 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     source_config = source_root / Path(str(preprocessing["base_config"]))
     effective = _load_preprocessing_document(source_config, source_root)
     output_root = run_root / "outputs/preprocessing"
-    effective["output_path"] = str(output_root)
     effective_config = output_root / "effective_config.yaml"
     output_marker = output_root / ".preprocessed.done"
     qa_path = output_root / "qa.json"
-    if output_root.exists() and any(output_root.iterdir()):
-        existing = sorted(path.name for path in output_root.iterdir())
-        raise FileExistsError(
-            f"Preprocessing output root is not empty for this immutable run: {existing}"
-        )
-    write_yaml(effective_config, effective)
+    attempts = run_root / ".state/attempts/preprocessing"
+    identity = {"config_sha256": sha256_file(config_path), "effective": effective}
+    # Normalize YAML dates for the JSON receipt comparison on a later attempt.
+    identity = json.loads(json.dumps(identity, default=str))
+    if restore_attempt(attempts, identity, run_root):
+        return output_marker
+    attempt = new_attempt(attempts)
+    effective["output_path"] = str(attempt / "dataset")
+    attempt_config = attempt / "effective_config.yaml"
+    write_yaml(attempt_config, effective)
 
     from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
 
-    pipeline_config = PreprocessingConfig.from_file(effective_config)
-    dataset_path = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
+    pipeline_config = PreprocessingConfig.from_file(attempt_config)
+    attempt_dataset = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
         strict=True
     )
-    dataset_path.relative_to(output_root.resolve(strict=True))
-    if dataset_path.is_symlink() or not dataset_path.is_file():
+    attempt_dataset.relative_to(attempt.resolve(strict=True))
+    if attempt_dataset.is_symlink() or not attempt_dataset.is_file():
         raise ValueError(
-            f"Preprocessing output must be a regular NetCDF file: {dataset_path}"
+            f"Preprocessing output must be a regular NetCDF file: {attempt_dataset}"
         )
+    dataset_path = output_root / f"{preprocessing_dataset_name(config)}.nc"
 
     import xarray as xr
 
-    dataset = xr.open_dataset(dataset_path, engine="netcdf4")
+    dataset = xr.open_dataset(attempt_dataset, engine="netcdf4")
     try:
         qa_record = {
             "schema_version": 2,
@@ -1189,22 +1234,35 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
                 dataset,
             ),
             "effective_config": str(effective_config),
-            "effective_config_sha256": sha256_file(effective_config),
+            "effective_config_sha256": sha256_file(attempt_config),
             "source_config": str(source_config.relative_to(source_root)),
             "source_config_sha256": sha256_file(source_config),
             "completed_at": datetime.now(UTC).isoformat(),
         }
     finally:
         dataset.close()
-    write_json(qa_path, qa_record)
+    attempt_qa = attempt / "qa.json"
+    attempt_marker = attempt / ".preprocessed.done"
+    write_json(attempt_qa, qa_record)
     write_json(
-        output_marker,
+        attempt_marker,
         {
             "dataset": str(dataset_path),
-            "dataset_sha256": sha256_file(dataset_path),
+            "dataset_sha256": sha256_file(attempt_dataset),
             "qa": str(qa_path),
-            "qa_sha256": sha256_file(qa_path),
+            "qa_sha256": sha256_file(attempt_qa),
         },
+    )
+    complete_attempt(
+        attempt,
+        identity,
+        {
+            dataset_path: attempt_dataset,
+            effective_config: attempt_config,
+            qa_path: attempt_qa,
+            output_marker: attempt_marker,
+        },
+        run_root,
     )
     return output_marker
 

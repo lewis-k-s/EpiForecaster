@@ -12,6 +12,8 @@ if WORKFLOW_KIND == "train":
             marker=str(TRAINING_DONE),
         threads:
             CPUS_PER_TASK
+        resources:
+            gpu=1
         log:
             str(RUN_ROOT / "logs/train_model.log")
         params:

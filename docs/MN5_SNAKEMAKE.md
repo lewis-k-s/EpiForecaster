@@ -35,9 +35,10 @@ Templates use `acc_bscls`; `acc_debug` is also accepted when its wall-time
 limits fit the run. No `--mem` or `--mem-per-cpu` directive is permitted
 because MN5 derives host memory from the CPU allocation.
 
-Single training and evaluation use `N=1`. Cross-validation, HPO, and ablation
-use their configured fold or worker count, currently `N=4` in production
-templates. `N` must be between one and the four GPUs on the ACC node.
+Single training and evaluation use `N=1`. HPO and ablation use their configured
+worker count. Cross-validation uses up to `N` concurrent folds, with ten folds
+and four GPUs in the production template. `N` must be between one and four.
+The coordinator sets the Snakemake CPU, job, and GPU limits from the allocation.
 
 The batch shell owns the allocation and runs the lightweight Snakemake manager.
 A parallel worker rule launches:
@@ -49,10 +50,16 @@ srun --nodes=1 --ntasks=N --ntasks-per-node=N \
 ```
 
 Each rank receives one GPU and 20 CPUs. `SLURM_PROCID` becomes an explicit
-logical worker ID. Optuna workers coordinate through their GPFS journal;
-cross-validation ranks own deterministic fold directories. Workers do not
+logical worker ID. Optuna workers coordinate through their GPFS journal.
+Study workers do not
 communicate with Snakemake while running. If one rank fails, Slurm terminates
 the worker step and the batch job fails.
+
+Cross-validation uses separate training and evaluation rules for each fold.
+Each rule requests one GPU and 20 CPUs in one exact `srun` step. There are no
+fixed fold waves or campaign-wide training barrier: evaluation depends only on
+its own fold's checkpoint and manifests. The finalizer waits for every fold's
+declared evaluation files.
 
 After every HPO worker marker exists, separate DAG stages resolve
 `study.best_trial`, validate and copy its exact checkpoint, evaluate it, promote
@@ -138,11 +145,11 @@ data manifest. The public targets are:
 train:           prepare_run -> stage_data -> train_model
 evaluate:        prepare_run -> stage_data -> evaluate_model
 train_evaluate:  train_model -> evaluate_model
-hpo:             launch_optuna_workers -> select_best_trial
+hpo:             initialize_study -> launch_optuna_workers -> select_best_trial
                  -> evaluate_model -> promote_best_model
                  -> cleanup_losing_checkpoints
-ablation:        launch_ablation_workers -> finalize_ablation
-crossval:        train_crossval_folds -> evaluate_crossval_folds
+ablation:        initialize_study -> launch_ablation_workers -> finalize_ablation
+crossval:        train_crossval_fold[fold] -> evaluate_crossval_fold[fold]
                  -> finalize_crossval
 preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
@@ -153,7 +160,7 @@ for training, while the raw synthetic Zarr is a provenance-only DVC target.
 
 The corrected 20-run corpus uses
 `workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml`. The immutable
-run owns the processed Zarr, QA record, generated DVC pointer, and publication
+run owns the processed NetCDF, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
@@ -245,9 +252,29 @@ coverage, run-context, aggregate table, and artifact manifest. Completion
 markers remain receipts rather than the sole scientific output contract.
 
 `stage_data` materializes the pinned DVC payloads once in the run workspace.
-Each worker then copies those inputs into rank-specific node-local scratch and
-mounts them read-only over the immutable source tree. GPFS remains authoritative
-for the Optuna journal, logs, checkpoints, outputs, and promotion records.
+The first scientific step copies them to an allocation-local cache on the node.
+The key includes the run config and data manifest. A lock protects construction;
+only a complete copy is published. All ranks and later stages mount this copy
+read-only. Each process keeps a private temporary directory. Shared leases keep
+the cache alive during execution, and the coordinator removes it on exit when
+no step still uses it. An abrupt allocation loss can leave node-local files;
+a later allocation uses a different cache path. GPFS remains authoritative for
+the journal, logs, checkpoints, outputs, and promotion records.
+
+Study journals and worker receipts are durable state. Worker rules own only a
+completion output, so Snakemake failure cleanup and reruns cannot delete study
+progress. The initialization rule creates the journal before workers start.
+
+Preprocessing and cross-validation keep each attempt under `.state/attempts/`.
+Partial attempts remain available for inspection. A completed attempt has a
+receipt with the config identity and file hashes. On retry, the runtime checks
+those hashes and restores missing public outputs without repeating the work.
+Publication uses atomic hard links within the run filesystem, so large payloads
+do not require a second copy. Keep attempt directories for the lifetime of the
+run: they contain the training logs, dynamics, and recovery evidence. Incomplete
+training attempts restart from the configured initial state; completed folds
+are reused. Preprocessing declares `<dataset_name>.nc` as a DAG output, and
+publication depends on that file as well as its QA evidence.
 
 ## Prepare and submit
 
