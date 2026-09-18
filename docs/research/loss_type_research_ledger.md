@@ -169,3 +169,34 @@ with all 13 calibration/event tests. Ruff and whitespace checks passed.
 The protocol now names the replacement dataset and the March confirmation
 boundary from the dated role manifest. Dataset QA remains a required gate;
 no scientific loss comparison or improvement claim has been made.
+
+## 2026-09-18: replacement run queued and fixed screen renderer tested
+
+Prepared and dry-ran `loss-preprocess-20260918-r2` from source commit `69f7f88`.
+Interactive request `46081822` remained pending with no start estimate and no
+steps; it was cancelled unused. The authorized `acc_debug` fallback is job
+`46081958` (one GPU, 20 CPUs, 90 minutes). Latest scheduler state: pending for
+priority, with no node assigned. Continue this job; do not create a duplicate
+because it is queued. When it starts, attach through `mn5` to the observed node.
+
+`scripts/research/loss_screen.py` renders the 48 declared science identities.
+It parses every override through the canonical model config and checks that
+all non-treatment settings match. It refuses an unpinned replacement dataset.
+It prepares templates only; allocation, training, and evaluation remain with
+the immutable MN5 launcher. No screen has been submitted.
+
+`evaluation/research_comparison.py` checks exact forecast support and observed
+values before producing equal-head paired WIS and per-head diagnostics. It
+resamples disjoint target-date blocks that include all regions and heads.
+Before any new forecast scores have been obtained, pin a conservative minimum
+of four 28-day blocks for a screening uncertainty interval (2,000 draws, seed
+852). Shorter evidence is point evidence only and cannot pass promotion. The
+short selection period, and possibly confirmation, can therefore support a
+promising candidate but not a confirmed superiority claim. This helper does
+not replace final event or noninferiority gates.
+
+Validation: 1,315 tests passed, two skipped; Ruff passed. Pyright passed for all
+new research modules. After a pandas typing adjustment, all eight comparison
+tests passed again. No training has completed and no notable improvement has
+been obtained. Keep the goal active through preprocessing QA, acceptance, and
+paired training/evaluation within the declared budget.

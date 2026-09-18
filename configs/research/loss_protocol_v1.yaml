@@ -56,6 +56,13 @@ screen:
   mobility: [true, false]
   max_epochs: 50
   early_stopping_patience: 5
+uncertainty:
+  unit: all_regions_and_heads_in_disjoint_target_date_blocks
+  block_days: 28
+  minimum_blocks_for_screening_interval: 4
+  bootstrap_draws: 2000
+  bootstrap_seed: 852
+  insufficient_support: point_evidence_only_no_promotion
 events:
   definition: high_incidence_exceedance_research_proxy
   primary_head: cases
