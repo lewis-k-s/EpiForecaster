@@ -368,3 +368,15 @@ The scheduler accounting snapshot covers all allocated jobs in this campaign:
 393 GPU-seconds (0.1092 GPU-hours), including preprocessing and failed startup.
 No pending allocation time is counted. Evidence is in `compute_budget.json`
 and `scheduler_accounting_20260918.txt`; refresh after terminal runs.
+
+## 2026-09-18: first acceptance run submitted on debug fallback
+
+Interactive request `46084703` was still pending with no node, no active step,
+and no start estimate after about nine minutes. It was cancelled while still
+pending; its owning PTY exited. Submitted the existing immutable Normal NLL
+run `loss-acceptance-normal-nll-m1-f1-s52-r4` on `acc_debug` as job `46085156`
+(one GPU, 20 CPUs requested, 30-minute cap). The submission receipt is saved
+with its preparation and dry-run receipts. Continue this exact job. Attach
+through SSH only after a fresh scheduler check identifies its live node.
+The prepared Student-t CRPS run remains unsubmitted until this pipeline check
+passes. No forecast improvement has yet been measured.
