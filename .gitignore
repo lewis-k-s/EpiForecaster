@@ -54,6 +54,7 @@ outputs/loss_research/*
 !outputs/loss_research/loss-type-research-v1/
 outputs/loss_research/loss-type-research-v1/*
 !outputs/loss_research/loss-type-research-v1/raw_inputs.dvc
+!outputs/loss_research/loss-type-research-v1/real_loss_fit20200930_v1.nc.dvc
 logs/
 test_outputs/
 test_output/

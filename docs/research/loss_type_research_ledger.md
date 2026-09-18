@@ -308,3 +308,38 @@ checks bounds against quantiles and coverage against those bounds.
 Validation: 1,329 tests passed, two skipped; Ruff, research module type checks,
 and whitespace checks passed. R5 job `46083788` is still pending for priority.
 No new dataset or forecast improvement is available. Continue the same job.
+
+## 2026-09-18: approved dataset published and locally verified
+
+R5 job `46083788` completed successfully on `as01r1b15` in 4 minutes 53 seconds.
+The SSH jump through `mn5` succeeded while its allocation was active. DVC
+staging, preprocessing, publication, and completion steps all exited zero.
+The full logs, NetCDF dataset, effective config, QA, and publication receipt are
+synced under `outputs/loss_research/loss-type-research-v1/preprocessing/r5`.
+
+Published dataset `real_loss_fit20200930_v1.nc` has DVC MD5
+`b5b684d5b9f31369895589c413f39291` and SHA-256
+`b9e2b1424abb7f2b3294ab19939c8be7519f8643991530a9ffde52e28c9c1421`.
+The local dataset, QA, and effective-config hashes match the receipt. The local
+DVC pointer sits beside its payload in the research output root, and the
+protocol now pins its MD5. The previous dataset is unchanged.
+
+The dataset has 435 daily dates and 768 regions. The local role check verified
+the complete daily grid, 60-day history, 28-day horizon/gaps, and fitted
+preprocessing cutoff. Observed cells in fit/selection/calibration are:
+cases 21,402/9,686/11,760; hospitalizations 12,775/3,780/3,022;
+deaths 31,537/17,144/17,871; N1 wastewater 2,170/823/590.
+No observed cell in these checks is non-finite. Confirmation labels were not
+inspected. `local_support_qa.json` records the checks. Some municipality Kalman
+fits used configured fallback variances; preserve the warnings in the log.
+Full model sample eligibility remains an acceptance gate.
+
+Requested one one-GPU, 20-CPU, one-hour `acc_interactive` allocation as job
+`46084703` for the bounded acceptance matrix. No other user allocation was
+active at the request. Keep its local PTY alive. Do not submit a duplicate
+interactive request. There is still no trained comparison or measured forecast
+improvement.
+
+After pinning the published input, all 1,329 tests passed again (two skipped).
+Ruff, DVC status for the new pointer, and whitespace checks passed. The eight
+bounded acceptance templates were rendered under `acceptance/templates-v1`.

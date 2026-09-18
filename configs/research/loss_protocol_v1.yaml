@@ -34,7 +34,7 @@ execution:
 data:
   historical_dataset_dvc_md5: 1e695877f8565c40dcec4c214b0813b8.dir
   research_dataset_name: real_loss_fit20200930_v1
-  research_dataset_dvc_md5: null
+  research_dataset_dvc_md5: b5b684d5b9f31369895589c413f39291
   role_manifest: configs/research/loss_roles_v1.json
   region2vec_dvc_md5: e04ff23fe17dbbb245315798fd7cd887
   dataset_start: '2020-03-01'
@@ -45,7 +45,7 @@ data:
   prohibit_confirmation_labels_in_development: true
   require_disjoint_fit_selection_calibration_roles: true
   require_source_overlap_audit: true
-  scientific_gate: replacement_dataset_publication_and_support_QA_required
+  scientific_gate: dataset_QA_passed_bounded_model_acceptance_required
 acceptance:
   max_epochs: 2
   max_batches_per_epoch: 10
