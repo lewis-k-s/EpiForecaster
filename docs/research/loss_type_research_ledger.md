@@ -282,3 +282,11 @@ happens to exist. This turns the observed cluster failure into a local check.
 Full validation: 1,320 tests passed, two skipped; Ruff and whitespace checks
 passed. Prepare the corrected input layout as R5, preserving all prior runs.
 The goal remains active and no forecast comparison has been made.
+
+R5 was prepared and dry-ran from `02947ae`, then submitted as `acc_debug` job
+`46083788` with one GPU, 20 CPUs, and a 90-minute cap. Local receipts are in
+`outputs/loss_research/loss-type-research-v1/preprocessing/r5`. Continue this
+job; do not resubmit while it is pending or running. Use a fresh scheduler
+check before attaching to its assigned node. The task-specific SSH host-key
+file is `/private/tmp/epiforecaster-loss-known-hosts`; accept only new keys and
+keep existing-key verification enabled. No science comparison has started.
