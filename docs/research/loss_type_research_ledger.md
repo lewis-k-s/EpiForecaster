@@ -290,3 +290,21 @@ job; do not resubmit while it is pending or running. Use a fresh scheduler
 check before attaching to its assigned node. The task-specific SSH host-key
 file is `/private/tmp/epiforecaster-loss-known-hosts`; accept only new keys and
 keep existing-key verification enabled. No science comparison has started.
+
+## 2026-09-18: verified artifact reader and calibrated interval consistency
+
+The research artifact reader now requires a checkpoint SHA-256 from a separate
+training receipt or direct checkpoint hash. It checks completion, the protected
+role contract, required inventory entries, file hashes, calibration identity,
+and the selection-only C0/C1/C2 tables before analysis. It does not refit
+calibration or read confirmation labels. Tests reject incomplete, changed,
+misidentified, duplicate, and unsafe artifact paths.
+
+An export audit found that calibrated rows retained raw interval bounds while
+coverage, widths, and quantiles used the calibrated scale. The export now sets
+interval and point-error columns from the same control. A regression test
+checks bounds against quantiles and coverage against those bounds.
+
+Validation: 1,329 tests passed, two skipped; Ruff, research module type checks,
+and whitespace checks passed. R5 job `46083788` is still pending for priority.
+No new dataset or forecast improvement is available. Continue the same job.

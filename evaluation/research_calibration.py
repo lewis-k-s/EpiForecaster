@@ -209,6 +209,9 @@ def score_research_calibrators(
             scored["pit"] = distribution.cdf(residual)
             scored["nll"] = -distribution.logpdf(residual) + np.log(scale.numpy())
             scored["absolute_error"] = np.abs((y - loc).numpy())
+            scored["prediction"] = loc.numpy()
+            scored["abs_error"] = scored.absolute_error
+            scored["sq_error"] = (y - loc).numpy() ** 2
             scored["target_units"] = (
                 "log1p_concentration" if target == "wastewater" else "log1p_per_100k"
             )
@@ -237,6 +240,8 @@ def score_research_calibrators(
                 half_width = scale.numpy() * float(
                     distribution.ppf((1 + level / 100) / 2)
                 )
+                scored[f"interval_low_{level}"] = loc.numpy() - half_width
+                scored[f"interval_high_{level}"] = loc.numpy() + half_width
                 scored[f"covered_{level}"] = scored.absolute_error <= half_width
                 scored[f"width_{level}"] = 2 * half_width
                 metrics[f"coverage_{level}"] = float(scored[f"covered_{level}"].mean())

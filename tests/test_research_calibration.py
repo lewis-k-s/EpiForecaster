@@ -47,6 +47,8 @@ def calibration():
 def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
     calibration, manifest
 ):
+    calibration["interval_low_95"] = -999.0
+    calibration["interval_high_95"] = 999.0
     artifact = fit_research_calibrators(
         calibration, manifest, checkpoint_sha256="a" * 64
     )
@@ -72,6 +74,15 @@ def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
     assert len(quantile_columns) == 23
     assert (np.diff(rows[quantile_columns].to_numpy(), axis=1) > 0).all()
     assert np.allclose(rows.quantile_500, rows.distribution_loc)
+    assert np.allclose(rows.interval_low_95, rows.quantile_025)
+    assert np.allclose(rows.interval_high_95, rows.quantile_975)
+    assert np.allclose(rows.width_95, rows.interval_high_95 - rows.interval_low_95)
+    assert np.array_equal(
+        rows.covered_95,
+        rows.observed.between(rows.interval_low_95, rows.interval_high_95),
+    )
+    assert np.allclose(rows.prediction, rows.quantile_500)
+    assert np.allclose(rows.abs_error, rows.absolute_error)
     assert rows.forecast_origin_date.eq("2020-10-28").all()
     assert (
         rows.loc[rows.target.eq("wastewater"), "target_units"]
