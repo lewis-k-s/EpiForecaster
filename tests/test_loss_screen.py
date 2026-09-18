@@ -79,6 +79,7 @@ def test_acceptance_covers_family_loss_and_mobility_without_science_budget(proto
         assert values["training.epochs"] == "2"
         assert values["training.early_stopping_patience"] == "1"
         assert values["training.compile"] == "false"
+        assert values["training.compile_backward"] == "false"
         assert values["training.crossval_fold_index"] == "1"
         assert values["training.seed"] == "52"
         assert template["resources"]["allocation"]["runtime"] == 30

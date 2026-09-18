@@ -151,8 +151,11 @@ def acceptance_templates(
         training["model_id"] = identity
         training["experiment_name"] += "-acceptance"
         training["max_batches"] = acceptance["max_batches_per_epoch"]
-        training["overrides"].append(
-            f"training.compile={str(acceptance['compile']).lower()}"
+        training["overrides"].extend(
+            [
+                f"training.compile={str(acceptance['compile']).lower()}",
+                f"training.compile_backward={str(acceptance['compile']).lower()}",
+            ]
         )
         EpiForecasterConfig.load(
             REPO_ROOT / training["base_config"], overrides=training["overrides"]

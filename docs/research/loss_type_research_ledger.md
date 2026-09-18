@@ -447,3 +447,37 @@ directory. Continue this exact job and inspect its first training output.
 Only claim the reader fix works after successful cluster initialization.
 Cumulative allocated use through R5 is 660 GPU-seconds (0.1833 GPU-hours).
 No model has completed training and no loss comparison is available yet.
+
+## 2026-09-18: first complete training and research-evaluation acceptance
+
+R6 job `46087093` completed on `as02r1b07` in 367 seconds, with all steps
+exiting zero. SSH jump attachment succeeded. The h5netcdf reader passed the
+former crash point, and the trainer built 1,942 fit samples, 17 selection
+samples, and 16 calibration samples. Training saved best-WIS, best-CRPS, and
+final checkpoints. The finite validation WIS was 0.440687; this is acceptance
+evidence only and is excluded from scientific selection.
+
+The complete outputs and logs are synced under
+`acceptance/normal-nll-m1-f1-s52-r6`. Direct local hashing of `best_model.pt`
+matches training receipt SHA-256
+`bbfca498698c55f3a36bb73e150ae80be1b37f7eeb48ff2a34104646c7d84c21`.
+The research artifact reader verifies all required files, completion markers,
+checkpoint/calibration/role identities, and file hashes. It reads 2,358 scored
+rows across all four heads and C0/C1/C2, plus 2,562 case-event rows. Evidence is
+in `local_artifact_verification.json`. No confirmation evaluation was run.
+Optional per-head plotting still assumes Zarr and reported a warning; the
+canonical metric and event artifacts were generated and verified.
+
+The production base's separate `compile_backward=true` remained active even
+though acceptance set `compile=false`. The acceptance renderer now sets both
+flags from the acceptance compilation choice; the full screen keeps production
+settings. Preserve R6 as a successful bounded compiled acceptance. Also note
+that the existing `max_batches` CLI path limits execution to one epoch, despite
+the template's two-epoch ceiling; epoch 0 in its summary is the epoch index.
+Neither observation changes the scientific screen's 50-epoch limit.
+
+The renderer correction passes all 1,331 tests (two skipped), Ruff, and
+whitespace checks. Next render a new acceptance template set and use a new
+Student-t CRPS run with the h5netcdf reader and both compiler paths disabled.
+The old prepared Student-t CRPS R1 remains unexecuted and superseded. No
+scientific baseline comparison or notable forecast improvement is available.
