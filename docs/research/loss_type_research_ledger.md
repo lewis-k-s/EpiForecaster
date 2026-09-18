@@ -343,3 +343,28 @@ improvement.
 After pinning the published input, all 1,329 tests passed again (two skipped).
 Ruff, DVC status for the new pointer, and whitespace checks passed. The eight
 bounded acceptance templates were rendered under `acceptance/templates-v1`.
+
+The persisted 10-fold manifest exactly matches all 161 valid target regions.
+Each planned fold (1, 4, 5) has observed values for all four heads in both its
+selection and calibration nodes. Counts are in `local_support_qa.json`.
+This is a support check; bounded training must still check sample eligibility.
+
+Prepared and remote-dry-ran from `c446239`:
+- `loss-acceptance-normal-nll-m1-f1-s52-r4`;
+- `loss-acceptance-student-t-crps-m1-f1-s52-r1`.
+
+Their receipts are saved in the matching local `acceptance` directories. The
+renderer outputs are ignored research artifacts, so preparation uses identical
+copies in `/private/tmp` through the launcher's external-template interface.
+The first attempt to prepare from an ignored in-repository template stopped
+locally before transfer or run reservation. No source change was needed.
+Neither acceptance run is submitted yet. Interactive job `46084703` remains
+pending without a start estimate; its PTY session is `59193`. Recheck it before
+any dispatch or fallback. Attach the Normal NLL run first, then Student-t CRPS
+if the first run passes and allocation time permits. Use the same immutable
+run IDs; do not prepare duplicate runs on a wait timeout.
+
+The scheduler accounting snapshot covers all allocated jobs in this campaign:
+393 GPU-seconds (0.1092 GPU-hours), including preprocessing and failed startup.
+No pending allocation time is counted. Evidence is in `compute_budget.json`
+and `scheduler_accounting_20260918.txt`; refresh after terminal runs.
