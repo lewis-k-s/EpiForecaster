@@ -49,6 +49,24 @@ def test_build_main_model_target_aggregate_schema_and_mapping() -> None:
         "observed_count_median",
         "observed_count_iqr",
     ]
+    expected_columns += [
+        f"{metric}_{suffix}"
+        for metric in (
+            "wis",
+            "crps",
+            "nll",
+            "probabilistic_effective_count",
+            "invalid_prediction_count",
+            "scale_floor_count",
+            "coverage_50",
+            "coverage_80",
+            "coverage_95",
+            "interval_width_50",
+            "interval_width_80",
+            "interval_width_95",
+        )
+        for suffix in ("median", "iqr")
+    ]
     assert list(df.columns) == expected_columns
     assert list(df["target"]) == ["hospitalizations", "wastewater", "cases", "deaths"]
     assert (df["model"] == "epiforecaster").all()
@@ -187,6 +205,9 @@ def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) 
             profiler=SimpleNamespace(enabled=False, profile_epochs=[]),
             max_batches=None,
             epochs=1,
+            selection_metric="auto",
+            retain_best_crps_checkpoint=False,
+            selection_required_heads=["ww", "hosp", "cases", "deaths"],
             early_stopping_patience=None,
             plot_forecasts=False,
             run_final_evaluation=True,

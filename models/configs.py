@@ -160,7 +160,7 @@ class JointLossConfig:
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
         valid_probes = {"obs_context"}
-        valid_observation_losses = {"mse", "rmse", "mae", "nll", "crps"}
+        valid_observation_losses = {"mse", "rmse", "mae", "nll", "crps", "wis"}
         valid_distribution_families = {"normal", "student_t"}
         self.observation_loss = self.observation_loss.lower()
         self.distribution_family = self.distribution_family.lower()
@@ -179,11 +179,6 @@ class JointLossConfig:
                 "distribution_family must be one of "
                 f"{sorted(valid_distribution_families)}, "
                 f"got {self.distribution_family!r}"
-            )
-        if self.observation_loss == "crps" and self.distribution_family != "normal":
-            raise ValueError(
-                "observation_loss='crps' currently requires "
-                "distribution_family='normal'"
             )
         if self.adaptive_scheme not in valid_schemes:
             raise ValueError(
@@ -212,6 +207,8 @@ class JointLossConfig:
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
+        if not math.isfinite(self.distribution_df):
+            raise ValueError("distribution_df must be finite")
         if self.distribution_family == "student_t" and self.distribution_df <= 2.0:
             raise ValueError(
                 "distribution_df must be > 2 for student_t intervals, "
@@ -1050,11 +1047,20 @@ class TrainingParams:
     min_learning_rate: float = 0.0
     gradient_clip_value: float = 5.0
     early_stopping_patience: int | None = 10  # None = disabled
+    # General training can select by objective; research pins a common metric.
+    selection_metric: str = "auto"
+    retain_best_crps_checkpoint: bool = False
+    selection_required_heads: list[str] = field(
+        default_factory=lambda: ["ww", "hosp", "cases", "deaths"]
+    )
     nan_loss_patience: int | None = None
     val_split: float = 0.2
     test_split: float = 0.1
     # Split strategy: "node" (default, region holdouts) or "time" (temporal splits)
     split_strategy: str = "node"
+    research_role_manifest_path: str | None = None
+    research_evaluation_role: str = "calibration"
+    research_confirmation_enabled: bool = False
     # Node split strategy when split_strategy="node".
     # - "random": seeded shuffle across valid regions
     # - "stratified": preserve population and wastewater-source representation
@@ -1188,6 +1194,23 @@ class TrainingParams:
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
+        if self.selection_metric not in {
+            "auto",
+            "mean_target_wis",
+            "mean_target_crps",
+            "mean_target_nll",
+            "mean_target_mae",
+        }:
+            raise ValueError(f"Unsupported selection_metric: {self.selection_metric!r}")
+        if (
+            not self.selection_required_heads
+            or len(set(self.selection_required_heads))
+            != len(self.selection_required_heads)
+            or set(self.selection_required_heads) - {"ww", "hosp", "cases", "deaths"}
+        ):
+            raise ValueError(
+                "selection_required_heads must name unique observation heads"
+            )
         if isinstance(self.curriculum, (dict, DictConfig)):
             curriculum_dict = cast(dict[str, Any], self.curriculum)
             self.curriculum = CurriculumConfig(**curriculum_dict)
@@ -1206,12 +1229,29 @@ class TrainingParams:
             )
 
         # Validate split_strategy
-        valid_strategies = {"node", "time"}
+        valid_strategies = {"node", "time", "research"}
         if self.split_strategy not in valid_strategies:
             raise ValueError(
                 f"Invalid split_strategy: {self.split_strategy}. "
                 f"Valid options: {sorted(valid_strategies)}"
             )
+
+        if self.split_strategy == "research":
+            if not self.research_role_manifest_path:
+                raise ValueError("Research splits require research_role_manifest_path")
+            if self.curriculum.enabled:
+                raise ValueError("Research roles do not support curriculum mixing")
+            if self.research_evaluation_role not in {"calibration", "confirmation"}:
+                raise ValueError(
+                    "Research evaluation role must be calibration or confirmation"
+                )
+            if (
+                self.research_evaluation_role == "confirmation"
+                and not self.research_confirmation_enabled
+            ):
+                raise ValueError(
+                    "Confirmation requires an explicit frozen-finalist configuration"
+                )
 
         valid_node_split_strategies = {"random", "stratified", "crossval"}
         if self.node_split_strategy not in valid_node_split_strategies:

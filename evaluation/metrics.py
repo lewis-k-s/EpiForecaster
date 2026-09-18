@@ -6,6 +6,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from evaluation.distribution_scores import (
+    distribution_wis,
+    standard_wis_half_widths,
+    student_t_crps,
+)
+
 _EPSILON = 1e-6
 _VALUE_CLAMP = 1.0e6
 
@@ -55,6 +61,7 @@ class MaskedMetricResult:
 class ProbabilisticBatchMetrics:
     nll: torch.Tensor
     crps: torch.Tensor
+    wis: torch.Tensor
     intervals: dict[str, tuple[torch.Tensor, torch.Tensor]]
     weights: torch.Tensor
 
@@ -63,10 +70,14 @@ class ProbabilisticBatchMetrics:
 class ProbabilisticMetricResult:
     nll: float
     crps: float
+    wis: float
+    invalid_prediction_count: int
+    scale_floor_count: int
     observed_count: int
     effective_count: float
     nll_per_h: list[float]
     crps_per_h: list[float]
+    wis_per_h: list[float]
     coverage_by_level: dict[str, float]
     interval_width_by_level: dict[str, float]
     coverage_per_h_by_level: dict[str, list[float]]
@@ -296,6 +307,14 @@ class TorchDistributionMetricAccumulator:
         self.nll_weight_sum = torch.tensor(0.0, device=device)
         self.crps_sum = torch.tensor(0.0, device=device)
         self.crps_weight_sum = torch.tensor(0.0, device=device)
+        self.wis_sum = torch.tensor(0.0, device=device)
+        self.invalid_prediction_count = torch.tensor(0, device=device, dtype=torch.long)
+        self.scale_floor_count = torch.tensor(0, device=device, dtype=torch.long)
+        self.wis_half_widths = torch.tensor(
+            standard_wis_half_widths(self.distribution_family, self.distribution_df),
+            device=device,
+            dtype=torch.float32,
+        )
         self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
         self.per_h_nll_sum = (
             torch.zeros(horizon, device=device) if horizon is not None else None
@@ -307,6 +326,9 @@ class TorchDistributionMetricAccumulator:
             torch.zeros(horizon, device=device) if horizon is not None else None
         )
         self.per_h_crps_count = (
+            torch.zeros(horizon, device=device) if horizon is not None else None
+        )
+        self.per_h_wis_sum = (
             torch.zeros(horizon, device=device) if horizon is not None else None
         )
         self.coverage_sum = {
@@ -415,6 +437,11 @@ class TorchDistributionMetricAccumulator:
             observed_mask=observed_mask,
             sample_weights=sample_weights,
         ).to(loc_clean.device)
+        invalid = (~torch.isfinite(loc) | ~torch.isfinite(scale) | (scale <= 0)) & (
+            mask > 0
+        )
+        self.invalid_prediction_count += invalid.sum()
+        self.scale_floor_count += ((scale <= self.scale_floor) & (mask > 0)).sum()
 
         nll = torch.nan_to_num(
             self._nll(loc=loc_clean, scale=scale_clean, target=target_clean),
@@ -430,17 +457,18 @@ class TorchDistributionMetricAccumulator:
         self.observed_count += (mask > 0).sum()
 
         if self.distribution_family == "normal":
-            crps = torch.nan_to_num(
-                _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean),
-                nan=0.0,
-                posinf=_VALUE_CLAMP,
-                neginf=0.0,
-            ).clamp(min=0.0, max=_VALUE_CLAMP)
-            weighted_crps = crps * mask
-            self.crps_sum += weighted_crps.sum()
-            self.crps_weight_sum += mask_sum
+            crps = _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
         else:
-            crps = torch.full_like(nll, float("nan"))
+            crps = student_t_crps(
+                loc_clean, scale_clean, target_clean, self.distribution_df
+            )
+        weighted_crps = crps * mask
+        self.crps_sum += weighted_crps.sum()
+        self.crps_weight_sum += mask_sum
+        wis = distribution_wis(
+            loc_clean, scale_clean, target_clean, self.wis_half_widths
+        )
+        self.wis_sum += (wis * mask).sum()
 
         if self.horizon is not None:
             assert self.per_h_nll_sum is not None
@@ -448,11 +476,12 @@ class TorchDistributionMetricAccumulator:
             assert mask_per_h is not None
             self.per_h_nll_sum += weighted_nll.sum(dim=0)
             self.per_h_nll_count += mask_per_h
-            if self.distribution_family == "normal":
-                assert self.per_h_crps_sum is not None
-                assert self.per_h_crps_count is not None
-                self.per_h_crps_sum += weighted_crps.sum(dim=0)
-                self.per_h_crps_count += mask_per_h
+            assert self.per_h_crps_sum is not None
+            assert self.per_h_crps_count is not None
+            assert self.per_h_wis_sum is not None
+            self.per_h_crps_sum += weighted_crps.sum(dim=0)
+            self.per_h_crps_count += mask_per_h
+            self.per_h_wis_sum += (wis * mask).sum(dim=0)
 
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for level_name in self.level_names:
@@ -480,6 +509,7 @@ class TorchDistributionMetricAccumulator:
         return ProbabilisticBatchMetrics(
             nll=nll,
             crps=crps,
+            wis=wis,
             intervals=intervals,
             weights=mask,
         )
@@ -541,6 +571,13 @@ class TorchDistributionMetricAccumulator:
                 numerator=self.crps_sum,
                 denominator=self.crps_weight_sum,
             ),
+            wis=self._mean_from_sums(
+                numerator=self.wis_sum, denominator=self.nll_weight_sum
+            )
+            if self.invalid_prediction_count.item() == 0
+            else float("nan"),
+            invalid_prediction_count=int(self.invalid_prediction_count.item()),
+            scale_floor_count=int(self.scale_floor_count.item()),
             observed_count=int(self.observed_count.item()),
             effective_count=float(self.nll_weight_sum.item()),
             nll_per_h=self._per_h_from_sums(
@@ -551,6 +588,11 @@ class TorchDistributionMetricAccumulator:
                 numerator=self.per_h_crps_sum,
                 denominator=self.per_h_crps_count,
             ),
+            wis_per_h=self._per_h_from_sums(
+                numerator=self.per_h_wis_sum, denominator=self.per_h_nll_count
+            )
+            if self.invalid_prediction_count.item() == 0
+            else [float("nan")] * (self.horizon or 0),
             coverage_by_level=coverage_by_level,
             interval_width_by_level=interval_width_by_level,
             coverage_per_h_by_level=coverage_per_h_by_level,

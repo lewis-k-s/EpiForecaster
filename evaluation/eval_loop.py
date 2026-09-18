@@ -238,6 +238,10 @@ def _add_probabilistic_metrics(
 ) -> None:
     metrics[f"nll_{head_name}_log1p_per_100k"] = summary.nll
     metrics[f"crps_{head_name}_log1p_per_100k"] = summary.crps
+    metrics[f"wis_{head_name}_log1p_per_100k"] = summary.wis
+    metrics[f"wis_{head_name}_per_h"] = summary.wis_per_h
+    metrics[f"invalid_prediction_count_{head_name}"] = summary.invalid_prediction_count
+    metrics[f"scale_floor_count_{head_name}"] = summary.scale_floor_count
     metrics[f"nll_{head_name}_per_h"] = summary.nll_per_h
     metrics[f"crps_{head_name}_per_h"] = summary.crps_per_h
     metrics[f"probabilistic_effective_count_{head_name}"] = summary.effective_count
@@ -757,6 +761,11 @@ def evaluate_loader(
                             weights=weights,
                             nll=hosp_prob_batch.nll,
                             crps=hosp_prob_batch.crps,
+                            wis=hosp_prob_batch.wis,
+                            distribution_loc=hosp_loc,
+                            distribution_scale=hosp_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=hosp_prob_batch.intervals,
                             mechanistic_predictions=hosp_mechanistic,
                             residual_contributions=hosp_residual,
@@ -861,6 +870,11 @@ def evaluate_loader(
                             weights=ww_effective_weights,
                             nll=ww_prob_batch.nll,
                             crps=ww_prob_batch.crps,
+                            wis=ww_prob_batch.wis,
+                            distribution_loc=ww_loc,
+                            distribution_scale=ww_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=ww_prob_batch.intervals,
                             mechanistic_predictions=ww_mechanistic,
                             residual_contributions=ww_residual,
@@ -966,6 +980,11 @@ def evaluate_loader(
                             weights=cases_effective_weights,
                             nll=cases_prob_batch.nll,
                             crps=cases_prob_batch.crps,
+                            wis=cases_prob_batch.wis,
+                            distribution_loc=cases_loc,
+                            distribution_scale=cases_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=cases_prob_batch.intervals,
                             mechanistic_predictions=cases_mechanistic,
                             residual_contributions=cases_residual,
@@ -1071,6 +1090,11 @@ def evaluate_loader(
                             weights=deaths_effective_weights,
                             nll=deaths_prob_batch.nll,
                             crps=deaths_prob_batch.crps,
+                            wis=deaths_prob_batch.wis,
+                            distribution_loc=deaths_loc,
+                            distribution_scale=deaths_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=deaths_prob_batch.intervals,
                             mechanistic_predictions=deaths_mechanistic,
                             residual_contributions=deaths_residual,

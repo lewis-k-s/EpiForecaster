@@ -103,6 +103,7 @@ def test_resume_from_legacy_checkpoint_without_residual_schedule_loads_state(
     config = SimpleNamespace(
         training=SimpleNamespace(
             resume_checkpoint_path=checkpoint_path,
+            selection_metric="auto",
             residual_schedule=ResidualScheduleConfig(),
         ),
         output=SimpleNamespace(

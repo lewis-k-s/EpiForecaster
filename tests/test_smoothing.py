@@ -268,3 +268,38 @@ class TestSmoothingRegressionQuality:
         smooth_log = np.array(candidate_filtered)[observed_mask]
         median_distortion = np.median(np.abs(smooth_log - raw_log))
         assert median_distortion <= 0.15
+
+
+@pytest.mark.parametrize("kind", ["kalman", "tobit", "holt"])
+def test_smoothing_does_not_initialize_from_a_future_observation(kind):
+    def run(values):
+        if kind == "kalman":
+            return KalmanSmoother(process_var=0.05, measurement_var=0.5).filter_series(
+                values
+            )[0]
+        if kind == "tobit":
+            return TobitKalmanSmoother(
+                process_var=0.05, measurement_var=0.5
+            ).filter_series(values, np.ones(len(values)))[0]
+        return DampedHoltSmoother().filter_series(values)[0]
+
+    a = np.array([np.nan, np.nan, 2.0, 3.0])
+    b = np.array([np.nan, np.nan, 2000.0, 3000.0])
+    np.testing.assert_array_equal(run(a)[:2], run(b)[:2])
+    np.testing.assert_array_equal(run(a)[:2], run(a[:2]))
+
+
+def test_kalman_parameter_cutoff_excludes_future_values():
+    dates = pd.date_range("2020-01-01", periods=40)
+    series = pd.Series(np.exp(np.sin(np.arange(40) / 3) + 2), index=dates)
+    changed = series.copy()
+    changed.iloc[20:] *= 1000
+    cutoff = "2020-01-20"
+    assert fit_kalman_params(series, fit_end_date=cutoff) == fit_kalman_params(
+        changed, fit_end_date=cutoff
+    )
+    assert fit_kalman_params(series, fit_end_date=cutoff) == fit_kalman_params(
+        series.iloc[:20]
+    )
+    with pytest.raises(ValueError, match="DatetimeIndex"):
+        fit_kalman_params(series.reset_index(drop=True), fit_end_date=cutoff)

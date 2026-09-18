@@ -47,6 +47,8 @@ class TemporalCovariatesConfig:
 class SmoothingConfig:
     """Configuration for offline causal smoothing."""
 
+    # Inclusive end of parameter fitting. None retains legacy full-series fitting.
+    parameter_fit_end_date: str | None = None
     clinical_method: str = "kalman_v2"
     wastewater_method: str = "tobit_kalman_v2"
     missing_policy: str = "predict"
@@ -63,6 +65,8 @@ class SmoothingConfig:
     holt_missing_trend_decay: float = 0.85
 
     def __post_init__(self):
+        if self.parameter_fit_end_date is not None:
+            datetime.strptime(self.parameter_fit_end_date, "%Y-%m-%d")
         valid_clinical = {"kalman_v2", "holt_damped"}
         valid_wastewater = {"tobit_kalman_v2"}
         valid_missing = {"predict", "momentum"}
@@ -178,6 +182,8 @@ class PreprocessingConfig:
     # Optional data paths
     synthetic_path: str | None = None
     hospitalizations_file: str | None = None
+    # Conservative availability shift for weekly totals stamped at week start.
+    hospitalizations_reporting_lag_days: int = 0
     deaths_file: str | None = None  # Deaths data (comarca-level)
     catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
     vaccination_file: str | None = None  # Municipality-level COVID vaccination data
@@ -264,6 +270,8 @@ class PreprocessingConfig:
             self.temporal_covariates = TemporalCovariatesConfig(
                 **self.temporal_covariates
             )
+        if self.hospitalizations_reporting_lag_days < 0:
+            raise ValueError("hospitalizations_reporting_lag_days must be non-negative")
         if isinstance(self.smoothing, dict):
             self.smoothing = SmoothingConfig(**self.smoothing)
         if not isinstance(self.source_provenance, dict):

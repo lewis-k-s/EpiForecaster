@@ -115,6 +115,10 @@ _PER_SERIES_METRIC_KEYS = [
     "crps_hosp_log1p_per_100k",
     "crps_cases_log1p_per_100k",
     "crps_deaths_log1p_per_100k",
+    "wis_ww_log1p_per_100k",
+    "wis_hosp_log1p_per_100k",
+    "wis_cases_log1p_per_100k",
+    "wis_deaths_log1p_per_100k",
     "r2_ww_log1p_per_100k",
     "r2_hosp_log1p_per_100k",
     "r2_cases_log1p_per_100k",
@@ -192,11 +196,38 @@ def compute_validation_selection_score(
     metrics: dict[str, Any],
     *,
     observation_loss: str,
+    selection_metric: str = "auto",
+    required_heads: tuple[str, ...] | list[str] = ("ww", "hosp", "cases", "deaths"),
 ) -> tuple[float, str]:
     """Choose the checkpoint-selection score for the current observation loss."""
+    if selection_metric != "auto":
+        metric_names = {
+            "mean_target_wis": "wis",
+            "mean_target_crps": "crps",
+            "mean_target_nll": "nll",
+            "mean_target_mae": "mae",
+        }
+        if selection_metric not in metric_names or not required_heads:
+            raise ValueError(
+                "An explicit selection metric requires a valid metric and heads"
+            )
+        values = []
+        for head in required_heads:
+            key = f"{metric_names[selection_metric]}_{head}_log1p_per_100k"
+            value = metrics.get(key)
+            if (
+                value is None
+                or not np.isfinite(float(value))
+                or metrics.get(f"invalid_prediction_count_{head}", 0) != 0
+            ):
+                raise ValueError(
+                    f"Required checkpoint-selection score is invalid: {key}"
+                )
+            values.append(float(value))
+        return float(np.mean(values)), selection_metric
     selection_score = compute_mean_target_mae(metrics)
     selection_metric = _SELECTION_METRIC_NAME
-    if observation_loss in {"nll", "crps"}:
+    if observation_loss in {"nll", "crps", "wis"}:
         crps_selection_score = compute_mean_target_crps(metrics)
         if np.isfinite(crps_selection_score):
             selection_score = crps_selection_score
@@ -537,6 +568,7 @@ class EpiForecasterTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float("inf")
+        self.best_val_crps = float("inf")
         self.best_val_selection_score = float("inf")
         self.best_val_selection_metric = _SELECTION_METRIC_NAME
         self.best_val_joint_loss = float("inf")
@@ -1132,6 +1164,8 @@ class EpiForecasterTrainer:
         if checkpoint_path is None:
             raise ValueError("resume_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self._validate_checkpoint_selection_contract(checkpoint)
+        self.best_val_crps = float(checkpoint.get("best_val_crps", float("inf")))
         self._validate_checkpoint_latent_scale_state(checkpoint)
         self._validate_checkpoint_residual_schedule_state(checkpoint)
 
@@ -1498,12 +1532,17 @@ class EpiForecasterTrainer:
                 compute_validation_selection_score(
                     val_metrics,
                     observation_loss=self.criterion.observation_loss,
+                    selection_metric=self.config.training.selection_metric,
+                    required_heads=self.config.training.selection_required_heads,
                 )
             )
 
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
+
+            if self.config.training.retain_best_crps_checkpoint:
+                self._maybe_save_crps_checkpoint(epoch, val_loss, val_metrics)
 
             # Learning rate scheduling (if per-epoch)
             if self.scheduler and self.config.training.scheduler_type == "step":
@@ -3370,6 +3409,48 @@ class EpiForecasterTrainer:
 
         return config_dict
 
+    def _validate_checkpoint_selection_contract(self, checkpoint: dict) -> None:
+        if self.config.training.selection_metric == "auto":
+            return
+        saved = checkpoint.get("config", {}).get("training", {})
+        selection = {
+            "selection_metric": self.config.training.selection_metric,
+            "selection_required_heads": self.config.training.selection_required_heads,
+        }
+        for key, value in selection.items():
+            if saved.get(key) != value:
+                raise ValueError(f"Checkpoint selection contract mismatch: {key}")
+        saved_joint = saved.get("loss", {}).get("joint", {})
+        current_joint = self.config.training.loss.joint
+        observation = {
+            "observation_loss": current_joint.observation_loss,
+            "distribution_family": current_joint.distribution_family,
+            "distribution_df": current_joint.distribution_df,
+        }
+        for key, value in observation.items():
+            if saved_joint.get(key) != value:
+                raise ValueError(f"Checkpoint observation contract mismatch: {key}")
+
+    def _maybe_save_crps_checkpoint(
+        self, epoch: int, val_loss: float, metrics: dict
+    ) -> None:
+        score, name = compute_validation_selection_score(
+            metrics,
+            observation_loss=self.criterion.observation_loss,
+            selection_metric="mean_target_crps",
+            required_heads=self.config.training.selection_required_heads,
+        )
+        if score < self.best_val_crps:
+            self.best_val_crps = score
+            if self.config.output.save_checkpoints:
+                self._save_checkpoint(
+                    epoch,
+                    val_loss,
+                    val_selection_score=score,
+                    val_selection_metric=name,
+                    is_best_crps=True,
+                )
+
     def _save_checkpoint(
         self,
         epoch: int,
@@ -3378,6 +3459,7 @@ class EpiForecasterTrainer:
         val_selection_metric: str | None = None,
         is_best: bool = False,
         is_final: bool = False,
+        is_best_crps: bool = False,
     ):
         """Save model checkpoint."""
         from utils.precision_policy import create_precision_signature
@@ -3396,6 +3478,7 @@ class EpiForecasterTrainer:
             "val_selection_score": val_selection_score,
             "val_selection_metric": val_selection_metric,
             "best_val_loss": self.best_val_loss,
+            "best_val_crps": self.best_val_crps,
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
             "best_val_joint_loss": self.best_val_joint_loss,
@@ -3429,7 +3512,9 @@ class EpiForecasterTrainer:
                 gradnorm_optimizer.state_dict()
             )
 
-        if is_best or is_final:
+        if is_best_crps:
+            filename = "best_crps_model.pt"
+        elif is_best or is_final:
             filename = "best_model.pt" if is_best else "final_model.pt"
         else:
             filename = f"checkpoint_epoch_{epoch:04d}.pt"

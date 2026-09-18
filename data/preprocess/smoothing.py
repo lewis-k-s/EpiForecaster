@@ -20,7 +20,9 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
-def fit_kalman_params(series: pd.Series) -> tuple[float, float]:
+def fit_kalman_params(
+    series: pd.Series, *, fit_end_date: str | None = None
+) -> tuple[float, float]:
     """
     Fit Kalman filter process/measurement variances from time series data.
 
@@ -37,6 +39,13 @@ def fit_kalman_params(series: pd.Series) -> tuple[float, float]:
     Raises:
         ValueError: If no finite positive observations available for fitting
     """
+    if fit_end_date is not None:
+        import pandas as pd
+
+        if not isinstance(series.index, pd.DatetimeIndex):
+            raise ValueError("Dated Kalman fitting requires a DatetimeIndex")
+        cutoff = pd.Timestamp(fit_end_date)
+        series = series.loc[series.index < cutoff + pd.Timedelta(days=1)]
     series = series.where(series > 0)
     series_log = np.log(series)
 
@@ -205,10 +214,6 @@ class KalmanSmoother:
         finite_mask = np.isfinite(values) & (values > 0)
         flags = np.where(finite_mask, 0, 2).astype(int).tolist()
 
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
-
         filtered: list[float] = []
 
         for value in values:
@@ -372,11 +377,6 @@ class TobitKalmanSmoother:
         values = np.asarray(values, dtype=float).reshape(-1)
         limits = np.asarray(limits, dtype=float).reshape(-1)
 
-        finite_mask = np.isfinite(values) & (values > 0)
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
-
         for value, limit in zip(values, limits, strict=False):
             pred_state = self.state
             pred_var = self.state_var + self.process_var
@@ -471,10 +471,6 @@ class DampedHoltSmoother:
         values = np.asarray(values, dtype=float).reshape(-1)
         finite_mask = np.isfinite(values) & (values > 0)
         flags = np.where(finite_mask, 0, 2).astype(int).tolist()
-
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
 
         filtered: list[float] = []
         for value in values:

@@ -1,0 +1,52 @@
+# Bounded infrastructure acceptance. These scores are not scientific results.
+run: {}
+source: {}
+container: {}
+workflow:
+  kind: train
+  target: train_evaluate
+dvc:
+  targets:
+    - data/files/mobility.zarr.dvc
+    - data/processed/real_with_id.zarr.dvc
+    - outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc
+training:
+  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  experiment_name: loss-score-acceptance
+  model_id: student-crps
+  max_batches: 10
+  overrides:
+    - data.region2vec_path=outputs/region_embeddings_no_mobility/region_embeddings.pt
+    - training.loss.joint.observation_loss=crps
+    - training.loss.joint.distribution_family=student_t
+    - training.loss.joint.distribution_df=5.0
+    - training.selection_metric=mean_target_wis
+    - training.split_strategy=time
+    - training.train_end_date=2020-08-01
+    - training.val_end_date=2020-11-01
+    - training.test_end_date=2021-01-31
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+    - training.compile=false
+    - training.profiler.enabled=false
+    - training.num_workers=1
+    - training.val_workers=1
+    - training.test_workers=1
+    - training.plot_forecasts=false
+evaluation:
+  split: val
+  granular: true
+  overrides:
+    - training.val_workers=1
+    - training.test_workers=1
+    - training.num_forecast_samples=1
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 45

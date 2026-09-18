@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn as nn
 
+from evaluation.distribution_scores import (
+    distribution_wis,
+    standard_wis_half_widths,
+    student_t_crps,
+)
+
 from models.configs import (
     DataConfig,
     JointLossConfig,
@@ -246,21 +252,16 @@ class JointInferenceLoss(nn.Module):
             raise ValueError(
                 f"obs_weight_sum must be positive, got {self.obs_weight_sum}"
             )
-        if self.observation_loss not in {"mse", "rmse", "mae", "nll", "crps"}:
+        if self.observation_loss not in {"mse", "rmse", "mae", "nll", "crps", "wis"}:
             raise ValueError(
                 "observation_loss must be one of "
-                "['crps', 'mae', 'mse', 'nll', 'rmse'], "
+                "['crps', 'mae', 'mse', 'nll', 'rmse', 'wis'], "
                 f"got {self.observation_loss!r}"
             )
         if self.distribution_family not in {"normal", "student_t"}:
             raise ValueError(
                 "distribution_family must be one of ['normal', 'student_t'], "
                 f"got {self.distribution_family!r}"
-            )
-        if self.observation_loss == "crps" and self.distribution_family != "normal":
-            raise ValueError(
-                "observation_loss='crps' currently requires "
-                "distribution_family='normal'"
             )
         if self.distribution_scale_floor <= 0:
             raise ValueError(
@@ -271,6 +272,15 @@ class JointInferenceLoss(nn.Module):
             raise ValueError(
                 f"distribution_df must be > 2 for student_t, got {self.distribution_df}"
             )
+        if not math.isfinite(self.distribution_df):
+            raise ValueError("distribution_df must be finite")
+        self.register_buffer(
+            "wis_half_widths",
+            torch.tensor(
+                standard_wis_half_widths(self.distribution_family, self.distribution_df)
+            ),
+            persistent=False,
+        )
         if not self.interval_levels:
             raise ValueError("interval_levels must not be empty")
         for level in self.interval_levels:
@@ -557,7 +567,12 @@ class JointInferenceLoss(nn.Module):
             return -dist.log_prob(target)
 
         if self.observation_loss == "crps":
+            if self.distribution_family == "student_t":
+                return student_t_crps(loc, scale, target, self.distribution_df)
             return self._normal_crps(loc=loc, scale=scale, target=target)
+
+        if self.observation_loss == "wis":
+            return distribution_wis(loc, scale, target, self.wis_half_widths.to(loc))
 
         raise ValueError(
             "distribution loss requested for unsupported observation_loss "
@@ -648,7 +663,7 @@ class JointInferenceLoss(nn.Module):
         loc, scale = self._get_head_distribution_params(
             model_outputs, head_name=head_name, horizon=horizon
         )
-        if self.observation_loss in {"nll", "crps"}:
+        if self.observation_loss in {"nll", "crps", "wis"}:
             return self._weighted_masked_distribution_loss_from_weights(
                 loc=loc,
                 scale=scale,

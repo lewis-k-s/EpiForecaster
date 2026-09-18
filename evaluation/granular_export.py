@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-GRANULAR_SCHEMA_VERSION = "3"
+GRANULAR_SCHEMA_VERSION = "4"
 GRANULAR_KEY_COLUMNS = ["split", "target", "node_id", "window_start", "horizon"]
 GRANULAR_INTERVAL_LEVEL_NAMES = ("50", "80", "95")
 GRANULAR_REQUIRED_FIELDNAMES = [
@@ -48,6 +48,13 @@ GRANULAR_FIELDNAMES = [
     "sq_error",
     "nll",
     "crps",
+    "wis",
+    "distribution_loc",
+    "distribution_scale",
+    "distribution_family",
+    "distribution_df",
+    "observed_mask",
+    "observation_weight",
     "interval_low_50",
     "interval_high_50",
     "covered_50",
@@ -162,6 +169,11 @@ def _row_dicts_from_batch(
     region_labels: Sequence[str] | None,
     nll: torch.Tensor | None = None,
     crps: torch.Tensor | None = None,
+    wis: torch.Tensor | None = None,
+    distribution_loc: torch.Tensor | None = None,
+    distribution_scale: torch.Tensor | None = None,
+    distribution_family: str | None = None,
+    distribution_df: float | None = None,
     intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     mechanistic_predictions: torch.Tensor | None = None,
     residual_contributions: torch.Tensor | None = None,
@@ -184,6 +196,14 @@ def _row_dicts_from_batch(
     observed_weights = torch.nan_to_num(weights.detach().float(), nan=0.0).cpu()
     nll_cpu = nll.detach().float().cpu() if nll is not None else None
     crps_cpu = crps.detach().float().cpu() if crps is not None else None
+    extra_tensors = {
+        name: value.detach().float().cpu() if value is not None else None
+        for name, value in {
+            "wis": wis,
+            "distribution_loc": distribution_loc,
+            "distribution_scale": distribution_scale,
+        }.items()
+    }
     mechanistic_cpu = (
         mechanistic_predictions.detach().float().cpu()
         if mechanistic_predictions is not None
@@ -275,6 +295,20 @@ def _row_dicts_from_batch(
                 if crps_cpu is not None
                 else float("nan"),
             }
+            row.update(
+                {
+                    name: float(value[batch_index, horizon_index])
+                    if value is not None
+                    else float("nan")
+                    for name, value in extra_tensors.items()
+                }
+            )
+            row.update(
+                distribution_family=distribution_family or "",
+                distribution_df=distribution_df,
+                observed_mask=is_observed,
+                observation_weight=float(observed_weights[batch_index, horizon_index]),
+            )
             for level_name in GRANULAR_INTERVAL_LEVEL_NAMES:
                 low_key = f"interval_low_{level_name}"
                 high_key = f"interval_high_{level_name}"
@@ -332,6 +366,11 @@ class _CsvGranularEvalWriter:
         region_labels: Sequence[str] | None,
         nll: torch.Tensor | None = None,
         crps: torch.Tensor | None = None,
+        wis: torch.Tensor | None = None,
+        distribution_loc: torch.Tensor | None = None,
+        distribution_scale: torch.Tensor | None = None,
+        distribution_family: str | None = None,
+        distribution_df: float | None = None,
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         mechanistic_predictions: torch.Tensor | None = None,
         residual_contributions: torch.Tensor | None = None,
@@ -351,6 +390,11 @@ class _CsvGranularEvalWriter:
             region_labels=region_labels,
             nll=nll,
             crps=crps,
+            wis=wis,
+            distribution_loc=distribution_loc,
+            distribution_scale=distribution_scale,
+            distribution_family=distribution_family,
+            distribution_df=distribution_df,
             intervals=intervals,
             mechanistic_predictions=mechanistic_predictions,
             residual_contributions=residual_contributions,
@@ -406,6 +450,13 @@ class _ParquetGranularEvalWriter:
                 ("sq_error", pa.float64()),
                 ("nll", pa.float64()),
                 ("crps", pa.float64()),
+                ("wis", pa.float64()),
+                ("distribution_loc", pa.float64()),
+                ("distribution_scale", pa.float64()),
+                ("distribution_family", pa.string()),
+                ("distribution_df", pa.float64()),
+                ("observed_mask", pa.bool_()),
+                ("observation_weight", pa.float64()),
                 ("interval_low_50", pa.float64()),
                 ("interval_high_50", pa.float64()),
                 ("covered_50", pa.float64()),
@@ -463,6 +514,11 @@ class _ParquetGranularEvalWriter:
         region_labels: Sequence[str] | None,
         nll: torch.Tensor | None = None,
         crps: torch.Tensor | None = None,
+        wis: torch.Tensor | None = None,
+        distribution_loc: torch.Tensor | None = None,
+        distribution_scale: torch.Tensor | None = None,
+        distribution_family: str | None = None,
+        distribution_df: float | None = None,
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         mechanistic_predictions: torch.Tensor | None = None,
         residual_contributions: torch.Tensor | None = None,
@@ -483,6 +539,11 @@ class _ParquetGranularEvalWriter:
                 region_labels=region_labels,
                 nll=nll,
                 crps=crps,
+                wis=wis,
+                distribution_loc=distribution_loc,
+                distribution_scale=distribution_scale,
+                distribution_family=distribution_family,
+                distribution_df=distribution_df,
                 intervals=intervals,
                 mechanistic_predictions=mechanistic_predictions,
                 residual_contributions=residual_contributions,

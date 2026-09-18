@@ -163,7 +163,10 @@ class CataloniaCasesProcessor:
                 fit_series = fit_series.where(fit_series > 0)
 
                 try:
-                    process_var, measurement_var = fit_kalman_params(fit_series)
+                    process_var, measurement_var = fit_kalman_params(
+                        fit_series,
+                        fit_end_date=self.config.smoothing.parameter_fit_end_date,
+                    )
                 except Exception as e:
                     print(
                         f"    ! Falling back to configured variances for {muni_code}: {e}"

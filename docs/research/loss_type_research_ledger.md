@@ -1,0 +1,121 @@
+# Loss-type research ledger
+
+## 2026-09-18: goal activated
+
+The user authorized the plan and execution with rolling `acc_interactive`
+allocations, an `acc_debug` fallback, and local copies of notable results.
+The goal is active. The fixed research settings are in
+`configs/research/loss_protocol_v1.yaml`.
+
+The live MN5 check found no pending or running jobs for `bsc008913`. Account
+`bsc08` permits `acc_interactive` with a two-hour, 40-CPU limit and `acc_debug`
+with a two-hour limit. A one-GPU acceptance run needs 20 CPUs. No allocation
+has been requested yet; numerical and integration checks must pass first.
+
+The local dataset metadata show 435 dates from 2020-03-01 to 2021-05-09.
+The period 2021-02-01 through 2021-05-09 is reserved from this loop's adaptive
+decisions. It has been used in past research. Confirmation on it can support
+only a retrospective claim. A validated fit/selection/calibration role manifest
+and source-overlap audit remain gates for scientific runs.
+
+Work in progress: common WIS selection and exports, Student-t CRPS, numerical
+validity checks, and bounded MN5 acceptance. The first 23 numerical reference
+tests passed. No forecast improvement has been measured or claimed.
+
+Every notable result will be copied to
+`outputs/loss_research/loss-type-research-v1/` with run, checkpoint, config,
+source-bundle, environment, input, protocol, and artifact identities. Research
+decisions will be appended here. Generated artifacts remain outside Git.
+
+## 2026-09-18: scoring acceptance prepared
+
+Implemented Student-t CRPS, fixed-grid WIS, explicit required-head checkpoint
+selection, canonical probabilistic aggregate columns, and granular schema 4
+with distribution parameters and observation support. These changes are in the
+working tree; the immutable source snapshot records their exact bytes.
+
+Validation: 152 focused tests passed; full suite 1,242 passed and two skipped;
+repository Ruff passed. Best-effort Pyright reported five existing config
+mapping-type issues, with no errors in the new distribution-score module.
+The effective acceptance config and its temporal boundaries were checked.
+
+Prepared run: `loss-score-acceptance-20260918-r1`. The immutable workflow dry-run
+passed. Its container SHA-256 is
+`b9789057bc686414649c5224bc908ada1556fba17486c8055a76b49cc61c48ba`.
+The requested interactive allocation is `46079355`, with one GPU, 20 CPUs,
+and one hour. It is pending as of the initial scheduler response. The workflow
+will attach only after the allocation is running and its resources are checked.
+
+## 2026-09-18: temporal-scaler defect found before execution
+
+The data-role audit found that `EpiDataset` fits the biomarker scaler on all
+dates even when `time_range` limits training windows. This violates temporal
+separation. Prepared acceptance run R1 is superseded without execution. The
+fix will limit scaler fitting to the training time range and will be tested
+with extreme future observations. A new source snapshot is required.
+
+The same audit confirmed a units caveat: clinical targets use log1p(per-100k),
+but wastewater uses log1p(concentration). Existing wastewater metric names
+contain the legacy `log1p_per_100k` suffix. The protocol now records the actual
+units per head; no cross-head raw-unit equivalence is claimed.
+
+The event and calibration module passed 14 focused tests. It has not yet been
+connected to the role-manifest and campaign pipeline. It is not sufficient to
+open the scientific execution gate.
+
+The corrected source passed 1,257 tests (two skipped), all Ruff checks, and the
+immutable workflow dry-run. Prepared replacement:
+`loss-score-acceptance-20260918-r2`. Its SIF is unchanged; its source snapshot
+contains the temporal-scaler fix. The interactive request remains pending with
+no reported start estimate after approximately ten minutes. Use the authorized
+debug fallback if the allocation is still pending at dispatch.
+
+## 2026-09-18: acceptance coordinator repair and source audit
+
+Cancelled unused pending interactive request `46079355`. Debug job `46079956`
+for R2 failed before training after seven seconds on `as01r4b10`. The dispatch
+record correctly names the SIF's Snakemake path, but the coordinator checked
+that path on the host. Its empty stdout/stderr and terminal receipt are retained.
+The fix restores SIF execution with the documented host Slurm bindings and
+preserves batch/interactive completion receipts. All 81 workflow tests passed.
+
+Replacement `loss-score-acceptance-20260918-r3` passed its immutable dry-run
+and was submitted as debug job `46080277`. It is pending at this entry.
+It contains the scoring and coordinator fixes, not the later preprocessing
+changes. It remains a bounded acceptance run, not a candidate comparison.
+
+The source audit found full-series preprocessing fits, future-observation
+initialization, and weekly hospitalization totals stamped at week start.
+See `loss_data_audit_20260918.md`. New parameter-fit bounds and causal stepping
+passed focused perturbation tests. Prepared a separate raw input identity and
+new preprocessing configuration. No raw input was altered and no new dataset
+has been generated or remotely published yet. The scientific gate is closed.
+
+Dated roles are declared in `configs/research/loss_roles_v1.json`. The research
+loader validates their gaps and preprocessing identity. Its default test loader
+is calibration; confirmation requires an explicit frozen-finalist config.
+The original spatial matrix remains a maximum screen, subject to all-head
+support and the short-period uncertainty limit. Unsupported evidence cannot
+pass promotion merely because its point estimate improves.
+
+## 2026-09-18: dataset rebuild authorized and inputs published
+
+The user explicitly approved the new research dataset and directed the agent to
+assume training authorization within this goal. This covers the planned MN5
+training and evaluation loop and the approved new preprocessing identity.
+
+All ten raw-input DVC objects were copied to the remote content-addressed store
+without replacing existing objects. Remote MD5 values match the local objects.
+Verification receipt: `outputs/loss_research/loss-type-research-v1/raw_remote_md5.txt`.
+
+R3 job `46080277` failed at container startup after seven seconds on
+`as01r1b29`: the optional `/opt/.snoopy/lib` mount source does not exist on that
+node. The next source version mounts site plugin trees only when present.
+It also removes an ineffective HOME environment override. No training ran.
+The replacement interactive request is `46080792` (one GPU, 20 CPUs, two hours).
+
+Validation after data roles and checkpoint retention: 1,285 tests passed, two
+skipped. The site-mount change then passed all 81 workflow tests. Ruff and
+`git diff --check` passed. Best-CRPS checkpoint retention is optional and does
+not control WIS early stopping; explicit-score resume rejects changed score,
+required-head, objective, family, or degrees-of-freedom settings.

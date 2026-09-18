@@ -60,7 +60,7 @@ class EDARProcessor:
             series = group.set_index("date").sort_index().asfreq("D")
             values = series["total_covid_flow"].to_numpy()
             limits = (
-                series["limit_flow"].ffill().bfill().to_numpy()
+                series["limit_flow"].ffill().to_numpy()
                 if "limit_flow" in series
                 else np.full_like(values, np.nan)
             )
@@ -69,21 +69,11 @@ class EDARProcessor:
             censored_mask = np.isfinite(limits) & (values <= limits)
             fit_series = fit_series.mask(censored_mask)
 
-            # Fully missing windows should propagate as missing observations
-            # rather than failing preprocessing for the entire dataset.
-            valid_fit = fit_series.where(fit_series > 0).dropna()
-            if valid_fit.empty:
-                series["total_covid_flow"] = np.nan
-                series["censor_flag"] = 2
-                series["process_var"] = fallback_process
-                series["measurement_var"] = fallback_measure
-                series["edar_id"] = edar_id
-                series["variant"] = variant
-                filtered_frames.append(series.reset_index())
-                continue
-
             try:
-                process_var, measurement_var = fit_kalman_params(fit_series)
+                process_var, measurement_var = fit_kalman_params(
+                    fit_series,
+                    fit_end_date=self.config.smoothing.parameter_fit_end_date,
+                )
             except (ValueError, RuntimeError):
                 process_var = fallback_process
                 measurement_var = fallback_measure
@@ -96,6 +86,9 @@ class EDARProcessor:
             filtered_log, flags = filter_model.filter_series(values, limits)
 
             series["total_covid_flow"] = np.exp(filtered_log)
+            # No observation has arrived before the first finite input.
+            seen = np.maximum.accumulate(np.isfinite(values) & (values > 0))
+            series.loc[~seen, "total_covid_flow"] = np.nan
             series["censor_flag"] = flags
             series["process_var"] = process_var
             series["measurement_var"] = measurement_var
@@ -132,12 +125,12 @@ class EDARProcessor:
         emap_bool = (emap_aligned > 0).astype(float)
         censor_filled = censor_xr_aligned.fillna(2.0)
 
-        any_missing = xr.dot(
-            (censor_filled == 2).astype(float), emap_bool, dim="edar_id"
-        ) > 0
-        any_censored = xr.dot(
-            (censor_filled == 1).astype(float), emap_bool, dim="edar_id"
-        ) > 0
+        any_missing = (
+            xr.dot((censor_filled == 2).astype(float), emap_bool, dim="edar_id") > 0
+        )
+        any_censored = (
+            xr.dot((censor_filled == 1).astype(float), emap_bool, dim="edar_id") > 0
+        )
         has_any_site = emap_bool.sum(dim="edar_id") > 0
 
         severity = xr.where(any_missing, 2.0, xr.where(any_censored, 1.0, 0.0))

@@ -90,6 +90,39 @@ class TestEpiDataset:
             assert ds.num_nodes == 5
             assert len(ds) > 0
 
+    def test_temporal_scaler_excludes_future_values_and_is_reused(
+        self, config, mock_xarray_dataset
+    ):
+        dataset = mock_xarray_dataset.copy(deep=True)
+        values = np.full((30, 5), 2.0, dtype=np.float32)
+        values[15:] = 1000.0
+        name = "edar_biomarker_N1"
+        for suffix, data in (
+            ("", values),
+            ("_mask", np.ones_like(values)),
+            ("_censor", np.zeros_like(values)),
+            ("_age", np.zeros_like(values)),
+        ):
+            dataset[f"{name}{suffix}"] = (("date", "region_id"), data)
+        with patch.object(EpiDataset, "load_canonical_dataset", return_value=dataset):
+            train = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1],
+                time_range=(0, 15),
+            )
+            validation = EpiDataset(
+                config=config,
+                target_nodes=[2],
+                context_nodes=[0, 1, 2],
+                time_range=(15, 30),
+                biomarker_preprocessor=train.biomarker_preprocessor,
+                mobility_preprocessor=train.mobility_preprocessor,
+            )
+        assert train.biomarker_preprocessor.scaler_params.center[name] == 2.0
+        assert validation.biomarker_preprocessor is train.biomarker_preprocessor
+        assert validation.biomarker_preprocessor.scaler_params.center[name] == 2.0
+
     def test_supervision_targets_preserve_small_positive_float32_values(
         self, config, mock_xarray_dataset
     ):

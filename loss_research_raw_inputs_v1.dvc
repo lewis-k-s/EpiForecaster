@@ -1,0 +1,6 @@
+outs:
+- md5: c65715e80dcc5947eb665c7f037ed9ed.dir
+  size: 232743467
+  nfiles: 9
+  hash: md5
+  path: outputs/loss_research/loss-type-research-v1/raw_inputs

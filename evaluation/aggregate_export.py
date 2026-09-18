@@ -19,6 +19,25 @@ _TARGET_AGGREGATE_COLUMNS = [
     "observed_count_median",
     "observed_count_iqr",
 ]
+_PROBABILISTIC_AGGREGATE_METRICS = (
+    "wis",
+    "crps",
+    "nll",
+    "probabilistic_effective_count",
+    "invalid_prediction_count",
+    "scale_floor_count",
+    "coverage_50",
+    "coverage_80",
+    "coverage_95",
+    "interval_width_50",
+    "interval_width_80",
+    "interval_width_95",
+)
+_TARGET_AGGREGATE_COLUMNS += [
+    f"{metric}_{suffix}"
+    for metric in _PROBABILISTIC_AGGREGATE_METRICS
+    for suffix in ("median", "iqr")
+]
 
 _JOINT_AGGREGATE_COLUMNS = [
     "model",
@@ -111,6 +130,21 @@ def build_main_model_target_aggregate(
         for metric_name in ["mae", "rmse", "r2", "observed_count"]:
             value = _finite_or_nan(eval_metrics.get(key_map[metric_name]))
             median, iqr = _median_and_iqr(value)
+            row[f"{metric_name}_median"] = median
+            row[f"{metric_name}_iqr"] = iqr
+        head = {
+            "hospitalizations": "hosp",
+            "wastewater": "ww",
+            "cases": "cases",
+            "deaths": "deaths",
+        }[target_name]
+        for metric_name in _PROBABILISTIC_AGGREGATE_METRICS:
+            key = f"{metric_name}_{head}"
+            if metric_name in {"wis", "crps", "nll"} or metric_name.startswith(
+                "interval_width_"
+            ):
+                key += "_log1p_per_100k"
+            median, iqr = _median_and_iqr(_finite_or_nan(eval_metrics.get(key)))
             row[f"{metric_name}_median"] = median
             row[f"{metric_name}_iqr"] = iqr
         rows.append(row)

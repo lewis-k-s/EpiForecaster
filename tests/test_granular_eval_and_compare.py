@@ -275,6 +275,13 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         "sq_error",
         "nll",
         "crps",
+        "wis",
+        "distribution_loc",
+        "distribution_scale",
+        "distribution_family",
+        "distribution_df",
+        "observed_mask",
+        "observation_weight",
         "interval_low_50",
         "interval_high_50",
         "covered_50",
@@ -329,7 +336,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "3"
+    assert meta["schema_version"] == "4"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -474,6 +481,13 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
         "sq_error",
         "nll",
         "crps",
+        "wis",
+        "distribution_loc",
+        "distribution_scale",
+        "distribution_family",
+        "distribution_df",
+        "observed_mask",
+        "observation_weight",
         "interval_low_50",
         "interval_high_50",
         "covered_50",

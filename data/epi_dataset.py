@@ -382,8 +382,15 @@ class EpiDataset(Dataset):
                 all_region_ids = self._dataset[REGION_COORD].values
                 train_region_ids = [all_region_ids[n] for n in train_nodes_with_bio]
 
-                # Only fit scaler on train nodes that have biomarkers
-                self.biomarker_preprocessor.fit_scaler(self._dataset, train_region_ids)
+                # Fit only the training regions and training dates. Window
+                # filtering alone does not prevent later values entering the scaler.
+                scaler_dataset = self._dataset
+                if self.time_range is not None:
+                    start_idx, end_idx = self.time_range
+                    scaler_dataset = scaler_dataset.isel(
+                        {TEMPORAL_COORD: slice(start_idx, end_idx)}
+                    )
+                self.biomarker_preprocessor.fit_scaler(scaler_dataset, train_region_ids)
         else:
             self.biomarker_preprocessor = biomarker_preprocessor
 

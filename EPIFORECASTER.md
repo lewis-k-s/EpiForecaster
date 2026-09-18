@@ -76,7 +76,9 @@ current batch. The observation weights \(\alpha_h\) sum to
 ### Probabilistic observation objectives
 
 Each observation head emits a predictive location \(\mu\) and positive scale
-\(\sigma\) in `log1p(per-100k)` target space. Production training uses Normal
+\(\sigma\). Clinical targets use `log1p(per-100k)`; wastewater uses
+`log1p(concentration)`. Existing wastewater metric keys retain the legacy
+`log1p_per_100k` suffix. Production training uses Normal
 negative log likelihood:
 
 $$
@@ -108,8 +110,18 @@ validation CRPS (`mean_target_crps`) when it is available. NLL training falls
 back to mean target NLL when CRPS is unavailable; the general fallback is mean
 target MAE.
 
-CRPS is currently implemented only for the Normal family. Scores are evaluated
-in `log1p(per-100k)` space and therefore are not raw-incidence CRPS.
+Fixed-df Student-t NLL and CRPS are also supported. Student-t CDF values use an
+exact trigonometric recurrence for integer df up to 100 and 64-point numerical
+integration otherwise. WIS training and evaluation use a fixed 23-quantile grid
+for both families. These are transformed-space scores, not raw-incidence CRPS.
+
+Research campaigns set `training.selection_metric=mean_target_wis` and declare
+`training.selection_required_heads`. Explicit selection rejects a missing or
+non-finite required score and invalid observed predictions; it cannot fall back
+to a different metric. General training retains `selection_metric=auto`.
+Canonical per-head aggregates include WIS, CRPS, NLL, interval coverage/width,
+and validity counts. Granular schema 4 retains distribution parameters, WIS,
+and observation support for later calibration and event evaluation.
 
 ### Observation weighting and supervision
 

@@ -284,6 +284,9 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
             profiler=SimpleNamespace(enabled=False),
             max_batches=None,
             epochs=1,
+            selection_metric="auto",
+            retain_best_crps_checkpoint=False,
+            selection_required_heads=["ww", "hosp", "cases", "deaths"],
             scheduler_type="none",
             plot_forecasts=False,
             run_final_evaluation=False,
@@ -393,6 +396,9 @@ class TestEpiForecasterTrainer:
             ),
             training=TrainingParams(
                 epochs=1,
+                selection_metric="auto",
+                retain_best_crps_checkpoint=False,
+                selection_required_heads=["ww", "hosp", "cases", "deaths"],
                 batch_size=4,
                 loss=LossConfig(name="joint_inference"),
                 curriculum=CurriculumConfig(enabled=False),
@@ -952,3 +958,57 @@ def test_build_wandb_payload_omits_histograms_when_frequency_is_zero():
     )
 
     assert payload is None
+
+
+def test_auxiliary_crps_checkpoint_does_not_change_primary_selection():
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(
+            selection_required_heads=["ww", "hosp", "cases", "deaths"]
+        ),
+        output=SimpleNamespace(save_checkpoints=True),
+    )
+    trainer.criterion = SimpleNamespace(observation_loss="nll")
+    trainer.best_val_crps = float("inf")
+    trainer.best_val_selection_score = 7.0
+    trainer.best_val_selection_metric = "mean_target_wis"
+    saved = []
+    trainer._save_checkpoint = lambda *args, **kwargs: saved.append((args, kwargs))
+    for epoch, score in enumerate([2.0, 3.0, 1.0]):
+        metrics = {
+            f"crps_{h}_log1p_per_100k": score for h in ["ww", "hosp", "cases", "deaths"]
+        }
+        trainer._maybe_save_crps_checkpoint(epoch, 99.0, metrics)
+    assert [args[0] for args, _ in saved] == [0, 2]
+    assert all(kwargs["is_best_crps"] for _, kwargs in saved)
+    assert all(
+        kwargs["val_selection_metric"] == "mean_target_crps" for _, kwargs in saved
+    )
+    assert trainer.best_val_selection_score == 7.0
+    assert trainer.best_val_selection_metric == "mean_target_wis"
+    assert trainer.best_val_crps == 1.0
+
+
+def test_explicit_selection_resume_rejects_policy_or_distribution_changes():
+    import copy
+    from dataclasses import asdict
+    from models.configs import TrainingParams
+
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.config = SimpleNamespace(
+        training=TrainingParams(selection_metric="mean_target_wis")
+    )
+    checkpoint = {"config": {"training": asdict(trainer.config.training)}}
+    trainer._validate_checkpoint_selection_contract(checkpoint)
+    for field, value in [
+        ("selection_metric", "mean_target_crps"),
+        ("selection_required_heads", ["cases"]),
+    ]:
+        changed = copy.deepcopy(checkpoint)
+        changed["config"]["training"][field] = value
+        with pytest.raises(ValueError, match="selection contract"):
+            trainer._validate_checkpoint_selection_contract(changed)
+    changed = copy.deepcopy(checkpoint)
+    changed["config"]["training"]["loss"]["joint"]["distribution_family"] = "student_t"
+    with pytest.raises(ValueError, match="observation contract"):
+        trainer._validate_checkpoint_selection_contract(changed)

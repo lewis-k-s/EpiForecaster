@@ -228,8 +228,11 @@ def test_joint_loss_distributional_validation() -> None:
     cfg = JointLossConfig(observation_loss="nll", distribution_family="student_t")
     assert cfg.distribution_family == "student_t"
 
-    with pytest.raises(ValueError, match="currently requires"):
-        JointLossConfig(observation_loss="crps", distribution_family="student_t")
+    for objective in ("crps", "wis"):
+        cfg = JointLossConfig(
+            observation_loss=objective, distribution_family="student_t"
+        )
+        assert cfg.observation_loss == objective
 
 
 @pytest.mark.epiforecaster
