@@ -2541,8 +2541,10 @@ def test_transferred_runner_attaches_without_sbatch(
     ).resolve() == run_root
 
 
-def test_external_launcher_coordinator_exports_validated_capacity(
-    tmp_path: Path,
+@pytest.mark.parametrize("mode", ["batch", "existing-allocation"])
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_container_coordinator_preserves_capacity_and_completion(
+    tmp_path: Path, mode: str, exit_code: int
 ) -> None:
     run_root = tmp_path / "run"
     attempt_root = run_root / ".state/executions/attempt"
@@ -2551,43 +2553,59 @@ def test_external_launcher_coordinator_exports_validated_capacity(
     source_root.mkdir()
     (run_root / "config.yaml").write_text("{}\n")
     capture = tmp_path / "capacity.txt"
-    snakemake = tmp_path / "snakemake"
-    snakemake.write_text(
-        "#!/bin/bash\n"
+    sif = tmp_path / "runtime.sif"
+    sif.touch()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Only the container runtime is executable on the host. The in-container
+    # Snakemake path deliberately does not exist in this test fixture.
+    singularity = fake_bin / "singularity"
+    singularity.write_text(
+        "#!/bin/bash\nset -euo pipefail\n"
+        'printf "%s\\n" "$@" >"$CAPTURE.container"\n'
+        'test "$1" = exec\nshift\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        "    --cleanenv|--containall) shift ;;\n"
+        "    --bind|--pwd) shift 2 ;;\n"
+        '    --env) export "$2"; shift 2 ;;\n'
+        "    *) break ;;\n"
+        "  esac\ndone\n"
+        'test "$1" = "$EXPECTED_SIF"\nshift\n'
+        'test "$1" = /usr/local/bin/snakemake\nshift\n'
         'printf "%s\\t%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_NTASKS" '
         '"$SLURM_CPUS_PER_TASK" >"$CAPTURE"\n'
         'printf "%s\\n" "$@" >"$CAPTURE.args"\n'
+        'printf "%s\\n" "$EPIFORECASTER_EXECUTION_MODE" >"$CAPTURE.mode"\n'
+        f"exit {exit_code}\n"
     )
-    snakemake.chmod(0o755)
+    singularity.chmod(0o755)
     coordinator = REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
     env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "CAPTURE": str(capture),
+        "EXPECTED_SIF": str(sif),
         "SLURM_JOB_ID": "98765",
         "SLURM_STEP_ID": "7",
         "SLURM_NNODES": "1",
-        "SLURM_NTASKS": "1",
+        "SLURM_JOB_NUM_NODES": "1",
+        "SLURM_NTASKS": "2" if mode == "batch" else "1",
+        "SLURM_CPUS_PER_TASK": "20",
     }
-
-    subprocess.run(
-        [
-            str(coordinator),
-            str(run_root),
-            str(snakemake),
-            "2",
-            "20",
-            "existing-allocation",
-            str(attempt_root),
-        ],
+    result = subprocess.run(
+        [str(coordinator), str(run_root), str(sif), "2", "20", mode, str(attempt_root)],
         env=env,
-        check=True,
+        capture_output=True,
+        text=True,
     )
-
+    assert result.returncode == exit_code, result.stderr
     assert capture.read_text() == "1\t2\t20\n"
+    assert Path(f"{capture}.mode").read_text().strip() == mode
     arguments = Path(f"{capture}.args").read_text().splitlines()
     assert arguments[arguments.index("--cores") + 1] == "40"
     assert arguments[arguments.index("--jobs") + 1] == "2"
     assert arguments[arguments.index("--resources") + 1] == "gpu=2"
-    assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
+    assert f"exit_code\t{exit_code}\n" in (attempt_root / "completed.tsv").read_text()
     assert (attempt_root / "coordinator.step_id").read_text() == "7\n"
 
 

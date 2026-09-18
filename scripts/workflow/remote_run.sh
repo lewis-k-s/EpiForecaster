@@ -585,7 +585,7 @@ submit_run() {
     "$coordinator"
     "$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
     "$RUN_ROOT"
-    "$SNAKEMAKE_BIN"
+    "$CONTAINER_SIF"
     "$TASKS"
     "$CPUS_PER_TASK"
     batch
@@ -698,7 +698,7 @@ attach_worker() {
     --error="$attempt_root/coordinator.err" \
     "$coordinator" \
     "$RUN_ROOT" \
-    "$SNAKEMAKE_BIN" \
+    "$CONTAINER_SIF" \
     "$TASKS" \
     "$CPUS_PER_TASK" \
     existing-allocation \
