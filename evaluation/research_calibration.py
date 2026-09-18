@@ -11,6 +11,7 @@ import torch
 from scipy import stats
 
 from evaluation.distribution_scores import (
+    WIS_INTERVAL_LEVELS,
     distribution_wis,
     normal_crps,
     standard_wis_half_widths,
@@ -208,6 +209,22 @@ def score_research_calibrators(
             scored["pit"] = distribution.cdf(residual)
             scored["nll"] = -distribution.logpdf(residual) + np.log(scale.numpy())
             scored["absolute_error"] = np.abs((y - loc).numpy())
+            scored["target_units"] = (
+                "log1p_concentration" if target == "wastewater" else "log1p_per_100k"
+            )
+            scored["forecast_origin_date"] = (
+                pd.to_datetime(scored.target_date)
+                - pd.to_timedelta(scored.horizon, unit="D")
+            ).dt.strftime("%Y-%m-%d")
+            quantiles = sorted(
+                {0.5}
+                | {round((1 - level) / 2, 8) for level in WIS_INTERVAL_LEVELS}
+                | {round((1 + level) / 2, 8) for level in WIS_INTERVAL_LEVELS}
+            )
+            for quantile in quantiles:
+                scored[f"quantile_{round(1000 * quantile):03d}"] = (
+                    loc.numpy() + scale.numpy() * float(distribution.ppf(quantile))
+                )
             metrics = {
                 key: float(scored[key].mean())
                 for key in ["wis", "crps", "nll", "absolute_error"]

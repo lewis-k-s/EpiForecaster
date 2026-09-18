@@ -200,3 +200,27 @@ new research modules. After a pandas typing adjustment, all eight comparison
 tests passed again. No training has completed and no notable improvement has
 been obtained. Keep the goal active through preprocessing QA, acceptance, and
 paired training/evaluation within the declared budget.
+
+## 2026-09-18: data-stage mount failure and complete research export fields
+
+R2 job `46081958` ran on `as02r5b31` and failed after 27 seconds. Coordinator
+preparation and data dependency hashing passed. Its first scientific job step
+failed before DVC staging: the individual checksum-file bind had no destination
+parent inside the contained runtime. The scientific wrapper now binds the
+immutable container directory read-only, as the coordinator already does.
+It also removes the ineffective HOME environment override. R2 logs are synced
+under `outputs/loss_research/loss-type-research-v1/preprocessing/r2/logs`.
+No preprocessing or model training completed in R2. The next run must be R3.
+No live interactive or scheduled allocation was available after this failure.
+
+JSON role and fold manifests now participate in generic scientific dependency
+fingerprints. Research schema 1 now exports all 23 WIS quantiles, explicit
+log-space target units, last-history-day forecast origins, fixed-rule event
+decisions, and nullable fitted-rule decisions. Unsupported decisions remain
+missing. These fields were added before any research forecasts were produced.
+The immutable-workflow guide documents their meanings and artifact contract.
+
+Validation: 1,317 tests passed, two skipped; Ruff, shell syntax, whitespace, and
+research module type checks passed. Host Slurm client dependencies were also
+checked inside the pinned SIF on the login node; this is a client namespace
+check, not evidence of a successful compute-node science step.

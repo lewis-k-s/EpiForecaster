@@ -1848,6 +1848,25 @@ def test_every_stage_depends_on_the_complete_scientific_source_bundle() -> None:
         assert run_config.stage_source_files(paths, config, stage) == expected
 
 
+def test_research_role_changes_invalidate_stage_fingerprints(tmp_path: Path) -> None:
+    from workflow.common import dependency_sources, source_fingerprint
+
+    roles = Path("configs/research/loss_roles_v1.json")
+    folds = Path("configs/crossval/folds.json")
+    for relative in [roles, folds]:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"version": 1}')
+    for stage in ["training", "evaluation"]:
+        sources = dependency_sources(tmp_path, [roles, folds], {}, stage)
+        assert set(sources) == {str(tmp_path / roles), str(tmp_path / folds)}
+        for relative in [roles, folds]:
+            before = source_fingerprint(tmp_path, sources)
+            path = tmp_path / relative
+            path.write_text(path.read_text() + "\n")
+            assert source_fingerprint(tmp_path, sources) != before
+
+
 def test_evaluation_writes_and_hashes_required_artifact_contract(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2727,8 +2746,10 @@ def test_run_scoped_dvc_push_uses_parent_workspace_bind(tmp_path: Path) -> None:
     assert global_parts[promotion_index + 1] == str(tmp_path / "promoted")
 
 
+@pytest.mark.parametrize("sidecar", [False, True])
 def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
     tmp_path: Path,
+    sidecar: bool,
 ) -> None:
     run_root = tmp_path / "run"
     source_root = tmp_path / "source"
@@ -2741,6 +2762,9 @@ def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
     for directory in (run_root, source_root, remote, cache, fake_bin, scratch):
         directory.mkdir()
     sif.touch()
+
+    if sidecar:
+        Path(f"{sif}.sha256").write_text("a" * 64 + "  runtime.sif\n")
 
     singularity = fake_bin / "singularity"
     singularity.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE"\n')
@@ -2782,6 +2806,10 @@ def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
         if line.startswith(f"{run_root}:")
     ]
     assert binds == [f"{run_root}:/workspace/run:rw"]
+    arguments = capture.read_text().splitlines()
+    assert "HOME=/tmp" not in arguments
+    assert (f"{sif.parent}:{sif.parent}:ro" in arguments) is sidecar
+    assert f"{sif}.sha256:{sif}.sha256:ro" not in arguments
 
 
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:

@@ -109,6 +109,14 @@ def score_research_events(
             selected["event_definition"] = name
             selected["value_threshold"] = definition.threshold
             selected["operating_probability_threshold"] = operating["threshold"]
+            selected["event_decision_fixed_0_5"] = selected.event_probability >= 0.5
+            selected["event_decision_operating"] = (
+                (selected.event_probability >= float(operating["threshold"])).astype(
+                    "boolean"
+                )
+                if operating["threshold"] is not None
+                else pd.Series(pd.NA, index=selected.index, dtype="boolean")
+            )
             bands = {}
             for band, low, high in [
                 ("all", 1, 28),

@@ -68,6 +68,16 @@ def test_calibration_artifact_roundtrip_and_out_of_fit_evaluation(
     assert (rows.distribution_loc == 0).all()
     assert (rows.crps >= 0).all() and (rows.wis >= 0).all()
     assert rows.pit.between(0, 1).all()
+    quantile_columns = sorted(c for c in rows if c.startswith("quantile_"))
+    assert len(quantile_columns) == 23
+    assert (np.diff(rows[quantile_columns].to_numpy(), axis=1) > 0).all()
+    assert np.allclose(rows.quantile_500, rows.distribution_loc)
+    assert rows.forecast_origin_date.eq("2020-10-28").all()
+    assert (
+        rows.loc[rows.target.eq("wastewater"), "target_units"]
+        .eq("log1p_concentration")
+        .all()
+    )
     json.dumps(summary, allow_nan=False)
     with pytest.raises(ValueError, match="cannot supply evaluation evidence"):
         score_research_calibrators(
@@ -174,15 +184,18 @@ def test_research_event_artifacts_use_fit_thresholds_and_frozen_operating_rules(
         fit, calibration, scored, artifact, manifest
     )
     assert len(events) == 20 * 3 * 2
+    assert not events.event_decision_fixed_0_5.any()
+    assert events.event_decision_operating.all()
     c0 = summary["definitions"]["q90"]["controls"]["C0"]
     assert c0["horizon_bands"]["all"]["fixed_0_5"]["recall"] == 0
     assert c0["horizon_bands"]["all"]["operating"]["recall"] == 1
     assert c0["horizon_bands"]["days_8_14"]["fixed_0_5"]["count"] == 0
     assert summary["hospitalizations"]["status"] == "unsupported"
     json.dumps(summary, allow_nan=False)
-    _, low_support = score_research_events(
+    unsupported_rows, low_support = score_research_events(
         fit, calibration, scored, artifact, manifest, min_support=21
     )
+    assert unsupported_rows.event_decision_operating.isna().all()
     assert (
         low_support["definitions"]["q90"]["controls"]["C0"]["operating_rule"]["reason"]
         == "insufficient_unique_positive_support"

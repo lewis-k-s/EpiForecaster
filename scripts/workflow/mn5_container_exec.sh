@@ -224,9 +224,10 @@ configure_shared_binds() {
 
   # Publication receipts read the immutable SIF digest from inside the
   # contained runtime. The SIF itself is an execution input, not a bind, so
-  # expose its immutable sidecar explicitly.
+  # expose its immutable directory. File binds cannot create missing parent
+  # directories on all MN5 container mounts.
   if [ -f "${SIF}.sha256" ]; then
-    BINDS+=("${SIF}.sha256:${SIF}.sha256:ro")
+    BINDS+=("$(dirname "$SIF"):$(dirname "$SIF"):ro")
   fi
 
   if [ "${#INPUT_PATHS[@]}" -gt 0 ]; then
@@ -287,7 +288,6 @@ configure_singularity_arguments() {
   SINGULARITY_ARGS+=(
     --env "PATH=$container_path"
     --env "PYTHONPATH=/workspace/source"
-    --env "HOME=/tmp"
     --env "XDG_CACHE_HOME=/tmp/.cache"
     --env "MPLCONFIGDIR=/tmp/matplotlib"
     --env "TMPDIR=/tmp"

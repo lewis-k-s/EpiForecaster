@@ -350,3 +350,34 @@ rule finishes with `.state/workflow.done`. Direct public targets expose their
 declared artifacts without rewriting that default receipt. Existing run
 directories and promotion destinations are never overwritten. Do not run
 `dvc gc` while any run or promoted artifact may reference the shared cache.
+
+## Loss research evaluation
+
+For a protected research training config, set `evaluation.research_outputs: true`,
+`evaluation.split: val`, and `evaluation.granular: true`. The workflow evaluates
+selection (`val`) and calibration (`test`) from one checkpoint. This development
+path rejects confirmation-enabled configs and changes to the trained observation
+objective. It publishes a complete attempt only after both evaluations and the
+research artifacts pass validation. Recovery restores the complete attempt.
+
+The evaluation directory includes `research_fit_cases.parquet`,
+`research_calibration.json`, `research_scored.parquet`, `research_summary.json`,
+`research_events.parquet`, and `research_events.json`. Raw calibration outputs
+are under `calibration/`. The top-level evaluation manifest hashes all outputs
+and records the checkpoint and dated-role manifest identities. JSON role and
+fold manifests are part of scientific stage dependency fingerprints.
+
+Research score schema 1 includes the original distribution parameters, calibrated
+scale, observed target, target units, last-history-day forecast origin, data role,
+control ID, WIS, CRPS, NLL, median absolute error, PIT, coverage and interval width.
+Its 23 `quantile_NNN` columns give probabilities `NNN / 1000` on the declared
+WIS grid (for example, `quantile_025` and `quantile_500`). Values use log target
+units. Wastewater uses log1p concentration; the clinical heads use log1p per
+100,000. Do not interpret exponentiated Student-t values as finite means.
+
+Event schema 1 contains high-incidence case labels and probabilities, fitted
+value and alert thresholds, `event_decision_fixed_0_5`, and nullable
+`event_decision_operating`. A missing operating decision denotes unsupported
+calibration evidence. It is not a negative alert. Summary JSON contains metric
+counts, support reasons, and horizon-band results. Hospitalization event scores
+remain unsupported until source-level aggregation is defined.

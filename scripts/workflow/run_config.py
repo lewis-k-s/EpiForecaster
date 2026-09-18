@@ -66,7 +66,7 @@ SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
     "vendor",
 }
 SCIENTIFIC_SOURCE_FILES = {"cli.py", "pyproject.toml", "uv.lock"}
-SCIENTIFIC_SOURCE_SUFFIXES = {".py", ".sh", ".smk", ".toml", ".yaml", ".yml"}
+SCIENTIFIC_SOURCE_SUFFIXES = {".py", ".sh", ".smk", ".toml", ".yaml", ".yml", ".json"}
 DEPENDENCY_STAGES = {
     "data",
     "training",
