@@ -439,3 +439,11 @@ Reader validation: 1,331 tests passed, two skipped; Ruff and whitespace checks
 passed. Best-effort Pyright reports ten errors in unchanged tensor/topology
 sections of `data/epi_dataset.py`, with none at the modified reader. Save the
 new reader as a separate source identity before preparing R6.
+
+R6 `loss-acceptance-normal-nll-m1-f1-s52-r6` was prepared and remote-dry-ran
+from `a91476f`, then submitted as `acc_debug` job `46087093` with the same
+one-GPU/30-minute bound. The receipts are saved under its local acceptance
+directory. Continue this exact job and inspect its first training output.
+Only claim the reader fix works after successful cluster initialization.
+Cumulative allocated use through R5 is 660 GPU-seconds (0.1833 GPU-hours).
+No model has completed training and no loss comparison is available yet.
