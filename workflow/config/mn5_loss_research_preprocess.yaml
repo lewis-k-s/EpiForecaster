@@ -7,7 +7,7 @@ workflow:
   target: preprocess
 dvc:
   targets:
-    - loss_research_raw_inputs_v1.dvc
+    - outputs/loss_research/loss-type-research-v1/raw_inputs.dvc
     - data/files/mobility.zarr.dvc
   provenance_targets: []
 preprocessing:

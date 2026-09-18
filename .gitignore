@@ -49,6 +49,11 @@ outputs/region_embeddings/*
 !outputs/region_embeddings_no_mobility/
 outputs/region_embeddings_no_mobility/*
 !outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc
+!outputs/loss_research/
+outputs/loss_research/*
+!outputs/loss_research/loss-type-research-v1/
+outputs/loss_research/loss-type-research-v1/*
+!outputs/loss_research/loss-type-research-v1/raw_inputs.dvc
 logs/
 test_outputs/
 test_output/

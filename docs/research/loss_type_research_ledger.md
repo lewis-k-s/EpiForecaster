@@ -260,3 +260,25 @@ Validation: 1,319 tests passed, two skipped; Ruff, Pyright for the renderer, and
 whitespace checks passed. Preprocessing job `46082766` remains live and pending
 for priority with no start estimate. Do not resubmit it while it is pending.
 No new dataset, forecast score, or notable improvement has been obtained yet.
+
+## 2026-09-18: raw inputs fetched; source mount parent corrected
+
+R4 job `46082766` ran on `as01r4b30` for 45 seconds. Its data step fetched both
+DVC targets (7,682 files) and DVC reported them up to date. It then rejected a
+missing source mount parent: `outputs/loss_research/loss-type-research-v1`.
+The container/runtime fixes passed this stage. Preprocessing did not begin.
+An SSH jump was attempted while the job was live; first-host-key setup and the
+short failure window prevented a completed attachment. Do not attach to the
+ended allocation. Logs are synced in the local preprocessing `r4` directory.
+
+Move the raw pointer from the repository root to
+`outputs/loss_research/loss-type-research-v1/raw_inputs.dvc`, beside its payload.
+The DVC hash remains `c65715e80dcc5947eb665c7f037ed9ed.dir`; no raw data changed.
+The Git ignore exception covers only the pointer; payloads and logs remain
+ignored. Local DVC status passes. Preparation now rejects a DVC mount parent
+that is absent from the source inventory, even if an ignored local directory
+happens to exist. This turns the observed cluster failure into a local check.
+
+Full validation: 1,320 tests passed, two skipped; Ruff and whitespace checks
+passed. Prepare the corrected input layout as R5, preserving all prior runs.
+The goal remains active and no forecast comparison has been made.

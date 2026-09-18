@@ -44,7 +44,7 @@ support are checked. Existing `real_with_id` results are diagnostics only.
 
 ## New input and output identities
 
-`loss_research_raw_inputs_v1.dvc` identifies copied raw inputs, with an input
+`outputs/loss_research/loss-type-research-v1/raw_inputs.dvc` identifies copied raw inputs, with an input
 SHA-256 manifest, under the ignored research output directory. Its DVC hash is
 `c65715e80dcc5947eb665c7f037ed9ed.dir` (9 files, 232,743,467 bytes). The original
 input files and the existing processed dataset are unchanged.

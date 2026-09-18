@@ -3,4 +3,4 @@ outs:
   size: 232743467
   nfiles: 9
   hash: md5
-  path: outputs/loss_research/loss-type-research-v1/raw_inputs
+  path: raw_inputs

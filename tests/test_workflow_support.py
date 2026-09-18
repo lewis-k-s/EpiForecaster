@@ -2972,3 +2972,28 @@ def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert not (marker_root / "000.done").exists()
     assert "outcome=continuation" in (marker_root / "000.partial").read_text()
+
+
+def test_snapshot_rejects_dvc_mount_parent_missing_from_inventory(
+    tmp_path: Path,
+) -> None:
+    pointer = tmp_path / "raw.dvc"
+    pointer.write_text(
+        yaml.safe_dump({"outs": [{"md5": "a.dir", "path": "inputs/raw/data"}]})
+    )
+    config = {"dvc": {"targets": ["raw.dvc"]}}
+    with pytest.raises(ValueError, match="DVC mount parents"):
+        run_config.validate_code_data_separation(tmp_path, [Path("raw.dvc")], config)
+    parent = tmp_path / "inputs/raw"
+    parent.mkdir(parents=True)
+    # A directory that only exists locally is not enough for the source bundle.
+    with pytest.raises(ValueError, match="DVC mount parents"):
+        run_config.validate_code_data_separation(tmp_path, [Path("raw.dvc")], config)
+    pointer.rename(parent / "data.dvc")
+    (parent / "data.dvc").write_text(
+        yaml.safe_dump({"outs": [{"md5": "a.dir", "path": "data"}]})
+    )
+    relative = Path("inputs/raw/data.dvc")
+    assert run_config.validate_code_data_separation(
+        tmp_path, [relative], {"dvc": {"targets": [str(relative)]}}
+    ) == {relative: Path("inputs/raw/data")}
