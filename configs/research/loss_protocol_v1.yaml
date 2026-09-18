@@ -32,17 +32,20 @@ execution:
   roll_allocations: true
   preserve_immutable_runs: true
 data:
-  dataset_dvc_md5: 1e695877f8565c40dcec4c214b0813b8.dir
+  historical_dataset_dvc_md5: 1e695877f8565c40dcec4c214b0813b8.dir
+  research_dataset_name: real_loss_fit20200930_v1
+  research_dataset_dvc_md5: null
+  role_manifest: configs/research/loss_roles_v1.json
   region2vec_dvc_md5: e04ff23fe17dbbb245315798fd7cd887
   dataset_start: '2020-03-01'
   dataset_end: '2021-05-09'
-  confirmation_start: '2021-02-01'
+  confirmation_start: '2021-03-01'
   confirmation_end: '2021-05-09'
   confirmation_claim: retrospective_previously_studied_period
   prohibit_confirmation_labels_in_development: true
   require_disjoint_fit_selection_calibration_roles: true
   require_source_overlap_audit: true
-  scientific_gate: validated_role_manifest_required
+  scientific_gate: replacement_dataset_publication_and_support_QA_required
 screen:
   anchor_campaign: configs/campaigns/epiforecaster_nood_region2vec_context_v1.yaml
   folds: [1, 4, 5]
@@ -57,6 +60,7 @@ events:
   definition: high_incidence_exceedance_research_proxy
   primary_head: cases
   secondary_head: hosp
+  secondary_head_status: unsupported_until_source_aggregation_is_identified
   training_quantile: 0.9
   quantile_method: higher
   sensitivity_quantile: 0.95

@@ -26,6 +26,18 @@ ALLOCATION_FIELDS = (
     "runtime",
 )
 DISPATCH_REQUEST_SCHEMA_VERSION = 1
+RESEARCH_OUTPUT_FILES = (
+    "research_fit_cases.parquet",
+    "research_calibration.json",
+    "research_scored.parquet",
+    "research_summary.json",
+    "research_events.parquet",
+    "research_events.json",
+    "calibration/test_summary.json",
+    "calibration/test_node_metrics.csv",
+    "calibration/test_node_metrics_per_head.csv",
+    "calibration/test_granular.parquet",
+)
 WORKFLOW_KINDS = {
     "train",
     "evaluate",
@@ -297,6 +309,19 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 raise ValueError(
                     "preprocessing.handoff_manifest must be a source-relative path"
                 )
+
+    evaluation = workflow_config.get("evaluation", {})
+    research_outputs = evaluation.get("research_outputs", False)
+    if not isinstance(research_outputs, bool):
+        raise ValueError("evaluation.research_outputs must be Boolean")
+    if research_outputs and (
+        kind not in {"train", "evaluate", "crossval"}
+        or evaluation.get("split") != "val"
+        or evaluation.get("granular") is not True
+    ):
+        raise ValueError(
+            "Research outputs require train/evaluate/crossval with split=val and granular=true"
+        )
 
     provenance = workflow_config.get("provenance", {})
     if not isinstance(provenance, dict):

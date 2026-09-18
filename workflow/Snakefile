@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
 from scripts.workflow.run_config import (
+    RESEARCH_OUTPUT_FILES,
     preprocessing_dataset_name,
     validate_mn5_allocation,
     workflow_kind,
@@ -112,6 +113,9 @@ EVALUATION_ARTIFACTS = [
 ]
 if bool(config.get("evaluation", {}).get("granular", False)):
     EVALUATION_ARTIFACTS.append(str(EVALUATION_GRANULAR))
+
+if config.get("evaluation", {}).get("research_outputs", False):
+    EVALUATION_ARTIFACTS.extend(str(EVALUATION_DIR / name) for name in RESEARCH_OUTPUT_FILES)
 
 if WORKFLOW_KIND == "train":
     training = config["training"]

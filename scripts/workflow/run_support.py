@@ -1576,6 +1576,122 @@ def evaluate_best(
     return evaluation_manifest
 
 
+def evaluate_research_model(
+    config_path: Path,
+    run_root: Path,
+    checkpoint_path: Path,
+) -> Path:
+    """Evaluate development roles and publish one complete research attempt."""
+    import torch
+    from data.research_roles import load_role_manifest
+    from evaluation.research_pipeline import write_research_outputs
+    from models.configs import EpiForecasterConfig
+    from scripts.workflow.run_config import RESEARCH_OUTPUT_FILES
+
+    workflow_config = load_yaml(config_path)
+    validate_workflow_contract(workflow_config)
+    evaluation = workflow_config["evaluation"]
+    overrides = [str(value) for value in evaluation.get("overrides", [])]
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = EpiForecasterConfig.from_dict(saved["config"])
+    original_joint = config.training.loss.joint
+    config = EpiForecasterConfig.apply_overrides(config, overrides)
+    if config.training.loss.joint != original_joint:
+        raise ValueError(
+            "Research evaluation cannot change the trained observation objective"
+        )
+    if (
+        config.training.split_strategy != "research"
+        or config.training.research_evaluation_role != "calibration"
+        or config.training.research_confirmation_enabled
+    ):
+        raise ValueError(
+            "Development research requires protected selection/calibration roles"
+        )
+    role_path = config.training.research_role_manifest_path
+    if role_path is None:
+        raise ValueError("Research evaluation requires a role manifest")
+    manifest, role_hash = load_role_manifest(role_path)
+    checkpoint_hash = sha256_file(checkpoint_path)
+    identity = {
+        "config_sha256": sha256_file(config_path),
+        "checkpoint_sha256": checkpoint_hash,
+        "role_manifest_sha256": role_hash,
+    }
+    attempts = run_root / ".state/attempts/research_evaluation"
+    destination = run_root / "outputs/evaluation"
+    if restore_attempt(attempts, identity, run_root):
+        return destination / "evaluation_manifest.json"
+    attempt = new_attempt(attempts)
+    output = attempt / "outputs/evaluation"
+    selection_manifest = evaluate_best(checkpoint_path, output, "val", overrides, True)
+    shutil.copy2(selection_manifest, output / "selection_evaluation_manifest.json")
+    evaluate_best(checkpoint_path, output / "calibration", "test", overrides, True)
+    write_research_outputs(
+        config=config,
+        manifest=manifest,
+        checkpoint_sha256=checkpoint_hash,
+        selection_path=output / "val_granular.parquet",
+        calibration_path=output / "calibration/test_granular.parquet",
+        output_dir=output,
+    )
+    required = {
+        "val_summary.json",
+        "val_node_metrics.csv",
+        "val_node_metrics_per_head.csv",
+        "val_granular.parquet",
+        *RESEARCH_OUTPUT_FILES,
+    }
+    missing = sorted(name for name in required if not (output / name).is_file())
+    if missing:
+        raise FileNotFoundError(f"Research evaluation is incomplete: {missing}")
+    artifacts = sorted(
+        path
+        for path in output.rglob("*")
+        if path.is_file() and path not in {selection_manifest, output / ".done"}
+    )
+    write_json(
+        selection_manifest,
+        {
+            "schema_version": 1,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_sha256": checkpoint_hash,
+            "split": "val",
+            "granular": True,
+            "research_outputs": True,
+            "role_manifest_sha256": role_hash,
+            "data_roles": {"val": "selection", "test": "calibration"},
+            "artifacts": [
+                {
+                    "path": str(path.relative_to(output)),
+                    "sha256": sha256_file(path),
+                    "required": str(path.relative_to(output)) in required,
+                }
+                for path in artifacts
+            ],
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    write_json(
+        output / ".done",
+        {
+            "evaluation_manifest": str(destination / "evaluation_manifest.json"),
+            "checkpoint_sha256": checkpoint_hash,
+        },
+    )
+    complete_attempt(
+        attempt,
+        identity,
+        {
+            destination / path.relative_to(output): path
+            for path in output.rglob("*")
+            if path.is_file()
+        },
+        run_root,
+    )
+    return destination / "evaluation_manifest.json"
+
+
 def evaluate_configured_model(
     config_path: Path,
     run_root: Path,
@@ -1623,6 +1739,8 @@ def evaluate_configured_model(
         expected_sha256 = str(evaluation_input["checkpoint_sha256"])
         if sha256_file(resolved_checkpoint) != expected_sha256:
             raise ValueError("Pinned evaluation checkpoint failed SHA-256 validation")
+    if evaluation.get("research_outputs", False):
+        return evaluate_research_model(config_path, run_root, resolved_checkpoint)
     return evaluate_best(
         resolved_checkpoint,
         run_root / "outputs/evaluation",

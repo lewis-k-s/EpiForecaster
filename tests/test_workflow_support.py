@@ -2601,6 +2601,8 @@ def test_container_coordinator_preserves_capacity_and_completion(
     assert result.returncode == exit_code, result.stderr
     assert capture.read_text() == "1\t2\t20\n"
     assert Path(f"{capture}.mode").read_text().strip() == mode
+    container_arguments = Path(f"{capture}.container").read_text().splitlines()
+    assert f"{sif.parent}:{sif.parent}:ro" in container_arguments
     arguments = Path(f"{capture}.args").read_text().splitlines()
     assert arguments[arguments.index("--cores") + 1] == "40"
     assert arguments[arguments.index("--jobs") + 1] == "2"

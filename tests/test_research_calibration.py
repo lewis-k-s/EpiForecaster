@@ -145,3 +145,99 @@ def test_calibration_rejects_changed_artifacts_and_checkpoint(calibration, manif
         score_research_calibrators(
             selection, changed, manifest, role="selection", checkpoint_sha256="a" * 64
         )
+
+
+def test_research_event_artifacts_use_fit_thresholds_and_frozen_operating_rules(
+    calibration, manifest
+):
+    from evaluation.research_events import score_research_events
+
+    calibration.loc[calibration.target.eq("cases"), "observed"] = np.linspace(1, 3, 20)
+    artifact = fit_research_calibrators(
+        calibration, manifest, checkpoint_sha256="a" * 64
+    )
+    selection = calibration.assign(role="selection", target_date="2020-10-29")
+    scored, _ = score_research_calibrators(
+        selection, artifact, manifest, role="selection", checkpoint_sha256="a" * 64
+    )
+    fit = pd.DataFrame(
+        {
+            "role": "fit",
+            "target": "cases",
+            "source_id": "case_municipality",
+            "target_date": pd.date_range("2020-09-01", periods=10),
+            "observed": np.linspace(0, 0.5, 10),
+            "observed_mask": True,
+        }
+    )
+    events, summary = score_research_events(
+        fit, calibration, scored, artifact, manifest
+    )
+    assert len(events) == 20 * 3 * 2
+    c0 = summary["definitions"]["q90"]["controls"]["C0"]
+    assert c0["horizon_bands"]["all"]["fixed_0_5"]["recall"] == 0
+    assert c0["horizon_bands"]["all"]["operating"]["recall"] == 1
+    assert c0["horizon_bands"]["days_8_14"]["fixed_0_5"]["count"] == 0
+    assert summary["hospitalizations"]["status"] == "unsupported"
+    json.dumps(summary, allow_nan=False)
+    _, low_support = score_research_events(
+        fit, calibration, scored, artifact, manifest, min_support=21
+    )
+    assert (
+        low_support["definitions"]["q90"]["controls"]["C0"]["operating_rule"]["reason"]
+        == "insufficient_unique_positive_support"
+    )
+    fit["target_date"] = "2020-12-29"
+    with pytest.raises(ValueError, match="fit role"):
+        score_research_events(fit, calibration, scored, artifact, manifest)
+
+
+def test_pipeline_writes_all_canonical_research_artifacts(
+    monkeypatch, tmp_path, calibration, manifest
+):
+    from evaluation import research_pipeline as pipeline
+    from models.configs import EpiForecasterConfig
+
+    config = EpiForecasterConfig.load(
+        "configs/train_epifor_smoke.yaml",
+        overrides=[
+            "training.split_strategy=research",
+            "training.research_role_manifest_path=configs/research/loss_roles_v1.json",
+            "model.forecast_horizon=28",
+        ],
+    )
+    fit = pd.DataFrame(
+        {
+            "role": "fit",
+            "target": "cases",
+            "source_id": "a",
+            "target_date": pd.date_range("2020-09-01", periods=20),
+            "observed": np.linspace(0, 2, 20),
+            "observed_mask": True,
+        }
+    )
+    monkeypatch.setattr(pipeline, "load_fit_cases", lambda *args: fit)
+    cal_path = tmp_path / "cal.parquet"
+    sel_path = tmp_path / "sel.parquet"
+    calibration.to_parquet(cal_path)
+    calibration.assign(role="selection", target_date="2020-10-29").to_parquet(sel_path)
+    output = tmp_path / "outputs"
+    paths = pipeline.write_research_outputs(
+        config=config,
+        manifest=manifest,
+        checkpoint_sha256="a" * 64,
+        selection_path=sel_path,
+        calibration_path=cal_path,
+        output_dir=output,
+    )
+    assert {path.name for path in paths} == set(pipeline.RESEARCH_ARTIFACTS)
+    for path in paths:
+        if path.suffix == ".json":
+            json.loads(path.read_text())
+        else:
+            assert not pd.read_parquet(path).empty
+    scores = pd.read_parquet(output / "research_scored.parquet")
+    assert set(scores.role) == {"selection"}
+    assert set(scores.control) == {"C0", "C1", "C2"}
+    events = json.loads((output / "research_events.json").read_text())
+    assert events["hospitalizations"]["status"] == "unsupported"

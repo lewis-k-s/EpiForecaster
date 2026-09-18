@@ -152,6 +152,7 @@ container_args=(
   --cleanenv
   --containall
   --bind "$RUN_ROOT:$RUN_ROOT:rw"
+  --bind "$(dirname "$CONTAINER_SIF"):$(dirname "$CONTAINER_SIF"):ro"
   --bind /usr/bin/srun:/usr/bin/srun:ro
   --bind /usr/lib64/slurm:/usr/lib64/slurm:ro
   --bind /usr/lib64/libmunge.so.2.0.1:/usr/lib64/libmunge.so.2.0.1:ro

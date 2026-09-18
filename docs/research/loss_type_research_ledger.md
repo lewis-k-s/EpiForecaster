@@ -145,3 +145,27 @@ research roles, distribution scores, event/calibration helpers, and calibration
 artifacts. Acceptance configuration now pins two epochs and ten batches per
 epoch. No scientific comparison is allowed before replacement data QA and
 observed support checks pass.
+
+## 2026-09-18: research outputs integrated; preprocessing mount repaired
+
+Preprocessing R1 job `46081066` failed after 14 seconds on `as01r3b26`.
+Snakemake started correctly, but its coordinator namespace lacked the SIF
+checksum sidecar. Data staging and preprocessing did not run. Logs are saved
+under `outputs/loss_research/loss-type-research-v1/preprocessing/r1/logs`.
+The next source version mounts the immutable container directory read-only.
+The failed run is preserved.
+
+The `evaluation.research_outputs` workflow option now evaluates selection and
+calibration from the same checkpoint. It publishes calibrated proper scores,
+case event probabilities, fixed and fitted alert scores, source support counts,
+and hash-bound manifests from one complete recoverable attempt. A failed
+attempt does not publish a completion marker. Hospital event scores remain
+unsupported pending a valid source aggregation contract. Tests cover role and
+region exclusion, canonical artifact generation, failed publication, and
+recovery without repeated evaluation.
+
+Full suite: 1,304 passed, two skipped. A further artifact generation test passed
+with all 13 calibration/event tests. Ruff and whitespace checks passed.
+The protocol now names the replacement dataset and the March confirmation
+boundary from the dated role manifest. Dataset QA remains a required gate;
+no scientific loss comparison or improvement claim has been made.
