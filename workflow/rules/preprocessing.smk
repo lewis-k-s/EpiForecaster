@@ -76,6 +76,7 @@ if WORKFLOW_KIND == "preprocess":
                 dvc_mode="push",
                 cpus=CPUS_PER_TASK,
                 promotion_root=str(PREPROCESSING_ROOT),
+                host_step=True,
             )
         shell:
             "{params.command} > {log:q} 2>&1"

@@ -94,6 +94,7 @@ if WORKFLOW_KIND == "train":
                     dvc_mode="push",
                     cpus=CPUS_PER_TASK,
                     promotion_root=str(RUN_ROOT / "evidence"),
+                    host_step=True,
                 )
             shell:
                 "{params.command} > {log:q} 2>&1"

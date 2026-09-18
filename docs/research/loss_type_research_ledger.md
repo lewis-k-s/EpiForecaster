@@ -224,3 +224,14 @@ Validation: 1,317 tests passed, two skipped; Ruff, shell syntax, whitespace, and
 research module type checks passed. Host Slurm client dependencies were also
 checked inside the pinned SIF on the login node; this is a client namespace
 check, not evidence of a successful compute-node science step.
+
+## 2026-09-18: pre-submission publication audit
+
+R3 was prepared from `83c6848` but was not submitted. A source audit found two
+publication paths without host Slurm steps: dataset publication and optional
+training-evidence retention. With the containerized coordinator, both require
+an explicit `srun` step to invoke the host container wrapper. Those paths now
+use the same host-step contract as other publication rules. The generated DAG
+commands pass focused tests. All direct scientific-container rule calls were
+checked for this boundary. Preserve R3 as an unexecuted superseded snapshot;
+prepare R4 from this correction. The full suite is being rerun before dispatch.
