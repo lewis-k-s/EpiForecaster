@@ -235,3 +235,11 @@ use the same host-step contract as other publication rules. The generated DAG
 commands pass focused tests. All direct scientific-container rule calls were
 checked for this boundary. Preserve R3 as an unexecuted superseded snapshot;
 prepare R4 from this correction. The full suite is being rerun before dispatch.
+
+R4 passed immutable preparation and remote dry-run from `e6d9b36`. Full validation
+passed: 1,318 tests, two skipped. It is submitted on `acc_debug` as job
+`46082766`, with one GPU, 20 CPUs, and a 90-minute cap. Submission and dry-run
+receipts are saved under the local preprocessing `r4` evidence directory.
+Continue this exact job and inspect its first science step before any further
+retry. The comparison gate remains closed until preprocessing publication,
+dataset support QA, and bounded model acceptance pass.
