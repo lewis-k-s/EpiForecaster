@@ -481,3 +481,35 @@ whitespace checks. Next render a new acceptance template set and use a new
 Student-t CRPS run with the h5netcdf reader and both compiler paths disabled.
 The old prepared Student-t CRPS R1 remains unexecuted and superseded. No
 scientific baseline comparison or notable forecast improvement is available.
+
+## 2026-09-18: remaining acceptance matrix prepared; Student-t CRPS submitted
+
+All seven remaining fixed acceptance cases were prepared and remote-dry-ran
+from `aad037f`, with the h5netcdf reader and both compilation flags disabled.
+The exact identities, template hashes, and states are recorded in
+`acceptance/run_inventory_v2.json`. Per-run preparation/dry-run receipts are
+saved locally. Normal NLL mobility-on is complete as R6; Student-t CRPS
+mobility-on is R2; the other six cases are R1. Do not recreate these runs.
+
+Requested rolling one-GPU/20-CPU/one-hour interactive job `46088104`. It had no
+node or active step after about eight minutes and was cancelled while pending;
+its PTY exited. Live policy checks show `acc_debug` has MaxJobsPU=1 and
+MaxSubmitPU=1. Submit fallback runs one at a time. The interactive partition
+is up and contains the single shared GPU login node `alogin3`; no slot was
+assigned to this request. Node inventory access via `sinfo` is not permitted.
+Do not infer zero capacity from that denied query or bypass its restriction.
+
+Submitted `loss-acceptance-student-t-crps-m1-f1-s52-r2` on `acc_debug` as job
+`46088534` (one GPU, 30-minute cap). Continue this exact job. After it passes
+artifact verification, use the already prepared Normal CRPS mobility-off R1
+case, then the remaining fixed acceptance cases. Retain the four-GPU-hour
+acceptance limit and the full research budget. Cumulative allocated use through
+Normal NLL R6 is 1,027 GPU-seconds (0.2853 GPU-hours), including preprocessing.
+
+The Normal NLL R6 root config, source/input manifest, data manifest, and
+training completion receipt are now also synced under `run_receipts`.
+The recorded source bundle SHA-256 is
+`2bceb40e6970b5babc21c795a3c86036c18dc4c9b18fe69fff9af31f25867a41`.
+Its exported C0 WIS agrees with the trainer's score. This acceptance record
+remains excluded from scientific selection; no notable forecast improvement
+has been established.
