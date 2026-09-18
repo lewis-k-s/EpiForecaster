@@ -401,3 +401,13 @@ has been measured.
 Diagnostic-wrapper validation passed: 1,329 tests, two skipped; Ruff and shell
 syntax checks passed. This change improves failure evidence; it does not claim
 to fix the native crash.
+
+R5 `loss-acceptance-normal-nll-m1-f1-s52-r5` was prepared and remote-dry-ran
+from `6b30ac1`, then submitted as `acc_debug` job `46086058` with the same
+one-GPU/30-minute bound. The receipts are saved under the matching local
+acceptance directory. This is the first diagnostic retry of the native failure.
+Continue job `46086058`; a wait timeout is not evidence to restart it. Inspect
+its fault trace if initialization fails. The existing Student-t CRPS R1 is
+still unsubmitted and lacks the new diagnostics; preserve that prepared run.
+Refresh the compute budget after terminal state. Allocated use through the
+failed R4 run is 525 GPU-seconds (0.1458 GPU-hours).
