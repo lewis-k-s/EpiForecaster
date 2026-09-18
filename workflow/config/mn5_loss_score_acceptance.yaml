@@ -21,6 +21,8 @@ training:
     - training.loss.joint.distribution_family=student_t
     - training.loss.joint.distribution_df=5.0
     - training.selection_metric=mean_target_wis
+    - training.epochs=2
+    - training.early_stopping_patience=1
     - training.split_strategy=time
     - training.train_end_date=2020-08-01
     - training.val_end_date=2020-11-01

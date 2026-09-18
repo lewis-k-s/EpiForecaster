@@ -119,3 +119,29 @@ skipped. The site-mount change then passed all 81 workflow tests. Ruff and
 `git diff --check` passed. Best-CRPS checkpoint retention is optional and does
 not control WIS early stopping; explicit-score resume rejects changed score,
 required-head, objective, family, or degrees-of-freedom settings.
+
+## 2026-09-18: approved preprocessing queued; calibration contracts tested
+
+Prepared and dry-ran `loss-preprocess-20260918-r1` from commit `17b24ec`.
+The interactive request `46080792` remained pending with no start estimate;
+it was cancelled without execution. Submitted preprocessing on `acc_debug` as
+job `46081066`, with one GPU, 20 CPUs, and a 90-minute cap. Attach by SSH jump
+only after the scheduler identifies an allocated node owned by this job.
+
+R2 and R3 acceptance failure logs, configs, and dispatch/execution receipts
+have been synced to the local acceptance evidence directory. These are failure
+records, not forecast results. No notable improvement has been observed.
+
+Added role-checked C0/C1/C2 calibration artifact fitting and scoring. Artifacts
+bind the checkpoint SHA-256, role-manifest content hash, forecast identities,
+per-head scale fits, and counts. Evaluation rejects fit-role reuse, altered
+artifacts, mismatched checkpoints, role-crossing forecast windows, duplicate
+identities, invalid observed predictions, and mixed distribution identities.
+The canonical scored rows include WIS, CRPS, NLL, PIT, coverage, and width.
+These APIs are tested but still need the campaign artifact integration.
+
+Validation: 1,296 tests passed, two skipped; Ruff passed. Pyright passed for
+research roles, distribution scores, event/calibration helpers, and calibration
+artifacts. Acceptance configuration now pins two epochs and ten batches per
+epoch. No scientific comparison is allowed before replacement data QA and
+observed support checks pass.

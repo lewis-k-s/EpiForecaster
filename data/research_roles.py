@@ -41,7 +41,10 @@ def research_time_ranges(
         or index.hasnans
         or not index.is_monotonic_increasing
         or index.has_duplicates
-        or not (np.diff(index.asi8) == pd.Timedelta(days=1).value).all()
+        or not (
+            np.diff(index.to_numpy(dtype="datetime64[ns]").astype(np.int64))
+            == pd.Timedelta(days=1).value
+        ).all()
     ):
         raise ValueError("Research roles require a complete ordered daily date grid")
     ranges = {}
@@ -58,7 +61,8 @@ def research_time_ranges(
             raise ValueError(
                 f"{role} needs a forecast-horizon gap after the prior role"
             )
-        start_idx, end_idx = int(index.get_loc(start)), int(index.get_loc(end)) + 1
+        locations = index.get_indexer(pd.DatetimeIndex([start, end]))
+        start_idx, end_idx = int(locations[0]), int(locations[1]) + 1
         if start_idx < input_window or end_idx - start_idx < horizon:
             raise ValueError(f"{role} lacks history or a full label horizon")
         ranges[role] = (start_idx - input_window, end_idx)
