@@ -411,3 +411,31 @@ its fault trace if initialization fails. The existing Student-t CRPS R1 is
 still unsubmitted and lacks the new diagnostics; preserve that prepared run.
 Refresh the compute budget after terminal state. Allocated use through the
 failed R4 run is 525 GPU-seconds (0.1458 GPU-hours).
+
+## 2026-09-18: native traceback identifies the NetCDF4 reopen path
+
+R5 diagnostic job `46086058` ran on `as01r2b22`; SSH jump attachment succeeded.
+It failed after 135 seconds. The traceback places the fault in the native
+`netCDF4` file open called by xarray's file manager, from
+`EpiDataset.load_canonical_dataset` during construction of the training split.
+Fold metadata reads had completed; the Dask worker threads were idle in the
+captured trace. This narrows the failure to input reopening, before losses,
+model forward calls, or optimizer steps. It does not establish the underlying
+native-library defect. The trace is saved in the local R5 logs.
+
+Switch the processed NetCDF4 read path to the already declared `h5netcdf`
+backend. Preserve xarray's Zarr path and the published dataset. Two real-file
+tests check decoded values, attributes, coordinates, masks, run selection,
+and repeated lazy opens after a sibling reader closes. Local parity on the
+published data passes for all non-mobility fields from fit through calibration
+and complete mobility matrices on 2020-05-01, 2020-09-30, and 2021-01-31.
+No confirmation labels were read. Evidence is in `netcdf_backend_parity.json`.
+The pinned SIF's lock SHA-256 equals the local lock and includes h5netcdf/h5py.
+A small earlier local netCDF4 read/close probe also passed, so local success is
+not proof that the cluster crash is fixed. Require the next cluster acceptance
+run to pass. This will be the second retry of the observed native failure.
+
+Reader validation: 1,331 tests passed, two skipped; Ruff and whitespace checks
+passed. Best-effort Pyright reports ten errors in unchanged tensor/topology
+sections of `data/epi_dataset.py`, with none at the modified reader. Save the
+new reader as a separate source identity before preparing R6.

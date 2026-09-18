@@ -47,7 +47,9 @@ def open_processed_dataset(path: Path | str, **kwargs: Any) -> xr.Dataset:
     p = Path(path)
     if p.is_dir() or p.suffix == ".zarr":
         return xr.open_zarr(str(p), **kwargs)
-    return xr.open_dataset(str(p), engine="netcdf4", **kwargs)
+    # The MN5 netCDF4 backend crashes when the research split reopens a file
+    # after threaded metadata reads. Use the h5py-backed NetCDF4 reader.
+    return xr.open_dataset(str(p), engine="h5netcdf", **kwargs)
 
 
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
