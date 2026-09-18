@@ -513,3 +513,32 @@ The recorded source bundle SHA-256 is
 Its exported C0 WIS agrees with the trainer's score. This acceptance record
 remains excluded from scientific selection; no notable forecast improvement
 has been established.
+
+## 2026-09-18: Student-t CRPS acceptance verified; mobility-off case submitted
+
+Student-t CRPS mobility-on R2 job `46088534` completed on `as03r4b26` in
+332 seconds. SSH jump attachment succeeded. Both compilation paths were
+disabled, training and evaluation completed, and checkpoints, all evaluation
+outputs, logs, root configuration, source/input manifest, and training receipts
+are synced locally. Direct checkpoint hashing matches both training receipts:
+`4b26aad24e59343ddb2f0ea478415f1c416253d318567fc65037191c950821da`.
+
+The canonical artifact reader verifies all required hashes and protected roles.
+There are 2,358 scored rows across the four heads and three controls, plus
+2,562 case-event rows. Distribution identity is Student-t with df 5, and the
+training objective is CRPS. Acceptance WIS is C0 0.423859, C1 0.381948,
+C2 0.382481. These figures are pipeline checks, not scientific ranking or
+promotion evidence. No confirmation evaluation was run. The optional plotting
+warning is unchanged; canonical metrics and events are complete.
+
+Two of eight acceptance cases are now complete and locally verified.
+Submitted the existing `loss-acceptance-normal-crps-m0-f1-s52-r1` run as
+`acc_debug` job `46089017` (one GPU, 30-minute cap). Continue this job; the
+single-job queue was empty before submission. The other five unsubmitted
+cases remain prepared. Use `acceptance/run_inventory_v2.json` for their exact
+identities. No duplicate preparation is needed.
+
+Updated scheduler accounting: 1,359 GPU-seconds (0.3775 GPU-hours), including
+preprocessing and all failed startup attempts. Keep the goal active through the
+remaining acceptance cases, paired scientific screen, and bounded confirmation.
+No notable scientific improvement has yet been established.
