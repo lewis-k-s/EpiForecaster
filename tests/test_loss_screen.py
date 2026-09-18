@@ -61,3 +61,34 @@ def test_screen_refuses_unpinned_dataset(protocol):
         loss_screen.screen_templates(protocol, "data/processed/real_with_id.zarr.dvc")
     with pytest.raises(ValueError, match="source-relative"):
         loss_screen.screen_templates(protocol, "../data.dvc")
+
+
+def test_acceptance_covers_family_loss_and_mobility_without_science_budget(protocol):
+    pointer = "data/processed/real_with_id.zarr.dvc"
+    protocol["data"]["research_dataset_dvc_md5"] = yaml.safe_load(
+        Path(pointer).read_text()
+    )["outs"][0]["md5"]
+    templates = loss_screen.acceptance_templates(protocol, pointer)
+    assert len(templates) == 8
+    settings = set()
+    for identity, template in templates:
+        assert identity.startswith("loss-acceptance-")
+        assert template["training"]["max_batches"] == 10
+        assert template["training"]["experiment_name"].endswith("-acceptance")
+        values = dict(item.split("=", 1) for item in template["training"]["overrides"])
+        assert values["training.epochs"] == "2"
+        assert values["training.early_stopping_patience"] == "1"
+        assert values["training.compile"] == "false"
+        assert values["training.crossval_fold_index"] == "1"
+        assert values["training.seed"] == "52"
+        assert template["resources"]["allocation"]["runtime"] == 30
+        settings.add(
+            (
+                values["training.loss.joint.distribution_family"],
+                values["training.loss.joint.observation_loss"],
+                values["model.type.mobility"],
+            )
+        )
+    assert len(settings) == 8
+    assert protocol["screen"]["max_epochs"] == 50
+    assert protocol["screen"]["folds"] == [1, 4, 5]

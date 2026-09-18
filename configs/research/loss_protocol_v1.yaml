@@ -46,6 +46,13 @@ data:
   require_disjoint_fit_selection_calibration_roles: true
   require_source_overlap_audit: true
   scientific_gate: replacement_dataset_publication_and_support_QA_required
+acceptance:
+  max_epochs: 2
+  max_batches_per_epoch: 10
+  early_stopping_patience: 1
+  compile: false
+  max_allocation_minutes: 30
+  scientific_selection_eligible: false
 screen:
   anchor_campaign: configs/campaigns/epiforecaster_nood_region2vec_context_v1.yaml
   folds: [1, 4, 5]

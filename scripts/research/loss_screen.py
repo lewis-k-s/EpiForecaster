@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import itertools
 import json
@@ -130,14 +131,46 @@ def screen_templates(protocol: dict, dataset_pointer: str) -> list[tuple[str, di
     return templates
 
 
+def acceptance_templates(
+    protocol: dict, dataset_pointer: str
+) -> list[tuple[str, dict]]:
+    """Use the first declared fold/seed for bounded pipeline acceptance only."""
+    bounded = copy.deepcopy(protocol)
+    bounded["screen"]["folds"] = protocol["screen"]["folds"][:1]
+    bounded["screen"]["paired_seeds"] = protocol["screen"]["paired_seeds"][:1]
+    acceptance = protocol["acceptance"]
+    bounded["screen"]["max_epochs"] = acceptance["max_epochs"]
+    bounded["screen"]["early_stopping_patience"] = acceptance["early_stopping_patience"]
+    bounded["execution"]["max_allocation_minutes"] = acceptance[
+        "max_allocation_minutes"
+    ]
+    templates = []
+    for science_id, template in screen_templates(bounded, dataset_pointer):
+        identity = science_id.replace("loss-b-", "loss-acceptance-", 1)
+        training = template["training"]
+        training["model_id"] = identity
+        training["experiment_name"] += "-acceptance"
+        training["max_batches"] = acceptance["max_batches_per_epoch"]
+        training["overrides"].append(
+            f"training.compile={str(acceptance['compile']).lower()}"
+        )
+        EpiForecasterConfig.load(
+            REPO_ROOT / training["base_config"], overrides=training["overrides"]
+        )
+        templates.append((identity, template))
+    return templates
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-pointer", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--stage", choices=["screen", "acceptance"], default="screen")
     args = parser.parse_args()
     protocol_bytes = (REPO_ROOT / PROTOCOL).read_bytes()
     protocol = yaml.safe_load(protocol_bytes)
-    templates = screen_templates(protocol, args.dataset_pointer)
+    render = acceptance_templates if args.stage == "acceptance" else screen_templates
+    templates = render(protocol, args.dataset_pointer)
     args.output.mkdir(parents=True, exist_ok=False)
     records = []
     for identity, template in templates:
@@ -150,12 +183,14 @@ def main() -> None:
                 "template_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         )
-    (args.output / "screen.json").write_text(
+    (args.output / f"{args.stage}.json").write_text(
         json.dumps(
             {
                 "schema_version": 1,
                 "protocol_sha256": hashlib.sha256(protocol_bytes).hexdigest(),
                 "status": "prepared_not_submitted",
+                "stage": args.stage,
+                "scientific_selection_eligible": args.stage == "screen",
                 "candidates": records,
             },
             indent=2,

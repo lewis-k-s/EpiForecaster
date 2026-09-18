@@ -243,3 +243,20 @@ receipts are saved under the local preprocessing `r4` evidence directory.
 Continue this exact job and inspect its first science step before any further
 retry. The comparison gate remains closed until preprocessing publication,
 dataset support QA, and bounded model acceptance pass.
+
+## 2026-09-18: bounded acceptance matrix ready
+
+The renderer now supports `--stage acceptance`. After the replacement dataset
+passes QA and its DVC identity is pinned, it creates eight acceptance templates:
+Normal/Student-t by NLL/CRPS by mobility on/off, using fold 1 and seed 52.
+Each run has two epochs, ten batches per epoch, early-stop patience one, and a
+30-minute allocation cap. They use eager execution and the same protected data
+roles and research outputs. Their scores are excluded from scientific selection.
+The main screen retains the production compilation setting. Enforce the existing
+four-GPU-hour cumulative acceptance cap when dispatching; the matrix is not an
+authorization to exceed it.
+
+Validation: 1,319 tests passed, two skipped; Ruff, Pyright for the renderer, and
+whitespace checks passed. Preprocessing job `46082766` remains live and pending
+for priority with no start estimate. Do not resubmit it while it is pending.
+No new dataset, forecast score, or notable improvement has been obtained yet.
