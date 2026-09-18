@@ -288,6 +288,8 @@ configure_singularity_arguments() {
   SINGULARITY_ARGS+=(
     --env "PATH=$container_path"
     --env "PYTHONPATH=/workspace/source"
+    --env "PYTHONFAULTHANDLER=1"
+    --env "PYTHONUNBUFFERED=1"
     --env "XDG_CACHE_HOME=/tmp/.cache"
     --env "MPLCONFIGDIR=/tmp/matplotlib"
     --env "TMPDIR=/tmp"

@@ -380,3 +380,24 @@ with its preparation and dry-run receipts. Continue this exact job. Attach
 through SSH only after a fresh scheduler check identifies its live node.
 The prepared Student-t CRPS run remains unsubmitted until this pipeline check
 passes. No forecast improvement has yet been measured.
+
+## 2026-09-18: native failure during first training initialization
+
+Job `46085156` ran on `as02r5b31`; SSH jump attachment succeeded while active.
+It failed after 132 seconds. DVC staging passed. The training subprocess
+resolved the 128/17/16 train/selection/calibration node split, then died with
+`SIGSEGV` before an optimization step. This is a native-process failure, not
+an observed non-finite loss or an empty-fold rejection. The original log has
+no native traceback, so the cause is not yet established. Logs are synced in
+`acceptance/normal-nll-m1-f1-s52-r4/logs`.
+
+Enable Python fault handling and unbuffered output in the scientific container
+wrapper before a new immutable diagnostic acceptance attempt. Preserve R4.
+The next attempt will retain the same data, model, loss, seed, and limits;
+only diagnostics change. Do not launch the prepared Student-t CRPS R1 while
+the common initialization path remains unresolved. No forecast improvement
+has been measured.
+
+Diagnostic-wrapper validation passed: 1,329 tests, two skipped; Ruff and shell
+syntax checks passed. This change improves failure evidence; it does not claim
+to fix the native crash.
