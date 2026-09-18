@@ -542,3 +542,22 @@ Updated scheduler accounting: 1,359 GPU-seconds (0.3775 GPU-hours), including
 preprocessing and all failed startup attempts. Keep the goal active through the
 remaining acceptance cases, paired scientific screen, and bounded confirmation.
 No notable scientific improvement has yet been established.
+
+## 2026-09-18: goal paused and continuation handover prepared
+
+The user requested a goal pause and a handover for a smaller model. The goal
+tool confirmed `paused`; the local scheduler monitor was stopped. No further
+jobs were submitted. At 14:20:07 UTC, already submitted job `46089017` was
+running on `as03r3b03`, with two seconds elapsed and its existing 30-minute
+limit. It was not cancelled. Recheck its terminal state before continuation.
+
+The fixed scientific screen has 48 rendered templates under
+`outputs/loss_research/loss-type-research-v1/screen/templates-v1`; identity and
+template-hash checks passed. No scientific screen run has been prepared or
+submitted. Its dispatch gate still requires all eight acceptance cases.
+
+Resume instructions, exact run identities, verification commands, data hashes,
+budget gates, and incomplete confirmation work are in
+`docs/research/loss_type_autoresearch_handover_20260918.md`. This pause supersedes
+the earlier instruction in this ledger to keep the goal active. Do not resume
+dispatch until the user resumes the goal.
