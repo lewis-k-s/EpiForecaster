@@ -1,0 +1,6 @@
+muni_code_6digit,muni_name,comarca_code,comarca_name,muni_code_5digit,has_edar
+010019,MuniA,01,Alt Camp,01001,no
+010029,MuniB,01,Alt Camp,01002,no
+020039,MuniC,02,Bergueda,02003,yes
+030049,MuniD,03,Selva,03004,no
+430059,MuniE,43,Vall d'Aran,43005,yes

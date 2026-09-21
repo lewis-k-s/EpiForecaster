@@ -1,0 +1,9 @@
+setmana_epidemiologica,any,data_inici,data_final,codi_regio,nom_regio,codi_ambit,nom_ambit,codi_abs,nom_abs,sexe,grup_edat,index_socioeconomic,casos,poblacio
+202018,2020,27/04/2020,03/05/2020,00,No disponible,00,No disponible,000,No disponible,No disponible,No disponible,-1,73,0
+202018,2020,27/04/2020,03/05/2020,08,Catalunya Central,11,Bages,088,Cardona,Home,65 a 69,-1,2,210
+202018,2020,27/04/2020,03/05/2020,08,Catalunya Central,11,Bages,088,Cardona,Dona,65 a 69,97,1,197
+202019,2020,04/05/2020,10/05/2020,08,Catalunya Central,11,Bages,088,Cardona,Home,70 a 74,97,0,205
+202118,2021,03/05/2021,09/05/2021,08,Catalunya Central,11,Bages,088,Cardona,Dona,80 a 84,97,1,208
+202010,2020,02/03/2020,08/03/2020,09,Girona,17,Selva,183,Santa Coloma de Farners,Home,50 a 54,97,4,1200
+202119,2021,10/05/2021,16/05/2021,12,Terres de l'Ebre,43,Montsia,243,Amposta,Home,65 a 69,97,2,500
+202120,2021,17/05/2021,23/05/2021,12,Terres de l'Ebre,43,Montsia,243,Amposta,Dona,70 a 74,97,1,505
