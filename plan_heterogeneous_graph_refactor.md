@@ -1,7 +1,7 @@
 EpiForecaster: native-support heterogeneous GNN refactor
 
-Status: Agreed architectural direction; implementation handover. Sections 10–12 (added 21 September 2026, after full repository verification) ground the plan in the actual codebase, freeze cross-slice interfaces, and break the work into implementation slices; where they conflict with earlier assumptions, the verified repository facts in section 10 prevail and the deviation is called out explicitly.
-Date: 21 September 2026.
+Status: Implementation active; post-review remediation is not yet releasable. As of 22 September 2026, FIX-A, FIX-C, FIX-D, and both FIX-E parts are committed and their focused gate is green (124 tests passed; Ruff and `git diff --check` passed). R17 corrected the per-capita units contract across dataset, model, reporting operator, and loss. FIX-B is the next active slice. EVL-1, ENC-1, CMP-1, and CUT-1 remain. Section 12.2c records the version-control checkpoint and the revised execution gates.
+Date: 22 September 2026.
 Scope: Spatial representation and forecast-query refactor, with the necessary data, routing, training and evaluation changes. No major transformer or SIRHD redesign.
 
 1. End goal and rationale
@@ -364,7 +364,7 @@ class NativeEpiBatch:
 
 ### 11.5 Reporting-operator semantics (weekly ABS)
 
-Given daily admission-flow trajectory `f_{1..H}` (fraction space) from the SIRHD rollout and source population `P_w` for epi-week `w`: mechanistic weekly location = `log1p( (Σ_{t∈w} f_t) · P_w · 1e5 )`; sum **before** transform (§6). Weekly intervals are complete Mon–Sun weeks fully inside `(origin, origin+H]`; partial weeks get mask 0. Anchoring/delta-forecasting for the weekly head is disabled in v1 (frozen choice, mirrors the deaths head). Scale: obs-context-driven exactly like other heads. The predictive distribution and all scores live in weekly `log1p(per-100k·week)` space; raw-count MAE is derived by inverse transform with `P_w` recorded.
+Given daily admission-flow trajectory `f_{1..H}` in fraction space from the SIRHD rollout and source population `P_w` for epi-week `w`, the mechanistic weekly location is `log1p((Σ_{t∈w} kernel_t(f)) · clinical_scale · 1e5)`. Population does not multiply a fraction-space model output. The matching raw-count target is `log1p((count_w / P_w) · 1e5)`. Sum **before** transform (§6). Weekly intervals are complete Mon-Sun weeks fully inside `(origin, origin+H]`; partial weeks get mask 0. Anchoring/delta-forecasting for the weekly head is disabled in v1 (frozen choice, mirrors the deaths head). Scale: obs-context-driven exactly like other heads. The predictive distribution and all scores live in weekly `log1p(per-100k·week)` space; raw-count MAE is derived by inverse transform with `P_w` recorded.
 
 ### 11.6 Configuration surface
 
@@ -542,26 +542,62 @@ Independent starts (safe to parallelize): `QC-1`, `REG-1`, `GEO-1`, `OBS-1`, `OB
 
 ### 12.2b Review remediation rulings (post-checkpoint review, 2026-09-22)
 
-The pre-compaction review of the 18 landed slices returned NO-SHIP: one runtime blocker plus contract violations, several originating from dispatch-spec ambiguities rather than implementer error. These rulings are binding for the remediation slices (FIX-A…FIX-E below); where they amend §10–§11, this section wins.
+The pre-compaction review of the 17 landed implementation slices from QC-1 through TRN-1 returned NO-SHIP: one runtime blocker plus contract violations, several originating from dispatch-spec ambiguities rather than implementer error. These rulings are binding for the remediation slices (FIX-A…FIX-E below); where they amend §10–§11, this section wins.
 
 - **R1 (blocker — loss alignment)**: `NativeJointInferenceLoss` aligns `[B,H+1]` daily-head outputs to `[B,H]` internally via the existing nowcast-drop convention (mirror `_HEAD_HAS_NOWCAST`); the trainer-side alignment workaround is removed; a model→loss integration test (real `NativeEpiForecaster` outputs + real `NativeEpiBatch`) is mandatory.
-- **R2 (daily target units)**: daily cases/deaths targets stay raw counts at rest and in the batch; the LOSS applies `log1p(count · pop_audited · 1e5)` at consumption per routed row (uniform single code path; municipal stored-log values are un-inverted to raw by DS-1 exactly as comarca deaths already are).
+- **R2 (daily target units)**: daily cases/deaths targets stay raw counts at rest and in the batch; the loss applies `log1p((count / pop_audited) · 1e5)` at consumption per routed row (uniform single code path; municipal stored-log values are un-inverted to raw by DS-1 exactly as comarca deaths already are).
 - **R3 (ABS audited denominator)**: the ABS node population is `Σ_m fl_pop(m) · (overlap_pop(m,a) / pop_est(m))` — municipality-normalized allocation of audited municipal population (never a transpose/inverse of source-normalized weights, §3); `overlap_pop_est` remains graph-weighting/QC only. `native_graph` carries both, distinctly named.
 - **R4 (pairwise overlap mass)**: `overlap_pop_est(A,B) = Σ_cell TOT_P(cell) · area(A∩B∩cell) / area(cell)` — grid population allocated to the actual pairwise intersection geometry; marginal-coverage products are prohibited; zero-area pairs yield zero mass and are dropped. Rebuild `overlap_edges` + `native_graph` after this fix.
-- **R5 (weekly hosp composition)**: weekly location = `log1p( (Σ_{t∈week} kernel_t(hospitalization_flow)) · clinical_scale · P_w · 1e5 )` — the existing hosp head's delay kernel applies per-day in physical space BEFORE interval summation, and the learned positive clinical scale participates; residual stays 0 and anchoring off (v1 frozen); gradients must reach kernel and scale parameters (test required).
+- **R5 (weekly hosp composition)**: weekly model location = `log1p((Σ_{t∈week} kernel_t(hospitalization_flow)) · clinical_scale · 1e5)` because `hospitalization_flow` is already a population fraction. The matching raw-count target is `log1p((count_week / P_w) · 1e5)`. The existing hosp head's delay kernel applies per day in fraction space before interval summation, and the learned positive clinical scale participates; residual stays 0 and anchoring off (v1 frozen); gradients must reach kernel and scale parameters (test required).
 - **R6 (no coverage renormalization)**: context pooling uses raw destination fractions with a zero-valued deficit slot (a 0.6-covered sole neighbor contributes `0.6 × feature`); `ctx_coverage` reports the deficit; the current renormalizing test is inverted.
 - **R7 (count-once enforced)**: the loss deduplicates routed rows by `(source_type, source_id, forecast_origin, horizon, realization, head)` before scoring; duplicates cannot change loss or `n_eff` (test required).
 - **R8 (fold exclusions — frozen v1 policy)**: observed sources with zero folded overlap mass (26 ABS + 9 comarcas under the 161-region representative universe) are excluded from fold assignment as an explicit recorded policy; the manifest hashes the assigned ∪ excluded universe and the loader validates exact universe membership (not merely duplicate absence). The fold audit consumes one canonical edge direction.
 - **R9 (confirmation guard enforced)**: with `confirmation_guard=True` (default), DS-1 index construction rejects origins whose target window `(origin, origin+H]` intersects 2020-12-31..2021-01-27; an explicit override is required for calibration-period work; tested for inside/crossing windows.
-- **R10 (consumption-time transforms)**: DS-1 history features are type-aware: ABS weekly values → `log1p(counts · pop_graph · 1e5)`, comarca daily deaths likewise; municipal cases keep the stored log form; OD-context features (when enabled) apply `od_min_flow_raw`/`od_self_flows` at consumption. Stores remain raw at rest.
+- **R10 (consumption-time transforms)**: DS-1 history features are type-aware: ABS weekly values become `log1p((counts / pop_graph) · 1e5)`, and comarca daily deaths use the same per-capita direction; municipal cases keep the stored log form; OD-context features (when enabled) apply `od_min_flow_raw`/`od_self_flows` at consumption. Stores remain raw at rest.
 - **R11 (sentinel conjunction)**: the ABS sentinel predicate is the structural conjunction (§10.3(4)), centralized in one function shared by registry and processor; isolated sentinel-like fields on otherwise real rows are retained (tested).
 - **R12**: BAT-1 emits the frozen source-type one-hot block in `hist` (contract fidelity alongside the type id).
 - **R13**: the optional per-source static embedding raises `NotImplementedError` in v1 (unusable through the public forward; do not leave a dead option).
 - **R14**: the manifest code stamp hashes every artifact-producing module (native_sources, both processors, native_registry).
 - **R15**: cases-head anchoring is wired from history when `delta_forecasting` is enabled (weekly hosp and deaths stay unanchored).
 - **R16 (recorded exception)**: MITMA zones with zero municipal overlap (4 of 456; uninhabited border strips) are a documented exception — the plan's all-zone coverage criterion is amended to "all prefix zones covered or audited"; the zero-overlap set is recorded per build.
+- **R17 (blocker — dimensional consistency)**: `population` is a denominator for raw observed counts, not a multiplier. Raw count histories and targets use `log1p((count / population) · 1e5)`. Fraction-space SIRHD flows use `log1p(fraction · clinical_scale · 1e5)` and do not multiply by population. This ruling corrects the multiplication notation that was present in the first R2/R5/R10 draft and in the initial WIP tests. Add scale-invariance tests: equal per-capita rates at different populations produce equal transformed targets, and an identical fraction-space flow has the same reporting-operator location for both populations.
 
-Remediation slices (worker-light, dependency-ordered): **FIX-A** loss (R1, R2, R7 + integration test); **FIX-B** overlap/graph rebuild (R3, R4 + fold re-derivation under R8); **FIX-C** model (R5, R13, R15); **FIX-D** dataset (R6, R9, R10, R11 with registry/processor); **FIX-E** batch/manifest (R12, R14) + plan-only R16. Each fix lands with its inverted/missing tests per the review's §3 list. CMP-1 and CUT-1 wait for FIX-A…E plus EVL-1/ENC-1.
+Remediation slices (worker-light, dependency-ordered): **FIX-A** loss (R1, R2, R7, R17 + integration test); **FIX-B** overlap/graph rebuild (R3, R4 + fold re-derivation under R8); **FIX-C** model and reporting operator (R5, R13, R15, R17); **FIX-D** dataset (R6, R9, R10, R11, R17 with registry/processor); **FIX-E** batch/manifest (R12, R14) + plan-only R16. Each fix lands with its inverted/missing tests per the review's §3 list. CMP-1 and CUT-1 wait for FIX-A…E plus EVL-1/ENC-1.
+
+### 12.2c Version-control checkpoint and revised gates (2026-09-22)
+
+#### Observed repository state
+
+- The branch is `heterogeneous-graph-refactor` at `cd7980b` (the FIX-E trainer follow-up). It has no configured upstream. It contains 25 commits after `codex/develop-integration` at `9e0ea7e`; 17 are the named implementation slices QC-1 through TRN-1, five are remediation commits (FIX-A, FIX-C, FIX-D, and two FIX-E parts), and three are planning or review-record commits.
+- Relative to that implementation base, the committed programme changes 45 files with 15,978 inserted lines. This is a focused feature series even though the branch is also 100 commits ahead of `master` because `codex/develop-integration` already contains the wider integration history. Do not rewrite or rebase this history while the worktree is dirty. Confirm the intended review base before publication.
+- The remediation source and test changes are committed. `plan_heterogeneous_graph_refactor.md` is the only modified tracked file at this checkpoint.
+- `tex` has no recorded submodule-pointer change, but its nested worktree contains three unrelated untracked files (`draft_miguel_comments.md`, `draft_miguel_comments.pdf`, and `manuscript.zip`). Preserve them and do not stage the submodule.
+- Generated native artifacts are present under `data/files/geo/generated/` and `data/processed/native_support/`. The current ignore rules cover `*.zarr` directories but do not cover the generated GeoJSON, Parquet, and JSON files. Treat all of these as local generated state until a dedicated DVC or ignore-policy decision is made. Do not mix them into remediation commits.
+
+#### Validation evidence
+
+The first focused run reported **103 passed, 6 failed**. It exposed these defects:
+
+1. `TestAbsSentinelMask::test_every_proper_subset_of_the_conjunction_is_retained`: the test helper passes duplicate keyword arguments.
+2. `test_od_threshold_and_self_flow_policy`: the test calls a keyword-only helper positionally.
+3. `test_cases_nowcast_column_dropped_internally`: the manually dropped comparison does not use the same case tensor values as the model-shaped case.
+4. `test_daily_raw_count_targets_score_in_log1p_per100k_space`: eager evaluation of the `dict.get` default raises `KeyError('pred_cases')` even when `dist_cases_loc` exists.
+5. `test_daily_head_population_falls_back_to_source_pop`: the same eager-default defect.
+6. `test_duplicate_routing_does_not_change_loss_or_counts`: the asserted duplicate routed position for hospital admissions is wrong for `head_index=[1,1]`.
+
+Dimensional review also found R17: the tests encoded multiplication by population despite the established `log1p(count / population · 1e5)` contract. The remediation corrected the six failures and R17. The repeated focused command now reports **124 passed**, including the model-to-loss integration and equal-rate/different-population regression tests. Ruff and `git diff --check` also pass. This is focused evidence only; the full remediation acceptance gate remains after FIX-B and artifact rebuild.
+
+#### Revised execution order
+
+1. **Completed: stabilize and separate FIX-A, FIX-C, FIX-D, R17, and the FIX-E follow-up.** Commits: `ecf7dab`, `c89d181`, `52a5380`, and `cd7980b`.
+2. **Next: implement FIX-B before real-artifact acceptance.** Replace marginal-coverage products with true pairwise grid-cell intersections, derive the audited ABS denominator with municipality-normalized allocation, apply the explicit zero-overlap fold exclusions, and rebuild `overlap_edges`, `native_graph`, the manifest, and native folds. The currently generated artifacts predate FIX-B and are not acceptance evidence.
+3. **Run the remediation acceptance gate.** Run Ruff on the remediation files, all native unit tests, `git diff --check`, the bounded native training smoke, and a clean rebuild/QC of the generated native artifacts. Then run the full required project test suite before the review checkpoint. Record warnings separately from failures; the known Zarr v3 string warnings do not make a failing test pass.
+4. **Implement EVL-1 before ENC-1.** Freeze and test the native evaluation/export contract on the fixed-pooling baseline before adding learned heterogeneous messages. This follows the project's core-testing boundary and prevents encoder work from masking evaluation defects.
+5. **Implement ENC-1 and repeat the same evaluation smoke.** Require pooled/heterogeneous zero-init equivalence, relation-path gradients, native-history residual preservation, and identical single-query versus mixed-batch results.
+6. **Hold a second review checkpoint.** Only after FIX-A through FIX-E, EVL-1, and ENC-1 are green may CMP-1 start. CUT-1 remains last and requires the full suite, documentation, artifact policy, and explicit review-base/upstream decision.
+
+The status names in this section are evidence labels: **committed**, **uncommitted work in progress**, **not implemented**, and **validated** are not interchangeable.
+
 ### 12.3 Explicitly out of this programme
 
 EDAR/plant migration (Stage 5), synthetic-native unification ([E1] state mapping), direct initial-state/rate conditioning, `mitma_v2` estudios-basicos ingestion (2022+, outside the study window), the Nommon mobility-indicator product, the SIRHD-vs-direct-decoder ablation, and any latent-stability programme change (§2, §6). GEOSTAT 2011-vintage grid accuracy and IGCG 2025 boundary-vintage drift are recorded limitations with cross-checks (§11.7, `GEO-1`), not blockers. None of the excluded items may be silently pulled into a slice.
