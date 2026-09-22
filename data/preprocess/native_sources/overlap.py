@@ -6,10 +6,10 @@ MITMA zone ↔ municipality/ABS/comarca) in EPSG:3042 — never composed
 through municipal crosswalks (plan §3, §10.3(2)).
 
 Population weighting (plan §11.7), primary ``geostat_grid`` policy:
-    overlap_pop_est(A, B) = Σ_cell TOT_P(cell) · frac(cell ∩ A) · frac(cell ∩ B)
+    overlap_pop_est(A, B) = Σ_cell TOT_P(cell) · area(cell ∩ A ∩ B) / area(cell)
     pop_est(X)            = Σ_cell TOT_P(cell) · frac(cell ∩ X)
 with frac(cell ∩ X) = area(cell ∩ X) / area(cell). The
-``uniform_density`` fallback runs the identical bilinear estimator with
+``uniform_density`` fallback runs the identical intersection estimator with
 the municipal polygons (audited ``fl_population_por_municipis``
 population, uniform within each municipality) as the surface.
 
@@ -82,7 +82,7 @@ EDGE_COLUMNS = (
 POLICIES = ("geostat_grid", "uniform_density")
 
 
-# Population surface and the bilinear grid estimator
+# Population surface and the exact grid-intersection estimator
 
 
 @dataclass(frozen=True)
@@ -161,40 +161,64 @@ def node_stats(
     return stats[["pop_est", "area_m2", "coverage"]]
 
 
+def pairwise_polygon_intersections(
+    a: gpd.GeoDataFrame, a_col: str, b: gpd.GeoDataFrame, b_col: str
+) -> gpd.GeoDataFrame:
+    """Positive-area ``A ∩ B`` geometries with stable string endpoint ids."""
+    inter = gpd.overlay(
+        a[[a_col, "geometry"]].rename(columns={a_col: "a_id"}),
+        b[[b_col, "geometry"]].rename(columns={b_col: "b_id"}),
+        how="intersection",
+    )
+    if inter.empty:
+        return gpd.GeoDataFrame(
+            {"a_id": pd.Series(dtype=str), "b_id": pd.Series(dtype=str)},
+            geometry=gpd.GeoSeries([], crs=a.crs),
+            crs=a.crs,
+        )
+    inter["a_id"] = inter["a_id"].astype(str)
+    inter["b_id"] = inter["b_id"].astype(str)
+    inter = inter[inter.geometry.area > 0].copy()
+    return inter[["a_id", "b_id", "geometry"]].reset_index(drop=True)
+
+
 def overlap_pop_table(
     surface: PopulationSurface,
-    frac_a: pd.DataFrame,
-    frac_b: pd.DataFrame,
+    intersections: gpd.GeoDataFrame,
 ) -> pd.DataFrame:
-    """Shared population per pair: Σ_piece pop · frac_a · frac_b.
+    """Shared population per pair from the true triple intersection.
 
-    Symmetric by construction: swapping the two cover tables yields the
-    same pair values.
+    For each population piece, this computes
+    ``population * area(piece ∩ A ∩ B) / area(piece)`` (review ruling R4).
+    Multiplying the separate marginal cover fractions is prohibited because
+    it assigns population to disjoint polygons that merely share a grid cell.
     """
-    left = frac_a.assign(_pop=frac_a["piece_pos"].map(surface.pieces["population"]))
-    merged = left.merge(
-        frac_b.rename(columns={"target_id": "target_id_b", "frac": "frac_b"}),
-        on="piece_pos",
-    )
-    if merged.empty:
+    if intersections.empty:
         return pd.DataFrame(columns=["a_id", "b_id", "overlap_pop_est"])
-    merged["_w"] = merged["frac"] * merged["frac_b"] * merged["_pop"]
-    out = (
-        merged.groupby(["target_id", "target_id_b"])["_w"].sum().reset_index()
+    pieces = surface.pieces[["population", "piece_area", "geometry"]].copy()
+    triple = gpd.overlay(
+        pieces,
+        intersections[["a_id", "b_id", "geometry"]],
+        how="intersection",
     )
-    out.columns = ["a_id", "b_id", "overlap_pop_est"]
-    return out
+    if triple.empty:
+        return pd.DataFrame(columns=["a_id", "b_id", "overlap_pop_est"])
+    triple = triple[triple.geometry.area > 0].copy()
+    triple["_w"] = (
+        triple["population"] * triple.geometry.area / triple["piece_area"]
+    )
+    return (
+        triple.groupby(["a_id", "b_id"], as_index=False)["_w"]
+        .sum()
+        .rename(columns={"_w": "overlap_pop_est"})
+    )
 
 
 def polygon_overlap_area(
     a: gpd.GeoDataFrame, a_col: str, b: gpd.GeoDataFrame, b_col: str
 ) -> pd.DataFrame:
     """Direct polygon intersection area (m²) per id pair — both policies."""
-    inter = gpd.overlay(
-        a[[a_col, "geometry"]].rename(columns={a_col: "a_id"}),
-        b[[b_col, "geometry"]].rename(columns={b_col: "b_id"}),
-        how="intersection",
-    )
+    inter = pairwise_polygon_intersections(a, a_col, b, b_col)
     if inter.empty:
         return pd.DataFrame(columns=["a_id", "b_id", "overlap_area_m2"])
     inter["_area"] = inter.geometry.area
@@ -453,19 +477,23 @@ def assemble_edge_tables(
     relation_stats: dict[str, dict] = {}
 
     def _pair_table(t_a: str, t_b: str) -> pd.DataFrame:
-        area = polygon_overlap_area(
+        intersections = pairwise_polygon_intersections(
             node_frames[t_a], id_cols[t_a], node_frames[t_b], id_cols[t_b]
         )
-        pop = overlap_pop_table(
-            surface, frac_cache[id_cols[t_a]], frac_cache[id_cols[t_b]]
+        if intersections.empty:
+            return pd.DataFrame(
+                columns=["a_id", "b_id", "overlap_area_m2", "overlap_pop_est"]
+            )
+        area = (
+            intersections.assign(_area=intersections.geometry.area)
+            .groupby(["a_id", "b_id"], as_index=False)["_area"]
+            .sum()
+            .rename(columns={"_area": "overlap_area_m2"})
         )
-        pairs = area.merge(pop, on=["a_id", "b_id"], how="outer")
-        pairs["overlap_area_m2"] = pairs["overlap_area_m2"].fillna(0.0)
+        pop = overlap_pop_table(surface, intersections)
+        pairs = area.merge(pop, on=["a_id", "b_id"], how="left")
         pairs["overlap_pop_est"] = pairs["overlap_pop_est"].fillna(0.0)
-        # Keep pairs whose polygons merely touch (area 0) but whose shared
-        # grid cells still split population between both endpoints.
-        keep = (pairs["overlap_area_m2"] > 0) | (pairs["overlap_pop_est"] > 0)
-        return pairs[keep]
+        return pairs[pairs["overlap_area_m2"] > 0]
 
     intersection_relations = [
         ("municipality", "abs"),

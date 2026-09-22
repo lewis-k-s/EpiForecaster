@@ -94,16 +94,21 @@ def _synthetic_nodes() -> NodeTable:
 
 def _synthetic_edges() -> tuple[RelationEdges, RelationEdges]:
     """ABS 001 -> fold 0 majority; ABS 002 exact tie folds 0/1; ABS 003 and
-    comarca 02 only touch the unfolded municipality; comarca 01 -> fold 1."""
+    comarca 02 only touch the unfolded municipality; comarca 01 -> fold 1.
+    Every geometric pair is present in both graph directions; derivation must
+    consume the canonical municipality->source direction exactly once (R8).
+    """
     abs_edges = RelationEdges(
-        src_idx=np.array([0, 5, 5, 6, 6, 7, 8]),
-        dst_idx=np.array([5, 1, 2, 0, 2, 4, 0]),
-        overlap_pop_est=np.array([10.0, 5.0, 2.0, 4.0, 4.0, 9.0, 50.0]),
+        src_idx=np.array([0, 5, 1, 5, 2, 5, 0, 6, 2, 6, 4, 7, 0, 8]),
+        dst_idx=np.array([5, 0, 5, 1, 5, 2, 6, 0, 6, 2, 7, 4, 8, 0]),
+        overlap_pop_est=np.array(
+            [10.0, 10.0, 5.0, 5.0, 2.0, 2.0, 4.0, 4.0, 4.0, 4.0, 9.0, 9.0, 50.0, 50.0]
+        ),
     )
     comarca_edges = RelationEdges(
-        src_idx=np.array([9, 9, 10]),
-        dst_idx=np.array([2, 0, 4]),
-        overlap_pop_est=np.array([9.0, 3.0, 6.0]),
+        src_idx=np.array([2, 9, 0, 9, 4, 10]),
+        dst_idx=np.array([9, 2, 9, 0, 10, 4]),
+        overlap_pop_est=np.array([9.0, 9.0, 3.0, 3.0, 6.0, 6.0]),
     )
     return abs_edges, comarca_edges
 
@@ -227,8 +232,8 @@ class TestManifestRoundTrip:
         assert payload["schema"] == "native_source_folds.v1"
         assert payload["derivation"] == "majority_overlap_pop"
         assert payload["municipal_manifest_ref"]["filename"] == "municipal.json"
-        assert payload["abs_id_hash"] == hash_region_ids(["001", "002"])
-        assert payload["comarca_id_hash"] == hash_region_ids(["01"])
+        assert payload["abs_id_hash"] == hash_region_ids(["001", "002", "003"])
+        assert payload["comarca_id_hash"] == hash_region_ids(["01", "02"])
         audit = payload["audit"]
         assert audit["counts"]["abs_assigned"] == 2
         assert audit["counts"]["abs_unassigned_observed"] == 1
@@ -251,6 +256,8 @@ class TestManifestRoundTrip:
         assert [fold.fold_index for fold in loaded.folds] == [0, 1, 2]
         assert loaded.folds[0].municipalities == ("08001", "08002")
         assert loaded.abs_id_hash == payload["abs_id_hash"]
+        assert loaded.excluded_abs == ("003",)
+        assert loaded.excluded_comarcas == ("02",)
 
     def _write_and_break(self, tmp_path: Path, mutate) -> Path:
         municipal_path = tmp_path / "municipal.json"
@@ -283,6 +290,28 @@ class TestManifestRoundTrip:
 
         out_path, municipal_path = self._write_and_break(tmp_path, bad_hash)
         with pytest.raises(ValueError, match="abs_id_hash"):
+            load_native_fold_manifest(
+                out_path, municipal_manifest_path=municipal_path, expected_num_folds=3
+            )
+
+    def test_excluded_source_omission_breaks_universe_hash(self, tmp_path: Path) -> None:
+        def omit_excluded(payload: dict) -> None:
+            payload["audit"]["unassigned_observed"]["abs"] = []
+
+        out_path, municipal_path = self._write_and_break(tmp_path, omit_excluded)
+        with pytest.raises(ValueError, match="assigned plus excluded universe"):
+            load_native_fold_manifest(
+                out_path, municipal_manifest_path=municipal_path, expected_num_folds=3
+            )
+
+    def test_source_cannot_be_assigned_and_excluded(self, tmp_path: Path) -> None:
+        def duplicate_universe_role(payload: dict) -> None:
+            payload["audit"]["unassigned_observed"]["abs"].append("001")
+
+        out_path, municipal_path = self._write_and_break(
+            tmp_path, duplicate_universe_role
+        )
+        with pytest.raises(ValueError, match="both assigned and excluded"):
             load_native_fold_manifest(
                 out_path, municipal_manifest_path=municipal_path, expected_num_folds=3
             )

@@ -113,6 +113,8 @@ class NativeFoldManifest:
     folds: tuple[NativeFold, ...]
     abs_id_hash: str
     comarca_id_hash: str
+    excluded_abs: tuple[str, ...]
+    excluded_comarcas: tuple[str, ...]
     municipal_ref: dict[str, str]
     audit: dict
 
@@ -156,7 +158,10 @@ def _fold_pop_sums(
         if src_type == SOURCE_MUNICIPALITY and dst_type == source_type:
             source_id, municipality_id = nodes.source_id[dst], nodes.source_id[src]
         elif src_type == source_type and dst_type == SOURCE_MUNICIPALITY:
-            source_id, municipality_id = nodes.source_id[src], nodes.source_id[dst]
+            # The graph stores reciprocal directed rows with the same overlap
+            # mass. Consume municipality->source only so fold mass is counted
+            # exactly once (review ruling R8).
+            continue
         else:
             raise ValueError(
                 f"edge does not join {source_type} with municipality: "
@@ -353,8 +358,15 @@ def assemble_native_fold_manifest(
             "run_id": municipal.manifest.run_id,
         },
         "derivation": DERIVATION,
-        "abs_id_hash": hash_region_ids(sorted(derivation.fold_of_abs)),
-        "comarca_id_hash": hash_region_ids(sorted(derivation.fold_of_comarca)),
+        "abs_id_hash": hash_region_ids(
+            sorted(set(derivation.fold_of_abs) | set(derivation.unassigned_abs))
+        ),
+        "comarca_id_hash": hash_region_ids(
+            sorted(
+                set(derivation.fold_of_comarca)
+                | set(derivation.unassigned_comarca)
+            )
+        ),
         "folds": folds,
         "audit": {
             "counts": {
@@ -476,13 +488,45 @@ def load_native_fold_manifest(
     _assert_exactly_once(folds, "municipalities")
     _assert_exactly_once(folds, "abs")
     _assert_exactly_once(folds, "comarcas")
+    audit = dict(payload.get("audit", {}))
+    unassigned = audit.get("unassigned_observed", {})
+    if not isinstance(unassigned, dict):
+        raise ValueError("Native fold manifest audit.unassigned_observed must be a map")
+    excluded_by_attr = {
+        "abs": tuple(str(x) for x in unassigned.get("abs", [])),
+        "comarcas": tuple(str(x) for x in unassigned.get("comarcas", [])),
+    }
     for key, attr in (("abs_id_hash", "abs"), ("comarca_id_hash", "comarcas")):
         assigned = sorted(
             source_id for fold in folds for source_id in getattr(fold, attr)
         )
-        expected = hash_region_ids(assigned)
+        excluded = excluded_by_attr[attr]
+        if len(excluded) != len(set(excluded)):
+            raise ValueError(f"Native fold manifest {attr} exclusions contain duplicates")
+        overlap = sorted(set(assigned) & set(excluded))
+        if overlap:
+            raise ValueError(
+                f"Native fold manifest {attr} sources are both assigned and excluded: "
+                f"{overlap}"
+            )
+        universe = sorted(set(assigned) | set(excluded))
+        expected = hash_region_ids(universe)
         if str(payload.get(key, "")) != expected:
-            raise ValueError(f"Native fold manifest {key} mismatch")
+            raise ValueError(
+                f"Native fold manifest {key} mismatch for assigned plus excluded universe"
+            )
+    counts = audit.get("counts", {})
+    expected_counts = {
+        "abs_observed": sum(len(fold.abs) for fold in folds)
+        + len(excluded_by_attr["abs"]),
+        "comarca_observed": sum(len(fold.comarcas) for fold in folds)
+        + len(excluded_by_attr["comarcas"]),
+    }
+    for key, expected in expected_counts.items():
+        if int(counts.get(key, -1)) != expected:
+            raise ValueError(
+                f"Native fold manifest {key} does not match assigned plus excluded universe"
+            )
     municipal_ref = dict(payload.get("municipal_manifest_ref", {}))
     if municipal_manifest_path is not None:
         municipal = load_municipal_folds(municipal_manifest_path, num_folds=num_folds)
@@ -505,8 +549,10 @@ def load_native_fold_manifest(
         folds=folds,
         abs_id_hash=str(payload["abs_id_hash"]),
         comarca_id_hash=str(payload["comarca_id_hash"]),
+        excluded_abs=excluded_by_attr["abs"],
+        excluded_comarcas=excluded_by_attr["comarcas"],
         municipal_ref=municipal_ref,
-        audit=dict(payload.get("audit", {})),
+        audit=audit,
     )
 
 

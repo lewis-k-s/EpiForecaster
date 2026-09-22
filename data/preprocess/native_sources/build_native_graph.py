@@ -6,7 +6,8 @@ Builds ``data/processed/native_support/native_graph.zarr`` (zarr v3 via
 - root group: node table on the ``node`` dim with string coord ``node_uid``
   (``f"{node_type}:{source_id}"``), variables ``node_type``, ``source_id``,
   ``population`` (float32, NaN where no sound denominator exists) and
-  ``status`` (``observed``/``unobserved``/``unmapped``), plus ``od_zone_ref``
+  ``status`` (``observed``/``unobserved``/``unmapped``), ABS-only
+  ``overlap_population_est`` (the GEOSTAT weighting quantity), plus ``od_zone_ref``
   (dim ``od_zone``): the ``od_mitma`` zone ids in OD zone coord order,
   mapping ``"mitma:<id>"`` node uids into OD origin/target indices.
 - ``edges/<relation>`` group per relation: flat long layout on dim ``edge``
@@ -18,9 +19,10 @@ Builds ``data/processed/native_support/native_graph.zarr`` (zarr v3 via
 Node set: the union of overlap-edge endpoints and the ``od_mitma`` zone
 registry. Statuses are REG-1 registry passthrough; overlap-side ids missing
 from a registry are ``unmapped``; registry codes with no graph presence
-surface as validation warnings, not silent drops. ABS node population is
-overlap-implied (plan §10.3(4)): the sum of ``overlap_pop_est`` over the
-node's municipality->abs rows, NaN only when no such rows exist.
+surface as validation warnings, not silent drops. ABS node ``population``
+is the audited municipal denominator allocated with municipality-normalized
+overlap fractions (review ruling R3). ``overlap_population_est`` retains the
+separate GEOSTAT graph-weighting quantity.
 """
 
 from __future__ import annotations
@@ -62,6 +64,7 @@ EDGE_COLUMNS = (
     "dst_type",
     "dst_id",
     "overlap_pop_est",
+    "frac_of_src_pop",
     "frac_of_dst_pop",
 )
 RELATION_VARS = ("src_idx", "dst_idx", "weight", "overlap_pop_est")
@@ -112,7 +115,8 @@ BUILD_POLICY: dict[str, str] = {
     "node_set": "overlap-edge endpoints + od_mitma zone registry; extra registry codes warn",
     "node_order": "node_uid lexicographic",
     "status": "registry passthrough; overlap-only ids 'unmapped'; mitma 'observed'",
-    "population": "registry values; mitma: od zone_population; abs: overlap-implied muni sum",
+    "population": "registry values; mitma: od zone_population; abs: audited muni population allocated by frac_of_src_pop",
+    "overlap_population_est": "ABS-only sum of municipality->abs overlap_pop_est; graph weighting/QC, never the clinical denominator",
     "edges": "both directions per relation; weight=frac_of_dst_pop; (src_idx, dst_idx) order",
     "od_zone_ref": "od_mitma zone_id in OD coord order; joins mitma nodes to OD indices",
 }
@@ -180,8 +184,10 @@ def build_node_table(
 
     Nodes are the union of overlap-edge endpoints and the od zone registry
     (mitma). Population: registry values for municipality/comarca, od
-    ``zone_population`` for mitma, overlap-implied municipal sums for abs
-    (NaN when the ABS has no municipality->abs rows).
+    ``zone_population`` for mitma, and audited municipal population allocated
+    to ABS with each municipality's ``frac_of_src_pop`` (review ruling R3).
+    The raw GEOSTAT overlap sum is kept separately as
+    ``overlap_population_est``.
     """
     rel = assign_relations(overlap)
     endpoints: dict[str, set[str]] = {}
@@ -202,14 +208,45 @@ def build_node_table(
     types = [row[1] for row in rows]
     ids = [row[2] for row in rows]
 
-    abs_pop = (
-        rel[(rel["src_type"] == SOURCE_MUNICIPALITY) & (rel["dst_type"] == SOURCE_ABS)]
-        .groupby("dst_id")["overlap_pop_est"]
-        .sum()
+    muni_abs = rel[
+        (rel["src_type"] == SOURCE_MUNICIPALITY)
+        & (rel["dst_type"] == SOURCE_ABS)
+    ].copy()
+    frac_src = muni_abs["frac_of_src_pop"].to_numpy(dtype=np.float64)
+    bad_frac = ~np.isfinite(frac_src) | (frac_src < 0) | (
+        frac_src > 1 + WEIGHT_BOUND_TOL
     )
+    if bad_frac.any():
+        raise ValueError(
+            "municipality->abs frac_of_src_pop outside [0, 1]: "
+            f"{frac_src[bad_frac][:5].tolist()}"
+        )
+    abs_overlap_pop = muni_abs.groupby("dst_id")["overlap_pop_est"].sum()
+    municipal_population = {
+        rec.source_id: float(rec.population)
+        for rec in registry.records_for(SOURCE_MUNICIPALITY)
+        if rec.population is not None
+    }
+    muni_abs["_audited_municipal_population"] = muni_abs["src_id"].map(
+        municipal_population
+    )
+    incomplete_abs = set(
+        muni_abs.loc[
+            muni_abs["_audited_municipal_population"].isna(), "dst_id"
+        ].astype(str)
+    )
+    muni_abs["_allocated_audited_population"] = (
+        muni_abs["_audited_municipal_population"] * muni_abs["frac_of_src_pop"]
+    )
+    abs_pop = muni_abs.groupby("dst_id")["_allocated_audited_population"].sum(
+        min_count=1
+    )
+    for abs_id in incomplete_abs:
+        abs_pop.loc[abs_id] = np.nan
     od_pop = {zone: float(pop) for zone, pop in zip(od_ids, od_zone_populations)}
 
     populations = np.full(len(uids), np.nan, dtype=np.float32)
+    overlap_populations = np.full(len(uids), np.nan, dtype=np.float32)
     statuses: list[str] = []
     for k, (node_type, sid) in enumerate(zip(types, ids)):
         record = registry.get(node_type, sid)
@@ -223,6 +260,8 @@ def build_node_table(
         if node_type == SOURCE_ABS:
             if sid in abs_pop.index:
                 populations[k] = np.float32(abs_pop[sid])
+            if sid in abs_overlap_pop.index:
+                overlap_populations[k] = np.float32(abs_overlap_pop[sid])
         elif node_type == SOURCE_MITMA:
             populations[k] = np.float32(od_pop[sid])
         elif record is not None and record.population is not None:
@@ -233,6 +272,7 @@ def build_node_table(
             "node_type": types,
             "source_id": ids,
             "population": populations,
+            "overlap_population_est": overlap_populations,
             "status": statuses,
         }
     )
@@ -302,6 +342,10 @@ def assemble_native_graph(
             "node_type": ("node", nodes["node_type"].to_numpy(dtype=str)),
             "source_id": ("node", nodes["source_id"].to_numpy(dtype=str)),
             "population": ("node", nodes["population"].to_numpy()),
+            "overlap_population_est": (
+                "node",
+                nodes["overlap_population_est"].to_numpy(),
+            ),
             "status": ("node", nodes["status"].to_numpy(dtype=str)),
             "od_zone_ref": (("od_zone",), np.array([str(z) for z in od_zone_ids])),
         },
@@ -329,10 +373,21 @@ def validate_native_graph(
     nodes without an overlap edge (municipalities specifically without a
     membership row), mitma/od-registry misalignment, and implausible ABS
     populations. Non-fatal findings (per-destination fraction sums above 1
-    from overlapping mitma zones, ABS nodes without overlap-implied
+    from overlapping mitma zones, ABS nodes without an audited
     population, registry codes with no graph presence) become warnings.
     """
     warnings: list[str] = []
+    required_root = {
+        "node_type",
+        "source_id",
+        "population",
+        "overlap_population_est",
+        "status",
+        "od_zone_ref",
+    }
+    missing_root = sorted(required_root - set(root.data_vars))
+    if missing_root:
+        raise ValueError(f"native graph root missing variables: {missing_root}")
     if set(relations) != set(RELATION_PAIRS):
         raise ValueError(
             f"relation groups {sorted(relations)} != {sorted(RELATION_PAIRS)}"
@@ -414,7 +469,7 @@ def validate_native_graph(
     if good.size and ((good <= 0).any() or (good > ABS_POPULATION_MAX).any()):
         bad_pops = good[(good <= 0) | (good > ABS_POPULATION_MAX)]
         raise ValueError(
-            f"ABS overlap-implied population outside (0, {ABS_POPULATION_MAX}]: "
+            f"ABS audited population outside (0, {ABS_POPULATION_MAX}]: "
             f"{bad_pops[:5].tolist()}"
         )
 

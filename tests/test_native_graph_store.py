@@ -199,10 +199,20 @@ class TestSyntheticAssembly:
     def test_population_semantics(self):
         root, _relations, report = _assemble()
         pops = dict(zip(root.coords["node"].values, root["population"].values))
+        overlap_pops = dict(
+            zip(
+                root.coords["node"].values,
+                root["overlap_population_est"].values,
+            )
+        )
 
-        # ABS population is the overlap-implied municipal sum
-        assert pops["abs:001"] == pytest.approx(100.0, abs=1e-3)
+        # R3: audited ABS denominator uses municipal audited populations and
+        # municipality-normalized fractions: 100*0.5 + 200*0.5 = 150.
+        # The distinct GEOSTAT overlap quantity remains 60+40 = 100.
+        assert pops["abs:001"] == pytest.approx(150.0, abs=1e-3)
+        assert overlap_pops["abs:001"] == pytest.approx(100.0, abs=1e-3)
         assert np.isnan(pops["abs:002"])  # no municipality->abs rows
+        assert np.isnan(overlap_pops["abs:002"])
         assert pops["municipality:08001"] == 100.0
         assert np.isnan(pops["municipality:08004"])  # registry-absent
         assert pops["comarca:01"] == 300.0
@@ -210,9 +220,9 @@ class TestSyntheticAssembly:
         assert np.isnan(pops["mitma:17002"])  # NaN zone population passthrough
         assert pops["mitma:17003"] == 5.0
         assert report.abs_population == {
-            "min": pytest.approx(100.0),
-            "median": pytest.approx(100.0),
-            "max": pytest.approx(100.0),
+            "min": pytest.approx(150.0),
+            "median": pytest.approx(150.0),
+            "max": pytest.approx(150.0),
         }
 
     def test_edge_layout_counts_and_order(self):
@@ -301,14 +311,20 @@ class TestValidationFailures:
             )
 
     def test_abs_population_out_of_range_raises(self):
-        overlap = _synthetic_overlap()
-        to_abs = (overlap["src_type"] == SOURCE_MUNICIPALITY) & (
-            overlap["dst_id"] == "001"
+        registry = _synthetic_registry()
+        registry.add(
+            SourceRecord(
+                SOURCE_MUNICIPALITY,
+                "08001",
+                STATUS_OBSERVED,
+                5.0e6,
+                None,
+                None,
+            )
         )
-        overlap.loc[to_abs, "overlap_pop_est"] = 3.0e6
 
-        with pytest.raises(ValueError, match="ABS overlap-implied population"):
-            _assemble(overlap=overlap)
+        with pytest.raises(ValueError, match="ABS audited population"):
+            _assemble(registry=registry)
 
     def test_unknown_relation_pair_raises(self):
         overlap = pd.concat(
@@ -400,16 +416,22 @@ class TestRealArtifacts:
         )
         assert root["od_zone_ref"].values.tolist() == zone_ids
 
-        # every observed clinical node has >=1 overlap edge: assemble_native_graph
-        # already raises otherwise; assert the audited ABS population stats
-        abs_pops = (
-            overlap[
-                (overlap["src_type"] == SOURCE_MUNICIPALITY)
-                & (overlap["dst_type"] == SOURCE_ABS)
-            ]
-            .groupby("dst_id")["overlap_pop_est"]
-            .sum()
+        # Every observed clinical node has >=1 overlap edge. R3 uses audited
+        # municipal population times the municipality-normalized overlap
+        # fraction, not the raw GEOSTAT overlap sum.
+        municipal_pop = {
+            rec.source_id: float(rec.population)
+            for rec in registry.records_for(SOURCE_MUNICIPALITY)
+            if rec.population is not None
+        }
+        muni_abs = overlap[
+            (overlap["src_type"] == SOURCE_MUNICIPALITY)
+            & (overlap["dst_type"] == SOURCE_ABS)
+        ].copy()
+        muni_abs["allocated"] = (
+            muni_abs["src_id"].map(municipal_pop) * muni_abs["frac_of_src_pop"]
         )
+        abs_pops = muni_abs.groupby("dst_id")["allocated"].sum(min_count=1)
         assert report.abs_population["max"] == pytest.approx(abs_pops.max(), rel=1e-5)
         assert 0 < report.abs_population["min"] <= report.abs_population["max"] <= 2e6
 

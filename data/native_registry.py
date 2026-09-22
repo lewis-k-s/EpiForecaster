@@ -15,8 +15,9 @@ follow plan section 11.3:
 Orchestrator ruling (2026-09-21): ``poblacio`` in the ABS CSV is a
 per-(sex, age)-stratum, case-only population, so the CSV cannot supply an ABS
 population denominator. ABS records carry ``population=None``; the audited ABS
-denominator is assigned later at ``native_graph`` assembly from overlap-implied
-municipal population (plan sections 10.3(4) and 11.3). The sentinel filter is
+denominator is assigned later at ``native_graph`` assembly from audited
+municipal population and municipality-normalized overlap fractions (review
+ruling R3). The sentinel filter is
 the single canonical structural conjunction of :func:`abs_sentinel_mask`,
 shared verbatim by this registry builder and the ABS admissions processor
 (review ruling R11); isolated sentinel-like fields on otherwise real rows are

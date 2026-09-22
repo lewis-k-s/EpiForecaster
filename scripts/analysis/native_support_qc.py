@@ -3,8 +3,8 @@
 Builds ``native_manifest_v2.json`` (:mod:`data.preprocess.native_sources.manifest`)
 and a reconciliation report over the built native-support artifacts:
 
-- ABS case-strata ``stratum_pop_sum`` weekly lower bound vs the overlap-implied
-  ABS population in ``native_graph`` (ratios; >1 is a warning with numbers);
+- ABS case-strata ``stratum_pop_sum`` weekly lower bound vs the audited ABS
+  population in ``native_graph`` (ratios; >1 is a warning with numbers);
 - comarca population closure (``obs_deaths`` member-sum vs graph nodes);
 - MITMA zone-count reconciliation (442 prefix / 454 G1 diagnostics /
   458 transform attr vs the built 456);
@@ -63,7 +63,7 @@ EXPECTED_MITMA_ZONE_COUNTS = {
     "built": 456,
 }
 
-_ABS_SECTION = "ABS stratum-pop (weekly max) vs overlap-implied graph population"
+_ABS_SECTION = "ABS stratum-pop (weekly max) vs audited graph population"
 
 
 def load_graph_nodes(graph: xr.Dataset) -> pd.DataFrame:

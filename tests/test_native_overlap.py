@@ -168,11 +168,12 @@ class TestFractionalCover:
         assert stats["coverage"]["003"] == 0.0
 
 
-class TestBilinearOverlap:
+class TestPairwiseOverlap:
     def test_shared_population_2x2(self, grid_surface, munis, abs_rows):
-        fa = ov._fractional_cover(grid_surface, munis, "municipality_id")
-        fb = ov._fractional_cover(grid_surface, abs_rows, "abs_id")
-        table = ov.overlap_pop_table(grid_surface, fa, fb)
+        intersections = ov.pairwise_polygon_intersections(
+            munis, "municipality_id", abs_rows, "abs_id"
+        )
+        table = ov.overlap_pop_table(grid_surface, intersections)
         got = {(r.a_id, r.b_id): r.overlap_pop_est for r in table.itertuples()}
         # Each cell shared by exactly one (muni, ABS) pair.
         assert got[("08001", "001")] == pytest.approx(100.0)
@@ -181,13 +182,42 @@ class TestBilinearOverlap:
         assert got[("08002", "002")] == pytest.approx(400.0)
 
     def test_symmetry_under_swap(self, grid_surface, munis, abs_rows):
-        fa = ov._fractional_cover(grid_surface, munis, "municipality_id")
-        fb = ov._fractional_cover(grid_surface, abs_rows, "abs_id")
-        forward = ov.overlap_pop_table(grid_surface, fa, fb)
-        backward = ov.overlap_pop_table(grid_surface, fb, fa)
+        forward = ov.overlap_pop_table(
+            grid_surface,
+            ov.pairwise_polygon_intersections(
+                munis, "municipality_id", abs_rows, "abs_id"
+            ),
+        )
+        backward = ov.overlap_pop_table(
+            grid_surface,
+            ov.pairwise_polygon_intersections(
+                abs_rows, "abs_id", munis, "municipality_id"
+            ),
+        )
         fwd = {(r.a_id, r.b_id): r.overlap_pop_est for r in forward.itertuples()}
         bwd = {(r.b_id, r.a_id): r.overlap_pop_est for r in backward.itertuples()}
         assert fwd == pytest.approx(bwd)
+
+    def test_true_intersection_not_product_of_marginal_covers(self, grid_surface):
+        """R4: coincident half-cells carry half, not one quarter, population."""
+        left_half = box(ORIGIN_X, ORIGIN_Y, ORIGIN_X + KM / 2, ORIGIN_Y + KM)
+        a = _gdf(["a"], [left_half], "a_id")
+        b = _gdf(["b"], [left_half], "b_id")
+        intersections = ov.pairwise_polygon_intersections(a, "a_id", b, "b_id")
+        table = ov.overlap_pop_table(grid_surface, intersections)
+        assert table["overlap_pop_est"].iloc[0] == pytest.approx(50.0)
+
+        # Disjoint halves share the same populated cell but have no pairwise
+        # polygon intersection. The former marginal-product estimator would
+        # have fabricated 25 people of overlap.
+        right = _gdf(
+            ["right"],
+            [box(ORIGIN_X + KM / 2, ORIGIN_Y, ORIGIN_X + KM, ORIGIN_Y + KM)],
+            "b_id",
+        )
+        disjoint = ov.pairwise_polygon_intersections(a, "a_id", right, "b_id")
+        assert disjoint.empty
+        assert ov.overlap_pop_table(grid_surface, disjoint).empty
 
     def test_polygon_overlap_area(self):
         a = _gdf(["a"], [_km_box(0, 0, 2, 1)], "abs_id")
