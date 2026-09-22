@@ -5,7 +5,10 @@ Sunday-start shared grid (43 days), Monday week-starts, a
 ``native_graph.zarr`` with node table + edge subgroup, weekly admissions
 and daily deaths stores, a ``real_with_id``-shaped cases zarr, and an
 optional ``od_mitma.zarr``. Expected eligibility sets and pooled context
-values are hand-derived. Real-artifact integration is skipif-guarded.
+values are hand-derived. The confirmation-guard test (ruling R9) writes a
+second grid spanning the reserved window; ``_write_native_root``
+parameterizes ``grid_start``/``days`` for it. Real-artifact integration is
+skipif-guarded.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import xarray as xr
 import zarr
 
 from data.native_dataset import (
+    CONFIRMATION_WINDOW,
     SOURCE_TYPE_IDS,
     NativeDatasetConfig,
     NativeSupportDataset,
@@ -32,6 +36,12 @@ T = 43
 MONDAY_OFFSETS = np.array([1, 8, 15, 22, 29, 36])
 L, H = 14, 7
 ORIGINS = list(range(L - 1, T - H))  # 13..35, stride 1
+
+# Confirmation-guard fixture grid: 2020-11-22 (Sunday) + 74 days through
+# 2021-02-03; the reserved window sits at offsets 39..66, leaving origins
+# after it (up to 66) reachable with L + H = 21 days of grid.
+GUARD_GRID_START = np.datetime64("2020-11-22", "D")
+GUARD_DAYS = 74
 
 MUNIS = ["01001", "01002", "01003", "01004"]
 MUNI_POP = {"01001": 40000.0, "01002": 30000.0, "01003": 20000.0, "01004": 10000.0}
@@ -59,28 +69,38 @@ def _grid_dates() -> np.ndarray:
     return GRID_START + np.arange(T, dtype="timedelta64[D]")
 
 
-def _cases_mask(muni: str) -> np.ndarray:
-    mask = np.ones(T, dtype=bool)
+def _cases_mask(muni: str, days: int = T) -> np.ndarray:
+    mask = np.ones(days, dtype=bool)
     if muni == "01003":
         mask[:10] = False
     return mask
 
 
-def _deaths_mask(comarca: str) -> np.ndarray:
-    mask = np.ones(T, dtype=bool)
+def _deaths_mask(comarca: str, days: int = T) -> np.ndarray:
+    mask = np.ones(days, dtype=bool)
     if comarca == "02":
         mask[sorted(DEATH_GAP)] = False
     return mask
 
 
-def _cases_value(muni: str) -> np.ndarray:
+def _cases_value(muni: str, days: int = T) -> np.ndarray:
     value = np.log1p(CASE_COUNT[muni] / MUNI_POP[muni] * 1e5)
-    return np.full(T, value, dtype=np.float16)
+    return np.full(days, value, dtype=np.float16)
 
 
-def _write_native_root(root: Path, *, with_od: bool = False) -> None:
-    """Write native_graph/obs_admissions/obs_deaths (+ od_mitma) fixtures."""
-    dates = _grid_dates()
+def _write_native_root(
+    root: Path,
+    *,
+    with_od: bool = False,
+    grid_start: np.datetime64 = GRID_START,
+    days: int = T,
+) -> None:
+    """Write native_graph/obs_admissions/obs_deaths (+ od_mitma) fixtures.
+
+    ``grid_start`` must be a Sunday so ``MONDAY_OFFSETS`` stay Mondays; all
+    arrays size to ``days``.
+    """
+    dates = grid_start + np.arange(days, dtype="timedelta64[D]")
 
     # -- node table -----------------------------------------------------
     rows: list[tuple[str, str, str, float]] = []
@@ -196,17 +216,20 @@ def _write_native_root(root: Path, *, with_od: bool = False) -> None:
             "value": (
                 ("date", "comarca_id"),
                 np.stack(
-                    [np.full(T, DEATH_VALUE[c], dtype=np.float32) for c in COMARCAS],
+                    [
+                        np.full(days, DEATH_VALUE[c], dtype=np.float32)
+                        for c in COMARCAS
+                    ],
                     axis=1,
                 ),
             ),
             "mask": (
                 ("date", "comarca_id"),
-                np.stack([_deaths_mask(c) for c in COMARCAS], axis=1),
+                np.stack([_deaths_mask(c, days) for c in COMARCAS], axis=1),
             ),
             "age": (
                 ("date", "comarca_id"),
-                np.ones((T, len(COMARCAS)), dtype=np.uint8),
+                np.ones((days, len(COMARCAS)), dtype=np.uint8),
             ),
             "population": (
                 ("comarca_id",),
@@ -226,19 +249,19 @@ def _write_native_root(root: Path, *, with_od: bool = False) -> None:
         {
             "cases": (
                 ("run_id", "date", "region_id"),
-                np.stack([_cases_value(m) for m in MUNIS], axis=-1)[None],
+                np.stack([_cases_value(m, days) for m in MUNIS], axis=-1)[None],
             ),
             "cases_mask": (
                 ("run_id", "date", "region_id"),
-                np.stack([_cases_mask(m) for m in MUNIS], axis=-1)[None],
+                np.stack([_cases_mask(m, days) for m in MUNIS], axis=-1)[None],
             ),
             "cases_age": (
                 ("run_id", "date", "region_id"),
-                np.ones((1, T, len(MUNIS)), dtype=np.uint8),
+                np.ones((1, days, len(MUNIS)), dtype=np.uint8),
             ),
             "temporal_covariates": (
                 ("date", "covariate"),
-                (np.arange(T, dtype=np.float32)[:, None] * np.arange(4)[None, :])
+                (np.arange(days, dtype=np.float32)[:, None] * np.arange(4)[None, :])
                 / 10.0,
             ),
         },
@@ -252,7 +275,7 @@ def _write_native_root(root: Path, *, with_od: bool = False) -> None:
     cases.to_zarr(root / "real_with_id.zarr")
 
     if with_od:
-        mobility = np.zeros((T, 3, 3), dtype=np.float32)
+        mobility = np.zeros((days, 3, 3), dtype=np.float32)
         mobility[14, 1, 0] = 100.0  # z2 -> z1
         mobility[14, 2, 1] = 300.0  # z3 -> z2
         mobility[14, 0, 2] = 600.0  # z1 -> z3
@@ -374,7 +397,9 @@ def test_origin_dow_sunday_for_weekly_origins(dataset: NativeSupportDataset) -> 
         assert dataset[identities[("abs", "101", origin)]]["origin_dow"] == 6
 
 
-def test_abs_history_interval_placement(dataset: NativeSupportDataset) -> None:
+def test_abs_history_interval_placement(
+    dataset: NativeSupportDataset, native_root: Path
+) -> None:
     identities = {
         (q.source_type, q.source_id, q.forecast_origin): i
         for i, q in enumerate(dataset.queries)
@@ -382,8 +407,14 @@ def test_abs_history_interval_placement(dataset: NativeSupportDataset) -> None:
     item = dataset[identities[("abs", "101", 14)]]
     hist = item["hist"]
     # History window covers grid days 1..14: Mondays at day 1 and day 8.
-    assert hist[0, 0].item() == 10.0
-    assert hist[7, 0].item() == 12.0
+    # Rulings R10/R17 consumption transform: log1p(count / pop_graph * 1e5)
+    # with the ABS graph population 33000; the stored value stays raw.
+    assert hist[0, 0].item() == pytest.approx(
+        np.log1p(10.0 / ABS_POP["101"] * 1e5), rel=1e-6
+    )
+    assert hist[7, 0].item() == pytest.approx(
+        np.log1p(12.0 / ABS_POP["101"] * 1e5), rel=1e-6
+    )
     weekly_days = {0, 7}
     for day in range(L):
         if day not in weekly_days:
@@ -394,6 +425,12 @@ def test_abs_history_interval_placement(dataset: NativeSupportDataset) -> None:
             assert item["hist_mask"][day]
             assert hist[day, 1].item() == 1.0
             assert hist[day, 2].item() == 1.0
+    # Stores stay raw at rest: re-read the week-1 value from the store.
+    adm = xr.open_zarr(native_root / "obs_admissions.zarr")
+    stored = float(adm["value"].sel(abs_id="101").values[0])
+    assert stored == 10.0
+    # The TARGET stays the raw weekly count (14.0, pinned below in
+    # test_abs_weekly_target_alignment_and_populations).
 
 
 def test_abs_weekly_target_alignment_and_populations(
@@ -431,21 +468,33 @@ def test_abs_incomplete_week_slot_is_masked(tmp_path: Path) -> None:
     assert item["target_stratum_pop_sum"].tolist() == [900.0, 0.0]
 
 
-def test_comarca_history_stores_raw_counts(dataset: NativeSupportDataset) -> None:
+def test_comarca_history_value_transform_and_raw_target(
+    dataset: NativeSupportDataset, native_root: Path
+) -> None:
+    """Rulings R10/R17: hist is log1p(count / pop_graph * 1e5); the target
+    stays the raw count; the store keeps raw counts at rest."""
     identities = {
         (q.source_type, q.source_id, q.forecast_origin): i
         for i, q in enumerate(dataset.queries)
     }
     item = dataset[identities[("comarca", "01", 13)]]
     assert item["hist"].shape == (L, 7)
-    assert torch.all(item["hist"][:, 0] == 2.0)  # raw counts, no transform
+    expected_value = np.log1p(DEATH_VALUE["01"] / COMARCA_POP["01"] * 1e5)
+    assert item["hist"][:, 0] == pytest.approx(
+        torch.full((L,), expected_value, dtype=torch.float32), rel=1e-6
+    )
     assert torch.all(item["hist"][:, 1] == 1.0)
+    # TARGET STAYS RAW (the loss owns target-side transforms).
     assert item["target"].shape == (H,)
-    assert torch.all(item["target"] == 2.0)
+    assert torch.all(item["target"] == DEATH_VALUE["01"])
     assert torch.all(item["target_mask"])
     assert item["source_pop"] == COMARCA_POP["01"]
     assert item["target_population_graph"] == COMARCA_POP["01"]
     assert item["source_type_id"] == SOURCE_TYPE_IDS["comarca"]
+    # Store stays raw at rest: re-read a value from obs_deaths.zarr.
+    deaths = xr.open_zarr(native_root / "obs_deaths.zarr")
+    stored = float(deaths["value"].sel(comarca_id="01").values[0])
+    assert stored == DEATH_VALUE["01"]
 
 
 def test_comarca_gap_keeps_missing_rows_missing(dataset: NativeSupportDataset) -> None:
@@ -460,9 +509,15 @@ def test_comarca_gap_keeps_missing_rows_missing(dataset: NativeSupportDataset) -
     assert item["hist_mask"][:6].all()
 
 
-def test_pooling_weights_normalized_with_deficit(
+def test_pooling_raw_fractions_zero_deficit_contribution(
     dataset: NativeSupportDataset,
 ) -> None:
+    """Ruling R6: raw destination fractions, never renormalized.
+
+    A partially covered context contributes ``coverage x feature`` plus a
+    zero-valued deficit slot — no renormalization to fake completeness —
+    and ``ctx_coverage`` keeps reporting the deficit.
+    """
     identities = {
         (q.source_type, q.source_id, q.forecast_origin): i
         for i, q in enumerate(dataset.queries)
@@ -482,9 +537,10 @@ def test_pooling_weights_normalized_with_deficit(
     assert full["ctx_coverage"] == pytest.approx(1.0)  # deficit slot = 0
 
     partial = dataset[identities[("abs", "102", 14)]]
-    # Single neighbor with raw weight 0.6: normalized to 1.0, deficit 0.4.
+    # Single neighbor with raw weight 0.6: contributes 0.6 x series — NOT
+    # 1.0 x — with the 0.4 deficit contributing zeros.
     assert partial["ctx_feat"][:, 0] == pytest.approx(
-        torch.from_numpy(_cases_value("01004")[window].astype(np.float32)),
+        torch.from_numpy(0.6 * _cases_value("01004")[window].astype(np.float32)),
         rel=1e-3,
         abs=1e-4,
     )
@@ -546,6 +602,109 @@ def test_od_context_row_gated(tmp_path: Path) -> None:
     assert municipal["ctx_feat"][:, 3].eq(0).all()  # no overlapping MITMA zones
 
 
+def test_confirmation_guard_excludes_reserved_window_origins(
+    tmp_path: Path,
+) -> None:
+    """Ruling R9 (plan section 10.3(10)): guard-on drops every origin whose
+    target window ``(origin, origin+H]`` intersects the reserved window;
+    guard-off keeps everything."""
+    _write_native_root(tmp_path, grid_start=GUARD_GRID_START, days=GUARD_DAYS)
+    grid = GUARD_GRID_START + np.arange(GUARD_DAYS, dtype="timedelta64[D]")
+    win_start, win_end = CONFIRMATION_WINDOW
+
+    def reserved(origin: int) -> bool:
+        target = grid[origin + 1 : origin + H + 1]
+        return bool(((target >= win_start) & (target <= win_end)).any())
+
+    def build(guard: bool) -> NativeSupportDataset:
+        return NativeSupportDataset(
+            tmp_path,
+            tmp_path / "real_with_id.zarr",
+            NativeDatasetConfig(
+                input_window_length=L,
+                forecast_horizon=H,
+                confirmation_guard=guard,
+            ),
+        )
+
+    off = build(False)
+    on = build(True)
+    assert NativeDatasetConfig().confirmation_guard is True  # default on
+    assert off.head_counts.keys() == on.head_counts.keys()
+
+    # Guard-off keeps everything; guard-on drops exactly the reserved
+    # origins, per head (the guard is index-wide, not per source).
+    for head in off.head_counts:
+        off_pairs = {(s, o) for _, s, o in off.head_index[head]}
+        on_pairs = {(s, o) for _, s, o in on.head_index[head]}
+        assert on_pairs == {(s, o) for s, o in off_pairs if not reserved(o)}
+
+    cases_off = {o for _, s, o in off.head_index["cases"] if s == "01001"}
+    cases_on = {o for _, s, o in on.head_index["cases"] if s == "01001"}
+    # Origin INSIDE the reserved window: excluded.
+    assert 42 in cases_off and 42 not in cases_on
+    # Origin BEFORE the window whose horizon crosses into it: excluded.
+    assert 35 in cases_off and 35 not in cases_on
+    # Origin at the window's last day, target fully after it: kept.
+    assert 66 in cases_on
+    assert reserved(42) and reserved(35) and not reserved(66)
+
+
+def test_od_threshold_and_self_flow_policy(tmp_path: Path) -> None:
+    """Ruling R10: consumption-time od_min_flow_raw threshold and
+    od_self_flows policy on a synthetic OD row; the store stays raw."""
+    _write_native_root(tmp_path, with_od=True)
+    mobility = np.zeros((T, 3, 3), dtype=np.float32)
+    # Synthetic OD row at day 14: self-flows (diagonal), small cross-flows
+    # below any threshold, one large flow.
+    mobility[14] = np.array(
+        [[500.0, 50.0, 100.0], [40.0, 200.0, 0.0], [0.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    od = xr.Dataset(
+        {"mobility": (("date", "origin", "target"), mobility)},
+        coords={
+            "date": _grid_dates().astype("datetime64[ns]"),
+            "origin": ["z1", "z2", "z3"],
+            "target": ["z1", "z2", "z3"],
+            "zone": np.arange(3),
+            "zone_id": (("zone",), ["z1", "z2", "z3"]),
+        },
+    )
+    od.to_zarr(tmp_path / "od_mitma.zarr", mode="w")
+
+    def build(**kwargs: object) -> NativeSupportDataset:
+        config = NativeDatasetConfig(
+            input_window_length=L,
+            forecast_horizon=H,
+            include_od_context=True,
+            **kwargs,
+        )
+        return NativeSupportDataset(tmp_path, tmp_path / "real_with_id.zarr", config)
+
+    identities = {
+        (q.source_type, q.source_id, q.forecast_origin): i
+        for i, q in enumerate(build(confirmation_guard=False).queries)
+    }
+
+    def share_of(ds: NativeSupportDataset) -> float:
+        item = ds[identities[("abs", "101", 14)]]
+        return float(item["ctx_feat"][0, 3])
+
+    # retain + min 10: nothing dropped -> (500+50+40+200)/(500+50+100+40+200).
+    retain_small = build(od_min_flow_raw=10.0, od_self_flows="retain")
+    assert share_of(retain_small) == pytest.approx(790.0 / 890.0)
+    # retain + min 100: the 50 and 40 flows drop -> 700/800.
+    retain_large = build(od_min_flow_raw=100.0, od_self_flows="retain")
+    assert share_of(retain_large) == pytest.approx(700.0 / 800.0)
+    # drop + min 100: the diagonal (500, 200) clears too -> 0 incoming.
+    drop_large = build(od_min_flow_raw=100.0, od_self_flows="drop")
+    assert share_of(drop_large) == 0.0
+    # Raw store untouched by consumption-time policy.
+    raw = xr.open_zarr(tmp_path / "od_mitma.zarr")
+    assert float(raw["mobility"].values[14, 0, 0]) == 500.0
+
+
 def test_config_validation() -> None:
     with pytest.raises(ValueError):
         NativeDatasetConfig(window_stride=0)
@@ -553,6 +712,10 @@ def test_config_validation() -> None:
         NativeDatasetConfig(input_window_length=0)
     with pytest.raises(ValueError):
         NativeDatasetConfig(min_history_observed_fraction=1.5)
+    with pytest.raises(ValueError):
+        NativeDatasetConfig(od_self_flows="keep")
+    with pytest.raises(ValueError):
+        NativeDatasetConfig(od_min_flow_raw=-1.0)
 
 
 # ----------------------------------------------------------------------

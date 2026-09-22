@@ -1,8 +1,9 @@
 """Tests for the native ABS admissions processor (slice OBS-1).
 
 Unit tests run on a hand-computed synthetic fixture CSV (2 real ABS x 3 epi
-weeks plus sentinel rows) exercising weekly placement, structural-triple
-sentinel filtering, sex x age-group aggregation, stratum population sums and
+weeks plus sentinel rows) exercising weekly placement, canonical-conjunction
+sentinel filtering (ruling R11: the same ``abs_sentinel_mask`` the registry
+builder uses), sex x age-group aggregation, stratum population sums and
 the deviation warning, zero-vs-missing semantics, age-channel behavior,
 window cropping, and the zarr v3 roundtrip. The integration test
 cross-checks the real input files and is skipped when they are absent.
@@ -17,6 +18,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from data.native_registry import abs_sentinel_mask
 from data.preprocess.config import PreprocessingConfig
 from data.preprocess.processors.abs_admissions_processor import (
     ABS_FILE,
@@ -82,6 +84,24 @@ def _row(
     return row
 
 
+def _sentinel_row(week: int) -> dict[str, object]:
+    """A Catalonia-total row matching the full structural conjunction."""
+    return _row(
+        week,
+        "000",
+        9,
+        0,
+        codi_regio="00",
+        nom_regio="No disponible",
+        codi_ambit="00",
+        nom_ambit="No disponible",
+        nom_abs="No disponible",
+        sexe="No disponible",
+        grup_edat="No disponible",
+        index_socioeconomic=-1,
+    )
+
+
 def _fixture_rows() -> list[dict[str, object]]:
     return [
         # ABS 001 week 0: two strata -> value 3, stratum_pop_sum 259 + 301
@@ -89,11 +109,9 @@ def _fixture_rows() -> list[dict[str, object]]:
         _row(0, "001", 2, 301, sexe="Dona", grup_edat="60 a 64"),
         # ABS 001 week 1: reported zero-case stratum -> value 0, mask True
         _row(1, "001", 0, 560),
-        # Sentinel rows, each caught by exactly one structural-triple
-        # condition (§10.3(4)): the OR filter must drop all three
-        _row(0, "000", 9, 5_000),  # codi_abs == "000"
-        _row(0, "099", 7, 4_000, codi_regio="00"),  # codi_regio == "00"
-        _row(0, "098", 6, 3_000, sexe="No disponible"),  # "No disponible"
+        # Catalonia-total sentinel row: only the full structural conjunction
+        # (§10.3(4), ruling R11) marks it
+        _sentinel_row(0),
         # Real newer ABS 002 carries index_socioeconomic == -1 with genuine
         # admissions -> must be retained, never treated as a sentinel
         _row(1, "002", 4, 100, index_socioeconomic=-1, grup_edat="30 a 34"),
@@ -218,11 +236,30 @@ class TestABSAdmissionsProcessor:
         assert (age[:, 2] == 14).all()  # never reported
 
     def test_sentinel_filter_and_retention(self, processed: xr.Dataset) -> None:
-        # All three single-condition sentinel rows are dropped...
+        # The full-conjunction Catalonia-total row is dropped...
         assert set(processed["abs_id"].values) == {"001", "002"}
         # ...while the index_socioeconomic == -1 real row is retained with
         # its genuine admissions (4 on ABS 002 week 1)
         assert processed["value"].sel(date="2021-06-14", abs_id="002").item() == 4.0
+
+    def test_codi_abs_000_with_real_fields_is_retained(self, tmp_path: Path) -> None:
+        # An isolated sentinel-like field never drops a row (ruling R11):
+        # codi_abs == "000" with real fields is a genuine (if odd) ABS here.
+        rows = [
+            _fixture_rows()[0],
+            _sentinel_row(0),
+            _row(0, "000", 9, 5_000),
+        ]
+        ds = _process(tmp_path, rows, *FULL_WINDOW)
+        assert set(ds["abs_id"].values) == {"000", "001"}
+        assert ds["value"].sel(date="2021-06-07", abs_id="000").item() == 9.0
+
+    def test_sentinel_predicate_matches_registry_canonical(self) -> None:
+        frame = pd.DataFrame(_fixture_rows(), columns=CSV_COLUMNS)
+        mask = abs_sentinel_mask(frame)
+        # Exactly the one full-conjunction row is flagged; the -1 real row
+        # and every real ABS row are retained.
+        assert mask.tolist() == [False, False, False, True, False, False]
 
     def test_no_deviation_warning_on_consistent_weeks(self, tmp_path: Path) -> None:
         with warnings.catch_warnings(record=True) as caught:
@@ -264,17 +301,7 @@ class TestABSAdmissionsProcessor:
         assert "index_socioeconomic" in processed.attrs["sentinel_filter"]
 
     def test_empty_dataset_when_only_sentinels(self, tmp_path: Path) -> None:
-        rows = [
-            _row(
-                0,
-                "000",
-                3,
-                0,
-                codi_regio="00",
-                sexe="No disponible",
-                grup_edat="No disponible",
-            )
-        ]
+        rows = [_sentinel_row(0)]
         ds = _process(tmp_path, rows, *FULL_WINDOW)
         assert ds.sizes["abs_id"] == 0
         assert ds.sizes["date"] == 3  # complete window grid

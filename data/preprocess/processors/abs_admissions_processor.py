@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from ...native_registry import abs_sentinel_mask
 from ..config import TEMPORAL_COORD, PreprocessingConfig
 
 ABS_FILE = "COVID-19__Persones_hospitalitzades.csv"
@@ -47,8 +48,10 @@ class ABSAdmissionsProcessor:
 
     Processing pipeline:
     1. Load the raw (epi-week, ABS, sex, age group) CSV, dropping only the
-       structural sentinel triple (never ``index_socioeconomic == -1``:
-       real newer ABS carry it with genuine admissions, §10.3(4)).
+       canonical sentinel conjunction (:func:`data.native_registry.abs_sentinel_mask`,
+       ruling R11) — isolated sentinel-like fields on real rows are never
+       filtered (real newer ABS carry ``index_socioeconomic == -1`` with
+       genuine admissions, §10.3(4)).
     2. Aggregate strata to ABS-weeks (admissions and stratum_pop_sum sums).
     3. Place onto the complete Monday-week grid inside the configured
        window, marking unreported ABS-weeks as missing.
@@ -92,16 +95,12 @@ class ABSAdmissionsProcessor:
             dtype={"codi_abs": str, "codi_regio": str, "codi_ambit": str},
         )
 
-        # Sentinel filter on the ORIGINAL columns (§10.3(4)): the structural
-        # triple only. The three conditions coincide exactly on the real
-        # file (311 Catalonia-total rows); OR-semantics keeps the filter
-        # robust to any one of them appearing alone.
-        sentinel = (
-            (df["codi_abs"] == "000")
-            | (df["codi_regio"] == "00")
-            | (df["sexe"] == "No disponible")
-            | (df["grup_edat"] == "No disponible")
-        )
+        # Sentinel filter on the ORIGINAL columns (§10.3(4), ruling R11):
+        # the canonical structural conjunction, shared verbatim with the
+        # registry builder. On the real file it drops exactly the 311
+        # Catalonia-total rows; isolated sentinel-like fields on otherwise
+        # real rows are retained.
+        sentinel = abs_sentinel_mask(df)
         df = df[~sentinel]
 
         df = df.drop(columns=["codi_regio", "codi_ambit"], errors="ignore")
@@ -330,9 +329,12 @@ class ABSAdmissionsProcessor:
             "source_file": self.ABS_FILE,
             "raw_rows_retained": n_raw_rows,
             "sentinel_filter": (
-                "structural triple: codi_abs=='000' OR codi_regio=='00' OR "
-                "'No disponible'; index_socioeconomic==-1 retained (real "
-                "newer ABS carry it with genuine admissions, §10.3(4))"
+                "canonical structural conjunction (§10.3(4), ruling R11): "
+                "codi_abs=='000' AND codi_regio=='00' AND 'No disponible' "
+                "name fields AND index_socioeconomic==-1 AND poblacio==0; "
+                "isolated sentinel-like fields on real rows retained (real "
+                "newer ABS carry index_socioeconomic==-1 with genuine "
+                "admissions)"
             ),
             "week_convention": "epi weeks Monday (date) to Sunday (week_end)",
             "population_caveat": (

@@ -1,11 +1,13 @@
 """Tests for native source registries (slice REG-1, plan section 12.2).
 
-Fixture-driven classes cover sentinel filtering (structural triple only),
+Fixture-driven classes cover sentinel filtering (the canonical structural
+conjunction of :func:`data.native_registry.abs_sentinel_mask`, ruling R11),
 sex/week aggregation, zero-observed-stays-observed, unmapped statuses in both
 directions, population provenance, and string-ID preservation (leading zeros
 never int-ified). A skipif-guarded integration class builds all three
 registries from the real input files when present and asserts the audited
-reconciliation numbers.
+reconciliation numbers, including the exact-311 sentinel-set equivalence
+between the canonical conjunction and the former OR filters.
 """
 
 from __future__ import annotations
@@ -13,12 +15,14 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from data.native_registry import (
     ABS_POPULATION_NOTE,
     POP_SOURCE_COMARCA_MEMBER_SUM,
     POP_SOURCE_MUNICIPAL_AUDITED,
+    SENTINEL_LABEL,
     SOURCE_ABS,
     SOURCE_COMARCA,
     SOURCE_MUNICIPALITY,
@@ -28,6 +32,7 @@ from data.native_registry import (
     STUDY_WINDOW_START,
     SourceRecord,
     SourceRegistry,
+    abs_sentinel_mask,
     build_abs_registry,
     build_comarca_registry,
     build_municipal_registry,
@@ -128,6 +133,112 @@ class TestSourceRegistry:
         assert registry.counts_by_status(SOURCE_COMARCA) == {}
 
 
+ABS_CSV_COLUMNS = [
+    "setmana_epidemiologica",
+    "any",
+    "data_inici",
+    "data_final",
+    "codi_regio",
+    "nom_regio",
+    "codi_ambit",
+    "nom_ambit",
+    "codi_abs",
+    "nom_abs",
+    "sexe",
+    "grup_edat",
+    "index_socioeconomic",
+    "casos",
+    "poblacio",
+]
+
+
+def _abs_row(**overrides: object) -> dict[str, object]:
+    """A real-fields ABS CSV row; overrides produce sentinel-like variants."""
+    row: dict[str, object] = {
+        "setmana_epidemiologica": 202018,
+        "any": 2020,
+        "data_inici": "27/04/2020",
+        "data_final": "03/05/2020",
+        "codi_regio": "08",
+        "nom_regio": "Catalunya Central",
+        "codi_ambit": "11",
+        "nom_ambit": "Bages",
+        "codi_abs": "088",
+        "nom_abs": "Cardona",
+        "sexe": "Home",
+        "grup_edat": "65 a 69",
+        "index_socioeconomic": 97,
+        "casos": 2,
+        "poblacio": 210,
+    }
+    row.update(overrides)
+    return row
+
+
+def _sentinel_row(**overrides: object) -> dict[str, object]:
+    """A Catalonia-total row: every verified conjunction field matches."""
+    row = {
+        "codi_regio": "00",
+        "nom_regio": SENTINEL_LABEL,
+        "codi_ambit": "00",
+        "nom_ambit": SENTINEL_LABEL,
+        "codi_abs": "000",
+        "nom_abs": SENTINEL_LABEL,
+        "index_socioeconomic": -1,
+        "casos": 73,
+        "poblacio": 0,
+    }
+    row.update(overrides)
+    return _abs_row(**row)
+
+
+class TestAbsSentinelMask:
+    def test_full_conjunction_flagged_in_both_stratum_shapes(self):
+        # Real file: 297 sentinel rows carry "No disponible" strata, 14 (the
+        # Home / 50 a 54 stratum) carry real stratum values; both shapes are
+        # Catalonia-total sentinels because sexe/grup_edat are not conjuncts.
+        nd_strata = pd.DataFrame(
+            [_sentinel_row(sexe=SENTINEL_LABEL, grup_edat=SENTINEL_LABEL)]
+        )
+        real_strata = pd.DataFrame([_sentinel_row()])
+        assert bool(abs_sentinel_mask(nd_strata).iloc[0]) is True
+        assert bool(abs_sentinel_mask(real_strata).iloc[0]) is True
+
+    def test_isolated_codi_abs_000_with_real_fields_is_retained(self):
+        frame = pd.DataFrame([_abs_row(codi_abs="000")])
+        assert not abs_sentinel_mask(frame).any()
+
+    def test_isolated_index_socioeconomic_minus_one_is_retained(self):
+        frame = pd.DataFrame([_abs_row(index_socioeconomic=-1)])
+        assert not abs_sentinel_mask(frame).any()
+
+    def test_isolated_poblacio_zero_is_retained(self):
+        frame = pd.DataFrame([_abs_row(poblacio=0)])
+        assert not abs_sentinel_mask(frame).any()
+
+    def test_every_proper_subset_of_the_conjunction_is_retained(self):
+        variants = [
+            _sentinel_row(codi_regio="08"),
+            _sentinel_row(nom_regio="Girona"),
+            _sentinel_row(nom_ambit="Selva"),
+            _sentinel_row(nom_abs="Amposta"),
+            _sentinel_row(index_socioeconomic=97),
+            _sentinel_row(poblacio=12),
+        ]
+        assert not abs_sentinel_mask(pd.DataFrame(variants)).any()
+
+    def test_string_and_numeric_dtypes_agree(self):
+        as_str = pd.DataFrame([_sentinel_row(), _abs_row()], dtype=str)
+        as_native = pd.DataFrame([_sentinel_row(), _abs_row()])
+        assert abs_sentinel_mask(as_str).equals(abs_sentinel_mask(as_native))
+        assert abs_sentinel_mask(as_str).tolist() == [True, False]
+
+    def test_missing_numeric_field_is_retained(self):
+        row = _sentinel_row()
+        row["poblacio"] = None
+        assert not abs_sentinel_mask(pd.DataFrame([row])).any()
+
+
 class TestAbsRegistry:
     def test_sentinel_rows_dropped_and_excluded(self):
         registry, report = _fixture_abs_registry()
@@ -140,9 +251,9 @@ class TestAbsRegistry:
     def test_index_socioeconomic_minus_one_rows_are_kept(self):
         _registry, report = _fixture_abs_registry()
 
-        # The sentinel row carries index_socioeconomic == -1 too; if -1 were
-        # (wrongly) treated as a sentinel marker, two rows would be dropped
-        # and one real abs-week observation would vanish.
+        # index_socioeconomic == -1 is a conjunction member, but alone it
+        # never marks a sentinel: the fixture's real ABS 088 row carries -1
+        # with genuine admissions and must survive the filter.
         assert report.sentinel_rows_dropped == 1
         assert report.abs_week_observations_in_window == 4
         assert report.casos_in_window == 8
@@ -422,6 +533,30 @@ class TestRealFileIntegration:
         assert registry.get(SOURCE_ABS, "000") is None
         assert all(r.population is None for r in registry)
         assert report.population_note == ABS_POPULATION_NOTE
+
+    def test_abs_sentinel_conjunction_drops_exactly_311(self):
+        frame = pd.read_csv(REAL_ABS, dtype=str)
+        conjunction = abs_sentinel_mask(frame)
+
+        assert int(conjunction.sum()) == 311
+        # Same set as the former OR filters (both the registry and the
+        # processor variants — verified identical on the real file).
+        or_filter = (
+            frame["codi_abs"].eq("000")
+            | frame["codi_regio"].eq("00")
+            | frame["nom_regio"].eq(SENTINEL_LABEL)
+            | frame["nom_ambit"].eq(SENTINEL_LABEL)
+            | frame["nom_abs"].eq(SENTINEL_LABEL)
+        )
+        assert frame.index[conjunction].equals(frame.index[or_filter])
+
+        # The six real newer ABS carrying index_socioeconomic == -1 with
+        # genuine admissions survive the conjunction.
+        minus_one = pd.to_numeric(
+            frame["index_socioeconomic"], errors="coerce"
+        ).eq(-1)
+        newer_abs = set(frame.loc[minus_one & ~conjunction, "codi_abs"].unique())
+        assert newer_abs == {"399", "404", "405", "406", "408", "409"}
 
     def test_abs_geometry_reconciliation(self):
         geopandas = pytest.importorskip("geopandas")

@@ -15,23 +15,33 @@ included, mirroring the municipal path) and ``H`` target days
 (:mod:`models.reporting_operators`) aggregates.
 
 Eligibility. A ``(source, origin)`` pair is indexed when the source is
-registry-``observed`` for its routed head and both windows clear the
+registry-``observed`` for its routed head, both windows clear the
 minimum-observation counts of ``DataConfig._resolve_min_observed_map``
 (reused verbatim) at the head's native cadence: cases/deaths count
 observed days (cadence 1); the weekly ``hosp`` head counts complete
-reported Mon-Sun weeks (cadence 7) fully inside each window.
+reported Mon-Sun weeks (cadence 7) fully inside each window. With
+``confirmation_guard`` on (default, ruling R9) an origin is additionally
+rejected when its target window ``(origin, origin+H]`` intersects the
+reserved ``CONFIRMATION_WINDOW`` (plan section 10.3(10)); an explicit
+``confirmation_guard=False`` opts in for calibration-period work.
 
 Histories ``hist [L, F_native]`` — three clinical channels (value, mask,
-age) followed by the ``k`` shared temporal covariates. Channel values
-carry NO consumption-time transform; transforms happen at loss/eval:
+age) followed by the ``k`` shared temporal covariates. VALUE channels are
+type-aware consumption transforms (ruling R10) of raw-at-rest stores:
+masks and ages are raw, unreported days keep value 0, and TARGETS STAY
+RAW COUNTS (the loss owns target-side transforms):
 
 - municipality: daily cases from ``real_with_id.zarr`` as stored —
-  ``log1p(per-100k)`` float16 — with cases mask and age.
+  ``log1p(per-100k)`` float16, already transformed by provenance — with
+  cases mask and age.
 - abs: weekly admissions on the daily grid with interval placement —
-  the weekly raw-count value and its reporting age sit on the week-start
-  (Monday) day only; all other days carry value 0 with mask 0.
-- comarca: daily raw death counts, mask and age from ``obs_deaths.zarr``
-  (raw counts at rest, plan section 11.3).
+  the weekly value and its reporting age sit on the week-start (Monday)
+  day only; all other days carry value 0 with mask 0. The value channel
+  is ``log1p((weekly_count / pop_graph) · 1e5)`` computed from the raw
+  stored count and the ABS graph population.
+- comarca: daily deaths from ``obs_deaths.zarr`` (raw counts at rest,
+  plan section 11.3); the value channel is
+  ``log1p((daily_count / pop_graph) · 1e5)``; mask and age are raw.
 
 Targets are raw counts plus the graph population denominator: municipal
 cases are inverted from the stored ``log1p(per-100k)`` values at index
@@ -41,19 +51,23 @@ lower bound, section 10.3(4)) beside ``target_population_graph``.
 
 Context ``ctx_feat [L, D_ctx]``. Fixed pooling over the query source's
 municipal overlap neighbors from ``native_graph.zarr`` edges, taken in
-the ``(src=municipality, dst=query source)`` direction — the
-destination-normalized population fractions. Raw weights sum to
-``ctx_coverage <= 1`` (the population share reachable through municipal
-overlaps); the coverage deficit is exposed as the leading slot of the
-full weight vector ``[deficit, w_1..w_M]``, a zero-contribution
-component, so the weights always sum to exactly 1 and the pooling uses
-the coverage-normalized tail. Municipal query sources have no municipal
-overlap neighbors: their context is zero with coverage 0 (Stage-2
-property; ENC-1 replaces fixed pooling). With ``include_od_context``
-(default off) one extra constant feature column carries the origin-day
-incoming trip share into the source's overlapping MITMA zones: the sum
-of ``od_mitma`` trips targeting those zones at the origin day, divided
-by the total incoming trips over all zones that day.
+the ``(src=municipality, dst=query source)`` direction. Weights are the
+RAW destination-population fractions, NEVER renormalized (ruling R6):
+they sum to ``ctx_coverage <= 1`` (the population share reachable
+through municipal overlaps) and the uncovered deficit acts as an
+explicit zero-valued slot — a sole ``0.6``-weight neighbor contributes
+``0.6 × feature`` and ``0.4 × zeros`` — so ``ctx_coverage`` keeps
+reporting the deficit instead of the pooling faking completeness.
+Municipal query sources have no municipal overlap neighbors: their
+context is zero with coverage 0 (Stage-2 property; ENC-1 replaces fixed
+pooling). With ``include_od_context`` (default off) one extra constant
+feature column carries the origin-day incoming trip share into the
+source's overlapping MITMA zones: the sum of ``od_mitma`` trips
+targeting those zones at the origin day, divided by the total incoming
+trips over all zones that day, after the consumption-time OD policy
+(plan sections 11.6-11.7): flows below ``od_min_flow_raw`` are dropped
+and ``od_self_flows="drop"`` clears the diagonal before the shares are
+taken.
 
 Deterministic ordering: items sort by ``(source_type, source_id,
 forecast_origin)`` and identical ``(source, origin)`` pairs appear once.
@@ -83,7 +97,7 @@ from data.native_registry import (
     SourceRegistry,
 )
 from data.query_contract import ForecastQuery, validate_query
-from models.configs import DataConfig
+from models.configs import DataConfig, NATIVE_OD_SELF_FLOW_MODES
 
 #: Stable enum index per source type (BAT-1 collation consumes this).
 SOURCE_TYPE_IDS: dict[str, int] = {
@@ -109,6 +123,15 @@ _PER_100K = 100_000.0
 _POOL_RELATIONS = ("muni_abs", "muni_comarca")
 _OD_RELATIONS = ("mitma_abs", "mitma_comarca")
 
+#: Reserved model-confirmation window (plan section 10.3(10), ruling R9).
+#: [D1] used 2020-12-31..2021-01-27 for calibration only, so native
+#: evaluation must not score targets inside it unless an explicit
+#: ``confirmation_guard=False`` override opts in. Inclusive on both ends.
+CONFIRMATION_WINDOW: tuple[np.datetime64, np.datetime64] = (
+    np.datetime64("2020-12-31", "D"),
+    np.datetime64("2021-01-27", "D"),
+)
+
 
 def _day_of_week(date: np.datetime64) -> int:
     """Weekday (0=Monday..6=Sunday) of a ``datetime64[D]`` value."""
@@ -130,6 +153,13 @@ class NativeDatasetConfig:
     min_horizon_observed_fraction: float = 0.5
     # OD summary context row (plan section 11.4 D_ctx extension); default off.
     include_od_context: bool = False
+    # Consumption-time OD policy applied when ``include_od_context`` is on
+    # (plan sections 11.6-11.7, ruling R10).
+    od_min_flow_raw: float = 10.0
+    od_self_flows: str = "retain"
+    # Ruling R9: reject origins whose target window intersects
+    # ``CONFIRMATION_WINDOW`` unless explicitly disabled for calibration work.
+    confirmation_guard: bool = True
 
     def __post_init__(self) -> None:
         if self.input_window_length <= 0 or self.forecast_horizon <= 0:
@@ -143,6 +173,16 @@ class NativeDatasetConfig:
             value = float(getattr(self, name))
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1], got {value}")
+        if self.od_self_flows not in NATIVE_OD_SELF_FLOW_MODES:
+            raise ValueError(
+                f"od_self_flows must be one of {NATIVE_OD_SELF_FLOW_MODES}, "
+                f"got {self.od_self_flows!r}"
+            )
+        if (
+            not math.isfinite(float(self.od_min_flow_raw))
+            or self.od_min_flow_raw < 0
+        ):
+            raise ValueError("od_min_flow_raw must be finite and non-negative")
 
     def _min_observed(self, window_length: int, fraction: float, head: str) -> int:
         """``DataConfig._resolve_min_observed_map`` at the head's cadence."""
@@ -603,9 +643,22 @@ class NativeSupportDataset(Dataset):
         target = (cum[origins + self._H + 1] - cum[origins + 1]).T
         return hist, target
 
+    def _reserved_origin_mask(self, origins: np.ndarray) -> np.ndarray:
+        """Origins whose target window ``(origin, origin+H]`` intersects
+        ``CONFIRMATION_WINDOW`` (plan section 10.3(10), ruling R9)."""
+        win_start, win_end = CONFIRMATION_WINDOW
+        target_start = self._grid[origins + 1]
+        target_end = self._grid[origins + self._H]
+        return (target_start <= win_end) & (target_end >= win_start)
+
     def _build_index(self) -> list[tuple[ForecastQuery, str]]:
         """Deterministic per-head ``(source, origin)`` index (sorted, deduped)."""
         origins = self._origin_grid()
+        reserved = (
+            self._reserved_origin_mask(origins)
+            if self._config.confirmation_guard
+            else None
+        )
         entries: list[tuple[ForecastQuery, str]] = []
         for head in sorted(HEAD_SOURCE_TYPE):
             source_type = HEAD_SOURCE_TYPE[head]
@@ -622,11 +675,12 @@ class NativeSupportDataset(Dataset):
             min_history = self._config.min_history_observed(head)
             min_horizon = self._config.min_horizon_observed(head)
             for row, record in enumerate(records):
-                eligible = np.flatnonzero(
-                    (hist_counts[row] >= min_history)
-                    & (target_counts[row] >= min_horizon)
+                eligible = (hist_counts[row] >= min_history) & (
+                    target_counts[row] >= min_horizon
                 )
-                for offset in eligible:
+                if reserved is not None:
+                    eligible &= ~reserved
+                for offset in np.flatnonzero(eligible):
                     query = ForecastQuery(
                         source_type=source_type,  # type: ignore[arg-type]
                         source_id=record.source_id,
@@ -650,7 +704,7 @@ class NativeSupportDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _build_pools(self) -> dict[str, tuple[np.ndarray, np.ndarray, float]]:
-        """Per-source (cases columns, normalized weights, coverage).
+        """Per-source (cases columns, raw destination fractions, coverage).
 
         Neighbors are case-bearing municipalities; the coverage scalar is
         the query source's population share reachable through municipal
@@ -689,8 +743,9 @@ class NativeSupportDataset(Dataset):
                     weights.append(float(edges["weight"][row]))
         raw = np.asarray(weights, dtype=np.float32)
         coverage = float(raw.sum())
-        normalized = raw / coverage if coverage > 0.0 else raw
-        return np.asarray(columns, dtype=np.int64), normalized, coverage
+        # Ruling R6: raw destination fractions, never renormalized — the
+        # uncovered deficit stays an implicit zero-contribution slot.
+        return np.asarray(columns, dtype=np.int64), raw, coverage
 
     def _pooled_context(
         self, source_type: str, source_id: str, hist_slice: slice
@@ -704,7 +759,13 @@ class NativeSupportDataset(Dataset):
         return pooled.astype(np.float32, copy=False), coverage
 
     def _od_share(self, query: ForecastQuery) -> float:
-        """Origin-day incoming trip share into the source's overlapping zones."""
+        """Origin-day incoming trip share into the source's overlapping zones.
+
+        Consumption-time OD policy (plan sections 11.6-11.7, ruling R10):
+        flows below ``od_min_flow_raw`` are dropped and
+        ``od_self_flows="drop"`` clears the diagonal (origin==target)
+        before the shares are taken; the store stays raw at rest.
+        """
         assert self._od is not None
         node = self._node_index[f"{query.source_type}:{query.source_id}"]
         zone_columns: set[int] = set()
@@ -721,9 +782,13 @@ class NativeSupportDataset(Dataset):
         od_row = self._od.row_of(self._grid[query.forecast_origin])
         if od_row is None:
             return 0.0
+        flows = self._od.mobility[od_row].astype(np.float32, copy=True)
+        if self._config.od_self_flows == "drop":
+            np.fill_diagonal(flows, 0.0)
+        flows[flows < self._config.od_min_flow_raw] = 0.0
         columns = sorted(zone_columns)
-        incoming = float(self._od.mobility[od_row, :, columns].sum())
-        total = float(self._od.mobility[od_row, :, :].sum())
+        incoming = float(flows[:, columns].sum())
+        total = float(flows.sum())
         return incoming / total if total > 0.0 else 0.0
 
     # ------------------------------------------------------------------
@@ -733,6 +798,12 @@ class NativeSupportDataset(Dataset):
     def _municipal_history(
         self, source_id: str, hist_slice: slice
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Municipal cases history, ``[L, 3]``.
+
+        The stored ``log1p(per-100k)`` value channel is consumed as-is
+        (ruling R10: already transformed by provenance); targets are
+        inverted to raw counts separately.
+        """
         column = self._cases.columns[source_id]
         block = self._cases.channels[hist_slice, column, :].astype(np.float32)
         return block, self._cases.masks[hist_slice, column].copy()
@@ -752,8 +823,15 @@ class NativeSupportDataset(Dataset):
     def _abs_history(
         self, source_id: str, hist_slice: slice
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Weekly admissions interval-placed on the daily grid, ``[L, 3]``."""
+        """Weekly admissions interval-placed on the daily grid, ``[L, 3]``.
+
+        Consumption transform (ruling R10): the raw-at-rest weekly count
+        becomes ``log1p((count / pop_graph) · 1e5)`` using the ABS graph
+        population. Mask/age channels are raw; targets stay raw.
+        """
         column = self._adm.columns[source_id]
+        node = self._node_index[f"{SOURCE_ABS}:{source_id}"]
+        population = float(self._graph_nodes.population[node])
         hist_start = int(hist_slice.start)
         start = int(
             np.searchsorted(self._adm.dates, self._grid[hist_start], side="left")
@@ -770,8 +848,9 @@ class NativeSupportDataset(Dataset):
             )
             if offset < 0 or offset >= self._L or not self._adm.masks[row, column]:
                 continue
+            weekly_count = float(self._adm.values[row, column])
             block[offset] = (
-                self._adm.values[row, column],
+                math.log1p(weekly_count / population * _PER_100K),
                 1.0,
                 float(self._adm.ages[row, column]),
             )
@@ -803,12 +882,24 @@ class NativeSupportDataset(Dataset):
     def _comarca_history(
         self, source_id: str, hist_slice: slice
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Daily deaths history, ``[L, 3]``.
+
+        Consumption transform (ruling R10): the raw-at-rest count becomes
+        ``log1p((count / pop_graph) · 1e5)`` using the comarca graph
+        population, applied only where the mask is 1 (unreported days stay
+        0). Mask/age channels are raw; targets stay raw.
+        """
         column = self._deaths.columns[source_id]
+        node = self._node_index[f"{SOURCE_COMARCA}:{source_id}"]
+        population = float(self._graph_nodes.population[node])
         values = self._deaths_values[hist_slice, column]
         mask = self._deaths_masks[hist_slice, column]
+        value = np.log1p(
+            np.where(mask, values, 0.0) / population * _PER_100K
+        )
         block = np.stack(
             [
-                np.where(mask, values, 0.0),
+                value.astype(np.float32),
                 mask.astype(np.float32),
                 self._deaths_ages[hist_slice, column],
             ],

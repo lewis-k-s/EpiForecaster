@@ -17,9 +17,11 @@ per-(sex, age)-stratum, case-only population, so the CSV cannot supply an ABS
 population denominator. ABS records carry ``population=None``; the audited ABS
 denominator is assigned later at ``native_graph`` assembly from overlap-implied
 municipal population (plan sections 10.3(4) and 11.3). The sentinel filter is
-the structural triple only (``codi_abs=="000"`` / ``codi_regio=="00"`` /
-``"No disponible"`` text fields); ``index_socioeconomic==-1`` is carried by
-real ABS with genuine admissions and must never be filtered on.
+the single canonical structural conjunction of :func:`abs_sentinel_mask`,
+shared verbatim by this registry builder and the ABS admissions processor
+(review ruling R11); isolated sentinel-like fields on otherwise real rows are
+retained — in particular the six real newer ABS carry
+``index_socioeconomic==-1`` with genuine admissions.
 """
 
 from __future__ import annotations
@@ -55,6 +57,42 @@ ABS_POPULATION_NOTE = (
     "registry population is None and the audited ABS denominator is assigned "
     "at native_graph assembly (plan sections 10.3(4) and 11.3)"
 )
+
+
+def abs_sentinel_mask(frame: pd.DataFrame) -> pd.Series:
+    """Boolean mask of the ABS Catalonia-total sentinel rows (plan §10.3(4)).
+
+    The sentinel identity is the structural CONJUNCTION (review ruling R11):
+    ``codi_abs=="000"`` AND ``codi_regio=="00"`` AND the three name fields
+    ``nom_regio``/``nom_ambit``/``nom_abs`` equal ``"No disponible"`` AND
+    ``index_socioeconomic==-1`` AND ``poblacio==0``. Verified against the real
+    ``COVID-19__Persones_hospitalitzades.csv``: this selects exactly the 311
+    Catalonia-total rows — the identical set the former OR-based filters
+    dropped (both the registry and the processor variants).
+
+    ``sexe``/``grup_edat`` are deliberately NOT conjuncts: 14 of the 311 real
+    sentinel rows (the ``Home`` / ``50 a 54`` stratum) carry real stratum
+    values, so requiring ``"No disponible"`` there would retain 14
+    Catalonia-total rows. Conversely, isolated sentinel-like fields on
+    otherwise real rows never match the full conjunction — the six real newer
+    ABS carrying ``index_socioeconomic==-1`` with genuine admissions are
+    retained.
+
+    Numeric conjuncts are compared through ``pd.to_numeric`` so the predicate
+    behaves identically on string-dtyped frames (registry loader) and
+    native-dtyped frames (processor loader). Missing/NaN fields compare
+    False, i.e. such rows are retained. ``frame`` must carry the original
+    CSV columns; the returned Series is aligned to ``frame.index``.
+    """
+    return (
+        frame["codi_abs"].eq("000")
+        & frame["codi_regio"].eq("00")
+        & frame["nom_regio"].eq(SENTINEL_LABEL)
+        & frame["nom_ambit"].eq(SENTINEL_LABEL)
+        & frame["nom_abs"].eq(SENTINEL_LABEL)
+        & pd.to_numeric(frame["index_socioeconomic"], errors="coerce").eq(-1)
+        & pd.to_numeric(frame["poblacio"], errors="coerce").eq(0)
+    )
 
 
 @dataclass(frozen=True)
@@ -187,13 +225,13 @@ def build_abs_registry(
     """Build the ABS registry from ``COVID-19__Persones_hospitalitzades.csv``.
 
     Rows are per (epi-week, ABS, sex, age group). Sentinel Catalonia-total
-    rows (structural triple: ``codi_abs=="000"`` / ``codi_regio=="00"`` /
-    ``"No disponible"`` text fields) are dropped and counted. The observation
-    grain is one (abs, week) row with the sex/age strata ``casos`` summed
-    (plan section 12.2); ``observed`` requires at least one such row whose
-    ``data_inici`` week start falls inside ``window``. ``poblacio`` is never
-    promoted to a registry population (see module docstring); all ABS
-    populations are ``None``.
+    rows (the canonical structural conjunction of :func:`abs_sentinel_mask`)
+    are dropped and counted. The observation grain is one (abs, week) row
+    with the sex/age strata ``casos`` summed (plan section 12.2);
+    ``observed`` requires at least one such row whose ``data_inici`` week
+    start falls inside ``window``. ``poblacio`` is never promoted to a
+    registry population (see module docstring); all ABS populations are
+    ``None``.
 
     ``geometry_ids`` (e.g. ``ABS.shp`` ``CODABSa`` codes, normalized to
     3-digit zero-padded strings) reconciles the CSV against the geometry:
@@ -202,13 +240,7 @@ def build_abs_registry(
     """
     frame = pd.read_csv(csv_path, dtype=str)
     total_rows = len(frame)
-    sentinel_mask = (
-        frame["codi_abs"].eq("000")
-        | frame["codi_regio"].eq("00")
-        | frame["nom_regio"].eq(SENTINEL_LABEL)
-        | frame["nom_ambit"].eq(SENTINEL_LABEL)
-        | frame["nom_abs"].eq(SENTINEL_LABEL)
-    )
+    sentinel_mask = abs_sentinel_mask(frame)
     sentinel_rows_dropped = int(sentinel_mask.sum())
     frame = frame.loc[~sentinel_mask].copy()
     frame["week_start"] = pd.to_datetime(frame["data_inici"], format="%d/%m/%Y").dt.date

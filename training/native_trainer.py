@@ -154,6 +154,7 @@ class NativeTrainer:
                 min_horizon_observed_fraction=(
                     config.data.min_horizon_observed_fraction
                 ),
+                confirmation_guard=config.native.confirmation_guard,
             ),
         )
         origins = [query.forecast_origin for query in self.dataset.queries]
