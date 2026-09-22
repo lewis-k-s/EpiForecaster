@@ -12,12 +12,19 @@ import math
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 import wandb
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from data.epi_dataset import EpiDataset
 from data.latent_supervision import latent_scales_from_checkpoint
+from data.native_batch import NativeEpiBatch
+from data.native_dataset import CONFIRMATION_WINDOW, NativeSupportDataset
+from evaluation.aggregate_export import (
+    NativeAggregateAccumulator,
+    write_native_aggregate_outputs,
+)
 from evaluation.granular_export import (
     GRANULAR_SCHEMA_VERSION,
     GranularEvalWriter,
@@ -27,11 +34,19 @@ from evaluation.granular_export import (
 )
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.latent_diagnostics import build_latent_diagnostic_protocols
-from evaluation.losses import JointInferenceLoss, get_loss_from_config
+from evaluation.losses import (
+    JointInferenceLoss,
+    NativeJointInferenceLoss,
+    _binary_target_mask,
+    _count_once_slots,
+    _log1p_per100k_targets,
+    get_loss_from_config,
+)
 from evaluation.metrics import (
     ProbabilisticMetricResult,
     TorchDistributionMetricAccumulator,
     TorchMaskedMetricAccumulator,
+    TorchWeightedIntervalScoreAccumulator,
 )
 from evaluation.pathway_metrics import (
     ObservationLatentMetricResult,
@@ -382,6 +397,407 @@ def _add_delay_kernel_metrics(
             metrics[f"kernel_{head_name}_gamma_scale_upper_bound_hit"] = int(
                 boundary_hits["scale_upper"]
             )
+
+
+def assert_native_confirmation_period_safe(
+    *,
+    queries: list[Any],
+    date_grid: np.ndarray,
+    confirmation_guard: bool = True,
+) -> None:
+    """Fail when a native evaluation target window touches confirmation data."""
+    if not confirmation_guard:
+        return
+    dates = np.asarray(date_grid).astype("datetime64[D]")
+    reserved_start, reserved_end = CONFIRMATION_WINDOW
+    for query in queries:
+        target_start_index = int(query.forecast_origin) + 1
+        target_end_index = int(query.forecast_origin) + int(query.horizon_days)
+        if target_start_index < 0 or target_end_index >= len(dates):
+            raise ValueError(
+                f"native query target window is outside the date grid: {query}"
+            )
+        target_start = dates[target_start_index]
+        target_end = dates[target_end_index]
+        if target_start <= reserved_end and target_end >= reserved_start:
+            raise ValueError(
+                "native evaluation target window intersects the confirmation "
+                f"period {reserved_start}..{reserved_end}; set "
+                "confirmation_guard=False only for explicit calibration work"
+            )
+
+
+def _native_dataset_from_loader(loader: DataLoader) -> NativeSupportDataset:
+    dataset: Any = loader.dataset
+    while isinstance(dataset, Subset):
+        dataset = dataset.dataset
+    if not isinstance(dataset, NativeSupportDataset):
+        raise TypeError(
+            "native evaluation requires a NativeSupportDataset or Subset thereof"
+        )
+    return dataset
+
+
+def _native_daily_eval_view(
+    *,
+    head: str,
+    model_outputs: dict[str, Any],
+    batch: NativeEpiBatch,
+    criterion: NativeJointInferenceLoss,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    rows = batch.head_index.get(head)
+    raw_target = batch.head_target.get(head)
+    target_mask = batch.head_target_mask.get(head)
+    population = batch.head_population.get(head)
+    if rows is None or raw_target is None or target_mask is None or rows.numel() == 0:
+        return None
+    slots = _count_once_slots(batch, rows)
+    rows = rows.index_select(0, slots).to(device=device, dtype=torch.long)
+    raw_target = raw_target.index_select(0, slots).to(device=device).float()
+    target_mask = target_mask.index_select(0, slots).to(device)
+    if population is None:
+        population = batch.source_pop.index_select(0, rows)
+    else:
+        population = population.index_select(0, slots)
+    population = population.to(device=device).float()
+    target_width = int(raw_target.shape[1])
+    loc_tensor = model_outputs.get(f"dist_{head}_loc")
+    if loc_tensor is None:
+        loc_tensor = model_outputs[f"pred_{head}"]
+    loc = criterion._align_daily_head_tensor(
+        loc_tensor.to(device).index_select(0, rows),
+        head_name=head,
+        target_width=target_width,
+    )
+    scale_tensor = model_outputs.get(f"dist_{head}_scale")
+    scale = (
+        torch.ones_like(loc)
+        if scale_tensor is None
+        else criterion._align_daily_head_tensor(
+            scale_tensor.to(device).index_select(0, rows),
+            head_name=head,
+            target_width=target_width,
+        )
+    )
+    weights = _binary_target_mask(target_mask).float()
+    target = _log1p_per100k_targets(raw_target, population, weights)
+    raw_prediction = torch.expm1(loc).clamp_min(0.0) * (
+        population.unsqueeze(1) / 100_000.0
+    )
+    row_positions = batch.head_index[head].index_select(0, slots).tolist()
+    queries = [batch.queries[int(position)] for position in row_positions]
+    target_indices = torch.tensor(
+        [
+            [int(query.forecast_origin) + horizon + 1 for horizon in range(target_width)]
+            for query in queries
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+    return {
+        "queries": queries,
+        "loc": loc,
+        "scale": scale,
+        "target": target,
+        "raw_target": raw_target,
+        "raw_prediction": raw_prediction,
+        "population": population,
+        "weights": weights,
+        "target_indices": target_indices,
+    }
+
+
+def _native_hosp_eval_view(
+    *,
+    model_outputs: dict[str, Any],
+    batch: NativeEpiBatch,
+    criterion: NativeJointInferenceLoss,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    rows = batch.head_index.get("hosp")
+    raw_target = batch.head_target.get("hosp")
+    target_mask = batch.head_target_mask.get("hosp")
+    population = batch.head_population.get("hosp")
+    if (
+        rows is None
+        or raw_target is None
+        or target_mask is None
+        or population is None
+        or rows.numel() == 0
+    ):
+        return None
+    slots = _count_once_slots(batch, rows)
+    row_positions_tensor = rows.index_select(0, slots)
+    queries = [batch.queries[int(position)] for position in row_positions_tensor.tolist()]
+    raw_target = raw_target.index_select(0, slots).to(device=device).float()
+    target_mask = target_mask.index_select(0, slots).to(device)
+    population = population.index_select(0, slots).to(device=device).float()
+    loc = model_outputs["dist_hosp_weekly_loc"].to(device).index_select(0, slots)
+    scale = model_outputs["dist_hosp_weekly_scale"].to(device).index_select(0, slots)
+    weekly_mask = model_outputs["hosp_weekly_mask"].to(device).index_select(0, slots)
+    if raw_target.shape[1] < criterion.weekly_slots:
+        pad = criterion.weekly_slots - int(raw_target.shape[1])
+        raw_target = torch.cat(
+            [raw_target, raw_target.new_zeros(raw_target.shape[0], pad)], dim=1
+        )
+        target_mask = torch.cat(
+            [
+                target_mask,
+                torch.zeros(
+                    target_mask.shape[0],
+                    pad,
+                    dtype=torch.bool,
+                    device=device,
+                ),
+            ],
+            dim=1,
+        )
+    weights = (
+        _binary_target_mask(target_mask) & weekly_mask.to(dtype=torch.bool)
+    ).float()
+    target = _log1p_per100k_targets(raw_target, population, weights)
+    raw_prediction = torch.expm1(loc).clamp_min(0.0) * (
+        population.unsqueeze(1) / 100_000.0
+    )
+    target_indices: list[list[int]] = []
+    origin_dows = batch.origin_dow.index_select(0, row_positions_tensor).tolist()
+    for query, origin_dow in zip(queries, origin_dows, strict=True):
+        origin = int(query.forecast_origin)
+        first_monday = (-(int(origin_dow) + 1)) % 7
+        target_indices.append(
+            [origin + 1 + first_monday + 7 * week + 6 for week in range(criterion.weekly_slots)]
+        )
+    return {
+        "queries": queries,
+        "loc": loc,
+        "scale": scale,
+        "target": target,
+        "raw_target": raw_target,
+        "raw_prediction": raw_prediction,
+        "population": population,
+        "weights": weights,
+        "target_indices": torch.tensor(
+            target_indices, device=device, dtype=torch.long
+        ),
+    }
+
+
+@torch.no_grad()
+def evaluate_native_loader(
+    *,
+    model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: NativeJointInferenceLoss,
+    device: torch.device,
+    split_name: str = "Eval",
+    max_batches: int | None = None,
+    granular_output_path: Path | None = None,
+    granular_eval_format: str | None = None,
+    aggregate_output_dir: Path | None = None,
+    confirmation_guard: bool = True,
+) -> tuple[float, dict[str, Any], Any]:
+    """Evaluate routed native heads and write canonical EVL-1 artifacts."""
+    dataset = _native_dataset_from_loader(loader)
+    date_grid = dataset.date_grid
+    head_horizons = {
+        "cases": criterion.horizon_days,
+        "hosp": criterion.weekly_slots,
+        "deaths": criterion.horizon_days,
+    }
+    point_accumulators = {
+        head: TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+        for head, horizon in head_horizons.items()
+    }
+    raw_accumulators = {
+        head: TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+        for head, horizon in head_horizons.items()
+    }
+    distribution_accumulators = {
+        head: TorchDistributionMetricAccumulator(
+            device=device,
+            horizon=horizon,
+            distribution_family=criterion.distribution_family,
+            distribution_df=criterion.distribution_df,
+            scale_floor=criterion.distribution_scale_floor,
+            interval_levels=criterion.interval_levels,
+        )
+        for head, horizon in head_horizons.items()
+    }
+    wis_accumulators = {
+        head: TorchWeightedIntervalScoreAccumulator(
+            device=device,
+            horizon=horizon,
+            interval_levels=criterion.interval_levels,
+        )
+        for head, horizon in head_horizons.items()
+    }
+    aggregate_accumulator = NativeAggregateAccumulator()
+    granular_writer = (
+        GranularEvalWriter(
+            path=granular_output_path,
+            split_name=split_name,
+            output_format=granular_eval_format,
+        )
+        if granular_output_path is not None
+        else None
+    )
+    model_was_training = model.training
+    model.eval()
+    loss_sum = 0.0
+    processed_batches = 0
+    try:
+        for batch_index, batch in enumerate(loader):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            assert_native_confirmation_period_safe(
+                queries=batch.queries,
+                date_grid=date_grid,
+                confirmation_guard=confirmation_guard,
+            )
+            batch = batch.to(device)
+            outputs = model(batch)
+            components = criterion(outputs, batch)
+            loss_sum += float(components["total"].item())
+            processed_batches += 1
+            for head in ("cases", "hosp", "deaths"):
+                view = (
+                    _native_hosp_eval_view(
+                        model_outputs=outputs,
+                        batch=batch,
+                        criterion=criterion,
+                        device=device,
+                    )
+                    if head == "hosp"
+                    else _native_daily_eval_view(
+                        head=head,
+                        model_outputs=outputs,
+                        batch=batch,
+                        criterion=criterion,
+                        device=device,
+                    )
+                )
+                if view is None:
+                    continue
+                point_accumulators[head].update(
+                    view["loc"], view["target"], None, view["weights"]
+                )
+                raw_accumulators[head].update(
+                    view["raw_prediction"],
+                    view["raw_target"],
+                    None,
+                    view["weights"],
+                )
+                prob_batch = distribution_accumulators[head].update(
+                    loc=view["loc"],
+                    scale=view["scale"],
+                    targets=view["target"],
+                    observed_mask=None,
+                    sample_weights=view["weights"],
+                )
+                wis_batch = wis_accumulators[head].update(
+                    median=view["loc"],
+                    targets=view["target"],
+                    intervals=prob_batch.intervals,
+                    observed_mask=None,
+                    sample_weights=view["weights"],
+                )
+                wis_components = {
+                    "wis": wis_batch.wis,
+                    "dispersion": wis_batch.dispersion,
+                    "underprediction": wis_batch.underprediction,
+                    "overprediction": wis_batch.overprediction,
+                    "point": wis_batch.point,
+                }
+                source_types = [str(query.source_type) for query in view["queries"]]
+                source_ids = [str(query.source_id) for query in view["queries"]]
+                aggregate_accumulator.update(
+                    head=head,
+                    source_types=source_types,
+                    source_ids=source_ids,
+                    predictions=view["loc"],
+                    targets=view["target"],
+                    raw_predictions=view["raw_prediction"],
+                    raw_targets=view["raw_target"],
+                    weights=view["weights"],
+                    nll=prob_batch.nll,
+                    crps=prob_batch.crps,
+                    intervals=prob_batch.intervals,
+                    wis_components=wis_components,
+                )
+                if granular_writer is not None:
+                    granular_writer.write_native_rows(
+                        target_name=head,
+                        queries=view["queries"],
+                        node_ids=[
+                            dataset.graph_node_index(query.source_type, query.source_id)
+                            for query in view["queries"]
+                        ],
+                        predictions=view["loc"],
+                        targets=view["target"],
+                        raw_targets=view["raw_target"],
+                        raw_predictions=view["raw_prediction"],
+                        populations=view["population"],
+                        weights=view["weights"],
+                        target_indices=view["target_indices"],
+                        temporal_coords=date_grid,
+                        input_window_length=batch.t,
+                        nll=prob_batch.nll,
+                        crps=prob_batch.crps,
+                        intervals=prob_batch.intervals,
+                        wis_components=wis_components,
+                    )
+    finally:
+        if granular_writer is not None:
+            granular_writer.close()
+        if model_was_training:
+            model.train()
+    if processed_batches == 0:
+        raise ValueError("native evaluation processed no batches")
+
+    metrics: dict[str, Any] = {}
+    for head in ("cases", "hosp", "deaths"):
+        point = point_accumulators[head].finalize()
+        raw = raw_accumulators[head].finalize()
+        probabilistic = distribution_accumulators[head].finalize()
+        wis = wis_accumulators[head].finalize()
+        metrics.update(
+            {
+                f"mae_{head}_log1p_per_100k": point.mae,
+                f"rmse_{head}_log1p_per_100k": point.rmse,
+                f"raw_count_mae_{head}": raw.mae,
+                f"nll_{head}": probabilistic.nll,
+                f"crps_{head}": probabilistic.crps,
+                f"wis_{head}": wis.wis,
+                f"wis_dispersion_{head}": wis.dispersion,
+                f"wis_underprediction_{head}": wis.underprediction,
+                f"wis_overprediction_{head}": wis.overprediction,
+                f"wis_point_{head}": wis.point,
+                f"observed_count_{head}": wis.observed_count,
+                f"wis_per_h_{head}": wis.wis_per_h,
+            }
+        )
+    aggregate = aggregate_accumulator.finalize()
+    if aggregate_output_dir is not None:
+        write_native_aggregate_outputs(
+            output_dir=aggregate_output_dir,
+            split=split_name,
+            aggregate=aggregate,
+        )
+    if granular_output_path is not None:
+        write_granular_metadata_sidecar(
+            granular_output_path,
+            {
+                "split": split_name.strip().lower(),
+                "native_support": True,
+                "confirmation_guard": confirmation_guard,
+                "observed_only": True,
+                "metric_space": "log1p_per_100k",
+                "raw_count_metrics": ["raw_count_mae"],
+                "interval_levels": list(criterion.interval_levels),
+            },
+        )
+    return loss_sum / processed_batches, metrics, aggregate
 
 
 def evaluate_loader(

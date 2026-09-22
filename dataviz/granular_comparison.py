@@ -88,7 +88,7 @@ def _read_granular_table(path: Path) -> pd.DataFrame:
         if "region_id" in df.columns:
             df["region_id"] = df["region_id"].fillna("").astype(str)
         return df
-    return pd.read_csv(path, dtype={"region_id": str})
+    return pd.read_csv(path, dtype={"region_id": str, "source_id": str})
 
 
 def _load_granular_csv(path: Path) -> pd.DataFrame:

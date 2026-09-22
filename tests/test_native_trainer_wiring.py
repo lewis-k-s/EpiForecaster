@@ -372,6 +372,11 @@ def test_native_trainer_two_steps_finite_and_backward(tmp_path: Path) -> None:
     assert all(np.isfinite(losses))
     val_loss = results["val_loss_trace"][0]
     assert val_loss is not None and np.isfinite(val_loss)
+    assert set(trainer.last_val_metrics) >= {
+        "wis_cases",
+        "wis_hosp",
+        "wis_deaths",
+    }
 
     # Backward + optimizer step actually updated the model.
     parameter_after = next(trainer.model.parameters()).detach()

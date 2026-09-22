@@ -390,6 +390,15 @@ class NativeSupportDataset(Dataset):
             counts[head] = counts.get(head, 0) + 1
         return dict(sorted(counts.items()))
 
+    @property
+    def date_grid(self) -> np.ndarray:
+        """Shared daily coordinate used by query origins and evaluation."""
+        return self._grid.copy()
+
+    def graph_node_index(self, source_type: str, source_id: str) -> int:
+        """Stable native-graph node index for schema-v4 granular exports."""
+        return self._node_index[f"{source_type}:{source_id}"]
+
     def __len__(self) -> int:
         return len(self._items)
 

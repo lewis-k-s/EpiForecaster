@@ -1,10 +1,39 @@
 from __future__ import annotations
 
+import json
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import torch
+
+_NATIVE_TARGET_NAMES = {
+    "cases": "cases",
+    "hosp": "hospitalizations",
+    "deaths": "deaths",
+}
+_NATIVE_INTERVAL_LEVELS = ("50", "80", "95")
+_NATIVE_AGGREGATE_COLUMNS = [
+    "aggregation",
+    "target",
+    "source_type",
+    "source_id",
+    "horizon",
+    "observed_count",
+    "mae_log1p_per_100k",
+    "rmse_log1p_per_100k",
+    "raw_count_mae",
+    "nll",
+    "crps",
+    "wis",
+    "wis_dispersion",
+    "wis_underprediction",
+    "wis_overprediction",
+    "wis_point",
+    *[field for level in _NATIVE_INTERVAL_LEVELS for field in (f"coverage_{level}", f"interval_width_{level}")],
+]
 
 _TARGET_AGGREGATE_COLUMNS = [
     "model",
@@ -50,6 +79,211 @@ _JOINT_AGGREGATE_COLUMNS = [
     "joint_observed_count_deaths_median",
     "joint_observed_count_deaths_iqr",
 ]
+
+
+@dataclass
+class _NativeMetricSums:
+    count: float = 0.0
+    observed_count: int = 0
+    abs_error: float = 0.0
+    sq_error: float = 0.0
+    raw_abs_error: float = 0.0
+    nll: float = 0.0
+    crps: float = 0.0
+    wis: float = 0.0
+    wis_dispersion: float = 0.0
+    wis_underprediction: float = 0.0
+    wis_overprediction: float = 0.0
+    wis_point: float = 0.0
+    coverage: dict[str, float] = field(default_factory=dict)
+    interval_width: dict[str, float] = field(default_factory=dict)
+
+
+class NativeAggregateAccumulator:
+    """Online native metrics keyed by head, horizon, and source identity."""
+
+    def __init__(self) -> None:
+        self._groups: dict[
+            tuple[str, str, str, str, int], _NativeMetricSums
+        ] = {}
+
+    def update(
+        self,
+        *,
+        head: str,
+        source_types: list[str],
+        source_ids: list[str],
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        raw_predictions: torch.Tensor,
+        raw_targets: torch.Tensor,
+        weights: torch.Tensor,
+        nll: torch.Tensor,
+        crps: torch.Tensor,
+        intervals: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        wis_components: dict[str, torch.Tensor],
+    ) -> None:
+        target_name = _NATIVE_TARGET_NAMES[head]
+        arrays = {
+            "prediction": predictions.detach().float().cpu(),
+            "target": targets.detach().float().cpu(),
+            "raw_prediction": raw_predictions.detach().float().cpu(),
+            "raw_target": raw_targets.detach().float().cpu(),
+            "weights": weights.detach().float().cpu(),
+            "nll": nll.detach().float().cpu(),
+            "crps": crps.detach().float().cpu(),
+            **{
+                name: value.detach().float().cpu()
+                for name, value in wis_components.items()
+            },
+        }
+        interval_cpu = {
+            level: (low.detach().float().cpu(), high.detach().float().cpu())
+            for level, (low, high) in intervals.items()
+        }
+        batch_size, horizon_size = targets.shape
+        if len(source_types) != batch_size or len(source_ids) != batch_size:
+            raise ValueError("native aggregate identities do not match tensor rows")
+        for row in range(batch_size):
+            for horizon_index in range(horizon_size):
+                weight = float(arrays["weights"][row, horizon_index].item())
+                if weight <= 0:
+                    continue
+                keys = (
+                    (
+                        "source_horizon",
+                        target_name,
+                        source_types[row],
+                        source_ids[row],
+                        horizon_index + 1,
+                    ),
+                    (
+                        "head_horizon",
+                        target_name,
+                        "",
+                        "",
+                        horizon_index + 1,
+                    ),
+                    ("head_all", target_name, "", "", 0),
+                )
+                prediction = float(arrays["prediction"][row, horizon_index].item())
+                target = float(arrays["target"][row, horizon_index].item())
+                raw_prediction = float(
+                    arrays["raw_prediction"][row, horizon_index].item()
+                )
+                raw_target = float(arrays["raw_target"][row, horizon_index].item())
+                for key in keys:
+                    sums = self._groups.setdefault(key, _NativeMetricSums())
+                    sums.count += weight
+                    sums.observed_count += 1
+                    sums.abs_error += abs(prediction - target) * weight
+                    sums.sq_error += (prediction - target) ** 2 * weight
+                    sums.raw_abs_error += abs(raw_prediction - raw_target) * weight
+                    for name in (
+                        "nll",
+                        "crps",
+                        "wis",
+                        "wis_dispersion",
+                        "wis_underprediction",
+                        "wis_overprediction",
+                        "wis_point",
+                    ):
+                        source_name = name.removeprefix("wis_") if name != "wis" else "wis"
+                        sums_value = (
+                            arrays[source_name][row, horizon_index]
+                            if source_name in arrays
+                            else arrays[name][row, horizon_index]
+                        )
+                        setattr(
+                            sums,
+                            name,
+                            getattr(sums, name) + float(sums_value.item()) * weight,
+                        )
+                    for level in _NATIVE_INTERVAL_LEVELS:
+                        bounds = interval_cpu.get(level)
+                        if bounds is None:
+                            continue
+                        low = float(bounds[0][row, horizon_index].item())
+                        high = float(bounds[1][row, horizon_index].item())
+                        sums.coverage[level] = sums.coverage.get(level, 0.0) + (
+                            float(low <= target <= high) * weight
+                        )
+                        sums.interval_width[level] = sums.interval_width.get(
+                            level, 0.0
+                        ) + max(0.0, high - low) * weight
+
+    def finalize(self) -> pd.DataFrame:
+        rows: list[dict[str, Any]] = []
+        for key in sorted(self._groups):
+            aggregation, target, source_type, source_id, horizon = key
+            sums = self._groups[key]
+            denominator = max(sums.count, 1e-12)
+            row: dict[str, Any] = {
+                "aggregation": aggregation,
+                "target": target,
+                "source_type": source_type,
+                "source_id": source_id,
+                "horizon": horizon,
+                "observed_count": sums.observed_count,
+                "mae_log1p_per_100k": sums.abs_error / denominator,
+                "rmse_log1p_per_100k": math.sqrt(sums.sq_error / denominator),
+                "raw_count_mae": sums.raw_abs_error / denominator,
+                "nll": sums.nll / denominator,
+                "crps": sums.crps / denominator,
+                "wis": sums.wis / denominator,
+                "wis_dispersion": sums.wis_dispersion / denominator,
+                "wis_underprediction": sums.wis_underprediction / denominator,
+                "wis_overprediction": sums.wis_overprediction / denominator,
+                "wis_point": sums.wis_point / denominator,
+            }
+            for level in _NATIVE_INTERVAL_LEVELS:
+                row[f"coverage_{level}"] = (
+                    sums.coverage[level] / denominator
+                    if level in sums.coverage
+                    else float("nan")
+                )
+                row[f"interval_width_{level}"] = (
+                    sums.interval_width[level] / denominator
+                    if level in sums.interval_width
+                    else float("nan")
+                )
+            rows.append(row)
+        return pd.DataFrame(rows, columns=_NATIVE_AGGREGATE_COLUMNS)
+
+
+def write_native_aggregate_outputs(
+    *,
+    output_dir: Path,
+    split: str,
+    aggregate: pd.DataFrame,
+) -> dict[str, Path]:
+    """Write the canonical native aggregate CSV and head-level WIS JSON."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    split_key = split.strip().lower()
+    aggregate_path = output_dir / f"{split_key}_native_aggregate_metrics.csv"
+    summary_path = output_dir / f"{split_key}_native_wis_summary.json"
+    aggregate.to_csv(aggregate_path, index=False)
+    head_rows = aggregate[aggregate["aggregation"] == "head_all"]
+    summary = {
+        str(row.target): {
+            key: float(getattr(row, key))
+            for key in (
+                "wis",
+                "wis_dispersion",
+                "wis_underprediction",
+                "wis_overprediction",
+                "wis_point",
+            )
+        }
+        for row in head_rows.itertuples(index=False)
+    }
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return {
+        "native_aggregate_metrics": aggregate_path,
+        "native_wis_summary": summary_path,
+    }
 
 
 def _finite_or_nan(value: Any) -> float:

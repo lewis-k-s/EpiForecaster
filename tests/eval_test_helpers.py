@@ -177,6 +177,8 @@ def make_granular_row(**overrides: object) -> dict[str, object]:
         "split": "test",
         "target": "cases",
         "node_id": 1,
+        "source_type": "municipality",
+        "source_id": "08001",
         "region_id": "08001",
         "region_label": "region-a",
         "window_start": 0,

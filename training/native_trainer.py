@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader, Sampler, Subset
 
 from data.native_batch import ROUTED_HEADS, collate_native_batch
 from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
+from evaluation.eval_loop import evaluate_native_loader
 from evaluation.losses import get_native_loss_from_config
 from models.configs import EpiForecasterConfig
 from models.native_forecaster import NativeEpiForecaster, NativeForecasterConfig
@@ -244,6 +245,7 @@ class NativeTrainer:
         #: written to disk).
         self.best_val_loss: float | None = None
         self.best_state: dict[str, torch.Tensor] | None = None
+        self.last_val_metrics: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Guards
@@ -371,22 +373,16 @@ class NativeTrainer:
 
     @torch.no_grad()
     def _evaluate(self) -> float | None:
-        """Mean batch loss over the (``max_batches``-capped) val tail."""
+        """Routing-aware EVL-1 metrics over the capped validation tail."""
         assert self.val_loader is not None
-        self.model.eval()
-        totals: list[float] = []
-        max_batches = self.config.training.max_batches
-        for step, batch in enumerate(self.val_loader):
-            if max_batches is not None and step >= max_batches:
-                break
-            batch = batch.to(self.device)
-            outputs = self.model(batch)
-            components = self.criterion(outputs, batch)
-            total = components["total"]
-            if not torch.isfinite(total):
-                raise RuntimeError(
-                    f"Non-finite validation loss at val step {step} "
-                    f"(total={total.item()})."
-                )
-            totals.append(float(total.item()))
-        return sum(totals) / len(totals) if totals else None
+        loss, metrics, _aggregate = evaluate_native_loader(
+            model=self.model,
+            loader=self.val_loader,
+            criterion=self.criterion,
+            device=self.device,
+            split_name="Val",
+            max_batches=self.config.training.max_batches,
+            confirmation_guard=self.config.native.confirmation_guard,
+        )
+        self.last_val_metrics = metrics
+        return loss

@@ -1307,6 +1307,8 @@ def _build_same_slice_granular_rows(
                 "split": split,
                 "target": spec.canonical_name,
                 "node_id": node_id,
+                "source_type": "municipality" if region_id else "",
+                "source_id": region_id,
                 "region_id": region_id,
                 "region_label": region_label,
                 "window_start": window_start,

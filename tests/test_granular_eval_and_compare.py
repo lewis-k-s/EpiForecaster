@@ -14,6 +14,7 @@ import dataviz.granular_comparison as granular_comparison_module
 import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
+from evaluation.granular_export import GRANULAR_FIELDNAMES
 from evaluation.losses import JointInferenceLoss
 from models.configs import ObservationHeadConfig
 from models.observation_heads import ClinicalObservationHead, WastewaterObservationHead
@@ -254,37 +255,9 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
 
     df = pd.read_parquet(granular_output)
     df["region_id"] = df["region_id"].fillna("").astype(str)
-    assert list(df.columns) == [
-        "split",
-        "target",
-        "node_id",
-        "region_id",
-        "region_label",
-        "window_start",
-        "window_start_date",
-        "horizon",
-        "target_index",
-        "target_date",
-        "observed",
-        "prediction",
-        "mechanistic_prediction",
-        "residual_contribution",
-        "relevant_latent_name",
-        "relevant_latent_value",
-        "abs_error",
-        "sq_error",
-        "nll",
-        "crps",
-        "interval_low_50",
-        "interval_high_50",
-        "covered_50",
-        "interval_low_80",
-        "interval_high_80",
-        "covered_80",
-        "interval_low_95",
-        "interval_high_95",
-        "covered_95",
-    ]
+    assert list(df.columns) == GRANULAR_FIELDNAMES
+    assert set(df["source_type"]) == {"municipality"}
+    assert df["source_id"].astype(str).equals(df["region_id"].astype(str))
     assert len(df) == (
         granular_metrics["observed_count_hosp"]
         + granular_metrics["observed_count_ww"]
@@ -329,7 +302,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "3"
+    assert meta["schema_version"] == "4"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -453,37 +426,7 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
     )
 
     df = pd.read_csv(granular_csv, dtype={"region_id": str})
-    assert list(df.columns) == [
-        "split",
-        "target",
-        "node_id",
-        "region_id",
-        "region_label",
-        "window_start",
-        "window_start_date",
-        "horizon",
-        "target_index",
-        "target_date",
-        "observed",
-        "prediction",
-        "mechanistic_prediction",
-        "residual_contribution",
-        "relevant_latent_name",
-        "relevant_latent_value",
-        "abs_error",
-        "sq_error",
-        "nll",
-        "crps",
-        "interval_low_50",
-        "interval_high_50",
-        "covered_50",
-        "interval_low_80",
-        "interval_high_80",
-        "covered_80",
-        "interval_low_95",
-        "interval_high_95",
-        "covered_95",
-    ]
+    assert list(df.columns) == GRANULAR_FIELDNAMES
     meta = pd.read_json(granular_csv.with_suffix(".csv.meta.json"), typ="series")
     assert meta["granular_eval_format"] == "csv"
 

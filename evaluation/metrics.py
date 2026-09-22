@@ -73,6 +73,194 @@ class ProbabilisticMetricResult:
     interval_width_per_h_by_level: dict[str, list[float]]
 
 
+@dataclass
+class WeightedIntervalScoreBatch:
+    """Per-point WIS values and their additive decomposition."""
+
+    wis: torch.Tensor
+    dispersion: torch.Tensor
+    underprediction: torch.Tensor
+    overprediction: torch.Tensor
+    point: torch.Tensor
+    weights: torch.Tensor
+
+
+@dataclass
+class WeightedIntervalScoreResult:
+    """Masked mean WIS, components, counts, and per-horizon means."""
+
+    wis: float
+    dispersion: float
+    underprediction: float
+    overprediction: float
+    point: float
+    observed_count: int
+    effective_count: float
+    wis_per_h: list[float]
+    dispersion_per_h: list[float]
+    underprediction_per_h: list[float]
+    overprediction_per_h: list[float]
+    point_per_h: list[float]
+
+
+class TorchWeightedIntervalScoreAccumulator:
+    """Accumulate the standard weighted interval score on-device.
+
+    ``interval_levels`` are central coverage levels, so interval ``k`` has
+    ``alpha_k = 1 - level_k``. With ``K`` intervals, the score is
+
+    ``(0.5 * |y-m| + sum(alpha_k / 2 * IS_alpha_k)) / (K + 0.5)``.
+
+    The returned components are additive: ``wis == point + dispersion +
+    underprediction + overprediction`` up to floating-point tolerance.
+    """
+
+    _COMPONENTS = (
+        "wis",
+        "dispersion",
+        "underprediction",
+        "overprediction",
+        "point",
+    )
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        interval_levels: list[float] | tuple[float, ...],
+        horizon: int | None = None,
+    ) -> None:
+        self.device = device
+        self.horizon = horizon
+        self.interval_levels = tuple(float(level) for level in interval_levels)
+        if not self.interval_levels:
+            raise ValueError("WIS requires at least one central interval level")
+        if any(not 0.0 < level < 1.0 for level in self.interval_levels):
+            raise ValueError("WIS interval levels must be strictly between 0 and 1")
+        self.level_names = tuple(
+            interval_level_name(level) for level in self.interval_levels
+        )
+        self._sums = {
+            name: torch.tensor(0.0, device=device) for name in self._COMPONENTS
+        }
+        self._per_h_sums = {
+            name: torch.zeros(horizon, device=device)
+            for name in self._COMPONENTS
+            if horizon is not None
+        }
+        self._weight_sum = torch.tensor(0.0, device=device)
+        self._per_h_weight_sum = (
+            torch.zeros(horizon, device=device) if horizon is not None else None
+        )
+        self._observed_count = torch.tensor(0, device=device, dtype=torch.long)
+
+    def update(
+        self,
+        *,
+        median: torch.Tensor,
+        targets: torch.Tensor,
+        intervals: dict[str, tuple[torch.Tensor, torch.Tensor]],
+        observed_mask: torch.Tensor | None,
+        sample_weights: torch.Tensor | None = None,
+    ) -> WeightedIntervalScoreBatch:
+        missing = sorted(set(self.level_names) - set(intervals))
+        if missing:
+            raise ValueError(f"WIS intervals missing levels: {missing}")
+        median_clean = torch.nan_to_num(
+            median.float(), nan=0.0, posinf=_VALUE_CLAMP, neginf=-_VALUE_CLAMP
+        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
+        target_clean = torch.nan_to_num(
+            targets.float(), nan=0.0, posinf=_VALUE_CLAMP, neginf=-_VALUE_CLAMP
+        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP).to(median_clean.device)
+        finite_target = torch.isfinite(targets.float()).to(median_clean.device).float()
+        if sample_weights is not None:
+            weights = torch.nan_to_num(
+                sample_weights.float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp_min(0.0)
+        elif observed_mask is None:
+            weights = finite_target
+        else:
+            weights = torch.nan_to_num(
+                observed_mask.float(), nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp(0.0, 1.0)
+        weights = weights.to(median_clean.device) * finite_target
+
+        normalizer = len(self.interval_levels) + 0.5
+        point = 0.5 * (median_clean - target_clean).abs() / normalizer
+        dispersion = torch.zeros_like(point)
+        underprediction = torch.zeros_like(point)
+        overprediction = torch.zeros_like(point)
+        for level, level_name in zip(
+            self.interval_levels, self.level_names, strict=True
+        ):
+            alpha = 1.0 - level
+            low, high = intervals[level_name]
+            low = torch.nan_to_num(low.float(), nan=0.0).to(median_clean.device)
+            high = torch.nan_to_num(high.float(), nan=0.0).to(median_clean.device)
+            width = (high - low).clamp_min(0.0)
+            dispersion += (alpha / 2.0) * width / normalizer
+            underprediction += (
+                (target_clean - high).clamp_min(0.0) / normalizer
+            )
+            overprediction += (
+                (low - target_clean).clamp_min(0.0) / normalizer
+            )
+        wis = point + dispersion + underprediction + overprediction
+        batch = WeightedIntervalScoreBatch(
+            wis=wis,
+            dispersion=dispersion,
+            underprediction=underprediction,
+            overprediction=overprediction,
+            point=point,
+            weights=weights,
+        )
+        weight_sum = weights.sum()
+        self._weight_sum += weight_sum
+        self._observed_count += (weights > 0).sum()
+        if self.horizon is not None:
+            if wis.ndim != 2 or int(wis.shape[1]) != self.horizon:
+                raise ValueError(
+                    f"WIS horizon expected [B, {self.horizon}], got {tuple(wis.shape)}"
+                )
+            assert self._per_h_weight_sum is not None
+            self._per_h_weight_sum += weights.sum(dim=0)
+        for name in self._COMPONENTS:
+            values = getattr(batch, name)
+            self._sums[name] += (values * weights).sum()
+            if self.horizon is not None:
+                self._per_h_sums[name] += (values * weights).sum(dim=0)
+        return batch
+
+    def _mean(self, name: str) -> float:
+        if float(self._weight_sum.item()) <= 0:
+            return float("nan")
+        return float((self._sums[name] / self._weight_sum).item())
+
+    def _per_h(self, name: str) -> list[float]:
+        if self.horizon is None or self._per_h_weight_sum is None:
+            return []
+        out = torch.full_like(self._per_h_sums[name], float("nan"))
+        valid = self._per_h_weight_sum > 0
+        out[valid] = self._per_h_sums[name][valid] / self._per_h_weight_sum[valid]
+        return out.tolist()
+
+    def finalize(self) -> WeightedIntervalScoreResult:
+        return WeightedIntervalScoreResult(
+            wis=self._mean("wis"),
+            dispersion=self._mean("dispersion"),
+            underprediction=self._mean("underprediction"),
+            overprediction=self._mean("overprediction"),
+            point=self._mean("point"),
+            observed_count=int(self._observed_count.item()),
+            effective_count=float(self._weight_sum.item()),
+            wis_per_h=self._per_h("wis"),
+            dispersion_per_h=self._per_h("dispersion"),
+            underprediction_per_h=self._per_h("underprediction"),
+            overprediction_per_h=self._per_h("overprediction"),
+            point_per_h=self._per_h("point"),
+        )
+
+
 def interval_level_name(level: float) -> str:
     pct = float(level) * 100.0
     if abs(pct - round(pct)) < 1e-6:

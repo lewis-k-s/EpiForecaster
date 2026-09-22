@@ -9,13 +9,15 @@ from typing import Any
 import numpy as np
 import torch
 
-GRANULAR_SCHEMA_VERSION = "3"
+GRANULAR_SCHEMA_VERSION = "4"
 GRANULAR_KEY_COLUMNS = ["split", "target", "node_id", "window_start", "horizon"]
 GRANULAR_INTERVAL_LEVEL_NAMES = ("50", "80", "95")
 GRANULAR_REQUIRED_FIELDNAMES = [
     "split",
     "target",
     "node_id",
+    "source_type",
+    "source_id",
     "region_id",
     "region_label",
     "window_start",
@@ -31,6 +33,8 @@ GRANULAR_FIELDNAMES = [
     "split",
     "target",
     "node_id",
+    "source_type",
+    "source_id",
     "region_id",
     "region_label",
     "window_start",
@@ -48,6 +52,15 @@ GRANULAR_FIELDNAMES = [
     "sq_error",
     "nll",
     "crps",
+    "population",
+    "observed_raw",
+    "prediction_raw",
+    "abs_error_raw",
+    "wis",
+    "wis_dispersion",
+    "wis_underprediction",
+    "wis_overprediction",
+    "wis_point",
     "interval_low_50",
     "interval_high_50",
     "covered_50",
@@ -229,6 +242,8 @@ def _row_dicts_from_batch(
             region_label = str(region_labels[node_id])
         if not region_label:
             region_label = region_id
+        source_type = "municipality" if region_id else ""
+        source_id = region_id
 
         for horizon_index in range(horizon_size):
             is_observed = bool(observed_weights[batch_index, horizon_index].item() > 0)
@@ -241,6 +256,8 @@ def _row_dicts_from_batch(
                 "split": split_name,
                 "target": canonical_target,
                 "node_id": node_id,
+                "source_type": source_type,
+                "source_id": source_id,
                 "region_id": region_id,
                 "region_label": region_label,
                 "window_start": window_start,
@@ -274,6 +291,15 @@ def _row_dicts_from_batch(
                 "crps": float(crps_cpu[batch_index, horizon_index].item())
                 if crps_cpu is not None
                 else float("nan"),
+                "population": float("nan"),
+                "observed_raw": float("nan"),
+                "prediction_raw": float("nan"),
+                "abs_error_raw": float("nan"),
+                "wis": float("nan"),
+                "wis_dispersion": float("nan"),
+                "wis_underprediction": float("nan"),
+                "wis_overprediction": float("nan"),
+                "wis_point": float("nan"),
             }
             for level_name in GRANULAR_INTERVAL_LEVEL_NAMES:
                 low_key = f"interval_low_{level_name}"
@@ -287,6 +313,146 @@ def _row_dicts_from_batch(
                     row[high_key] = high
                     row[covered_key] = (
                         float(low <= observed_value <= high)
+                        if is_observed
+                        else float("nan")
+                    )
+                else:
+                    row[low_key] = float("nan")
+                    row[high_key] = float("nan")
+                    row[covered_key] = float("nan")
+            rows.append(row)
+    return rows
+
+
+def _native_row_dicts_from_head(
+    *,
+    split_name: str,
+    observed_only: bool,
+    target_name: str,
+    queries: Sequence[Any],
+    node_ids: Sequence[int],
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    raw_targets: torch.Tensor,
+    raw_predictions: torch.Tensor,
+    populations: torch.Tensor,
+    weights: torch.Tensor,
+    target_indices: torch.Tensor,
+    temporal_coords: Sequence[Any],
+    input_window_length: int,
+    nll: torch.Tensor,
+    crps: torch.Tensor,
+    intervals: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    wis_components: dict[str, torch.Tensor],
+) -> list[dict[str, Any]]:
+    """Build schema-v4 rows for one routed native head block."""
+    canonical_target = _TARGET_NAMES[target_name]
+    tensors = {
+        "prediction": predictions,
+        "target": targets,
+        "raw_target": raw_targets,
+        "raw_prediction": raw_predictions,
+        "weights": weights,
+        "target_indices": target_indices,
+        "nll": nll,
+        "crps": crps,
+        **wis_components,
+    }
+    cpu = {
+        name: torch.nan_to_num(value.detach().float(), nan=0.0).cpu()
+        for name, value in tensors.items()
+    }
+    population_cpu = populations.detach().float().cpu()
+    interval_cpu = {
+        level: (low.detach().float().cpu(), high.detach().float().cpu())
+        for level, (low, high) in intervals.items()
+    }
+    batch_size, horizon_size = targets.shape
+    if len(queries) != batch_size or len(node_ids) != batch_size:
+        raise ValueError(
+            "native granular identity count does not match routed tensor rows"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for batch_index, query in enumerate(queries):
+        source_type = str(query.source_type)
+        source_id = str(query.source_id)
+        region_id = source_id if source_type == "municipality" else ""
+        window_start = int(query.forecast_origin) - input_window_length + 1
+        for horizon_index in range(horizon_size):
+            is_observed = bool(cpu["weights"][batch_index, horizon_index] > 0)
+            if observed_only and not is_observed:
+                continue
+            target_index = int(
+                cpu["target_indices"][batch_index, horizon_index].item()
+            )
+            observed = float(cpu["target"][batch_index, horizon_index].item())
+            prediction = float(
+                cpu["prediction"][batch_index, horizon_index].item()
+            )
+            observed_raw = float(
+                cpu["raw_target"][batch_index, horizon_index].item()
+            )
+            prediction_raw = float(
+                cpu["raw_prediction"][batch_index, horizon_index].item()
+            )
+            row: dict[str, Any] = {
+                "split": split_name,
+                "target": canonical_target,
+                "node_id": int(node_ids[batch_index]),
+                "source_type": source_type,
+                "source_id": source_id,
+                "region_id": region_id,
+                "region_label": source_id,
+                "window_start": window_start,
+                "window_start_date": _format_temporal_coord(
+                    temporal_coords, window_start
+                ),
+                "horizon": horizon_index + 1,
+                "target_index": target_index,
+                "target_date": _format_temporal_coord(
+                    temporal_coords, target_index
+                ),
+                "observed": observed,
+                "prediction": prediction,
+                "mechanistic_prediction": float("nan"),
+                "residual_contribution": float("nan"),
+                "relevant_latent_name": "",
+                "relevant_latent_value": float("nan"),
+                "abs_error": abs(prediction - observed),
+                "sq_error": (prediction - observed) ** 2,
+                "nll": float(cpu["nll"][batch_index, horizon_index].item()),
+                "crps": float(cpu["crps"][batch_index, horizon_index].item()),
+                "population": float(population_cpu[batch_index].item()),
+                "observed_raw": observed_raw,
+                "prediction_raw": prediction_raw,
+                "abs_error_raw": abs(prediction_raw - observed_raw),
+                "wis": float(cpu["wis"][batch_index, horizon_index].item()),
+                "wis_dispersion": float(
+                    cpu["dispersion"][batch_index, horizon_index].item()
+                ),
+                "wis_underprediction": float(
+                    cpu["underprediction"][batch_index, horizon_index].item()
+                ),
+                "wis_overprediction": float(
+                    cpu["overprediction"][batch_index, horizon_index].item()
+                ),
+                "wis_point": float(
+                    cpu["point"][batch_index, horizon_index].item()
+                ),
+            }
+            for level_name in GRANULAR_INTERVAL_LEVEL_NAMES:
+                low_key = f"interval_low_{level_name}"
+                high_key = f"interval_high_{level_name}"
+                covered_key = f"covered_{level_name}"
+                if level_name in interval_cpu:
+                    low_tensor, high_tensor = interval_cpu[level_name]
+                    low = float(low_tensor[batch_index, horizon_index].item())
+                    high = float(high_tensor[batch_index, horizon_index].item())
+                    row[low_key] = low
+                    row[high_key] = high
+                    row[covered_key] = (
+                        float(low <= observed <= high)
                         if is_observed
                         else float("nan")
                     )
@@ -359,6 +525,14 @@ class _CsvGranularEvalWriter:
         ):
             self._writer.writerow(row)
 
+    def write_native_rows(self, **kwargs: Any) -> None:
+        for row in _native_row_dicts_from_head(
+            split_name=self.split_name,
+            observed_only=self.observed_only,
+            **kwargs,
+        ):
+            self._writer.writerow(row)
+
 
 class _ParquetGranularEvalWriter:
     """Buffered Parquet writer for large granular eval exports."""
@@ -389,6 +563,8 @@ class _ParquetGranularEvalWriter:
                 ("split", pa.string()),
                 ("target", pa.string()),
                 ("node_id", pa.int64()),
+                ("source_type", pa.string()),
+                ("source_id", pa.string()),
                 ("region_id", pa.string()),
                 ("region_label", pa.string()),
                 ("window_start", pa.int64()),
@@ -406,6 +582,15 @@ class _ParquetGranularEvalWriter:
                 ("sq_error", pa.float64()),
                 ("nll", pa.float64()),
                 ("crps", pa.float64()),
+                ("population", pa.float64()),
+                ("observed_raw", pa.float64()),
+                ("prediction_raw", pa.float64()),
+                ("abs_error_raw", pa.float64()),
+                ("wis", pa.float64()),
+                ("wis_dispersion", pa.float64()),
+                ("wis_underprediction", pa.float64()),
+                ("wis_overprediction", pa.float64()),
+                ("wis_point", pa.float64()),
                 ("interval_low_50", pa.float64()),
                 ("interval_high_50", pa.float64()),
                 ("covered_50", pa.float64()),
@@ -493,6 +678,17 @@ class _ParquetGranularEvalWriter:
         if len(self._rows) >= self.row_group_size:
             self._flush()
 
+    def write_native_rows(self, **kwargs: Any) -> None:
+        self._rows.extend(
+            _native_row_dicts_from_head(
+                split_name=self.split_name,
+                observed_only=self.observed_only,
+                **kwargs,
+            )
+        )
+        if len(self._rows) >= self.row_group_size:
+            self._flush()
+
 
 class GranularEvalWriter:
     """Format-aware granular eval writer preserving the existing call surface."""
@@ -524,3 +720,6 @@ class GranularEvalWriter:
 
     def write_rows(self, **kwargs: Any) -> None:
         self._writer.write_rows(**kwargs)
+
+    def write_native_rows(self, **kwargs: Any) -> None:
+        self._writer.write_native_rows(**kwargs)

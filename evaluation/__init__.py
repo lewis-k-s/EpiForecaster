@@ -13,7 +13,7 @@ Key submodules:
 """
 
 # Core evaluation components
-from evaluation.eval_loop import eval_checkpoint, evaluate_loader
+from evaluation.eval_loop import eval_checkpoint, evaluate_loader, evaluate_native_loader
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.selection import (
     _GLOBAL_RNG,
@@ -54,6 +54,7 @@ __all__ = [
     "_GLOBAL_RNG",
     # Evaluation
     "evaluate_loader",
+    "evaluate_native_loader",
     # High-level pipelines
     "eval_checkpoint",
     "evaluate_checkpoint_topk_forecasts",
