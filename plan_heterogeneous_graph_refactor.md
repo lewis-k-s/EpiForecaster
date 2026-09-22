@@ -1,6 +1,6 @@
 EpiForecaster: native-support heterogeneous GNN refactor
 
-Status: Implementation active. As of 22 September 2026, FIX-A through FIX-E, the acceptance-smoke denominator exclusion, and EVL-1 are committed. The remediation and EVL-1 gates are green: the bounded native smoke completes, the full suite reports 1,544 passed and 2 skipped, Ruff and `git diff --check` pass, and the regenerated native-support QC report has zero errors. ENC-1 is the active slice; CMP-1 and CUT-1 remain. Section 12.2c records the version-control checkpoint and execution gates.
+Status: Implementation active. As of 22 September 2026, FIX-A through FIX-E, EVL-1, and ENC-1 are committed and the second review checkpoint is green. The pooled and heterogeneous bounded native smokes complete, the full suite reports 1,551 passed and 2 skipped, Ruff, focused Pyright, and `git diff --check` pass, and the regenerated native-support QC report has zero errors. CMP-1 is the active slice; CUT-1 remains. Section 12.2c records the version-control checkpoint and execution gates.
 Date: 22 September 2026.
 Scope: Spatial representation and forecast-query refactor, with the necessary data, routing, training and evaluation changes. No major transformer or SIRHD redesign.
 
@@ -568,9 +568,9 @@ Remediation slices (worker-light, dependency-ordered): **FIX-A** loss (R1, R2, R
 
 #### Observed repository state
 
-- The branch is `heterogeneous-graph-refactor` at `ff13da6` (EVL-1 native evaluation and exports). It has no configured upstream. It contains 32 commits after `codex/develop-integration` at `9e0ea7e`; 18 are named implementation slices QC-1 through EVL-1, seven are remediation/acceptance fixes, and seven are planning or review-record commits.
-- Relative to that implementation base, the committed programme changes 56 files with 18,586 inserted and 68 deleted lines. This is a focused feature series even though the branch is also ahead of `master` because `codex/develop-integration` already contains the wider integration history. Do not rewrite or rebase this history while the worktree is dirty. Confirm the intended review base before publication.
-- The FIX-A through FIX-E source and test changes are committed. `plan_heterogeneous_graph_refactor.md` is the only modified tracked file at this checkpoint.
+- The implementation head is `5054411` (ENC-1 typed native graph encoder), followed only by this checkpoint record. The branch has no configured upstream. At the implementation head it contains 34 commits after `codex/develop-integration` at `9e0ea7e`; 19 are named implementation slices QC-1 through ENC-1, seven are remediation/acceptance fixes, and eight are planning or review-record commits.
+- Relative to that implementation base, the committed programme changes 58 files with 19,355 inserted and 68 deleted lines. This is a focused feature series even though the branch is also ahead of `master` because `codex/develop-integration` already contains the wider integration history. Do not rewrite or rebase this history while the worktree is dirty. Confirm the intended review base before publication.
+- The source and test changes through ENC-1 are committed. `plan_heterogeneous_graph_refactor.md` is the only modified tracked file while this checkpoint is recorded.
 - `tex` has no recorded submodule-pointer change, but its nested worktree contains three unrelated untracked files (`draft_miguel_comments.md`, `draft_miguel_comments.pdf`, and `manuscript.zip`). Preserve them and do not stage the submodule.
 - Generated native artifacts are present under `data/files/geo/generated/` and `data/processed/native_support/`. The current ignore rules cover `*.zarr` directories but do not cover the generated GeoJSON, Parquet, and JSON files. The local artifacts were rebuilt after FIX-B: `overlap_edges.parquet` has 21,802 directed rows, `native_graph.zarr` has 1,841 nodes, and the fold manifest records 350 assigned plus 26 excluded observed ABS and 33 assigned plus 9 excluded observed comarcas. Treat all of these as local generated state until a dedicated DVC or ignore-policy decision is made. Do not mix them into remediation commits.
 
@@ -593,14 +593,20 @@ The first bounded native training smoke then exposed observed ABS sources with n
 
 EVL-1 commit `ff13da6` adds the standard weighted interval score and additive point/dispersion/underprediction/overprediction components, routing-aware native metrics, schema-v4 granular rows with native source identity and raw-count fields, source/head/horizon aggregates, WIS summaries, and the confirmation-period guard. The synthetic native evaluation smoke writes the granular Parquet file, metadata sidecar, aggregate CSV, and summary JSON. The EVL/native evaluation surface reports **375 passed, 1 skipped**; the bounded 2-epoch native training smoke still selects the same best validation loss of **21.182048**; the full project suite reports **1,544 passed, 2 skipped**; Ruff and `git diff --check` pass. EVL-1 is complete.
 
+ENC-1 commit `5054411` adds zero-gated typed municipality↔ABS and municipality↔comarca messages, origin-grouped directed OD graph context, a one-layer `MobilityDenseEncoder`, native MITMA and projected-municipal OD routing, and an explicit mobility-off path. Tests pin exact pooled/heterogeneous equivalence at zero initialization, every relation-path gradient, native-history preservation, parameter budgeting, identical single-query versus mixed-batch results, OD-source selection, and mobility enabled/disabled behavior. The real pooled smoke retains best validation loss **21.182048**; the real heterogeneous MITMA smoke completes 2 CPU epochs × 8 batches with best validation loss **21.139096**; the projected-municipal OD smoke also completes. The native suite reports **349 passed, 1 skipped** and the full project suite reports **1,551 passed, 2 skipped**. Project-wide Ruff, focused Pyright, and `git diff --check` pass.
+
+The second review checkpoint found no new blocker. The ENC commit contains only the intended nine source/test files; the `tex` nested worktree and generated native artifacts remain unstaged; the branch still has no upstream; and the review-base decision remains deferred to publication. CMP-1 may start, while CUT-1 remains gated on comparison completion and the final review-base decision.
+
 #### Revised execution order
 
 1. **Completed: stabilize and separate FIX-A, FIX-C, FIX-D, R17, and the FIX-E follow-up.** Commits: `ecf7dab`, `c89d181`, `52a5380`, and `cd7980b`.
 2. **Completed: implement and rebuild FIX-B.** Commit `4546bcd` replaces marginal-coverage products with true pairwise grid-cell intersections, derives the audited ABS denominator with municipality-normalized allocation, applies explicit zero-overlap fold exclusions, and validates the rebuilt overlap table, graph, manifest, native folds, and QC report.
 3. **Completed: remediation acceptance gate.** The clean rebuild/QC, bounded native smoke, all native tests, full project test suite, Ruff, and `git diff --check` are green. Known warnings were recorded separately from failures.
 4. **Completed: implement EVL-1 before ENC-1.** Commit `ff13da6` freezes and tests the native evaluation/export contract on the fixed-pooling baseline before learned heterogeneous messages are added.
-5. **Active: implement ENC-1 and repeat the same evaluation smoke.** Require pooled/heterogeneous zero-init equivalence, relation-path gradients, native-history residual preservation, and identical single-query versus mixed-batch results.
-6. **Hold a second review checkpoint.** Only after FIX-A through FIX-E, EVL-1, and ENC-1 are green may CMP-1 start. CUT-1 remains last and requires the full suite, documentation, artifact policy, and explicit review-base/upstream decision.
+5. **Completed: implement ENC-1 and repeat the same evaluation smoke.** Commit `5054411` satisfies pooled/heterogeneous zero-init equivalence, relation-path gradients, native-history residual preservation, identical single-query versus mixed-batch results, and both OD-source routes.
+6. **Completed: hold the second review checkpoint.** FIX-A through FIX-E, EVL-1, and ENC-1 are committed and green; unrelated and generated worktree state remains outside the commits.
+7. **Active: implement CMP-1.** Add the matched configuration matrix and source-aware comparison analysis, validate pairing and common-subset rules on synthetic smoke artifacts, and keep substantive execution MN5-only.
+8. **Pending: implement CUT-1 last.** Require the full suite, documentation, artifact policy, and explicit review-base/upstream decision.
 
 The status names in this section are evidence labels: **committed**, **uncommitted work in progress**, **not implemented**, and **validated** are not interchangeable.
 
