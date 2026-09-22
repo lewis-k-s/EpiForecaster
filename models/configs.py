@@ -1439,6 +1439,50 @@ class OutputConfig:
         return filename
 
 
+NATIVE_SPATIAL_ENCODERS = ("pooled", "hetero")
+NATIVE_OD_SOURCES = ("mitma", "municipal")
+NATIVE_OVERLAP_WEIGHTINGS = ("geostat_grid", "uniform_density")
+NATIVE_OD_SELF_FLOW_MODES = ("retain", "drop")
+
+
+@dataclass
+class NativeSupportConfig:
+    """Native-support training surface (plan section 11.6).
+
+    Attached additively to :class:`EpiForecasterConfig` as the optional
+    ``native`` field. Defaults keep the municipal path untouched: native
+    mode only activates with ``enabled: true`` in the YAML ``native`` block.
+    """
+
+    enabled: bool = False
+    root: str = "data/processed/native_support"
+    spatial_encoder: str = "pooled"
+    od_source: str = "mitma"
+    overlap_weighting: str = "geostat_grid"
+    od_self_flows: str = "retain"
+    od_min_flow_raw: float = 10.0
+    head_balanced_sampling: bool = True
+    confirmation_guard: bool = True
+
+    def __post_init__(self) -> None:
+        for name, allowed in (
+            ("spatial_encoder", NATIVE_SPATIAL_ENCODERS),
+            ("od_source", NATIVE_OD_SOURCES),
+            ("overlap_weighting", NATIVE_OVERLAP_WEIGHTINGS),
+            ("od_self_flows", NATIVE_OD_SELF_FLOW_MODES),
+        ):
+            value = getattr(self, name)
+            if value not in allowed:
+                raise ValueError(
+                    f"native.{name} must be one of {allowed}, got {value!r}"
+                )
+        if (
+            not math.isfinite(float(self.od_min_flow_raw))
+            or self.od_min_flow_raw < 0
+        ):
+            raise ValueError("native.od_min_flow_raw must be finite and non-negative")
+
+
 @dataclass
 class EpiForecasterConfig:
     """Structured configuration mirroring the training YAML schema.
@@ -1460,6 +1504,7 @@ class EpiForecasterConfig:
     data: DataConfig = MISSING
     training: TrainingParams = MISSING
     output: OutputConfig = MISSING
+    native: NativeSupportConfig = field(default_factory=NativeSupportConfig)
     env: str | None = None
 
     @classmethod
@@ -1524,6 +1569,9 @@ class EpiForecasterConfig:
             output=OutputConfig(
                 **_filter_init_fields(OutputConfig, merged_dict["output"])
             ),
+            native=NativeSupportConfig(
+                **_filter_init_fields(NativeSupportConfig, merged_dict.get("native", {}))
+            ),
         )
 
     @classmethod
@@ -1570,6 +1618,7 @@ class EpiForecasterConfig:
             "data": raw.get("data", {}) or {},
             "training": raw.get("training", {}) or {},
             "output": raw.get("output", {}) or {},
+            "native": raw.get("native", {}) or {},
             "env": raw.get("env"),
         }
         cls._reject_obsolete_mobility_fields(cfg_dict["data"])
@@ -1635,6 +1684,11 @@ class EpiForecasterConfig:
             ),
             output=OutputConfig(
                 **_filter_init_fields(OutputConfig, config_dict["output"])
+            ),
+            native=NativeSupportConfig(
+                **_filter_init_fields(
+                    NativeSupportConfig, config_dict.get("native", {})
+                )
             ),
             env=config_dict.get("env"),
         )

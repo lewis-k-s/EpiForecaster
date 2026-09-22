@@ -1488,6 +1488,10 @@ def _run_forecaster_training(
                 "Production training configs (env=mn5) must run on SLURM."
             )
 
+        if trainer_config.native.enabled:
+            _run_native_forecaster_training(trainer_config, config)
+            return
+
         logger = logging.getLogger(__name__)
         logger.info(f"Loading training configuration from: {config}")
         logger.debug(f"Training model: {trainer_config.model.type}")
@@ -1531,6 +1535,44 @@ def _run_forecaster_training(
         click.echo(f"❌ Training failed: {exc}", err=True)
         click.echo(traceback.format_exc(), err=True)
         raise click.ClickException(str(exc)) from exc
+
+
+def _run_native_forecaster_training(
+    trainer_config: EpiForecasterConfig,
+    config_path: str,
+) -> None:
+    """Execute the bounded native-support smoke workflow (slice TRN-1).
+
+    Selected additively from the existing ``train epiforecaster`` command
+    when the loaded config has ``native.enabled: true`` — no separate CLI
+    subcommand is needed because the config plumbing is shared unchanged.
+    """
+    # Imported lazily so the municipal path never loads native modules.
+    from training.native_trainer import NativeTrainer
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Native-support mode enabled; loading config from: {config_path}")
+    logger.info(f"Native root: {trainer_config.native.root}")
+
+    trainer = NativeTrainer(trainer_config)
+    results = trainer.run()
+
+    logger.info(f"\n{'=' * 60}")
+    logger.info("✅ NATIVE TRAINING COMPLETED SUCCESSFULLY")
+    logger.info(f"{'=' * 60}")
+    for epoch, losses in enumerate(results["train_loss_trace"]):
+        logger.info(
+            f"Epoch {epoch + 1} train losses: "
+            f"{['%.6f' % loss for loss in losses]}"
+        )
+    best = results["best_val_loss"]
+    if best is not None:
+        logger.info(f"Best validation loss: {best:.6f}")
+    else:
+        logger.info("Validation loss: n/a")
+    logger.info(f"Model parameters: {results['model_info']['parameters']:,}")
+    logger.info(f"Wall time: {results['wall_time_s']:.1f}s")
+    logger.info(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
