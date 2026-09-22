@@ -1,0 +1,6 @@
+outs:
+- md5: c81243953f3f7a014666236807f4093c.dir
+  size: 78517
+  nfiles: 15
+  hash: md5
+  path: obs_admissions.zarr

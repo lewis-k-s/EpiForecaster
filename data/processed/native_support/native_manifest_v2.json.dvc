@@ -1,0 +1,5 @@
+outs:
+- md5: 82e106502f42c7c379c798437615fbe5
+  size: 12994
+  hash: md5
+  path: native_manifest_v2.json

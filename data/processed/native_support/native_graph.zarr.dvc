@@ -1,0 +1,6 @@
+outs:
+- md5: 3c29421f6bd14a35a5082731ce041d09.dir
+  size: 240140
+  nfiles: 61
+  hash: md5
+  path: native_graph.zarr

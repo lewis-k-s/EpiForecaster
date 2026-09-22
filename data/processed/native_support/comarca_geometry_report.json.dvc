@@ -1,0 +1,5 @@
+outs:
+- md5: 8397892df44e7b80c412b7c679ba83eb
+  size: 15349
+  hash: md5
+  path: comarca_geometry_report.json

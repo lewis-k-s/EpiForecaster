@@ -1,0 +1,5 @@
+outs:
+- md5: 606bd5a78a8022a6d96a95f188194341
+  size: 12659
+  hash: md5
+  path: native_source_folds.json

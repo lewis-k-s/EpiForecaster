@@ -1,0 +1,6 @@
+outs:
+- md5: 811f707146310a3b9a5af6c4c17dd765.dir
+  size: 223684311
+  nfiles: 7677
+  hash: md5
+  path: od_municipal.zarr

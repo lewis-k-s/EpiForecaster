@@ -1,0 +1,6 @@
+outs:
+- md5: fd104dca23868b2dec05df144fbf7008.dir
+  size: 39684942
+  nfiles: 469
+  hash: md5
+  path: od_mitma.zarr
