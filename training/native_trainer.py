@@ -191,10 +191,13 @@ class NativeTrainer:
                 num_workers=0,
             )
 
-        first = self.dataset[0]
+        # Adapter widths from a COLLATED batch (review R12 collation): the
+        # one-hot source-type block is prepended at collation, so batch hist
+        # is [B, L, 5 + F_native] while dataset items stay [L, F_native].
+        collated_probe = collate_native_batch([self.dataset[0]])
         forecaster_config = NativeForecasterConfig(
-            f_native=int(first["hist"].shape[1]),
-            d_ctx=int(first["ctx_feat"].shape[1]),
+            f_native=int(collated_probe.hist.shape[2]),
+            d_ctx=int(collated_probe.ctx_feat.shape[2]),
             forecast_horizon=config.model.forecast_horizon,
             sequence_length=config.model.input_window_length,
             head_d_model=config.model.head_d_model,
