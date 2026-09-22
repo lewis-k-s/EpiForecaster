@@ -477,7 +477,7 @@ Independent starts (safe to parallelize): `QC-1`, `REG-1`, `GEO-1`, `OBS-1`, `OB
 
 #### ROP-1 — Weekly interval reporting operator (M)
 **Files**: new `models/reporting_operators.py`; new `tests/test_native_reporting_operators.py`.
-**Change**: `weekly_interval_sum(daily [B,H] or [B,H+1], origin_dow [B]) -> (sums [B,W], week_mask [B,W])` mapping complete Mon–Sun weeks inside `(origin, origin+H]` (vectorized, no Python loop over B); `weekly_log1p_per100k_location(sums, population) -> [B,W]` per §11.5; partial weeks → mask 0; nowcast-inclusive inputs drop t=0 first.
+**Change**: `weekly_interval_sum(daily [B,H] or [B,H+1], origin_dow [B]) -> (sums [B,W], week_mask [B,W])` mapping complete Mon–Sun weeks inside `(origin, origin+H]` (vectorized, no Python loop over B); `weekly_log1p_per100k_location(fraction_sums) -> [B,W]` per §11.5 and R17; partial weeks → mask 0; nowcast-inclusive inputs drop t=0 first.
 **Tests**: hand-computed 14-day cases (origins at each weekday; partial weeks; resulting W values); sum-before-transform property pinned by an explicit example (operator of sum ≠ transform of per-day sums); nowcast exclusion; population scaling.
 **Done when**: property tests green; no dependency on any other slice.
 
