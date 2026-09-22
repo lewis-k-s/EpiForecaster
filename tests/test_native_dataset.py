@@ -335,6 +335,31 @@ def test_head_counts_and_hand_derived_eligibility(
     assert [o for _, s, o in index["cases"] if s == "01001"] == ORIGINS
 
 
+def test_observed_source_without_audited_population_is_not_indexed(
+    tmp_path: Path,
+) -> None:
+    """A raw-count target cannot be queried without its rate denominator."""
+    _write_native_root(tmp_path)
+    graph = zarr.open_group(str(tmp_path / "native_graph.zarr"), mode="r+")
+    abs_101 = len(MUNIS)
+    graph["population"][abs_101] = np.nan
+
+    ds = NativeSupportDataset(
+        tmp_path,
+        tmp_path / "real_with_id.zarr",
+        NativeDatasetConfig(input_window_length=L, forecast_horizon=H),
+    )
+
+    record = ds.registry.get("abs", "101")
+    assert record is not None
+    assert record.status == "observed"
+    assert record.population is None
+    assert all(
+        not (query.source_type == "abs" and query.source_id == "101")
+        for query in ds.queries
+    )
+
+
 def test_dedup_and_deterministic_ordering(dataset: NativeSupportDataset) -> None:
     identities = [
         (q.source_type, q.source_id, q.forecast_origin) for q in dataset.queries
@@ -755,6 +780,11 @@ def test_real_artifacts_index_and_weekly_alignment() -> None:
         )
         assert pairs, f"head {head} must index real sources"
         assert all(st == expected_type for st, _, _ in pairs)
+        for source_id in sources:
+            record = ds.registry.get(expected_type, source_id)
+            assert record is not None
+            assert record.population is not None
+            assert np.isfinite(record.population) and record.population > 0
 
     # Spot-check one ABS query's weekly target alignment against the store.
     first_abs = next(q for q in ds.queries if q.source_type == "abs")

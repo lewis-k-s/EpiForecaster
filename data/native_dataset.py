@@ -666,6 +666,9 @@ class NativeSupportDataset(Dataset):
                 record
                 for record in self._registry.records_for(source_type)
                 if record.status == STATUS_OBSERVED
+                and record.population is not None
+                and math.isfinite(record.population)
+                and record.population > 0
             ]
             if not records:
                 continue
