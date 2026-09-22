@@ -583,7 +583,7 @@ class NativeTrainer:
 
     @staticmethod
     def _assert_no_wandb_config(config: EpiForecasterConfig) -> None:
-        """Reject identity-bearing W&B fields instead of ignoring them."""
+        """Reject every meaningful W&B setting instead of ignoring it."""
         output = config.output
         explicit = [
             name
@@ -598,6 +598,12 @@ class NativeTrainer:
             raise ValueError(
                 "NativeTrainer does not implement W&B tracking; remove the "
                 f"explicit output field(s) {explicit} from native configs."
+            )
+        if output.wandb_mode != "disabled":
+            raise ValueError(
+                "NativeTrainer does not implement W&B tracking; set "
+                "output.wandb_mode=disabled in native configs (wandb_project "
+                "is inert under disabled mode)."
             )
 
     @staticmethod
@@ -809,10 +815,28 @@ class NativeTrainer:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.training.gradient_clip_value
             )
+            self.global_step += 1
+            if not torch.isfinite(grad_norm):
+                # Record the offending observation before halting: the
+                # writer stores non-finite values as null plus an explicit
+                # nonfinite_fields entry (plan WP-B item 5).
+                self.training_dynamics_writer.append(
+                    step=self.global_step,
+                    epoch=epoch,
+                    values={
+                        "train_loss": float(total.item()),
+                        "grad_norm": float(grad_norm),
+                    },
+                )
+                raise NativeNonFiniteHalt(
+                    f"Non-finite gradient norm at epoch {epoch} step {step} "
+                    f"(loss={float(total.item()):.6f}, "
+                    f"grad_norm={float(grad_norm)}): halting native run "
+                    "before the optimizer step."
+                )
             self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
-            self.global_step += 1
             losses.append(float(total.item()))
             is_epoch_last = step + 1 == self.steps_per_epoch
             if (

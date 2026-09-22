@@ -55,6 +55,7 @@ model:
 output:
   experiment_name: native_smoke
   log_dir: outputs/training
+  wandb_mode: disabled
   write_granular_eval: false
 
 training:

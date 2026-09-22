@@ -217,6 +217,45 @@ def test_nonfinite_halt_finalizes_manifest(tmp_path: Path) -> None:
     assert manifest["error"]["type"] == "NativeNonFiniteHalt"
 
 
+def test_nonfinite_gradient_halts_before_optimizer_step(tmp_path: Path) -> None:
+    """A finite loss with NaN gradients must halt without stepping."""
+    _write_native_root(tmp_path)
+    trainer = NativeTrainer(_artifact_config(tmp_path), model_id="nan_grad")
+    params_before = {
+        name: parameter.detach().clone()
+        for name, parameter in trainer.model.named_parameters()
+    }
+    hook = next(trainer.model.parameters()).register_hook(
+        lambda grad: torch.full_like(grad, float("nan"))
+    )
+    try:
+        with pytest.raises(NativeNonFiniteHalt, match="gradient norm"):
+            trainer.run()
+    finally:
+        hook.remove()
+    # The optimizer never consumed the corrupted gradients.
+    for name, parameter in trainer.model.named_parameters():
+        assert torch.equal(parameter.detach(), params_before[name]), name
+
+    manifest = json.loads(
+        (trainer.experiment_dir / "training_dynamics_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "nonfinite_halt"
+    rows = [
+        json.loads(line)
+        for line in (trainer.experiment_dir / "training_dynamics.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert rows, "halt row must be recorded"
+    assert rows[-1]["nonfinite_fields"] == ["grad_norm"]
+    assert rows[-1]["grad_norm"] is None
+    assert rows[-1]["train_loss"] is not None  # the loss itself was finite
+
+
 def test_unrelated_failure_finalizes_failed_manifest(tmp_path: Path) -> None:
     _write_native_root(tmp_path)
     trainer = NativeTrainer(_artifact_config(tmp_path), model_id="failed_run")
@@ -310,6 +349,11 @@ def test_unsupported_configuration_rejected(tmp_path: Path) -> None:
     wandb.output.wandb_group = "stage4"
     with pytest.raises(ValueError, match="wandb_group"):
         NativeTrainer(wandb, model_id="reject_wandb")
+
+    online = _artifact_config(tmp_path)
+    online.output.wandb_mode = "online"
+    with pytest.raises(ValueError, match="wandb_mode"):
+        NativeTrainer(online, model_id="reject_wandb_mode")
 
     compiled = _artifact_config(tmp_path)
     compiled.training.compile = True

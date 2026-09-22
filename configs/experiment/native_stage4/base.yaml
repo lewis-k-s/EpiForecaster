@@ -60,6 +60,7 @@ output:
   write_granular_eval: true
   granular_eval_format: csv
   granular_eval_filename: "{split}_granular.csv"
+  wandb_mode: disabled
 
 training:
   seed: 52

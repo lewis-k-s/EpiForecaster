@@ -267,7 +267,9 @@ def _trainer_config(root: Path, **native_kwargs: bool) -> EpiForecasterConfig:
             warmup_steps=0,
         ),
         output=OutputConfig(
-            experiment_name="native_trainer_test", log_dir=str(root / "outputs")
+            experiment_name="native_trainer_test",
+            log_dir=str(root / "outputs"),
+            wandb_mode="disabled",
         ),
         native=NativeSupportConfig(enabled=True, root=str(root), **native_options),
     )
