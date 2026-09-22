@@ -1,6 +1,6 @@
 EpiForecaster: native-support heterogeneous GNN refactor
 
-Status: Clinical prototype implementation complete. As of 22 September 2026, FIX-A through FIX-E, EVL-1, ENC-1, CMP-1, and CUT-1 are committed. The default bounded command now uses the source-native clinical interface; the municipal/wastewater branch is explicit. The full suite reports 1,559 passed and 2 skipped, the native suite reports 354 passed and 1 skipped, Ruff, focused Pyright, and `git diff --check` pass, and the regenerated native-support QC report has zero errors. Section 12.2c records the final version-control checkpoint and the separate MN5 production-dispatch gate.
+Status: Clinical prototype implementation complete; MN5 dispatch-readiness work active. As of 22 September 2026, FIX-A through FIX-E, EVL-1, ENC-1, CMP-1, CUT-1, dispatch WP-A, and dispatch WP-B are committed. Commit `387833a` publishes the 11 native Stage-4 inputs and audit artifacts through per-artifact DVC pointers, and the `mn5-nfs` object store has been verified byte-for-byte through a clean-workspace pull. WP-B gives the native trainer the canonical model-root, checkpoint, training-dynamics, selection-score, precision, and loader contracts; the bounded smoke reproduces val_loss 23.249019 exactly with `mean_target_crps=2.026719` recorded as the selection score, and reload from `best_model.pt` reproduces the saved validation metrics within 1e-9. The default bounded command uses the source-native clinical interface; the municipal/wastewater branch is explicit. The full suite now reports 1,569 passed and 2 skipped, Ruff, focused Pyright (no new errors), and `git diff --check` pass, and the regenerated native-support QC report has zero errors. Section 12.2c is the pre-publication historical checkpoint; §12.2d records the current dispatch gate and the WP-C through WP-E sequence.
 Date: 22 September 2026.
 Scope: Spatial representation and forecast-query refactor, with the necessary data, routing, training and evaluation changes. No major transformer or SIRHD redesign.
 
@@ -564,7 +564,7 @@ The pre-compaction review of the 17 landed implementation slices from QC-1 throu
 
 Remediation slices (worker-light, dependency-ordered): **FIX-A** loss (R1, R2, R7, R17 + integration test); **FIX-B** overlap/graph rebuild (R3, R4 + fold re-derivation under R8); **FIX-C** model and reporting operator (R5, R13, R15, R17); **FIX-D** dataset (R6, R9, R10, R11, R17 with registry/processor); **FIX-E** batch/manifest (R12, R14) + plan-only R16. Each fix lands with its inverted/missing tests per the review's §3 list. CMP-1 and CUT-1 wait for FIX-A…E plus EVL-1/ENC-1.
 
-### 12.2c Version-control checkpoint and revised gates (2026-09-22)
+### 12.2c Version-control checkpoint and revised gates (historical, 2026-09-22 before WP-A)
 
 #### Observed repository state
 
@@ -615,6 +615,133 @@ The Stage-4 matrix is a frozen experiment contract, not an authorization to disp
 8. **Completed: implement CUT-1 last.** Commit `a0fcac7` cuts the bounded clinical default to native support, makes legacy municipal/wastewater configs explicit, updates documentation and artifact policy, passes the full suite, and fixes the review base at `codex/develop-integration` without setting an upstream before publication.
 
 The status names in this section are evidence labels: **committed**, **uncommitted work in progress**, **not implemented**, and **validated** are not interchangeable.
+
+### 12.2d MN5 dispatch-readiness work packages (current, 2026-09-22)
+
+The clinical prototype remains complete. This section supersedes §12.2c only for the production-dispatch gate; it does not rewrite the implementation or validation history above. Direct cluster CLI training remains prohibited. Substantive native training and comparison runs must use the immutable MN5 Snakemake workflow.
+
+#### Current repository and artifact state
+
+- **WP-A complete and committed as `387833a`.** The branch head publishes 11 per-artifact DVC pointers under `data/processed/native_support/`: `native_graph.zarr`, `obs_admissions.zarr`, `obs_deaths.zarr`, `od_mitma.zarr`, `od_municipal.zarr`, `overlap_edges.parquet`, `native_source_folds.json`, `native_manifest_v2.json`, `native_support_qc_report.json`, `overlap_report.json`, and `comarca_geometry_report.json`.
+- The QC command was rerun with `--report-output data/processed/native_support/native_support_qc_report.json`. It rewrote `native_manifest_v2.json` deterministically and produced a byte-identical manifest. The QC report has zero errors, one known four-code registry-coverage warning, and the recorded MITMA v1↔v2 population-crosswalk open item. These two entries remain non-blocking recorded limitations.
+- Artifact identity is split deliberately: DVC file and directory hashes identify the complete published payload, including Zarr chunks; `native_manifest_v2.json` supplies source and construction provenance and does not claim to hash Zarr chunk arrays.
+- The 11 pointers require 8,227 distinct DVC objects and approximately 265.1 MB. Because `dt` and the MN5 login environment did not provide a DVC executable, publication reproduced the existing `mn5-nfs` `storage/files/md5/<prefix>/<suffix>[.dir]` object layout directly and preserved the shared setgid permissions.
+- Publication validation has three recorded layers: the remote GPFS object sweep reported `missing=0`, `bad_size=0`, and `bad_hash=0` across all 8,227 objects; a clean-workspace `dvc pull` fetched those objects and materialized 8,243 files with DVC's MD5 checks; and the six regular-file payloads matched the repository originals byte-for-byte, including an equal SHA-256 for `overlap_edges.parquet`.
+- Temporary publication state was removed locally and remotely. Immediately after WP-A, the worktree was clean except for the preserved unrelated `tex` nested-worktree state; this plan update is the subsequent tracked-file change. The in-container Apptainer `stage_data` pull remains intentionally untested until WP-D, because that boundary exists only on MN5.
+
+WP-A clears the native-input publication gate. It did not by itself authorize training dispatch; WP-B supplies the canonical production artifact lifecycle, and only the native campaign/finalizer wiring (WP-C) remains before the dispatch gate.
+
+#### WP-B — Native trainer canonical artifact lifecycle (complete)
+
+**Scope**: `training/native_trainer.py`, `cli.py`, `configs/experiment/native_stage4/base.yaml`, focused native trainer/evaluation tests, and shared artifact helpers where reuse avoids contract drift.
+
+Implement the following as one bounded production-artifact slice:
+
+1. Give `NativeTrainer` a stable `model_id` contract equivalent to `EpiForecasterTrainer`: an explicit constructor value takes precedence, then `EPIFORECASTER_MODEL_ID`, then the existing safe generated fallback. Create `experiment_dir = log_dir / experiment_name / model_id` for every run, not only when checkpoint saving is enabled.
+2. Route every run-owned artifact through `experiment_dir`: granular and aggregate evaluation outputs, metadata sidecars, `campaign_identity.json`, checkpoints, `training_dynamics.jsonl`, and `training_dynamics_manifest.json`. No fold or seed may write directly to the shared `log_dir / experiment_name` directory.
+3. Compute a native three-head validation-selection score as the unweighted mean over finite cases, hospital-admission, and death metrics. Use CRPS first, NLL second, and transformed-rate MAE as the final fallback, and record which metric was selected. Record `best_val_selection_score`, `best_val_selection_metric`, `best_val_joint_loss`, and per-head metrics separately.
+4. Select the in-memory best state and `checkpoints/best_model.pt` by `best_val_selection_score`, not by joint validation loss alone. Write a canonical checkpoint dictionary containing the model, optimizer, scheduler when present, epoch/global step, explicit config, precision signature, selection fields, joint loss, per-head metrics, and training trace needed for an audited reload. Do not write only a raw state dictionary.
+5. Initialize `TrainingDynamicsWriter` for every native run. Append finite step evidence under the configured logging frequencies and finalize exactly once as `complete`, `failed`, or `nonfinite_halt`. A detected non-finite loss or gradient uses `nonfinite_halt`; unrelated exceptions use `failed`.
+6. Use the shared precision policy: float32 parameters with optional CUDA BF16 autocast. Do not introduce FP16 weights or `GradScaler`. CPU acceptance keeps autocast disabled.
+7. Honor `num_workers`, `val_workers`, `persistent_workers`, `prefetch_factor`, and `pin_memory`. Apply persistent workers and prefetch only when the corresponding worker count is positive. Preserve deterministic sampler order and do not initialize CUDA before worker processes are created.
+8. Resolve W&B explicitly. For this dispatch slice, prefer removing native Stage-4 W&B fields and suppressing worker-injected W&B overrides for native runs unless native W&B support is implemented and tested. Do not silently accept ignored configuration.
+9. Set `output.save_checkpoints: true` in the production Stage-4 base only after the canonical checkpoint path and reload contract pass.
+
+**WP-B acceptance gate**:
+
+- A bounded CPU run with a fixed `EPIFORECASTER_MODEL_ID` and `output.save_checkpoints=true` writes the canonical model-root layout without changing the established smoke loss beyond deterministic tolerance.
+- Loading `best_model.pt` into a fresh native model reproduces the saved best-state validation rows and aggregate metrics within the declared numeric tolerance.
+- `training-dynamics-analyze` accepts the completed bundle, and focused tests exercise `complete`, `failed`, and `nonfinite_halt` manifests.
+- Tests prove that two fold/seed identities under one experiment name cannot overwrite each other's evaluation or checkpoint artifacts.
+- Loader tests cover zero-worker and positive-worker configurations, including conditional persistent-worker/prefetch behavior. WP-D supplies the real CUDA BF16 and multi-worker acceptance.
+- Focused tests, the native suite, Ruff, focused Pyright, and `git diff --check` pass before WP-C consumes the new contract.
+
+**WP-B completion record (2026-09-22).** `NativeTrainer` now resolves `model_id`
+(constructor value, then `EPIFORECASTER_MODEL_ID`, then Slurm job, then a unique
+run id) and creates `log_dir/experiment_name/model_id` for every run; all
+run-owned artifacts live there, including granular/aggregate exports and
+metadata sidecars. Best state and `checkpoints/best_model.pt` are selected by
+the three-head `compute_native_selection_score` (CRPS mean, NLL under the NLL
+objective, transformed-rate MAE final fallback — municipal chain parity over
+native metric keys), with the joint loss and per-head CRPS recorded separately.
+The checkpoint is a canonical dictionary (model/optimizer/scheduler states,
+epoch and global step, full config, serialized `NativeForecasterConfig`,
+precision signature, selection fields, traces, head counts), loadable through
+`load_native_checkpoint`. `TrainingDynamicsWriter` runs for every native run
+and finalizes exactly once as `complete`, `failed`, or `nonfinite_halt`
+(`NativeNonFiniteHalt` on a detected non-finite loss). Precision follows the
+shared policy (float32 parameters, optional CUDA BF16 autocast, no FP16 or
+`GradScaler`); `evaluate_native_loader` gained opt-in autocast parameters
+(default off, municipal path untouched). Loaders honor
+`num_workers`/`val_workers`/`persistent_workers`/`prefetch_factor`/`pin_memory`
+through `native_loader_kwargs`, are built before any CUDA tensor operation, and
+preserve the deterministic sampler order. W&B identity fields, `torch.compile`,
+and `output.save_best_only=false` are rejected at construction rather than
+silently ignored; `wandb_group` was removed from the Stage-4 base, which now
+sets `save_checkpoints: true`.
+
+Acceptance evidence: the bounded real smoke with fixed model ids
+(`wpb_smoke_m1/m2/m3`) reproduces the established numbers exactly across three
+independent runs (epoch means 14.024126/12.281200, `val_loss=23.249019`,
+`mean_target_crps=2.026719`) with isolated per-id model roots;
+`load_native_checkpoint` reproduces the saved best-state validation loss and
+metrics within 1e-9; `load_training_dynamics_identity` and
+`training-dynamics-analyze` accept the completed bundle (3 sampled rows;
+`insufficient_data` is the expected analyzer verdict at smoke scale). New
+`tests/test_native_trainer_artifacts.py` (10 tests) covers layout, reload
+fidelity, root isolation across fold/seed identities, the selection chain, both
+failure statuses, loader worker modes, and configuration rejection. The full
+project suite reports **1,569 passed, 2 skipped**; Ruff, formatting, focused
+Pyright (the seven pre-existing municipal `eval_loop.py` errors are unchanged),
+and `git diff --check` pass. WP-D owns real CUDA BF16 and multi-worker
+acceptance.
+
+#### WP-C — Freeze the experiment policy, then wire campaign and workflow
+
+WP-C begins with a scientific-policy checkpoint. Record these decisions before generating the campaign hash:
+
+1. **Screening replication policy** — choose one:
+   - exploratory: three preselected folds × seed 52, followed by a prespecified shortlist confirmation over all ten folds with seed 53; or
+   - replicated: three preselected folds × seeds 52 and 53, followed by confirmation of the shortlisted pairs over all ten folds × both seeds.
+   Do not describe a 96-identity two-seed screen and then add "seed 53 only" as if seed 53 were new. The screen and confirmation populations must be explicit and internally consistent.
+2. **Condition-set policy** — either retain all 16 factorial conditions and record that the mobility-off MITMA/municipal OD pairs are deliberate behavioral duplicates, or adopt a conditional 12-condition design and update the matrix, campaign validation, and comparison analysis together. Do not silently remove identities from a declared 16-condition matrix.
+3. **Native fold selection** — generate and check in an audit of held-out municipality, ABS, and comarca coverage for every native fold, including geographic spread and observed-target counts. Select the three screening folds from this audit. The legacy municipal `[1,4,5]` rationale is not evidence for the native folds.
+4. **Phase execution** — choose one immutable interface. A single complete campaign has one static DVC target set and must stage both OD stores. If encoder, mobility, and OD-context phases need separate staging or advancement gates, define separate phase campaigns/workflow configs and teach the analysis to accept their declared condition sets. Per-trial conditional DVC staging is not supported by the current workflow.
+
+After those decisions are frozen:
+
+- Add `configs/campaigns/native_stage4_v1.yaml` with the selected condition set, folds, seeds, smoke-fold subset, base config, equal-budget paths, completeness rules, and provenance rules. `smoke_fold_indices` must be a subset of the production fold set.
+- Keep `allowed_difference_paths` limited to condition-controlled factor paths. Fold, seed, model ID, and experiment name are runtime identity fields, not condition differences.
+- Add a validation test that the campaign condition set is exactly equivalent to the authoritative Stage-4 matrix, or generate one representation from the other so they cannot drift.
+- Add the native branch to `ablation_worker.objective`: apply `native.fold_index`, pass the explicit `model_id` to `NativeTrainer`, consume the native selection result, and write `campaign_identity.json` in the model root.
+- Write a per-trial `training_manifest.json` containing the campaign/condition/fold/seed identity, exact overrides, checkpoint SHA-256, training-dynamics manifest and artifact identities, granular/aggregate identities, and completion time. The ablation worker invokes trainers directly, so the single-training `run_support.train_model` manifest does not cover these trials.
+- Add `workflow/config/mn5_native_stage4.yaml` and a matching smoke config. Keep the legacy `mn5_ablation.yaml` unchanged. The native workflow DVC list must include `real_with_id.zarr.dvc` plus every native runtime or provenance pointer required by that campaign.
+- Add a native finalizer in `run_support.py` and the matching native required-output set in `workflow/Snakefile`. Reconcile every discovered model root and granular export against the exact JournalStorage identity and `campaign_identity.json`; reject missing, duplicate, extra, or stale outputs.
+- Decide how to handle the historical municipal reference required by `native_stage4_comparison.py`: either publish and stage it as a declared provenance input, or make it an optional post-run comparison. The native MN5 finalizer must not depend on an ignored local `outputs/` tree.
+
+**WP-C acceptance gate**: the campaign loads with no undeclared drift, compiles the exact declared identity matrix, a local bounded worker test writes one complete canonical trial root, the native finalizer rejects incomplete or mismatched identities, and an immutable-workflow dry run resolves the native DAG and required outputs.
+
+#### WP-D — MN5 bounded coverage smoke
+
+Run WP-D only after WP-C freezes the production campaign and smoke subset. Any later campaign, fold, seed, or condition amendment changes the campaign hash and requires a new WP-D smoke.
+
+Use the immutable workflow launcher with the native smoke config; do not invoke the trainer directly on a login or network-enabled node. The initial resource shape is two workers on two ACC GPUs with 20 CPUs per task, subject to live `bsc_queues` and project-account validation at dispatch time. Bound every trial to one epoch and two training/validation batches.
+
+The smoke must prove all of the following in one run:
+
+- Apptainer can pull and bind every declared native DVC pointer through `stage_data`, including nested `data/processed` and `data/processed/native_support` paths.
+- Each worker uses CUDA BF16 when enabled, honors worker/pinning configuration, and writes an isolated model root.
+- `best_model.pt`, `training_dynamics.jsonl`, `training_dynamics_manifest.json`, `training_manifest.json`, granular output, aggregate output, and campaign identity all exist and pass their recorded hashes.
+- JournalStorage reaches exactly one successful terminal attempt per expected identity; no incomplete, duplicate, stale, or out-of-campaign output enters finalization.
+- The native comparison bundle and workflow manifest are written, the confirmation period remains untouched, and scheduler completion is reported separately from artifact/scientific completion.
+
+Use measured worker wall time and GPU utilization from WP-D to replace the current 1–3 GPU-hour-per-identity planning range. Do not authorize WP-E from the unmeasured estimate alone.
+
+#### WP-E — Prespecified screening and confirmation dispatch
+
+Dispatch the screening campaign only after WP-D passes for the exact same campaign hash, source bundle, container/environment identity, and DVC input identities. Run the declared phases or phase campaigns in their frozen order. Apply the prespecified advancement rule without reading the confirmation-period outcomes or changing folds, seeds, objectives, budgets, or condition identities mid-run.
+
+For each allocation, preserve the immutable run root and record scheduler state separately from trial and artifact state. Final screening and confirmation reports must retain fold-seed results, equal-source common-subset identities, WIS components, raw-count error, coverage, source variability, capacity, optimizer exposure, compute use, checkpoint hashes, and training-dynamics identities. An expanded ten-fold confirmation is a new immutable campaign/run identity, never an in-place mutation of the screening run.
 
 ### 12.3 Explicitly out of this programme
 
