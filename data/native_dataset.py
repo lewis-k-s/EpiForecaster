@@ -187,10 +187,7 @@ class NativeDatasetConfig:
                 f"od_self_flows must be one of {NATIVE_OD_SELF_FLOW_MODES}, "
                 f"got {self.od_self_flows!r}"
             )
-        if (
-            not math.isfinite(float(self.od_min_flow_raw))
-            or self.od_min_flow_raw < 0
-        ):
+        if not math.isfinite(float(self.od_min_flow_raw)) or self.od_min_flow_raw < 0:
             raise ValueError("od_min_flow_raw must be finite and non-negative")
         if self.spatial_encoder not in NATIVE_SPATIAL_ENCODERS:
             raise ValueError(
@@ -199,8 +196,7 @@ class NativeDatasetConfig:
             )
         if self.od_source not in NATIVE_OD_SOURCES:
             raise ValueError(
-                f"od_source must be one of {NATIVE_OD_SOURCES}, "
-                f"got {self.od_source!r}"
+                f"od_source must be one of {NATIVE_OD_SOURCES}, got {self.od_source!r}"
             )
 
     def _min_observed(self, window_length: int, fraction: float, head: str) -> int:
@@ -374,13 +370,17 @@ class NativeSupportDataset(Dataset):
         needed_rels = tuple(
             dict.fromkeys(
                 _POOL_RELATIONS
-                + (_OD_RELATIONS if config.include_od_context else ())
+                + (
+                    _OD_RELATIONS
+                    if config.include_od_context and config.mobility_enabled
+                    else ()
+                )
                 + hetero_relations
             )
         )
         self._edges = self._load_graph_edges(root, needed_rels)
-        needs_od = config.include_od_context or (
-            config.spatial_encoder == "hetero" and config.mobility_enabled
+        needs_od = config.mobility_enabled and (
+            config.include_od_context or config.spatial_encoder == "hetero"
         )
         self._od = self._load_od_store(root, config.od_source) if needs_od else None
         self._adm = self._load_admissions(root / "obs_admissions.zarr")
@@ -394,9 +394,7 @@ class NativeSupportDataset(Dataset):
         self._L = config.input_window_length
         self._H = config.forecast_horizon
         if self._od is not None:
-            self._od_zone_index = {
-                zone: i for i, zone in enumerate(self._od.zone_ids)
-            }
+            self._od_zone_index = {zone: i for i, zone in enumerate(self._od.zone_ids)}
         self._registry = self._build_registry()
         self._relation_pools = self._build_relation_pools()
         self._pools = self._build_pools()
@@ -479,8 +477,8 @@ class NativeSupportDataset(Dataset):
             query.source_type, query.source_id, hist_slice
         )
         if self._config.include_od_context:
-            assert self._od is not None
-            od_column = np.full((self._L, 1), self._od_share(query), dtype=np.float32)
+            od_share = self._od_share(query) if self._config.mobility_enabled else 0.0
+            od_column = np.full((self._L, 1), od_share, dtype=np.float32)
             pooled = np.concatenate([pooled, od_column], axis=1)
 
         node = self._node_index[f"{query.source_type}:{query.source_id}"]
@@ -787,9 +785,9 @@ class NativeSupportDataset(Dataset):
             node = self._node_index.get(f"{SOURCE_MUNICIPALITY}:{region_id}")
             if node is not None:
                 node_to_cases[node] = column
-        relation_pools: dict[
-            str, dict[str, tuple[np.ndarray, np.ndarray, float]]
-        ] = {name: {} for name in _POOL_RELATIONS}
+        relation_pools: dict[str, dict[str, tuple[np.ndarray, np.ndarray, float]]] = {
+            name: {} for name in _POOL_RELATIONS
+        }
         for relation in _POOL_RELATIONS:
             for source_type in (SOURCE_ABS, SOURCE_COMARCA, SOURCE_MUNICIPALITY):
                 for record in self._registry.records_for(source_type):
@@ -853,13 +851,9 @@ class NativeSupportDataset(Dataset):
             block = np.zeros((self._L, 3), dtype=np.float32)
             if columns.size:
                 cases = self._cases.channels[hist_slice][:, columns, :]
-                block = (cases * weights[None, :, None]).sum(
-                    axis=1, dtype=np.float32
-                )
+                block = (cases * weights[None, :, None]).sum(axis=1, dtype=np.float32)
             if source_type == SOURCE_MUNICIPALITY:
-                block += self._reverse_relation_context(
-                    relation, source_id, hist_slice
-                )
+                block += self._reverse_relation_context(relation, source_id, hist_slice)
             relation_ctx[relation] = block.astype(np.float32, copy=False)
         pooled, coverage = self._pooled_context(source_type, source_id, hist_slice)
         return relation_ctx, pooled, coverage
@@ -1136,9 +1130,7 @@ class NativeSupportDataset(Dataset):
         population = float(self._graph_nodes.population[node])
         values = self._deaths_values[hist_slice, column]
         mask = self._deaths_masks[hist_slice, column]
-        value = np.log1p(
-            np.where(mask, values, 0.0) / population * _PER_100K
-        )
+        value = np.log1p(np.where(mask, values, 0.0) / population * _PER_100K)
         block = np.stack(
             [
                 value.astype(np.float32),

@@ -84,9 +84,7 @@ def test_wis_zero_width_intervals_and_masked_rows() -> None:
 
 
 def test_confirmation_period_guard_raises_unless_disabled() -> None:
-    dates = np.datetime64("2020-12-28", "D") + np.arange(
-        14, dtype="timedelta64[D]"
-    )
+    dates = np.datetime64("2020-12-28", "D") + np.arange(14, dtype="timedelta64[D]")
     query = ForecastQuery(
         source_type="municipality",
         source_id="01001",
@@ -136,7 +134,12 @@ def test_native_eval_smoke_writes_v4_granular_and_aggregates(
     rows = pd.read_parquet(granular)
     assert list(rows.columns) == GRANULAR_FIELDNAMES
     assert set(rows["source_type"]) == {"municipality", "abs", "comarca"}
-    assert rows.loc[rows["source_type"] != "municipality", "region_id"].fillna("").eq("").all()
+    assert (
+        rows.loc[rows["source_type"] != "municipality", "region_id"]
+        .fillna("")
+        .eq("")
+        .all()
+    )
     municipal = rows[rows["source_type"] == "municipality"]
     assert municipal["region_id"].astype(str).equals(municipal["source_id"].astype(str))
     assert (rows["population"] > 0).all()
@@ -171,3 +174,26 @@ def test_native_eval_smoke_writes_v4_granular_and_aggregates(
         "hospitalizations",
         "deaths",
     }
+
+
+def test_native_trainer_writes_stage4_metadata_after_best_state(tmp_path: Path) -> None:
+    _write_native_root(tmp_path)
+    config = _trainer_config(tmp_path)
+    config.training.max_batches = 1
+    config.output.write_granular_eval = True
+    config.output.granular_eval_format = "csv"
+    config.output.granular_eval_filename = "{split}_granular.csv"
+    config.native.fold_index = None
+
+    result = NativeTrainer(config).run()
+
+    granular = Path(result["evaluation_artifacts"]["granular"])
+    metadata = json.loads(
+        granular.with_suffix(".csv.meta.json").read_text(encoding="utf-8")
+    )
+    assert granular.exists()
+    assert metadata["schema_version"] == "4"
+    assert metadata["experiment_name"] == "native_trainer_test"
+    assert metadata["objective"] == "nll"
+    assert metadata["fold"] is None
+    assert metadata["generalization_claim"].startswith("held-out source")

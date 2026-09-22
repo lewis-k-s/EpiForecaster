@@ -21,6 +21,7 @@ import zarr
 
 from data.native_batch import ROUTED_HEADS
 from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
+from data.query_contract import ForecastQuery
 from models.configs import (
     DataConfig,
     EpiForecasterConfig,
@@ -33,6 +34,7 @@ from models.configs import (
 from training.native_trainer import (
     HeadBalancedSampler,
     NativeTrainer,
+    source_fold_temporal_split,
     temporal_tail_split,
 )
 
@@ -73,7 +75,7 @@ def _cases_value(muni: str) -> np.ndarray:
 
 def _write_native_root(root: Path) -> None:
     """Write native_graph/obs_admissions/obs_deaths + a real_with_id-shaped
-    cases zarr (no OD context: ``include_od_context`` is off in TRN-1)."""
+    cases zarr and the small OD fixture used by the native trainer."""
     dates = GRID_START + np.arange(T, dtype="timedelta64[D]")
 
     rows: list[tuple[str, str, str, float]] = []
@@ -103,9 +105,9 @@ def _write_native_root(root: Path) -> None:
     node_index = {(t, i): k for k, (t, i, _, _) in enumerate(rows)}
 
     def edge(rel: str, pairs: list[tuple[str, str, str, str, float]]) -> None:
-        group = zarr.open_group(str(root / "native_graph.zarr"), mode="a").require_group(
-            f"edges/{rel}"
-        )
+        group = zarr.open_group(
+            str(root / "native_graph.zarr"), mode="a"
+        ).require_group(f"edges/{rel}")
         group.create_array(
             "src_idx",
             data=np.array(
@@ -118,7 +120,9 @@ def _write_native_root(root: Path) -> None:
                 [node_index[(dt, di)] for _, _, dt, di, _ in pairs], dtype="int32"
             ),
         )
-        group.create_array("weight", data=np.array([w for *_, w in pairs], dtype="float32"))
+        group.create_array(
+            "weight", data=np.array([w for *_, w in pairs], dtype="float32")
+        )
 
     edge(
         "muni_abs",
@@ -186,7 +190,10 @@ def _write_native_root(root: Path) -> None:
                 ("date", "comarca_id"),
                 np.ones((T, len(COMARCAS)), dtype=bool),
             ),
-            "age": (("date", "comarca_id"), np.ones((T, len(COMARCAS)), dtype=np.uint8)),
+            "age": (
+                ("date", "comarca_id"),
+                np.ones((T, len(COMARCAS)), dtype=np.uint8),
+            ),
             "population": (
                 ("comarca_id",),
                 np.array([COMARCA_POP[c] for c in COMARCAS], dtype=np.float32),
@@ -216,7 +223,8 @@ def _write_native_root(root: Path) -> None:
             ),
             "temporal_covariates": (
                 ("date", "covariate"),
-                (np.arange(T, dtype=np.float32)[:, None] * np.arange(4)[None, :]) / 10.0,
+                (np.arange(T, dtype=np.float32)[:, None] * np.arange(4)[None, :])
+                / 10.0,
             ),
         },
         coords={
@@ -230,9 +238,12 @@ def _write_native_root(root: Path) -> None:
 
 
 def _trainer_config(root: Path, **native_kwargs: bool) -> EpiForecasterConfig:
+    native_options = {"mobility_enabled": False, **native_kwargs}
     return EpiForecasterConfig(
         model=ModelConfig(
-            type=ModelVariant(cases=False, regions=False, biomarkers=False, mobility=False),
+            type=ModelVariant(
+                cases=False, regions=False, biomarkers=False, mobility=False
+            ),
             mobility_embedding_dim=16,
             region_embedding_dim=8,
             input_window_length=L,
@@ -257,7 +268,7 @@ def _trainer_config(root: Path, **native_kwargs: bool) -> EpiForecasterConfig:
         output=OutputConfig(
             experiment_name="native_trainer_test", log_dir=str(root / "outputs")
         ),
-        native=NativeSupportConfig(enabled=True, root=str(root), **native_kwargs),
+        native=NativeSupportConfig(enabled=True, root=str(root), **native_options),
     )
 
 
@@ -323,6 +334,8 @@ def test_native_support_config_defaults() -> None:
     assert config.mobility_enabled is True
     assert config.hetero_hidden_dim == 16
     assert config.hetero_parameter_budget == 100_000
+    assert config.fold_manifest.endswith("native_source_folds.json")
+    assert config.fold_index is None
     assert config.head_balanced_sampling is True
     assert config.confirmation_guard is True
     with pytest.raises(ValueError):
@@ -333,6 +346,8 @@ def test_native_support_config_defaults() -> None:
         NativeSupportConfig(hetero_hidden_dim=0)
     with pytest.raises(ValueError):
         NativeSupportConfig(hetero_parameter_budget=0)
+    with pytest.raises(ValueError):
+        NativeSupportConfig(fold_index=-1)
 
 
 def test_config_roundtrip_and_smoke_yaml() -> None:
@@ -447,6 +462,37 @@ def test_temporal_tail_split_rejects_bad_fraction() -> None:
         temporal_tail_split([1, 2, 3], val_fraction=1.0)
     with pytest.raises(ValueError):
         temporal_tail_split([], val_fraction=0.1)
+
+
+def test_source_fold_temporal_split_excludes_unassigned_and_pairs_tail() -> None:
+    def query(source_type: str, source_id: str, origin: int) -> ForecastQuery:
+        return ForecastQuery(
+            source_type=source_type,  # type: ignore[arg-type]
+            source_id=source_id,
+            forecast_origin=origin,
+            horizon_days=2,
+            requested_heads=frozenset({"cases"}),
+        )
+
+    queries = [
+        query(source_type, source_id, origin)
+        for origin in (10, 20)
+        for source_type, source_id in (
+            ("municipality", "train"),
+            ("abs", "held"),
+            ("comarca", "excluded"),
+        )
+    ]
+    train, val = source_fold_temporal_split(
+        queries,
+        val_fraction=0.5,
+        assigned_sources={("municipality", "train"), ("abs", "held")},
+        held_out_sources={("abs", "held")},
+    )
+
+    assert train == [0]
+    assert val == [4]
+    assert all(queries[position].source_id != "excluded" for position in train + val)
 
 
 # Sanity: the fixture writer is exercised through the trainer tests above;

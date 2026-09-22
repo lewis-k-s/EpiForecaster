@@ -107,7 +107,9 @@ def test_zero_init_hetero_is_full_model_equivalent_to_pooled(tmp_path: Path) -> 
         assert torch.equal(hetero_outputs[key], pooled_outputs[key])
 
 
-def test_every_relation_path_has_gradient_and_history_is_residual(tmp_path: Path) -> None:
+def test_every_relation_path_has_gradient_and_history_is_residual(
+    tmp_path: Path,
+) -> None:
     _items, batch = _mixed_batch(tmp_path)
     model = _model(batch, "hetero")
     _open_gates(model)
@@ -184,9 +186,12 @@ def test_mobility_disabled_needs_no_od_artifact_and_trains(tmp_path: Path) -> No
             forecast_horizon=H,
             spatial_encoder="hetero",
             mobility_enabled=False,
+            include_od_context=True,
         ),
     )
     batch = collate_native_batch([dataset[0]])
+    assert batch.ctx_feat.shape[2] == 4
+    assert batch.ctx_feat[:, :, -1].eq(0).all()
     model = NativeEpiForecaster(
         NativeForecasterConfig(
             f_native=int(batch.hist.shape[2]),
@@ -203,9 +208,9 @@ def test_mobility_disabled_needs_no_od_artifact_and_trains(tmp_path: Path) -> No
     )
     assert model.spatial_encoder is not None
     assert model.spatial_encoder.mobility_encoder is None
-    total = NativeJointInferenceLoss(
-        horizon_days=H, observation_loss="nll"
-    )(model(batch), batch)["total"]
+    total = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")(
+        model(batch), batch
+    )["total"]
     assert torch.isfinite(total)
     total.backward()
 

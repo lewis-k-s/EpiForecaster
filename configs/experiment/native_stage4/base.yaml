@@ -1,0 +1,92 @@
+# Production-only Stage-4 native clinical comparison base.
+# Do not run this config locally. Expand matrix.yaml into immutable MN5 runs.
+
+native:
+  enabled: true
+  root: data/processed/native_support
+  spatial_encoder: pooled
+  od_source: mitma
+  overlap_weighting: geostat_grid
+  od_self_flows: retain
+  od_min_flow_raw: 10.0
+  head_balanced_sampling: true
+  confirmation_guard: true
+  mobility_enabled: true
+  hetero_hidden_dim: 16
+  hetero_parameter_budget: 100000
+  fold_manifest: data/processed/native_support/native_source_folds.json
+  fold_index: 0
+
+data:
+  dataset_path: data/processed/real_with_id.zarr
+  min_history_observed_fraction: 0.5
+  min_horizon_observed_fraction: 0.5
+  window_stride: 1
+
+model:
+  type:
+    cases: false
+    regions: false
+    biomarkers: false
+    mobility: false
+  params:
+    mobility_embedding_dim: 16
+    region_embedding_dim: 8
+    max_neighbors: 20
+    input_window_length: 28
+    forecast_horizon: 14
+    head_d_model: 48
+    head_n_heads: 2
+    head_num_layers: 1
+    head_dropout: 0.1
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
+
+output:
+  experiment_name: native_stage4
+  log_dir: outputs/training/native_stage4
+  save_checkpoints: true
+  save_best_only: true
+  write_granular_eval: true
+  granular_eval_format: csv
+  granular_eval_filename: "{split}_granular.csv"
+  wandb_group: native_stage4
+
+training:
+  seed: 52
+  split_seed: 42
+  device: cuda
+  batch_size: 128
+  epochs: 100
+  max_batches: null
+  learning_rate: 0.0005
+  optimizer: adamw
+  weight_decay: 1.0e-05
+  scheduler_type: cosine
+  warmup_steps: 100
+  min_learning_rate: 0.0
+  gradient_clip_value: 5.0
+  early_stopping_patience: null
+  val_split: 0.1
+  num_workers: 8
+  val_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  plot_forecasts: false
+  enable_mixed_precision: true
+  loss:
+    name: joint_inference
+    joint:
+      observation_loss: nll
+      adaptive_scheme: none
+      latent:
+        total_weight: 0.0

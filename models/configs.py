@@ -1466,6 +1466,8 @@ class NativeSupportConfig:
     mobility_enabled: bool = True
     hetero_hidden_dim: int = 16
     hetero_parameter_budget: int = 100_000
+    fold_manifest: str = "data/processed/native_support/native_source_folds.json"
+    fold_index: int | None = None
 
     def __post_init__(self) -> None:
         for name, allowed in (
@@ -1479,15 +1481,14 @@ class NativeSupportConfig:
                 raise ValueError(
                     f"native.{name} must be one of {allowed}, got {value!r}"
                 )
-        if (
-            not math.isfinite(float(self.od_min_flow_raw))
-            or self.od_min_flow_raw < 0
-        ):
+        if not math.isfinite(float(self.od_min_flow_raw)) or self.od_min_flow_raw < 0:
             raise ValueError("native.od_min_flow_raw must be finite and non-negative")
         if self.hetero_hidden_dim <= 0:
             raise ValueError("native.hetero_hidden_dim must be positive")
         if self.hetero_parameter_budget <= 0:
             raise ValueError("native.hetero_parameter_budget must be positive")
+        if self.fold_index is not None and self.fold_index < 0:
+            raise ValueError("native.fold_index must be non-negative when set")
 
 
 @dataclass
@@ -1577,7 +1578,9 @@ class EpiForecasterConfig:
                 **_filter_init_fields(OutputConfig, merged_dict["output"])
             ),
             native=NativeSupportConfig(
-                **_filter_init_fields(NativeSupportConfig, merged_dict.get("native", {}))
+                **_filter_init_fields(
+                    NativeSupportConfig, merged_dict.get("native", {})
+                )
             ),
         )
 

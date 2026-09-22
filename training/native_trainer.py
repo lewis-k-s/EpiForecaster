@@ -18,7 +18,9 @@ config seed (one item from each routed head in turn, ``cases``/``hosp``/
 ``deaths`` rotation); with the flag off, a plain seeded shuffle. Validation
 uses the temporal tail split: the last ``training.val_split`` fraction of
 distinct forecast origins (at least one), so validation never precedes
-training in time (plan section 7).
+training in time (plan section 7). Stage-4 configs also select one audited
+source fold: training uses assigned sources outside the fold and validation
+uses held-out sources inside the fold on the temporal tail.
 
 Bounds. ``training.max_batches`` caps both the per-epoch training pass and
 the validation pass, keeping the smoke run CPU-runnable in minutes.
@@ -32,13 +34,16 @@ import random
 import time
 from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler, Subset
 
 from data.native_batch import ROUTED_HEADS, collate_native_batch
+from data.native_crossval import NativeFold, load_native_fold_manifest
 from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
+from data.query_contract import ForecastQuery
 from evaluation.eval_loop import evaluate_native_loader
 from evaluation.losses import get_native_loss_from_config
 from models.configs import EpiForecasterConfig
@@ -48,7 +53,12 @@ from utils.device import resolve_device
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["HeadBalancedSampler", "NativeTrainer", "temporal_tail_split"]
+__all__ = [
+    "HeadBalancedSampler",
+    "NativeTrainer",
+    "source_fold_temporal_split",
+    "temporal_tail_split",
+]
 
 #: Legacy projected municipal inputs that native mode must never load
 #: (plan section 10.2: superseded for native configs).
@@ -127,6 +137,49 @@ def temporal_tail_split(
     return train, val
 
 
+def _fold_source_keys(fold: NativeFold) -> set[tuple[str, str]]:
+    """Return typed source identities for one audited native fold."""
+    return {
+        *(("municipality", source_id) for source_id in fold.municipalities),
+        *(("abs", source_id) for source_id in fold.abs),
+        *(("comarca", source_id) for source_id in fold.comarcas),
+    }
+
+
+def source_fold_temporal_split(
+    queries: Sequence[ForecastQuery],
+    *,
+    val_fraction: float,
+    assigned_sources: set[tuple[str, str]],
+    held_out_sources: set[tuple[str, str]],
+) -> tuple[list[int], list[int]]:
+    """Combine an audited source holdout with a forward temporal tail.
+
+    Unassigned sources are excluded. Training uses assigned, non-held-out
+    sources before the tail. Validation uses held-out sources in the tail.
+    Local pre-origin history remains visible, matching the frozen v1
+    generalization claim.
+    """
+    origins = [query.forecast_origin for query in queries]
+    temporal_train, temporal_val = temporal_tail_split(origins, val_fraction)
+
+    def key(position: int) -> tuple[str, str]:
+        query = queries[position]
+        return str(query.source_type), str(query.source_id)
+
+    train = [
+        position
+        for position in temporal_train
+        if key(position) in assigned_sources and key(position) not in held_out_sources
+    ]
+    val = [position for position in temporal_val if key(position) in held_out_sources]
+    if not train:
+        raise ValueError("native source-fold split produced no training queries")
+    if not val:
+        raise ValueError("native source-fold split produced no validation queries")
+    return train, val
+
+
 class NativeTrainer:
     """Bounded smoke trainer over the native-support path."""
 
@@ -160,12 +213,34 @@ class NativeTrainer:
                 od_min_flow_raw=config.native.od_min_flow_raw,
                 od_self_flows=config.native.od_self_flows,
                 mobility_enabled=config.native.mobility_enabled,
+                include_od_context=True,
             ),
         )
-        origins = [query.forecast_origin for query in self.dataset.queries]
-        train_positions, val_positions = temporal_tail_split(
-            origins, config.training.val_split
-        )
+        queries = self.dataset.queries
+        if config.native.fold_index is None:
+            origins = [query.forecast_origin for query in queries]
+            train_positions, val_positions = temporal_tail_split(
+                origins, config.training.val_split
+            )
+        else:
+            manifest = load_native_fold_manifest(Path(config.native.fold_manifest))
+            if config.native.fold_index >= manifest.num_folds:
+                raise ValueError(
+                    "native.fold_index outside manifest range: "
+                    f"{config.native.fold_index} >= {manifest.num_folds}"
+                )
+            assigned_sources = set().union(
+                *(_fold_source_keys(fold) for fold in manifest.folds)
+            )
+            held_out_sources = _fold_source_keys(
+                manifest.folds[config.native.fold_index]
+            )
+            train_positions, val_positions = source_fold_temporal_split(
+                queries,
+                val_fraction=config.training.val_split,
+                assigned_sources=assigned_sources,
+                held_out_sources=held_out_sources,
+            )
         logger.info(
             "Native index: %d items (%s), train %d / val %d",
             len(self.dataset),
@@ -329,9 +404,33 @@ class NativeTrainer:
                 {key: value.to(self.device) for key, value in self.best_state.items()}
             )
         parameters = sum(p.numel() for p in self.model.parameters())
-        trainable = sum(
-            p.numel() for p in self.model.parameters() if p.requires_grad
-        )
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        artifact_paths: dict[str, str] = {}
+        if self.config.output.write_granular_eval and self.val_loader is not None:
+            output_dir = (
+                Path(self.config.output.log_dir) / self.config.output.experiment_name
+            )
+            granular_path = (
+                output_dir
+                / self.config.output.resolve_granular_eval_filename(split="val")
+            )
+            self._evaluate(
+                granular_output_path=granular_path,
+                aggregate_output_dir=output_dir,
+                granular_metadata={
+                    "optimizer_steps": sum(len(epoch) for epoch in train_trace),
+                    "model_parameters": parameters,
+                    "trainable_parameters": trainable,
+                    "wall_time_s_before_final_eval": time.perf_counter() - started,
+                },
+            )
+            artifact_paths = {
+                "granular": str(granular_path),
+                "granular_metadata": str(
+                    granular_path.with_suffix(f"{granular_path.suffix}.meta.json")
+                ),
+                "aggregate_dir": str(output_dir),
+            }
         return {
             "best_val_loss": self.best_val_loss,
             "total_epochs": self.config.training.epochs,
@@ -343,6 +442,7 @@ class NativeTrainer:
                 "parameters": parameters,
                 "trainable_parameters": trainable,
             },
+            "evaluation_artifacts": artifact_paths,
         }
 
     def _train_epoch(self, epoch: int) -> list[float]:
@@ -381,7 +481,13 @@ class NativeTrainer:
         return losses
 
     @torch.no_grad()
-    def _evaluate(self) -> float | None:
+    def _evaluate(
+        self,
+        *,
+        granular_output_path: Path | None = None,
+        aggregate_output_dir: Path | None = None,
+        granular_metadata: dict[str, object] | None = None,
+    ) -> float | None:
         """Routing-aware EVL-1 metrics over the capped validation tail."""
         assert self.val_loader is not None
         loss, metrics, _aggregate = evaluate_native_loader(
@@ -392,6 +498,31 @@ class NativeTrainer:
             split_name="Val",
             max_batches=self.config.training.max_batches,
             confirmation_guard=self.config.native.confirmation_guard,
+            granular_output_path=granular_output_path,
+            granular_eval_format=self.config.output.granular_eval_format,
+            aggregate_output_dir=aggregate_output_dir,
+            granular_metadata={
+                "experiment_name": self.config.output.experiment_name,
+                "spatial_encoder": self.config.native.spatial_encoder,
+                "mobility_enabled": self.config.native.mobility_enabled,
+                "od_source": self.config.native.od_source,
+                "objective": self.config.training.loss.joint.observation_loss,
+                "fold": self.config.native.fold_index,
+                "seed": self.config.training.seed,
+                "split_seed": self.config.training.split_seed,
+                "epochs": self.config.training.epochs,
+                "batch_size": self.config.training.batch_size,
+                "max_batches": self.config.training.max_batches,
+                "optimizer": self.config.training.optimizer,
+                "learning_rate": self.config.training.learning_rate,
+                "steps_per_epoch": self.steps_per_epoch,
+                "fold_manifest": self.config.native.fold_manifest,
+                "generalization_claim": (
+                    "held-out source, visible context history "
+                    "(temporal-forecasting mode)"
+                ),
+                **(granular_metadata or {}),
+            },
         )
         self.last_val_metrics = metrics
         return loss

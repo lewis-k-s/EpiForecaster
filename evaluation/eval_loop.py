@@ -489,7 +489,10 @@ def _native_daily_eval_view(
     queries = [batch.queries[int(position)] for position in row_positions]
     target_indices = torch.tensor(
         [
-            [int(query.forecast_origin) + horizon + 1 for horizon in range(target_width)]
+            [
+                int(query.forecast_origin) + horizon + 1
+                for horizon in range(target_width)
+            ]
             for query in queries
         ],
         device=device,
@@ -529,7 +532,9 @@ def _native_hosp_eval_view(
         return None
     slots = _count_once_slots(batch, rows)
     row_positions_tensor = rows.index_select(0, slots)
-    queries = [batch.queries[int(position)] for position in row_positions_tensor.tolist()]
+    queries = [
+        batch.queries[int(position)] for position in row_positions_tensor.tolist()
+    ]
     raw_target = raw_target.index_select(0, slots).to(device=device).float()
     target_mask = target_mask.index_select(0, slots).to(device)
     population = population.index_select(0, slots).to(device=device).float()
@@ -566,7 +571,10 @@ def _native_hosp_eval_view(
         origin = int(query.forecast_origin)
         first_monday = (-(int(origin_dow) + 1)) % 7
         target_indices.append(
-            [origin + 1 + first_monday + 7 * week + 6 for week in range(criterion.weekly_slots)]
+            [
+                origin + 1 + first_monday + 7 * week + 6
+                for week in range(criterion.weekly_slots)
+            ]
         )
     return {
         "queries": queries,
@@ -577,9 +585,7 @@ def _native_hosp_eval_view(
         "raw_prediction": raw_prediction,
         "population": population,
         "weights": weights,
-        "target_indices": torch.tensor(
-            target_indices, device=device, dtype=torch.long
-        ),
+        "target_indices": torch.tensor(target_indices, device=device, dtype=torch.long),
     }
 
 
@@ -596,6 +602,7 @@ def evaluate_native_loader(
     granular_eval_format: str | None = None,
     aggregate_output_dir: Path | None = None,
     confirmation_guard: bool = True,
+    granular_metadata: dict[str, Any] | None = None,
 ) -> tuple[float, dict[str, Any], Any]:
     """Evaluate routed native heads and write canonical EVL-1 artifacts."""
     dataset = _native_dataset_from_loader(loader)
@@ -785,17 +792,20 @@ def evaluate_native_loader(
             aggregate=aggregate,
         )
     if granular_output_path is not None:
+        metadata = {
+            "split": split_name.strip().lower(),
+            "native_support": True,
+            "confirmation_guard": confirmation_guard,
+            "observed_only": True,
+            "metric_space": "log1p_per_100k",
+            "raw_count_metrics": ["raw_count_mae"],
+            "interval_levels": list(criterion.interval_levels),
+        }
+        if granular_metadata is not None:
+            metadata.update(granular_metadata)
         write_granular_metadata_sidecar(
             granular_output_path,
-            {
-                "split": split_name.strip().lower(),
-                "native_support": True,
-                "confirmation_guard": confirmation_guard,
-                "observed_only": True,
-                "metric_space": "log1p_per_100k",
-                "raw_count_metrics": ["raw_count_mae"],
-                "interval_levels": list(criterion.interval_levels),
-            },
+            metadata,
         )
     return loss_sum / processed_batches, metrics, aggregate
 
