@@ -1463,6 +1463,9 @@ class NativeSupportConfig:
     od_min_flow_raw: float = 10.0
     head_balanced_sampling: bool = True
     confirmation_guard: bool = True
+    mobility_enabled: bool = True
+    hetero_hidden_dim: int = 16
+    hetero_parameter_budget: int = 100_000
 
     def __post_init__(self) -> None:
         for name, allowed in (
@@ -1481,6 +1484,10 @@ class NativeSupportConfig:
             or self.od_min_flow_raw < 0
         ):
             raise ValueError("native.od_min_flow_raw must be finite and non-negative")
+        if self.hetero_hidden_dim <= 0:
+            raise ValueError("native.hetero_hidden_dim must be positive")
+        if self.hetero_parameter_budget <= 0:
+            raise ValueError("native.hetero_parameter_budget must be positive")
 
 
 @dataclass

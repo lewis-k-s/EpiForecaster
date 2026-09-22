@@ -320,12 +320,19 @@ def test_native_support_config_defaults() -> None:
     assert config.overlap_weighting == "geostat_grid"
     assert config.od_self_flows == "retain"
     assert config.od_min_flow_raw == 10.0
+    assert config.mobility_enabled is True
+    assert config.hetero_hidden_dim == 16
+    assert config.hetero_parameter_budget == 100_000
     assert config.head_balanced_sampling is True
     assert config.confirmation_guard is True
     with pytest.raises(ValueError):
         NativeSupportConfig(spatial_encoder="dense")
     with pytest.raises(ValueError):
         NativeSupportConfig(od_min_flow_raw=-1.0)
+    with pytest.raises(ValueError):
+        NativeSupportConfig(hetero_hidden_dim=0)
+    with pytest.raises(ValueError):
+        NativeSupportConfig(hetero_parameter_budget=0)
 
 
 def test_config_roundtrip_and_smoke_yaml() -> None:

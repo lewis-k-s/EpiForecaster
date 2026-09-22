@@ -31,7 +31,7 @@ import math
 import random
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -70,7 +70,7 @@ class HeadBalancedSampler(Sampler[int]):
 
     def __init__(
         self,
-        head_items: dict[str, Sequence[int]],
+        head_items: Mapping[str, Sequence[int]],
         *,
         seed: int,
         balanced: bool = True,
@@ -155,6 +155,11 @@ class NativeTrainer:
                     config.data.min_horizon_observed_fraction
                 ),
                 confirmation_guard=config.native.confirmation_guard,
+                spatial_encoder=config.native.spatial_encoder,
+                od_source=config.native.od_source,
+                od_min_flow_raw=config.native.od_min_flow_raw,
+                od_self_flows=config.native.od_self_flows,
+                mobility_enabled=config.native.mobility_enabled,
             ),
         )
         origins = [query.forecast_origin for query in self.dataset.queries]
@@ -209,6 +214,10 @@ class NativeTrainer:
             observation_heads=config.model.observation_heads,
             init_weights=config.model.init_weights,
             strict=config.model.strict,
+            spatial_encoder=config.native.spatial_encoder,
+            mobility_enabled=config.native.mobility_enabled,
+            hetero_hidden_dim=config.native.hetero_hidden_dim,
+            hetero_parameter_budget=config.native.hetero_parameter_budget,
         )
         self.model = NativeEpiForecaster(forecaster_config).to(self.device)
         self.criterion = get_native_loss_from_config(
@@ -283,7 +292,7 @@ class NativeTrainer:
     def _head_items(self, positions: list[int]) -> dict[str, list[int]]:
         items: dict[str, list[int]] = {head: [] for head in ROUTED_HEADS}
         for position in positions:
-            items[self.dataset[position]["head"]].append(position)
+            items[self.dataset.head_at(position)].append(position)
         return items
 
     # ------------------------------------------------------------------

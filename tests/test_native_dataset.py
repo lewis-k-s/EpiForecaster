@@ -157,6 +157,10 @@ def _write_native_root(
             ("municipality", "01002", "abs", "101", 0.3),
             ("municipality", "01003", "abs", "101", 0.2),
             ("municipality", "01004", "abs", "102", 0.6),
+            ("abs", "101", "municipality", "01001", 0.5),
+            ("abs", "101", "municipality", "01002", 0.5),
+            ("abs", "101", "municipality", "01003", 0.5),
+            ("abs", "102", "municipality", "01004", 0.5),
         ],
     )
     edge(
@@ -165,9 +169,23 @@ def _write_native_root(
             ("municipality", "01001", "comarca", "01", 0.7),
             ("municipality", "01002", "comarca", "01", 0.3),
             ("municipality", "01003", "comarca", "02", 0.6),
+            ("comarca", "01", "municipality", "01001", 1.0),
+            ("comarca", "01", "municipality", "01002", 1.0),
+            ("comarca", "02", "municipality", "01003", 1.0),
         ],
     )
     if with_od:
+        edge(
+            "mitma_muni",
+            [
+                ("municipality", "01001", "mitma", "z1", 1.0),
+                ("mitma", "z1", "municipality", "01001", 1.0),
+                ("municipality", "01002", "mitma", "z2", 1.0),
+                ("mitma", "z2", "municipality", "01002", 1.0),
+                ("municipality", "01003", "mitma", "z3", 1.0),
+                ("mitma", "z3", "municipality", "01003", 1.0),
+            ],
+        )
         edge(
             "mitma_abs",
             [("mitma", "z1", "abs", "101", 1.0), ("mitma", "z2", "abs", "101", 1.0)],

@@ -78,7 +78,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, NotRequired, TypedDict, cast
 
 import numpy as np
 import torch
@@ -97,7 +97,12 @@ from data.native_registry import (
     SourceRegistry,
 )
 from data.query_contract import ForecastQuery, validate_query
-from models.configs import DataConfig, NATIVE_OD_SELF_FLOW_MODES
+from models.configs import (
+    DataConfig,
+    NATIVE_OD_SELF_FLOW_MODES,
+    NATIVE_OD_SOURCES,
+    NATIVE_SPATIAL_ENCODERS,
+)
 
 #: Stable enum index per source type (BAT-1 collation consumes this).
 SOURCE_TYPE_IDS: dict[str, int] = {
@@ -122,6 +127,7 @@ _DAYS_PER_WEEK = 7
 _PER_100K = 100_000.0
 _POOL_RELATIONS = ("muni_abs", "muni_comarca")
 _OD_RELATIONS = ("mitma_abs", "mitma_comarca")
+_HETERO_MITMA_RELATIONS = ("mitma_muni", "mitma_abs", "mitma_comarca")
 
 #: Reserved model-confirmation window (plan section 10.3(10), ruling R9).
 #: [D1] used 2020-12-31..2021-01-27 for calibration only, so native
@@ -160,6 +166,9 @@ class NativeDatasetConfig:
     # Ruling R9: reject origins whose target window intersects
     # ``CONFIRMATION_WINDOW`` unless explicitly disabled for calibration work.
     confirmation_guard: bool = True
+    spatial_encoder: str = "pooled"
+    od_source: str = "mitma"
+    mobility_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.input_window_length <= 0 or self.forecast_horizon <= 0:
@@ -183,6 +192,16 @@ class NativeDatasetConfig:
             or self.od_min_flow_raw < 0
         ):
             raise ValueError("od_min_flow_raw must be finite and non-negative")
+        if self.spatial_encoder not in NATIVE_SPATIAL_ENCODERS:
+            raise ValueError(
+                f"spatial_encoder must be one of {NATIVE_SPATIAL_ENCODERS}, "
+                f"got {self.spatial_encoder!r}"
+            )
+        if self.od_source not in NATIVE_OD_SOURCES:
+            raise ValueError(
+                f"od_source must be one of {NATIVE_OD_SOURCES}, "
+                f"got {self.od_source!r}"
+            )
 
     def _min_observed(self, window_length: int, fraction: float, head: str) -> int:
         """``DataConfig._resolve_min_observed_map`` at the head's cadence."""
@@ -219,6 +238,10 @@ class NativeDatasetItem(TypedDict):
     target_mask: torch.Tensor  # same shape as target
     target_population_graph: float
     target_stratum_pop_sum: torch.Tensor | None  # [W] float32, hosp only
+    relation_ctx: NotRequired[dict[str, torch.Tensor]]  # relation -> [L, 3]
+    od_node_features: NotRequired[torch.Tensor]  # [N, 3]
+    od_adjacency: NotRequired[torch.Tensor]  # [N, N]
+    od_target_weights: NotRequired[torch.Tensor]  # [N]
 
 
 class _GraphNodes(NamedTuple):
@@ -286,16 +309,26 @@ class _AdmSeries(_ObsSeries):
         self.stratum = stratum
 
 
-class _OdStore(NamedTuple):
-    """``od_mitma.zarr``: daily raw OD trips over the MITMA zone set."""
+class _OdStore:
+    """Lazy daily OD access with source-specific at-rest decoding."""
 
-    dates: np.ndarray  # [date] datetime64[D]
-    zone_ids: list[str]
-    mobility: np.ndarray  # [date, origin, target] float32
+    def __init__(self, dataset: xr.Dataset, *, log1p_stored: bool) -> None:
+        self._dataset = dataset
+        self.dates = np.asarray(dataset["date"].values).astype("datetime64[D]")
+        self.zone_ids = [str(zone) for zone in dataset["zone_id"].values]
+        self.log1p_stored = log1p_stored
+        self._rows = {date: row for row, date in enumerate(self.dates)}
 
     def row_of(self, date: np.datetime64) -> int | None:
-        rows = np.flatnonzero(self.dates == date.astype("datetime64[D]"))
-        return int(rows[0]) if rows.size else None
+        return self._rows.get(date.astype("datetime64[D]"))
+
+    def flows_at(self, row: int) -> np.ndarray:
+        flows = np.asarray(
+            self._dataset["mobility"].isel(date=row).values, dtype=np.float32
+        )
+        if self.log1p_stored:
+            flows = np.expm1(flows)
+        return flows
 
 
 def _align_daily(
@@ -331,11 +364,25 @@ class NativeSupportDataset(Dataset):
         self._config = config
         root = Path(native_root)
         self._graph_nodes, self._node_index = self._load_graph_nodes(root)
-        needed_rels = _POOL_RELATIONS + (
-            _OD_RELATIONS if config.include_od_context else ()
+        hetero_relations = (
+            _HETERO_MITMA_RELATIONS
+            if config.spatial_encoder == "hetero"
+            and config.mobility_enabled
+            and config.od_source == "mitma"
+            else ()
+        )
+        needed_rels = tuple(
+            dict.fromkeys(
+                _POOL_RELATIONS
+                + (_OD_RELATIONS if config.include_od_context else ())
+                + hetero_relations
+            )
         )
         self._edges = self._load_graph_edges(root, needed_rels)
-        self._od = self._load_od_store(root) if config.include_od_context else None
+        needs_od = config.include_od_context or (
+            config.spatial_encoder == "hetero" and config.mobility_enabled
+        )
+        self._od = self._load_od_store(root, config.od_source) if needs_od else None
         self._adm = self._load_admissions(root / "obs_admissions.zarr")
         self._deaths = self._load_store(root / "obs_deaths.zarr", "comarca_id")
         self._cases = self._load_cases(real_with_id_path)
@@ -348,10 +395,13 @@ class NativeSupportDataset(Dataset):
         self._H = config.forecast_horizon
         if self._od is not None:
             self._od_zone_index = {
-                zone: i for i, zone in enumerate(self._graph_nodes.od_zone_ref)
+                zone: i for i, zone in enumerate(self._od.zone_ids)
             }
         self._registry = self._build_registry()
+        self._relation_pools = self._build_relation_pools()
         self._pools = self._build_pools()
+        self._od_feature_weights = self._build_od_feature_weights()
+        self._od_graph_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._items = self._build_index()
 
     # ------------------------------------------------------------------
@@ -402,6 +452,10 @@ class NativeSupportDataset(Dataset):
     def __len__(self) -> int:
         return len(self._items)
 
+    def head_at(self, index: int) -> str:
+        """Routed head for an index without materializing its graph tensors."""
+        return self._items[index][1]
+
     def __getitem__(self, idx: int) -> NativeDatasetItem:
         query, head = self._items[idx]
         origin = query.forecast_origin
@@ -421,16 +475,17 @@ class NativeSupportDataset(Dataset):
             target, target_mask = self._comarca_target(query.source_id, target_slice)
         hist = np.concatenate([hist, covariates], axis=1)
 
-        pooled, coverage = self._pooled_context(
+        relation_ctx, pooled, coverage = self._relation_context(
             query.source_type, query.source_id, hist_slice
         )
-        if self._od is not None:
+        if self._config.include_od_context:
+            assert self._od is not None
             od_column = np.full((self._L, 1), self._od_share(query), dtype=np.float32)
             pooled = np.concatenate([pooled, od_column], axis=1)
 
         node = self._node_index[f"{query.source_type}:{query.source_id}"]
         population = float(self._graph_nodes.population[node])
-        return {
+        item: NativeDatasetItem = {
             "query": query,
             "head": head,
             "hist": torch.from_numpy(hist),
@@ -447,7 +502,18 @@ class NativeSupportDataset(Dataset):
             "target_stratum_pop_sum": (
                 None if stratum is None else torch.from_numpy(stratum)
             ),
+            "relation_ctx": {
+                name: torch.from_numpy(value) for name, value in relation_ctx.items()
+            },
         }
+        if self._config.spatial_encoder == "hetero" and self._config.mobility_enabled:
+            od_features, od_adjacency = self._od_graph_context(query.forecast_origin)
+            item["od_node_features"] = torch.from_numpy(od_features)
+            item["od_adjacency"] = torch.from_numpy(od_adjacency)
+            item["od_target_weights"] = torch.from_numpy(
+                self._od_target_weights(query.source_type, query.source_id)
+            )
+        return item
 
     # ------------------------------------------------------------------
     # Registry and index construction
@@ -488,12 +554,9 @@ class NativeSupportDataset(Dataset):
             }
         return edges
 
-    def _load_od_store(self, root: Path) -> _OdStore:
-        ds = xr.open_zarr(root / "od_mitma.zarr")
-        mobility = np.asarray(ds["mobility"].values, dtype=np.float32)
-        dates = np.asarray(ds["date"].values).astype("datetime64[D]")
-        zone_ids = [str(z) for z in ds["zone_id"].values]
-        return _OdStore(dates, zone_ids, mobility)
+    def _load_od_store(self, root: Path, od_source: str) -> _OdStore:
+        ds = xr.open_zarr(root / f"od_{od_source}.zarr")
+        return _OdStore(ds, log1p_stored=od_source == "municipal")
 
     def _load_admissions(self, path: Path) -> _AdmSeries:
         """Load the weekly admissions store; ``stratum_pop_sum`` is required."""
@@ -715,6 +778,50 @@ class NativeSupportDataset(Dataset):
     # Context pooling
     # ------------------------------------------------------------------
 
+    def _build_relation_pools(
+        self,
+    ) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray, float]]]:
+        """Municipal-neighbor pools kept separate by typed relation."""
+        node_to_cases = np.full(len(self._graph_nodes.source_id), -1, dtype=np.int64)
+        for column, region_id in enumerate(self._cases.source_ids):
+            node = self._node_index.get(f"{SOURCE_MUNICIPALITY}:{region_id}")
+            if node is not None:
+                node_to_cases[node] = column
+        relation_pools: dict[
+            str, dict[str, tuple[np.ndarray, np.ndarray, float]]
+        ] = {name: {} for name in _POOL_RELATIONS}
+        for relation in _POOL_RELATIONS:
+            for source_type in (SOURCE_ABS, SOURCE_COMARCA, SOURCE_MUNICIPALITY):
+                for record in self._registry.records_for(source_type):
+                    key = f"{source_type}:{record.source_id}"
+                    if key not in self._node_index:
+                        continue
+                    relation_pools[relation][key] = self._pool_for_relation(
+                        relation, source_type, record.source_id, node_to_cases
+                    )
+        return relation_pools
+
+    def _pool_for_relation(
+        self,
+        relation: str,
+        source_type: str,
+        source_id: str,
+        node_to_cases: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        node = self._node_index[f"{source_type}:{source_id}"]
+        is_muni = self._graph_nodes.node_type == SOURCE_MUNICIPALITY
+        columns: list[int] = []
+        weights: list[float] = []
+        edges = self._edges[relation]
+        for row in np.flatnonzero(edges["dst_idx"] == node):
+            src = int(edges["src_idx"][row])
+            case_column = int(node_to_cases[src])
+            if is_muni[src] and case_column >= 0:
+                columns.append(case_column)
+                weights.append(float(edges["weight"][row]))
+        raw = np.asarray(weights, dtype=np.float32)
+        return np.asarray(columns, dtype=np.int64), raw, float(raw.sum())
+
     def _build_pools(self) -> dict[str, tuple[np.ndarray, np.ndarray, float]]:
         """Per-source (cases columns, raw destination fractions, coverage).
 
@@ -723,41 +830,66 @@ class NativeSupportDataset(Dataset):
         overlaps with case observations. Municipal queries have no
         municipal overlap neighbors: empty pooling, coverage 0.
         """
-        node_to_cases = np.full(len(self._graph_nodes.source_id), -1, dtype=np.int64)
-        for column, region_id in enumerate(self._cases.source_ids):
-            node = self._node_index.get(f"{SOURCE_MUNICIPALITY}:{region_id}")
-            if node is not None:
-                node_to_cases[node] = column
         pools: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
         for source_type in (SOURCE_ABS, SOURCE_COMARCA, SOURCE_MUNICIPALITY):
             for record in self._registry.records_for(source_type):
-                if f"{source_type}:{record.source_id}" not in self._node_index:
+                key = f"{source_type}:{record.source_id}"
+                if key not in self._node_index:
                     continue  # graph-absent sources are never queried
-                pools[f"{source_type}:{record.source_id}"] = self._pool_for(
-                    source_type, record.source_id, node_to_cases
-                )
+                blocks = [self._relation_pools[name][key] for name in _POOL_RELATIONS]
+                columns = np.concatenate([block[0] for block in blocks])
+                weights = np.concatenate([block[1] for block in blocks])
+                pools[key] = (columns, weights, sum(block[2] for block in blocks))
         return pools
 
-    def _pool_for(
-        self, source_type: str, source_id: str, node_to_cases: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        node = self._node_index[f"{source_type}:{source_id}"]
-        is_muni = self._graph_nodes.node_type == SOURCE_MUNICIPALITY
-        columns: list[int] = []
-        weights: list[float] = []
+    def _relation_context(
+        self, source_type: str, source_id: str, hist_slice: slice
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, float]:
+        """Bidirectional typed messages plus the unchanged pooled baseline."""
+        key = f"{source_type}:{source_id}"
+        relation_ctx: dict[str, np.ndarray] = {}
         for relation in _POOL_RELATIONS:
-            edges = self._edges[relation]
-            for row in np.flatnonzero(edges["dst_idx"] == node):
-                src = int(edges["src_idx"][row])
-                case_column = int(node_to_cases[src])
-                if is_muni[src] and case_column >= 0:
-                    columns.append(case_column)
-                    weights.append(float(edges["weight"][row]))
-        raw = np.asarray(weights, dtype=np.float32)
-        coverage = float(raw.sum())
-        # Ruling R6: raw destination fractions, never renormalized — the
-        # uncovered deficit stays an implicit zero-contribution slot.
-        return np.asarray(columns, dtype=np.int64), raw, coverage
+            columns, weights, _ = self._relation_pools[relation][key]
+            block = np.zeros((self._L, 3), dtype=np.float32)
+            if columns.size:
+                cases = self._cases.channels[hist_slice][:, columns, :]
+                block = (cases * weights[None, :, None]).sum(
+                    axis=1, dtype=np.float32
+                )
+            if source_type == SOURCE_MUNICIPALITY:
+                block += self._reverse_relation_context(
+                    relation, source_id, hist_slice
+                )
+            relation_ctx[relation] = block.astype(np.float32, copy=False)
+        pooled, coverage = self._pooled_context(source_type, source_id, hist_slice)
+        return relation_ctx, pooled, coverage
+
+    def _reverse_relation_context(
+        self, relation: str, municipality_id: str, hist_slice: slice
+    ) -> np.ndarray:
+        """ABS/comarca histories sent back to a municipal target."""
+        target = self._node_index[f"{SOURCE_MUNICIPALITY}:{municipality_id}"]
+        expected_type = SOURCE_ABS if relation == "muni_abs" else SOURCE_COMARCA
+        block = np.zeros((self._L, 3), dtype=np.float32)
+        edges = self._edges[relation]
+        for edge in np.flatnonzero(edges["dst_idx"] == target):
+            src = int(edges["src_idx"][edge])
+            if self._graph_nodes.node_type[src] != expected_type:
+                continue
+            population = float(self._graph_nodes.population[src])
+            if not math.isfinite(population) or population <= 0:
+                continue
+            source_id = str(self._graph_nodes.source_id[src])
+            if expected_type == SOURCE_ABS:
+                if source_id not in self._adm.columns:
+                    continue
+                history, _ = self._abs_history(source_id, hist_slice)
+            else:
+                if source_id not in self._deaths.columns:
+                    continue
+                history, _ = self._comarca_history(source_id, hist_slice)
+            block += history * float(edges["weight"][edge])
+        return block
 
     def _pooled_context(
         self, source_type: str, source_id: str, hist_slice: slice
@@ -769,6 +901,104 @@ class NativeSupportDataset(Dataset):
             block = self._cases.channels[hist_slice][:, columns, :]  # [L, M, 3]
             pooled = (block * weights[None, :, None]).sum(axis=1, dtype=np.float32)
         return pooled.astype(np.float32, copy=False), coverage
+
+    def _build_od_feature_weights(self) -> np.ndarray:
+        """Map municipal case features into the configured OD node set."""
+        if (
+            self._config.spatial_encoder != "hetero"
+            or not self._config.mobility_enabled
+            or self._od is None
+        ):
+            return np.zeros((0, len(self._cases.source_ids)), dtype=np.float32)
+        zone_index = {zone: index for index, zone in enumerate(self._od.zone_ids)}
+        case_index = {
+            source_id: index for index, source_id in enumerate(self._cases.source_ids)
+        }
+        weights = np.zeros(
+            (len(self._od.zone_ids), len(self._cases.source_ids)), dtype=np.float32
+        )
+        if self._config.od_source == "municipal":
+            for zone, row in zone_index.items():
+                column = case_index.get(zone)
+                if column is not None:
+                    weights[row, column] = 1.0
+            return weights
+
+        edges = self._edges["mitma_muni"]
+        for edge in range(len(edges["src_idx"])):
+            src = int(edges["src_idx"][edge])
+            dst = int(edges["dst_idx"][edge])
+            if (
+                self._graph_nodes.node_type[src] != SOURCE_MUNICIPALITY
+                or self._graph_nodes.node_type[dst] != "mitma"
+            ):
+                continue
+            zone = zone_index.get(str(self._graph_nodes.source_id[dst]))
+            column = case_index.get(str(self._graph_nodes.source_id[src]))
+            if zone is not None and column is not None:
+                weights[zone, column] += float(edges["weight"][edge])
+        return weights
+
+    def _od_graph_context(self, origin: int) -> tuple[np.ndarray, np.ndarray]:
+        """Origin-specific OD node features and incoming-normalized adjacency."""
+        cached = self._od_graph_cache.get(origin)
+        if cached is not None:
+            return cached
+        assert self._od is not None
+        features = self._od_feature_weights @ self._cases.channels[origin]
+        od_row = self._od.row_of(self._grid[origin])
+        if od_row is None:
+            flows = np.zeros(
+                (len(self._od.zone_ids), len(self._od.zone_ids)), dtype=np.float32
+            )
+        else:
+            flows = self._od.flows_at(od_row).astype(np.float32, copy=True)
+        if self._config.od_self_flows == "drop":
+            np.fill_diagonal(flows, 0.0)
+        flows[(flows <= 0.0) | (flows < self._config.od_min_flow_raw)] = 0.0
+        incoming = flows.sum(axis=0, dtype=np.float64).astype(np.float32)
+        adjacency = flows.T
+        np.divide(
+            adjacency,
+            incoming[:, None],
+            out=adjacency,
+            where=incoming[:, None] > 0,
+        )
+        result = (
+            features.astype(np.float32, copy=False),
+            adjacency.astype(np.float32, copy=False),
+        )
+        if len(self._od_graph_cache) >= 16:
+            self._od_graph_cache.pop(next(iter(self._od_graph_cache)))
+        self._od_graph_cache[origin] = result
+        return result
+
+    def _od_target_weights(self, source_type: str, source_id: str) -> np.ndarray:
+        """Typed hop from configured OD nodes back to one clinical target."""
+        assert self._od is not None
+        weights = np.zeros(len(self._od.zone_ids), dtype=np.float32)
+        zone_index = {zone: index for index, zone in enumerate(self._od.zone_ids)}
+        if self._config.od_source == "municipal":
+            if source_type == SOURCE_MUNICIPALITY:
+                zone = zone_index.get(source_id)
+                if zone is not None:
+                    weights[zone] = 1.0
+                return weights
+            relation = "muni_abs" if source_type == SOURCE_ABS else "muni_comarca"
+            expected_type = SOURCE_MUNICIPALITY
+        else:
+            relation = f"mitma_{source_type.replace('municipality', 'muni')}"
+            expected_type = "mitma"
+        target = self._node_index[f"{source_type}:{source_id}"]
+        edges = self._edges[relation]
+        for edge in np.flatnonzero(edges["dst_idx"] == target):
+            src = int(edges["src_idx"][edge])
+            if self._graph_nodes.node_type[src] != expected_type:
+                continue
+            zone = zone_index.get(str(self._graph_nodes.source_id[src]))
+            if zone is not None:
+                weights[zone] += float(edges["weight"][edge])
+        return weights
 
     def _od_share(self, query: ForecastQuery) -> float:
         """Origin-day incoming trip share into the source's overlapping zones.
@@ -794,7 +1024,7 @@ class NativeSupportDataset(Dataset):
         od_row = self._od.row_of(self._grid[query.forecast_origin])
         if od_row is None:
             return 0.0
-        flows = self._od.mobility[od_row].astype(np.float32, copy=True)
+        flows = self._od.flows_at(od_row).astype(np.float32, copy=True)
         if self._config.od_self_flows == "drop":
             np.fill_diagonal(flows, 0.0)
         flows[flows < self._config.od_min_flow_raw] = 0.0

@@ -62,6 +62,7 @@ from models.configs import (
     SIRPhysicsConfig,
 )
 from models.epiforecaster import EpiForecaster
+from models.hetero_encoder import HeterogeneousContextEncoder
 from models.reporting_operators import (
     weekly_interval_sum,
     weekly_log1p_per100k_location,
@@ -113,6 +114,10 @@ class NativeForecasterConfig:
     observation_heads: ObservationHeadConfig = field(default_factory=ObservationHeadConfig)
     init_weights: InitWeightsConfig = field(default_factory=InitWeightsConfig)
     strict: bool = True
+    spatial_encoder: str = "pooled"
+    mobility_enabled: bool = True
+    hetero_hidden_dim: int = 16
+    hetero_parameter_budget: int = 100_000
 
     def __post_init__(self) -> None:
         for name in ("f_native", "forecast_horizon", "sequence_length", "d_in",
@@ -121,6 +126,11 @@ class NativeForecasterConfig:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         if self.d_ctx < 0:
             raise ValueError(f"d_ctx must be non-negative, got {self.d_ctx}")
+        if self.spatial_encoder not in {"pooled", "hetero"}:
+            raise ValueError(
+                "spatial_encoder must be 'pooled' or 'hetero', got "
+                f"{self.spatial_encoder!r}"
+            )
 
 
 class NativeInputAdapter(nn.Module):
@@ -164,13 +174,19 @@ class NativeInputAdapter(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
         self.to(MODEL_PARAM_DTYPE)
 
-    def forward(self, batch: NativeEpiBatch) -> torch.Tensor:
+    def forward(
+        self,
+        batch: NativeEpiBatch,
+        *,
+        ctx_feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Assemble per-row native features; returns ``[B, L, d_in]``."""
         hist = batch.hist
         seq_len = hist.shape[1]
+        context = batch.ctx_feat if ctx_feat is None else ctx_feat
         features: list[torch.Tensor] = [
             hist,
-            batch.ctx_feat,
+            context,
             repeat(
                 self.type_embedding(batch.source_type_id.long()),
                 "b e -> b l e",
@@ -312,6 +328,16 @@ class NativeEpiForecaster(nn.Module):
         self.weekly_slots = -(-config.forecast_horizon // 7)
         self.input_adapter = NativeInputAdapter(config)
         self.base = _build_base_forecaster(config)
+        self.spatial_encoder = (
+            HeterogeneousContextEncoder(
+                context_dim=config.d_ctx,
+                hidden_dim=config.hetero_hidden_dim,
+                mobility_enabled=config.mobility_enabled,
+                parameter_budget=config.hetero_parameter_budget,
+            )
+            if config.spatial_encoder == "hetero"
+            else None
+        )
         logger.info(
             "Initialized NativeEpiForecaster: f_native=%d d_ctx=%d d_in=%d "
             "horizon=%d W_max=%d",
@@ -324,7 +350,12 @@ class NativeEpiForecaster(nn.Module):
 
     def forward(self, batch: NativeEpiBatch) -> dict[str, torch.Tensor | dict[str, torch.Tensor | None]]:
         """Run the native-support forward pass over a collated batch."""
-        x_seq = self.input_adapter(batch)
+        spatial_context = (
+            self.spatial_encoder(batch)
+            if self.spatial_encoder is not None
+            else batch.ctx_feat
+        )
+        x_seq = self.input_adapter(batch, ctx_feat=spatial_context)
         encoder_outputs = self.base.backbone(x_seq)
         beta_t = encoder_outputs["beta_t"]
         obs_context = encoder_outputs["obs_context"]
@@ -417,6 +448,7 @@ class NativeEpiForecaster(nn.Module):
             "source_type_id": batch.source_type_id,
             "origin_dow": batch.origin_dow,
             "head_index": dict(batch.head_index),
+            "spatial_context": spatial_context,
         }
         return outputs
 
