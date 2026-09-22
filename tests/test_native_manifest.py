@@ -17,6 +17,7 @@ import pytest
 import xarray as xr
 
 from data.preprocess.native_sources.manifest import (
+    CODE_STAMP_MODULES,
     CONFIRMATION_PERIOD,
     SCHEMA,
     SCHEMA_VERSION,
@@ -220,6 +221,32 @@ class TestManifest:
         stamp = manifest["code_stamp"]
         assert stamp == code_stamp()  # package stamp is environment-independent
         assert stamp["package_sha256"]
+        assert stamp["modules"] == list(CODE_STAMP_MODULES)
+
+    def test_code_stamp_tracks_expanded_modules(self, tmp_path):
+        """Mutating any R14 module's content (tmp mirror) moves the stamp."""
+        package = tmp_path / "native_sources"
+        package.mkdir()
+        (package / "builder.py").write_text("# package source\n")
+        repo = tmp_path / "repo"
+        for relative in CODE_STAMP_MODULES:
+            _touch(repo / relative, f"# {relative}\n")
+        base = code_stamp(package, repo_root=repo)
+        assert base["modules"] == list(CODE_STAMP_MODULES)
+        for relative in CODE_STAMP_MODULES:
+            (repo / relative).write_text(f"# mutated {relative}\n")
+            mutated = code_stamp(package, repo_root=repo)
+            assert mutated["package_sha256"] != base["package_sha256"]
+            (repo / relative).write_text(f"# {relative}\n")
+        assert code_stamp(package, repo_root=repo) == base
+
+    def test_code_stamp_missing_module_is_hard_error(self, tmp_path):
+        package = tmp_path / "native_sources"
+        package.mkdir()
+        truncated = tmp_path / "truncated-repo"
+        _touch(truncated / CODE_STAMP_MODULES[0], "# present\n")
+        with pytest.raises(FileNotFoundError, match="code-stamp module missing"):
+            code_stamp(package, repo_root=truncated)
 
     def test_input_change_detected(self, tmp_path):
         root, spec = _mini_support(tmp_path)

@@ -1,9 +1,12 @@
 """Native-support batch container and collation (plan sections 11.4, 12.2 BAT-1).
 
 Collates DS-1 ``NativeDatasetItem`` dicts (:mod:`data.native_dataset`) into
-the unified :class:`NativeEpiBatch`: stacked ``[B, L, F_native]`` history,
-source conditioning, and per-head supervised blocks routed by each query's
-``requested_heads``. Pure tensor work — no I/O and no dataset access.
+the unified :class:`NativeEpiBatch`: stacked ``[B, L, 5 + F_native]``
+history — a frozen source-type one-hot block (review R12, one channel per
+:data:`SOURCE_TYPE_ORDER` entry, repeated over ``L``) followed by the
+per-query native channels — source conditioning, and per-head supervised
+blocks routed by each query's ``requested_heads``. Pure tensor work — no
+I/O and no dataset access.
 
 Routing is per requested head, so a synthetic multi-head query contributes
 its row to every requested head's block; real-data routing (plan section
@@ -96,7 +99,7 @@ class NativeEpiBatch:
 
     # -- Frozen plan section 11.4 fields --------------------------------
     queries: list[ForecastQuery]  # length B, order-defining
-    hist: torch.Tensor  # (B, L, F_native) unified history features
+    hist: torch.Tensor  # (B, L, 5 + F_native): leading source-type one-hot + native channels
     hist_mask: torch.Tensor  # (B, L) observed-validity for the query's own series
     source_type_id: torch.Tensor  # (B,) int enum index
     source_pop: torch.Tensor  # (B,) audited denominator for per-100k transform
@@ -179,13 +182,32 @@ def _collect_head_extra(
     return {_HEAD_EXTRA_KEY: _stack_uniform(provided, _HEAD_EXTRA_KEY)}
 
 
+def _source_type_one_hot(
+    source_ids: torch.Tensor, length: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """``[B, L, 5]`` frozen one-hot of each row's source type (review R12).
+
+    One channel per :data:`SOURCE_TYPE_ORDER` entry, identical across all
+    ``L`` history rows of an item — including pad rows, whose native
+    channels are zero but whose type is still known.
+    """
+    block = torch.zeros(
+        source_ids.shape[0], length, len(SOURCE_TYPE_ORDER), dtype=dtype
+    )
+    block.scatter_(2, source_ids.view(-1, 1, 1).expand(-1, length, 1), 1.0)
+    return block
+
+
 def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
     """Collate DS-1 items into a :class:`NativeEpiBatch`.
 
     Validates source-type one-hot consistency
     (``item["source_type_id"]`` vs the query's enum index in
     :data:`SOURCE_TYPE_ORDER`), asserts uniform per-slot shapes, and routes
-    each row into the blocks of every head its query requests.
+    each row into the blocks of every head its query requests. The batch
+    ``hist`` gains the frozen leading source-type one-hot block (review
+    R12): ``[B, L, 5 + F_native]`` with the item's native channels kept
+    verbatim behind the one-hot; ``source_type_id`` stays alongside it.
     """
     if not items:
         raise ValueError("collate_native_batch requires a non-empty item list")
@@ -251,13 +273,19 @@ def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
         )
         head_extra[head] = _collect_head_extra(routed, head)
 
+    source_ids = torch.tensor(
+        [int(item["source_type_id"]) for item in items], dtype=torch.long
+    )
+    hist = _stack_uniform([item["hist"] for item in items], "hist")
+    hist = torch.cat(
+        [_source_type_one_hot(source_ids, hist.shape[1], hist.dtype), hist], dim=2
+    )
+
     return NativeEpiBatch(
         queries=queries,
-        hist=_stack_uniform([item["hist"] for item in items], "hist"),
+        hist=hist,
         hist_mask=_stack_uniform([item["hist_mask"] for item in items], "hist_mask"),
-        source_type_id=torch.tensor(
-            [int(item["source_type_id"]) for item in items], dtype=torch.long
-        ),
+        source_type_id=source_ids,
         source_pop=torch.tensor(
             [float(item["source_pop"]) for item in items], dtype=torch.float32
         ),

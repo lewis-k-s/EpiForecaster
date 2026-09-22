@@ -18,6 +18,7 @@ import torch
 
 from data.native_batch import (
     SOURCE_TYPE_IDS,
+    SOURCE_TYPE_ORDER,
     collate_native_batch,
 )
 from data.native_dataset import (
@@ -31,7 +32,8 @@ from data.query_contract import ForecastQuery, SourceType
 pytestmark = pytest.mark.epiforecaster
 
 L = 8
-F_NATIVE = 5  # 3 clinical channels + 2 temporal-covariate columns
+F_NATIVE = 5  # per-item native channels: 3 clinical + 2 temporal covariates
+N_TYPES = len(SOURCE_TYPE_ORDER)  # frozen leading one-hot block width (R12)
 D_CTX = 3
 H = 4  # daily target width (cases/deaths)
 W = 2  # weekly target width (hosp)
@@ -135,7 +137,7 @@ def test_mixed_three_type_batch_shapes(mixed_items: list[NativeDatasetItem]) -> 
     batch = collate_native_batch(mixed_items)
     assert batch.b == 3
     assert batch.t == L
-    assert batch.hist.shape == (3, L, F_NATIVE)
+    assert batch.hist.shape == (3, L, N_TYPES + F_NATIVE)
     assert batch.hist.dtype == torch.float32
     assert batch.hist_mask.shape == (3, L)
     assert batch.hist_mask.dtype == torch.bool
@@ -187,6 +189,24 @@ def test_source_type_id_mismatch_raises() -> None:
     item = _item("municipality", {"cases"}, source_type_id=3)
     with pytest.raises(ValueError, match="source_type_id"):
         collate_native_batch([item])
+
+
+def test_hist_leading_block_is_exactly_source_type_one_hot(
+    mixed_items: list[NativeDatasetItem],
+) -> None:
+    batch = collate_native_batch(mixed_items)
+    expected = torch.zeros(3, L, N_TYPES)
+    for row, item in enumerate(mixed_items):
+        expected[row, :, SOURCE_TYPE_IDS[item["query"].source_type]] = 1.0
+    block = batch.hist[:, :, :N_TYPES]
+    # Each row's 5-block matches its query type; every other slot is zero.
+    assert torch.equal(block, expected)
+    # EXACTLY one-hot: every history row sums to 1 with 0/1 entries only.
+    assert torch.equal(block.sum(dim=-1), torch.ones(3, L))
+    assert bool(((block == 0.0) | (block == 1.0)).all())
+    # The per-query native channels pass through verbatim behind the block.
+    for row, item in enumerate(mixed_items):
+        assert torch.equal(batch.hist[row, :, N_TYPES:], item["hist"])
 
 
 def test_item_head_outside_requested_heads_raises() -> None:
@@ -264,9 +284,13 @@ def test_padding_zeros_carry_mask_zero() -> None:
     batch = collate_native_batch([item])
     assert batch.hist_mask[0, [1, 4]].tolist() == [False, False]
     assert int(batch.hist_mask[0].sum()) == L - 2
-    assert float(batch.hist[0, 1].abs().sum()) == 0.0
-    assert float(batch.hist[0, 4].abs().sum()) == 0.0
-    assert float(batch.hist[0, 0].abs().sum()) > 0.0
+    # Native channels stay zero on pad rows; the one-hot type block is
+    # repeated over every row, pads included (type is still known there).
+    assert float(batch.hist[0, 1, N_TYPES:].abs().sum()) == 0.0
+    assert float(batch.hist[0, 4, N_TYPES:].abs().sum()) == 0.0
+    assert float(batch.hist[0, 0, N_TYPES:].abs().sum()) > 0.0
+    assert batch.hist[0, :, :N_TYPES].sum(dim=-1).tolist() == [1.0] * L
+    assert batch.hist[0, 1, SOURCE_TYPE_IDS["municipality"]].item() == 1.0
 
 
 def test_absent_head_blocks_are_none() -> None:
@@ -417,7 +441,12 @@ def test_real_artifacts_collate_matches_head_counts() -> None:
     batch = collate_native_batch(items)
     assert batch.b == 8
     assert batch.t == 60  # NativeDatasetConfig default input window
-    assert batch.hist.shape == (8, 60, int(items[0]["hist"].shape[1]))
+    assert batch.hist.shape == (8, 60, N_TYPES + int(items[0]["hist"].shape[1]))
+    for row, item in enumerate(items):
+        one_hot = batch.hist[row, :, :N_TYPES]
+        assert one_hot.sum(dim=-1).tolist() == [1.0] * 60
+        assert one_hot[:, int(item["source_type_id"])].eq(1.0).all()
+        assert torch.equal(batch.hist[row, :, N_TYPES:], item["hist"])
 
     # Real-data routing is single-head (plan section 11.1): routed blocks
     # partition the batch rows and never exceed the dataset's head_counts.

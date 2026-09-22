@@ -21,7 +21,9 @@ Hashing methods (each recorded in the manifest itself):
 - ``overlap_edges.parquet``: full file sha256 (it is a single small file).
 
 ``git rev-parse`` is unavailable to goal-loop slices, so the code-version
-stamp is a content hash of the ``native_sources`` package sources.
+stamp is a content hash of the ``native_sources`` package sources plus the
+explicit artifact-producing modules outside the package (both clinical
+processors and the native registry — review R14).
 
 The manifest contains no wall-clock timestamps: identical inputs and package
 sources must produce byte-identical JSON (determinism contract, tested).
@@ -61,9 +63,24 @@ ZARR_METADATA_METHOD = (
 )
 LISTING_METHOD = "sha256 of the sorted '(relpath size sha256)' newline listing"
 PACKAGE_METHOD = (
-    "content hash of the native_sources package sources; git rev-parse is "
-    "unavailable to goal-loop slices (plan §12.0)"
+    "content hash of the native_sources package sources plus the "
+    "artifact-producing modules listed in code_stamp.modules (both clinical "
+    "processors and the native registry); git rev-parse is unavailable to "
+    "goal-loop slices (plan §12.0, review R14)"
 )
+
+#: Explicit artifact-producing modules hashed into the code stamp beside the
+#: ``native_sources`` package sources (review R14): the two clinical
+#: processors produce the ``obs_*.zarr`` stores and :mod:`data.native_registry`
+#: produces the registry the builders and folds consume. Paths are relative
+#: to the repository root.
+CODE_STAMP_MODULES: tuple[str, ...] = (
+    "data/preprocess/processors/abs_admissions_processor.py",
+    "data/preprocess/processors/comarca_deaths_processor.py",
+    "data/native_registry.py",
+)
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 CLINICAL_NOTE = (
     "sits outside catalonia_preprocessing_inputs_v1 (see dvc_anchor); hashed "
     "here individually per plan §11.3"
@@ -205,16 +222,35 @@ def _store_schema_attr(store: Path) -> dict:
     return out
 
 
-def code_stamp(package_dir: Path | None = None) -> dict:
-    """Content hash of the producing package (no git available, §12.0)."""
+def code_stamp(package_dir: Path | None = None, repo_root: Path | None = None) -> dict:
+    """Content hash of every artifact-producing module (§12.0, review R14).
+
+    Hashes the ``native_sources`` package sources plus the explicit
+    :data:`CODE_STAMP_MODULES` set (both clinical processors and the native
+    registry), so any code change that can alter a hashed artifact moves the
+    stamp. ``repo_root`` overrides where the explicit modules resolve from
+    (tests use a tmp mirror); it defaults to this checkout's repository root.
+    """
     root = Path(package_dir) if package_dir else Path(__file__).resolve().parent
+    module_root = Path(repo_root) if repo_root else _REPO_ROOT
     files = sorted(p for p in root.glob("*.py") if p.is_file())
     rows = [(p.name, p.stat().st_size, sha256_file(p)) for p in files]
+    for relative in CODE_STAMP_MODULES:
+        path = module_root / relative
+        if not path.is_file():
+            raise FileNotFoundError(f"manifest code-stamp module missing: {path}")
+        rows.append((relative, path.stat().st_size, sha256_file(path)))
     return {
         "method": PACKAGE_METHOD,
         "package": str(root),
         "package_sha256": _listing_digest(rows),
-        "files": {"summary": f"{len(files)} package .py files"},
+        "files": {
+            "summary": (
+                f"{len(files)} package .py files + {len(CODE_STAMP_MODULES)} "
+                "artifact-producing modules"
+            )
+        },
+        "modules": list(CODE_STAMP_MODULES),
     }
 
 
