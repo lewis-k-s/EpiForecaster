@@ -603,6 +603,8 @@ def evaluate_native_loader(
     aggregate_output_dir: Path | None = None,
     confirmation_guard: bool = True,
     granular_metadata: dict[str, Any] | None = None,
+    autocast_enabled: bool = False,
+    autocast_dtype: torch.dtype | None = None,
 ) -> tuple[float, dict[str, Any], Any]:
     """Evaluate routed native heads and write canonical EVL-1 artifacts."""
     dataset = _native_dataset_from_loader(loader)
@@ -663,8 +665,13 @@ def evaluate_native_loader(
                 confirmation_guard=confirmation_guard,
             )
             batch = batch.to(device)
-            outputs = model(batch)
-            components = criterion(outputs, batch)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=autocast_dtype,
+                enabled=autocast_enabled,
+            ):
+                outputs = model(batch)
+                components = criterion(outputs, batch)
             loss_sum += float(components["total"].item())
             processed_batches += 1
             for head in ("cases", "hosp", "deaths"):

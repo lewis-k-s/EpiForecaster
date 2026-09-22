@@ -1561,14 +1561,20 @@ def _run_native_forecaster_training(
     logger.info(f"{'=' * 60}")
     for epoch, losses in enumerate(results["train_loss_trace"]):
         logger.info(
-            f"Epoch {epoch + 1} train losses: "
-            f"{['%.6f' % loss for loss in losses]}"
+            f"Epoch {epoch + 1} train losses: {['%.6f' % loss for loss in losses]}"
         )
-    best = results["best_val_loss"]
-    if best is not None:
-        logger.info(f"Best validation loss: {best:.6f}")
+    selection = results.get("best_val_selection_score")
+    if selection is not None:
+        logger.info(
+            "Best validation selection: "
+            f"{results['best_val_selection_metric']}={selection:.6f}"
+        )
+    joint = results.get("best_val_joint_loss")
+    if joint is not None:
+        logger.info(f"Best validation joint loss: {joint:.6f}")
     else:
         logger.info("Validation loss: n/a")
+    logger.info(f"Model root: {results['model_root']}")
     logger.info(f"Model parameters: {results['model_info']['parameters']:,}")
     logger.info(f"Wall time: {results['wall_time_s']:.1f}s")
     logger.info(f"{'=' * 60}")

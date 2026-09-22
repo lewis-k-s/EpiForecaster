@@ -54,13 +54,12 @@ model:
 output:
   experiment_name: native_stage4
   log_dir: outputs/training/native_stage4
-  # Native checkpoint/dynamics integration is an MN5 workflow gate.
-  save_checkpoints: false
+  # Canonical checkpoint + training-dynamics lifecycle is the WP-B contract.
+  save_checkpoints: true
   save_best_only: true
   write_granular_eval: true
   granular_eval_format: csv
   granular_eval_filename: "{split}_granular.csv"
-  wandb_group: native_stage4
 
 training:
   seed: 52

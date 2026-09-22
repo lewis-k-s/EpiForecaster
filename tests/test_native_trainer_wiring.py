@@ -261,6 +261,7 @@ def _trainer_config(root: Path, **native_kwargs: bool) -> EpiForecasterConfig:
             seed=42,
             split_seed=42,
             device="cpu",
+            enable_mixed_precision=False,
             val_split=0.1,
             scheduler_type="cosine",
             warmup_steps=0,
