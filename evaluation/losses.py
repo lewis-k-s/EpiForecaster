@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -17,6 +19,7 @@ from utils.training_utils import drop_nowcast
 
 if TYPE_CHECKING:
     from data.epi_batch import EpiBatch
+    from data.native_batch import NativeEpiBatch
 
 _LOSS_VALUE_CLAMP = 1.0e6
 _RMSE_EPS = 1.0e-8
@@ -1037,3 +1040,478 @@ class JointInferenceLoss(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Compile-safe train path (kept separate to avoid eval-path regressions)."""
         return self.compute_components(model_outputs, targets, batch_data)
+
+
+# ---------------------------------------------------------------------------
+# Native-support routed loss (plan sections 12.2 LOS-1, 11.1, 11.5)
+# ---------------------------------------------------------------------------
+
+#: Per-100k constant of the weekly ``log1p(per-100k * week)`` target space
+#: (plan section 11.5; mirrors ``models.reporting_operators``).
+_WEEKLY_PER_100K = 100_000.0
+
+#: Heads with routed per-head blocks in :class:`NativeEpiBatch` (section 11.4).
+_NATIVE_ROUTED_HEADS = ("cases", "hosp", "deaths")
+
+
+def device_zero(device: torch.device) -> torch.Tensor:
+    """Zero scalar tensor on ``device`` (inactive-head anchor)."""
+    return torch.tensor(0.0, device=device)
+
+
+def device_false(device: torch.device) -> torch.Tensor:
+    """False bool scalar tensor on ``device`` (inactive-head flag)."""
+    return torch.tensor(False, device=device, dtype=torch.bool)
+
+
+def _binary_target_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Strict binary supervision mask (base ``_build_supervision_weights`` semantics)."""
+    observed = torch.nan_to_num(mask.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    return observed > 0.5
+
+
+@dataclass(frozen=True)
+class NativeHeadCountAudit:
+    """Per-head section 7 supervision counts and count-once audit (LOS-1).
+
+    ``supervised_points`` counts weight-eligible target slots per head block
+    (``head_target_mask > 0.5``; the loss additionally intersects this with
+    the weekly completeness mask for ``hosp``). ``duplicate_row_positions``
+    lists, per head, the batch-row positions whose routing identity
+    ``(source_type, source_id, forecast_origin, horizon_days, realization_id)``
+    occurs more than once in that head's ``head_index``; ``duplicates`` is the
+    total number of beyond-once occurrences across heads.
+    """
+
+    supervised_points: dict[str, int]
+    routed_rows: dict[str, int]
+    duplicate_row_positions: dict[str, tuple[int, ...]]
+    duplicates: int
+
+    def as_log_dict(self) -> dict[str, object]:
+        """Plain-dict view for section 7 structured logging."""
+        return {
+            "supervised_points": dict(self.supervised_points),
+            "routed_rows": dict(self.routed_rows),
+            "duplicate_row_positions": {
+                head: list(positions)
+                for head, positions in self.duplicate_row_positions.items()
+            },
+            "duplicates": self.duplicates,
+        }
+
+
+def _routing_identity(
+    native_batch: NativeEpiBatch, position: int
+) -> tuple[object, str, int, int, str]:
+    """Count-once identity of one batch row: ``(source, origin, interval, run)``."""
+    query = native_batch.queries[position]
+    return (
+        query.source_type,
+        query.source_id,
+        query.forecast_origin,
+        query.horizon_days,
+        query.realization_id,
+    )
+
+
+def audit_head_counts(native_batch: NativeEpiBatch) -> NativeHeadCountAudit:
+    """Count per-head supervised points and flag duplicate routing identities.
+
+    Each routed row should appear at most once per head: DS-1/BAT-1 routing
+    keys a block row by the query's trajectory identity, so a duplicated query
+    (same ``(source, origin, interval)`` routed twice into one head) would be
+    counted twice by the loss. The loss consumes routing as-built; this audit
+    exists so section 7 logging can flag such duplicates.
+    """
+    supervised_points: dict[str, int] = {}
+    routed_rows: dict[str, int] = {}
+    duplicate_row_positions: dict[str, tuple[int, ...]] = {}
+    duplicates = 0
+
+    for head in (*_NATIVE_ROUTED_HEADS, "ww"):
+        rows = native_batch.head_index.get(head)
+        mask = native_batch.head_target_mask.get(head)
+        if (
+            head not in _NATIVE_ROUTED_HEADS
+            or rows is None
+            or mask is None
+            or int(rows.numel()) == 0
+        ):
+            supervised_points[head] = 0
+            routed_rows[head] = 0
+            duplicate_row_positions[head] = ()
+            continue
+
+        supervised_points[head] = int(_binary_target_mask(mask).sum().item())
+        routed_rows[head] = int(rows.numel())
+        identities = [
+            _routing_identity(native_batch, position) for position in rows.tolist()
+        ]
+        counts = Counter(identities)
+        duplicate_row_positions[head] = tuple(
+            position
+            for position in sorted(set(rows.tolist()))
+            if counts[_routing_identity(native_batch, position)] > 1
+        )
+        duplicates += sum(count - 1 for count in counts.values() if count > 1)
+
+    return NativeHeadCountAudit(
+        supervised_points=supervised_points,
+        routed_rows=routed_rows,
+        duplicate_row_positions=duplicate_row_positions,
+        duplicates=duplicates,
+    )
+
+
+def get_native_loss_from_config(
+    loss_config: LossConfig | None,
+    *,
+    observation_heads_config: ObservationHeadConfig,
+    horizon_days: int,
+) -> NativeJointInferenceLoss:
+    """Build :class:`NativeJointInferenceLoss` from the training loss config.
+
+    Mirrors the :func:`get_loss_from_config` kwargs plumbing. Municipal
+    window-eligibility gates (``min_history_observed``/``min_observed``) do
+    not apply in native mode: eligibility is the routing block plus the
+    weekly completeness mask (plan section 11.5).
+    """
+    if loss_config is None:
+        joint_cfg = JointLossConfig()
+    else:
+        name_lower = (loss_config.name or "").lower()
+        if name_lower != "joint_inference":
+            raise ValueError(
+                "Only training.loss.name='joint_inference' is supported for "
+                f"EpiForecaster, got {loss_config.name!r}."
+            )
+        joint_cfg = loss_config.joint
+    if joint_cfg.adaptive_scheme == "gradnorm" and joint_cfg.observation_loss == "nll":
+        raise ValueError(
+            "adaptive_scheme='gradnorm' requires a non-negative observation "
+            "loss; observation_loss='nll' is signed. Use fixed weighting or "
+            "a non-negative objective such as 'crps'."
+        )
+
+    return NativeJointInferenceLoss(
+        horizon_days=horizon_days,
+        observation_loss=joint_cfg.observation_loss,
+        distribution_family=joint_cfg.distribution_family,
+        distribution_df=joint_cfg.distribution_df,
+        distribution_scale_floor=observation_heads_config.distribution_scale_floor,
+        interval_levels=joint_cfg.interval_levels,
+        obs_weight_sum=joint_cfg.gradnorm_obs_weight_sum,
+        latent_total_weight=joint_cfg.latent.total_weight,
+        latent_scaling=joint_cfg.latent.scaling,
+        latent_component_weights=joint_cfg.latent.component_weights,
+        disable_ww=joint_cfg.disable_ww,
+        disable_hosp=joint_cfg.disable_hosp,
+        disable_cases=joint_cfg.disable_cases,
+        disable_deaths=joint_cfg.disable_deaths,
+    )
+
+
+class NativeJointInferenceLoss(JointInferenceLoss):
+    """Routed loss for native support (plan section 12.2 LOS-1).
+
+    Additive subclass of :class:`JointInferenceLoss`: the municipal path is
+    untouched, and scoring reuses the base class's weighted-masked
+    distribution helpers (no reimplemented NLL/CRPS math).
+
+    Head slots keep the base task order ``("ww", "hosp", "cases", "deaths")``
+    (section 11.1; :attr:`~training.gradnorm.GradNormController.task_names`
+    is unchanged, so adaptive weights for native mode are a TRN-1
+    integration concern — this loss only exposes components compatible with
+    the existing controller):
+
+    - ``cases``/``deaths``: masked distribution loss (NLL or CRPS per
+      ``observation_loss``, normal family) on the routed rows ``[B_., H]``
+      in the existing daily ``log1p(per-100k)`` space — targets arrive
+      pre-transformed from DS-1, so no transform is applied here.
+    - ``hosp``: weekly masked distribution loss on ``[B_h, W_max]`` in weekly
+      ``log1p(per-100k * week)`` space. The weekly target is transformed here
+      from the batch's interval-summed raw weekly counts and the audited
+      graph population: ``log1p(counts * P * 1e5)`` (section 11.5 — the model
+      side sums fractions before the transform; the target side is
+      interval-summed raw counts transformed once). Effective weights are
+      ``head_target_mask & hosp_weekly_mask``: partial/absent weeks, including
+      ``W_max`` trailing slots beyond a narrower per-dow target width, are
+      weight-0. The weekly component fills the daily-``hosp`` 4-vector slot.
+    - ``ww``: zero-scalar component, permanently inactive — wastewater stays
+      on the legacy branch, unsupervised in native mode.
+
+    ``compose_total_loss`` is inherited unchanged: equal active split or
+    GradNorm weights against ``obs_weight_sum`` over the 4-vector
+    ``obs_active_mask`` with ``ww`` forced inactive.
+
+    Latent SIRHD supervision is rejected (frozen v1 choice, section 11.7:
+    native-mode training is real-data-only; synthetic stays on the municipal
+    path).
+    """
+
+    def __init__(
+        self,
+        *,
+        horizon_days: int,
+        observation_loss: str = "mse",
+        distribution_family: str = "normal",
+        distribution_df: float = 5.0,
+        distribution_scale_floor: float = 1.0e-3,
+        interval_levels: list[float] | tuple[float, ...] | None = None,
+        obs_weight_sum: float = 0.95,
+        latent_total_weight: float = 0.0,
+        latent_scaling: str = "none",
+        latent_component_weights: dict[str, float] | None = None,
+        disable_ww: bool = False,
+        disable_hosp: bool = False,
+        disable_cases: bool = False,
+        disable_deaths: bool = False,
+    ) -> None:
+        if not isinstance(horizon_days, int) or isinstance(horizon_days, bool):
+            raise ValueError(
+                f"horizon_days must be an int, got {type(horizon_days).__name__}"
+            )
+        if horizon_days < 1:
+            raise ValueError(f"horizon_days must be positive, got {horizon_days}")
+        if float(latent_total_weight) > 0:
+            raise ValueError(
+                "Native mode trains real-data-only in v1 (plan section 11.7): "
+                "latent SIRHD supervision (latent_total_weight > 0) is not "
+                "supported by NativeJointInferenceLoss; synthetic latent "
+                "supervision stays on the municipal JointInferenceLoss path."
+            )
+        super().__init__(
+            observation_loss=observation_loss,
+            distribution_family=distribution_family,
+            distribution_df=distribution_df,
+            distribution_scale_floor=distribution_scale_floor,
+            interval_levels=interval_levels,
+            obs_weight_sum=obs_weight_sum,
+            latent_total_weight=latent_total_weight,
+            latent_scaling=latent_scaling,
+            latent_component_weights=latent_component_weights,
+            disable_ww=disable_ww,
+            disable_hosp=disable_hosp,
+            disable_cases=disable_cases,
+            disable_deaths=disable_deaths,
+        )
+        self.horizon_days = int(horizon_days)
+        #: Fixed weekly output width (MOD-1 W_max normalization ruling):
+        #: ``W_max = ceil(H / 7)`` slots for every row regardless of origin dow.
+        self.weekly_slots = -(-self.horizon_days // 7)
+
+    @staticmethod
+    def _zero_anchor(model_outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Graph-connected zero scalar, mirroring the base anchor in ``compute_components``."""
+        for key in (
+            "pred_cases",
+            "dist_cases_loc",
+            "pred_deaths",
+            "dist_deaths_loc",
+            "pred_hosp_weekly",
+            "dist_hosp_weekly_loc",
+        ):
+            tensor = model_outputs.get(key)
+            if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                return (
+                    torch.nan_to_num(
+                        tensor.float(), nan=0.0, posinf=0.0, neginf=0.0
+                    ).sum()
+                    * 0.0
+                )
+        return torch.zeros(())
+
+    def _daily_head_loss(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        native_batch: NativeEpiBatch,
+        *,
+        head_name: str,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Routed daily ``cases``/``deaths`` loss; returns (loss, n_eff, active)."""
+        rows = native_batch.head_index.get(head_name)
+        target = native_batch.head_target.get(head_name)
+        mask = native_batch.head_target_mask.get(head_name)
+        if rows is None or int(rows.numel()) == 0:
+            return device_zero(device), device_zero(device), device_false(device)
+        if target is None or mask is None:
+            raise ValueError(
+                f"Head {head_name!r} has routed rows but is missing its "
+                "target or target_mask block"
+            )
+        rows = rows.to(device=device, dtype=torch.long)
+        loc = model_outputs[f"dist_{head_name}_loc"].to(device).index_select(0, rows)
+        scale = (
+            model_outputs[f"dist_{head_name}_scale"].to(device).index_select(0, rows)
+        )
+        if tuple(loc.shape) != tuple(target.shape):
+            raise ValueError(
+                f"Head {head_name!r}: model distribution shape "
+                f"{tuple(loc.shape)} does not match routed target shape "
+                f"{tuple(target.shape)}"
+            )
+        target = target.to(device=device, dtype=torch.float32)
+        weights = _binary_target_mask(mask.to(device)).float()
+        loss = self._weighted_masked_distribution_loss_from_weights(
+            loc=loc, scale=scale, target=target, weights=weights
+        )
+        return loss, weights.sum(), weights.sum() > 0
+
+    def _weekly_hosp_loss(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        native_batch: NativeEpiBatch,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Weekly ``hosp`` loss in weekly ``log1p(per-100k * week)`` space."""
+        rows = native_batch.head_index.get("hosp")
+        raw_counts = native_batch.head_target.get("hosp")
+        target_mask = native_batch.head_target_mask.get("hosp")
+        population = native_batch.head_population.get("hosp")
+        if rows is None or int(rows.numel()) == 0:
+            return device_zero(device), device_zero(device), device_false(device)
+        if raw_counts is None or target_mask is None or population is None:
+            raise ValueError(
+                "Head 'hosp' has routed rows but is missing its target, "
+                "target_mask, or population block"
+            )
+        loc = model_outputs["dist_hosp_weekly_loc"].to(device)
+        scale = model_outputs["dist_hosp_weekly_scale"].to(device)
+        weekly_mask = model_outputs["hosp_weekly_mask"].to(device)
+        if loc.shape[1] != self.weekly_slots:
+            raise ValueError(
+                f"Weekly hosp distribution width {loc.shape[1]} does not "
+                f"match W_max={self.weekly_slots} "
+                f"(ceil({self.horizon_days}/7))"
+            )
+        if loc.shape != scale.shape or tuple(weekly_mask.shape) != tuple(loc.shape):
+            raise ValueError(
+                f"Weekly hosp loc/scale/mask shapes disagree: "
+                f"{tuple(loc.shape)} vs {tuple(scale.shape)} vs "
+                f"{tuple(weekly_mask.shape)}"
+            )
+
+        raw = raw_counts.to(device=device, dtype=torch.float32)
+        if raw.shape[1] > self.weekly_slots:
+            raise ValueError(
+                f"Weekly hosp target width {raw.shape[1]} exceeds "
+                f"W_max={self.weekly_slots}; per-dow target widths are "
+                "bounded by the MOD-1 W_max normalization ruling"
+            )
+        # Target side of section 11.5: interval-summed raw weekly counts,
+        # transformed once — log1p(counts * P * 1e5).
+        pop = population.to(device=device, dtype=torch.float32).unsqueeze(1)
+        target = torch.log1p(raw * pop * _WEEKLY_PER_100K)
+        target_mask_binary = _binary_target_mask(target_mask.to(device))
+        if raw.shape[1] < self.weekly_slots:
+            # Per-dow narrower target class (MOD-1 W_max ruling): pad on the
+            # right with weight-0 slots — those slots are incomplete weeks.
+            pad = self.weekly_slots - raw.shape[1]
+            target = torch.cat([target, target.new_zeros(target.shape[0], pad)], dim=1)
+            target_mask_binary = torch.cat(
+                [
+                    target_mask_binary,
+                    torch.zeros(
+                        target_mask_binary.shape[0],
+                        pad,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                ],
+                dim=1,
+            )
+        if tuple(target.shape) != tuple(loc.shape):
+            raise ValueError(
+                f"Weekly hosp target shape {tuple(target.shape)} does not "
+                f"match model distribution shape {tuple(loc.shape)}"
+            )
+        weights = (target_mask_binary & weekly_mask.to(dtype=torch.bool)).float()
+        loss = self._weighted_masked_distribution_loss_from_weights(
+            loc=loc, scale=scale, target=target, weights=weights
+        )
+        return loss, weights.sum(), weights.sum() > 0
+
+    def compute_components(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        native_batch: NativeEpiBatch,
+    ) -> dict[str, torch.Tensor]:
+        """Routed components mirroring the base ``compute_components`` keys."""
+        zero_anchor = self._zero_anchor(model_outputs)
+        device = zero_anchor.device
+
+        # ww: legacy branch only — zero-scalar, never active in native mode.
+        ww_loss = zero_anchor
+        ww_n_eff = device_zero(device)
+        ww_active = device_false(device)
+
+        losses: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        for head in _NATIVE_ROUTED_HEADS:
+            disable_attr = self._HEAD_DISABLE_ATTR[head]
+            if bool(getattr(self, disable_attr)):
+                losses[head] = (
+                    zero_anchor,
+                    device_zero(device),
+                    device_false(device),
+                )
+            elif head == "hosp":
+                losses[head] = self._weekly_hosp_loss(
+                    model_outputs, native_batch, device=device
+                )
+            else:
+                losses[head] = self._daily_head_loss(
+                    model_outputs, native_batch, head_name=head, device=device
+                )
+
+        components: dict[str, torch.Tensor] = {
+            "ww": ww_loss,
+            "hosp": losses["hosp"][0],
+            "cases": losses["cases"][0],
+            "deaths": losses["deaths"][0],
+            "sird_supervision": zero_anchor,
+            "sird_supervision_raw": zero_anchor,
+        }
+        obs_active_mask = torch.stack(
+            [
+                ww_active,
+                losses["hosp"][2],
+                losses["cases"][2],
+                losses["deaths"][2],
+            ]
+        ).to(dtype=torch.bool)
+        totals = self.compose_total_loss(
+            components=components,
+            obs_active_mask=obs_active_mask,
+        )
+        return {
+            "ww": ww_loss,
+            "hosp": losses["hosp"][0],
+            "cases": losses["cases"][0],
+            "deaths": losses["deaths"][0],
+            "sird_supervision": zero_anchor,
+            "sird_supervision_raw": zero_anchor,
+            "ww_weighted": totals["ww_weighted"],
+            "hosp_weighted": totals["hosp_weighted"],
+            "cases_weighted": totals["cases_weighted"],
+            "deaths_weighted": totals["deaths_weighted"],
+            "sird_supervision_weighted": totals["sird_supervision_weighted"],
+            "ww_n_eff": ww_n_eff,
+            "hosp_n_eff": losses["hosp"][1],
+            "cases_n_eff": losses["cases"][1],
+            "deaths_n_eff": losses["deaths"][1],
+            "obs_weights": totals["obs_weights"],
+            "obs_active_mask": obs_active_mask,
+            "obs_total": totals["obs_total"],
+            "total": totals["total"],
+        }
+
+    def forward(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        native_batch: NativeEpiBatch,
+    ) -> dict[str, torch.Tensor]:
+        """Routed loss components over a native batch (native trainer path)."""
+        return self.compute_components(model_outputs, native_batch)
