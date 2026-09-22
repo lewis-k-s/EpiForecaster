@@ -116,59 +116,32 @@ def weekly_interval_sum(
 
 def weekly_log1p_per100k_location(
     weekly_sums: torch.Tensor,
-    population: torch.Tensor,
 ) -> torch.Tensor:
     """Mechanistic weekly location in log1p(per-100k) space (plan §11.5).
 
-    Computes ``log1p(weekly_sums * population * 1e5)``: the weekly sum of the
-    fraction-space daily flow becomes a per-100k count via the source
-    population for that epi week, then the single transform is applied. The
-    aggregation happens in :func:`weekly_interval_sum` before this transform
-    (§6: preserve units before aggregation, transform afterwards); applying
-    this transform per day and summing is a different, wrong operator.
+    Computes ``log1p(weekly_sums * 1e5)``. ``weekly_sums`` is already a
+    population fraction, so population must not multiply it (review ruling
+    R17). The aggregation happens in :func:`weekly_interval_sum` before this
+    transform (§6: preserve units before aggregation, transform afterwards);
+    applying this transform per day and summing is a different, wrong
+    operator.
 
     Args:
-        weekly_sums: Weekly sums ``[B, W]`` from :func:`weekly_interval_sum`.
-        population: Source population, either per source ``[B]`` (broadcast
-            over weeks) or per (source, week) ``[B, W]`` — the audited
-            denominator for that epi week (for ABS, the native weekly
-            population assigned at ``native_graph`` assembly, not the
-            case-only CSV ``poblacio``, per plan §10.3(4)).
+        weekly_sums: Weekly fraction sums ``[B, W]`` from
+            :func:`weekly_interval_sum`.
 
     Returns:
         Weekly locations ``[B, W]`` in the dtype of ``weekly_sums``.
 
     Raises:
-        ValueError: If shapes are inconsistent or any population entry is not
-            positive and finite.
+        ValueError: If ``weekly_sums`` is not a floating rank-2 tensor.
     """
     if weekly_sums.ndim != 2:
         raise ValueError(
             f"weekly_sums must be rank-2 [B, W], got shape {tuple(weekly_sums.shape)}"
         )
-    batch_size, num_weeks = weekly_sums.shape
-
-    if population.ndim == 1:
-        if population.shape[0] != batch_size:
-            raise ValueError(
-                f"population must have length {batch_size} to broadcast over "
-                f"weeks, got shape {tuple(population.shape)}"
-            )
-        pop = population.reshape(batch_size, 1)
-    elif population.ndim == 2:
-        if population.shape != weekly_sums.shape:
-            raise ValueError(
-                f"population must match weekly_sums shape {batch_size, num_weeks}, "
-                f"got shape {tuple(population.shape)}"
-            )
-        pop = population
-    else:
+    if not weekly_sums.dtype.is_floating_point:
         raise ValueError(
-            f"population must be [B] or [B, W], got shape {tuple(population.shape)}"
+            f"weekly_sums must have a floating dtype, got {weekly_sums.dtype}"
         )
-
-    pop = pop.to(weekly_sums.dtype)
-    if not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all()):
-        raise ValueError("population entries must be positive and finite")
-
-    return torch.log1p(weekly_sums * pop * _PER_100K)
+    return torch.log1p(weekly_sums * _PER_100K)

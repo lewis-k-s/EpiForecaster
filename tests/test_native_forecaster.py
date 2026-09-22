@@ -27,11 +27,15 @@ from models.native_forecaster import (
     NativeForecasterConfig,
     _weekly_hosp_mechanics,
 )
+from models.reporting_operators import (
+    weekly_interval_sum,
+    weekly_log1p_per100k_location,
+)
 
 pytestmark = pytest.mark.epiforecaster
 
 L = 12
-F_NATIVE = 5  # 3 clinical channels + 2 shared covariate columns
+F_NATIVE = 5  # 3 clinical channels + 2 shared covariate columns (item-level)
 D_CTX = 4
 D_IN = 24
 OBS_CONTEXT_DIM = 16
@@ -41,10 +45,21 @@ POP_ABS = 50_000.0
 POP_COMARCA = 60_000.0
 
 
-def _model(horizon: int) -> NativeEpiForecaster:
+def _model(
+    horizon: int,
+    f_native: int,
+    *,
+    observation_heads: ObservationHeadConfig | None = None,
+) -> NativeEpiForecaster:
+    """Tiny model whose history width matches the batch under test.
+
+    ``f_native`` is derived from the actual batch ``hist`` width (the
+    collated batch prepends the frozen 5-channel source-type one-hot ahead
+    of the item's native channels), never assumed from a constant.
+    """
     torch.manual_seed(1234)
     config = NativeForecasterConfig(
-        f_native=F_NATIVE,
+        f_native=f_native,
         d_ctx=D_CTX,
         forecast_horizon=horizon,
         sequence_length=L,
@@ -54,11 +69,26 @@ def _model(horizon: int) -> NativeEpiForecaster:
         head_d_model=32,
         head_n_heads=2,
         head_num_layers=2,
-        observation_heads=ObservationHeadConfig(obs_context_dim=OBS_CONTEXT_DIM),
+        observation_heads=(
+            observation_heads
+            if observation_heads is not None
+            else ObservationHeadConfig(obs_context_dim=OBS_CONTEXT_DIM)
+        ),
     )
     model = NativeEpiForecaster(config)
     model.eval()
     return model
+
+
+def _identity_hosp_heads() -> ObservationHeadConfig:
+    """Hosp head config whose delay kernel is the exact identity.
+
+    A length-1 kernel support softmax-normalizes to the single weight 1.0,
+    so the delay kernel is ``k(x) = x`` regardless of learnability — the
+    regression anchor under which the R5 weekly composition reduces to the
+    raw ROP-1 formula on the admission flow.
+    """
+    return ObservationHeadConfig(obs_context_dim=OBS_CONTEXT_DIM, kernel_length_hosp=1)
 
 
 def _item(
@@ -102,12 +132,11 @@ def _item(
 
 def test_single_query_matches_mixed_batch() -> None:
     """The same query produces identical outputs alone vs inside a batch."""
-    model = _model(horizon=14)
     abs_item = _item(
         "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
         horizon=14, pop=POP_ABS,
     )
-    single = model(collate_native_batch([abs_item]))
+    single_batch = collate_native_batch([abs_item])
     mixed_batch = collate_native_batch(
         [
             _item(
@@ -121,6 +150,8 @@ def test_single_query_matches_mixed_batch() -> None:
             ),
         ]
     )
+    model = _model(horizon=14, f_native=mixed_batch.hist.shape[2])
+    single = model(single_batch)
     mixed = model(mixed_batch)
     row = 1  # abs query position inside the mixed batch
     for key in (
@@ -152,8 +183,6 @@ def test_single_query_matches_mixed_batch() -> None:
 
 def test_requested_heads_do_not_change_trajectories() -> None:
     """Adding a head to a query's routing leaves its rollout untouched."""
-    model = _model(horizon=14)
-
     def manual_batch(muni_heads: frozenset[str]) -> NativeEpiBatch:
         has_hosp = "hosp" in muni_heads
         w_max = 2
@@ -225,8 +254,11 @@ def test_requested_heads_do_not_change_trajectories() -> None:
             head_extra={"cases": {}, "hosp": {}, "deaths": {}},
         )
 
-    cases_only = model(manual_batch(frozenset({"cases"})))
-    cases_plus_hosp = model(manual_batch(frozenset({"cases", "hosp"})))
+    cases_only_batch = manual_batch(frozenset({"cases"}))
+    cases_plus_hosp_batch = manual_batch(frozenset({"cases", "hosp"}))
+    model = _model(horizon=14, f_native=cases_only_batch.hist.shape[2])
+    cases_only = model(cases_only_batch)
+    cases_plus_hosp = model(cases_plus_hosp_batch)
     for key in (
         "S_trajectory",
         "I_trajectory",
@@ -262,8 +294,13 @@ def _naive_weekly_sums(daily: torch.Tensor, origin_dow: int) -> list[float]:
 
 
 def test_weekly_outputs_match_reporting_operator() -> None:
-    """Weekly keys align with hand-computed ROP-1 semantics (H=14)."""
-    model = _model(horizon=14)
+    """Weekly keys align with hand-computed ROP-1 semantics (H=14).
+
+    Under the identity hosp kernel the R5 composition (delay kernel, then
+    interval sum, then ``log1p(sums · clinical_scale · 1e5)``)
+    reduces to the previous raw-flow formula with the head's clinical
+    scale (init 0.05, the ~5% hospitalization rate) folded in.
+    """
     batch = collate_native_batch(
         [
             _item(
@@ -275,6 +312,11 @@ def test_weekly_outputs_match_reporting_operator() -> None:
                 horizon=14, pop=POP_ABS,
             ),
         ]
+    )
+    model = _model(
+        horizon=14,
+        f_native=batch.hist.shape[2],
+        observation_heads=_identity_hosp_heads(),
     )
     out = model(batch)
     loc = out["mechanistic_hosp_weekly"]
@@ -290,18 +332,24 @@ def test_weekly_outputs_match_reporting_operator() -> None:
     assert mask[1].tolist() == [True, True]
     assert out["pred_hosp_weekly"][0, 1].item() == 0.0
 
-    population = batch.head_population["hosp"]
+    clinical_scale = model.base.hosp_head.get_scale().item()
     for row, dow in ((0, 0), (1, 6)):
         sums = _naive_weekly_sums(source[row, 1:], dow)
         for week, week_sum in enumerate(sums):
-            expected = math.log1p(week_sum * population[row].item() * 1e5)
+            expected = math.log1p(week_sum * clinical_scale * 1e5)
             assert loc[row, week].item() == pytest.approx(expected, rel=1e-5)
             # Inverting the single transform recovers the raw weekly sum:
             # sum-before-transform, not a sum of transformed days.
             recovered = math.expm1(loc[row, week].item()) / (
-                population[row].item() * 1e5
+                clinical_scale * 1e5
             )
             assert recovered == pytest.approx(week_sum, rel=1e-4)
+    # Regression anchor: with the identity kernel the composition equals
+    # the raw-flow reporting operator with the clinical scale folded in
+    # (R5 reduces to the pre-R5 formula up to the learned scale).
+    reference_sums, _ = weekly_interval_sum(source, batch.origin_dow, horizon=14)
+    reference = weekly_log1p_per100k_location(reference_sums * clinical_scale)
+    assert torch.allclose(loc, reference, atol=1e-6)
     # Masked trailing slot is an exact zero sum -> log1p(0) location.
     assert loc[0, 1].item() == 0.0
     assert bool(torch.isfinite(scale).all())
@@ -309,8 +357,6 @@ def test_weekly_outputs_match_reporting_operator() -> None:
 
 def test_weekly_w_max_normalization_h21() -> None:
     """H=21 always emits W_max=3 slots; trailing slots zero + mask 0."""
-    model = _model(horizon=21)
-    assert model.weekly_slots == 3
     batch = collate_native_batch(
         [
             _item(
@@ -323,6 +369,12 @@ def test_weekly_w_max_normalization_h21() -> None:
             ),
         ]
     )
+    model = _model(
+        horizon=21,
+        f_native=batch.hist.shape[2],
+        observation_heads=_identity_hosp_heads(),
+    )
+    assert model.weekly_slots == 3
     out = model(batch)
     loc = out["mechanistic_hosp_weekly"]
     mask = out["hosp_weekly_mask"]
@@ -334,8 +386,9 @@ def test_weekly_w_max_normalization_h21() -> None:
     sums, week_mask = _weekly_hosp_mechanics(
         out["hospitalization_flow"],
         out["origin_dow"],
-        batch.head_population["hosp"],
         21,
+        model.base.hosp_head.delay_kernel,
+        model.base.hosp_head.get_scale(),
     )[:2]
     assert week_mask[0].tolist() == [True, True, False]
     assert sums[0, 2].item() == 0.0
@@ -343,32 +396,31 @@ def test_weekly_w_max_normalization_h21() -> None:
 
 def test_gradients_reach_adapter_backbone_and_heads() -> None:
     """loss = mean(cases loc + deaths loc + weekly hosp loc) reaches params."""
-    model = _model(horizon=14)
-    out = model(
-        collate_native_batch(
-            [
-                _item(
-                    "municipality", frozenset({"cases"}), source_id="08019",
-                    origin_dow=0, horizon=14, pop=POP_MUNI,
-                ),
-                _item(
-                    "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
-                    horizon=14, pop=POP_ABS,
-                ),
-                _item(
-                    "comarca", frozenset({"deaths"}), source_id="06",
-                    origin_dow=3, horizon=14, pop=POP_COMARCA,
-                ),
-            ]
-        )
+    batch = collate_native_batch(
+        [
+            _item(
+                "municipality", frozenset({"cases"}), source_id="08019",
+                origin_dow=0, horizon=14, pop=POP_MUNI,
+            ),
+            _item(
+                "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
+                horizon=14, pop=POP_ABS,
+            ),
+            _item(
+                "comarca", frozenset({"deaths"}), source_id="06",
+                origin_dow=3, horizon=14, pop=POP_COMARCA,
+            ),
+        ]
     )
+    model = _model(horizon=14, f_native=batch.hist.shape[2])
+    out = model(batch)
     loss = (
         out["dist_cases_loc"].mean()
         + out["dist_deaths_loc"].mean()
         + out["dist_hosp_weekly_loc"].mean()
         # Scale terms: the predictive scales are distribution parameters
         # outside the locations, so they are added to exercise every head's
-        # scale-projection route (the hosp head's only live parameter path).
+        # scale-projection route.
         + out["dist_cases_scale"].mean()
         + out["dist_deaths_scale"].mean()
         + out["dist_hosp_weekly_scale"].mean()
@@ -399,9 +451,10 @@ def test_gradients_reach_adapter_backbone_and_heads() -> None:
             "alpha",
             "distribution_scale_proj",
         ),
-        # The weekly path deliberately bypasses the hosp kernel; its scale
-        # projection is the live parameter route (module docstring).
-        model.base.hosp_head: ("distribution_scale_proj",),
+        # The weekly path routes through the hosp kernel and clinical scale
+        # (R5); under the default config the kernel is frozen (buffers only),
+        # so its live parameter routes are the scale and the scale projection.
+        model.base.hosp_head: ("delay_kernel", "scale", "distribution_scale_proj"),
     }
     for head, prefixes in head_paths.items():
         for name, param in head.named_parameters():
@@ -412,7 +465,6 @@ def test_gradients_reach_adapter_backbone_and_heads() -> None:
 
 def test_output_shape_contract() -> None:
     """All outputs follow the section 11.4 conventions [B, .] / [B_h, W_max]."""
-    model = _model(horizon=14)
     batch = collate_native_batch(
         [
             _item(
@@ -429,6 +481,7 @@ def test_output_shape_contract() -> None:
             ),
         ]
     )
+    model = _model(horizon=14, f_native=batch.hist.shape[2])
     out = model(batch)
     assert model.input_adapter(batch).shape == (3, L, D_IN)
     for key in (
@@ -469,9 +522,8 @@ def test_output_shape_contract() -> None:
     assert out["head_index"]["deaths"].tolist() == [2]
 
 
-def test_per_source_embedding_requires_source_index() -> None:
-    """The optional per-source embedding raises without an index tensor."""
-    torch.manual_seed(1234)
+def test_per_source_embedding_raises_not_implemented() -> None:
+    """R13: the per-source static embedding is deferred beyond v1."""
     config = NativeForecasterConfig(
         f_native=F_NATIVE,
         d_ctx=D_CTX,
@@ -479,30 +531,116 @@ def test_per_source_embedding_requires_source_index() -> None:
         sequence_length=L,
         d_in=D_IN,
         use_per_source_embedding=True,
-        num_sources=4,
         head_d_model=32,
         head_n_heads=2,
         head_num_layers=2,
         observation_heads=ObservationHeadConfig(obs_context_dim=OBS_CONTEXT_DIM),
     )
-    model = NativeEpiForecaster(config)
-    model.eval()
+    with pytest.raises(NotImplementedError, match="deferred beyond v1"):
+        NativeEpiForecaster(config)
+
+
+def test_weekly_hosp_gradients_reach_kernel_and_scale() -> None:
+    """R5: a weekly-location loss reaches the hosp delay kernel and scale.
+
+    The default config freezes the hosp kernel (buffers hold no
+    parameters), so connectivity is proven with a learnable-kernel config.
+    """
+    heads = ObservationHeadConfig(
+        obs_context_dim=OBS_CONTEXT_DIM,
+        learnable_kernel_hosp=True,
+        learnable_scale_hosp=True,
+    )
     batch = collate_native_batch(
         [
             _item(
                 "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
                 horizon=14, pop=POP_ABS,
-            )
+            ),
+            _item(
+                "abs", frozenset({"hosp"}), source_id="089", origin_dow=3,
+                horizon=14, pop=POP_ABS,
+            ),
         ]
     )
-    with pytest.raises(ValueError, match="source_index is required"):
-        model.input_adapter(batch)
-    indexed = model.input_adapter(batch, source_index=torch.tensor([2]))
-    assert indexed.shape == (1, L, D_IN)
-    with pytest.raises(ValueError, match="num_sources"):
-        NativeForecasterConfig(
-            f_native=F_NATIVE,
-            d_ctx=D_CTX,
-            use_per_source_embedding=True,
-            num_sources=0,
-        )
+    model = _model(
+        horizon=14, f_native=batch.hist.shape[2], observation_heads=heads
+    )
+    assert list(model.base.hosp_head.delay_kernel.named_parameters())
+    out = model(batch)
+    out["dist_hosp_weekly_loc"].sum().backward()
+    for name, param in model.base.hosp_head.delay_kernel.named_parameters():
+        assert param.grad is not None, name
+        assert torch.isfinite(param.grad).all(), name
+        assert param.grad.abs().sum() > 0, name
+    scale = model.base.hosp_head.scale
+    assert scale.grad is not None
+    assert torch.isfinite(scale.grad).all()
+    assert scale.grad.abs().item() > 0
+
+
+def test_cases_anchoring_wiring() -> None:
+    """R15: delta forecasting anchors only cases-routed rows from history.
+
+    Hand example: the anchored location continues the last valid cases
+    history value (masked decoys are ignored); rows without a valid anchor
+    and rows not routed to cases stay untouched, as do the rollout, the
+    deaths head, the weekly hosp block, and the cases scale path.
+    """
+    off_heads = ObservationHeadConfig(obs_context_dim=OBS_CONTEXT_DIM)
+    on_heads = ObservationHeadConfig(
+        obs_context_dim=OBS_CONTEXT_DIM, delta_forecasting=True
+    )
+    observed = _item(
+        "municipality", frozenset({"cases"}), source_id="08019",
+        origin_dow=0, horizon=14, pop=POP_MUNI,
+    )
+    hist_observed = torch.zeros(L, F_NATIVE)
+    hist_observed[:, 0] = torch.arange(1, L + 1) * 0.25
+    hist_observed[:10, 1] = 1.0  # last valid observation: index 9 -> 2.5
+    hist_observed[10:, 0] = 99.0  # masked decoys must not become the anchor
+    observed["hist"] = hist_observed
+    blind = _item(
+        "municipality", frozenset({"cases"}), source_id="08020",
+        origin_dow=0, horizon=14, pop=POP_MUNI,
+    )
+    hist_blind = torch.zeros(L, F_NATIVE)
+    hist_blind[:, 0] = 5.0  # all-zero mask: no valid anchor
+    blind["hist"] = hist_blind
+    batch = collate_native_batch(
+        [
+            observed,
+            blind,
+            _item(
+                "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
+                horizon=14, pop=POP_ABS,
+            ),
+        ]
+    )
+    off = _model(horizon=14, f_native=batch.hist.shape[2], observation_heads=off_heads)
+    on = _model(horizon=14, f_native=batch.hist.shape[2], observation_heads=on_heads)
+    assert torch.equal(off.base.cases_head.scale, on.base.cases_head.scale)
+    out_off, out_on = off(batch), on(batch)
+
+    # Anchoring never touches the rollout, the deaths head, the weekly hosp
+    # block, or the obs-context-driven cases scale.
+    for key in (
+        "I_trajectory",
+        "hospitalization_flow",
+        "dist_deaths_loc",
+        "dist_deaths_scale",
+        "dist_cases_scale",
+        "dist_hosp_weekly_loc",
+        "dist_hosp_weekly_scale",
+        "hosp_weekly_mask",
+    ):
+        assert torch.equal(out_off[key], out_on[key]), key
+
+    raw = out_off["dist_cases_loc"]
+    # Row 0: anchored on the last valid history value (2.5), decoys ignored.
+    expected_row = torch.clamp(2.5 + raw[0] - raw[0, :1], min=0.0)
+    assert torch.allclose(out_on["dist_cases_loc"][0], expected_row, atol=1e-6)
+    assert not torch.allclose(out_on["dist_cases_loc"][0], raw[0])
+    # Row 1 has no valid observation; row 2 is not routed to cases.
+    assert torch.equal(out_on["dist_cases_loc"][1], raw[1])
+    assert torch.equal(out_on["dist_cases_loc"][2], raw[2])

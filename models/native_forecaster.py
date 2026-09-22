@@ -17,13 +17,16 @@ Sunday-origin row uses all three. The dataset may emit per-dow widths
 ``W <= W_max`` in ``head_target``; consumers gather against this module's
 ``W_max`` outputs, never the reverse.
 
-Weekly scale and residual (frozen v1 choices, plan section 11.5):
+Weekly composition and scale (plan section 12.2b R5):
 
-- The weekly mechanistic location is
-  :func:`~models.reporting_operators.weekly_log1p_per100k_location` applied
-  to the summed fraction-space admission flow with the head's audited graph
-  population (sum before transform). The hosp head's delay kernel is NOT
-  routed: its ~21-day reporting kernel would smear across weekly slots.
+- The weekly mechanistic location routes through the hosp head's existing
+  machinery: the head's delay kernel applies per day in physical fraction
+  space to the nowcast-padded admission flow, the kernel-processed days are
+  summed over complete Mon-Sun weeks (sum before transform), and the
+  learned positive clinical scale participates inside the single weekly
+  ``log1p(per-100k)`` transform:
+  ``log1p((Σ_{t∈week} kernel_t(flow)) · clinical_scale · 1e5)``. The flow
+  is already a population fraction (review ruling R17).
 - The predictive scale reuses the hosp head's obs-context-driven scale
   projection (:meth:`ClinicalObservationHead.get_distribution_scale`) on a
   week-aligned context: the mean of the t0-augmented ``obs_context`` over
@@ -31,11 +34,7 @@ Weekly scale and residual (frozen v1 choices, plan section 11.5):
   available days; fully absent weeks (mask 0) receive a zero context and are
   loss-masked downstream.
 - The weekly residual is frozen to zero in v1 and weekly anchoring /
-  delta-forecasting is disabled: the head's residual projection is not
-  directly callable without the kernel path, because the residual
-  contribution is defined by the head's composition internals (alpha
-  scaling, anchor composition, residual log-location budget); reusing the
-  bare projection would duplicate private semantics.
+  delta-forecasting is disabled (frozen choice, mirroring the deaths head).
 
 The adapter consumes ``hist``, ``ctx_feat``, ``source_type_id`` and
 ``source_pop``. The standalone ``temporal_covariates`` batch field is
@@ -55,6 +54,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from data.native_batch import SOURCE_TYPE_ORDER, NativeEpiBatch
+from models.anchor_utils import resolve_last_valid_anchor
 from models.configs import (
     InitWeightsConfig,
     ModelVariant,
@@ -69,6 +69,13 @@ from models.reporting_operators import (
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
 logger = logging.getLogger(__name__)
+
+#: Width of the frozen leading source-type one-hot block that collation
+#: prepends to ``hist`` (review R12): ``[B, L, 5 + F_native]`` with the item's
+#: native clinical channels (value, mask, age, covariates) kept verbatim
+#: behind it. The municipal cases anchor reads the item channels through
+#: this offset.
+_ONE_HOT_WIDTH = len(SOURCE_TYPE_ORDER)
 
 __all__ = [
     "NativeEpiForecaster",
@@ -95,8 +102,9 @@ class NativeForecasterConfig:
     d_in: int = 64
     adapter_hidden_dim: int = 64
     type_embedding_dim: int = 8
+    # Deferred beyond v1 (plan section 12.2b R13): enabling it makes
+    # :class:`NativeInputAdapter` construction raise ``NotImplementedError``.
     use_per_source_embedding: bool = False
-    num_sources: int = 0
     head_d_model: int = 96
     head_n_heads: int = 2
     head_num_layers: int = 2
@@ -113,11 +121,6 @@ class NativeForecasterConfig:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         if self.d_ctx < 0:
             raise ValueError(f"d_ctx must be non-negative, got {self.d_ctx}")
-        if self.use_per_source_embedding and self.num_sources <= 0:
-            raise ValueError(
-                "use_per_source_embedding requires num_sources > 0, "
-                f"got {self.num_sources}"
-            )
 
 
 class NativeInputAdapter(nn.Module):
@@ -134,27 +137,25 @@ class NativeInputAdapter(nn.Module):
     NOT zero-init so the adapter contributes signal from the first step; the
     backbone's ReZero gates already damp its early influence.
 
-    The optional per-source static embedding (plan section 11.7) is OFF by
-    default; when enabled, :meth:`forward` requires a ``source_index [B]``
-    tensor of registry positions.
+    The optional per-source static embedding (plan section 11.7) is deferred
+    beyond v1 (plan section 12.2b R13): enabling
+    ``NativeForecasterConfig.use_per_source_embedding`` raises
+    ``NotImplementedError`` at construction instead of leaving a dead path.
     """
 
     def __init__(self, config: NativeForecasterConfig) -> None:
         super().__init__()
         self.config = config
+        if config.use_per_source_embedding:
+            raise NotImplementedError(
+                "per-source static embedding is deferred beyond v1 "
+                "(plan §12.2b R13)"
+            )
         self.type_embedding = nn.Embedding(
             num_embeddings=len(SOURCE_TYPE_ORDER),
             embedding_dim=config.type_embedding_dim,
         )
         input_dim = config.f_native + config.d_ctx + config.type_embedding_dim + 1
-        if config.use_per_source_embedding:
-            self.per_source_embedding: nn.Embedding | None = nn.Embedding(
-                num_embeddings=config.num_sources,
-                embedding_dim=config.type_embedding_dim,
-            )
-            input_dim += config.type_embedding_dim
-        else:
-            self.per_source_embedding = None
         self.input_proj = nn.Linear(input_dim, config.adapter_hidden_dim)
         self.output_proj = nn.Linear(config.adapter_hidden_dim, config.d_in)
         nn.init.xavier_normal_(self.input_proj.weight)
@@ -163,17 +164,8 @@ class NativeInputAdapter(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
         self.to(MODEL_PARAM_DTYPE)
 
-    def forward(
-        self,
-        batch: NativeEpiBatch,
-        source_index: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Assemble per-row native features; returns ``[B, L, d_in]``.
-
-        Raises:
-            ValueError: If the per-source static embedding is enabled but
-                ``source_index`` is not provided.
-        """
+    def forward(self, batch: NativeEpiBatch) -> torch.Tensor:
+        """Assemble per-row native features; returns ``[B, L, d_in]``."""
         hist = batch.hist
         seq_len = hist.shape[1]
         features: list[torch.Tensor] = [
@@ -190,19 +182,6 @@ class NativeInputAdapter(nn.Module):
                 l=seq_len,
             ),
         ]
-        if self.per_source_embedding is not None:
-            if source_index is None:
-                raise ValueError(
-                    "source_index is required when the per-source static "
-                    "embedding is enabled"
-                )
-            features.append(
-                repeat(
-                    self.per_source_embedding(source_index.long()),
-                    "b e -> b l e",
-                    l=seq_len,
-                )
-            )
         hidden = F.silu(self.input_proj(torch.cat(features, dim=-1)))
         return self.output_proj(hidden)
 
@@ -239,19 +218,24 @@ def _build_base_forecaster(config: NativeForecasterConfig) -> EpiForecaster:
 def _weekly_hosp_mechanics(
     hospitalization_flow: torch.Tensor,
     origin_dow: torch.Tensor,
-    population: torch.Tensor,
     horizon: int,
+    delay_kernel: nn.Module,
+    clinical_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Weekly ABS mechanistic block (plan section 11.5).
+    """Weekly ABS mechanistic block (plan sections 11.5, 12.2b R5).
 
-    Prepends the zero nowcast column so :func:`weekly_interval_sum` drops it
-    (the weekly head observes the admission interval flow, not a t=0
-    nowcast), sums complete Mon-Sun weeks, and applies the single weekly
-    ``log1p(per-100k)`` transform with the audited graph population.
+    Prepends the zero nowcast column so :func:`weekly_interval_sum` drops it,
+    applies the hosp head's delay kernel per day in physical fraction space,
+    sums complete Mon-Sun weeks, and applies the single weekly
+    ``log1p(per-100k)`` transform with the learned clinical scale. The flow
+    is already a population fraction, so population does not enter this
+    model-side transform (review ruling R17):
+    ``log1p((Σ_{t∈week} kernel_t(flow)) · clinical_scale · 1e5)``.
 
     Returns:
         ``(mechanistic_loc [B, W_max], week_mask [B, W_max] bool,
-        observation_source [B, H + 1])``.
+        hospitalization_source [B, H + 1])`` — the kernel-input source,
+        mirroring the daily heads' ``observation_source`` convention.
     """
     batch_size = hospitalization_flow.shape[0]
     source = torch.cat(
@@ -264,8 +248,9 @@ def _weekly_hosp_mechanics(
         ],
         dim=1,
     )
-    sums, week_mask = weekly_interval_sum(source, origin_dow, horizon=horizon)
-    loc = weekly_log1p_per100k_location(sums, population.to(sums.dtype))
+    delayed = delay_kernel(source)
+    sums, week_mask = weekly_interval_sum(delayed, origin_dow, horizon=horizon)
+    loc = weekly_log1p_per100k_location(sums * clinical_scale.to(sums.dtype))
     return loc, week_mask, source
 
 
@@ -368,14 +353,24 @@ class NativeEpiForecaster(nn.Module):
             [obs_context[:, :1, :], obs_context], dim=1
         )
 
-        # Anchoring disabled for native v1 (plan section 11.5):
-        # last_observed stays None, which keeps the anchor composition inert
-        # regardless of the shared head anchor_mode configuration.
+        # Cases anchoring (plan section 12.2b R15): when the shared head
+        # config enables delta forecasting, the last valid observation of
+        # each CASES-routed row (municipal hist channels [value, mask])
+        # anchors that row's cases head exactly like the base's municipal
+        # path. All other rows carry a zero anchor mask, so their anchor
+        # composition stays inert; deaths and the weekly hosp head remain
+        # unanchored (frozen v1).
+        cases_last = cases_last_mask = None
+        if (
+            self.config.observation_heads.delta_forecasting
+            and self.config.observation_heads.anchor_mode != "disabled"
+        ):
+            cases_last, cases_last_mask = self._resolve_cases_anchor(batch)
         dist_cases = self.base.cases_head.forward_distribution(
             I_trajectory=i_traj,
             obs_context=obs_context_with_init,
-            last_observed=None,
-            last_observed_mask=None,
+            last_observed=cases_last,
+            last_observed_mask=cases_last_mask,
         )
         dist_deaths = self.base.deaths_head.forward_distribution(
             I_trajectory=death_flow,
@@ -425,6 +420,34 @@ class NativeEpiForecaster(nn.Module):
         }
         return outputs
 
+    def _resolve_cases_anchor(
+        self, batch: NativeEpiBatch
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Last valid cases observation per row, from the collated history.
+
+        CASES-routed rows are municipal rows whose item hist channels
+        ``[value, mask]`` (behind the leading one-hot block) hold the daily
+        cases block in the head's own ``log1p(per-100k)`` space, exactly
+        like the base's municipal path. Rows routed elsewhere keep a zero
+        anchor value and mask, leaving their anchor composition inert.
+        """
+        anchor = torch.zeros(
+            batch.hist.shape[0], device=batch.hist.device, dtype=batch.hist.dtype
+        )
+        anchor_mask = torch.zeros_like(anchor)
+        rows = batch.head_index.get("cases")
+        if rows is None or rows.numel() == 0:
+            return anchor, anchor_mask
+        rows = rows.long()
+        cases_hist = batch.hist.index_select(0, rows)
+        values, mask = resolve_last_valid_anchor(
+            cases_hist[:, :, _ONE_HOT_WIDTH], cases_hist[:, :, _ONE_HOT_WIDTH + 1]
+        )
+        return (
+            anchor.index_copy(0, rows, values.to(anchor.dtype)),
+            anchor_mask.index_copy(0, rows, mask.to(anchor_mask.dtype)),
+        )
+
     def _weekly_hosp_outputs(
         self,
         batch: NativeEpiBatch,
@@ -454,17 +477,13 @@ class NativeEpiForecaster(nn.Module):
             }
 
         rows = rows.long()
-        population = batch.head_population.get("hosp")
-        if population is None:
-            raise ValueError(
-                "hosp-routed batch is missing head_population['hosp']"
-            )
         origin_dow = batch.origin_dow.index_select(0, rows)
         mechanistic_loc, week_mask, source = _weekly_hosp_mechanics(
             hospitalization_flow.index_select(0, rows),
             origin_dow,
-            population,
             horizon,
+            self.base.hosp_head.delay_kernel,
+            self.base.hosp_head.get_scale(),
         )
         week_context = _week_aligned_obs_context(
             obs_context_with_init.index_select(0, rows),

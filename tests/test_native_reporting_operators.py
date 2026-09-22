@@ -158,60 +158,35 @@ def test_sum_before_transform_contrast() -> None:
     daily = torch.tensor(
         [[1e-4, 2e-4, 3e-4, 2e-4, 1e-4, 5e-5, 1e-4]], dtype=torch.float32
     )
-    population = torch.tensor([20000.0])
-
     sums, mask = weekly_interval_sum(daily, torch.tensor([6]))
     assert torch.equal(mask, torch.tensor([[True]]))
-    location = weekly_log1p_per100k_location(sums, population)
+    location = weekly_log1p_per100k_location(sums)
 
-    # Correct operator: log1p(sum(f) * P * 1e5) with sum(f) = 1.05e-3.
-    assert math.isclose(location.item(), math.log1p(2.1e6), rel_tol=1e-6)
-    reference = torch.log1p(torch.tensor(1.05e-3 * 20000.0 * 1e5))
+    # R17: fraction-space flow needs only the per-100k factor.
+    assert math.isclose(location.item(), math.log1p(105.0), rel_tol=1e-6)
+    reference = torch.log1p(torch.tensor(1.05e-3 * 1e5))
     assert location.item() == reference.item()
 
-    # Transform-per-day-then-sum is a different, wrong operator (~87 nats).
-    per_day = torch.log1p(daily * population.reshape(1, 1) * 1e5).sum()
-    assert abs(location.item() - per_day.item()) > 50
+    # Transform-per-day-then-sum is a different, wrong operator.
+    per_day = torch.log1p(daily * 1e5).sum()
+    assert abs(location.item() - per_day.item()) > 10
     assert not torch.allclose(location, per_day)
 
 
-def test_population_broadcast_and_scaling() -> None:
+def test_fraction_location_does_not_depend_on_population() -> None:
+    """R17: an identical fraction-space flow has one reporting location."""
     weekly_sums = torch.tensor([[0.001, 0.002], [0.003, 0.0]])
-    per_source = torch.tensor([150000.0, 300000.0])
-    expected = torch.log1p(weekly_sums * per_source.unsqueeze(1) * 1e5)
-
-    loc_b = weekly_log1p_per100k_location(weekly_sums, per_source)
-    assert torch.equal(loc_b, expected)
-
-    per_week = torch.tensor(
-        [[150000.0, 150000.0], [300000.0, 300000.0]], dtype=torch.float32
-    )
-    loc_bw = weekly_log1p_per100k_location(weekly_sums, per_week)
-    assert torch.equal(loc_bw, expected)
-
-    loc_f64 = weekly_log1p_per100k_location(weekly_sums, per_source.double())
-    assert loc_f64.dtype == torch.float32
-    assert torch.allclose(loc_f64, expected)
+    expected = torch.log1p(weekly_sums * 1e5)
+    location = weekly_log1p_per100k_location(weekly_sums)
+    assert torch.equal(location, expected)
+    assert location[0, 0].item() == location.new_tensor(math.log1p(100.0)).item()
 
 
-def test_population_must_be_positive_finite() -> None:
-    sums = torch.tensor([[0.001, 0.002]])
-
-    for bad in (0.0, -5.0, float("inf"), float("nan")):
-        with pytest.raises(ValueError):
-            weekly_log1p_per100k_location(sums, torch.tensor([bad]))
-        with pytest.raises(ValueError):
-            weekly_log1p_per100k_location(sums, torch.tensor([[bad, 1.0]]))
-
-    # float64 populations are cast before the guard, so overflow to inf in
-    # float32 must be rejected too.
-    with pytest.raises(ValueError):
-        weekly_log1p_per100k_location(sums, torch.tensor([1e300], dtype=torch.float64))
-
-    with pytest.raises(ValueError):
-        weekly_log1p_per100k_location(sums, torch.tensor([1.0, 2.0]))
-    with pytest.raises(ValueError):
-        weekly_log1p_per100k_location(sums, torch.ones(2, 2))
+def test_location_input_validation() -> None:
+    with pytest.raises(ValueError, match="rank-2"):
+        weekly_log1p_per100k_location(torch.ones(2))
+    with pytest.raises(ValueError, match="floating"):
+        weekly_log1p_per100k_location(torch.ones(1, 2, dtype=torch.long))
 
 
 def test_dtype_and_determinism() -> None:
@@ -221,11 +196,11 @@ def test_dtype_and_determinism() -> None:
     sums, mask = weekly_interval_sum(daily, dow)
     assert sums.dtype == torch.float32
     assert mask.dtype == torch.bool
-    location = weekly_log1p_per100k_location(sums, torch.tensor([250000.0]))
+    location = weekly_log1p_per100k_location(sums)
     assert location.dtype == torch.float32
 
     sums_again, mask_again = weekly_interval_sum(daily, dow)
-    location_again = weekly_log1p_per100k_location(sums_again, torch.tensor([250000.0]))
+    location_again = weekly_log1p_per100k_location(sums_again)
     assert torch.equal(sums, sums_again)
     assert torch.equal(mask, mask_again)
     assert torch.equal(location, location_again)
@@ -241,15 +216,14 @@ def test_batch_rows_independent_and_gradient_flow() -> None:
     assert torch.equal(batch_mask, single_mask.expand(4, 2))
 
     # One-hot rows keep s_w in {0, 1}, making the diagonal gradient explicit:
-    # d loc / d f_t = p1e5 / (1 + s_w * p1e5) when day t sits in a complete
+    # d loc / d f_t = 1e5 / (1 + s_w * 1e5) when day t sits in a complete
     # week (its value is the row's only contribution to s_w), exactly 0 for
     # leading/trailing partial days (the completeness mask zeroes them).
-    p1e5 = 250000.0 * 1e5
-    gain = p1e5 / (1.0 + p1e5)
+    gain = 1e5 / (1.0 + 1e5)
     for origin_dow in (0, 6):
         daily = torch.eye(14, requires_grad=True)
         sums, _ = weekly_interval_sum(daily, torch.full((14,), origin_dow))
-        location = weekly_log1p_per100k_location(sums, torch.full((14,), 250000.0))
+        location = weekly_log1p_per100k_location(sums)
         location.sum().backward()
 
         for day in range(14):
