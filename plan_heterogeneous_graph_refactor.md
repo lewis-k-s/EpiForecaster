@@ -696,6 +696,31 @@ Pyright (the seven pre-existing municipal `eval_loop.py` errors are unchanged),
 and `git diff --check` pass. WP-D owns real CUDA BF16 and multi-worker
 acceptance.
 
+**WP-B.1 correction (post-review, 2026-09-22, commit `3ea0700`).** Two review
+findings closed. First, `_train_epoch` now checks `torch.isfinite(grad_norm)`
+after clipping and **before** `optimizer.step()`: a finite loss with corrupted
+gradients raises `NativeNonFiniteHalt`, appends the offending observation to
+`training_dynamics.jsonl` (non-finite value stored as null with an explicit
+`nonfinite_fields` entry), and leaves parameters untouched — a test pins
+parameter equality across the halt and the `nonfinite_halt` manifest. Second,
+the W&B contract now also requires `output.wandb_mode=disabled`; the two
+native configs and test fixtures pin it. Focused suites report **20 passed**;
+the bounded smoke still reproduces `val_loss=23.249019` and
+`mean_target_crps=2.026719` exactly. WP-B is now closed.
+
+**Native fold audit (commit `b6b3c1c`).**
+`scripts/analysis/audit_native_folds.py` emits per-fold held-out composition
+to `outputs/reports/native_fold_audit/`. Key evidence: municipalities are
+balanced (16–17 per fold, 161 total) but ABS fold sizes range 23–88 and
+comarca sizes 1–6. Fold 6 is a mega-fold: 88 observed ABS (26.6% of observed
+ABS population), 5 comarcas (31.2% of comarca population), and 1.77M owned
+overlap population versus 0.36–0.78M elsewhere. Folds 3 and 5 hold out only
+one comarca each (<1.1% of comarca population). Every fold's held-out ABS and
+comarcas are fully observed, and every fold includes 10–13 Barcelona
+municipalities plus Girona/Lleida/Tarragona representation except fold 2
+(no Tarragona) and folds 5/7/8 (no Lleida). Screening folds must be selected
+from this table; `[1,4,5]` is not evidence here.
+
 #### WP-C — Freeze the experiment policy, then wire campaign and workflow
 
 WP-C begins with a scientific-policy checkpoint. Record these decisions before generating the campaign hash:
