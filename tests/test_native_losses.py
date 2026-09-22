@@ -18,6 +18,7 @@ from data.native_batch import SOURCE_TYPE_IDS, NativeEpiBatch
 from data.query_contract import ForecastQuery, SourceType
 from evaluation.losses import (
     NativeJointInferenceLoss,
+    _log1p_per100k_targets,
     audit_head_counts,
     get_native_loss_from_config,
 )
@@ -214,6 +215,20 @@ def _daily_outputs(b: int, width: int = H) -> dict[str, torch.Tensor]:
     }
 
 
+def _model_shaped_daily_outputs(b: int) -> dict[str, torch.Tensor]:
+    """Real-model daily widths: cases ``[B, H + 1]`` with nowcast, deaths ``[B, H]``."""
+    cases = _daily_outputs(b, width=H + 1)
+    deaths = _daily_outputs(b, width=H)
+    return {
+        "pred_cases": cases["pred_cases"],
+        "dist_cases_loc": cases["dist_cases_loc"],
+        "dist_cases_scale": cases["dist_cases_scale"],
+        "pred_deaths": deaths["pred_deaths"],
+        "dist_deaths_loc": deaths["dist_deaths_loc"],
+        "dist_deaths_scale": deaths["dist_deaths_scale"],
+    }
+
+
 def _weekly_outputs(
     rows: int,
     weekly_mask: torch.Tensor,
@@ -241,7 +256,12 @@ def _weekly_outputs(
 
 @pytest.mark.parametrize("observation_loss", ["nll", "crps"])
 def test_per_head_losses_match_manual_formulas(observation_loss: str) -> None:
-    """2-row 3-step example per head, one masked point each (5 active slots)."""
+    """2-row 3-step example per head, one masked point each (5 active slots).
+
+    R2: batch targets are RAW daily counts; the loss scores them against
+    ``log1p(count / pop * 1e5)`` (cases pop 250, deaths pop 180000), so the
+    closed-form references consume the hand-transformed targets.
+    """
     queries = [
         _query("municipality", "08121", 10, {"cases", "deaths"}),
         _query("municipality", "08122", 11, {"cases", "deaths"}),
@@ -254,19 +274,21 @@ def test_per_head_losses_match_manual_formulas(observation_loss: str) -> None:
     )
     loc_c = torch.tensor([[1.0, 2.0, 3.0], [-0.5, 0.25, 2.0]])
     scale_c = torch.tensor([[0.5, 1.0, 1.5], [0.75, 0.5, 1.25]])
-    target_c = torch.tensor([[1.5, 0.0, 2.5], [0.0, 1.0, 3.0]])
+    raw_c = torch.tensor([[1.5, 0.0, 2.5], [0.0, 1.0, 3.0]])
     mask_c = torch.tensor([[1.0, 1.0, 1.0], [1.0, 0.0, 1.0]])
     loc_d = torch.tensor([[0.5, 1.5, 2.5], [1.0, 0.0, 1.5]])
     scale_d = torch.tensor([[0.8, 1.2, 0.9], [1.1, 0.7, 1.3]])
-    target_d = torch.tensor([[1.0, 2.0, 1.5], [0.5, 0.5, 2.0]])
+    raw_d = torch.tensor([[1.0, 2.0, 1.5], [0.5, 0.5, 2.0]])
     mask_d = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
-    batch.head_target["cases"] = target_c.clone()
-    batch.head_target["deaths"] = target_d.clone()
+    batch.head_target["cases"] = raw_c.clone()
+    batch.head_target["deaths"] = raw_d.clone()
     batch.head_target_mask["cases"] = mask_c.bool()
     batch.head_target_mask["deaths"] = mask_d.bool()
 
     loss = NativeJointInferenceLoss(horizon_days=3, observation_loss=observation_loss)
     point = _normal_nll if observation_loss == "nll" else _normal_crps
+    target_c = torch.log1p(raw_c / 250.0 * 1e5)
+    target_d = torch.log1p(raw_d / 180_000.0 * 1e5)
     expected_cases = point(loc_c, scale_c, target_c)[mask_c > 0.5].mean()
     expected_deaths = point(loc_d, scale_d, target_d)[mask_d > 0.5].mean()
 
@@ -288,12 +310,77 @@ def test_per_head_losses_match_manual_formulas(observation_loss: str) -> None:
 
 
 # ----------------------------------------------------------------------
+# 1b. R1: internal nowcast alignment of daily-head model tensors
+# ----------------------------------------------------------------------
+
+
+def test_cases_nowcast_column_dropped_internally() -> None:
+    """R1: model-shaped [B, H+1] cases tensors score like manually dropped t0."""
+    batch = _default_three_head_batch()
+    outputs = {
+        **_model_shaped_daily_outputs(3),
+        **_weekly_outputs(1, torch.tensor([[True, False]])),
+    }
+    loss = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")
+    components = loss(outputs, batch)
+
+    dropped = {
+        **outputs,
+        "pred_cases": outputs["pred_cases"][:, 1:],
+        "dist_cases_loc": outputs["dist_cases_loc"][:, 1:],
+        "dist_cases_scale": outputs["dist_cases_scale"][:, 1:],
+    }
+    expected = loss(dropped, batch)
+    torch.testing.assert_close(components["cases"], expected["cases"])
+    torch.testing.assert_close(components["deaths"], expected["deaths"])
+
+    # Hand-computed cases reference: drop t0, transform the raw targets
+    # with the routed population block (250.0), score against the wide loc.
+    raw = batch.head_target["cases"]
+    case_rows = batch.head_index["cases"]
+    expected_cases = _normal_nll(
+        outputs["dist_cases_loc"].index_select(0, case_rows)[:, 1:],
+        outputs["dist_cases_scale"].index_select(0, case_rows)[:, 1:],
+        torch.log1p(raw / 250.0 * 1e5),
+    ).mean()
+    torch.testing.assert_close(components["cases"], expected_cases)
+    assert components["cases_n_eff"].item() == float(H)
+    assert components["deaths_n_eff"].item() == float(H)
+
+
+def test_misaligned_daily_widths_raise_clear_error() -> None:
+    """R1: non-conforming daily widths fail loudly instead of being truncated."""
+    batch = _default_three_head_batch()
+    outputs = {
+        **_model_shaped_daily_outputs(3),
+        **_weekly_outputs(1, torch.tensor([[True, False]])),
+    }
+    loss = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")
+
+    # Deaths has no nowcast (municipal convention): [B, H+1] cannot align.
+    deaths_wide = dict(outputs)
+    deaths_wide["dist_deaths_loc"] = torch.cat(
+        [outputs["dist_deaths_loc"], outputs["dist_deaths_loc"][:, -1:]], dim=1
+    )
+    with pytest.raises(ValueError, match="deaths"):
+        loss(deaths_wide, batch)
+
+    # Cases width H+2 is neither the target width nor the nowcast width.
+    cases_wide = dict(outputs)
+    cases_wide["dist_cases_loc"] = torch.cat(
+        [outputs["dist_cases_loc"], outputs["dist_cases_loc"][:, -1:]], dim=1
+    )
+    with pytest.raises(ValueError, match="cases"):
+        loss(cases_wide, batch)
+
+
+# ----------------------------------------------------------------------
 # 2. Weekly target transform + mask composition
 # ----------------------------------------------------------------------
 
 
 def test_weekly_target_transform_and_mask_composition() -> None:
-    """log1p(counts * P * 1e5) targets; weekly completeness excludes slots."""
+    """log1p(counts / P * 1e5) targets; weekly completeness excludes slots."""
     batch = _make_batch(
         queries=[
             _query("abs", "088", 20, {"hosp"}),  # dow 6: two complete weeks
@@ -308,12 +395,12 @@ def test_weekly_target_transform_and_mask_composition() -> None:
     loss = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")
     components = loss(_weekly_outputs(2, weekly_mask), batch)
 
-    # Worked number: row 0 slot 0 -> log1p(3.0 * 70000 * 1e5) = log1p(2.1e7).
+    # Worked number: row 0 slot 0 -> log1p(3 / 70000 * 1e5).
     active_target = torch.tensor(
         [
-            math.log1p(3.0 * 70_000.0 * 1e5),
-            math.log1p(4.0 * 70_000.0 * 1e5),
-            math.log1p(5.0 * 50_000.0 * 1e5),
+            math.log1p(3.0 / 70_000.0 * 1e5),
+            math.log1p(4.0 / 70_000.0 * 1e5),
+            math.log1p(5.0 / 50_000.0 * 1e5),
         ]
     )
     active_loc = torch.tensor([20.0, 20.5, 21.0])
@@ -374,13 +461,113 @@ def test_weekly_narrow_target_width_pads_trailing_slots() -> None:
     components = loss(_weekly_outputs(2, weekly_mask), batch)
 
     active_target = torch.tensor(
-        [math.log1p(3.0 * 70_000.0 * 1e5), math.log1p(5.0 * 50_000.0 * 1e5)]
+        [math.log1p(3.0 / 70_000.0 * 1e5), math.log1p(5.0 / 50_000.0 * 1e5)]
     )
     active_loc = torch.tensor([20.0, 21.0])
     active_scale = torch.tensor([1.0, 1.5])
     expected = _normal_nll(active_loc, active_scale, active_target).mean()
     torch.testing.assert_close(components["hosp"], expected)
     assert components["hosp_n_eff"].item() == 2.0
+
+
+# ----------------------------------------------------------------------
+# 2b. R2: daily raw-count targets transformed at consumption
+# ----------------------------------------------------------------------
+
+
+def test_daily_targets_transform_log1p_per100k_at_consumption() -> None:
+    """R2/R17: raw counts -> log1p(count / pop * 1e5) after masking.
+
+    Hand-computed for pop 250: raw 2.0 -> log1p(800), raw 4.0 ->
+    log1p(1600). The masked slot's junk raw value (NaN here, a negative in
+    the invariance check) cannot leak in: masked slots are set to target 0.
+    """
+    pop = torch.tensor([250.0])
+    weights = torch.tensor([[1.0, 0.0, 1.0]])
+    target = _log1p_per100k_targets(
+        torch.tensor([[2.0, float("nan"), 4.0]]), pop, weights
+    )
+    expected = torch.tensor(
+        [[math.log1p(2.0 / 250.0 * 1e5), 0.0, math.log1p(4.0 / 250.0 * 1e5)]]
+    )
+    torch.testing.assert_close(target, expected)
+
+    junk = _log1p_per100k_targets(torch.tensor([[2.0, -3.0, 4.0]]), pop, weights)
+    torch.testing.assert_close(junk, expected)
+
+
+def test_daily_target_transform_is_equal_rate_invariant() -> None:
+    """R17: equal count/population rates have equal transformed targets."""
+    transformed = _log1p_per100k_targets(
+        torch.tensor([[10.0], [100.0]]),
+        torch.tensor([1_000.0, 10_000.0]),
+        torch.ones(2, 1),
+    )
+    torch.testing.assert_close(transformed[0], transformed[1])
+    torch.testing.assert_close(transformed, torch.full((2, 1), math.log1p(1_000.0)))
+
+
+@pytest.mark.parametrize("population", [0.0, -1.0, float("inf"), float("nan")])
+def test_daily_target_transform_rejects_invalid_population(population: float) -> None:
+    with pytest.raises(ValueError, match="population"):
+        _log1p_per100k_targets(
+            torch.ones(1, 1), torch.tensor([population]), torch.ones(1, 1)
+        )
+
+
+def test_daily_raw_count_targets_score_in_log1p_per100k_space() -> None:
+    """R2 end-to-end: raw-count cases score against the transformed targets,
+    and a junk raw value in a masked slot leaves the loss unchanged."""
+    queries = [_query("municipality", "08121", 10, {"cases"})]
+    batch = _make_batch(queries=queries, cases_rows=(0,), daily_width=3)
+    batch.head_target["cases"] = torch.tensor([[2.0, float("nan"), 4.0]])
+    batch.head_target_mask["cases"] = torch.tensor([[True, False, True]])
+    loc = torch.tensor([[0.5, 1.0, 2.0]])
+    scale = torch.tensor([[1.0, 1.0, 1.0]])
+    loss = NativeJointInferenceLoss(horizon_days=3, observation_loss="nll")
+    components = loss({"dist_cases_loc": loc, "dist_cases_scale": scale}, batch)
+
+    expected = _normal_nll(
+        loc,
+        scale,
+        torch.tensor(
+            [[math.log1p(2.0 / 250.0 * 1e5), 0.0, math.log1p(4.0 / 250.0 * 1e5)]]
+        ),
+    )[torch.tensor([[True, False, True]])].mean()
+    torch.testing.assert_close(components["cases"], expected)
+    assert components["cases_n_eff"].item() == 2.0
+
+    # Invariance: cleaning the junk masked slot to 0.0 changes nothing.
+    batch.head_target["cases"] = torch.tensor([[2.0, 0.0, 4.0]])
+    clean = loss({"dist_cases_loc": loc, "dist_cases_scale": scale}, batch)
+    torch.testing.assert_close(clean["cases"], components["cases"])
+
+
+def test_daily_head_population_falls_back_to_source_pop() -> None:
+    """R2: without a head_population block, pop is gathered from source_pop."""
+    queries = [
+        _query("municipality", "08121", 10, {"cases"}),
+        _query("municipality", "08122", 11, {"cases"}),
+    ]
+    batch = _make_batch(queries=queries, cases_rows=(0, 1), daily_width=2)
+    batch.head_population["cases"] = None
+    batch.source_pop = torch.tensor([111.0, 222.0])
+    batch.head_target["cases"] = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    batch.head_target_mask["cases"] = torch.ones(2, 2, dtype=torch.bool)
+    loc = torch.tensor([[0.5, 1.0], [2.0, 3.0]])
+    scale = torch.ones(2, 2)
+    loss = NativeJointInferenceLoss(horizon_days=2, observation_loss="nll")
+    components = loss({"dist_cases_loc": loc, "dist_cases_scale": scale}, batch)
+
+    expected_target = torch.tensor(
+        [
+            [math.log1p(1.0 / 111.0 * 1e5), math.log1p(2.0 / 111.0 * 1e5)],
+            [math.log1p(3.0 / 222.0 * 1e5), math.log1p(4.0 / 222.0 * 1e5)],
+        ]
+    )
+    expected = _normal_nll(loc, scale, expected_target).mean()
+    torch.testing.assert_close(components["cases"], expected)
+    assert components["cases_n_eff"].item() == 4.0
 
 
 # ----------------------------------------------------------------------
@@ -477,8 +664,8 @@ def test_audit_head_counts_flags_duplicate_routing() -> None:
     assert audit.as_log_dict()["duplicates"] == 0
 
     # A duplicated query collated twice routes row 0 into the cases block
-    # twice; the audit flags the identity double-count (the loss itself
-    # consumes routing as-built).
+    # twice; the audit flags the identity double-count (the loss dedupes it
+    # before scoring — see the R7 enforcement test below).
     duplicated = _default_three_head_batch()
     duplicated.head_index["cases"] = torch.tensor([0, 0], dtype=torch.long)
     duplicated.head_target["cases"] = torch.stack(
@@ -491,6 +678,51 @@ def test_audit_head_counts_flags_duplicate_routing() -> None:
     assert audit_dup.duplicate_row_positions["cases"] == (0,)
     assert audit_dup.supervised_points["cases"] == 2 * H
     assert audit_dup.as_log_dict()["duplicates"] == 1
+
+
+def test_duplicate_routing_does_not_change_loss_or_counts() -> None:
+    """R7: a duplicated routed query scores identically to the deduplicated
+    batch — same total, per-head losses, n_eff, and weights — while the raw
+    batch is still flagged by the audit."""
+    loss = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")
+    weekly = _weekly_outputs(1, torch.tensor([[True, False]]))
+    clean_batch = _default_three_head_batch()
+    clean = loss({**_daily_outputs(3), **weekly}, clean_batch)
+
+    duplicated_batch = _default_three_head_batch()
+    duplicated_batch.head_index["cases"] = torch.tensor([0, 0], dtype=torch.long)
+    duplicated_batch.head_target["cases"] = torch.stack(
+        [clean_batch.head_target["cases"][0]] * 2
+    )
+    duplicated_batch.head_target_mask["cases"] = torch.ones(2, H, dtype=torch.bool)
+    duplicated_batch.head_population["cases"] = torch.full((2,), 250.0)
+    duplicated_batch.head_index["hosp"] = torch.tensor([1, 1], dtype=torch.long)
+    duplicated_batch.head_target["hosp"] = clean_batch.head_target["hosp"].repeat(
+        2, 1
+    )
+    duplicated_batch.head_target_mask["hosp"] = torch.ones(2, W_MAX, dtype=torch.bool)
+    duplicated_batch.head_population["hosp"] = torch.full((2,), 70_000.0)
+    duplicated_weekly = {
+        key: value.repeat(2, 1) if value.ndim == 2 else value
+        for key, value in weekly.items()
+    }
+    duplicated = loss(
+        {**_daily_outputs(3), **duplicated_weekly}, duplicated_batch
+    )
+
+    audit = audit_head_counts(duplicated_batch)
+    assert audit.duplicates == 2  # malformed batch still flagged
+    assert audit.duplicate_row_positions["cases"] == (0,)
+    assert audit.duplicate_row_positions["hosp"] == (1,)
+
+    torch.testing.assert_close(duplicated["total"], clean["total"])
+    for head in ("cases", "hosp", "deaths"):
+        torch.testing.assert_close(duplicated[head], clean[head])
+        assert duplicated[f"{head}_n_eff"].item() == clean[f"{head}_n_eff"].item()
+    torch.testing.assert_close(duplicated["obs_weights"], clean["obs_weights"])
+    assert duplicated["cases_n_eff"].item() == float(H)
+    assert duplicated["hosp_n_eff"].item() == 1.0
+    assert duplicated["deaths_n_eff"].item() == float(H)
 
 
 def test_audit_head_counts_narrow_weekly_block() -> None:

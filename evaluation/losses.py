@@ -1046,9 +1046,9 @@ class JointInferenceLoss(nn.Module):
 # Native-support routed loss (plan sections 12.2 LOS-1, 11.1, 11.5)
 # ---------------------------------------------------------------------------
 
-#: Per-100k constant of the weekly ``log1p(per-100k * week)`` target space
-#: (plan section 11.5; mirrors ``models.reporting_operators``).
-_WEEKLY_PER_100K = 100_000.0
+#: Per-100k constant of the shared ``log1p(per-100k * interval)`` target
+#: space (plan sections 11.4/11.5; mirrors ``models.reporting_operators``).
+_PER_100K = 100_000.0
 
 #: Heads with routed per-head blocks in :class:`NativeEpiBatch` (section 11.4).
 _NATIVE_ROUTED_HEADS = ("cases", "hosp", "deaths")
@@ -1115,14 +1115,60 @@ def _routing_identity(
     )
 
 
+def _count_once_slots(
+    native_batch: NativeEpiBatch, rows: torch.Tensor
+) -> torch.Tensor:
+    """Routed-block slots kept under the count-once rule (review ruling R7).
+
+    A query routed twice into one head must not change any component loss,
+    ``n_eff``, or supervised count: the first occurrence in routed-block
+    order wins and later duplicates are dropped before any gather.
+    ``audit_head_counts`` still flags the malformed batch for logging.
+    """
+    seen: set[tuple[object, str, int, int, str]] = set()
+    keep: list[int] = []
+    for slot, position in enumerate(rows.tolist()):
+        identity = _routing_identity(native_batch, int(position))
+        if identity not in seen:
+            seen.add(identity)
+            keep.append(slot)
+    return torch.tensor(keep, dtype=torch.long, device=rows.device)
+
+
+def _log1p_per100k_targets(
+    raw_counts: torch.Tensor,
+    population: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Daily-head target transform at consumption (review ruling R2).
+
+    ``cases``/``deaths`` targets are raw daily counts in the batch (DS-1
+    emits raw); the loss transforms them once, per routed row, in the shared
+    ``log1p(per-100k)`` target space — mirroring the weekly hosp transform in
+    ``_weekly_hosp_loss`` (whose own semantics are unchanged):
+
+        ``target = log1p((raw_count / pop_audited) * 1e5)``
+
+    The transform runs AFTER masking: masked slots (weight 0) are set to
+    target 0 so junk raw values there (negative or NaN) cannot yield
+    NaN/inf targets.
+    """
+    pop = population.to(dtype=raw_counts.dtype).unsqueeze(1)
+    if not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all()):
+        raise ValueError("population entries must be positive and finite")
+    safe_counts = torch.where(weights > 0, raw_counts, torch.zeros_like(raw_counts))
+    return torch.log1p(safe_counts / pop * _PER_100K)
+
+
 def audit_head_counts(native_batch: NativeEpiBatch) -> NativeHeadCountAudit:
     """Count per-head supervised points and flag duplicate routing identities.
 
     Each routed row should appear at most once per head: DS-1/BAT-1 routing
     keys a block row by the query's trajectory identity, so a duplicated query
     (same ``(source, origin, interval)`` routed twice into one head) would be
-    counted twice by the loss. The loss consumes routing as-built; this audit
-    exists so section 7 logging can flag such duplicates.
+    counted twice by the loss. The loss enforces count-once itself
+    (``_count_once_slots``, review ruling R7); this audit stays for section 7
+    logging and still flags malformed batches.
     """
     supervised_points: dict[str, int] = {}
     routed_rows: dict[str, int] = {}
@@ -1227,12 +1273,19 @@ class NativeJointInferenceLoss(JointInferenceLoss):
 
     - ``cases``/``deaths``: masked distribution loss (NLL or CRPS per
       ``observation_loss``, normal family) on the routed rows ``[B_., H]``
-      in the existing daily ``log1p(per-100k)`` space — targets arrive
-      pre-transformed from DS-1, so no transform is applied here.
+      in the existing daily ``log1p(per-100k)`` space. Targets arrive as RAW
+      daily counts (review ruling R2: DS-1 emits raw); the loss transforms
+      at consumption, per routed row, ``log1p((count / pop_audited) * 1e5)``
+      after masking (masked slots get target 0). ``pop_audited`` is
+      ``head_population[head]`` when present, else ``batch.source_pop``
+      gathered at the routed rows. Gathered model tensors are aligned
+      internally (review ruling R1, municipal ``_HEAD_HAS_NOWCAST``
+      convention): ``cases`` may carry the model's t=0 nowcast column
+      ``[B_., H + 1]`` and loses it; ``deaths`` emits ``[B_., H]``.
     - ``hosp``: weekly masked distribution loss on ``[B_h, W_max]`` in weekly
       ``log1p(per-100k * week)`` space. The weekly target is transformed here
       from the batch's interval-summed raw weekly counts and the audited
-      graph population: ``log1p(counts * P * 1e5)`` (section 11.5 — the model
+      graph population: ``log1p((counts / P) * 1e5)`` (section 11.5 — the model
       side sums fractions before the transform; the target side is
       interval-summed raw counts transformed once). Effective weights are
       ``head_target_mask & hosp_weekly_mask``: partial/absent weeks, including
@@ -1244,6 +1297,13 @@ class NativeJointInferenceLoss(JointInferenceLoss):
     ``compose_total_loss`` is inherited unchanged: equal active split or
     GradNorm weights against ``obs_weight_sum`` over the 4-vector
     ``obs_active_mask`` with ``ww`` forced inactive.
+
+    Count-once is enforced before scoring (review ruling R7): routed rows
+    are deduplicated by routing identity
+    ``(source_type, source_id, forecast_origin, horizon_days,
+    realization_id)`` per head, first occurrence winning, so a duplicated
+    query changes no component loss, ``n_eff``, or count.
+    ``audit_head_counts`` still audits the raw batch.
 
     Latent SIRHD supervision is rejected (frozen v1 choice, section 11.7:
     native-mode training is real-data-only; synthetic stays on the municipal
@@ -1322,6 +1382,29 @@ class NativeJointInferenceLoss(JointInferenceLoss):
                 )
         return torch.zeros(())
 
+    def _align_daily_head_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        head_name: str,
+        target_width: int,
+    ) -> torch.Tensor:
+        """Drop a gathered daily-head tensor's t=0 nowcast column (R1).
+
+        Mirrors the municipal ``_HEAD_HAS_NOWCAST`` convention: gathered
+        ``cases`` tensors may arrive ``[B_h, H + 1]`` and lose their t=0
+        column; ``deaths`` emits ``[B_h, H]`` and passes through untouched.
+        Any other width is left alone and fails the subsequent shape check
+        with a clear error (``drop_nowcast`` would silently truncate).
+        """
+        if (
+            self._HEAD_HAS_NOWCAST[head_name]
+            and tensor.ndim >= 2
+            and int(tensor.shape[1]) == target_width + 1
+        ):
+            return drop_nowcast(tensor, target_width)
+        return tensor
+
     def _daily_head_loss(
         self,
         model_outputs: dict[str, torch.Tensor],
@@ -1342,9 +1425,38 @@ class NativeJointInferenceLoss(JointInferenceLoss):
                 "target or target_mask block"
             )
         rows = rows.to(device=device, dtype=torch.long)
-        loc = model_outputs[f"dist_{head_name}_loc"].to(device).index_select(0, rows)
+        target_width = int(target.shape[1])
+        population = native_batch.head_population.get(head_name)
+        # R7 count-once: drop later duplicates of an already-scored routing
+        # identity before any gather, so a repeated query changes no
+        # component loss, n_eff, or count (audit_head_counts still flags it).
+        slots = _count_once_slots(native_batch, rows)
+        if int(slots.numel()) != int(rows.numel()):
+            rows = rows.index_select(0, slots)
+            target = target.index_select(0, slots)
+            mask = mask.index_select(0, slots)
+            if population is not None:
+                population = population.index_select(0, slots)
+        # R1: gathered cases tensors may carry the model's t=0 nowcast
+        # column ([B_h, H + 1]) and lose it; deaths passes through. The loc
+        # resolution mirrors the municipal pred-key fallback convention.
+        loc_tensor = model_outputs.get(f"dist_{head_name}_loc")
+        if loc_tensor is None:
+            loc_tensor = model_outputs[self._HEAD_PRED_KEY[head_name]]
+        loc = self._align_daily_head_tensor(
+            loc_tensor.to(device).index_select(0, rows),
+            head_name=head_name,
+            target_width=target_width,
+        )
+        scale = model_outputs.get(f"dist_{head_name}_scale")
         scale = (
-            model_outputs[f"dist_{head_name}_scale"].to(device).index_select(0, rows)
+            torch.ones_like(loc)
+            if scale is None
+            else self._align_daily_head_tensor(
+                scale.to(device).index_select(0, rows),
+                head_name=head_name,
+                target_width=target_width,
+            )
         )
         if tuple(loc.shape) != tuple(target.shape):
             raise ValueError(
@@ -1354,6 +1466,13 @@ class NativeJointInferenceLoss(JointInferenceLoss):
             )
         target = target.to(device=device, dtype=torch.float32)
         weights = _binary_target_mask(mask.to(device)).float()
+        if population is None:
+            # R2 denominator fallback: the batch-level audited population
+            # gathered at the (deduplicated) routed rows.
+            population = native_batch.source_pop.index_select(0, rows)
+        target = _log1p_per100k_targets(
+            target, population.to(device=device, dtype=torch.float32), weights
+        )
         loss = self._weighted_masked_distribution_loss_from_weights(
             loc=loc, scale=scale, target=target, weights=weights
         )
@@ -1378,9 +1497,24 @@ class NativeJointInferenceLoss(JointInferenceLoss):
                 "Head 'hosp' has routed rows but is missing its target, "
                 "target_mask, or population block"
             )
+        # R7 count-once: same deduplication as the daily heads — the weekly
+        # model block is row-aligned with the routed block, so all seven
+        # tensors are sliced together by kept slot.
+        n_routed = int(rows.numel())
+        slots = _count_once_slots(native_batch, rows)
+        deduped = int(slots.numel()) != n_routed
+        if deduped:
+            rows = rows.index_select(0, slots)
+            raw_counts = raw_counts.index_select(0, slots)
+            target_mask = target_mask.index_select(0, slots)
+            population = population.index_select(0, slots)
         loc = model_outputs["dist_hosp_weekly_loc"].to(device)
         scale = model_outputs["dist_hosp_weekly_scale"].to(device)
         weekly_mask = model_outputs["hosp_weekly_mask"].to(device)
+        if deduped:
+            loc = loc.index_select(0, slots)
+            scale = scale.index_select(0, slots)
+            weekly_mask = weekly_mask.index_select(0, slots)
         if loc.shape[1] != self.weekly_slots:
             raise ValueError(
                 f"Weekly hosp distribution width {loc.shape[1]} does not "
@@ -1402,9 +1536,14 @@ class NativeJointInferenceLoss(JointInferenceLoss):
                 "bounded by the MOD-1 W_max normalization ruling"
             )
         # Target side of section 11.5: interval-summed raw weekly counts,
-        # transformed once — log1p(counts * P * 1e5).
+        # transformed once — log1p((counts / P) * 1e5).
         pop = population.to(device=device, dtype=torch.float32).unsqueeze(1)
-        target = torch.log1p(raw * pop * _WEEKLY_PER_100K)
+        if not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all()):
+            raise ValueError("population entries must be positive and finite")
+        safe_raw = torch.where(
+            _binary_target_mask(target_mask.to(device)), raw, torch.zeros_like(raw)
+        )
+        target = torch.log1p(safe_raw / pop * _PER_100K)
         target_mask_binary = _binary_target_mask(target_mask.to(device))
         if raw.shape[1] < self.weekly_slots:
             # Per-dow narrower target class (MOD-1 W_max ruling): pad on the

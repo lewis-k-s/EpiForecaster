@@ -44,7 +44,6 @@ from models.configs import EpiForecasterConfig
 from models.native_forecaster import NativeEpiForecaster, NativeForecasterConfig
 from training.optim_factory import create_optimizer, create_scheduler
 from utils.device import resolve_device
-from utils.training_utils import drop_nowcast
 
 logger = logging.getLogger(__name__)
 
@@ -282,24 +281,6 @@ class NativeTrainer:
             items[self.dataset[position]["head"]].append(position)
         return items
 
-    def _align_to_native_loss(
-        self,
-        outputs: dict[str, torch.Tensor | dict[str, torch.Tensor | None]],
-    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor | None]]:
-        """Drop the cases t=0 nowcast column (integration responsibility).
-
-        ``NativeEpiForecaster`` emits daily case distributions ``[B, H + 1]``
-        with the nowcast; the routed native loss contract (LOS-1) consumes
-        ``[B, H]`` — mirroring the municipal ``_align_head_tensor``. Deaths
-        already carry no nowcast and the weekly hosp block is ``[B_h, W_max]``.
-        """
-        horizon = self.config.model.forecast_horizon
-        for key in ("dist_cases_loc", "dist_cases_scale", "pred_cases"):
-            value = outputs.get(key)
-            if isinstance(value, torch.Tensor) and value.shape[-1] > horizon:
-                outputs[key] = drop_nowcast(value, horizon)
-        return outputs
-
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
@@ -358,7 +339,7 @@ class NativeTrainer:
             if max_batches is not None and step >= max_batches:
                 break
             batch = batch.to(self.device)
-            outputs = self._align_to_native_loss(self.model(batch))
+            outputs = self.model(batch)
             components = self.criterion(outputs, batch)
             total = components["total"]
             if not torch.isfinite(total):
@@ -396,7 +377,7 @@ class NativeTrainer:
             if max_batches is not None and step >= max_batches:
                 break
             batch = batch.to(self.device)
-            outputs = self._align_to_native_loss(self.model(batch))
+            outputs = self.model(batch)
             components = self.criterion(outputs, batch)
             total = components["total"]
             if not torch.isfinite(total):
