@@ -8,7 +8,46 @@ The model infers latent epidemiological states ($S, I, H, R, D$) via a different
 
 The core philosophy is: **Physics constrains the Latent State, while Observations constrain the Physics.**
 
-## 2. Architecture
+### Current real-data interfaces
+
+The default clinical interface is source-native. It uses direct forecast
+queries and preserves each observation source:
+
+| Head | Source support | Cadence |
+| --- | --- | --- |
+| Cases | Municipality | Daily |
+| Hospital admissions | ABS | Complete Monday-Sunday week |
+| Deaths | Comarca | Daily |
+
+`NativeSupportDataset` emits one typed `(source, forecast origin)` query. The
+native batch routes each row to one supported head. It keeps raw count targets,
+audited population denominators, masks, reporting age, overlap context, and OD
+context separate. `NativeEpiForecaster` then applies one shared SIRHD rollout
+and the source-specific reporting operator. Native evaluation writes granular
+schema-v4 rows with `source_type` and `source_id`, plus per-head and per-horizon
+WIS, WIS components, point error, interval coverage, and raw-count error.
+
+Use the bounded local acceptance config:
+
+```bash
+uv run train epiforecaster --config configs/train_epifor_smoke.yaml
+```
+
+The fixed-pooling baseline and the typed heterogeneous encoder are selected
+with `native.spatial_encoder: pooled|hetero`. Mobility-off keeps the model
+width fixed, zero-fills the OD summary, removes OD graph messages, and does not
+open an OD artifact. Source-aware comparisons use the audited
+`native_source_folds.json` manifest and the Stage-4 contract under
+`configs/experiment/native_stage4/`.
+
+The municipal four-channel model in the sections below is now an explicit
+legacy interface. It remains available for the wastewater branch because EDAR
+source-native migration is outside the current clinical cutover. Use
+`configs/train_epifor_legacy_municipal_smoke.yaml` for bounded local work. The
+projected municipal hospitalization and death CSV files are not valid inputs
+for native clinical training.
+
+## 2. Legacy municipal/wastewater architecture
 
 The model operates as a three-stage differentiable pipeline:
 

@@ -38,7 +38,7 @@ def _write_campaign(
     smoke_folds: list[int] | None = None,
     allowed_paths: list[str] | None = None,
 ) -> Path:
-    base = Path("configs/train_epifor_smoke.yaml").resolve()
+    base = Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()
     campaign: dict[str, object] = {
         "schema_version": 1,
         "campaign_id": "campaign-test",

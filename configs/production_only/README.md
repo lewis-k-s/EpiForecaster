@@ -9,7 +9,7 @@
 ## Configuration Files
 
 ### `train_epifor_mn5_full.yaml`
-- Production training on real data
+- Explicit legacy municipal/wastewater production training on real data
 - Resources: CUDA GPU, 20 CPUs, 64 batch size
 - Memory: ~80GB RAM recommended
 
@@ -97,13 +97,14 @@ complete workflow config before preparation when evaluation is required. Use
 not separate submission interfaces.
 
 The checked-in production model configs are deliberately limited to the
-canonical real-data model and canonical synthetic pretraining model. Historical
+explicit legacy mixed-signal model and canonical synthetic pretraining model. Historical
 experiment variants belong in immutable run manifests and overrides rather
 than additional evergreen YAML files.
 
 ## Local Acceptance
 
-Substantive EpiForecaster work uses the MN5 Snakemake interface. The sole local
-training config is a bounded parser/runtime acceptance check:
+Substantive EpiForecaster work uses the MN5 Snakemake interface. Local configs
+are bounded parser/runtime acceptance checks:
 
-- `configs/train_epifor_smoke.yaml` - 10 training batches with one worker per loader
+- `configs/train_epifor_smoke.yaml` - default source-native clinical acceptance
+- `configs/train_epifor_legacy_municipal_smoke.yaml` - explicit legacy municipal/wastewater acceptance

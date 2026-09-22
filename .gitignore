@@ -40,6 +40,12 @@ data/files/*.csv
 data/files/*.parquet
 data/files/*.h5
 data/processed/*.zarr
+# Native-support builders produce local evidence until a dedicated DVC
+# publication step creates reviewed pointer files.
+data/files/geo/generated/*
+!data/files/geo/generated/*.dvc
+data/processed/native_support/*
+!data/processed/native_support/*.dvc
 outputs/
 !outputs/
 outputs/*

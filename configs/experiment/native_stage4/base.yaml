@@ -54,7 +54,8 @@ model:
 output:
   experiment_name: native_stage4
   log_dir: outputs/training/native_stage4
-  save_checkpoints: true
+  # Native checkpoint/dynamics integration is an MN5 workflow gate.
+  save_checkpoints: false
   save_best_only: true
   write_granular_eval: true
   granular_eval_format: csv

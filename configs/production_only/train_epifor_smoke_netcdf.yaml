@@ -1,5 +1,8 @@
 env: "mn5"
 
+native:
+  enabled: false
+
 # Smoke training config for validating latent SIRHD calibration on the
 # NetCDF4 5-run smoke corpus.
 

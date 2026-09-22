@@ -1168,7 +1168,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
         storage=storage,
         direction="minimize",
     )
-    base_config = Path("configs/train_epifor_smoke.yaml").resolve()
+    base_config = Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()
     campaign_path = tmp_path / "campaign.yaml"
     campaign_path.write_text(
         yaml.safe_dump(

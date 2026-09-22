@@ -2,6 +2,8 @@
 # The only scientific difference among these arm configs is latent scaling;
 # the workflow sets max_batches only for bounded interactive acceptance.
 env: mn5
+native:
+  enabled: false
 data:
   dataset_path: data/processed/synthetic_netcdf_smoke_2run.nc
   region2vec_path: outputs/region_embeddings/region_embeddings.pt

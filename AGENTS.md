@@ -91,12 +91,18 @@ For config-driven training and the dataset pipeline, load the **`model-training`
 Key local entry points:
 
 - `uv run train regions --config configs/train_regions.yaml` — local Region2Vec training
-- `uv run train epiforecaster --config configs/train_epifor_smoke.yaml` — bounded local acceptance only
+- `uv run train epiforecaster --config configs/train_epifor_smoke.yaml` — default bounded source-native clinical acceptance
+- `uv run train epiforecaster --config configs/train_epifor_legacy_municipal_smoke.yaml` — explicit legacy municipal/wastewater acceptance only
 - `uv run preprocess (regions|epiforecaster)` — data preparation
 
 Substantive EpiForecaster training and evaluation use the immutable MN5
 Snakemake workflow. Do not introduce additional local EpiForecaster training
 configs as alternate production interfaces.
+
+The clinical default uses municipality cases, native ABS admissions, and native
+comarca deaths with preserved source IDs. The projected municipal clinical
+channels are legacy-only. The municipal branch remains explicit because the
+wastewater migration is a separate Stage-5 task.
 
 ### Remote MN5 Cluster Work
 

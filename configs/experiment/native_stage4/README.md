@@ -5,9 +5,12 @@ The matrix has 16 conditions for each fold and seed. Run the three phases in
 order: encoder, mobility, then OD context. Do not run the full matrix as an
 uncontrolled local sweep.
 
-Production execution is MN5-only. First version the native-support artifacts
-and add their immutable identities to the workflow input manifest. Then render
-each condition as an immutable workflow run with these overrides:
+Substantive execution is MN5-only. This slice freezes the experiment contract
+but does not authorize dispatch. Before any run, version the native-support
+artifacts, add their identities to the workflow input manifest, and extend the
+immutable workflow to accept the native trainer's checkpoint and
+training-dynamics artifacts. Direct cluster CLI runs are prohibited. After
+that workflow gate is implemented, render each condition with these overrides:
 
 ```text
 native.spatial_encoder=<pooled|hetero>

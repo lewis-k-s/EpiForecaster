@@ -1,5 +1,10 @@
 env: "mn5"
 
+# Explicit legacy municipal/wastewater branch. The clinical-only default uses
+# source-native support; EDAR migration remains a separate Stage-5 task.
+native:
+  enabled: false
+
 data:
   dataset_path: data/processed/real_with_id.zarr
   region2vec_path: outputs/region_embeddings/region_embeddings.pt

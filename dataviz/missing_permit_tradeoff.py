@@ -290,8 +290,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/train_epifor_smoke.yaml"),
-        help="Training config path (default: configs/train_epifor_smoke.yaml)",
+        default=Path("configs/train_epifor_legacy_municipal_smoke.yaml"),
+        help="Training config path (default: configs/train_epifor_legacy_municipal_smoke.yaml)",
     )
     parser.add_argument(
         "--output-dir",

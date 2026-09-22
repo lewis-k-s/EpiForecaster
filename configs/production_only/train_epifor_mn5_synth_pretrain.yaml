@@ -1,5 +1,8 @@
 env: "mn5"
 
+native:
+  enabled: false
+
 # Production synthetic pretraining config for the corrected continuous
 # SIRHD reporting-v1 corpus. Mirrors the MN5 full training template and enables
 # direct latent SIRHD supervision for stage-1 pretraining.

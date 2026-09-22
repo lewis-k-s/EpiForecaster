@@ -6,16 +6,16 @@ metrics under various conditions.
 
 Usage:
     # Benchmark using a training config file
-    dataloader-analyze configs/train_epifor_smoke.yaml
+    dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml
 
     # Quick test (fewer batches)
-    dataloader-analyze configs/train_epifor_smoke.yaml --num-batches 20
+    dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml --num-batches 20
 
     # JSON output
-    dataloader-analyze configs/train_epifor_smoke.yaml --json > benchmark.json
+    dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml --json > benchmark.json
 
     # Override device
-    dataloader-analyze configs/train_epifor_smoke.yaml --device cpu
+    dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml --device cpu
 """
 
 import argparse
@@ -519,16 +519,16 @@ def main():
         epilog="""
 Examples:
   # Benchmark using a training config file
-  dataloader-analyze configs/train_epifor_smoke.yaml
+  dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml
 
   # Quick test (fewer batches)
-  dataloader-analyze configs/train_epifor_smoke.yaml --num-batches 20
+  dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml --num-batches 20
 
   # JSON output
-  dataloader-analyze configs/train_epifor_smoke.yaml --json > benchmark.json
+  dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml --json > benchmark.json
 
   # Override device
-  dataloader-analyze configs/train_epifor_smoke.yaml --device cpu
+  dataloader-analyze configs/train_epifor_legacy_municipal_smoke.yaml --device cpu
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

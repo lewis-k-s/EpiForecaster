@@ -316,7 +316,7 @@ def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:
 def test_campaign_analysis_requires_exact_provenanced_paired_fold_identities(
     tmp_path: Path,
 ) -> None:
-    base_config = Path("configs/train_epifor_smoke.yaml").resolve()
+    base_config = Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()
     split_manifest = tmp_path / "splits.json"
     split_manifest.write_text(
         json.dumps({"num_folds": 2, "folds": []}) + "\n",
@@ -477,7 +477,7 @@ def test_nonfolded_output_identity_uses_none_fold(tmp_path: Path) -> None:
                 "campaign_id": "nonfolded",
                 "stage": "ablation",
                 "hypothesis": "non-folded campaigns have no fold identity",
-                "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
+                "base_config": str(Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()),
                 "baseline_condition": "baseline",
                 "fixed_overrides": {"training": {"epochs": 1}},
                 "conditions": [
@@ -557,7 +557,7 @@ def test_campaign_outputs_reject_empty_or_missing_required_metric_columns(
                 "campaign_id": "empty-metrics",
                 "stage": "ablation",
                 "hypothesis": "metric contracts fail closed",
-                "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
+                "base_config": str(Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()),
                 "baseline_condition": "baseline",
                 "fixed_overrides": {"training": {"epochs": 1}},
                 "conditions": [

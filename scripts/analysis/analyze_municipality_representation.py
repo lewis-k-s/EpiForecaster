@@ -8,7 +8,7 @@ Diagnoses:
 
 Usage:
     python scripts/analysis/analyze_municipality_representation.py \\
-        --config configs/train_epifor_smoke.yaml
+        --config configs/train_epifor_legacy_municipal_smoke.yaml
 """
 
 from __future__ import annotations
@@ -1114,7 +1114,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/train_epifor_smoke.yaml"),
+        default=Path("configs/train_epifor_legacy_municipal_smoke.yaml"),
         help="Training config to inspect.",
     )
     parser.add_argument(

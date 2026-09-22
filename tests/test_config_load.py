@@ -7,7 +7,7 @@ from omegaconf import errors
 
 from models.configs import EpiForecasterConfig
 
-BASE_LOCAL_CONFIG = "configs/train_epifor_smoke.yaml"
+BASE_LOCAL_CONFIG = "configs/train_epifor_legacy_municipal_smoke.yaml"
 
 
 OVERRIDE_CASES = [
@@ -108,6 +108,23 @@ def test_production_training_configs_default_to_normal_nll(config_path: str) -> 
 
     assert cfg.training.loss.joint.observation_loss == "nll"
     assert cfg.training.loss.joint.distribution_family == "normal"
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        "configs/train_epifor_legacy_municipal_smoke.yaml",
+        "configs/production_only/train_epifor_mn5_full.yaml",
+        "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
+    ],
+)
+def test_legacy_municipal_configs_opt_out_of_native_default(
+    config_path: str,
+) -> None:
+    cfg = EpiForecasterConfig.load(config_path)
+
+    assert cfg.native.enabled is False
 
 
 @pytest.mark.epiforecaster

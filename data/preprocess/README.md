@@ -1,6 +1,42 @@
 # Preprocessing Pipeline Guide
 
-This document summarizes how `data/preprocess/pipeline.py` converts raw epidemiological sources into the canonical Zarr dataset that every downstream experiment consumes. The pipeline no longer emits variant-specific layouts—every run writes the same tensor structure so model variants (base, mobility-aware, region embeddings, etc.) can decide how to interpret the shared features.
+This document describes both preprocessing interfaces. The source-native
+clinical interface is the default. The municipal tensor pipeline remains for
+the explicit legacy wastewater branch.
+
+## Source-native clinical contract
+
+Native preprocessing writes versioned artifacts under
+`data/processed/native_support/`. These artifacts preserve observation support
+instead of projecting every target to municipalities:
+
+| Artifact | Contract |
+| --- | --- |
+| `native_graph.zarr` | Typed municipality, ABS, comarca, and MITMA nodes with audited populations and directed overlap relations |
+| `obs_admissions.zarr` | Raw weekly ABS admission counts, masks, ages, and QC-only reported-stratum population sums |
+| `obs_deaths.zarr` | Raw daily comarca death counts, masks, and ages |
+| `od_mitma.zarr` | Primary raw native MITMA OD context |
+| `od_municipal.zarr` | Stage-4 projected-context comparison artifact only |
+| `native_source_folds.json` | Audited source-aware folds and explicit unassigned-source exclusions |
+| `native_support_manifest.json` | Versioned source and artifact identities |
+
+Municipality cases still come from `data/processed/real_with_id.zarr`. Native
+training does not load `hospitalizations_municipality.csv` or
+`deaths_municipality.csv`. Those projected files remain only for explicit
+legacy or comparison work. Missing `(date, source)` rows have mask 0 and are
+never converted to observed zeros.
+
+Run native builders through their config-driven preprocessing entry points and
+validate the manifest and QC report before training. Do not modify generated
+stores in place. Create a new versioned artifact set when inputs or operators
+change.
+
+## Legacy municipal/wastewater tensor pipeline
+
+`data/preprocess/pipeline.py` converts raw sources into the municipal Zarr used
+by the explicit legacy interface. The pipeline emits one stable tensor layout
+for the remaining municipal, mobility, region-embedding, and wastewater
+variants.
 
 ## Inputs and Canonical Variables
 

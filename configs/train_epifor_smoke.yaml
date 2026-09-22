@@ -1,35 +1,45 @@
-# Bounded local acceptance config. Substantive EpiForecaster training runs on MN5
-# through the immutable Snakemake workflow.
+# Default bounded local acceptance config for source-native clinical training.
+# Substantive EpiForecaster training runs on MN5 through the immutable
+# Snakemake workflow; this config is a tiny CPU smoke run over the real
+# native-support artifacts (data/processed/native_support). Selected inside
+# `uv run train epiforecaster --config configs/train_epifor_smoke.yaml`
+# via the additive native.enabled branch (no separate CLI subcommand).
+
+native:
+  enabled: true
+  root: data/processed/native_support
+  spatial_encoder: pooled
+  od_source: mitma
+  overlap_weighting: geostat_grid
+  od_self_flows: retain
+  od_min_flow_raw: 10.0
+  head_balanced_sampling: true
+  confirmation_guard: true
 
 data:
   dataset_path: data/processed/real_with_id.zarr
-  region2vec_path: outputs/region_embeddings/region_embeddings.pt
-  use_valid_targets: true
-  mobility_min_flow_raw: 10.0
-  mobility_weight_clip_max: 8.0
   min_history_observed_fraction: 0.5
   min_horizon_observed_fraction: 0.5
   window_stride: 1
-  sample_ordering: time
 
 model:
   type:
-    cases: true
-    regions: true
-    biomarkers: true
-    mobility: true
+    cases: false
+    regions: false
+    biomarkers: false
+    mobility: false
   params:
+    # Required ModelConfig fields; variant features are unused in native
+    # mode (NativeForecasterConfig builds a minimal base internally).
     mobility_embedding_dim: 16
-    region_embedding_dim: 64
-    include_day_of_week: true
-    include_holidays: true
-    include_lockdown_severity: true
-    include_vaccination: true
-    gnn_module: gcn
-    input_window_length: 60
-    forecast_horizon: 28
+    region_embedding_dim: 8
     max_neighbors: 20
-    gnn_depth: 2
+    input_window_length: 28
+    forecast_horizon: 14
+    head_d_model: 48
+    head_n_heads: 2
+    head_num_layers: 1
+    head_dropout: 0.1
     sir_physics:
       dt: 1.0
       enforce_nonnegativity: true
@@ -43,7 +53,7 @@ model:
       residual_clip: 10000.0
 
 output:
-  experiment_name: local_smoke
+  experiment_name: native_smoke
   log_dir: outputs/training
   write_granular_eval: false
 
@@ -51,29 +61,22 @@ training:
   seed: 42
   split_seed: 42
   device: cpu
-  init_checkpoint_path: null
-  batch_size: 2
-  gradient_accumulation_steps: 1
-  gradient_clip_value: 5.0
-  warmup_steps: 0
-  early_stopping_patience: null
-  nan_loss_patience: 3
-  epochs: 1
-  max_batches: 10
-  learning_rate: 0.0001
+  batch_size: 16
+  epochs: 2
+  max_batches: 8
+  learning_rate: 0.0005
+  optimizer: adamw
   weight_decay: 1.0e-05
-  num_workers: 1
-  val_workers: 1
-  test_workers: 1
+  scheduler_type: cosine
+  warmup_steps: 0
+  min_learning_rate: 0.0
+  gradient_clip_value: 5.0
+  early_stopping_patience: null
+  val_split: 0.1
+  num_workers: 0
+  val_workers: 0
   persistent_workers: false
   prefetch_factor: 1
-  split_strategy: node
-  node_split_strategy: stratified
-  node_split_population_bins: 5
-  val_split: 0.2
-  test_split: 0.1
-  profiler:
-    enabled: false
   plot_forecasts: false
   enable_mixed_precision: false
   loss:
@@ -81,9 +84,5 @@ training:
     joint:
       observation_loss: nll
       adaptive_scheme: none
-      gradnorm_obs_weight_sum: 0.95
-      gradnorm_update_every: 16
-      gradnorm_ema_decay: 0.9
-      gradnorm_probe: obs_context
       latent:
         total_weight: 0.0

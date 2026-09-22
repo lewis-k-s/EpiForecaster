@@ -5,7 +5,7 @@ Covers: the head-balanced deterministic round-robin sampler, the
 trip, smoke-YAML load), a 2-step forward+backward smoke on a synthetic
 native-support fixture (replicating the DS-1 test fixture builder), and
 the temporal tail split. Real-artifact acceptance runs through
-``uv run train epiforecaster --config configs/train_epifor_native_smoke.yaml``.
+``uv run train epiforecaster --config configs/train_epifor_smoke.yaml``.
 """
 
 from __future__ import annotations
@@ -324,7 +324,7 @@ def test_head_balanced_sampler_interleaves_and_is_deterministic() -> None:
 
 def test_native_support_config_defaults() -> None:
     config = NativeSupportConfig()
-    assert config.enabled is False
+    assert config.enabled is True
     assert config.root == "data/processed/native_support"
     assert config.spatial_encoder == "pooled"
     assert config.od_source == "mitma"
@@ -351,7 +351,7 @@ def test_native_support_config_defaults() -> None:
 
 
 def test_config_roundtrip_and_smoke_yaml() -> None:
-    smoke_path = CONFIGS_DIR / "train_epifor_native_smoke.yaml"
+    smoke_path = CONFIGS_DIR / "train_epifor_smoke.yaml"
     config = EpiForecasterConfig.load(smoke_path)
     assert config.native.enabled is True
     assert config.native.root == "data/processed/native_support"
@@ -365,7 +365,7 @@ def test_config_roundtrip_and_smoke_yaml() -> None:
     restored = EpiForecasterConfig.from_dict(config.to_dict())
     assert restored.native == config.native
 
-    # A dict without a native block restores the municipal defaults.
+    # A dict without a native block restores the source-native default.
     legacy = config.to_dict()
     legacy.pop("native")
     assert EpiForecasterConfig.from_dict(legacy).native == NativeSupportConfig()

@@ -1449,12 +1449,11 @@ NATIVE_OD_SELF_FLOW_MODES = ("retain", "drop")
 class NativeSupportConfig:
     """Native-support training surface (plan section 11.6).
 
-    Attached additively to :class:`EpiForecasterConfig` as the optional
-    ``native`` field. Defaults keep the municipal path untouched: native
-    mode only activates with ``enabled: true`` in the YAML ``native`` block.
+    Attached to :class:`EpiForecasterConfig` as the clinical default. The
+    legacy municipal/wastewater path requires ``enabled: false`` in its YAML.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     root: str = "data/processed/native_support"
     spatial_encoder: str = "pooled"
     od_source: str = "mitma"

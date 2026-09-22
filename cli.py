@@ -1541,11 +1541,10 @@ def _run_native_forecaster_training(
     trainer_config: EpiForecasterConfig,
     config_path: str,
 ) -> None:
-    """Execute the bounded native-support smoke workflow (slice TRN-1).
+    """Execute source-native clinical training.
 
-    Selected additively from the existing ``train epiforecaster`` command
-    when the loaded config has ``native.enabled: true`` — no separate CLI
-    subcommand is needed because the config plumbing is shared unchanged.
+    This is the default real-data clinical interface. Explicit legacy
+    municipal/wastewater configs set ``native.enabled: false``.
     """
     # Imported lazily so the municipal path never loads native modules.
     from training.native_trainer import NativeTrainer

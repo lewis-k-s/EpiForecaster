@@ -39,17 +39,17 @@ The slope distribution (0.86 mean, slightly below 1.0) indicates that:
 ```bash
 # Basic usage (default 14-day stride, all nodes)
 python -m dataviz.neighborhood_global_regression \
-    --config configs/train_epifor_smoke.yaml
+    --config configs/train_epifor_legacy_municipal_smoke.yaml
 
 # Analyze specific split with custom stride
 python -m dataviz.neighborhood_global_regression \
-    --config configs/train_epifor_smoke.yaml \
+    --config configs/train_epifor_legacy_municipal_smoke.yaml \
     --split train \
     --window-stride 7
 
 # Custom mobility threshold
 python -m dataviz.neighborhood_global_regression \
-    --config configs/train_epifor_smoke.yaml \
+    --config configs/train_epifor_legacy_municipal_smoke.yaml \
     --mobility-threshold 10.0 \
     --output-dir outputs/reports/my_analysis
 ```
