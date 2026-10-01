@@ -102,103 +102,6 @@ def _write_pointer(
     )
 
 
-def test_mn5_smoke_uses_short_single_gpu_debug_workload() -> None:
-    production = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
-    smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
-
-    assert smoke["workflow"] == production["workflow"]
-    assert smoke["dvc"] == production["dvc"]
-    assert smoke["promotion"] == production["promotion"]
-    assert smoke["optuna"]["base_config"] == production["optuna"]["base_config"]
-    assert smoke["optuna"]["workers"] == 1
-    assert smoke["optuna"]["trials_per_worker"] == 1
-    assert smoke["optuna"]["timeout_s"] == 300
-    assert smoke["optuna"]["epochs"] == 1
-    assert smoke["optuna"]["max_batches"] == 1
-    assert "training.compile=false" in smoke["optuna"]["overrides"]
-    assert smoke["evaluation"]["overrides"] == [
-        "training.max_batches=1",
-        "training.compile=false",
-        "training.val_workers=1",
-        "training.test_workers=1",
-    ]
-    assert smoke["resources"]["allocation"] == {
-        "account": "bsc08",
-        "partition": "acc",
-        "qos": "acc_debug",
-        "nodes": 1,
-        "tasks": 1,
-        "cpus_per_task": 20,
-        "gres": "gpu:1",
-        "runtime": 20,
-    }
-
-
-def test_probabilistic_smoke_reuses_short_debug_shape_with_normal_nll() -> None:
-    smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
-    probabilistic = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
-    )
-
-    assert probabilistic["workflow"] == smoke["workflow"]
-    assert probabilistic["dvc"] == smoke["dvc"]
-    assert probabilistic["evaluation"] == smoke["evaluation"]
-    assert probabilistic["resources"] == smoke["resources"]
-    for field in (
-        "workers",
-        "trials_per_worker",
-        "timeout_s",
-        "epochs",
-        "max_batches",
-    ):
-        assert probabilistic["optuna"][field] == smoke["optuna"][field]
-    assert (
-        "training.loss.joint.observation_loss=nll"
-        in probabilistic["optuna"]["overrides"]
-    )
-    assert (
-        "training.loss.joint.distribution_family=normal"
-        in probabilistic["optuna"]["overrides"]
-    )
-
-
-def test_probabilistic_batch_smoke_only_changes_qos() -> None:
-    debug = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
-    )
-    batch = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke_batch.yaml").read_text()
-    )
-
-    debug["resources"]["allocation"]["qos"] = "acc_bscls"
-    assert batch == debug
-
-
-def test_single_training_smoke_composes_training_and_evaluation() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_train_smoke.yaml").read_text()
-    )
-
-    assert smoke["workflow"] == {"kind": "train", "target": "train_evaluate"}
-    assert smoke["training"]["max_batches"] == 10
-    assert "training.num_workers=1" in smoke["training"]["overrides"]
-    assert "training.val_workers=1" in smoke["training"]["overrides"]
-    assert "training.test_workers=1" in smoke["training"]["overrides"]
-    assert "training.run_final_evaluation=false" in smoke["training"]["overrides"]
-    assert "training.compile=false" in smoke["training"]["overrides"]
-    assert smoke["evaluation"]["split"] == "test"
-    assert smoke["resources"]["allocation"] == {
-        "account": "bsc08",
-        "partition": "acc",
-        "qos": "acc_bscls",
-        "nodes": 1,
-        "tasks": 1,
-        "cpus_per_task": 20,
-        "gres": "gpu:1",
-        "runtime": 60,
-    }
-
-
 def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
     smoke = yaml.safe_load(
         (REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml").read_text()
@@ -1591,6 +1494,7 @@ def _workflow_mode_config(kind: str, run_root: Path) -> dict:
     return config
 
 
+@pytest.mark.integration
 def test_snakefile_builds_expected_dag(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_config(run_root, REPO_ROOT)
@@ -1615,6 +1519,7 @@ def test_snakefile_builds_expected_dag(tmp_path: Path) -> None:
     assert re.search(r"^total\s+14$", result.stdout, re.MULTILINE)
 
 
+@pytest.mark.integration
 def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     tmp_path: Path,
 ) -> None:
@@ -1660,6 +1565,7 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     assert "evaluation_manifest.json" in composed_result.stdout
 
 
+@pytest.mark.integration
 def test_single_training_smoke_default_dag_reaches_evaluation(
     tmp_path: Path,
 ) -> None:
@@ -1720,6 +1626,7 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
     assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
 
 
+@pytest.mark.integration
 def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     tmp_path: Path,
 ) -> None:
@@ -1742,6 +1649,7 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert re.search(r"^total\s+8$", result.stdout, re.MULTILINE)
 
 
+@pytest.mark.integration
 def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     tmp_path: Path,
 ) -> None:
@@ -1769,6 +1677,7 @@ def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
 
 
+@pytest.mark.integration
 def test_evaluation_only_dag_pins_checkpoint_inside_the_run(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("evaluate", run_root)

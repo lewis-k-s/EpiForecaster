@@ -26,7 +26,6 @@ PREPROCESSING_CONFIGS = sorted(
 CAMPAIGN_CONFIGS = sorted(CONFIG_ROOT.glob("campaigns/*.yaml"))
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize("campaign_path", CAMPAIGN_CONFIGS)
 def test_ablation_campaign_configs_parse(campaign_path):
     """Campaign YAML has its own schema; it is not a training configuration."""
@@ -88,7 +87,6 @@ def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
 
 
 @pytest.mark.epiforecaster
-@pytest.mark.integration
 @pytest.mark.parametrize("config_path", EPIFORECASTER_TRAINING_CONFIGS)
 def test_epiforecaster_training_configs_parse(config_path):
     """Test that all EpiForecaster training configs can be parsed."""
@@ -114,7 +112,6 @@ def test_epiforecaster_rejects_non_joint_loss_name():
 
 
 @pytest.mark.region
-@pytest.mark.integration
 @pytest.mark.parametrize("config_path", REGION2VEC_CONFIGS)
 def test_region2vec_configs_parse(config_path):
     """Test that all Region2Vec configs can be parsed."""
@@ -128,7 +125,6 @@ def test_region2vec_configs_parse(config_path):
     assert cfg.clustering is not None
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize("config_path", PREPROCESSING_CONFIGS)
 def test_preprocessing_configs_parse(config_path):
     """Test that all preprocessing configs can be parsed."""

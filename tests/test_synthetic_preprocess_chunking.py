@@ -639,6 +639,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
 
 
 @pytest.mark.epiforecaster
+@pytest.mark.integration
 def test_pipeline_end_to_end_synthetic(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     region_metadata_path = tmp_path / "edar_map.nc"

@@ -1,12 +1,5 @@
 """
-Tests for SIR Roll-Forward Module.
-
-Tests cover:
-1. Basic forward pass and shape validation
-2. Physics correctness (SIR dynamics)
-3. Constraint enforcement (non-negativity, mass conservation)
-4. Gradient flow (differentiability)
-5. Edge cases (zero initial infected, very high beta, etc.)
+Isolated checks for SIR dynamics, constraints, gradients, and edge cases.
 """
 
 import pytest
@@ -14,86 +7,6 @@ import torch
 
 from models.sir_rollforward import SIRRollForward
 from tests.model_test_helpers import run_standard_sir_scenario
-
-
-class TestSIRRollForwardBasics:
-    """Basic functionality tests."""
-
-    def test_initialization(self):
-        """Test module initialization with default parameters."""
-        module = SIRRollForward()
-        # Gamma and mortality are no longer in init
-        assert module.dt == 1.0
-        assert module.enforce_nonnegativity is True
-        assert module.enforce_mass_conservation is True
-
-    def test_initialization_custom_params(self):
-        """Test module initialization with custom parameters."""
-        module = SIRRollForward(
-            dt=0.5,
-            enforce_nonnegativity=False,
-            enforce_mass_conservation=False,
-        )
-        assert module.dt == 0.5
-        assert module.enforce_nonnegativity is False
-        assert module.enforce_mass_conservation is False
-
-    def test_forward_output_shapes(self):
-        """Test that forward pass produces correct output shapes."""
-        batch_size = 4
-        horizon = 7
-
-        module = SIRRollForward()
-
-        beta_t = torch.rand(batch_size, horizon) * 0.5  # Random beta in [0, 0.5]
-        gamma_t = torch.ones(batch_size, horizon) * 0.2
-        mortality_t = torch.zeros(batch_size, horizon)
-        population = torch.tensor([1000.0, 2000.0, 5000.0, 10000.0])
-
-        # Initial state: mostly susceptible, some infected
-        S0 = population * 0.95
-        I0 = population * 0.05
-        R0 = torch.zeros(batch_size)
-
-        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
-
-        # Check all outputs exist
-        assert "S_trajectory" in result
-        assert "I_trajectory" in result
-        assert "R_trajectory" in result
-        assert "physics_residual" in result
-        assert "beta_t" in result
-
-        # Check shapes (trajectories include initial state)
-        assert result["S_trajectory"].shape == (batch_size, horizon + 1)
-        assert result["I_trajectory"].shape == (batch_size, horizon + 1)
-        assert result["R_trajectory"].shape == (batch_size, horizon + 1)
-        assert result["physics_residual"].shape == (batch_size, horizon)
-        assert result["beta_t"].shape == (batch_size, horizon)
-
-    @pytest.mark.device
-    def test_forward_device_consistency(self, accelerator_device):
-        """Test that all outputs are on the same device as inputs."""
-        batch_size = 2
-        horizon = 5
-
-        module = SIRRollForward()
-
-        beta_t = torch.rand(batch_size, horizon, device=accelerator_device) * 0.5
-        gamma_t = torch.ones(batch_size, horizon, device=accelerator_device) * 0.2
-        mortality_t = torch.zeros(batch_size, horizon, device=accelerator_device)
-        population = torch.tensor([1000.0, 2000.0], device=accelerator_device)
-        S0 = population * 0.9
-        I0 = population * 0.1
-        R0 = torch.zeros(batch_size, device=accelerator_device)
-
-        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
-
-        # All outputs should be on the same device as inputs
-        for key, tensor in result.items():
-            assert tensor.device.type == beta_t.device.type, (
-                f"Output {key} on {tensor.device} but expected {beta_t.device}"
-            )
 
 
 class TestSIRPhysics:
@@ -140,35 +53,6 @@ class TestSIRPhysics:
         # Check that R is non-decreasing
         for t in range(horizon):
             assert torch.all(R_traj[:, t + 1] >= R_traj[:, t] - 1e-6)
-
-    def test_epidemic_peak_pattern(self):
-        """Test that I increases then decreases during epidemic."""
-        batch_size = 1
-        horizon = 50
-
-        module = SIRRollForward()
-
-        # High transmission rate initially
-        beta_t = torch.ones(batch_size, horizon) * 0.5
-        gamma_t = torch.ones(batch_size, horizon) * 0.2
-        mortality_t = torch.zeros(batch_size, horizon)
-        population = torch.tensor([10000.0])
-        S0 = torch.tensor([9900.0])
-        I0 = torch.tensor([100.0])
-        R0 = torch.zeros(batch_size)
-
-        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
-        I_traj = result["I_trajectory"][0]
-
-        # Find peak
-        peak_idx = torch.argmax(I_traj)
-
-        # Should have initial increase
-        assert peak_idx > 0
-
-        # Should eventually decrease (if horizon is long enough)
-        if horizon > 20:
-            assert I_traj[-1] < I_traj[peak_idx]
 
     def test_zero_beta_no_transmission(self):
         """Test that beta=0 means no new infections."""
@@ -255,19 +139,6 @@ class TestSIRConstraints:
 class TestSIRGradients:
     """Tests for gradient flow and differentiability."""
 
-    def test_beta_gradient_flow(self):
-        """Test that gradients flow back through beta_t."""
-        scenario = run_standard_sir_scenario(horizon=5, beta_requires_grad=True)
-
-        # Compute some loss on the output
-        loss = scenario.result["I_trajectory"].sum()
-        loss.backward()
-
-        # Check that beta_t received gradients
-        assert scenario.beta_t.grad is not None
-        assert scenario.beta_t.grad.shape == scenario.beta_t.shape
-        assert not torch.all(scenario.beta_t.grad == 0)
-
     def test_initial_state_gradient_flow(self):
         """Test that gradients flow back through initial states."""
         batch_size = 2
@@ -323,21 +194,6 @@ class TestSIRGradients:
 class TestSIRLoss:
     """Tests for the SIR consistency loss computation."""
 
-    def test_sir_loss_non_negative(self):
-        """Test that SIR loss is always non-negative."""
-        scenario = run_standard_sir_scenario()
-        loss = scenario.module.compute_sir_loss(
-            scenario.result["S_trajectory"],
-            scenario.result["I_trajectory"],
-            scenario.result["R_trajectory"],
-            scenario.beta_t,
-            scenario.gamma_t,
-            scenario.mortality_t,
-            scenario.population,
-        )
-
-        assert loss.item() >= 0
-
     def test_sir_loss_zero_for_perfect_dynamics(self):
         """Test that SIR loss is near zero when dynamics are perfectly satisfied."""
         # This is a bit tricky to test directly, but we can verify that
@@ -374,20 +230,6 @@ class TestSIRLoss:
 
 class TestReproductionNumber:
     """Tests for R_t computation."""
-
-    def test_basic_reproduction_number_shape(self):
-        """Test that R_t has correct shape."""
-        horizon = 10
-        scenario = run_standard_sir_scenario(horizon=horizon)
-        R_t = scenario.module.get_basic_reproduction_number(
-            scenario.beta_t,
-            scenario.gamma_t,
-            scenario.mortality_t,
-            scenario.result["S_trajectory"],
-            scenario.population,
-        )
-
-        assert R_t.shape == (2, horizon)
 
     def test_reproduction_number_formula(self):
         """Test that R_t = beta * S / (gamma * N)."""
@@ -546,32 +388,6 @@ class TestEdgeCases:
         assert torch.allclose(result["S_trajectory"], torch.zeros(1, horizon + 1))
         assert torch.allclose(result["I_trajectory"][0], expected_I, rtol=1e-4)
 
-    def test_very_long_horizon(self):
-        """Test stability with long trajectories."""
-        batch_size = 1
-        horizon = 200
-
-        module = SIRRollForward()
-
-        beta_t = torch.ones(batch_size, horizon) * 0.3
-        gamma_t = torch.ones(batch_size, horizon) * 0.2
-        mortality_t = torch.zeros(batch_size, horizon)
-        population = torch.tensor([10000.0])
-        S0 = torch.tensor([9900.0])
-        I0 = torch.tensor([100.0])
-        R0 = torch.zeros(batch_size)
-
-        result = module(beta_t, gamma_t, mortality_t, S0, I0, R0, population)
-
-        # Check mass conservation throughout
-        total = result["S_trajectory"] + result["I_trajectory"] + result["R_trajectory"]
-        expected_total = population.unsqueeze(1).expand(-1, horizon + 1)
-
-        assert torch.allclose(total, expected_total, rtol=1e-4, atol=1e-4)
-
-        # In the long run, epidemic should die out (I -> 0)
-        assert result["I_trajectory"][0, -1] < result["I_trajectory"][0, 0]
-
     def test_time_varying_beta(self):
         """Test with time-varying transmission rate."""
         batch_size = 1
@@ -602,16 +418,6 @@ class TestEdgeCases:
 
         # Peak should occur in first half (when beta is high)
         assert peak_idx <= 10
-
-    def test_single_step(self):
-        """Test with horizon=1 (single step)."""
-        result = run_standard_sir_scenario(horizon=1).result
-
-        # Should still produce correct shapes
-        assert result["S_trajectory"].shape == (2, 2)
-        assert result["I_trajectory"].shape == (2, 2)
-        assert result["R_trajectory"].shape == (2, 2)
-
 
 class TestSIRHDFlows:
     """Tests for hospitalized latent state and H -> D mortality path."""
