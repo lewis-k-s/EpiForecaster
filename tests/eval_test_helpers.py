@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from evaluation.selection import WindowSelectionSpec
@@ -149,29 +147,6 @@ def install_plot_forecast_harness(
     )
 
 
-def make_head_metric_row(
-    target: str,
-    node_id: int,
-    *,
-    mae: float,
-    rmse: float | None = None,
-    observed_count: int = 4,
-    population: float | None = None,
-    region_id: str | None = None,
-    region_label: str | None = None,
-) -> dict[str, object]:
-    return {
-        "target": target,
-        "node_id": node_id,
-        "region_id": region_id or f"{8000 + node_id:05d}",
-        "region_label": region_label or f"Region {node_id}",
-        "population": population if population is not None else 1000.0 + node_id,
-        "observed_count": observed_count,
-        "mae": mae,
-        "rmse": rmse if rmse is not None else mae + 0.1,
-    }
-
-
 def make_granular_row(**overrides: object) -> dict[str, object]:
     row: dict[str, object] = {
         "split": "test",
@@ -194,82 +169,3 @@ def make_granular_row(**overrides: object) -> dict[str, object]:
 
 def write_granular_fixture(path: Path, rows: list[dict[str, object]]) -> None:
     pd.DataFrame(rows).to_csv(path, index=False)
-
-
-def write_head_plot_inputs(
-    tmp_path: Path,
-    *,
-    metric_rows: list[dict[str, object]],
-    granular_rows: list[dict[str, object]],
-    dataset_path: Path,
-) -> Path:
-    csv_path = tmp_path / "test_node_metrics_per_head.csv"
-    pd.DataFrame(metric_rows).to_csv(csv_path, index=False)
-    csv_path.with_suffix(".csv.meta.json").write_text(
-        json.dumps(
-            {
-                "checkpoint_path": str(tmp_path / "checkpoint.ckpt"),
-                "dataset_path": str(dataset_path),
-                "run_id": 0,
-                "schema_version": "1",
-                "split": "test",
-            }
-        ),
-        encoding="utf-8",
-    )
-    pd.DataFrame(granular_rows).to_csv(tmp_path / "test_granular.csv", index=False)
-    return csv_path
-
-
-def make_forecast_sample(
-    spec: WindowSelectionSpec,
-    *,
-    target: str = "cases",
-    horizon: int = 2,
-    include_full_series: bool = False,
-) -> dict[str, object]:
-    prediction = np.arange(4, 4 + horizon, dtype=np.float32)
-    payload: dict[str, object] = {
-        "actual_context": np.array([1, 2, 3, 4, 5], dtype=np.float32),
-        "prediction": prediction,
-        "target": prediction.copy(),
-        "history": np.array([1, 2, 3], dtype=np.float32),
-        "window_mae": float(spec.score),
-    }
-    sample: dict[str, object] = {
-        "node_id": spec.node_id,
-        "window_start": spec.window_start,
-        "node_label": f"Region {spec.node_id}",
-        "t_rel": np.arange(-2, 3),
-        "H": horizon,
-        "targets": {target: payload},
-        "window_mae": float(spec.score),
-    }
-    if include_full_series:
-        payload["full_series"] = np.linspace(0.0, 1.0, 30, dtype=np.float32)
-        sample.update(t0=spec.window_start + 3, series_t=np.arange(30))
-    return sample
-
-
-def install_head_plot_harness(
-    monkeypatch: Any,
-    *,
-    sample_factory: Any = make_forecast_sample,
-    forecast_horizon: int = 2,
-    model: object | None = None,
-) -> None:
-    config = SimpleNamespace(
-        model=SimpleNamespace(input_window_length=3, forecast_horizon=forecast_horizon)
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.load_model_from_checkpoint",
-        lambda *args, **kwargs: (model or object(), config, {}),
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.build_loader_from_config",
-        lambda *args, **kwargs: (object(), None),
-    )
-    monkeypatch.setattr(
-        "dataviz.eval_head_plots.collect_forecast_samples_for_window_specs",
-        lambda **kwargs: [sample_factory(spec) for spec in kwargs["window_specs"]],
-    )

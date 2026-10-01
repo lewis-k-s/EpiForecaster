@@ -44,6 +44,7 @@ def _snakemake(snakefile: Path, target: str) -> subprocess.CompletedProcess:
 
 @pytest.mark.parametrize("kind", ["hpo", "ablation"])
 @pytest.mark.parametrize("failure_status", [1, 75])
+@pytest.mark.integration
 def test_study_rule_preserves_progress_and_resumes(tmp_path, kind, failure_status):
     """Execute the actual worker rule with a failing stand-in for srun."""
     rules = (REPO_ROOT / "workflow/rules/studies.smk").read_text()

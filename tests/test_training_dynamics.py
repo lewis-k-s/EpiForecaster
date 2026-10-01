@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import subprocess
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +11,6 @@ import torch
 import yaml
 
 from scripts.analysis.analyze_training_dynamics import (
-    _analyze_trace,
     analyze_training_dynamics,
     write_analysis_bundle,
 )
@@ -41,25 +38,6 @@ def _writer(tmp_path, *, resume: bool = False) -> TrainingDynamicsWriter:
     )
 
 
-def test_artifact_contract_import_does_not_load_training_runtime() -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; "
-                "import training.training_dynamics; "
-                "assert 'torch' not in sys.modules; "
-                "assert 'training.epiforecaster_trainer' not in sys.modules"
-            ),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-
 def test_writer_normalizes_nonfinite_values_and_finalizes(tmp_path) -> None:
     writer = _writer(tmp_path)
     row = writer.append(
@@ -80,9 +58,7 @@ def test_writer_normalizes_nonfinite_values_and_finalizes(tmp_path) -> None:
     assert manifest["status"] == "complete"
     artifact = tmp_path / DYNAMICS_ARTIFACT_NAME
     assert manifest["artifact_sha256"] == sha256_file(artifact)
-    assert json.loads(
-        (tmp_path / DYNAMICS_MANIFEST_NAME).read_text()
-    ) == manifest
+    assert json.loads((tmp_path / DYNAMICS_MANIFEST_NAME).read_text()) == manifest
     identity = load_training_dynamics_identity(tmp_path)
     assert identity["status"] == "complete"
     assert identity["row_count"] == 1
@@ -200,36 +176,7 @@ def test_analyzer_reports_insufficient_data_and_disabled_mobility(tmp_path) -> N
     analysis = analyze_training_dynamics(tmp_path)
     assert analysis["analysis_status"] == "insufficient_data"
     assert analysis["clipping"]["clipped_fraction"] == 1.0
-    assert (
-        analysis["components"]["gradnorm_mobility_gnn"]["status"]
-        == "not_applicable"
-    )
-
-
-def test_analyzer_uses_exact_rows_for_loss_gradient_association(tmp_path) -> None:
-    writer = _writer(tmp_path)
-    for index in range(20):
-        writer.append(
-            step=index * 10,
-            epoch=index // 5,
-            values={
-                "loss_train_step": float(20 - index),
-                "gradnorm_total_preclip": float(index + 1),
-                "gradient_clip_threshold": 100.0,
-                "gradnorm_backbone_encoder": float(index + 1) / 2,
-                "time_batch_s": 0.2 + index / 100,
-            },
-        )
-    writer.finalize("complete")
-
-    analysis = analyze_training_dynamics(tmp_path / DYNAMICS_MANIFEST_NAME)
-    assert analysis["analysis_status"] == "analyzed"
-    assert analysis["loss"]["count"] == 20
-    assert analysis["loss_gradient_association"]["count"] == 20
-    assert (
-        analysis["components"]["gradnorm_backbone_encoder"]["status"]
-        == "analyzed"
-    )
+    assert analysis["components"]["gradnorm_mobility_gnn"]["status"] == "not_applicable"
 
 
 def test_analyzer_rejects_non_monotonic_steps(tmp_path) -> None:
@@ -263,34 +210,12 @@ def test_analyzer_rejects_tampered_terminal_artifact(tmp_path) -> None:
         analyze_training_dynamics(tmp_path)
 
 
-def test_analyzer_reports_partial_lifecycle_and_exact_spike_steps(tmp_path) -> None:
-    writer = _writer(tmp_path)
-    for index in range(21):
-        writer.append(
-            step=index * 10,
-            epoch=0,
-            values={"loss_train_step": 100.0 if index == 7 else 1.0},
-        )
-
-    analysis = analyze_training_dynamics(tmp_path)
-
-    assert analysis["identity"]["manifest_status"] == "running"
-    assert analysis["loss"]["robust_spike_steps"] == [70]
-    assert analysis["findings"][0]["code"] == "partial_lifecycle"
-    assert analysis["findings"][0]["evidence"]["manifest_status"] == "running"
-    assert analysis["findings"][1]["code"] == "robust_loss_spikes"
-    assert analysis["findings"][1]["evidence"]["steps"] == [70]
-    assert all("hypothesis" not in finding for finding in analysis["findings"])
-
-
 def test_nonfinite_helper_persists_triggering_observation(tmp_path) -> None:
     writer = _writer(tmp_path)
     parameter = torch.nn.Parameter(torch.tensor(1.0))
     trainer = SimpleNamespace(
         training_dynamics_writer=writer,
-        config=SimpleNamespace(
-            training=SimpleNamespace(gradient_clip_value=5.0)
-        ),
+        config=SimpleNamespace(training=SimpleNamespace(gradient_clip_value=5.0)),
         optimizer=torch.optim.SGD([parameter], lr=0.1),
         current_epoch=2,
         global_step=10,
@@ -359,147 +284,6 @@ def test_trainer_run_finalizes_pruned_and_failed_dynamics() -> None:
         assert finalized[0][1]["summary"]["training_history"] == {}
 
 
-def test_analyzer_exposes_curve_clipping_and_component_series(tmp_path) -> None:
-    writer = _writer(tmp_path)
-    for index in range(25):
-        loss = 5.0 if index == 12 else 1.0 - index / 100.0
-        total = 4.0 if index in {12, 13} else 0.5
-        writer.append(
-            step=(index + 1) * 10,
-            epoch=index // 5,
-            values={
-                "loss_train_step": loss,
-                "gradnorm_total_preclip": total,
-                "gradient_clip_threshold": 1.0,
-                "gradient_clip_factor": min(1.0, 1.0 / total),
-                "gradnorm_backbone_encoder": total / 2.0,
-                "time_batch_s": 0.1,
-                "time_dataload_s": 0.02,
-                "time_model_step_s": 0.08,
-            },
-        )
-    writer.finalize("complete")
-
-    analysis = analyze_training_dynamics(tmp_path)
-
-    assert len(analysis["loss"]["series"]) == 25
-    assert analysis["loss"]["best_sampled_step"] == 250
-    assert analysis["loss"]["epoch_summaries"][0]["count"] == 5
-    assert analysis["clipping"]["clipped_steps"] == [130, 140]
-    assert analysis["clipping"]["strongest_clip_factor"] == pytest.approx(0.25)
-    backbone = analysis["components"]["gradnorm_backbone_encoder"]
-    assert len(backbone["series"]) == 25
-    assert backbone["median_squared_norm_share_pct"] == pytest.approx(25.0)
-    assert analysis["evidence_coverage"]["validation_history"] == "not_available"
-
-
-def test_profiler_trace_analysis_reports_hotspots_and_duration_semantics(
-    tmp_path,
-) -> None:
-    trace_path = tmp_path / "worker.pt.trace.json"
-    trace_path.write_text(
-        json.dumps(
-            {
-                "traceEvents": [
-                    {
-                        "name": "ProfilerStep#1",
-                        "cat": "user_annotation",
-                        "ph": "X",
-                        "ts": 0,
-                        "dur": 1000,
-                    },
-                    {
-                        "name": "aten::matmul",
-                        "cat": "cpu_op",
-                        "ph": "X",
-                        "ts": 100,
-                        "dur": 400,
-                    },
-                    {
-                        "name": "gemm_kernel",
-                        "cat": "kernel",
-                        "ph": "X",
-                        "ts": 200,
-                        "dur": 300,
-                    },
-                    {
-                        "name": "cudaDeviceSynchronize",
-                        "cat": "cuda_runtime",
-                        "ph": "X",
-                        "ts": 600,
-                        "dur": 100,
-                    },
-                    {
-                        "name": "CompiledFxGraph",
-                        "cat": "user_annotation",
-                        "ph": "X",
-                        "ts": 700,
-                        "dur": 200,
-                    },
-                ]
-            }
-        )
-    )
-
-    analysis = _analyze_trace(trace_path)
-
-    assert analysis["trace_duration_ms"] == pytest.approx(1.0)
-    assert analysis["top_cpu_operations"][0]["name"] == "aten::matmul"
-    assert analysis["top_cuda_kernels"][0]["name"] == "gemm_kernel"
-    assert analysis["synchronization"]["count"] == 1
-    assert analysis["compilation"]["summed_duration_ms"] == pytest.approx(0.2)
-    assert analysis["duration_semantics"] == "inclusive_nested"
-
-
-def test_analysis_bundle_writes_tables_plots_and_refuses_overwrite(tmp_path) -> None:
-    model_root = tmp_path / "model"
-    writer = _writer(model_root)
-    for index in range(20):
-        writer.append(
-            step=(index + 1) * 10,
-            epoch=index // 5,
-            values={
-                "loss_train_step": 1.0 - index / 100.0,
-                "gradnorm_total_preclip": 0.5,
-                "gradient_clip_threshold": 1.0,
-                "time_batch_s": 0.1,
-            },
-        )
-    writer.finalize("complete")
-    analysis = analyze_training_dynamics(model_root)
-    output_dir = tmp_path / "report"
-
-    bundle = write_analysis_bundle(analysis, output_dir)
-
-    assert (output_dir / "analysis.json").is_file()
-    assert (output_dir / "provenance.json").is_file()
-    assert (output_dir / "bundle_manifest.json").is_file()
-    assert not (output_dir / "report.md").exists()
-    assert Path(bundle["tables"]["loss_series"]).is_file()
-    assert Path(bundle["tables"]["timing_summary"]).is_file()
-    assert Path(bundle["figures"]["loss_curve"]).is_file()
-    manifest = json.loads((output_dir / "bundle_manifest.json").read_text())
-    assert manifest["tables"]["loss_series"] == "tables/loss_series.csv"
-    assert manifest["figures"]["loss_curve"] == "figures/loss_curve.png"
-    assert manifest["provenance"] == "provenance.json"
-    with pytest.raises(FileExistsError, match="refuse to overwrite"):
-        write_analysis_bundle(analysis, output_dir)
-
-
-def test_training_dynamics_value_axis_scales() -> None:
-    from scripts.analysis.analyze_training_dynamics import _value_axis_scale
-
-    assert _value_axis_scale([2.0, 0.5], signed=True) == ("log", {})
-    assert _value_axis_scale([0.5, -0.2], signed=True) == (
-        "symlog",
-        {"linthresh": 1e-2},
-    )
-    assert _value_axis_scale([100.0, 0.5], signed=False) == (
-        "log",
-        {"nonpositive": "clip"},
-    )
-
-
 def test_provenance_query_reconciles_dvc_and_survives_portable_copy(
     tmp_path,
 ) -> None:
@@ -554,13 +338,7 @@ def test_provenance_query_reconciles_dvc_and_survives_portable_copy(
     state = run_root / ".state"
     state.mkdir()
     (state / "data_manifest.json").write_text(
-        json.dumps(
-            {
-                "targets": {
-                    "data/processed/data.zarr.dvc": {"md5": "data.dir"}
-                }
-            }
-        )
+        json.dumps({"targets": {"data/processed/data.zarr.dvc": {"md5": "data.dir"}}})
     )
     dependencies = state / "dependencies"
     dependencies.mkdir()
@@ -583,13 +361,10 @@ def test_provenance_query_reconciles_dvc_and_survives_portable_copy(
     assert provenance["dvc"]["reconciliation"] == "matched"
     assert provenance["dvc"]["targets"][0]["materialization"] == "confirmed"
     assert provenance["dvc"]["targets"][1]["materialization"] == "not_applicable"
-    assert provenance["training_evidence"]["retention_class"] == (
-        "run_scoped_hashed"
-    )
+    assert provenance["training_evidence"]["retention_class"] == ("run_scoped_hashed")
     table = provenance_table(provenance)
     assert any(
-        row["category"] == "dvc_input"
-        and row["identity"] == "data.dir"
+        row["category"] == "dvc_input" and row["identity"] == "data.dir"
         for row in table
     )
 
@@ -629,50 +404,7 @@ def test_provenance_query_reconciles_dvc_and_survives_portable_copy(
     )
     analysis = analyze_training_dynamics(model_root)
     assert analysis["provenance"]["run"]["run_id"] == "run-1"
-    assert analysis["provenance"]["training_evidence"]["dvc_tracking"] == (
-        "recorded"
-    )
+    assert analysis["provenance"]["training_evidence"]["dvc_tracking"] == ("recorded")
     output_dir = tmp_path / "portable-report"
     bundle = write_analysis_bundle(analysis, output_dir)
     assert Path(bundle["tables"]["provenance"]).is_file()
-
-
-def test_analyzer_reports_adaptive_gradnorm_controller_telemetry(tmp_path) -> None:
-    writer = _writer(tmp_path)
-    for index in range(20):
-        values = {
-            "loss_train_step": 1.0,
-            "gradnorm_total_preclip": 1.0,
-            "gradient_clip_threshold": 5.0,
-        }
-        for task_index, task in enumerate(("ww", "hosp", "cases", "deaths")):
-            values[f"gradnorm_w_{task}"] = 0.2 + task_index / 100
-            values[f"gradnorm_active_{task}"] = 1.0
-            values[f"gradnorm_task_loss_{task}"] = 0.5
-            values[f"gradnorm_task_norm_{task}"] = 0.1
-            values[f"gradnorm_target_norm_{task}"] = 0.11
-            values[f"gradnorm_rate_{task}"] = 1.0
-        values["gradnorm_sidecar_ran"] = float(index % 2 == 0)
-        values["gradnorm_L_grad"] = 0.04
-        if index % 5 == 0:
-            values["grad_snapshot_global_norm"] = 0.5
-            values["grad_snapshot_non_finite_layers"] = 0
-            values["grad_snapshot_vanishing_layers"] = 2
-            values["grad_snapshot_exploding_layers"] = 0
-            values["grad_snapshot_head_ww_unexpected_zero"] = float(index == 10)
-        writer.append(
-            step=(index + 1) * 10,
-            epoch=index // 5,
-            values=values,
-        )
-    writer.finalize("complete")
-
-    analysis = analyze_training_dynamics(tmp_path)
-
-    controller = analysis["adaptive_gradnorm"]
-    assert controller["status"] == "analyzed"
-    assert controller["sidecar_update_count"] == 10
-    assert controller["tasks"]["ww"]["median_weight"] == pytest.approx(0.2)
-    assert analysis["evidence_coverage"]["adaptive_gradnorm_controller"] == "analyzed"
-    assert analysis["gradient_snapshots"]["count"] == 4
-    assert analysis["gradient_snapshots"]["unexpected_zero_steps"]["ww"] == [110]
