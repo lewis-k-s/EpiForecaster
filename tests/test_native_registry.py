@@ -13,10 +13,13 @@ between the canonical conjunction and the former OR filters.
 from __future__ import annotations
 
 from datetime import date
+import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 
 from data.native_registry import (
     ABS_POPULATION_NOTE,
@@ -25,6 +28,7 @@ from data.native_registry import (
     SENTINEL_LABEL,
     SOURCE_ABS,
     SOURCE_COMARCA,
+    SOURCE_EDAR,
     SOURCE_MUNICIPALITY,
     STATUS_OBSERVED,
     STATUS_UNMAPPED,
@@ -35,6 +39,7 @@ from data.native_registry import (
     abs_sentinel_mask,
     build_abs_registry,
     build_comarca_registry,
+    build_edar_registry,
     build_municipal_registry,
 )
 
@@ -131,6 +136,90 @@ class TestSourceRegistry:
             "unmapped": 2,
         }
         assert registry.counts_by_status(SOURCE_COMARCA) == {}
+
+
+class TestEdarRegistry:
+    def _write_inputs(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        wastewater_path = tmp_path / "wastewater.csv"
+        pd.DataFrame(
+            {
+                "id mostra": [
+                    "E001-2020-04-01",
+                    "E001-2020-04-08",
+                    "E002-2019-12-01",
+                    "E004-2020-04-01",
+                ]
+            }
+        ).to_csv(wastewater_path, index=False)
+        contribution_path = tmp_path / "contribution.nc"
+        xr.Dataset(
+            {
+                "contribution_ratio": (
+                    ("edar_id", "home"),
+                    np.array([[1.0, 0.0], [0.5, 0.0], [0.0, 0.0]]),
+                )
+            },
+            coords={
+                "edar_id": ["E001", "E002", "E003"],
+                "home": ["08001", "08002"],
+            },
+        ).to_netcdf(contribution_path)
+        geometry_path = tmp_path / "edar.geojson"
+        geometry_path.write_text(
+            json.dumps(
+                {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {"codi_edar": "E001"},
+                            "geometry": {
+                                "type": "Point",
+                                "coordinates": [2.0, 41.0],
+                            },
+                        },
+                        {
+                            "type": "Feature",
+                            "properties": {"codi_edar": "E005"},
+                            "geometry": {
+                                "type": "Point",
+                                "coordinates": [2.1, 41.1],
+                            },
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return wastewater_path, contribution_path, geometry_path
+
+    def test_observation_and_mapping_control_status_not_geometry(
+        self, tmp_path: Path
+    ) -> None:
+        paths = self._write_inputs(tmp_path)
+        registry, report = build_edar_registry(*paths)
+
+        assert registry.source_status(SOURCE_EDAR, "E001") == STATUS_OBSERVED
+        assert registry.source_status(SOURCE_EDAR, "E002") == STATUS_UNOBSERVED
+        assert registry.source_status(SOURCE_EDAR, "E003") == STATUS_UNMAPPED
+        assert registry.source_status(SOURCE_EDAR, "E004") == STATUS_UNMAPPED
+        assert registry.source_status(SOURCE_EDAR, "E005") == STATUS_UNMAPPED
+        assert report.observation_only_codes == ("E004",)
+        assert report.mapping_only_codes == ("E003",)
+        assert report.zero_support_codes == ("E003",)
+        assert report.missing_geometry_codes == ("E002", "E003", "E004")
+        assert report.geometry_only_codes == ("E005",)
+
+    def test_bad_sample_identity_fails_closed(self, tmp_path: Path) -> None:
+        wastewater_path, contribution_path, geometry_path = self._write_inputs(tmp_path)
+        pd.DataFrame({"id mostra": ["not-an-edar-sample"]}).to_csv(
+            wastewater_path, index=False
+        )
+
+        with pytest.raises(ValueError, match="Invalid EDAR sample"):
+            build_edar_registry(
+                wastewater_path, contribution_path, geometry_path
+            )
 
 
 ABS_CSV_COLUMNS = [

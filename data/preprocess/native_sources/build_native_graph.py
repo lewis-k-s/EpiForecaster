@@ -41,16 +41,18 @@ import zarr
 
 from data.native_registry import (
     SOURCE_ABS,
+    SOURCE_EDAR,
     SOURCE_MUNICIPALITY,
     STATUS_OBSERVED,
     STATUS_UNMAPPED,
     SourceRegistry,
     build_abs_registry,
     build_comarca_registry,
+    build_edar_registry,
     build_municipal_registry,
 )
 
-SCHEMA = "native_graph.v1"
+SCHEMA = "native_graph.v2"
 SOURCE_MITMA = "mitma"
 
 #: Every od_mitma zone carries 451 in-window mobility days, so all mitma
@@ -81,6 +83,23 @@ RELATION_PAIRS: dict[str, frozenset[tuple[str, str]]] = {
     "mitma_comarca": frozenset({("mitma", "comarca"), ("comarca", "mitma")}),
 }
 
+EDAR_RELATION_PAIRS: dict[str, frozenset[tuple[str, str]]] = {
+    "muni_edar_catchment": frozenset(
+        {("municipality", "edar"), ("edar", "municipality")}
+    ),
+    "edar_abs_catchment": frozenset({("edar", "abs"), ("abs", "edar")}),
+    "edar_comarca_catchment": frozenset(
+        {("edar", "comarca"), ("comarca", "edar")}
+    ),
+    "edar_located_in_municipality": frozenset(
+        {("edar", "municipality"), ("municipality", "edar")}
+    ),
+    "edar_located_in_abs": frozenset({("edar", "abs"), ("abs", "edar")}),
+    "edar_located_in_comarca": frozenset(
+        {("edar", "comarca"), ("comarca", "edar")}
+    ),
+}
+
 WEIGHT_BOUND_TOL = 1e-6  # float64 fracs equal to 1.0 up to 1 ulp
 PER_DST_SUM_TOL = 1e-3  # overlapping mitma _AM zones may exceed 1 in sum
 ABS_POPULATION_MAX = 2e6
@@ -96,6 +115,15 @@ DEFAULT_MPIS_CSV = Path("data/files/mpiscatalunya.csv")
 DEFAULT_POPULATION_CSV = Path("data/files/fl_population_por_municipis.csv")
 DEFAULT_REFERENCE_CSV = Path("data/files/municipality_id_reference.csv")
 DEFAULT_ABS_SHP = Path("data/files/geo/cartografia/ABS.shp")
+DEFAULT_WASTEWATER_CSV = Path("data/files/wastewater_biomarkers_icra.csv")
+DEFAULT_EDAR_CONTRIBUTION = Path("data/files/edar_muni_edges.nc")
+DEFAULT_EDAR_GEOJSON = Path("data/files/geo/EDAR.geojson")
+DEFAULT_EDAR_CATCHMENT = Path(
+    "data/processed/native_support/edar_catchment_edges.parquet"
+)
+DEFAULT_EDAR_POINTS = Path(
+    "data/processed/native_support/edar_point_locations.parquet"
+)
 
 #: od_mitma attrs copied into the provenance summary.
 OD_ATTR_SUMMARY_KEYS = (
@@ -179,6 +207,8 @@ def build_node_table(
     overlap: pd.DataFrame,
     od_zone_ids: Sequence[str],
     od_zone_populations: Sequence[float],
+    edar_catchment: pd.DataFrame | None = None,
+    edar_points: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Deterministic node frame (§11.3): one row per node_uid, uid-sorted.
 
@@ -198,6 +228,16 @@ def build_node_table(
     if len(od_ids) != len(set(od_ids)):
         raise ValueError("duplicate zone ids in the od_mitma registry")
     endpoints.setdefault(SOURCE_MITMA, set()).update(od_ids)
+    for edar_table in (edar_catchment, edar_points):
+        if edar_table is None:
+            continue
+        endpoints.setdefault(SOURCE_EDAR, set()).update(
+            edar_table["edar_id"].astype(str)
+        )
+        for target_type, group in edar_table.groupby("target_type"):
+            endpoints.setdefault(str(target_type), set()).update(
+                group["target_id"].astype(str)
+            )
 
     rows = sorted(
         (f"{node_type}:{sid}", node_type, sid)
@@ -244,6 +284,14 @@ def build_node_table(
     for abs_id in incomplete_abs:
         abs_pop.loc[abs_id] = np.nan
     od_pop = {zone: float(pop) for zone, pop in zip(od_ids, od_zone_populations)}
+    edar_pop: dict[str, float] = {}
+    if edar_catchment is not None:
+        edar_pop = {
+            str(edar_id): float(values.iloc[0])
+            for edar_id, values in edar_catchment.groupby("edar_id")[
+                "catchment_population_est"
+            ]
+        }
 
     populations = np.full(len(uids), np.nan, dtype=np.float32)
     overlap_populations = np.full(len(uids), np.nan, dtype=np.float32)
@@ -264,6 +312,8 @@ def build_node_table(
                 overlap_populations[k] = np.float32(abs_overlap_pop[sid])
         elif node_type == SOURCE_MITMA:
             populations[k] = np.float32(od_pop[sid])
+        elif node_type == SOURCE_EDAR and sid in edar_pop:
+            populations[k] = np.float32(edar_pop[sid])
         elif record is not None and record.population is not None:
             populations[k] = np.float32(record.population)
     return pd.DataFrame(
@@ -291,6 +341,7 @@ def _relation_dataset(
         dtype=np.int32,
     )
     order = np.lexsort((dst_idx, src_idx))
+    relation_pairs = RELATION_PAIRS | EDAR_RELATION_PAIRS
     return xr.Dataset(
         {
             "src_idx": ("edge", src_idx[order]),
@@ -311,7 +362,7 @@ def _relation_dataset(
         attrs={
             "relation": name,
             "directed_pairs": "|".join(
-                f"{s}->{d}" for s, d in sorted(RELATION_PAIRS[name])
+                f"{s}->{d}" for s, d in sorted(relation_pairs[name])
             ),
             "weight_definition": "frac_of_dst_pop",
             "row_order": "(src_idx, dst_idx)",
@@ -319,11 +370,88 @@ def _relation_dataset(
     )
 
 
+def _edar_relation_frames(
+    catchment: pd.DataFrame | None,
+    points: pd.DataFrame | None,
+) -> dict[str, pd.DataFrame]:
+    """Convert catchment and point tables to bidirectional graph rows."""
+    columns = (
+        "src_type",
+        "src_id",
+        "dst_type",
+        "dst_id",
+        "overlap_pop_est",
+        "frac_of_dst_pop",
+    )
+    rows: dict[str, list[dict[str, object]]] = {
+        name: [] for name in EDAR_RELATION_PAIRS
+    }
+    if catchment is not None:
+        for record in catchment.itertuples(index=False):
+            base = {
+                "overlap_pop_est": float(record.served_population_est),
+            }
+            rows[str(record.relation)].extend(
+                [
+                    base
+                    | {
+                        "src_type": str(record.target_type),
+                        "src_id": str(record.target_id),
+                        "dst_type": SOURCE_EDAR,
+                        "dst_id": str(record.edar_id),
+                        "frac_of_dst_pop": float(record.frac_of_edar_catchment),
+                    },
+                    base
+                    | {
+                        "src_type": SOURCE_EDAR,
+                        "src_id": str(record.edar_id),
+                        "dst_type": str(record.target_type),
+                        "dst_id": str(record.target_id),
+                        "frac_of_dst_pop": float(
+                            record.frac_of_target_population_served
+                        ),
+                    },
+                ]
+            )
+    if points is not None:
+        for record in points.itertuples(index=False):
+            for src_type, src_id, dst_type, dst_id in (
+                (
+                    SOURCE_EDAR,
+                    str(record.edar_id),
+                    str(record.target_type),
+                    str(record.target_id),
+                ),
+                (
+                    str(record.target_type),
+                    str(record.target_id),
+                    SOURCE_EDAR,
+                    str(record.edar_id),
+                ),
+            ):
+                rows[str(record.relation)].append(
+                    {
+                        "src_type": src_type,
+                        "src_id": src_id,
+                        "dst_type": dst_type,
+                        "dst_id": dst_id,
+                        "overlap_pop_est": np.nan,
+                        "frac_of_dst_pop": 1.0,
+                    }
+                )
+    return {
+        name: pd.DataFrame(relation_rows, columns=columns)
+        for name, relation_rows in rows.items()
+    }
+
+
 def assemble_native_graph(
     registry: SourceRegistry,
     overlap: pd.DataFrame,
     od_zone_ids: Sequence[str],
     od_zone_populations: Sequence[float],
+    edar_catchment: pd.DataFrame | None = None,
+    edar_points: pd.DataFrame | None = None,
 ) -> tuple[xr.Dataset, dict[str, xr.Dataset], GraphValidationReport]:
     """Assemble the §11.3 store in memory and validate it.
 
@@ -334,7 +462,14 @@ def assemble_native_graph(
     if missing:
         raise ValueError(f"overlap table missing columns: {missing}")
     rel = assign_relations(overlap)
-    nodes = build_node_table(registry, rel, od_zone_ids, od_zone_populations)
+    nodes = build_node_table(
+        registry,
+        rel,
+        od_zone_ids,
+        od_zone_populations,
+        edar_catchment,
+        edar_points,
+    )
     uid_index = {uid: k for k, uid in enumerate(nodes["node_uid"])}
 
     root = xr.Dataset(
@@ -356,6 +491,15 @@ def assemble_native_graph(
         name: _relation_dataset(name, rel[rel["relation"] == name], uid_index)
         for name in sorted(RELATION_PAIRS)
     }
+    if edar_catchment is not None or edar_points is not None:
+        edar_frames = _edar_relation_frames(edar_catchment, edar_points)
+        relations.update(
+            {
+                name: _relation_dataset(name, frame, uid_index)
+                for name, frame in sorted(edar_frames.items())
+            }
+        )
+    root.attrs["relation_names"] = sorted(relations)
     report = validate_native_graph(root, relations, registry, od_zone_ids)
     return root, relations, report
 
@@ -388,9 +532,10 @@ def validate_native_graph(
     missing_root = sorted(required_root - set(root.data_vars))
     if missing_root:
         raise ValueError(f"native graph root missing variables: {missing_root}")
-    if set(relations) != set(RELATION_PAIRS):
+    expected_relations = set(root.attrs.get("relation_names", RELATION_PAIRS))
+    if set(relations) != expected_relations:
         raise ValueError(
-            f"relation groups {sorted(relations)} != {sorted(RELATION_PAIRS)}"
+            f"relation groups {sorted(relations)} != {sorted(expected_relations)}"
         )
     uids = np.asarray(root.coords["node"].values)
     types = np.asarray(root["node_type"].values)
@@ -419,7 +564,11 @@ def validate_native_graph(
             weights=weights.astype(np.float64),
             minlength=n_nodes,
         )
-        over = int((dst_sums > 1 + PER_DST_SUM_TOL).sum())
+        over = (
+            0
+            if name.startswith("edar_located_in_")
+            else int((dst_sums > 1 + PER_DST_SUM_TOL).sum())
+        )
         if over:
             warnings.append(
                 f"{name}: frac_of_dst_pop sums above 1+{PER_DST_SUM_TOL} for {over} "
@@ -529,7 +678,9 @@ def assert_same_assembly(
     for name, ds_a in rel_a.items():
         for var in RELATION_VARS:
             if not np.array_equal(
-                np.asarray(ds_a[var].values), np.asarray(rel_b[name][var].values)
+                np.asarray(ds_a[var].values),
+                np.asarray(rel_b[name][var].values),
+                equal_nan=var == "overlap_pop_est",
             ):
                 raise ValueError(f"{name}/{var} differs between assemblies")
 
@@ -552,9 +703,10 @@ def write_native_graph(
 def open_native_graph(output: str | Path) -> tuple[xr.Dataset, dict[str, xr.Dataset]]:
     """Reopen a written store: (root, relations) with per-relation datasets."""
     root = xr.open_zarr(output)
+    relation_names = root.attrs.get("relation_names", sorted(RELATION_PAIRS))
     relations = {
         name: xr.open_zarr(output, group=f"edges/{name}")
-        for name in sorted(RELATION_PAIRS)
+        for name in relation_names
     }
     return root, relations
 
@@ -595,6 +747,11 @@ def build(
     population_csv: str | Path = DEFAULT_POPULATION_CSV,
     reference_csv: str | Path = DEFAULT_REFERENCE_CSV,
     abs_geometry_shp: str | Path = DEFAULT_ABS_SHP,
+    wastewater_csv: str | Path = DEFAULT_WASTEWATER_CSV,
+    edar_contribution: str | Path = DEFAULT_EDAR_CONTRIBUTION,
+    edar_geojson: str | Path = DEFAULT_EDAR_GEOJSON,
+    edar_catchment_parquet: str | Path = DEFAULT_EDAR_CATCHMENT,
+    edar_points_parquet: str | Path = DEFAULT_EDAR_POINTS,
 ) -> dict:
     """Assemble, validate, and write ``native_graph.zarr``; return the report.
 
@@ -610,16 +767,36 @@ def build(
         Path(reference_csv),
         Path(abs_geometry_shp),
     )
+    edar_registry, _ = build_edar_registry(
+        wastewater_csv, edar_contribution, edar_geojson
+    )
+    registry.extend(edar_registry)
     overlap = pd.read_parquet(overlap_parquet)
+    edar_catchment = pd.read_parquet(edar_catchment_parquet)
+    edar_points = pd.read_parquet(edar_points_parquet)
     od = xr.open_zarr(od_mitma_zarr)
     zone_ids = [str(z) for z in od["zone_id"].values]
     zone_populations = np.asarray(od["zone_population"].values, dtype=np.float32)
 
-    assembled = assemble_native_graph(registry, overlap, zone_ids, zone_populations)
+    assembled = assemble_native_graph(
+        registry,
+        overlap,
+        zone_ids,
+        zone_populations,
+        edar_catchment,
+        edar_points,
+    )
     root, relations, report = assembled
     assert_same_assembly(
         assembled[:2],
-        assemble_native_graph(registry, overlap, zone_ids, zone_populations)[:2],
+        assemble_native_graph(
+            registry,
+            overlap,
+            zone_ids,
+            zone_populations,
+            edar_catchment,
+            edar_points,
+        )[:2],
     )
 
     root.attrs["provenance"] = {
@@ -644,6 +821,13 @@ def build(
                 k: od.attrs[k] for k in OD_ATTR_SUMMARY_KEYS if k in od.attrs
             }
             | {"n_dates_missing": len(od.attrs.get("dates_missing", []))},
+        },
+        "edar": {
+            "wastewater_csv": Path(wastewater_csv).name,
+            "contribution": Path(edar_contribution).name,
+            "geojson": Path(edar_geojson).name,
+            "catchment_edges": Path(edar_catchment_parquet).name,
+            "point_locations": Path(edar_points_parquet).name,
         },
     }
     root.attrs["validation"] = report.to_attr()
@@ -673,6 +857,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "population-csv": DEFAULT_POPULATION_CSV,
         "reference-csv": DEFAULT_REFERENCE_CSV,
         "abs-geometry-shp": DEFAULT_ABS_SHP,
+        "wastewater-csv": DEFAULT_WASTEWATER_CSV,
+        "edar-contribution": DEFAULT_EDAR_CONTRIBUTION,
+        "edar-geojson": DEFAULT_EDAR_GEOJSON,
+        "edar-catchment-parquet": DEFAULT_EDAR_CATCHMENT,
+        "edar-points-parquet": DEFAULT_EDAR_POINTS,
     }
     for flag, default in flag_defaults.items():
         parser.add_argument(f"--{flag}", type=Path, default=default)

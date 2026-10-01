@@ -30,9 +30,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, replace
 from datetime import date
+import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import xarray as xr
 
 STUDY_WINDOW_START = date(2020, 3, 1)
 STUDY_WINDOW_END = date(2021, 5, 9)
@@ -42,6 +45,7 @@ Window = tuple[date, date]
 SOURCE_MUNICIPALITY = "municipality"
 SOURCE_ABS = "abs"
 SOURCE_COMARCA = "comarca"
+SOURCE_EDAR = "edar"
 
 STATUS_OBSERVED = "observed"
 STATUS_UNOBSERVED = "unobserved"
@@ -212,9 +216,145 @@ class MunicipalRegistryReport:
     total_population: float
 
 
+@dataclass(frozen=True)
+class EdarRegistryReport:
+    """Independent EDAR observation, catchment, and point reconciliation."""
+
+    observation_rows: int
+    observation_ids: int
+    mapping_ids: int
+    positive_mapping_ids: int
+    geometry_ids: int
+    observed_codes: int
+    unobserved_codes: int
+    unmapped_codes: int
+    observation_only_codes: tuple[str, ...]
+    mapping_only_codes: tuple[str, ...]
+    zero_support_codes: tuple[str, ...]
+    missing_geometry_codes: tuple[str, ...]
+    geometry_only_codes: tuple[str, ...]
+
+
 def _in_window(day: date, window: Window) -> bool:
     start, end = window
     return start <= day <= end
+
+
+def build_edar_registry(
+    wastewater_csv_path: str | Path,
+    contribution_path: str | Path,
+    geometry_path: str | Path,
+    *,
+    window: Window = (STUDY_WINDOW_START, STUDY_WINDOW_END),
+) -> tuple[SourceRegistry, EdarRegistryReport]:
+    """Build an EDAR registry without making point geometry query-critical.
+
+    A plant is ``observed`` when it has at least one sample in ``window`` and
+    a positive municipality contribution row. Observation-only, mapping-only,
+    and zero-support IDs are ``unmapped``. Point geometry is an independent
+    context relation: missing points are reported but do not change an EDAR's
+    query status.
+    """
+    wastewater = pd.read_csv(wastewater_csv_path, usecols=["id mostra"], dtype=str)
+    extracted = wastewater["id mostra"].str.extract(
+        r"^(?P<edar_id>[A-Za-z0-9_]+)-(?P<sample_date>\d{4}-\d{2}-\d{2})$"
+    )
+    invalid = extracted.isna().any(axis=1)
+    if invalid.any():
+        examples = wastewater.loc[invalid, "id mostra"].head(5).tolist()
+        raise ValueError(f"Invalid EDAR sample identifiers: {examples}")
+    extracted["edar_id"] = extracted["edar_id"].astype(str)
+    extracted["sample_date"] = pd.to_datetime(
+        extracted["sample_date"], format="%Y-%m-%d", errors="raise"
+    ).dt.date
+    dates_by_id: dict[str, list[date]] = {
+        str(edar_id): list(sample_dates)
+        for edar_id, sample_dates in (
+            extracted.groupby("edar_id")["sample_date"].agg(list).to_dict().items()
+        )
+    }
+    observation_ids: set[str] = set(dates_by_id)
+
+    with xr.open_dataset(contribution_path) as contribution_ds:
+        if "contribution_ratio" not in contribution_ds:
+            raise ValueError("EDAR contribution store lacks 'contribution_ratio'")
+        contribution = contribution_ds["contribution_ratio"].load()
+    if contribution.dims != ("edar_id", "home"):
+        raise ValueError(
+            "EDAR contribution_ratio dims must be ('edar_id', 'home'), got "
+            f"{contribution.dims}"
+        )
+    mapping_ids: set[str] = {
+        str(value) for value in contribution["edar_id"].values.tolist()
+    }
+    if len(mapping_ids) != contribution.sizes["edar_id"]:
+        raise ValueError("Duplicate edar_id labels in EDAR contribution store")
+    values = np.asarray(contribution.values, dtype=np.float64)
+    if (~np.isfinite(values) & ~np.isnan(values)).any():
+        raise ValueError("EDAR contribution store contains non-finite values")
+    if np.nanmin(values) < 0 or np.nanmax(values) > 1:
+        raise ValueError("EDAR contribution ratios must be in [0, 1]")
+    positive = np.nansum(np.where(values > 0, values, 0.0), axis=1) > 0
+    positive_mapping_ids: set[str] = {
+        str(edar_id)
+        for edar_id, has_support in zip(
+            contribution["edar_id"].values.tolist(), positive, strict=True
+        )
+        if has_support
+    }
+
+    geometry_payload = json.loads(Path(geometry_path).read_text(encoding="utf-8"))
+    geometry_codes = [
+        str(feature.get("properties", {}).get("codi_edar", "")).strip()
+        for feature in geometry_payload.get("features", [])
+    ]
+    if any(not code for code in geometry_codes):
+        raise ValueError("EDAR geometry contains a feature without codi_edar")
+    if len(geometry_codes) != len(set(geometry_codes)):
+        raise ValueError("EDAR geometry contains duplicate codi_edar values")
+    geometry_ids: set[str] = set(geometry_codes)
+
+    registry = SourceRegistry()
+    all_ids = sorted(observation_ids | mapping_ids | geometry_ids)
+    for edar_id in all_ids:
+        sample_dates = dates_by_id.get(edar_id, [])
+        reconciled = edar_id in observation_ids and edar_id in positive_mapping_ids
+        observed = any(_in_window(day, window) for day in sample_dates)
+        if not reconciled:
+            status = STATUS_UNMAPPED
+        else:
+            status = STATUS_OBSERVED if observed else STATUS_UNOBSERVED
+        registry.add(
+            SourceRecord(
+                source_type=SOURCE_EDAR,
+                source_id=edar_id,
+                status=status,
+                population=None,
+                first_date=min(sample_dates) if sample_dates else None,
+                last_date=max(sample_dates) if sample_dates else None,
+            )
+        )
+
+    counts = registry.counts_by_status(SOURCE_EDAR)
+    zero_support = mapping_ids - positive_mapping_ids
+    report = EdarRegistryReport(
+        observation_rows=len(wastewater),
+        observation_ids=len(observation_ids),
+        mapping_ids=len(mapping_ids),
+        positive_mapping_ids=len(positive_mapping_ids),
+        geometry_ids=len(geometry_ids),
+        observed_codes=counts.get(STATUS_OBSERVED, 0),
+        unobserved_codes=counts.get(STATUS_UNOBSERVED, 0),
+        unmapped_codes=counts.get(STATUS_UNMAPPED, 0),
+        observation_only_codes=tuple(sorted(observation_ids - mapping_ids)),
+        mapping_only_codes=tuple(sorted(mapping_ids - observation_ids)),
+        zero_support_codes=tuple(sorted(zero_support)),
+        missing_geometry_codes=tuple(
+            sorted((observation_ids | mapping_ids) - geometry_ids)
+        ),
+        geometry_only_codes=tuple(sorted(geometry_ids - (observation_ids | mapping_ids))),
+    )
+    return registry, report
 
 
 def build_abs_registry(
@@ -295,8 +435,11 @@ def build_abs_registry(
         geometry_only = tuple(sorted(geometry_set - csv_set))
         csv_missing = tuple(sorted(csv_set - geometry_set))
         for code in csv_missing:
+            record = registry.get(SOURCE_ABS, code)
+            if record is None:
+                raise AssertionError(f"ABS registry lost source {code}")
             registry.add(
-                replace(registry.get(SOURCE_ABS, code), status=STATUS_UNMAPPED)
+                replace(record, status=STATUS_UNMAPPED)
             )
 
     counts = registry.counts_by_status(SOURCE_ABS)

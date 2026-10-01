@@ -20,6 +20,7 @@ import xarray as xr
 from data.native_registry import (
     SOURCE_ABS,
     SOURCE_COMARCA,
+    SOURCE_EDAR,
     SOURCE_MUNICIPALITY,
     STATUS_OBSERVED,
     STATUS_UNMAPPED,
@@ -163,6 +164,74 @@ def _assemble(
 
 
 class TestSyntheticAssembly:
+    def test_edar_catchment_and_point_relations_stay_distinct(self):
+        registry = _synthetic_registry()
+        registry.add(
+            SourceRecord(SOURCE_EDAR, "E1", STATUS_OBSERVED, None, None, None)
+        )
+        catchment = pd.DataFrame(
+            [
+                {
+                    "relation": "muni_edar_catchment",
+                    "edar_id": "E1",
+                    "target_type": SOURCE_MUNICIPALITY,
+                    "target_id": "08001",
+                    "served_population_est": 80.0,
+                    "catchment_population_est": 80.0,
+                    "frac_of_edar_catchment": 1.0,
+                    "frac_of_target_population_served": 0.8,
+                },
+                {
+                    "relation": "edar_abs_catchment",
+                    "edar_id": "E1",
+                    "target_type": SOURCE_ABS,
+                    "target_id": "001",
+                    "served_population_est": 80.0,
+                    "catchment_population_est": 80.0,
+                    "frac_of_edar_catchment": 1.0,
+                    "frac_of_target_population_served": 0.5,
+                },
+                {
+                    "relation": "edar_comarca_catchment",
+                    "edar_id": "E1",
+                    "target_type": SOURCE_COMARCA,
+                    "target_id": "01",
+                    "served_population_est": 80.0,
+                    "catchment_population_est": 80.0,
+                    "frac_of_edar_catchment": 1.0,
+                    "frac_of_target_population_served": 0.25,
+                },
+            ]
+        )
+        points = pd.DataFrame(
+            [
+                {
+                    "relation": "edar_located_in_comarca",
+                    "edar_id": "E1",
+                    "target_type": SOURCE_COMARCA,
+                    "target_id": "02",
+                }
+            ]
+        )
+
+        root, relations, report = assemble_native_graph(
+            registry,
+            _synthetic_overlap(),
+            OD_ZONE_IDS,
+            OD_ZONE_POPS,
+            catchment,
+            points,
+        )
+
+        assert report.node_counts[SOURCE_EDAR] == 1
+        node = root.coords["node"].values.tolist().index("edar:E1")
+        assert root["population"].values[node] == pytest.approx(80.0)
+        assert relations["edar_comarca_catchment"].sizes["edge"] == 2
+        assert relations["edar_located_in_comarca"].sizes["edge"] == 2
+        catchment_targets = relations["edar_comarca_catchment"]["dst_idx"].values
+        location_targets = relations["edar_located_in_comarca"]["dst_idx"].values
+        assert not np.array_equal(catchment_targets, location_targets)
+
     def test_node_counts_order_and_ids(self):
         root, _relations, report = _assemble()
 
@@ -455,8 +524,12 @@ class TestRealArtifacts:
             SOURCE_MUNICIPALITY: 963,
             SOURCE_ABS: 379,
             SOURCE_COMARCA: 43,
+            SOURCE_EDAR: 59,
             MITMA: 456,
         }
+        assert report["edge_counts"]["muni_edar_catchment"] == 418
+        assert report["edge_counts"]["edar_abs_catchment"] == 1336
+        assert report["edge_counts"]["edar_comarca_catchment"] == 134
 
         build(output=tmp_path / "again.zarr")
         root_b, rel_b = open_native_graph(tmp_path / "again.zarr")

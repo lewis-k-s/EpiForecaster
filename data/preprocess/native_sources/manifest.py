@@ -1,6 +1,6 @@
-"""Native-support manifest v2 (slice MAN-1; plan §11.3, §12.2).
+"""Native-support manifest v4 (clinical, mortality, and EDAR artifacts).
 
-``native_manifest_v2.json`` records the sha256 of every input consumed by the
+``native_manifest_v4.json`` records the sha256 of inputs consumed by the
 native-support builders: the two native clinical CSVs (recorded as sitting
 outside ``catalonia_preprocessing_inputs_v1`` — closing [D1]'s provenance
 gap), the geometry inputs, the read-only ``dasymetric_mob`` inputs, a
@@ -36,9 +36,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-SCHEMA = "native_manifest_v2"
-SCHEMA_VERSION = 2
-MANIFEST_NAME = "native_manifest_v2.json"
+SCHEMA = "native_manifest_v4"
+SCHEMA_VERSION = 4
+MANIFEST_NAME = "native_manifest_v4.json"
 
 #: Frozen marker (plan §10.3(10), §11.3): [D1] used this window for
 #: calibration only; scoring it requires an explicit guard flag.
@@ -77,6 +77,8 @@ PACKAGE_METHOD = (
 CODE_STAMP_MODULES: tuple[str, ...] = (
     "data/preprocess/processors/abs_admissions_processor.py",
     "data/preprocess/processors/comarca_deaths_processor.py",
+    "data/preprocess/processors/abs_excess_deaths_processor.py",
+    "data/preprocess/processors/native_wastewater_processor.py",
     "data/native_registry.py",
 )
 
@@ -92,8 +94,15 @@ PRODUCED_STORES = (
     "native_graph",
     "obs_admissions",
     "obs_deaths",
+    "obs_deaths_abs_excess",
+    "obs_wastewater",
 )
-PRODUCED_PARQUET = "overlap_edges"
+PRODUCED_FILES = {
+    "overlap_edges": "overlap_edges.parquet",
+    "edar_catchment_edges": "edar_catchment_edges.parquet",
+    "edar_point_locations": "edar_point_locations.parquet",
+    "edar_support_report": "edar_support_report.json",
+}
 
 
 @dataclass(frozen=True)
@@ -113,6 +122,9 @@ class InputPaths:
         "data/files/geo/generated/comarques_igcg_v2r1.geojson"
     )
     reference_csv: Path = Path("data/files/municipality_id_reference.csv")
+    wastewater_csv: Path = Path("data/files/wastewater_biomarkers_icra.csv")
+    edar_contribution: Path = Path("data/files/edar_muni_edges.nc")
+    edar_geojson: Path = Path("data/files/geo/EDAR.geojson")
     dasymetric_root: Path = DEFAULT_DASYMETRIC_ROOT
 
     def daily_dir(self) -> Path:
@@ -264,7 +276,8 @@ def build_manifest(root: str | Path, inputs: InputPaths | None = None) -> dict:
     root = Path(root)
 
     produced: dict = {
-        PRODUCED_PARQUET: _file_entry(root / "overlap_edges.parquet", PRODUCED_PARQUET),
+        name: _file_entry(root / filename, name)
+        for name, filename in PRODUCED_FILES.items()
     }
     schema_versions: dict = {}
     for store in PRODUCED_STORES:
@@ -275,6 +288,12 @@ def build_manifest(root: str | Path, inputs: InputPaths | None = None) -> dict:
             )
         produced[store] = zarr_metadata_digest(store_dir)
         schema_versions[store] = _store_schema_attr(store_dir)
+
+    excess_metadata = json.loads(
+        (root / "obs_deaths_abs_excess.zarr" / "zarr.json").read_text()
+    ).get("attributes", {})
+    if not excess_metadata.get("source_sha256"):
+        raise ValueError("ABS excess mortality store lacks source_sha256")
 
     return {
         "schema": SCHEMA,
@@ -291,6 +310,7 @@ def build_manifest(root: str | Path, inputs: InputPaths | None = None) -> dict:
                 "files": [
                     _file_entry(spec.abs_csv, "hospitalizations"),
                     _file_entry(spec.deaths_csv, "deaths"),
+                    _file_entry(spec.wastewater_csv, "wastewater"),
                 ],
             },
             "geometry": {
@@ -302,11 +322,13 @@ def build_manifest(root: str | Path, inputs: InputPaths | None = None) -> dict:
                     _file_entry(spec.mpis_csv, "mpiscatalunya.csv"),
                     _file_entry(spec.population_csv, "fl_population_por_municipis.csv"),
                     _file_entry(spec.comarques_geojson, "comarques_igcg_v2r1.geojson"),
+                    _file_entry(spec.edar_geojson, "EDAR.geojson"),
                 ],
             },
             "registry": {
                 "files": [
-                    _file_entry(spec.reference_csv, "municipality_id_reference.csv")
+                    _file_entry(spec.reference_csv, "municipality_id_reference.csv"),
+                    _file_entry(spec.edar_contribution, "edar_muni_edges.nc"),
                 ],
             },
             "dasymetric_readonly": {
@@ -325,6 +347,12 @@ def build_manifest(root: str | Path, inputs: InputPaths | None = None) -> dict:
         },
         "produced": produced,
         "produced_schema_versions": schema_versions,
+        "abs_excess_source": {
+            "source_file": excess_metadata.get("source_file"),
+            "source_sha256": excess_metadata["source_sha256"],
+            "expected_definition": excess_metadata.get("expected_definition"),
+            "zero_fill_policy": excess_metadata.get("zero_fill_policy"),
+        },
     }
 
 

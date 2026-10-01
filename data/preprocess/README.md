@@ -1,10 +1,10 @@
 # Preprocessing Pipeline Guide
 
-This document describes both preprocessing interfaces. The source-native
-clinical interface is the default. The municipal tensor pipeline remains for
-the explicit legacy wastewater branch.
+This worktree uses source-native clinical and EDAR inputs with the heterogeneous
+model. Municipality preprocessing supplies cases, vaccination, and calendar
+features. The municipal training model belongs to the legacy worktree.
 
-## Source-native clinical contract
+## Source-native contract
 
 Native preprocessing writes versioned artifacts under
 `data/processed/native_support/`. These artifacts preserve observation support
@@ -12,17 +12,35 @@ instead of projecting every target to municipalities:
 
 | Artifact | Contract |
 | --- | --- |
-| `native_graph.zarr` | Typed municipality, ABS, comarca, and MITMA nodes with audited populations and directed overlap relations |
+| `native_graph.zarr` | Typed municipality, ABS, comarca, MITMA, and EDAR nodes with audited populations and directed overlap, catchment, and point-location relations |
 | `obs_admissions.zarr` | Raw weekly ABS admission counts, masks, ages, and QC-only reported-stratum population sums |
-| `obs_deaths.zarr` | Raw daily comarca death counts, masks, and ages |
+| `obs_wastewater.zarr` | Raw EDAR assay concentrations, detection limits, censor codes, causal histories, flow, and rainfall |
 | `od_mitma.zarr` | Primary raw native MITMA OD context |
 | `od_municipal.zarr` | Stage-4 projected-context comparison artifact only |
-| `native_source_folds.json` | Audited source-aware folds and explicit unassigned-source exclusions |
-| `native_support_manifest.json` | Versioned source and artifact identities |
+| `edar_catchment_edges.parquet` | Contribution-weighted EDAR relations to municipalities, ABS, and comarques |
+| `edar_point_locations.parquet` | Independent point-in-polygon location relations for EDAR plants |
+| `obs_deaths_abs_excess.zarr` | Daily ABS observed all-cause deaths, 2017–19 expected deaths, and signed excess; 376 ABS codes match the native graph |
+| `native_manifest_v4.json` | Source and artifact identities for the ABS excess-deaths cutover |
+
+The training DAG derives `native_source_sets/assignments.parquet` and a small
+version-4 `manifest.json` from the processed inputs. It publishes these through
+DVC. Do not commit generated membership JSONs. Changes to preprocessing,
+eligibility, or the split policy require a new split asset. Earlier target
+windows must end before the next split's origins begin.
+
+Build the ABS mortality store from the downloaded Catalonia death CSV with
+`uv run python -m data.preprocess.processors.abs_excess_deaths_processor
+--source-csv /path/to/defuncions_a_catalunya_3cre-fa8v_20260928.csv`.
+The builder refuses to replace an existing store. It records the source file
+name and SHA-256 in the store; the v4 manifest repeats them. The CSV is an
+external source input and is not contained in the DVC output pointer.
 
 Municipality cases still come from `data/processed/real_with_id.zarr`. Native
 training does not load `hospitalizations_municipality.csv` or
-`deaths_municipality.csv`. Those projected files remain only for explicit
+`deaths_municipality.csv`. Wastewater stays at EDAR support: each query owns
+an assay target block. The contribution matrix defines the catchment and its
+population; the GeoJSON point defines plant location only. These two relation
+families are not interchangeable. Projected files remain only for explicit
 legacy or comparison work. Missing `(date, source)` rows have mask 0 and are
 never converted to observed zeros.
 
@@ -31,12 +49,12 @@ validate the manifest and QC report before training. Do not modify generated
 stores in place. Create a new versioned artifact set when inputs or operators
 change.
 
-## Legacy municipal/wastewater tensor pipeline
+## Municipality input preprocessing
 
-`data/preprocess/pipeline.py` converts raw sources into the municipal Zarr used
-by the explicit legacy interface. The pipeline emits one stable tensor layout
-for the remaining municipal, mobility, region-embedding, and wastewater
-variants.
+`data/preprocess/pipeline.py` supplies municipality cases, vaccination, and
+calendar features in `real_with_id.zarr`. The native forecaster reads these
+fields from that store. Native ABS and EDAR observations stay in their own
+stores. Projected hospital and death series are not model inputs in this worktree.
 
 ## Inputs and Canonical Variables
 

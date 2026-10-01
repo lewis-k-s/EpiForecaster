@@ -1,6 +1,6 @@
 """Native-support QC report (slice MAN-1; plan §11.3, §12.2).
 
-Builds ``native_manifest_v2.json`` (:mod:`data.preprocess.native_sources.manifest`)
+Builds ``native_manifest_v4.json`` (:mod:`data.preprocess.native_sources.manifest`)
 and a reconciliation report over the built native-support artifacts:
 
 - ABS case-strata ``stratum_pop_sum`` weekly lower bound vs the audited ABS

@@ -66,6 +66,9 @@ def _make_inputs(
         population_csv=files / "fl_population_por_municipis.csv",
         comarques_geojson=files / "geo/generated/comarques_igcg_v2r1.geojson",
         reference_csv=files / "municipality_id_reference.csv",
+        wastewater_csv=files / "wastewater_biomarkers_icra.csv",
+        edar_contribution=files / "edar_muni_edges.nc",
+        edar_geojson=files / "geo/EDAR.geojson",
         dasymetric_root=dasymetric,
     )
     _touch(spec.abs_csv, "codi_abs,casos\n001,1\n")
@@ -78,6 +81,9 @@ def _make_inputs(
     _touch(spec.population_csv, "code,pop\n")
     _touch(spec.comarques_geojson, "{}\n")
     _touch(spec.reference_csv, "muni_code_5digit\n")
+    _touch(spec.wastewater_csv, "edar_id,date,N1\n")
+    _touch(spec.edar_contribution, "netcdf-placeholder\n")
+    _touch(spec.edar_geojson, "{}\n")
     for suffix in ("shp", "shx", "dbf", "prj", "cpg"):
         _touch(spec.distritos_shp().with_suffix(f".{suffix}"), f"distritos-{suffix}\n")
     for suffix in ("shp", "shx", "dbf", "prj", "cpg"):
@@ -178,16 +184,42 @@ def _write_mini_stores(root: Path) -> None:
         origin=("origin", np.array(["m1", "m2"], dtype=object)),
         target=("target", np.array(["m1", "m2"], dtype=object)),
     )
+    wastewater = dataset(
+        {"schema": "native_wastewater_observations.v1"},
+        concentration_raw=(
+            ("date", "edar_id", "assay"),
+            np.ones((2, 1, 1), dtype=np.float32),
+        ),
+    ).assign_coords(
+        date=("date", np.array(["2020-03-01", "2020-03-02"], dtype="datetime64[ns]")),
+        edar_id=("edar_id", np.array(["E1"], dtype=object)),
+        assay=("assay", np.array(["N1"], dtype=object)),
+    )
 
     root.mkdir(parents=True, exist_ok=True)
     graph.to_zarr(root / "native_graph.zarr", mode="w", consolidated=False)
     admissions.to_zarr(root / "obs_admissions.zarr", mode="w", consolidated=False)
     deaths.to_zarr(root / "obs_deaths.zarr", mode="w", consolidated=False)
+    dataset(
+        {"schema": "obs_deaths_abs_excess", "source_sha256": "test-sha256"},
+        value=(("date", "abs_id"), np.ones((2, 1), dtype=np.float32)),
+    ).assign_coords(
+        date=np.array(["2020-03-01", "2020-03-02"], dtype="datetime64[ns]"),
+        abs_id=np.array(["001"], dtype=object),
+    ).to_zarr(root / "obs_deaths_abs_excess.zarr", mode="w", consolidated=False)
     od_mitma.to_zarr(root / "od_mitma.zarr", mode="w", consolidated=False)
     od_municipal.to_zarr(root / "od_municipal.zarr", mode="w", consolidated=False)
+    wastewater.to_zarr(root / "obs_wastewater.zarr", mode="w", consolidated=False)
     pd.DataFrame({"src_id": ["001"], "dst_id": ["m1"]}).to_parquet(
         root / "overlap_edges.parquet"
     )
+    pd.DataFrame({"edar_id": ["E1"]}).to_parquet(
+        root / "edar_catchment_edges.parquet"
+    )
+    pd.DataFrame({"edar_id": ["E1"]}).to_parquet(
+        root / "edar_point_locations.parquet"
+    )
+    (root / "edar_support_report.json").write_text("{}\n")
 
 
 def _mini_support(base: Path) -> tuple[Path, InputPaths]:
@@ -524,6 +556,7 @@ def _real_available() -> bool:
         "native_graph",
         "obs_admissions",
         "obs_deaths",
+        "obs_deaths_abs_excess",
     ]
     return (
         root.is_dir()
