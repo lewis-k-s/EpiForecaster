@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.config_fixtures import write_config_fixture
+
 import json
 from pathlib import Path
 
@@ -316,7 +318,7 @@ def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:
 def test_campaign_analysis_requires_exact_provenanced_paired_fold_identities(
     tmp_path: Path,
 ) -> None:
-    base_config = Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()
+    base_config = write_config_fixture(tmp_path)
     split_manifest = tmp_path / "splits.json"
     split_manifest.write_text(
         json.dumps({"num_folds": 2, "folds": []}) + "\n",
@@ -343,8 +345,8 @@ def test_campaign_analysis_requires_exact_provenanced_paired_fold_identities(
                     {
                         "name": "mobility:off",
                         "hypothesis": "intervention",
-                        "overrides": {"model": {"type": {"mobility": False}}},
-                        "allowed_difference_paths": ["model.type.mobility"],
+                        "overrides": {"native": {"mobility_enabled": False}},
+                        "allowed_difference_paths": ["native.mobility_enabled"],
                     },
                 ],
                 "paired_model_seeds": [42, 43],
@@ -477,7 +479,7 @@ def test_nonfolded_output_identity_uses_none_fold(tmp_path: Path) -> None:
                 "campaign_id": "nonfolded",
                 "stage": "ablation",
                 "hypothesis": "non-folded campaigns have no fold identity",
-                "base_config": str(Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()),
+                "base_config": str(write_config_fixture(tmp_path)),
                 "baseline_condition": "baseline",
                 "fixed_overrides": {"training": {"epochs": 1}},
                 "conditions": [
@@ -557,7 +559,7 @@ def test_campaign_outputs_reject_empty_or_missing_required_metric_columns(
                 "campaign_id": "empty-metrics",
                 "stage": "ablation",
                 "hypothesis": "metric contracts fail closed",
-                "base_config": str(Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()),
+                "base_config": str(write_config_fixture(tmp_path)),
                 "baseline_condition": "baseline",
                 "fixed_overrides": {"training": {"epochs": 1}},
                 "conditions": [

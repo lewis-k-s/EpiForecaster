@@ -8,11 +8,12 @@ in the EpiForecaster pipeline.
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .epiforecaster_trainer import EpiForecasterConfig, EpiForecasterTrainer
+    from models.configs import EpiForecasterConfig
+    from .native_trainer import NativeTrainer
     from .region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
 
 __all__ = [
-    "EpiForecasterTrainer",
+    "NativeTrainer",
     "EpiForecasterConfig",
     "Region2VecTrainer",
     "RegionTrainerConfig",
@@ -21,12 +22,13 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     """Load trainer APIs lazily so artifact helpers stay dependency-light."""
-    if name in {"EpiForecasterConfig", "EpiForecasterTrainer"}:
-        from .epiforecaster_trainer import EpiForecasterConfig, EpiForecasterTrainer
+    if name in {"EpiForecasterConfig", "NativeTrainer"}:
+        from models.configs import EpiForecasterConfig
+        from .native_trainer import NativeTrainer
 
         return {
             "EpiForecasterConfig": EpiForecasterConfig,
-            "EpiForecasterTrainer": EpiForecasterTrainer,
+            "NativeTrainer": NativeTrainer,
         }[name]
     if name in {"Region2VecTrainer", "RegionTrainerConfig"}:
         from .region2vec_trainer import Region2VecTrainer, RegionTrainerConfig

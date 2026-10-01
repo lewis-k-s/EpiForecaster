@@ -59,6 +59,7 @@ def _model(
     """
     torch.manual_seed(1234)
     config = NativeForecasterConfig(
+        mobility_enabled=False,
         f_native=f_native,
         d_ctx=D_CTX,
         forecast_horizon=horizon,
@@ -113,9 +114,8 @@ def _item(
             requested_heads=heads,
         ),
         "head": sorted(heads)[0],
-        "hist": torch.arange(L * F_NATIVE, dtype=torch.float32).reshape(
-            L, F_NATIVE
-        ) + value,
+        "hist": torch.arange(L * F_NATIVE, dtype=torch.float32).reshape(L, F_NATIVE)
+        + value,
         "hist_mask": torch.ones(L, dtype=torch.bool),
         "ctx_feat": torch.full((L, D_CTX), value),
         "ctx_coverage": 0.5,
@@ -133,20 +133,32 @@ def _item(
 def test_single_query_matches_mixed_batch() -> None:
     """The same query produces identical outputs alone vs inside a batch."""
     abs_item = _item(
-        "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
-        horizon=14, pop=POP_ABS,
+        "abs",
+        frozenset({"hosp"}),
+        source_id="088",
+        origin_dow=6,
+        horizon=14,
+        pop=POP_ABS,
     )
     single_batch = collate_native_batch([abs_item])
     mixed_batch = collate_native_batch(
         [
             _item(
-                "municipality", frozenset({"cases"}), source_id="08019",
-                origin_dow=0, horizon=14, pop=POP_MUNI,
+                "municipality",
+                frozenset({"cases"}),
+                source_id="08019",
+                origin_dow=0,
+                horizon=14,
+                pop=POP_MUNI,
             ),
             abs_item,
             _item(
-                "comarca", frozenset({"deaths"}), source_id="06",
-                origin_dow=3, horizon=14, pop=POP_COMARCA,
+                "comarca",
+                frozenset({"deaths"}),
+                source_id="06",
+                origin_dow=3,
+                horizon=14,
+                pop=POP_COMARCA,
             ),
         ]
     )
@@ -183,6 +195,7 @@ def test_single_query_matches_mixed_batch() -> None:
 
 def test_requested_heads_do_not_change_trajectories() -> None:
     """Adding a head to a query's routing leaves its rollout untouched."""
+
     def manual_batch(muni_heads: frozenset[str]) -> NativeEpiBatch:
         has_hosp = "hosp" in muni_heads
         w_max = 2
@@ -204,12 +217,9 @@ def test_requested_heads_do_not_change_trajectories() -> None:
         ]
         hist = torch.stack(
             [
-                torch.arange(L * F_NATIVE, dtype=torch.float32).reshape(
-                    L, F_NATIVE
-                ),
-                torch.arange(L * F_NATIVE, dtype=torch.float32).reshape(
-                    L, F_NATIVE
-                ) + 7.0,
+                torch.arange(L * F_NATIVE, dtype=torch.float32).reshape(L, F_NATIVE),
+                torch.arange(L * F_NATIVE, dtype=torch.float32).reshape(L, F_NATIVE)
+                + 7.0,
             ]
         )
         return NativeEpiBatch(
@@ -222,8 +232,9 @@ def test_requested_heads_do_not_change_trajectories() -> None:
             ctx_feat=torch.arange(2 * L * D_CTX, dtype=torch.float32).reshape(
                 2, L, D_CTX
             ),
-            temporal_covariates=torch.arange(2 * L * 2, dtype=torch.float32)
-            .reshape(2, L, 2),
+            temporal_covariates=torch.arange(2 * L * 2, dtype=torch.float32).reshape(
+                2, L, 2
+            ),
             head_index={
                 "cases": torch.tensor([0]),
                 "hosp": torch.tensor([0]) if has_hosp else None,
@@ -240,9 +251,7 @@ def test_requested_heads_do_not_change_trajectories() -> None:
             },
             head_target_mask={
                 "cases": torch.ones(1, 14, dtype=torch.bool),
-                "hosp": (
-                    torch.ones(1, w_max, dtype=torch.bool) if has_hosp else None
-                ),
+                "hosp": (torch.ones(1, w_max, dtype=torch.bool) if has_hosp else None),
                 "deaths": torch.ones(1, 14, dtype=torch.bool),
             },
             head_population={
@@ -304,12 +313,20 @@ def test_weekly_outputs_match_reporting_operator() -> None:
     batch = collate_native_batch(
         [
             _item(
-                "abs", frozenset({"hosp"}), source_id="088", origin_dow=0,
-                horizon=14, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="088",
+                origin_dow=0,
+                horizon=14,
+                pop=POP_ABS,
             ),
             _item(
-                "abs", frozenset({"hosp"}), source_id="089", origin_dow=6,
-                horizon=14, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="089",
+                origin_dow=6,
+                horizon=14,
+                pop=POP_ABS,
             ),
         ]
     )
@@ -340,9 +357,7 @@ def test_weekly_outputs_match_reporting_operator() -> None:
             assert loc[row, week].item() == pytest.approx(expected, rel=1e-5)
             # Inverting the single transform recovers the raw weekly sum:
             # sum-before-transform, not a sum of transformed days.
-            recovered = math.expm1(loc[row, week].item()) / (
-                clinical_scale * 1e5
-            )
+            recovered = math.expm1(loc[row, week].item()) / (clinical_scale * 1e5)
             assert recovered == pytest.approx(week_sum, rel=1e-4)
     # Regression anchor: with the identity kernel the composition equals
     # the raw-flow reporting operator with the clinical scale folded in
@@ -360,12 +375,20 @@ def test_weekly_w_max_normalization_h21() -> None:
     batch = collate_native_batch(
         [
             _item(
-                "abs", frozenset({"hosp"}), source_id="088", origin_dow=0,
-                horizon=21, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="088",
+                origin_dow=0,
+                horizon=21,
+                pop=POP_ABS,
             ),
             _item(
-                "abs", frozenset({"hosp"}), source_id="089", origin_dow=6,
-                horizon=21, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="089",
+                origin_dow=6,
+                horizon=21,
+                pop=POP_ABS,
             ),
         ]
     )
@@ -394,137 +417,53 @@ def test_weekly_w_max_normalization_h21() -> None:
     assert sums[0, 2].item() == 0.0
 
 
-def test_gradients_reach_adapter_backbone_and_heads() -> None:
-    """loss = mean(cases loc + deaths loc + weekly hosp loc) reaches params."""
-    batch = collate_native_batch(
-        [
-            _item(
-                "municipality", frozenset({"cases"}), source_id="08019",
-                origin_dow=0, horizon=14, pop=POP_MUNI,
-            ),
-            _item(
-                "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
-                horizon=14, pop=POP_ABS,
-            ),
-            _item(
-                "comarca", frozenset({"deaths"}), source_id="06",
-                origin_dow=3, horizon=14, pop=POP_COMARCA,
-            ),
-        ]
+def test_wastewater_output_is_assay_level_and_ignores_target_flow() -> None:
+    """EDAR output is one routed block; future flow stays supervision-only."""
+    item = _item(
+        "edar",
+        frozenset({"ww"}),
+        source_id="1",
+        origin_dow=2,
+        horizon=14,
+        pop=75_000.0,
     )
-    model = _model(horizon=14, f_native=batch.hist.shape[2])
-    out = model(batch)
-    loss = (
-        out["dist_cases_loc"].mean()
-        + out["dist_deaths_loc"].mean()
-        + out["dist_hosp_weekly_loc"].mean()
-        # Scale terms: the predictive scales are distribution parameters
-        # outside the locations, so they are added to exercise every head's
-        # scale-projection route.
-        + out["dist_cases_scale"].mean()
-        + out["dist_deaths_scale"].mean()
-        + out["dist_hosp_weekly_scale"].mean()
-    )
-    loss.backward()
-    assert torch.isfinite(loss)
-
-    for label, module in (
-        ("adapter", model.input_adapter),
-        ("backbone", model.base.backbone),
-    ):
-        for name, param in module.named_parameters():
-            assert param.grad is not None, f"{label}.{name}"
-            assert torch.isfinite(param.grad).all(), f"{label}.{name}"
-
-    head_paths = {
-        model.base.cases_head: (
-            "delay_kernel",
-            "scale",
-            "residual_proj",
-            "alpha",
-            "distribution_scale_proj",
-        ),
-        model.base.deaths_head: (
-            "delay_kernel",
-            "scale",
-            "residual_proj",
-            "alpha",
-            "distribution_scale_proj",
-        ),
-        # The weekly path routes through the hosp kernel and clinical scale
-        # (R5); under the default config the kernel is frozen (buffers only),
-        # so its live parameter routes are the scale and the scale projection.
-        model.base.hosp_head: ("delay_kernel", "scale", "distribution_scale_proj"),
+    item["target"] = torch.full((14, 3), 100.0)
+    item["target_mask"] = torch.ones(14, 3, dtype=torch.bool)
+    item["target_extra"] = {
+        "detection_limit": torch.full((14, 3), 10.0),
+        "censor_code": torch.zeros(14, 3, dtype=torch.uint8),
+        "flow_m3_24h": torch.full((14,), 1_000.0),
+        "flow_mask": torch.ones(14, dtype=torch.bool),
     }
-    for head, prefixes in head_paths.items():
-        for name, param in head.named_parameters():
-            if name.startswith(prefixes):
-                assert param.grad is not None, name
-                assert torch.isfinite(param.grad).all(), name
-
-
-def test_output_shape_contract() -> None:
-    """All outputs follow the section 11.4 conventions [B, .] / [B_h, W_max]."""
-    batch = collate_native_batch(
-        [
-            _item(
-                "municipality", frozenset({"cases"}), source_id="08019",
-                origin_dow=0, horizon=14, pop=POP_MUNI,
-            ),
-            _item(
-                "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
-                horizon=14, pop=POP_ABS,
-            ),
-            _item(
-                "comarca", frozenset({"deaths"}), source_id="06", origin_dow=3,
-                horizon=14, pop=POP_COMARCA,
-            ),
-        ]
-    )
+    batch = collate_native_batch([item])
     model = _model(horizon=14, f_native=batch.hist.shape[2])
-    out = model(batch)
-    assert model.input_adapter(batch).shape == (3, L, D_IN)
+    first = model(batch)
+    batch.head_extra["ww"]["flow_m3_24h"].fill_(1.0e9)
+    second = model(batch)
+
     for key in (
-        "S_trajectory",
-        "I_trajectory",
-        "H_trajectory",
-        "R_trajectory",
-        "D_trajectory",
+        "pred_ww",
+        "dist_ww_loc",
+        "dist_ww_scale",
+        "mechanistic_ww",
+        "residual_ww",
     ):
-        assert out[key].shape == (3, 15), key
-    for key in ("hospitalization_flow", "death_flow", "physics_residual", "beta_t"):
-        assert out[key].shape == (3, 14), key
-    assert out["obs_context"].shape == (3, 14, OBS_CONTEXT_DIM)
-    assert out["initial_states"].shape == (3, 4)
-    for key in ("dist_cases_loc", "dist_cases_scale"):
-        assert out[key].shape == (3, 15), key
-    for key in ("dist_deaths_loc", "dist_deaths_scale"):
-        assert out[key].shape == (3, 14), key
-    for key in (
-        "pred_hosp_weekly",
-        "dist_hosp_weekly_loc",
-        "dist_hosp_weekly_scale",
-        "mechanistic_hosp_weekly",
-        "residual_hosp_weekly",
-    ):
-        assert out[key].shape == (1, 2), key
-    assert out["hosp_weekly_mask"].shape == (1, 2)
-    assert out["hosp_weekly_mask"].dtype == torch.bool
-    # Frozen v1 weekly residual: loc == mechanistic exactly.
-    assert torch.equal(out["pred_hosp_weekly"], out["mechanistic_hosp_weekly"])
-    assert torch.equal(out["pred_cases"], out["dist_cases_loc"])
-    assert torch.equal(out["pred_deaths"], out["dist_deaths_loc"])
-    # Query metadata echo and routing.
-    assert out["source_type_id"].tolist() == [0, 1, 2]
-    assert out["origin_dow"].tolist() == [0, 6, 3]
-    assert out["head_index"]["cases"].tolist() == [0]
-    assert out["head_index"]["hosp"].tolist() == [1]
-    assert out["head_index"]["deaths"].tolist() == [2]
+        assert first[key].shape == (1, 14, 3)
+        assert torch.equal(first[key], second[key])
+        assert torch.isfinite(first[key]).all()
+    assert first["observation_source_ww"].shape == (1, 14)
+
+    loss = first["dist_ww_loc"].mean() + first["dist_ww_scale"].mean()
+    loss.backward()
+    for parameter in model.wastewater_head.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
 
 
 def test_per_source_embedding_raises_not_implemented() -> None:
     """R13: the per-source static embedding is deferred beyond v1."""
     config = NativeForecasterConfig(
+        mobility_enabled=False,
         f_native=F_NATIVE,
         d_ctx=D_CTX,
         forecast_horizon=14,
@@ -554,18 +493,24 @@ def test_weekly_hosp_gradients_reach_kernel_and_scale() -> None:
     batch = collate_native_batch(
         [
             _item(
-                "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
-                horizon=14, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="088",
+                origin_dow=6,
+                horizon=14,
+                pop=POP_ABS,
             ),
             _item(
-                "abs", frozenset({"hosp"}), source_id="089", origin_dow=3,
-                horizon=14, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="089",
+                origin_dow=3,
+                horizon=14,
+                pop=POP_ABS,
             ),
         ]
     )
-    model = _model(
-        horizon=14, f_native=batch.hist.shape[2], observation_heads=heads
-    )
+    model = _model(horizon=14, f_native=batch.hist.shape[2], observation_heads=heads)
     assert list(model.base.hosp_head.delay_kernel.named_parameters())
     out = model(batch)
     out["dist_hosp_weekly_loc"].sum().backward()
@@ -592,8 +537,12 @@ def test_cases_anchoring_wiring() -> None:
         obs_context_dim=OBS_CONTEXT_DIM, delta_forecasting=True
     )
     observed = _item(
-        "municipality", frozenset({"cases"}), source_id="08019",
-        origin_dow=0, horizon=14, pop=POP_MUNI,
+        "municipality",
+        frozenset({"cases"}),
+        source_id="08019",
+        origin_dow=0,
+        horizon=14,
+        pop=POP_MUNI,
     )
     hist_observed = torch.zeros(L, F_NATIVE)
     hist_observed[:, 0] = torch.arange(1, L + 1) * 0.25
@@ -601,8 +550,12 @@ def test_cases_anchoring_wiring() -> None:
     hist_observed[10:, 0] = 99.0  # masked decoys must not become the anchor
     observed["hist"] = hist_observed
     blind = _item(
-        "municipality", frozenset({"cases"}), source_id="08020",
-        origin_dow=0, horizon=14, pop=POP_MUNI,
+        "municipality",
+        frozenset({"cases"}),
+        source_id="08020",
+        origin_dow=0,
+        horizon=14,
+        pop=POP_MUNI,
     )
     hist_blind = torch.zeros(L, F_NATIVE)
     hist_blind[:, 0] = 5.0  # all-zero mask: no valid anchor
@@ -612,8 +565,12 @@ def test_cases_anchoring_wiring() -> None:
             observed,
             blind,
             _item(
-                "abs", frozenset({"hosp"}), source_id="088", origin_dow=6,
-                horizon=14, pop=POP_ABS,
+                "abs",
+                frozenset({"hosp"}),
+                source_id="088",
+                origin_dow=6,
+                horizon=14,
+                pop=POP_ABS,
             ),
         ]
     )

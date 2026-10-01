@@ -46,6 +46,7 @@ belong to ENC-1/LOS-1, not the model forward.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 import torch
@@ -82,6 +83,7 @@ __all__ = [
     "NativeEpiForecaster",
     "NativeForecasterConfig",
     "NativeInputAdapter",
+    "NativeWastewaterHead",
 ]
 
 
@@ -89,8 +91,8 @@ __all__ = [
 class NativeForecasterConfig:
     """Widths and base-model wiring for :class:`NativeEpiForecaster`.
 
-    ``f_native`` is the unified history width from the batch (the query's
-    three clinical channels plus the ``k`` shared temporal covariates),
+    ``f_native`` is the unified history width from the batch (routed source
+    history, optional municipality vaccination, and shared temporal covariates),
     ``d_ctx`` the fixed-pooling context width. ``d_in`` is the backbone input
     width the adapter emits; it is the single source of truth for the
     composed base's input arithmetic.
@@ -111,25 +113,34 @@ class NativeForecasterConfig:
     head_num_layers: int = 2
     head_dropout: float = 0.1
     sir_physics: SIRPhysicsConfig = field(default_factory=SIRPhysicsConfig)
-    observation_heads: ObservationHeadConfig = field(default_factory=ObservationHeadConfig)
+    observation_heads: ObservationHeadConfig = field(
+        default_factory=ObservationHeadConfig
+    )
     init_weights: InitWeightsConfig = field(default_factory=InitWeightsConfig)
     strict: bool = True
-    spatial_encoder: str = "pooled"
+    spatial_encoder: str = "hetero"
     mobility_enabled: bool = True
+    wastewater_enabled: bool = False
     hetero_hidden_dim: int = 16
+    include_vaccination: bool = True
     hetero_parameter_budget: int = 100_000
 
     def __post_init__(self) -> None:
-        for name in ("f_native", "forecast_horizon", "sequence_length", "d_in",
-                     "adapter_hidden_dim", "type_embedding_dim"):
+        for name in (
+            "f_native",
+            "forecast_horizon",
+            "sequence_length",
+            "d_in",
+            "adapter_hidden_dim",
+            "type_embedding_dim",
+        ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         if self.d_ctx < 0:
             raise ValueError(f"d_ctx must be non-negative, got {self.d_ctx}")
-        if self.spatial_encoder not in {"pooled", "hetero"}:
+        if self.spatial_encoder != "hetero":
             raise ValueError(
-                "spatial_encoder must be 'pooled' or 'hetero', got "
-                f"{self.spatial_encoder!r}"
+                f"spatial_encoder must be 'hetero', got {self.spatial_encoder!r}"
             )
 
 
@@ -158,8 +169,7 @@ class NativeInputAdapter(nn.Module):
         self.config = config
         if config.use_per_source_embedding:
             raise NotImplementedError(
-                "per-source static embedding is deferred beyond v1 "
-                "(plan §12.2b R13)"
+                "per-source static embedding is deferred beyond v1 (plan §12.2b R13)"
             )
         self.type_embedding = nn.Embedding(
             num_embeddings=len(SOURCE_TYPE_ORDER),
@@ -200,6 +210,82 @@ class NativeInputAdapter(nn.Module):
         ]
         hidden = F.silu(self.input_proj(torch.cat(features, dim=-1)))
         return self.output_proj(hidden)
+
+
+class NativeWastewaterHead(nn.Module):
+    """Map an EDAR rollout to assay-level ``log1p(concentration)``.
+
+    The shared shedding kernel acts on infected fractions. The EDAR catchment
+    population converts that fraction to infected people, and the last known
+    causal 24-hour flow converts the result to a concentration proxy. A
+    positive assay-specific scale absorbs assay response and units. Target
+    period flow is not an input.
+    """
+
+    def __init__(
+        self,
+        *,
+        context_dim: int,
+        assay_count: int = 3,
+        scale_init: float = 1.0e6,
+        distribution_scale_init: float = 0.3,
+        distribution_scale_floor: float = 1.0e-3,
+    ) -> None:
+        super().__init__()
+        if assay_count <= 0:
+            raise ValueError("assay_count must be positive")
+        if scale_init <= 0:
+            raise ValueError("scale_init must be positive")
+        self.assay_count = assay_count
+        self.distribution_scale_floor = float(distribution_scale_floor)
+        self.log_assay_scale = nn.Parameter(
+            torch.full((assay_count,), math.log(scale_init), dtype=MODEL_PARAM_DTYPE)
+        )
+        self.residual_proj = nn.Linear(context_dim, assay_count)
+        self.distribution_scale_proj = nn.Linear(context_dim, assay_count)
+        nn.init.xavier_normal_(self.residual_proj.weight, gain=0.1)
+        nn.init.zeros_(self.residual_proj.bias)
+        nn.init.zeros_(self.distribution_scale_proj.weight)
+        scale_margin = max(
+            float(distribution_scale_init) - self.distribution_scale_floor,
+            1.0e-8,
+        )
+        nn.init.constant_(
+            self.distribution_scale_proj.bias,
+            math.log(math.expm1(scale_margin)),
+        )
+
+    def forward(
+        self,
+        *,
+        shedding_fraction: torch.Tensor,
+        catchment_population: torch.Tensor,
+        causal_flow: torch.Tensor,
+        obs_context: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return assay-level location, scale, and mechanistic components."""
+        infected_people = (
+            shedding_fraction.float() * catchment_population.float().unsqueeze(1)
+        )
+        concentration_proxy = infected_people / causal_flow.float().clamp_min(
+            1.0
+        ).unsqueeze(1)
+        assay_scale = torch.exp(self.log_assay_scale.float()).view(1, 1, -1)
+        mechanistic = torch.log1p(
+            concentration_proxy.clamp_min(0.0).unsqueeze(-1) * assay_scale
+        )
+        residual = self.residual_proj(obs_context.float())
+        loc = mechanistic + residual
+        scale = (
+            F.softplus(self.distribution_scale_proj(obs_context.float()))
+            + self.distribution_scale_floor
+        )
+        return {
+            "loc": loc,
+            "scale": scale,
+            "mechanistic_loc": mechanistic,
+            "residual_loc": residual,
+        }
 
 
 def _build_base_forecaster(config: NativeForecasterConfig) -> EpiForecaster:
@@ -257,7 +343,9 @@ def _weekly_hosp_mechanics(
     source = torch.cat(
         [
             torch.zeros(
-                batch_size, 1, device=hospitalization_flow.device,
+                batch_size,
+                1,
+                device=hospitalization_flow.device,
                 dtype=hospitalization_flow.dtype,
             ),
             hospitalization_flow,
@@ -290,9 +378,7 @@ def _week_aligned_obs_context(
     first_monday = torch.remainder(-origin_dow.long() - 1, 7)
     day_offsets = torch.arange(horizon, device=device)
     rel = day_offsets.unsqueeze(0) - first_monday.unsqueeze(1)
-    week_of_day = torch.div(rel, 7, rounding_mode="floor").clamp(
-        0, weekly_slots - 1
-    )
+    week_of_day = torch.div(rel, 7, rounding_mode="floor").clamp(0, weekly_slots - 1)
     in_interval = (rel >= 0).to(dtype)
 
     ctx_days = obs_context_with_init[:, 1:, :]
@@ -328,15 +414,21 @@ class NativeEpiForecaster(nn.Module):
         self.weekly_slots = -(-config.forecast_horizon // 7)
         self.input_adapter = NativeInputAdapter(config)
         self.base = _build_base_forecaster(config)
-        self.spatial_encoder = (
-            HeterogeneousContextEncoder(
-                context_dim=config.d_ctx,
-                hidden_dim=config.hetero_hidden_dim,
-                mobility_enabled=config.mobility_enabled,
-                parameter_budget=config.hetero_parameter_budget,
-            )
-            if config.spatial_encoder == "hetero"
-            else None
+        self.wastewater_head = NativeWastewaterHead(
+            context_dim=config.observation_heads.obs_context_dim,
+            distribution_scale_init=(config.observation_heads.distribution_scale_init),
+            distribution_scale_floor=(
+                config.observation_heads.distribution_scale_floor
+            ),
+        )
+        self.spatial_encoder = HeterogeneousContextEncoder(
+            context_dim=config.d_ctx,
+            hidden_dim=config.hetero_hidden_dim,
+            mobility_enabled=config.mobility_enabled,
+            wastewater_enabled=config.wastewater_enabled,
+            relation_input_dim=6 if config.include_vaccination else 3,
+            od_input_dim=6 if config.include_vaccination else 3,
+            parameter_budget=config.hetero_parameter_budget,
         )
         logger.info(
             "Initialized NativeEpiForecaster: f_native=%d d_ctx=%d d_in=%d "
@@ -348,13 +440,11 @@ class NativeEpiForecaster(nn.Module):
             self.weekly_slots,
         )
 
-    def forward(self, batch: NativeEpiBatch) -> dict[str, torch.Tensor | dict[str, torch.Tensor | None]]:
+    def forward(
+        self, batch: NativeEpiBatch
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor | None]]:
         """Run the native-support forward pass over a collated batch."""
-        spatial_context = (
-            self.spatial_encoder(batch)
-            if self.spatial_encoder is not None
-            else batch.ctx_feat
-        )
+        spatial_context = self.spatial_encoder(batch)
         x_seq = self.input_adapter(batch, ctx_feat=spatial_context)
         encoder_outputs = self.base.backbone(x_seq)
         beta_t = encoder_outputs["beta_t"]
@@ -380,9 +470,7 @@ class NativeEpiForecaster(nn.Module):
         death_flow = sir_outputs["death_flow"]
         hospitalization_flow = sir_outputs["hospitalization_flow"]
 
-        obs_context_with_init = torch.cat(
-            [obs_context[:, :1, :], obs_context], dim=1
-        )
+        obs_context_with_init = torch.cat([obs_context[:, :1, :], obs_context], dim=1)
 
         # Cases anchoring (plan section 12.2b R15): when the shared head
         # config enables delta forecasting, the last valid observation of
@@ -412,6 +500,7 @@ class NativeEpiForecaster(nn.Module):
         weekly = self._weekly_hosp_outputs(
             batch, hospitalization_flow, obs_context_with_init
         )
+        wastewater = self._wastewater_outputs(batch, i_traj, obs_context)
 
         outputs: dict[str, torch.Tensor | dict[str, torch.Tensor | None]] = {
             "beta_t": beta_t,
@@ -445,12 +534,60 @@ class NativeEpiForecaster(nn.Module):
             "residual_input_deaths": dist_deaths["residual_input"],
             "observation_source_deaths": death_flow,
             **weekly,
+            **wastewater,
             "source_type_id": batch.source_type_id,
             "origin_dow": batch.origin_dow,
             "head_index": dict(batch.head_index),
             "spatial_context": spatial_context,
         }
         return outputs
+
+    def _wastewater_outputs(
+        self,
+        batch: NativeEpiBatch,
+        infected_trajectory: torch.Tensor,
+        obs_context: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Assay-level EDAR outputs for the routed wastewater rows."""
+        rows = batch.head_index.get("ww")
+        horizon = self.forecast_horizon
+        assay_count = self.wastewater_head.assay_count
+        device = infected_trajectory.device
+        dtype = infected_trajectory.dtype
+        if rows is None or rows.numel() == 0:
+            empty = torch.zeros(0, horizon, assay_count, device=device, dtype=dtype)
+            return {
+                "pred_ww": empty,
+                "dist_ww_loc": empty,
+                "dist_ww_scale": empty,
+                "mechanistic_ww": empty,
+                "residual_ww": empty,
+                "observation_source_ww": torch.zeros(
+                    0, horizon, device=device, dtype=dtype
+                ),
+            }
+
+        rows = rows.to(device=device, dtype=torch.long)
+        routed_infected = infected_trajectory.index_select(0, rows)
+        shedding = self.base.ww_head.shedding_conv(
+            routed_infected.float(), torch.ones_like(routed_infected.float())
+        )[:, 1:]
+        flow_log1p = batch.hist.index_select(0, rows)[:, -1, _ONE_HOT_WIDTH + 3]
+        causal_flow = torch.expm1(flow_log1p.float()).clamp_min(1.0)
+        outputs = self.wastewater_head(
+            shedding_fraction=shedding,
+            catchment_population=batch.source_pop.index_select(0, rows),
+            causal_flow=causal_flow,
+            obs_context=obs_context.index_select(0, rows),
+        )
+        return {
+            "pred_ww": outputs["loc"],
+            "dist_ww_loc": outputs["loc"],
+            "dist_ww_scale": outputs["scale"],
+            "mechanistic_ww": outputs["mechanistic_loc"],
+            "residual_ww": outputs["residual_loc"],
+            "observation_source_ww": shedding,
+        }
 
     def _resolve_cases_anchor(
         self, batch: NativeEpiBatch

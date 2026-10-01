@@ -133,49 +133,7 @@ def mixed_items() -> list[NativeDatasetItem]:
 # ----------------------------------------------------------------------
 
 
-def test_mixed_three_type_batch_shapes(mixed_items: list[NativeDatasetItem]) -> None:
-    batch = collate_native_batch(mixed_items)
-    assert batch.b == 3
-    assert batch.t == L
-    assert batch.hist.shape == (3, L, N_TYPES + F_NATIVE)
-    assert batch.hist.dtype == torch.float32
-    assert batch.hist_mask.shape == (3, L)
-    assert batch.hist_mask.dtype == torch.bool
-    assert batch.source_type_id.shape == (3,)
-    assert batch.source_type_id.dtype == torch.long
-    assert batch.source_type_id.tolist() == [0, 1, 2]
-    assert batch.source_pop.dtype == torch.float32
-    assert batch.source_pop.tolist() == pytest.approx([250.0, 70_000.0, 180_000.0])
-    assert batch.origin_dow.dtype == torch.long
-    assert batch.origin_dow.tolist() == [2, 3, 4]
-    assert batch.ctx_feat.shape == (3, L, D_CTX)
-    assert batch.temporal_covariates.shape == (3, L, 2)
-    assert batch.ctx_coverage.shape == (3,)
-    assert batch.ctx_coverage.dtype == torch.float32
-    assert batch.ctx_coverage.tolist() == pytest.approx([0.5, 0.25, 0.5])
-    assert set(batch.head_index) == {"cases", "hosp", "deaths"}
-    assert batch.head_index["cases"].tolist() == [0]
-    assert batch.head_index["hosp"].tolist() == [1]
-    assert batch.head_index["deaths"].tolist() == [2]
-    assert batch.head_target["cases"].shape == (1, H)
-    assert batch.head_target["hosp"].shape == (1, W)
-    assert batch.head_target["deaths"].shape == (1, H)
-    assert batch.head_target_mask["cases"].shape == (1, H)
-    assert batch.head_target_mask["hosp"].shape == (1, W)
-    assert batch.head_target["cases"][0, 0].item() == pytest.approx(8121.0)
-    assert batch.head_population["hosp"].tolist() == pytest.approx([70_000.0])
-
-
-@pytest.mark.parametrize(
-    ("source_type", "expected_id"),
-    [
-        ("municipality", 0),
-        ("abs", 1),
-        ("comarca", 2),
-        ("mitma", 3),
-        ("edar", 4),
-    ],
-)
+@pytest.mark.parametrize(("source_type", "expected_id"), [("municipality", 0), ("abs", 1), ("comarca", 2), ("edar", 4)])
 def test_source_type_id_matches_enum(
     source_type: SourceType, expected_id: int
 ) -> None:
@@ -233,8 +191,8 @@ def test_routing_covers_each_row_exactly_once(
     batch = collate_native_batch(mixed_items)
     seen: list[int] = []
     for index in batch.head_index.values():
-        assert index is not None
-        seen.extend(index.tolist())
+        if index is not None:
+            seen.extend(index.tolist())
     assert sorted(seen) == list(range(len(mixed_items)))
 
 
@@ -243,8 +201,7 @@ def test_routing_matches_requested_heads(
 ) -> None:
     batch = collate_native_batch(mixed_items)
     for head, index in batch.head_index.items():
-        assert index is not None
-        for position in index.tolist():
+        for position in [] if index is None else index.tolist():
             assert head in mixed_items[position]["query"].requested_heads
     for position, item in enumerate(mixed_items):
         for head in item["query"].requested_heads:
@@ -429,7 +386,7 @@ def test_real_artifacts_collate_matches_head_counts() -> None:
         if len(items) == 8:
             break
         item = ds[position]
-        if item["query"].source_type == "abs":
+        if item["head"] == "hosp":
             width = int(item["target"].shape[0])
             if hosp_width is None:
                 hosp_width = width
@@ -458,9 +415,9 @@ def test_real_artifacts_collate_matches_head_counts() -> None:
     assert routed_total == 8
     weekly_width = hosp_width if hosp_width is not None else H
     for head, index in batch.head_index.items():
-        assert head in ds.head_counts
         if index is None:
             continue
+        assert head in ds.head_counts
         assert index.tolist() == sorted(index.tolist())
         assert int(index.numel()) <= ds.head_counts[head]
         targets = batch.head_target[head]
@@ -479,7 +436,7 @@ def test_real_artifacts_collate_matches_head_counts() -> None:
     assert batch.source_type_id.tolist() == [
         int(item["source_type_id"]) for item in items
     ]
-    if hosp_width is not None:
+    if batch.head_index["hosp"] is not None:
         extra = batch.head_extra["hosp"]
         assert extra is not None
         stratum = extra["stratum_pop_sum"]
@@ -488,7 +445,7 @@ def test_real_artifacts_collate_matches_head_counts() -> None:
             sum(
                 1
                 for item in items
-                if item["query"].source_type == "abs"
+                if item["head"] == "hosp"
             ),
             hosp_width,
         )

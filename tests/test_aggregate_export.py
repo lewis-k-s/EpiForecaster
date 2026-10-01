@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pandas as pd
 import pytest
-import torch
 
 from evaluation.aggregate_export import (
     build_main_model_joint_observation_aggregate,
     build_main_model_target_aggregate,
     write_main_model_aggregate_csvs,
 )
-from training.epiforecaster_trainer import EpiForecasterTrainer
 
 
 def test_build_main_model_target_aggregate_schema_and_mapping() -> None:
@@ -169,93 +166,3 @@ def test_write_main_model_aggregate_csvs_writes_expected_paths(tmp_path: Path) -
     joint_df = pd.read_csv(artifacts["val_main_model_joint_loss_aggregate"])
     assert not target_df.empty
     assert not joint_df.empty
-
-
-@pytest.mark.epiforecaster
-def test_run_calls_main_model_aggregate_writer_for_val_and_test(tmp_path: Path) -> None:
-    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
-    trainer._status = lambda *_args, **_kwargs: None
-    trainer.config = SimpleNamespace(
-        output=SimpleNamespace(
-            experiment_name="exp",
-            save_checkpoints=True,
-            save_best_only=False,
-            checkpoint_frequency=1,
-            write_granular_eval=False,
-        ),
-        training=SimpleNamespace(
-            profiler=SimpleNamespace(enabled=False, profile_epochs=[]),
-            max_batches=None,
-            epochs=1,
-            early_stopping_patience=None,
-            plot_forecasts=False,
-            run_final_evaluation=True,
-        ),
-    )
-    trainer.experiment_dir = tmp_path
-    trainer.wandb_run = None
-    trainer.nan_loss_triggered = False
-    trainer.current_epoch = 0
-    trainer.best_val_loss = float("inf")
-    trainer.patience_counter = 0
-    trainer.trial = None
-    trainer.pruning_start_epoch = 10
-    trainer.scheduler = None
-    trainer.criterion = SimpleNamespace(observation_loss="mse")
-    trainer.val_loader = object()
-    trainer.test_loader = object()
-    trainer.metric_artifacts = {}
-    trainer.model = torch.nn.Linear(1, 1)
-    trainer.device = torch.device("cpu")
-    trainer.best_val_selection_score = float("inf")
-    trainer.best_val_selection_metric = "mean_target_mae"
-    trainer.best_val_joint_loss = float("inf")
-    trainer.best_val_series_metrics = {}
-    trainer.cleanup_dataloaders = lambda: None
-    trainer._train_epoch = lambda: 0.0
-    trainer._save_checkpoint = lambda *args, **kwargs: None
-    trainer._load_best_model_for_final_evaluation = lambda: tmp_path / "best_model.pt"
-    trainer._log_epoch = lambda **_kwargs: None
-    trainer._evaluate_split = lambda *_args, **_kwargs: (
-        0.5,
-        {"mae": 1.0, "rmse": 2.0, "r2": 0.2},
-        {},
-    )
-    trainer.test_epoch = lambda **_kwargs: (
-        0.6,
-        {"mae": 1.1, "rmse": 2.1, "r2": 0.3},
-        {},
-    )
-
-    called_splits: list[str] = []
-
-    def _fake_writer(
-        split_name: str, eval_metrics: dict[str, float]
-    ) -> dict[str, Path]:
-        del eval_metrics
-        split_key = split_name.lower()
-        called_splits.append(split_key)
-        target_path = tmp_path / f"{split_key}_main_model_aggregate_metrics.csv"
-        joint_path = tmp_path / f"{split_key}_main_model_joint_loss_aggregate.csv"
-        trainer.metric_artifacts[f"{split_key}_main_model_aggregate_metrics"] = (
-            target_path
-        )
-        trainer.metric_artifacts[f"{split_key}_main_model_joint_loss_aggregate"] = (
-            joint_path
-        )
-        return {
-            f"{split_key}_main_model_aggregate_metrics": target_path,
-            f"{split_key}_main_model_joint_loss_aggregate": joint_path,
-        }
-
-    trainer._write_main_model_aggregate_csvs = _fake_writer
-
-    results = EpiForecasterTrainer.run(trainer)
-    assert called_splits == ["val", "test"]
-    assert "metric_artifacts" in results
-    assert set(results["metric_artifacts"].keys()) == {
-        "val_main_model_aggregate_metrics",
-        "val_main_model_joint_loss_aggregate",
-        "test_main_model_aggregate_metrics",
-        "test_main_model_joint_loss_aggregate",
-    }

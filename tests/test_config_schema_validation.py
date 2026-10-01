@@ -3,19 +3,12 @@ from pathlib import Path
 import pytest
 
 from data.preprocess.config import PreprocessingConfig
+from tests.config_fixtures import config_fixture
 from models.configs import EpiForecasterConfig, ObservationHeadConfig
 from training.region2vec_trainer import RegionTrainerConfig
-from scripts.hpo.ablation_worker import load_campaign
 
 
 CONFIG_ROOT = Path("configs")
-EPIFORECASTER_TRAINING_CONFIGS = sorted(
-    [
-        *CONFIG_ROOT.glob("train_epifor*.yaml"),
-        *CONFIG_ROOT.glob("production_only/train_epifor*.yaml"),
-        *CONFIG_ROOT.glob("experiment/*.yaml"),
-    ]
-)
 REGION2VEC_CONFIGS = sorted(CONFIG_ROOT.glob("train_regions*.yaml"))
 PREPROCESSING_CONFIGS = sorted(
     [
@@ -23,81 +16,6 @@ PREPROCESSING_CONFIGS = sorted(
         *CONFIG_ROOT.glob("production_only/preprocess*.yaml"),
     ]
 )
-CAMPAIGN_CONFIGS = sorted(CONFIG_ROOT.glob("campaigns/*.yaml"))
-
-
-@pytest.mark.parametrize("campaign_path", CAMPAIGN_CONFIGS)
-def test_ablation_campaign_configs_parse(campaign_path):
-    """Campaign YAML has its own schema; it is not a training configuration."""
-    campaign = load_campaign(Path(campaign_path))
-    assert campaign.conditions
-    assert campaign.baseline_condition in campaign.conditions_by_name
-    assert campaign.equal_budget_policy.paths == (
-        "training.epochs",
-        "training.max_batches",
-    )
-
-
-def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
-    """Delay-family ablations stay normalized and diagnosable."""
-    campaign = load_campaign(Path("configs/campaigns/ablation_default_v1.yaml"))
-    conditions = campaign.conditions_by_name
-
-    assert {
-        "kernel:ww:gamma",
-        "kernel:hosp:gamma",
-        "kernel:cases:gamma",
-        "kernel:deaths:gamma",
-        "kernel:clinical:gamma",
-    }.issubset(conditions)
-    assert not {
-        "kernel:ww:free",
-        "kernel:hosp:free",
-        "kernel:cases:free",
-        "kernel:deaths:free",
-        "kernel:all:free",
-    }.intersection(conditions)
-    assert conditions["kernel:hosp:gamma"].overrides == {
-        "model": {
-            "observation_heads": {
-                "learnable_kernel_hosp": True,
-                "kernel_parameterization_hosp": "gamma",
-            }
-        }
-    }
-    assert conditions["kernel:clinical:gamma"].overrides == {
-        "model": {
-            "observation_heads": {
-                "learnable_kernel_hosp": True,
-                "kernel_parameterization_hosp": "gamma",
-                "kernel_parameterization_cases": "gamma",
-                "kernel_parameterization_deaths": "gamma",
-            }
-        }
-    }
-    assert conditions["kernel:ww:gamma"].overrides == {
-        "model": {
-            "observation_heads": {
-                "learnable_kernel_ww": True,
-                "kernel_parameterization_ww": "gamma",
-                "kernel_length_ww": 35,
-            }
-        }
-    }
-
-
-@pytest.mark.epiforecaster
-@pytest.mark.parametrize("config_path", EPIFORECASTER_TRAINING_CONFIGS)
-def test_epiforecaster_training_configs_parse(config_path):
-    """Test that all EpiForecaster training configs can be parsed."""
-    cfg = EpiForecasterConfig.load(config_path)
-    # Basic validation that the config loaded
-    assert cfg.model is not None
-    assert cfg.data is not None
-    assert cfg.training is not None
-    assert cfg.output is not None
-    # Verify that the config uses joint_inference loss (required by EpiForecasterTrainer)
-    assert cfg.training.loss.name == "joint_inference"
 
 
 @pytest.mark.epiforecaster
@@ -105,10 +23,9 @@ def test_epiforecaster_rejects_non_joint_loss_name():
     with pytest.raises(
         ValueError, match="only supports training.loss.name='joint_inference'"
     ):
-        EpiForecasterConfig.load(
-            "configs/train_epifor_smoke.yaml",
-            overrides=["training.loss.name=mse"],
-        )
+        payload = config_fixture().to_dict()
+        payload["training"]["loss"]["name"] = "mse"
+        EpiForecasterConfig.from_dict(payload)
 
 
 @pytest.mark.region
@@ -161,6 +78,7 @@ def test_corrected_sirhd_preprocessing_has_versioned_artifact_identity():
     )
     assert config["smoothing"]["clinical_method"] == "holt_damped"
     assert config["continuous_storage_dtype"] == "float32"
+
 
 @pytest.mark.epiforecaster
 @pytest.mark.parametrize("value", [0.0, -1.5])

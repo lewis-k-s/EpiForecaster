@@ -60,8 +60,8 @@ class TestRoutingTable:
     def test_heads_for_source_matches_frozen_contract(self) -> None:
         assert HEADS_FOR_SOURCE == {
             "municipality": frozenset({"cases"}),
-            "abs": frozenset({"hosp"}),
-            "comarca": frozenset({"deaths"}),
+            "abs": frozenset({"hosp", "deaths"}),
+            "comarca": frozenset(),
             "mitma": frozenset(),
             "edar": frozenset({"ww"}),
         }
@@ -90,7 +90,7 @@ class TestValidateQuery:
         [
             ("municipality", "08121", {"cases"}),
             ("abs", "088", {"hosp"}),
-            ("comarca", "06", {"deaths"}),
+            ("abs", "088", {"deaths"}),
             ("edar", "EDIAB", {"ww"}),
         ],
     )

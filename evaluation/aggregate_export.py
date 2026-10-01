@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 
 _NATIVE_TARGET_NAMES = {
+    "ww": "wastewater",
     "cases": "cases",
     "hosp": "hospitalizations",
     "deaths": "deaths",

@@ -331,6 +331,7 @@ def _native_row_dicts_from_head(
     target_name: str,
     queries: Sequence[Any],
     node_ids: Sequence[int],
+    source_ids: Sequence[str] | None = None,
     predictions: torch.Tensor,
     targets: torch.Tensor,
     raw_targets: torch.Tensor,
@@ -368,7 +369,11 @@ def _native_row_dicts_from_head(
         for level, (low, high) in intervals.items()
     }
     batch_size, horizon_size = targets.shape
-    if len(queries) != batch_size or len(node_ids) != batch_size:
+    if (
+        len(queries) != batch_size
+        or len(node_ids) != batch_size
+        or (source_ids is not None and len(source_ids) != batch_size)
+    ):
         raise ValueError(
             "native granular identity count does not match routed tensor rows"
         )
@@ -376,7 +381,11 @@ def _native_row_dicts_from_head(
     rows: list[dict[str, Any]] = []
     for batch_index, query in enumerate(queries):
         source_type = str(query.source_type)
-        source_id = str(query.source_id)
+        source_id = (
+            str(query.source_id)
+            if source_ids is None
+            else str(source_ids[batch_index])
+        )
         region_id = source_id if source_type == "municipality" else ""
         window_start = int(query.forecast_origin) - input_window_length + 1
         for horizon_index in range(horizon_size):

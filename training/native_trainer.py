@@ -1,49 +1,6 @@
-"""Production trainer for native-support training (slice TRN-1, WP-B).
+"""Source-native heterogeneous training and evaluation.
 
-Trainer for the native-support path (plan sections 12.2 TRN-1, 11.6, and
-12.2d WP-B): it wires :class:`~data.native_dataset.NativeSupportDataset`
-through ``collate_native_batch`` into a
-:class:`~models.native_forecaster.NativeEpiForecaster` and the routed
-:class:`~evaluation.losses.NativeJointInferenceLoss`.
-
-Every run owns a canonical model root
-``log_dir / experiment_name / model_id`` — the same layout the municipal
-:class:`~training.epiforecaster_trainer.EpiForecasterTrainer` and the
-immutable MN5 workflow's ``run_support.train_model`` contract use. All
-run-owned artifacts live there: ``checkpoints/best_model.pt`` (canonical
-checkpoint dictionary, never a bare state dict), the final-epoch
-checkpoint, ``training_dynamics.jsonl`` plus its manifest, and the
-final-best-state granular/aggregate evaluation exports. No fold or seed
-may write into the shared ``log_dir / experiment_name`` directory.
-
-Best state is selected by the three-head validation-selection score
-(CRPS mean, NLL fallback, transformed-rate MAE final fallback — the
-municipal chain over native metric keys), not by joint validation loss
-alone; the joint loss is recorded separately.
-
-Precision follows the shared policy: float32 parameters with optional
-CUDA BF16 autocast. FP16 weights and ``GradScaler`` are intentionally
-not supported. Evaluation runs under the same autocast policy.
-
-Still deliberately not ported from the municipal trainer: W&B
-(explicitly rejected, not silently ignored), GradNorm, curriculum
-mixing, torch.compile, profiler, and mid-training resume. The municipal
-path in ``dataloader_factory``/``epiforecaster_trainer`` is untouched —
-the native branch lives here and is selected additively in ``cli.py``
-when ``config.native.enabled``.
-
-Sampling. With ``native.head_balanced_sampling`` the training order is a
-deterministic round-robin interleave of per-head item indices under the
-config seed (one item from each routed head in turn, ``cases``/``hosp``/
-``deaths`` rotation); with the flag off, a plain seeded shuffle. Validation
-uses the temporal tail split: the last ``training.val_split`` fraction of
-distinct forecast origins (at least one), so validation never precedes
-training in time (plan section 7). Stage-4 configs also select one audited
-source fold: training uses assigned sources outside the fold and validation
-uses held-out sources inside the fold on the temporal tail.
-
-Bounds. ``training.max_batches`` caps both the per-epoch training pass and
-the validation pass, keeping the bounded smoke run CPU-runnable in minutes.
+The municipal trainer belongs to the separate legacy worktree.
 """
 
 from __future__ import annotations
@@ -53,7 +10,7 @@ import math
 import os
 import random
 import time
-from collections import deque
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -64,8 +21,16 @@ import torch
 from torch.utils.data import DataLoader, Sampler, Subset
 
 from data.native_batch import ROUTED_HEADS, collate_native_batch
-from data.native_crossval import NativeFold, load_native_fold_manifest
-from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
+
+from data.native_inputs import native_dataset, split_identity
+from data.native_source_sets import (
+    CalendarSplit,
+    QueryEligibilityRecord,
+    SourceSetManifest,
+    load_source_set_manifest,
+    split_queries_for_run,
+    freeze_calendar_split,
+)
 from data.query_contract import ForecastQuery
 from evaluation.eval_loop import evaluate_native_loader
 from evaluation.losses import get_native_loss_from_config
@@ -92,7 +57,7 @@ from utils.precision_policy import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "HeadBalancedSampler",
+    "HierarchicalBalancedSampler",
     "NativeNonFiniteHalt",
     "NativeTrainer",
     "compute_native_selection_score",
@@ -100,7 +65,7 @@ __all__ = [
     "forecaster_config_to_dict",
     "load_native_checkpoint",
     "native_loader_kwargs",
-    "source_fold_temporal_split",
+    "source_set_manifest_split",
     "temporal_tail_split",
 ]
 
@@ -112,66 +77,88 @@ _LEGACY_PROJECTED_MARKERS = (
 )
 
 #: Routed native heads supervised in real-data training (plan section 11.1).
-_NATIVE_HEADS = ("cases", "hosp", "deaths")
+_NATIVE_HEADS = ("ww", "cases", "hosp", "deaths")
 
-_SELECTION_METRIC_NAME = "mean_target_mae"
-_CRPS_SELECTION_METRIC_NAME = "mean_target_crps"
-_NLL_SELECTION_METRIC_NAME = "mean_target_nll"
+_SELECTION_METRIC_NAME = "mean_target_wis"
 
 _BEST_CHECKPOINT_NAME = "best_model.pt"
 _FINAL_CHECKPOINT_NAME = "final_model.pt"
 _CHECKPOINT_SCHEMA_VERSION = 1
 
 
+def _validation_epoch_record(
+    *,
+    epoch: int,
+    step: int,
+    joint_loss: float,
+    selection_metric: str,
+    selection_score: float,
+    metrics: Mapping[str, object],
+) -> dict[str, object]:
+    """Keep the already-computed validation scores for each completed epoch."""
+    record: dict[str, object] = {
+        "epoch": epoch,
+        "step": step,
+        "joint_loss": _optional_float(joint_loss),
+        "selection_metric": selection_metric,
+        "selection_score": _optional_float(selection_score),
+    }
+    for head in _NATIVE_HEADS:
+        for metric in (
+            "nll",
+            "crps",
+            "wis",
+            "wis_dispersion",
+            "wis_underprediction",
+            "wis_overprediction",
+            "wis_point",
+        ):
+            record[f"{metric}_{head}"] = _optional_float(
+                metrics.get(f"{metric}_{head}")
+            )
+        count = metrics.get(f"observed_count_{head}")
+        record[f"observed_count_{head}"] = (
+            int(count)
+            if isinstance(count, int | float) and not isinstance(count, bool)
+            else None
+        )
+    record["censored_nll_ww"] = _optional_float(metrics.get("censored_nll_ww"))
+    censored_count = metrics.get("censored_count_ww")
+    record["censored_count_ww"] = (
+        int(censored_count)
+        if isinstance(censored_count, int | float)
+        and not isinstance(censored_count, bool)
+        else None
+    )
+    return record
+
+
 class NativeNonFiniteHalt(RuntimeError):
     """Raised when a non-finite training loss halts a native run."""
 
 
-def _finite_metric_mean(metrics: Mapping[str, Any], keys: Sequence[str]) -> float:
-    """Mean over finite values among ``keys``; ``inf`` when none qualify."""
-    values: list[float] = []
-    for key in keys:
-        value = metrics.get(key)
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            continue
-        value_float = float(value)
-        if math.isfinite(value_float):
-            values.append(value_float)
-    if not values:
-        return float("inf")
-    return float(np.mean(values))
-
-
 def compute_native_selection_score(
     metrics: Mapping[str, object],
-    *,
-    observation_loss: str,
 ) -> tuple[float, str]:
-    """Three-head validation-selection score (municipal chain, native keys).
+    """Equal-head WIS over observed routed targets, independent of train loss.
 
-    CRPS mean over finite routed heads first, NLL mean when the objective
-    is NLL and CRPS is unavailable, transformed-rate MAE mean as the final
-    fallback. Returns the score and the selected metric name.
+    Heads with no observed targets are excluded. An observed head must have
+    a finite WIS; silently dropping it would change the selection objective.
     """
-    selection_score = _finite_metric_mean(
-        metrics, tuple(f"mae_{head}_log1p_per_100k" for head in _NATIVE_HEADS)
-    )
-    selection_metric = _SELECTION_METRIC_NAME
-    if observation_loss in {"nll", "crps"}:
-        crps_score = _finite_metric_mean(
-            metrics, tuple(f"crps_{head}" for head in _NATIVE_HEADS)
-        )
-        if math.isfinite(crps_score):
-            selection_score = crps_score
-            selection_metric = _CRPS_SELECTION_METRIC_NAME
-        elif observation_loss == "nll":
-            nll_score = _finite_metric_mean(
-                metrics, tuple(f"nll_{head}" for head in _NATIVE_HEADS)
-            )
-            if math.isfinite(nll_score):
-                selection_score = nll_score
-                selection_metric = _NLL_SELECTION_METRIC_NAME
-    return selection_score, selection_metric
+    values: list[float] = []
+    for head in _NATIVE_HEADS:
+        count = metrics.get(f"observed_count_{head}")
+        if count == 0:
+            continue
+        value = _optional_float(metrics.get(f"wis_{head}"))
+        if value is None:
+            if isinstance(count, int | float) and count > 0:
+                raise ValueError(f"Observed head {head!r} has no finite validation WIS")
+            continue
+        values.append(value)
+    if not values:
+        raise ValueError("Native validation requires at least one finite observed WIS")
+    return float(np.mean(values)), _SELECTION_METRIC_NAME
 
 
 def _resolve_worker_count(cfg_workers: int) -> int:
@@ -191,8 +178,8 @@ def native_loader_kwargs(
     """DataLoader keyword arguments honoring the shared worker policy.
 
     ``pin_memory`` applies only on CUDA. ``persistent_workers`` and
-    ``prefetch_factor`` apply only with a positive worker count; the
-    multiprocessing context is selected only when workers will fork.
+    ``prefetch_factor`` apply only with a positive worker count. CUDA workers
+    use spawn because this trainer starts them after model CUDA initialization.
     """
     num_workers = _resolve_worker_count(workers)
     kwargs: dict[str, Any] = {
@@ -200,8 +187,10 @@ def native_loader_kwargs(
         "pin_memory": bool(training_config.pin_memory and device_type == "cuda"),
     }
     if num_workers > 0:
-        kwargs["multiprocessing_context"] = select_multiprocessing_context(
-            device_type, all_num_workers_zero=False
+        kwargs["multiprocessing_context"] = (
+            "spawn"
+            if device_type == "cuda"
+            else select_multiprocessing_context(device_type, all_num_workers_zero=False)
         )
         if training_config.persistent_workers:
             kwargs["persistent_workers"] = True
@@ -244,42 +233,80 @@ def load_native_checkpoint(
     return model, record
 
 
-class HeadBalancedSampler(Sampler[int]):
-    """Deterministic round-robin interleave of per-head dataset indices.
+class HierarchicalBalancedSampler(Sampler[int]):
+    """Choose a head, then a source, then an origin with equal exposure.
 
-    Each head's index list is shuffled under ``seed``, then items are
-    yielded one per head in ``head_order`` rotation until all queues drain.
-    Heads keep equal exposure per batch window regardless of their item
-    counts (plan section 7: log sampling frequencies per head). With
-    ``balanced=False`` the sampler is a plain seeded shuffle of the union.
+    Balanced mode oversamples smaller heads to the largest head's item count.
+    Inside each head it round-robins sources, and cycles each source's shuffled
+    origins. Thus head counts are equal and source counts within a head differ
+    by at most one. Plain mode shuffles every unique item once per epoch.
     """
 
     def __init__(
         self,
-        head_items: Mapping[str, Sequence[int]],
+        head_source_items: Mapping[str, Mapping[tuple[str, str], Sequence[int]]],
         *,
         seed: int,
         balanced: bool = True,
         head_order: Sequence[str] = ROUTED_HEADS,
     ) -> None:
-        self._rng = random.Random(seed)
-        self._head_order = [head for head in head_order if head_items.get(head)]
         self._indices: list[int] = []
-        if balanced:
-            queues: dict[str, deque[int]] = {}
-            for head in self._head_order:
-                items = sorted(head_items[head])
-                self._rng.shuffle(items)
-                queues[head] = deque(items)
-            while any(queues.values()):
-                for head in self._head_order:
-                    if queues[head]:
-                        self._indices.append(queues[head].popleft())
-        else:
-            union = [index for head in self._head_order for index in head_items[head]]
-            self._indices = self._rng.sample(sorted(union), len(union))
+        self._seed = seed
+        self._plain = not balanced
+        self._epoch = 0
+        active_heads = [
+            head for head in head_order if any(head_source_items.get(head, {}).values())
+        ]
+        all_items = [
+            index
+            for head in active_heads
+            for items in head_source_items[head].values()
+            for index in items
+        ]
+        if len(all_items) != len(set(all_items)):
+            raise ValueError(
+                "hierarchical sampler input contains duplicate item indices"
+            )
+        if not balanced:
+            self._indices = sorted(all_items)
+            return
+        if not active_heads:
+            return
+
+        target_per_head = max(
+            sum(len(items) for items in head_source_items[head].values())
+            for head in active_heads
+        )
+        streams: dict[str, list[int]] = {}
+        for head in active_heads:
+            rng = random.Random(f"{seed}|{head}")
+            source_order = sorted(
+                source for source, items in head_source_items[head].items() if items
+            )
+            rng.shuffle(source_order)
+            source_items: dict[tuple[str, str], list[int]] = {}
+            for source in source_order:
+                items = sorted(head_source_items[head][source])
+                rng.shuffle(items)
+                source_items[source] = items
+            stream: list[int] = []
+            for step in range(target_per_head):
+                source = source_order[step % len(source_order)]
+                source_step = step // len(source_order)
+                items = source_items[source]
+                stream.append(items[source_step % len(items)])
+            streams[head] = stream
+
+        for step in range(target_per_head):
+            for head in active_heads:
+                self._indices.append(streams[head][step])
 
     def __iter__(self) -> Iterator[int]:
+        if self._plain:
+            indices = self._indices.copy()
+            random.Random(f"{self._seed}|{self._epoch}").shuffle(indices)
+            self._epoch += 1
+            return iter(indices)
         return iter(self._indices)
 
     def __len__(self) -> int:
@@ -287,7 +314,7 @@ class HeadBalancedSampler(Sampler[int]):
 
 
 def temporal_tail_split(
-    origins: Sequence[int], val_fraction: float
+    origins: Sequence[int], val_fraction: float, forecast_horizon: int = 1
 ) -> tuple[list[int], list[int]]:
     """Split item positions into (train, val) by the last ``val_fraction`` of
     distinct forecast origins.
@@ -308,56 +335,76 @@ def temporal_tail_split(
         len(unique_sorted), max(1, math.ceil(val_fraction * len(unique_sorted)))
     )
     threshold = unique_sorted[-n_val_origins]
-    train = [i for i, origin in enumerate(origins) if origin < threshold]
+    train = [
+        i for i, origin in enumerate(origins) if origin + forecast_horizon < threshold
+    ]
     val = [i for i, origin in enumerate(origins) if origin >= threshold]
     return train, val
 
 
-def _fold_source_keys(fold: NativeFold) -> set[tuple[str, str]]:
-    """Return typed source identities for one audited native fold."""
-    return {
-        *(("municipality", source_id) for source_id in fold.municipalities),
-        *(("abs", source_id) for source_id in fold.abs),
-        *(("comarca", source_id) for source_id in fold.comarcas),
-    }
-
-
-def source_fold_temporal_split(
+def source_set_manifest_split(
     queries: Sequence[ForecastQuery],
+    heads: Sequence[str],
+    manifest: SourceSetManifest,
     *,
-    val_fraction: float,
-    assigned_sources: set[tuple[str, str]],
-    held_out_sources: set[tuple[str, str]],
-) -> tuple[list[int], list[int]]:
-    """Combine an audited source holdout with a forward temporal tail.
-
-    Unassigned sources are excluded. Training uses assigned, non-held-out
-    sources before the tail. Validation uses held-out sources in the tail.
-    Local pre-origin history remains visible, matching the frozen v1
-    generalization claim.
-    """
-    origins = [query.forecast_origin for query in queries]
-    temporal_train, temporal_val = temporal_tail_split(origins, val_fraction)
-
-    def key(position: int) -> tuple[str, str]:
-        query = queries[position]
-        return str(query.source_type), str(query.source_id)
-
-    train = [
-        position
-        for position in temporal_train
-        if key(position) in assigned_sources and key(position) not in held_out_sources
+    run_index: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Apply a v2 source-set manifest and its frozen calendar intervals."""
+    if len(queries) != len(heads):
+        raise ValueError("queries and heads must have the same length")
+    if not 0 <= run_index < manifest.num_folds:
+        raise ValueError(
+            f"native fold index {run_index} outside 0..{manifest.num_folds - 1}"
+        )
+    inventory = [
+        QueryEligibilityRecord(
+            source_type=str(query.source_type),
+            source_id=str(query.source_id),
+            head=head,
+            origin=int(query.forecast_origin),
+        )
+        for query, head in zip(queries, heads, strict=True)
     ]
-    val = [position for position in temporal_val if key(position) in held_out_sources]
-    if not train:
-        raise ValueError("native source-fold split produced no training queries")
-    if not val:
-        raise ValueError("native source-fold split produced no validation queries")
-    return train, val
+    validation_start = manifest.validation_start_origin
+    test_start = manifest.test_start_origin
+    calendar = CalendarSplit(
+        train=tuple(
+            index
+            for index, query in enumerate(inventory)
+            if query.origin + manifest.forecast_horizon < validation_start
+        ),
+        validation=tuple(
+            index
+            for index, query in enumerate(inventory)
+            if validation_start <= query.origin
+            and query.origin + manifest.forecast_horizon < test_start
+        ),
+        test=tuple(
+            index for index, query in enumerate(inventory) if query.origin >= test_start
+        ),
+        validation_start_origin=validation_start,
+        test_start_origin=test_start,
+        forecast_horizon=manifest.forecast_horizon,
+    )
+    splits = split_queries_for_run(
+        inventory,
+        manifest.assignments,
+        calendar,
+        manifest.run_roles[run_index],
+    )
+    expected_heads = set(heads)
+    for name, positions in zip(("train", "validation", "test"), splits, strict=True):
+        present = {heads[position] for position in positions}
+        missing = sorted(expected_heads - present)
+        if missing:
+            raise ValueError(
+                f"native source-set run {run_index} {name} split lacks heads: {missing}"
+            )
+    return splits
 
 
-class NativeTrainer:
-    """Production trainer over the native-support path."""
+class NativeRuntime:
+    """Shared native data, model, and evaluation state without training artifacts."""
 
     def __init__(
         self,
@@ -373,78 +420,81 @@ class NativeTrainer:
             np.random.seed(config.training.seed)
             torch.manual_seed(config.training.seed)
 
-        self.model_id = self._resolve_model_id(model_id)
-        self.experiment_dir = (
-            Path(config.output.log_dir) / config.output.experiment_name / self.model_id
-        )
-        self.experiment_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_dir = self.experiment_dir / "checkpoints"
-        if config.output.save_checkpoints:
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.model_id = model_id or "evaluation"
 
         self.device = resolve_device(config.training.device)
 
-        self.dataset = NativeSupportDataset(
-            native_root=config.native.root,
-            real_with_id_path=config.data.dataset_path,
-            config=NativeDatasetConfig(
-                input_window_length=config.model.input_window_length,
-                forecast_horizon=config.model.forecast_horizon,
-                window_stride=config.data.window_stride,
-                min_history_observed_fraction=(
-                    config.data.min_history_observed_fraction
-                ),
-                min_horizon_observed_fraction=(
-                    config.data.min_horizon_observed_fraction
-                ),
-                confirmation_guard=config.native.confirmation_guard,
-                spatial_encoder=config.native.spatial_encoder,
-                od_source=config.native.od_source,
-                od_min_flow_raw=config.native.od_min_flow_raw,
-                od_self_flows=config.native.od_self_flows,
-                mobility_enabled=config.native.mobility_enabled,
-                include_od_context=True,
-            ),
-        )
+        self.dataset = native_dataset(config)
         queries = self.dataset.queries
+        test_positions: list[int] = []
+        self.source_sets: SourceSetManifest | None = None
         if config.native.fold_index is None:
             origins = [query.forecast_origin for query in queries]
             train_positions, val_positions = temporal_tail_split(
-                origins, config.training.val_split
+                origins, config.training.val_split, config.model.forecast_horizon
             )
         else:
-            manifest = load_native_fold_manifest(Path(config.native.fold_manifest))
-            if config.native.fold_index >= manifest.num_folds:
+            source_sets = load_source_set_manifest(Path(config.native.fold_manifest))
+            if source_sets.provenance != split_identity(config, self.dataset):
                 raise ValueError(
-                    "native.fold_index outside manifest range: "
-                    f"{config.native.fold_index} >= {manifest.num_folds}"
+                    "Native split asset is stale: processed inputs or eligibility/policy changed; rebuild source sets"
                 )
-            assigned_sources = set().union(
-                *(_fold_source_keys(fold) for fold in manifest.folds)
+            inventory = [
+                QueryEligibilityRecord(
+                    str(q.source_type),
+                    str(q.source_id),
+                    self.dataset.head_at(i),
+                    int(q.forecast_origin),
+                )
+                for i, q in enumerate(queries)
+            ]
+            if set(source_sets.assignments) != {
+                (q.source_type, q.source_id) for q in inventory
+            }:
+                raise ValueError(
+                    "Native split asset does not match the exact eligible source inventory"
+                )
+            expected_calendar = freeze_calendar_split(
+                inventory,
+                validation_fraction=config.native.validation_fraction,
+                test_fraction=config.native.test_fraction,
+                forecast_horizon=config.model.forecast_horizon,
             )
-            held_out_sources = _fold_source_keys(
-                manifest.folds[config.native.fold_index]
-            )
-            train_positions, val_positions = source_fold_temporal_split(
+            if (source_sets.validation_start_origin, source_sets.test_start_origin) != (
+                expected_calendar.validation_start_origin,
+                expected_calendar.test_start_origin,
+            ):
+                raise ValueError(
+                    "Native split calendar differs from its input/policy identity"
+                )
+            self.source_sets = source_sets
+            train_positions, val_positions, test_positions = source_set_manifest_split(
                 queries,
-                val_fraction=config.training.val_split,
-                assigned_sources=assigned_sources,
-                held_out_sources=held_out_sources,
+                [self.dataset.head_at(i) for i in range(len(queries))],
+                source_sets,
+                run_index=config.native.fold_index,
             )
+        self.split_provenance = (
+            self.source_sets.provenance
+            if self.source_sets is not None
+            else split_identity(config, self.dataset)
+        )
         logger.info(
-            "Native index: %d items (%s), train %d / val %d",
+            "Native index: %d items (%s), train %d / val %d / test %d",
             len(self.dataset),
             self.dataset.head_counts,
             len(train_positions),
             len(val_positions),
+            len(test_positions),
         )
 
-        sampler = HeadBalancedSampler(
-            self._head_items(train_positions),
+        sampler = HierarchicalBalancedSampler(
+            self._head_source_items(train_positions),
             seed=config.training.seed if config.training.seed is not None else 0,
             balanced=config.native.head_balanced_sampling,
         )
         batch_size = config.training.batch_size
+        collate = collate_native_batch
         # Loaders are created before any CUDA tensor operation so worker
         # processes fork from a CUDA-clean parent (plan WP-B item 7).
         train_kwargs = native_loader_kwargs(
@@ -456,7 +506,7 @@ class NativeTrainer:
             self.dataset,
             batch_size=batch_size,
             sampler=sampler,
-            collate_fn=collate_native_batch,
+            collate_fn=collate,
             **train_kwargs,
         )
         self.val_loader: DataLoader | None = None
@@ -470,9 +520,25 @@ class NativeTrainer:
                 Subset(self.dataset, val_positions),
                 batch_size=batch_size,
                 shuffle=False,
-                collate_fn=collate_native_batch,
+                collate_fn=collate,
                 **val_kwargs,
             )
+        self.test_loader: DataLoader | None = None
+        if test_positions:
+            test_kwargs = native_loader_kwargs(
+                config.training,
+                workers=config.training.test_workers,
+                device_type=self.device.type,
+            )
+            self.test_loader = DataLoader(
+                Subset(self.dataset, test_positions),
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate,
+                **test_kwargs,
+            )
+        if config.training.diagnostic_test_trace_epochs and self.test_loader is None:
+            raise ValueError("Diagnostic test trace requires a test split")
 
         # Adapter widths from a COLLATED batch (review R12 collation): the
         # one-hot source-type block is prepended at collation, so batch hist
@@ -493,6 +559,8 @@ class NativeTrainer:
             strict=config.model.strict,
             spatial_encoder=config.native.spatial_encoder,
             mobility_enabled=config.native.mobility_enabled,
+            wastewater_enabled=config.native.wastewater_enabled,
+            include_vaccination=config.native.include_vaccination,
             hetero_hidden_dim=config.native.hetero_hidden_dim,
             hetero_parameter_budget=config.native.hetero_parameter_budget,
         )
@@ -503,40 +571,12 @@ class NativeTrainer:
             horizon_days=config.model.forecast_horizon,
         )
         self.precision_policy = resolve_precision_policy(config.training, self.device)
-        self.optimizer = create_optimizer(
-            self.model,
-            optimizer_name=config.training.optimizer,
-            learning_rate=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
-            optimizer_eps=self.precision_policy.optimizer_eps,
-            device=self.device,
-        )
         n_train_batches = math.ceil(len(sampler) / batch_size)
         self.steps_per_epoch = (
             min(n_train_batches, config.training.max_batches)
             if config.training.max_batches is not None
             else n_train_batches
         )
-        self.scheduler = create_scheduler(
-            self.optimizer,
-            scheduler_type=config.training.scheduler_type,
-            total_steps=max(1, self.steps_per_epoch * config.training.epochs),
-            warmup_steps=config.training.warmup_steps,
-            eta_min=config.training.min_learning_rate,
-        )
-        self.training_dynamics_writer = TrainingDynamicsWriter(
-            self.experiment_dir,
-            progress_log_frequency=config.training.progress_log_frequency,
-            grad_norm_log_frequency=config.training.grad_norm_log_frequency,
-            mobility_enabled=config.native.mobility_enabled,
-        )
-        self.global_step = 0
-        self.best_val_selection_score: float | None = None
-        self.best_val_selection_metric: str | None = None
-        self.best_val_joint_loss: float | None = None
-        self.best_val_series_metrics: dict[str, float | None] = {}
-        self.best_state: dict[str, torch.Tensor] | None = None
-        self.last_val_metrics: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Guards and identity
@@ -547,8 +587,7 @@ class NativeTrainer:
         """Construction-time contract checks (plan sections 12.2, 11.6)."""
         if not config.native.enabled:
             raise ValueError(
-                "NativeTrainer requires native.enabled=true; the municipal "
-                "path is EpiForecasterTrainer."
+                "This worktree requires native.enabled=true and the heterogeneous trainer."
             )
         if config.training.curriculum.enabled:
             raise ValueError(
@@ -570,6 +609,15 @@ class NativeTrainer:
                 "Native checkpointing writes best/final checkpoints only; "
                 "output.save_best_only must be true."
             )
+        test_epochs = config.training.diagnostic_test_trace_epochs
+        if any(
+            type(epoch) is not int or not 1 <= epoch <= config.training.epochs
+            for epoch in test_epochs
+        ) or test_epochs != sorted(set(test_epochs)):
+            raise ValueError(
+                "training.diagnostic_test_trace_epochs must contain unique, "
+                "ascending, 1-based epochs within training.epochs"
+            )
         for field_name in ("dataset_path", "real_dataset_path"):
             value = getattr(config.data, field_name)
             for marker in _LEGACY_PROJECTED_MARKERS:
@@ -579,7 +627,7 @@ class NativeTrainer:
                         f"municipal input {marker!r}; native mode never "
                         "loads pre-projected hosp/deaths series."
                     )
-        NativeTrainer._assert_no_wandb_config(config)
+        NativeRuntime._assert_no_wandb_config(config)
 
     @staticmethod
     def _assert_no_wandb_config(config: EpiForecasterConfig) -> None:
@@ -623,11 +671,256 @@ class NativeTrainer:
             return slurm_job_id
         return f"run_{time.time_ns()}"
 
-    def _head_items(self, positions: list[int]) -> dict[str, list[int]]:
-        items: dict[str, list[int]] = {head: [] for head in ROUTED_HEADS}
+    def _head_source_items(
+        self, positions: list[int]
+    ) -> dict[str, dict[tuple[str, str], list[int]]]:
+        """Training indices grouped by routed head and typed source."""
+        items: dict[str, dict[tuple[str, str], list[int]]] = {
+            head: {} for head in ROUTED_HEADS
+        }
+        queries = self.dataset.queries
         for position in positions:
-            items[self.dataset.head_at(position)].append(position)
+            head = self.dataset.head_at(position)
+            query = queries[position]
+            source = str(query.source_type), str(query.source_id)
+            items[head].setdefault(source, []).append(position)
         return items
+
+    def _evaluate(
+        self,
+        *,
+        loader: DataLoader | None = None,
+        split_name: str = "Val",
+        granular_output_path: Path | None = None,
+        aggregate_output_dir: Path | None = None,
+        granular_metadata: dict[str, Any] | None = None,
+    ) -> tuple[float, dict[str, Any]]:
+        """Routing-aware metrics over a validation or test loader."""
+        selected_loader = self.val_loader if loader is None else loader
+        if selected_loader is None:
+            raise ValueError(f"native {split_name} evaluation has no loader")
+        loss, metrics, _aggregate = evaluate_native_loader(
+            model=self.model,
+            loader=selected_loader,
+            criterion=self.criterion,
+            device=self.device,
+            split_name=split_name,
+            max_batches=self.config.training.max_batches,
+            confirmation_guard=self.config.native.confirmation_guard,
+            granular_output_path=granular_output_path,
+            granular_eval_format=self.config.output.granular_eval_format,
+            aggregate_output_dir=aggregate_output_dir,
+            autocast_enabled=self.precision_policy.autocast_enabled,
+            autocast_dtype=self.precision_policy.autocast_dtype,
+            granular_metadata={
+                "experiment_name": self.config.output.experiment_name,
+                "model_id": self.model_id,
+                "spatial_encoder": self.config.native.spatial_encoder,
+                "mobility_enabled": self.config.native.mobility_enabled,
+                "od_source": self.config.native.od_source,
+                "objective": self.config.training.loss.joint.observation_loss,
+                "fold": self.config.native.fold_index,
+                "seed": self.config.training.seed,
+                "split_seed": self.config.training.split_seed,
+                "epochs": self.config.training.epochs,
+                "batch_size": self.config.training.batch_size,
+                "max_batches": self.config.training.max_batches,
+                "optimizer": self.config.training.optimizer,
+                "learning_rate": self.config.training.learning_rate,
+                "steps_per_epoch": self.steps_per_epoch,
+                "fold_manifest": self.config.native.fold_manifest,
+                "generalization_claim": (
+                    "held-out native sources with frozen future calendar intervals; local pre-origin history remains visible"
+                    if self.source_sets is not None
+                    else "temporal holdout with visible pre-origin source history"
+                ),
+                **(granular_metadata or {}),
+            },
+        )
+        if split_name.lower() == "val":
+            self.last_val_metrics = metrics
+        return loss, metrics
+
+
+class NativeTrainer(NativeRuntime):
+    """Native training lifecycle and checkpoint resume."""
+
+    def __init__(
+        self,
+        config: EpiForecasterConfig,
+        *,
+        model_id: str | None = None,
+        trial: Any = None,
+        pruning_start_epoch: int = 10,
+    ) -> None:
+        super().__init__(config, model_id=model_id)
+        self.trial = trial
+        self.pruning_start_epoch = pruning_start_epoch
+        self.model_id = self._resolve_model_id(model_id)
+        self.experiment_dir = (
+            Path(config.output.log_dir) / config.output.experiment_name / self.model_id
+        )
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir = self.experiment_dir / "checkpoints"
+        if config.output.save_checkpoints:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.optimizer = create_optimizer(
+            self.model,
+            optimizer_name=config.training.optimizer,
+            learning_rate=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
+            optimizer_eps=self.precision_policy.optimizer_eps,
+            device=self.device,
+        )
+        self.scheduler = create_scheduler(
+            self.optimizer,
+            scheduler_type=config.training.scheduler_type,
+            total_steps=max(1, self.steps_per_epoch * config.training.epochs),
+            warmup_steps=config.training.warmup_steps,
+            eta_min=config.training.min_learning_rate,
+        )
+        self.training_dynamics_writer = TrainingDynamicsWriter(
+            self.experiment_dir,
+            progress_log_frequency=config.training.progress_log_frequency,
+            grad_norm_log_frequency=config.training.grad_norm_log_frequency,
+            mobility_enabled=config.native.mobility_enabled,
+        )
+        (self.experiment_dir / "config.json").write_text(
+            json.dumps(config.to_dict(), indent=2, sort_keys=True) + "\n"
+        )
+        self.global_step = 0
+        self.best_val_selection_score: float | None = None
+        self.best_val_selection_metric: str | None = None
+        self.best_val_joint_loss: float | None = None
+        self.best_val_series_metrics: dict[str, float | None] = {}
+        self.best_state: dict[str, torch.Tensor] | None = None
+        self.last_val_metrics: dict[str, object] = {}
+        self.validation_epoch_trace: list[dict[str, object]] = []
+        self.train_epoch_trace: list[dict[str, object]] = []
+        self.test_epoch_trace: list[dict[str, object]] = []
+        self.start_epoch = 0
+        self.resumed_train_trace: list[list[float]] = []
+        self.resumed_val_trace: list[float | None] = []
+        if config.training.init_checkpoint_path is not None:
+            raise ValueError(
+                "Native training requires resume_checkpoint_path for continuation"
+            )
+        if config.training.resume_checkpoint_path is not None:
+            self._restore_training_checkpoint(
+                Path(config.training.resume_checkpoint_path)
+            )
+
+    def _restore_training_checkpoint(self, path: Path) -> None:
+        """Resume at an epoch boundary without resetting the optimizer schedule."""
+        record = torch.load(path, map_location="cpu", weights_only=False)
+        if record["forecaster_config"] != forecaster_config_to_dict(
+            self.forecaster_config
+        ):
+            raise ValueError("Native resume forecaster configuration differs")
+        previous = record["config"]
+        current = self.config.to_dict()
+        if record["split_provenance"] != self.split_provenance:
+            raise ValueError("Native resume split input identity differs")
+        if record["split_asset"] is not None and self.source_sets is not None:
+            if (
+                record["split_asset"]["assignments"]
+                != (self.source_sets.path.parent / "assignments.parquet").read_bytes()
+            ):
+                raise ValueError("Native resume source assignments differ")
+        for block, locations in (
+            ("data", {"dataset_path", "real_dataset_path"}),
+            ("native", {"root", "fold_manifest"}),
+        ):
+            saved = {
+                key: value
+                for key, value in previous[block].items()
+                if key not in locations
+            }
+            active = {
+                key: value
+                for key, value in current[block].items()
+                if key not in locations
+            }
+            if saved != active:
+                raise ValueError(f"Native resume {block} configuration differs")
+        for name in (
+            "epochs",
+            "max_batches",
+            "optimizer",
+            "learning_rate",
+            "weight_decay",
+            "scheduler_type",
+            "warmup_steps",
+            "min_learning_rate",
+            "seed",
+            "split_seed",
+            "loss",
+        ):
+            if previous["training"][name] != current["training"][name]:
+                raise ValueError(f"Native resume training.{name} differs")
+        self.start_epoch = int(record["epoch"]) + 1
+        if not 0 < self.start_epoch < self.config.training.epochs:
+            raise ValueError("Native resume checkpoint has no remaining epochs")
+        if record["best_val_selection_score"] is None or (
+            record["validation_epoch_trace"][-1]["selection_score"]
+            != record["best_val_selection_score"]
+        ):
+            raise ValueError(
+                "Native continuation requires a best-validation checkpoint"
+            )
+        completed_batches = record["train_loss_trace"]
+        if len(completed_batches) != self.start_epoch or int(
+            record["global_step"]
+        ) != sum(len(epoch_batches) for epoch_batches in completed_batches):
+            raise ValueError("Native resume completed-step history differs")
+        if previous["training"]["batch_size"] != self.config.training.batch_size:
+            logger.info(
+                "Native resume batch size %d -> %d; preserving scheduler state, "
+                "new steps per epoch=%d",
+                previous["training"]["batch_size"],
+                self.config.training.batch_size,
+                self.steps_per_epoch,
+            )
+        if record["precision_signature"] != create_precision_signature(
+            self.precision_policy
+        ):
+            raise ValueError("Native resume precision policy differs")
+        self.model.load_state_dict(record["model_state_dict"])
+        self.optimizer.load_state_dict(record["optimizer_state_dict"])
+        scheduler_state = record["scheduler_state_dict"]
+        if (self.scheduler is None) != (scheduler_state is None):
+            raise ValueError("Native resume scheduler differs")
+        if self.scheduler is not None:
+            self.scheduler.load_state_dict(scheduler_state)
+        self.global_step = int(record["global_step"])
+        self.best_val_selection_score = record["best_val_selection_score"]
+        self.best_val_selection_metric = record["best_val_selection_metric"]
+        self.best_val_joint_loss = record["best_val_joint_loss"]
+        self.best_val_series_metrics = dict(record["best_val_series_metrics"])
+        self.best_state = {
+            key: value.detach().cpu().clone()
+            for key, value in self.model.state_dict().items()
+        }
+        self.validation_epoch_trace = list(record["validation_epoch_trace"])
+        self.train_epoch_trace = list(record.get("train_epoch_trace", []))
+        self.resumed_train_trace = list(record["train_loss_trace"])
+        self.resumed_val_trace = list(record["val_joint_loss_trace"])
+        self._save_checkpoint(
+            self.start_epoch - 1,
+            is_best=True,
+            train_trace=self.resumed_train_trace,
+            val_trace=self.resumed_val_trace,
+        )
+        logger.info(
+            "Native resume: completed epochs=%d global_step=%d; continuing to epoch %d",
+            self.start_epoch,
+            self.global_step,
+            self.config.training.epochs,
+        )
+        logger.info(
+            "Parent checkpoint has no RNG state; dropout and worker RNG restart from config seed"
+        )
 
     # ------------------------------------------------------------------
     # Training
@@ -636,10 +929,10 @@ class NativeTrainer:
     def run(self) -> dict:
         """Run the bounded training loop and return its summary record."""
         started = time.perf_counter()
-        train_trace: list[list[float]] = []
-        val_trace: list[float | None] = []
+        train_trace: list[list[float]] = list(self.resumed_train_trace)
+        val_trace: list[float | None] = list(self.resumed_val_trace)
         try:
-            for epoch in range(self.config.training.epochs):
+            for epoch in range(self.start_epoch, self.config.training.epochs):
                 epoch_losses = self._train_epoch(epoch)
                 train_trace.append(epoch_losses)
                 if self.val_loader is None:
@@ -648,9 +941,24 @@ class NativeTrainer:
                 val_loss, metrics = self._evaluate()
                 val_trace.append(val_loss)
                 selection_score, selection_metric = compute_native_selection_score(
-                    metrics,
-                    observation_loss=(self.config.training.loss.joint.observation_loss),
+                    metrics
                 )
+                self.validation_epoch_trace.append(
+                    _validation_epoch_record(
+                        epoch=epoch + 1,
+                        step=self.global_step,
+                        joint_loss=val_loss,
+                        selection_metric=selection_metric,
+                        selection_score=selection_score,
+                        metrics=metrics,
+                    )
+                )
+                if self.trial is not None and epoch >= self.pruning_start_epoch:
+                    self.trial.report(selection_score, epoch)
+                    if self.trial.should_prune():
+                        from optuna import TrialPruned
+
+                        raise TrialPruned(f"Native trial pruned at epoch {epoch + 1}")
                 if (
                     self.best_val_selection_score is None
                     or selection_score < self.best_val_selection_score
@@ -659,7 +967,7 @@ class NativeTrainer:
                     self.best_val_selection_metric = selection_metric
                     self.best_val_joint_loss = val_loss
                     self.best_val_series_metrics = {
-                        head: _optional_float(metrics.get(f"crps_{head}"))
+                        head: _optional_float(metrics.get(f"wis_{head}"))
                         for head in _NATIVE_HEADS
                     }
                     self.best_state = {
@@ -674,15 +982,35 @@ class NativeTrainer:
                             val_trace=val_trace,
                         )
                 logger.info(
-                    "native epoch %d/%d mean_train_loss=%.6f val_loss=%s "
-                    "selection=%s=%.6f",
+                    "native epoch %d/%d mean_train_loss=%.6f val_loss=%.6f "
+                    "selection=%s=%.6f val_joint_loss=%s",
                     epoch + 1,
                     self.config.training.epochs,
                     sum(epoch_losses) / max(1, len(epoch_losses)),
-                    f"{val_loss:.6f}" if val_loss is not None else "n/a",
+                    selection_score,
                     selection_metric,
                     selection_score,
+                    f"{val_loss:.6f}" if val_loss is not None else "n/a",
                 )
+                if epoch + 1 in self.config.training.diagnostic_test_trace_epochs:
+                    assert self.test_loader is not None
+                    diagnostic_test_loss, diagnostic_test_metrics = self._evaluate(
+                        loader=self.test_loader,
+                        split_name="Test",
+                    )
+                    diagnostic_score, diagnostic_metric = (
+                        compute_native_selection_score(diagnostic_test_metrics)
+                    )
+                    self.test_epoch_trace.append(
+                        _validation_epoch_record(
+                            epoch=epoch + 1,
+                            step=self.global_step,
+                            joint_loss=diagnostic_test_loss,
+                            selection_metric=diagnostic_metric,
+                            selection_score=diagnostic_score,
+                            metrics=diagnostic_test_metrics,
+                        )
+                    )
             if self.best_state is None:
                 # No validation available: the final state is the best state.
                 self.best_state = {
@@ -711,7 +1039,13 @@ class NativeTrainer:
                 p.numel() for p in self.model.parameters() if p.requires_grad
             )
             artifact_paths: dict[str, str] = {}
-            if self.config.output.write_granular_eval and self.val_loader is not None:
+            test_loss: float | None = None
+            test_metrics: dict[str, Any] = {}
+            if (
+                self.config.training.run_final_evaluation
+                and self.config.output.write_granular_eval
+                and self.val_loader is not None
+            ):
                 granular_path = (
                     self.experiment_dir
                     / self.config.output.resolve_granular_eval_filename(split="val")
@@ -739,6 +1073,33 @@ class NativeTrainer:
                     ),
                     "aggregate_dir": str(self.experiment_dir),
                 }
+            if (
+                self.config.training.run_final_evaluation
+                and self.test_loader is not None
+            ):
+                test_granular_path = (
+                    self.experiment_dir
+                    / self.config.output.resolve_granular_eval_filename(split="test")
+                    if self.config.output.write_granular_eval
+                    else None
+                )
+                test_loss, test_metrics = self._evaluate(
+                    loader=self.test_loader,
+                    split_name="Test",
+                    granular_output_path=test_granular_path,
+                    aggregate_output_dir=(
+                        self.experiment_dir
+                        if self.config.output.write_granular_eval
+                        else None
+                    ),
+                )
+                if test_granular_path is not None:
+                    artifact_paths["test_granular"] = str(test_granular_path)
+                    artifact_paths["test_granular_metadata"] = str(
+                        test_granular_path.with_suffix(
+                            f"{test_granular_path.suffix}.meta.json"
+                        )
+                    )
             if self.config.output.save_checkpoints:
                 artifact_paths["checkpoint"] = str(
                     self.checkpoint_dir / _BEST_CHECKPOINT_NAME
@@ -760,22 +1121,27 @@ class NativeTrainer:
             raise
         except Exception as exc:
             self.training_dynamics_writer.finalize(
-                "failed",
+                "pruned" if type(exc).__name__ == "TrialPruned" else "failed",
                 error_type=type(exc).__name__,
                 error_message=str(exc),
                 summary=self._dynamics_summary(train_trace, val_trace),
             )
             raise
         return {
-            "best_val_loss": self.best_val_joint_loss,
+            "best_val_loss": self.best_val_selection_score,
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
             "best_val_joint_loss": self.best_val_joint_loss,
             "best_val_series_metrics": dict(self.best_val_series_metrics),
             "total_epochs": self.config.training.epochs,
             "train_loss_trace": train_trace,
-            "val_loss_trace": val_trace,
+            "train_epoch_trace": list(self.train_epoch_trace),
+            **self._validation_history(val_trace),
+            "validation_epoch_trace": list(self.validation_epoch_trace),
+            "test_epoch_trace": list(self.test_epoch_trace),
             "head_counts": self.dataset.head_counts,
+            "test_loss": test_loss,
+            "test_metrics": test_metrics,
             "wall_time_s": time.perf_counter() - started,
             "model_info": {
                 "parameters": parameters,
@@ -790,7 +1156,10 @@ class NativeTrainer:
 
     def _train_epoch(self, epoch: int) -> list[float]:
         self.model.train()
-        losses: list[float] = []
+        # Keep detached metrics on the device until logging or epoch completion.
+        # Double precision preserves the previous host-side weighted arithmetic.
+        device_losses: list[torch.Tensor] = []
+        metric_totals = torch.zeros(10, dtype=torch.float64, device=self.device)
         max_batches = self.config.training.max_batches
         for step, batch in enumerate(self.train_loader):
             if max_batches is not None and step >= max_batches:
@@ -810,6 +1179,29 @@ class NativeTrainer:
                     f"(total={total.item()}): halting native run. Inspect "
                     "the per-head components and targets."
                 )
+            scores = torch.stack(
+                [
+                    components[
+                        "ww_uncensored_objective" if head == "ww" else head
+                    ].detach()
+                    for head in _NATIVE_HEADS
+                ]
+            ).to(dtype=torch.float64)
+            counts = torch.stack(
+                [
+                    components[
+                        "ww_uncensored_count" if head == "ww" else f"{head}_n_eff"
+                    ].detach()
+                    for head in _NATIVE_HEADS
+                ]
+            ).to(dtype=torch.float64)
+            metric_totals[:4].add_(scores * counts)
+            metric_totals[4:8].add_(counts)
+            ww_count = components["ww_n_eff"].detach().to(dtype=torch.float64)
+            metric_totals[8].add_(
+                components["ww"].detach().to(dtype=torch.float64) * ww_count
+            )
+            metric_totals[9].add_(ww_count)
             self.optimizer.zero_grad()
             total.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -837,79 +1229,78 @@ class NativeTrainer:
             self.optimizer.step()
             if self.scheduler is not None:
                 self.scheduler.step()
-            losses.append(float(total.item()))
+            device_losses.append(total.detach())
             is_epoch_last = step + 1 == self.steps_per_epoch
-            if (
+            log_progress = (
                 self.global_step % self.config.training.progress_log_frequency == 0
                 or is_epoch_last
-            ):
+            )
+            if log_progress:
+                progress_loss, progress_grad_norm = (
+                    torch.stack((total.detach(), grad_norm.detach())).cpu().tolist()
+                )
                 self.training_dynamics_writer.append(
                     step=self.global_step,
                     epoch=epoch,
                     values={
-                        "train_loss": losses[-1],
-                        "grad_norm": float(grad_norm),
+                        "train_loss": progress_loss,
+                        "grad_norm": progress_grad_norm,
                     },
                 )
-            logger.info(
-                "native epoch %d step %d/%d total_loss=%.6f",
-                epoch + 1,
-                step + 1,
-                self.steps_per_epoch,
-                losses[-1],
+                logger.info(
+                    "native epoch %d step %d/%d total_loss=%.6f",
+                    epoch + 1,
+                    step + 1,
+                    self.steps_per_epoch,
+                    progress_loss,
+                )
+        epoch_values = (
+            torch.cat(
+                [metric_totals]
+                + (
+                    [torch.stack(device_losses).to(dtype=torch.float64)]
+                    if device_losses
+                    else []
+                )
             )
+            .cpu()
+            .tolist()
+        )
+        score_sums = dict(zip(_NATIVE_HEADS, epoch_values[:4], strict=True))
+        score_counts = dict(zip(_NATIVE_HEADS, epoch_values[4:8], strict=True))
+        ww_mixed_sum, ww_mixed_count = epoch_values[8:10]
+        losses = epoch_values[10:]
+        self.train_epoch_trace.append(
+            {
+                "epoch": epoch + 1,
+                "step": self.global_step,
+                "batch_size": self.config.training.batch_size,
+                "objective": self.config.training.loss.joint.observation_loss,
+                "joint_loss": float(np.mean(losses)) if losses else None,
+                "ww_mixed_objective": (
+                    ww_mixed_sum / ww_mixed_count if ww_mixed_count > 0 else None
+                ),
+                "ww_censored_count": ww_mixed_count - score_counts["ww"],
+                "ww_uncensored_count": score_counts["ww"],
+                **{
+                    f"{self.config.training.loss.joint.observation_loss}_{head}": (
+                        score_sums[head] / score_counts[head]
+                        if score_counts[head] > 0
+                        else None
+                    )
+                    for head in _NATIVE_HEADS
+                },
+                **{
+                    f"observed_count_{head}": (
+                        ww_mixed_count if head == "ww" else score_counts[head]
+                    )
+                    for head in _NATIVE_HEADS
+                },
+            }
+        )
         return losses
 
     @torch.no_grad()
-    def _evaluate(
-        self,
-        *,
-        granular_output_path: Path | None = None,
-        aggregate_output_dir: Path | None = None,
-        granular_metadata: dict[str, Any] | None = None,
-    ) -> tuple[float, dict[str, Any]]:
-        """Routing-aware EVL-1 metrics over the capped validation tail."""
-        assert self.val_loader is not None
-        loss, metrics, _aggregate = evaluate_native_loader(
-            model=self.model,
-            loader=self.val_loader,
-            criterion=self.criterion,
-            device=self.device,
-            split_name="Val",
-            max_batches=self.config.training.max_batches,
-            confirmation_guard=self.config.native.confirmation_guard,
-            granular_output_path=granular_output_path,
-            granular_eval_format=self.config.output.granular_eval_format,
-            aggregate_output_dir=aggregate_output_dir,
-            autocast_enabled=self.precision_policy.autocast_enabled,
-            autocast_dtype=self.precision_policy.autocast_dtype,
-            granular_metadata={
-                "experiment_name": self.config.output.experiment_name,
-                "model_id": self.model_id,
-                "spatial_encoder": self.config.native.spatial_encoder,
-                "mobility_enabled": self.config.native.mobility_enabled,
-                "od_source": self.config.native.od_source,
-                "objective": self.config.training.loss.joint.observation_loss,
-                "fold": self.config.native.fold_index,
-                "seed": self.config.training.seed,
-                "split_seed": self.config.training.split_seed,
-                "epochs": self.config.training.epochs,
-                "batch_size": self.config.training.batch_size,
-                "max_batches": self.config.training.max_batches,
-                "optimizer": self.config.training.optimizer,
-                "learning_rate": self.config.training.learning_rate,
-                "steps_per_epoch": self.steps_per_epoch,
-                "fold_manifest": self.config.native.fold_manifest,
-                "generalization_claim": (
-                    "held-out source, visible context history "
-                    "(temporal-forecasting mode)"
-                ),
-                **(granular_metadata or {}),
-            },
-        )
-        self.last_val_metrics = metrics
-        return loss, metrics
-
     def _save_checkpoint(
         self,
         epoch: int,
@@ -936,18 +1327,44 @@ class NativeTrainer:
             "config": self.config.to_dict(),
             "forecaster_config": forecaster_config_to_dict(self.forecaster_config),
             "precision_signature": create_precision_signature(self.precision_policy),
+            "split_provenance": self.split_provenance,
+            "split_asset": (
+                {
+                    "manifest": self.source_sets.path.read_bytes(),
+                    "assignments": (
+                        self.source_sets.path.parent / "assignments.parquet"
+                    ).read_bytes(),
+                }
+                if self.source_sets is not None
+                else None
+            ),
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
             "best_val_joint_loss": self.best_val_joint_loss,
             "best_val_series_metrics": dict(self.best_val_series_metrics),
             "train_loss_trace": train_trace or [],
-            "val_loss_trace": val_trace or [],
+            "train_epoch_trace": list(self.train_epoch_trace),
+            **self._validation_history(val_trace or []),
+            "validation_epoch_trace": list(self.validation_epoch_trace),
             "head_counts": self.dataset.head_counts,
         }
         filename = _BEST_CHECKPOINT_NAME if is_best else _FINAL_CHECKPOINT_NAME
         path = self.checkpoint_dir / filename
         torch.save(checkpoint, path)
         return path
+
+    def _validation_history(self, joint_trace: list[float | None]) -> dict[str, object]:
+        """Label the primary WIS history and the joint objective separately."""
+        by_epoch = {
+            row["epoch"]: row["selection_score"] for row in self.validation_epoch_trace
+        }
+        return {
+            "val_loss_metric": _SELECTION_METRIC_NAME,
+            "val_loss_trace": [
+                by_epoch.get(epoch + 1) for epoch in range(len(joint_trace))
+            ],
+            "val_joint_loss_trace": joint_trace,
+        }
 
     def _dynamics_summary(
         self,
@@ -959,7 +1376,10 @@ class NativeTrainer:
             "total_epochs": self.config.training.epochs,
             "global_step": self.global_step,
             "train_loss_trace": train_trace,
-            "val_loss_trace": val_trace,
+            "train_epoch_trace": list(self.train_epoch_trace),
+            **self._validation_history(val_trace),
+            "validation_epoch_trace": list(self.validation_epoch_trace),
+            "test_epoch_trace": list(self.test_epoch_trace),
             "best_val_selection_score": _optional_float(self.best_val_selection_score),
             "best_val_selection_metric": self.best_val_selection_metric,
             "best_val_joint_loss": _optional_float(self.best_val_joint_loss),

@@ -1,13 +1,28 @@
 """Tests for OmegaConf-based config loading with overrides."""
 
 from operator import attrgetter
+import yaml
 
 import pytest
 from omegaconf import errors
 
 from models.configs import EpiForecasterConfig
+from tests.config_fixtures import config_fixture
 
-BASE_LOCAL_CONFIG = "configs/train_epifor_legacy_municipal_smoke.yaml"
+
+@pytest.fixture
+def base_config(tmp_path):
+    config = config_fixture()
+    config.training.learning_rate = 0.0005
+    config.training.max_batches = 8
+    config.training.num_workers = config.training.val_workers = (
+        config.training.test_workers
+    ) = 0
+    config.training.loss.joint.observation_loss = "crps"
+    config.training.loss.joint.distribution_family = "student_t"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config.to_dict()))
+    return path
 
 
 OVERRIDE_CASES = [
@@ -22,7 +37,7 @@ OVERRIDE_CASES = [
         "model.type.cases": True,
         "model.type.regions": True,
         "model.type.biomarkers": True,
-        "model.type.mobility": True,
+        "native.mobility_enabled": True,
     },
     {"model.gnn_depth": 3},
     {
@@ -61,106 +76,74 @@ OVERRIDE_CASES = [
         "crossval-node-split",
     ],
 )
-def test_load_config_overrides(expected):
+def test_load_config_overrides(expected, base_config):
     """Dotted overrides should update their typed config fields."""
     overrides = [
         f"{path}={str(value).lower() if isinstance(value, bool) else value}"
         for path, value in expected.items()
     ]
-    cfg = EpiForecasterConfig.load(BASE_LOCAL_CONFIG, overrides=overrides)
+    cfg = EpiForecasterConfig.load(base_config, overrides=overrides)
 
     for path, value in expected.items():
         assert attrgetter(path)(cfg) == value
 
 
 @pytest.mark.epiforecaster
-def test_load_config_without_overrides():
+def test_load_config_without_overrides(base_config):
     """Test that config loads correctly without overrides."""
-    cfg = EpiForecasterConfig.load(BASE_LOCAL_CONFIG)
+    cfg = EpiForecasterConfig.load(base_config)
 
-    assert cfg.training.learning_rate == 0.0001
+    assert cfg.training.learning_rate == 0.0005
     assert cfg.output.write_granular_eval is False
     assert cfg.output.granular_eval_format == "parquet"
     assert (
         cfg.output.resolve_granular_eval_filename(split="test")
         == "test_granular.parquet"
     )
-    assert cfg.training.node_split_strategy == "stratified"
+    assert cfg.training.node_split_strategy == "random"
     assert cfg.training.node_split_population_bins == 5
-    assert cfg.training.max_batches == 10
-    assert cfg.training.num_workers == 1
-    assert cfg.training.val_workers == 1
-    assert cfg.training.test_workers == 1
-    assert cfg.training.loss.joint.observation_loss == "nll"
-    assert cfg.training.loss.joint.distribution_family == "normal"
+    assert cfg.training.max_batches == 8
+    assert cfg.training.num_workers == 0
+    assert cfg.training.val_workers == 0
+    assert cfg.training.test_workers == 0
+    assert cfg.training.loss.joint.observation_loss == "crps"
+    assert cfg.training.loss.joint.distribution_family == "student_t"
 
 
 @pytest.mark.epiforecaster
-@pytest.mark.parametrize(
-    "config_path",
-    [
-        "configs/production_only/train_epifor_mn5_full.yaml",
-        "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
-    ],
-)
-def test_production_training_configs_default_to_normal_nll(config_path: str) -> None:
-    cfg = EpiForecasterConfig.load(config_path)
-
-    assert cfg.training.loss.joint.observation_loss == "nll"
-    assert cfg.training.loss.joint.distribution_family == "normal"
-
-
-@pytest.mark.epiforecaster
-@pytest.mark.parametrize(
-    "config_path",
-    [
-        "configs/train_epifor_legacy_municipal_smoke.yaml",
-        "configs/production_only/train_epifor_mn5_full.yaml",
-        "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
-    ],
-)
-def test_legacy_municipal_configs_opt_out_of_native_default(
-    config_path: str,
-) -> None:
-    cfg = EpiForecasterConfig.load(config_path)
-
-    assert cfg.native.enabled is False
-
-
-@pytest.mark.epiforecaster
-def test_load_config_strict_mode_rejects_unknown_keys():
+def test_load_config_strict_mode_rejects_unknown_keys(base_config):
     """Test that strict mode rejects unknown keys."""
     with pytest.raises((errors.ConfigKeyError, errors.ValidationError, KeyError)):
         EpiForecasterConfig.load(
-            BASE_LOCAL_CONFIG,
+            base_config,
             overrides=["training.unknown_field=123"],
             strict=True,
         )
 
 
 @pytest.mark.epiforecaster
-def test_load_config_rejects_invalid_node_split_strategy():
+def test_load_config_rejects_invalid_node_split_strategy(base_config):
     """Test that invalid node split strategy is rejected."""
     with pytest.raises(ValueError, match="Invalid node_split_strategy"):
         EpiForecasterConfig.load(
-            BASE_LOCAL_CONFIG,
+            base_config,
             overrides=["training.node_split_strategy=not_a_strategy"],
         )
 
 
 @pytest.mark.epiforecaster
-def test_backward_compatibility_from_file():
+def test_backward_compatibility_from_file(base_config):
     """Test that from_file() method still works."""
-    cfg = EpiForecasterConfig.from_file(BASE_LOCAL_CONFIG)
+    cfg = EpiForecasterConfig.from_file(base_config)
 
-    assert cfg.training.learning_rate == 0.0001
+    assert cfg.training.learning_rate == 0.0005
 
 
 @pytest.mark.epiforecaster
-def test_from_dict_reconstructs_config():
+def test_from_dict_reconstructs_config(base_config):
     """Test that from_dict() correctly reconstructs a config from to_dict()."""
     # Load a config and convert to dict (as would be saved in checkpoint)
-    original = EpiForecasterConfig.load(BASE_LOCAL_CONFIG)
+    original = EpiForecasterConfig.load(base_config)
     config_dict = original.to_dict()
 
     # Reconstruct from dict (as would be loaded from checkpoint)

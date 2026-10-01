@@ -16,8 +16,8 @@ from einops import repeat
 from data.native_batch import SOURCE_TYPE_IDS, NativeEpiBatch
 from models.mobility_gnn import MobilityDenseEncoder
 
-OVERLAP_RELATIONS = ("muni_abs", "muni_comarca")
-MOBILITY_TARGET_TYPES = ("municipality", "abs", "comarca")
+OVERLAP_RELATIONS = ("muni_abs",)
+MOBILITY_TARGET_TYPES = ("municipality", "abs")
 
 
 class TypedOverlapMessage(nn.Module):
@@ -45,6 +45,7 @@ class HeterogeneousContextEncoder(nn.Module):
         od_input_dim: int = 3,
         hidden_dim: int = 16,
         mobility_enabled: bool = True,
+        wastewater_enabled: bool = False,
         parameter_budget: int = 100_000,
     ) -> None:
         super().__init__()
@@ -52,10 +53,13 @@ class HeterogeneousContextEncoder(nn.Module):
             raise ValueError("heterogeneous context_dim must be positive")
         self.context_dim = context_dim
         self.mobility_enabled = mobility_enabled
+        overlap_relations = OVERLAP_RELATIONS + (
+            ("muni_edar_catchment",) if wastewater_enabled else ()
+        )
         self.overlap_messages = nn.ModuleDict(
             {
                 relation: TypedOverlapMessage(relation_input_dim, context_dim)
-                for relation in OVERLAP_RELATIONS
+                for relation in overlap_relations
             }
         )
         self.mobility_encoder: MobilityDenseEncoder | None = None
@@ -69,10 +73,13 @@ class HeterogeneousContextEncoder(nn.Module):
                 module_type="gcn",
                 dropout=0.0,
             )
+            mobility_target_types = MOBILITY_TARGET_TYPES + (
+                ("edar",) if wastewater_enabled else ()
+            )
             self.mobility_messages = nn.ModuleDict(
                 {
                     source_type: TypedOverlapMessage(context_dim, context_dim)
-                    for source_type in MOBILITY_TARGET_TYPES
+                    for source_type in mobility_target_types
                 }
             )
         self.parameter_count = sum(parameter.numel() for parameter in self.parameters())

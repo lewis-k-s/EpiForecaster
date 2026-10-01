@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -11,6 +10,7 @@ import pytest
 import yaml
 
 from scripts.hpo import ablation_worker as worker
+from tests.config_fixtures import config_fixture
 
 
 @dataclass
@@ -38,7 +38,8 @@ def _write_campaign(
     smoke_folds: list[int] | None = None,
     allowed_paths: list[str] | None = None,
 ) -> Path:
-    base = Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()
+    base = tmp_path / "base.yaml"
+    base.write_text(yaml.safe_dump(config_fixture().to_dict()))
     campaign: dict[str, object] = {
         "schema_version": 1,
         "campaign_id": "campaign-test",
@@ -58,9 +59,11 @@ def _write_campaign(
             {
                 "name": "mobility:off",
                 "hypothesis": "model switch",
-                "overrides": {"model.type.mobility": False},
+                "overrides": {"native.mobility_enabled": False},
                 "allowed_difference_paths": (
-                    ["model.type.mobility"] if allowed_paths is None else allowed_paths
+                    ["native.mobility_enabled"]
+                    if allowed_paths is None
+                    else allowed_paths
                 ),
             },
         ],
@@ -83,13 +86,8 @@ def _write_campaign(
         },
     }
     if folds is not None:
-        manifest = tmp_path / "splits.json"
-        manifest.write_text(
-            json.dumps({"num_folds": max(folds) + 1, "folds": []}) + "\n",
-            encoding="utf-8",
-        )
         cross_validation: dict[str, object] = {
-            "split_manifest": str(manifest),
+            "num_folds": max(3, max(folds) + 1),
             "fold_indices": folds,
         }
         if smoke_folds is not None:
@@ -104,7 +102,7 @@ def test_structured_campaign_compiles_condition_fold_seed_matrix(
     tmp_path: Path,
 ) -> None:
     campaign = worker.load_campaign(_write_campaign(tmp_path, folds=[0, 1]))
-    assert campaign.crossval_num_folds == 2
+    assert campaign.crossval_num_folds == 3
 
     queue = worker.build_trial_queue(campaign)
 
@@ -162,39 +160,30 @@ def test_folded_objective_enables_manifest_backed_cross_validation(
 
     def load_config(path, overrides):  # noqa: ANN001
         captured["overrides"] = overrides
-        return SimpleNamespace(output=SimpleNamespace(log_dir=""))
+        return SimpleNamespace(
+            output=SimpleNamespace(log_dir=""), native=SimpleNamespace(fold_manifest="")
+        )
 
     monkeypatch.setattr(worker.EpiForecasterConfig, "load", staticmethod(load_config))
-    monkeypatch.setattr(worker, "EpiForecasterTrainer", Trainer)
+    monkeypatch.setattr(worker, "NativeTrainer", Trainer)
+    monkeypatch.setattr(worker, "build_for_config", lambda *args: None)
 
     worker.objective(Trial(), campaign=campaign, run_root=tmp_path, smoketest=True)
 
-    assert "training.crossval_enabled=true" in captured["overrides"]
-    assert "training.crossval_num_folds=2" in captured["overrides"]
-    assert "training.crossval_fold_index=1" in captured["overrides"]
+    assert "native.fold_index=1" in captured["overrides"]
+    assert "native.num_folds=3" in captured["overrides"]
+    assert "native.fold_index=1" in captured["overrides"]
     assert "training.compile=false" in captured["overrides"]
-    wandb_tags_override = next(
-        value
-        for value in captured["overrides"]
-        if value.startswith("output.wandb_tags=")
-    )
-    wandb_tags = json.loads(wandb_tags_override.split("=", 1)[1])
-    assert f"campaign_sha256_{campaign.sha256[:48]}" in wandb_tags
-    assert all(1 <= len(tag) <= 64 for tag in wandb_tags)
-    assert attrs["best_val_selection_metric"] == "mae_median"
-    assert attrs["best_val_selection_value"] == 1.0
-    assert attrs["optuna_value_purpose"] == "validation_selection_coordination"
-    assert "campaign_primary_metric" not in attrs
-    assert "campaign_primary_direction" not in attrs
+    assert "output.wandb_mode=disabled" in captured["overrides"]
 
 
 def test_campaign_rejects_fold_outside_manifest_bounds(tmp_path: Path) -> None:
     path = _write_campaign(tmp_path, folds=[0, 1])
     campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
-    campaign["cross_validation"]["fold_indices"] = [2]
+    campaign["cross_validation"]["fold_indices"] = [3]
     path.write_text(yaml.safe_dump(campaign), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="exceed manifest num_folds"):
+    with pytest.raises(ValueError, match="exceed num_folds"):
         worker.load_campaign(path)
 
 
@@ -205,15 +194,12 @@ def test_campaign_rejects_undeclared_config_drift(tmp_path: Path) -> None:
         worker.load_campaign(path)
 
 
-def test_campaign_rejects_missing_split_manifest_before_execution(
-    tmp_path: Path,
-) -> None:
+def test_campaign_rejects_invalid_native_fold_count(tmp_path: Path) -> None:
     path = _write_campaign(tmp_path)
-    campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
-    campaign["cross_validation"] = {"fold_indices": [0, 1]}
-    path.write_text(yaml.safe_dump(campaign), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="split_manifest is required"):
+    campaign = yaml.safe_load(path.read_text())
+    campaign["cross_validation"] = {"num_folds": 2, "fold_indices": [0, 1]}
+    path.write_text(yaml.safe_dump(campaign))
+    with pytest.raises(ValueError, match="at least three"):
         worker.load_campaign(path)
 
 

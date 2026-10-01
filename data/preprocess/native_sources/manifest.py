@@ -75,11 +75,14 @@ PACKAGE_METHOD = (
 #: produces the registry the builders and folds consume. Paths are relative
 #: to the repository root.
 CODE_STAMP_MODULES: tuple[str, ...] = (
+    "data/preprocess/smoothing.py",
     "data/preprocess/processors/abs_admissions_processor.py",
     "data/preprocess/processors/comarca_deaths_processor.py",
     "data/preprocess/processors/abs_excess_deaths_processor.py",
     "data/preprocess/processors/native_wastewater_processor.py",
     "data/native_registry.py",
+    "data/native_source_sets.py",
+    "data/build_native_source_sets.py",
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]

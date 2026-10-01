@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn as nn
 
-from evaluation.student_t_scores import student_t5_crps
+from evaluation.student_t_scores import student_t5_cdf, student_t5_crps
 
 from models.configs import (
     DataConfig,
@@ -1056,7 +1056,7 @@ class JointInferenceLoss(nn.Module):
 _PER_100K = 100_000.0
 
 #: Heads with routed per-head blocks in :class:`NativeEpiBatch` (section 11.4).
-_NATIVE_ROUTED_HEADS = ("cases", "hosp", "deaths")
+_NATIVE_ROUTED_HEADS = ("ww", "cases", "hosp", "deaths")
 
 
 def device_zero(device: torch.device) -> torch.Tensor:
@@ -1120,9 +1120,7 @@ def _routing_identity(
     )
 
 
-def _count_once_slots(
-    native_batch: NativeEpiBatch, rows: torch.Tensor
-) -> torch.Tensor:
+def _count_once_slots(native_batch: NativeEpiBatch, rows: torch.Tensor) -> torch.Tensor:
     """Routed-block slots kept under the count-once rule (review ruling R7).
 
     A query routed twice into one head must not change any component loss,
@@ -1180,15 +1178,10 @@ def audit_head_counts(native_batch: NativeEpiBatch) -> NativeHeadCountAudit:
     duplicate_row_positions: dict[str, tuple[int, ...]] = {}
     duplicates = 0
 
-    for head in (*_NATIVE_ROUTED_HEADS, "ww"):
+    for head in _NATIVE_ROUTED_HEADS:
         rows = native_batch.head_index.get(head)
         mask = native_batch.head_target_mask.get(head)
-        if (
-            head not in _NATIVE_ROUTED_HEADS
-            or rows is None
-            or mask is None
-            or int(rows.numel()) == 0
-        ):
+        if rows is None or mask is None or int(rows.numel()) == 0:
             supervised_points[head] = 0
             routed_rows[head] = 0
             duplicate_row_positions[head] = ()
@@ -1296,12 +1289,14 @@ class NativeJointInferenceLoss(JointInferenceLoss):
       ``head_target_mask & hosp_weekly_mask``: partial/absent weeks, including
       ``W_max`` trailing slots beyond a narrower per-dow target width, are
       weight-0. The weekly component fills the daily-``hosp`` 4-vector slot.
-    - ``ww``: zero-scalar component, permanently inactive — wastewater stays
-      on the legacy branch, unsupervised in native mode.
+    - ``ww``: assay-level EDAR loss in ``log1p(concentration)`` space.
+      Uncensored observations use the configured distribution score.
+      Left-censored observations use the configured distribution probability below the
+      recorded detection limit.
 
     ``compose_total_loss`` is inherited unchanged: equal active split or
     GradNorm weights against ``obs_weight_sum`` over the 4-vector
-    ``obs_active_mask`` with ``ww`` forced inactive.
+    ``obs_active_mask``.
 
     Count-once is enforced before scoring (review ruling R7): routed rows
     are deduplicated by routing identity
@@ -1476,12 +1471,131 @@ class NativeJointInferenceLoss(JointInferenceLoss):
             # gathered at the (deduplicated) routed rows.
             population = native_batch.source_pop.index_select(0, rows)
         target = _log1p_per100k_targets(
-            target, population.to(device=device, dtype=torch.float32), weights
+            target,
+            population.to(device=device, dtype=torch.float32),
+            weights,
         )
         loss = self._weighted_masked_distribution_loss_from_weights(
             loc=loc, scale=scale, target=target, weights=weights
         )
         return loss, weights.sum(), weights.sum() > 0
+
+    def left_censored_nll(
+        self, loc: torch.Tensor, scale: torch.Tensor, detection_limit: torch.Tensor
+    ) -> torch.Tensor:
+        """Score a raw detection limit with the configured forecast family."""
+        safe_scale = torch.nan_to_num(
+            scale.float(), nan=self.distribution_scale_floor
+        ).clamp_min(self.distribution_scale_floor)
+        z = (
+            torch.log1p(detection_limit.float().clamp_min(0.0)) - loc.float()
+        ) / safe_scale
+        if self.distribution_family == "student_t":
+            if self.distribution_df != 5.0:
+                raise ValueError(
+                    "Left-censored Student-t wastewater requires distribution_df=5.0"
+                )
+            score = -student_t5_cdf(z).clamp_min(1.0e-12).log()
+        else:
+            score = -torch.special.log_ndtr(z)
+        return torch.nan_to_num(score, nan=0.0, posinf=_LOSS_VALUE_CLAMP)
+
+    def _wastewater_loss(
+        self,
+        model_outputs: dict[str, torch.Tensor],
+        native_batch: NativeEpiBatch,
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assay-level EDAR loss with left-censoring at the reported LoD."""
+        rows = native_batch.head_index.get("ww")
+        raw_target = native_batch.head_target.get("ww")
+        target_mask = native_batch.head_target_mask.get("ww")
+        extras = native_batch.head_extra.get("ww", {})
+        if rows is None or int(rows.numel()) == 0:
+            return (
+                device_zero(device),
+                device_zero(device),
+                device_false(device),
+                device_zero(device),
+                device_zero(device),
+            )
+        detection_limit = extras.get("detection_limit")
+        censor_code = extras.get("censor_code")
+        if (
+            raw_target is None
+            or target_mask is None
+            or detection_limit is None
+            or censor_code is None
+        ):
+            raise ValueError(
+                "Head 'ww' requires target, target_mask, detection_limit, "
+                "and censor_code blocks"
+            )
+
+        rows = rows.to(device=device, dtype=torch.long)
+        slots = _count_once_slots(native_batch, rows)
+        deduped = int(slots.numel()) != int(rows.numel())
+        if deduped:
+            raw_target = raw_target.index_select(0, slots)
+            target_mask = target_mask.index_select(0, slots)
+            detection_limit = detection_limit.index_select(0, slots)
+            censor_code = censor_code.index_select(0, slots)
+
+        loc = model_outputs["dist_ww_loc"].to(device=device, dtype=torch.float32)
+        scale = model_outputs["dist_ww_scale"].to(device=device, dtype=torch.float32)
+        if deduped:
+            loc = loc.index_select(0, slots)
+            scale = scale.index_select(0, slots)
+        target = raw_target.to(device=device, dtype=torch.float32)
+        mask = _binary_target_mask(target_mask.to(device))
+        code = censor_code.to(device=device, dtype=torch.uint8)
+        lod = detection_limit.to(device=device, dtype=torch.float32)
+        if loc.shape != target.shape or scale.shape != target.shape:
+            raise ValueError(
+                "Head 'ww' model and target shapes disagree: "
+                f"{tuple(loc.shape)}, {tuple(scale.shape)}, {tuple(target.shape)}"
+            )
+        if code.shape != target.shape or lod.shape != target.shape:
+            raise ValueError("Head 'ww' censor metadata must match target shape")
+
+        uncensored = mask & (code == 0)
+        censored = mask & (code == 1)
+        invalid = mask & (code > 1)
+        if bool(invalid.any()):
+            raise ValueError("Observed wastewater slots must use censor_code 0 or 1")
+        if (
+            bool(censored.any())
+            and self.distribution_family == "student_t"
+            and self.distribution_df != 5.0
+        ):
+            raise ValueError(
+                "Left-censored Student-t wastewater requires distribution_df=5.0"
+            )
+
+        safe_target = torch.log1p(
+            torch.where(uncensored, target, torch.zeros_like(target)).clamp_min(0.0)
+        )
+        uncensored_weights = uncensored.float()
+        uncensored_loss = self._weighted_masked_distribution_loss_from_weights(
+            loc=loc,
+            scale=scale,
+            target=safe_target,
+            weights=uncensored_weights,
+        )
+        uncensored_count = uncensored_weights.sum()
+
+        censored_nll = self.left_censored_nll(
+            loc, scale, torch.where(censored, lod, torch.zeros_like(lod))
+        )
+        censored_sum = torch.where(
+            censored, censored_nll, torch.zeros_like(censored_nll)
+        ).sum()
+        censored_count = censored.float().sum()
+        n_eff = uncensored_count + censored_count
+        total = uncensored_loss * uncensored_count + censored_sum
+        loss = torch.where(n_eff > 0, total / n_eff.clamp_min(1.0), total * 0.0)
+        return loss, n_eff, n_eff > 0, uncensored_loss, uncensored_count
 
     def _weekly_hosp_loss(
         self,
@@ -1587,13 +1701,19 @@ class NativeJointInferenceLoss(JointInferenceLoss):
         zero_anchor = self._zero_anchor(model_outputs)
         device = zero_anchor.device
 
-        # ww: legacy branch only — zero-scalar, never active in native mode.
-        ww_loss = zero_anchor
-        ww_n_eff = device_zero(device)
-        ww_active = device_false(device)
+        if self.disable_ww:
+            ww_loss = zero_anchor
+            ww_n_eff = device_zero(device)
+            ww_active = device_false(device)
+            ww_uncensored_loss = zero_anchor
+            ww_uncensored_count = device_zero(device)
+        else:
+            ww_loss, ww_n_eff, ww_active, ww_uncensored_loss, ww_uncensored_count = (
+                self._wastewater_loss(model_outputs, native_batch, device=device)
+            )
 
         losses: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        for head in _NATIVE_ROUTED_HEADS:
+        for head in ("cases", "hosp", "deaths"):
             disable_attr = self._HEAD_DISABLE_ATTR[head]
             if bool(getattr(self, disable_attr)):
                 losses[head] = (
@@ -1643,6 +1763,8 @@ class NativeJointInferenceLoss(JointInferenceLoss):
             "deaths_weighted": totals["deaths_weighted"],
             "sird_supervision_weighted": totals["sird_supervision_weighted"],
             "ww_n_eff": ww_n_eff,
+            "ww_uncensored_objective": ww_uncensored_loss,
+            "ww_uncensored_count": ww_uncensored_count,
             "hosp_n_eff": losses["hosp"][1],
             "cases_n_eff": losses["cases"][1],
             "deaths_n_eff": losses["deaths"][1],

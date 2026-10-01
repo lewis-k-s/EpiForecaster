@@ -372,11 +372,6 @@ class TobitKalmanSmoother:
         values = np.asarray(values, dtype=float).reshape(-1)
         limits = np.asarray(limits, dtype=float).reshape(-1)
 
-        finite_mask = np.isfinite(values) & (values > 0)
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
-
         for value, limit in zip(values, limits, strict=False):
             pred_state = self.state
             pred_var = self.state_var + self.process_var
@@ -384,7 +379,13 @@ class TobitKalmanSmoother:
 
             limit_valid = np.isfinite(limit) and limit > 0
 
-            if not np.isfinite(value) or value <= 0:
+            # Initialize from the current sample only. A zero with a positive
+            # detection limit is an observed left-censored sample, not missing.
+            if (
+                not np.isfinite(value)
+                or value < 0
+                or (value == 0 and not limit_valid)
+            ):
                 self._apply_missing_update(pred_state=pred_state, pred_var=pred_var)
                 filtered.append(float(self.state))
                 flags.append(2)

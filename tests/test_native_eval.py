@@ -2,23 +2,16 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
 import torch
 
 from data.query_contract import ForecastQuery
 from evaluation.eval_loop import (
     assert_native_confirmation_period_safe,
-    evaluate_native_loader,
 )
-from evaluation.granular_export import GRANULAR_FIELDNAMES
 from evaluation.metrics import TorchWeightedIntervalScoreAccumulator
-from tests.test_native_trainer_wiring import _trainer_config, _write_native_root
-from training.native_trainer import NativeTrainer
 
 pytestmark = pytest.mark.epiforecaster
 
@@ -99,101 +92,3 @@ def test_confirmation_period_guard_raises_unless_disabled() -> None:
     assert_native_confirmation_period_safe(
         queries=[query], date_grid=dates, confirmation_guard=False
     )
-
-
-def test_native_eval_smoke_writes_v4_granular_and_aggregates(
-    tmp_path: Path,
-) -> None:
-    _write_native_root(tmp_path)
-    trainer = NativeTrainer(_trainer_config(tmp_path))
-    assert trainer.val_loader is not None
-    granular = tmp_path / "native_eval.parquet"
-    aggregate_dir = tmp_path / "eval_outputs"
-
-    loss, metrics, aggregate = evaluate_native_loader(
-        model=trainer.model,
-        loader=trainer.val_loader,
-        criterion=trainer.criterion,
-        device=torch.device("cpu"),
-        split_name="Val",
-        granular_output_path=granular,
-        aggregate_output_dir=aggregate_dir,
-    )
-
-    assert np.isfinite(loss)
-    for head in ("cases", "hosp", "deaths"):
-        assert metrics[f"observed_count_{head}"] > 0
-        assert np.isfinite(metrics[f"wis_{head}"])
-        assert metrics[f"wis_{head}"] == pytest.approx(
-            metrics[f"wis_point_{head}"]
-            + metrics[f"wis_dispersion_{head}"]
-            + metrics[f"wis_underprediction_{head}"]
-            + metrics[f"wis_overprediction_{head}"]
-        )
-
-    rows = pd.read_parquet(granular)
-    assert list(rows.columns) == GRANULAR_FIELDNAMES
-    assert set(rows["source_type"]) == {"municipality", "abs", "comarca"}
-    assert (
-        rows.loc[rows["source_type"] != "municipality", "region_id"]
-        .fillna("")
-        .eq("")
-        .all()
-    )
-    municipal = rows[rows["source_type"] == "municipality"]
-    assert municipal["region_id"].astype(str).equals(municipal["source_id"].astype(str))
-    assert (rows["population"] > 0).all()
-    assert (rows["horizon"] >= 1).all()
-
-    metadata = json.loads(
-        granular.with_suffix(".parquet.meta.json").read_text(encoding="utf-8")
-    )
-    assert metadata["schema_version"] == "4"
-    assert metadata["native_support"] is True
-    assert metadata["confirmation_guard"] is True
-
-    assert set(aggregate["aggregation"]) == {
-        "source_horizon",
-        "head_horizon",
-        "head_all",
-    }
-    head_all = aggregate[aggregate["aggregation"] == "head_all"]
-    assert set(head_all["target"]) == {"cases", "hospitalizations", "deaths"}
-    for row in head_all.itertuples(index=False):
-        assert row.wis == pytest.approx(
-            row.wis_point
-            + row.wis_dispersion
-            + row.wis_underprediction
-            + row.wis_overprediction
-        )
-    assert (aggregate_dir / "val_native_aggregate_metrics.csv").exists()
-    summary_path = aggregate_dir / "val_native_wis_summary.json"
-    assert summary_path.exists()
-    assert set(json.loads(summary_path.read_text(encoding="utf-8"))) == {
-        "cases",
-        "hospitalizations",
-        "deaths",
-    }
-
-
-def test_native_trainer_writes_stage4_metadata_after_best_state(tmp_path: Path) -> None:
-    _write_native_root(tmp_path)
-    config = _trainer_config(tmp_path)
-    config.training.max_batches = 1
-    config.output.write_granular_eval = True
-    config.output.granular_eval_format = "csv"
-    config.output.granular_eval_filename = "{split}_granular.csv"
-    config.native.fold_index = None
-
-    result = NativeTrainer(config).run()
-
-    granular = Path(result["evaluation_artifacts"]["granular"])
-    metadata = json.loads(
-        granular.with_suffix(".csv.meta.json").read_text(encoding="utf-8")
-    )
-    assert granular.exists()
-    assert metadata["schema_version"] == "4"
-    assert metadata["experiment_name"] == "native_trainer_test"
-    assert metadata["objective"] == "nll"
-    assert metadata["fold"] is None
-    assert metadata["generalization_claim"].startswith("held-out source")

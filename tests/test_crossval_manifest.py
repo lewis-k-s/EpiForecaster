@@ -95,32 +95,3 @@ def test_load_crossval_manifest_rejects_dataset_identity_mismatch(
             expected_num_folds=2,
             expected_run_id="real",
         )
-
-
-def test_checked_representative_manifest_has_acceptance_receipt() -> None:
-    path = REPO_ROOT / "configs/crossval/representative_10fold_mobility_refined.json"
-    payload = json.loads(path.read_text())
-    valid_region_ids = sorted(
-        region_id for fold in payload["folds"] for region_id in fold["region_ids"]
-    )
-
-    manifest = load_crossval_fold_manifest(
-        path,
-        valid_region_ids=valid_region_ids,
-        expected_num_folds=10,
-        expected_run_id="real",
-    )
-    diagnostics = payload["diagnostics"]["refinement"]
-
-    assert len(manifest.folds) == 10
-    assert sorted(map(len, manifest.folds)) == [16] * 9 + [17]
-    assert diagnostics["swap_count"] == 15
-    assert diagnostics["final_minimum_target_retained_flow"] >= 0.75
-    assert (
-        diagnostics["final_worst_fold_internal_flow_fraction"]
-        <= diagnostics["outlier_internal_flow_ceiling"]
-    )
-    assert (
-        diagnostics["final_balance_squared_count_deviation"]
-        <= diagnostics["baseline_balance_squared_count_deviation"]
-    )

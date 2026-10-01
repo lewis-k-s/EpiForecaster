@@ -1445,8 +1445,6 @@ def evaluate_best(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / f"{split}_summary.json"
-    node_metrics_path = output_dir / f"{split}_node_metrics.csv"
-    per_head_metrics_path = output_dir / f"{split}_node_metrics_per_head.csv"
     granular_path = output_dir / f"{split}_granular.parquet"
     command = [
         sys.executable,
@@ -1460,8 +1458,6 @@ def evaluate_best(
         split,
         "--output",
         str(output_dir),
-        "--node-metrics-csv",
-        str(node_metrics_path),
         "--summary-json",
         str(summary_path),
     ]
@@ -1470,9 +1466,25 @@ def evaluate_best(
     if granular:
         command.append("--granular")
     _run(command)
-    required_artifacts = [summary_path, node_metrics_path, per_head_metrics_path]
+    required_artifacts = [
+        summary_path,
+        output_dir / f"{split}_native_aggregate_metrics.csv",
+        output_dir / f"{split}_native_wis_summary.json",
+        output_dir / f"{split}_native_excess_deaths.csv",
+    ]
     if granular:
         required_artifacts.append(granular_path)
+        required_artifacts.append(granular_path.with_suffix(".parquet.meta.json"))
+        required_artifacts.extend(
+            output_dir / f"{split}_{suffix}"
+            for suffix in (
+                "example_history.parquet",
+                "example_rows.parquet",
+                "window_support.csv",
+                "example_selection.csv",
+                "example_availability.csv",
+            )
+        )
     missing = [path for path in required_artifacts if not path.is_file()]
     if missing:
         rendered = ", ".join(str(path) for path in missing)

@@ -4,8 +4,9 @@ Indexes per-head ``(source, origin)`` forecast queries over the native
 support artifacts and yields one item per query — the ``NativeEpiBatch``
 field set of section 11.4 minus collation (BAT-1 owns collation). Reads
 only the native root (``native_graph.zarr``, ``obs_admissions.zarr``,
-``obs_deaths.zarr``, optional ``od_mitma.zarr``) plus
-``real_with_id.zarr``.
+``obs_deaths_abs_excess.zarr``, optional ``obs_wastewater.zarr``, optional
+``od_mitma.zarr``) plus ``real_with_id.zarr``. Native wastewater also reads
+the EDAR-to-municipality catchment table.
 
 Window geometry. The shared daily grid is the ``date`` coordinate of
 ``real_with_id.zarr`` (435 days, 2020-03-01..2021-05-09). A query with
@@ -25,8 +26,13 @@ rejected when its target window ``(origin, origin+H]`` intersects the
 reserved ``CONFIRMATION_WINDOW`` (plan section 10.3(10)); an explicit
 ``confirmation_guard=False`` opts in for calibration-period work.
 
-Histories ``hist [L, F_native]`` — three clinical channels (value, mask,
-age) followed by the ``k`` shared temporal covariates. VALUE channels are
+Histories ``hist [L, F_native]`` contain three clinical channels (value,
+mask, age), or four EDAR channels (assay-history mean, sample presence,
+minimum sample age, last causal flow). By default, three municipality-only
+vaccination channels (first-dose rate, observation mask, age / 14) follow;
+other source types carry zeros. The ``k`` shared temporal covariates come
+last. Vaccination and graph context use only days through the forecast
+origin. Clinical value channels are
 type-aware consumption transforms (ruling R10) of raw-at-rest stores:
 masks and ages are raw, unreported days keep value 0, and TARGETS STAY
 RAW COUNTS (the loss owns target-side transforms):
@@ -39,13 +45,19 @@ RAW COUNTS (the loss owns target-side transforms):
   day only; all other days carry value 0 with mask 0. The value channel
   is ``log1p((weekly_count / pop_graph) · 1e5)`` computed from the raw
   stored count and the ABS graph population.
-- comarca: daily deaths from ``obs_deaths.zarr`` (raw counts at rest,
-  plan section 11.3); the value channel is
-  ``log1p((daily_count / pop_graph) · 1e5)``; mask and age are raw.
+- abs: daily all-cause deaths from ``obs_deaths_abs_excess.zarr`` share the
+  ABS row with weekly admissions. Both heads use the same six-channel
+  history (admissions value/mask/age plus deaths value/mask/age). Death
+  values are observed counts transformed to ``log1p(per-100k)``; expected
+  pre-pandemic counts are carried beside targets for excess evaluation.
+- edar: causal assay history in ``log1p(concentration)`` space. The target is
+  the assay-specific raw concentration block with detection-limit and censor
+  metadata. Catchment population comes from contribution-weighted
+  municipalities; flow at the forecast target is supervision metadata only.
 
 Targets are raw counts plus the graph population denominator: municipal
 cases are inverted from the stored ``log1p(per-100k)`` values at index
-time; deaths and weekly admissions are already raw. The weekly ``hosp``
+time; all-cause deaths and weekly admissions are already raw. The weekly ``hosp``
 block additionally carries ``target_stratum_pop_sum`` (per-week QC-only
 lower bound, section 10.3(4)) beside ``target_population_graph``.
 
@@ -81,6 +93,7 @@ from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast
 
 import numpy as np
+import pandas as pd
 import torch
 import xarray as xr
 import zarr
@@ -89,6 +102,7 @@ from torch.utils.data import Dataset
 from data.native_registry import (
     SOURCE_ABS,
     SOURCE_COMARCA,
+    SOURCE_EDAR,
     SOURCE_MUNICIPALITY,
     STATUS_OBSERVED,
     STATUS_UNMAPPED,
@@ -117,17 +131,24 @@ SOURCE_TYPE_IDS: dict[str, int] = {
 HEAD_SOURCE_TYPE: dict[str, str] = {
     "cases": SOURCE_MUNICIPALITY,
     "hosp": SOURCE_ABS,
-    "deaths": SOURCE_COMARCA,
+    "deaths": SOURCE_ABS,
+    "ww": SOURCE_EDAR,
 }
 
 #: Native head name -> key in ``TARGET_OBSERVATION_CADENCE_DAYS``.
-_LEGACY_HEAD_KEY = {"cases": "cases", "hosp": "hospitalizations", "deaths": "deaths"}
+_LEGACY_HEAD_KEY = {
+    "cases": "cases",
+    "hosp": "hospitalizations",
+    "deaths": "deaths",
+    "ww": "wastewater",
+}
 
 _DAYS_PER_WEEK = 7
 _PER_100K = 100_000.0
-_POOL_RELATIONS = ("muni_abs", "muni_comarca")
-_OD_RELATIONS = ("mitma_abs", "mitma_comarca")
+_POOL_RELATIONS = ("muni_abs",)
+_OD_RELATIONS = ("mitma_muni", "mitma_abs", "mitma_comarca")
 _HETERO_MITMA_RELATIONS = ("mitma_muni", "mitma_abs", "mitma_comarca")
+_EDAR_CONTEXT_RELATION = "muni_edar_catchment"
 
 #: Reserved model-confirmation window (plan section 10.3(10), ruling R9).
 #: [D1] used 2020-12-31..2021-01-27 for calibration only, so native
@@ -166,9 +187,11 @@ class NativeDatasetConfig:
     # Ruling R9: reject origins whose target window intersects
     # ``CONFIRMATION_WINDOW`` unless explicitly disabled for calibration work.
     confirmation_guard: bool = True
-    spatial_encoder: str = "pooled"
+    spatial_encoder: str = "hetero"
     od_source: str = "mitma"
     mobility_enabled: bool = True
+    wastewater_enabled: bool = False
+    include_vaccination: bool = True
 
     def __post_init__(self) -> None:
         if self.input_window_length <= 0 or self.forecast_horizon <= 0:
@@ -234,8 +257,9 @@ class NativeDatasetItem(TypedDict):
     target_mask: torch.Tensor  # same shape as target
     target_population_graph: float
     target_stratum_pop_sum: torch.Tensor | None  # [W] float32, hosp only
+    target_extra: NotRequired[dict[str, torch.Tensor]]
     relation_ctx: NotRequired[dict[str, torch.Tensor]]  # relation -> [L, 3]
-    od_node_features: NotRequired[torch.Tensor]  # [N, 3]
+    od_node_features: NotRequired[torch.Tensor]  # [N, 3 or 6]
     od_adjacency: NotRequired[torch.Tensor]  # [N, N]
     od_target_weights: NotRequired[torch.Tensor]  # [N]
 
@@ -283,10 +307,12 @@ class _CasesSeries(_ObsSeries):
         channels: np.ndarray,
         masks: np.ndarray,
         covariates: np.ndarray,
+        vaccination: np.ndarray | None,
     ) -> None:
         super().__init__(dates, region_ids, channels[:, :, 0], masks, channels[:, :, 2])
         self.channels = channels  # [T, M, 3] float32 value/mask/age
         self.covariates = covariates  # [T, k] float32
+        self.vaccination = vaccination  # [T, M, 3] or None when disabled
 
 
 class _AdmSeries(_ObsSeries):
@@ -303,6 +329,56 @@ class _AdmSeries(_ObsSeries):
     ) -> None:
         super().__init__(dates, source_ids, values, masks, ages)
         self.stratum = stratum
+
+
+class _DeathsSeries(_ObsSeries):
+    """ABS observed all-cause deaths with a fixed expected-count baseline."""
+
+    def __init__(
+        self,
+        dates: np.ndarray,
+        source_ids: list[str],
+        values: np.ndarray,
+        masks: np.ndarray,
+        ages: np.ndarray,
+        expected: np.ndarray,
+    ) -> None:
+        super().__init__(dates, source_ids, values, masks, ages)
+        self.expected = expected
+
+
+class _WastewaterSeries:
+    """EDAR-level assay observations aligned to the shared daily grid."""
+
+    def __init__(self, dataset: xr.Dataset) -> None:
+        self.dates = np.asarray(dataset["date"].values).astype("datetime64[D]")
+        self.source_ids = [str(value) for value in dataset["edar_id"].values]
+        self.assays = [str(value) for value in dataset["assay"].values]
+        self.columns = {
+            source_id: index for index, source_id in enumerate(self.source_ids)
+        }
+        self.concentration = np.asarray(
+            dataset["concentration_raw"].values, dtype=np.float32
+        )
+        self.detection_limit = np.asarray(
+            dataset["detection_limit"].values, dtype=np.float32
+        )
+        self.mask = np.asarray(dataset["observed_mask"].values, dtype=bool)
+        self.censor_code = np.asarray(dataset["censor_code"].values, dtype=np.uint8)
+        self.history = np.asarray(dataset["history_log1p"].values, dtype=np.float32)
+        self.history_available = np.asarray(
+            dataset["history_available_mask"].values, dtype=bool
+        )
+        self.age = np.asarray(dataset["history_age_days"].values, dtype=np.float32)
+        self.flow = np.asarray(dataset["flow_m3_24h"].values, dtype=np.float32)
+        self.flow_mask = np.asarray(dataset["flow_mask"].values, dtype=bool)
+        self.flow_history_log1p = np.full_like(self.flow, np.nan, dtype=np.float32)
+        for column in range(self.flow.shape[1]):
+            last = np.nan
+            for row in range(self.flow.shape[0]):
+                if self.flow_mask[row, column]:
+                    last = np.float32(np.log1p(self.flow[row, column]))
+                self.flow_history_log1p[row, column] = last
 
 
 class _OdStore:
@@ -384,9 +460,26 @@ class NativeSupportDataset(Dataset):
         )
         self._od = self._load_od_store(root, config.od_source) if needs_od else None
         self._adm = self._load_admissions(root / "obs_admissions.zarr")
-        self._deaths = self._load_store(root / "obs_deaths.zarr", "comarca_id")
+        self._deaths = self._load_abs_deaths(root / "obs_deaths_abs_excess.zarr")
         self._cases = self._load_cases(real_with_id_path)
         self._grid = self._cases.dates
+        if not np.array_equal(self._deaths.dates, self._grid):
+            raise ValueError("ABS excess deaths date grid differs from cases")
+        self._deaths_expected = self._deaths.expected
+        self._ww: _WastewaterSeries | None = None
+        self._edar_population: dict[str, float] = {}
+        self._edar_case_pools: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
+        self._edar_municipality_weights: dict[str, dict[str, float]] = {}
+        wastewater_path = root / "obs_wastewater.zarr"
+        catchment_path = root / "edar_catchment_edges.parquet"
+        if config.wastewater_enabled:
+            if not wastewater_path.exists() or not catchment_path.exists():
+                raise FileNotFoundError(
+                    "native wastewater requires obs_wastewater.zarr and "
+                    "edar_catchment_edges.parquet"
+                )
+            self._ww = self._load_wastewater(wastewater_path)
+            self._load_edar_catchment(catchment_path)
         # Deaths aligned onto the shared grid (absent dates -> mask 0).
         self._deaths_values, self._deaths_masks, self._deaths_ages = _align_daily(
             self._deaths, self._grid
@@ -401,6 +494,7 @@ class NativeSupportDataset(Dataset):
         self._od_feature_weights = self._build_od_feature_weights()
         self._od_graph_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._items = self._build_index()
+        self._context_source_roles: dict[str, str] | None = None
 
     # ------------------------------------------------------------------
     # Public surface
@@ -414,6 +508,17 @@ class NativeSupportDataset(Dataset):
     def registry(self) -> SourceRegistry:
         """Registry derived from the stores and graph statuses (per head)."""
         return self._registry
+
+    def set_context_source_roles(self, source_roles: dict[str, str]) -> None:
+        """Keep spatial context within each query's frozen source role."""
+        self._context_source_roles = dict(source_roles)
+
+    def _context_allowed(self, query_key: str, context_key: str) -> bool:
+        roles = self._context_source_roles
+        return roles is None or (
+            roles.get(query_key) in {"train", "validation", "test"}
+            and roles.get(query_key) == roles.get(context_key)
+        )
 
     @property
     def queries(self) -> list[ForecastQuery]:
@@ -443,9 +548,19 @@ class NativeSupportDataset(Dataset):
         """Shared daily coordinate used by query origins and evaluation."""
         return self._grid.copy()
 
+    @property
+    def wastewater_assays(self) -> tuple[str, ...]:
+        """Stable assay order of the native wastewater target block."""
+        return () if self._ww is None else tuple(self._ww.assays)
+
     def graph_node_index(self, source_type: str, source_id: str) -> int:
         """Stable native-graph node index for schema-v4 granular exports."""
-        return self._node_index[f"{source_type}:{source_id}"]
+        key = f"{source_type}:{source_id}"
+        if key in self._node_index:
+            return self._node_index[key]
+        if source_type == SOURCE_EDAR and self._ww is not None:
+            return len(self._graph_nodes.source_id) + self._ww.columns[source_id]
+        raise KeyError(key)
 
     def __len__(self) -> int:
         return len(self._items)
@@ -462,15 +577,44 @@ class NativeSupportDataset(Dataset):
         covariates = self._cases.covariates[hist_slice].astype(np.float32)
         stratum: np.ndarray | None = None
 
+        target_extra: dict[str, torch.Tensor] | None = None
         if query.source_type == SOURCE_MUNICIPALITY:
             hist, hist_mask = self._municipal_history(query.source_id, hist_slice)
             target, target_mask = self._municipal_target(query.source_id, target_slice)
         elif query.source_type == SOURCE_ABS:
-            hist, hist_mask = self._abs_history(query.source_id, hist_slice)
-            target, target_mask, stratum = self._abs_target(query.source_id, origin)
+            hist, hist_mask = self._abs_joint_history(query.source_id, hist_slice)
+            if head == "deaths":
+                target, target_mask = self._abs_deaths_target(
+                    query.source_id, target_slice
+                )
+                target_extra = {
+                    "expected_deaths": torch.from_numpy(
+                        self._deaths_expected[
+                            target_slice, self._deaths.columns[query.source_id]
+                        ].copy()
+                    )
+                }
+            else:
+                target, target_mask, stratum = self._abs_target(query.source_id, origin)
         else:
-            hist, hist_mask = self._comarca_history(query.source_id, hist_slice)
-            target, target_mask = self._comarca_target(query.source_id, target_slice)
+            hist, hist_mask = self._edar_history(query.source_id, hist_slice)
+            target, target_mask, extra = self._edar_target(
+                query.source_id, target_slice
+            )
+            target_extra = {
+                name: torch.from_numpy(value) for name, value in extra.items()
+            }
+        if hist.shape[1] < 6:
+            hist = np.concatenate(
+                [hist, np.zeros((self._L, 6 - hist.shape[1]), dtype=np.float32)],
+                axis=1,
+            )
+        if self._cases.vaccination is not None:
+            vaccination = np.zeros((self._L, 3), dtype=np.float32)
+            if query.source_type == SOURCE_MUNICIPALITY:
+                column = self._cases.columns[query.source_id]
+                vaccination = self._cases.vaccination[hist_slice, column].copy()
+            hist = np.concatenate([hist, vaccination], axis=1)
         hist = np.concatenate([hist, covariates], axis=1)
 
         relation_ctx, pooled, coverage = self._relation_context(
@@ -481,8 +625,7 @@ class NativeSupportDataset(Dataset):
             od_column = np.full((self._L, 1), od_share, dtype=np.float32)
             pooled = np.concatenate([pooled, od_column], axis=1)
 
-        node = self._node_index[f"{query.source_type}:{query.source_id}"]
-        population = float(self._graph_nodes.population[node])
+        population = self._source_population(query.source_type, query.source_id)
         item: NativeDatasetItem = {
             "query": query,
             "head": head,
@@ -504,6 +647,8 @@ class NativeSupportDataset(Dataset):
                 name: torch.from_numpy(value) for name, value in relation_ctx.items()
             },
         }
+        if target_extra is not None:
+            item["target_extra"] = target_extra
         if self._config.spatial_encoder == "hetero" and self._config.mobility_enabled:
             od_features, od_adjacency = self._od_graph_context(query.forecast_origin)
             item["od_node_features"] = torch.from_numpy(od_features)
@@ -563,6 +708,55 @@ class NativeSupportDataset(Dataset):
             raise ValueError(f"{path} is missing the stratum_pop_sum variable")
         return loaded
 
+    def _load_wastewater(self, path: Path) -> _WastewaterSeries:
+        dataset = xr.open_zarr(path).compute()
+        if dataset.attrs.get("schema") != "native_wastewater_observations.v1":
+            raise ValueError(f"Unsupported native wastewater schema in {path}")
+        if not np.array_equal(
+            np.asarray(dataset["date"].values).astype("datetime64[D]"), self._grid
+        ):
+            dataset = dataset.reindex(date=self._grid).compute()
+        return _WastewaterSeries(dataset)
+
+    def _load_edar_catchment(self, path: Path) -> None:
+        edges = pd.read_parquet(path)
+        municipal = edges[edges["target_type"] == SOURCE_MUNICIPALITY].copy()
+        if municipal.empty:
+            raise ValueError("EDAR catchment table has no municipality rows")
+        self._edar_population = {
+            str(edar_id): float(values.iloc[0])
+            for edar_id, values in municipal.groupby("edar_id")[
+                "catchment_population_est"
+            ]
+        }
+        case_columns = {
+            source_id: index for index, source_id in enumerate(self._cases.source_ids)
+        }
+        for edar_id, rows in municipal.groupby("edar_id"):
+            columns: list[int] = []
+            weights: list[float] = []
+            for row in rows.itertuples(index=False):
+                column = case_columns.get(str(row.target_id))
+                if column is not None:
+                    columns.append(column)
+                    weights.append(cast(float, row.frac_of_edar_catchment))
+            weight_array = np.asarray(weights, dtype=np.float32)
+            self._edar_case_pools[str(edar_id)] = (
+                np.asarray(columns, dtype=np.int64),
+                weight_array,
+                float(weight_array.sum()),
+            )
+            self._edar_municipality_weights[str(edar_id)] = {
+                str(row.target_id): cast(float, row.frac_of_edar_catchment)
+                for row in rows.itertuples(index=False)
+            }
+
+    def _source_population(self, source_type: str, source_id: str) -> float:
+        if source_type == SOURCE_EDAR:
+            return self._edar_population[source_id]
+        node = self._node_index[f"{source_type}:{source_id}"]
+        return float(self._graph_nodes.population[node])
+
     def _load_store(self, path: Path, dim_name: str) -> _ObsSeries | _AdmSeries:
         ds = xr.open_zarr(path).compute()
         dates = np.asarray(ds["date"].values).astype("datetime64[D]")
@@ -582,9 +776,39 @@ class NativeSupportDataset(Dataset):
             return _AdmSeries(dates, source_ids, values, masks, ages, stratum)
         return _ObsSeries(dates, source_ids, values, masks, ages)
 
+    def _load_abs_deaths(self, path: Path) -> _DeathsSeries:
+        ds = xr.open_zarr(path).compute()
+        if ds.attrs.get("schema") != "obs_deaths_abs_excess":
+            raise ValueError("ABS excess deaths store has an unexpected schema")
+        dates = np.asarray(ds["date"].values).astype("datetime64[D]")
+        source_ids = [str(value) for value in ds["abs_id"].values]
+        values = np.asarray(ds["value"].values, dtype=np.float32)
+        masks = np.asarray(ds["mask"].values, dtype=bool)
+        ages = np.asarray(ds["age"].values, dtype=np.float32)
+        expected = np.asarray(ds["expected"].values, dtype=np.float32)
+        excess = np.asarray(ds["excess"].values, dtype=np.float32)
+        if (
+            np.any(values < 0)
+            or not np.isfinite(expected).all()
+            or np.any(expected < 0)
+            or not np.allclose(excess, values - expected, atol=1e-4)
+        ):
+            raise ValueError("ABS excess deaths store has invalid count or baseline")
+        return _DeathsSeries(dates, source_ids, values, masks, ages, expected)
+
     def _load_cases(self, real_with_id_path: str | Path) -> _CasesSeries:
         ds = xr.open_zarr(real_with_id_path)
         needed = ["cases", "cases_mask", "cases_age", "temporal_covariates"]
+        if self._config.include_vaccination:
+            vaccination_names = (
+                "vaccination_rate",
+                "vaccination_rate_mask",
+                "vaccination_rate_age",
+            )
+            missing = [name for name in vaccination_names if name not in ds]
+            if missing:
+                raise ValueError(f"native vaccination input missing: {missing}")
+            needed.extend(vaccination_names)
         ds = ds[needed]
         if "run_id" in ds.dims:
             run_ids = [str(r).strip() for r in ds["run_id"].values]
@@ -602,7 +826,25 @@ class NativeSupportDataset(Dataset):
         )
         masks = np.asarray(ds["cases_mask"].values, dtype=bool)
         covariates = np.asarray(ds["temporal_covariates"].values, dtype=np.float32)
-        return _CasesSeries(dates, region_ids, channels, masks, covariates)
+        vaccination = None
+        if self._config.include_vaccination:
+            vaccination = np.stack(
+                [
+                    np.asarray(ds["vaccination_rate"].values, dtype=np.float32),
+                    np.asarray(ds["vaccination_rate_mask"].values, dtype=np.float32),
+                    np.clip(
+                        np.asarray(ds["vaccination_rate_age"].values, dtype=np.float32)
+                        / 14.0,
+                        0.0,
+                        1.0,
+                    ),
+                ],
+                axis=-1,
+            )
+            vaccination[:, :, 0] = np.nan_to_num(
+                vaccination[:, :, 0], nan=0.0, posinf=0.0, neginf=0.0
+            )
+        return _CasesSeries(dates, region_ids, channels, masks, covariates, vaccination)
 
     def _build_registry(self) -> SourceRegistry:
         """Derive per-head source statuses from the stores + graph statuses."""
@@ -624,36 +866,56 @@ class NativeSupportDataset(Dataset):
                     last_date=None,
                 )
             )
-        for store, source_type in (
-            (self._adm, SOURCE_ABS),
-            (self._deaths, SOURCE_COMARCA),
+        for source_id in sorted(
+            set(self._adm.source_ids) | set(self._deaths.source_ids)
         ):
-            for j, source_id in enumerate(store.source_ids):
-                node = self._node_index.get(f"{source_type}:{source_id}")
-                if (
-                    node is None
-                    or str(self._graph_nodes.status[node]) == STATUS_UNMAPPED
-                ):
-                    status = STATUS_UNMAPPED
-                elif not bool(store.masks[:, j].any()):
-                    status = STATUS_UNOBSERVED
-                else:
-                    status = STATUS_OBSERVED
-                population = (
-                    float(self._graph_nodes.population[node])
-                    if node is not None
-                    else None
+            source_type = SOURCE_ABS
+            observed = any(
+                source_id in store.columns
+                and bool(store.masks[:, store.columns[source_id]].any())
+                for store in (self._adm, self._deaths)
+            )
+            node = self._node_index.get(f"{source_type}:{source_id}")
+            if node is None or str(self._graph_nodes.status[node]) == STATUS_UNMAPPED:
+                status = STATUS_UNMAPPED
+            elif not observed:
+                status = STATUS_UNOBSERVED
+            else:
+                status = STATUS_OBSERVED
+            population = (
+                float(self._graph_nodes.population[node]) if node is not None else None
+            )
+            registry.add(
+                SourceRecord(
+                    source_type=source_type,
+                    source_id=source_id,
+                    status=status,
+                    population=(
+                        population
+                        if population is not None and math.isfinite(population)
+                        else None
+                    ),
+                    first_date=None,
+                    last_date=None,
+                )
+            )
+        if self._ww is not None:
+            for column, source_id in enumerate(self._ww.source_ids):
+                population = self._edar_population.get(source_id)
+                observed = bool(self._ww.mask[:, column, :].any())
+                status = (
+                    STATUS_OBSERVED
+                    if observed and population is not None and population > 0
+                    else STATUS_UNMAPPED
+                    if population is None
+                    else STATUS_UNOBSERVED
                 )
                 registry.add(
                     SourceRecord(
-                        source_type=source_type,
+                        source_type=SOURCE_EDAR,
                         source_id=source_id,
                         status=status,
-                        population=(
-                            population
-                            if population is not None and math.isfinite(population)
-                            else None
-                        ),
+                        population=population,
                         first_date=None,
                         last_date=None,
                     )
@@ -704,8 +966,13 @@ class NativeSupportDataset(Dataset):
             hist = (cum[h_hi] - cum[h_lo]).T
             target = (cum[t_hi] - cum[t_lo]).T
             return hist, target
-        masks = self._cases.masks if head == "cases" else self._deaths_masks
-        store = self._cases if head == "cases" else self._deaths
+        if head == "ww":
+            assert self._ww is not None
+            masks = self._ww.mask.any(axis=2)
+            store = self._ww
+        else:
+            masks = self._cases.masks if head == "cases" else self._deaths_masks
+            store = self._cases if head == "cases" else self._deaths
         columns = np.array([store.columns[s] for s in source_ids])
         cum = np.vstack([np.zeros((1, masks.shape[1])), np.cumsum(masks, axis=0)])
         cum = cum[:, columns]
@@ -739,6 +1006,8 @@ class NativeSupportDataset(Dataset):
                 and record.population is not None
                 and math.isfinite(record.population)
                 and record.population > 0
+                and (head != "hosp" or record.source_id in self._adm.columns)
+                and (head != "deaths" or record.source_id in self._deaths.columns)
             ]
             if not records:
                 continue
@@ -768,6 +1037,7 @@ class NativeSupportDataset(Dataset):
                 entry[0].source_type,
                 entry[0].source_id,
                 entry[0].forecast_origin,
+                entry[1],
             )
         )
         return entries
@@ -838,6 +1108,8 @@ class NativeSupportDataset(Dataset):
                 columns = np.concatenate([block[0] for block in blocks])
                 weights = np.concatenate([block[1] for block in blocks])
                 pools[key] = (columns, weights, sum(block[2] for block in blocks))
+        for source_id, pool in self._edar_case_pools.items():
+            pools[f"{SOURCE_EDAR}:{source_id}"] = pool
         return pools
 
     def _relation_context(
@@ -847,15 +1119,41 @@ class NativeSupportDataset(Dataset):
         key = f"{source_type}:{source_id}"
         relation_ctx: dict[str, np.ndarray] = {}
         for relation in _POOL_RELATIONS:
-            columns, weights, _ = self._relation_pools[relation][key]
-            block = np.zeros((self._L, 3), dtype=np.float32)
-            if columns.size:
-                cases = self._cases.channels[hist_slice][:, columns, :]
-                block = (cases * weights[None, :, None]).sum(axis=1, dtype=np.float32)
-            if source_type == SOURCE_MUNICIPALITY:
-                block += self._reverse_relation_context(relation, source_id, hist_slice)
+            width = 6 if self._cases.vaccination is not None else 3
+            block = np.zeros((self._L, width), dtype=np.float32)
+            if source_type != SOURCE_EDAR:
+                columns, weights, _ = self._relation_pools[relation][key]
+                if columns.size:
+                    allowed = np.asarray(
+                        [
+                            self._context_allowed(
+                                key,
+                                f"{SOURCE_MUNICIPALITY}:{self._cases.source_ids[column]}",
+                            )
+                            for column in columns
+                        ],
+                        dtype=bool,
+                    )
+                    municipal = self._municipal_features(hist_slice, columns[allowed])
+                    block = (municipal * weights[allowed][None, :, None]).sum(
+                        axis=1, dtype=np.float32
+                    )
+                if source_type == SOURCE_MUNICIPALITY:
+                    block[:, :3] += self._reverse_relation_context(
+                        relation, source_id, hist_slice
+                    )
             relation_ctx[relation] = block.astype(np.float32, copy=False)
         pooled, coverage = self._pooled_context(source_type, source_id, hist_slice)
+        if self._config.wastewater_enabled:
+            width = 6 if self._cases.vaccination is not None else 3
+            edar_context = np.zeros((self._L, width), dtype=np.float32)
+            if source_type == SOURCE_EDAR:
+                edar_context[:, :3] = pooled
+                if self._cases.vaccination is not None:
+                    edar_context[:, 3:] = self._pooled_vaccination(
+                        source_type, source_id, hist_slice
+                    )
+            relation_ctx[_EDAR_CONTEXT_RELATION] = edar_context
         return relation_ctx, pooled, coverage
 
     def _reverse_relation_context(
@@ -874,14 +1172,17 @@ class NativeSupportDataset(Dataset):
             if not math.isfinite(population) or population <= 0:
                 continue
             source_id = str(self._graph_nodes.source_id[src])
+            if not self._context_allowed(
+                f"{SOURCE_MUNICIPALITY}:{municipality_id}",
+                f"{expected_type}:{source_id}",
+            ):
+                continue
             if expected_type == SOURCE_ABS:
                 if source_id not in self._adm.columns:
                     continue
                 history, _ = self._abs_history(source_id, hist_slice)
             else:
-                if source_id not in self._deaths.columns:
-                    continue
-                history, _ = self._comarca_history(source_id, hist_slice)
+                continue  # comarca nodes no longer carry death observations
             block += history * float(edges["weight"][edge])
         return block
 
@@ -892,12 +1193,59 @@ class NativeSupportDataset(Dataset):
         columns, weights, coverage = self._pools[f"{source_type}:{source_id}"]
         pooled = np.zeros((self._L, 3), dtype=np.float32)
         if columns.size:
+            allowed = np.asarray(
+                [
+                    self._context_allowed(
+                        f"{source_type}:{source_id}",
+                        f"{SOURCE_MUNICIPALITY}:{self._cases.source_ids[column]}",
+                    )
+                    for column in columns
+                ],
+                dtype=bool,
+            )
+            columns, weights = columns[allowed], weights[allowed]
+            coverage = float(weights.sum())
             block = self._cases.channels[hist_slice][:, columns, :]  # [L, M, 3]
             pooled = (block * weights[None, :, None]).sum(axis=1, dtype=np.float32)
         return pooled.astype(np.float32, copy=False), coverage
 
+    def _pooled_vaccination(
+        self, source_type: str, source_id: str, hist_slice: slice
+    ) -> np.ndarray:
+        """Pool municipality vaccination with the same catchment weights."""
+        assert self._cases.vaccination is not None
+        columns, weights, _ = self._pools[f"{source_type}:{source_id}"]
+        allowed = np.asarray(
+            [
+                self._context_allowed(
+                    f"{source_type}:{source_id}",
+                    f"{SOURCE_MUNICIPALITY}:{self._cases.source_ids[column]}",
+                )
+                for column in columns
+            ],
+            dtype=bool,
+        )
+        vaccination = self._cases.vaccination[hist_slice][:, columns[allowed]]
+        return (vaccination * weights[allowed][None, :, None]).sum(
+            axis=1, dtype=np.float32
+        )
+
+    def _municipal_features(
+        self, hist_slice: slice, columns: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Municipal case and optional vaccination history at the query origin."""
+        cases = self._cases.channels[hist_slice]
+        if columns is not None:
+            cases = cases[:, columns]
+        if self._cases.vaccination is None:
+            return cases
+        vaccination = self._cases.vaccination[hist_slice]
+        if columns is not None:
+            vaccination = vaccination[:, columns]
+        return np.concatenate([cases, vaccination], axis=-1)
+
     def _build_od_feature_weights(self) -> np.ndarray:
-        """Map municipal case features into the configured OD node set."""
+        """Map municipal features into the configured OD node set."""
         if (
             self._config.spatial_encoder != "hetero"
             or not self._config.mobility_enabled
@@ -939,7 +1287,10 @@ class NativeSupportDataset(Dataset):
         if cached is not None:
             return cached
         assert self._od is not None
-        features = self._od_feature_weights @ self._cases.channels[origin]
+        features = (
+            self._od_feature_weights
+            @ self._municipal_features(slice(origin, origin + 1))[0]
+        )
         od_row = self._od.row_of(self._grid[origin])
         if od_row is None:
             flows = np.zeros(
@@ -968,10 +1319,33 @@ class NativeSupportDataset(Dataset):
         return result
 
     def _od_target_weights(self, source_type: str, source_id: str) -> np.ndarray:
-        """Typed hop from configured OD nodes back to one clinical target."""
+        """Build fixed source weights without an origin-dependent input."""
         assert self._od is not None
         weights = np.zeros(len(self._od.zone_ids), dtype=np.float32)
         zone_index = {zone: index for index, zone in enumerate(self._od.zone_ids)}
+        if source_type == SOURCE_EDAR:
+            municipality_weights = self._edar_municipality_weights[source_id]
+            if self._config.od_source == "municipal":
+                for municipality_id, catchment_weight in municipality_weights.items():
+                    zone = zone_index.get(municipality_id)
+                    if zone is not None:
+                        weights[zone] += catchment_weight
+                return weights
+            edges = self._edges["mitma_muni"]
+            for municipality_id, catchment_weight in municipality_weights.items():
+                target = self._node_index.get(
+                    f"{SOURCE_MUNICIPALITY}:{municipality_id}"
+                )
+                if target is None:
+                    continue
+                for edge in np.flatnonzero(edges["dst_idx"] == target):
+                    src = int(edges["src_idx"][edge])
+                    if self._graph_nodes.node_type[src] != "mitma":
+                        continue
+                    zone = zone_index.get(str(self._graph_nodes.source_id[src]))
+                    if zone is not None:
+                        weights[zone] += catchment_weight * float(edges["weight"][edge])
+            return weights
         if self._config.od_source == "municipal":
             if source_type == SOURCE_MUNICIPALITY:
                 zone = zone_index.get(source_id)
@@ -1003,16 +1377,20 @@ class NativeSupportDataset(Dataset):
         before the shares are taken; the store stays raw at rest.
         """
         assert self._od is not None
-        node = self._node_index[f"{query.source_type}:{query.source_id}"]
-        zone_columns: set[int] = set()
-        for relation in _OD_RELATIONS:
-            edges = self._edges[relation]
-            for row in np.flatnonzero(edges["dst_idx"] == node):
-                src = int(edges["src_idx"][row])
-                if self._graph_nodes.node_type[src] == "mitma":
-                    zone_columns.add(
-                        self._od_zone_index[str(self._graph_nodes.source_id[src])]
-                    )
+        if query.source_type == SOURCE_EDAR:
+            zone_weights = self._od_target_weights(query.source_type, query.source_id)
+            zone_columns = set(np.flatnonzero(zone_weights > 0).tolist())
+        else:
+            node = self._node_index[f"{query.source_type}:{query.source_id}"]
+            zone_columns = set()
+            for relation in _OD_RELATIONS:
+                edges = self._edges[relation]
+                for row in np.flatnonzero(edges["dst_idx"] == node):
+                    src = int(edges["src_idx"][row])
+                    if self._graph_nodes.node_type[src] == "mitma":
+                        zone_columns.add(
+                            self._od_zone_index[str(self._graph_nodes.source_id[src])]
+                        )
         if not zone_columns:
             return 0.0
         od_row = self._od.row_of(self._grid[query.forecast_origin])
@@ -1079,6 +1457,12 @@ class NativeSupportDataset(Dataset):
         )
         block = np.zeros((self._L, 3), dtype=np.float32)
         for row in range(start, end):
+            # A weekly total is available only after its complete interval.
+            if (
+                self._adm.dates[row] + np.timedelta64(6, "D")
+                > self._grid[int(hist_slice.stop) - 1]
+            ):
+                continue
             offset = int(
                 (self._adm.dates[row] - self._grid[hist_start]).astype(np.int64)
             )
@@ -1091,6 +1475,18 @@ class NativeSupportDataset(Dataset):
                 float(self._adm.ages[row, column]),
             )
         return block, block[:, 1] > 0
+
+    def _abs_joint_history(
+        self, source_id: str, hist_slice: slice
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Use the same admission and all-cause history for both ABS heads."""
+        admissions = deaths = np.zeros((self._L, 3), dtype=np.float32)
+        admission_mask = death_mask = np.zeros(self._L, dtype=bool)
+        if source_id in self._adm.columns:
+            admissions, admission_mask = self._abs_history(source_id, hist_slice)
+        if source_id in self._deaths.columns:
+            deaths, death_mask = self._abs_deaths_history(source_id, hist_slice)
+        return np.concatenate([admissions, deaths], axis=1), admission_mask | death_mask
 
     def _abs_target(
         self, source_id: str, origin: int
@@ -1115,18 +1511,18 @@ class NativeSupportDataset(Dataset):
             stratum[week] = self._adm.stratum[row, column]
         return values, mask, stratum
 
-    def _comarca_history(
+    def _abs_deaths_history(
         self, source_id: str, hist_slice: slice
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Daily deaths history, ``[L, 3]``.
+        """Daily ABS all-cause death counts, ``[L, 3]``.
 
         Consumption transform (ruling R10): the raw-at-rest count becomes
-        ``log1p((count / pop_graph) · 1e5)`` using the comarca graph
+        ``log1p((count / pop_graph) · 1e5)`` using the ABS graph
         population, applied only where the mask is 1 (unreported days stay
         0). Mask/age channels are raw; targets stay raw.
         """
         column = self._deaths.columns[source_id]
-        node = self._node_index[f"{SOURCE_COMARCA}:{source_id}"]
+        node = self._node_index[f"{SOURCE_ABS}:{source_id}"]
         population = float(self._graph_nodes.population[node])
         values = self._deaths_values[hist_slice, column]
         mask = self._deaths_masks[hist_slice, column]
@@ -1141,10 +1537,71 @@ class NativeSupportDataset(Dataset):
         )
         return block.astype(np.float32, copy=False), mask.copy()
 
-    def _comarca_target(
+    def _abs_deaths_target(
         self, source_id: str, target_slice: slice
     ) -> tuple[np.ndarray, np.ndarray]:
         column = self._deaths.columns[source_id]
         values = self._deaths_values[target_slice, column]
         mask = self._deaths_masks[target_slice, column]
         return np.where(mask, values, 0.0).astype(np.float32), mask.copy()
+
+    def _edar_history(
+        self, source_id: str, hist_slice: slice
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Assay-aware EDAR history compressed to four causal channels.
+
+        Assay targets remain separate. The conditioning value is the masked
+        mean of per-assay causal ``log1p`` histories, followed by raw sample
+        presence, minimum assay age, and causally carried ``log1p`` 24-hour
+        flow. No target-window flow enters model input.
+        """
+        assert self._ww is not None
+        column = self._ww.columns[source_id]
+        history = self._ww.history[hist_slice, column, :]
+        available = self._ww.history_available[hist_slice, column, :]
+        count = available.sum(axis=1)
+        value = np.divide(
+            np.where(available, history, 0.0).sum(axis=1),
+            count,
+            out=np.zeros(self._L, dtype=np.float32),
+            where=count > 0,
+        )
+        observed = np.asarray(
+            self._ww.mask[hist_slice, column, :].any(axis=1), dtype=bool
+        )
+        ages = self._ww.age[hist_slice, column, :]
+        age = np.full(self._L, 0.0, dtype=np.float32)
+        for row in range(self._L):
+            finite = ages[row][np.isfinite(ages[row])]
+            if finite.size:
+                age[row] = float(finite.min())
+        flow = np.nan_to_num(
+            self._ww.flow_history_log1p[hist_slice, column], nan=0.0
+        ).astype(np.float32)
+        block = np.stack(
+            [value, observed.astype(np.float32), age, flow], axis=-1
+        ).astype(np.float32)
+        return block, observed.copy()
+
+    def _edar_target(
+        self, source_id: str, target_slice: slice
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+        """Raw ``[H, assay]`` concentrations plus censor and flow extras."""
+        assert self._ww is not None
+        column = self._ww.columns[source_id]
+        mask = self._ww.mask[target_slice, column, :]
+        concentration = self._ww.concentration[target_slice, column, :]
+        target = np.where(mask, concentration, 0.0).astype(np.float32)
+        extra = {
+            "detection_limit": np.nan_to_num(
+                self._ww.detection_limit[target_slice, column, :], nan=0.0
+            ).astype(np.float32),
+            "censor_code": self._ww.censor_code[target_slice, column, :].astype(
+                np.uint8
+            ),
+            "flow_m3_24h": np.nan_to_num(
+                self._ww.flow[target_slice, column], nan=0.0
+            ).astype(np.float32),
+            "flow_mask": self._ww.flow_mask[target_slice, column].copy(),
+        }
+        return target, mask.copy(), extra

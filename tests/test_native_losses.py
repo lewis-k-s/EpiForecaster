@@ -96,6 +96,7 @@ def _make_batch(
     cases_rows: tuple[int, ...] = (),
     hosp_rows: tuple[int, ...] = (),
     deaths_rows: tuple[int, ...] = (),
+    ww_rows: tuple[int, ...] = (),
     daily_width: int = H,
     hosp_width: int = W_MAX,
     cases_mask: torch.Tensor | None = None,
@@ -104,11 +105,16 @@ def _make_batch(
     raw_counts: torch.Tensor | None = None,
     hosp_pop: torch.Tensor | None = None,
     origin_dow: tuple[int, ...] | None = None,
+    ww_target: torch.Tensor | None = None,
+    ww_mask: torch.Tensor | None = None,
+    ww_lod: torch.Tensor | None = None,
+    ww_censor_code: torch.Tensor | None = None,
 ) -> NativeEpiBatch:
     """Hand-built batch: only head blocks carry meaningful values; the shared
     history/context fields are deterministic filler the loss never reads."""
     b = len(queries)
     head_index: dict[str, torch.Tensor | None] = {
+        "ww": None,
         "cases": None,
         "hosp": None,
         "deaths": None,
@@ -116,6 +122,32 @@ def _make_batch(
     head_target = dict(head_index)
     head_target_mask = dict(head_index)
     head_population = dict(head_index)
+    head_extra: dict[str, dict[str, torch.Tensor | None]] = {
+        head: {} for head in head_index
+    }
+
+    if ww_rows:
+        shape = (len(ww_rows), daily_width, 3)
+        head_index["ww"] = torch.tensor(ww_rows, dtype=torch.long)
+        head_target["ww"] = (
+            ww_target.clone() if ww_target is not None else torch.full(shape, 100.0)
+        )
+        head_target_mask["ww"] = (
+            ww_mask.clone()
+            if ww_mask is not None
+            else torch.ones(shape, dtype=torch.bool)
+        )
+        head_population["ww"] = torch.full((len(ww_rows),), 50_000.0)
+        head_extra["ww"] = {
+            "detection_limit": (
+                ww_lod.clone() if ww_lod is not None else torch.full(shape, 10.0)
+            ),
+            "censor_code": (
+                ww_censor_code.clone()
+                if ww_censor_code is not None
+                else torch.zeros(shape, dtype=torch.uint8)
+            ),
+        }
 
     if cases_rows:
         head_index["cases"] = torch.tensor(cases_rows, dtype=torch.long)
@@ -144,9 +176,9 @@ def _make_batch(
         head_target["hosp"] = (
             raw_counts.clone()
             if raw_counts is not None
-            else (
-                3.0 * torch.arange(1, hosp_width + 1, dtype=torch.float32)
-            ).repeat(len(hosp_rows), 1)
+            else (3.0 * torch.arange(1, hosp_width + 1, dtype=torch.float32)).repeat(
+                len(hosp_rows), 1
+            )
         )
         head_target_mask["hosp"] = (
             hosp_mask.clone()
@@ -179,7 +211,7 @@ def _make_batch(
         head_target_mask=head_target_mask,
         head_population=head_population,
         ctx_coverage=torch.ones(b),
-        head_extra={"cases": {}, "hosp": {}, "deaths": {}},
+        head_extra=head_extra,
     )
 
 
@@ -235,12 +267,12 @@ def _weekly_outputs(
     slots: int = W_MAX,
     loc_offset: float = 20.0,
 ) -> dict[str, torch.Tensor]:
-    loc = loc_offset + 0.5 * torch.arange(
-        rows * slots, dtype=torch.float32
-    ).reshape(rows, slots)
-    scale = 1.0 + 0.25 * torch.arange(
-        rows * slots, dtype=torch.float32
-    ).reshape(rows, slots)
+    loc = loc_offset + 0.5 * torch.arange(rows * slots, dtype=torch.float32).reshape(
+        rows, slots
+    )
+    scale = 1.0 + 0.25 * torch.arange(rows * slots, dtype=torch.float32).reshape(
+        rows, slots
+    )
     return {
         "pred_hosp_weekly": loc,
         "dist_hosp_weekly_loc": loc,
@@ -307,6 +339,83 @@ def test_per_head_losses_match_manual_formulas(observation_loss: str) -> None:
     torch.testing.assert_close(components["deaths"], expected_deaths)
     assert components["cases_n_eff"].item() == 5.0
     assert components["deaths_n_eff"].item() == 5.0
+
+
+def test_wastewater_loss_combines_uncensored_nll_and_left_censoring() -> None:
+    raw = torch.tensor([[[9.0, 0.0, 19.0], [4.0, 14.0, 29.0]]])
+    lod = torch.tensor([[[1.0, 5.0, 1.0], [1.0, 1.0, 1.0]]])
+    code = torch.tensor([[[0, 1, 0], [0, 0, 0]]], dtype=torch.uint8)
+    batch = _make_batch(
+        queries=[_query("edar", "E1", 10, {"ww"})],
+        ww_rows=(0,),
+        daily_width=2,
+        ww_target=raw,
+        ww_lod=lod,
+        ww_censor_code=code,
+    )
+    loc = torch.log1p(raw).detach().clone()
+    loc[0, 0, 1] = math.log1p(8.0)
+    loc.requires_grad_(True)
+    scale = torch.full_like(loc, 0.5, requires_grad=True)
+    criterion = NativeJointInferenceLoss(horizon_days=2, observation_loss="nll")
+    components = criterion(
+        {
+            "pred_ww": loc,
+            "dist_ww_loc": loc,
+            "dist_ww_scale": scale,
+        },
+        batch,
+    )
+
+    uncensored = code == 0
+    uncensored_nll = _normal_nll(loc, scale, torch.log1p(raw))[uncensored].sum()
+    z = (torch.log1p(lod[code == 1]) - loc[code == 1]) / scale[code == 1]
+    censored_nll = -torch.special.log_ndtr(z).sum()
+    expected = (uncensored_nll + censored_nll) / 6.0
+    torch.testing.assert_close(components["ww"], expected)
+    assert components["ww_n_eff"].item() == 6.0
+    assert components["obs_active_mask"].tolist() == [True, False, False, False]
+
+    components["total"].backward()
+    assert loc.grad is not None and torch.isfinite(loc.grad).all()
+    assert scale.grad is not None and torch.isfinite(scale.grad).all()
+
+
+def test_wastewater_student_t_crps_keeps_censor_likelihood_separate() -> None:
+    from scipy import stats
+
+    raw = torch.tensor([[[9.0, 0.0, 19.0], [4.0, 14.0, 29.0]]])
+    lod = torch.tensor([[[1.0, 5.0, 1.0], [1.0, 1.0, 1.0]]])
+    code = torch.tensor([[[0, 1, 0], [0, 0, 0]]], dtype=torch.uint8)
+    batch = _make_batch(
+        queries=[_query("edar", "E1", 10, {"ww"})],
+        ww_rows=(0,),
+        daily_width=2,
+        ww_target=raw,
+        ww_lod=lod,
+        ww_censor_code=code,
+    )
+    loc = torch.log1p(raw).detach().clone()
+    loc[0, 0, 1] = math.log1p(8.0)
+    loc.requires_grad_(True)
+    scale = torch.full_like(loc, 0.5, requires_grad=True)
+    criterion = NativeJointInferenceLoss(
+        horizon_days=2,
+        observation_loss="crps",
+        distribution_family="student_t",
+        distribution_df=5.0,
+    )
+    components = criterion(
+        {"pred_ww": loc, "dist_ww_loc": loc, "dist_ww_scale": scale}, batch
+    )
+    z = ((torch.log1p(lod[code == 1]) - loc[code == 1]) / scale[code == 1]).item()
+    censored_nll = -math.log(stats.t.cdf(z, 5))
+    uncensored = components["ww_uncensored_objective"]
+    torch.testing.assert_close(components["ww"], (uncensored * 5 + censored_nll) / 6)
+    assert components["ww_uncensored_count"].item() == 5
+    components["total"].backward()
+    assert torch.isfinite(loc.grad).all()
+    assert torch.isfinite(scale.grad).all()
 
 
 # ----------------------------------------------------------------------
@@ -610,9 +719,7 @@ def test_inactive_head_zero_weighted_and_weights_renormalize() -> None:
         "total",
     ):
         assert key in components
-    torch.testing.assert_close(
-        components["total"], components["obs_total"]
-    )
+    torch.testing.assert_close(components["total"], components["obs_total"])
 
     # Empty hosp routing: component anchored to zero and 0-weighted; the
     # equal split renormalizes over the two remaining active heads.
@@ -660,7 +767,12 @@ def test_audit_head_counts_flags_duplicate_routing() -> None:
     assert audit.duplicates == 0
     assert audit.supervised_points == {"cases": H, "hosp": W_MAX, "deaths": H, "ww": 0}
     assert audit.routed_rows == {"cases": 1, "hosp": 1, "deaths": 1, "ww": 0}
-    assert audit.duplicate_row_positions == {"cases": (), "hosp": (), "deaths": (), "ww": ()}
+    assert audit.duplicate_row_positions == {
+        "cases": (),
+        "hosp": (),
+        "deaths": (),
+        "ww": (),
+    }
     assert audit.as_log_dict()["duplicates"] == 0
 
     # A duplicated query collated twice routes row 0 into the cases block
@@ -697,18 +809,14 @@ def test_duplicate_routing_does_not_change_loss_or_counts() -> None:
     duplicated_batch.head_target_mask["cases"] = torch.ones(2, H, dtype=torch.bool)
     duplicated_batch.head_population["cases"] = torch.full((2,), 250.0)
     duplicated_batch.head_index["hosp"] = torch.tensor([1, 1], dtype=torch.long)
-    duplicated_batch.head_target["hosp"] = clean_batch.head_target["hosp"].repeat(
-        2, 1
-    )
+    duplicated_batch.head_target["hosp"] = clean_batch.head_target["hosp"].repeat(2, 1)
     duplicated_batch.head_target_mask["hosp"] = torch.ones(2, W_MAX, dtype=torch.bool)
     duplicated_batch.head_population["hosp"] = torch.full((2,), 70_000.0)
     duplicated_weekly = {
         key: value.repeat(2, 1) if value.ndim == 2 else value
         for key, value in weekly.items()
     }
-    duplicated = loss(
-        {**_daily_outputs(3), **duplicated_weekly}, duplicated_batch
-    )
+    duplicated = loss({**_daily_outputs(3), **duplicated_weekly}, duplicated_batch)
 
     audit = audit_head_counts(duplicated_batch)
     assert audit.duplicates == 2  # malformed batch still flagged

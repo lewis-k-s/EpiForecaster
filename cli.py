@@ -8,7 +8,6 @@ This module provides a streamlined command-line interface with only two main com
 This replaces the complex variant-specific CLI with configuration-driven training.
 """
 
-import json
 import logging
 import math
 import traceback
@@ -24,10 +23,7 @@ from data.preprocess.region_graph_preprocessor import (
     RegionGraphPreprocessConfig,
     RegionGraphPreprocessor,
 )
-from training.epiforecaster_trainer import (
-    EpiForecasterConfig,
-    EpiForecasterTrainer,
-)
+from models.configs import EpiForecasterConfig
 from training.region2vec_trainer import Region2VecTrainer, RegionTrainerConfig
 from utils.logging import setup_logging
 from utils.platform import is_slurm_cluster
@@ -276,528 +272,63 @@ cli.add_command(plot_cli, name="plot")
 
 @eval_cli.command("epiforecaster")
 @click.option(
-    "--experiment",
-    type=str,
-    default=None,
-    help="Experiment name (e.g., 'local_full'). Used to auto-resolve paths.",
-)
-@click.option(
-    "--run",
-    type=str,
-    default=None,
-    help="Run ID (e.g., 'run_1767364191170741000'). Used with --experiment.",
-)
-@click.option(
-    "--checkpoint",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Path to checkpoint. Optional if --experiment and --run are provided.",
+    "--checkpoint", type=click.Path(exists=True, path_type=Path), required=True
 )
 @click.option(
     "--split",
-    type=click.Choice(["val", "test", "full"], case_sensitive=False),
+    type=click.Choice(["val", "test"], case_sensitive=False),
     default="val",
     show_default=True,
-    help="Which split to evaluate.",
 )
 @click.option(
     "--output",
-    type=click.Path(path_type=Path),
+    type=click.Path(file_okay=False, path_type=Path),
     default=None,
-    help="Optional output image path.",
+    help="Directory for canonical evaluation artifacts.",
 )
+@click.option("--summary-json", type=click.Path(path_type=Path), default=None)
 @click.option(
-    "--node-metrics-csv",
-    "node_metrics_csv",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Optional CSV output path for node-summary metrics (node_id, mae, num_samples).",
+    "--granular/--no-granular",
+    default=False,
+    help="Write Parquet rows and example-support artifacts.",
 )
-@click.option(
-    "--granular-csv",
-    type=click.Path(path_type=Path),
-    default=None,
-    help=(
-        "Optional path for granular per-example error rows; "
-        "format is inferred from suffix."
-    ),
-)
-@click.option(
-    "--granular",
-    is_flag=True,
-    help="Enable granular per-example error export.",
-)
-@click.option(
-    "--summary-json",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Optional machine-readable evaluation summary output.",
-)
-@click.option(
-    "--output-csv",
-    "node_metrics_csv",
-    type=click.Path(path_type=Path),
-    default=None,
-    hidden=True,
-)
-@click.option(
-    "--log-dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Optional W&B run directory for eval metrics.",
-)
+@click.option("--eval-batch-size", type=click.IntRange(min=1), default=None)
 @click.option(
     "--override",
+    "overrides",
     multiple=True,
-    help="Override config values (e.g., training.device=cpu, training.val_workers=4)",
-)
-@click.option(
-    "--eval-batch-size",
-    type=int,
-    default=None,
-    help="Override evaluation batch size (useful for memory-heavy mobility graphs).",
-)
-@click.option(
-    "--compare-baselines",
-    type=click.Path(path_type=Path),
-    default=None,
-    help=(
-        "Optional baseline metrics CSV (fold or aggregate) to compare against current "
-        "checkpoint metrics."
-    ),
-)
-@click.option(
-    "--selection-mode",
-    type=click.Choice(
-        ["node_quartile", "granular_window_quartile", "granular_window_worst"],
-        case_sensitive=False,
-    ),
-    default="node_quartile",
-    show_default=True,
-    help="How to select plotted examples after evaluation.",
-)
-@click.option(
-    "--include-sird-latents",
-    is_flag=True,
-    help="Also save a joint SIRHD latent trajectory figure for selected forecasts.",
-)
-@click.option(
-    "--include-relevant-latent",
-    is_flag=True,
-    help=(
-        "Overlay each target's relevant mechanistic source from canonical granular "
-        "evaluation rows."
-    ),
-)
-@click.option(
-    "--node-metric-target",
-    type=click.Choice(
-        ["hospitalizations", "wastewater", "cases", "deaths"],
-        case_sensitive=False,
-    ),
-    default="hospitalizations",
-    show_default=True,
-    help="Explicit target to use for node-based MAE selection and node CSV export.",
-)
-@click.option(
-    "--compare-evals",
-    is_flag=True,
-    help=(
-        "Run matching baseline evaluations for this config/split and compare the "
-        "fresh baseline artifacts against the current checkpoint metrics."
-    ),
+    help="Typed configuration override, such as training.max_batches=8.",
 )
 def eval_epiforecaster(
-    experiment: str | None,
-    run: str | None,
-    checkpoint: Path | None,
+    checkpoint: Path,
     split: str,
     output: Path | None,
-    node_metrics_csv: Path | None,
-    granular_csv: Path | None,
-    granular: bool,
     summary_json: Path | None,
-    log_dir: Path | None,
-    override: tuple[str, ...],
+    granular: bool,
     eval_batch_size: int | None,
-    compare_baselines: Path | None,
-    selection_mode: str,
-    include_sird_latents: bool,
-    include_relevant_latent: bool,
-    node_metric_target: str,
-    compare_evals: bool,
-):
-    """Evaluate an EpiForecaster checkpoint and generate quartile-based forecast plots.
+    overrides: tuple[str, ...],
+) -> None:
+    """Evaluate a native checkpoint without starting or resuming training."""
+    from evaluation.native_checkpoint import evaluate_native_checkpoint
 
-    Use --override to customize evaluation settings like workers, device, or sampling:
-
-    \b
-    --override training.val_workers=4      # Use 4 workers for eval dataloader
-    --override training.device=cpu          # Use CPU instead of GPU
-    --override training.num_forecast_samples=6  # Sample 6 nodes per quartile
-    """
+    output_dir = output or (
+        summary_json.parent if summary_json is not None else Path("outputs/evaluation")
+    )
+    effective_overrides = list(overrides)
+    if eval_batch_size is not None:
+        effective_overrides.append(f"training.batch_size={eval_batch_size}")
     try:
-        per_head_node_metrics_csv: Path | None = None
-        effective_overrides = list(override)
-        write_granular_eval = bool(
-            granular or granular_csv is not None or include_relevant_latent
-        )
-
-        if not any(item.startswith("output.write_granular_eval=") for item in override):
-            effective_overrides.append(
-                f"output.write_granular_eval={'true' if write_granular_eval else 'false'}"
-            )
-
-        def _derive_per_head_node_metrics_path(path: Path) -> Path:
-            return path.with_name(f"{path.stem}_per_head{path.suffix}")
-
-        output_dir_override: Path | None = None
-        if output is not None and (
-            (output.exists() and output.is_dir())
-            or (not output.exists() and not output.suffix)
-        ):
-            output_dir_override = output
-            output_dir_override.mkdir(parents=True, exist_ok=True)
-            output = output / f"{split}_forecasts.png"
-
-        def _apply_output_dir_defaults(base_dir: Path) -> None:
-            nonlocal output, node_metrics_csv, per_head_node_metrics_csv, granular_csv
-            if output is None:
-                output = base_dir / f"{split}_forecasts.png"
-            if node_metrics_csv is None:
-                node_metrics_csv = base_dir / f"{split}_node_metrics.csv"
-            per_head_node_metrics_csv = _derive_per_head_node_metrics_path(
-                node_metrics_csv
-            )
-            if granular_csv is None and write_granular_eval:
-                granular_csv = base_dir / f"{split}_granular.parquet"
-
-        # Resolve paths from experiment/run if provided
-        if experiment and run:
-            from utils.run_discovery import (
-                resolve_checkpoint_path,
-                get_eval_output_dir,
-                list_available_runs,
-            )
-
-            if checkpoint is None:
-                try:
-                    checkpoint = resolve_checkpoint_path(
-                        experiment_name=experiment,
-                        run_id=run,
-                    )
-                except FileNotFoundError as e:
-                    click.echo(f"❌ Checkpoint not found: {e}", err=True)
-                    click.echo(
-                        f"\n{list_available_runs(experiment_name=experiment)}", err=True
-                    )
-                    raise click.ClickException("Cannot resolve checkpoint path")
-
-            # Auto-resolve output paths to eval directory
-            eval_dir = get_eval_output_dir(experiment_name=experiment, run_id=run)
-            _apply_output_dir_defaults(output_dir_override or eval_dir)
-
-            click.echo("Resolved output paths:")
-            click.echo(f"  Checkpoint: {checkpoint}")
-            click.echo(f"  Plot: {output}")
-            click.echo(f"  Node metrics CSV: {node_metrics_csv}")
-            click.echo(f"  Per-head node metrics CSV: {per_head_node_metrics_csv}")
-            click.echo(f"  Granular output: {granular_csv}")
-        elif checkpoint is not None and experiment is None and run is None:
-            # User provided --checkpoint but not --experiment/--run
-            from utils.run_discovery import (
-                extract_run_from_checkpoint_path,
-                prompt_to_save_eval,
-                get_eval_output_dir,
-            )
-
-            extracted = extract_run_from_checkpoint_path(checkpoint)
-
-            if extracted is not None:
-                extracted_experiment, extracted_run = extracted
-                click.echo(
-                    f"Detected: experiment={extracted_experiment}, run={extracted_run}"
-                )
-                should_save = prompt_to_save_eval(
-                    extracted_experiment, extracted_run, default=True
-                )
-
-                if should_save:
-                    eval_dir = get_eval_output_dir(
-                        experiment_name=extracted_experiment, run_id=extracted_run
-                    )
-                    _apply_output_dir_defaults(output_dir_override or eval_dir)
-                else:
-                    click.echo(
-                        "Skipping persistence. Use --output to specify save location."
-                    )
-            else:
-                # Could not extract - default to current directory
-                click.echo("Could not auto-detect experiment/run from checkpoint path.")
-                _apply_output_dir_defaults(output_dir_override or Path.cwd())
-        elif checkpoint is None:
-            raise click.ClickException(
-                "Must provide either --checkpoint or both --experiment and --run"
-            )
-
-        if per_head_node_metrics_csv is None and node_metrics_csv is not None:
-            per_head_node_metrics_csv = _derive_per_head_node_metrics_path(
-                node_metrics_csv
-            )
-
-        # Suppress zarr logging spam
-        logging.getLogger("zarr").setLevel(logging.WARNING)
-        logging.getLogger("numcodecs").setLevel(logging.WARNING)
-
-        from evaluation.epiforecaster_eval import (
-            eval_checkpoint,
-            select_nodes_by_loss,
-            generate_forecast_plots,
-        )
-
-        # Step 1: Evaluate (with config overrides if provided)
-        eval_result = eval_checkpoint(
+        summary = evaluate_native_checkpoint(
             checkpoint_path=checkpoint,
-            split=split,
-            log_dir=log_dir,
+            split=split.lower(),
+            output_dir=output_dir,
             overrides=effective_overrides,
-            node_metrics_csv_path=node_metrics_csv,
-            per_head_node_metrics_csv_path=per_head_node_metrics_csv,
-            granular_output_path=granular_csv,
-            granular_eval_format=None,
-            batch_size=eval_batch_size,
-            node_metrics_target=node_metric_target,
+            granular=granular,
+            summary_path=summary_json or output_dir / f"{split.lower()}_summary.json",
         )
-
-        # Get samples_per_group from config (default 3)
-        samples_per_group = eval_result["config"].training.num_forecast_samples
-
-        node_groups: dict[str, list[int]] | None = None
-        window_groups = None
-        selection_mode_key = selection_mode.lower()
-        if selection_mode_key in ("granular_window_quartile", "granular_window_worst"):
-            from evaluation.selection import (
-                load_window_selection_specs_from_granular,
-                select_windows_by_loss,
-                select_worst_windows_by_loss,
-            )
-
-            if granular_csv is None or not granular_csv.exists():
-                raise click.ClickException(
-                    f"{selection_mode_key} selection requires granular eval rows; "
-                    "no granular output was produced for this eval."
-                )
-            window_specs = load_window_selection_specs_from_granular(
-                granular_csv=granular_csv,
-                split=split,
-            )
-            if not window_specs:
-                raise click.ClickException(
-                    f"No granular window candidates found in {granular_csv}"
-                )
-            if selection_mode_key == "granular_window_worst":
-                window_groups = select_worst_windows_by_loss(
-                    window_specs=window_specs,
-                    k=samples_per_group,
-                )
-            else:
-                window_groups = select_windows_by_loss(
-                    window_specs=window_specs,
-                    samples_per_group=samples_per_group,
-                )
-        else:
-            node_groups = select_nodes_by_loss(
-                node_mae=eval_result["node_mae"].get(node_metric_target, {}),
-                target_name=node_metric_target,
-                strategy="quartile",
-                samples_per_group=samples_per_group,
-            )
-
-        # Step 3: Generate plots (use "last" window by default)
-        try:
-            plot_result = generate_forecast_plots(
-                model=eval_result["model"],
-                loader=eval_result["loader"],
-                node_groups=node_groups,
-                window_groups=window_groups,
-                window="last",
-                output_path=output,
-                log_dir=log_dir,
-                include_sird_latents=include_sird_latents,
-                include_relevant_latent=include_relevant_latent,
-                granular_eval_path=granular_csv,
-            )
-
-            # Step 4: Show results
-            total_nodes = len(plot_result["selected_nodes"])
-            if selection_mode_key in (
-                "granular_window_quartile",
-                "granular_window_worst",
-            ):
-                selection_label = (
-                    "worst granular windows"
-                    if selection_mode_key == "granular_window_worst"
-                    else "quartiles"
-                )
-                click.echo(
-                    f"Selected {total_nodes} node-window examples from {selection_label}:"
-                )
-                for group_name, specs in plot_result["window_groups"].items():
-                    click.echo(f"  {group_name}: {len(specs)} windows")
-            else:
-                click.echo(f"Selected {total_nodes} nodes from quartiles:")
-                for group_name, nodes in plot_result["node_groups"].items():
-                    click.echo(f"  {group_name}: {len(nodes)} nodes")
-
-            saved_forecast_paths: list[Path] = []
-            if output is not None:
-                if output.exists():
-                    saved_forecast_paths.append(output)
-                saved_forecast_paths.extend(
-                    sorted(output.parent.glob(f"{output.stem}_*{output.suffix}"))
-                )
-                if not saved_forecast_paths:
-                    click.echo(
-                        "Warning: Forecast plotting completed but no forecast image files "
-                        f"were written under {output.parent}"
-                    )
-        except Exception as e:
-            click.echo(f"Warning: Plotting failed: {e}")
-
-        per_head_plot_artifacts: dict[str, Path] = {}
-        if per_head_node_metrics_csv is not None:
-            try:
-                from dataviz.eval_head_plots import render_eval_per_head_plots
-
-                per_head_plot_artifacts = render_eval_per_head_plots(
-                    per_head_node_metrics_csv=per_head_node_metrics_csv,
-                    output_dir=per_head_node_metrics_csv.parent,
-                    samples_per_quartile=4,
-                    model=eval_result["model"],
-                    config=eval_result["config"],
-                    loader=eval_result["loader"],
-                )
-            except Exception as e:
-                click.echo(f"Warning: Per-head eval plotting failed: {e}")
-
-        # Show eval metrics
-        loss = eval_result["eval_loss"]
-        metrics = eval_result["eval_metrics"]
-        summary = _format_eval_summary(loss, metrics)
-        click.echo(f"\nEval summary ({split}):\n{summary}")
-        if summary_json is not None:
-            summary_json.parent.mkdir(parents=True, exist_ok=True)
-            summary_json.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "checkpoint": str(checkpoint.resolve()),
-                        "split": split,
-                        "eval_loss": _json_metric_value(float(loss)),
-                        "metrics": {
-                            str(name): _json_metric_value(value)
-                            for name, value in sorted(metrics.items())
-                        },
-                    },
-                    indent=2,
-                    sort_keys=True,
-                    allow_nan=False,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-        baseline_results_csv = compare_baselines
-        if compare_evals:
-            if split.lower() == "full":
-                raise click.ClickException(
-                    "--compare-evals is not supported with --split full"
-                )
-            from evaluation.baseline_eval import (
-                compare_model_metrics_against_baselines,
-                run_same_slice_baseline_evaluation,
-            )
-
-            if compare_baselines is not None:
-                click.echo(
-                    "--compare-evals supplied; ignoring explicit --compare-baselines "
-                    f"path: {compare_baselines}"
-                )
-
-            if node_metrics_csv is not None:
-                baseline_output_dir = (
-                    node_metrics_csv.parent / f"{split}_baseline_eval_same_window"
-                )
-            elif output is not None:
-                baseline_output_dir = (
-                    output.parent / f"{split}_baseline_eval_same_window"
-                )
-            else:
-                baseline_output_dir = Path.cwd() / f"{split}_baseline_eval_same_window"
-
-            artifacts = run_same_slice_baseline_evaluation(
-                config=eval_result["config"],
-                output_dir=baseline_output_dir,
-                models=[
-                    "exp_smoothing",
-                    "last_observed",
-                    "sarima",
-                    "sarimax",
-                    "varmax",
-                ],
-                config_path=str(checkpoint.parent.parent / "config.yaml"),
-                split=split,
-            )
-            baseline_results_csv = artifacts["baseline_aggregate_metrics"]
-            click.echo(f"Saved fresh baseline artifacts to: {baseline_output_dir}")
-
-        if baseline_results_csv is not None:
-            from evaluation.baseline_eval import compare_model_metrics_against_baselines
-            from dataviz.eval_head_plots import render_baseline_delta_plots
-
-            if node_metrics_csv is not None:
-                delta_csv = node_metrics_csv.with_name(f"{split}_baseline_deltas.csv")
-            elif output is not None:
-                delta_csv = output.with_name(f"{split}_baseline_deltas.csv")
-            else:
-                delta_csv = Path(f"{split}_baseline_deltas.csv")
-
-            compare_model_metrics_against_baselines(
-                eval_metrics=metrics,
-                baseline_results_csv=baseline_results_csv,
-                output_csv=delta_csv,
-            )
-            click.echo(f"Saved baseline deltas to: {delta_csv}")
-            try:
-                baseline_plot_artifacts = render_baseline_delta_plots(
-                    baseline_deltas_csv=delta_csv,
-                    output_dir=delta_csv.parent,
-                )
-                for plot_name, plot_path in sorted(baseline_plot_artifacts.items()):
-                    click.echo(f"Saved {plot_name} to: {plot_path}")
-            except Exception as e:
-                click.echo(f"Warning: Baseline delta plotting failed: {e}")
-
-        if log_dir is not None:
-            click.echo(f"Eval metrics logged to: {log_dir}")
-        if output is not None and output.exists():
-            click.echo(f"Saved plot to: {output}")
-        if node_metrics_csv is not None:
-            click.echo(f"Saved node metrics to: {node_metrics_csv}")
-        if per_head_node_metrics_csv is not None:
-            click.echo(f"Saved per-head node metrics to: {per_head_node_metrics_csv}")
-        for plot_name, plot_path in sorted(per_head_plot_artifacts.items()):
-            click.echo(f"Saved {plot_name} to: {plot_path}")
-        if granular_csv is not None:
-            click.echo(f"Saved granular metrics to: {granular_csv}")
-        if summary_json is not None:
-            click.echo(f"Saved evaluation summary to: {summary_json}")
-        if wandb.run is not None:
-            wandb.finish()
     except Exception as exc:
-        click.echo(f"❌ Evaluation failed: {exc}", err=True)
-        click.echo(traceback.format_exc(), err=True)
         raise click.ClickException(str(exc)) from exc
+    click.echo(f"Native {split} joint WIS: {summary['joint_wis']:.6f}")
 
 
 @eval_cli.command("baselines")
@@ -1471,7 +1002,7 @@ def _run_forecaster_training(
     max_batches: int | None,
     overrides: tuple[str, ...] = (),
 ) -> None:
-    """Execute the original unified forecaster training workflow."""
+    """Execute the native heterogeneous forecaster."""
     try:
         override_list = list(overrides)
 
@@ -1488,48 +1019,7 @@ def _run_forecaster_training(
                 "Production training configs (env=mn5) must run on SLURM."
             )
 
-        if trainer_config.native.enabled:
-            _run_native_forecaster_training(trainer_config, config)
-            return
-
-        logger = logging.getLogger(__name__)
-        logger.info(f"Loading training configuration from: {config}")
-        logger.debug(f"Training model: {trainer_config.model.type}")
-        logger.debug(f"Using dataset: {trainer_config.data.dataset_path}")
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Configuration:")
-            logger.debug(f"  - Epochs: {trainer_config.training.epochs}")
-            logger.debug(f"  - Batch size: {trainer_config.training.batch_size}")
-            logger.debug(f"  - Learning rate: {trainer_config.training.learning_rate}")
-            if trainer_config.training.resume_checkpoint_path:
-                logger.debug(
-                    f"  - Resume from: {trainer_config.training.resume_checkpoint_path}"
-                )
-
-        trainer = EpiForecasterTrainer(trainer_config)
-        results = trainer.run()
-
-        logger.info(f"\n{'=' * 60}")
-        logger.info("✅ TRAINING COMPLETED SUCCESSFULLY")
-        logger.info(f"{'=' * 60}")
-        logger.info(f"Best validation loss: {results['best_val_loss']:.6f}")
-        logger.info(f"Total epochs trained: {results['total_epochs']}")
-        logger.info(f"Model parameters: {results['model_info']['parameters']:,}")
-        logger.info(
-            f"Trainable parameters: {results['model_info']['trainable_parameters']:,}"
-        )
-        metric_artifacts = results.get("metric_artifacts", {})
-        if metric_artifacts:
-            logger.info("Main-model aggregate metrics:")
-            for name in sorted(metric_artifacts.keys()):
-                logger.info(f"  {name}: {metric_artifacts[name]}")
-        log_dir = (
-            Path(trainer.config.output.log_dir)
-            / trainer.config.output.experiment_name
-            / trainer.model_id
-        )
-        logger.info(f"Training logs saved to: {log_dir}")
-        logger.info(f"{'=' * 60}")
+        _run_native_forecaster_training(trainer_config, config)
 
     except Exception as exc:  # pragma: no cover - CLI handles presentation
         click.echo(f"❌ Training failed: {exc}", err=True)
@@ -1541,12 +1031,10 @@ def _run_native_forecaster_training(
     trainer_config: EpiForecasterConfig,
     config_path: str,
 ) -> None:
-    """Execute source-native clinical training.
+    """Execute source-native clinical and EDAR training.
 
-    This is the default real-data clinical interface. Explicit legacy
-    municipal/wastewater configs set ``native.enabled: false``.
+    This worktree uses the heterogeneous model only.
     """
-    # Imported lazily so the municipal path never loads native modules.
     from training.native_trainer import NativeTrainer
 
     logger = logging.getLogger(__name__)
@@ -1571,7 +1059,7 @@ def _run_native_forecaster_training(
         )
     joint = results.get("best_val_joint_loss")
     if joint is not None:
-        logger.info(f"Best validation joint loss: {joint:.6f}")
+        logger.info(f"Validation joint loss at selected checkpoint: {joint:.6f}")
     else:
         logger.info("Validation loss: n/a")
     logger.info(f"Model root: {results['model_root']}")

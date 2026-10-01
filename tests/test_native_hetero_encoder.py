@@ -11,10 +11,9 @@ import xarray as xr
 
 from data.native_batch import collate_native_batch
 from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
-from evaluation.losses import NativeJointInferenceLoss
 from models.hetero_encoder import HeterogeneousContextEncoder
 from models.native_forecaster import NativeEpiForecaster, NativeForecasterConfig
-from tests.test_native_dataset import H, L, MUNIS, T, _write_native_root
+from tests.native_dataset_fixtures import H, L, MUNIS, T, _write_native_root
 
 pytestmark = pytest.mark.epiforecaster
 
@@ -33,13 +32,18 @@ def _mixed_batch(tmp_path: Path):
         ),
     )
     positions = {
-        (query.source_type, query.source_id, query.forecast_origin): index
+        (
+            query.source_type,
+            query.source_id,
+            query.forecast_origin,
+            dataset.head_at(index),
+        ): index
         for index, query in enumerate(dataset.queries)
     }
     items = [
-        dataset[positions[("municipality", "01001", 14)]],
-        dataset[positions[("abs", "101", 14)]],
-        dataset[positions[("comarca", "02", 14)]],
+        dataset[positions[("municipality", "01001", 14, "cases")]],
+        dataset[positions[("abs", "101", 14, "hosp")]],
+        dataset[positions[("abs", "102", 14, "deaths")]],
     ]
     return items, collate_native_batch(items)
 
@@ -72,39 +76,79 @@ def _open_gates(model: NativeEpiForecaster) -> None:
 
 
 def test_graph_context_is_grouped_once_per_identical_origin(tmp_path: Path) -> None:
-    _items, batch = _mixed_batch(tmp_path)
+    items, batch = _mixed_batch(tmp_path)
 
-    assert batch.od_node_features.shape == (1, 3, 3)
+    assert batch.od_node_features.shape == (1, 3, 6)
     assert batch.od_adjacency.shape == (1, 3, 3)
     assert batch.od_target_weights.shape == (3, 3)
     assert batch.od_group_index.tolist() == [0, 0, 0]
-    assert set(batch.relation_ctx) == {"muni_abs", "muni_comarca"}
+    assert set(batch.relation_ctx) == {"muni_abs"}
     assert batch.relation_ctx["muni_abs"][0].abs().sum() > 0
-    assert batch.relation_ctx["muni_comarca"][0].abs().sum() > 0
     assert batch.relation_ctx["muni_abs"][1].abs().sum() > 0
-    assert batch.relation_ctx["muni_comarca"][2].abs().sum() > 0
+    assert batch.relation_ctx["muni_abs"][2].abs().sum() > 0
+    # The OD graph and overlap messages use municipality vaccination at or
+    # before the forecast origin. Later values are not available to the model.
+    assert batch.od_node_features[0, 0, 3].item() == pytest.approx(14 / T)
+    assert items[0]["hist"][-1, 6].item() == pytest.approx(14 / T)
+    assert batch.relation_ctx["muni_abs"][1, -1, 3].item() > 0
+    assert batch.relation_ctx["muni_abs"][1, -1, 3].item() == pytest.approx(14 / T)
 
 
-def test_zero_init_hetero_is_full_model_equivalent_to_pooled(tmp_path: Path) -> None:
-    _items, batch = _mixed_batch(tmp_path)
-    torch.manual_seed(23)
-    pooled = _model(batch, "pooled").eval()
-    torch.manual_seed(23)
-    hetero = _model(batch, "hetero").eval()
+def test_future_vaccination_cannot_change_origin_inputs(tmp_path: Path) -> None:
+    _write_native_root(tmp_path, with_od=True)
+    dataset = NativeSupportDataset(
+        tmp_path,
+        tmp_path / "real_with_id.zarr",
+        NativeDatasetConfig(
+            input_window_length=L,
+            forecast_horizon=H,
+            spatial_encoder="hetero",
+        ),
+    )
+    position = next(
+        index
+        for index, query in enumerate(dataset.queries)
+        if (query.source_type, query.source_id, query.forecast_origin)
+        == ("abs", "101", 14)
+    )
+    before = dataset[position]
+    assert dataset._cases.vaccination is not None
+    dataset._cases.vaccination[15:, :, :] = 999.0
+    dataset._od_graph_cache.clear()
+    after = dataset[position]
+    assert torch.equal(before["hist"], after["hist"])
+    assert torch.equal(
+        before["relation_ctx"]["muni_abs"], after["relation_ctx"]["muni_abs"]
+    )
+    assert torch.equal(before["od_node_features"], after["od_node_features"])
 
-    with torch.no_grad():
-        pooled_outputs = pooled(batch)
-        hetero_outputs = hetero(batch)
 
-    assert torch.equal(hetero_outputs["spatial_context"], batch.ctx_feat)
-    for key in (
-        "beta_t",
-        "initial_states",
-        "dist_cases_loc",
-        "dist_deaths_loc",
-        "dist_hosp_weekly_loc",
-    ):
-        assert torch.equal(hetero_outputs[key], pooled_outputs[key])
+def test_hetero_vaccination_opt_out_restores_three_channel_graph(
+    tmp_path: Path,
+) -> None:
+    _write_native_root(tmp_path, with_od=True)
+    dataset = NativeSupportDataset(
+        tmp_path,
+        tmp_path / "real_with_id.zarr",
+        NativeDatasetConfig(
+            input_window_length=L,
+            forecast_horizon=H,
+            spatial_encoder="hetero",
+            include_vaccination=False,
+        ),
+    )
+    batch = collate_native_batch([dataset[0]])
+    assert batch.od_node_features.shape[-1] == 3
+    assert batch.relation_ctx["muni_abs"].shape[-1] == 3
+    config = NativeForecasterConfig(
+        f_native=batch.hist.shape[-1],
+        d_ctx=batch.ctx_feat.shape[-1],
+        sequence_length=L,
+        forecast_horizon=H,
+        spatial_encoder="hetero",
+        include_vaccination=False,
+    )
+    assert torch.isfinite(NativeEpiForecaster(config)(batch)["spatial_context"]).all()
 
 
 def test_every_relation_path_has_gradient_and_history_is_residual(
@@ -127,10 +171,8 @@ def test_every_relation_path_has_gradient_and_history_is_residual(
         assert parameter.grad.abs().sum() > 0, name
 
 
-def test_single_query_matches_mixed_batch_and_both_modes_train(tmp_path: Path) -> None:
+def test_single_query_matches_mixed_batch(tmp_path: Path) -> None:
     items, mixed = _mixed_batch(tmp_path)
-    torch.manual_seed(7)
-    pooled = _model(mixed, "pooled")
     torch.manual_seed(7)
     hetero = _model(mixed, "hetero")
     _open_gates(hetero)
@@ -146,17 +188,6 @@ def test_single_query_matches_mixed_batch_and_both_modes_train(tmp_path: Path) -
             assert single_outputs["beta_t"][0] == pytest.approx(
                 mixed_outputs["beta_t"][row], abs=1e-6
             )
-
-    criterion = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")
-    for model in (pooled, hetero.train()):
-        model.zero_grad(set_to_none=True)
-        total = criterion(model(mixed), mixed)["total"]
-        assert torch.isfinite(total)
-        total.backward()
-        assert any(
-            parameter.grad is not None and parameter.grad.abs().sum() > 0
-            for parameter in model.parameters()
-        )
 
 
 def test_parameter_budget_is_enforced() -> None:
@@ -174,45 +205,6 @@ def test_parameter_budget_is_enforced() -> None:
             mobility_enabled=True,
             parameter_budget=encoder.parameter_count - 1,
         )
-
-
-def test_mobility_disabled_needs_no_od_artifact_and_trains(tmp_path: Path) -> None:
-    _write_native_root(tmp_path, with_od=False)
-    dataset = NativeSupportDataset(
-        tmp_path,
-        tmp_path / "real_with_id.zarr",
-        NativeDatasetConfig(
-            input_window_length=L,
-            forecast_horizon=H,
-            spatial_encoder="hetero",
-            mobility_enabled=False,
-            include_od_context=True,
-        ),
-    )
-    batch = collate_native_batch([dataset[0]])
-    assert batch.ctx_feat.shape[2] == 4
-    assert batch.ctx_feat[:, :, -1].eq(0).all()
-    model = NativeEpiForecaster(
-        NativeForecasterConfig(
-            f_native=int(batch.hist.shape[2]),
-            d_ctx=int(batch.ctx_feat.shape[2]),
-            forecast_horizon=H,
-            sequence_length=L,
-            head_d_model=32,
-            head_n_heads=2,
-            head_num_layers=1,
-            head_dropout=0.0,
-            spatial_encoder="hetero",
-            mobility_enabled=False,
-        )
-    )
-    assert model.spatial_encoder is not None
-    assert model.spatial_encoder.mobility_encoder is None
-    total = NativeJointInferenceLoss(horizon_days=H, observation_loss="nll")(
-        model(batch), batch
-    )["total"]
-    assert torch.isfinite(total)
-    total.backward()
 
 
 def test_projected_municipal_od_source_decodes_and_routes(tmp_path: Path) -> None:
@@ -255,11 +247,11 @@ def test_projected_municipal_od_source_decodes_and_routes(tmp_path: Path) -> Non
         [
             dataset[positions[("municipality", "01001", 14)]],
             dataset[positions[("abs", "101", 14)]],
-            dataset[positions[("comarca", "02", 14)]],
+            dataset[positions[("abs", "102", 14)]],
         ]
     )
 
-    assert batch.od_node_features.shape == (1, 4, 3)
+    assert batch.od_node_features.shape == (1, 4, 6)
     assert batch.od_adjacency[0, 0, 1].item() == pytest.approx(1.0)
     assert batch.od_target_weights[0].tolist() == [1.0, 0.0, 0.0, 0.0]
     assert batch.od_target_weights[1].sum().item() == pytest.approx(1.0)

@@ -57,7 +57,8 @@ from scripts.hpo.trial_artifacts import (
 )
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
 from scripts.hpo.worker_identity import logical_worker_id
-from training.epiforecaster_trainer import EpiForecasterTrainer
+from training.native_trainer import NativeTrainer
+from data.build_native_source_sets import build_for_config
 from training.training_dynamics import load_training_dynamics_identity
 from utils.logging import setup_logging
 
@@ -434,7 +435,9 @@ def objective(
     # Run training and return objective.
     # Pass trial to trainer for intermediate pruning support.
     model_id = trial_model_id(int(trial.number))
-    trainer = EpiForecasterTrainer(
+    cfg.native.fold_manifest = str(trial_dir / "inputs/native_source_sets/manifest.json")
+    build_for_config(cfg, Path(cfg.native.fold_manifest))
+    trainer = NativeTrainer(
         cfg,
         trial=trial,
         pruning_start_epoch=pruning_start_epoch,

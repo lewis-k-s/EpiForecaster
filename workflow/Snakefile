@@ -107,11 +107,19 @@ EVALUATION_MANIFEST = EVALUATION_DIR / "evaluation_manifest.json"
 EVALUATION_DONE = EVALUATION_DIR / ".done"
 EVALUATION_ARTIFACTS = [
     str(EVALUATION_SUMMARY),
-    str(EVALUATION_NODE_METRICS),
-    str(EVALUATION_PER_HEAD_METRICS),
+    str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_native_aggregate_metrics.csv"),
+    str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_native_wis_summary.json"),
+    str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_native_excess_deaths.csv"),
 ]
 if bool(config.get("evaluation", {}).get("granular", False)):
-    EVALUATION_ARTIFACTS.append(str(EVALUATION_GRANULAR))
+    EVALUATION_ARTIFACTS.extend(
+        str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_{suffix}")
+        for suffix in (
+            "granular.parquet", "granular.parquet.meta.json", "example_history.parquet",
+            "example_rows.parquet", "window_support.csv", "example_selection.csv",
+            "example_availability.csv",
+        )
+    )
 
 if WORKFLOW_KIND == "train":
     training = config["training"]

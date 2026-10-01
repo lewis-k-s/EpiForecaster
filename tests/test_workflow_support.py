@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.config_fixtures import write_config_fixture
+
 import json
 import os
 import re
@@ -1071,7 +1073,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
         storage=storage,
         direction="minimize",
     )
-    base_config = Path("configs/train_epifor_legacy_municipal_smoke.yaml").resolve()
+    base_config = write_config_fixture(tmp_path)
     campaign_path = tmp_path / "campaign.yaml"
     campaign_path.write_text(
         yaml.safe_dump(
@@ -1093,8 +1095,8 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
                     {
                         "name": "mobility:off",
                         "hypothesis": "intervention",
-                        "overrides": {"model": {"type": {"mobility": False}}},
-                        "allowed_difference_paths": ["model.type.mobility"],
+                        "overrides": {"native": {"mobility_enabled": False}},
+                        "allowed_difference_paths": ["native.mobility_enabled"],
                     },
                 ],
                 "paired_model_seeds": [42],
@@ -1543,7 +1545,7 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     assert "--ntasks=1" in train_result.stdout
     assert "--gpus-per-task=1" in train_result.stdout
     assert "training.run_final_evaluation=false" in config["training"]["overrides"]
-    assert str(REPO_ROOT / "training/epiforecaster_trainer.py") in train_result.stdout
+    assert str(REPO_ROOT / "training/native_trainer.py") in train_result.stdout
     assert str(REPO_ROOT / "configs/production_only/train_epifor_mn5_full.yaml") in (
         train_result.stdout
     )
@@ -1733,7 +1735,7 @@ def test_every_stage_depends_on_the_complete_scientific_source_bundle() -> None:
     paths = [
         Path("cli.py"),
         Path("models/epiforecaster.py"),
-        Path("training/epiforecaster_trainer.py"),
+        Path("training/native_trainer.py"),
         Path("evaluation/eval_loop.py"),
         Path("plotting/forecast_plots.py"),
         Path("scripts/hpo/hpsearch_worker.py"),
@@ -1765,13 +1767,20 @@ def test_evaluation_writes_and_hashes_required_artifact_contract(
 
     def fake_run(command, *, cwd=None, env=None):
         summary = Path(command[command.index("--summary-json") + 1])
-        node_metrics = Path(command[command.index("--node-metrics-csv") + 1])
         summary.parent.mkdir(parents=True, exist_ok=True)
         summary.write_text('{"eval_loss": 0.5}\n')
-        node_metrics.write_text("node_id,mae\n0,0.1\n")
-        node_metrics.with_name("test_node_metrics_per_head.csv").write_text(
-            "target,node_id,mae\ncases,0,0.1\n"
-        )
+        for suffix in (
+            "native_aggregate_metrics.csv",
+            "native_excess_deaths.csv",
+            "native_wis_summary.json",
+            "granular.parquet.meta.json",
+            "example_history.parquet",
+            "example_rows.parquet",
+            "window_support.csv",
+            "example_selection.csv",
+            "example_availability.csv",
+        ):
+            (summary.parent / f"test_{suffix}").write_text("fixture\n")
         (summary.parent / "test_granular.parquet").write_bytes(b"parquet")
 
     monkeypatch.setattr(run_support, "_run", fake_run)
@@ -1787,12 +1796,11 @@ def test_evaluation_writes_and_hashes_required_artifact_contract(
     assert manifest_path == output_dir / "evaluation_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["checkpoint_sha256"] == run_support.sha256_file(checkpoint)
-    assert [artifact["path"] for artifact in manifest["artifacts"]] == [
-        "test_granular.parquet",
-        "test_node_metrics.csv",
-        "test_node_metrics_per_head.csv",
-        "test_summary.json",
-    ]
+    assert {artifact["path"] for artifact in manifest["artifacts"]} == {
+        path.name
+        for path in output_dir.iterdir()
+        if path.name not in {"evaluation_manifest.json", ".done"}
+    }
     assert all(artifact["required"] for artifact in manifest["artifacts"])
 
 
@@ -2792,3 +2800,47 @@ def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert not (marker_root / "000.done").exists()
     assert "outcome=continuation" in (marker_root / "000.partial").read_text()
+
+
+def test_evaluation_accepts_native_artifact_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkpoint = tmp_path / "best_model.pt"
+    checkpoint.write_bytes(b"native checkpoint")
+    output_dir = tmp_path / "evaluation"
+
+    def fake_run(command, *, cwd=None, env=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "test_summary.json").write_text(
+            '{"joint_wis": 0.4, "report_context": {"native_support": true}}\n'
+        )
+        (output_dir / "test_native_aggregate_metrics.csv").write_text("wis\n0.4\n")
+        (output_dir / "test_native_wis_summary.json").write_text("{}\n")
+        (output_dir / "test_native_excess_deaths.csv").write_text("abs_id\n101\n")
+        (output_dir / "test_granular.parquet").write_bytes(b"parquet")
+        (output_dir / "test_granular.parquet.meta.json").write_text("{}\n")
+        for suffix in (
+            "example_history.parquet",
+            "example_rows.parquet",
+            "window_support.csv",
+            "example_selection.csv",
+            "example_availability.csv",
+        ):
+            (output_dir / f"test_{suffix}").write_bytes(b"saved export")
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+    manifest_path = run_support.evaluate_best(checkpoint, output_dir, "test", [], True)
+    manifest = json.loads(manifest_path.read_text())
+    assert {item["path"] for item in manifest["artifacts"] if item["required"]} == {
+        "test_summary.json",
+        "test_native_aggregate_metrics.csv",
+        "test_native_wis_summary.json",
+        "test_native_excess_deaths.csv",
+        "test_granular.parquet",
+        "test_granular.parquet.meta.json",
+        "test_example_history.parquet",
+        "test_example_rows.parquet",
+        "test_window_support.csv",
+        "test_example_selection.csv",
+        "test_example_availability.csv",
+    }

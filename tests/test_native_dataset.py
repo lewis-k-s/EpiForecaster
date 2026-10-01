@@ -28,286 +28,24 @@ from data.native_dataset import (
     NativeSupportDataset,
 )
 
+from tests.native_dataset_fixtures import (
+    T,
+    L,
+    H,
+    ORIGINS,
+    GUARD_GRID_START,
+    GUARD_DAYS,
+    MUNIS,
+    MUNI_POP,
+    ABS_POP,
+    DEATH_VALUE,
+    _grid_dates,
+    _cases_value,
+    _write_native_root,
+)
+
+
 pytestmark = pytest.mark.epiforecaster
-
-# Shared daily grid: 2020-03-01 (Sunday) + 43 days; Mondays at 1, 8, ..., 36.
-GRID_START = np.datetime64("2020-03-01", "D")
-T = 43
-MONDAY_OFFSETS = np.array([1, 8, 15, 22, 29, 36])
-L, H = 14, 7
-ORIGINS = list(range(L - 1, T - H))  # 13..35, stride 1
-
-# Confirmation-guard fixture grid: 2020-11-22 (Sunday) + 74 days through
-# 2021-02-03; the reserved window sits at offsets 39..66, leaving origins
-# after it (up to 66) reachable with L + H = 21 days of grid.
-GUARD_GRID_START = np.datetime64("2020-11-22", "D")
-GUARD_DAYS = 74
-
-MUNIS = ["01001", "01002", "01003", "01004"]
-MUNI_POP = {"01001": 40000.0, "01002": 30000.0, "01003": 20000.0, "01004": 10000.0}
-CASE_COUNT = {"01001": 3.0, "01002": 5.0, "01003": 7.0, "01004": 2.0}
-
-ABS_IDS = ["101", "102", "103"]
-ABS_POP = {"101": 33000.0, "102": 5000.0, "103": 3000.0}
-ABS_VALUE = {"101": [10, 12, 14, 16, 18, 20], "102": [0, 5, 7, 0, 0, 0], "103": [1] * 6}
-ABS_MASK = {
-    "101": [1] * 6,
-    "102": [0, 1, 1, 0, 0, 0],
-    "103": [1] * 6,
-}
-ABS_STRATUM = {"101": 900.0, "102": 400.0, "103": 100.0}
-
-COMARCAS = ["01", "02"]
-COMARCA_POP = {"01": 50000.0, "02": 70000.0}
-DEATH_VALUE = {"01": 2.0, "02": 4.0}
-DEATH_GAP = set(range(20, 27))  # comarca 02 unreported days
-
-COVARIATES = ["dow_sin", "dow_cos", "is_holiday", "lockdown_severity"]
-
-
-def _grid_dates() -> np.ndarray:
-    return GRID_START + np.arange(T, dtype="timedelta64[D]")
-
-
-def _cases_mask(muni: str, days: int = T) -> np.ndarray:
-    mask = np.ones(days, dtype=bool)
-    if muni == "01003":
-        mask[:10] = False
-    return mask
-
-
-def _deaths_mask(comarca: str, days: int = T) -> np.ndarray:
-    mask = np.ones(days, dtype=bool)
-    if comarca == "02":
-        mask[sorted(DEATH_GAP)] = False
-    return mask
-
-
-def _cases_value(muni: str, days: int = T) -> np.ndarray:
-    value = np.log1p(CASE_COUNT[muni] / MUNI_POP[muni] * 1e5)
-    return np.full(days, value, dtype=np.float16)
-
-
-def _write_native_root(
-    root: Path,
-    *,
-    with_od: bool = False,
-    grid_start: np.datetime64 = GRID_START,
-    days: int = T,
-) -> None:
-    """Write native_graph/obs_admissions/obs_deaths (+ od_mitma) fixtures.
-
-    ``grid_start`` must be a Sunday so ``MONDAY_OFFSETS`` stay Mondays; all
-    arrays size to ``days``.
-    """
-    dates = grid_start + np.arange(days, dtype="timedelta64[D]")
-
-    # -- node table -----------------------------------------------------
-    rows: list[tuple[str, str, str, float]] = []
-    for muni in MUNIS:  # geometry nodes only; the registry reads cases data
-        rows.append(("municipality", muni, "unobserved", MUNI_POP[muni]))
-    for abs_id in ABS_IDS:
-        status = "unmapped" if abs_id == "103" else "observed"
-        rows.append(("abs", abs_id, status, ABS_POP[abs_id]))
-    for comarca in COMARCAS:
-        rows.append(("comarca", comarca, "observed", COMARCA_POP[comarca]))
-    zones = ["z1", "z2", "z3"]
-    for zone in zones:
-        rows.append(("mitma", zone, "observed", 1000.0))
-    uids = [f"{t}:{i}" for t, i, _, _ in rows]
-    node = xr.Dataset(
-        {
-            "source_id": ("node", [i for _, i, _, _ in rows]),
-            "node_type": ("node", [t for t, _, _, _ in rows]),
-            "status": ("node", [s for _, _, s, _ in rows]),
-            "population": ("node", np.array([p for *_, p in rows], dtype=np.float32)),
-            "od_zone_ref": (("od_zone",), zones),
-        },
-        coords={"node": uids, "od_zone": np.arange(len(zones))},
-    )
-    node.to_zarr(root / "native_graph.zarr")
-
-    # -- edge groups: (src_idx, dst_idx) with frac_of_dst_pop weights ----
-    node_index = {(t, i): k for k, (t, i, _, _) in enumerate(rows)}
-
-    def edge(rel: str, pairs: list[tuple[str, str, str, str, float]]) -> None:
-        group = zarr.open_group(
-            str(root / "native_graph.zarr"), mode="a"
-        ).require_group(f"edges/{rel}")
-        group.create_array(
-            "src_idx",
-            data=np.array(
-                [node_index[(st, si)] for st, si, _, _, _ in pairs], dtype="int32"
-            ),
-        )
-        group.create_array(
-            "dst_idx",
-            data=np.array(
-                [node_index[(dt, di)] for _, _, dt, di, _ in pairs], dtype="int32"
-            ),
-        )
-        group.create_array(
-            "weight", data=np.array([w for *_, w in pairs], dtype="float32")
-        )
-
-    edge(
-        "muni_abs",
-        [
-            ("municipality", "01001", "abs", "101", 0.5),
-            ("municipality", "01002", "abs", "101", 0.3),
-            ("municipality", "01003", "abs", "101", 0.2),
-            ("municipality", "01004", "abs", "102", 0.6),
-            ("abs", "101", "municipality", "01001", 0.5),
-            ("abs", "101", "municipality", "01002", 0.5),
-            ("abs", "101", "municipality", "01003", 0.5),
-            ("abs", "102", "municipality", "01004", 0.5),
-        ],
-    )
-    edge(
-        "muni_comarca",
-        [
-            ("municipality", "01001", "comarca", "01", 0.7),
-            ("municipality", "01002", "comarca", "01", 0.3),
-            ("municipality", "01003", "comarca", "02", 0.6),
-            ("comarca", "01", "municipality", "01001", 1.0),
-            ("comarca", "01", "municipality", "01002", 1.0),
-            ("comarca", "02", "municipality", "01003", 1.0),
-        ],
-    )
-    if with_od:
-        edge(
-            "mitma_muni",
-            [
-                ("municipality", "01001", "mitma", "z1", 1.0),
-                ("mitma", "z1", "municipality", "01001", 1.0),
-                ("municipality", "01002", "mitma", "z2", 1.0),
-                ("mitma", "z2", "municipality", "01002", 1.0),
-                ("municipality", "01003", "mitma", "z3", 1.0),
-                ("mitma", "z3", "municipality", "01003", 1.0),
-            ],
-        )
-        edge(
-            "mitma_abs",
-            [("mitma", "z1", "abs", "101", 1.0), ("mitma", "z2", "abs", "101", 1.0)],
-        )
-        edge("mitma_comarca", [("mitma", "z3", "comarca", "02", 1.0)])
-
-    # -- weekly admissions -----------------------------------------------
-    monday_dates = dates[MONDAY_OFFSETS]
-    adm = xr.Dataset(
-        {
-            "value": (
-                ("date", "abs_id"),
-                np.array(
-                    [[ABS_VALUE[a][w] for a in ABS_IDS] for w in range(6)],
-                    dtype=np.float32,
-                ),
-            ),
-            "mask": (
-                ("date", "abs_id"),
-                np.array([[bool(ABS_MASK[a][w]) for a in ABS_IDS] for w in range(6)]),
-            ),
-            "age": (
-                ("date", "abs_id"),
-                np.array(
-                    [[1 if ABS_MASK[a][w] else 2 for a in ABS_IDS] for w in range(6)],
-                    dtype=np.uint8,
-                ),
-            ),
-            "stratum_pop_sum": (
-                ("date", "abs_id"),
-                np.full((6, len(ABS_IDS)), 0.0, dtype=np.float32)
-                + np.array([ABS_STRATUM[a] for a in ABS_IDS], dtype=np.float32),
-            ),
-        },
-        coords={
-            "date": monday_dates.astype("datetime64[ns]"),
-            "abs_id": ABS_IDS,
-            "week_end": ("date", (monday_dates + 6).astype("datetime64[ns]")),
-        },
-    )
-    adm.to_zarr(root / "obs_admissions.zarr")
-
-    # -- daily deaths ------------------------------------------------------
-    deaths = xr.Dataset(
-        {
-            "value": (
-                ("date", "comarca_id"),
-                np.stack(
-                    [
-                        np.full(days, DEATH_VALUE[c], dtype=np.float32)
-                        for c in COMARCAS
-                    ],
-                    axis=1,
-                ),
-            ),
-            "mask": (
-                ("date", "comarca_id"),
-                np.stack([_deaths_mask(c, days) for c in COMARCAS], axis=1),
-            ),
-            "age": (
-                ("date", "comarca_id"),
-                np.ones((days, len(COMARCAS)), dtype=np.uint8),
-            ),
-            "population": (
-                ("comarca_id",),
-                np.array([COMARCA_POP[c] for c in COMARCAS], dtype=np.float32),
-            ),
-        },
-        coords={
-            "date": dates.astype("datetime64[ns]"),
-            "comarca_id": COMARCAS,
-            "comarca_name": (("comarca_id",), [f"name-{c}" for c in COMARCAS]),
-        },
-    )
-    deaths.to_zarr(root / "obs_deaths.zarr")
-
-    # -- real_with_id-shaped cases store -----------------------------------
-    cases = xr.Dataset(
-        {
-            "cases": (
-                ("run_id", "date", "region_id"),
-                np.stack([_cases_value(m, days) for m in MUNIS], axis=-1)[None],
-            ),
-            "cases_mask": (
-                ("run_id", "date", "region_id"),
-                np.stack([_cases_mask(m, days) for m in MUNIS], axis=-1)[None],
-            ),
-            "cases_age": (
-                ("run_id", "date", "region_id"),
-                np.ones((1, days, len(MUNIS)), dtype=np.uint8),
-            ),
-            "temporal_covariates": (
-                ("date", "covariate"),
-                (np.arange(days, dtype=np.float32)[:, None] * np.arange(4)[None, :])
-                / 10.0,
-            ),
-        },
-        coords={
-            "run_id": ["real"],
-            "date": dates.astype("datetime64[ns]"),
-            "region_id": MUNIS,
-            "covariate": COVARIATES,
-        },
-    )
-    cases.to_zarr(root / "real_with_id.zarr")
-
-    if with_od:
-        mobility = np.zeros((days, 3, 3), dtype=np.float32)
-        mobility[14, 1, 0] = 100.0  # z2 -> z1
-        mobility[14, 2, 1] = 300.0  # z3 -> z2
-        mobility[14, 0, 2] = 600.0  # z1 -> z3
-        od = xr.Dataset(
-            {"mobility": (("date", "origin", "target"), mobility)},
-            coords={
-                "date": dates.astype("datetime64[ns]"),
-                "origin": zones,
-                "target": zones,
-                "zone": np.arange(3),
-                "zone_id": (("zone",), zones),
-            },
-        )
-        od.to_zarr(root / "od_mitma.zarr")
 
 
 @pytest.fixture()
@@ -347,8 +85,8 @@ def test_head_counts_and_hand_derived_eligibility(
     assert [o for _, s, o in index["hosp"] if s == "101"] == EXPECTED_ABS_101
     assert [o for _, s, o in index["hosp"] if s == "102"] == EXPECTED_ABS_102
     assert all(s != "103" for _, s, _ in index["hosp"])  # graph-unmapped
-    assert [o for _, s, o in index["deaths"] if s == "02"] == EXPECTED_COMARCA_02
-    assert [o for _, s, o in index["deaths"] if s == "01"] == ORIGINS
+    assert [o for _, s, o in index["deaths"] if s == "102"] == EXPECTED_COMARCA_02
+    assert [o for _, s, o in index["deaths"] if s == "101"] == ORIGINS
     assert [o for _, s, o in index["cases"] if s == "01003"] == EXPECTED_MUNI_01003
     assert [o for _, s, o in index["cases"] if s == "01001"] == ORIGINS
 
@@ -380,21 +118,24 @@ def test_observed_source_without_audited_population_is_not_indexed(
 
 def test_dedup_and_deterministic_ordering(dataset: NativeSupportDataset) -> None:
     identities = [
-        (q.source_type, q.source_id, q.forecast_origin) for q in dataset.queries
+        (q.source_type, q.source_id, q.forecast_origin, dataset.head_at(i))
+        for i, q in enumerate(dataset.queries)
     ]
-    assert len(set(identities)) == len(identities)  # same (source, origin) once
+    assert len(set(identities)) == len(identities)
     assert identities == sorted(identities)
 
 
-def test_first_item_is_abs_101_at_origin_14(dataset: NativeSupportDataset) -> None:
+def test_first_item_is_abs_101_deaths_at_origin_13(
+    dataset: NativeSupportDataset,
+) -> None:
     query = dataset.queries[0]
     assert (query.source_type, query.source_id, query.forecast_origin) == (
         "abs",
         "101",
-        14,
+        13,
     )
     item = dataset[0]
-    assert item["head"] == "hosp"
+    assert item["head"] == "deaths"
     assert item["source_type_id"] == SOURCE_TYPE_IDS["abs"]
 
 
@@ -407,7 +148,7 @@ def test_municipal_history_channels_and_raw_target(
     }
     idx = identities[("municipality", "01001", 13)]
     item = dataset[idx]
-    assert item["hist"].shape == (L, 7)
+    assert item["hist"].shape == (L, 13)
     assert item["hist"].dtype == torch.float32
     expected_value = float(_cases_value("01001")[13])
     assert item["hist"][:, 0] == pytest.approx(expected_value, rel=1e-3)
@@ -417,7 +158,10 @@ def test_municipal_history_channels_and_raw_target(
         np.arange(0, L, dtype=np.float32)[:, None]
         * np.arange(4, dtype=np.float32)[None, :]
     ) / 10.0
-    assert torch.allclose(item["hist"][:, 3:], torch.from_numpy(covariates))
+    assert torch.allclose(item["hist"][:, 6], torch.arange(L, dtype=torch.float32) / T)
+    assert torch.all(item["hist"][:, 7] == 1)
+    assert torch.all(item["hist"][:, 8] == 0)
+    assert torch.allclose(item["hist"][:, 9:], torch.from_numpy(covariates))
     assert torch.allclose(item["temporal_covariates"], torch.from_numpy(covariates))
     # Raw counts inverted from the stored log1p(per-100k): count = 3.0.
     assert item["target"].shape == (H,)
@@ -429,6 +173,35 @@ def test_municipal_history_channels_and_raw_target(
     assert item["source_type_id"] == SOURCE_TYPE_IDS["municipality"]
     # 2020-03-14 is a Saturday.
     assert item["origin_dow"] == 5
+
+
+def test_native_vaccination_can_be_disabled(native_root: Path) -> None:
+    dataset = NativeSupportDataset(
+        native_root,
+        native_root / "real_with_id.zarr",
+        NativeDatasetConfig(
+            input_window_length=L,
+            forecast_horizon=H,
+            include_vaccination=False,
+        ),
+    )
+    assert dataset[0]["hist"].shape == (L, 10)
+    assert dataset[0]["relation_ctx"]["muni_abs"].shape == (L, 3)
+
+
+def test_native_vaccination_requires_canonical_fields(native_root: Path) -> None:
+    cases = xr.open_zarr(native_root / "real_with_id.zarr")
+    without_vaccination = cases.drop_vars(
+        ["vaccination_rate", "vaccination_rate_mask", "vaccination_rate_age"]
+    )
+    path = native_root / "cases_without_vaccination.zarr"
+    without_vaccination.to_zarr(path)
+    with pytest.raises(ValueError, match="native vaccination input missing"):
+        NativeSupportDataset(
+            native_root,
+            path,
+            NativeDatasetConfig(input_window_length=L, forecast_horizon=H),
+        )
 
 
 def test_origin_dow_sunday_for_weekly_origins(dataset: NativeSupportDataset) -> None:
@@ -462,7 +235,7 @@ def test_abs_history_interval_placement(
     for day in range(L):
         if day not in weekly_days:
             assert hist[day, 0].item() == 0.0
-            assert not item["hist_mask"][day]
+            assert hist[day, 1].item() == 0.0
             assert hist[day, 2].item() == 0.0
         else:
             assert item["hist_mask"][day]
@@ -511,45 +284,51 @@ def test_abs_incomplete_week_slot_is_masked(tmp_path: Path) -> None:
     assert item["target_stratum_pop_sum"].tolist() == [900.0, 0.0]
 
 
-def test_comarca_history_value_transform_and_raw_target(
+def test_abs_deaths_history_value_transform_and_raw_target(
     dataset: NativeSupportDataset, native_root: Path
 ) -> None:
     """Rulings R10/R17: hist is log1p(count / pop_graph * 1e5); the target
     stays the raw count; the store keeps raw counts at rest."""
-    identities = {
-        (q.source_type, q.source_id, q.forecast_origin): i
+    index = next(
+        i
         for i, q in enumerate(dataset.queries)
-    }
-    item = dataset[identities[("comarca", "01", 13)]]
-    assert item["hist"].shape == (L, 7)
-    expected_value = np.log1p(DEATH_VALUE["01"] / COMARCA_POP["01"] * 1e5)
-    assert item["hist"][:, 0] == pytest.approx(
+        if (q.source_type, q.source_id, q.forecast_origin, dataset.head_at(i))
+        == ("abs", "101", 13, "deaths")
+    )
+    item = dataset[index]
+    assert item["hist"].shape == (L, 13)
+    expected_value = np.log1p(DEATH_VALUE["01"] / ABS_POP["101"] * 1e5)
+    assert item["hist"][:, 3] == pytest.approx(
         torch.full((L,), expected_value, dtype=torch.float32), rel=1e-6
     )
-    assert torch.all(item["hist"][:, 1] == 1.0)
+    assert torch.all(item["hist"][:, 4] == 1.0)
     # TARGET STAYS RAW (the loss owns target-side transforms).
     assert item["target"].shape == (H,)
     assert torch.all(item["target"] == DEATH_VALUE["01"])
     assert torch.all(item["target_mask"])
-    assert item["source_pop"] == COMARCA_POP["01"]
-    assert item["target_population_graph"] == COMARCA_POP["01"]
-    assert item["source_type_id"] == SOURCE_TYPE_IDS["comarca"]
-    # Store stays raw at rest: re-read a value from obs_deaths.zarr.
-    deaths = xr.open_zarr(native_root / "obs_deaths.zarr")
-    stored = float(deaths["value"].sel(comarca_id="01").values[0])
+    assert item["source_pop"] == ABS_POP["101"]
+    assert item["target_population_graph"] == ABS_POP["101"]
+    assert item["source_type_id"] == SOURCE_TYPE_IDS["abs"]
+    assert torch.all(item["target_extra"]["expected_deaths"] == 1)
+    deaths = xr.open_zarr(native_root / "obs_deaths_abs_excess.zarr")
+    stored = float(deaths["value"].sel(abs_id="101").values[0])
     assert stored == DEATH_VALUE["01"]
 
 
-def test_comarca_gap_keeps_missing_rows_missing(dataset: NativeSupportDataset) -> None:
-    identities = {
-        (q.source_type, q.source_id, q.forecast_origin): i
+def test_abs_deaths_gap_keeps_missing_rows_missing(
+    dataset: NativeSupportDataset,
+) -> None:
+    index = next(
+        i
         for i, q in enumerate(dataset.queries)
-    }
-    item = dataset[identities[("comarca", "02", 27)]]
+        if (q.source_type, q.source_id, q.forecast_origin, dataset.head_at(i))
+        == ("abs", "102", 27, "deaths")
+    )
+    item = dataset[index]
     # History window [14, 27] contains the unreported days 20..26.
-    assert not item["hist_mask"][6:13].any()
-    assert item["hist"][6:13, 0].eq(0).all()
-    assert item["hist_mask"][:6].all()
+    assert item["hist"][6:13, 4].eq(0).all()
+    assert item["hist"][6:13, 3].eq(0).all()
+    assert item["hist"][:6, 4].eq(1).all()
 
 
 def test_pooling_raw_fractions_zero_deficit_contribution(
@@ -787,7 +566,7 @@ def test_real_artifacts_index_and_weekly_alignment() -> None:
     for head, expected_type in (
         ("cases", "municipality"),
         ("hosp", "abs"),
-        ("deaths", "comarca"),
+        ("deaths", "abs"),
     ):
         pairs = ds.head_index[head]
         sources = {s for _, s, _ in pairs}
@@ -805,7 +584,11 @@ def test_real_artifacts_index_and_weekly_alignment() -> None:
             assert np.isfinite(record.population) and record.population > 0
 
     # Spot-check one ABS query's weekly target alignment against the store.
-    first_abs = next(q for q in ds.queries if q.source_type == "abs")
+    first_abs = next(
+        q
+        for i, q in enumerate(ds.queries)
+        if q.source_type == "abs" and ds.head_at(i) == "hosp"
+    )
     item = ds[ds.queries.index(first_abs)]
     adm = xr.open_zarr(REAL_ROOT / "obs_admissions.zarr").compute()
     dates = adm["date"].values.astype("datetime64[D]")

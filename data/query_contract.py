@@ -17,14 +17,14 @@ SourceType = Literal["municipality", "abs", "comarca", "mitma", "edar"]
 
 # Real-data query routing (supervised heads only; synthetic may request
 # unions). Head names stay the canonical set ``ww | hosp | cases | deaths``
-# used by evaluation/losses.py and the export modules; the weekly ABS variant
-# is ``hosp`` scored at weekly reporting intervals, not a fifth head name.
+# used by evaluation/losses.py and the export modules. ABS carries weekly
+# admissions and daily all-cause deaths; excess is derived at evaluation.
 HEADS_FOR_SOURCE: dict[SourceType, frozenset[str]] = {
     "municipality": frozenset({"cases"}),
-    "abs": frozenset({"hosp"}),
-    "comarca": frozenset({"deaths"}),
+    "abs": frozenset({"hosp", "deaths"}),
+    "comarca": frozenset(),  # geographic context only
     "mitma": frozenset(),  # context-only, never queried
-    "edar": frozenset({"ww"}),  # legacy branch only, until Stage 5
+    "edar": frozenset({"ww"}),
 }
 
 # Reporting interval per canonical head, in days on the shared daily grid.

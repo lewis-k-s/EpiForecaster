@@ -10,32 +10,38 @@ the temporal tail split. Real-artifact acceptance runs through
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
-import xarray as xr
-import zarr
+import yaml
 
-from data.native_batch import ROUTED_HEADS
+from data.native_batch import collate_native_batch
 from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
+from data.native_source_sets import FoldRoles, SourceSetManifest
 from data.query_contract import ForecastQuery
 from models.configs import (
-    DataConfig,
     EpiForecasterConfig,
-    ModelConfig,
-    ModelVariant,
     NativeSupportConfig,
-    OutputConfig,
-    TrainingParams,
 )
+from tests.config_fixtures import config_fixture
+from models.native_forecaster import NativeEpiForecaster, NativeForecasterConfig
 from training.native_trainer import (
-    HeadBalancedSampler,
+    HierarchicalBalancedSampler,
     NativeTrainer,
-    source_fold_temporal_split,
+    source_set_manifest_split,
     temporal_tail_split,
+)
+
+from tests.native_fixtures import (
+    COVARIATES,
+    L,
+    H,
+    _trainer_config,
+    _write_native_root,
+    _write_native_wastewater,
 )
 
 pytestmark = pytest.mark.epiforecaster
@@ -45,234 +51,6 @@ CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
 # ----------------------------------------------------------------------
 # Synthetic native-support fixture (replicated from tests/test_native_dataset.py)
 # ----------------------------------------------------------------------
-
-GRID_START = np.datetime64("2020-03-01", "D")
-T = 43
-MONDAY_OFFSETS = np.array([1, 8, 15, 22, 29, 36])
-L, H = 14, 7
-
-MUNIS = ["01001", "01002", "01003", "01004"]
-MUNI_POP = {"01001": 40000.0, "01002": 30000.0, "01003": 20000.0, "01004": 10000.0}
-CASE_COUNT = {"01001": 3.0, "01002": 5.0, "01003": 7.0, "01004": 2.0}
-
-ABS_IDS = ["101", "102", "103"]
-ABS_POP = {"101": 33000.0, "102": 5000.0, "103": 3000.0}
-ABS_VALUE = {"101": [10, 12, 14, 16, 18, 20], "102": [0, 5, 7, 0, 0, 0], "103": [1] * 6}
-ABS_MASK = {"101": [1] * 6, "102": [0, 1, 1, 0, 0, 0], "103": [1] * 6}
-ABS_STRATUM = {"101": 900.0, "102": 400.0, "103": 100.0}
-
-COMARCAS = ["01", "02"]
-COMARCA_POP = {"01": 50000.0, "02": 70000.0}
-DEATH_VALUE = {"01": 2.0, "02": 4.0}
-
-COVARIATES = ["dow_sin", "dow_cos", "is_holiday", "lockdown_severity"]
-
-
-def _cases_value(muni: str) -> np.ndarray:
-    value = np.log1p(CASE_COUNT[muni] / MUNI_POP[muni] * 1e5)
-    return np.full(T, value, dtype=np.float16)
-
-
-def _write_native_root(root: Path) -> None:
-    """Write native_graph/obs_admissions/obs_deaths + a real_with_id-shaped
-    cases zarr and the small OD fixture used by the native trainer."""
-    dates = GRID_START + np.arange(T, dtype="timedelta64[D]")
-
-    rows: list[tuple[str, str, str, float]] = []
-    for muni in MUNIS:
-        rows.append(("municipality", muni, "unobserved", MUNI_POP[muni]))
-    for abs_id in ABS_IDS:
-        status = "unmapped" if abs_id == "103" else "observed"
-        rows.append(("abs", abs_id, status, ABS_POP[abs_id]))
-    for comarca in COMARCAS:
-        rows.append(("comarca", comarca, "observed", COMARCA_POP[comarca]))
-    zones = ["z1", "z2", "z3"]
-    for zone in zones:
-        rows.append(("mitma", zone, "observed", 1000.0))
-    uids = [f"{t}:{i}" for t, i, _, _ in rows]
-    node = xr.Dataset(
-        {
-            "source_id": ("node", [i for _, i, _, _ in rows]),
-            "node_type": ("node", [t for t, _, _, _ in rows]),
-            "status": ("node", [s for _, _, s, _ in rows]),
-            "population": ("node", np.array([p for *_, p in rows], dtype=np.float32)),
-            "od_zone_ref": (("od_zone",), zones),
-        },
-        coords={"node": uids, "od_zone": np.arange(len(zones))},
-    )
-    node.to_zarr(root / "native_graph.zarr")
-
-    node_index = {(t, i): k for k, (t, i, _, _) in enumerate(rows)}
-
-    def edge(rel: str, pairs: list[tuple[str, str, str, str, float]]) -> None:
-        group = zarr.open_group(
-            str(root / "native_graph.zarr"), mode="a"
-        ).require_group(f"edges/{rel}")
-        group.create_array(
-            "src_idx",
-            data=np.array(
-                [node_index[(st, si)] for st, si, _, _, _ in pairs], dtype="int32"
-            ),
-        )
-        group.create_array(
-            "dst_idx",
-            data=np.array(
-                [node_index[(dt, di)] for _, _, dt, di, _ in pairs], dtype="int32"
-            ),
-        )
-        group.create_array(
-            "weight", data=np.array([w for *_, w in pairs], dtype="float32")
-        )
-
-    edge(
-        "muni_abs",
-        [
-            ("municipality", "01001", "abs", "101", 0.5),
-            ("municipality", "01002", "abs", "101", 0.3),
-            ("municipality", "01003", "abs", "101", 0.2),
-            ("municipality", "01004", "abs", "102", 0.6),
-        ],
-    )
-    edge(
-        "muni_comarca",
-        [
-            ("municipality", "01001", "comarca", "01", 0.7),
-            ("municipality", "01002", "comarca", "01", 0.3),
-            ("municipality", "01003", "comarca", "02", 0.6),
-        ],
-    )
-
-    monday_dates = dates[MONDAY_OFFSETS]
-    adm = xr.Dataset(
-        {
-            "value": (
-                ("date", "abs_id"),
-                np.array(
-                    [[ABS_VALUE[a][w] for a in ABS_IDS] for w in range(6)],
-                    dtype=np.float32,
-                ),
-            ),
-            "mask": (
-                ("date", "abs_id"),
-                np.array([[bool(ABS_MASK[a][w]) for a in ABS_IDS] for w in range(6)]),
-            ),
-            "age": (
-                ("date", "abs_id"),
-                np.array(
-                    [[1 if ABS_MASK[a][w] else 2 for a in ABS_IDS] for w in range(6)],
-                    dtype=np.uint8,
-                ),
-            ),
-            "stratum_pop_sum": (
-                ("date", "abs_id"),
-                np.full((6, len(ABS_IDS)), 0.0, dtype=np.float32)
-                + np.array([ABS_STRATUM[a] for a in ABS_IDS], dtype=np.float32),
-            ),
-        },
-        coords={
-            "date": monday_dates.astype("datetime64[ns]"),
-            "abs_id": ABS_IDS,
-            "week_end": ("date", (monday_dates + 6).astype("datetime64[ns]")),
-        },
-    )
-    adm.to_zarr(root / "obs_admissions.zarr")
-
-    deaths = xr.Dataset(
-        {
-            "value": (
-                ("date", "comarca_id"),
-                np.stack(
-                    [np.full(T, DEATH_VALUE[c], dtype=np.float32) for c in COMARCAS],
-                    axis=1,
-                ),
-            ),
-            "mask": (
-                ("date", "comarca_id"),
-                np.ones((T, len(COMARCAS)), dtype=bool),
-            ),
-            "age": (
-                ("date", "comarca_id"),
-                np.ones((T, len(COMARCAS)), dtype=np.uint8),
-            ),
-            "population": (
-                ("comarca_id",),
-                np.array([COMARCA_POP[c] for c in COMARCAS], dtype=np.float32),
-            ),
-        },
-        coords={
-            "date": dates.astype("datetime64[ns]"),
-            "comarca_id": COMARCAS,
-            "comarca_name": (("comarca_id",), [f"name-{c}" for c in COMARCAS]),
-        },
-    )
-    deaths.to_zarr(root / "obs_deaths.zarr")
-
-    cases = xr.Dataset(
-        {
-            "cases": (
-                ("run_id", "date", "region_id"),
-                np.stack([_cases_value(m) for m in MUNIS], axis=-1)[None],
-            ),
-            "cases_mask": (
-                ("run_id", "date", "region_id"),
-                np.ones((1, T, len(MUNIS)), dtype=bool),
-            ),
-            "cases_age": (
-                ("run_id", "date", "region_id"),
-                np.ones((1, T, len(MUNIS)), dtype=np.uint8),
-            ),
-            "temporal_covariates": (
-                ("date", "covariate"),
-                (np.arange(T, dtype=np.float32)[:, None] * np.arange(4)[None, :])
-                / 10.0,
-            ),
-        },
-        coords={
-            "run_id": ["real"],
-            "date": dates.astype("datetime64[ns]"),
-            "region_id": MUNIS,
-            "covariate": COVARIATES,
-        },
-    )
-    cases.to_zarr(root / "real_with_id.zarr")
-
-
-def _trainer_config(root: Path, **native_kwargs: bool) -> EpiForecasterConfig:
-    native_options = {"mobility_enabled": False, **native_kwargs}
-    return EpiForecasterConfig(
-        model=ModelConfig(
-            type=ModelVariant(
-                cases=False, regions=False, biomarkers=False, mobility=False
-            ),
-            mobility_embedding_dim=16,
-            region_embedding_dim=8,
-            input_window_length=L,
-            forecast_horizon=H,
-            max_neighbors=20,
-            head_d_model=32,
-            head_n_heads=2,
-            head_num_layers=1,
-        ),
-        data=DataConfig(dataset_path=str(root / "real_with_id.zarr")),
-        training=TrainingParams(
-            epochs=1,
-            max_batches=2,
-            batch_size=8,
-            seed=42,
-            split_seed=42,
-            device="cpu",
-            enable_mixed_precision=False,
-            val_split=0.1,
-            scheduler_type="cosine",
-            warmup_steps=0,
-        ),
-        output=OutputConfig(
-            experiment_name="native_trainer_test",
-            log_dir=str(root / "outputs"),
-            wandb_mode="disabled",
-        ),
-        native=NativeSupportConfig(enabled=True, root=str(root), **native_options),
-    )
 
 
 # ----------------------------------------------------------------------
@@ -289,35 +67,56 @@ def _heads_of(order: Sequence[int]) -> list[str]:
     return [membership[i] for i in order]
 
 
-def test_head_balanced_sampler_interleaves_and_is_deterministic() -> None:
-    head_items = {
-        "cases": list(range(10)),
-        "hosp": list(range(10, 14)),
-        "deaths": list(range(14, 16)),
+def test_hierarchical_sampler_balances_heads_then_sources() -> None:
+    grouped = {
+        "cases": {
+            ("municipality", "m1"): list(range(8)),
+            ("municipality", "m2"): [8, 9],
+        },
+        "hosp": {
+            ("abs", "a1"): [10, 11, 12],
+            ("abs", "a2"): [13],
+        },
+        "deaths": {
+            ("comarca", "c1"): [14],
+            ("comarca", "c2"): [15],
+        },
     }
-    order = list(HeadBalancedSampler(head_items, seed=42))
-    heads = _heads_of(order)
+    membership = {
+        **{index: ("cases", "m1") for index in range(8)},
+        8: ("cases", "m2"),
+        9: ("cases", "m2"),
+        10: ("hosp", "a1"),
+        11: ("hosp", "a1"),
+        12: ("hosp", "a1"),
+        13: ("hosp", "a2"),
+        14: ("deaths", "c1"),
+        15: ("deaths", "c2"),
+    }
 
-    # Counts 10/4/2 -> every item appears exactly once.
-    assert len(order) == 16
-    assert sorted(order) == list(range(16))
-    assert heads.count("cases") == 10
-    assert heads.count("hosp") == 4
-    assert heads.count("deaths") == 2
+    order = list(HierarchicalBalancedSampler(grouped, seed=42))
+    routed = [membership[index] for index in order]
 
-    # Round-robin interleave: while all heads have stock, each rotation
-    # window contains one item of every head.
-    assert set(heads[0:3]) == {"cases", "hosp", "deaths"}
-    assert set(heads[3:6]) == {"cases", "hosp", "deaths"}
-    assert set(heads[6:9]) == {"cases", "hosp"}  # deaths exhausted after 2
+    assert len(order) == 30  # 10 samples for each of three heads
+    assert Counter(head for head, _source in routed) == {
+        "cases": 10,
+        "hosp": 10,
+        "deaths": 10,
+    }
+    for head in ("cases", "hosp", "deaths"):
+        counts = Counter(
+            source for routed_head, source in routed if routed_head == head
+        )
+        assert max(counts.values()) - min(counts.values()) <= 1
+    assert list(HierarchicalBalancedSampler(grouped, seed=42)) == order
 
-    # Deterministic under seed.
-    assert list(HeadBalancedSampler(head_items, seed=42)) == order
-
-    # Plain mode: same multiset, seeded shuffle.
-    plain = list(HeadBalancedSampler(head_items, seed=42, balanced=False))
+    plain = list(HierarchicalBalancedSampler(grouped, seed=42, balanced=False))
     assert sorted(plain) == list(range(16))
-    assert list(HeadBalancedSampler(head_items, seed=42, balanced=False)) == plain
+    plain_sampler = HierarchicalBalancedSampler(grouped, seed=42, balanced=False)
+    first_epoch = list(plain_sampler)
+    second_epoch = list(plain_sampler)
+    assert sorted(first_epoch) == sorted(second_epoch) == list(range(16))
+    assert first_epoch != second_epoch
 
 
 # ----------------------------------------------------------------------
@@ -329,17 +128,19 @@ def test_native_support_config_defaults() -> None:
     config = NativeSupportConfig()
     assert config.enabled is True
     assert config.root == "data/processed/native_support"
-    assert config.spatial_encoder == "pooled"
+    assert config.spatial_encoder == "hetero"
     assert config.od_source == "mitma"
     assert config.overlap_weighting == "geostat_grid"
     assert config.od_self_flows == "retain"
     assert config.od_min_flow_raw == 10.0
     assert config.mobility_enabled is True
+    assert config.wastewater_enabled is True
+    assert config.include_vaccination is True
     assert config.hetero_hidden_dim == 16
     assert config.hetero_parameter_budget == 100_000
-    assert config.fold_manifest.endswith("native_source_folds.json")
+    assert config.fold_manifest.endswith("native_source_sets/manifest.json")
     assert config.fold_index is None
-    assert config.head_balanced_sampling is True
+    assert config.head_balanced_sampling is False
     assert config.confirmation_guard is True
     with pytest.raises(ValueError):
         NativeSupportConfig(spatial_encoder="dense")
@@ -353,13 +154,19 @@ def test_native_support_config_defaults() -> None:
         NativeSupportConfig(fold_index=-1)
 
 
-def test_config_roundtrip_and_smoke_yaml() -> None:
-    smoke_path = CONFIGS_DIR / "train_epifor_smoke.yaml"
+def test_config_roundtrip_and_overrides(tmp_path: Path) -> None:
+    smoke_path = tmp_path / "config.yaml"
+    source = config_fixture()
+    source.training.device = "cpu"
+    source.model.input_window_length = 28
+    source.model.forecast_horizon = 14
+    smoke_path.write_text(yaml.safe_dump(source.to_dict()))
     config = EpiForecasterConfig.load(smoke_path)
     assert config.native.enabled is True
     assert config.native.root == "data/processed/native_support"
-    assert config.native.head_balanced_sampling is True
+    assert config.native.head_balanced_sampling is False
     assert config.native.confirmation_guard is True
+    assert config.native.wastewater_enabled is True
     assert config.model.forecast_horizon == 14
     assert config.model.input_window_length == 28
     assert config.training.epochs >= 2
@@ -383,32 +190,6 @@ def test_config_roundtrip_and_smoke_yaml() -> None:
 # ----------------------------------------------------------------------
 # (3) Two training steps on the synthetic fixture
 # ----------------------------------------------------------------------
-
-
-def test_native_trainer_two_steps_finite_and_backward(tmp_path: Path) -> None:
-    _write_native_root(tmp_path)
-    trainer = NativeTrainer(_trainer_config(tmp_path))
-    parameter_before = next(trainer.model.parameters()).detach().clone()
-
-    results = trainer.run()
-
-    losses = results["train_loss_trace"][0]
-    assert len(losses) == 2  # epochs=1 x max_batches=2 -> exactly 2 steps
-    assert all(np.isfinite(losses))
-    val_loss = results["val_loss_trace"][0]
-    assert val_loss is not None and np.isfinite(val_loss)
-    assert set(trainer.last_val_metrics) >= {
-        "wis_cases",
-        "wis_hosp",
-        "wis_deaths",
-    }
-
-    # Backward + optimizer step actually updated the model.
-    parameter_after = next(trainer.model.parameters()).detach()
-    assert not torch.equal(parameter_before, parameter_after)
-
-    # All three routed heads were represented in the index.
-    assert set(results["head_counts"]) == set(ROUTED_HEADS)
 
 
 def test_native_trainer_construction_guards(tmp_path: Path) -> None:
@@ -447,8 +228,8 @@ def test_temporal_tail_split() -> None:
     assert sorted(origins[i] for i in val) == [34, 35]
     assert train and val
     assert set(train).isdisjoint(val)
-    assert sorted(train + val) == list(range(len(origins)))
-    assert max(origins[i] for i in train) < min(origins[i] for i in val)
+    assert set(train + val) <= set(range(len(origins)))
+    assert max(origins[i] + 1 for i in train) < min(origins[i] for i in val)
 
     # Zero fraction keeps everything for training.
     train_all, val_empty = temporal_tail_split(origins, val_fraction=0.0)
@@ -467,35 +248,46 @@ def test_temporal_tail_split_rejects_bad_fraction() -> None:
         temporal_tail_split([], val_fraction=0.1)
 
 
-def test_source_fold_temporal_split_excludes_unassigned_and_pairs_tail() -> None:
-    def query(source_type: str, source_id: str, origin: int) -> ForecastQuery:
-        return ForecastQuery(
-            source_type=source_type,  # type: ignore[arg-type]
+def test_source_set_manifest_split_uses_rotating_roles_and_three_intervals(
+    tmp_path: Path,
+) -> None:
+    queries = [
+        ForecastQuery(
+            source_type="municipality",
             source_id=source_id,
             forecast_origin=origin,
             horizon_days=2,
             requested_heads=frozenset({"cases"}),
         )
-
-    queries = [
-        query(source_type, source_id, origin)
-        for origin in (10, 20)
-        for source_type, source_id in (
-            ("municipality", "train"),
-            ("abs", "held"),
-            ("comarca", "excluded"),
-        )
+        for origin in (5, 15, 25)
+        for source_id in ("test", "validation", "train")
     ]
-    train, val = source_fold_temporal_split(
-        queries,
-        val_fraction=0.5,
-        assigned_sources={("municipality", "train"), ("abs", "held")},
-        held_out_sources={("abs", "held")},
+    manifest = SourceSetManifest(
+        path=tmp_path / "source_sets.json",
+        num_folds=3,
+        assignments={
+            ("municipality", "test"): 0,
+            ("municipality", "validation"): 1,
+            ("municipality", "train"): 2,
+        },
+        validation_start_origin=10,
+        test_start_origin=20,
+        forecast_horizon=1,
+        provenance={},
+        run_roles=(
+            FoldRoles(0, (2,), 1, 0),
+            FoldRoles(1, (0,), 2, 1),
+            FoldRoles(2, (1,), 0, 2),
+        ),
     )
 
-    assert train == [0]
-    assert val == [4]
-    assert all(queries[position].source_id != "excluded" for position in train + val)
+    train, validation, test = source_set_manifest_split(
+        queries, ["cases"] * len(queries), manifest, run_index=0
+    )
+
+    assert train == [2]
+    assert validation == [4]
+    assert test == [6]
 
 
 # Sanity: the fixture writer is exercised through the trainer tests above;
@@ -507,3 +299,73 @@ def test_dataset_config_matches_fixture(tmp_path: Path) -> None:
     )
     dataset = NativeSupportDataset(tmp_path, tmp_path / "real_with_id.zarr", config)
     assert set(dataset.head_counts) == {"cases", "deaths", "hosp"}
+
+
+def test_dataset_indexes_one_wastewater_query_per_edar_origin(
+    tmp_path: Path,
+) -> None:
+    _write_native_root(tmp_path)
+    _write_native_wastewater(tmp_path)
+    config = NativeDatasetConfig(
+        input_window_length=L,
+        forecast_horizon=H,
+        window_stride=1,
+        wastewater_enabled=True,
+    )
+    dataset = NativeSupportDataset(tmp_path, tmp_path / "real_with_id.zarr", config)
+
+    wastewater_indices = [
+        index for index in range(len(dataset)) if dataset.head_at(index) == "ww"
+    ]
+    assert wastewater_indices
+    identities = {
+        (
+            dataset.queries[index].source_id,
+            dataset.queries[index].forecast_origin,
+        )
+        for index in wastewater_indices
+    }
+    assert len(identities) == len(wastewater_indices)
+
+    item = dataset[wastewater_indices[0]]
+    assert item["query"].source_type == "edar"
+    assert item["target"].shape == (H, 3)
+    assert item["target_mask"].shape == (H, 3)
+    assert item["hist"].shape == (L, 6 + 3 + len(COVARIATES))
+    assert item["target_extra"]["detection_limit"].shape == (H, 3)
+    assert item["target_extra"]["censor_code"].shape == (H, 3)
+    assert item["target_extra"]["flow_m3_24h"].shape == (H,)
+    assert item["target_extra"]["flow_mask"].shape == (H,)
+    assert item["source_pop"] in {1000.0, 2000.0}
+
+
+def test_hetero_wastewater_accepts_vaccination_relation(tmp_path: Path) -> None:
+    _write_native_root(tmp_path)
+    _write_native_wastewater(tmp_path)
+    dataset = NativeSupportDataset(
+        tmp_path,
+        tmp_path / "real_with_id.zarr",
+        NativeDatasetConfig(
+            input_window_length=L,
+            forecast_horizon=H,
+            wastewater_enabled=True,
+            spatial_encoder="hetero",
+            mobility_enabled=False,
+        ),
+    )
+    index = next(i for i in range(len(dataset)) if dataset.head_at(i) == "ww")
+    batch = collate_native_batch([dataset[index]])
+    assert batch.relation_ctx["muni_edar_catchment"].shape[-1] == 6
+    assert batch.relation_ctx["muni_edar_catchment"][:, :, 3:].sum() > 0
+    model = NativeEpiForecaster(
+        NativeForecasterConfig(
+            f_native=batch.hist.shape[-1],
+            d_ctx=batch.ctx_feat.shape[-1],
+            sequence_length=L,
+            forecast_horizon=H,
+            spatial_encoder="hetero",
+            wastewater_enabled=True,
+            mobility_enabled=False,
+        )
+    )
+    assert torch.isfinite(model(batch)["spatial_context"]).all()

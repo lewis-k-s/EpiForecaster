@@ -100,3 +100,7 @@ WATCHDOG.yml
 
 # Cluster-local notes
 PROD_RUN.md
+
+# Derived native split assets are published through DVC.
+/data/processed/native_support/native_source_sets/
+/configs/splits/*.json

@@ -59,7 +59,7 @@ if SOURCE_TYPE_IDS != _DATASET_SOURCE_TYPE_IDS:
     )
 
 #: Supervised heads with routed per-head blocks (plan section 11.4).
-ROUTED_HEADS: tuple[str, ...] = ("cases", "hosp", "deaths")
+ROUTED_HEADS: tuple[str, ...] = ("ww", "cases", "hosp", "deaths")
 
 #: Head QC extras carried beside the frozen blocks (additive ``head_extra``).
 _HEAD_EXTRA_KEY = "stratum_pop_sum"
@@ -99,7 +99,9 @@ class NativeEpiBatch:
 
     # -- Frozen plan section 11.4 fields --------------------------------
     queries: list[ForecastQuery]  # length B, order-defining
-    hist: torch.Tensor  # (B, L, 5 + F_native): leading source-type one-hot + native channels
+    hist: (
+        torch.Tensor
+    )  # (B, L, 5 + F_native): leading source-type one-hot + native channels
     hist_mask: torch.Tensor  # (B, L) observed-validity for the query's own series
     source_type_id: torch.Tensor  # (B,) int enum index
     source_pop: torch.Tensor  # (B,) audited denominator for per-100k transform
@@ -107,8 +109,12 @@ class NativeEpiBatch:
     ctx_feat: torch.Tensor  # (B, L, D_ctx) fixed-pooling context
     temporal_covariates: torch.Tensor  # (B, L, k), shared with the municipal path
     # Per-head supervised blocks, gathered by routing index (length B_h <= B):
-    head_index: dict[str, torch.Tensor | None]  # {"cases","hosp","deaths"} row positions
-    head_target: dict[str, torch.Tensor | None]  # cases/deaths: (B_·, H) daily; hosp: (B_h, W) weekly
+    head_index: dict[
+        str, torch.Tensor | None
+    ]  # {"cases","hosp","deaths"} row positions
+    head_target: dict[
+        str, torch.Tensor | None
+    ]  # cases/deaths: (B_·, H) daily; hosp: (B_h, W) weekly
     head_target_mask: dict[str, torch.Tensor | None]
     head_population: dict[str, torch.Tensor | None]  # per-head denominator
     # -- Additive extensions (documented; not part of the frozen block) --
@@ -120,7 +126,7 @@ class NativeEpiBatch:
     relation_ctx: dict[str, torch.Tensor] = field(default_factory=dict)
     od_node_features: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, 0, 3)
-    )  # (G, N, 3)
+    )  # (G, N, 3 or 6 with vaccination)
     od_adjacency: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, 0, 0)
     )  # (G, N, N)
@@ -152,9 +158,7 @@ class NativeEpiBatch:
         safe_non_blocking = bool(non_blocking) and device.type == "cuda"
         for field_name in self.__dataclass_fields__:
             value = getattr(self, field_name)
-            setattr(
-                self, field_name, _move_tensors(value, device, safe_non_blocking)
-            )
+            setattr(self, field_name, _move_tensors(value, device, safe_non_blocking))
         return self
 
     def pin_memory(self) -> "NativeEpiBatch":
@@ -185,17 +189,28 @@ def _collect_head_extra(
     contract violation because extras are row-aligned with the routed block
     and a missing slot cannot be represented.
     """
-    values = [item.get("target_stratum_pop_sum") for item in routed]
-    provided = [value for value in values if value is not None]
-    if not provided:
+    extras = [dict(item.get("target_extra", {})) for item in routed]
+    stratum = [item.get("target_stratum_pop_sum") for item in routed]
+    if any(value is not None for value in stratum):
+        for item_extra, value in zip(extras, stratum, strict=True):
+            if value is not None:
+                item_extra[_HEAD_EXTRA_KEY] = value
+    keys = sorted({key for item_extra in extras for key in item_extra})
+    if not keys:
         return {_HEAD_EXTRA_KEY: None}
-    if len(provided) != len(routed):
-        raise ValueError(
-            f"Head {head!r}: {len(provided)} of {len(routed)} routed items "
-            f"provide {_HEAD_EXTRA_KEY!r}; extras are row-aligned and must "
-            "be provided by all or none"
-        )
-    return {_HEAD_EXTRA_KEY: _stack_uniform(provided, _HEAD_EXTRA_KEY)}
+    collected: dict[str, torch.Tensor | None] = {}
+    for key in keys:
+        values = [item_extra.get(key) for item_extra in extras]
+        provided = [value for value in values if value is not None]
+        if len(provided) != len(routed):
+            raise ValueError(
+                f"Head {head!r}: {len(provided)} of {len(routed)} routed items "
+                f"provide {key!r}; extras are row-aligned and must be provided "
+                "by all or none"
+            )
+        collected[key] = _stack_uniform(provided, key)
+    collected.setdefault(_HEAD_EXTRA_KEY, None)
+    return collected
 
 
 def _source_type_one_hot(
@@ -246,9 +261,7 @@ def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
             )
         origin_dow = int(item["origin_dow"])
         if not 0 <= origin_dow <= 6:
-            raise ValueError(
-                f"Item {position} origin_dow {origin_dow} outside 0..6"
-            )
+            raise ValueError(f"Item {position} origin_dow {origin_dow} outside 0..6")
 
     head_index: dict[str, torch.Tensor | None] = {}
     head_target: dict[str, torch.Tensor | None] = {}
@@ -346,9 +359,7 @@ def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
             group_index.append(group)
         od_node_features = _stack_uniform(grouped_features, "od_node_features")
         od_adjacency = _stack_uniform(grouped_adjacency, "od_adjacency")
-        od_target_weights = _stack_uniform(
-            target_weights, "od_target_weights"
-        )
+        od_target_weights = _stack_uniform(target_weights, "od_target_weights")
         od_group_index = torch.tensor(group_index, dtype=torch.long)
     else:
         od_node_features = torch.zeros(0, 0, 3)
@@ -356,7 +367,7 @@ def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
         od_target_weights = torch.zeros(len(items), 0)
         od_group_index = torch.zeros(len(items), dtype=torch.long)
 
-    return NativeEpiBatch(
+    batch = NativeEpiBatch(
         queries=queries,
         hist=hist,
         hist_mask=_stack_uniform([item["hist_mask"] for item in items], "hist_mask"),
@@ -385,3 +396,4 @@ def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
         od_target_weights=od_target_weights,
         od_group_index=od_group_index,
     )
+    return batch

@@ -485,7 +485,15 @@ def _native_daily_eval_view(
     raw_prediction = torch.expm1(loc).clamp_min(0.0) * (
         population.unsqueeze(1) / 100_000.0
     )
-    row_positions = batch.head_index[head].index_select(0, slots).tolist()
+    expected_deaths = None
+    if head == "deaths":
+        expected_block = batch.head_extra.get("deaths", {}).get("expected_deaths")
+        if expected_block is None:
+            raise ValueError("ABS deaths evaluation requires expected_deaths")
+        expected_deaths = expected_block.index_select(0, slots).to(device).float()
+        if expected_deaths.shape != raw_target.shape:
+            raise ValueError("ABS expected deaths shape differs from target")
+    row_positions = rows.tolist()
     queries = [batch.queries[int(position)] for position in row_positions]
     target_indices = torch.tensor(
         [
@@ -505,6 +513,7 @@ def _native_daily_eval_view(
         "target": target,
         "raw_target": raw_target,
         "raw_prediction": raw_prediction,
+        "expected_deaths": expected_deaths,
         "population": population,
         "weights": weights,
         "target_indices": target_indices,
@@ -589,6 +598,103 @@ def _native_hosp_eval_view(
     }
 
 
+def _native_wastewater_eval_view(
+    *,
+    model_outputs: dict[str, Any],
+    batch: NativeEpiBatch,
+    dataset: NativeSupportDataset,
+    criterion: NativeJointInferenceLoss,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    """Flatten ``[EDAR, day, assay]`` into assay-specific evaluation rows."""
+    rows = batch.head_index.get("ww")
+    raw_target = batch.head_target.get("ww")
+    target_mask = batch.head_target_mask.get("ww")
+    extras = batch.head_extra.get("ww", {})
+    detection_limit = extras.get("detection_limit")
+    censor_code = extras.get("censor_code")
+    population = batch.head_population.get("ww")
+    if (
+        rows is None
+        or raw_target is None
+        or target_mask is None
+        or detection_limit is None
+        or censor_code is None
+        or rows.numel() == 0
+    ):
+        return None
+    slots = _count_once_slots(batch, rows)
+    row_positions = rows.index_select(0, slots)
+    queries = [batch.queries[int(position)] for position in row_positions.tolist()]
+    raw_target = raw_target.index_select(0, slots).to(device=device).float()
+    target_mask = target_mask.index_select(0, slots).to(device)
+    detection_limit = detection_limit.index_select(0, slots).to(device).float()
+    censor_code = censor_code.index_select(0, slots).to(device)
+    loc = model_outputs["dist_ww_loc"].to(device).index_select(0, slots)
+    scale = model_outputs["dist_ww_scale"].to(device).index_select(0, slots)
+    if population is None:
+        population = batch.source_pop.index_select(0, row_positions)
+    else:
+        population = population.index_select(0, slots)
+    population = population.to(device=device).float()
+
+    assay_count = int(raw_target.shape[2])
+    if assay_count != len(dataset.wastewater_assays):
+        raise ValueError("wastewater assay coordinate does not match target block")
+
+    def flatten_assays(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.permute(0, 2, 1).reshape(-1, tensor.shape[1])
+
+    loc = flatten_assays(loc)
+    scale = flatten_assays(scale)
+    raw_target = flatten_assays(raw_target)
+    target_mask = flatten_assays(target_mask)
+    detection_limit = flatten_assays(detection_limit)
+    censor_code = flatten_assays(censor_code)
+    target = torch.log1p(raw_target.clamp_min(0.0))
+    uncensored = _binary_target_mask(target_mask) & (censor_code == 0)
+    censored = _binary_target_mask(target_mask) & (censor_code == 1)
+    weights = uncensored.float()
+    raw_prediction = torch.expm1(loc).clamp_min(0.0)
+    expanded_queries = [query for query in queries for _ in dataset.wastewater_assays]
+    source_ids = [
+        f"{query.source_id}::{assay}"
+        for query in queries
+        for assay in dataset.wastewater_assays
+    ]
+    target_indices = torch.tensor(
+        [
+            [
+                int(query.forecast_origin) + horizon + 1
+                for horizon in range(criterion.horizon_days)
+            ]
+            for query in expanded_queries
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+    scores = criterion.left_censored_nll(
+        loc,
+        scale,
+        torch.where(censored, detection_limit, torch.zeros_like(detection_limit)),
+    )
+    censored_nll = torch.where(censored, scores, torch.zeros_like(scores))
+    return {
+        "queries": expanded_queries,
+        "source_ids": source_ids,
+        "loc": loc,
+        "scale": scale,
+        "target": target,
+        "raw_target": raw_target,
+        "raw_prediction": raw_prediction,
+        "population": population.repeat_interleave(assay_count),
+        "weights": weights,
+        "target_indices": target_indices,
+        "censored_nll_sum": censored_nll.sum(),
+        "censored_count": censored.sum(),
+    }
+
+
 @torch.no_grad()
 def evaluate_native_loader(
     *,
@@ -610,6 +716,7 @@ def evaluate_native_loader(
     dataset = _native_dataset_from_loader(loader)
     date_grid = dataset.date_grid
     head_horizons = {
+        "ww": criterion.horizon_days,
         "cases": criterion.horizon_days,
         "hosp": criterion.weekly_slots,
         "deaths": criterion.horizon_days,
@@ -642,6 +749,32 @@ def evaluate_native_loader(
         for head, horizon in head_horizons.items()
     }
     aggregate_accumulator = NativeAggregateAccumulator()
+    excess_abs_error = 0.0
+    excess_observed = 0
+    excess_handle = None
+    excess_writer = None
+    if aggregate_output_dir is not None:
+        aggregate_output_dir.mkdir(parents=True, exist_ok=True)
+        excess_path = (
+            aggregate_output_dir / f"{split_name.lower()}_native_excess_deaths.csv"
+        )
+        excess_handle = excess_path.open("w", newline="")
+        excess_writer = csv_lib.writer(excess_handle)
+        excess_writer.writerow(
+            [
+                "split",
+                "abs_id",
+                "origin_index",
+                "horizon",
+                "target_index",
+                "target_date",
+                "expected_all_cause",
+                "observed_all_cause",
+                "predicted_all_cause",
+                "observed_excess",
+                "predicted_excess",
+            ]
+        )
     granular_writer = (
         GranularEvalWriter(
             path=granular_output_path,
@@ -655,6 +788,8 @@ def evaluate_native_loader(
     model.eval()
     loss_sum = 0.0
     processed_batches = 0
+    censored_ww_nll_sum = 0.0
+    censored_ww_count = 0
     try:
         for batch_index, batch in enumerate(loader):
             if max_batches is not None and batch_index >= max_batches:
@@ -674,9 +809,17 @@ def evaluate_native_loader(
                 components = criterion(outputs, batch)
             loss_sum += float(components["total"].item())
             processed_batches += 1
-            for head in ("cases", "hosp", "deaths"):
+            for head in ("ww", "cases", "hosp", "deaths"):
                 view = (
-                    _native_hosp_eval_view(
+                    _native_wastewater_eval_view(
+                        model_outputs=outputs,
+                        batch=batch,
+                        dataset=dataset,
+                        criterion=criterion,
+                        device=device,
+                    )
+                    if head == "ww"
+                    else _native_hosp_eval_view(
                         model_outputs=outputs,
                         batch=batch,
                         criterion=criterion,
@@ -693,6 +836,47 @@ def evaluate_native_loader(
                 )
                 if view is None:
                     continue
+                if head == "deaths":
+                    expected = view["expected_deaths"]
+                    observed_excess = view["raw_target"] - expected
+                    predicted_excess = view["raw_prediction"] - expected
+                    active = view["weights"] > 0
+                    excess_abs_error += float(
+                        ((predicted_excess - observed_excess).abs() * active).sum()
+                    )
+                    excess_observed += int(active.sum())
+                    if excess_writer is not None:
+                        expected_cpu = expected.detach().cpu().numpy()
+                        observed_cpu = view["raw_target"].detach().cpu().numpy()
+                        predicted_cpu = view["raw_prediction"].detach().cpu().numpy()
+                        active_cpu = active.detach().cpu().numpy()
+                        indices_cpu = view["target_indices"].detach().cpu().numpy()
+                        for row, query in enumerate(view["queries"]):
+                            for day in range(active_cpu.shape[1]):
+                                if not active_cpu[row, day]:
+                                    continue
+                                target_index = int(indices_cpu[row, day])
+                                baseline = float(expected_cpu[row, day])
+                                observed_count = float(observed_cpu[row, day])
+                                predicted_count = float(predicted_cpu[row, day])
+                                excess_writer.writerow(
+                                    [
+                                        split_name.lower(),
+                                        str(query.source_id),
+                                        int(query.forecast_origin),
+                                        day + 1,
+                                        target_index,
+                                        str(date_grid[target_index]),
+                                        baseline,
+                                        observed_count,
+                                        predicted_count,
+                                        observed_count - baseline,
+                                        predicted_count - baseline,
+                                    ]
+                                )
+                if head == "ww":
+                    censored_ww_nll_sum += float(view["censored_nll_sum"].item())
+                    censored_ww_count += int(view["censored_count"].item())
                 point_accumulators[head].update(
                     view["loc"], view["target"], None, view["weights"]
                 )
@@ -724,7 +908,10 @@ def evaluate_native_loader(
                     "point": wis_batch.point,
                 }
                 source_types = [str(query.source_type) for query in view["queries"]]
-                source_ids = [str(query.source_id) for query in view["queries"]]
+                source_ids = view.get(
+                    "source_ids",
+                    [str(query.source_id) for query in view["queries"]],
+                )
                 aggregate_accumulator.update(
                     head=head,
                     source_types=source_types,
@@ -743,6 +930,7 @@ def evaluate_native_loader(
                     granular_writer.write_native_rows(
                         target_name=head,
                         queries=view["queries"],
+                        source_ids=source_ids,
                         node_ids=[
                             dataset.graph_node_index(query.source_type, query.source_id)
                             for query in view["queries"]
@@ -762,6 +950,8 @@ def evaluate_native_loader(
                         wis_components=wis_components,
                     )
     finally:
+        if excess_handle is not None:
+            excess_handle.close()
         if granular_writer is not None:
             granular_writer.close()
         if model_was_training:
@@ -770,7 +960,11 @@ def evaluate_native_loader(
         raise ValueError("native evaluation processed no batches")
 
     metrics: dict[str, Any] = {}
-    for head in ("cases", "hosp", "deaths"):
+    metrics["mae_excess_deaths_raw"] = (
+        excess_abs_error / excess_observed if excess_observed else float("nan")
+    )
+    metrics["observed_excess_deaths"] = excess_observed
+    for head in ("ww", "cases", "hosp", "deaths"):
         point = point_accumulators[head].finalize()
         raw = raw_accumulators[head].finalize()
         probabilistic = distribution_accumulators[head].finalize()
@@ -791,6 +985,25 @@ def evaluate_native_loader(
                 f"wis_per_h_{head}": wis.wis_per_h,
             }
         )
+        if head == "ww":
+            metrics["mae_ww_log1p_concentration"] = point.mae
+            metrics["rmse_ww_log1p_concentration"] = point.rmse
+            metrics["raw_concentration_mae_ww"] = raw.mae
+    metrics["censored_nll_ww"] = (
+        censored_ww_nll_sum / censored_ww_count
+        if censored_ww_count > 0
+        else float("nan")
+    )
+    metrics["censored_count_ww"] = censored_ww_count
+    active_wis = [
+        float(metrics[f"wis_{head}"])
+        for head in ("ww", "cases", "hosp", "deaths")
+        if metrics[f"observed_count_{head}"] > 0
+    ]
+    if active_wis and not all(math.isfinite(value) for value in active_wis):
+        raise ValueError("Observed native head has no finite WIS")
+    metrics["joint_wis"] = float(np.mean(active_wis)) if active_wis else float("nan")
+    metrics["joint_wis_head_count"] = len(active_wis)
     aggregate = aggregate_accumulator.finalize()
     if aggregate_output_dir is not None:
         write_native_aggregate_outputs(
@@ -804,7 +1017,13 @@ def evaluate_native_loader(
             "native_support": True,
             "confirmation_guard": confirmation_guard,
             "observed_only": True,
-            "metric_space": "log1p_per_100k",
+            "metric_space": "target_specific",
+            "metric_space_by_target": {
+                "cases": "log1p_per_100k",
+                "hospitalizations": "log1p_per_100k_week",
+                "deaths": "log1p_per_100k",
+                "wastewater": "log1p_concentration",
+            },
             "raw_count_metrics": ["raw_count_mae"],
             "interval_levels": list(criterion.interval_levels),
         }

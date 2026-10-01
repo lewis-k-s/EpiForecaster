@@ -366,6 +366,8 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     tmp_path,
 ) -> None:
     cfg = _joint_loss_cfg_stub(joint={"observation_loss": "mae"})
+    cfg.native = SimpleNamespace(fold_manifest="")
+    monkeypatch.setattr("scripts.hpo.hpsearch_worker.build_for_config", lambda *args: None)
     cfg.output = SimpleNamespace(log_dir=str(tmp_path), experiment_name="study")
     cfg.training.epochs = 1
     captured: dict[str, object] = {}
@@ -435,7 +437,7 @@ def test_objective_returns_selection_score_and_records_joint_loss(
 
     monkeypatch.setattr("scripts.hpo.hpsearch_worker.EpiForecasterConfig", _FakeConfig)
     monkeypatch.setattr(
-        "scripts.hpo.hpsearch_worker.EpiForecasterTrainer", _FakeTrainer
+        "scripts.hpo.hpsearch_worker.NativeTrainer", _FakeTrainer
     )
 
     def _fake_suggest_params(

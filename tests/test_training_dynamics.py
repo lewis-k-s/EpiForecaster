@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import json
 import math
-import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-import torch
 import yaml
 
 from scripts.analysis.analyze_training_dynamics import (
@@ -18,7 +15,6 @@ from scripts.analysis.query_run_provenance import (
     collect_training_provenance,
     provenance_table,
 )
-from training.epiforecaster_trainer import EpiForecasterTrainer
 from training.training_dynamics import (
     DYNAMICS_ARTIFACT_NAME,
     DYNAMICS_MANIFEST_NAME,
@@ -208,80 +204,6 @@ def test_analyzer_rejects_tampered_terminal_artifact(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         analyze_training_dynamics(tmp_path)
-
-
-def test_nonfinite_helper_persists_triggering_observation(tmp_path) -> None:
-    writer = _writer(tmp_path)
-    parameter = torch.nn.Parameter(torch.tensor(1.0))
-    trainer = SimpleNamespace(
-        training_dynamics_writer=writer,
-        config=SimpleNamespace(training=SimpleNamespace(gradient_clip_value=5.0)),
-        optimizer=torch.optim.SGD([parameter], lr=0.1),
-        current_epoch=2,
-        global_step=10,
-        curriculum_sampler=None,
-    )
-
-    EpiForecasterTrainer._append_nonfinite_dynamics_record(
-        trainer,
-        loss=torch.tensor(float("nan")),
-        grad_norm=torch.tensor(2.0),
-        batch_start_time=time.time(),
-        data_time_s=0.1,
-        model_step_time_s=0.2,
-        component_gradnorm_log_data={},
-        gradnorm_step_log_data={},
-        gradient_snapshot_log_data={},
-        model_diagnostics_log_data={},
-    )
-
-    row = json.loads((tmp_path / DYNAMICS_ARTIFACT_NAME).read_text())
-    assert row["loss_train_step"] is None
-    assert row["nonfinite_fields"] == ["loss_train_step"]
-    assert row["step"] == 10
-
-
-def test_trainer_run_finalizes_complete_dynamics() -> None:
-    finalized: list[tuple[str, dict[str, object]]] = []
-    trainer = SimpleNamespace(
-        training_dynamics_writer=SimpleNamespace(
-            finalize=lambda status, **kwargs: finalized.append((status, kwargs))
-        ),
-        nan_loss_triggered=False,
-        _run_training=lambda: {"ok": True},
-    )
-
-    result = EpiForecasterTrainer.run(trainer)
-
-    assert result == {"ok": True}
-    assert finalized[0][0] == "complete"
-    assert finalized[0][1]["summary"]["training_history"] == {}
-
-
-def test_trainer_run_finalizes_pruned_and_failed_dynamics() -> None:
-    class TrialPruned(Exception):
-        pass
-
-    for error, expected in [
-        (TrialPruned("pruned"), "pruned"),
-        (RuntimeError("failed"), "failed"),
-    ]:
-        finalized: list[tuple[str, dict[str, object]]] = []
-
-        def fail() -> None:
-            raise error
-
-        trainer = SimpleNamespace(
-            training_dynamics_writer=SimpleNamespace(
-                finalize=lambda status, **kwargs: finalized.append((status, kwargs))
-            ),
-            _run_training=fail,
-        )
-        with pytest.raises(type(error)):
-            EpiForecasterTrainer.run(trainer)
-        assert finalized[0][0] == expected
-        assert finalized[0][1]["error_type"] == type(error).__name__
-        assert finalized[0][1]["summary"]["training_history"] == {}
 
 
 def test_provenance_query_reconciles_dvc_and_survives_portable_copy(

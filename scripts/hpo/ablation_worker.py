@@ -27,7 +27,8 @@ from optuna.storages.journal import JournalFileBackend
 
 from models.configs import EpiForecasterConfig
 from scripts.hpo.worker_identity import compute_worker_seed as _compute_worker_seed
-from training.epiforecaster_trainer import EpiForecasterTrainer
+from training.native_trainer import NativeTrainer
+from data.build_native_source_sets import build_for_config
 from utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -206,26 +207,6 @@ def _flatten(value: Any, prefix: tuple[str, ...] = ()) -> dict[str, Any]:
 def _resolve_source_path(raw: str) -> Path:
     path = Path(raw)
     return path if path.is_absolute() else Path.cwd() / path
-
-
-def _manifest_num_folds(path: Path) -> int:
-    """Read the persisted manifest's explicit fold cardinality."""
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"Cannot parse cross-validation split manifest {path}: {exc}"
-        ) from exc
-    if not isinstance(manifest, dict):
-        raise ValueError(
-            f"cross_validation.split_manifest must contain an object: {path}"
-        )
-    num_folds = manifest.get("num_folds")
-    if not isinstance(num_folds, int) or isinstance(num_folds, bool) or num_folds <= 0:
-        raise ValueError(
-            f"cross_validation.split_manifest has invalid num_folds: {path}"
-        )
-    return num_folds
 
 
 def _hydrate_effective_config(
@@ -434,28 +415,13 @@ def load_campaign(path: Path) -> AblationCampaign:
             raise ValueError(
                 "cross_validation.smoke_fold_indices must be a subset of fold_indices"
             )
-        manifest_raw = cv.get("split_manifest")
-        if fold_indices and not isinstance(manifest_raw, str):
+        crossval_num_folds = cv.get("num_folds", 10)
+        if type(crossval_num_folds) is not int or crossval_num_folds < 3:
             raise ValueError(
-                "cross_validation.split_manifest is required when folds are configured"
+                "cross_validation.num_folds must be an integer of at least three"
             )
-        if manifest_raw is not None:
-            split_manifest = _resolve_source_path(
-                _string(manifest_raw, field="cross_validation.split_manifest")
-            )
-            if not split_manifest.is_file():
-                raise ValueError(
-                    f"cross_validation.split_manifest does not exist: {split_manifest}"
-                )
-            crossval_num_folds = _manifest_num_folds(split_manifest)
-            invalid_folds = [
-                fold for fold in fold_indices if fold >= crossval_num_folds
-            ]
-            if invalid_folds:
-                raise ValueError(
-                    "cross_validation.fold_indices exceed manifest num_folds "
-                    f"{crossval_num_folds}: {invalid_folds}"
-                )
+        if any(fold >= crossval_num_folds for fold in fold_indices):
+            raise ValueError("cross_validation.fold_indices exceed num_folds")
     metrics = _mapping(root["metrics"], field="metrics")
     primary = _mapping(metrics.get("primary"), field="metrics.primary")
     completeness_requirements = _mapping(
@@ -837,31 +803,17 @@ def objective(
         "output.write_granular_eval=true",
     ]
     if fold is not None:
-        assert campaign.split_manifest is not None
         assert campaign.crossval_num_folds is not None
         overrides += [
-            "training.crossval_enabled=true",
-            f"training.crossval_num_folds={campaign.crossval_num_folds}",
-            f"training.crossval_fold_index={fold}",
-            f"training.crossval_manifest_path={campaign.split_manifest}",
+            f"native.num_folds={campaign.crossval_num_folds}",
+            f"native.fold_index={fold}",
         ]
     if smoketest:
         overrides += _as_cli_overrides(campaign.smoke_overrides)
     experiment_name = f"mn5_ablation__{campaign.campaign_id}__{condition_name}"
-    tags = [
-        "mn5",
-        "ablation",
-        f"campaign_{campaign.campaign_id}",
-        f"condition_{condition_name}",
-        f"seed_{seed}",
-        f"campaign_sha256_{campaign.sha256[:48]}",
-    ]
-    if fold is not None:
-        tags.append(f"fold_{fold}")
     overrides += [
         f"output.experiment_name={experiment_name}",
-        f"output.wandb_group=ablation_{campaign.campaign_id}",
-        f"output.wandb_tags={json.dumps(tags, separators=(',', ':'))}",
+        "output.wandb_mode=disabled",
     ]
     if smoketest:
         overrides += ["training.max_batches=2", "training.epochs=1"]
@@ -870,7 +822,14 @@ def objective(
     model_id = (
         f"ablation_t{trial.number}_f{fold if fold is not None else 'none'}_s{seed}"
     )
-    trainer = EpiForecasterTrainer(cfg, model_id=model_id)
+    cfg.native.fold_manifest = str(
+        Path(cfg.output.log_dir)
+        / experiment_name
+        / model_id
+        / "inputs/native_source_sets/manifest.json"
+    )
+    build_for_config(cfg, Path(cfg.native.fold_manifest))
+    trainer = NativeTrainer(cfg, model_id=model_id)
     results = trainer.run()
     if trainer.experiment_dir is not None:
         output_identity = trainer.experiment_dir / "campaign_identity.json"

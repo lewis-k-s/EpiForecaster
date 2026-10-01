@@ -1107,6 +1107,9 @@ class TrainingParams:
     # Run canonical validation/test evaluation after selecting the best checkpoint.
     # Workflow-managed training disables this and evaluates in a separate DAG rule.
     run_final_evaluation: bool = True
+    # Diagnostic-only test evaluations during training. These never select a
+    # checkpoint; use explicit 1-based epochs to bound cost and test exposure.
+    diagnostic_test_trace_epochs: list[int] = field(default_factory=list)
     # Loss configuration (single or composite)
     loss: LossConfig = field(default_factory=LossConfig)
     # forecast plotting during validation/test evaluation
@@ -1440,7 +1443,7 @@ class OutputConfig:
         return filename
 
 
-NATIVE_SPATIAL_ENCODERS = ("pooled", "hetero")
+NATIVE_SPATIAL_ENCODERS = ("hetero",)
 NATIVE_OD_SOURCES = ("mitma", "municipal")
 NATIVE_OVERLAP_WEIGHTINGS = ("geostat_grid", "uniform_density")
 NATIVE_OD_SELF_FLOW_MODES = ("retain", "drop")
@@ -1450,24 +1453,31 @@ NATIVE_OD_SELF_FLOW_MODES = ("retain", "drop")
 class NativeSupportConfig:
     """Native-support training surface (plan section 11.6).
 
-    Attached to :class:`EpiForecasterConfig` as the clinical default. The
-    legacy municipal/wastewater path requires ``enabled: false`` in its YAML.
+    This worktree supports only the source-native heterogeneous model.
+    NativeRuntime rejects ``enabled: false``.
     """
 
     enabled: bool = True
     root: str = "data/processed/native_support"
-    spatial_encoder: str = "pooled"
+    spatial_encoder: str = "hetero"
     od_source: str = "mitma"
     overlap_weighting: str = "geostat_grid"
     od_self_flows: str = "retain"
     od_min_flow_raw: float = 10.0
-    head_balanced_sampling: bool = True
+    head_balanced_sampling: bool = False
     confirmation_guard: bool = True
     mobility_enabled: bool = True
+    wastewater_enabled: bool = True
+    include_vaccination: bool = True
     hetero_hidden_dim: int = 16
     hetero_parameter_budget: int = 100_000
-    fold_manifest: str = "data/processed/native_support/native_source_folds.json"
+    fold_manifest: str = (
+        "data/processed/native_support/native_source_sets/manifest.json"
+    )
     fold_index: int | None = None
+    num_folds: int = 10
+    validation_fraction: float = 0.1
+    test_fraction: float = 0.1
 
     def __post_init__(self) -> None:
         for name, allowed in (
@@ -1487,6 +1497,16 @@ class NativeSupportConfig:
             raise ValueError("native.hetero_hidden_dim must be positive")
         if self.hetero_parameter_budget <= 0:
             raise ValueError("native.hetero_parameter_budget must be positive")
+        if type(self.num_folds) is not int or self.num_folds < 3:
+            raise ValueError("native.num_folds must be an integer of at least three")
+        if not (
+            0 < self.validation_fraction < 1
+            and 0 < self.test_fraction < 1
+            and self.validation_fraction + self.test_fraction < 1
+        ):
+            raise ValueError(
+                "native validation/test fractions must be positive and sum to less than one"
+            )
         if self.fold_index is not None and self.fold_index < 0:
             raise ValueError("native.fold_index must be non-negative when set")
 
