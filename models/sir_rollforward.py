@@ -159,6 +159,40 @@ class SIRRollForward(nn.Module):
         # Validate and normalize initial states
         S0, I0, H0, R0 = self._sanitize_initial_states(S0, I0, H0, R0, population)
 
+        return self._rollout(
+            beta_t,
+            gamma_t,
+            mortality_t,
+            S0,
+            I0,
+            H0,
+            R0,
+            population,
+            hospitalization_rate_t,
+            hospital_recovery_t,
+            hospital_mortality_t,
+        )
+
+    def _rollout(
+        self,
+        beta_t: torch.Tensor,
+        gamma_t: torch.Tensor,
+        mortality_t: torch.Tensor,
+        S0: torch.Tensor,
+        I0: torch.Tensor,
+        H0: torch.Tensor,
+        R0: torch.Tensor,
+        population: torch.Tensor,
+        hospitalization_rate_t: torch.Tensor,
+        hospital_recovery_t: torch.Tensor,
+        hospital_mortality_t: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Tensor rollout after eager shape, population, and initial-state checks.
+
+        Compile this callable alone to preserve strict validation and checkpoint
+        keys while fusing the fixed-horizon Euler loop.
+        """
+        _, horizon = beta_t.shape
         # Initialize Deceased state at 0 (representing *new* deaths since start of window)
         # or we could require D0. For now, assuming D starts at 0 relative to window.
         D0 = torch.zeros_like(S0)

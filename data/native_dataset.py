@@ -183,6 +183,8 @@ class NativeDatasetConfig:
     # Consumption-time OD policy applied when ``include_od_context`` is on
     # (plan sections 11.6-11.7, ruling R10).
     od_min_flow_raw: float = 10.0
+    od_graph_cache_size: int = 16
+    cache_od_target_weights: bool = False
     od_self_flows: str = "retain"
     # Ruling R9: reject origins whose target window intersects
     # ``CONFIRMATION_WINDOW`` unless explicitly disabled for calibration work.
@@ -212,6 +214,8 @@ class NativeDatasetConfig:
             )
         if not math.isfinite(float(self.od_min_flow_raw)) or self.od_min_flow_raw < 0:
             raise ValueError("od_min_flow_raw must be finite and non-negative")
+        if type(self.od_graph_cache_size) is not int or self.od_graph_cache_size < 1:
+            raise ValueError("od_graph_cache_size must be a positive integer")
         if self.spatial_encoder not in NATIVE_SPATIAL_ENCODERS:
             raise ValueError(
                 f"spatial_encoder must be one of {NATIVE_SPATIAL_ENCODERS}, "
@@ -493,6 +497,7 @@ class NativeSupportDataset(Dataset):
         self._pools = self._build_pools()
         self._od_feature_weights = self._build_od_feature_weights()
         self._od_graph_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._od_target_weight_cache: dict[tuple[str, str], np.ndarray] = {}
         self._items = self._build_index()
         self._context_source_roles: dict[str, str] | None = None
 
@@ -1313,12 +1318,23 @@ class NativeSupportDataset(Dataset):
             features.astype(np.float32, copy=False),
             adjacency.astype(np.float32, copy=False),
         )
-        if len(self._od_graph_cache) >= 16:
+        if len(self._od_graph_cache) >= self._config.od_graph_cache_size:
             self._od_graph_cache.pop(next(iter(self._od_graph_cache)))
         self._od_graph_cache[origin] = result
         return result
 
     def _od_target_weights(self, source_type: str, source_id: str) -> np.ndarray:
+        """Typed hop from configured OD nodes back to one clinical target."""
+        if not self._config.cache_od_target_weights:
+            return self._build_od_target_weights(source_type, source_id)
+        key = (source_type, source_id)
+        cached = self._od_target_weight_cache.get(key)
+        if cached is None:
+            cached = self._build_od_target_weights(source_type, source_id)
+            self._od_target_weight_cache[key] = cached
+        return cached
+
+    def _build_od_target_weights(self, source_type: str, source_id: str) -> np.ndarray:
         """Build fixed source weights without an origin-dependent input."""
         assert self._od is not None
         weights = np.zeros(len(self._od.zone_ids), dtype=np.float32)

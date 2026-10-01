@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -136,6 +136,124 @@ class NativeEpiBatch:
     od_group_index: torch.Tensor = field(
         default_factory=lambda: torch.zeros(0, dtype=torch.long)
     )  # (B,)
+    head_count_once_slots: dict[str, torch.Tensor] = field(default_factory=dict)
+    _loss_metadata_tokens: dict[str, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _loss_metadata_queries: tuple[ForecastQuery, ...] = field(
+        default_factory=tuple, init=False, repr=False
+    )
+    _ww_has_censored: bool = field(default=False, init=False, repr=False)
+
+    def _metadata_tokens(self, head: str) -> tuple[tuple[int, int], ...] | None:
+        """Detect replacement and in-place edits without reading device values."""
+        tensors = (
+            self.head_index.get(head),
+            self.head_population.get(head),
+            self.head_target_mask.get(head),
+            self.head_extra.get(head, {}).get("censor_code"),
+            self.head_count_once_slots.get(head),
+        )
+        if any(t is not None and t.is_inference() for t in tensors):
+            return None  # Inference tensors have no mutation version counter.
+        return tuple((id(t), t._version) for t in tensors if t is not None)
+
+    def loss_metadata_valid(self, head: str) -> bool:
+        """Use CPU-checked metadata only while the checked batch is unchanged."""
+        return (
+            head in self._loss_metadata_tokens
+            and tuple(self.queries) == self._loss_metadata_queries
+            and self._metadata_tokens(head) == self._loss_metadata_tokens[head]
+        )
+
+    def cached_count_once_slots(self, rows: torch.Tensor) -> torch.Tensor | None:
+        for head, index in self.head_index.items():
+            if rows is index and self.loss_metadata_valid(head):
+                return self.head_count_once_slots[head]
+        return None
+
+    def prepare_loss_metadata(self) -> None:
+        """Deduplicate routing and check fixed input values during CPU collation."""
+        self._loss_metadata_tokens.clear()
+        self.head_count_once_slots.clear()
+        self._loss_metadata_queries = tuple(self.queries)
+        for head, rows in self.head_index.items():
+            if rows is None or rows.numel() == 0:
+                continue
+            if rows.device.type != "cpu":
+                raise ValueError("Loss metadata must be prepared on CPU")
+            seen = set()
+            keep = []
+            for slot, position in enumerate(rows.tolist()):
+                query = self.queries[position]
+                identity = (
+                    query.source_type,
+                    query.source_id,
+                    query.forecast_origin,
+                    query.horizon_days,
+                    query.realization_id,
+                )
+                if identity not in seen:
+                    keep.append(slot)
+                    seen.add(identity)
+            if head != "ww":
+                population = self.head_population[head]
+                if population is None or population.device.type != "cpu":
+                    raise ValueError("CPU head populations are required for metadata")
+                selected_population = population[keep].float()
+                if not bool(torch.isfinite(selected_population).all()) or not bool(
+                    (selected_population > 0).all()
+                ):
+                    raise ValueError("population entries must be positive and finite")
+            else:
+                mask = self.head_target_mask[head]
+                code = self.head_extra[head].get("censor_code")
+                if mask is None or code is None:
+                    raise ValueError(
+                        "Wastewater metadata requires mask and censor_code"
+                    )
+                if mask.device.type != "cpu" or code.device.type != "cpu":
+                    raise ValueError("Wastewater metadata must be prepared on CPU")
+                observed = (
+                    torch.nan_to_num(
+                        mask[keep].float(), nan=0.0, posinf=1.0, neginf=0.0
+                    )
+                    > 0.5
+                )
+                selected_code = code[keep].to(dtype=torch.uint8)
+                if bool((observed & (selected_code > 1)).any()):
+                    raise ValueError(
+                        "Observed wastewater slots must use censor_code 0 or 1"
+                    )
+                self._ww_has_censored = bool((observed & (selected_code == 1)).any())
+            self.head_count_once_slots[head] = torch.tensor(keep, dtype=torch.long)
+            tokens = self._metadata_tokens(head)
+            if tokens is not None:
+                self._loss_metadata_tokens[head] = tokens
+
+    def _refresh_loss_metadata(self, valid_heads: list[str]) -> None:
+        self._loss_metadata_tokens.clear()
+        for head in valid_heads:
+            tokens = self._metadata_tokens(head)
+            if tokens is not None:
+                self._loss_metadata_tokens[head] = tokens
+
+    def __getstate__(self) -> dict[str, object]:
+        """Transfer checked metadata without copying process-local tensor IDs."""
+        state = self.__dict__.copy()
+        state["_serialized_valid_loss_metadata"] = [
+            head
+            for head in self._loss_metadata_tokens
+            if self.loss_metadata_valid(head)
+        ]
+        state["_loss_metadata_tokens"] = {}
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Bind metadata tokens to the tensors received from a loader worker."""
+        valid_heads = cast(list[str], state.pop("_serialized_valid_loss_metadata", []))
+        self.__dict__.update(state)
+        self._refresh_loss_metadata(valid_heads)
 
     @property
     def b(self) -> int:
@@ -156,15 +274,23 @@ class NativeEpiBatch:
         if isinstance(device, str):
             device = torch.device(device)
         safe_non_blocking = bool(non_blocking) and device.type == "cuda"
+        valid_heads = [
+            h for h in self._loss_metadata_tokens if self.loss_metadata_valid(h)
+        ]
         for field_name in self.__dataclass_fields__:
             value = getattr(self, field_name)
             setattr(self, field_name, _move_tensors(value, device, safe_non_blocking))
+        self._refresh_loss_metadata(valid_heads)
         return self
 
     def pin_memory(self) -> "NativeEpiBatch":
         """Pin CPU tensors recursively so CUDA transfers can be non-blocking."""
+        valid_heads = [
+            h for h in self._loss_metadata_tokens if self.loss_metadata_valid(h)
+        ]
         for field_name in self.__dataclass_fields__:
             setattr(self, field_name, _pin_tensors(getattr(self, field_name)))
+        self._refresh_loss_metadata(valid_heads)
         return self
 
 
@@ -229,7 +355,9 @@ def _source_type_one_hot(
     return block
 
 
-def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
+def collate_native_batch(
+    items: Sequence[NativeDatasetItem], *, precompute_loss_metadata: bool = False
+) -> NativeEpiBatch:
     """Collate DS-1 items into a :class:`NativeEpiBatch`.
 
     Validates source-type one-hot consistency
@@ -396,4 +524,6 @@ def collate_native_batch(items: Sequence[NativeDatasetItem]) -> NativeEpiBatch:
         od_target_weights=od_target_weights,
         od_group_index=od_group_index,
     )
+    if precompute_loss_metadata:
+        batch.prepare_loss_metadata()
     return batch

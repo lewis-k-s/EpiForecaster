@@ -26,6 +26,8 @@ def native_dataset(config: EpiForecasterConfig) -> NativeSupportDataset:
             spatial_encoder=config.native.spatial_encoder,
             od_source=config.native.od_source,
             od_min_flow_raw=config.native.od_min_flow_raw,
+            od_graph_cache_size=config.native.od_graph_cache_size,
+            cache_od_target_weights=config.native.cache_od_target_weights,
             od_self_flows=config.native.od_self_flows,
             mobility_enabled=config.native.mobility_enabled,
             wastewater_enabled=config.native.wastewater_enabled,

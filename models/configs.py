@@ -1091,6 +1091,8 @@ class TrainingParams:
     )
     device: str = "auto"
     num_workers: int = 4
+    # BLAS budget for spawned native loader workers; None preserves inheritance.
+    worker_blas_threads: int | None = None
     val_workers: int = 4
     test_workers: int = (
         0  # Test loader workers (typically 0 since test runs once at end)
@@ -1293,6 +1295,10 @@ class TrainingParams:
             raise ValueError(
                 f"warmup_steps must be non-negative, got {self.warmup_steps}"
             )
+        if self.worker_blas_threads is not None and (
+            type(self.worker_blas_threads) is not int or self.worker_blas_threads < 1
+        ):
+            raise ValueError("worker_blas_threads must be a positive integer or null")
         if self.pathway_gradient_frequency < 0:
             raise ValueError(
                 "pathway_gradient_frequency must be non-negative, "
@@ -1464,6 +1470,11 @@ class NativeSupportConfig:
     overlap_weighting: str = "geostat_grid"
     od_self_flows: str = "retain"
     od_min_flow_raw: float = 10.0
+    od_graph_cache_size: int = 16
+    cache_od_target_weights: bool = False
+    precompute_loss_metadata: bool = False
+    compile_sir_rollout: bool = False
+    compile_loss_scores: bool = False
     head_balanced_sampling: bool = False
     confirmation_guard: bool = True
     mobility_enabled: bool = True
@@ -1493,6 +1504,8 @@ class NativeSupportConfig:
                 )
         if not math.isfinite(float(self.od_min_flow_raw)) or self.od_min_flow_raw < 0:
             raise ValueError("native.od_min_flow_raw must be finite and non-negative")
+        if type(self.od_graph_cache_size) is not int or self.od_graph_cache_size < 1:
+            raise ValueError("native.od_graph_cache_size must be a positive integer")
         if self.hetero_hidden_dim <= 0:
             raise ValueError("native.hetero_hidden_dim must be positive")
         if self.hetero_parameter_budget <= 0:

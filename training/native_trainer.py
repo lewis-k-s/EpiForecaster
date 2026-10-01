@@ -13,11 +13,13 @@ import time
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from einops import rearrange
 from torch.utils.data import DataLoader, Sampler, Subset
 
 from data.native_batch import ROUTED_HEADS, collate_native_batch
@@ -33,7 +35,7 @@ from data.native_source_sets import (
 )
 from data.query_contract import ForecastQuery
 from evaluation.eval_loop import evaluate_native_loader
-from evaluation.losses import get_native_loss_from_config
+from evaluation.losses import NativeJointInferenceLoss, get_native_loss_from_config
 from models.configs import (
     EpiForecasterConfig,
     InitWeightsConfig,
@@ -197,6 +199,69 @@ def native_loader_kwargs(
         if prefetch_enabled(training_config.prefetch_factor):
             kwargs["prefetch_factor"] = training_config.prefetch_factor
     return kwargs
+
+
+def configure_native_worker_threads(threads: int | None, *, device_type: str) -> None:
+    """Set BLAS limits before CUDA loader workers import NumPy under spawn.
+
+    The parent has already loaded its numerical libraries. This changes the
+    environment inherited by new spawned workers, not the parent's loaded
+    thread pools. Fork workers cannot use this policy.
+    """
+    if threads is None:
+        return
+    if device_type != "cuda":
+        raise ValueError("worker_blas_threads requires CUDA native spawn workers")
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[name] = str(threads)
+    logger.info("Native spawned worker BLAS thread budget: %d", threads)
+
+
+def compile_native_loss_scores(
+    criterion: NativeJointInferenceLoss,
+    *,
+    mode: str = "default",
+    backend: str = "inductor",
+) -> None:
+    """Compile a flat score boundary for sliced, variable-size distributions.
+
+    AOTAutograd in the pinned runtime can reject the horizon slice's padded
+    row stride and can confuse equal batch/assay dimensions. The score is an
+    elementwise weighted reduction, so a flat contiguous boundary removes
+    these layouts without changing the reduction or its gradients.
+    """
+    eager = criterion._weighted_masked_distribution_loss_from_weights
+    compiled = torch.compile(
+        eager,
+        backend=backend,
+        fullgraph=True,
+        dynamic=True,
+        mode=mode,
+    )
+
+    def scores(
+        *,
+        loc: torch.Tensor,
+        scale: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if not (loc.shape == scale.shape == target.shape == weights.shape):
+            return eager(loc=loc, scale=scale, target=target, weights=weights)
+        return compiled(
+            loc=rearrange(loc, "... -> (...)").contiguous(),
+            scale=rearrange(scale, "... -> (...)").contiguous(),
+            target=rearrange(target, "... -> (...)").contiguous(),
+            weights=rearrange(weights, "... -> (...)").contiguous(),
+        )
+
+    criterion._weighted_masked_distribution_loss_from_weights = scores
 
 
 def forecaster_config_to_dict(config: NativeForecasterConfig) -> dict[str, Any]:
@@ -494,7 +559,13 @@ class NativeRuntime:
             balanced=config.native.head_balanced_sampling,
         )
         batch_size = config.training.batch_size
-        collate = collate_native_batch
+        configure_native_worker_threads(
+            config.training.worker_blas_threads, device_type=self.device.type
+        )
+        collate = partial(
+            collate_native_batch,
+            precompute_loss_metadata=config.native.precompute_loss_metadata,
+        )
         # Loaders are created before any CUDA tensor operation so worker
         # processes fork from a CUDA-clean parent (plan WP-B item 7).
         train_kwargs = native_loader_kwargs(
@@ -570,6 +641,22 @@ class NativeRuntime:
             observation_heads_config=config.model.observation_heads,
             horizon_days=config.model.forecast_horizon,
         )
+        if config.native.compile_sir_rollout:
+            rollout = self.model.base.sir_rollforward
+            rollout._rollout = torch.compile(
+                rollout._rollout,
+                fullgraph=True,
+                dynamic=True,
+                mode=config.training.compile_mode,
+            )
+            logger.info(
+                "Compiled native SIR tensor rollout; strict checks remain eager"
+            )
+        if config.native.compile_loss_scores:
+            compile_native_loss_scores(
+                self.criterion, mode=config.training.compile_mode
+            )
+            logger.info("Compiled native masked distribution scores")
         self.precision_policy = resolve_precision_policy(config.training, self.device)
         n_train_batches = math.ceil(len(sampler) / batch_size)
         self.steps_per_epoch = (
@@ -604,6 +691,12 @@ class NativeRuntime:
             raise ValueError(
                 "torch.compile is not wired for native mode; disable training.compile."
             )
+        if config.native.compile_loss_scores and (
+            config.training.loss.joint.observation_loss != "crps"
+            or config.training.loss.joint.distribution_family != "student_t"
+            or config.training.loss.joint.distribution_df != 5.0
+        ):
+            raise ValueError("native.compile_loss_scores requires Student-t5 CRPS")
         if not config.output.save_best_only:
             raise ValueError(
                 "Native checkpointing writes best/final checkpoints only; "
@@ -1165,6 +1258,15 @@ class NativeTrainer(NativeRuntime):
             if max_batches is not None and step >= max_batches:
                 break
             batch = batch.to(self.device)
+            metadata_heads = 0
+            if self.config.native.precompute_loss_metadata:
+                for head, rows in batch.head_index.items():
+                    if rows is not None and rows.numel() > 0:
+                        if not batch.loss_metadata_valid(head):
+                            raise ValueError(
+                                f"Lost CPU loss metadata for head {head!r}"
+                            )
+                        metadata_heads += 1
             with torch.autocast(
                 device_type=self.device.type,
                 dtype=self.precision_policy.autocast_dtype,
@@ -1245,6 +1347,11 @@ class NativeTrainer(NativeRuntime):
                     values={
                         "train_loss": progress_loss,
                         "grad_norm": progress_grad_norm,
+                        **(
+                            {"loss_metadata_active_heads": metadata_heads}
+                            if self.config.native.precompute_loss_metadata
+                            else {}
+                        ),
                     },
                 )
                 logger.info(

@@ -399,6 +399,38 @@ def test_held_out_poison_cannot_change_training_or_pre_origin_history(
         assert rows.loc[rows.target == "deaths", "observed_raw"].max() > 1e15
 
 
+def test_native_pipeline_compile_on_and_off(tmp_path: Path, monkeypatch) -> None:
+    """One paired compiler acceptance run, with fixed mobility and vaccination."""
+    records, scores = [], []
+    for compile_enabled in (False, True):
+        root = tmp_path / str(compile_enabled)
+        root.mkdir()
+        config = pipeline_config(root, strict=True, mobility=True)
+        config.native.compile_sir_rollout = compile_enabled
+        config.native.compile_loss_scores = compile_enabled
+        build_for_config(config, Path(config.native.fold_manifest))
+        record, score = _run_pipeline(config, monkeypatch)
+        records.append(record)
+        scores.append(score)
+    assert (
+        records[0]["model_state_dict"].keys() == records[1]["model_state_dict"].keys()
+    )
+    np.testing.assert_allclose(
+        records[0]["train_loss_trace"],
+        records[1]["train_loss_trace"],
+        rtol=2e-4,
+        atol=2e-5,
+    )
+    for key, value in records[0]["model_state_dict"].items():
+        torch.testing.assert_close(
+            records[1]["model_state_dict"][key], value, rtol=2e-4, atol=2e-5
+        )
+    for split in ("val", "test"):
+        assert scores[0][split]["joint_wis"] == pytest.approx(
+            scores[1][split]["joint_wis"], rel=2e-4
+        )
+
+
 def test_incomplete_admission_week_is_not_visible_to_daily_queries(
     tmp_path: Path,
 ) -> None:

@@ -1128,6 +1128,9 @@ def _count_once_slots(native_batch: NativeEpiBatch, rows: torch.Tensor) -> torch
     order wins and later duplicates are dropped before any gather.
     ``audit_head_counts`` still flags the malformed batch for logging.
     """
+    cached = native_batch.cached_count_once_slots(rows)
+    if cached is not None:
+        return cached
     seen: set[tuple[object, str, int, int, str]] = set()
     keep: list[int] = []
     for slot, position in enumerate(rows.tolist()):
@@ -1142,6 +1145,8 @@ def _log1p_per100k_targets(
     raw_counts: torch.Tensor,
     population: torch.Tensor,
     weights: torch.Tensor,
+    *,
+    validate_population: bool = True,
 ) -> torch.Tensor:
     """Daily-head target transform at consumption (review ruling R2).
 
@@ -1157,7 +1162,9 @@ def _log1p_per100k_targets(
     NaN/inf targets.
     """
     pop = population.to(dtype=raw_counts.dtype).unsqueeze(1)
-    if not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all()):
+    if validate_population and (
+        not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all())
+    ):
         raise ValueError("population entries must be positive and finite")
     safe_counts = torch.where(weights > 0, raw_counts, torch.zeros_like(raw_counts))
     return torch.log1p(safe_counts / pop * _PER_100K)
@@ -1474,6 +1481,7 @@ class NativeJointInferenceLoss(JointInferenceLoss):
             target,
             population.to(device=device, dtype=torch.float32),
             weights,
+            validate_population=not native_batch.loss_metadata_valid(head_name),
         )
         loss = self._weighted_masked_distribution_loss_from_weights(
             loc=loc, scale=scale, target=target, weights=weights
@@ -1562,10 +1570,11 @@ class NativeJointInferenceLoss(JointInferenceLoss):
         uncensored = mask & (code == 0)
         censored = mask & (code == 1)
         invalid = mask & (code > 1)
-        if bool(invalid.any()):
+        metadata_valid = native_batch.loss_metadata_valid("ww")
+        if not metadata_valid and bool(invalid.any()):
             raise ValueError("Observed wastewater slots must use censor_code 0 or 1")
         if (
-            bool(censored.any())
+            (native_batch._ww_has_censored if metadata_valid else bool(censored.any()))
             and self.distribution_family == "student_t"
             and self.distribution_df != 5.0
         ):
@@ -1657,7 +1666,9 @@ class NativeJointInferenceLoss(JointInferenceLoss):
         # Target side of section 11.5: interval-summed raw weekly counts,
         # transformed once — log1p((counts / P) * 1e5).
         pop = population.to(device=device, dtype=torch.float32).unsqueeze(1)
-        if not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all()):
+        if not native_batch.loss_metadata_valid("hosp") and (
+            not bool(torch.isfinite(pop).all()) or not bool((pop > 0).all())
+        ):
             raise ValueError("population entries must be positive and finite")
         safe_raw = torch.where(
             _binary_target_mask(target_mask.to(device)), raw, torch.zeros_like(raw)
