@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from evaluation.student_t_scores import student_t5_crps
+
 _EPSILON = 1e-6
 _VALUE_CLAMP = 1.0e6
 
@@ -169,9 +171,13 @@ class TorchWeightedIntervalScoreAccumulator:
         median_clean = torch.nan_to_num(
             median.float(), nan=0.0, posinf=_VALUE_CLAMP, neginf=-_VALUE_CLAMP
         ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        target_clean = torch.nan_to_num(
-            targets.float(), nan=0.0, posinf=_VALUE_CLAMP, neginf=-_VALUE_CLAMP
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP).to(median_clean.device)
+        target_clean = (
+            torch.nan_to_num(
+                targets.float(), nan=0.0, posinf=_VALUE_CLAMP, neginf=-_VALUE_CLAMP
+            )
+            .clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
+            .to(median_clean.device)
+        )
         finite_target = torch.isfinite(targets.float()).to(median_clean.device).float()
         if sample_weights is not None:
             weights = torch.nan_to_num(
@@ -199,12 +205,8 @@ class TorchWeightedIntervalScoreAccumulator:
             high = torch.nan_to_num(high.float(), nan=0.0).to(median_clean.device)
             width = (high - low).clamp_min(0.0)
             dispersion += (alpha / 2.0) * width / normalizer
-            underprediction += (
-                (target_clean - high).clamp_min(0.0) / normalizer
-            )
-            overprediction += (
-                (low - target_clean).clamp_min(0.0) / normalizer
-            )
+            underprediction += (target_clean - high).clamp_min(0.0) / normalizer
+            overprediction += (low - target_clean).clamp_min(0.0) / normalizer
         wis = point + dispersion + underprediction + overprediction
         batch = WeightedIntervalScoreBatch(
             wis=wis,
@@ -617,9 +619,17 @@ class TorchDistributionMetricAccumulator:
         self.nll_weight_sum += mask_sum
         self.observed_count += (mask > 0).sum()
 
-        if self.distribution_family == "normal":
+        if self.distribution_family == "normal" or (
+            self.distribution_family == "student_t" and self.distribution_df == 5.0
+        ):
             crps = torch.nan_to_num(
-                _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean),
+                (
+                    _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
+                    if self.distribution_family == "normal"
+                    else student_t5_crps(
+                        loc=loc_clean, scale=scale_clean, target=target_clean
+                    )
+                ),
                 nan=0.0,
                 posinf=_VALUE_CLAMP,
                 neginf=0.0,
@@ -636,7 +646,9 @@ class TorchDistributionMetricAccumulator:
             assert mask_per_h is not None
             self.per_h_nll_sum += weighted_nll.sum(dim=0)
             self.per_h_nll_count += mask_per_h
-            if self.distribution_family == "normal":
+            if self.distribution_family == "normal" or (
+                self.distribution_family == "student_t" and self.distribution_df == 5.0
+            ):
                 assert self.per_h_crps_sum is not None
                 assert self.per_h_crps_count is not None
                 self.per_h_crps_sum += weighted_crps.sum(dim=0)

@@ -141,12 +141,20 @@ def test_joint_loss_defaults_and_distribution_validation() -> None:
         "r": 0.2,
         "death_flow": 0.2,
     }
-    for objective in ("nll", "crps", "wis"):
+    for objective in ("nll", "crps"):
         assert (
             JointLossConfig(
                 observation_loss=objective, distribution_family="student_t"
             ).observation_loss
             == objective
+        )
+    with pytest.raises(ValueError, match="observation_loss"):
+        JointLossConfig(observation_loss="wis", distribution_family="student_t")
+    with pytest.raises(ValueError, match="distribution_df=5.0"):
+        JointLossConfig(
+            observation_loss="crps",
+            distribution_family="student_t",
+            distribution_df=7.0,
         )
     with pytest.raises(ValueError, match="requires a non-negative observation loss"):
         JointLossConfig(observation_loss="nll", adaptive_scheme="gradnorm")

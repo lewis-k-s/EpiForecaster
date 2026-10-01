@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn as nn
 
+from evaluation.student_t_scores import student_t5_crps
+
 from models.configs import (
     DataConfig,
     JointLossConfig,
@@ -260,11 +262,12 @@ class JointInferenceLoss(nn.Module):
                 "distribution_family must be one of ['normal', 'student_t'], "
                 f"got {self.distribution_family!r}"
             )
-        if self.observation_loss == "crps" and self.distribution_family != "normal":
-            raise ValueError(
-                "observation_loss='crps' currently requires "
-                "distribution_family='normal'"
-            )
+        if (
+            self.observation_loss == "crps"
+            and self.distribution_family == "student_t"
+            and self.distribution_df != 5.0
+        ):
+            raise ValueError("Student-t CRPS requires distribution_df=5.0")
         if self.distribution_scale_floor <= 0:
             raise ValueError(
                 "distribution_scale_floor must be positive, "
@@ -560,6 +563,8 @@ class JointInferenceLoss(nn.Module):
             return -dist.log_prob(target)
 
         if self.observation_loss == "crps":
+            if self.distribution_family == "student_t":
+                return student_t5_crps(loc=loc, scale=scale, target=target)
             return self._normal_crps(loc=loc, scale=scale, target=target)
 
         raise ValueError(

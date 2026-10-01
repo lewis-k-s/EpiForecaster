@@ -180,11 +180,12 @@ class JointLossConfig:
                 f"{sorted(valid_distribution_families)}, "
                 f"got {self.distribution_family!r}"
             )
-        if self.observation_loss == "crps" and self.distribution_family != "normal":
-            raise ValueError(
-                "observation_loss='crps' currently requires "
-                "distribution_family='normal'"
-            )
+        if (
+            self.observation_loss == "crps"
+            and self.distribution_family == "student_t"
+            and self.distribution_df != 5.0
+        ):
+            raise ValueError("Student-t CRPS requires distribution_df=5.0")
         if self.adaptive_scheme not in valid_schemes:
             raise ValueError(
                 f"adaptive_scheme must be one of {sorted(valid_schemes)}, "
