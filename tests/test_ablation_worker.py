@@ -155,7 +155,13 @@ def test_folded_objective_enables_manifest_backed_cross_validation(
         def run(self):
             return {
                 "best_val_selection_score": 1.0,
-                "best_val_selection_metric": "mae_median",
+                "best_val_selection_metric": "wis",
+                "selection_score": 1.0,
+                "selection_metric_definition": {
+                    "metric": "wis",
+                    "aggregation": "equal_head_mean",
+                    "direction": "minimize",
+                },
             }
 
     def load_config(path, overrides):  # noqa: ANN001

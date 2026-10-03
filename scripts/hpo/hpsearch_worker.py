@@ -88,6 +88,8 @@ def _record_training_dynamics_attrs(
         identity["status"],
     )
     return identity
+
+
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
 
 # Global flag for signal handling
@@ -237,21 +239,19 @@ def suggest_epiforecaster_params(
 
     # --- data knobs (high leverage; affect effective signal/noise) ---
 
-    # Node vs time iteration order; independent of split_strategy.
-    overrides["data.sample_ordering"] = trial.suggest_categorical(
-        "data.sample_ordering",
-        _categorical_choices(("node", "time")),
-    )
-
-    # Edge selection is defined in raw-flow units before log-space upper clipping.
-    overrides["data.mobility_min_flow_raw"] = trial.suggest_categorical(
-        "data.mobility_min_flow_raw",
-        _categorical_choices((0.0, 1.0, 5.0, 10.0, 20.0, 50.0)),
-    )
+    # Native OD selection uses raw-flow units. Municipal ordering and model
+    # graph parameters do not affect the native dataset or encoder.
+    if base_cfg.native.mobility_enabled:
+        overrides["native.od_min_flow_raw"] = trial.suggest_categorical(
+            "native.od_min_flow_raw",
+            _categorical_choices((0.0, 1.0, 5.0, 10.0, 20.0, 50.0)),
+        )
+        overrides["native.hetero_hidden_dim"] = trial.suggest_categorical(
+            "native.hetero_hidden_dim", _categorical_choices((8, 16))
+        )
 
     # Pin fixed values for the simplified pass rather than inheriting config-specific
     # defaults, so each trial uses the same reduced baseline.
-    overrides["model.head_positional_encoding"] = "sinusoidal"
     overrides["model.observation_heads.residual_mode"] = "additive"
     overrides["model.observation_heads.obs_context_dim"] = 96
     overrides["model.observation_heads.residual_layers"] = 2
@@ -262,25 +262,6 @@ def suggest_epiforecaster_params(
         "model.observation_heads.delta_forecasting",
         _categorical_choices((False, True)),
     )
-
-    # --- mobility graph knobs (conditional) ---
-    if base_cfg.model.type.mobility:
-        overrides["model.gnn_depth"] = trial.suggest_int("model.gnn_depth", 1, 2)
-        overrides["model.gnn_module"] = trial.suggest_categorical(
-            "model.gnn_module", _categorical_choices(("gcn", "gat"))
-        )
-        overrides["model.mobility_embedding_dim"] = trial.suggest_categorical(
-            "model.mobility_embedding_dim", _categorical_choices((16, 32, 64, 128))
-        )
-
-    if base_cfg.model.type.regions:
-        # Region embedding dim must match the precomputed region2vec weights.
-        # Keep it fixed in HPO; tune it in the region2vec trainer instead.
-        pass
-
-    if base_cfg.model.temporal_covariates_dim > 0:
-        overrides["model.include_day_of_week"] = base_cfg.model.include_day_of_week
-        overrides["model.include_holidays"] = base_cfg.model.include_holidays
 
     # --- observation-head capacity ---
     overrides["model.observation_heads.residual_hidden_dim"] = (
@@ -435,7 +416,9 @@ def objective(
     # Run training and return objective.
     # Pass trial to trainer for intermediate pruning support.
     model_id = trial_model_id(int(trial.number))
-    cfg.native.fold_manifest = str(trial_dir / "inputs/native_source_sets/manifest.json")
+    cfg.native.fold_manifest = str(
+        trial_dir / "inputs/native_source_sets/manifest.json"
+    )
     build_for_config(cfg, Path(cfg.native.fold_manifest))
     trainer = NativeTrainer(
         cfg,
@@ -455,26 +438,14 @@ def objective(
     try:
         results = trainer.run()
         training_dynamics = _record_training_dynamics_attrs(trial, trial_dir)
-        best_val = float(
-            results.get(
-                "best_val_selection_score",
-                results.get("best_val_loss", float("inf")),
-            )
-        )
-        best_val_joint_loss = float(
-            results.get(
-                "best_val_joint_loss",
-                results.get("best_val_loss", float("inf")),
-            )
-        )
-        selection_metric = str(
-            results.get("best_val_selection_metric", "mean_target_mae")
-        )
+        best_val = float(results["selection_score"])
+        selection_definition = results["selection_metric_definition"]
+        selection_metric = selection_definition["metric"]
         training_loss_objective = cfg.training.loss.joint.observation_loss
 
         trial.set_user_attr("best_val_selection_score", best_val)
         trial.set_user_attr("best_val_selection_metric", selection_metric)
-        trial.set_user_attr("best_val_joint_loss", best_val_joint_loss)
+        trial.set_user_attr("selection_metric_definition", selection_definition)
         trial.set_user_attr("training_loss_objective", training_loss_objective)
 
         # Store per-series metrics as trial user attrs for downstream analysis
@@ -497,11 +468,10 @@ def objective(
 
     duration_s = time.time() - start_time
     logger.info(
-        "Trial %d complete: selection_score=%.6f (%s), joint_loss=%.6f, duration=%.1fs",
+        "Trial %d complete: selection_score=%.6f (%s), duration=%.1fs",
         trial.number,
         best_val,
         selection_metric,
-        best_val_joint_loss,
         duration_s,
     )
     logger.info("=== Trial %d finished ===", trial.number)
@@ -515,7 +485,7 @@ def objective(
                 "value": best_val,
                 "selection_metric": selection_metric,
                 "best_val_selection_score": best_val,
-                "best_val_joint_loss": best_val_joint_loss,
+                "selection_metric_definition": selection_definition,
                 "training_loss_objective": training_loss_objective,
                 "params": trial.params,
                 "overrides": overrides,

@@ -445,8 +445,13 @@ class TorchDistributionMetricAccumulator:
         distribution_df: float = 5.0,
         scale_floor: float = 1.0e-3,
         interval_levels: list[float] | tuple[float, ...] = (0.5, 0.8, 0.95),
+        compute_nll: bool = True,
+        compute_crps: bool = True,
     ) -> None:
         self.device = device
+        self.compute_nll = compute_nll
+        self.compute_crps = compute_crps
+        self.effective_weight_sum = torch.tensor(0.0, device=device)
         self.horizon = horizon
         self.distribution_family = distribution_family.lower()
         self.distribution_df = float(distribution_df)
@@ -606,22 +611,27 @@ class TorchDistributionMetricAccumulator:
             sample_weights=sample_weights,
         ).to(loc_clean.device)
 
-        nll = torch.nan_to_num(
-            self._nll(loc=loc_clean, scale=scale_clean, target=target_clean),
-            nan=_VALUE_CLAMP,
-            posinf=_VALUE_CLAMP,
-            neginf=-_VALUE_CLAMP,
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        weighted_nll = nll * mask
         mask_sum = mask.sum()
         mask_per_h = mask.sum(dim=0) if self.horizon is not None else None
-        self.nll_sum += weighted_nll.sum()
-        self.nll_weight_sum += mask_sum
+        self.effective_weight_sum += mask_sum
         self.observed_count += (mask > 0).sum()
-
-        if self.distribution_family == "normal" or (
-            self.distribution_family == "student_t" and self.distribution_df == 5.0
-        ):
+        if self.compute_nll:
+            nll = torch.nan_to_num(
+                self._nll(loc=loc_clean, scale=scale_clean, target=target_clean),
+                nan=_VALUE_CLAMP,
+                posinf=_VALUE_CLAMP,
+                neginf=-_VALUE_CLAMP,
+            ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
+            weighted_nll = nll * mask
+            self.nll_sum += weighted_nll.sum()
+            self.nll_weight_sum += mask_sum
+        else:
+            nll = torch.full_like(loc_clean, float("nan"))
+        crps_available = self.compute_crps and (
+            self.distribution_family == "normal"
+            or (self.distribution_family == "student_t" and self.distribution_df == 5.0)
+        )
+        if crps_available:
             crps = torch.nan_to_num(
                 (
                     _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
@@ -644,11 +654,10 @@ class TorchDistributionMetricAccumulator:
             assert self.per_h_nll_sum is not None
             assert self.per_h_nll_count is not None
             assert mask_per_h is not None
-            self.per_h_nll_sum += weighted_nll.sum(dim=0)
-            self.per_h_nll_count += mask_per_h
-            if self.distribution_family == "normal" or (
-                self.distribution_family == "student_t" and self.distribution_df == 5.0
-            ):
+            if self.compute_nll:
+                self.per_h_nll_sum += weighted_nll.sum(dim=0)
+                self.per_h_nll_count += mask_per_h
+            if crps_available:
                 assert self.per_h_crps_sum is not None
                 assert self.per_h_crps_count is not None
                 self.per_h_crps_sum += weighted_crps.sum(dim=0)
@@ -742,7 +751,7 @@ class TorchDistributionMetricAccumulator:
                 denominator=self.crps_weight_sum,
             ),
             observed_count=int(self.observed_count.item()),
-            effective_count=float(self.nll_weight_sum.item()),
+            effective_count=float(self.effective_weight_sum.item()),
             nll_per_h=self._per_h_from_sums(
                 numerator=self.per_h_nll_sum,
                 denominator=self.per_h_nll_count,

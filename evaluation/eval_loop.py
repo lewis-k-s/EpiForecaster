@@ -42,6 +42,7 @@ from evaluation.losses import (
     _log1p_per100k_targets,
     get_loss_from_config,
 )
+from evaluation.native_scoring import NativeEvaluationScorer
 from evaluation.metrics import (
     ProbabilisticMetricResult,
     TorchDistributionMetricAccumulator,
@@ -443,7 +444,7 @@ def _native_daily_eval_view(
     head: str,
     model_outputs: dict[str, Any],
     batch: NativeEpiBatch,
-    criterion: NativeJointInferenceLoss,
+    scorer: NativeEvaluationScorer,
     device: torch.device,
 ) -> dict[str, Any] | None:
     rows = batch.head_index.get(head)
@@ -465,7 +466,7 @@ def _native_daily_eval_view(
     loc_tensor = model_outputs.get(f"dist_{head}_loc")
     if loc_tensor is None:
         loc_tensor = model_outputs[f"pred_{head}"]
-    loc = criterion._align_daily_head_tensor(
+    loc = scorer._align_daily_head_tensor(
         loc_tensor.to(device).index_select(0, rows),
         head_name=head,
         target_width=target_width,
@@ -474,7 +475,7 @@ def _native_daily_eval_view(
     scale = (
         torch.ones_like(loc)
         if scale_tensor is None
-        else criterion._align_daily_head_tensor(
+        else scorer._align_daily_head_tensor(
             scale_tensor.to(device).index_select(0, rows),
             head_name=head,
             target_width=target_width,
@@ -524,7 +525,7 @@ def _native_hosp_eval_view(
     *,
     model_outputs: dict[str, Any],
     batch: NativeEpiBatch,
-    criterion: NativeJointInferenceLoss,
+    scorer: NativeEvaluationScorer,
     device: torch.device,
 ) -> dict[str, Any] | None:
     rows = batch.head_index.get("hosp")
@@ -550,8 +551,8 @@ def _native_hosp_eval_view(
     loc = model_outputs["dist_hosp_weekly_loc"].to(device).index_select(0, slots)
     scale = model_outputs["dist_hosp_weekly_scale"].to(device).index_select(0, slots)
     weekly_mask = model_outputs["hosp_weekly_mask"].to(device).index_select(0, slots)
-    if raw_target.shape[1] < criterion.weekly_slots:
-        pad = criterion.weekly_slots - int(raw_target.shape[1])
+    if raw_target.shape[1] < scorer.weekly_slots:
+        pad = scorer.weekly_slots - int(raw_target.shape[1])
         raw_target = torch.cat(
             [raw_target, raw_target.new_zeros(raw_target.shape[0], pad)], dim=1
         )
@@ -582,7 +583,7 @@ def _native_hosp_eval_view(
         target_indices.append(
             [
                 origin + 1 + first_monday + 7 * week + 6
-                for week in range(criterion.weekly_slots)
+                for week in range(scorer.weekly_slots)
             ]
         )
     return {
@@ -603,7 +604,7 @@ def _native_wastewater_eval_view(
     model_outputs: dict[str, Any],
     batch: NativeEpiBatch,
     dataset: NativeSupportDataset,
-    criterion: NativeJointInferenceLoss,
+    scorer: NativeEvaluationScorer,
     device: torch.device,
 ) -> dict[str, Any] | None:
     """Flatten ``[EDAR, day, assay]`` into assay-specific evaluation rows."""
@@ -666,14 +667,14 @@ def _native_wastewater_eval_view(
         [
             [
                 int(query.forecast_origin) + horizon + 1
-                for horizon in range(criterion.horizon_days)
+                for horizon in range(scorer.horizon_days)
             ]
             for query in expanded_queries
         ],
         device=device,
         dtype=torch.long,
     )
-    scores = criterion.left_censored_nll(
+    scores = scorer.left_censored_nll(
         loc,
         scale,
         torch.where(censored, detection_limit, torch.zeros_like(detection_limit)),
@@ -700,8 +701,9 @@ def evaluate_native_loader(
     *,
     model: torch.nn.Module,
     loader: DataLoader,
-    criterion: NativeJointInferenceLoss,
+    scorer: NativeEvaluationScorer,
     device: torch.device,
+    training_objective_diagnostic: NativeJointInferenceLoss | None = None,
     split_name: str = "Eval",
     max_batches: int | None = None,
     granular_output_path: Path | None = None,
@@ -711,15 +713,15 @@ def evaluate_native_loader(
     granular_metadata: dict[str, Any] | None = None,
     autocast_enabled: bool = False,
     autocast_dtype: torch.dtype | None = None,
-) -> tuple[float, dict[str, Any], Any]:
+) -> tuple[dict[str, Any], Any]:
     """Evaluate routed native heads and write canonical EVL-1 artifacts."""
     dataset = _native_dataset_from_loader(loader)
     date_grid = dataset.date_grid
     head_horizons = {
-        "ww": criterion.horizon_days,
-        "cases": criterion.horizon_days,
-        "hosp": criterion.weekly_slots,
-        "deaths": criterion.horizon_days,
+        "ww": scorer.horizon_days,
+        "cases": scorer.horizon_days,
+        "hosp": scorer.weekly_slots,
+        "deaths": scorer.horizon_days,
     }
     point_accumulators = {
         head: TorchMaskedMetricAccumulator(device=device, horizon=horizon)
@@ -733,10 +735,12 @@ def evaluate_native_loader(
         head: TorchDistributionMetricAccumulator(
             device=device,
             horizon=horizon,
-            distribution_family=criterion.distribution_family,
-            distribution_df=criterion.distribution_df,
-            scale_floor=criterion.distribution_scale_floor,
-            interval_levels=criterion.interval_levels,
+            distribution_family=scorer.distribution_family,
+            distribution_df=scorer.distribution_df,
+            scale_floor=scorer.distribution_scale_floor,
+            interval_levels=scorer.interval_levels,
+            compute_nll="nll" in scorer.config.metrics,
+            compute_crps="crps" in scorer.config.metrics,
         )
         for head, horizon in head_horizons.items()
     }
@@ -744,7 +748,7 @@ def evaluate_native_loader(
         head: TorchWeightedIntervalScoreAccumulator(
             device=device,
             horizon=horizon,
-            interval_levels=criterion.interval_levels,
+            interval_levels=scorer.interval_levels,
         )
         for head, horizon in head_horizons.items()
     }
@@ -806,8 +810,9 @@ def evaluate_native_loader(
                 enabled=autocast_enabled,
             ):
                 outputs = model(batch)
-                components = criterion(outputs, batch)
-            loss_sum += float(components["total"].item())
+                if training_objective_diagnostic is not None:
+                    components = training_objective_diagnostic(outputs, batch)
+                    loss_sum += float(components["total"].item())
             processed_batches += 1
             for head in ("ww", "cases", "hosp", "deaths"):
                 view = (
@@ -815,14 +820,14 @@ def evaluate_native_loader(
                         model_outputs=outputs,
                         batch=batch,
                         dataset=dataset,
-                        criterion=criterion,
+                        scorer=scorer,
                         device=device,
                     )
                     if head == "ww"
                     else _native_hosp_eval_view(
                         model_outputs=outputs,
                         batch=batch,
-                        criterion=criterion,
+                        scorer=scorer,
                         device=device,
                     )
                     if head == "hosp"
@@ -830,7 +835,7 @@ def evaluate_native_loader(
                         head=head,
                         model_outputs=outputs,
                         batch=batch,
-                        criterion=criterion,
+                        scorer=scorer,
                         device=device,
                     )
                 )
@@ -959,7 +964,7 @@ def evaluate_native_loader(
     if processed_batches == 0:
         raise ValueError("native evaluation processed no batches")
 
-    metrics: dict[str, Any] = {}
+    metrics: dict[str, Any] = {"evaluation_metrics": list(scorer.config.metrics)}
     metrics["mae_excess_deaths_raw"] = (
         excess_abs_error / excess_observed if excess_observed else float("nan")
     )
@@ -971,9 +976,15 @@ def evaluate_native_loader(
         wis = wis_accumulators[head].finalize()
         metrics.update(
             {
-                f"mae_{head}_log1p_per_100k": point.mae,
-                f"rmse_{head}_log1p_per_100k": point.rmse,
-                f"raw_count_mae_{head}": raw.mae,
+                f"mae_{head}_log1p_per_100k": point.mae
+                if "mae" in scorer.config.metrics
+                else None,
+                f"rmse_{head}_log1p_per_100k": point.rmse
+                if "rmse" in scorer.config.metrics
+                else None,
+                f"raw_count_mae_{head}": raw.mae
+                if "mae" in scorer.config.metrics
+                else None,
                 f"nll_{head}": probabilistic.nll,
                 f"crps_{head}": probabilistic.crps,
                 f"wis_{head}": wis.wis,
@@ -986,9 +997,15 @@ def evaluate_native_loader(
             }
         )
         if head == "ww":
-            metrics["mae_ww_log1p_concentration"] = point.mae
-            metrics["rmse_ww_log1p_concentration"] = point.rmse
-            metrics["raw_concentration_mae_ww"] = raw.mae
+            metrics["mae_ww_log1p_concentration"] = (
+                point.mae if "mae" in scorer.config.metrics else None
+            )
+            metrics["rmse_ww_log1p_concentration"] = (
+                point.rmse if "rmse" in scorer.config.metrics else None
+            )
+            metrics["raw_concentration_mae_ww"] = (
+                raw.mae if "mae" in scorer.config.metrics else None
+            )
     metrics["censored_nll_ww"] = (
         censored_ww_nll_sum / censored_ww_count
         if censored_ww_count > 0
@@ -1002,8 +1019,8 @@ def evaluate_native_loader(
     ]
     if active_wis and not all(math.isfinite(value) for value in active_wis):
         raise ValueError("Observed native head has no finite WIS")
-    metrics["joint_wis"] = float(np.mean(active_wis)) if active_wis else float("nan")
-    metrics["joint_wis_head_count"] = len(active_wis)
+    metrics["wis"] = float(np.mean(active_wis)) if active_wis else float("nan")
+    metrics["wis_head_count"] = len(active_wis)
     aggregate = aggregate_accumulator.finalize()
     if aggregate_output_dir is not None:
         write_native_aggregate_outputs(
@@ -1025,7 +1042,8 @@ def evaluate_native_loader(
                 "wastewater": "log1p_concentration",
             },
             "raw_count_metrics": ["raw_count_mae"],
-            "interval_levels": list(criterion.interval_levels),
+            "interval_levels": list(scorer.interval_levels),
+            "evaluation_metrics": list(scorer.config.metrics),
         }
         if granular_metadata is not None:
             metadata.update(granular_metadata)
@@ -1033,7 +1051,9 @@ def evaluate_native_loader(
             granular_output_path,
             metadata,
         )
-    return loss_sum / processed_batches, metrics, aggregate
+    if training_objective_diagnostic is not None:
+        metrics["training_objective_diagnostic"] = loss_sum / processed_batches
+    return metrics, aggregate
 
 
 def evaluate_loader(

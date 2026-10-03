@@ -849,10 +849,13 @@ def objective(
             encoding="utf-8",
         )
         trial.set_user_attr("campaign_output_identity", str(output_identity))
-    selection_value = float(results["best_val_selection_score"])
+    selection_value = float(results["selection_score"])
     trial.set_user_attr("best_val_selection_value", selection_value)
     trial.set_user_attr(
         "best_val_selection_metric", str(results["best_val_selection_metric"])
+    )
+    trial.set_user_attr(
+        "selection_metric_definition", results["selection_metric_definition"]
     )
     return selection_value
 

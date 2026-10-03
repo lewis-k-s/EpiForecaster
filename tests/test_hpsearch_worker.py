@@ -131,14 +131,15 @@ def _base_cfg_stub(**overrides: Any) -> SimpleNamespace:
     return SimpleNamespace(
         model=SimpleNamespace(**model_defaults),
         training=SimpleNamespace(**training_defaults),
+        native=SimpleNamespace(
+            mobility_enabled=overrides.pop("native_mobility", False)
+        ),
     )
 
 
 def _mobility_cfg_stub(**overrides: Any) -> SimpleNamespace:
     """Config stub with mobility enabled."""
-    model_overrides = overrides.setdefault("model", {})
-    model_overrides["type"] = SimpleNamespace(mobility=True, regions=False)
-    return _base_cfg_stub(**overrides)
+    return _base_cfg_stub(native_mobility=True, **overrides)
 
 
 def _temporal_covariates_cfg_stub(**overrides: Any) -> SimpleNamespace:
@@ -235,16 +236,14 @@ class TestSuggestEpiforecasterParams:
         assert call[0] == "categorical"
         assert call[2] == ("nll", "crps")
 
-    def test_data_knobs_sample_ordering(self) -> None:
+    def test_native_search_does_not_sample_municipal_data_knobs(self) -> None:
         trial = _StubTrial()
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        assert "data.sample_ordering" in overrides
-        assert overrides["data.sample_ordering"] in ("node", "time")
-
-    def test_data_knobs_mobility_min_flow_raw(self) -> None:
-        trial = _StubTrial()
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        assert "data.mobility_min_flow_raw" in overrides
+        overrides = suggest_epiforecaster_params(
+            trial=trial, base_cfg=_mobility_cfg_stub()
+        )
+        assert "data.sample_ordering" not in overrides
+        assert "data.mobility_min_flow_raw" not in overrides
+        assert "native.od_min_flow_raw" in overrides
 
     def test_full_worker_does_not_suggest_missing_permit(self) -> None:
         trial = _StubTrial()
@@ -256,56 +255,36 @@ class TestSuggestEpiforecasterParams:
         ]
         assert missing_override_keys == []
 
-    def test_mobility_model_knobs_gnn_depth(self) -> None:
+    def test_native_graph_search_uses_supported_fields(self) -> None:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(
             trial=trial, base_cfg=_mobility_cfg_stub()
         )
-        assert "model.gnn_depth" in overrides
-        call = next(c for c in trial.suggest_calls if c[1] == "model.gnn_depth")
-        assert call[0] == "int"
-        assert call[2] == (1, 2)
+        assert overrides["native.hetero_hidden_dim"] in (8, 16)
+        assert overrides["native.od_min_flow_raw"] in (0.0, 1.0, 5.0, 10.0, 20.0, 50.0)
+        assert not {
+            "model.gnn_depth",
+            "model.gnn_module",
+            "model.mobility_embedding_dim",
+        }.intersection(overrides)
 
-    def test_mobility_model_knobs_gnn_module(self) -> None:
-        trial = _StubTrial()
-        overrides = suggest_epiforecaster_params(
-            trial=trial, base_cfg=_mobility_cfg_stub()
-        )
-        assert "model.gnn_module" in overrides
-        assert overrides["model.gnn_module"] in ("gcn", "gat")
-
-    def test_mobility_model_knobs_embedding_dim(self) -> None:
-        trial = _StubTrial()
-        overrides = suggest_epiforecaster_params(
-            trial=trial, base_cfg=_mobility_cfg_stub()
-        )
-        assert "model.mobility_embedding_dim" in overrides
-        assert overrides["model.mobility_embedding_dim"] in (16, 32, 64, 128)
-
-    def test_no_mobility_skips_gnn_knobs(self) -> None:
-        trial = _StubTrial()
-        suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        gnn_calls = [c for c in trial.suggest_calls if "gnn" in c[1]]
-        assert gnn_calls == []
-
-    def test_temporal_covariates_enabled_sets_flags(self) -> None:
-        trial = _StubTrial(categorical_values={"model.use_temporal_covariates": True})
-        cfg = _temporal_covariates_cfg_stub()
-        overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
-        assert overrides["model.include_day_of_week"] is True
-        assert overrides["model.include_holidays"] is True
-
-    def test_no_temporal_covariates_skips_flag_overrides(self) -> None:
-        trial = _StubTrial()
-        suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        cov_calls = [c for c in trial.suggest_calls if "temporal_covariates" in c[1]]
-        assert cov_calls == []
-
-    def test_head_positional_encoding(self) -> None:
+    def test_no_mobility_skips_od_search(self) -> None:
         trial = _StubTrial()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=_base_cfg_stub())
-        assert "model.head_positional_encoding" in overrides
-        assert overrides["model.head_positional_encoding"] in ("sinusoidal", "learned")
+        assert not {"native.od_min_flow_raw", "native.hetero_hidden_dim"}.intersection(
+            overrides
+        )
+
+    def test_native_search_does_not_set_unused_backbone_flags(self) -> None:
+        trial = _StubTrial()
+        overrides = suggest_epiforecaster_params(
+            trial=trial, base_cfg=_temporal_covariates_cfg_stub()
+        )
+        assert not {
+            "model.include_day_of_week",
+            "model.include_holidays",
+            "model.head_positional_encoding",
+        }.intersection(overrides)
 
     def test_joint_inference_no_static_loss_weight_overrides(self) -> None:
         trial = _StubTrial()
@@ -361,13 +340,15 @@ class TestSuggestEpiforecasterParams:
         assert "model.observation_heads.residual_hidden_dim" in overrides
 
 
-def test_objective_returns_selection_score_and_records_joint_loss(
+def test_objective_returns_explicit_selection_score_and_definition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     cfg = _joint_loss_cfg_stub(joint={"observation_loss": "mae"})
     cfg.native = SimpleNamespace(fold_manifest="")
-    monkeypatch.setattr("scripts.hpo.hpsearch_worker.build_for_config", lambda *args: None)
+    monkeypatch.setattr(
+        "scripts.hpo.hpsearch_worker.build_for_config", lambda *args: None
+    )
     cfg.output = SimpleNamespace(log_dir=str(tmp_path), experiment_name="study")
     cfg.training.epochs = 1
     captured: dict[str, object] = {}
@@ -427,18 +408,21 @@ def test_objective_returns_selection_score_and_records_joint_loss(
             writer.finalize("complete")
             return {
                 "best_val_selection_score": 0.25,
-                "best_val_selection_metric": "mean_target_mae",
-                "best_val_joint_loss": 1.75,
+                "best_val_selection_metric": "wis",
+                "selection_score": 0.25,
+                "selection_metric_definition": {
+                    "metric": "wis",
+                    "aggregation": "equal_head_mean",
+                    "direction": "minimize",
+                },
                 "best_val_series_metrics": {
-                    "mae_ww_log1p_per_100k": 0.2,
-                    "mae_hosp_log1p_per_100k": 0.3,
+                    "wis_ww": 0.2,
+                    "wis_hosp": 0.3,
                 },
             }
 
     monkeypatch.setattr("scripts.hpo.hpsearch_worker.EpiForecasterConfig", _FakeConfig)
-    monkeypatch.setattr(
-        "scripts.hpo.hpsearch_worker.NativeTrainer", _FakeTrainer
-    )
+    monkeypatch.setattr("scripts.hpo.hpsearch_worker.NativeTrainer", _FakeTrainer)
 
     def _fake_suggest_params(
         *,
@@ -472,10 +456,11 @@ def test_objective_returns_selection_score_and_records_joint_loss(
 
     assert value == pytest.approx(0.25)
     assert trial.user_attrs["best_val_selection_score"] == pytest.approx(0.25)
-    assert trial.user_attrs["best_val_selection_metric"] == "mean_target_mae"
-    assert trial.user_attrs["best_val_joint_loss"] == pytest.approx(1.75)
+    assert trial.user_attrs["best_val_selection_metric"] == "wis"
+    assert "best_val_joint_loss" not in trial.user_attrs
+    assert trial.user_attrs["selection_metric_definition"]["metric"] == "wis"
     assert trial.user_attrs["training_loss_objective"] == "mae"
-    assert trial.user_attrs["best_val_mae_ww_log1p_per_100k"] == pytest.approx(0.2)
+    assert trial.user_attrs["best_val_wis_ww"] == pytest.approx(0.2)
     assert captured["pruning_start_epoch"] == 3
     assert captured["constructor_model_id"] == "trial-000000"
     assert captured["trainer_model_id"] == "trial-000000"
@@ -492,7 +477,8 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["value"] == pytest.approx(0.25)
     assert summary["best_val_selection_score"] == pytest.approx(0.25)
-    assert summary["best_val_joint_loss"] == pytest.approx(1.75)
+    assert "best_val_joint_loss" not in summary
+    assert summary["selection_metric_definition"]["aggregation"] == "equal_head_mean"
     assert summary["training_loss_objective"] == "mae"
     assert summary["best_model_path"] == str(checkpoint)
     assert summary["best_model_sha256"] == checkpoint_sha256

@@ -24,6 +24,7 @@ from data.native_source_sets import FoldRoles, SourceSetManifest
 from data.query_contract import ForecastQuery
 from models.configs import (
     EpiForecasterConfig,
+    EvaluationConfig,
     NativeSupportConfig,
 )
 from tests.config_fixtures import config_fixture
@@ -165,6 +166,12 @@ def test_config_roundtrip_and_overrides(tmp_path: Path) -> None:
     source.training.device = "cpu"
     source.model.input_window_length = 28
     source.model.forecast_horizon = 14
+    source.evaluation = EvaluationConfig(
+        metrics=["wis", "nll"],
+        selection_metric="nll",
+        distribution_family="normal",
+        interval_levels=[0.6, 0.9],
+    )
     smoke_path.write_text(yaml.safe_dump(source.to_dict()))
     config = EpiForecasterConfig.load(smoke_path)
     assert config.native.enabled is True
@@ -179,6 +186,43 @@ def test_config_roundtrip_and_overrides(tmp_path: Path) -> None:
 
     restored = EpiForecasterConfig.from_dict(config.to_dict())
     assert restored.native == config.native
+    assert config.evaluation == source.evaluation
+    assert restored.evaluation == source.evaluation
+    default_evaluation = config.to_dict()
+    default_evaluation.pop("evaluation")
+    assert (
+        EpiForecasterConfig.from_dict(default_evaluation).evaluation
+        == EvaluationConfig()
+    )
+    scored = EpiForecasterConfig.load(
+        smoke_path,
+        overrides=[
+            "evaluation.metrics=[wis,crps]",
+            "evaluation.selection_metric=crps",
+            "evaluation.training_objective_diagnostic=true",
+            "evaluation.interval_levels=[0.5,0.9]",
+        ],
+    )
+    assert scored.evaluation.selection_metric == "crps"
+    assert scored.evaluation.training_objective_diagnostic is True
+    assert scored.evaluation.interval_levels == [0.5, 0.9]
+    assert (
+        EpiForecasterConfig.from_dict(scored.to_dict()).evaluation == scored.evaluation
+    )
+    for overrides in (
+        ["evaluation.metrics=[wis]", "evaluation.selection_metric=crps"],
+        ["evaluation.metrics=[crps]"],
+        ["evaluation.selection_aggregation=observation_mean"],
+        ["evaluation.interval_levels=[0.0,0.9]"],
+        ["evaluation.interval_levels=[0.5,0.5]"],
+        ["evaluation.distribution_family=invalid"],
+        ["evaluation.distribution_family=student_t", "evaluation.distribution_df=4.0"],
+        ["training.early_stopping_patience=0"],
+    ):
+        with pytest.raises(ValueError):
+            EpiForecasterConfig.load(smoke_path, overrides=overrides)
+    direct = EpiForecasterConfig.load(smoke_path, overrides=["native.decoder=direct"])
+    assert EpiForecasterConfig.from_dict(direct.to_dict()).native.decoder == "direct"
 
     # A dict without a native block restores the source-native default.
     legacy = config.to_dict()

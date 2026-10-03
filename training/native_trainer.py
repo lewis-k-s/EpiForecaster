@@ -36,6 +36,10 @@ from data.native_source_sets import (
 from data.query_contract import ForecastQuery
 from evaluation.eval_loop import evaluate_native_loader
 from evaluation.losses import NativeJointInferenceLoss, get_native_loss_from_config
+from evaluation.native_scoring import (
+    NativeEvaluationScorer,
+    native_selection as compute_native_selection_score,
+)
 from models.configs import (
     EpiForecasterConfig,
     InitWeightsConfig,
@@ -81,86 +85,50 @@ _LEGACY_PROJECTED_MARKERS = (
 #: Routed native heads supervised in real-data training (plan section 11.1).
 _NATIVE_HEADS = ("ww", "cases", "hosp", "deaths")
 
-_SELECTION_METRIC_NAME = "mean_target_wis"
 
 _BEST_CHECKPOINT_NAME = "best_model.pt"
 _FINAL_CHECKPOINT_NAME = "final_model.pt"
-_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 2
+
+
+class NativeNonFiniteHalt(RuntimeError):
+    """Raised when a non-finite training objective halts a native run."""
 
 
 def _validation_epoch_record(
-    *,
-    epoch: int,
-    step: int,
-    joint_loss: float,
-    selection_metric: str,
-    selection_score: float,
-    metrics: Mapping[str, object],
+    *, epoch: int, step: int, split: str, metrics: dict[str, Any]
 ) -> dict[str, object]:
-    """Keep the already-computed validation scores for each completed epoch."""
+    """Canonical held-out scores, independent of the training objective."""
     record: dict[str, object] = {
         "epoch": epoch,
         "step": step,
-        "joint_loss": _optional_float(joint_loss),
-        "selection_metric": selection_metric,
-        "selection_score": _optional_float(selection_score),
+        f"{split}_wis": _optional_float(metrics["wis"]),
     }
+    if split == "val":
+        record["selection_score"] = _optional_float(metrics["selection_score"])
+        record["selection_metric_definition"] = metrics["selection_metric_definition"]
     for head in _NATIVE_HEADS:
-        for metric in (
-            "nll",
-            "crps",
+        for key in (
             "wis",
+            "crps",
+            "nll",
             "wis_dispersion",
             "wis_underprediction",
             "wis_overprediction",
             "wis_point",
         ):
-            record[f"{metric}_{head}"] = _optional_float(
-                metrics.get(f"{metric}_{head}")
-            )
-        count = metrics.get(f"observed_count_{head}")
-        record[f"observed_count_{head}"] = (
-            int(count)
-            if isinstance(count, int | float) and not isinstance(count, bool)
-            else None
-        )
+            record[f"{key}_{head}"] = _optional_float(metrics.get(f"{key}_{head}"))
+        record[f"observed_count_{head}"] = metrics.get(f"observed_count_{head}", 0)
+        record[f"wis_per_h_{head}"] = [
+            _optional_float(value) for value in metrics.get(f"wis_per_h_{head}", [])
+        ]
     record["censored_nll_ww"] = _optional_float(metrics.get("censored_nll_ww"))
-    censored_count = metrics.get("censored_count_ww")
-    record["censored_count_ww"] = (
-        int(censored_count)
-        if isinstance(censored_count, int | float)
-        and not isinstance(censored_count, bool)
-        else None
-    )
+    record["censored_count_ww"] = metrics.get("censored_count_ww", 0)
+    if "training_objective_diagnostic" in metrics:
+        record["training_objective_diagnostic"] = _optional_float(
+            metrics["training_objective_diagnostic"]
+        )
     return record
-
-
-class NativeNonFiniteHalt(RuntimeError):
-    """Raised when a non-finite training loss halts a native run."""
-
-
-def compute_native_selection_score(
-    metrics: Mapping[str, object],
-) -> tuple[float, str]:
-    """Equal-head WIS over observed routed targets, independent of train loss.
-
-    Heads with no observed targets are excluded. An observed head must have
-    a finite WIS; silently dropping it would change the selection objective.
-    """
-    values: list[float] = []
-    for head in _NATIVE_HEADS:
-        count = metrics.get(f"observed_count_{head}")
-        if count == 0:
-            continue
-        value = _optional_float(metrics.get(f"wis_{head}"))
-        if value is None:
-            if isinstance(count, int | float) and count > 0:
-                raise ValueError(f"Observed head {head!r} has no finite validation WIS")
-            continue
-        values.append(value)
-    if not values:
-        raise ValueError("Native validation requires at least one finite observed WIS")
-    return float(np.mean(values)), _SELECTION_METRIC_NAME
 
 
 def _resolve_worker_count(cfg_workers: int) -> int:
@@ -608,8 +576,6 @@ class NativeRuntime:
                 collate_fn=collate,
                 **test_kwargs,
             )
-        if config.training.diagnostic_test_trace_epochs and self.test_loader is None:
-            raise ValueError("Diagnostic test trace requires a test split")
 
         # Adapter widths from a COLLATED batch (review R12 collation): the
         # one-hot source-type block is prepended at collation, so batch hist
@@ -637,10 +603,10 @@ class NativeRuntime:
             hetero_parameter_budget=config.native.hetero_parameter_budget,
         )
         self.model = NativeEpiForecaster(self.forecaster_config).to(self.device)
-        self.criterion = get_native_loss_from_config(
-            config.training.loss,
-            observation_heads_config=config.model.observation_heads,
-            horizon_days=config.model.forecast_horizon,
+        self.evaluation_scorer = NativeEvaluationScorer(
+            config.evaluation,
+            config.model.forecast_horizon,
+            config.model.observation_heads.distribution_scale_floor,
         )
         if config.native.compile_sir_rollout:
             if config.native.decoder != "sir":
@@ -657,11 +623,6 @@ class NativeRuntime:
             logger.info(
                 "Compiled native SIR tensor rollout; strict checks remain eager"
             )
-        if config.native.compile_loss_scores:
-            compile_native_loss_scores(
-                self.criterion, mode=config.training.compile_mode
-            )
-            logger.info("Compiled native masked distribution scores")
         self.precision_policy = resolve_precision_policy(config.training, self.device)
         n_train_batches = math.ceil(len(sampler) / batch_size)
         self.steps_per_epoch = (
@@ -696,25 +657,10 @@ class NativeRuntime:
             raise ValueError(
                 "torch.compile is not wired for native mode; disable training.compile."
             )
-        if config.native.compile_loss_scores and (
-            config.training.loss.joint.observation_loss != "crps"
-            or config.training.loss.joint.distribution_family != "student_t"
-            or config.training.loss.joint.distribution_df != 5.0
-        ):
-            raise ValueError("native.compile_loss_scores requires Student-t5 CRPS")
         if not config.output.save_best_only:
             raise ValueError(
                 "Native checkpointing writes best/final checkpoints only; "
                 "output.save_best_only must be true."
-            )
-        test_epochs = config.training.diagnostic_test_trace_epochs
-        if any(
-            type(epoch) is not int or not 1 <= epoch <= config.training.epochs
-            for epoch in test_epochs
-        ) or test_epochs != sorted(set(test_epochs)):
-            raise ValueError(
-                "training.diagnostic_test_trace_epochs must contain unique, "
-                "ascending, 1-based epochs within training.epochs"
             )
         for field_name in ("dataset_path", "real_dataset_path"):
             value = getattr(config.data, field_name)
@@ -792,15 +738,25 @@ class NativeRuntime:
         granular_output_path: Path | None = None,
         aggregate_output_dir: Path | None = None,
         granular_metadata: dict[str, Any] | None = None,
-    ) -> tuple[float, dict[str, Any]]:
-        """Routing-aware metrics over a validation or test loader."""
+    ) -> dict[str, Any]:
+        """Routing-aware evaluation, with an optional objective diagnostic."""
         selected_loader = self.val_loader if loader is None else loader
         if selected_loader is None:
             raise ValueError(f"native {split_name} evaluation has no loader")
-        loss, metrics, _aggregate = evaluate_native_loader(
+        diagnostic = (
+            get_native_loss_from_config(
+                self.config.training.loss,
+                observation_heads_config=self.config.model.observation_heads,
+                horizon_days=self.config.model.forecast_horizon,
+            )
+            if self.config.evaluation.training_objective_diagnostic
+            else None
+        )
+        metrics, _aggregate = evaluate_native_loader(
             model=self.model,
             loader=selected_loader,
-            criterion=self.criterion,
+            scorer=self.evaluation_scorer,
+            training_objective_diagnostic=diagnostic,
             device=self.device,
             split_name=split_name,
             max_batches=self.config.training.max_batches,
@@ -817,7 +773,7 @@ class NativeRuntime:
                 "decoder": self.config.native.decoder,
                 "mobility_enabled": self.config.native.mobility_enabled,
                 "od_source": self.config.native.od_source,
-                "objective": self.config.training.loss.joint.observation_loss,
+                "evaluation_metrics": list(self.config.evaluation.metrics),
                 "fold": self.config.native.fold_index,
                 "seed": self.config.training.seed,
                 "split_seed": self.config.training.split_seed,
@@ -838,7 +794,12 @@ class NativeRuntime:
         )
         if split_name.lower() == "val":
             self.last_val_metrics = metrics
-        return loss, metrics
+            score, definition = compute_native_selection_score(
+                metrics, self.config.evaluation
+            )
+            metrics["selection_score"] = score
+            metrics["selection_metric_definition"] = definition
+        return metrics
 
 
 class NativeTrainer(NativeRuntime):
@@ -853,6 +814,22 @@ class NativeTrainer(NativeRuntime):
         pruning_start_epoch: int = 10,
     ) -> None:
         super().__init__(config, model_id=model_id)
+        if config.native.compile_loss_scores and (
+            config.training.loss.joint.observation_loss != "crps"
+            or config.training.loss.joint.distribution_family != "student_t"
+            or config.training.loss.joint.distribution_df != 5.0
+        ):
+            raise ValueError("native.compile_loss_scores requires Student-t5 CRPS")
+        self.criterion = get_native_loss_from_config(
+            config.training.loss,
+            observation_heads_config=config.model.observation_heads,
+            horizon_days=config.model.forecast_horizon,
+        )
+        if config.native.compile_loss_scores:
+            compile_native_loss_scores(
+                self.criterion, mode=config.training.compile_mode
+            )
+            logger.info("Compiled native masked distribution scores")
         self.trial = trial
         self.pruning_start_epoch = pruning_start_epoch
         self.model_id = self._resolve_model_id(model_id)
@@ -891,7 +868,12 @@ class NativeTrainer(NativeRuntime):
         self.global_step = 0
         self.best_val_selection_score: float | None = None
         self.best_val_selection_metric: str | None = None
-        self.best_val_joint_loss: float | None = None
+        self.selection_metric_definition: dict[str, Any] = {}
+        self.selected_epoch: int | None = None
+        self.selected_step: int | None = None
+        self.selected_val_wis: float | None = None
+        self.epochs_without_improvement = 0
+        self.selected_training_objective_diagnostic: float | None = None
         self.best_val_series_metrics: dict[str, float | None] = {}
         self.best_state: dict[str, torch.Tensor] | None = None
         self.last_val_metrics: dict[str, object] = {}
@@ -913,6 +895,8 @@ class NativeTrainer(NativeRuntime):
     def _restore_training_checkpoint(self, path: Path) -> None:
         """Resume at an epoch boundary without resetting the optimizer schedule."""
         record = torch.load(path, map_location="cpu", weights_only=False)
+        if record.get("schema_version") != _CHECKPOINT_SCHEMA_VERSION:
+            raise ValueError("Native resume requires checkpoint schema version 2")
         if record["forecaster_config"] != forecaster_config_to_dict(
             self.forecaster_config
         ):
@@ -958,6 +942,8 @@ class NativeTrainer(NativeRuntime):
         ):
             if previous["training"][name] != current["training"][name]:
                 raise ValueError(f"Native resume training.{name} differs")
+        if previous["evaluation"] != current["evaluation"]:
+            raise ValueError("Native resume evaluation configuration differs")
         self.start_epoch = int(record["epoch"]) + 1
         if not 0 < self.start_epoch < self.config.training.epochs:
             raise ValueError("Native resume checkpoint has no remaining epochs")
@@ -968,7 +954,7 @@ class NativeTrainer(NativeRuntime):
             raise ValueError(
                 "Native continuation requires a best-validation checkpoint"
             )
-        completed_batches = record["train_loss_trace"]
+        completed_batches = record["train_objective_trace"]
         if len(completed_batches) != self.start_epoch or int(
             record["global_step"]
         ) != sum(len(epoch_batches) for epoch_batches in completed_batches):
@@ -995,7 +981,13 @@ class NativeTrainer(NativeRuntime):
         self.global_step = int(record["global_step"])
         self.best_val_selection_score = record["best_val_selection_score"]
         self.best_val_selection_metric = record["best_val_selection_metric"]
-        self.best_val_joint_loss = record["best_val_joint_loss"]
+        self.selected_training_objective_diagnostic = record.get(
+            "selected_training_objective_diagnostic"
+        )
+        self.selection_metric_definition = record["selection_metric_definition"]
+        self.selected_epoch = record["selected_epoch"]
+        self.selected_step = record["selected_step"]
+        self.selected_val_wis = record["val_wis"]
         self.best_val_series_metrics = dict(record["best_val_series_metrics"])
         self.best_state = {
             key: value.detach().cpu().clone()
@@ -1003,8 +995,8 @@ class NativeTrainer(NativeRuntime):
         }
         self.validation_epoch_trace = list(record["validation_epoch_trace"])
         self.train_epoch_trace = list(record.get("train_epoch_trace", []))
-        self.resumed_train_trace = list(record["train_loss_trace"])
-        self.resumed_val_trace = list(record["val_joint_loss_trace"])
+        self.resumed_train_trace = list(record["train_objective_trace"])
+        self.resumed_val_trace = list(record["val_wis_trace"])
         self._save_checkpoint(
             self.start_epoch - 1,
             is_best=True,
@@ -1037,18 +1029,15 @@ class NativeTrainer(NativeRuntime):
                 if self.val_loader is None:
                     val_trace.append(None)
                     continue
-                val_loss, metrics = self._evaluate()
-                val_trace.append(val_loss)
-                selection_score, selection_metric = compute_native_selection_score(
-                    metrics
-                )
+                metrics = self._evaluate()
+                val_trace.append(metrics["wis"])
+                selection_score = metrics["selection_score"]
+                definition = metrics["selection_metric_definition"]
                 self.validation_epoch_trace.append(
                     _validation_epoch_record(
                         epoch=epoch + 1,
                         step=self.global_step,
-                        joint_loss=val_loss,
-                        selection_metric=selection_metric,
-                        selection_score=selection_score,
+                        split="val",
                         metrics=metrics,
                     )
                 )
@@ -1063,10 +1052,17 @@ class NativeTrainer(NativeRuntime):
                     or selection_score < self.best_val_selection_score
                 ):
                     self.best_val_selection_score = selection_score
-                    self.best_val_selection_metric = selection_metric
-                    self.best_val_joint_loss = val_loss
+                    self.best_val_selection_metric = definition["metric"]
+                    self.selection_metric_definition = definition
+                    self.selected_epoch = epoch + 1
+                    self.selected_step = self.global_step
+                    self.selected_val_wis = metrics["wis"]
+                    self.epochs_without_improvement = 0
+                    self.selected_training_objective_diagnostic = metrics.get(
+                        "training_objective_diagnostic"
+                    )
                     self.best_val_series_metrics = {
-                        head: _optional_float(metrics.get(f"wis_{head}"))
+                        f"wis_{head}": _optional_float(metrics.get(f"wis_{head}"))
                         for head in _NATIVE_HEADS
                     }
                     self.best_state = {
@@ -1080,36 +1076,24 @@ class NativeTrainer(NativeRuntime):
                             train_trace=train_trace,
                             val_trace=val_trace,
                         )
+                else:
+                    self.epochs_without_improvement += 1
                 logger.info(
-                    "native epoch %d/%d mean_train_loss=%.6f val_loss=%.6f "
-                    "selection=%s=%.6f val_joint_loss=%s",
+                    "native epoch %d/%d train_objective=%.6f val_wis=%.6f selection_score=%.6f selection_metric=%s selection_aggregation=%s",
                     epoch + 1,
                     self.config.training.epochs,
                     sum(epoch_losses) / max(1, len(epoch_losses)),
+                    metrics["wis"],
                     selection_score,
-                    selection_metric,
-                    selection_score,
-                    f"{val_loss:.6f}" if val_loss is not None else "n/a",
+                    definition["metric"],
+                    definition["aggregation"],
                 )
-                if epoch + 1 in self.config.training.diagnostic_test_trace_epochs:
-                    assert self.test_loader is not None
-                    diagnostic_test_loss, diagnostic_test_metrics = self._evaluate(
-                        loader=self.test_loader,
-                        split_name="Test",
+                patience = self.config.training.early_stopping_patience
+                if patience is not None and self.epochs_without_improvement >= patience:
+                    logger.info(
+                        "Native early stopping on the configured validation selection score"
                     )
-                    diagnostic_score, diagnostic_metric = (
-                        compute_native_selection_score(diagnostic_test_metrics)
-                    )
-                    self.test_epoch_trace.append(
-                        _validation_epoch_record(
-                            epoch=epoch + 1,
-                            step=self.global_step,
-                            joint_loss=diagnostic_test_loss,
-                            selection_metric=diagnostic_metric,
-                            selection_score=diagnostic_score,
-                            metrics=diagnostic_test_metrics,
-                        )
-                    )
+                    break
             if self.best_state is None:
                 # No validation available: the final state is the best state.
                 self.best_state = {
@@ -1118,14 +1102,14 @@ class NativeTrainer(NativeRuntime):
                 }
                 if self.config.output.save_checkpoints:
                     self._save_checkpoint(
-                        self.config.training.epochs - 1,
+                        len(train_trace) - 1,
                         is_best=True,
                         train_trace=train_trace,
                         val_trace=val_trace,
                     )
             if self.config.output.save_checkpoints:
                 self._save_checkpoint(
-                    self.config.training.epochs - 1,
+                    len(train_trace) - 1,
                     is_best=False,
                     train_trace=train_trace,
                     val_trace=val_trace,
@@ -1138,7 +1122,6 @@ class NativeTrainer(NativeRuntime):
                 p.numel() for p in self.model.parameters() if p.requires_grad
             )
             artifact_paths: dict[str, str] = {}
-            test_loss: float | None = None
             test_metrics: dict[str, Any] = {}
             if (
                 self.config.training.run_final_evaluation
@@ -1182,7 +1165,7 @@ class NativeTrainer(NativeRuntime):
                     if self.config.output.write_granular_eval
                     else None
                 )
-                test_loss, test_metrics = self._evaluate(
+                test_metrics = self._evaluate(
                     loader=self.test_loader,
                     split_name="Test",
                     granular_output_path=test_granular_path,
@@ -1191,6 +1174,16 @@ class NativeTrainer(NativeRuntime):
                         if self.config.output.write_granular_eval
                         else None
                     ),
+                )
+                self.test_epoch_trace.append(
+                    _validation_epoch_record(
+                        epoch=self.selected_epoch or len(train_trace),
+                        step=self.selected_step
+                        if self.selected_step is not None
+                        else self.global_step,
+                        split="test",
+                        metrics=test_metrics,
+                    )
                 )
                 if test_granular_path is not None:
                     artifact_paths["test_granular"] = str(test_granular_path)
@@ -1227,19 +1220,19 @@ class NativeTrainer(NativeRuntime):
             )
             raise
         return {
-            "best_val_loss": self.best_val_selection_score,
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
-            "best_val_joint_loss": self.best_val_joint_loss,
+            **self._selection_record(),
             "best_val_series_metrics": dict(self.best_val_series_metrics),
-            "total_epochs": self.config.training.epochs,
-            "train_loss_trace": train_trace,
+            "total_epochs": len(train_trace),
+            "epoch_budget": self.config.training.epochs,
+            "train_objective_trace": train_trace,
             "train_epoch_trace": list(self.train_epoch_trace),
             **self._validation_history(val_trace),
             "validation_epoch_trace": list(self.validation_epoch_trace),
             "test_epoch_trace": list(self.test_epoch_trace),
             "head_counts": self.dataset.head_counts,
-            "test_loss": test_loss,
+            "test_wis": _optional_float(test_metrics.get("wis")),
             "test_metrics": test_metrics,
             "wall_time_s": time.perf_counter() - started,
             "model_info": {
@@ -1324,8 +1317,9 @@ class NativeTrainer(NativeRuntime):
                     step=self.global_step,
                     epoch=epoch,
                     values={
-                        "train_loss": float(total.item()),
+                        "train_objective": float(total.item()),
                         "grad_norm": float(grad_norm),
+                        "gradient_clip_threshold": self.config.training.gradient_clip_value,
                     },
                 )
                 raise NativeNonFiniteHalt(
@@ -1351,8 +1345,9 @@ class NativeTrainer(NativeRuntime):
                     step=self.global_step,
                     epoch=epoch,
                     values={
-                        "train_loss": progress_loss,
+                        "train_objective": progress_loss,
                         "grad_norm": progress_grad_norm,
+                        "gradient_clip_threshold": self.config.training.gradient_clip_value,
                         **(
                             {"loss_metadata_active_heads": metadata_heads}
                             if self.config.native.precompute_loss_metadata
@@ -1361,7 +1356,7 @@ class NativeTrainer(NativeRuntime):
                     },
                 )
                 logger.info(
-                    "native epoch %d step %d/%d total_loss=%.6f",
+                    "native epoch %d step %d/%d train_objective=%.6f",
                     epoch + 1,
                     step + 1,
                     self.steps_per_epoch,
@@ -1389,7 +1384,7 @@ class NativeTrainer(NativeRuntime):
                 "step": self.global_step,
                 "batch_size": self.config.training.batch_size,
                 "objective": self.config.training.loss.joint.observation_loss,
-                "joint_loss": float(np.mean(losses)) if losses else None,
+                "train_objective": float(np.mean(losses)) if losses else None,
                 "ww_mixed_objective": (
                     ww_mixed_sum / ww_mixed_count if ww_mixed_count > 0 else None
                 ),
@@ -1453,9 +1448,9 @@ class NativeTrainer(NativeRuntime):
             ),
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
-            "best_val_joint_loss": self.best_val_joint_loss,
+            **self._selection_record(),
             "best_val_series_metrics": dict(self.best_val_series_metrics),
-            "train_loss_trace": train_trace or [],
+            "train_objective_trace": train_trace or [],
             "train_epoch_trace": list(self.train_epoch_trace),
             **self._validation_history(val_trace or []),
             "validation_epoch_trace": list(self.validation_epoch_trace),
@@ -1466,18 +1461,22 @@ class NativeTrainer(NativeRuntime):
         torch.save(checkpoint, path)
         return path
 
-    def _validation_history(self, joint_trace: list[float | None]) -> dict[str, object]:
-        """Label the primary WIS history and the joint objective separately."""
-        by_epoch = {
-            row["epoch"]: row["selection_score"] for row in self.validation_epoch_trace
+    def _selection_record(self) -> dict[str, Any]:
+        record = {
+            "val_wis": _optional_float(self.selected_val_wis),
+            "selection_score": _optional_float(self.best_val_selection_score),
+            "selection_metric_definition": dict(self.selection_metric_definition),
+            "selected_epoch": self.selected_epoch,
+            "selected_step": self.selected_step,
         }
-        return {
-            "val_loss_metric": _SELECTION_METRIC_NAME,
-            "val_loss_trace": [
-                by_epoch.get(epoch + 1) for epoch in range(len(joint_trace))
-            ],
-            "val_joint_loss_trace": joint_trace,
-        }
+        if self.config.evaluation.training_objective_diagnostic:
+            record["selected_training_objective_diagnostic"] = (
+                self.selected_training_objective_diagnostic
+            )
+        return record
+
+    def _validation_history(self, wis_trace: list[float | None]) -> dict[str, object]:
+        return {"val_wis_trace": wis_trace}
 
     def _dynamics_summary(
         self,
@@ -1486,16 +1485,17 @@ class NativeTrainer(NativeRuntime):
     ) -> dict[str, object]:
         """Terminal lifecycle evidence without checkpoint deserialization."""
         return {
-            "total_epochs": self.config.training.epochs,
+            "total_epochs": len(train_trace),
+            "epoch_budget": self.config.training.epochs,
             "global_step": self.global_step,
-            "train_loss_trace": train_trace,
+            "train_objective_trace": train_trace,
             "train_epoch_trace": list(self.train_epoch_trace),
             **self._validation_history(val_trace),
             "validation_epoch_trace": list(self.validation_epoch_trace),
             "test_epoch_trace": list(self.test_epoch_trace),
             "best_val_selection_score": _optional_float(self.best_val_selection_score),
             "best_val_selection_metric": self.best_val_selection_metric,
-            "best_val_joint_loss": _optional_float(self.best_val_joint_loss),
+            **self._selection_record(),
             "best_val_series_metrics": {
                 head: _optional_float(value)
                 for head, value in self.best_val_series_metrics.items()

@@ -17,7 +17,8 @@ import pytest
 import torch
 
 from evaluation.eval_loop import evaluate_native_loader
-from models.configs import TrainingParams
+from evaluation.native_checkpoint import evaluate_native_checkpoint
+from models.configs import EvaluationConfig, TrainingParams
 from scripts.analysis.analyze_training_dynamics import analyze_training_dynamics
 from tests.native_fixtures import _trainer_config, _write_native_root
 from training.native_trainer import (
@@ -65,7 +66,7 @@ def test_native_info_progress_follows_configured_cadence(
         if record.name == "training.native_trainer"
         and "native epoch 1 step" in record.getMessage()
     ]
-    assert [message.split(" total_loss=")[0] for message in progress] == [
+    assert [message.split(" train_objective=")[0] for message in progress] == [
         "native epoch 1 step 2/3",
         "native epoch 1 step 3/3",
     ]
@@ -114,7 +115,7 @@ def test_native_training_device_metrics_preserve_weighted_epoch_scores(
     losses = trainer._train_epoch(0)
     trace = trainer.train_epoch_trace[-1]
     assert losses == expected_losses
-    assert trace["joint_loss"] == pytest.approx(sum(expected_losses) / 3)
+    assert trace["train_objective"] == pytest.approx(sum(expected_losses) / 3)
     for head in rows[0]:
         expected = (
             expected_sums[head] / expected_counts[head]
@@ -142,7 +143,7 @@ def test_native_training_empty_epoch_has_no_scores(tmp_path: Path) -> None:
     trainer.train_loader = []
     assert trainer._train_epoch(0) == []
     trace = trainer.train_epoch_trace[-1]
-    assert trace["joint_loss"] is None
+    assert trace["train_objective"] is None
     assert trace["ww_mixed_objective"] is None
     for head in ("ww", "cases", "hosp", "deaths"):
         assert trace[f"observed_count_{head}"] == 0
@@ -201,13 +202,12 @@ def test_canonical_model_root_layout_and_identity(tmp_path: Path) -> None:
     )
     assert epoch_trace[0]["epoch"] == 1
     assert epoch_trace[0]["step"] == trainer.global_step
-    assert epoch_trace[0]["joint_loss"] == pytest.approx(
-        results["val_joint_loss_trace"][0]
-    )
-    assert epoch_trace[0]["selection_metric"] == "mean_target_wis"
-    assert results["val_loss_metric"] == "mean_target_wis"
-    assert results["val_loss_trace"][0] == epoch_trace[0]["selection_score"]
-    assert results["best_val_loss"] == results["best_val_selection_score"]
+    assert "joint_loss" not in epoch_trace[0]
+    assert "val_joint_loss_trace" not in results
+    assert epoch_trace[0]["val_wis"] == results["val_wis_trace"][0]
+    assert epoch_trace[0]["selection_metric_definition"]["metric"] == "wis"
+    assert results["val_wis_trace"][0] == epoch_trace[0]["selection_score"]
+    assert results["selection_score"] == results["best_val_selection_score"]
     assert epoch_trace[0]["observed_count_cases"] > 0
     assert epoch_trace[0]["crps_cases"] is not None
     assert epoch_trace[0]["wis_cases"] == pytest.approx(
@@ -224,43 +224,62 @@ def test_canonical_model_root_layout_and_identity(tmp_path: Path) -> None:
     assert epoch_trace[0]["censored_count_ww"] == 0
 
     analysis = analyze_training_dynamics(model_root)
+    assert analysis["loss"]["metric"] == "train_objective"
+    assert analysis["loss"]["count"] > 0
+    assert analysis["validation"]["metric"] == "val_wis"
+    assert analysis["validation"]["best_epoch"] == results["selected_epoch"]
+    assert analysis["validation"]["best_selection_score"] == results["selection_score"]
     assert analysis["identity"]["manifest_status"] == "complete"
 
     assert results["best_val_selection_score"] is not None
-    assert results["best_val_selection_metric"] == "mean_target_wis"
-    assert results["best_val_joint_loss"] is not None
+    assert results["best_val_selection_metric"] == "wis"
+    assert "best_val_joint_loss" not in results
     assert set(results["best_val_series_metrics"]) == {
-        "ww",
-        "cases",
-        "hosp",
-        "deaths",
+        "wis_ww",
+        "wis_cases",
+        "wis_hosp",
+        "wis_deaths",
     }
-    assert results["best_val_series_metrics"]["ww"] is None
-    assert results["best_val_series_metrics"]["cases"] == epoch_trace[0]["wis_cases"]
+    assert results["best_val_series_metrics"]["wis_ww"] is None
+    assert (
+        results["best_val_series_metrics"]["wis_cases"] == epoch_trace[0]["wis_cases"]
+    )
 
     _, record = load_native_checkpoint(model_root / "checkpoints/best_model.pt")
     assert record["model_id"] == "canonical_m1"
     assert record["config"]["native"]["enabled"] is True
     assert record["precision_signature"]["param_dtype"] == "float32"
     assert record["scheduler_state_dict"] is not None
-    assert record["val_loss_metric"] == "mean_target_wis"
-    assert record["val_loss_trace"] == results["val_loss_trace"]
-    assert record["val_joint_loss_trace"] == results["val_joint_loss_trace"]
+    assert record["val_wis_trace"] == results["val_wis_trace"]
+    assert "val_joint_loss_trace" not in record
 
 
-@pytest.mark.parametrize("objective", ["nll", "crps", "mse"])
-def test_checkpoint_follows_wis_when_other_scores_disagree(
+@pytest.mark.parametrize("selection_metric", ["wis", "crps"])
+def test_selection_drives_checkpoint_early_stop_hpo_and_selected_test(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    objective: str,
+    selection_metric: str,
 ) -> None:
     _write_native_root(tmp_path)
     config = _artifact_config(tmp_path)
-    config.training.epochs = 3
-    config.training.loss.joint.observation_loss = objective
+    config.training.epochs = 5
+    config.training.early_stopping_patience = 1
+    config.evaluation.selection_metric = selection_metric
+    config.evaluation.training_objective_diagnostic = True
     config.output.write_granular_eval = False
-    trainer = NativeTrainer(config, model_id="wis_ranking")
-    trainer.test_loader = None
+    reports = []
+
+    class Trial:
+        def report(self, score, epoch):
+            reports.append((score, epoch))
+
+        def should_prune(self):
+            return False
+
+    trainer = NativeTrainer(
+        config, model_id="ranking", trial=Trial(), pruning_start_epoch=0
+    )
+    trainer.test_loader = trainer.val_loader
     parameter = next(trainer.model.parameters())
 
     def train_epoch(epoch):
@@ -269,54 +288,75 @@ def test_checkpoint_follows_wis_when_other_scores_disagree(
         trainer.global_step += trainer.steps_per_epoch
         return [1.0] * trainer.steps_per_epoch
 
-    evaluations = iter(
-        [
-            (3.0, {"wis_cases": 0.5, "crps_cases": 0.1, "observed_count_cases": 2}),
-            (2.0, {"wis_cases": 0.2, "crps_cases": 0.2, "observed_count_cases": 2}),
-            (1.0, {"wis_cases": 0.4, "crps_cases": 0.3, "observed_count_cases": 2}),
-        ]
-    )
+    calls = {"val": 0, "test": 0}
+    selected_epoch = 2 if selection_metric == "wis" else 1
+
+    def evaluate(**kwargs):
+        split = kwargs.get("split_name", "Val").lower()
+        index = calls[split]
+        calls[split] += 1
+        if split == "test":
+            assert torch.all(parameter == selected_epoch)
+            metrics = {
+                "wis_cases": 0.001,
+                "crps_cases": 0.002,
+                "observed_count_cases": 2,
+                "training_objective_diagnostic": 99.0,
+            }
+        else:
+            metrics = {
+                "wis_cases": [0.5, 0.2, 0.4][index],
+                "crps_cases": [0.1, 0.2, 0.3][index],
+                "observed_count_cases": 2,
+                "training_objective_diagnostic": [3.0, 2.0, 1.0][index],
+            }
+        score, definition = compute_native_selection_score(metrics, config.evaluation)
+        return {
+            **metrics,
+            "wis": metrics["wis_cases"],
+            "selection_score": score,
+            "selection_metric_definition": definition,
+        }
+
     monkeypatch.setattr(trainer, "_train_epoch", train_epoch)
-    monkeypatch.setattr(trainer, "_evaluate", lambda: next(evaluations))
+    monkeypatch.setattr(trainer, "_evaluate", evaluate)
     result = trainer.run()
-    assert result["val_loss_trace"] == [0.5, 0.2, 0.4]
-    assert result["val_joint_loss_trace"] == [3.0, 2.0, 1.0]
-    assert result["best_val_loss"] == 0.2
-    assert result["best_val_joint_loss"] == 2.0
-    assert torch.all(parameter == 2.0)
+    count = 3 if selection_metric == "wis" else 2
+    assert result["total_epochs"] == count
+    assert result["epoch_budget"] == 5
+    assert result["val_wis_trace"] == [0.5, 0.2, 0.4][:count]
+    assert "val_joint_loss_trace" not in result
+    assert result["selection_score"] == (0.2 if selection_metric == "wis" else 0.1)
+    assert result["selected_epoch"] == selected_epoch
+    assert result["selected_training_objective_diagnostic"] == (
+        2.0 if selection_metric == "wis" else 3.0
+    )
+    assert result["selection_metric_definition"]["metric"] == selection_metric
+    assert [score for score, _ in reports] == (
+        [0.5, 0.2, 0.4] if selection_metric == "wis" else [0.1, 0.2]
+    )
+    assert calls["test"] == 1
+    assert result["test_wis"] == 0.001
+    assert result["test_epoch_trace"][0]["epoch"] == selected_epoch
+    assert "selection_score" not in result["test_epoch_trace"][0]
+    assert torch.all(parameter == selected_epoch)
     _, checkpoint = load_native_checkpoint(trainer.checkpoint_dir / "best_model.pt")
-    assert checkpoint["epoch"] == 1
-    assert checkpoint["best_val_series_metrics"]["cases"] == 0.2
-    assert checkpoint["val_loss_trace"] == [0.5, 0.2]
-    _, final = load_native_checkpoint(trainer.checkpoint_dir / "final_model.pt")
-    assert final["val_loss_trace"] == [0.5, 0.2, 0.4]
-
-
-def test_diagnostic_test_epoch_trace_does_not_select_checkpoint(
-    tmp_path: Path,
-) -> None:
-    _write_native_root(tmp_path)
-    config = _artifact_config(tmp_path)
-    trainer = NativeTrainer(config, model_id="diagnostic_trace")
-    # Reuse the bounded validation loader to test the diagnostic evaluation path.
-    trainer.test_loader = trainer.val_loader
-    trainer.config.training.diagnostic_test_trace_epochs = [1]
-
-    results = trainer.run()
-
-    assert len(results["validation_epoch_trace"]) == 1
-    assert len(results["test_epoch_trace"]) == 1
-    assert results["test_epoch_trace"][0]["epoch"] == 1
-    assert results["test_epoch_trace"][0]["crps_cases"] == pytest.approx(
-        results["validation_epoch_trace"][0]["crps_cases"]
+    assert checkpoint["epoch"] == selected_epoch - 1
+    assert result["val_wis"] == (0.2 if selection_metric == "wis" else 0.5)
+    with pytest.raises(ValueError, match="validation-selected checkpoint"):
+        evaluate_native_checkpoint(
+            checkpoint_path=trainer.checkpoint_dir / "final_model.pt",
+            split="test",
+            output_dir=tmp_path / "rejected_test",
+            overrides=[],
+            granular=False,
+            summary_path=tmp_path / "rejected_test.json",
+        )
+    assert checkpoint["selection_score"] == result["selection_score"]
+    assert (
+        checkpoint["selection_metric_definition"]
+        == result["selection_metric_definition"]
     )
-    assert results["best_val_selection_score"] == pytest.approx(
-        results["validation_epoch_trace"][0]["selection_score"]
-    )
-    manifest = json.loads(
-        (Path(results["model_root"]) / "training_dynamics_manifest.json").read_text()
-    )
-    assert manifest["summary"]["test_epoch_trace"] == results["test_epoch_trace"]
 
 
 # ----------------------------------------------------------------------
@@ -332,16 +372,16 @@ def test_reload_reproduces_final_validation_metrics(tmp_path: Path) -> None:
     )
     assert model.training is False  # eval mode after reload
 
-    loss, metrics, _aggregate = evaluate_native_loader(
+    metrics, _aggregate = evaluate_native_loader(
         model=model,
         loader=trainer.val_loader,
-        criterion=trainer.criterion,
+        scorer=trainer.evaluation_scorer,
         device=torch.device("cpu"),
         split_name="Val",
         max_batches=trainer.config.training.max_batches,
         confirmation_guard=trainer.config.native.confirmation_guard,
     )
-    assert loss == pytest.approx(float(results["best_val_joint_loss"]), abs=1e-9)
+    assert metrics["wis"] == pytest.approx(results["selection_score"], abs=1e-9)
     for key in ("crps_cases", "crps_hosp", "crps_deaths", "wis_cases"):
         assert metrics[key] == pytest.approx(
             float(trainer.last_val_metrics[key]), abs=1e-9, rel=1e-9
@@ -388,15 +428,15 @@ def test_selection_score_prefers_wis() -> None:
         "mae_cases_log1p_per_100k": 0.5,
     }
     # Selection does not receive or depend on the training objective.
-    score, metric = compute_native_selection_score(metrics)
-    assert metric == "mean_target_wis"
+    score, metric = compute_native_selection_score(metrics, EvaluationConfig())
+    assert metric["metric"] == "wis"
     assert score == pytest.approx(2.0)
 
 
 def test_selection_score_includes_native_wastewater_when_available() -> None:
     metrics = {"wis_ww": 4.0, "wis_cases": 1.0, "wis_hosp": 2.0, "wis_deaths": 3.0}
-    score, metric = compute_native_selection_score(metrics)
-    assert metric == "mean_target_wis"
+    score, metric = compute_native_selection_score(metrics, EvaluationConfig())
+    assert metric["metric"] == "wis"
     assert score == pytest.approx(2.5)
 
 
@@ -408,7 +448,8 @@ def test_selection_score_rejects_missing_wis_for_observed_head(value) -> None:
                 "observed_count_cases": 2,
                 "wis_cases": value,
                 "wis_hosp": 1.0,
-            }
+            },
+            EvaluationConfig(),
         )
 
 
@@ -421,9 +462,10 @@ def test_selection_score_excludes_unobserved_heads_and_never_falls_back() -> Non
             "observed_count_hosp": 1,
             "wis_ww": 100.0,
             "observed_count_ww": 0,
-        }
+        },
+        EvaluationConfig(),
     )
-    assert metric == "mean_target_wis"
+    assert metric["metric"] == "wis"
     assert score == pytest.approx(3.0)  # Equal heads, not observed-count weights.
     with pytest.raises(ValueError, match="at least one finite observed WIS"):
         compute_native_selection_score(
@@ -431,7 +473,8 @@ def test_selection_score_excludes_unobserved_heads_and_never_falls_back() -> Non
                 "crps_cases": 1.0,
                 "nll_cases": 2.0,
                 "mae_cases_log1p_per_100k": 0.5,
-            }
+            },
+            EvaluationConfig(),
         )
 
 
@@ -496,7 +539,7 @@ def test_nonfinite_gradient_halts_before_optimizer_step(tmp_path: Path) -> None:
     assert rows, "halt row must be recorded"
     assert rows[-1]["nonfinite_fields"] == ["grad_norm"]
     assert rows[-1]["grad_norm"] is None
-    assert rows[-1]["train_loss"] is not None  # the loss itself was finite
+    assert rows[-1]["train_objective"] is not None  # the loss itself was finite
 
 
 def test_unrelated_failure_finalizes_failed_manifest(tmp_path: Path) -> None:
@@ -658,7 +701,7 @@ def test_native_resume_restores_schedule_and_continues_epoch_history(
     ):
         torch.testing.assert_close(parameter, original)
     assert resumed.best_val_selection_score == parent.best_val_selection_score
-    assert resumed.resumed_val_trace == saved["val_joint_loss_trace"]
+    assert resumed.resumed_val_trace == saved["val_wis_trace"]
     assert (resumed.checkpoint_dir / "best_model.pt").is_file()
     epochs = []
     original_train_epoch = resumed._train_epoch

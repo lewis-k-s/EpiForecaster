@@ -328,7 +328,7 @@ def eval_epiforecaster(
         )
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Native {split} joint WIS: {summary['joint_wis']:.6f}")
+    click.echo(f"Native {split}_wis: {summary[f'{split}_wis']:.6f}")
 
 
 @eval_cli.command("baselines")
@@ -1047,7 +1047,7 @@ def _run_native_forecaster_training(
     logger.info(f"\n{'=' * 60}")
     logger.info("✅ NATIVE TRAINING COMPLETED SUCCESSFULLY")
     logger.info(f"{'=' * 60}")
-    for epoch, losses in enumerate(results["train_loss_trace"]):
+    for epoch, losses in enumerate(results["train_objective_trace"]):
         logger.info(
             f"Epoch {epoch + 1} train losses: {['%.6f' % loss for loss in losses]}"
         )
@@ -1057,11 +1057,12 @@ def _run_native_forecaster_training(
             "Best validation selection: "
             f"{results['best_val_selection_metric']}={selection:.6f}"
         )
-    joint = results.get("best_val_joint_loss")
-    if joint is not None:
-        logger.info(f"Validation joint loss at selected checkpoint: {joint:.6f}")
-    else:
-        logger.info("Validation loss: n/a")
+    logger.info("Selection definition: %s", results["selection_metric_definition"])
+    diagnostic = results.get("selected_training_objective_diagnostic")
+    if diagnostic is not None:
+        logger.info(
+            "Training objective diagnostic on validation at selection: %.6f", diagnostic
+        )
     logger.info(f"Model root: {results['model_root']}")
     logger.info(f"Model parameters: {results['model_info']['parameters']:,}")
     logger.info(f"Wall time: {results['wall_time_s']:.1f}s")

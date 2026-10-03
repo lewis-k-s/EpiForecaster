@@ -39,6 +39,16 @@ def evaluate_native_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if "forecaster_config" not in checkpoint:
         raise ValueError("Checkpoint is not a native forecaster checkpoint")
+    if (
+        split == "test"
+        and checkpoint.get("schema_version") == 2
+        and (
+            checkpoint["selected_epoch"] is None
+            or checkpoint["epoch"] + 1 != checkpoint["selected_epoch"]
+            or checkpoint["global_step"] != checkpoint["selected_step"]
+        )
+    ):
+        raise ValueError("Test evaluation requires the validation-selected checkpoint")
     config = EpiForecasterConfig.from_dict(checkpoint["config"])
     if overrides:
         config = EpiForecasterConfig.apply_overrides(config, overrides)
@@ -68,7 +78,7 @@ def evaluate_native_checkpoint(
     if loader is None:
         raise ValueError(f"Native checkpoint has no {split} split")
     output_dir.mkdir(parents=True, exist_ok=True)
-    objective_loss, metrics = trainer._evaluate(
+    metrics = trainer._evaluate(
         loader=loader,
         split_name=split.capitalize(),
         granular_output_path=(
@@ -80,9 +90,37 @@ def evaluate_native_checkpoint(
         {
             "split": split,
             "checkpoint": str(checkpoint_path),
-            "objective_loss": objective_loss,
-            "primary_metric": "joint_wis",
-            "joint_wis": metrics["joint_wis"],
+            "primary_metric": f"{split}_wis",
+            f"{split}_wis": metrics["wis"],
+            "censored_nll_ww": metrics["censored_nll_ww"],
+            "censored_count_ww": metrics["censored_count_ww"],
+            "uncensored_count_ww": metrics["observed_count_ww"],
+            **(
+                {
+                    "selection_score": metrics["selection_score"],
+                    "selection_metric_definition": metrics[
+                        "selection_metric_definition"
+                    ],
+                }
+                if split == "val"
+                else {
+                    "checkpoint_selection_score": checkpoint.get(
+                        "selection_score", checkpoint.get("best_val_selection_score")
+                    ),
+                    "selection_metric_definition": checkpoint.get(
+                        "selection_metric_definition"
+                    ),
+                }
+            ),
+            **(
+                {
+                    "training_objective_diagnostic": metrics[
+                        "training_objective_diagnostic"
+                    ]
+                }
+                if "training_objective_diagnostic" in metrics
+                else {}
+            ),
             "metrics": metrics,
             "report_context": {
                 **report_context(config),

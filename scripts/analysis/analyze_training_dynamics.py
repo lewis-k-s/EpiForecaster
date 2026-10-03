@@ -74,7 +74,9 @@ def _resolve_input(path: Path) -> tuple[Path, dict[str, Any] | None]:
             or not artifact.is_file()
             or artifact.is_symlink()
         ):
-            raise FileNotFoundError(f"Training dynamics artifact is missing: {artifact}")
+            raise FileNotFoundError(
+                f"Training dynamics artifact is missing: {artifact}"
+            )
         if manifest.get("status") in DYNAMICS_TERMINAL_STATUSES:
             load_training_dynamics_identity(path.parent)
         return artifact, manifest
@@ -100,6 +102,12 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
                     f"Unsupported row schema at line {line_number}: "
                     f"{row.get('schema_version')!r}"
                 )
+            # Normalize recorded native fields at the read boundary. Do not
+            # reconstruct objective or gradient values from checkpoints/logs.
+            if "train_objective" in row:
+                row["loss_train_step"] = row["train_objective"]
+            if "grad_norm" in row:
+                row["gradnorm_total_preclip"] = row["grad_norm"]
             rows.append(row)
 
     steps = [int(row["step"]) for row in rows]
@@ -140,7 +148,11 @@ def _rolling_median(values: np.ndarray, width: int) -> list[float]:
     return [
         float(
             np.median(
-                values[max(0, index - half_width) : min(values.size, index + half_width + 1)]
+                values[
+                    max(0, index - half_width) : min(
+                        values.size, index + half_width + 1
+                    )
+                ]
             )
         )
         for index in range(values.size)
@@ -167,9 +179,7 @@ def _loss_analysis(
     first_median = float(np.median(values[:width]))
     last_median = float(np.median(values[-width:]))
     relative_change = (
-        (last_median - first_median) / abs(first_median)
-        if first_median != 0
-        else None
+        (last_median - first_median) / abs(first_median) if first_median != 0 else None
     )
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
@@ -258,7 +268,11 @@ def _clipping_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             int(row["step"]),
             float(total),
             float(threshold),
-            float(row.get("gradient_clip_factor", min(1.0, float(threshold) / float(total)))),
+            float(
+                row.get(
+                    "gradient_clip_factor", min(1.0, float(threshold) / float(total))
+                )
+            ),
         )
         for row in rows
         if (total := row.get("gradnorm_total_preclip")) is not None
@@ -331,7 +345,9 @@ def _component_analysis(
                 and math.isfinite(float(row["gradnorm_total_preclip"]))
                 and float(row["gradnorm_total_preclip"]) > 0
             ]
-            norms = np.asarray([float(row[field]) for row in component_rows], dtype=float)
+            norms = np.asarray(
+                [float(row[field]) for row in component_rows], dtype=float
+            )
             component_steps = np.asarray(
                 [int(row["step"]) for row in component_rows],
                 dtype=float,
@@ -513,6 +529,26 @@ def _profile_analysis(artifact: Path) -> dict[str, Any]:
 
 def _validation_analysis(manifest: dict[str, Any] | None) -> dict[str, Any]:
     summary = manifest.get("summary", {}) if manifest is not None else {}
+    if "val_wis_trace" in summary:
+        series = summary.get("validation_epoch_trace", [])
+        finite = [
+            row
+            for row in series
+            if row.get("val_wis") is not None and math.isfinite(row["val_wis"])
+        ]
+        if not finite:
+            return {"status": "not_available", "missing_reason": "no_finite_values"}
+        return {
+            "status": "analyzed",
+            "count": len(finite),
+            "metric": "val_wis",
+            "best_epoch": summary["selected_epoch"],
+            "selected_val_wis": summary["val_wis"],
+            "last_val_wis": finite[-1]["val_wis"],
+            "selection_metric_definition": summary["selection_metric_definition"],
+            "best_selection_score": summary["selection_score"],
+            "series": series,
+        }
     history = summary.get("training_history", {})
     validation = history.get("val_loss", [])
     training = history.get("train_loss", [])
@@ -638,8 +674,7 @@ def _adaptive_gradnorm_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             else {"status": "not_sampled", "count": 0}
         )
     target_evidence = any(
-        any(f"target_norm_{task}" in row for task in GRADNORM_TASKS)
-        for row in series
+        any(f"target_norm_{task}" in row for task in GRADNORM_TASKS) for row in series
     )
     return {
         "status": "analyzed" if target_evidence else "partial",
@@ -673,16 +708,13 @@ def _gradient_snapshot_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "count": len(snapshot_rows),
         "steps": [int(row["step"]) for row in snapshot_rows],
         "non_finite_layer_observations": sum(
-            int(row.get("grad_snapshot_non_finite_layers", 0))
-            for row in snapshot_rows
+            int(row.get("grad_snapshot_non_finite_layers", 0)) for row in snapshot_rows
         ),
         "max_vanishing_layers": max(
-            int(row.get("grad_snapshot_vanishing_layers", 0))
-            for row in snapshot_rows
+            int(row.get("grad_snapshot_vanishing_layers", 0)) for row in snapshot_rows
         ),
         "max_exploding_layers": max(
-            int(row.get("grad_snapshot_exploding_layers", 0))
-            for row in snapshot_rows
+            int(row.get("grad_snapshot_exploding_layers", 0)) for row in snapshot_rows
         ),
         "unexpected_zero_steps": unexpected_zero_steps,
     }
@@ -748,12 +780,15 @@ def analyze_training_dynamics(
         [int(row["step"]) for row in loss_rows],
         [int(row["epoch"]) for row in loss_rows],
     )
+    loss["metric"] = (
+        "train_objective"
+        if any("train_objective" in row for row in rows)
+        else "training_loss"
+    )
     findings: list[dict[str, Any]] = []
     manifest_status = manifest.get("status") if manifest else "unmanifested"
     if manifest is not None:
-        expected_range = (
-            [int(rows[0]["step"]), int(rows[-1]["step"])] if rows else None
-        )
+        expected_range = [int(rows[0]["step"]), int(rows[-1]["step"])] if rows else None
         observed_range = (
             [manifest.get("first_step"), manifest.get("last_step")]
             if manifest.get("first_step") is not None
@@ -779,7 +814,9 @@ def analyze_training_dynamics(
             {
                 "code": "nonfinite_observation",
                 "severity": "error",
-                "evidence": {"nonfinite_fields": dict(sorted(nonfinite_counts.items()))},
+                "evidence": {
+                    "nonfinite_fields": dict(sorted(nonfinite_counts.items()))
+                },
             }
         )
     if loss.get("status") == "analyzed" and loss["robust_spike_count"] > 0:
@@ -834,8 +871,7 @@ def analyze_training_dynamics(
             )
     if profiler.get("status") == "analyzed":
         compilation_ms = sum(
-            trace["compilation"]["summed_duration_ms"]
-            for trace in profiler["traces"]
+            trace["compilation"]["summed_duration_ms"] for trace in profiler["traces"]
         )
         if compilation_ms > 0:
             findings.append(
@@ -872,9 +908,7 @@ def analyze_training_dynamics(
     )
     return {
         "analysis_status": (
-            "analyzed"
-            if loss_values.size >= MIN_ANALYSIS_ROWS
-            else "insufficient_data"
+            "analyzed" if loss_values.size >= MIN_ANALYSIS_ROWS else "insufficient_data"
         ),
         "identity": identity,
         "provenance": provenance,
@@ -915,9 +949,7 @@ def analyze_training_dynamics(
                 )
                 else "not_sampled"
             ),
-            "adaptive_gradnorm_controller": (
-                adaptive_gradnorm["status"]
-            ),
+            "adaptive_gradnorm_controller": (adaptive_gradnorm["status"]),
             "gradient_snapshots": gradient_snapshots["status"],
             "profiler": (
                 "available"
@@ -972,7 +1004,18 @@ def _write_loss_figure(data: dict[str, Any], output_path: Path) -> bool:
             zorder=3,
         )
     validation = data["validation"]
-    if validation["status"] == "analyzed":
+    if validation["status"] == "analyzed" and validation.get("metric") == "val_wis":
+        wis_axis = axis.twinx()
+        wis_axis.plot(
+            [row["step"] for row in validation["series"]],
+            [row["val_wis"] for row in validation["series"]],
+            color="#d46b08",
+            marker="o",
+            label="val_wis",
+        )
+        wis_axis.set_ylabel("val_wis · equal-head mean")
+        wis_axis.legend(loc="upper right")
+    elif validation["status"] == "analyzed":
         epoch_last_steps = {
             row["epoch"]: row["last_step"] for row in loss.get("epoch_summaries", [])
         }
@@ -991,9 +1034,9 @@ def _write_loss_figure(data: dict[str, Any], output_path: Path) -> bool:
                 label="Validation joint loss",
             )
     axis.set(
-        title="Sampled training loss",
+        title=f"Sampled {loss.get('metric', 'training_loss')}",
         xlabel="Optimizer step",
-        ylabel="Training loss",
+        ylabel=loss.get("metric", "training_loss"),
     )
     # Normal NLL can legitimately cross zero, so retain its sign while giving
     # sub-unit magnitudes logarithmic visual resolution.
@@ -1160,9 +1203,7 @@ def _write_adaptive_gradnorm_figure(
     figure, axis = plt.subplots(figsize=(10, 5))
     for task in GRADNORM_TASKS:
         points = [
-            (row["step"], row[f"w_{task}"])
-            for row in series
-            if f"w_{task}" in row
+            (row["step"], row[f"w_{task}"]) for row in series if f"w_{task}" in row
         ]
         if points:
             axis.plot(
@@ -1207,8 +1248,7 @@ def _write_profiler_figure(data: dict[str, Any], output_path: Path) -> bool:
     top = sorted(durations.items(), key=lambda item: item[1], reverse=True)[:10]
     top.reverse()
     labels = [
-        name if len(name) <= 64 else f"{name[:34]}…{name[-25:]}"
-        for name, _ in top
+        name if len(name) <= 64 else f"{name[:34]}…{name[-25:]}" for name, _ in top
     ]
     figure, axis = plt.subplots(figsize=(10, 6))
     axis.barh(
@@ -1230,9 +1270,7 @@ def _write_profiler_figure(data: dict[str, Any], output_path: Path) -> bool:
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> bool:
     if not rows:
         return False
-    fieldnames = list(
-        dict.fromkeys(key for row in rows for key in row)
-    )
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -1263,11 +1301,7 @@ def _tabular_data(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     component_summary = [
         {
             "component": component_name,
-            **{
-                key: value
-                for key, value in component.items()
-                if key != "series"
-            },
+            **{key: value for key, value in component.items() if key != "series"},
         }
         for component_name, component in data["components"].items()
     ]
@@ -1296,15 +1330,12 @@ def _tabular_data(data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                     "summed_duration_ms"
                 ],
                 "compilation_count": trace["compilation"]["count"],
-                "compilation_duration_ms": trace["compilation"][
-                    "summed_duration_ms"
-                ],
+                "compilation_duration_ms": trace["compilation"]["summed_duration_ms"],
                 "duration_semantics": trace["duration_semantics"],
             }
         )
         profiler_steps.extend(
-            {"trace_index": trace_index, **row}
-            for row in trace["profiled_steps"]
+            {"trace_index": trace_index, **row} for row in trace["profiled_steps"]
         )
         for activity, key in (
             ("cpu", "top_cpu_operations"),

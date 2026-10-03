@@ -4,8 +4,9 @@ from pathlib import Path
 
 from typing import Any, cast
 
-import yaml
 from omegaconf import MISSING, DictConfig, OmegaConf
+
+from scripts.workflow.config_templates import load_config_template
 
 GNN_TYPES = ["gcn", "gat"]
 GRAPH_ADJACENCY_SOURCES = ["mobility", "spatial_knn", "spatial_queen"]
@@ -1105,13 +1106,9 @@ class TrainingParams:
     prefetch_factor: int | None = 4
     pin_memory: bool = True
     eval_frequency: int = 5
-    eval_metrics: list[str] = field(default_factory=lambda: ["mse", "mae", "rmse"])
     # Run canonical validation/test evaluation after selecting the best checkpoint.
     # Workflow-managed training disables this and evaluates in a separate DAG rule.
     run_final_evaluation: bool = True
-    # Diagnostic-only test evaluations during training. These never select a
-    # checkpoint; use explicit 1-based epochs to bound cost and test exposure.
-    diagnostic_test_trace_epochs: list[int] = field(default_factory=list)
     # Loss configuration (single or composite)
     loss: LossConfig = field(default_factory=LossConfig)
     # forecast plotting during validation/test evaluation
@@ -1209,6 +1206,14 @@ class TrainingParams:
             raise ValueError(
                 "EpiForecaster only supports training.loss.name='joint_inference', "
                 f"got {self.loss.name!r}."
+            )
+
+        if self.early_stopping_patience is not None and (
+            type(self.early_stopping_patience) is not int
+            or self.early_stopping_patience < 1
+        ):
+            raise ValueError(
+                "training.early_stopping_patience must be a positive integer or null"
             )
 
         # Validate split_strategy
@@ -1411,6 +1416,66 @@ class TrainingParams:
 
 
 @dataclass
+class EvaluationConfig:
+    """Held-out scores and the single rule used to select a checkpoint.
+
+    These settings are independent of the training objective and its weights.
+    Censored wastewater NLL and counts are always reported alongside WIS.
+    """
+
+    metrics: list[str] = field(
+        default_factory=lambda: ["wis", "crps", "nll", "mae", "rmse"]
+    )
+    selection_metric: str = "wis"
+    selection_aggregation: str = "equal_head_mean"
+    distribution_family: str = "student_t"
+    distribution_df: float = 5.0
+    interval_levels: list[float] = field(default_factory=lambda: [0.5, 0.8, 0.95])
+    training_objective_diagnostic: bool = False
+
+    def __post_init__(self) -> None:
+        allowed = {"wis", "crps", "nll", "mae", "rmse"}
+        if (
+            not self.metrics
+            or len(set(self.metrics)) != len(self.metrics)
+            or not set(self.metrics) <= allowed
+            or "wis" not in self.metrics
+        ):
+            raise ValueError(
+                "evaluation.metrics must contain wis and unique supported scores: "
+                f"{sorted(allowed)}"
+            )
+        if self.selection_metric not in {"wis", "crps", "nll"} or (
+            self.selection_metric not in self.metrics
+        ):
+            raise ValueError(
+                "evaluation.selection_metric must be an enabled wis/crps/nll score"
+            )
+        if self.selection_aggregation != "equal_head_mean":
+            raise ValueError("evaluation.selection_aggregation must be equal_head_mean")
+        if self.distribution_family not in {"normal", "student_t"}:
+            raise ValueError(
+                "evaluation.distribution_family must be normal or student_t"
+            )
+        if self.distribution_family == "student_t" and self.distribution_df != 5.0:
+            raise ValueError(
+                "Native evaluation supports Student-t with distribution_df=5"
+            )
+        if (
+            not self.interval_levels
+            or len(set(self.interval_levels)) != len(self.interval_levels)
+            or any(not 0 < level < 1 for level in self.interval_levels)
+        ):
+            raise ValueError(
+                "evaluation.interval_levels must be unique levels between 0 and 1"
+            )
+        if type(self.training_objective_diagnostic) is not bool:
+            raise ValueError(
+                "evaluation.training_objective_diagnostic must be a boolean"
+            )
+
+
+@dataclass
 class OutputConfig:
     """Logging and checkpoint settings from the ``output`` YAML block."""
 
@@ -1493,9 +1558,10 @@ class NativeSupportConfig:
     test_fraction: float = 0.1
 
     def __post_init__(self) -> None:
-        if (
-            Path(self.wastewater_filename).name != self.wastewater_filename
-            or not self.wastewater_filename.endswith(".zarr")
+        if Path(
+            self.wastewater_filename
+        ).name != self.wastewater_filename or not self.wastewater_filename.endswith(
+            ".zarr"
         ):
             raise ValueError("native.wastewater_filename must be one Zarr filename")
         for name, allowed in (
@@ -1556,6 +1622,7 @@ class EpiForecasterConfig:
     training: TrainingParams = MISSING
     output: OutputConfig = MISSING
     native: NativeSupportConfig = field(default_factory=NativeSupportConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     env: str | None = None
 
     @classmethod
@@ -1625,6 +1692,7 @@ class EpiForecasterConfig:
                     NativeSupportConfig, merged_dict.get("native", {})
                 )
             ),
+            evaluation=EvaluationConfig(**merged_dict.get("evaluation", {})),
         )
 
     @classmethod
@@ -1656,9 +1724,7 @@ class EpiForecasterConfig:
         if not config_path.exists():
             raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-        raw = yaml.safe_load(config_path.read_text())
-        if raw is None:
-            raise ValueError(f"Configuration file is empty: {config_path}")
+        raw = load_config_template(config_path)
 
         model_dict = (raw.get("model", {}) or {}).copy()
         if "params" in model_dict:
@@ -1672,6 +1738,7 @@ class EpiForecasterConfig:
             "training": raw.get("training", {}) or {},
             "output": raw.get("output", {}) or {},
             "native": raw.get("native", {}) or {},
+            "evaluation": raw.get("evaluation", {}) or {},
             "env": raw.get("env"),
         }
         cls._reject_obsolete_mobility_fields(cfg_dict["data"])
@@ -1744,4 +1811,5 @@ class EpiForecasterConfig:
                 )
             ),
             env=config_dict.get("env"),
+            evaluation=EvaluationConfig(**config_dict.get("evaluation", {})),
         )

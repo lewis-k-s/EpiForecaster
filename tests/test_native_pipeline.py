@@ -137,9 +137,10 @@ def _run_pipeline(config, monkeypatch):
     assert not list(model_root.glob("test_*"))
     checkpoint = model_root / "checkpoints/best_model.pt"
     record = torch.load(checkpoint, weights_only=False)
+    assert record["forecaster_config"]["decoder"] == config.native.decoder
     assert record["global_step"] == 2
-    assert len(record["train_loss_trace"][0]) == 2
-    assert np.isfinite(record["train_loss_trace"]).all()
+    assert len(record["train_objective_trace"][0]) == 2
+    assert np.isfinite(record["train_objective_trace"]).all()
     for prefix in (
         "input_adapter.",
         "base.backbone.",
@@ -158,7 +159,7 @@ def _run_pipeline(config, monkeypatch):
             for k, v in record["model_state_dict"].items()
             if k.startswith("wastewater_head.")
         )
-    assert record["best_val_selection_metric"] == "mean_target_wis"
+    assert record["best_val_selection_metric"] == "wis"
     terminal = json.loads((model_root / "training_dynamics_manifest.json").read_text())
     assert terminal["status"] == "complete"
     # A saved resume setting must have no effect on standalone evaluation.
@@ -171,24 +172,47 @@ def _run_pipeline(config, monkeypatch):
     for split in ("val", "test"):
         previous = None
         for repeat in range(2):
-            result = CliRunner().invoke(
-                cli,
-                [
-                    "eval",
-                    "epiforecaster",
-                    "--checkpoint",
-                    str(checkpoint),
-                    "--split",
-                    split,
-                    "--output",
-                    str(output),
-                    "--summary-json",
-                    str(output / f"{split}_summary.json"),
-                    "--granular",
-                    "--override",
-                    "training.max_batches=8",
-                ],
-            )
+            args = [
+                "eval",
+                "epiforecaster",
+                "--checkpoint",
+                str(checkpoint),
+                "--split",
+                split,
+                "--output",
+                str(output),
+                "--summary-json",
+                str(output / f"{split}_summary.json"),
+                "--granular",
+                "--override",
+                "training.max_batches=8",
+            ]
+            if repeat:
+                # Poison the training-loss configuration, not the predictions.
+                # Evaluation must neither instantiate nor call that criterion.
+                for override in (
+                    "training.loss.joint.gradnorm_obs_weight_sum=0.01",
+                    "training.loss.joint.disable_cases=true",
+                    "training.loss.joint.disable_hosp=true",
+                    "training.loss.joint.disable_deaths=true",
+                    "training.loss.joint.disable_ww=true",
+                    "training.loss.joint.observation_loss=nll",
+                    "training.loss.joint.distribution_family=normal",
+                    "training.loss.joint.interval_levels=[0.2,0.9]",
+                ):
+                    args.extend(["--override", override])
+            with monkeypatch.context() as evaluation_patch:
+
+                def forbidden_criterion(*_args, **_kwargs):
+                    raise AssertionError(
+                        "Normal evaluation must not use the training objective"
+                    )
+
+                evaluation_patch.setattr(
+                    "training.native_trainer.get_native_loss_from_config",
+                    forbidden_criterion,
+                )
+                result = CliRunner().invoke(cli, args)
             assert result.exit_code == 0, result.output
             current = json.loads((output / f"{split}_summary.json").read_text())
             rows = pd.read_parquet(output / f"{split}_granular.parquet")
@@ -198,8 +222,62 @@ def _run_pipeline(config, monkeypatch):
             previous = current, rows
         summary = json.loads((output / f"{split}_summary.json").read_text())
         metrics = summary["metrics"]
-        assert np.isfinite(summary["joint_wis"])
+        assert "objective_loss" not in summary
+        assert "training_objective_diagnostic" not in metrics
+        assert summary["primary_metric"] == f"{split}_wis"
+        assert summary["censored_nll_ww"] == metrics["censored_nll_ww"]
+        assert summary["censored_count_ww"] == metrics["censored_count_ww"]
+        assert summary["uncensored_count_ww"] == metrics["observed_count_ww"]
+        assert summary["selection_metric_definition"]["metric"] == "wis"
+        if split == "test":
+            assert "selection_score" not in summary
+            assert "selection_score" not in summary["metrics"]
+            assert summary["checkpoint_selection_score"] == record["selection_score"]
+        assert (
+            summary["selection_metric_definition"]["aggregation"] == "equal_head_mean"
+        )
+        assert np.isfinite(summary[f"{split}_wis"])
         summaries[split] = summary
+        if config.native.decoder == "direct":
+            for diagnostic in (False, True):
+                destination = tmp_path / f"extra_{split}_{diagnostic}"
+                args = [
+                    "eval",
+                    "epiforecaster",
+                    "--checkpoint",
+                    str(checkpoint),
+                    "--split",
+                    split,
+                    "--output",
+                    str(destination),
+                    "--summary-json",
+                    str(destination / "summary.json"),
+                    "--override",
+                    "training.max_batches=8",
+                ]
+                if diagnostic:
+                    args.extend(
+                        ["--override", "evaluation.training_objective_diagnostic=true"]
+                    )
+                else:
+                    args.extend(["--override", "evaluation.metrics=[wis]"])
+                result = CliRunner().invoke(cli, args)
+                assert result.exit_code == 0, result.output
+                extra = json.loads((destination / "summary.json").read_text())
+                assert extra[f"{split}_wis"] == summary[f"{split}_wis"]
+                if diagnostic:
+                    assert np.isfinite(extra["training_objective_diagnostic"])
+                else:
+                    assert extra["metrics"]["crps_cases"] is None
+                    assert extra["metrics"]["nll_cases"] is None
+                    assert (
+                        extra["metrics"]["censored_count_ww"]
+                        == metrics["censored_count_ww"]
+                    )
+                    assert (
+                        extra["metrics"]["censored_nll_ww"]
+                        == metrics["censored_nll_ww"]
+                    )
         if config.native.wastewater_enabled:
             assert metrics["censored_count_ww"] > 0
             assert np.isfinite(metrics["censored_nll_ww"])
@@ -228,8 +306,9 @@ def _run_pipeline(config, monkeypatch):
         )
         assert metadata["schema_version"] == "4"
         assert metadata["native_support"] is True
+        assert metadata["decoder"] == config.native.decoder
         assert metadata["confirmation_guard"] is True
-        assert metadata["objective"] == "crps"
+        assert metadata["evaluation_metrics"] == config.evaluation.metrics
         assert metadata["generalization_claim"].startswith("held-out native sources")
         assert list(granular.columns) == GRANULAR_FIELDNAMES
         assert (granular.population > 0).all()
@@ -416,7 +495,7 @@ def test_held_out_poison_cannot_change_training_or_pre_origin_history(
                 actual.relation_ctx[key], expected.relation_ctx[key], rtol=0, atol=0
             )
         record, scores = _run_pipeline(config, monkeypatch)
-        assert record["train_loss_trace"] == clean_record["train_loss_trace"]
+        assert record["train_objective_trace"] == clean_record["train_objective_trace"]
         for key, value in clean_record["model_state_dict"].items():
             torch.testing.assert_close(
                 record["model_state_dict"][key], value, rtol=0, atol=0
@@ -431,7 +510,7 @@ def test_held_out_poison_cannot_change_training_or_pre_origin_history(
                     right[key], left[key], rtol=0, atol=0, equal_nan=True
                 )
         # Positive control: the poison reaches evaluation labels and scores.
-        assert scores[split]["joint_wis"] > clean_scores[split]["joint_wis"] * 5
+        assert scores[split][f"{split}_wis"] > clean_scores[split][f"{split}_wis"] * 5
         rows = pd.read_parquet(root / f"evaluation/{split}_granular.parquet")
         assert rows.loc[rows.target == "deaths", "observed_raw"].max() > 1e15
 
@@ -453,8 +532,8 @@ def test_native_pipeline_compile_on_and_off(tmp_path: Path, monkeypatch) -> None
         records[0]["model_state_dict"].keys() == records[1]["model_state_dict"].keys()
     )
     np.testing.assert_allclose(
-        records[0]["train_loss_trace"],
-        records[1]["train_loss_trace"],
+        records[0]["train_objective_trace"],
+        records[1]["train_objective_trace"],
         rtol=2e-4,
         atol=2e-5,
     )
@@ -463,8 +542,8 @@ def test_native_pipeline_compile_on_and_off(tmp_path: Path, monkeypatch) -> None
             records[1]["model_state_dict"][key], value, rtol=2e-4, atol=2e-5
         )
     for split in ("val", "test"):
-        assert scores[0][split]["joint_wis"] == pytest.approx(
-            scores[1][split]["joint_wis"], rel=2e-4
+        assert scores[0][split][f"{split}_wis"] == pytest.approx(
+            scores[1][split][f"{split}_wis"], rel=2e-4
         )
 
 
@@ -505,6 +584,8 @@ def test_censor_score_matches_training_and_evaluation(
     from data.native_batch import collate_native_batch
     from evaluation.losses import NativeJointInferenceLoss
     from evaluation.eval_loop import _native_wastewater_eval_view
+    from evaluation.native_scoring import NativeEvaluationScorer
+    from models.configs import EvaluationConfig
 
     _write_native_root(tmp_path)
     _write_native_wastewater(tmp_path)
@@ -530,7 +611,11 @@ def test_censor_score_matches_training_and_evaluation(
         model_outputs=outputs,
         batch=batch,
         dataset=dataset,
-        criterion=loss,
+        scorer=NativeEvaluationScorer(
+            config=EvaluationConfig(distribution_family=family),
+            horizon_days=config.model.forecast_horizon,
+            distribution_scale_floor=loss.distribution_scale_floor,
+        ),
         device=torch.device("cpu"),
     )
     assert view is not None
@@ -541,3 +626,46 @@ def test_censor_score_matches_training_and_evaluation(
     training.backward()
     assert torch.isfinite(loc.grad).all() and loc.grad.abs().sum() > 0
     assert torch.isfinite(scale.grad).all() and scale.grad.abs().sum() > 0
+
+
+def test_workflow_publishes_split_asset_to_local_dvc(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from scripts.workflow.run_support import build_native_splits
+
+    source = tmp_path / "source"
+    source.mkdir()
+    config = pipeline_config(source, strict=True, wastewater=False)
+    base = source / "config.yaml"
+    base.write_text(yaml.safe_dump(config.to_dict()))
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    workflow = run_root / "config.yaml"
+    workflow.write_text(
+        yaml.safe_dump(
+            {
+                "training": {"base_config": str(base), "overrides": []},
+                "dvc": {
+                    "cache": str(tmp_path / "cache"),
+                    "remote": str(tmp_path / "remote"),
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("DVC_NO_ANALYTICS", "true")
+    # Reproduce the output-parent directory created by Snakemake before the rule.
+    (run_root / "inputs/native_source_sets").mkdir(parents=True)
+    receipt_path = build_native_splits(workflow, source, run_root)
+    receipt = json.loads(receipt_path.read_text())
+    manifest = load_source_set_manifest(
+        run_root / "inputs/native_source_sets/manifest.json"
+    )
+    assert receipt["provenance"] == manifest.provenance
+    assert set(kind for kind, _ in manifest.assignments) == {"municipality", "abs"}
+    pointer = yaml.safe_load(
+        (run_root / "outputs/split_publication/native_source_sets.dvc").read_text()
+    )
+    assert pointer["outs"][0]["md5"].endswith(".dir")
+    assert (tmp_path / "remote").is_dir()
+    with pytest.raises(FileExistsError, match="already exists"):
+        build_native_splits(workflow, source, run_root)
