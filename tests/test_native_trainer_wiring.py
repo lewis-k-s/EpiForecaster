@@ -129,6 +129,7 @@ def test_native_support_config_defaults() -> None:
     assert config.enabled is True
     assert config.root == "data/processed/native_support"
     assert config.spatial_encoder == "hetero"
+    assert config.decoder == "sir"
     assert config.od_source == "mitma"
     assert config.overlap_weighting == "geostat_grid"
     assert config.od_self_flows == "retain"
@@ -152,6 +153,10 @@ def test_native_support_config_defaults() -> None:
         NativeSupportConfig(hetero_parameter_budget=0)
     with pytest.raises(ValueError):
         NativeSupportConfig(fold_index=-1)
+    with pytest.raises(ValueError, match="decoder"):
+        NativeSupportConfig(decoder="unknown")
+    with pytest.raises(ValueError, match="compile_sir_rollout"):
+        NativeSupportConfig(decoder="direct", compile_sir_rollout=True)
 
 
 def test_config_roundtrip_and_overrides(tmp_path: Path) -> None:

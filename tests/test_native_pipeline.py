@@ -24,11 +24,21 @@ pytestmark = pytest.mark.epiforecaster
 
 
 @pytest.mark.parametrize(
-    "strict,mobility,wastewater",
-    [(True, True, True), (False, False, True), (True, False, False)],
+    "strict,mobility,wastewater,decoder",
+    [
+        (True, True, True, "sir"),
+        (False, False, True, "sir"),
+        (True, False, False, "sir"),
+        (True, True, True, "direct"),
+    ],
 )
 def test_bounded_native_pipeline(
-    tmp_path: Path, strict: bool, mobility: bool, wastewater: bool, monkeypatch
+    tmp_path: Path,
+    strict: bool,
+    mobility: bool,
+    wastewater: bool,
+    decoder: str,
+    monkeypatch,
 ) -> None:
     config = pipeline_config(
         tmp_path,
@@ -37,6 +47,14 @@ def test_bounded_native_pipeline(
         vaccination=True,
         wastewater=wastewater,
     )
+    config.native.decoder = decoder
+    if strict and mobility and decoder == "sir":
+        # A versioned input must reach split generation, training, and evaluation.
+        versioned = "obs_wastewater_causal_v2.zarr"
+        (tmp_path / "obs_wastewater.zarr").rename(tmp_path / versioned)
+        config.native.wastewater_filename = versioned
+    if decoder == "direct":
+        config.model.observation_heads.delta_forecasting = True
     asset = build_for_config(config, Path(config.native.fold_manifest))
     manifest = load_source_set_manifest(Path(config.native.fold_manifest))
     dataset = native_dataset(config)
@@ -87,6 +105,25 @@ def _run_pipeline(config, monkeypatch):
     """Train two steps, reload the checkpoint, and check both evaluation exports."""
     tmp_path = Path(config.native.root)
     runtime = NativeRuntime(config)
+    if config.native.decoder == "direct":
+        from models.sir_rollforward import SIRRollForward
+
+        assert not any(
+            isinstance(module, SIRRollForward) for module in runtime.model.modules()
+        )
+        assert not any(
+            "_projection" in name
+            and any(
+                term in name
+                for term in ("beta", "gamma", "mortality", "hospital", "initial_states")
+            )
+            for name, _ in runtime.model.named_parameters()
+        )
+
+        def forbidden_sir(*_args, **_kwargs):
+            raise AssertionError("The direct decoder must never run SIR")
+
+        monkeypatch.setattr(SIRRollForward, "forward", forbidden_sir)
     initial = {k: v.clone() for k, v in runtime.model.state_dict().items()}
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(config.to_dict()))

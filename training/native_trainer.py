@@ -629,6 +629,7 @@ class NativeRuntime:
             init_weights=config.model.init_weights,
             strict=config.model.strict,
             spatial_encoder=config.native.spatial_encoder,
+            decoder=config.native.decoder,
             mobility_enabled=config.native.mobility_enabled,
             wastewater_enabled=config.native.wastewater_enabled,
             include_vaccination=config.native.include_vaccination,
@@ -642,6 +643,10 @@ class NativeRuntime:
             horizon_days=config.model.forecast_horizon,
         )
         if config.native.compile_sir_rollout:
+            if config.native.decoder != "sir":
+                raise ValueError(
+                    "native.compile_sir_rollout requires native.decoder=sir"
+                )
             rollout = self.model.base.sir_rollforward
             rollout._rollout = torch.compile(
                 rollout._rollout,
@@ -809,6 +814,7 @@ class NativeRuntime:
                 "experiment_name": self.config.output.experiment_name,
                 "model_id": self.model_id,
                 "spatial_encoder": self.config.native.spatial_encoder,
+                "decoder": self.config.native.decoder,
                 "mobility_enabled": self.config.native.mobility_enabled,
                 "od_source": self.config.native.od_source,
                 "objective": self.config.training.loss.joint.observation_loss,

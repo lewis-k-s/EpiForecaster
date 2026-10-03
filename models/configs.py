@@ -1466,6 +1466,7 @@ class NativeSupportConfig:
     enabled: bool = True
     root: str = "data/processed/native_support"
     spatial_encoder: str = "hetero"
+    decoder: str = "sir"
     od_source: str = "mitma"
     overlap_weighting: str = "geostat_grid"
     od_self_flows: str = "retain"
@@ -1499,6 +1500,7 @@ class NativeSupportConfig:
             raise ValueError("native.wastewater_filename must be one Zarr filename")
         for name, allowed in (
             ("spatial_encoder", NATIVE_SPATIAL_ENCODERS),
+            ("decoder", ("sir", "direct")),
             ("od_source", NATIVE_OD_SOURCES),
             ("overlap_weighting", NATIVE_OVERLAP_WEIGHTINGS),
             ("od_self_flows", NATIVE_OD_SELF_FLOW_MODES),
@@ -1508,6 +1510,8 @@ class NativeSupportConfig:
                 raise ValueError(
                     f"native.{name} must be one of {allowed}, got {value!r}"
                 )
+        if self.decoder == "direct" and self.compile_sir_rollout:
+            raise ValueError("native.compile_sir_rollout requires native.decoder=sir")
         if not math.isfinite(float(self.od_min_flow_raw)) or self.od_min_flow_raw < 0:
             raise ValueError("native.od_min_flow_raw must be finite and non-negative")
         if type(self.od_graph_cache_size) is not int or self.od_graph_cache_size < 1:

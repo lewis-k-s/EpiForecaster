@@ -1,11 +1,10 @@
 """Native-support forecaster adapter (plan sections 12.2 MOD-1, 11.4-11.5).
 
-Composes the existing :class:`~models.epiforecaster.EpiForecaster`: the base
-contributes its temporal backbone, SIRHD roll-forward and observation heads
-unchanged, constructed with a minimal ``ModelVariant`` (all municipal input
-features disabled) so its own width arithmetic is bypassed. The base's
-``forward`` is never called; its head-composition pattern is mirrored here so
-the native path stays free of municipal four-channel semantics.
+The default SIR decoder composes the existing
+:class:`~models.epiforecaster.EpiForecaster` with municipal input features
+disabled. The direct decoder uses the same temporal backbone and predicts
+native observation distributions without SIR or reporting-kernel modules.
+Neither path calls the municipal base's ``forward``.
 
 W_max normalization (orchestrator ruling resolving BAT-1's width finding):
 weekly hospitalization outputs are always computed at the fixed width
@@ -64,10 +63,12 @@ from models.configs import (
 )
 from models.epiforecaster import EpiForecaster
 from models.hetero_encoder import HeterogeneousContextEncoder
+from models.observation_heads import _compose_observation_prediction
 from models.reporting_operators import (
     weekly_interval_sum,
     weekly_log1p_per100k_location,
 )
+from models.transformer_backbone import TransformerBackbone
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,8 @@ __all__ = [
     "NativeForecasterConfig",
     "NativeInputAdapter",
     "NativeWastewaterHead",
+    "DirectObservationHead",
+    "NativeDirectDecoder",
 ]
 
 
@@ -119,6 +122,7 @@ class NativeForecasterConfig:
     init_weights: InitWeightsConfig = field(default_factory=InitWeightsConfig)
     strict: bool = True
     spatial_encoder: str = "hetero"
+    decoder: str = "sir"
     mobility_enabled: bool = True
     wastewater_enabled: bool = False
     hetero_hidden_dim: int = 16
@@ -142,6 +146,8 @@ class NativeForecasterConfig:
             raise ValueError(
                 f"spatial_encoder must be 'hetero', got {self.spatial_encoder!r}"
             )
+        if self.decoder not in {"sir", "direct"}:
+            raise ValueError("decoder must be 'sir' or 'direct'")
 
 
 class NativeInputAdapter(nn.Module):
@@ -288,7 +294,59 @@ class NativeWastewaterHead(nn.Module):
         }
 
 
-def _build_base_forecaster(config: NativeForecasterConfig) -> EpiForecaster:
+class DirectObservationHead(nn.Module):
+    """Predict location and scale directly in the native target's log1p units."""
+
+    def __init__(self, config: ObservationHeadConfig, *, output_dim: int = 1) -> None:
+        super().__init__()
+        self.assay_count = output_dim
+        self.distribution_scale_floor = config.distribution_scale_floor
+        self.location_proj = nn.Linear(config.obs_context_dim, output_dim)
+        self.distribution_scale_proj = nn.Linear(config.obs_context_dim, output_dim)
+        nn.init.xavier_normal_(self.location_proj.weight, gain=0.1)
+        nn.init.zeros_(self.location_proj.bias)
+        nn.init.zeros_(self.distribution_scale_proj.weight)
+        margin = max(
+            config.distribution_scale_init - config.distribution_scale_floor, 1.0e-8
+        )
+        nn.init.constant_(
+            self.distribution_scale_proj.bias, math.log(math.expm1(margin))
+        )
+
+    def forward(self, obs_context: torch.Tensor) -> dict[str, torch.Tensor]:
+        loc = F.softplus(self.location_proj(obs_context.float()))
+        scale = (
+            F.softplus(self.distribution_scale_proj(obs_context.float()))
+            + self.distribution_scale_floor
+        )
+        return {"loc": loc, "scale": scale}
+
+
+class NativeDirectDecoder(nn.Module):
+    """Shared temporal backbone and clinical heads without SIR modules."""
+
+    def __init__(self, config: NativeForecasterConfig) -> None:
+        super().__init__()
+        self.backbone = TransformerBackbone(
+            in_dim=config.d_in,
+            d_model=config.head_d_model,
+            n_heads=config.head_n_heads,
+            num_layers=config.head_num_layers,
+            horizon=config.forecast_horizon,
+            dropout=config.head_dropout,
+            rezero_init=config.init_weights.rezero_init,
+            obs_context_final_gain=config.init_weights.obs_context_final_gain,
+            obs_context_dim=config.observation_heads.obs_context_dim,
+            sir_enabled=False,
+        )
+        self.cases_head = DirectObservationHead(config.observation_heads)
+        self.hosp_head = DirectObservationHead(config.observation_heads)
+        self.deaths_head = DirectObservationHead(config.observation_heads)
+
+
+def _build_base_forecaster(
+    config: NativeForecasterConfig,
+) -> EpiForecaster | NativeDirectDecoder:
     """Minimal base forecaster: backbone + SIRHD + heads, nothing else.
 
     All variant features are disabled, so the base's input width arithmetic
@@ -297,6 +355,8 @@ def _build_base_forecaster(config: NativeForecasterConfig) -> EpiForecaster:
     as a pre-assembled feature block). ``use_population`` stays off because
     population enters through the adapter's ``log1p(population)`` channel.
     """
+    if config.decoder == "direct":
+        return NativeDirectDecoder(config)
     return EpiForecaster(
         variant_type=ModelVariant(
             cases=False, biomarkers=False, mobility=False, regions=False
@@ -396,7 +456,7 @@ def _week_aligned_obs_context(
 class NativeEpiForecaster(nn.Module):
     """Native-support forecaster composing a minimal :class:`EpiForecaster`.
 
-    One shared per-row rollout (adapter -> backbone -> SIRHD) feeds every
+    The default shared per-row rollout (adapter -> backbone -> SIRHD) feeds every
     routed head; routing decides which supervised blocks are produced, never
     the trajectory (plan section 4). Cases and deaths distributions are
     produced for all rows; the weekly ABS block is produced for the rows
@@ -404,7 +464,9 @@ class NativeEpiForecaster(nn.Module):
     weekly keys (``pred_hosp_weekly``, ``dist_hosp_weekly_loc/scale``,
     ``mechanistic_hosp_weekly``, ``residual_hosp_weekly``,
     ``hosp_weekly_mask``, ``observation_source_hosp_weekly``) and the echoed
-    query metadata (``source_type_id``, ``origin_dow``, ``head_index``).
+    query metadata (``source_type_id``, ``origin_dow``, ``head_index``). The direct
+    decoder keeps the same observation distributions and routing but omits
+    mechanistic, residual, and latent trajectory outputs.
     """
 
     def __init__(self, config: NativeForecasterConfig) -> None:
@@ -414,13 +476,20 @@ class NativeEpiForecaster(nn.Module):
         self.weekly_slots = -(-config.forecast_horizon // 7)
         self.input_adapter = NativeInputAdapter(config)
         self.base = _build_base_forecaster(config)
-        self.wastewater_head = NativeWastewaterHead(
-            context_dim=config.observation_heads.obs_context_dim,
-            distribution_scale_init=(config.observation_heads.distribution_scale_init),
-            distribution_scale_floor=(
-                config.observation_heads.distribution_scale_floor
-            ),
-        )
+        if config.decoder == "direct":
+            self.wastewater_head = DirectObservationHead(
+                config.observation_heads, output_dim=3
+            )
+        else:
+            self.wastewater_head = NativeWastewaterHead(
+                context_dim=config.observation_heads.obs_context_dim,
+                distribution_scale_init=(
+                    config.observation_heads.distribution_scale_init
+                ),
+                distribution_scale_floor=(
+                    config.observation_heads.distribution_scale_floor
+                ),
+            )
         self.spatial_encoder = HeterogeneousContextEncoder(
             context_dim=config.d_ctx,
             hidden_dim=config.hetero_hidden_dim,
@@ -447,8 +516,10 @@ class NativeEpiForecaster(nn.Module):
         spatial_context = self.spatial_encoder(batch)
         x_seq = self.input_adapter(batch, ctx_feat=spatial_context)
         encoder_outputs = self.base.backbone(x_seq)
-        beta_t = encoder_outputs["beta_t"]
         obs_context = encoder_outputs["obs_context"]
+        if self.config.decoder == "direct":
+            return self._direct_outputs(batch, obs_context, spatial_context)
+        beta_t = encoder_outputs["beta_t"]
         initial_states = F.softmax(encoder_outputs["initial_states_logits"], dim=-1)
 
         # SIRHD in fraction space, matching the base composition: the state
@@ -541,6 +612,70 @@ class NativeEpiForecaster(nn.Module):
             "spatial_context": spatial_context,
         }
         return outputs
+
+    def _direct_outputs(
+        self,
+        batch: NativeEpiBatch,
+        obs_context: torch.Tensor,
+        spatial_context: torch.Tensor,
+    ) -> dict[str, torch.Tensor | dict[str, torch.Tensor | None]]:
+        """Route the shared transformer context to daily, weekly, and assay heads."""
+        assert isinstance(self.base, NativeDirectDecoder)
+        assert isinstance(self.wastewater_head, DirectObservationHead)
+        with_init = torch.cat([obs_context[:, :1], obs_context], dim=1)
+        cases = self.base.cases_head(with_init)
+        if (
+            self.config.observation_heads.delta_forecasting
+            and self.config.observation_heads.anchor_mode != "disabled"
+        ):
+            anchor, mask = self._resolve_cases_anchor(batch)
+            cases["loc"] = _compose_observation_prediction(
+                mechanistic_raw=torch.zeros_like(cases["loc"].squeeze(-1)),
+                residual_raw=cases["loc"].squeeze(-1),
+                delta_forecasting=True,
+                anchor_mode=self.config.observation_heads.anchor_mode,
+                last_observed=anchor,
+                last_observed_mask=mask,
+            )["loc"].unsqueeze(-1)
+        deaths = self.base.deaths_head(obs_context)
+        hosp_rows = batch.head_index.get("hosp")
+        if hosp_rows is None:
+            hosp_rows = torch.empty(0, device=obs_context.device, dtype=torch.long)
+        routed_context = with_init.index_select(0, hosp_rows)
+        origin_dow = batch.origin_dow.index_select(0, hosp_rows)
+        week_context = _week_aligned_obs_context(
+            routed_context, origin_dow, self.forecast_horizon, self.weekly_slots
+        )
+        _, week_mask = weekly_interval_sum(
+            obs_context.new_zeros(len(hosp_rows), self.forecast_horizon + 1),
+            origin_dow,
+            horizon=self.forecast_horizon,
+        )
+        hosp = self.base.hosp_head(week_context)
+        ww_rows = batch.head_index.get("ww")
+        if ww_rows is None:
+            ww_rows = torch.empty(0, device=obs_context.device, dtype=torch.long)
+        ww = self.wastewater_head(obs_context.index_select(0, ww_rows))
+        return {
+            "pred_cases": cases["loc"].squeeze(-1),
+            "dist_cases_loc": cases["loc"].squeeze(-1),
+            "dist_cases_scale": cases["scale"].squeeze(-1),
+            "pred_deaths": deaths["loc"].squeeze(-1),
+            "dist_deaths_loc": deaths["loc"].squeeze(-1),
+            "dist_deaths_scale": deaths["scale"].squeeze(-1),
+            "pred_hosp_weekly": hosp["loc"].squeeze(-1),
+            "dist_hosp_weekly_loc": hosp["loc"].squeeze(-1),
+            "dist_hosp_weekly_scale": hosp["scale"].squeeze(-1),
+            "hosp_weekly_mask": week_mask,
+            "pred_ww": ww["loc"],
+            "dist_ww_loc": ww["loc"],
+            "dist_ww_scale": ww["scale"],
+            "obs_context": obs_context,
+            "spatial_context": spatial_context,
+            "source_type_id": batch.source_type_id,
+            "origin_dow": batch.origin_dow,
+            "head_index": dict(batch.head_index),
+        }
 
     def _wastewater_outputs(
         self,

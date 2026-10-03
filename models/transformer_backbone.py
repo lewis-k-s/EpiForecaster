@@ -211,9 +211,8 @@ class TransformerBackbone(nn.Module):
     """
     Transformer-based backbone for joint inference framework.
 
-    Outputs SIR parameters (beta_t, initial states) and observation context
-    instead of direct forecasts. The forecasts are generated via SIR roll-forward
-    and observation heads.
+    Outputs observation context and, when enabled, SIR parameters.
+    The direct native decoder constructs no SIR rate or initial-state heads.
     """
 
     def __init__(
@@ -235,6 +234,7 @@ class TransformerBackbone(nn.Module):
         device=None,
         obs_context_dim: int = 96,
         sir_physics: SIRPhysicsConfig | None = None,
+        sir_enabled: bool = True,
     ):
         """
         Initialize TransformerBackbone.
@@ -256,6 +256,7 @@ class TransformerBackbone(nn.Module):
             obs_context_final_gain: Xavier gain for obs-context final linear layer
             obs_context_dim: Dimension of observation context output
             sir_physics: SIR physics config for parameter bounds
+            sir_enabled: Construct and predict SIR rates and initial states
         """
         super().__init__()
 
@@ -270,6 +271,7 @@ class TransformerBackbone(nn.Module):
         self.positional_encoding = positional_encoding
         self.max_seq_len = max_seq_len
         self.obs_context_dim = obs_context_dim
+        self.sir_enabled = sir_enabled
         self.sir_physics = sir_physics or SIRPhysicsConfig()
         if rezero_init <= 0:
             raise ValueError(f"rezero_init must be positive, got {rezero_init}")
@@ -320,55 +322,56 @@ class TransformerBackbone(nn.Module):
         )
         self.final_norm = nn.RMSNorm(d_model) if use_layer_norm else nn.Identity()
 
-        # Output heads for SIR parameters and observation context
-        # Beta_t: time-varying transmission rate [B, H]
-        self.beta_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, horizon),
-        )
+        if self.sir_enabled:
+            # Output heads for SIR parameters and observation context
+            # Beta_t: time-varying transmission rate [B, H]
+            self.beta_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, horizon),
+            )
 
-        # Mortality rate: time-varying mortality rate [B, H]
-        self.mortality_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, horizon),
-        )
+            # Mortality rate: time-varying mortality rate [B, H]
+            self.mortality_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, horizon),
+            )
 
-        # Hospital admission rate: I -> H flow [B, H]
-        self.hospitalization_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, horizon),
-        )
+            # Hospital admission rate: I -> H flow [B, H]
+            self.hospitalization_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, horizon),
+            )
 
-        # Hospital discharge/recovery rate: H -> R flow [B, H]
-        self.hospital_recovery_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, horizon),
-        )
+            # Hospital discharge/recovery rate: H -> R flow [B, H]
+            self.hospital_recovery_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, horizon),
+            )
 
-        # Hospital mortality rate: H -> D flow [B, H]
-        self.hospital_mortality_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, horizon),
-        )
+            # Hospital mortality rate: H -> D flow [B, H]
+            self.hospital_mortality_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, horizon),
+            )
 
-        # Gamma (recovery rate): time-varying recovery rate [B, H]
-        self.gamma_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, horizon),
-        )
+            # Gamma (recovery rate): time-varying recovery rate [B, H]
+            self.gamma_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, horizon),
+            )
 
-        # Initial states: logits for S0, I0, H0, R0 proportions [B, 4]
-        self.initial_states_projection = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, 4),
-        )
+            # Initial states: logits for S0, I0, H0, R0 proportions [B, 4]
+            self.initial_states_projection = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 4),
+            )
 
         # Observation context: per-timestep features for observation heads [B, H, C_obs]
         self.obs_context_projection = nn.Sequential(
@@ -390,66 +393,69 @@ class TransformerBackbone(nn.Module):
         """Initialize projections with epidemiology-informed conservative priors."""
         self._init_linear_xavier(self.input_projection)
 
-        projection_stems = [
-            self.beta_projection[0],
-            self.gamma_projection[0],
-            self.mortality_projection[0],
-            self.hospitalization_projection[0],
-            self.hospital_recovery_projection[0],
-            self.hospital_mortality_projection[0],
-            self.initial_states_projection[0],
-            self.obs_context_projection[0],
-        ]
+        projection_stems = [self.obs_context_projection[0]]
+        if self.sir_enabled:
+            projection_stems = [
+                self.beta_projection[0],
+                self.gamma_projection[0],
+                self.mortality_projection[0],
+                self.hospitalization_projection[0],
+                self.hospital_recovery_projection[0],
+                self.hospital_mortality_projection[0],
+                self.initial_states_projection[0],
+                self.obs_context_projection[0],
+            ]
         for layer in projection_stems:
             self._init_linear_xavier(layer)
 
-        cfg = self.sir_physics
-        self._init_rate_head(
-            self.beta_projection[2],
-            prior=0.25,
-            min_value=cfg.beta_min,
-            max_value=cfg.beta_max,
-        )
-        self._init_rate_head(
-            self.gamma_projection[2],
-            prior=0.14,
-            min_value=cfg.gamma_min,
-            max_value=cfg.gamma_max,
-        )
-        self._init_rate_head(
-            self.mortality_projection[2],
-            prior=0.0005,
-            min_value=cfg.mortality_min,
-            max_value=cfg.mortality_max,
-        )
-        self._init_rate_head(
-            self.hospitalization_projection[2],
-            prior=0.02,
-            min_value=cfg.hospitalization_min,
-            max_value=cfg.hospitalization_max,
-        )
-        self._init_rate_head(
-            self.hospital_recovery_projection[2],
-            prior=0.1,
-            min_value=cfg.hospital_recovery_min,
-            max_value=cfg.hospital_recovery_max,
-        )
-        self._init_rate_head(
-            self.hospital_mortality_projection[2],
-            prior=0.005,
-            min_value=cfg.hospital_mortality_min,
-            max_value=cfg.hospital_mortality_max,
-        )
+        if self.sir_enabled:
+            cfg = self.sir_physics
+            self._init_rate_head(
+                self.beta_projection[2],
+                prior=0.25,
+                min_value=cfg.beta_min,
+                max_value=cfg.beta_max,
+            )
+            self._init_rate_head(
+                self.gamma_projection[2],
+                prior=0.14,
+                min_value=cfg.gamma_min,
+                max_value=cfg.gamma_max,
+            )
+            self._init_rate_head(
+                self.mortality_projection[2],
+                prior=0.0005,
+                min_value=cfg.mortality_min,
+                max_value=cfg.mortality_max,
+            )
+            self._init_rate_head(
+                self.hospitalization_projection[2],
+                prior=0.02,
+                min_value=cfg.hospitalization_min,
+                max_value=cfg.hospitalization_max,
+            )
+            self._init_rate_head(
+                self.hospital_recovery_projection[2],
+                prior=0.1,
+                min_value=cfg.hospital_recovery_min,
+                max_value=cfg.hospital_recovery_max,
+            )
+            self._init_rate_head(
+                self.hospital_mortality_projection[2],
+                prior=0.005,
+                min_value=cfg.hospital_mortality_min,
+                max_value=cfg.hospital_mortality_max,
+            )
 
-        # Encourage plausible initial composition at startup: S >> I > H ~= R.
-        # Use default dtype (float32) for initial prior
-        initial_prior = torch.tensor([0.9945, 0.004, 0.0005, 0.001])
-        initial_bias = torch.log(initial_prior)
-        self._init_linear_small_xavier_with_bias(
-            self.initial_states_projection[2],
-            initial_bias.tolist(),
-            gain=self.initial_state_final_gain,
-        )
+            # Encourage plausible initial composition at startup: S >> I > H ~= R.
+            # Use default dtype (float32) for initial prior
+            initial_prior = torch.tensor([0.9945, 0.004, 0.0005, 0.001])
+            initial_bias = torch.log(initial_prior)
+            self._init_linear_small_xavier_with_bias(
+                self.initial_states_projection[2],
+                initial_bias.tolist(),
+                gain=self.initial_state_final_gain,
+            )
 
         # Keep bias anchored at zero while giving GradNorm's obs_context probe
         # a non-degenerate path from step 0.
@@ -544,6 +550,9 @@ class TransformerBackbone(nn.Module):
             encoded = layer(encoded, key_padding_mask=key_padding_mask)
         encoded = self.final_norm(encoded)
 
+        if not self.sir_enabled:
+            return {"obs_context": self._observation_context(encoded)}
+
         # Sequence-to-vector: use final time step for parameter prediction
         final_hidden = encoded[:, -1, :]  # [batch_size, d_model]
 
@@ -584,19 +593,7 @@ class TransformerBackbone(nn.Module):
             final_hidden
         )  # [batch_size, 4] — S0, I0, H0, R0 logits
 
-        # Observation context: per-timestep features
-        # Use all encoded positions, project each to obs_context_dim
-        obs_context = self.obs_context_projection(
-            encoded
-        )  # [batch_size, seq_len, obs_context_dim]
-
-        # Take last `horizon` timesteps for forecasting
-        if seq_len >= self.horizon:
-            obs_context = obs_context[:, -self.horizon :, :]
-        else:
-            # Pad if sequence is shorter than horizon
-            pad_len = self.horizon - seq_len
-            obs_context = F.pad(obs_context, (0, 0, pad_len, 0), mode="replicate")
+        obs_context = self._observation_context(encoded)
 
         return {
             "beta_t": beta_t,
@@ -608,6 +605,24 @@ class TransformerBackbone(nn.Module):
             "initial_states_logits": initial_states_logits,
             "obs_context": obs_context,
         }
+
+    def _observation_context(self, encoded: torch.Tensor) -> torch.Tensor:
+        """Project the encoded sequence to the fixed observation horizon."""
+        # Observation context: per-timestep features
+        # Use all encoded positions, project each to obs_context_dim
+        obs_context = self.obs_context_projection(
+            encoded
+        )  # [batch_size, seq_len, obs_context_dim]
+
+        # Take last `horizon` timesteps for forecasting
+        if encoded.shape[1] >= self.horizon:
+            obs_context = obs_context[:, -self.horizon :, :]
+        else:
+            # Pad if sequence is shorter than horizon
+            pad_len = self.horizon - encoded.shape[1]
+            obs_context = F.pad(obs_context, (0, 0, pad_len, 0), mode="replicate")
+
+        return obs_context
 
     def count_parameters(self) -> int:
         """Count total number of trainable parameters."""
