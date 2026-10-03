@@ -314,6 +314,7 @@ configure_singularity_arguments() {
     --env "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
     --env "SLURM_STEP_ID=${SLURM_STEP_ID:-}"
     --env "SLURM_PROCID=${SLURM_PROCID:-}"
+    --env "EPIFORECASTER_WORKER_ID=${EPIFORECASTER_WORKER_ID:-${SLURM_PROCID:-0}}"
   )
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     SINGULARITY_ARGS+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
@@ -334,6 +335,12 @@ main() {
   configure_shared_binds
   stage_dvc_inputs
   configure_singularity_arguments
+  if [ "$USE_NV" -eq 1 ]; then
+    SCIENTIFIC_COMMAND=(
+      python -m scripts.workflow.gpu_telemetry --run-root /workspace/run --
+      "${SCIENTIFIC_COMMAND[@]}"
+    )
+  fi
   if singularity "${SINGULARITY_ARGS[@]}" "${SCIENTIFIC_COMMAND[@]}"; then
     return 0
   else

@@ -152,7 +152,7 @@ main() {
   render_worker_arguments
 
   set +e
-  "$SOURCE_ROOT/scripts/workflow/mn5_container_exec.sh" \
+  EPIFORECASTER_WORKER_ID="$WORKER_INDEX" "$SOURCE_ROOT/scripts/workflow/mn5_container_exec.sh" \
     --run-root "$RUN_ROOT" \
     --source-root "$SOURCE_ROOT" \
     --sif "$SIF" \
