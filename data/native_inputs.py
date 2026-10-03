@@ -31,6 +31,7 @@ def native_dataset(config: EpiForecasterConfig) -> NativeSupportDataset:
             od_self_flows=config.native.od_self_flows,
             mobility_enabled=config.native.mobility_enabled,
             wastewater_enabled=config.native.wastewater_enabled,
+            wastewater_filename=config.native.wastewater_filename,
             include_vaccination=config.native.include_vaccination,
             include_od_context=True,
         ),
@@ -82,7 +83,7 @@ def split_identity(config: EpiForecasterConfig, dataset: NativeSupportDataset) -
     ):
         inputs[name] = root / name
     if config.native.wastewater_enabled:
-        for name in ("obs_wastewater.zarr", "edar_catchment_edges.parquet"):
+        for name in (config.native.wastewater_filename, "edar_catchment_edges.parquet"):
             inputs[name] = root / name
     if config.native.mobility_enabled:
         name = (

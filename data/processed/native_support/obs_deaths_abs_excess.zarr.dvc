@@ -1,0 +1,6 @@
+outs:
+- md5: c0e4f20c5e84612c83a86ec55b469b6c.dir
+  size: 1273153
+  nfiles: 18
+  hash: md5
+  path: obs_deaths_abs_excess.zarr

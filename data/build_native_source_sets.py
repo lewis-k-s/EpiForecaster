@@ -178,7 +178,7 @@ def build_inventory(
     if not config.native.wastewater_enabled:
         return records, queries, grid
 
-    wastewater = xr.open_zarr(root / "obs_wastewater.zarr")
+    wastewater = xr.open_zarr(root / config.native.wastewater_filename)
     wastewater = wastewater.sel(date=wastewater.date < cutoff).compute()
     ww_counts = Counter(q.source_id for q in queries if q.source_type == "edar")
     catchment = pd.read_parquet(root / "edar_catchment_edges.parquet")

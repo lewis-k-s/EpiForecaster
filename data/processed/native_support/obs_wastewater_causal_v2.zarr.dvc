@@ -1,0 +1,6 @@
+outs:
+- md5: 58f03caa79ebf978f298e3235fc5e205.dir
+  size: 93443
+  nfiles: 33
+  hash: md5
+  path: obs_wastewater_causal_v2.zarr

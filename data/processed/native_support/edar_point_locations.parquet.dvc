@@ -1,0 +1,5 @@
+outs:
+- md5: 0bfc528210ee8e649a9ff98974a5fa79
+  size: 4847
+  hash: md5
+  path: edar_point_locations.parquet

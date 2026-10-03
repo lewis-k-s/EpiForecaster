@@ -96,8 +96,10 @@ def build_native_wastewater_observations(
     sample = source[list(_RAW_COLUMNS) + list(_ASSAY_COLUMNS.values())].rename(
         columns=_RAW_COLUMNS
     )
-    identity = sample["sample_id"].astype(str).str.extract(
-        r"^(?P<edar_id>[A-Za-z0-9_]+)-(?P<date>\d{4}-\d{2}-\d{2})$"
+    identity = (
+        sample["sample_id"]
+        .astype(str)
+        .str.extract(r"^(?P<edar_id>[A-Za-z0-9_]+)-(?P<date>\d{4}-\d{2}-\d{2})$")
     )
     invalid = identity.isna().any(axis=1)
     if invalid.any():
@@ -215,7 +217,11 @@ def build_native_wastewater_observations(
 
     plant_names = (
         sample.groupby("edar_id")["plant_name"]
-        .agg(lambda values: sorted(set(map(str, values.dropna())))[0] if values.notna().any() else "")
+        .agg(
+            lambda values: sorted(set(map(str, values.dropna())))[0]
+            if values.notna().any()
+            else ""
+        )
         .reindex(edar_ids)
         .to_numpy(dtype=str)
     )
@@ -264,6 +270,108 @@ def write_native_wastewater_observations(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_zarr(output, mode="w", zarr_format=3)
+
+
+def rebuild_native_wastewater_histories(dataset: xr.Dataset) -> xr.Dataset:
+    """Repair derived histories from preserved raw observations and parameters."""
+    if dataset.attrs.get("schema") != SCHEMA:
+        raise ValueError(f"Expected wastewater schema {SCHEMA!r}")
+    parameters = {
+        name: float(dataset.attrs[name])
+        for name in ("process_var", "measurement_var", "censor_inflation")
+    }
+    if any(not np.isfinite(value) or value <= 0 for value in parameters.values()):
+        raise ValueError("Wastewater filter parameters must be finite and positive")
+    dimensions = ("date", "edar_id", "assay")
+    for name in ("concentration_raw", "detection_limit", "history_log1p"):
+        if dataset[name].dims != dimensions:
+            raise ValueError(f"Unexpected wastewater dimensions for {name}")
+    repaired = dataset.copy(deep=True)
+    history = np.full(dataset["history_log1p"].shape, np.nan, dtype=np.float32)
+    for plant in range(dataset.sizes["edar_id"]):
+        for assay in range(dataset.sizes["assay"]):
+            filtered, available = _causal_history(
+                dataset["concentration_raw"].values[:, plant, assay],
+                dataset["detection_limit"].values[:, plant, assay],
+                **parameters,
+            )
+            if not np.array_equal(
+                available, dataset["history_available_mask"].values[:, plant, assay]
+            ):
+                raise ValueError("History repair would change the availability mask")
+            history[:, plant, assay] = filtered
+    repaired["history_log1p"].data = history
+    return repaired
+
+
+def qa_native_wastewater_history_repair(
+    parent: xr.Dataset, repaired: xr.Dataset
+) -> dict:
+    """Check preservation and prefix causality, including poisoned future values."""
+    xr.testing.assert_identical(
+        parent.drop_vars("history_log1p"), repaired.drop_vars("history_log1p")
+    )
+    expected = rebuild_native_wastewater_histories(parent)
+    xr.testing.assert_identical(expected, repaired)
+    parameters = {
+        name: float(parent.attrs[name])
+        for name in ("process_var", "measurement_var", "censor_inflation")
+    }
+    changed_series = []
+    checks = 0
+    for plant in range(parent.sizes["edar_id"]):
+        for assay in range(parent.sizes["assay"]):
+            values = parent["concentration_raw"].values[:, plant, assay]
+            limits = parent["detection_limit"].values[:, plant, assay]
+            history = repaired["history_log1p"].values[:, plant, assay]
+            previous = parent["history_log1p"].values[:, plant, assay]
+            equal = np.isclose(history, previous, rtol=1e-6, atol=1e-6, equal_nan=True)
+            if not equal.all():
+                changed_series.append(
+                    {
+                        "edar_id": str(parent["edar_id"].values[plant]),
+                        "assay": str(parent["assay"].values[assay]),
+                        "changed_days": int((~equal).sum()),
+                        "max_absolute_change": float(
+                            np.nanmax(np.abs(history - previous))
+                        ),
+                    }
+                )
+            # Check shared calendar cuts and each series' initialization boundary.
+            cuts = {len(values) // 4, len(values) // 2, 3 * len(values) // 4}
+            for mask in (np.isfinite(values), np.isfinite(values) & (values > 0)):
+                rows = np.flatnonzero(mask)
+                if rows.size:
+                    cuts.update((int(rows[0]), int(rows[0]) + 1))
+            for stop in sorted(cuts):
+                if not 0 < stop < len(values):
+                    continue
+                prefix, _ = _causal_history(values[:stop], limits[:stop], **parameters)
+                poisoned = values.copy()
+                poisoned[stop:][np.isfinite(poisoned[stop:])] = 1e20
+                poison_history, _ = _causal_history(poisoned, limits, **parameters)
+                if not (
+                    np.array_equal(history[:stop], prefix, equal_nan=True)
+                    and np.array_equal(
+                        history[:stop], poison_history[:stop], equal_nan=True
+                    )
+                ):
+                    raise ValueError(
+                        "Wastewater histories depend on future observations"
+                    )
+                checks += 1
+    return {
+        "qa_passed": True,
+        "dimensions": dict(repaired.sizes),
+        "preserved_variables": sorted(parent.data_vars.keys() - {"history_log1p"}),
+        "coordinates_and_attributes_preserved": True,
+        "parameters": parameters,
+        "changed_series": changed_series,
+        "changed_series_count": len(changed_series),
+        "causality_checks": checks,
+        "future_poison_value": 1e20,
+        "causality_policy": "calendar quartiles and first-sample/first-positive boundaries",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:

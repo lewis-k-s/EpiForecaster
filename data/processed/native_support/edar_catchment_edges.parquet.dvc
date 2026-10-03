@@ -1,0 +1,5 @@
+outs:
+- md5: 523a5bbca92de504ff095c586b7e0304
+  size: 33505
+  hash: md5
+  path: edar_catchment_edges.parquet

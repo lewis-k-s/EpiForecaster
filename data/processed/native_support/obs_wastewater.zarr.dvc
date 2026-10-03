@@ -1,0 +1,6 @@
+outs:
+- md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+  size: 93426
+  nfiles: 33
+  hash: md5
+  path: obs_wastewater.zarr

@@ -193,6 +193,7 @@ class NativeDatasetConfig:
     od_source: str = "mitma"
     mobility_enabled: bool = True
     wastewater_enabled: bool = False
+    wastewater_filename: str = "obs_wastewater.zarr"
     include_vaccination: bool = True
 
     def __post_init__(self) -> None:
@@ -474,13 +475,12 @@ class NativeSupportDataset(Dataset):
         self._edar_population: dict[str, float] = {}
         self._edar_case_pools: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
         self._edar_municipality_weights: dict[str, dict[str, float]] = {}
-        wastewater_path = root / "obs_wastewater.zarr"
+        wastewater_path = root / config.wastewater_filename
         catchment_path = root / "edar_catchment_edges.parquet"
         if config.wastewater_enabled:
             if not wastewater_path.exists() or not catchment_path.exists():
                 raise FileNotFoundError(
-                    "native wastewater requires obs_wastewater.zarr and "
-                    "edar_catchment_edges.parquet"
+                    f"native wastewater requires {wastewater_path} and {catchment_path}"
                 )
             self._ww = self._load_wastewater(wastewater_path)
             self._load_edar_catchment(catchment_path)

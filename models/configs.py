@@ -1479,6 +1479,7 @@ class NativeSupportConfig:
     confirmation_guard: bool = True
     mobility_enabled: bool = True
     wastewater_enabled: bool = True
+    wastewater_filename: str = "obs_wastewater.zarr"
     include_vaccination: bool = True
     hetero_hidden_dim: int = 16
     hetero_parameter_budget: int = 100_000
@@ -1491,6 +1492,11 @@ class NativeSupportConfig:
     test_fraction: float = 0.1
 
     def __post_init__(self) -> None:
+        if (
+            Path(self.wastewater_filename).name != self.wastewater_filename
+            or not self.wastewater_filename.endswith(".zarr")
+        ):
+            raise ValueError("native.wastewater_filename must be one Zarr filename")
         for name, allowed in (
             ("spatial_encoder", NATIVE_SPATIAL_ENCODERS),
             ("od_source", NATIVE_OD_SOURCES),

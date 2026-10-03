@@ -13,6 +13,7 @@ def load_example_history(
     *,
     native_root: Path | None = None,
     cases_path: Path | None = None,
+    wastewater_filename: str = "obs_wastewater.zarr",
 ) -> pd.DataFrame:
     """Read observed history from the pinned input stores, preserving missingness."""
     outputs = []
@@ -22,13 +23,11 @@ def load_example_history(
             dataset = xr.open_zarr(cases_path or root / "real_with_id.zarr")
         else:
             filename = {
-                "deaths": "obs_deaths_abs_excess",
-                "hospitalizations": "obs_admissions",
-                "wastewater": "obs_wastewater",
+                "deaths": "obs_deaths_abs_excess.zarr",
+                "hospitalizations": "obs_admissions.zarr",
+                "wastewater": wastewater_filename,
             }[target]
-            dataset = xr.open_zarr(
-                (native_root or root / "native_support") / f"{filename}.zarr"
-            )
+            dataset = xr.open_zarr((native_root or root / "native_support") / filename)
         with dataset:
             for source in sources.source_id.unique():
                 population = float(
