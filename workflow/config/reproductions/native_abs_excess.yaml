@@ -1,0 +1,92 @@
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
+evaluation:
+  split: test
+  granular: true
+  overrides:
+  - training.max_batches=null
+variants:
+  resume_b16:
+    workflow:
+      kind: train
+      target: train
+    training:
+      base_config: configs/train_epifor_smoke.yaml
+      experiment_name: native_abs_excess_vax_60_28_continue_e6
+      model_id: model
+      max_batches: null
+      overrides:
+      - training.device=cuda
+      - training.epochs=10
+      - training.max_batches=null
+      - training.batch_size=16
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - training.enable_mixed_precision=true
+      - native.spatial_encoder=hetero
+      - native.include_vaccination=true
+      - native.fold_index=0
+      - output.save_checkpoints=true
+      - output.write_granular_eval=true
+      - output.granular_eval_format=parquet
+      - model.input_window_length=60
+      - model.forecast_horizon=28
+      resume_checkpoint: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-abs-excess-vax-60-28-10ep-debug-20260930/outputs/training/native_abs_excess_vax_60_28_10ep/model/checkpoints/best_model.pt
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 120
+  resume_b32:
+    workflow:
+      kind: train
+      target: train
+    training:
+      base_config: configs/train_epifor_smoke.yaml
+      experiment_name: native_abs_excess_vax_60_28_continue_e6_b32
+      model_id: model
+      max_batches: null
+      overrides:
+      - training.device=cuda
+      - training.epochs=10
+      - training.max_batches=null
+      - training.batch_size=32
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - training.enable_mixed_precision=true
+      - native.spatial_encoder=hetero
+      - native.include_vaccination=true
+      - native.fold_index=0
+      - output.save_checkpoints=true
+      - output.write_granular_eval=true
+      - output.granular_eval_format=parquet
+      - model.input_window_length=60
+      - model.forecast_horizon=28
+      resume_checkpoint: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-abs-excess-vax-60-28-10ep-debug-20260930/outputs/training/native_abs_excess_vax_60_28_10ep/model/checkpoints/best_model.pt
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 120
+  evaluate:
+    workflow:
+      kind: evaluate
+      target: evaluate
+    evaluation:
+      checkpoint: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-abs-excess-vax-20ep-debug-20260930/outputs/training/native_abs_excess_vax_20ep/model/checkpoints/best_model.pt
+      overrides:
+      - training.device=cuda
+      - training.test_workers=2
+      - training.val_workers=2
+    resources:
+      allocation:
+        partition: accinteractive
+        qos: acc_interactive
+        runtime: 30

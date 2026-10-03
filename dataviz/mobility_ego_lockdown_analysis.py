@@ -605,7 +605,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/train_epifor_legacy_municipal_smoke.yaml"),
+        required=True,
         help="Training config path",
     )
     parser.add_argument(

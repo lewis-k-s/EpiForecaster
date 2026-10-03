@@ -31,6 +31,19 @@ trajectories. Observation heads apply the reporting kernels and source-specific
 operators. Admissions use complete weekly intervals. Wastewater remains an
 assay-level output. Future flow values are supervision metadata, not inputs.
 
+`native.decoder=sir` is the default. `native.decoder=direct` connects the same
+transformer observation context directly to learned location and scale heads.
+The direct mode constructs no SIR rollout, rate projections, initial-state
+projections, or reporting kernels. Cases and deaths stay daily; admissions use
+week-aligned context and the same complete-week mask; wastewater stays at assay
+level. The heads predict in the existing target-specific log1p units. Cases
+anchoring still follows the observation-head config. SIR compilation must be
+disabled in direct mode; loss-score compilation remains available.
+
+The `direct` and `all_causal` variants of
+`workflow/config/mn5_native_performance.yaml` form a three-epoch check. It keeps vaccination, mobility, data, splits,
+loss, and training budget fixed while changing the decoder.
+
 Only `native.spatial_encoder=hetero` is supported. With mobility disabled,
 OD messages are absent and no OD store is read. With vaccination disabled,
 the three vaccination channels are absent from local and relation histories.
@@ -75,18 +88,51 @@ Substantive runs use `scripts/workflow/mn5_workflow.sh`; see
 [MN5 workflow](docs/MN5_SNAKEMAKE.md). Do not run production configs locally.
 The DAG owns final evaluation. `training.run_final_evaluation=false` keeps
 per-epoch validation for checkpoint selection but prevents final validation
-exports and test evaluation inside training. Explicit diagnostic test epochs
-are separate and must be declared in advance.
+exports and test evaluation inside training. Test evaluates the selected
+checkpoint only and never selects a checkpoint.
 
-Checkpoint selection uses mean-target validation WIS. Joint objective loss is
-recorded separately. Normal and fixed five-degree Student-t forecasts support
+Training minimizes `train_objective`, defined by `training.loss.joint`.
+Validation and test scores use the independent `evaluation` config:
+
+```yaml
+evaluation:
+  metrics: [wis, crps, nll, mae, rmse]
+  selection_metric: wis
+  selection_aggregation: equal_head_mean
+  distribution_family: student_t
+  distribution_df: 5.0
+  interval_levels: [0.5, 0.8, 0.95]
+  training_objective_diagnostic: false
+```
+
+`val_wis` and `test_wis` are equal-head means over heads with exact observations.
+Each head first averages WIS over its observed targets. The selection rule gives
+each observed head equal weight, without training-loss weights. It records
+`selection_score` and `selection_metric_definition`, including the metric,
+aggregation, direction, heads and score space. Checkpoint selection, early
+stopping and HPO use this same validation score. CRPS or NLL can be configured
+as the selection metric when enabled in `evaluation.metrics`.
+
+Normal evaluation does not compute a validation training objective. Set
+`evaluation.training_objective_diagnostic=true` to include the optional
+`training_objective_diagnostic`. This batch-mean diagnostic never selects a
+checkpoint. There is no normal `val_joint_loss` field.
+
+Normal and fixed five-degree Student-t forecasts support
 CRPS. Clinical scores use `log1p(per-100k)`; wastewater uses
 `log1p(concentration)`. A left-censored wastewater observation uses the configured
 forecast distribution's probability below its detection limit. Training and
-evaluation call the same censor score. WIS uses uncensored observations and is
-reported with point, dispersion, underprediction, and overprediction components.
+evaluation use the same left-censor likelihood formula. WIS uses uncensored
+observations and is reported by head, horizon and source, with point, dispersion,
+underprediction and overprediction components. Censored wastewater NLL,
+censored counts and uncensored counts remain visible alongside WIS. A censored
+observation has no exact target and is excluded from WIS and its selection mean.
 
-Standalone evaluation constructs data, model, and loss state without an
+New native checkpoints use schema version 2 and the explicit score names above.
+Resume requires this schema. Evaluation can read older native checkpoints;
+existing scientific artifacts stay unchanged.
+
+Standalone evaluation constructs data, model, and scoring state without an
 optimizer, scheduler, training-dynamics writer, or resume operation. It checks
 the saved input and model identities. Canonical granular files are Parquet,
 regardless of the training export format. Evaluation also writes aggregate

@@ -173,7 +173,7 @@ class TestResidualScheduleConfig:
 
     def test_yaml_round_trip_preserves_schedule(self):
         cfg = EpiForecasterConfig.load(
-            Path("configs/experiment/sirhd_latent_rescaling_baseline.yaml"),
+            Path("configs/train_epifor_smoke.yaml"),
             overrides=[
                 "training.residual_schedule.enabled=true",
                 (

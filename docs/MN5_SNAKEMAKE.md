@@ -11,13 +11,88 @@ allocation-internal lightweight coordinator and launches scientific work as
 one or more `srun` job steps.
 
 The same immutable run supports two execution adapters: `run` requests a batch
-allocation, while `run-interactive` attaches to a compatible active
-`acc_interactive` allocation through `srun --external-launcher`. Both adapters
-use the same snapshot-owned coordinator, DAG, containers, data contracts, logs,
-manifests, and scientific artifact rules.
+allocation, while `run-interactive` attaches to a compatible held
+`acc_interactive` or `acc_debug` allocation through `srun --external-launcher`.
+Both adapters use the same snapshot-owned coordinator, DAG, containers, data
+contracts, logs, manifests, and scientific artifact rules.
 
 The workflow does not use nested `sbatch` submissions, worker arrays, or a
 separate GPP coordinator allocation.
+
+## Native model and derived source sets
+
+This worktree executes only NativeTrainer with the heterogeneous graph encoder.
+The municipal model belongs to the separate legacy worktree. All active native
+workflow templates stage ABS excess deaths and the version-4 native manifest.
+
+Single training has the dependency chain `stage_data -> native_source_sets ->
+train_model -> evaluate_model`. The split step uses the effective training
+config and processed inputs. It writes `inputs/native_source_sets/assignments.parquet`
+and a small `manifest.json`, then publishes a run-owned DVC pointer under
+`outputs/split_publication/`. The receipt records input identities and hashes.
+Generated membership is excluded from the source bundle.
+
+Source folds are deterministic for a dataset and eligibility policy. The asset
+records processed content hashes, the full eligible query hash, split seed,
+window length, horizon, stride, mask thresholds, and calendar boundaries.
+Target intervals are purged across time boundaries. Training rejects any
+changed input or policy. It records the exact split asset in the checkpoint.
+Independent evaluation checks the checkpoint identities and has no trainer
+resume lifecycle. Final evaluation honors `training.run_final_evaluation`;
+the DAG sets it to false and owns the canonical evaluation exports.
+
+The `mn5_native_wastewater_history_repair.yaml` preprocessing template rebuilds
+only `history_log1p` from the pinned parent Zarr's raw concentration and detection
+limits. It uses the parent's fixed filter parameters. QA checks all other
+variables, coordinates, and attributes for equality, then checks truncated and
+future-poisoned histories at calendar and initialization boundaries. The run
+writes a new Zarr under `outputs/preprocessing/` and publishes its DVC pointer
+and receipt. The parent asset stays unchanged. The QA record binds the parent
+DVC identity, source hashes, parameters, and output tree hash.
+
+Select a published version with `native.wastewater_filename` under `native.root`
+and stage its DVC pointer. Split generation, training, evaluation, and example
+exports use that same filename. The filename defaults to `obs_wastewater.zarr`.
+The old native manifest records the parent input bundle; the repair receipt
+records the new asset's lineage. It does not imply that the other assets were
+rebuilt.
+
+
+## GPU telemetry
+
+Every command launched with `mn5_container_exec.sh --nv` has a device sampler
+in the same worker step. This includes single training, evaluation, HPO,
+cross-validation, and ablation workers. CPU commands do not start a sampler.
+No extra Slurm allocation or concurrent Snakemake rule is needed.
+
+The sampler queries `nvidia-smi` about every ten seconds. It records GPU and
+memory-controller utilisation, used and total device memory in MiB, power in
+watts, and temperature in degrees Celsius. Memory-controller utilisation is
+activity, not the fraction of device memory occupied. Device memory includes
+more than PyTorch tensor allocations. Missing counter values remain `N/A`.
+
+CUDA driver enumeration resolves visible device ordinals to UUIDs without
+creating a CUDA context. Queries select those UUIDs explicitly. Missing GPU
+visibility, unavailable driver tools, or query failures produce telemetry
+warnings; they do not change the scientific command's exit status. The sampler
+never falls back to querying every GPU on a shared node. This contract supports
+full GPUs; MIG visibility is not supported.
+
+Each worker invocation writes a unique directory under
+`outputs/gpu_telemetry/`. It contains `gpu_samples.csv` and `manifest.json`.
+The manifest records the execution attempt, Slurm job and step, rank, logical
+worker ID, GPU UUIDs, sampling interval, UTC start/end times, sample/error
+counts, scientific exit code, and the completed CSV hash. Retries and worker
+waves have separate directories. An HPO worker's trace can span several trials;
+use the worker ID and UTC timestamps to join it to trial records.
+
+Sampling stops when the command exits. SIGINT and SIGTERM are forwarded to
+the scientific process group. A hard scheduler kill can leave a partial CSV
+and a running manifest; telemetry does not prove scientific completion.
+These are optional diagnostic artifacts, not required completion outputs.
+The sampler uses no PyTorch profiler and adds no training-loop synchronisation.
+It applies to newly prepared source bundles; existing immutable runs retain
+their deployed source.
 
 ## Allocation contract
 
@@ -138,6 +213,7 @@ data manifest. The public targets are:
 train:           prepare_run -> stage_data -> train_model
 evaluate:        prepare_run -> stage_data -> evaluate_model
 train_evaluate:  train_model -> evaluate_model
+train_evaluate_report: train_model -> evaluate_model -> build_run_report
 hpo:             launch_optuna_workers -> select_best_trial
                  -> evaluate_model -> promote_best_model
                  -> cleanup_losing_checkpoints
@@ -147,9 +223,8 @@ crossval:        train_crossval_folds -> evaluate_crossval_folds
 preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
-Synthetic pretraining uses the same `train` entity through
-`workflow/config/mn5_synth_pretrain.yaml`. Its processed Zarr is materialized
-for training, while the raw synthetic Zarr is a provenance-only DVC target.
+Synthetic model pretraining is maintained in the municipal worktree. This
+worktree retains synthetic preprocessing as a separate data preparation task.
 
 The corrected 20-run corpus uses
 `workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml`. The immutable
@@ -157,9 +232,14 @@ run owns the processed Zarr, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
-`mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
-is the training manifest and checkpoint. `train_evaluate` is the explicit
-composition when both stages are wanted. Training and HPO trials force
+`mn5_train.yaml` and `mn5_train_smoke.yaml` pin
+`workflow.target: train_evaluate_report`. Evaluation writes validation and test
+outputs from the selected checkpoint. The final CPU rule produces tables and
+figures at `outputs/reports/single_run/report.html`. It does not add a qualitative
+review. If an upstream rule fails, no report is produced. See
+[single-run reports](SINGLE_RUN_REPORTS.md) for the input contract.
+`train` ends at training provenance; `train_evaluate` ends at evaluation.
+Training and HPO trials force
 `training.run_final_evaluation=false`; evaluation is owned by the downstream
 rule. Ablation trials retain final test metrics because paired-seed aggregation
 consumes those per-trial artifacts.
@@ -269,12 +349,17 @@ bash scripts/workflow/mn5_workflow.sh run-interactive \
 ```
 
 Omit the allocation ID only when exactly one compatible `acc_interactive`
-allocation is active. The adapter attaches the immutable workflow to that
-allocation and never calls `sbatch`.
+allocation is active. To attach to an `acc_debug` allocation, start it with
+`salloc` and pass its job ID explicitly. The adapter rejects `sbatch` jobs,
+attaches the immutable workflow to the held allocation, and never calls
+`sbatch` itself.
 
-The selected public target is immutable after preparation. Choose `train` or
-`train_evaluate` in the template's `workflow.target` before `prepare`; `run`
+The selected public target is immutable after preparation. Choose `train`,
+`train_evaluate`, or `train_evaluate_report` in the template's `workflow.target`
+before `prepare`; `run`
 does not accept targets, overrides, or arbitrary Snakemake arguments.
+Preparation accepts workflow overrides before the run is frozen; see
+`workflow/config/README.md`.
 
 Select study templates explicitly:
 
@@ -285,8 +370,6 @@ bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
   --config workflow/config/mn5_ablation.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <crossval-run-id> \
   --config workflow/config/mn5_crossval.yaml
-bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
-  --config workflow/config/mn5_synth_pretrain.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <preprocess-run-id> \
   --config workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml
 ```
@@ -295,6 +378,19 @@ For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set
 `evaluation.checkpoint` to an absolute GPFS checkpoint path, and pass that
 complete config with `--config`. Preparation fails before transfer if the field
 is unset or relative.
+
+For downstream recovery after completed training, an evaluation-only run can set
+`evaluation.splits: [val, test]`. To retain the original training records, set
+`evaluation.training_model_root` to the absolute producer model directory and
+`provenance.training_evidence_retention: dvc`. Preparation verifies the selected
+checkpoint against the producer manifest, checks the canonical record hashes,
+and pins read-only copies under `inputs/training_evidence`. The new manifest and
+retention receipt record the original producer identity separately from the
+evaluation run. This does not repeat training or modify the producer run.
+The coordinator mounts external checkpoint directories read-only. If the
+producer model directory contains the checkpoint, one parent directory mount
+covers both inputs. This avoids overlapping mounts and missing file mount
+points in the contained filesystem. Scientific stages use the pinned copies.
 
 The snapshot-owned `remote_run.sh` reads resource fields from the immutable
 dispatch record. The batch adapter passes them to `sbatch`; the interactive

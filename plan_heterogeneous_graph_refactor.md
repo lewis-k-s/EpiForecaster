@@ -1,12 +1,12 @@
 EpiForecaster: native-support heterogeneous GNN refactor
 
-Status: Clinical prototype implementation complete; MN5 dispatch-readiness work active. As of 22 September 2026, FIX-A through FIX-E, EVL-1, ENC-1, CMP-1, CUT-1, dispatch WP-A, and dispatch WP-B are committed. Commit `387833a` publishes the 11 native Stage-4 inputs and audit artifacts through per-artifact DVC pointers, and the `mn5-nfs` object store has been verified byte-for-byte through a clean-workspace pull. WP-B gives the native trainer the canonical model-root, checkpoint, training-dynamics, selection-score, precision, and loader contracts; the bounded smoke reproduces val_loss 23.249019 exactly with `mean_target_crps=2.026719` recorded as the selection score, and reload from `best_model.pt` reproduces the saved validation metrics within 1e-9. The default bounded command uses the source-native clinical interface; the municipal/wastewater branch is explicit. The full suite now reports 1,569 passed and 2 skipped, Ruff, focused Pyright (no new errors), and `git diff --check` pass, and the regenerated native-support QC report has zero errors. Section 12.2c is the pre-publication historical checkpoint; §12.2d records the current dispatch gate and the WP-C through WP-E sequence.
+Status: The source-native clinical prototype and local Stage-5 EDAR migration are implemented. The EDAR work adds plant observations, contribution-defined catchments, independent point-location relations, direct multi-resolution source sets, routed model/loss/evaluation support, and versioned DVC pointers. Local validation is active; no substantive MN5 training has been dispatched. Sections 12.2c and 12.2d remain the Stage-4 historical checkpoint and dispatch plan. Section 12.2e supersedes their split and EDAR assumptions for new runs.
 Date: 22 September 2026.
 Scope: Spatial representation and forecast-query refactor, with the necessary data, routing, training and evaluation changes. No major transformer or SIRHD redesign.
 
 1. End goal and rationale
 
-Build one jointly trained forecaster that preserves native observation supports: municipal cases, ABS hospital admissions and comarca deaths, informed by mobility on native MITMA regions. The completed source-native design also accommodates EDAR wastewater observations; stage that migration separately to isolate the clinical and mobility changes.
+Build one jointly trained forecaster that preserves native observation supports: municipal cases, ABS hospital admissions, comarca deaths, and EDAR wastewater concentrations, informed by mobility on native MITMA regions.
 
 A forecast sample represents one source population at one forecast origin, not a municipality with four geographically harmonized labels. A forward call can process multiple source types and heads together. The heterogeneous GNN supplies source-specific context; the existing temporal backbone and shared SIRHD decoder operate on each queried source sequence.
 
@@ -189,7 +189,7 @@ Stage 4 — Run matched calibration comparisons. Compare fixed pooling against l
 
 Report native WIS, point error, interval coverage and WIS components by head and horizon. Keep equal-source transformed-rate metrics distinct from raw-count/population-sensitive metrics. Report source and fold-seed variability; do not treat repeated origins or overlapping supports as independent replications. Use common source/date subsets for direct comparisons and report expanded coverage separately. Existing municipal WIS is a historical diagnostic, not a directly comparable primary native score.
 
-Stage 5 — Complete EDAR migration separately. Add plant queries using validated catchment/contribution semantics, assay masks, normalization and reporting operators. Do not equate wastewater concentration with additive clinical counts or assume an administrative population is the catchment population. Until then, keep the legacy wastewater branch and its support explicitly identified, with the same treatment in paired clinical experiments; do not label the system fully source-native.
+Stage 5 — Complete EDAR migration separately. Add plant queries using validated catchment/contribution semantics, assay masks, censor-aware scoring, normalization and reporting operators. Do not equate wastewater concentration with additive clinical counts or assume an administrative population is the catchment population. This stage is now implemented locally; §12.2e defines the validation and dispatch gates.
 
 The SIRHD/direct-decoder ablation and changes to synthetic latent training remain separate from these spatial comparisons. Access the untouched confirmation period only after the evaluation protocol and selected design are frozen.
 
@@ -309,7 +309,7 @@ HEADS_FOR_SOURCE = {
     "abs": frozenset({"hosp"}),
     "comarca": frozenset({"deaths"}),
     "mitma": frozenset(),       # context-only, never queried
-    "edar": frozenset({"ww"}),  # legacy branch only, until Stage 5
+    "edar": frozenset({"ww"}),
 }
 REPORTING_CADENCE_DAYS = {"cases": 1, "hosp": 7, "deaths": 1, "ww": 7}
 ```
@@ -340,7 +340,11 @@ All stores are zarr v3 written via `xarray.to_zarr`, string IDs as coords, stora
 - `od_mitma.zarr` — **primary mobility graph**: native MITMA-zone OD built from `dasymetric_mob/data/mitma_v1` (slice `MOB-2`): dims `(date, origin, target)` over the audited Catalan MITMA zone set, `mobility` = raw summed trips float32 at rest (log1p/threshold applied at consumption), zone registry (ID ↔ `distritos_mitma.shp` ↔ `poblacion.csv`), audit attrs: zone-count reconciliation, `diag_mass_fraction`, retained mass per policy, date completeness (451 days). Built store (verified): 451 days × 456 zones (442 prefix + 14 footprint-only), `dates_missing=[]`, deterministic across rebuilds. Zone populations use the frozen exact-`distrito` join only (349/456 available; 107 NaN because the v2 `poblacion.csv` zonification is finer than v1 zones and `_AM` districts key differently) — accepted for v1 because MITMA nodes are context-only; the v1↔v2 population crosswalk (`relacion_ine_zonificacionMitma.csv`) is a recorded MAN-1 QC item, not a blocker. Never fabricate municipal-sum populations for subdivided zones.
 - `od_municipal.zarr` — comparability artifact built from the in-repo `mobility.zarr` (slice `MOB-1`): the 963-zone municipal-coded projection, log1p float16, same audit attrs; consumed only by the projected-context condition of Stage-4 comparisons.
 - `native_graph.zarr` — node table (`node_type, source_id, population, status ∈ {observed, unobserved, unmapped}`) + per-relation edge groups with endpoint-normalized weights.
-- `native_manifest_v2.json` — sha256 of every input file (including the two native clinical CSVs, closing [D1]'s provenance gap), code-version stamp, schema versions, reconciliation results, `confirmation_period: ["2020-12-31", "2021-01-27"]` marker.
+- `obs_wastewater.zarr` — dims `(date, edar_id, assay)` for N1/N2/IP4: raw concentration, detection limit, true-observation mask, censor code, causal history, availability age, flow, flow mask, rainfall, and plant name. Future target flow is supervision metadata and is not a model input.
+- `edar_catchment_edges.parquet` — contribution-defined EDAR links to municipalities, ABS, and comarques. It records served population and both endpoint fractions.
+- `edar_point_locations.parquet` — independent point-in-polygon plant location links. A point relation never substitutes for a catchment relation.
+- `native_source_sets_v2.json` — direct, exactly-once source assignments for municipality, ABS, comarca, and EDAR, plus frozen chronological train, validation, and test origin intervals.
+- `native_manifest_v3.json` — sha256 of every input file, including wastewater observations, contribution matrix, and EDAR GeoJSON; code-version stamp; schema versions; reconciliation results; and the reserved confirmation-period marker.
 
 ### 11.4 `NativeEpiBatch` (`data/native_batch.py`)
 
@@ -356,10 +360,11 @@ class NativeEpiBatch:
     ctx_feat: torch.Tensor                    # (B, L, D_ctx) fixed-pooling context (Stage 2) / hetero encoder input (Stage 3)
     temporal_covariates: torch.Tensor         # (B, L, k), shared with the municipal path
     # Per-head supervised blocks, gathered by routing index (length B_h ≤ B):
-    head_index: dict[str, torch.Tensor | None]      # {"cases","hosp","deaths"} row positions
-    head_target: dict[str, torch.Tensor | None]     # cases/deaths: (B_·, H) daily; hosp: (B_h, W) weekly
+    head_index: dict[str, torch.Tensor | None]      # {"ww","cases","hosp","deaths"} row positions
+    head_target: dict[str, torch.Tensor | None]     # ww: (B_ww,H,A); clinical shapes as below
     head_target_mask: dict[str, torch.Tensor | None]
     head_population: dict[str, torch.Tensor | None] # per-head denominator (ABS native weekly population)
+    head_extra: dict[str, dict[str, torch.Tensor]]  # WW LoD, censor, flow and flow mask
 ```
 
 ### 11.5 Reporting-operator semantics (weekly ABS)
@@ -368,14 +373,14 @@ Given daily admission-flow trajectory `f_{1..H}` in fraction space from the SIRH
 
 ### 11.6 Configuration surface
 
-New dataclasses in `models/configs.py` (defaults on the dataclass; no runtime fallbacks): `NativeSupportConfig` (`enabled: bool = True` after CUT-1, `root: str = "data/processed/native_support"`, `spatial_encoder: Literal["pooled","hetero"] = "pooled"`, `od_source: Literal["mitma","municipal"] = "mitma"`, `overlap_weighting: Literal["geostat_grid","uniform_density"] = "geostat_grid"`, `od_self_flows: Literal["retain","drop"] = "retain"`, `od_min_flow_raw: float = 10.0`, `head_balanced_sampling: bool = True`, `confirmation_guard: bool = True`), plus native-builder keys in `data/preprocess/config.py` (including `mitma_source_root`, an explicit path to the read-only `dasymetric_mob` checkout, required only for `MOB-2`). Native mode disables curriculum mixing and the legacy projected municipal hosp/deaths inputs (asserted, not silently ignored). Bounded local acceptance config: `configs/train_epifor_smoke.yaml`; the legacy municipal/wastewater smoke is explicit at `configs/train_epifor_legacy_municipal_smoke.yaml`; substantive runs remain MN5-only.
+New dataclasses in `models/configs.py` (defaults on the dataclass; no runtime fallbacks): `NativeSupportConfig` (`enabled: bool = True`, `root: str = "data/processed/native_support"`, `spatial_encoder: Literal["pooled","hetero"] = "pooled"`, `od_source: Literal["mitma","municipal"] = "mitma"`, `overlap_weighting: Literal["geostat_grid","uniform_density"] = "geostat_grid"`, `od_self_flows: Literal["retain","drop"] = "retain"`, `od_min_flow_raw: float = 10.0`, `head_balanced_sampling: bool = True`, `confirmation_guard: bool = True`, `wastewater_enabled: bool = True`, `fold_manifest: str = "data/processed/native_support/native_source_sets_v2.json"`), plus native-builder keys in `data/preprocess/config.py`. Native mode disables curriculum mixing and projected municipal hospitalization/death labels. Bounded local acceptance config: `configs/train_epifor_smoke.yaml`; the municipal training interface is maintained in its own worktree; substantive runs remain MN5-only.
 
 ### 11.7 Frozen v1 policy choices (upgrade paths noted)
 
 - **Overlap weighting**: GEOSTAT 1-km grid weighting (grid cells + populations from `dasymetric_mob`, §10.2b) as the primary policy — the same weighting [G1] and the existing dasymetric transform used, which keeps our overlaps consistent with both; uniform-municipal-density areal weighting is the fallback when the grid is unavailable. Both keep overlap-grid populations distinct from audited denominators (§3). Known limitation: the grid is 2011-vintage; recorded in provenance, consistent with every existing artifact derived from it.
 - **Mobility graph**: native MITMA-zone OD (`od_mitma.zarr`) is primary; the 963-zone municipal projection (`od_municipal.zarr`) is retained for the projected-context comparison condition. OD direction always origin→target; self-flow policy and thresholds are consumption-time, recorded per §11.3 audits.
 - **Absent-row policy for registries**: absent `(date, source)` rows are missing (mask 0), never zero; genuine zeros only where the source reports them. QC reports absence rates; revisit only with evidence.
-- **Splits**: municipal folds from the existing representative manifest; ABS/comarca fold = fold owning the majority of the source's population overlap; exactly-once per source type validated. Generalization claim documented as "held-out source, visible context history" (temporal-forecasting mode, §7).
+- **Splits**: assign every eligible municipality, ABS, comarca, and EDAR directly. Balance source count, eligible-query count, support population, burden, geography, and EDAR assay/censor/flow coverage within source type. For run `r`, test uses fold `r`, validation uses fold `(r+1) mod K`, and training uses the remaining folds. Intersect these roles with frozen chronological train, validation, and test origin intervals. Generalization claim: "held-out native source and future origin interval, with graph context visible."
 - **Source conditioning**: source-type embedding (+ optional per-source static embedding) concatenated into the backbone input; direct initial-state/rate conditioning deferred.
 - **Synthetic data**: continues on the municipal path; native-mode training is real-data-only in this programme. Synthetic-native unification (shared-rollout multi-head queries, [E1] state mapping) is a separate follow-up.
 
@@ -507,9 +512,13 @@ Independent starts (safe to parallelize): `QC-1`, `REG-1`, `GEO-1`, `OBS-1`, `OB
 
 #### SPL-1 — Source-aware splits (M; depends GRF-1)
 **Files**: new `data/native_crossval.py`; new `tests/test_native_splits.py`.
-**Change**: `native_source_folds.json`: load the existing representative municipal manifest (`configs/crossval/representative_10fold_mobility_refined.json`), derive ABS/comarca fold membership by majority population overlap (§11.7); validate exactly-once per source type, fold count, ID hashing (mirror `data/crossval_manifest.py` patterns under a new version key); leakage audit: no supervised source in two folds; the generalization claim recorded in the manifest.
+**Change**: `native_source_folds.json`: load the existing representative municipal manifest (the retired representative municipal manifest), derive ABS/comarca fold membership by majority population overlap (§11.7); validate exactly-once per source type, fold count, ID hashing (mirror `data/crossval_manifest.py` patterns under a new version key); leakage audit: no supervised source in two folds; the generalization claim recorded in the manifest.
 **Tests**: derivation on synthetic overlaps (majority; deterministic tie-break by source ID); exactly-once violations raise; real-manifest integration `skipif`.
 **Done when**: fold manifest generated with audit report; §9 source-aware-split checks pass.
+
+**Superseded for Stage 5.** This majority-overlap derivation remains a
+Stage-4 historical record. New runs use `native_source_sets_v2.json` as
+defined in §11.7 and §12.2e.
 
 #### TRN-1 — Trainer wiring and smoke run (M; depends LOS-1, SPL-1)
 **Files**: modify `training/dataloader_factory.py`, `training/epiforecaster_trainer.py` (native branch behind `NativeSupportConfig.enabled`; municipal path intact), `models/configs.py` (§11.6); add the native smoke config (renamed to the default `configs/train_epifor_smoke.yaml` by CUT-1); new `tests/test_native_trainer_wiring.py`.
@@ -537,7 +546,7 @@ Independent starts (safe to parallelize): `QC-1`, `REG-1`, `GEO-1`, `OBS-1`, `OB
 
 #### CUT-1 — Cutover and documentation (S; after the review checkpoint)
 **Files**: modify native-facing `configs/`, `EPIFORECASTER.md`, `AGENTS.md` cross-references, `data/preprocess/README.md`; retire the projected municipal hosp/deaths CSVs from native training paths (files remain for paired projected-context experiments per §8); remove dead mid-programme adapters.
-**Change**: single clean cutover for the clinical prototype: native support is the default real-data interface; the legacy municipal four-channel path remains available only behind explicit config for paired experiments and the untouched wastewater branch (Stage 5 stays open).
+**Change**: single clean cutover for the clinical prototype: native support is the default real-data interface; the municipal four-channel path remains available only behind explicit compatibility config. Stage 5 later extends the native interface to EDAR.
 **Done when**: docs state the new contract; no orphaned code paths; `uv run ruff check .` and `uv run pytest tests/ -q` green.
 
 ### 12.2b Review remediation rulings (post-checkpoint review, 2026-09-22)
@@ -633,7 +642,7 @@ WP-A clears the native-input publication gate. It did not by itself authorize tr
 
 #### WP-B — Native trainer canonical artifact lifecycle (complete)
 
-**Scope**: `training/native_trainer.py`, `cli.py`, `configs/experiment/native_stage4/base.yaml`, focused native trainer/evaluation tests, and shared artifact helpers where reuse avoids contract drift.
+**Scope**: `training/native_trainer.py`, `cli.py`, the shared native scientific config, focused native trainer/evaluation tests, and shared artifact helpers where reuse avoids contract drift.
 
 Implement the following as one bounded production-artifact slice:
 
@@ -768,6 +777,53 @@ Dispatch the screening campaign only after WP-D passes for the exact same campai
 
 For each allocation, preserve the immutable run root and record scheduler state separately from trial and artifact state. Final screening and confirmation reports must retain fold-seed results, equal-source common-subset identities, WIS components, raw-count error, coverage, source variability, capacity, optimizer exposure, compute use, checkpoint hashes, and training-dynamics identities. An expanded ten-fold confirmation is a new immutable campaign/run identity, never an in-place mutation of the screening run.
 
+### 12.2e Stage-5 EDAR checkpoint and execution plan
+
+Stage 5 changes the split unit from a municipality-derived geography to an
+independently assigned source of each supervised type. This is required
+because clinical targets and EDAR targets now exist at their own source
+resolution. A common fold number coordinates repeated runs; it does not imply
+that the sources in one fold share administrative ownership.
+
+The local implementation has these contracts:
+
+1. `build_edar_registry` reconciles 59 observation and contribution IDs.
+   Geometry is audited separately; a missing plant point does not erase a
+   valid catchment or supervised EDAR source.
+2. The contribution matrix defines EDAR-to-municipality served population.
+   Municipality-to-ABS and municipality-to-comarca relations compose this to
+   catchment links. GeoJSON point-in-polygon creates separate plant-location
+   links. The graph stores both directions for all six relation types.
+3. One query is indexed per `(EDAR, forecast origin)`. N1, N2, and IP4 are one
+   assay target block, not three independently sampled queries. The model uses
+   causal assay history and last causal flow. It cannot read target-date flow.
+4. Uncensored observations use the configured Normal NLL or CRPS in
+   `log1p(concentration)` space. Left-censored observations contribute
+   `-log P(Y <= log1p(LoD))`. Granular and aggregate evaluation identify the
+   assay with `EDAR::assay` source IDs and report censored NLL separately.
+5. `native_source_sets_v2.json` assigns every eligible municipality, ABS,
+   comarca, and EDAR exactly once. The builder balances each source type
+   directly. The calendar has disjoint chronological train, validation, and
+   test intervals. Run `r` uses test fold `r`, validation fold `r+1`, and all
+   other folds for training.
+
+The remaining execution gates are ordered and must not be combined:
+
+1. Complete local unit, integration, DVC-pointer, lint, and bounded one-batch
+   acceptance checks on the final graph and evaluation export.
+2. Validate an immutable MN5 smoke workflow configuration that stages every
+   new runtime and provenance pointer. This is a dry contract check only.
+3. In a new immutable run, dispatch a bounded MN5 CUDA smoke. Verify data
+   staging, BF16, workers, checkpoint reload, evaluation files, and artifact
+   hashes. Preserve the old Stage-4 runs unchanged.
+4. Freeze a Stage-5 campaign matrix only after the smoke passes. Compare
+   clinical-only and clinical-plus-EDAR training under identical source-set
+   roles, calendar intervals, seeds, model capacity, optimizer exposure, and
+   evaluation subsets. Do not use confirmation-period outcomes to select it.
+5. Dispatch substantive training only through the immutable MN5 Snakemake
+   interface. Report source and assay coverage, censor counts, catchment
+   coverage, per-head WIS/CRPS, raw-unit errors, and fold-seed variability.
+
 ### 12.3 Explicitly out of this programme
 
-EDAR/plant migration (Stage 5), synthetic-native unification ([E1] state mapping), direct initial-state/rate conditioning, `mitma_v2` estudios-basicos ingestion (2022+, outside the study window), the Nommon mobility-indicator product, the SIRHD-vs-direct-decoder ablation, and any latent-stability programme change (§2, §6). GEOSTAT 2011-vintage grid accuracy and IGCG 2025 boundary-vintage drift are recorded limitations with cross-checks (§11.7, `GEO-1`), not blockers. None of the excluded items may be silently pulled into a slice.
+Synthetic-native unification ([E1] state mapping), direct initial-state/rate conditioning, `mitma_v2` estudios-basicos ingestion (2022+, outside the study window), the Nommon mobility-indicator product, the SIRHD-vs-direct-decoder ablation, and any latent-stability programme change (§2, §6). GEOSTAT 2011-vintage grid accuracy and IGCG 2025 boundary-vintage drift are recorded limitations with cross-checks (§11.7, `GEO-1`), not blockers. None of the excluded items may be silently pulled into a slice.

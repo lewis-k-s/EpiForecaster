@@ -7,7 +7,7 @@ Usage:
 
 Examples:
     uv run dataviz
-    uv run dataviz configs/train_epifor_legacy_municipal_smoke.yaml configs/preprocess_full.yaml outputs/reports
+    uv run dataviz /path/to/municipal-config.yaml configs/preprocess_full.yaml outputs/reports
 """
 
 from __future__ import annotations
@@ -184,17 +184,14 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  uv run dataviz                                    # Use defaults
-  uv run dataviz configs/train_epifor_legacy_municipal_smoke.yaml     # Bounded local config
+  uv run dataviz /path/to/municipal-config.yaml     # Explicit municipal config
   uv run dataviz configs/train.yaml configs/prep.yaml outputs/viz  # Full custom
 """,
     )
     parser.add_argument(
         "train_config",
         type=Path,
-        nargs="?",
-        default=Path("configs/train_epifor_legacy_municipal_smoke.yaml"),
-        help="Training config YAML (default: configs/train_epifor_legacy_municipal_smoke.yaml)",
+        help="Training config YAML from the municipal worktree",
     )
     parser.add_argument(
         "preprocess_config",

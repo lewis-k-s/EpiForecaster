@@ -1,0 +1,297 @@
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
+workflow:
+  kind: train
+  target: train
+training:
+  base_config: configs/train_epifor_smoke.yaml
+  model_id: model
+  overrides:
+  - training.device=cuda
+  - training.enable_mixed_precision=true
+  - output.save_checkpoints=true
+  - output.write_granular_eval=true
+  - output.granular_eval_format=parquet
+evaluation:
+  split: test
+  granular: true
+variants:
+  abs_excess_smoke:
+    training:
+      experiment_name: native_abs_excess_smoke
+      max_batches: 4
+      overrides:
+      - training.epochs=1
+      - training.max_batches=4
+      - training.batch_size=32
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - native.spatial_encoder=hetero
+      - native.fold_index=0
+    evaluation:
+      overrides:
+      - training.max_batches=null
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 60
+  abs_excess_vax_1ep_interactive:
+    training:
+      experiment_name: native_abs_excess_vax_1ep
+      max_batches: null
+      overrides:
+      - training.epochs=1
+      - training.max_batches=null
+      - training.batch_size=32
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - native.spatial_encoder=hetero
+      - native.include_vaccination=true
+      - native.fold_index=0
+    evaluation:
+      overrides:
+      - training.max_batches=null
+    resources:
+      allocation:
+        partition: accinteractive
+        qos: acc_interactive
+        runtime: 100
+  abs_excess_vax_20ep_debug:
+    training:
+      experiment_name: native_abs_excess_vax_20ep
+      max_batches: null
+      overrides:
+      - training.epochs=20
+      - training.max_batches=null
+      - training.batch_size=64
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - native.spatial_encoder=hetero
+      - native.include_vaccination=true
+      - native.fold_index=0
+    evaluation:
+      overrides:
+      - training.max_batches=null
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 120
+  abs_excess_vax_60_28_10ep_debug:
+    training:
+      experiment_name: native_abs_excess_vax_60_28_10ep
+      max_batches: null
+      overrides:
+      - training.epochs=10
+      - training.max_batches=null
+      - training.batch_size=16
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - native.spatial_encoder=hetero
+      - native.include_vaccination=true
+      - native.fold_index=0
+      - model.input_window_length=60
+      - model.forecast_horizon=28
+    evaluation:
+      overrides:
+      - training.max_batches=null
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 120
+  abs_excess_vax_60_28_smoke:
+    training:
+      experiment_name: native_abs_excess_vax_60_28_smoke
+      max_batches: 8
+      overrides:
+      - training.epochs=1
+      - training.max_batches=8
+      - training.batch_size=16
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - native.spatial_encoder=hetero
+      - native.include_vaccination=true
+      - native.fold_index=0
+      - model.input_window_length=60
+      - model.forecast_horizon=28
+    evaluation:
+      overrides:
+      - training.max_batches=null
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 30
+  wastewater_debug_10ep:
+    training:
+      experiment_name: native_wastewater_debug_10ep
+      max_batches: null
+      overrides:
+      - training.epochs=10
+      - training.max_batches=null
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+    evaluation:
+      overrides:
+      - training.max_batches=null
+      - training.val_workers=2
+      - training.test_workers=2
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 100
+  wastewater_debug_b32_20ep:
+    training:
+      experiment_name: native_wastewater_debug_b32_20ep
+      max_batches: null
+      overrides:
+      - training.batch_size=32
+      - training.epochs=20
+      - training.max_batches=null
+      - training.progress_log_frequency=100
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+    evaluation:
+      overrides:
+      - training.max_batches=null
+      - training.val_workers=2
+      - training.test_workers=2
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 120
+  wastewater_full_50ep:
+    training:
+      experiment_name: native_wastewater_full_50ep
+      max_batches: null
+      overrides:
+      - training.epochs=50
+      - training.max_batches=null
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+    evaluation:
+      overrides:
+      - training.max_batches=null
+      - training.val_workers=2
+      - training.test_workers=2
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_bscls
+        runtime: 480
+  wastewater_one_batch_spawn:
+    training:
+      experiment_name: native_wastewater_one_batch_spawn
+      max_batches: 1
+      overrides:
+      - training.epochs=1
+      - training.num_workers=1
+      - training.val_workers=1
+      - training.test_workers=1
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - training.run_final_evaluation=true
+    evaluation:
+      overrides:
+      - training.max_batches=1
+      - training.val_workers=1
+      - training.test_workers=1
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 60
+  wastewater_one_batch_spawn_4w:
+    training:
+      experiment_name: native_wastewater_one_batch_spawn_4w
+      max_batches: 1
+      overrides:
+      - training.epochs=1
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - training.run_final_evaluation=true
+    evaluation:
+      overrides:
+      - training.max_batches=1
+      - training.val_workers=2
+      - training.test_workers=2
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 60
+  wastewater_one_batch_zero_workers:
+    training:
+      experiment_name: native_wastewater_one_batch_zero_workers
+      max_batches: 1
+      overrides:
+      - training.epochs=1
+      - training.num_workers=0
+      - training.val_workers=0
+      - training.test_workers=0
+      - training.persistent_workers=false
+      - training.run_final_evaluation=true
+    evaluation:
+      overrides:
+      - training.max_batches=1
+      - training.val_workers=0
+      - training.test_workers=0
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 60
+  wastewater_smoke:
+    training:
+      experiment_name: native_wastewater_smoke
+      max_batches: 96
+      overrides:
+      - training.epochs=1
+      - training.num_workers=4
+      - training.val_workers=2
+      - training.test_workers=2
+      - training.persistent_workers=true
+      - training.prefetch_factor=2
+      - training.run_final_evaluation=true
+    evaluation:
+      overrides:
+      - training.max_batches=96
+      - training.val_workers=2
+      - training.test_workers=2
+    resources:
+      allocation:
+        partition: acc
+        qos: acc_debug
+        runtime: 60

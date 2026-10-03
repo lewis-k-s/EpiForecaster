@@ -16,14 +16,20 @@ Canonical/general-purpose templates:
 
 | Template | Kind | Target | Purpose |
 | --- | --- | --- | --- |
-| `mn5_train.yaml` | `train` | `train` | single training |
-| `mn5_train_smoke.yaml` | `train` | `train_evaluate` | bounded train/evaluate acceptance |
+| `mn5_train.yaml` | `train` | `train_evaluate_report` | single training and report |
+| `mn5_train_smoke.yaml` | `train` | `train_evaluate_report` | bounded train/evaluate/report acceptance |
 | `mn5_evaluate.yaml` | `evaluate` | `evaluate` | pinned-checkpoint evaluation |
 | `mn5_crossval.yaml` | `crossval` | `crossval` | persisted-fold cross-validation |
 | `mn5.yaml` | `hpo` | `hpo` | HPO |
 | `mn5_smoke.yaml` | `hpo` | `hpo` | bounded HPO acceptance |
 | `mn5_ablation.yaml` | `ablation` | `ablation` | ablation study |
-| `mn5_synth_pretrain.yaml` | `train` | `train` | synthetic pretraining |
+| `mn5_profile.yaml` | `train` | `train` | native profiling |
+
+Workflow bases and named variants are resolved during preparation. Use
+`prepare --config TEMPLATE --variant NAME` for a collection. Preparation-only
+`--override KEY=VALUE` values are workflow fields, not training dotlist entries.
+The saved run config contains all resolved settings; dispatch does not accept
+new overrides. See `workflow/config/README.md` for current collections.
 
 Targets are pinned before immutable preparation. Do not run configs under
 `configs/production_only/` locally.
@@ -64,9 +70,8 @@ pointer and cache object. Distinguish:
 - generated outputs that are not production-ready until their DVC pointer is
   published.
 
-Synthetic pretraining is unavailable while
-`data/processed/synthetic_full_holt_damped.zarr.dvc` is absent. Report that gate;
-do not create or publish the pointer implicitly.
+Synthetic model pretraining is maintained in the municipal worktree. This
+worktree retains synthetic preprocessing as a separate data preparation task.
 
 Preprocessing is a potentially expensive mutation. In particular,
 `configs/preprocess_full.yaml` overwrites its configured canonical Zarr. Inspect

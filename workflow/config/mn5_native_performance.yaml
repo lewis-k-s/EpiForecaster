@@ -1,0 +1,157 @@
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
+workflow:
+  kind: train
+  target: train
+training:
+  base_config: configs/train_epifor_smoke.yaml
+  experiment_name: native_perf_b32_400x3
+  model_id: model
+  max_batches: 400
+  overrides:
+  - training.device=cuda
+  - training.epochs=3
+  - training.max_batches=400
+  - training.batch_size=32
+  - training.num_workers=4
+  - training.val_workers=2
+  - training.test_workers=2
+  - training.persistent_workers=true
+  - training.prefetch_factor=2
+  - training.enable_mixed_precision=true
+  - native.spatial_encoder=hetero
+  - native.include_vaccination=true
+  - native.fold_index=0
+  - output.save_checkpoints=true
+  - output.write_granular_eval=false
+  - output.granular_eval_format=parquet
+  - model.input_window_length=60
+  - model.forecast_horizon=28
+evaluation:
+  split: test
+  granular: false
+  overrides:
+  - training.max_batches=null
+resources:
+  allocation:
+    runtime: 15
+variants:
+  baseline: {}
+  blas:
+    training:
+      overrides:
+      - training.worker_blas_threads=1
+  cache:
+    training:
+      overrides:
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+  blas_cache:
+    training:
+      overrides:
+      - training.worker_blas_threads=1
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+  routing:
+    training:
+      overrides:
+      - native.precompute_loss_metadata=true
+  combined:
+    training:
+      overrides:
+      - training.worker_blas_threads=1
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+      - native.precompute_loss_metadata=true
+  compile_sir:
+    training:
+      overrides:
+      - native.compile_sir_rollout=true
+  compile_scores:
+    training:
+      overrides:
+      - native.compile_loss_scores=true
+  all:
+    training:
+      overrides:
+      - training.worker_blas_threads=1
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+      - native.precompute_loss_metadata=true
+      - native.compile_sir_rollout=true
+      - native.compile_loss_scores=true
+    resources:
+      allocation:
+        runtime: 8
+  all_b64:
+    training:
+      experiment_name: native_perf_b64_200x3
+      max_batches: 200
+      overrides:
+      - training.worker_blas_threads=1
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+      - native.precompute_loss_metadata=true
+      - native.compile_sir_rollout=true
+      - native.compile_loss_scores=true
+      - training.batch_size=64
+      - training.max_batches=200
+      - training.progress_log_frequency=5
+    resources:
+      allocation:
+        runtime: 8
+  all_causal:
+    training:
+      overrides:
+      - training.worker_blas_threads=1
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+      - native.precompute_loss_metadata=true
+      - native.compile_sir_rollout=true
+      - native.compile_loss_scores=true
+      - native.wastewater_filename=obs_wastewater_causal_v2.zarr
+    resources:
+      allocation:
+        runtime: 20
+    provenance:
+      training_evidence_retention: run
+      input_repairs:
+      - pointer: data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+        parent_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+        parent_dvc_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+        output_dvc_md5: 58f03caa79ebf978f298e3235fc5e205.dir
+        producing_run_id: native-ww-causal-v2-7c25445-20261002-c
+        producing_source_snapshot_sha256: c09887300f3303e8b7dad18ca6116127a4cc1603a62d49ebaeef5653c6b4ad17
+        qa_sha256: c190479dc0f3e3cc9f7756976bf49176f368d84895754a778795aeddc4c25bda
+        publication_receipt_sha256: 46598ea4875646f96ac3c4cd022e0df6b790c0060e08029e932648486571c708
+        publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-ww-causal-v2-7c25445-20261002-c/outputs/preprocessing/publication/receipt.json
+    extends: workflow/config/profiles/native_causal_inputs.yaml
+  direct:
+    training:
+      experiment_name: native_direct_b32_400x3
+      overrides:
+      - training.worker_blas_threads=1
+      - native.od_graph_cache_size=512
+      - native.cache_od_target_weights=true
+      - native.precompute_loss_metadata=true
+      - native.compile_sir_rollout=false
+      - native.compile_loss_scores=true
+      - native.decoder=direct
+      - native.wastewater_filename=obs_wastewater_causal_v2.zarr
+    resources:
+      allocation:
+        runtime: 20
+    provenance:
+      training_evidence_retention: run
+      input_repairs:
+      - pointer: data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+        parent_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+        parent_dvc_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+        output_dvc_md5: 58f03caa79ebf978f298e3235fc5e205.dir
+        producing_run_id: native-ww-causal-v2-7c25445-20261002-c
+        producing_source_snapshot_sha256: c09887300f3303e8b7dad18ca6116127a4cc1603a62d49ebaeef5653c6b4ad17
+        qa_sha256: c190479dc0f3e3cc9f7756976bf49176f368d84895754a778795aeddc4c25bda
+        publication_receipt_sha256: 46598ea4875646f96ac3c4cd022e0df6b790c0060e08029e932648486571c708
+        publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-ww-causal-v2-7c25445-20261002-c/outputs/preprocessing/publication/receipt.json
+    extends: workflow/config/profiles/native_causal_inputs.yaml

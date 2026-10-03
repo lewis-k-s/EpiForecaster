@@ -1,0 +1,22 @@
+workflow:
+  kind: preprocess
+  target: preprocess
+dvc:
+  targets:
+  - data/processed/native_support/obs_wastewater.zarr.dvc
+  provenance_targets: []
+preprocessing:
+  processor: native_wastewater_history
+  input_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+  parent_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+  dataset_name: obs_wastewater_causal_v2
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 10
