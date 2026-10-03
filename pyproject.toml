@@ -76,6 +76,8 @@ plot = "cli:plot_cli"
 # Analysis CLI tools
 training-dynamics-analyze = "scripts.analysis.analyze_training_dynamics:main"
 training-provenance-query = "scripts.analysis.query_run_provenance:main"
+run-report-render = "scripts.analysis.render_run_report:main"
+run-report-build = "scripts.analysis.build_run_report:main"
 hpsearch-analyze = "scripts.analysis.analyze_hpsearch_journal:main"
 # Data visualization runner
 dataviz = "scripts.analysis.dataviz_runner:main"
