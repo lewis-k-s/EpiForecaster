@@ -312,3 +312,115 @@ def test_publish_preprocessed_dataset_rejects_nonempty_publication(
         assert "publication already exists" in str(error)
     else:
         raise AssertionError("Nonempty publication directory was accepted")
+
+
+def test_native_history_repair_and_dvc_publication(tmp_path: Path) -> None:
+    """Exercise real Zarr IO, preservation, poison QA, publication, and tamper gating."""
+    import hashlib
+    import pytest
+    from data.preprocess.processors.native_wastewater_processor import (
+        build_native_wastewater_observations,
+    )
+    from tests.test_native_wastewater_processor import _write_wastewater
+
+    source = tmp_path / "source"
+    source.mkdir()
+    csv = tmp_path / "wastewater.csv"
+    _write_wastewater(csv)
+    import pandas as pd
+
+    raw = pd.read_csv(csv)
+    raw.loc[0, "N1(CG/L)"] = 0.0
+    raw.to_csv(csv, index=False)
+    parent = build_native_wastewater_observations(
+        csv, start_date="2020-03-01", end_date="2020-03-10"
+    )
+    expected_history = parent["history_log1p"].copy(deep=True)
+    # Represent an obsolete, acausal published history.
+    parent["history_log1p"] = parent["history_log1p"] + 3.0
+    parent_path = source / "data/native/parent.zarr"
+    parent.to_zarr(parent_path, zarr_format=3)
+    parent_md5 = hashlib.md5(b"parent", usedforsecurity=False).hexdigest() + ".dir"
+    pointer = parent_path.with_suffix(".zarr.dvc")
+    pointer.write_text(
+        yaml.safe_dump({"outs": [{"md5": parent_md5, "path": "parent.zarr"}]})
+    )
+    for name in (
+        "data/preprocess/processors/native_wastewater_processor.py",
+        "data/preprocess/smoothing.py",
+        "scripts/workflow/run_support.py",
+    ):
+        destination = source / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(name), destination)
+    run = tmp_path / "run"
+    run.mkdir()
+    digest = tmp_path / "runtime.sif.sha256"
+    digest.write_text("abc123  runtime.sif\n")
+    workflow = _preprocess_workflow()
+    workflow.update(
+        {
+            "run": {"id": "repair", "root": str(run)},
+            "source": {"git_sha": "abc", "source_snapshot_sha256": "def"},
+            "container": {"sif": "runtime.sif", "digest_file": str(digest)},
+            "dvc": {
+                "targets": ["data/native/parent.zarr.dvc"],
+                "remote": str(tmp_path / "remote"),
+                "cache": str(tmp_path / "cache"),
+            },
+            "preprocessing": {
+                "processor": "native_wastewater_history",
+                "input_pointer": "data/native/parent.zarr.dvc",
+                "parent_md5": parent_md5,
+                "dataset_name": "repaired",
+            },
+        }
+    )
+    config = run / "config.yaml"
+    config.write_text(yaml.safe_dump(workflow))
+    run_support.write_json(
+        run / ".state/data_manifest.json",
+        {
+            "targets": {"data/native/parent.zarr.dvc": {"md5": parent_md5}},
+        },
+    )
+    parent_hash = run_support._tree_digest(parent_path)
+    marker = run_support.run_preprocessing(config, source, run)
+    output = run / "outputs/preprocessing/repaired.zarr"
+    qa_path = output.parent / "qa.json"
+    qa = json.loads(qa_path.read_text())
+    assert qa["qa_passed"] and qa["causality_checks"] > 0
+    assert qa["changed_series_count"] > 0
+    assert qa["parent_dvc_md5"] == parent_md5
+    with xr.open_zarr(output) as restored:
+        xr.testing.assert_identical(restored["history_log1p"], expected_history)
+        xr.testing.assert_identical(
+            restored.drop_vars("history_log1p"), parent.drop_vars("history_log1p")
+        )
+    assert run_support._tree_digest(parent_path) == parent_hash
+    with pytest.raises(FileExistsError, match="not empty"):
+        run_support.run_preprocessing(config, source, run)
+    metadata = output / "zarr.json"
+    original = metadata.read_bytes()
+    metadata.write_bytes(original + b" ")
+    with pytest.raises(ValueError, match="changed after QA"):
+        run_support.publish_preprocessed_dataset(config, run)
+    metadata.write_bytes(original)
+    receipt = run_support.publish_preprocessed_dataset(config, run)
+    published = json.loads(receipt.read_text())
+    assert published["dvc_md5"].endswith(".dir")
+    assert published["input_dvc_hashes"] == {"data/native/parent.zarr.dvc": parent_md5}
+    assert (
+        published["dataset_sha256"] == json.loads(marker.read_text())["dataset_sha256"]
+    )
+    pointer_record = yaml.safe_load((receipt.parent / "repaired.zarr.dvc").read_text())
+    assert pointer_record["outs"][0]["md5"] == published["dvc_md5"]
+    assert (
+        tmp_path
+        / "remote/files/md5"
+        / published["dvc_md5"][:2]
+        / published["dvc_md5"][2:]
+    ).is_file()
+    with pytest.raises(FileExistsError, match="already exists"):
+        run_support.publish_preprocessed_dataset(config, run)
+    assert run_support._tree_digest(parent_path) == parent_hash

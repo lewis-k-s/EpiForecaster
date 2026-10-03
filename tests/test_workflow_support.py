@@ -19,6 +19,8 @@ import optuna
 import pytest
 import yaml
 
+from scripts.workflow.config_templates import load_config_template
+
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
@@ -105,13 +107,11 @@ def _write_pointer(
 
 
 def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml").read_text()
-    )
+    smoke = load_config_template(REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml")
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
     assert smoke["ablation"] == {
-        "study_name": "epiforecaster_ablation_smoke_v1",
+        "study_name": "epiforecaster_native_ablation_smoke_v1",
         "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
         "workers": 2,
         "trials_per_worker": 4,
@@ -134,13 +134,13 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
 
 
 def test_coverage_smoke_exercises_default_campaign_subset() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml").read_text()
+    smoke = load_config_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml"
     )
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
     assert smoke["ablation"] == {
-        "study_name": "epiforecaster_ablation_default_smoke_v1",
+        "study_name": "epiforecaster_native_ablation_default_smoke_v1",
         "campaign": "configs/campaigns/ablation_default_v1.yaml",
         "workers": 2,
         "closeout_signal_seconds": 600,
@@ -162,9 +162,7 @@ def test_coverage_smoke_exercises_default_campaign_subset() -> None:
 
 
 def test_ablation_timeout_reserves_the_declared_slurm_closeout() -> None:
-    config = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation.yaml").read_text()
-    )
+    config = load_config_template(REPO_ROOT / "workflow/config/mn5_ablation.yaml")
 
     assert run_config.validate_mn5_allocation(config)["runtime"] == 420
     assert config["ablation"]["timeout_s"] == (
@@ -661,7 +659,9 @@ def test_evaluation_resolves_pinned_checkpoint_in_runtime_run_namespace(
     assert captured["checkpoint"] == pinned.resolve()
 
 
+@pytest.mark.parametrize("checkpoint_mode", ["init", "resume"])
 def test_prepare_run_pins_training_initialization_checkpoint(
+    checkpoint_mode: str,
     tmp_path: Path,
 ) -> None:
     run_root = tmp_path / "runs/fine-tune"
@@ -687,7 +687,7 @@ def test_prepare_run_pins_training_initialization_checkpoint(
         "base_config": "configs/production_only/train_epifor_mn5_full.yaml",
         "experiment_name": "fine-tune",
         "model_id": "model",
-        "init_checkpoint": str(external_checkpoint),
+        f"{checkpoint_mode}_checkpoint": str(external_checkpoint),
         "overrides": [],
     }
     config.pop("optuna")
@@ -704,34 +704,26 @@ def test_prepare_run_pins_training_initialization_checkpoint(
     finally:
         source_root.chmod(0o755)
 
-    pinned = run_root / "inputs/training_init_checkpoint.pt"
+    pinned = run_root / f"inputs/training_{checkpoint_mode}_checkpoint.pt"
     manifest = yaml.safe_load(manifest_path.read_text())
     assert pinned.read_bytes() == b"pretrained checkpoint"
     assert not pinned.stat().st_mode & 0o222
     assert manifest["training_input"]["pinned_checkpoint"] == str(pinned)
-    assert manifest["identity"]["init_checkpoint_sha256"] == (
+    assert manifest["identity"][f"{checkpoint_mode}_checkpoint_sha256"] == (
         run_support.sha256_file(pinned)
     )
 
 
-def test_production_workflow_tracks_required_region_embedding() -> None:
-    workflow = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
-    training = yaml.safe_load(
-        (REPO_ROOT / "configs/production_only/train_epifor_mn5_full.yaml").read_text()
-    )
-    pointer_relative = Path("outputs/region_embeddings/region_embeddings.pt.dvc")
-    pointer = REPO_ROOT / pointer_relative
-
-    assert pointer_relative.as_posix() in workflow["dvc"]["targets"]
-    output = run_support.dvc_output(pointer)
-    assert pointer_relative.parent / output["path"] == Path(
-        training["data"]["region2vec_path"]
-    )
-    assert output["md5"] == "5205439ed1bd8a079aa57aed37507654"
+def test_production_workflow_stages_native_graph_and_abs_deaths() -> None:
+    workflow = load_config_template(REPO_ROOT / "workflow/config/mn5.yaml")
+    targets = workflow["dvc"]["targets"]
+    assert "data/processed/native_support/native_graph.zarr.dvc" in targets
+    assert "data/processed/native_support/obs_deaths_abs_excess.zarr.dvc" in targets
+    assert not any("native_source_sets_v" in target for target in targets)
 
 
 def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> None:
-    workflow = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
+    workflow = load_config_template(REPO_ROOT / "workflow/config/mn5.yaml")
     paths = run_config.source_files(REPO_ROOT)
 
     payloads = run_config.validate_code_data_separation(REPO_ROOT, paths, workflow)
@@ -741,9 +733,9 @@ def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> No
     assert Path("scripts/workflow/remote_run.sh") in paths
     assert Path("scripts/workflow/remote_tooling.sh") in paths
     assert set(payloads) == {
-        Path("data/files/mobility.zarr.dvc"),
-        Path("data/processed/real_with_id.zarr.dvc"),
-        Path("outputs/region_embeddings/region_embeddings.pt.dvc"),
+        Path(target)
+        for target in workflow["dvc"]["targets"]
+        + workflow["dvc"].get("provenance_targets", [])
     }
     assert not any(
         path == payload or payload in path.parents
@@ -756,7 +748,7 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     profile = yaml.safe_load(
         (REPO_ROOT / "workflow/profiles/mn5/config.yaml").read_text()
     )
-    workflow = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
+    workflow = load_config_template(REPO_ROOT / "workflow/config/mn5.yaml")
     coordinator = (
         REPO_ROOT / "scripts/workflow/snakemake_coordinator.sbatch"
     ).read_text()
@@ -833,6 +825,18 @@ def test_single_training_requires_one_task_and_one_gpu(tmp_path: Path) -> None:
     config["resources"]["allocation"].update(tasks=4, gres="gpu:4")
 
     with pytest.raises(ValueError, match="tasks=4"):
+        run_config.validate_mn5_allocation(config)
+
+
+def test_interactive_training_allocation_uses_site_partition(tmp_path: Path) -> None:
+    config = _workflow_mode_config("train", tmp_path / "run")
+    allocation = config["resources"]["allocation"]
+    allocation.update(partition="accinteractive", qos="acc_interactive", runtime=100)
+
+    assert run_config.validate_mn5_allocation(config) == allocation
+
+    allocation["runtime"] = 121
+    with pytest.raises(ValueError, match="at most 120 minutes"):
         run_config.validate_mn5_allocation(config)
 
 
@@ -1297,6 +1301,12 @@ def test_crossval_fold_builds_isolated_train_evaluate_config(
         run_support.write_json(manifest, {"ok": True})
         return manifest
 
+    def fake_splits(path, source, fold_root):
+        manifest = fold_root / "inputs/native_source_sets/manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}")
+
+    monkeypatch.setattr(run_support, "build_native_splits", fake_splits)
     monkeypatch.setattr(run_support, "train_model", fake_train)
     monkeypatch.setattr(run_support, "evaluate_configured_model", fake_evaluate)
 
@@ -1309,11 +1319,11 @@ def test_crossval_fold_builds_isolated_train_evaluate_config(
     assert isinstance(fold_config, dict)
     assert fold_config["workflow"] == {"kind": "train", "target": "train_evaluate"}
     assert fold_config["training"]["model_id"] == "model"
-    assert "training.crossval_fold_index=1" in fold_config["training"]["overrides"]
-    assert "training.crossval_num_folds=3" in fold_config["training"]["overrides"]
-    assert (
-        "training.crossval_manifest_path=configs/crossval/manifest.json"
-        in fold_config["training"]["overrides"]
+    assert "native.fold_index=1" in fold_config["training"]["overrides"]
+    assert "native.num_folds=3" in fold_config["training"]["overrides"]
+    assert not any(
+        "crossval_manifest_path=" in value
+        for value in fold_config["training"]["overrides"]
     )
     assert "training.seed=17" in fold_config["training"]["overrides"]
     assert captured["source"] == source_root
@@ -1373,9 +1383,11 @@ def _write_source_inventory(run_root: Path) -> None:
     (run_root / ".state/published.done").write_text("run_id=test-run\n")
 
 
+@pytest.mark.parametrize("precreated_output_parent", [False, True])
 def test_retain_training_evidence_publishes_one_dvc_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    precreated_output_parent: bool,
 ) -> None:
     run_root = tmp_path / "run"
     model_root = run_root / "outputs/training/single/model"
@@ -1406,7 +1418,8 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
     )
 
     def fake_run(command: list[str], *, cwd=None, env=None) -> None:
-        del env
+        if command == ["dvc", "init", "--no-scm"]:
+            assert env["DVC_SITE_CACHE_DIR"] == str(Path(cwd) / ".dvc/tmp/site-cache")
         if command[:3] == ["dvc", "add", "artifacts"]:
             assert cwd is not None
             Path(cwd, "artifacts.dvc").write_text(
@@ -1423,6 +1436,10 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
             )
 
     monkeypatch.setattr(run_support, "_run", fake_run)
+
+    destination = run_root / "evidence/training/single/model"
+    if precreated_output_parent:
+        destination.mkdir(parents=True)
 
     retention_path = run_support.retain_training_evidence(
         config_path,
@@ -1443,10 +1460,71 @@ def test_retain_training_evidence_publishes_one_dvc_directory(
     assert (retention_path.parent / "artifacts.dvc").is_file()
     assert not (retention_path.parent / "artifacts").exists()
     assert (run_root / ".state/training_evidence_retained.done").is_file()
+    with pytest.raises(FileExistsError, match="occupied"):
+        run_support.retain_training_evidence(config_path, run_root, model_root)
+
+
+def test_completed_producer_evidence_is_pinned_and_verified(tmp_path: Path) -> None:
+    producer = tmp_path / "producer/model"
+    _complete_training_dynamics(producer)
+    dynamics = producer / "training_dynamics.jsonl"
+    dynamics_manifest = producer / "training_dynamics_manifest.json"
+    training_manifest = producer / "training_manifest.json"
+    checkpoint_hash = "a" * 64
+    training_manifest.write_text(
+        json.dumps(
+            {
+                "checkpoint_sha256": checkpoint_hash,
+                "training_dynamics": {
+                    "artifact_sha256": run_support.sha256_file(dynamics),
+                    "manifest_sha256": run_support.sha256_file(dynamics_manifest),
+                },
+            }
+        )
+    )
+    provenance = producer / "training_provenance.json"
+    provenance.write_text(
+        json.dumps(
+            {
+                "run": {"run_id": "producer", "source_snapshot_sha256": "b" * 64},
+                "training_evidence": {
+                    "artifacts": [
+                        {"name": path.name, "sha256": run_support.sha256_file(path)}
+                        for path in (dynamics, dynamics_manifest, training_manifest)
+                    ]
+                },
+            }
+        )
+    )
+    pinned = tmp_path / "recovery/inputs/training_evidence"
+    receipt = run_support.pin_training_evidence(
+        producer, pinned, checkpoint_sha256=checkpoint_hash
+    )
+    assert receipt["producer"]["run_id"] == "producer"
+    for name, identity in receipt["artifacts"].items():
+        assert run_support.sha256_file(pinned / name) == identity["sha256"]
+        assert not (pinned / name).stat().st_mode & 0o222
+    assert (
+        run_support.pin_training_evidence(
+            producer, pinned, checkpoint_sha256=checkpoint_hash
+        )
+        == receipt
+    )
+    with pytest.raises(ValueError, match="evaluation checkpoint"):
+        run_support.pin_training_evidence(producer, pinned, checkpoint_sha256="c" * 64)
+    dynamics.write_text("future poison")
+    with pytest.raises(ValueError, match="SHA-256"):
+        run_support.pin_training_evidence(
+            producer, pinned, checkpoint_sha256=checkpoint_hash
+        )
+    assert (
+        run_support.sha256_file(pinned / dynamics.name)
+        == receipt["artifacts"][dynamics.name]["sha256"]
+    )
 
 
 def _use_repository_sources(config: dict) -> None:
-    production = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
+    production = load_config_template(REPO_ROOT / "workflow/config/mn5.yaml")
     config["run"]["source_root"] = str(REPO_ROOT)
     config["dvc"]["targets"] = production["dvc"]["targets"]
 
@@ -1456,18 +1534,14 @@ def _workflow_mode_config(kind: str, run_root: Path) -> dict:
     _use_repository_sources(config)
     config["workflow"]["kind"] = kind
     if kind == "train":
-        template = yaml.safe_load(
-            (REPO_ROOT / "workflow/config/mn5_train.yaml").read_text()
-        )
+        template = load_config_template(REPO_ROOT / "workflow/config/mn5_train.yaml")
         config["training"] = template["training"]
         config["evaluation"] = template["evaluation"]
         config["resources"] = template["resources"]
         config.pop("optuna")
         config.pop("promotion")
     elif kind == "evaluate":
-        template = yaml.safe_load(
-            (REPO_ROOT / "workflow/config/mn5_train.yaml").read_text()
-        )
+        template = load_config_template(REPO_ROOT / "workflow/config/mn5_train.yaml")
         config["evaluation"] = {
             **template["evaluation"],
             "checkpoint": str(run_root / "inputs/best_model.pt"),
@@ -1476,18 +1550,14 @@ def _workflow_mode_config(kind: str, run_root: Path) -> dict:
         config.pop("optuna")
         config.pop("promotion")
     elif kind == "ablation":
-        template = yaml.safe_load(
-            (REPO_ROOT / "workflow/config/mn5_ablation.yaml").read_text()
-        )
+        template = load_config_template(REPO_ROOT / "workflow/config/mn5_ablation.yaml")
         config["ablation"] = template["ablation"]
         config["resources"] = template["resources"]
         config.pop("optuna")
         config.pop("evaluation")
         config.pop("promotion")
     elif kind == "crossval":
-        template = yaml.safe_load(
-            (REPO_ROOT / "workflow/config/mn5_crossval.yaml").read_text()
-        )
+        template = load_config_template(REPO_ROOT / "workflow/config/mn5_crossval.yaml")
         config["crossval"] = template["crossval"]
         config["evaluation"] = template["evaluation"]
         config["resources"] = template["resources"]
@@ -1549,7 +1619,7 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     assert str(REPO_ROOT / "configs/production_only/train_epifor_mn5_full.yaml") in (
         train_result.stdout
     )
-    assert re.search(r"^total\s+8$", train_result.stdout, re.MULTILINE)
+    assert "native_source_sets" in train_result.stdout
 
     composed_result = _run_workflow_dry_run(
         config_path,
@@ -1573,9 +1643,7 @@ def test_single_training_smoke_default_dag_reaches_evaluation(
 ) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("train", run_root)
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_train_smoke.yaml").read_text()
-    )
+    smoke = load_config_template(REPO_ROOT / "workflow/config/mn5_train_smoke.yaml")
     config["workflow"]["target"] = smoke["workflow"]["target"]
     config["training"] = smoke["training"]
     config["evaluation"] = smoke["evaluation"]
@@ -1594,7 +1662,12 @@ def test_single_training_smoke_default_dag_reaches_evaluation(
     assert "test_summary.json" in result.stdout
     assert "evaluation_manifest.json" in result.stdout
     assert "complete_workflow" in result.stdout
-    assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
+    assert "val_summary.json" in result.stdout
+    assert "build_run_report" in result.stdout
+    assert "report_manifest.json" in result.stdout
+    assert "--cpus-per-task=1" in result.stdout
+    assert "onerror" not in (REPO_ROOT / "workflow/Snakefile").read_text()
+    assert "native_source_sets" in result.stdout
 
 
 def test_profiled_training_dag_retains_one_dvc_evidence_pack(
@@ -1602,11 +1675,7 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
 ) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("train", run_root)
-    profiled = yaml.safe_load(
-        (
-            REPO_ROOT / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
-        ).read_text()
-    )
+    profiled = load_config_template(REPO_ROOT / "workflow/config/mn5_profile.yaml")
     config["workflow"] = profiled["workflow"]
     config["training"] = profiled["training"]
     config["evaluation"] = profiled["evaluation"]
@@ -1625,7 +1694,14 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
     assert "dvc push artifacts.dvc" not in result.stdout
     assert "retain-training-evidence" in result.stdout
     assert "retention.json" in result.stdout
-    assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
+    assert "native_source_sets" in result.stdout
+    command = next(
+        line
+        for line in result.stdout.splitlines()
+        if "retain-training-evidence" in line
+    )
+    assert "srun --job-name=epi-workflow --nodes=1 --ntasks=1" in command
+    assert "--gpus-per-task" not in command
 
 
 @pytest.mark.integration
@@ -1680,9 +1756,17 @@ def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
 
 
 @pytest.mark.integration
-def test_evaluation_only_dag_pins_checkpoint_inside_the_run(tmp_path: Path) -> None:
+@pytest.mark.parametrize("retain_producer", [False, True])
+def test_evaluation_only_dag_pins_checkpoint_inside_the_run(
+    tmp_path: Path, retain_producer: bool
+) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("evaluate", run_root)
+    if retain_producer:
+        config["evaluation"].update(
+            splits=["val", "test"], training_model_root=str(tmp_path / "producer/model")
+        )
+        config["provenance"] = {"training_evidence_retention": "dvc"}
     checkpoint = Path(config["evaluation"]["checkpoint"])
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint")
@@ -1700,7 +1784,15 @@ def test_evaluation_only_dag_pins_checkpoint_inside_the_run(tmp_path: Path) -> N
     assert f"--input-path {checkpoint}" not in result.stdout
     assert "test_summary.json" in result.stdout
     assert "evaluation_manifest.json" in result.stdout
-    assert re.search(r"^total\s+7$", result.stdout, re.MULTILINE)
+    expected_rules = 8 if retain_producer else 7
+    assert re.search(rf"^total\s+{expected_rules}$", result.stdout, re.MULTILINE)
+    assert "--job-name=evaluate-native" in result.stdout
+    if retain_producer:
+        assert "val_summary.json" in result.stdout
+        assert "val_granular.parquet" in result.stdout
+        assert "test_granular.parquet" in result.stdout
+        assert "retain_training_evidence" in result.stdout
+        assert "inputs/training_evidence/training_provenance.json" in result.stdout
 
 
 def test_scientific_source_inventory_excludes_docs_and_tests() -> None:
@@ -1804,6 +1896,50 @@ def test_evaluation_writes_and_hashes_required_artifact_contract(
     assert all(artifact["required"] for artifact in manifest["artifacts"])
 
 
+def test_evaluation_accepts_native_artifact_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    checkpoint = tmp_path / "best_model.pt"
+    checkpoint.write_bytes(b"native checkpoint")
+    output_dir = tmp_path / "evaluation"
+
+    def fake_run(command, *, cwd=None, env=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "test_summary.json").write_text(
+            '{"joint_wis": 0.4, "report_context": {"native_support": true}}\n'
+        )
+        (output_dir / "test_native_aggregate_metrics.csv").write_text("wis\n0.4\n")
+        (output_dir / "test_native_wis_summary.json").write_text("{}\n")
+        (output_dir / "test_native_excess_deaths.csv").write_text("abs_id\n101\n")
+        (output_dir / "test_granular.parquet").write_bytes(b"parquet")
+        (output_dir / "test_granular.parquet.meta.json").write_text("{}\n")
+        for suffix in (
+            "example_history.parquet",
+            "example_rows.parquet",
+            "window_support.csv",
+            "example_selection.csv",
+            "example_availability.csv",
+        ):
+            (output_dir / f"test_{suffix}").write_bytes(b"saved export")
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+    manifest_path = run_support.evaluate_best(checkpoint, output_dir, "test", [], True)
+    manifest = json.loads(manifest_path.read_text())
+    assert {item["path"] for item in manifest["artifacts"] if item["required"]} == {
+        "test_summary.json",
+        "test_native_aggregate_metrics.csv",
+        "test_native_wis_summary.json",
+        "test_native_excess_deaths.csv",
+        "test_granular.parquet",
+        "test_granular.parquet.meta.json",
+        "test_example_history.parquet",
+        "test_example_rows.parquet",
+        "test_window_support.csv",
+        "test_example_selection.csv",
+        "test_example_availability.csv",
+    }
+
+
 def test_train_model_records_deterministic_checkpoint(
     monkeypatch,
     tmp_path: Path,
@@ -1861,7 +1997,9 @@ def test_train_model_records_deterministic_checkpoint(
     ]
 
 
+@pytest.mark.parametrize("checkpoint_mode", ["init", "resume"])
 def test_train_model_uses_validated_pinned_initialization_checkpoint(
+    checkpoint_mode: str,
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1870,7 +2008,7 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     base_config = source_root / "configs/train.yaml"
     base_config.parent.mkdir(parents=True)
     base_config.write_text("env: test\n")
-    pinned = run_root / "inputs/training_init_checkpoint.pt"
+    pinned = run_root / f"inputs/training_{checkpoint_mode}_checkpoint.pt"
     pinned.parent.mkdir(parents=True)
     pinned.write_bytes(b"pretrained")
     config = {
@@ -1878,7 +2016,7 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
             "base_config": "configs/train.yaml",
             "experiment_name": "fine-tune",
             "model_id": "model",
-            "init_checkpoint": "/gpfs/pretrain/best_model.pt",
+            f"{checkpoint_mode}_checkpoint": "/gpfs/pretrain/best_model.pt",
             "overrides": [],
         }
     }
@@ -1903,7 +2041,7 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     run_support.train_model(config_path, source_root, run_root)
 
     command = captured["command"]
-    expected_override = f"training.init_checkpoint_path={pinned}"
+    expected_override = f"training.{checkpoint_mode}_checkpoint_path={pinned}"
     assert expected_override in command
 
 
@@ -2165,6 +2303,7 @@ def _make_remote_run_staging(
         "scripts/__init__.py",
         "scripts/workflow/__init__.py",
         "scripts/workflow/run_config.py",
+        "scripts/workflow/config_templates.py",
         "scripts/workflow/remote_run.sh",
         "scripts/workflow/snakemake_coordinator.sh",
         "scripts/workflow/snakemake_coordinator.sbatch",
@@ -2389,8 +2528,21 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     ).resolve() == run_root
 
 
+@pytest.mark.parametrize(
+    ("qos", "partition", "batch_flag", "allowed"),
+    [
+        ("acc_interactive", "accinteractive", 0, True),
+        ("acc_debug", "acc", 0, True),
+        ("acc_debug", "acc", 1, False),
+        ("acc_bscls", "acc", 0, False),
+    ],
+)
 def test_transferred_runner_attaches_without_sbatch(
     tmp_path: Path,
+    qos: str,
+    partition: str,
+    batch_flag: int,
+    allowed: bool,
 ) -> None:
     staging, run_root, env = _make_remote_run_staging(tmp_path, token="attach")
     subprocess.run(
@@ -2409,7 +2561,8 @@ def test_transferred_runner_attaches_without_sbatch(
     scontrol.write_text(
         "#!/bin/bash\n"
         'printf "JobId=98765 JobState=RUNNING UserId=%s(1) Account=bsc08 '
-        "QOS=acc_interactive Partition=accinteractive NumNodes=1 NumTasks=4 "
+        f"QOS={qos} Partition={partition} BatchFlag={batch_flag} "
+        "NumNodes=1 NumTasks=4 "
         "NumCPUs=80 AllocTRES=cpu=80,gres/gpu=4 "
         'EndTime=2099-01-01T00:00:00\\n" "$USER"\n'
     )
@@ -2433,11 +2586,18 @@ def test_transferred_runner_attaches_without_sbatch(
     result = subprocess.run(
         [str(runner), "attach", "98765"],
         env=env,
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
 
+    if not allowed:
+        assert result.returncode != 0
+        assert "not a compatible running held ACC allocation" in result.stderr
+        assert not srun_calls.exists()
+        return
+
+    assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("attached:98765:")
     attempt_id = result.stdout.strip().split(":", 2)[2]
     attempt_root = run_root / ".state/executions" / attempt_id
@@ -2456,15 +2616,34 @@ def test_transferred_runner_attaches_without_sbatch(
     ).resolve() == run_root
 
 
+@pytest.mark.parametrize("checkpoint_mode", [None, "evaluate", "init", "resume"])
 def test_external_launcher_coordinator_exports_validated_capacity(
     tmp_path: Path,
+    checkpoint_mode: str | None,
 ) -> None:
     run_root = tmp_path / "run"
     attempt_root = run_root / ".state/executions/attempt"
     source_root = run_root / "source"
     attempt_root.mkdir(parents=True)
     source_root.mkdir()
-    (run_root / "config.yaml").write_text("{}\n")
+    external_checkpoint = tmp_path / "parent/best_model.pt"
+    external_checkpoint.parent.mkdir()
+    external_checkpoint.write_bytes(b"parent checkpoint")
+    config = {}
+    if checkpoint_mode == "evaluate":
+        config = {
+            "workflow": {"kind": "evaluate"},
+            "evaluation": {
+                "checkpoint": str(external_checkpoint),
+                "training_model_root": str(external_checkpoint.parent),
+            },
+        }
+    elif checkpoint_mode is not None:
+        config = {
+            "workflow": {"kind": "train"},
+            "training": {f"{checkpoint_mode}_checkpoint": str(external_checkpoint)},
+        }
+    (run_root / "config.yaml").write_text(yaml.safe_dump(config))
     capture = tmp_path / "capacity.txt"
     snakemake = tmp_path / "snakemake"
     snakemake.write_text(
@@ -2473,8 +2652,52 @@ def test_external_launcher_coordinator_exports_validated_capacity(
         '"$SLURM_CPUS_PER_TASK" >"$CAPTURE"\n'
     )
     snakemake.chmod(0o755)
-    coordinator = REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
+    sif = tmp_path / "runtime.sif"
+    sif.touch()
+    Path(f"{sif}.sha256").touch()
+    singularity_args = tmp_path / "singularity_args.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    singularity = fake_bin / "singularity"
+    singularity.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$@" >"$SINGULARITY_ARGS"\n'
+        'test "$1" = exec || exit 2\n'
+        "shift\n"
+        'while [ "$#" -gt 0 ]; do\n'
+        '  if [ "$1" = "$FAKE_SIF" ]; then\n'
+        "    shift\n"
+        '    if [ "$1" = /usr/local/bin/python ]; then\n'
+        "      shift\n"
+        '      exec python3 "$@"\n'
+        "    fi\n"
+        '    test "$1" = /usr/local/bin/snakemake || exit 4\n'
+        "    shift\n"
+        '    exec "$FAKE_SNAKEMAKE" "$@"\n'
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "exit 3\n"
+    )
+    singularity.chmod(0o755)
+    coordinator = tmp_path / "coordinator.sh"
+    original = (REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh").read_text()
+    # Test the real mount selection with a local stand-in for the GPFS root.
+    coordinator.write_text(
+        original.replace(
+            '[[ "$checkpoint_bind" != /gpfs/* ]]',
+            f'[[ "$checkpoint_bind" != {tmp_path}/* ]]',
+        ).replace(
+            '[[ "$training_evidence_bind" != /gpfs/* ]]',
+            f'[[ "$training_evidence_bind" != {tmp_path}/* ]]',
+        )
+    )
+    coordinator.chmod(0o755)
     env = os.environ | {
+        "FAKE_SIF": str(sif),
+        "FAKE_SNAKEMAKE": str(snakemake),
+        "SINGULARITY_ARGS": str(singularity_args),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "CAPTURE": str(capture),
         "SLURM_JOB_ID": "98765",
         "SLURM_STEP_ID": "7",
@@ -2486,7 +2709,8 @@ def test_external_launcher_coordinator_exports_validated_capacity(
         [
             str(coordinator),
             str(run_root),
-            str(snakemake),
+            "/usr/local/bin/snakemake",
+            str(sif),
             "2",
             "20",
             "existing-allocation",
@@ -2497,6 +2721,22 @@ def test_external_launcher_coordinator_exports_validated_capacity(
     )
 
     assert capture.read_text() == "1\t2\t20\n"
+    if checkpoint_mode is not None:
+        assert (
+            f"{external_checkpoint.parent}:{external_checkpoint.parent}:ro"
+            in singularity_args.read_text()
+        )
+        assert (
+            f"{external_checkpoint}:{external_checkpoint}:ro"
+            not in singularity_args.read_text()
+        )
+        assert (
+            singularity_args.read_text()
+            .splitlines()
+            .count(f"{external_checkpoint.parent}:{external_checkpoint.parent}:ro")
+            == 1
+        )
+    assert f"{sif}.sha256:{sif}.sha256:ro" in singularity_args.read_text()
     assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
     assert (attempt_root / "coordinator.step_id").read_text() == "7\n"
 
@@ -2508,10 +2748,14 @@ def test_slurm_step_disables_cpu_binding_for_existing_allocations(
     batch_step = slurm_step("echo batch", 20)
 
     monkeypatch.setenv("EPIFORECASTER_EXECUTION_MODE", "existing-allocation")
-    interactive_step = slurm_step("echo interactive", 20)
+    interactive_step = slurm_step("echo interactive", 20, job_name="train-native")
 
     assert "--cpu-bind=none" not in batch_step
     assert "--cpu-bind=none" in interactive_step
+    assert "--job-name=train-native" in interactive_step
+    assert "--cpus-per-task=20" in interactive_step
+    assert "--gpus-per-task=1" in interactive_step
+    assert "--exact" in interactive_step
 
 
 @pytest.mark.parametrize("command", ["run", "dry-run"])
@@ -2802,45 +3046,39 @@ def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
     assert "outcome=continuation" in (marker_root / "000.partial").read_text()
 
 
-def test_evaluation_accepts_native_artifact_contract(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_report_target_evaluates_validation_before_test_with_granular_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    checkpoint = tmp_path / "best_model.pt"
-    checkpoint.write_bytes(b"native checkpoint")
-    output_dir = tmp_path / "evaluation"
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    config = _workflow_mode_config("train", run_root)
+    config["workflow"]["target"] = "train_evaluate_report"
+    config["evaluation"]["granular"] = False
+    config_path = run_root / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    checkpoint = run_root / "best_model.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls = []
 
-    def fake_run(command, *, cwd=None, env=None):
+    def evaluate(checkpoint_path, output_dir, split, overrides, granular):
+        calls.append((split, granular))
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "test_summary.json").write_text(
-            '{"joint_wis": 0.4, "report_context": {"native_support": true}}\n'
+        manifest = output_dir / "evaluation_manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "artifacts": [
+                        {"path": f"{name}_summary.json", "required": False}
+                        for name, _ in calls
+                    ]
+                }
+            )
         )
-        (output_dir / "test_native_aggregate_metrics.csv").write_text("wis\n0.4\n")
-        (output_dir / "test_native_wis_summary.json").write_text("{}\n")
-        (output_dir / "test_native_excess_deaths.csv").write_text("abs_id\n101\n")
-        (output_dir / "test_granular.parquet").write_bytes(b"parquet")
-        (output_dir / "test_granular.parquet.meta.json").write_text("{}\n")
-        for suffix in (
-            "example_history.parquet",
-            "example_rows.parquet",
-            "window_support.csv",
-            "example_selection.csv",
-            "example_availability.csv",
-        ):
-            (output_dir / f"test_{suffix}").write_bytes(b"saved export")
+        return manifest
 
-    monkeypatch.setattr(run_support, "_run", fake_run)
-    manifest_path = run_support.evaluate_best(checkpoint, output_dir, "test", [], True)
-    manifest = json.loads(manifest_path.read_text())
-    assert {item["path"] for item in manifest["artifacts"] if item["required"]} == {
-        "test_summary.json",
-        "test_native_aggregate_metrics.csv",
-        "test_native_wis_summary.json",
-        "test_native_excess_deaths.csv",
-        "test_granular.parquet",
-        "test_granular.parquet.meta.json",
-        "test_example_history.parquet",
-        "test_example_rows.parquet",
-        "test_window_support.csv",
-        "test_example_selection.csv",
-        "test_example_availability.csv",
-    }
+    monkeypatch.setattr(run_support, "evaluate_best", evaluate)
+    manifest = run_support.evaluate_configured_model(config_path, run_root, checkpoint)
+    assert calls == [("val", True), ("test", True)]
+    record = json.loads(manifest.read_text())
+    assert record["splits"] == ["val", "test"]
+    assert all(artifact["required"] for artifact in record["artifacts"])

@@ -1,23 +1,11 @@
-# Production HPO configuration for Normal-NLL probabilistic forecasting.
-# Per-run paths and provenance fields are injected by
-# scripts/workflow/mn5_workflow.sh.
-
-run: {}
-source: {}
-container: {}
-
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
 workflow:
   kind: hpo
   target: hpo
-
-dvc:
-  targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
-    - outputs/region_embeddings/region_embeddings.pt.dvc
-
 optuna:
-  study_name: epiforecaster_probabilistic_hpo_v1
+  study_name: epiforecaster_native_normal_nll_hpo_v1
   base_config: configs/production_only/train_epifor_mn5_full.yaml
   workers: 4
   trials_per_worker: 10
@@ -30,26 +18,19 @@ optuna:
   search_space: default
   sample_training_loss_objective: false
   overrides:
-    - training.run_final_evaluation=false
-    - training.loss.joint.observation_loss=nll
-    - training.loss.joint.distribution_family=normal
-
+  - training.run_final_evaluation=false
+  - training.loss.joint.observation_loss=nll
+  - training.loss.joint.distribution_family=normal
 evaluation:
   split: test
   granular: true
   overrides:
-    - training.val_workers=2
-
+  - training.val_workers=2
 promotion:
   root: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/promoted
-
 resources:
   allocation:
-    account: bsc08
-    partition: acc
     qos: acc_bscls
-    nodes: 1
     tasks: 4
-    cpus_per_task: 20
     gres: gpu:4
     runtime: 420

@@ -42,6 +42,7 @@ if WORKFLOW_KIND in {"train", "evaluate", "hpo"}:
                     input_paths=EVALUATION_INPUT_PATHS,
                 ),
                 CPUS_PER_TASK,
+                job_name="evaluate-native",
             )
         shell:
             "{params.command} > {log:q} 2>&1"

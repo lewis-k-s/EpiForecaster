@@ -7,7 +7,8 @@ import sys
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
 from scripts.workflow.run_config import (
-    preprocessing_dataset_name,
+    evaluation_splits,
+    preprocessing_dataset_filename,
     validate_mn5_allocation,
     workflow_kind,
     workflow_target,
@@ -31,6 +32,7 @@ RUN_ROOT = Path(config["run"]["root"])
 SOURCE_ROOT = Path(config["run"]["source_root"])
 WORKFLOW_KIND = workflow_kind(config)
 WORKFLOW_TARGET = workflow_target(config)
+REPORT_ENABLED = WORKFLOW_KIND == "train" and WORKFLOW_TARGET == "train_evaluate_report"
 SIF = str(config["container"]["sif"])
 DVC_REMOTE = str(config["dvc"]["remote"])
 DVC_CACHE = str(config["dvc"]["cache"])
@@ -56,11 +58,16 @@ PREPARED = RUN_ROOT / ".state/prepared.done"
 MANIFEST = RUN_ROOT / "manifest.yaml"
 PINNED_EVALUATION_CHECKPOINT = RUN_ROOT / "inputs/evaluation_checkpoint.pt"
 PINNED_TRAINING_INIT_CHECKPOINT = RUN_ROOT / "inputs/training_init_checkpoint.pt"
+PINNED_TRAINING_RESUME_CHECKPOINT = RUN_ROOT / "inputs/training_resume_checkpoint.pt"
 PREPARE_OUTPUTS = [str(PREPARED), str(MANIFEST)]
 if WORKFLOW_KIND == "evaluate":
     PREPARE_OUTPUTS.append(str(PINNED_EVALUATION_CHECKPOINT))
+    if config["evaluation"].get("training_model_root") is not None:
+        PREPARE_OUTPUTS.extend(str(RUN_ROOT / "inputs/training_evidence" / name) for name in ("training_manifest.json", "training_dynamics_manifest.json", "training_dynamics.jsonl", "training_provenance.json"))
 if WORKFLOW_KIND == "train" and config["training"].get("init_checkpoint") is not None:
     PREPARE_OUTPUTS.append(str(PINNED_TRAINING_INIT_CHECKPOINT))
+if WORKFLOW_KIND == "train" and config["training"].get("resume_checkpoint") is not None:
+    PREPARE_OUTPUTS.append(str(PINNED_TRAINING_RESUME_CHECKPOINT))
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
 WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"
@@ -82,6 +89,8 @@ ACTIVE_STAGES = {
     "crossval": ("data", "crossval", "evaluation"),
     "preprocess": ("data", "preprocessing"),
 }[WORKFLOW_KIND]
+if REPORT_ENABLED:
+    ACTIVE_STAGES = (*ACTIVE_STAGES, "reporting")
 STAGE_SOURCES = {
     stage: dependency_sources(SOURCE_ROOT, SOURCE_INVENTORY, config, stage)
     for stage in ACTIVE_STAGES
@@ -105,21 +114,10 @@ EVALUATION_PER_HEAD_METRICS = (
 EVALUATION_GRANULAR = EVALUATION_DIR / f"{EVALUATION_SPLIT}_granular.parquet"
 EVALUATION_MANIFEST = EVALUATION_DIR / "evaluation_manifest.json"
 EVALUATION_DONE = EVALUATION_DIR / ".done"
-EVALUATION_ARTIFACTS = [
-    str(EVALUATION_SUMMARY),
-    str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_native_aggregate_metrics.csv"),
-    str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_native_wis_summary.json"),
-    str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_native_excess_deaths.csv"),
-]
-if bool(config.get("evaluation", {}).get("granular", False)):
-    EVALUATION_ARTIFACTS.extend(
-        str(EVALUATION_DIR / f"{EVALUATION_SPLIT}_{suffix}")
-        for suffix in (
-            "granular.parquet", "granular.parquet.meta.json", "example_history.parquet",
-            "example_rows.parquet", "window_support.csv", "example_selection.csv",
-            "example_availability.csv",
-        )
-    )
+EVALUATION_SUFFIXES = ["summary.json", "native_aggregate_metrics.csv", "native_wis_summary.json", "native_excess_deaths.csv"]
+if REPORT_ENABLED or bool(config.get("evaluation", {}).get("granular", False)):
+    EVALUATION_SUFFIXES.extend(["granular.parquet", "granular.parquet.meta.json", "example_history.parquet", "example_rows.parquet", "window_support.csv", "example_selection.csv", "example_availability.csv"])
+EVALUATION_ARTIFACTS = [str(EVALUATION_DIR / f"{split}_{suffix}") for split in evaluation_splits(config) for suffix in EVALUATION_SUFFIXES]
 
 if WORKFLOW_KIND == "train":
     training = config["training"]
@@ -131,6 +129,8 @@ if WORKFLOW_KIND == "train":
     )
     TRAINING_CHECKPOINT = TRAINING_ROOT / "checkpoints/best_model.pt"
     TRAINING_MANIFEST = TRAINING_ROOT / "training_manifest.json"
+    TRAINING_DYNAMICS_MANIFEST = TRAINING_ROOT / "training_dynamics_manifest.json"
+    TRAINING_DYNAMICS = TRAINING_ROOT / "training_dynamics.jsonl"
     TRAINING_PROVENANCE = TRAINING_ROOT / "training_provenance.json"
     TRAINING_EVIDENCE_RECORD = (
         RUN_ROOT
@@ -156,6 +156,10 @@ if WORKFLOW_KIND == "train":
         if WORKFLOW_TARGET == "train"
         else EVALUATION_MANIFEST
     )
+    REPORT_DIR = RUN_ROOT / "outputs/reports/single_run"
+    REPORT_MANIFEST = REPORT_DIR / "report_manifest.json"
+    if REPORT_ENABLED:
+        DEFAULT_TERMINAL = REPORT_MANIFEST
 elif WORKFLOW_KIND == "evaluate":
     EVALUATION_CHECKPOINT = PINNED_EVALUATION_CHECKPOINT
     EVALUATION_PREREQUISITES = []
@@ -164,6 +168,12 @@ elif WORKFLOW_KIND == "evaluate":
     )
     EVALUATION_INPUT_PATHS = ()
     DEFAULT_TERMINAL = EVALUATION_MANIFEST
+    if TRAINING_EVIDENCE_RETENTION == "dvc":
+        TRAINING_ROOT = RUN_ROOT / "inputs/training_evidence"
+        TRAINING_PROVENANCE = TRAINING_ROOT / "training_provenance.json"
+        TRAINING_MANIFEST = TRAINING_ROOT / "training_manifest.json"
+        TRAINING_EVIDENCE_RECORD = RUN_ROOT / "evidence/training/imported/model/retention.json"
+        EVALUATION_PREREQUISITES = [str(TRAINING_EVIDENCE_RECORD)]
 elif WORKFLOW_KIND == "hpo":
     optuna_config = config["optuna"]
     STUDY_NAME = str(optuna_config["study_name"])
@@ -217,13 +227,13 @@ elif WORKFLOW_KIND == "crossval":
     CROSSVAL_DONE = RUN_ROOT / ".state/crossval.done"
     DEFAULT_TERMINAL = CROSSVAL_MANIFEST
 elif WORKFLOW_KIND == "preprocess":
-    PREPROCESSING_DATASET_NAME = preprocessing_dataset_name(config)
+    PREPROCESSING_DATASET_FILENAME = preprocessing_dataset_filename(config)
     PREPROCESSING_ROOT = RUN_ROOT / "outputs/preprocessing"
     PREPROCESSING_EFFECTIVE_CONFIG = PREPROCESSING_ROOT / "effective_config.yaml"
     PREPROCESSING_QA = PREPROCESSING_ROOT / "qa.json"
     PREPROCESSING_DONE = PREPROCESSING_ROOT / ".preprocessed.done"
     PREPROCESSING_POINTER = (
-        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.nc.dvc"
+        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_FILENAME}.dvc"
     )
     PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
     PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
@@ -260,6 +270,7 @@ rule all:
 include: "rules/common.smk"
 include: "rules/training.smk"
 include: "rules/evaluation.smk"
+include: "rules/reporting.smk"
 include: "rules/studies.smk"
 include: "rules/promotion.smk"
 include: "rules/preprocessing.smk"

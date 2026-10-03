@@ -39,6 +39,7 @@ if WORKFLOW_KIND == "preprocess":
                 ),
                 CPUS_PER_TASK,
                 gpu=False,
+                job_name="preprocess-data",
             )
         shell:
             "{params.command} > {log:q} 2>&1"
@@ -72,7 +73,8 @@ if WORKFLOW_KIND == "preprocess":
                 dvc_remote=DVC_REMOTE,
                 dvc_cache=DVC_CACHE,
                 dvc_mode="push",
-                cpus=CPUS_PER_TASK,
+                cpus=1,
+                host_step=True,
                 promotion_root=str(PREPROCESSING_ROOT),
             )
         shell:

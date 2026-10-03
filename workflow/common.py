@@ -108,9 +108,16 @@ def container_command(
     return rendered
 
 
-def slurm_step(command: str, cpus_per_task: int, *, gpu: bool = True) -> str:
+def slurm_step(
+    command: str,
+    cpus_per_task: int,
+    *,
+    gpu: bool = True,
+    job_name: str = "epi-workflow",
+) -> str:
     step = [
         "srun",
+        f"--job-name={job_name}",
         "--nodes=1",
         "--ntasks=1",
         f"--cpus-per-task={cpus_per_task}",

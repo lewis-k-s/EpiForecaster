@@ -35,7 +35,8 @@ from scripts.hpo.trial_artifacts import (
     trial_directory,
 )
 from scripts.workflow.run_config import (
-    preprocessing_dataset_name,
+    evaluation_splits,
+    preprocessing_dataset_filename,
     validate_workflow_contract,
 )
 from training.training_dynamics import (
@@ -89,6 +90,7 @@ def write_dependency_contract(
         "selection": ("optuna",),
         "promotion": ("promotion", "dvc"),
         "preprocessing": ("preprocessing", "dvc"),
+        "reporting": ("workflow", "training", "evaluation"),
     }
     if stage not in stage_sections:
         raise ValueError(f"Unknown dependency stage: {stage}")
@@ -354,8 +356,17 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
                 label="Training initialization",
             )
             identity["init_checkpoint_sha256"] = training_input["checkpoint_sha256"]
+        configured_resume_checkpoint = config["training"].get("resume_checkpoint")
+        if configured_resume_checkpoint is not None:
+            training_input = pin_checkpoint(
+                Path(str(configured_resume_checkpoint)),
+                run_root / "inputs/training_resume_checkpoint.pt",
+                label="Training resume",
+            )
+            identity["resume_checkpoint_sha256"] = training_input["checkpoint_sha256"]
 
     evaluation_input = None
+    training_evidence_input = None
     if workflow_kind == "evaluate":
         evaluation_input = pin_checkpoint(
             Path(str(config["evaluation"]["checkpoint"])),
@@ -363,6 +374,12 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             label="Evaluation",
         )
         identity["input_checkpoint_sha256"] = evaluation_input["checkpoint_sha256"]
+        if config["evaluation"].get("training_model_root") is not None:
+            training_evidence_input = pin_training_evidence(
+                Path(str(config["evaluation"]["training_model_root"])),
+                run_root / "inputs/training_evidence",
+                checkpoint_sha256=evaluation_input["checkpoint_sha256"],
+            )
 
     manifest = {
         "schema_version": 1,
@@ -417,6 +434,8 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         manifest["evaluation_input"] = evaluation_input
     if training_input is not None:
         manifest["training_input"] = training_input
+    if training_evidence_input is not None:
+        manifest["training_evidence_input"] = training_evidence_input
     manifest_path = run_root / "manifest.yaml"
     write_yaml(manifest_path, manifest)
     prepared_path = run_root / ".state/prepared.done"
@@ -430,6 +449,84 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     manifest_path.chmod(0o444)
     prepared_path.chmod(0o444)
     return manifest_path
+
+
+def pin_training_evidence(
+    model_root: Path,
+    destination: Path,
+    *,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Pin completed producer evidence without changing its run or provenance."""
+    required = (
+        DYNAMICS_ARTIFACT_NAME,
+        DYNAMICS_MANIFEST_NAME,
+        "training_manifest.json",
+        "training_provenance.json",
+    )
+    selected = [
+        _validated_regular_file(
+            model_root / name, model_root, label="Producer evidence"
+        )
+        for name in required
+    ]
+    training = json.loads((model_root / "training_manifest.json").read_text())
+    dynamics = json.loads((model_root / DYNAMICS_MANIFEST_NAME).read_text())
+    provenance = json.loads((model_root / "training_provenance.json").read_text())
+    if training["checkpoint_sha256"] != checkpoint_sha256:
+        raise ValueError("Producer evidence does not match the evaluation checkpoint")
+    if dynamics["status"] != "complete":
+        raise ValueError("Producer training evidence is not complete")
+    expected = {
+        DYNAMICS_ARTIFACT_NAME: training["training_dynamics"]["artifact_sha256"],
+        DYNAMICS_MANIFEST_NAME: training["training_dynamics"]["manifest_sha256"],
+    }
+    for entry in provenance["training_evidence"]["artifacts"]:
+        if entry["name"] in expected and expected[entry["name"]] != entry["sha256"]:
+            raise ValueError("Producer training and provenance identities disagree")
+        expected[entry["name"]] = entry["sha256"]
+    if dynamics["artifact_sha256"] != expected[DYNAMICS_ARTIFACT_NAME]:
+        raise ValueError("Producer dynamics identities disagree")
+    selected.extend(
+        _validated_regular_file(path, model_root, label="Producer profiler trace")
+        for path in sorted(model_root.glob("*.pt.trace.json"))
+    )
+    hashes = {}
+    for source in selected:
+        digest = sha256_file(source)
+        if source.name != "training_provenance.json" and (
+            expected.get(source.name) != digest
+        ):
+            raise ValueError(
+                f"Producer evidence failed SHA-256 validation: {source.name}"
+            )
+        hashes[source.name] = {"sha256": digest, "bytes": source.stat().st_size}
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in selected:
+        pinned = destination / source.name
+        if pinned.exists():
+            _validated_regular_file(
+                pinned, destination, label="Pinned producer evidence"
+            )
+            if sha256_file(pinned) != hashes[source.name]["sha256"]:
+                raise ValueError(f"Pinned producer evidence conflicts: {pinned}")
+        else:
+            temporary = pinned.with_suffix(pinned.suffix + ".partial")
+            shutil.copyfile(source, temporary)
+            if sha256_file(temporary) != hashes[source.name]["sha256"]:
+                temporary.unlink()
+                raise ValueError(
+                    f"Producer evidence changed while being pinned: {source}"
+                )
+            temporary.chmod(0o444)
+            temporary.replace(pinned)
+    return {
+        "configured_model_root": str(model_root),
+        "pinned_model_root_relative": "inputs/training_evidence",
+        "producer": provenance["run"],
+        "checkpoint_sha256": checkpoint_sha256,
+        "artifacts": hashes,
+    }
 
 
 def _run(
@@ -460,6 +557,101 @@ def training_artifact_paths(
     return model_root / "checkpoints/best_model.pt", model_root
 
 
+def build_native_splits(config_path: Path, source_root: Path, run_root: Path) -> Path:
+    """Build and publish a run-owned split asset before model training."""
+    from data.build_native_source_sets import build_for_config
+    from models.configs import EpiForecasterConfig
+
+    workflow = load_yaml(config_path)
+    training = workflow["training"]
+    config = EpiForecasterConfig.load(
+        source_root / training["base_config"], overrides=training.get("overrides", [])
+    )
+    for block, name in ((config.data, "dataset_path"), (config.native, "root")):
+        path = Path(getattr(block, name))
+        if not path.is_absolute():
+            setattr(block, name, str(source_root / path))
+    asset = run_root / "inputs/native_source_sets"
+    if asset.is_symlink() or (
+        asset.exists() and (not asset.is_dir() or any(asset.iterdir()))
+    ):
+        raise FileExistsError(f"Native split asset already exists: {asset}")
+    if asset.is_dir():
+        # Snakemake creates declared output parents before it runs the rule.
+        asset.rmdir()
+    cache = Path(str(workflow["dvc"]["cache"]))
+    publication = run_root / "outputs/split_publication"
+    if publication.exists():
+        raise FileExistsError(f"Split publication already exists: {publication}")
+    publication.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="native-split-", dir=publication.parent
+    ) as temporary:
+        staging = Path(temporary)
+        payload = build_for_config(config, staging / "native_source_sets")
+        publication_environment = os.environ.copy()
+        publication_environment["DVC_SITE_CACHE_DIR"] = str(
+            staging / ".dvc/tmp/site-cache"
+        )
+        _run(["dvc", "init", "--no-scm"], cwd=staging, env=publication_environment)
+        _run(
+            ["dvc", "config", "core.site_cache_dir", ".dvc/tmp"],
+            cwd=staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "cache.dir", str(cache)],
+            cwd=staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "cache.shared", "group"],
+            cwd=staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "cache.type", "copy"],
+            cwd=staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "remote", "add", "-d", "splits", str(workflow["dvc"]["remote"])],
+            cwd=staging,
+            env=publication_environment,
+        )
+        lock = _with_cache_lock(cache)
+        try:
+            _run(
+                ["dvc", "add", "native_source_sets"],
+                cwd=staging,
+                env=publication_environment,
+            )
+            _run(
+                ["dvc", "push", "native_source_sets.dvc"],
+                cwd=staging,
+                env=publication_environment,
+            )
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+        # Keep the raw asset available to the trainer; the published DVC object is immutable.
+        asset.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(staging / "native_source_sets", asset)
+        shutil.copytree(staging, publication)
+    marker = run_root / ".state/native_splits.json"
+    write_json(
+        marker,
+        {
+            "schema": payload["schema"],
+            "provenance": payload["provenance"],
+            "pointer_sha256": sha256_file(publication / "native_source_sets.dvc"),
+            "manifest_sha256": sha256_file(asset / "manifest.json"),
+            "assignments_sha256": sha256_file(asset / "assignments.parquet"),
+        },
+    )
+    return marker
+
+
 def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
     """Run one deterministic training entity and record its exact checkpoint."""
     config = load_yaml(config_path)
@@ -487,6 +679,7 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         f"output.experiment_name={training['experiment_name']}",
         "output.save_checkpoints=true",
         "training.run_final_evaluation=false",
+        f"native.fold_manifest={run_root / 'inputs/native_source_sets/manifest.json'}",
     ]
     if training.get("init_checkpoint") is not None:
         pinned_init_checkpoint = run_root / "inputs/training_init_checkpoint.pt"
@@ -501,6 +694,17 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
                 "Pinned training initialization checkpoint failed validation"
             )
         overrides.append(f"training.init_checkpoint_path={pinned_init_checkpoint}")
+    if training.get("resume_checkpoint") is not None:
+        pinned_resume_checkpoint = run_root / "inputs/training_resume_checkpoint.pt"
+        manifest = load_yaml(run_root / "manifest.yaml")
+        expected_sha256 = str(manifest["training_input"]["checkpoint_sha256"])
+        if (
+            not pinned_resume_checkpoint.is_file()
+            or pinned_resume_checkpoint.is_symlink()
+            or sha256_file(pinned_resume_checkpoint) != expected_sha256
+        ):
+            raise ValueError("Pinned training resume checkpoint failed validation")
+        overrides.append(f"training.resume_checkpoint_path={pinned_resume_checkpoint}")
     for override in overrides:
         command.extend(["--override", override])
 
@@ -557,12 +761,8 @@ def _crossval_fold_config(config: dict[str, Any], fold: int) -> dict[str, Any]:
         "max_batches": options.get("max_batches"),
         "overrides": [
             *[str(value) for value in options.get("overrides", [])],
-            "training.crossval_enabled=true",
-            "training.node_split_strategy=crossval",
-            f"training.crossval_num_folds={folds}",
-            f"training.crossval_fold_index={fold}",
-            f"training.crossval_holdout_role={options.get('holdout_role', 'test')}",
-            f"training.crossval_manifest_path={options['split_manifest']}",
+            f"native.num_folds={folds}",
+            f"native.fold_index={fold}",
             f"training.seed={int(options['model_seed'])}",
         ],
     }
@@ -579,11 +779,6 @@ def train_crossval_fold(
     """Train one deterministic cross-validation fold."""
     config = load_yaml(config_path)
     options = config["crossval"]
-    split_manifest = source_root / str(options["split_manifest"])
-    if not split_manifest.is_file():
-        raise FileNotFoundError(
-            f"Cross-validation split manifest is missing: {split_manifest}"
-        )
     fold_config = _crossval_fold_config(config, fold)
     fold_root = _crossval_fold_root(config, run_root, fold)
     if fold_root.exists():
@@ -592,6 +787,8 @@ def train_crossval_fold(
     fold_config_path = fold_root / "config.yaml"
     write_yaml(fold_config_path, fold_config)
 
+    build_native_splits(fold_config_path, source_root, fold_root)
+    split_manifest = fold_root / "inputs/native_source_sets/manifest.json"
     train_model(fold_config_path, source_root, fold_root)
     checkpoint, model_root = training_artifact_paths(fold_config, fold_root)
     training_manifest = model_root / "training_manifest.json"
@@ -774,18 +971,13 @@ def finalize_crossval(config_path: Path, run_root: Path) -> Path:
         writer.writeheader()
         writer.writerows(aggregate_rows)
 
-    split_manifest_identities = {
-        (
-            str(record["split_manifest"]),
-            str(record["split_manifest_sha256"]),
-        )
-        for record in fold_records
-    }
-    if len(split_manifest_identities) != 1:
+    split_hashes = {str(record["split_manifest_sha256"]) for record in fold_records}
+    if len(split_hashes) != 1:
         raise ValueError(
             "Cross-validation folds do not share one split manifest identity"
         )
-    split_manifest_path, split_manifest_sha256 = split_manifest_identities.pop()
+    split_manifest_sha256 = split_hashes.pop()
+    split_manifest_path = fold_records[0]["split_manifest"]
 
     manifest = output_dir / "crossval_manifest.json"
     write_json(
@@ -1147,6 +1339,8 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     config = load_yaml(config_path)
     validate_workflow_contract(config)
     preprocessing = config["preprocessing"]
+    if preprocessing.get("processor", "offline") == "native_wastewater_history":
+        return _run_native_wastewater_history_repair(config, source_root, run_root)
     source_config = source_root / Path(str(preprocessing["base_config"]))
     effective = _load_preprocessing_document(source_config, source_root)
     output_root = run_root / "outputs/preprocessing"
@@ -1209,6 +1403,79 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     return output_marker
 
 
+def _run_native_wastewater_history_repair(
+    config: dict[str, Any], source_root: Path, run_root: Path
+) -> Path:
+    """Version the corrected causal history without changing the parent asset."""
+    import xarray as xr
+
+    from data.preprocess.processors.native_wastewater_processor import (
+        qa_native_wastewater_history_repair,
+        rebuild_native_wastewater_histories,
+        write_native_wastewater_observations,
+    )
+
+    preprocessing = config["preprocessing"]
+    pointer = source_root / preprocessing["input_pointer"]
+    identity = dvc_output(pointer)
+    if identity["md5"] != preprocessing["parent_md5"]:
+        raise ValueError("Wastewater parent DVC identity differs from the pinned input")
+    parent_path = (pointer.parent / identity["path"]).resolve(strict=True)
+    parent_path.relative_to(source_root.resolve(strict=True))
+    output_root = run_root / "outputs/preprocessing"
+    if output_root.exists() and any(output_root.iterdir()):
+        raise FileExistsError(
+            "Preprocessing output root is not empty for this immutable run"
+        )
+    output_root.mkdir(parents=True, exist_ok=True)
+    effective_path = output_root / "effective_config.yaml"
+    write_yaml(effective_path, preprocessing)
+    dataset_path = output_root / preprocessing_dataset_filename(config)
+    parent_hash = _tree_digest(parent_path)
+    with xr.open_zarr(parent_path) as opened:
+        parent = opened.load()
+        repaired = rebuild_native_wastewater_histories(parent)
+        write_native_wastewater_observations(repaired, dataset_path)
+        with xr.open_zarr(dataset_path) as restored:
+            qa = qa_native_wastewater_history_repair(parent, restored.load())
+    if _tree_digest(parent_path) != parent_hash:
+        raise ValueError("Wastewater parent changed during history repair")
+    qa_path = output_root / "qa.json"
+    write_json(
+        qa_path,
+        {
+            "schema_version": 3,
+            **qa,
+            "parent_dvc_md5": identity["md5"],
+            "parent_pointer": preprocessing["input_pointer"],
+            "parent_tree_sha256": parent_hash,
+            "dataset_relative": str(dataset_path.relative_to(run_root)),
+            "dataset_tree_sha256": _tree_digest(dataset_path),
+            "producer_sha256": {
+                name: sha256_file(source_root / name)
+                for name in (
+                    "data/preprocess/processors/native_wastewater_processor.py",
+                    "data/preprocess/smoothing.py",
+                    "scripts/workflow/run_support.py",
+                )
+            },
+            "effective_config_sha256": sha256_file(effective_path),
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    marker = output_root / ".preprocessed.done"
+    write_json(
+        marker,
+        {
+            "dataset": str(dataset_path),
+            "dataset_sha256": _tree_digest(dataset_path),
+            "qa": str(qa_path),
+            "qa_sha256": sha256_file(qa_path),
+        },
+    )
+    return marker
+
+
 def _tree_digest(root: Path) -> str:
     """Hash a regular-file tree without following links."""
     digest = hashlib.sha256()
@@ -1223,21 +1490,30 @@ def _tree_digest(root: Path) -> str:
 def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     """Publish a QA-passed dataset as a run-owned DVC pointer."""
     config = load_yaml(config_path)
-    dataset_name = preprocessing_dataset_name(config)
-    dataset_pointer = f"{dataset_name}.nc.dvc"
-    publication_payload = f"{dataset_name}.nc"
+    publication_payload = preprocessing_dataset_filename(config)
+    dataset_pointer = f"{publication_payload}.dvc"
+    directory_output = publication_payload.endswith(".zarr")
     output_root = run_root / "outputs/preprocessing"
     marker_path = output_root / ".preprocessed.done"
     marker = json.loads(marker_path.read_text())
-    dataset = Path(str(marker["dataset"])).resolve(strict=True)
+    dataset = Path(str(marker["dataset"]))
+    if dataset.is_symlink():
+        raise ValueError("Preprocessed dataset must not be a symlink")
+    dataset = dataset.resolve(strict=True)
     dataset.relative_to(output_root.resolve(strict=True))
-    if dataset.is_symlink() or not dataset.is_file():
-        raise ValueError("Preprocessed dataset must be a non-symlink NetCDF file")
-    if sha256_file(dataset) != str(marker["dataset_sha256"]):
+    if not (dataset.is_dir() if directory_output else dataset.is_file()):
+        raise ValueError("Preprocessed dataset has the wrong file format")
+    digest = _tree_digest if directory_output else sha256_file
+    if digest(dataset) != str(marker["dataset_sha256"]):
         raise ValueError("Preprocessed dataset changed after QA")
     qa_path = Path(str(marker["qa"])).resolve(strict=True)
     if sha256_file(qa_path) != str(marker["qa_sha256"]):
         raise ValueError("Preprocessing QA record changed before publication")
+    if (
+        directory_output
+        and json.loads(qa_path.read_text()).get("qa_passed") is not True
+    ):
+        raise ValueError("Wastewater repair QA did not pass")
 
     destination = output_root / "publication"
     if destination.exists():
@@ -1256,24 +1532,65 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     payload = scratch_staging / publication_payload
     commit_staging = output_root / f".publication.commit-{os.getpid()}"
     try:
-        shutil.copy2(dataset, payload)
-        if sha256_file(payload) != str(marker["dataset_sha256"]):
+        if directory_output:
+            shutil.copytree(dataset, payload)
+        else:
+            shutil.copy2(dataset, payload)
+        if digest(payload) != str(marker["dataset_sha256"]):
             raise ValueError("Publication staging changed the processed dataset")
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
-        _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)
+        publication_environment = os.environ.copy()
+        publication_environment["DVC_SITE_CACHE_DIR"] = str(
+            scratch_staging / ".dvc/tmp/site-cache"
+        )
+        _run(
+            ["dvc", "init", "--no-scm"],
+            cwd=scratch_staging,
+            env=publication_environment,
+        )
         _run(
             ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
             cwd=scratch_staging,
+            env=publication_environment,
         )
-        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=scratch_staging)
-        _run(["dvc", "config", "cache.dir", str(cache)], cwd=scratch_staging)
-        _run(["dvc", "config", "cache.shared", "group"], cwd=scratch_staging)
-        _run(["dvc", "config", "cache.type", "symlink"], cwd=scratch_staging)
+        _run(
+            ["dvc", "config", "core.remote", "mn5-nfs"],
+            cwd=scratch_staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "core.site_cache_dir", ".dvc/tmp"],
+            cwd=scratch_staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "cache.dir", str(cache)],
+            cwd=scratch_staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "cache.shared", "group"],
+            cwd=scratch_staging,
+            env=publication_environment,
+        )
+        _run(
+            ["dvc", "config", "cache.type", "symlink"],
+            cwd=scratch_staging,
+            env=publication_environment,
+        )
         lock_handle = _with_cache_lock(cache)
         try:
-            _run(["dvc", "add", publication_payload], cwd=scratch_staging)
-            _run(["dvc", "push", dataset_pointer], cwd=scratch_staging)
+            _run(
+                ["dvc", "add", publication_payload],
+                cwd=scratch_staging,
+                env=publication_environment,
+            )
+            _run(
+                ["dvc", "push", dataset_pointer],
+                cwd=scratch_staging,
+                env=publication_environment,
+            )
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
             lock_handle.close()
@@ -1577,13 +1894,23 @@ def evaluate_configured_model(
         expected_sha256 = str(evaluation_input["checkpoint_sha256"])
         if sha256_file(resolved_checkpoint) != expected_sha256:
             raise ValueError("Pinned evaluation checkpoint failed SHA-256 validation")
-    return evaluate_best(
-        resolved_checkpoint,
-        run_root / "outputs/evaluation",
-        str(evaluation["split"]),
-        [str(value) for value in evaluation.get("overrides", [])],
-        bool(evaluation.get("granular", False)),
-    )
+    report = config["workflow"].get("target") == "train_evaluate_report"
+    splits = evaluation_splits(config)
+    for split in splits:
+        manifest_path = evaluate_best(
+            resolved_checkpoint,
+            run_root / "outputs/evaluation",
+            split,
+            [str(value) for value in evaluation.get("overrides", [])],
+            report or bool(evaluation.get("granular", False)),
+        )
+    if report or len(splits) > 1:
+        manifest = json.loads(manifest_path.read_text())
+        manifest["splits"] = list(splits)
+        for artifact in manifest["artifacts"]:
+            artifact["required"] = True
+        write_json(manifest_path, manifest)
+    return manifest_path
 
 
 def finalize_ablation(
@@ -1920,15 +2247,25 @@ def retain_training_evidence(
     resolved_run = run_root.resolve(strict=True)
     resolved_model = model_root.resolve(strict=True)
     resolved_model.relative_to(resolved_run)
-    training = config["training"]
+    imported = config.get("workflow", {}).get("kind") == "evaluate"
+    training = (
+        {"experiment_name": "imported", "model_id": "model"}
+        if imported
+        else config["training"]
+    )
     experiment_name = _safe_component(
         training["experiment_name"], field="training.experiment_name"
     )
     model_id = _safe_component(training["model_id"], field="training.model_id")
     destination = run_root / "evidence/training" / experiment_name / model_id
-    if destination.exists():
+    # Snakemake creates output parent directories before it starts a shell rule.
+    # Permit that empty directory, but never replace existing retained evidence.
+    if destination.is_symlink() or (
+        destination.exists()
+        and (not destination.is_dir() or any(destination.iterdir()))
+    ):
         raise FileExistsError(
-            "Training evidence destination already exists and will not be "
+            "Training evidence destination is occupied and will not be "
             f"overwritten: {destination}"
         )
 
@@ -1957,6 +2294,16 @@ def retain_training_evidence(
         }
         for path in selected
     }
+    producer_input = None
+    if imported:
+        producer_input = load_yaml(run_root / "manifest.yaml")[
+            "training_evidence_input"
+        ]
+        expected_root = run_root / producer_input["pinned_model_root_relative"]
+        if resolved_model != expected_root.resolve(strict=True):
+            raise ValueError("Retention must consume the pinned producer evidence")
+        if artifact_hashes != producer_input["artifacts"]:
+            raise ValueError("Pinned producer evidence failed SHA-256 validation")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = destination.parent / f".{model_id}.staging-{os.getpid()}"
@@ -1973,12 +2320,22 @@ def retain_training_evidence(
                 "experiment_name": experiment_name,
                 "model_id": model_id,
                 "artifacts": artifact_hashes,
+                "training_evidence_input": producer_input,
             },
         )
 
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
-        _run(["dvc", "init", "--no-scm"], cwd=staging)
+        publication_environment = os.environ.copy()
+        publication_environment["DVC_SITE_CACHE_DIR"] = str(
+            staging / ".dvc/tmp/site-cache"
+        )
+        _run(["dvc", "init", "--no-scm"], cwd=staging, env=publication_environment)
+        _run(
+            ["dvc", "config", "core.site_cache_dir", ".dvc/tmp"],
+            cwd=staging,
+            env=publication_environment,
+        )
         _run(
             ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
             cwd=staging,
@@ -2008,6 +2365,7 @@ def retain_training_evidence(
             "dvc_pointer": "artifacts.dvc",
             "dvc_md5": pointer_identity["md5"],
             "artifacts": artifact_hashes,
+            "training_evidence_input": producer_input,
             "created_at": datetime.now(UTC).isoformat(),
         }
         write_json(staging / "retention.json", retention)
@@ -2132,6 +2490,9 @@ def build_parser() -> argparse.ArgumentParser:
     stage = subparsers.add_parser("stage-data")
     runtime_paths(stage)
 
+    splits = subparsers.add_parser("native-splits")
+    runtime_paths(splits)
+
     train = subparsers.add_parser("train")
     runtime_paths(train)
 
@@ -2202,6 +2563,8 @@ def main() -> None:
         prepare_run(args.config, args.source_root, args.run_root)
     elif args.command == "stage-data":
         stage_dvc(args.config, args.source_root, args.run_root)
+    elif args.command == "native-splits":
+        build_native_splits(args.config, args.source_root, args.run_root)
     elif args.command == "train":
         train_model(args.config, args.source_root, args.run_root)
     elif args.command == "preprocess":

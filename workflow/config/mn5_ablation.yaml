@@ -1,38 +1,21 @@
-# Declarative paired-seed campaign. Workers coordinate its fixed identity matrix
-# through JournalStorage; Optuna never samples ablation design parameters.
-
-run: {}
-source: {}
-container: {}
-
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
 workflow:
   kind: ablation
   target: ablation
-
-dvc:
-  targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
-    - outputs/region_embeddings/region_embeddings.pt.dvc
-
 ablation:
-  study_name: epiforecaster_ablation_v1
+  study_name: epiforecaster_native_ablation_v1
   campaign: configs/campaigns/ablation_default_v1.yaml
   workers: 4
-  # One-hour Slurm close-out is reserved for active trials and finalization.
   closeout_signal_seconds: 3600
   timeout_s: 21600
   sampler_seed: 42
   smoketest: false
   requeue_running: false
-
 resources:
   allocation:
-    account: bsc08
-    partition: acc
     qos: acc_bscls
-    nodes: 1
     tasks: 4
-    cpus_per_task: 20
     gres: gpu:4
     runtime: 420

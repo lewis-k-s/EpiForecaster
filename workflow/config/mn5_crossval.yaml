@@ -1,42 +1,27 @@
-run: {}
-source: {}
-container: {}
-
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
 workflow:
   kind: crossval
   target: crossval
-
-dvc:
-  targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
-    - outputs/region_embeddings/region_embeddings.pt.dvc
-
 crossval:
-  campaign_id: epiforecaster-representative-10fold-v2
+  campaign_id: epiforecaster-native-10fold-v4
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
   folds: 10
   model_seed: 42
   holdout_role: test
   max_batches: null
   overrides:
-    - output.save_checkpoints=true
-    - training.run_final_evaluation=false
-
+  - output.save_checkpoints=true
+  - training.run_final_evaluation=false
 evaluation:
   split: test
   granular: true
   overrides:
-    - training.val_workers=2
-
+  - training.val_workers=2
 resources:
   allocation:
-    account: bsc08
-    partition: acc
     qos: acc_bscls
-    nodes: 1
     tasks: 4
-    cpus_per_task: 20
     gres: gpu:4
     runtime: 420

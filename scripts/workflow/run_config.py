@@ -14,6 +14,11 @@ from typing import Any
 
 import yaml
 
+from scripts.workflow.config_templates import (
+    apply_template_overrides,
+    load_config_template,
+)
+
 
 ALLOCATION_FIELDS = (
     "account",
@@ -35,7 +40,7 @@ WORKFLOW_KINDS = {
     "preprocess",
 }
 WORKFLOW_TARGETS = {
-    "train": {"train", "train_evaluate"},
+    "train": {"train", "train_evaluate", "train_evaluate_report"},
     "evaluate": {"evaluate"},
     "hpo": {"hpo"},
     "ablation": {"ablation"},
@@ -65,6 +70,7 @@ DEPENDENCY_STAGES = {
     "selection",
     "promotion",
     "preprocessing",
+    "reporting",
 }
 
 
@@ -221,6 +227,15 @@ def preprocessing_dataset_name(workflow_config: dict[str, Any]) -> str:
     return value
 
 
+def preprocessing_dataset_filename(workflow_config: dict[str, Any]) -> str:
+    """Return the output format for the selected preprocessing processor."""
+    processor = workflow_config["preprocessing"].get("processor", "offline")
+    if processor not in {"offline", "native_wastewater_history"}:
+        raise ValueError(f"Unsupported preprocessing.processor: {processor!r}")
+    suffix = ".zarr" if processor == "native_wastewater_history" else ".nc"
+    return preprocessing_dataset_name(workflow_config) + suffix
+
+
 def scientific_source_files(paths: list[Path]) -> list[Path]:
     """Select source files whose changes invalidate scientific DAG rules."""
     selected: list[Path] = []
@@ -247,21 +262,26 @@ def stage_source_files(
     if stage not in DEPENDENCY_STAGES:
         raise ValueError(f"Unknown dependency stage: {stage}")
     selected = set(scientific_source_files(paths))
-    if stage in {"crossval", "training", "evaluation"} and isinstance(
-        workflow_config.get("crossval"),
-        dict,
-    ):
-        manifest = _safe_relative_path(
-            str(workflow_config["crossval"]["split_manifest"]),
-            field="crossval.split_manifest",
-        )
-        if manifest not in paths:
-            raise FileNotFoundError(
-                "Cross-validation split manifest is absent from the source "
-                f"bundle: {manifest}"
-            )
-        selected.add(manifest)
     return sorted(selected, key=lambda path: path.as_posix())
+
+
+def evaluation_splits(workflow_config: dict[str, Any]) -> tuple[str, ...]:
+    """Declare every split consumed by the evaluation stage."""
+    if workflow_config["workflow"].get("target") == "train_evaluate_report":
+        return ("val", "test")
+    evaluation = workflow_config.get("evaluation", {})
+    splits = evaluation.get("splits", [evaluation.get("split", "test")])
+    if (
+        not isinstance(splits, list)
+        or not splits
+        or any(
+            not isinstance(split, str) or split not in {"val", "test"}
+            for split in splits
+        )
+        or len(set(splits)) != len(splits)
+    ):
+        raise ValueError("evaluation.splits must contain distinct val/test entries")
+    return tuple(splits)
 
 
 def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
@@ -282,14 +302,27 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
 
     if kind == "preprocess":
         preprocessing = workflow_config["preprocessing"]
-        base_config = Path(str(preprocessing.get("base_config", "")))
-        if (
-            not base_config.parts
-            or base_config.is_absolute()
-            or ".." in base_config.parts
-        ):
-            raise ValueError("preprocessing.base_config must be a source-relative path")
-        preprocessing_dataset_name(workflow_config)
+        preprocessing_dataset_filename(workflow_config)
+        if preprocessing.get("processor", "offline") == "native_wastewater_history":
+            pointer = _safe_relative_path(
+                str(preprocessing.get("input_pointer", "")),
+                field="preprocessing.input_pointer",
+            )
+            if pointer.as_posix() not in workflow_config["dvc"]["targets"]:
+                raise ValueError(
+                    "Wastewater parent pointer must be a staged DVC target"
+                )
+            if not re.fullmatch(
+                r"[0-9a-f]{32}\.dir", str(preprocessing.get("parent_md5", ""))
+            ):
+                raise ValueError(
+                    "preprocessing.parent_md5 must pin a DVC directory identity"
+                )
+        else:
+            _safe_relative_path(
+                str(preprocessing.get("base_config", "")),
+                field="preprocessing.base_config",
+            )
         handoff_manifest = preprocessing.get("handoff_manifest")
         if handoff_manifest is not None:
             handoff_path = Path(str(handoff_manifest))
@@ -306,10 +339,11 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         raise ValueError(
             "provenance.training_evidence_retention must be 'run' or 'dvc'"
         )
-    if kind != "train" and evidence_retention == "dvc":
+    if "evaluation" in workflow_config:
+        evaluation_splits(workflow_config)
+    if kind not in {"train", "evaluate"} and evidence_retention == "dvc":
         raise ValueError(
-            "DVC training-evidence retention is currently supported only for "
-            "workflow.kind='train'"
+            "DVC training-evidence retention requires a training or evaluation workflow"
         )
 
     if kind == "train":
@@ -322,6 +356,16 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             if Path(value).name != value or value in {".", ".."}:
                 raise ValueError(f"training.{field} must be one safe path component")
         init_checkpoint = training.get("init_checkpoint")
+        resume_checkpoint = training.get("resume_checkpoint")
+        if init_checkpoint is not None and resume_checkpoint is not None:
+            raise ValueError(
+                "training init_checkpoint and resume_checkpoint are mutually exclusive"
+            )
+        if (
+            resume_checkpoint is not None
+            and not Path(str(resume_checkpoint)).is_absolute()
+        ):
+            raise ValueError("training.resume_checkpoint must be an absolute GPFS path")
         if init_checkpoint is not None and not Path(str(init_checkpoint)).is_absolute():
             raise ValueError(
                 "training.init_checkpoint must be an absolute GPFS path when provided"
@@ -339,6 +383,13 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             raise ValueError(
                 "evaluation.checkpoint must be an absolute GPFS path for an "
                 "evaluation-only workflow"
+            )
+        model_root = workflow_config["evaluation"].get("training_model_root")
+        if model_root is not None and not Path(str(model_root)).is_absolute():
+            raise ValueError("evaluation.training_model_root must be an absolute path")
+        if evidence_retention == "dvc" and model_root is None:
+            raise ValueError(
+                "Evaluation evidence retention requires evaluation.training_model_root"
             )
     elif kind == "ablation":
         ablation = workflow_config["ablation"]
@@ -363,7 +414,6 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         for field in (
             "base_config",
             "campaign_id",
-            "split_manifest",
             "folds",
             "model_seed",
         ):
@@ -372,9 +422,6 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         campaign_id = str(crossval["campaign_id"])
         if Path(campaign_id).name != campaign_id or campaign_id in {".", ".."}:
             raise ValueError("crossval.campaign_id must be one safe path component")
-        split_manifest = Path(str(crossval["split_manifest"]))
-        if split_manifest.is_absolute() or ".." in split_manifest.parts:
-            raise ValueError("crossval.split_manifest must be a source-relative path")
         model_seed = crossval["model_seed"]
         if (
             not isinstance(model_seed, int)
@@ -386,9 +433,9 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         if (
             not isinstance(folds, int)
             or isinstance(folds, bool)
-            or not 2 <= folds <= 100
+            or not 3 <= folds <= 100
         ):
-            raise ValueError("crossval.folds must be an integer between 2 and 100")
+            raise ValueError("crossval.folds must be an integer between 3 and 100")
     return kind
 
 
@@ -438,9 +485,11 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError(f"{workload_name}.workers must be an integer between 1 and 4")
 
+    qos = allocation.get("qos")
+    interactive = qos == "acc_interactive"
     expected = {
         "account": "bsc08",
-        "partition": "acc",
+        "partition": "accinteractive" if interactive else "acc",
         "nodes": 1,
         "tasks": expected_tasks,
         "cpus_per_task": 20,
@@ -451,12 +500,15 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         for key, value in expected.items()
         if allocation.get(key) != value
     }
-    qos = allocation.get("qos")
-    if qos not in {"acc_bscls", "acc_debug"}:
-        mismatches["qos"] = (qos, "acc_bscls or acc_debug")
+    if qos not in {"acc_bscls", "acc_debug", "acc_interactive"}:
+        mismatches["qos"] = (qos, "acc_bscls, acc_debug, or acc_interactive")
     runtime = allocation.get("runtime")
     if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
         mismatches["runtime"] = (runtime, "positive integer minutes")
+    elif interactive and runtime > 120:
+        mismatches["runtime"] = (runtime, "at most 120 minutes")
+    if interactive and expected_tasks > 2:
+        mismatches["tasks"] = (expected_tasks, "at most 2 interactive GPU tasks")
     if kind == "ablation":
         ablation = workflow_config["ablation"]
         expected_timeout_s = runtime * 60 - ablation["closeout_signal_seconds"]
@@ -557,6 +609,8 @@ def render_config(
     workflow_tooling_key: str,
     snakemake_version: str,
     snakemake_bin: Path,
+    variant: str | None = None,
+    overrides: list[str] | None = None,
 ) -> dict[str, Any]:
     paths = copy_source_snapshot(repo_root, snapshot_root)
     try:
@@ -566,13 +620,39 @@ def render_config(
     else:
         snapshot_template = snapshot_root / relative_template
 
-    document = yaml.safe_load(snapshot_template.read_text())
-    if not isinstance(document, dict):
-        raise ValueError(f"Workflow template must be a mapping: {template_path}")
+    document = load_config_template(
+        snapshot_template, root=snapshot_root, variant=variant
+    )
+    document = apply_template_overrides(document, overrides or [])
 
     validate_code_data_separation(snapshot_root, paths, document)
     validate_workflow_contract(document)
     validate_mn5_allocation(document)
+    kind = workflow_kind(document)
+    section = document.get(
+        {"train": "training", "hpo": "optuna", "crossval": "crossval"}.get(kind, "")
+    )
+    if section is not None:
+        from models.configs import EpiForecasterConfig
+
+        model_config = EpiForecasterConfig.load(
+            snapshot_root
+            / _safe_relative_path(
+                str(section["base_config"]), field=f"{kind}.base_config"
+            ),
+            overrides=section.get("overrides", []),
+        )
+        if not model_config.native.enabled:
+            raise ValueError("This worktree requires native.enabled=true")
+        if model_config.native.wastewater_enabled:
+            pointer = str(
+                Path(model_config.native.root)
+                / f"{model_config.native.wastewater_filename}.dvc"
+            )
+            if pointer not in document["dvc"]["targets"]:
+                raise ValueError(
+                    f"Configured wastewater input is not staged: {pointer}"
+                )
 
     identity = git_identity(repo_root, snapshot_root=snapshot_root, paths=paths)
     source_root = run_root / "source"
@@ -605,6 +685,11 @@ def render_config(
     )
     document.setdefault("provenance", {})
     document["provenance"].setdefault("training_evidence_retention", "run")
+    document["provenance"]["template"] = {
+        "path": str(template_path),
+        "variant": variant,
+        "overrides": overrides or [],
+    }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -727,6 +812,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     render = subparsers.add_parser("render")
     render.add_argument("--template", type=Path, required=True)
+    render.add_argument("--variant")
+    render.add_argument("--override", action="append", default=[])
     render.add_argument("--output", type=Path, required=True)
     render.add_argument("--dispatch-file", type=Path, required=True)
     render.add_argument("--file-list", type=Path, required=True)
@@ -756,6 +843,8 @@ def main() -> None:
     if args.command == "render":
         render_config(
             template_path=args.template,
+            variant=args.variant,
+            overrides=args.override,
             output_path=args.output,
             dispatch_file_path=args.dispatch_file,
             file_list_path=args.file_list,

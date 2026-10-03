@@ -583,6 +583,7 @@ submit_run() {
     "$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
     "$RUN_ROOT"
     "$SNAKEMAKE_BIN"
+    "$CONTAINER_SIF"
     "$TASKS"
     "$CPUS_PER_TASK"
     batch
@@ -602,6 +603,7 @@ submit_run() {
 discover_interactive_allocation() {
   local -a candidates
 
+  # Debug allocations need an explicit ID; do not discover an unrelated batch job.
   mapfile -t candidates < <(
     squeue -h -u "$USER" -t RUNNING -o '%i|%q' \
       | awk -F '|' '$2 == "acc_interactive" { print $1 }'
@@ -615,7 +617,7 @@ discover_interactive_allocation() {
 
 validate_interactive_allocation() {
   local job_id="$1"
-  local record state user_id account qos partition nodes tasks cpus alloc_tres
+  local record state user_id account qos partition batch_flag nodes tasks cpus alloc_tres
   local gpu_count required_cpus end_time end_epoch now_epoch remaining_seconds
 
   record="$(scontrol show job -o "$job_id")"
@@ -624,6 +626,7 @@ validate_interactive_allocation() {
   account="$(job_field "$record" Account)"
   qos="$(job_field "$record" QOS)"
   partition="$(job_field "$record" Partition)"
+  batch_flag="$(job_field "$record" BatchFlag)"
   nodes="$(job_field "$record" NumNodes)"
   tasks="$(job_field "$record" NumTasks)"
   cpus="$(job_field "$record" NumCPUs)"
@@ -634,9 +637,10 @@ validate_interactive_allocation() {
   if [ "$state" != "RUNNING" ] \
     || [ "$user_id" != "$USER" ] \
     || [ "$account" != "$ACCOUNT" ] \
-    || [ "$qos" != "acc_interactive" ] \
+    || { [ "$qos" != "acc_interactive" ] && [ "$qos" != "acc_debug" ]; } \
+    || [ "$batch_flag" != "0" ] \
     || [[ "$partition" != acc* ]]; then
-    echo "Allocation $job_id is not a compatible running ACC interactive allocation" >&2
+    echo "Allocation $job_id is not a compatible running held ACC allocation" >&2
     return 1
   fi
   if ! [[ "$nodes" =~ ^[1-9][0-9]*$ && "$tasks" =~ ^[1-9][0-9]*$ && "$cpus" =~ ^[1-9][0-9]*$ ]]; then
@@ -688,6 +692,7 @@ attach_worker() {
 
   set +e
   srun \
+    --job-name=epi-coordinator \
     --jobid="$job_id" \
     --external-launcher \
     --open-mode=append \
@@ -696,6 +701,7 @@ attach_worker() {
     "$coordinator" \
     "$RUN_ROOT" \
     "$SNAKEMAKE_BIN" \
+    "$CONTAINER_SIF" \
     "$TASKS" \
     "$CPUS_PER_TASK" \
     existing-allocation \

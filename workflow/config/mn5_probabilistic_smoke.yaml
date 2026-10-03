@@ -1,23 +1,11 @@
-# Lightweight end-to-end acceptance configuration for Normal-NLL probabilistic
-# forecasting. Per-run paths and provenance fields are injected by
-# scripts/workflow/mn5_workflow.sh.
-
-run: {}
-source: {}
-container: {}
-
+extends:
+- workflow/config/profiles/native_inputs.yaml
+- workflow/config/profiles/acc.yaml
 workflow:
   kind: hpo
   target: hpo
-
-dvc:
-  targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
-    - outputs/region_embeddings/region_embeddings.pt.dvc
-
 optuna:
-  study_name: epiforecaster_probabilistic_hpo_smoke_v1
+  study_name: epiforecaster_native_normal_nll_hpo_smoke_v1
   base_config: configs/production_only/train_epifor_mn5_full.yaml
   workers: 1
   trials_per_worker: 1
@@ -30,30 +18,20 @@ optuna:
   search_space: default
   sample_training_loss_objective: false
   overrides:
-    - training.run_final_evaluation=false
-    - training.compile=false
-    - training.loss.joint.observation_loss=nll
-    - training.loss.joint.distribution_family=normal
-
+  - training.run_final_evaluation=false
+  - training.compile=false
+  - training.loss.joint.observation_loss=nll
+  - training.loss.joint.distribution_family=normal
 evaluation:
   split: test
   granular: true
   overrides:
-    - training.max_batches=1
-    - training.compile=false
-    - training.val_workers=1
-    - training.test_workers=1
-
+  - training.max_batches=1
+  - training.compile=false
+  - training.val_workers=1
+  - training.test_workers=1
 promotion:
   root: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/promoted
-
 resources:
   allocation:
-    account: bsc08
-    partition: acc
-    qos: acc_debug
-    nodes: 1
-    tasks: 1
-    cpus_per_task: 20
-    gres: gpu:1
     runtime: 20

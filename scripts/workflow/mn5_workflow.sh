@@ -19,6 +19,7 @@ REMOTE_CONTAINER_SIF="${REMOTE_CONTAINER_SIF:?REMOTE_CONTAINER_SIF must be confi
 DVC_REMOTE_PATH="${DVC_REMOTE_PATH:?DVC_REMOTE_PATH must be configured}"
 DVC_CACHE_PATH="${DVC_CACHE_PATH:?DVC_CACHE_PATH must be configured}"
 TEMPLATE="${WORKFLOW_CONFIG_TEMPLATE:-$REPO_ROOT/workflow/config/mn5_train.yaml}"
+TEMPLATE_ARGUMENTS=()
 SNAKEMAKE_EXPECTED_VERSION="9.23.1"
 TOOLING_KEY=""
 REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"
@@ -32,7 +33,7 @@ REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") prepare [run-id] [--config TEMPLATE]
+  $(basename "$0") prepare [run-id] [--config TEMPLATE] [--variant NAME] [--override KEY=VALUE]
   $(basename "$0") dry-run <run-id>
   $(basename "$0") run <run-id>
   $(basename "$0") run-interactive <run-id> [allocation-job-id]
@@ -44,7 +45,7 @@ prepare snapshots this worktree into an atomically reserved project-GPFS run.
 The default template is workflow/config/mn5_train.yaml; use --config to select
 evaluation, preprocessing, cross-validation, HPO, or ablation.
 run submits the one-node ACC allocation declared by that immutable config.
-run-interactive attaches the same run to one compatible active allocation.
+run-interactive attaches the same run to a held acc_interactive or acc_debug allocation.
 EOF
 }
 
@@ -178,7 +179,8 @@ render_run_bundle() {
     --dvc-cache "$DVC_CACHE_PATH" \
     --workflow-tooling-key "$TOOLING_KEY" \
     --snakemake-version "$SNAKEMAKE_EXPECTED_VERSION" \
-    --snakemake-bin "$REMOTE_SNAKEMAKE_BIN"
+    --snakemake-bin "$REMOTE_SNAKEMAKE_BIN" \
+    ${TEMPLATE_ARGUMENTS[@]+"${TEMPLATE_ARGUMENTS[@]}"}
 }
 
 # Copy the complete directory-shaped bundle into a unique hidden staging leaf.
@@ -371,6 +373,13 @@ prepare_command() {
         fi
 
         TEMPLATE="$2"
+        shift 2
+        ;;
+      --variant|--override)
+        if [ "$#" -lt 2 ]; then
+          usage_error
+        fi
+        TEMPLATE_ARGUMENTS+=("$1" "$2")
         shift 2
         ;;
       *)
