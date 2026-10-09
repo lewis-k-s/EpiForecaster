@@ -230,9 +230,13 @@ def preprocessing_dataset_name(workflow_config: dict[str, Any]) -> str:
 def preprocessing_dataset_filename(workflow_config: dict[str, Any]) -> str:
     """Return the output format for the selected preprocessing processor."""
     processor = workflow_config["preprocessing"].get("processor", "offline")
-    if processor not in {"offline", "native_wastewater_history"}:
+    if processor not in {
+        "offline",
+        "native_wastewater_history",
+        "native_mortality_features",
+    }:
         raise ValueError(f"Unsupported preprocessing.processor: {processor!r}")
-    suffix = ".zarr" if processor == "native_wastewater_history" else ".nc"
+    suffix = ".nc" if processor == "offline" else ".zarr"
     return preprocessing_dataset_name(workflow_config) + suffix
 
 
@@ -303,15 +307,16 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     if kind == "preprocess":
         preprocessing = workflow_config["preprocessing"]
         preprocessing_dataset_filename(workflow_config)
-        if preprocessing.get("processor", "offline") == "native_wastewater_history":
+        if preprocessing.get("processor", "offline") in {
+            "native_wastewater_history",
+            "native_mortality_features",
+        }:
             pointer = _safe_relative_path(
                 str(preprocessing.get("input_pointer", "")),
                 field="preprocessing.input_pointer",
             )
             if pointer.as_posix() not in workflow_config["dvc"]["targets"]:
-                raise ValueError(
-                    "Wastewater parent pointer must be a staged DVC target"
-                )
+                raise ValueError("Native parent pointer must be a staged DVC target")
             if not re.fullmatch(
                 r"[0-9a-f]{32}\.dir", str(preprocessing.get("parent_md5", ""))
             ):
@@ -644,6 +649,17 @@ def render_config(
         )
         if not model_config.native.enabled:
             raise ValueError("This worktree requires native.enabled=true")
+        deaths_pointer = str(
+            Path(model_config.native.root)
+            / f"{model_config.native.deaths_filename}.dvc"
+        )
+        if (
+            model_config.native.mortality_features_enabled
+            and deaths_pointer not in document["dvc"]["targets"]
+        ):
+            raise ValueError(
+                f"Configured mortality input is not staged: {deaths_pointer}"
+            )
         if model_config.native.wastewater_enabled:
             pointer = str(
                 Path(model_config.native.root)

@@ -1,0 +1,26 @@
+workflow:
+  kind: preprocess
+  target: preprocess
+dvc:
+  targets:
+  - data/processed/native_support/obs_deaths_abs_excess.zarr.dvc
+  provenance_targets: []
+preprocessing:
+  processor: native_mortality_features
+  input_pointer: data/processed/native_support/obs_deaths_abs_excess.zarr.dvc
+  parent_md5: c0e4f20c5e84612c83a86ec55b469b6c.dir
+  dataset_name: obs_deaths_abs_mortality_features_v1
+  features:
+    short_window_days: 7
+    long_window_days: 14
+    lag_days: 1
+resources:
+  allocation:
+    account: bsc08
+    partition: accinteractive
+    qos: acc_interactive
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 10

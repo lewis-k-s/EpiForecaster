@@ -32,6 +32,8 @@ def native_dataset(config: EpiForecasterConfig) -> NativeSupportDataset:
             mobility_enabled=config.native.mobility_enabled,
             wastewater_enabled=config.native.wastewater_enabled,
             wastewater_filename=config.native.wastewater_filename,
+            deaths_filename=config.native.deaths_filename,
+            mortality_features_enabled=config.native.mortality_features_enabled,
             include_vaccination=config.native.include_vaccination,
             include_od_context=True,
         ),
@@ -78,7 +80,7 @@ def split_identity(config: EpiForecasterConfig, dataset: NativeSupportDataset) -
     for name in (
         "native_graph.zarr",
         "obs_admissions.zarr",
-        "obs_deaths_abs_excess.zarr",
+        config.native.deaths_filename,
         "overlap_edges.parquet",
     ):
         inputs[name] = root / name
@@ -117,6 +119,7 @@ def split_identity(config: EpiForecasterConfig, dataset: NativeSupportDataset) -
             "min_horizon_observed_fraction": config.data.min_horizon_observed_fraction,
             "confirmation_guard": config.native.confirmation_guard,
             "wastewater_enabled": config.native.wastewater_enabled,
+            "mortality_features_enabled": config.native.mortality_features_enabled,
         },
         "policy": {
             "seed": config.training.split_seed,

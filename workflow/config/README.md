@@ -59,6 +59,14 @@ before use. New runs should use a general template and an explicit checkpoint.
 The generic evaluation template requires its checkpoint to be filled before
 preparation.
 
+## Drafts with unpublished inputs
+
+`drafts/mn5_native_mortality_10ep.yaml` records the proposed mortality feature
+experiment. Its mortality DVC pointer is not yet present. Build and publish the
+asset with `mn5_native_mortality_features.yaml`, import the pointer, then promote
+the draft to this directory. The mortality tests check the draft's config; the
+standard template tests require every declared input pointer to exist.
+
 ## Retired interfaces
 
 Municipal training, synthetic model pretraining, latent-rescaling training

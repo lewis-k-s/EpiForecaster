@@ -1339,6 +1339,8 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     config = load_yaml(config_path)
     validate_workflow_contract(config)
     preprocessing = config["preprocessing"]
+    if preprocessing.get("processor", "offline") == "native_mortality_features":
+        return _run_native_mortality_features(config, source_root, run_root)
     if preprocessing.get("processor", "offline") == "native_wastewater_history":
         return _run_native_wastewater_history_repair(config, source_root, run_root)
     source_config = source_root / Path(str(preprocessing["base_config"]))
@@ -1476,6 +1478,80 @@ def _run_native_wastewater_history_repair(
     return marker
 
 
+def _run_native_mortality_features(
+    config: dict[str, Any], source_root: Path, run_root: Path
+) -> Path:
+    """Build a pinned native mortality asset in a new immutable run."""
+    import xarray as xr
+
+    from data.preprocess.processors.native_mortality_features_processor import (
+        MortalityFeaturesConfig,
+        add_native_mortality_features,
+        qa_native_mortality_features,
+        write_native_mortality_features,
+    )
+
+    preprocessing = config["preprocessing"]
+    feature_config = MortalityFeaturesConfig(**preprocessing["features"])
+    pointer = source_root / preprocessing["input_pointer"]
+    identity = dvc_output(pointer)
+    if identity["md5"] != preprocessing["parent_md5"]:
+        raise ValueError("Mortality parent DVC identity differs from the pinned input")
+    parent_path = (pointer.parent / identity["path"]).resolve(strict=True)
+    parent_path.relative_to(source_root.resolve(strict=True))
+    output_root = run_root / "outputs/preprocessing"
+    if output_root.exists() and any(output_root.iterdir()):
+        raise FileExistsError(
+            "Preprocessing output root is not empty for this immutable run"
+        )
+    output_root.mkdir(parents=True, exist_ok=True)
+    effective_path = output_root / "effective_config.yaml"
+    write_yaml(effective_path, preprocessing)
+    dataset_path = output_root / preprocessing_dataset_filename(config)
+    parent_hash = _tree_digest(parent_path)
+    with xr.open_zarr(parent_path) as opened:
+        parent = opened.load()
+        enriched = add_native_mortality_features(parent, feature_config)
+        write_native_mortality_features(enriched, dataset_path)
+        with xr.open_zarr(dataset_path) as restored:
+            qa = qa_native_mortality_features(parent, restored.load(), feature_config)
+    if _tree_digest(parent_path) != parent_hash:
+        raise ValueError("Mortality parent changed during preprocessing")
+    qa_path = output_root / "qa.json"
+    write_json(
+        qa_path,
+        {
+            "schema_version": 3,
+            **qa,
+            "parent_dvc_md5": identity["md5"],
+            "parent_pointer": preprocessing["input_pointer"],
+            "parent_tree_sha256": parent_hash,
+            "dataset_relative": str(dataset_path.relative_to(run_root)),
+            "dataset_tree_sha256": _tree_digest(dataset_path),
+            "producer_sha256": {
+                name: sha256_file(source_root / name)
+                for name in (
+                    "data/preprocess/processors/native_mortality_features_processor.py",
+                    "scripts/workflow/run_support.py",
+                )
+            },
+            "effective_config_sha256": sha256_file(effective_path),
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    marker = output_root / ".preprocessed.done"
+    write_json(
+        marker,
+        {
+            "dataset": str(dataset_path),
+            "dataset_sha256": _tree_digest(dataset_path),
+            "qa": str(qa_path),
+            "qa_sha256": sha256_file(qa_path),
+        },
+    )
+    return marker
+
+
 def _tree_digest(root: Path) -> str:
     """Hash a regular-file tree without following links."""
     digest = hashlib.sha256()
@@ -1513,7 +1589,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
         directory_output
         and json.loads(qa_path.read_text()).get("qa_passed") is not True
     ):
-        raise ValueError("Wastewater repair QA did not pass")
+        raise ValueError("Native preprocessing QA did not pass")
 
     destination = output_root / "publication"
     if destination.exists():

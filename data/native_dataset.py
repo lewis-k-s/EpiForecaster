@@ -194,9 +194,17 @@ class NativeDatasetConfig:
     mobility_enabled: bool = True
     wastewater_enabled: bool = False
     wastewater_filename: str = "obs_wastewater.zarr"
+    deaths_filename: str = "obs_deaths_abs_excess.zarr"
+    mortality_features_enabled: bool = False
     include_vaccination: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.mortality_features_enabled) is not bool:
+            raise ValueError("mortality_features_enabled must be a boolean")
+        if Path(
+            self.deaths_filename
+        ).name != self.deaths_filename or not self.deaths_filename.endswith(".zarr"):
+            raise ValueError("deaths_filename must be one Zarr filename")
         if self.input_window_length <= 0 or self.forecast_horizon <= 0:
             raise ValueError("window lengths must be positive")
         if self.window_stride <= 0:
@@ -347,9 +355,11 @@ class _DeathsSeries(_ObsSeries):
         masks: np.ndarray,
         ages: np.ndarray,
         expected: np.ndarray,
+        mortality_features: np.ndarray | None,
     ) -> None:
         super().__init__(dates, source_ids, values, masks, ages)
         self.expected = expected
+        self.mortality_features = mortality_features
 
 
 class _WastewaterSeries:
@@ -465,7 +475,7 @@ class NativeSupportDataset(Dataset):
         )
         self._od = self._load_od_store(root, config.od_source) if needs_od else None
         self._adm = self._load_admissions(root / "obs_admissions.zarr")
-        self._deaths = self._load_abs_deaths(root / "obs_deaths_abs_excess.zarr")
+        self._deaths = self._load_abs_deaths(root / config.deaths_filename)
         self._cases = self._load_cases(real_with_id_path)
         self._grid = self._cases.dates
         if not np.array_equal(self._deaths.dates, self._grid):
@@ -614,6 +624,19 @@ class NativeSupportDataset(Dataset):
                 [hist, np.zeros((self._L, 6 - hist.shape[1]), dtype=np.float32)],
                 axis=1,
             )
+        if self._config.mortality_features_enabled:
+            mortality = np.zeros((self._L, 5), dtype=np.float32)
+            if (
+                query.source_type == SOURCE_ABS
+                and query.source_id in self._deaths.columns
+            ):
+                features = self._deaths.mortality_features
+                assert features is not None
+                column = self._deaths.columns[query.source_id]
+                mortality = features[hist_slice, column].copy()
+                population = self._source_population(SOURCE_ABS, query.source_id)
+                mortality[:, :3] = np.log1p(mortality[:, :3] / population * _PER_100K)
+            hist = np.concatenate([hist, mortality], axis=1)
         if self._cases.vaccination is not None:
             vaccination = np.zeros((self._L, 3), dtype=np.float32)
             if query.source_type == SOURCE_MUNICIPALITY:
@@ -799,7 +822,37 @@ class NativeSupportDataset(Dataset):
             or not np.allclose(excess, values - expected, atol=1e-4)
         ):
             raise ValueError("ABS excess deaths store has invalid count or baseline")
-        return _DeathsSeries(dates, source_ids, values, masks, ages, expected)
+        mortality_features = None
+        if self._config.mortality_features_enabled:
+            from data.preprocess.processors.native_mortality_features_processor import (
+                MORTALITY_FEATURE_VARIABLES,
+                MortalityFeaturesConfig,
+                qa_native_mortality_features,
+            )
+
+            feature_config = MortalityFeaturesConfig(
+                short_window_days=ds.attrs["mortality_short_window_days"],
+                long_window_days=ds.attrs["mortality_long_window_days"],
+                lag_days=ds.attrs["mortality_lag_days"],
+            )
+            parent = ds.drop_vars(list(MORTALITY_FEATURE_VARIABLES))
+            parent.attrs = {
+                key: value
+                for key, value in ds.attrs.items()
+                if not key.startswith("mortality_")
+            }
+            qa_native_mortality_features(parent, ds, feature_config)
+            mortality_features = np.stack(
+                [expected]
+                + [
+                    np.asarray(ds[name].values, dtype=np.float32)
+                    for name in MORTALITY_FEATURE_VARIABLES
+                ],
+                axis=-1,
+            )
+        return _DeathsSeries(
+            dates, source_ids, values, masks, ages, expected, mortality_features
+        )
 
     def _load_cases(self, real_with_id_path: str | Path) -> _CasesSeries:
         ds = xr.open_zarr(real_with_id_path)

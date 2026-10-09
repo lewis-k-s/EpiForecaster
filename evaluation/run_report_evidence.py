@@ -54,6 +54,7 @@ def export_native_report_examples(
         native_root=Path(config.native.root),
         cases_path=Path(real_path),
         wastewater_filename=config.native.wastewater_filename,
+        deaths_filename=config.native.deaths_filename,
     )
     support = eligible_windows(
         window_support(rows, history, config.model.input_window_length)

@@ -1574,6 +1574,8 @@ class NativeSupportConfig:
     mobility_enabled: bool = True
     wastewater_enabled: bool = True
     wastewater_filename: str = "obs_wastewater.zarr"
+    deaths_filename: str = "obs_deaths_abs_excess.zarr"
+    mortality_features_enabled: bool = False
     include_vaccination: bool = True
     hetero_hidden_dim: int = 16
     hetero_parameter_budget: int = 100_000
@@ -1586,6 +1588,12 @@ class NativeSupportConfig:
     test_fraction: float = 0.1
 
     def __post_init__(self) -> None:
+        if type(self.mortality_features_enabled) is not bool:
+            raise ValueError("native.mortality_features_enabled must be a boolean")
+        if Path(
+            self.deaths_filename
+        ).name != self.deaths_filename or not self.deaths_filename.endswith(".zarr"):
+            raise ValueError("native.deaths_filename must be one Zarr filename")
         if Path(
             self.wastewater_filename
         ).name != self.wastewater_filename or not self.wastewater_filename.endswith(

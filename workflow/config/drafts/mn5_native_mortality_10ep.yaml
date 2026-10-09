@@ -1,0 +1,30 @@
+# Draft: promote after the named mortality asset has a published DVC pointer.
+extends:
+- workflow/config/mn5_native_plateau_diagnostics.yaml
+training:
+  experiment_name: native_mortality_features_v1
+  model_id: sir_mobility_on_f0_s42
+  overrides:
+  - data.dataset_path=data/processed/real_with_id_v3.zarr
+  - native.deaths_filename=obs_deaths_abs_mortality_features_v1.zarr
+  - native.mortality_features_enabled=true
+resources:
+  allocation:
+    partition: accinteractive
+    qos: acc_interactive
+    runtime: 60
+dvc:
+  targets:
+  - data/processed/real_with_id_v3.zarr.dvc
+  - data/processed/native_support/native_graph.zarr.dvc
+  - data/processed/native_support/obs_admissions.zarr.dvc
+  - data/processed/native_support/obs_deaths_abs_mortality_features_v1.zarr.dvc
+  - data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+  - data/processed/native_support/od_mitma.zarr.dvc
+  - data/processed/native_support/edar_catchment_edges.parquet.dvc
+  - data/processed/native_support/overlap_edges.parquet.dvc
+provenance:
+  diagnostic_reference_run: native-plateau-diag-20261009-a
+  diagnostic_intent: Add expected mortality and strictly past 7- and 14-day
+    observed mortality means with support fractions to both ABS heads. Use V3
+    clinical data and retain all four heads and the broad purged validation panel.

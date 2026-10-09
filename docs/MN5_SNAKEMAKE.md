@@ -57,6 +57,12 @@ The old native manifest records the parent input bundle; the repair receipt
 records the new asset's lineage. It does not imply that the other assets were
 rebuilt.
 
+`mn5_native_mortality_features.yaml` builds a new mortality asset from a pinned
+parent. It retains the daily targets and adds strictly past mortality summaries.
+Select it with `native.deaths_filename` and `native.mortality_features_enabled`.
+See [NATIVE_MORTALITY_FEATURES.md](NATIVE_MORTALITY_FEATURES.md) for the channel
+order, mask rules, and 10-epoch experiment template.
+
 
 ## GPU telemetry
 
