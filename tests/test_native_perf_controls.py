@@ -293,7 +293,7 @@ def test_wastewater_metadata_preserves_mask_and_censor_checks() -> None:
 def test_compiled_sir_core_preserves_values_gradients_and_strict_checks() -> None:
     eager = SIRRollForward(strict=True)
     compiled = SIRRollForward(strict=True)
-    compiled._rollout = torch.compile(
+    compiled._compiled_rollout = torch.compile(
         compiled._rollout, backend="aot_eager", fullgraph=True, dynamic=True
     )
     rates = {

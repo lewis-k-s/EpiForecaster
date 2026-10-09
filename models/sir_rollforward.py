@@ -17,6 +17,7 @@ Equations (discrete Euler):
 """
 
 import logging
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
@@ -54,6 +55,7 @@ class SIRRollForward(nn.Module):
         self.enforce_mass_conservation = enforce_mass_conservation
         self.residual_clip = residual_clip
         self.strict = strict
+        self._compiled_rollout: Callable[..., dict[str, torch.Tensor]] | None = None
 
         logger.info(
             f"Initialized SIRRollForward: dt={dt}, "
@@ -159,7 +161,12 @@ class SIRRollForward(nn.Module):
         # Validate and normalize initial states
         S0, I0, H0, R0 = self._sanitize_initial_states(S0, I0, H0, R0, population)
 
-        return self._rollout(
+        # The supported CUDA compiler fails on the batch-size-one specialization.
+        # Keep every sample and use the same eager equations for singleton tails.
+        rollout = self._rollout
+        if self._compiled_rollout is not None and batch_size > 1:
+            rollout = self._compiled_rollout
+        return rollout(
             beta_t,
             gamma_t,
             mortality_t,

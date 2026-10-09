@@ -48,6 +48,7 @@ from models.configs import (
     TrainingParams,
 )
 from models.native_forecaster import NativeEpiForecaster, NativeForecasterConfig
+from models.sir_rollforward import SIRRollForward
 from training.optim_factory import create_optimizer, create_scheduler
 from training.training_dynamics import (
     TrainingDynamicsWriter,
@@ -614,14 +615,16 @@ class NativeRuntime:
                     "native.compile_sir_rollout requires native.decoder=sir"
                 )
             rollout = self.model.base.sir_rollforward
-            rollout._rollout = torch.compile(
+            assert isinstance(rollout, SIRRollForward)
+            rollout._compiled_rollout = torch.compile(
                 rollout._rollout,
                 fullgraph=True,
                 dynamic=True,
                 mode=config.training.compile_mode,
             )
             logger.info(
-                "Compiled native SIR tensor rollout; strict checks remain eager"
+                "Compiled native SIR tensor rollout; singleton batches and strict "
+                "checks remain eager"
             )
         self.precision_policy = resolve_precision_policy(config.training, self.device)
         n_train_batches = math.ceil(len(sampler) / batch_size)

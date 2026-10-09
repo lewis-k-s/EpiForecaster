@@ -522,6 +522,12 @@ def test_native_pipeline_compile_on_and_off(tmp_path: Path, monkeypatch) -> None
         root = tmp_path / str(compile_enabled)
         root.mkdir()
         config = pipeline_config(root, strict=True, mobility=True)
+        build_for_config(config, Path(config.native.fold_manifest))
+        # Run a complete two-batch epoch whose final batch has one sample.
+        train_count = len(NativeRuntime(config).train_loader.sampler)
+        assert train_count > 2
+        config.training.batch_size = train_count - 1
+        config.training.max_batches = None
         config.native.compile_sir_rollout = compile_enabled
         config.native.compile_loss_scores = compile_enabled
         build_for_config(config, Path(config.native.fold_manifest))
