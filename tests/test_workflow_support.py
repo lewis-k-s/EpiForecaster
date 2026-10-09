@@ -2915,11 +2915,7 @@ def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
     assert "PYTHONFAULTHANDLER=1" in arguments
     assert "PYTHONUNBUFFERED=1" in arguments
     assert f"{sif.parent}:{sif.parent}:ro" in arguments
-    binds = [
-        line
-        for line in arguments
-        if line.startswith(f"{run_root}:")
-    ]
+    binds = [line for line in arguments if line.startswith(f"{run_root}:")]
     assert binds == [f"{run_root}:/workspace/run:rw"]
 
 

@@ -20,6 +20,12 @@ write_completion() {
   local temporary="$receipt.$$"
 
   trap - EXIT
+  local cache_script="$RUN_ROOT/source/scripts/workflow/node_input_cache.sh"
+  if [ -f "$cache_script" ] && command -v srun >/dev/null 2>&1; then
+    srun --nodes=1 --ntasks=1 --cpus-per-task=1 --exact \
+      bash "$cache_script" clean "$RUN_ROOT" \
+      || echo "Warning: allocation input cache cleanup failed" >&2
+  fi
   if [ ! -f "$receipt" ]; then
     printf '%s\n' \
       $'schema_version\t1' \

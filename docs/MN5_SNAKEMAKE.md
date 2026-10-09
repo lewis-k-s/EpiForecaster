@@ -331,9 +331,14 @@ coverage, run-context, aggregate table, and artifact manifest. Completion
 markers remain receipts rather than the sole scientific output contract.
 
 `stage_data` materializes the pinned DVC payloads once in the run workspace.
-Each worker then copies those inputs into rank-specific node-local scratch and
-mounts them read-only over the immutable source tree. GPFS remains authoritative
-for the Optuna journal, logs, checkpoints, outputs, and promotion records.
+The first scientific step copies them to an allocation-local cache on the node.
+The key includes the run config and data manifest. A lock protects construction;
+only a complete copy is published. All ranks and later stages mount this copy
+read-only. Each process keeps a private temporary directory. Shared leases keep
+the cache alive during execution, and the coordinator removes it on exit when
+no step still uses it. An abrupt allocation loss can leave node-local files;
+a later allocation uses a different cache path. GPFS remains authoritative for
+the journal, logs, checkpoints, outputs, and promotion records.
 
 ## Prepare and submit
 
