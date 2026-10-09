@@ -30,6 +30,7 @@ from training.training_dynamics import (
 
 MIN_ANALYSIS_ROWS = 20
 COMPONENT_FIELDS = (
+    "gradnorm_native_spatial_encoder",
     "gradnorm_sird_physics",
     "gradnorm_backbone_encoder",
     "gradnorm_mobility_gnn",

@@ -1,0 +1,76 @@
+extends:
+- workflow/config/mn5_train.yaml
+- workflow/config/profiles/native_causal_inputs.yaml
+training:
+  experiment_name: native_plateau_diagnostics_v1
+  model_id: sir_mobility_on_f0_s42
+  max_batches: null
+  overrides:
+  - model.input_window_length=60
+  - model.forecast_horizon=28
+  - training.epochs=10
+  - training.batch_size=32
+  - training.seed=42
+  - training.split_seed=42
+  - training.early_stopping_patience=null
+  - training.run_final_evaluation=false
+  - training.num_workers=4
+  - training.val_workers=2
+  - training.test_workers=2
+  - training.worker_blas_threads=1
+  - training.persistent_workers=true
+  - training.prefetch_factor=2
+  - training.enable_mixed_precision=true
+  - training.progress_log_frequency=100
+  - training.grad_norm_log_frequency=100
+  - training.component_gradient_diagnostics=true
+  - training.loss.joint.observation_loss=crps
+  - training.loss.joint.distribution_family=student_t
+  - training.loss.joint.distribution_df=5.0
+  - native.spatial_encoder=hetero
+  - native.decoder=sir
+  - native.mobility_enabled=true
+  - native.include_vaccination=true
+  - native.wastewater_enabled=true
+  - native.wastewater_filename=obs_wastewater_causal_v2.zarr
+  - native.fold_index=0
+  - native.num_folds=10
+  - native.validation_fraction=0.3
+  - native.test_fraction=0.1
+  - native.head_balanced_sampling=false
+  - native.od_graph_cache_size=512
+  - native.cache_od_target_weights=true
+  - native.precompute_loss_metadata=true
+  - native.compile_sir_rollout=true
+  - native.compile_loss_scores=true
+  - evaluation.selection_metric=wis
+  - evaluation.selection_aggregation=equal_head_mean
+  - evaluation.training_objective_diagnostic=true
+  - evaluation.epoch_diagnostics=true
+  - evaluation.training_panel_queries_per_source=3
+  - evaluation.minimum_validation_origins=56
+  - evaluation.origin_block_days=28
+  - output.save_checkpoints=true
+  - output.write_granular_eval=true
+  - output.granular_eval_format=parquet
+resources:
+  allocation:
+    qos: acc_debug
+    tasks: 1
+    gres: gpu:1
+    runtime: 120
+provenance:
+  diagnostic_reference_run: native-sir-mobility-full10ep-60cffe4-20261003-a
+  diagnostic_intent: Examine per-head generalization and wastewater calibration with
+    a broader purged validation calendar. The new split is a distinct experiment;
+    model and optimizer settings match the SIR mobility reference.
+  input_repairs:
+  - pointer: data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+    parent_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+    parent_dvc_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+    output_dvc_md5: 58f03caa79ebf978f298e3235fc5e205.dir
+    producing_run_id: native-ww-causal-v2-7c25445-20261002-c
+    producing_source_snapshot_sha256: c09887300f3303e8b7dad18ca6116127a4cc1603a62d49ebaeef5653c6b4ad17
+    qa_sha256: c190479dc0f3e3cc9f7756976bf49176f368d84895754a778795aeddc4c25bda
+    publication_receipt_sha256: 46598ea4875646f96ac3c4cd022e0df6b790c0060e08029e932648486571c708
+    publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-ww-causal-v2-7c25445-20261002-c/outputs/preprocessing/publication/receipt.json

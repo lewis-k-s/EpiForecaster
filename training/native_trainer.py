@@ -50,9 +50,15 @@ from models.configs import (
 from models.native_forecaster import NativeEpiForecaster, NativeForecasterConfig
 from models.sir_rollforward import SIRRollForward
 from training.optim_factory import create_optimizer, create_scheduler
+from training.native_diagnostics import (
+    fixed_training_panel,
+    native_component_gradient_norms,
+    native_gradient_group,
+)
 from training.training_dynamics import (
     TrainingDynamicsWriter,
     load_training_dynamics_identity,
+    sha256_file,
 )
 from utils.device import prefetch_enabled, resolve_device
 from utils.platform import select_multiprocessing_context
@@ -123,6 +129,11 @@ def _validation_epoch_record(
         record[f"wis_per_h_{head}"] = [
             _optional_float(value) for value in metrics.get(f"wis_per_h_{head}", [])
         ]
+        for key, value in metrics.items():
+            if key.startswith(("coverage_", "interval_width_")) and key.endswith(
+                f"_{head}"
+            ):
+                record[key] = _optional_float(value)
     record["censored_nll_ww"] = _optional_float(metrics.get("censored_nll_ww"))
     record["censored_count_ww"] = metrics.get("censored_count_ww", 0)
     if "training_objective_diagnostic" in metrics:
@@ -508,6 +519,24 @@ class NativeRuntime:
                 source_sets,
                 run_index=config.native.fold_index,
             )
+        validation_origins = {queries[i].forecast_origin for i in val_positions}
+        if len(validation_origins) < config.evaluation.minimum_validation_origins:
+            raise ValueError(
+                "Native validation has only "
+                f"{len(validation_origins)} origins after purging; requires "
+                f"{config.evaluation.minimum_validation_origins}"
+            )
+        self.validation_positions = val_positions
+        self.training_panel_positions = fixed_training_panel(
+            {
+                head: {
+                    source: sorted(items, key=lambda i: queries[i].forecast_origin)
+                    for source, items in sources.items()
+                }
+                for head, sources in self._head_source_items(train_positions).items()
+            },
+            config.evaluation.training_panel_queries_per_source,
+        )
         self.split_provenance = (
             self.source_sets.provenance
             if self.source_sets is not None
@@ -576,6 +605,16 @@ class NativeRuntime:
                 shuffle=False,
                 collate_fn=collate,
                 **test_kwargs,
+            )
+        self.training_panel_loader: DataLoader | None = None
+        if self.training_panel_positions:
+            self.training_panel_loader = DataLoader(
+                Subset(self.dataset, self.training_panel_positions),
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=collate,
+                num_workers=0,
+                generator=torch.Generator().manual_seed(config.training.split_seed),
             )
 
         # Adapter widths from a COLLATED batch (review R12 collation): the
@@ -883,6 +922,38 @@ class NativeTrainer(NativeRuntime):
         self.validation_epoch_trace: list[dict[str, object]] = []
         self.train_epoch_trace: list[dict[str, object]] = []
         self.test_epoch_trace: list[dict[str, object]] = []
+        self.training_panel_epoch_trace: list[dict[str, object]] = []
+        self.epoch_diagnostic_artifacts: list[dict[str, object]] = []
+        self.diagnostic_panels: dict[str, object] = {}
+        if config.evaluation.epoch_diagnostics:
+            panel_path = self.experiment_dir / "diagnostic_panels.json"
+            panel_payload = {
+                "schema_version": 1,
+                "selection": "evenly spaced eligible training origins per head/source",
+                "queries_per_source": config.evaluation.training_panel_queries_per_source,
+                "evaluation_max_batches": config.training.max_batches,
+                "panels": {
+                    split: [
+                        {
+                            "position": i,
+                            "head": self.dataset.head_at(i),
+                            "source_type": str(self.dataset.queries[i].source_type),
+                            "source_id": str(self.dataset.queries[i].source_id),
+                            "origin": int(self.dataset.queries[i].forecast_origin),
+                        }
+                        for i in positions
+                    ]
+                    for split, positions in (
+                        ("training_panel", self.training_panel_positions),
+                        ("val", self.validation_positions),
+                    )
+                },
+            }
+            panel_path.write_text(json.dumps(panel_payload, indent=2) + "\n")
+            self.diagnostic_panels = {
+                "path": panel_path.name,
+                "sha256": sha256_file(panel_path),
+            }
         self.start_epoch = 0
         self.resumed_train_trace: list[list[float]] = []
         self.resumed_val_trace: list[float | None] = []
@@ -998,6 +1069,12 @@ class NativeTrainer(NativeRuntime):
         }
         self.validation_epoch_trace = list(record["validation_epoch_trace"])
         self.train_epoch_trace = list(record.get("train_epoch_trace", []))
+        self.training_panel_epoch_trace = list(
+            record.get("training_panel_epoch_trace", [])
+        )
+        self.epoch_diagnostic_artifacts = list(
+            record.get("epoch_diagnostic_artifacts", [])
+        )
         self.resumed_train_trace = list(record["train_objective_trace"])
         self.resumed_val_trace = list(record["val_wis_trace"])
         self._save_checkpoint(
@@ -1032,7 +1109,7 @@ class NativeTrainer(NativeRuntime):
                 if self.val_loader is None:
                     val_trace.append(None)
                     continue
-                metrics = self._evaluate()
+                metrics = self._evaluate_epoch(epoch)
                 val_trace.append(metrics["wis"])
                 selection_score = metrics["selection_score"]
                 definition = metrics["selection_metric_definition"]
@@ -1231,6 +1308,7 @@ class NativeTrainer(NativeRuntime):
             "epoch_budget": self.config.training.epochs,
             "train_objective_trace": train_trace,
             "train_epoch_trace": list(self.train_epoch_trace),
+            **self._diagnostic_record(),
             **self._validation_history(val_trace),
             "validation_epoch_trace": list(self.validation_epoch_trace),
             "test_epoch_trace": list(self.test_epoch_trace),
@@ -1247,6 +1325,72 @@ class NativeTrainer(NativeRuntime):
             "precision_signature": create_precision_signature(self.precision_policy),
             "training_dynamics": load_training_dynamics_identity(self.experiment_dir),
             "evaluation_artifacts": artifact_paths,
+        }
+
+    def _evaluate_epoch(self, epoch: int) -> dict[str, Any]:
+        """Persist diagnostics without changing validation checkpoint selection."""
+        if not self.config.evaluation.epoch_diagnostics:
+            return self._evaluate()
+        output = self.experiment_dir / "epoch_diagnostics" / f"epoch_{epoch + 1:03d}"
+        output.mkdir(parents=True, exist_ok=True)
+        suffix = self.config.output.granular_eval_format
+        metadata = {"epoch": epoch + 1, "step": self.global_step}
+        metrics = self._evaluate(
+            granular_output_path=output / f"val_granular.{suffix}",
+            aggregate_output_dir=output,
+            granular_metadata=metadata,
+        )
+        if self.training_panel_loader is not None:
+            # The extra evaluation must not advance training dropout RNG state.
+            devices = [self.device.index or 0] if self.device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices):
+                panel_metrics = self._evaluate(
+                    loader=self.training_panel_loader,
+                    split_name="training_panel",
+                    granular_output_path=output / f"training_panel_granular.{suffix}",
+                    aggregate_output_dir=output,
+                    granular_metadata={
+                        **metadata,
+                        "generalization_claim": "fixed panel of training queries; diagnostic only",
+                    },
+                )
+            self.training_panel_epoch_trace.append(
+                _validation_epoch_record(
+                    epoch=epoch + 1,
+                    step=self.global_step,
+                    split="training_panel",
+                    metrics=panel_metrics,
+                )
+            )
+        self.epoch_diagnostic_artifacts.append(
+            {
+                "epoch": epoch + 1,
+                "step": self.global_step,
+                "files": [
+                    {
+                        "path": str(path.relative_to(self.experiment_dir)),
+                        "sha256": sha256_file(path),
+                    }
+                    for path in sorted(output.iterdir())
+                    if path.is_file()
+                ],
+            }
+        )
+        return metrics
+
+    def _diagnostic_record(self) -> dict[str, object]:
+        return {
+            "training_panel_epoch_trace": list(self.training_panel_epoch_trace),
+            "diagnostic_panels": dict(self.diagnostic_panels),
+            "epoch_diagnostic_artifacts": list(self.epoch_diagnostic_artifacts),
+            "component_gradient_groups": (
+                {
+                    name: native_gradient_group(name)
+                    for name, _ in self.model.named_parameters()
+                }
+                if self.config.training.component_gradient_diagnostics
+                else {}
+            ),
         }
 
     def _train_epoch(self, epoch: int) -> list[float]:
@@ -1308,6 +1452,19 @@ class NativeTrainer(NativeRuntime):
             metric_totals[9].add_(ww_count)
             self.optimizer.zero_grad()
             total.backward()
+            learning_rate_used = self.optimizer.param_groups[0]["lr"]
+            is_epoch_last = step + 1 == self.steps_per_epoch
+            component_norms = (
+                native_component_gradient_norms(self.model)
+                if self.config.training.component_gradient_diagnostics
+                and (
+                    (self.global_step + 1)
+                    % self.config.training.grad_norm_log_frequency
+                    == 0
+                    or is_epoch_last
+                )
+                else {}
+            )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.config.training.gradient_clip_value
             )
@@ -1335,12 +1492,11 @@ class NativeTrainer(NativeRuntime):
             if self.scheduler is not None:
                 self.scheduler.step()
             device_losses.append(total.detach())
-            is_epoch_last = step + 1 == self.steps_per_epoch
             log_progress = (
                 self.global_step % self.config.training.progress_log_frequency == 0
                 or is_epoch_last
             )
-            if log_progress:
+            if log_progress or component_norms:
                 progress_loss, progress_grad_norm = (
                     torch.stack((total.detach(), grad_norm.detach())).cpu().tolist()
                 )
@@ -1351,6 +1507,18 @@ class NativeTrainer(NativeRuntime):
                         "train_objective": progress_loss,
                         "grad_norm": progress_grad_norm,
                         "gradient_clip_threshold": self.config.training.gradient_clip_value,
+                        "lr": learning_rate_used,
+                        **component_norms,
+                        **{
+                            f"train_objective_{head}": float(components[head].detach())
+                            for head in _NATIVE_HEADS
+                        },
+                        **{
+                            f"train_support_{head}": float(
+                                components[f"{head}_n_eff"].detach()
+                            )
+                            for head in _NATIVE_HEADS
+                        },
                         **(
                             {"loss_metadata_active_heads": metadata_heads}
                             if self.config.native.precompute_loss_metadata
@@ -1455,6 +1623,7 @@ class NativeTrainer(NativeRuntime):
             "best_val_series_metrics": dict(self.best_val_series_metrics),
             "train_objective_trace": train_trace or [],
             "train_epoch_trace": list(self.train_epoch_trace),
+            **self._diagnostic_record(),
             **self._validation_history(val_trace or []),
             "validation_epoch_trace": list(self.validation_epoch_trace),
             "head_counts": self.dataset.head_counts,
@@ -1493,6 +1662,7 @@ class NativeTrainer(NativeRuntime):
             "global_step": self.global_step,
             "train_objective_trace": train_trace,
             "train_epoch_trace": list(self.train_epoch_trace),
+            **self._diagnostic_record(),
             **self._validation_history(val_trace),
             "validation_epoch_trace": list(self.validation_epoch_trace),
             "test_epoch_trace": list(self.test_epoch_trace),

@@ -33,7 +33,11 @@ _NATIVE_AGGREGATE_COLUMNS = [
     "wis_underprediction",
     "wis_overprediction",
     "wis_point",
-    *[field for level in _NATIVE_INTERVAL_LEVELS for field in (f"coverage_{level}", f"interval_width_{level}")],
+    *[
+        field
+        for level in _NATIVE_INTERVAL_LEVELS
+        for field in (f"coverage_{level}", f"interval_width_{level}")
+    ],
 ]
 
 _TARGET_AGGREGATE_COLUMNS = [
@@ -103,10 +107,9 @@ class _NativeMetricSums:
 class NativeAggregateAccumulator:
     """Online native metrics keyed by head, horizon, and source identity."""
 
-    def __init__(self) -> None:
-        self._groups: dict[
-            tuple[str, str, str, str, int], _NativeMetricSums
-        ] = {}
+    def __init__(self, *, origin_block_days: int = 0) -> None:
+        self.origin_block_days = origin_block_days
+        self._groups: dict[tuple[str, str, str, str, int], _NativeMetricSums] = {}
 
     def update(
         self,
@@ -123,6 +126,7 @@ class NativeAggregateAccumulator:
         crps: torch.Tensor,
         intervals: dict[str, tuple[torch.Tensor, torch.Tensor]],
         wis_components: dict[str, torch.Tensor],
+        origin_indices: list[int] | None = None,
     ) -> None:
         target_name = _NATIVE_TARGET_NAMES[head]
         arrays = {
@@ -145,6 +149,10 @@ class NativeAggregateAccumulator:
         batch_size, horizon_size = targets.shape
         if len(source_types) != batch_size or len(source_ids) != batch_size:
             raise ValueError("native aggregate identities do not match tensor rows")
+        if self.origin_block_days and (
+            origin_indices is None or len(origin_indices) != batch_size
+        ):
+            raise ValueError("origin-block aggregation requires one origin per row")
         for row in range(batch_size):
             for horizon_index in range(horizon_size):
                 weight = float(arrays["weights"][row, horizon_index].item())
@@ -167,6 +175,14 @@ class NativeAggregateAccumulator:
                     ),
                     ("head_all", target_name, "", "", 0),
                 )
+                if self.origin_block_days:
+                    assert origin_indices is not None
+                    start = (
+                        origin_indices[row] // self.origin_block_days
+                    ) * self.origin_block_days
+                    keys += (
+                        ("origin_block", target_name, "origin_index", str(start), 0),
+                    )
                 prediction = float(arrays["prediction"][row, horizon_index].item())
                 target = float(arrays["target"][row, horizon_index].item())
                 raw_prediction = float(
@@ -189,7 +205,9 @@ class NativeAggregateAccumulator:
                         "wis_overprediction",
                         "wis_point",
                     ):
-                        source_name = name.removeprefix("wis_") if name != "wis" else "wis"
+                        source_name = (
+                            name.removeprefix("wis_") if name != "wis" else "wis"
+                        )
                         sums_value = (
                             arrays[source_name][row, horizon_index]
                             if source_name in arrays
@@ -209,9 +227,10 @@ class NativeAggregateAccumulator:
                         sums.coverage[level] = sums.coverage.get(level, 0.0) + (
                             float(low <= target <= high) * weight
                         )
-                        sums.interval_width[level] = sums.interval_width.get(
-                            level, 0.0
-                        ) + max(0.0, high - low) * weight
+                        sums.interval_width[level] = (
+                            sums.interval_width.get(level, 0.0)
+                            + max(0.0, high - low) * weight
+                        )
 
     def finalize(self) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []

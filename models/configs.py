@@ -1117,6 +1117,8 @@ class TrainingParams:
         3  # Number of samples per category (best, worst, random)
     )
     grad_norm_log_frequency: int = 100
+    # Native disjoint parameter-group norms at grad_norm_log_frequency.
+    component_gradient_diagnostics: bool = False
     # Periodic eager probe of observation-loss gradients at the mechanistic source
     # and residual-location input. Zero disables the diagnostic sidecar.
     pathway_gradient_frequency: int = 0
@@ -1188,6 +1190,10 @@ class TrainingParams:
     compile_backward: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.component_gradient_diagnostics) is not bool:
+            raise ValueError(
+                "training.component_gradient_diagnostics must be a boolean"
+            )
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
@@ -1432,6 +1438,14 @@ class EvaluationConfig:
     distribution_df: float = 5.0
     interval_levels: list[float] = field(default_factory=lambda: [0.5, 0.8, 0.95])
     training_objective_diagnostic: bool = False
+    # Persist canonical source/horizon tables and predictions at each epoch.
+    epoch_diagnostics: bool = False
+    # Zero disables the fixed training panel; positive values cap each source.
+    training_panel_queries_per_source: int = 0
+    # Guard the effective validation origins after forecast-interval purging.
+    minimum_validation_origins: int = 0
+    # Zero disables canonical metrics grouped by fixed calendar-origin blocks.
+    origin_block_days: int = 0
 
     def __post_init__(self) -> None:
         allowed = {"wis", "crps", "nll", "mae", "rmse"}
@@ -1473,6 +1487,20 @@ class EvaluationConfig:
             raise ValueError(
                 "evaluation.training_objective_diagnostic must be a boolean"
             )
+        if type(self.epoch_diagnostics) is not bool:
+            raise ValueError("evaluation.epoch_diagnostics must be a boolean")
+        for name, value in (
+            (
+                "training_panel_queries_per_source",
+                self.training_panel_queries_per_source,
+            ),
+            ("minimum_validation_origins", self.minimum_validation_origins),
+            ("origin_block_days", self.origin_block_days),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"evaluation.{name} must be a non-negative integer")
+        if self.training_panel_queries_per_source and not self.epoch_diagnostics:
+            raise ValueError("A training panel requires evaluation.epoch_diagnostics")
 
 
 @dataclass

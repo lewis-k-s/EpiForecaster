@@ -752,7 +752,9 @@ def evaluate_native_loader(
         )
         for head, horizon in head_horizons.items()
     }
-    aggregate_accumulator = NativeAggregateAccumulator()
+    aggregate_accumulator = NativeAggregateAccumulator(
+        origin_block_days=scorer.config.origin_block_days
+    )
     excess_abs_error = 0.0
     excess_observed = 0
     excess_handle = None
@@ -930,6 +932,9 @@ def evaluate_native_loader(
                     crps=prob_batch.crps,
                     intervals=prob_batch.intervals,
                     wis_components=wis_components,
+                    origin_indices=[
+                        int(query.forecast_origin) for query in view["queries"]
+                    ],
                 )
                 if granular_writer is not None:
                     granular_writer.write_native_rows(
@@ -996,6 +1001,11 @@ def evaluate_native_loader(
                 f"wis_per_h_{head}": wis.wis_per_h,
             }
         )
+        for level in probabilistic.coverage_by_level:
+            metrics[f"coverage_{level}_{head}"] = probabilistic.coverage_by_level[level]
+            metrics[f"interval_width_{level}_{head}"] = (
+                probabilistic.interval_width_by_level[level]
+            )
         if head == "ww":
             metrics["mae_ww_log1p_concentration"] = (
                 point.mae if "mae" in scorer.config.metrics else None
