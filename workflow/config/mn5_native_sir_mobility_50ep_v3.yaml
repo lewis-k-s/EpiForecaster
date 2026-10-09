@@ -1,0 +1,60 @@
+extends:
+- workflow/config/profiles/native_causal_inputs.yaml
+- workflow/config/profiles/acc.yaml
+workflow:
+  kind: ablation
+  target: ablation
+ablation:
+  study_name: native_sir_mobility_50ep_v3_v1
+  campaign: configs/campaigns/native_sir_mobility_50ep_v3_v1.yaml
+  workers: 2
+  closeout_signal_seconds: 1800
+  timeout_s: 27000
+  sampler_seed: 42
+  smoketest: false
+  requeue_running: false
+resources:
+  allocation:
+    qos: acc_bscls
+    tasks: 2
+    gres: gpu:2
+    runtime: 480
+provenance:
+  input_repairs:
+  - pointer: data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+    parent_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+    parent_dvc_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+    output_dvc_md5: 58f03caa79ebf978f298e3235fc5e205.dir
+    producing_run_id: native-ww-causal-v2-7c25445-20261002-c
+    producing_source_snapshot_sha256: c09887300f3303e8b7dad18ca6116127a4cc1603a62d49ebaeef5653c6b4ad17
+    qa_sha256: c190479dc0f3e3cc9f7756976bf49176f368d84895754a778795aeddc4c25bda
+    publication_receipt_sha256: 46598ea4875646f96ac3c4cd022e0df6b790c0060e08029e932648486571c708
+    publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-ww-causal-v2-7c25445-20261002-c/outputs/preprocessing/publication/receipt.json
+  diagnostic_reference_run: native-sir-mobility-full10ep-60cffe4-20261003-a
+  diagnostic_acceptance_run: native-plateau-diag-20261009-a
+  diagnostic_intent: Replace the pending old-input 50-epoch campaign with the v3 clinical
+    dataset. Retain SIR mobility on/off, fold 0, seed 42, 50 epochs, the cosine schedule,
+    broader validation and all diagnostics. Regenerate source assignments for v3;
+    this run does not isolate the epoch budget from input preprocessing changes.
+  supersedes_run: native-sir-mobility-50ep-20261009-a
+  supersedes_job: '47091526'
+  clinical_dataset:
+    pointer: data/processed/real_with_id_v3.zarr.dvc
+    dvc_md5: 17bb89b338bb0314b2f90d7dfd9dd1c8.dir
+    pointer_sha256: 26867603186135767edb019b3bf6b239899902aa7514501e69957cbc5b316532
+    dataset_sha256: 4ced97e8d298d23357a0651a335954e37a4eef622ec527aca1795695634b5a5b
+    qa_sha256: d274c326eba035b01cb093b9d27d98241a0f940ca1d5f058061c823ee5663c18
+    publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/.staging-clinical-v3-288f99ca98de46a69b31a39d09692e77/publication_receipt.json
+    preprocessing_config: configs/preprocess_clinical_v3.yaml
+    native_wastewater_policy: separate corrected native EDAR input is retained
+    publication_receipt_sha256: 038c6b52a60afc61bda9631df0113d651acde16f54951da8c9cc05ad2eb9c2db
+dvc:
+  targets:
+  - data/processed/real_with_id_v3.zarr.dvc
+  - data/processed/native_support/native_graph.zarr.dvc
+  - data/processed/native_support/obs_admissions.zarr.dvc
+  - data/processed/native_support/obs_deaths_abs_excess.zarr.dvc
+  - data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+  - data/processed/native_support/od_mitma.zarr.dvc
+  - data/processed/native_support/edar_catchment_edges.parquet.dvc
+  - data/processed/native_support/overlap_edges.parquet.dvc

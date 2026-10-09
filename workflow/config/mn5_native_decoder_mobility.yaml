@@ -1,0 +1,32 @@
+extends:
+- workflow/config/profiles/native_causal_inputs.yaml
+- workflow/config/profiles/acc.yaml
+workflow:
+  kind: ablation
+  target: ablation
+ablation:
+  study_name: native_decoder_mobility_v1
+  campaign: configs/campaigns/native_decoder_mobility_v1.yaml
+  workers: 4
+  closeout_signal_seconds: 900
+  timeout_s: 9900
+  sampler_seed: 42
+  smoketest: false
+  requeue_running: false
+resources:
+  allocation:
+    qos: acc_bscls
+    tasks: 4
+    gres: gpu:4
+    runtime: 180
+provenance:
+  input_repairs:
+  - pointer: data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+    parent_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+    parent_dvc_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+    output_dvc_md5: 58f03caa79ebf978f298e3235fc5e205.dir
+    producing_run_id: native-ww-causal-v2-7c25445-20261002-c
+    producing_source_snapshot_sha256: c09887300f3303e8b7dad18ca6116127a4cc1603a62d49ebaeef5653c6b4ad17
+    qa_sha256: c190479dc0f3e3cc9f7756976bf49176f368d84895754a778795aeddc4c25bda
+    publication_receipt_sha256: 46598ea4875646f96ac3c4cd022e0df6b790c0060e08029e932648486571c708
+    publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-ww-causal-v2-7c25445-20261002-c/outputs/preprocessing/publication/receipt.json

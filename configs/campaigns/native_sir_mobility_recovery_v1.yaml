@@ -1,0 +1,116 @@
+schema_version: 1
+campaign_id: native_sir_mobility_recovery_v1
+stage: ablation
+hypothesis: Complete both SIR arms after the singleton compiler failure; retain the
+  completed direct arms from the original campaign.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: sir_mobility_on
+fixed_overrides:
+  model:
+    input_window_length: 60
+    forecast_horizon: 28
+  training:
+    epochs: 10
+    max_batches: null
+    batch_size: 32
+    split_seed: 42
+    early_stopping_patience: null
+    run_final_evaluation: true
+    num_workers: 4
+    val_workers: 2
+    test_workers: 2
+    worker_blas_threads: 1
+    persistent_workers: true
+    prefetch_factor: 2
+    enable_mixed_precision: true
+    progress_log_frequency: 100
+    loss:
+      joint:
+        observation_loss: crps
+        distribution_family: student_t
+        distribution_df: 5.0
+  native:
+    spatial_encoder: hetero
+    decoder: sir
+    mobility_enabled: true
+    include_vaccination: true
+    wastewater_enabled: true
+    wastewater_filename: obs_wastewater_causal_v2.zarr
+    od_graph_cache_size: 512
+    cache_od_target_weights: true
+    precompute_loss_metadata: true
+    compile_sir_rollout: true
+    compile_loss_scores: true
+  evaluation:
+    metrics:
+    - wis
+    - crps
+    - nll
+    - mae
+    - rmse
+    selection_metric: wis
+    selection_aggregation: equal_head_mean
+    distribution_family: student_t
+    distribution_df: 5.0
+    interval_levels:
+    - 0.5
+    - 0.8
+    - 0.95
+    training_objective_diagnostic: false
+  output:
+    save_checkpoints: true
+    write_granular_eval: true
+    granular_eval_format: parquet
+smoke_overrides:
+  training:
+    device: cpu
+    num_workers: 0
+    val_workers: 0
+    test_workers: 0
+    enable_mixed_precision: false
+    worker_blas_threads: null
+  native:
+    compile_sir_rollout: false
+    compile_loss_scores: false
+conditions:
+- name: sir_mobility_on
+  hypothesis: SIR with mobility is the paired reference.
+  overrides: {}
+  allowed_difference_paths: []
+- name: sir_mobility_off
+  hypothesis: Removing mobility measures its contribution with SIR decoding.
+  overrides:
+    native:
+      mobility_enabled: false
+  allowed_difference_paths:
+  - native.mobility_enabled
+paired_model_seeds:
+- 42
+cross_validation:
+  fold_indices:
+  - 0
+  num_folds: 10
+metrics:
+  primary:
+    name: wis
+    direction: minimize
+  secondary:
+  - crps
+  - nll
+  safety: []
+  diagnostic:
+  - best_val_selection_value
+equal_budget_policy:
+  paths:
+  - training.epochs
+  - training.max_batches
+  - training.batch_size
+  - model.input_window_length
+  - model.forecast_horizon
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true

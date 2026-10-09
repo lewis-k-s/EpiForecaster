@@ -146,6 +146,7 @@ main() {
     fi
 
     srun \
+      --job-name="$WORKER_GROUP-workers" \
       --nodes=1 \
       --ntasks="$wave_workers" \
       --ntasks-per-node="$wave_workers" \

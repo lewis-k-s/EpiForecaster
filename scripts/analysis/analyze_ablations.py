@@ -34,15 +34,31 @@ logger = logging.getLogger(__name__)
 
 EXPERIMENT_PREFIX_NEW = "mn5_ablation__"
 EXPERIMENT_REGEX_LEGACY = re.compile(r"^mn5_ablation_(.+)$")
-METRICS = ["mae_median", "rmse_median", "r2_median"]
+METRICS = [
+    "wis",
+    "crps",
+    "nll",
+    "mae",
+    "rmse",
+    "mae_median",
+    "rmse_median",
+    "r2_median",
+]
 FINGERPRINT_EXCLUDE_PATHS = {
     ("training", "seed"),
     ("training", "crossval_fold_index"),
+    ("native", "fold_index"),
+    ("native", "fold_manifest"),
+    ("output", "log_dir"),
     ("output", "wandb_group"),
     ("output", "wandb_tags"),
     ("output", "experiment_name"),
 }
 CONTEXT_PATHS: dict[str, tuple[str, ...]] = {
+    "native_decoder": ("native", "decoder"),
+    "native_mobility_enabled": ("native", "mobility_enabled"),
+    "native_include_vaccination": ("native", "include_vaccination"),
+    "native_fold_index": ("native", "fold_index"),
     "model_type_mobility": ("model", "type", "mobility"),
     "model_type_regions": ("model", "type", "regions"),
     "model_mobility_embedding_dim": ("model", "mobility_embedding_dim"),
@@ -82,7 +98,13 @@ def _run_label(run: AblationRun) -> str:
 
 
 def _has_test_metrics(run: AblationRun) -> bool:
-    return (run.run_dir / "test_main_model_aggregate_metrics.csv").exists()
+    return any(
+        (run.run_dir / name).is_file()
+        for name in (
+            "test_native_aggregate_metrics.csv",
+            "test_main_model_aggregate_metrics.csv",
+        )
+    )
 
 
 def parse_experiment_name(experiment_name: str) -> tuple[str | None, str] | None:
@@ -121,7 +143,13 @@ def _nested_pop(obj: dict[str, Any], path: tuple[str, ...]) -> None:
 
 
 def load_run_config(run_dir: Path) -> dict[str, Any]:
-    """Load run config from config.yaml."""
+    """Load the canonical native config, or a historical YAML record."""
+    native_path = run_dir / "config.json"
+    if native_path.is_file():
+        config = json.loads(native_path.read_text())
+        if not isinstance(config, dict):
+            raise ValueError(f"Config file is not a mapping: {native_path}")
+        return config
     config_path = run_dir / "config.yaml"
     if not config_path.exists():
         raise ValueError(f"Missing config file for run: {run_dir}")
@@ -151,12 +179,17 @@ def get_run_seed(run_dir: Path) -> int | None:
 def get_run_fold(run_dir: Path) -> int | None:
     """Extract a fold only from a persisted cross-validation run."""
     try:
-        training = _nested_get(load_run_config(run_dir), ("training",))
+        config = load_run_config(run_dir)
     except ValueError:
         return None
-    if not isinstance(training, dict) or training.get("crossval_enabled") is not True:
-        return None
-    fold = training.get("crossval_fold_index")
+    native = config.get("native", {})
+    if native.get("enabled") is True:
+        fold = native.get("fold_index")
+    else:
+        training = config.get("training", {})
+        if training.get("crossval_enabled") is not True:
+            return None
+        fold = training.get("crossval_fold_index")
     try:
         return int(fold) if fold is not None else None
     except (TypeError, ValueError):
@@ -274,6 +307,13 @@ def _context_value(config: dict[str, Any], key: str) -> Any:
 def _classify_neighborhood_aggregation(
     config: dict[str, Any],
 ) -> tuple[bool, str, str]:
+    native = config.get("native", {})
+    if native.get("enabled") is True:
+        return (
+            True,
+            "native_heterogeneous",
+            f"Native heterogeneous graph; mobility enabled={native['mobility_enabled']}.",
+        )
     mobility_enabled = bool(_nested_get(config, ("model", "type", "mobility")))
     adjacency_source = str(
         _nested_get(config, ("model", "graph_adjacency_source")) or "unknown"
@@ -429,8 +469,42 @@ def validate_ablation_run_consistency(
         )
 
 
+def _native_test_record(run_dir: Path) -> dict[str, Any]:
+    from training.training_dynamics import load_training_dynamics_identity
+
+    load_training_dynamics_identity(run_dir)
+    summary = json.loads((run_dir / "training_dynamics_manifest.json").read_text())[
+        "summary"
+    ]
+    trace = summary.get("test_epoch_trace", [])
+    if (
+        len(trace) != 1
+        or trace[0]["epoch"] != summary["selected_epoch"]
+        or trace[0]["step"] != summary["selected_step"]
+    ):
+        raise ValueError(f"{run_dir}: test must use the selected checkpoint")
+    return trace[0]
+
+
 def load_test_metrics(run_dir: Path) -> pd.DataFrame | None:
     """Load test metrics CSV from a run directory."""
+    native_file = run_dir / "test_native_aggregate_metrics.csv"
+    if native_file.is_file():
+        metrics = pd.read_csv(native_file, dtype={"source_id": str})
+        metrics = metrics.loc[metrics.aggregation == "head_all"].copy()
+        # The joint WIS is already recorded by canonical evaluation. Keep it
+        # separate from the per-head rows and never pool source/horizon rows.
+        record = _native_test_record(run_dir)
+        metrics = pd.concat(
+            [
+                metrics,
+                pd.DataFrame(
+                    [{"target": "equal_head_mean", "wis": record["test_wis"]}]
+                ),
+            ],
+            ignore_index=True,
+        )
+        return metrics
     metrics_file = run_dir / "test_main_model_aggregate_metrics.csv"
     if not metrics_file.exists():
         logger.warning(f"Metrics file not found: {metrics_file}")
@@ -441,6 +515,31 @@ def load_test_metrics(run_dir: Path) -> pd.DataFrame | None:
     except Exception as exc:  # pragma: no cover - depends on filesystem state
         logger.error(f"Failed to load {metrics_file}: {exc}")
         return None
+
+
+def build_censored_wastewater_report(
+    ablation_runs: dict[str, list[AblationRun]],
+) -> pd.DataFrame:
+    """Keep the canonical censored score and its support separate from WIS."""
+    records = []
+    for condition, runs in sorted(ablation_runs.items()):
+        for run in runs:
+            if not (run.run_dir / "test_native_aggregate_metrics.csv").is_file():
+                continue
+            test = _native_test_record(run.run_dir)
+            records.append(
+                {
+                    "model": condition,
+                    "seed": run.seed,
+                    "fold": run.fold,
+                    "selected_epoch": test["epoch"],
+                    "selected_step": test["step"],
+                    "censored_nll_ww": test["censored_nll_ww"],
+                    "censored_count_ww": test["censored_count_ww"],
+                    "observed_count_ww": test["observed_count_ww"],
+                }
+            )
+    return pd.DataFrame(records)
 
 
 def aggregate_ablation_metrics(
@@ -1006,6 +1105,11 @@ def main() -> int:
     aggregated_path = args.output_dir / "ablation_metrics_aggregated.csv"
     aggregated_df.to_csv(aggregated_path, index=False)
     logger.info(f"Saved aggregated metrics to {aggregated_path}")
+    censored_df = build_censored_wastewater_report(ablation_runs)
+    if not censored_df.empty:
+        censored_df.to_csv(
+            args.output_dir / "ablation_censored_wastewater.csv", index=False
+        )
 
     logger.info("Computing deltas from baseline...")
     deltas_df = compute_baseline_deltas(aggregated_df, baseline_name=baseline_name)
@@ -1034,6 +1138,13 @@ def main() -> int:
     # Campaign comparisons intentionally aggregate only per-run aggregate metric
     # tables. Granular windows are not exchangeable observations and are never
     # pooled by this analysis entry point.
+    primary = declaration.primary_metric.replace("_median", "")
+    plot_metrics = list(
+        dict.fromkeys(
+            metric.replace("_median", "")
+            for metric in (declaration.primary_metric, *declaration.secondary_metrics)
+        )
+    )
 
     logger.info("Generating ablation plots...")
     try:
@@ -1050,14 +1161,16 @@ def main() -> int:
         plot_ablation_comparison(
             aggregated_path,
             output_dir=args.output_dir,
+            metrics=plot_metrics,
             baseline_name=baseline_name,
         )
-        plot_ablation_summary_grid(
-            aggregated_path,
-            deltas_csv=deltas_path if not deltas_df.empty else None,
-            output_dir=args.output_dir,
-            baseline_name=baseline_name,
-        )
+        if "r2_mean" in aggregated_df.columns:
+            plot_ablation_summary_grid(
+                aggregated_path,
+                deltas_csv=deltas_path if not deltas_df.empty else None,
+                output_dir=args.output_dir,
+                baseline_name=baseline_name,
+            )
         heatmap_df = seed_matched_df if not seed_matched_df.empty else deltas_df
         heatmap_csv = (
             seed_matched_path
@@ -1065,7 +1178,7 @@ def main() -> int:
             else deltas_path
         )
         if not heatmap_df.empty:
-            for metric in ["mae", "rmse", "r2"]:
+            for metric in plot_metrics:
                 try:
                     plot_ablation_deltas_heatmap(
                         heatmap_csv,
@@ -1078,20 +1191,20 @@ def main() -> int:
             plot_neighborhood_aggregation_heatmap(
                 heatmap_csv,
                 output_dir=args.output_dir,
-                metric="mae",
+                metric=primary,
                 baseline_name=baseline_name,
             )
             plot_mobility_ablation_heatmap(
                 heatmap_csv,
                 output_dir=args.output_dir,
-                metric="mae",
+                metric=primary,
                 baseline_name=baseline_name,
             )
             try:
                 plot_head_ablation_heatmap(
                     heatmap_csv,
                     output_dir=args.output_dir,
-                    metric="mae",
+                    metric=primary,
                     baseline_name=baseline_name,
                 )
             except ValueError as exc:
@@ -1101,6 +1214,7 @@ def main() -> int:
                 seed_matched_path,
                 seed_pairwise_path,
                 output_dir=args.output_dir / "seed_matched_diagnostics",
+                metrics=plot_metrics,
                 baseline_name=baseline_name,
             )
     except Exception as exc:
@@ -1111,7 +1225,7 @@ def main() -> int:
     print("=" * 80)
     print(f"\nAggregated metrics for {len(aggregated_df['model'].unique())} ablations")
     print(f"Targets: {', '.join(sorted(aggregated_df['target'].unique()))}")
-    print("\nMetrics: MAE, RMSE, R²")
+    print(f"\nPrimary metric: {declaration.primary_metric}")
     print(f"\nOutput directory: {args.output_dir}")
     print("\nFiles generated:")
     print(f"  - {aggregated_path.name}")
@@ -1127,34 +1241,36 @@ def main() -> int:
         print(f"  - {seed_matched_path.name}")
 
     print("\n" + "-" * 80)
-    print("Sample of aggregated metrics (MAE means):")
+    print(f"Sample of aggregated metrics ({primary} means):")
     print("-" * 80)
     pivot = aggregated_df.pivot_table(
         index="model",
         columns="target",
-        values="mae_mean",
+        values=f"{primary}_mean",
     )
     print(pivot.to_string())
 
     if not deltas_df.empty:
         print("\n" + "-" * 80)
-        print("Sample of deltas from baseline (MAE % change):")
+        print(f"Sample of deltas from baseline ({primary} % change):")
         print("-" * 80)
         pivot_delta = deltas_df.pivot_table(
             index="model",
             columns="target",
-            values="mae_delta_pct",
+            values=f"{primary}_delta_pct",
         )
         print(pivot_delta.to_string())
 
     if not seed_matched_df.empty:
         print("\n" + "-" * 80)
-        print("Seed-matched deltas from baseline (MAE % change, mean across pairs):")
+        print(
+            f"Seed-matched deltas from baseline ({primary} % change, mean across pairs):"
+        )
         print("-" * 80)
         pivot_seed = seed_matched_df.pivot_table(
             index="model",
             columns="target",
-            values="mae_delta_pct_mean",
+            values=f"{primary}_delta_pct_mean",
         )
         print(pivot_seed.to_string())
 

@@ -61,9 +61,8 @@ def test_ablation_campaign_configs_parse(campaign_path):
     campaign = load_campaign(Path(campaign_path))
     assert campaign.conditions
     assert campaign.baseline_condition in campaign.conditions_by_name
-    assert campaign.equal_budget_policy.paths == (
-        "training.epochs",
-        "training.max_batches",
+    assert {"training.epochs", "training.max_batches"} <= set(
+        campaign.equal_budget_policy.paths
     )
 
 

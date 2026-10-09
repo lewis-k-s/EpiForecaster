@@ -1,0 +1,92 @@
+extends:
+- workflow/config/profiles/native_causal_inputs.yaml
+- workflow/config/profiles/acc.yaml
+workflow:
+  kind: ablation
+  target: ablation
+ablation:
+  study_name: native_sir_mobility_recovery_v1
+  campaign: configs/campaigns/native_sir_mobility_recovery_v1.yaml
+  workers: 2
+  closeout_signal_seconds: 900
+  timeout_s: 6300
+  sampler_seed: 42
+  smoketest: false
+  requeue_running: false
+resources:
+  allocation:
+    qos: acc_bscls
+    tasks: 2
+    gres: gpu:2
+    runtime: 120
+provenance:
+  input_repairs:
+  - pointer: data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+    parent_pointer: data/processed/native_support/obs_wastewater.zarr.dvc
+    parent_dvc_md5: 881d214d9fea19a9f3b6faa7f6e7c4b4.dir
+    output_dvc_md5: 58f03caa79ebf978f298e3235fc5e205.dir
+    producing_run_id: native-ww-causal-v2-7c25445-20261002-c
+    producing_source_snapshot_sha256: c09887300f3303e8b7dad18ca6116127a4cc1603a62d49ebaeef5653c6b4ad17
+    qa_sha256: c190479dc0f3e3cc9f7756976bf49176f368d84895754a778795aeddc4c25bda
+    publication_receipt_sha256: 46598ea4875646f96ac3c4cd022e0df6b790c0060e08029e932648486571c708
+    publication_receipt_path: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/native-ww-causal-v2-7c25445-20261002-c/outputs/preprocessing/publication/receipt.json
+  campaign_recovery:
+    original_run_id: native-decoder-mobility-full10ep-60cffe4-20261003-a
+    original_source_snapshot_sha256: 7775440610995bac73584e21883645a8199c5d93558f4b33cb31991692ab6722
+    original_config_sha256: 87c87e7d7be17e674397f76d786c6963824c4e1da2d3a5748de48cbbc13208e2
+    completed_conditions_preserved:
+    - direct_mobility_on
+    - direct_mobility_off
+    conditions_retried:
+    - sir_mobility_on
+    - sir_mobility_off
+    reason: Both SIR trials failed in the compiled batch-size-one rollout after 3620
+      optimizer steps. Singleton rollout uses the same eager equations; other batches
+      stay compiled.
+    completed_models:
+      direct_mobility_off:
+        producer_model: native_decoder_mobility_v1/mn5_ablation__native_decoder_mobility_v1__direct_mobility_off/ablation_t3_f0_s42
+        selected_epoch: 7
+        selected_step: 25347
+        artifacts_sha256:
+          campaign_identity.json: 23f977053274d181bacbdf5cc42ea4d1f089be355824bc51793db608d9ffca3a
+          checkpoints/best_model.pt: 75769558a944359fba263e0f58b55dc6babefc9b601093bde88ee5ce39150109
+          checkpoints/final_model.pt: 92c80de615a38a3e58a2d2163f8e9775ad5c11d9b02f758f191a8b01964f3956
+          config.json: 4edbaa797afa3684156d485a0145b64360bf5c6f0db3b308133dd8e9d0247382
+          inputs/native_source_sets/assignments.parquet: 681ebf9e1520db41c061dc8b0f9a7773b2fedf3a83814bee2d6bfc10557a7ced
+          inputs/native_source_sets/manifest.json: ddfbcdadda81f02aca14268e88f629c00b7c744bb258a2370f18751aa28da3de
+          test_granular.parquet: 4d4812002350c25cef50276ca4fcf427bc68d972a6486da1b262c3bb2f3fe67f
+          test_granular.parquet.meta.json: e4ffd7a518fde86f08ab58bcb55e0bd27a4025c7439f10057d90d2b3a224242e
+          test_native_aggregate_metrics.csv: 5fbc1b5dbf731676dfd3b260ed64b534870dbae03e16c58dd539c8867a74dfe2
+          test_native_excess_deaths.csv: ca069d64cb6544055c2489570bdfa37fdffd6e0b4ef4bdb9138667cbc074830e
+          test_native_wis_summary.json: cabdeb2ddaa2333d3f82cd66227668232803fde4709431a84e0d0d7507f4452e
+          training_dynamics.jsonl: 1c233f0da627e64896eb56f582c105498c992f4666b037084e87801ea01f76ea
+          training_dynamics_manifest.json: 4fcb78262e3f63c80a134d59112923bf771b2d875fdf10baf6259fa19095703d
+          val_granular.parquet: a360e9d89ec359bb24b396d1ca097570033cba676bb8ac6fd289d63d4ee28e2e
+          val_granular.parquet.meta.json: e09de8a646706f1009ec224ace034a0a7834ed0a02db34f3d7e1b538388dda64
+          val_native_aggregate_metrics.csv: 8b2f7ad1721513bab64a49ebed10ff401f123a53cdcc658c29209969ce9320ee
+          val_native_excess_deaths.csv: 0271b2b439b8dea83cb17005d496e7e6d710c977536d3d0de2483ebad4f11be6
+          val_native_wis_summary.json: a37faf112a84782620d538ee85161f4a41eb464c45c9beff9ca93c8531b885c3
+      direct_mobility_on:
+        producer_model: native_decoder_mobility_v1/mn5_ablation__native_decoder_mobility_v1__direct_mobility_on/ablation_t2_f0_s42
+        selected_epoch: 3
+        selected_step: 10863
+        artifacts_sha256:
+          campaign_identity.json: f0ad9149041744e209ddc6bc2f66b9a9140378bbc5a18ae93f62e591b26b21b6
+          checkpoints/best_model.pt: 2992063daadba104940e826f9d85e0447399cc5e6d613ed2e2111c23ffc8b4f3
+          checkpoints/final_model.pt: 6c8eccce2369255d9340a78128415c215aec9039b8e040772f37d65d90bb3d74
+          config.json: a36e1398b18b706cdcfcb5da32d899df9e69d32ddfd1d38f41ec480db3c25c97
+          inputs/native_source_sets/assignments.parquet: 681ebf9e1520db41c061dc8b0f9a7773b2fedf3a83814bee2d6bfc10557a7ced
+          inputs/native_source_sets/manifest.json: b21728396ac6e23d8319072e4b48a0d9b9be6525622d0a222ec99e16008ec950
+          test_granular.parquet: 16eafe2aea14c17b2a821e5da15af40e61ac5a956d5031bc4d8c128693f2a3c3
+          test_granular.parquet.meta.json: f4f56d86411bc48cb2ee47ece56b3f37f33848781f408723845c7a4ddd4ecd0d
+          test_native_aggregate_metrics.csv: 3904d94047a4a3deef3ed78c99217b2954dabd89893f3c039ab6e7b4e795d668
+          test_native_excess_deaths.csv: 67e1f6e7841f8056b00cef39285e061516fe15eac85871f58cdfec7555ef515c
+          test_native_wis_summary.json: 4fe782c1f251440ca6b49b7dcf7d4477af63c47cee9049ea53a0c5614a2cb01d
+          training_dynamics.jsonl: 5daf55e4526ae00211f6ac2a56c65f84c60853db86cf6029572478ca4aad1de4
+          training_dynamics_manifest.json: b71b094458577f7d6ae2c3c10e23ae25c9aa4f66dc1b6d2a90cbb7a5f51a91cc
+          val_granular.parquet: 67ef1090afabac72b566951476b139823546771fb32e29926ebf9198f49e8213
+          val_granular.parquet.meta.json: f80d4da33d49593188fff5d191631e2982735df308a01813f6236f122ca6f06a
+          val_native_aggregate_metrics.csv: e368a1346022d5c267658e2f342b2533900187e5d401970303682e923b06fa69
+          val_native_excess_deaths.csv: f05ae5b2d131037f19a35d8537b881a3600ad919fad8f8b3012a7f0fc3c25155
+          val_native_wis_summary.json: df59784a556ab5b79cfcf6b321a49eeae3107a2d8208faed02c41ca129acc003
