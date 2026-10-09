@@ -187,6 +187,21 @@ def validate_code_data_separation(
             "DVC payloads must not be included in the relocatable source bundle: "
             f"{included}"
         )
+    missing_bind_roots = sorted(
+        {
+            payload.parent
+            for payload in payloads.values()
+            if payload.parent != Path(".")
+            and not any(payload.parent in path.parents for path in selected)
+        },
+        key=lambda path: path.as_posix(),
+    )
+    if missing_bind_roots:
+        raise ValueError(
+            "DVC mount parents must exist in the source inventory; place the "
+            "pointer beside its payload: "
+            + ", ".join(path.as_posix() for path in missing_bind_roots)
+        )
     return payloads
 
 
