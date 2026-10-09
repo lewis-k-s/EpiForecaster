@@ -2875,6 +2875,7 @@ def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
     for directory in (run_root, source_root, remote, cache, fake_bin, scratch):
         directory.mkdir()
     sif.touch()
+    Path(f"{sif}.sha256").touch()
 
     singularity = fake_bin / "singularity"
     singularity.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE"\n')
@@ -2910,9 +2911,13 @@ def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
         check=True,
     )
 
+    arguments = capture.read_text().splitlines()
+    assert "PYTHONFAULTHANDLER=1" in arguments
+    assert "PYTHONUNBUFFERED=1" in arguments
+    assert f"{sif.parent}:{sif.parent}:ro" in arguments
     binds = [
         line
-        for line in capture.read_text().splitlines()
+        for line in arguments
         if line.startswith(f"{run_root}:")
     ]
     assert binds == [f"{run_root}:/workspace/run:rw"]
