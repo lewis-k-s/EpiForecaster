@@ -7,7 +7,6 @@ import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import seaborn as sns
 import xarray as xr
@@ -19,9 +18,7 @@ if sys_path not in __import__("sys").path:
 from data.preprocess.config import (  # noqa: E402
     REGION_COORD,
     TEMPORAL_COORD,
-    PreprocessingConfig,
 )
-from data.preprocess.processors.edar_processor import EDARProcessor  # noqa: E402
 from utils.plotting import Style, format_date_axis, save_figure  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -77,37 +74,28 @@ def aggregate_cases_to_catchments(
 
 
 def load_site_biomarkers(
-    config: PreprocessingConfig,
+    wastewater_path: Path,
     dates: pd.DatetimeIndex,
     catchment_ids: list[str],
     variants: list[str] | None,
 ) -> xr.Dataset:
-    processor = EDARProcessor(config)
-    flow_xr, censor_xr = processor.process_site_level(config.wastewater_file)
-
-    flow = flow_xr.sel(run_id="real").assign_coords(
-        edar_id=flow_xr["edar_id"].astype(str)
+    """Load plant-level histories and masks from the native observation store."""
+    with xr.open_zarr(wastewater_path) as source:
+        if source.attrs.get("schema") != "native_wastewater_observations.v1":
+            raise ValueError(f"Not a native wastewater store: {wastewater_path}")
+        ids = sorted(set(catchment_ids) & set(source.edar_id.values.astype(str)))
+        if not ids:
+            raise ValueError("No shared treatment plants between mapping and store")
+        selected = source[["history_log1p", "observed_mask"]].sel(edar_id=ids)
+        if variants is not None:
+            selected = selected.sel(assay=variants)
+        selected = selected.rename({"assay": "variant"}).reindex(date=dates).load()
+    return xr.Dataset(
+        {
+            "biomarker": selected["history_log1p"],
+            "biomarker_mask": selected["observed_mask"].fillna(False).astype(bool),
+        }
     )
-    censor = censor_xr.sel(run_id="real").assign_coords(
-        edar_id=censor_xr["edar_id"].astype(str)
-    )
-
-    if variants is None:
-        selected_variants = [str(v) for v in flow["variant"].values.tolist()]
-    else:
-        selected_variants = variants
-
-    flow = flow.sel(edar_id=catchment_ids, variant=selected_variants)
-    censor = censor.sel(edar_id=catchment_ids, variant=selected_variants)
-
-    flow = flow.reindex({TEMPORAL_COORD: dates})
-    censor = censor.reindex({TEMPORAL_COORD: dates}).fillna(2)
-
-    values = np.log1p(flow.clip(min=0))
-    values.name = "biomarker"
-    mask = ((censor < 1.5) & (flow > 0)).fillna(False)
-    mask.name = "biomarker_mask"
-    return xr.Dataset({"biomarker": values, "biomarker_mask": mask})
 
 
 def select_catchments(
@@ -182,8 +170,7 @@ def plot_catchment_series(plot_df: pd.DataFrame, output_path: Path) -> None:
             (catchment_df["series"] == "cases") & catchment_df["mask"].astype(bool)
         ]
         bio_df = catchment_df[
-            (catchment_df["series"] == "biomarker")
-            & catchment_df["mask"].astype(bool)
+            (catchment_df["series"] == "biomarker") & catchment_df["mask"].astype(bool)
         ]
 
         sns.lineplot(
@@ -250,9 +237,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/processed/real_with_id.zarr"),
     )
     parser.add_argument(
-        "--config",
+        "--wastewater-path",
         type=Path,
-        default=Path("configs/preprocess_full.yaml"),
+        default=Path("data/processed/native_support/obs_wastewater.zarr"),
     )
     parser.add_argument(
         "--region-metadata",
@@ -274,14 +261,13 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
 
-    config = PreprocessingConfig.from_file(args.config)
     dataset = xr.open_zarr(args.dataset_path)
     dates = pd.DatetimeIndex(pd.to_datetime(dataset[TEMPORAL_COORD].values))
 
     mapping = load_mapping(args.region_metadata)
     cases_ds = aggregate_cases_to_catchments(dataset, mapping)
     biomarker_ds = load_site_biomarkers(
-        config,
+        args.wastewater_path,
         dates,
         [str(v) for v in mapping["edar_id"].values.tolist()],
         args.variants,

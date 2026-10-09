@@ -6,7 +6,6 @@ canonical tensor formats. Each processor handles a specific data type:
 
 - MobilityProcessor: NetCDF mobility data → graph tensors
 - CataloniaCasesProcessor: COVID case CSV → xarray tensors with mask/age channels
-- EDARProcessor: Wastewater biomarker data → normalized tensors
 - AlignmentProcessor: Multi-dataset temporal and spatial alignment
 - DeathsProcessor: Catalonia COVID deaths data → xarray tensors
 - HospitalizationsProcessor: Catalonia COVID hospitalizations → daily municipality-level tensors
@@ -20,7 +19,6 @@ raw data into the canonical EpiBatch format.
 
 from .alignment_processor import AlignmentProcessor
 from .catalonia_cases_processor import CataloniaCasesProcessor
-from .edar_processor import EDARProcessor
 from .deaths_processor import DeathsProcessor
 from .hospitalizations_processor import HospitalizationsProcessor
 from .mobility_processor import MobilityProcessor
@@ -31,7 +29,6 @@ from .vaccination_processor import VaccinationProcessor
 __all__ = [
     "MobilityProcessor",
     "CataloniaCasesProcessor",
-    "EDARProcessor",
     "AlignmentProcessor",
     "DeathsProcessor",
     "HospitalizationsProcessor",

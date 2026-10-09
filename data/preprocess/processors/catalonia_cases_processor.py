@@ -16,7 +16,7 @@ import pandas as pd
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from ..smoothing import DampedHoltSmoother, KalmanSmoother, fit_kalman_params
+from ..smoothing import DampedHoltSmoother, KalmanSmoother
 
 
 class CataloniaCasesProcessor:
@@ -134,19 +134,12 @@ class CataloniaCasesProcessor:
     def _apply_kalman_smoothing(self, daily_df: pd.DataFrame) -> pd.DataFrame:
         """Apply configured causal filtering for case data.
 
-        Observed positive counts are preserved in the output value channel, while
+        Observed nonnegative counts are preserved in the output value channel, while
         the filter is used to fill timesteps treated as missing by the current
         preprocessing semantics.
         """
         method = self.config.smoothing.clinical_method
         print(f"  Applying causal smoothing to cases (method={method})...")
-
-        fallback_process = float(
-            self.config.validation_options.get("process_var", 0.05)
-        )
-        fallback_measure = float(
-            self.config.validation_options.get("measurement_var", 0.5)
-        )
 
         smoothed_records = []
 
@@ -158,22 +151,9 @@ class CataloniaCasesProcessor:
             values = muni_data["cases"].values
 
             if method == "kalman_v2":
-                # Fit Kalman parameters from data (mask zero/negative for fitting)
-                fit_series = pd.Series(values, index=muni_data.index)
-                fit_series = fit_series.where(fit_series > 0)
-
-                try:
-                    process_var, measurement_var = fit_kalman_params(fit_series)
-                except Exception as e:
-                    print(
-                        f"    ! Falling back to configured variances for {muni_code}: {e}"
-                    )
-                    process_var = fallback_process
-                    measurement_var = fallback_measure
-
                 smoother = KalmanSmoother(
-                    process_var=process_var,
-                    measurement_var=measurement_var,
+                    process_var=self.config.smoothing.process_var,
+                    measurement_var=self.config.smoothing.measurement_var,
                     missing_policy=self.config.smoothing.missing_policy,
                     momentum_decay=self.config.smoothing.momentum_decay,
                     momentum_max_steps=self.config.smoothing.momentum_max_steps,
@@ -200,7 +180,7 @@ class CataloniaCasesProcessor:
 
             # Preserve recorded values at observed timesteps; use filtered values for gaps.
             for i, date in enumerate(muni_data.index):
-                filtered_value = float(np.exp(filtered_values[i]))
+                filtered_value = max(float(np.expm1(filtered_values[i])), 0.0)
                 case_value = float(values[i]) if observed_mask[i] else filtered_value
                 smoothed_records.append(
                     {
@@ -289,11 +269,10 @@ class CataloniaCasesProcessor:
             columns="municipality_code",
             values="cases",
             aggfunc="sum",
-            fill_value=0,
         )
 
         # Reindex to complete date range
-        pivot = pivot.reindex(date_range, fill_value=0)
+        pivot = pivot.reindex(date_range)
 
         # Rename for compatibility
         pivot.columns.name = REGION_COORD

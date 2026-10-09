@@ -73,9 +73,7 @@ def config(temp_data_dir: Path) -> PreprocessingConfig:
         data_dir=str(temp_data_dir),
         cases_file=str(temp_data_dir / "unused.csv"),
         mobility_path=str(temp_data_dir / "unused.nc"),
-        wastewater_file=str(temp_data_dir / "unused.csv"),
         population_file=str(temp_data_dir / "unused.csv"),
-        region_metadata_file=str(temp_data_dir / "unused.json"),
         start_date=datetime(2022, 1, 1),
         end_date=datetime(2022, 1, 15),  # 2 weeks for forecast_horizon=7
         output_path=str(temp_data_dir),
@@ -148,6 +146,7 @@ def test_deaths_processor_municipality_level(
     assert float(result.deaths_mask.sum()) == 3.0
     # Age channel should include staleness beyond observation days
     assert float(result.deaths_age.max()) > 1.0
+
 
 @pytest.mark.region
 def test_deaths_processor_holt_damped_keeps_mask_age_semantics(

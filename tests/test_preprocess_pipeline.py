@@ -17,9 +17,7 @@ def mock_config(tmp_path):
     # Create dummy files to pass config validation
     (tmp_path / "cases.csv").touch()
     (tmp_path / "mob.nc").touch()
-    (tmp_path / "ww.csv").touch()
     (tmp_path / "pop.csv").write_text("id,d.population\n")
-    (tmp_path / "meta.nc").touch()
     (tmp_path / "hosp.csv").touch()
     (tmp_path / "deaths.csv").touch()
 
@@ -27,9 +25,7 @@ def mock_config(tmp_path):
         data_dir=str(tmp_path),
         cases_file=str(tmp_path / "cases.csv"),
         mobility_path=str(tmp_path / "mob.nc"),
-        wastewater_file=str(tmp_path / "ww.csv"),
         population_file=str(tmp_path / "pop.csv"),
-        region_metadata_file=str(tmp_path / "meta.nc"),
         hospitalizations_file=str(tmp_path / "hosp.csv"),
         deaths_file=str(tmp_path / "deaths.csv"),
         start_date=datetime(2022, 1, 1),
@@ -43,8 +39,7 @@ def mock_config(tmp_path):
 
 class TestPipelineSourceSelection:
     @patch("data.preprocess.pipeline.SyntheticProcessor")
-    @patch("data.preprocess.pipeline.EDARProcessor")
-    def test_synthetic_source_dispatch(self, MockEDAR, MockSynthetic, mock_config):
+    def test_synthetic_source_dispatch(self, MockSynthetic, mock_config):
         """Verify synthetic data source selection and processor dispatch."""
         mock_config.synthetic_path = "synthetic_data.zarr"
 
@@ -53,15 +48,10 @@ class TestPipelineSourceSelection:
             "cases": xr.DataArray([1], dims=["x"]),
             "mobility": xr.DataArray([1], dims=["x"]),
             "population": xr.DataArray([1], dims=["x"]),
-            "edar_flow": xr.DataArray([1], dims=["x"]),
-            "edar_censor": xr.DataArray([1], dims=["x"]),
         }
         MockSynthetic.return_value.process.return_value = mock_processed
 
         pipeline = OfflinePreprocessingPipeline(mock_config)
-
-        # Mock EDAR processing from xarray
-        MockEDAR.return_value.process_from_xarray.return_value = xr.Dataset()
 
         # We need to mock _load_raw_sources because it's called by run(),
         # but we want to test its internal logic.
@@ -69,15 +59,13 @@ class TestPipelineSourceSelection:
 
         assert MockSynthetic.called
         assert MockSynthetic.return_value.process.called_with("synthetic_data.zarr")
-        assert "edar" in processed
+        assert "edar" not in processed
         assert processed["hospitalizations"] is None
         assert processed["deaths"] is None
 
     @patch("data.preprocess.pipeline.SyntheticProcessor")
-    @patch("data.preprocess.pipeline.EDARProcessor")
     def test_synthetic_source_dispatch_preserves_temporal_covariates(
         self,
-        MockEDAR,
         MockSynthetic,
         mock_config,
     ):
@@ -95,14 +83,11 @@ class TestPipelineSourceSelection:
             "cases": xr.DataArray([1], dims=["x"]),
             "mobility": xr.DataArray([1], dims=["x"]),
             "population": xr.DataArray([1], dims=["x"]),
-            "edar_flow": xr.DataArray([1], dims=["x"]),
-            "edar_censor": xr.DataArray([1], dims=["x"]),
             "temporal_covariates": temporal_covariates,
         }
         MockSynthetic.return_value.process.return_value = mock_processed
 
         pipeline = OfflinePreprocessingPipeline(mock_config)
-        MockEDAR.return_value.process_from_xarray.return_value = xr.Dataset()
         processed = pipeline._load_raw_sources()
 
         assert "temporal_covariates" in processed
@@ -115,7 +100,6 @@ class TestPipelineSourceSelection:
         pipeline = OfflinePreprocessingPipeline(mock_config)
         pipeline.processors["cases"] = Mock()
         pipeline.processors["mobility"] = Mock()
-        pipeline.processors["edar"] = Mock()
         pipeline.processors["hospitalizations"] = Mock()
         pipeline.processors["deaths"] = Mock()
         pipeline._load_population_data = Mock()
@@ -124,7 +108,6 @@ class TestPipelineSourceSelection:
 
         assert pipeline.processors["cases"].process.called
         assert pipeline.processors["mobility"].process.called
-        assert pipeline.processors["edar"].process.called
 
 
 class TestPipelineOptionalSources:
@@ -140,7 +123,6 @@ class TestPipelineOptionalSources:
         # Mock mandatory sources
         pipeline.processors["cases"] = Mock()
         pipeline.processors["mobility"] = Mock()
-        pipeline.processors["edar"] = Mock()
         pipeline._load_population_data = Mock()
 
         # According to Phase 3 plan, it should continue and return None for these.
@@ -154,6 +136,21 @@ class TestPipelineOptionalSources:
 
 
 class TestPipelineMasksAndMetadata:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "edar_biomarker_N1",
+            "edar_biomarker_N1_mask",
+            "biomarker_data_start",
+            "edar_has_source",
+        ],
+    )
+    def test_writer_rejects_municipal_wastewater(self, mock_config, name):
+        pipeline = OfflinePreprocessingPipeline(mock_config)
+        with pytest.raises(ValueError, match="Municipal wastewater"):
+            pipeline._save_aligned_dataset(xr.Dataset({name: ("region_id", [1])}))
+        assert not pipeline._output_path().exists()
+
     def test_compute_valid_targets_mask(self, mock_config):
         """Test valid_targets density threshold behavior."""
         pipeline = OfflinePreprocessingPipeline(mock_config)
@@ -214,40 +211,40 @@ class TestPipelineMasksAndMetadata:
         assert bool(mask.sel(run_id=0, region_id="R1"))
         assert not bool(mask.sel(run_id=0, region_id="R2"))
 
-    @patch("xarray.open_dataarray")
-    def test_compute_edar_region_mask(self, mock_open_da, mock_config):
-        """Test edar_has_source mask alignment/reindex."""
-        pipeline = OfflinePreprocessingPipeline(mock_config)
-
-        # Mock region metadata (emap)
-        # edar_id, home (region_id)
-        # E1 covers R1
-        # E2 covers R2
-        # R3 has no EDAR
-        regions = ["R1", "R2", "R3"]
-        edar_ids = ["E1", "E2"]
-
-        emap_data = np.zeros((2, 3))
-        emap_data[0, 0] = 1  # E1 -> R1
-        emap_data[1, 1] = 1  # E2 -> R2
-
-        mock_emap = xr.DataArray(
-            emap_data,
-            coords={"edar_id": edar_ids, "home": ["R1", "R2", "R3"]},
-            dims=["edar_id", "home"],
-            name="region_metadata",
-        )
-        mock_open_da.return_value = mock_emap
-
-        mask = pipeline._compute_edar_region_mask("dummy_path", np.array(regions))
-
-        assert mask.sel(region_id="R1") == 1
-        assert mask.sel(region_id="R2") == 1
-        assert mask.sel(region_id="R3") == 0
-        assert mask.name == "edar_has_source"
-
 
 class TestPipelineStorage:
+    def test_versioned_zarr_roundtrip_and_overwrite_guard(self, mock_config):
+        mock_config.output_format = "zarr"
+        mock_config.dataset_version = 2
+        mock_config.overwrite_output = False
+        mock_config.continuous_storage_dtype = "float32"
+        pipeline = OfflinePreprocessingPipeline(mock_config)
+        dataset = xr.Dataset(
+            {
+                "cases": (("run_id", "date", REGION_COORD), [[[0.0], [10.0]]]),
+                "cases_mask": (("run_id", "date", REGION_COORD), [[[True], [False]]]),
+                "cases_age": (("run_id", "date", REGION_COORD), [[[1], [2]]]),
+                "population": ((REGION_COORD,), [100000]),
+            },
+            coords={
+                "run_id": ["real"],
+                "date": pd.date_range("2022-01-01", periods=2),
+                REGION_COORD: ["08019"],
+            },
+        )
+        path = pipeline._save_aligned_dataset(dataset)
+        with xr.open_zarr(path) as saved:
+            assert saved.attrs["dataset_version"] == 2
+            assert saved.cases.dtype == np.float32
+            assert saved.cases_mask.dtype == bool
+            np.testing.assert_allclose(saved.cases, np.log1p(dataset.cases))
+            np.testing.assert_array_equal(saved.cases_mask, dataset.cases_mask)
+        with pytest.raises(FileExistsError, match="Refusing to replace"):
+            pipeline._save_aligned_dataset(dataset)
+        pipeline._load_raw_sources = Mock(side_effect=AssertionError("must not run"))
+        with pytest.raises(FileExistsError, match="Refusing to replace"):
+            pipeline.run()
+
     def test_saved_netcdf_chunk_schema(self, mock_config, tmp_path):
         """Test saved NetCDF chunk schema for run_id, date, and spatial dims."""
         pipeline = OfflinePreprocessingPipeline(mock_config)
@@ -309,7 +306,7 @@ class TestPipelineStorage:
         assert saved_ds.attrs["log_transformed"] == 1
         assert saved_ds.attrs["population_norm"] == 1
         assert saved_ds.attrs["smoothing_clinical_method"] == "kalman_v2"
-        assert saved_ds.attrs["smoothing_wastewater_method"] == "tobit_kalman_v2"
+        assert saved_ds.attrs["wastewater_support"] == "separate_native_edar_store"
         assert saved_ds.attrs["smoothing_missing_policy"] == "predict"
         assert "preprocessing_config_yaml" in saved_ds.attrs
         config_yaml = saved_ds.attrs["preprocessing_config_yaml"]
@@ -382,9 +379,7 @@ class TestPreprocessingConfigValidation:
         """Holiday calendar must exist when holidays are enabled."""
         (tmp_path / "cases.csv").touch()
         (tmp_path / "mob.nc").touch()
-        (tmp_path / "ww.csv").touch()
         (tmp_path / "pop.csv").write_text("id,d.population\n")
-        (tmp_path / "meta.nc").touch()
         missing_holiday_file = tmp_path / "does_not_exist.csv"
 
         with pytest.raises(ValueError, match="Holiday calendar file does not exist"):
@@ -392,9 +387,7 @@ class TestPreprocessingConfigValidation:
                 data_dir=str(tmp_path),
                 cases_file=str(tmp_path / "cases.csv"),
                 mobility_path=str(tmp_path / "mob.nc"),
-                wastewater_file=str(tmp_path / "ww.csv"),
                 population_file=str(tmp_path / "pop.csv"),
-                region_metadata_file=str(tmp_path / "meta.nc"),
                 start_date=datetime(2022, 1, 1),
                 end_date=datetime(2022, 1, 10),
                 output_path=str(tmp_path / "out"),

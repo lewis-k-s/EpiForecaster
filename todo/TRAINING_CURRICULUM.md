@@ -205,7 +205,7 @@ streaming reconstruction.
 To ensure the synthetic data is indistinguishable from real data to the preprocessing pipeline:
 
 *   **Explicit LoD:** The generator **must** output a `detection_limit` (or `LD(CG/L)`) variable for every wastewater measurement.
-    *   *Why:* The `EDARProcessor` uses `limit_flow = detection_limit * flow_rate` to set the censoring floor for the Tobit Kalman Filter. Without this, synthetic censoring is handled incorrectly.
+    *   *Why:* Plant-level wastewater observations require detection limits for censored targets. Municipal wastewater projection has been removed from this worktree.
 *   **Variable Naming:** Ensure `cases`, `mobility`, `population` match the real Zarr structure.
 
 ### 2. Mobility Format (Unified Dense)

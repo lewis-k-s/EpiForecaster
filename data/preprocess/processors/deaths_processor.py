@@ -13,7 +13,7 @@ import pandas as pd
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from ..smoothing import KalmanSmoother, fit_kalman_params
+from ..smoothing import KalmanSmoother
 
 
 class DeathsProcessor:
@@ -93,13 +93,6 @@ class DeathsProcessor:
         """Filter deaths time series and interpolate missing days per municipality."""
         print("  Applying Kalman smoothing to deaths...")
 
-        fallback_process = float(
-            self.config.validation_options.get("process_var", 0.05)
-        )
-        fallback_measure = float(
-            self.config.validation_options.get("measurement_var", 0.5)
-        )
-
         smoothed_records: list[dict[str, object]] = []
         for muni_code in daily_df["municipality_code"].unique():
             muni_data = daily_df[daily_df["municipality_code"] == muni_code].copy()
@@ -109,25 +102,15 @@ class DeathsProcessor:
             observed = muni_data["deaths"].notna().to_numpy()
             values = muni_data["deaths"].to_numpy()
 
-            fit_series = pd.Series(values, index=muni_data.index).where(lambda s: s > 0)
-            try:
-                process_var, measurement_var = fit_kalman_params(fit_series)
-            except Exception as e:
-                print(
-                    f"    ! Falling back to configured variances for {muni_code}: {e}"
-                )
-                process_var = fallback_process
-                measurement_var = fallback_measure
-
             kf = KalmanSmoother(
-                process_var=process_var,
-                measurement_var=measurement_var,
+                process_var=self.config.smoothing.process_var,
+                measurement_var=self.config.smoothing.measurement_var,
             )
             filtered_values, flags = kf.filter_series(values)
 
             # Preserve recorded values at observed timesteps; use filtered values for gaps.
             for i, date in enumerate(muni_data.index):
-                filtered_value = float(np.exp(filtered_values[i]))
+                filtered_value = max(float(np.expm1(filtered_values[i])), 0.0)
                 death_value = float(values[i]) if observed[i] else filtered_value
                 smoothed_records.append(
                     {

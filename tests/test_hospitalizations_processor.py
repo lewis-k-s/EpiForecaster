@@ -28,9 +28,7 @@ def mock_config(tmp_path):
         data_dir=str(tmp_path),
         cases_file=str(tmp_path / "cases.csv"),
         mobility_path=str(tmp_path / "mob.nc"),
-        wastewater_file=str(tmp_path / "ww.csv"),
         population_file=str(tmp_path / "pop.csv"),
-        region_metadata_file=str(tmp_path / "meta.nc"),
         hospitalizations_file=str(tmp_path / "hosp.csv"),
         deaths_file=str(tmp_path / "deaths.csv"),
         start_date=datetime(2022, 1, 1),
@@ -256,7 +254,16 @@ class TestKalmanSmoothing:
             {
                 "date": dates,
                 "municipality_code": "08019",
-                "hospitalizations": [10.0, np.nan, np.nan, 12.0, np.nan, 14.0, 15.0, np.nan],
+                "hospitalizations": [
+                    10.0,
+                    np.nan,
+                    np.nan,
+                    12.0,
+                    np.nan,
+                    14.0,
+                    15.0,
+                    np.nan,
+                ],
             }
         )
 

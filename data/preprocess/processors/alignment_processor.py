@@ -4,10 +4,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from constants import (
-    EDAR_BIOMARKER_PREFIX,
-    EDAR_BIOMARKER_VARIANTS,
-)
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 
 logger = logging.getLogger(__name__)
@@ -128,7 +124,11 @@ class AlignmentProcessor:
         else:
             mask = aligned[value_name].notnull()
         aligned[mask_name] = mask
-        aligned[age_name] = self._compute_age_from_mask(mask)
+        if value_name == "vaccination_rate" and age_name in aligned:
+            # Cumulative coverage includes doses before the output date range.
+            aligned[age_name] = aligned[age_name].fillna(14).astype(np.uint8)
+        else:
+            aligned[age_name] = self._compute_age_from_mask(mask)
         return aligned
 
     def _build_mobility_time_mask(
@@ -158,7 +158,6 @@ class AlignmentProcessor:
         self,
         cases_data: xr.DataArray,
         mobility_data: xr.Dataset,
-        edar_data: xr.Dataset,
         population_data: xr.DataArray,
         hospitalizations_data: xr.Dataset | None = None,
         deaths_data: xr.Dataset | None = None,
@@ -171,7 +170,6 @@ class AlignmentProcessor:
         Args:
             cases_data: Processed cases dataset
             mobility_data: Processed mobility dataset (OD matrix)
-            edar_data: Processed EDAR dataset (per-variant variables)
             population_data: Processed population dataset
             hospitalizations_data: Optional processed hospitalizations dataset
             deaths_data: Optional processed deaths dataset
@@ -200,13 +198,6 @@ class AlignmentProcessor:
             target_dates,
             label="Mobility",
         )
-        edar_aligned = self._align_temporal_dataset(
-            edar_data,
-            target_dates,
-            label="EDAR",
-            allow_subset_in_strict=True,
-        )
-
         # STEP 2: Spatial alignment - identify common regions
         # All datasets should use REGION_COORD for spatial dimension
         cases_regions = set(cases_aligned[REGION_COORD].values)
@@ -219,10 +210,6 @@ class AlignmentProcessor:
 
         # Find intersection of all region sets
         common_regions = sorted(cases_regions.intersection(mobility_regions))
-
-        assert np.isin(edar_aligned[REGION_COORD].values, common_regions).all(), (
-            "EDAR regions are not subset of common regions"
-        )
 
         # Validate hospitalizations regions if provided
         if hospitalizations_data is not None:
@@ -277,7 +264,6 @@ class AlignmentProcessor:
             origin=common_regions, destination=common_regions
         )
         population_final = population_data.sel({REGION_COORD: common_regions})
-        edar_final = edar_aligned.reindex({REGION_COORD: common_regions})
 
         # Align hospitalizations if provided
         if hospitalizations_data is not None:
@@ -338,8 +324,8 @@ class AlignmentProcessor:
             vaccination_final["vaccination_rate_mask"] = vaccination_final[
                 "vaccination_rate_mask"
             ].fillna(False)
-            vaccination_final["vaccination_rate_age"] = self._compute_age_from_mask(
-                vaccination_final["vaccination_rate_mask"]
+            vaccination_final["vaccination_rate_age"] = (
+                vaccination_final["vaccination_rate_age"].fillna(14).astype(np.uint8)
             )
         else:
             vaccination_final = None
@@ -355,73 +341,9 @@ class AlignmentProcessor:
         else:
             latent_sird_final = None
 
-        # Fill mask/censor/age channels with proper defaults for regions without EDAR data
-        # Mask: False (no measurement), Censor: 0 (not censored), Age: 14 (max age)
-        for var_name in edar_final.data_vars:
-            if var_name.endswith("_mask"):
-                edar_final[var_name] = edar_final[var_name].fillna(False)
-            elif var_name.endswith("_censor"):
-                edar_final[var_name] = edar_final[var_name].fillna(0)
-            elif var_name.endswith("_age"):
-                edar_final[var_name] = edar_final[var_name].fillna(14)
-
-        # Compute biomarker data start offset for each (run_id, region) pair
-        # For each pair, find the first time index where biomarker data > 0
-        # Use -1 for regions with no biomarker data
-        print("Computing biomarker data start offset per (run_id, region)...")
-        # Get only true biomarker variables (exclude mask/censor/age channels)
-        biomarker_vars = [
-            f"{EDAR_BIOMARKER_PREFIX}{v}"
-            for v in EDAR_BIOMARKER_VARIANTS
-            if f"{EDAR_BIOMARKER_PREFIX}{v}" in edar_final.data_vars
-        ]
-
-        # run_id always exists on all data variables
-        first_biomarker = edar_final[biomarker_vars[0]]
-        run_ids = first_biomarker["run_id"].values
         mobility_time_mask = self._build_mobility_time_mask(
-            mobility_data,
-            target_dates,
-            run_ids,
+            mobility_data, target_dates, cases_final["run_id"].values
         )
-
-        # Create 2D array for (run_id, region) pairs
-        biomarker_data_start = xr.DataArray(
-            np.full((len(run_ids), len(common_regions)), -1, dtype=np.int32),
-            dims=["run_id", REGION_COORD],
-            coords={"run_id": run_ids, REGION_COORD: common_regions},
-            name="biomarker_data_start",
-        )
-
-        # Vectorized approach using xarray operations
-        # Stack all biomarkers: (n_variants, n_runs, n_dates, n_regions)
-        all_biomarkers = edar_final[biomarker_vars].to_array(dim="variant")
-
-        # Find where any biomarker has valid data: (n_runs, n_dates, n_regions)
-        has_data = (all_biomarkers > 0) & all_biomarkers.notnull()
-        has_data_any = has_data.any(dim="variant")
-
-        # Use argmax along date dimension to find first True
-        # argmax on boolean returns first True index (0 if all False, but we handle that)
-        first_idx = has_data_any.argmax(
-            dim="date"
-        ).compute()  # Compute for use as indexer
-
-        # Handle all-False case: check if there's actually data at the argmax position
-        has_data_at_first = has_data_any.isel(date=first_idx)
-        first_idx_corrected = xr.where(has_data_at_first, first_idx, -1)
-
-        # Convert to numpy and assign to biomarker_data_start
-        # Note: first_idx_corrected already has dims (run_id, region_id)
-        biomarker_data_start.values = first_idx_corrected.astype(np.int32).values
-
-        print(
-            f"  (run_id, region) pairs with biomarker data: {(biomarker_data_start.values >= 0).sum()}/{biomarker_data_start.size}"
-        )
-        if (biomarker_data_start.values >= 0).sum() > 0:
-            valid_starts = biomarker_data_start.values[biomarker_data_start.values >= 0]
-            print(f"  First data start index: {valid_starts.min()}")
-            print(f"  Last data start index: {valid_starts.max()}")
 
         # Generate report
         _report = {
@@ -436,8 +358,6 @@ class AlignmentProcessor:
             mobility_final,
             mobility_time_mask,
             population_final,
-            edar_final,
-            biomarker_data_start,
         ]
         if hosp_final is not None:
             datasets_to_merge.append(hosp_final)

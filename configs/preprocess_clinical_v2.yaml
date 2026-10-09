@@ -1,0 +1,17 @@
+# V2 is opt-in. Existing training configs continue to use real_with_id.zarr.
+base_config: preprocess_full.yaml
+dataset_name: real_with_id_v2
+dataset_version: 2
+output_format: zarr
+overwrite_output: false
+continuous_storage_dtype: float32
+smoothing:
+  process_var: 0.05
+  measurement_var: 0.5
+source_provenance:
+  preprocessing_version: 2
+  case_missing_policy: absent municipality-day rows remain unknown
+  clinical_filter_transform: log1p
+  filter_parameter_policy: fixed configured variances; no full-series fitting
+  filter_initialization_policy: current observation only; no earlier values
+  vaccination_policy: accumulate prior doses before cropping the output

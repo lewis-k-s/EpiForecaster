@@ -1,0 +1,9 @@
+# V3 removes municipal wastewater. Native EDAR observations stay separate.
+# Existing training configs retain their pinned input versions.
+base_config: preprocess_clinical_v2.yaml
+dataset_name: real_with_id_v3
+dataset_version: 3
+source_provenance:
+  preprocessing_version: 3
+  wastewater_support: separate_native_edar_store
+  municipal_wastewater_policy: excluded from clinical preprocessing

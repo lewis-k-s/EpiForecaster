@@ -46,13 +46,6 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
         coords={"run_id": run_ids, "region_id": region_ids},
     )
 
-    edar_biomarker = xr.DataArray(
-        rng.random((len(run_ids), len(dates), len(region_ids))),
-        dims=("run_id", "date", "region_id"),
-        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
-        name="edar_biomarker_N1",
-    )
-
     return xr.Dataset(
         {
             "cases": cases,
@@ -60,7 +53,6 @@ def _make_synthetic_dataset(run_ids, dates, region_ids):
             "mobility_base": mobility_base,
             "mobility_kappa0": mobility_kappa0,
             "population": population,
-            "edar_biomarker_N1": edar_biomarker,
         }
     )
 
@@ -99,12 +91,9 @@ def test_alignment_preserves_mobility_coords(tmp_path):
     mobility_ds = processor._extract_mobility(ds)
     population_da = processor._extract_population(ds)
 
-    edar_ds = xr.Dataset({"edar_biomarker_N1": ds["edar_biomarker_N1"]})
-
     aligned = aligner.align_datasets(
         cases_data=cases_ds["cases"],
         mobility_data=mobility_ds,
-        edar_data=edar_ds,
         population_data=population_da,
     )
 
@@ -150,7 +139,6 @@ def test_alignment_derives_deaths_mask_and_age_from_observations(tmp_path):
         coords={"region_id": region_ids},
         name="population",
     )
-    edar_ds = xr.Dataset({"edar_biomarker_N1": ds["edar_biomarker_N1"]})
 
     # Deaths values include true missing observations (NaN) that should remain mask=0.
     deaths_values = np.array(
@@ -175,7 +163,6 @@ def test_alignment_derives_deaths_mask_and_age_from_observations(tmp_path):
     aligned = aligner.align_datasets(
         cases_data=cases_da,
         mobility_data=mobility,
-        edar_data=edar_ds,
         population_data=population_da,
         deaths_data=deaths_ds,
     )
@@ -220,7 +207,6 @@ def test_alignment_recomputes_hospitalization_age_from_mask(tmp_path):
         coords={"region_id": region_ids},
         name="population",
     )
-    edar_ds = xr.Dataset({"edar_biomarker_N1": ds["edar_biomarker_N1"]})
 
     hosp_values = np.array(
         [[[10.0, 20.0], [9.0, 19.0], [8.0, 18.0], [7.0, 17.0]]], dtype=np.float32
@@ -253,7 +239,6 @@ def test_alignment_recomputes_hospitalization_age_from_mask(tmp_path):
     aligned = aligner.align_datasets(
         cases_data=cases_da,
         mobility_data=mobility,
-        edar_data=edar_ds,
         population_data=population_da,
         hospitalizations_data=hospitalizations_ds,
     )

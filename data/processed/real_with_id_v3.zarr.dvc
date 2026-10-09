@@ -1,0 +1,6 @@
+outs:
+- md5: 17bb89b338bb0314b2f90d7dfd9dd1c8.dir
+  size: 402548082
+  nfiles: 2405
+  hash: md5
+  path: real_with_id_v3.zarr

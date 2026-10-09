@@ -13,7 +13,6 @@ from data.preprocess.processors.hospitalizations_processor import (
     HospitalizationsProcessor,
 )
 from data.preprocess.processors.catalonia_cases_processor import CataloniaCasesProcessor
-from data.preprocess.processors.edar_processor import EDARProcessor
 
 
 @pytest.fixture
@@ -21,7 +20,6 @@ def minimal_config(tmp_path):
     # Create dummy files to pass config validation
     (tmp_path / "cases.csv").touch()
     (tmp_path / "mob.nc").touch()
-    (tmp_path / "ww.csv").touch()
     (tmp_path / "pop.csv").write_text("id,d.population\n")
     (tmp_path / "meta.json").touch()
     (tmp_path / "hosp.csv").touch()
@@ -31,9 +29,7 @@ def minimal_config(tmp_path):
         data_dir=str(tmp_path),
         cases_file=str(tmp_path / "cases.csv"),
         mobility_path=str(tmp_path / "mob.nc"),
-        wastewater_file=str(tmp_path / "ww.csv"),
         population_file=str(tmp_path / "pop.csv"),
-        region_metadata_file=str(tmp_path / "meta.json"),
         hospitalizations_file=str(tmp_path / "hosp.csv"),
         deaths_file=str(tmp_path / "deaths.csv"),
         start_date=datetime(2022, 1, 1),
@@ -60,9 +56,6 @@ class TestPipelineRobustness:
 
         pipeline.processors["mobility"] = Mock()
         pipeline.processors["mobility"].process.return_value = "mobility_data"
-
-        pipeline.processors["edar"] = Mock()
-        pipeline.processors["edar"].process.return_value = "edar_data"
 
         pipeline.processors["hospitalizations"] = Mock()
         pipeline.processors["hospitalizations"].process.side_effect = Exception(
@@ -92,10 +85,8 @@ class TestPipelineRobustness:
         # Mock the other processors
         pipeline.processors["cases"] = Mock()
         pipeline.processors["mobility"] = Mock()
-        pipeline.processors["edar"] = Mock()
         pipeline.processors["cases"].process.return_value = "ok"
         pipeline.processors["mobility"].process.return_value = "ok"
-        pipeline.processors["edar"].process.return_value = "ok"
         pipeline._load_population_data = Mock(return_value="pop_data")
 
         # Should not raise - hospitalizations is skipped when not configured
@@ -150,30 +141,6 @@ class TestProcessorsKalmanFallback:
         assert "cases" in result.columns
         # Result should have the expected number of rows
         assert len(result) == len(daily_df)
-
-    def test_edar_kalman_no_fallback(self, minimal_config):
-        """Test that EDAR processor handles fitting failure by marking as missing."""
-        proc = EDARProcessor(minimal_config)
-
-        dates = pd.date_range("2022-01-01", periods=10)
-        daily_df = pd.DataFrame(
-            {
-                "date": dates,
-                "edar_id": "E1",
-                "variant": "N1",
-                "total_covid_flow": np.zeros(10),
-                "limit_flow": np.ones(10),
-            }
-        )
-
-        # Should not raise, but mark as missing (flag 2)
-        result = proc._apply_tobit_kalman(daily_df)
-
-        assert not result.empty
-        assert (result["censor_flag"] == 2).all(), "Should mark failed fits as missing"
-        assert result["total_covid_flow"].isna().all(), (
-            "Flow should be NaN for failed fits"
-        )
 
 
 class TestSmoothedDataValidity:
@@ -231,45 +198,6 @@ class TestSmoothedDataValidity:
             "Missing hospitalization values should be interpolated"
         )
 
-    def test_edar_censor_flags_aggregation(self, minimal_config):
-        """Test max-severity aggregation of censor flags."""
-        proc = EDARProcessor(minimal_config)
-
-        # Mock data:
-        # Region R1 has contribution from E1 (flag 0) and E2 (flag 1) -> Expect 1
-        # Region R2 has contribution from E3 (flag 2) -> Expect 2
-
-        coords = {
-            "run_id": ["real"],
-            "date": [np.datetime64("2022-01-01")],
-            "edar_id": ["E1", "E2", "E3"],
-            "variant": ["N1"],
-        }
-
-        censor_data = np.array([[[[0.0], [1.0], [2.0]]]])  # (run, date, edar, var)
-        censor_xr = xr.DataArray(
-            censor_data, coords=coords, dims=["run_id", "date", "edar_id", "variant"]
-        )
-
-        emap_coords = {"edar_id": ["E1", "E2", "E3"], "region_id": ["R1", "R2"]}
-        # E1->R1, E2->R1, E3->R2
-        emap_data = np.array(
-            [
-                [1.0, 0.0],  # E1
-                [1.0, 0.0],  # E2
-                [0.0, 1.0],  # E3
-            ]
-        )
-        emap = xr.DataArray(
-            emap_data, coords=emap_coords, dims=["edar_id", "region_id"]
-        )
-
-        result = proc._aggregate_censor_flags(censor_xr, emap)
-
-        # Check R1: max(0, 1) = 1
-        r1_flag = result.sel(region_id="R1", variant="N1").values.item()
-        assert r1_flag == 1.0, f"R1 should be censored (1), got {r1_flag}"
-
 
 class TestStrictnessRefactor:
     def test_deaths_not_filled_with_zero(self, minimal_config):
@@ -288,7 +216,7 @@ class TestStrictnessRefactor:
             coords={TEMPORAL_COORD: dates, REGION_COORD: regions},
             dims=[TEMPORAL_COORD, REGION_COORD],
             name="cases",
-        )
+        ).expand_dims(run_id=["real"])
 
         # Deaths (missing R2)
         deaths = xr.DataArray(
@@ -305,17 +233,6 @@ class TestStrictnessRefactor:
             coords={TEMPORAL_COORD: dates, "origin": regions, "destination": regions}
         )
 
-        # EDAR (dummy with one variable)
-        edar = xr.Dataset(coords={TEMPORAL_COORD: dates, REGION_COORD: regions})
-        edar["edar_biomarker_N1"] = xr.DataArray(
-            np.zeros((len(dates), len(regions))),
-            coords={TEMPORAL_COORD: dates, REGION_COORD: regions},
-            dims=[TEMPORAL_COORD, REGION_COORD],
-        )
-        # Add run_id to match processor expectations
-        edar["edar_biomarker_N1"] = edar["edar_biomarker_N1"].expand_dims(run_id=[1])
-
-        # Population (dummy)
         pop = xr.DataArray(
             np.ones(len(regions)),
             coords={REGION_COORD: regions},
@@ -327,7 +244,6 @@ class TestStrictnessRefactor:
         aligned = proc.align_datasets(
             cases_data=cases,
             mobility_data=mobility,
-            edar_data=edar,
             population_data=pop,
             deaths_data=deaths,
         )
@@ -335,38 +251,3 @@ class TestStrictnessRefactor:
         # Check R2 deaths - should be NaN, NOT 0.0
         r2_deaths = aligned["deaths"].sel(region_id="R2").values
         assert np.all(np.isnan(r2_deaths)), "Missing deaths data should be NaN, not 0.0"
-
-    def test_edar_missing_site_is_missing_flag(self, minimal_config):
-        """Verify that an EDAR site with NO data results in Missing (2) flag, not Uncensored (0)."""
-        proc = EDARProcessor(minimal_config)
-
-        # Setup: Region R1 maps to E1. E1 has NO data in the censor array (NaN).
-
-        coords = {
-            "run_id": ["real"],
-            "date": [np.datetime64("2022-01-01")],
-            "edar_id": ["E1"],
-            "variant": ["N1"],
-        }
-
-        # Censor data is all NaN (missing site)
-        censor_data = np.full((1, 1, 1, 1), np.nan)
-        censor_xr = xr.DataArray(
-            censor_data, coords=coords, dims=["run_id", "date", "edar_id", "variant"]
-        )
-
-        emap_coords = {"edar_id": ["E1"], "region_id": ["R1"]}
-        emap_data = np.array([[1.0]])
-        emap = xr.DataArray(
-            emap_data, coords=emap_coords, dims=["edar_id", "region_id"]
-        )
-
-        result = proc._aggregate_censor_flags(censor_xr, emap)
-
-        # Check R1 flag
-        r1_flag = result.sel(region_id="R1", variant="N1").values.item()
-
-        # EXPECTED FAILURE: Currently implementation fills with 0 (Uncensored)
-        assert r1_flag == 2.0, (
-            f"Missing site should be flagged as Missing (2.0), got {r1_flag}"
-        )

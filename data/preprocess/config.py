@@ -48,7 +48,8 @@ class SmoothingConfig:
     """Configuration for offline causal smoothing."""
 
     clinical_method: str = "kalman_v2"
-    wastewater_method: str = "tobit_kalman_v2"
+    process_var: float = 0.05
+    measurement_var: float = 0.5
     missing_policy: str = "predict"
     momentum_decay: float = 0.5
     momentum_max_steps: int = 4
@@ -64,18 +65,12 @@ class SmoothingConfig:
 
     def __post_init__(self):
         valid_clinical = {"kalman_v2", "holt_damped"}
-        valid_wastewater = {"tobit_kalman_v2"}
         valid_missing = {"predict", "momentum"}
 
         if self.clinical_method not in valid_clinical:
             raise ValueError(
                 f"Invalid clinical_method: {self.clinical_method}. "
                 f"Valid options: {sorted(valid_clinical)}"
-            )
-        if self.wastewater_method not in valid_wastewater:
-            raise ValueError(
-                f"Invalid wastewater_method: {self.wastewater_method}. "
-                f"Valid options: {sorted(valid_wastewater)}"
             )
         if self.missing_policy not in valid_missing:
             raise ValueError(
@@ -96,6 +91,10 @@ class SmoothingConfig:
             raise ValueError("process_var_floor must be positive")
         if self.measurement_var_floor <= 0.0:
             raise ValueError("measurement_var_floor must be positive")
+        if not (0.0 < self.process_var < float("inf")):
+            raise ValueError("process_var must be finite and positive")
+        if not (0.0 < self.measurement_var < float("inf")):
+            raise ValueError("measurement_var must be finite and positive")
         if not (0.0 < self.holt_alpha <= 1.0):
             raise ValueError("holt_alpha must be in (0, 1]")
         if not (0.0 <= self.holt_beta <= 1.0):
@@ -122,9 +121,7 @@ class PreprocessingConfig:
             and SyntheticProcessor is used instead.
         mobility_path: Path to NetCDF mobility data
         cases_file: Path to COVID case data CSV
-        wastewater_file: Path to wastewater biomarker data
         population_file: Path to population data for normalization
-        region_metadata_file: Path to regional metadata
         hospitalizations_file: Optional path to hospitalizations data CSV
         deaths_file: Optional path to deaths data CSV (comarca-level)
         catalonia_cases_file: Optional path to Catalonia official cases data
@@ -136,7 +133,6 @@ class PreprocessingConfig:
         sequence_length: Length of input sequences for models
 
         min_flow_threshold: Minimum flow threshold for mobility pairs (i,j)
-        wastewater_flow_mode: "total_flow" or "concentration" for EDAR
 
         alignment_strategy: Strategy for aligning multiple datasets
         temporal_alignment_mode: "strict" requires datasets to already match the
@@ -167,9 +163,7 @@ class PreprocessingConfig:
     data_dir: str
     cases_file: str
     mobility_path: str
-    wastewater_file: str
     population_file: str
-    region_metadata_file: str
     start_date: datetime
     end_date: datetime
     output_path: str
@@ -187,17 +181,6 @@ class PreprocessingConfig:
 
     # Feature processing options
     min_flow_threshold: int = 10
-    wastewater_flow_mode: str = "total_flow"  # "total_flow" or "concentration"
-
-    # Censor inflation multiplier for Tobit-Kalman filtering.
-    # Multiplier applied to the measurement variance when an observation is censored
-    # (i.e., below the detection limit). In TobitKalmanSmoother.filter_series
-    # (see data/preprocess/smoothing.py), when value <= limit,
-    # the effective measurement variance is:
-    #   r_eff = measurement_var * censor_inflation
-    # So a higher censor_inflation down-weights censored observations (trusts them
-    # less) and yields smoother state updates.
-    censor_inflation: float = 4.0
 
     # Temporal processing parameters
     forecast_horizon: int = 7
@@ -211,12 +194,15 @@ class PreprocessingConfig:
     # Output configuration
     compression: str = "blosc"
     continuous_storage_dtype: str = "float16"
+    output_format: str = "netcdf"
+    dataset_version: int = 1
+    overwrite_output: bool = True
     chunk_sizes: dict[str, list[int]] | None = None
 
     # Alignment and validation options
     alignment_strategy: str = "interpolate"  # "interpolate", "nearest", "spline"
     temporal_alignment_mode: str = "strict"  # "strict" or "outer"
-    target_dataset: str = "cases"  # "cases", "mobility", "wastewater"
+    target_dataset: str = "cases"  # "cases", "mobility"
     crop_datasets: bool = True
     validate_alignment: bool = True
     generate_alignment_report: bool = True
@@ -287,13 +273,6 @@ class PreprocessingConfig:
         cases_path = Path(self.cases_file)
         if not cases_path.exists():
             raise ValueError(f"Cases file does not exist: {self.cases_file}")
-
-        if self.wastewater_file:
-            wastewater_path = Path(self.wastewater_file)
-            if not wastewater_path.exists():
-                raise ValueError(
-                    f"Wastewater file does not exist: {self.wastewater_file}"
-                )
 
         if self.hospitalizations_file:
             hospitalizations_path = Path(self.hospitalizations_file)
@@ -393,6 +372,10 @@ class PreprocessingConfig:
             raise ValueError("memory_limit_gb must be positive")
 
         valid_storage_dtypes = {"float16", "float32"}
+        if self.output_format not in {"netcdf", "zarr"}:
+            raise ValueError("output_format must be 'netcdf' or 'zarr'")
+        if self.dataset_version < 1:
+            raise ValueError("dataset_version must be positive")
         if self.continuous_storage_dtype not in valid_storage_dtypes:
             raise ValueError(
                 "continuous_storage_dtype must be one of "
@@ -538,7 +521,6 @@ class PreprocessingConfig:
             "data_sources": {
                 "mobility": self.mobility_path,
                 "cases": self.cases_file,
-                "wastewater": self.wastewater_file,
                 "population": self.population_file,
                 "hospitalizations": self.hospitalizations_file,
                 "deaths": self.deaths_file,

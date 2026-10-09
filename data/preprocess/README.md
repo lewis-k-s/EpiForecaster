@@ -4,6 +4,38 @@ This worktree uses source-native clinical and EDAR inputs with the heterogeneous
 model. Municipality preprocessing supplies cases, vaccination, and calendar
 features. The municipal training model belongs to the legacy worktree.
 
+## Clinical dataset version 3
+
+Build the opt-in clinical dataset with:
+
+```bash
+uv run preprocess epiforecaster --config configs/preprocess_clinical_v3.yaml
+```
+
+The output is `data/processed/real_with_id_v3.zarr`. It uses float32 storage,
+records `dataset_version: 3`, and refuses to replace an existing dataset.
+Existing training configs continue to select `real_with_id.zarr`. Select V3
+with a `data.dataset_path` override and generate new native source sets before
+using it in an immutable training run. Earlier split manifests bind the V1
+input bytes and cannot be reused for V3.
+
+V3 removes municipal wastewater values, masks, censor codes, ages, and
+coverage metadata. The clinical pipeline no longer accepts wastewater or
+EDAR-to-municipality mapping inputs. Native plant observations and catchment
+relations remain in the separate native stores. V1 and V2 assets remain
+unchanged; their projected wastewater fields are historical outputs.
+
+Clinical filters operate in `log1p` space with fixed configured
+`smoothing.process_var` and `smoothing.measurement_var`. They initialize from
+the current observation and expose zero values with mask 0 before the first
+observation. Explicit zero counts retain mask 1. Absent municipality-day rows
+remain unknown; the case source has no reporting-availability flag that would
+justify treating every absent row as an observed zero.
+
+Vaccination coverage and age are computed from all prior dose records before
+the output is cropped. Alignment preserves that prior history in the age
+channel.
+
 ## Source-native contract
 
 Native preprocessing writes versioned artifacts under
@@ -63,22 +95,21 @@ stores. Projected hospital and death series are not model inputs in this worktre
 | `population` | `(region,)` (persisted as `(region, 1)` in Zarr) | Static per administrative region. Sourced from the case metadata. Required for per-100k normalization in preprocessing. |
 | `cases` | `(time, region)` | Daily (or configured cadence) case counts. Required input that defines the master time/region grid. |
 | `vaccination_rate` | `(time, region)` | Cumulative first-dose COVID-19 vaccination coverage per municipality, computed from official Generalitat administered-dose records and population. |
-| `edar_biomarker_<variant>` | `(time, region)` | Per-variant wastewater signal (e.g., N1, N2, IP4) aggregated from EDAR sites to target regions using the contribution matrix. |
-| `mobility` | `(time, region, region)` | Origin–destination matrix per timestamp. Optional but expected for the standard build; placeholder tensors are created if mobility is missing so the output schema stays stable. |
-
-Because `cases` and EDAR biomarkers resolve to `(time, region)` series, the combined feature width for temporal signals depends on the number of biomarker variants.
+| `mobility` | `(time, region, region)` | Origin–destination matrix per timestamp; required for the real clinical build. |
 
 ## Processing Stages
 
-1. **Raw loaders (`CasesProcessor`, `EDARProcessor`, `MobilityProcessor`)** – Each processor reads its source (CSV, NetCDF, etc.), performs source-specific cleaning, and emits tensors plus metadata (date ranges, region lists).
-2. **Alignment (`AlignmentProcessor`)** – Harmonizes temporal indices to the configured timeline and uses `region_metadata` to translate biomarker/mobility regions into the case region ID space. The default `temporal_alignment_mode: "strict"` preserves the historical exact-match behavior for cases and mobility; `temporal_alignment_mode: "outer"` reindexes sources to the configured range so wastewater-only tails can remain in the canonical output without marking unavailable cases or mobility as observed.
-3. **Static transforms** – All continuous series are log1p-transformed before dtype conversion to prevent float16 overflow:
-   - **Clinical series** (`cases`, `hospitalizations`, `deaths`): log1p(per-100k) using population
-   - **Mobility**: log1p only
-   - **Biomarker values**: log1p only
-   - **Vaccination coverage**: left in rate space `[0, 1]`
-4. **Validation and storage** – Consistency checks guarantee every batch has identical node/edge counts and no NaNs before persisting via `DatasetStorage.save_dataset()`.
-5. **Reporting** – A JSON report (same directory as the Zarr store) captures configuration, alignment outcomes, statistics, and warnings for reproducibility.
+1. **Raw loaders** — Read cases, mobility, population, and configured clinical
+   sources. Synthetic preprocessing extracts these fields from the raw bundle;
+   plant observations in that bundle are not projected to municipalities.
+2. **Alignment** — Align cases and mobility by municipality ID. Strict temporal
+   alignment requires the configured daily range; outer alignment preserves
+   unavailable dates in the observation masks.
+3. **Static transforms** — Use `log1p(per-100k)` for clinical counts, `log1p` for
+   mobility, and rate space for vaccination coverage.
+4. **Storage** — Write Zarr or NetCDF according to `output_format`. The writer
+   rejects municipal wastewater fields. V3 uses float32 for continuous values.
+5. **Provenance** — Record the resolved config and source identities in attributes.
 
 ## Causal Smoothing Modes
 
@@ -91,76 +122,43 @@ future dates).
 | Method | Config key | Behavior |
 | --- | --- | --- |
 | Kalman v2 | `smoothing.clinical_method: "kalman_v2"` | Random-walk Kalman filter with configurable missing policy (`predict` default, optional bounded `momentum`), innovation clipping, and re-entry gain capping to reduce hard jump artifacts after sparse gaps. |
-| Damped Holt | `smoothing.clinical_method: "holt_damped"` | Causal level+trend smoother (log space) with damped trend carry through missing intervals to avoid plateaus and spikes. |
+| Damped Holt | `smoothing.clinical_method: "holt_damped"` | Causal level+trend smoother in log1p space with damped trend carry through missing intervals. |
 
-### Wastewater series (EDAR variants)
+### Native wastewater
 
-| Method | Config key | Behavior |
-| --- | --- | --- |
-| Tobit Kalman v2 | `smoothing.wastewater_method: "tobit_kalman_v2"` | Causal Tobit-Kalman filtering for censored observations (LOD-aware), with the same missing-policy and robust re-entry controls as Kalman v2. |
+`native_wastewater_processor.py` preserves each plant and assay. It stores raw
+concentration, detection limit, censor code, observation mask, age, flow, and
+fixed-parameter causal Tobit-Kalman history. These fields are not merged into
+municipality features. `NativeSupportDataset` reads this separate store.
 
-## Wastewater (EDAR) Processing Methodology
-
-The wastewater processor (`EDARProcessor`) implements a sophisticated pipeline to handle the unique challenges of environmental surveillance data, particularly sparsity and limits of detection (LOD).
-
-### 1. Data Cleaning & Flow Calculation
-- **Variant Selection:** For each site, the two most prevalent variants (e.g., N1, N2, IP4) are selected based on data availability.
-- **Flow Normalization:** Viral loads (CG/L) can be converted to total flow (CG/day) using daily flow rates ($m^3/day$), or kept as concentrations by setting `wastewater_flow_mode: "concentration"`.
-- **Temporal Aggregation:** Multiple measurements per day are averaged.
-
-### 2. Imputation and Smoothing (Tobit Kalman Filter)
-To address missing data and censored observations (values below the limit of detection), we implement a **Tobit Kalman Filter**:
-
-- **State Space Model:** We model the log-transformed viral flow as a local level process (random walk) observed with noise.
-- **Censored Data (Values $\le$ LOD):** Instead of treating these as zeros or missing, we use a Tobit update step. The filter updates the state estimate using the probability mass of the predicted distribution that falls below the LOD. This statistically imputes the most likely value consistent with the "non-detect" observation.
-- **Missing Data:** Days with no samples are handled causally according to `smoothing.missing_policy`. Default `predict` uses one-step prediction only; optional `momentum` enables bounded decayed extrapolation (with configurable max steps). Censor flag remains 2 to indicate imputed values.
-- **Parameter Estimation:** Process and measurement variances are fitted per-site using Maximum Likelihood Estimation (MLE) on the available non-censored data.
-
-### 3. Spatial Aggregation
-Processed site-level data is mapped to administrative regions using a contribution matrix (defined in `region_metadata`). This transforms the sparse site-level signals into a continuous, region-aligned tensor.
-
-### 4. Quality Control & Diagnostics
-We provide specialized tools to analyze data quality and the efficacy of the processing:
-
-- **Sparsity Analysis:** `dataviz/analyze_wastewater_sparsity.py`
-  - Visualizes temporal availability and below-detection rates.
-  - Compares LOCF (Last Observation Carried Forward) vs. true sparsity.
-  - Generates "traffic light" heatmaps of data coverage.
-  
-- **Canonical Output Check:** `dataviz/canonical_biomarker_series.py`
-  - Plots the final processed time series per region.
-  - Generates heatmaps of the canonical biomarker tensor.
-  - Useful for verifying that the imputation produced realistic trends.
+Use `native.wastewater_filename` to select a pinned native wastewater version.
+The catchment plot accepts `--wastewater-path` and reads this store directly.
+Source sample dates do not establish lab result availability; an as-of study
+must account for reporting delay separately.
 
 ## Output Dataset Contract
 
-Running the pipeline always yields a Zarr dataset whose arrays follow this layout:
+V3 writes a Zarr dataset with the following arrays (NetCDF is also supported):
 
 | Array | Shape | Dtype | Description |
 | --- | --- | --- | --- |
-| `cases` | `(run_id, time, region, 1)` | float16 | Canonical case counts (log1p per-100k transformed). |
+| `cases` | `(run_id, time, region)` | float32 | Canonical case counts (log1p per-100k transformed). |
 | `cases_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
 | `cases_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). 14 = no prior observation. |
-| `hospitalizations` | `(run_id, time, region, 1)` | float16 | Hospitalization counts (log1p per-100k, Kalman-smoothed). |
+| `hospitalizations` | `(run_id, time, region)` | float32 | Hospitalization counts (log1p per-100k, Kalman-smoothed). |
 | `hospitalizations_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
 | `hospitalizations_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). |
-| `deaths` | `(run_id, time, region, 1)` | float16 | Death counts (log1p per-100k, Kalman-smoothed). |
+| `deaths` | `(run_id, time, region)` | float32 | Death counts (log1p per-100k, Kalman-smoothed). |
 | `deaths_mask` | `(run_id, time, region)` | bool | True if observed, False if missing/interpolated. |
 | `deaths_age` | `(run_id, time, region)` | uint8 | Days since last observation (0-14). |
-| `vaccination_rate` | `(run_id, time, region)` | float16 | Cumulative first-dose vaccination coverage, clipped to `[0, 1]`. |
+| `vaccination_rate` | `(run_id, time, region)` | float32 | Cumulative first-dose vaccination coverage, clipped to `[0, 1]`. |
 | `vaccination_rate_mask` | `(run_id, time, region)` | bool | True if the source had administered first-dose rows for the municipality-date. |
 | `vaccination_rate_age` | `(run_id, time, region)` | uint8 | Days since last source first-dose observation (0-14). |
-| `edar_biomarker_<variant>` | `(run_id, time, region)` | float16 | Per-variant biomarker intensity (log1p, Kalman-filtered). |
-| `edar_biomarker_<variant>_mask` | `(run_id, time, region)` | bool | True if measured (finite and positive), False otherwise. |
-| `edar_biomarker_<variant>_censor` | `(run_id, time, region)` | uint8 | 0=uncensored, 1=censored at LOD, 2=missing/imputed. |
-| `edar_biomarker_<variant>_age` | `(run_id, time, region)` | uint8 | Days since last measurement (0-14). 14 = no EDAR coverage. |
-| `biomarker_data_start` | `(run_id, region)` | int16 | First time index with biomarker data. -1 = no coverage. |
-| `mobility` | `(run_id, time, origin, destination)` | float16 | Origin–destination flow tensor (log1p-transformed). |
+| `mobility` | `(run_id, time, origin, destination)` | float32 | Origin–destination flow tensor (log1p-transformed). |
 | `mobility_time_mask` | `(run_id, time)` | bool | True when the mobility tensor has source data for the timestep. False for outer-aligned dates beyond the OD data range. |
 | `population` | `(region,)` | int32 | Static population per region. |
-| `edar_has_source` | `(region,)` | bool | True if region has EDAR site contributions. |
 | `valid_targets` | `(run_id, region)` | bool | True if (run, region) meets minimum data density. |
-| `temporal_covariates` | `(time, covariate)` | float16 | Calendar features such as `[dow_sin, dow_cos, is_holiday, lockdown_severity]` when enabled. |
+| `temporal_covariates` | `(time, covariate)` | float32 | Calendar features such as `[dow_sin, dow_cos, is_holiday, lockdown_severity]` when enabled. |
 
 ### Dataset Attributes
 
@@ -168,37 +166,35 @@ The Zarr dataset includes the following attributes to indicate the transforms ap
 
 | Attribute | Value | Description |
 | --- | --- | --- |
-| `log_transformed` | `true` | All continuous series (clinical, mobility, biomarkers) are log1p-transformed. |
-| `population_norm` | `true` | Clinical series (cases, hospitalizations, deaths) are per-100k normalized. |
+| `log_transformed` | `true` | Clinical counts and mobility are log1p-transformed; vaccination remains a rate. |
+| `population_norm` | `1` | Clinical series (cases, hospitalizations, deaths) are per-100k normalized. |
 
 ### Dtype Rationale
 
 | Category | Dtype | Reason |
 | --- | --- | --- |
-| Continuous values | float16 | 2 bytes, sufficient precision for log1p-transformed inputs; matches model bf16 compute. Overflow prevented by log1p transform. |
+| Continuous values | float32 | 4 bytes; preserves small positive observations and transformed values. |
 | Binary masks | bool | 1 byte, clear semantics (observed vs missing). |
 | Age channels | uint8 | 1 byte, range 0-14 days. |
-| Censor flags | uint8 | 1 byte, values 0/1/2. |
-| Data start indices | int16 | 2 bytes, needs -1 sentinel, max ~1000 days fits easily. |
 | Population | int32 | 4 bytes, populations < 2.1B. |
 | Binary flags | bool | 1 byte, clear semantics. |
 
-Any additional metadata (alignment summaries, preprocessing config, pipeline timing) is bundled in the accompanying JSON report and within each `EpiBatch.metadata` field.
+The resolved preprocessing config and source provenance are stored in dataset attributes.
 
 ## Running the Pipeline
 
 ```bash
-uv run preprocess epiforecaster --config configs/preprocess_full.yaml
+uv run preprocess epiforecaster --config configs/preprocess_clinical_v3.yaml
 ```
 
 * Use a single configuration file to describe the desired dataset. Variant-specific switches should live in the training/model configs, not here.
-* The pipeline infers the output path via `PreprocessingConfig.get_output_dataset_path()` and overwrites previous artifacts if they share the same dataset name—copy/rename if you need historical snapshots.
+* The output name follows `dataset_name` and `output_format`. The V3 config sets `overwrite_output: false`; use a new version for each rebuild.
 * To inspect the result, open the Zarr with `xarray.open_zarr(<zarr_path>)` and validate expected dimensions, masks, and attributes.
 
 ## Practical Notes
 
 - Keep raw inputs in `data/raw/` and let the pipeline write to `data/processed/` or `outputs/` via your config. Large artifacts should stay out of version control.
-- If mobility data is missing or fails validation, the pipeline logs a warning and writes zero-filled tensors so the output contract stays intact.
-- When updating biomarker definitions or region mappings, ensure the `region_metadata` you supply still produces the `(time, region)` series; otherwise the alignment step will raise before writing artifacts.
+- Real preprocessing requires cases, mobility, and population. Missing required inputs cause an error.
+- Changes to native wastewater or catchment relations use separate versioned native artifacts.
 
 This guide should be kept in sync with `data/preprocess/pipeline.py` whenever the preprocessing stages or output schema changes.

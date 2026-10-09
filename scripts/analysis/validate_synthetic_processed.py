@@ -119,9 +119,7 @@ def validate(store: Path) -> dict[str, Any]:
             if "lockdown_severity" not in covariates:
                 failures.append("lockdown_severity temporal covariate is absent")
             else:
-                lockdown = ds["temporal_covariates"].sel(
-                    covariate="lockdown_severity"
-                )
+                lockdown = ds["temporal_covariates"].sel(covariate="lockdown_severity")
                 lockdown_min = float(lockdown.min().compute())
                 lockdown_max = float(lockdown.max().compute())
                 report["lockdown_severity_range"] = [lockdown_min, lockdown_max]
@@ -163,7 +161,7 @@ def validate(store: Path) -> dict[str, Any]:
                 "log_transformed",
                 "population_norm",
                 "smoothing_clinical_method",
-                "smoothing_wastewater_method",
+                "wastewater_support",
             )
         }
         if ds.attrs.get("smoothing_clinical_method") != "holt_damped":

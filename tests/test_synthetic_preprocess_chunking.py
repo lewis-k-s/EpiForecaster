@@ -22,6 +22,7 @@ def _write_minimal_synthetic_zarr(
     latent_h_name="latent_H_true",
     include_deaths_true=True,
     death_flow_offset=0.0,
+    include_wastewater=True,
 ):
     rng = np.random.default_rng(123)
 
@@ -122,8 +123,9 @@ def _write_minimal_synthetic_zarr(
         latent_h_name: latent_h,
         "latent_R_true": latent_r,
         "latent_D_true": latent_d,
-        **edar_vars,
     }
+    if include_wastewater:
+        data_vars.update(edar_vars)
     if include_deaths_true:
         data_vars["deaths_true"] = xr.DataArray(
             death_flow_values + death_flow_offset,
@@ -134,16 +136,6 @@ def _write_minimal_synthetic_zarr(
     ds = xr.Dataset(data_vars)
 
     ds.to_zarr(path, mode="w", zarr_format=2)
-
-
-def _write_region_metadata(path, *, region_ids, edar_ids):
-    data = np.ones((len(edar_ids), len(region_ids)), dtype=np.float32)
-    emap = xr.DataArray(
-        data,
-        dims=("edar_id", "home"),
-        coords={"edar_id": edar_ids, "home": region_ids},
-    )
-    emap.to_netcdf(path)
 
 
 def _make_config(
@@ -610,7 +602,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
         dims=("run_id", "date", "region_id"),
         coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
     )
-    biomarker_mask = xr.DataArray(
+    cases_mask = xr.DataArray(
         da.from_array(data, chunks=(1, 3, 4)),  # type: ignore[arg-type]
         dims=("run_id", "date", "region_id"),
         coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
@@ -619,7 +611,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     aligned_dataset = xr.Dataset(
         {
             "cases": cases,
-            "edar_biomarker_N1_mask": biomarker_mask,
+            "cases_mask": cases_mask,
         }
     )
 
@@ -629,7 +621,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
     saved = xr.open_dataset(output_path, engine="netcdf4")
 
-    chunks = saved["edar_biomarker_N1_mask"].encoding.get("chunksizes")
+    chunks = saved["cases_mask"].encoding.get("chunksizes")
     assert chunks is not None
     assert chunks[0] == min(config.run_id_chunk_size, len(run_ids))
     assert chunks[1] == len(dates)
@@ -640,9 +632,9 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
 
 @pytest.mark.epiforecaster
 @pytest.mark.integration
-def test_pipeline_end_to_end_synthetic(tmp_path):
+@pytest.mark.parametrize("include_wastewater", [False, True])
+def test_pipeline_end_to_end_synthetic(tmp_path, include_wastewater):
     synthetic_path = tmp_path / "raw_synth.zarr"
-    region_metadata_path = tmp_path / "edar_map.nc"
 
     run_ids = np.array(["synth_a", "synth_b"], dtype="U50")
     dates = pd.date_range("2020-01-01", periods=4, freq="D")
@@ -655,15 +647,9 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
         dates=dates,
         region_ids=region_ids,
         edar_ids=edar_ids,
+        include_wastewater=include_wastewater,
     )
-    _write_region_metadata(
-        region_metadata_path,
-        region_ids=region_ids,
-        edar_ids=edar_ids,
-    )
-
     config = _make_config(tmp_path, synthetic_path)
-    config.region_metadata_file = str(region_metadata_path)
     config.continuous_storage_dtype = "float32"
 
     pipeline = OfflinePreprocessingPipeline(config)
@@ -673,6 +659,8 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
+    assert not any(name.startswith("edar_") for name in ds.variables)
+    assert "biomarker_data_start" not in ds
     assert "latent_S_true" in ds
     assert "latent_I_true" in ds
     assert "latent_H_true" in ds

@@ -15,7 +15,7 @@ import pandas as pd
 import xarray as xr
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
-from ..smoothing import DampedHoltSmoother, KalmanSmoother, fit_kalman_params
+from ..smoothing import DampedHoltSmoother, KalmanSmoother
 
 
 class HospitalizationsProcessor:
@@ -157,13 +157,6 @@ class HospitalizationsProcessor:
         method = self.config.smoothing.clinical_method
         print(f"  Applying causal smoothing (method={method})...")
 
-        fallback_process = float(
-            self.config.validation_options.get("process_var", 0.05)
-        )
-        fallback_measure = float(
-            self.config.validation_options.get("measurement_var", 0.5)
-        )
-
         smoothed_records = []
 
         for muni_code in daily_df["municipality_code"].unique():
@@ -177,21 +170,9 @@ class HospitalizationsProcessor:
             observed = muni_data["hospitalizations"].notna().to_numpy()
 
             if method == "kalman_v2":
-                # Fit Kalman parameters from observed data only
-                fit_series = muni_data["hospitalizations"].where(lambda s: s > 0)
-
-                try:
-                    process_var, measurement_var = fit_kalman_params(fit_series)
-                except Exception as e:
-                    print(
-                        f"    ! Falling back to configured variances for {muni_code}: {e}"
-                    )
-                    process_var = fallback_process
-                    measurement_var = fallback_measure
-
                 smoother = KalmanSmoother(
-                    process_var=process_var,
-                    measurement_var=measurement_var,
+                    process_var=self.config.smoothing.process_var,
+                    measurement_var=self.config.smoothing.measurement_var,
                     missing_policy=self.config.smoothing.missing_policy,
                     momentum_decay=self.config.smoothing.momentum_decay,
                     momentum_max_steps=self.config.smoothing.momentum_max_steps,
@@ -216,7 +197,7 @@ class HospitalizationsProcessor:
 
             # Preserve recorded values at observed timesteps; use filtered values for gaps.
             for i, date in enumerate(muni_data.index):
-                filtered_value = float(np.exp(filtered_values[i]))
+                filtered_value = max(float(np.expm1(filtered_values[i])), 0.0)
                 hosp_value = float(values[i]) if observed[i] else filtered_value
                 smoothed_records.append(
                     {

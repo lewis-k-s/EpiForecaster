@@ -24,7 +24,6 @@ from .utils import load_csv_with_string_ids
 from .processors.alignment_processor import AlignmentProcessor
 from .processors.catalonia_cases_processor import CataloniaCasesProcessor
 from .processors.deaths_processor import DeathsProcessor
-from .processors.edar_processor import EDARProcessor
 from .processors.hospitalizations_processor import HospitalizationsProcessor
 from .processors.mobility_processor import MobilityProcessor
 from .processors.synthetic_processor import SyntheticProcessor
@@ -58,7 +57,6 @@ class OfflinePreprocessingPipeline:
         self.config = config
         self.processors = {
             "mobility": MobilityProcessor(self.config),
-            "edar": EDARProcessor(self.config),
             "alignment": AlignmentProcessor(self.config),
         }
 
@@ -100,6 +98,9 @@ class OfflinePreprocessingPipeline:
         Returns:
             Path to the generated Zarr dataset
         """
+        output = self._output_path()
+        if output.exists() and not self.config.overwrite_output:
+            raise FileExistsError(f"Refusing to replace dataset: {output}")
         print("=" * 60)
         print("EPIFORECASTER OFFLINE PREPROCESSING PIPELINE")
         print("=" * 60)
@@ -133,7 +134,6 @@ class OfflinePreprocessingPipeline:
             alignment_result = self.processors["alignment"].align_datasets(
                 cases_data=processed_data["cases"],
                 mobility_data=processed_data["mobility"],
-                edar_data=processed_data["edar"],
                 population_data=processed_data["population"],
                 hospitalizations_data=processed_data.get("hospitalizations"),
                 deaths_data=processed_data.get("deaths"),
@@ -167,13 +167,6 @@ class OfflinePreprocessingPipeline:
             # Compute valid_targets mask based on data density
             valid_targets_mask = self._compute_valid_targets_mask(alignment_result)
             alignment_result["valid_targets"] = valid_targets_mask
-
-            # Add wastewater source availability per region
-            edar_region_mask = self._compute_edar_region_mask(
-                self.config.region_metadata_file,
-                alignment_result[REGION_COORD].values,
-            )
-            alignment_result["edar_has_source"] = edar_region_mask
 
             if "temporal_covariates" in processed_data:
                 temporal_covariates_da = processed_data["temporal_covariates"]
@@ -225,18 +218,6 @@ class OfflinePreprocessingPipeline:
             synthetic_processor = SyntheticProcessor(self.config)
             processed = synthetic_processor.process(self.config.synthetic_path)
 
-            # Process EDAR using the same code path as real data!
-            print("Processing synthetic EDAR data through shared aggregation path...")
-            edar_processor = self.processors["edar"]
-            processed["edar"] = edar_processor.process_from_xarray(
-                processed["edar_flow"],
-                processed["edar_censor"],
-                self.config.region_metadata_file,
-            )
-            # Remove temporary flow/censor keys
-            del processed["edar_flow"]
-            del processed["edar_censor"]
-
             # Ensure hospitalizations and deaths are set to None if not present
             # (the pipeline expects these keys to exist)
             if "hospitalizations" not in processed:
@@ -280,19 +261,6 @@ class OfflinePreprocessingPipeline:
             raw_data["mobility"] = mobility_data
         except Exception as e:
             raise RuntimeError(f"Failed to process mobility data: {str(e)}") from e
-
-        # Process wastewater/biomarker data (required)
-        if not self.config.wastewater_file:
-            raise RuntimeError("Wastewater data path is required but not configured")
-
-        print("Processing wastewater data...")
-        try:
-            edar_data = self.processors["edar"].process(
-                self.config.wastewater_file, self.config.region_metadata_file
-            )
-            raw_data["edar"] = edar_data
-        except Exception as e:
-            raise RuntimeError(f"Failed to process EDAR data: {str(e)}") from e
 
         # Process population data (required)
         if not self.config.population_file:
@@ -412,30 +380,29 @@ class OfflinePreprocessingPipeline:
 
         return valid_targets_da
 
-    def _compute_edar_region_mask(
-        self, region_metadata_file: str, region_ids: np.ndarray
-    ) -> xr.DataArray:
-        """Compute mask for regions with EDAR contributions."""
-        print("Computing edar_has_source mask...")
-        emap = xr.open_dataarray(region_metadata_file)
-        emap = emap.fillna(0).rename({"home": REGION_COORD})
-        emap = emap.assign_coords(
-            edar_id=emap["edar_id"].astype(str),
-            **{REGION_COORD: emap[REGION_COORD].astype(str)},
-        )
-        emap = emap.reindex({REGION_COORD: region_ids}, fill_value=0)
-        has_source = (emap > 0).any("edar_id").astype(np.int32)
-        has_source.name = "edar_has_source"
-
-        print(f"  Regions with EDAR source: {int(has_source.sum())}/{has_source.size}")
-        return has_source
+    def _output_path(self) -> Path:
+        suffix = "zarr" if self.config.output_format == "zarr" else "nc"
+        return Path(self.config.output_path) / f"{self.config.dataset_name}.{suffix}"
 
     def _save_aligned_dataset(self, aligned_dataset: xr.Dataset) -> Path:
         """Save aligned dataset to processed dir."""
+        municipal_wastewater = [
+            name
+            for name in aligned_dataset.variables
+            if str(name).startswith("edar_biomarker_")
+            or name in {"biomarker_data_start", "edar_has_source"}
+        ]
+        if municipal_wastewater:
+            raise ValueError(
+                "Municipal wastewater is not part of the clinical dataset: "
+                f"{municipal_wastewater}. Use the native EDAR observation store."
+            )
         print("Saving aligned dataset to processed dir...")
-        aligned_dataset_path = Path(self.config.output_path) / (
-            self.config.dataset_name + ".nc"
-        )
+        aligned_dataset_path = self._output_path()
+        if aligned_dataset_path.exists() and not self.config.overwrite_output:
+            raise FileExistsError(
+                f"Refusing to replace dataset: {aligned_dataset_path}"
+            )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Rechunk to uniform chunks for Zarr compatibility
@@ -493,21 +460,14 @@ class OfflinePreprocessingPipeline:
                 rechunked_dataset[var_name] = transformed
                 print(f"  {var_name}: log1p applied")
 
-            # Biomarker values (not _mask, _censor, _age): log1p only
-            elif var_name.startswith("edar_biomarker_") and not var_name.endswith(
-                ("_mask", "_censor", "_age")
-            ):
-                transformed = np.log1p(var.clip(min=0))
-                rechunked_dataset[var_name] = transformed
-                print(f"  {var_name}: log1p applied")
-
         # Metadata attrs are assigned after dtype conversion because we rebuild the
         # Dataset object there and would otherwise drop attrs.
         dataset_attrs = {
+            "dataset_version": self.config.dataset_version,
             "log_transformed": 1,
             "population_norm": 1,
             "smoothing_clinical_method": self.config.smoothing.clinical_method,
-            "smoothing_wastewater_method": self.config.smoothing.wastewater_method,
+            "wastewater_support": "separate_native_edar_store",
             "smoothing_missing_policy": self.config.smoothing.missing_policy,
             "continuous_storage_dtype": self.config.continuous_storage_dtype,
             "preprocessing_config_yaml": self._serialize_config_yaml(),
@@ -541,10 +501,7 @@ class OfflinePreprocessingPipeline:
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["censor"])
                 print(f"  {var_name}: {old_dtype} -> uint8")
             # Named variables with specific dtypes
-            elif var_name == "biomarker_data_start":
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["index"])
-                print(f"  {var_name}: {old_dtype} -> int16")
-            elif var_name in ("edar_has_source", "valid_targets", "mobility_time_mask"):
+            elif var_name in ("valid_targets", "mobility_time_mask"):
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["mask"])
                 print(f"  {var_name}: {old_dtype} -> bool")
             elif var_name == "population":
@@ -586,6 +543,17 @@ class OfflinePreprocessingPipeline:
             rechunked_dataset.attrs["positive_clinical_preservation_json"] = json.dumps(
                 positive_preservation, sort_keys=True
             )
+
+        if self.config.output_format == "zarr":
+            with dask.config.set(scheduler="single-threaded"):
+                rechunked_dataset.to_zarr(
+                    aligned_dataset_path,
+                    mode="w" if self.config.overwrite_output else "w-",
+                    zarr_format=2,
+                )
+            self._log_postwrite_summary(aligned_dataset_path)
+            print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
+            return aligned_dataset_path
 
         # Convert boolean variables to int8 for NetCDF4 compatibility.
         # NetCDF4 has no native boolean type; xarray reads int8 masks back
@@ -763,7 +731,11 @@ class OfflinePreprocessingPipeline:
 
     def _log_postwrite_summary(self, dataset_path: Path) -> None:
         """Verify the saved dataset is valid (e.g., mobility not all NaN)."""
-        ds = xr.open_dataset(dataset_path, engine="netcdf4")
+        ds = (
+            xr.open_zarr(dataset_path)
+            if self.config.output_format == "zarr"
+            else xr.open_dataset(dataset_path, engine="netcdf4")
+        )
         try:
             if "mobility" in ds:
                 # Check a sample to ensure data was preserved (not all NaN)

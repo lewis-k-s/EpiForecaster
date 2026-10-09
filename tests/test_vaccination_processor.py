@@ -4,21 +4,18 @@ import numpy as np
 import pandas as pd
 
 from data.preprocess.config import PreprocessingConfig
+from data.preprocess.processors.alignment_processor import AlignmentProcessor
 from data.preprocess.processors.vaccination_processor import VaccinationProcessor
 
 
 def _config(tmp_path) -> PreprocessingConfig:
     cases_file = tmp_path / "cases.csv"
     mobility_path = tmp_path / "mobility.zarr"
-    wastewater_file = tmp_path / "wastewater.csv"
     population_file = tmp_path / "population.csv"
-    region_metadata_file = tmp_path / "edar.nc"
     vaccination_file = tmp_path / "vaccination.csv"
 
     cases_file.touch()
     mobility_path.mkdir()
-    wastewater_file.touch()
-    region_metadata_file.touch()
     population_file.write_text("id,d.population\n08001,100\n08002,200\n")
     vaccination_file.write_text(
         "\n".join(
@@ -37,9 +34,7 @@ def _config(tmp_path) -> PreprocessingConfig:
         data_dir=str(tmp_path),
         cases_file=str(cases_file),
         mobility_path=str(mobility_path),
-        wastewater_file=str(wastewater_file),
         population_file=str(population_file),
-        region_metadata_file=str(region_metadata_file),
         vaccination_file=str(vaccination_file),
         start_date=datetime(2021, 1, 1),
         end_date=datetime(2021, 1, 4),
@@ -67,3 +62,23 @@ def test_vaccination_processor_builds_cumulative_first_dose_rate(tmp_path):
 
     assert bool(mask.sel(date="2021-01-02", region_id="08001")) is False
     assert int(age.sel(date="2021-01-02", region_id="08001")) == 2
+
+
+def test_vaccination_crop_preserves_prior_doses_and_age(tmp_path):
+    config = _config(tmp_path)
+    config.start_date = datetime(2021, 1, 2)
+    dataset = VaccinationProcessor(config).process(config.vaccination_file)
+    region = dataset.sel(run_id="real", region_id="08001")
+    np.testing.assert_allclose(region.vaccination_rate, [0.10, 0.15, 0.15])
+    np.testing.assert_array_equal(region.vaccination_rate_mask, [False, True, False])
+    np.testing.assert_array_equal(region.vaccination_rate_age, [2, 1, 2])
+    aligned = AlignmentProcessor(config)._align_clinical_dataset(
+        dataset,
+        pd.date_range(config.start_date, config.end_date),
+        value_name="vaccination_rate",
+        label="Vaccination",
+    )
+    np.testing.assert_array_equal(
+        aligned.vaccination_rate_age.sel(run_id="real", region_id="08001"),
+        [2, 1, 2],
+    )

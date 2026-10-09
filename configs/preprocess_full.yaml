@@ -19,8 +19,6 @@ hospitalizations_file: "data/files/hospitalizations_municipality.csv"
 vaccination_file: "data/files/vaccination_municipality.csv"
 
 # Other data sources
-wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
-region_metadata_file: "data/files/edar_muni_edges.nc"
 population_file: "data/files/fl_population_por_municipis.csv"
 mobility_path: "data/files/mobility.zarr"
 
@@ -30,7 +28,6 @@ end_date: "2021-05-09" # Latest mobility data available
 
 # Feature processing options
 min_flow_threshold: 10
-wastewater_flow_mode: "concentration"
 
 # Alignment and validation options
 alignment_strategy: "interpolate"
@@ -63,7 +60,6 @@ temporal_covariates:
 # Offline causal smoothing configuration
 smoothing:
   clinical_method: "kalman_v2" # "kalman_v2" or "holt_damped"
-  wastewater_method: "tobit_kalman_v2"
   missing_policy: "predict" # "predict" (default) or "momentum"
   momentum_decay: 0.5
   momentum_max_steps: 4

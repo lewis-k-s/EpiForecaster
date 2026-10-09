@@ -258,13 +258,33 @@ class TestSmoothingRegressionQuality:
         assert candidate_jump <= baseline_jump * 0.70
 
         # Candidate must remain finite and non-negative after inverse transform.
-        candidate_values = np.exp(np.array(candidate_filtered))
+        candidate_values = np.expm1(np.array(candidate_filtered))
         assert np.isfinite(candidate_values).all()
         assert (candidate_values >= 0.0).all()
 
         # On observed points, smoothed log values should stay close to observed log values.
         observed_mask = np.array(flags) == 0
-        raw_log = np.log(values[observed_mask] + 1e-9)
+        raw_log = np.log1p(values[observed_mask])
         smooth_log = np.array(candidate_filtered)[observed_mask]
         median_distortion = np.median(np.abs(smooth_log - raw_log))
         assert median_distortion <= 0.15
+
+
+@pytest.mark.parametrize("method", ["kalman_v2", "holt_damped"])
+def test_clinical_filter_preserves_zero_and_has_no_future_dependency(method):
+    def filter_values(values):
+        smoother = (
+            KalmanSmoother(process_var=0.05, measurement_var=0.5)
+            if method == "kalman_v2"
+            else DampedHoltSmoother()
+        )
+        return smoother.filter_series(np.asarray(values, dtype=float))
+
+    prefix = [np.nan, np.nan, 0.0, 10.0, np.nan, 12.0, np.nan]
+    expected, flags = filter_values(prefix)
+    assert expected[:3] == [0.0, 0.0, 0.0]
+    assert flags == [2, 2, 0, 0, 2, 0, 2]
+    for future in ([1.0, 2.0], [10000.0, 0.0], [np.nan, np.nan]):
+        actual, actual_flags = filter_values(prefix + future)
+        np.testing.assert_array_equal(actual[: len(prefix)], expected)
+        assert actual_flags[: len(prefix)] == flags

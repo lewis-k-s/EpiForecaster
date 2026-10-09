@@ -116,12 +116,18 @@ class VaccinationProcessor:
         date_range = pd.date_range(
             start=self.config.start_date, end=self.config.end_date, freq="D"
         )
+        history_start = (
+            min(date_range[0], first_doses["date"].min())
+            if not first_doses.empty
+            else date_range[0]
+        )
+        history_dates = pd.date_range(history_start, date_range[-1], freq="D")
         population = self._load_population()
 
         if first_doses.empty:
             region_ids = population.index.astype(str)
-            daily = pd.DataFrame(0.0, index=date_range, columns=region_ids)
-            observed = pd.DataFrame(False, index=date_range, columns=region_ids)
+            daily = pd.DataFrame(0.0, index=history_dates, columns=region_ids)
+            observed = pd.DataFrame(False, index=history_dates, columns=region_ids)
         else:
             daily = first_doses.pivot_table(
                 index="date",
@@ -131,7 +137,7 @@ class VaccinationProcessor:
             )
             daily.columns = daily.columns.astype(str)
             all_regions = population.index.union(daily.columns).astype(str)
-            daily = daily.reindex(index=date_range, columns=all_regions)
+            daily = daily.reindex(index=history_dates, columns=all_regions)
             observed = daily.notna()
             daily = daily.fillna(0.0)
 
@@ -141,6 +147,9 @@ class VaccinationProcessor:
         rate = rate.clip(lower=0.0, upper=1.0).fillna(0.0)
 
         age = self._compute_age_from_mask(observed.reindex_like(rate).fillna(False))
+        rate = rate.reindex(date_range)
+        observed = observed.reindex(date_range)
+        age = age.reindex(date_range)
 
         rate.index.name = TEMPORAL_COORD
         rate.columns.name = REGION_COORD
@@ -191,7 +200,9 @@ class VaccinationProcessor:
 
     @staticmethod
     def _compute_age_from_mask(mask: pd.DataFrame, max_age: int = 14) -> pd.DataFrame:
-        age = pd.DataFrame(max_age, index=mask.index, columns=mask.columns, dtype=np.uint8)
+        age = pd.DataFrame(
+            max_age, index=mask.index, columns=mask.columns, dtype=np.uint8
+        )
         for column in mask.columns:
             last_seen = None
             values = mask[column].to_numpy(dtype=bool)

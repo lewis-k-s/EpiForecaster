@@ -75,7 +75,7 @@ def _clip_innovation(
 
 class KalmanSmoother:
     """
-    Causal Kalman filter for non-censored clinical time series.
+    Causal Kalman filter for clinical time series in log1p space.
 
     State space model:
     - State transition: x_t = x_{t-1} + w_t,  w_t ~ N(0, process_var)
@@ -202,12 +202,8 @@ class KalmanSmoother:
             flags: 0=observed, 2=missing
         """
         values = np.asarray(values, dtype=float).reshape(-1)
-        finite_mask = np.isfinite(values) & (values > 0)
+        finite_mask = np.isfinite(values) & (values >= 0)
         flags = np.where(finite_mask, 0, 2).astype(int).tolist()
-
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
 
         filtered: list[float] = []
 
@@ -215,12 +211,15 @@ class KalmanSmoother:
             pred_state = self.state
             pred_var = self.state_var + self.process_var
 
-            if not np.isfinite(value) or value <= 0:
+            if not np.isfinite(value) or value < 0:
+                if not self.initialized:
+                    filtered.append(0.0)
+                    continue
                 self._apply_missing_update(pred_state=pred_state, pred_var=pred_var)
                 filtered.append(float(self.state))
                 continue
 
-            log_value = float(np.log(value + 1e-9))
+            log_value = float(np.log1p(value))
             if not self.initialized:
                 self._initialize(log_value)
                 pred_state = self.state
@@ -381,11 +380,7 @@ class TobitKalmanSmoother:
 
             # Initialize from the current sample only. A zero with a positive
             # detection limit is an observed left-censored sample, not missing.
-            if (
-                not np.isfinite(value)
-                or value < 0
-                or (value == 0 and not limit_valid)
-            ):
+            if not np.isfinite(value) or value < 0 or (value == 0 and not limit_valid):
                 self._apply_missing_update(pred_state=pred_state, pred_var=pred_var)
                 filtered.append(float(self.state))
                 flags.append(2)
@@ -434,7 +429,7 @@ class TobitKalmanSmoother:
 
 
 class DampedHoltSmoother:
-    """Causal damped Holt smoother operating in log space."""
+    """Causal damped Holt smoother operating in log1p space."""
 
     def __init__(
         self,
@@ -470,16 +465,12 @@ class DampedHoltSmoother:
             flags: 0=observed, 2=missing
         """
         values = np.asarray(values, dtype=float).reshape(-1)
-        finite_mask = np.isfinite(values) & (values > 0)
+        finite_mask = np.isfinite(values) & (values >= 0)
         flags = np.where(finite_mask, 0, 2).astype(int).tolist()
-
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
 
         filtered: list[float] = []
         for value in values:
-            if not np.isfinite(value) or value <= 0:
+            if not np.isfinite(value) or value < 0:
                 if not self.initialized:
                     filtered.append(0.0)
                     continue
@@ -489,7 +480,7 @@ class DampedHoltSmoother:
                 filtered.append(float(self.level))
                 continue
 
-            log_value = float(np.log(value + 1e-9))
+            log_value = float(np.log1p(value))
             if not self.initialized:
                 self._initialize(log_value)
                 filtered.append(float(self.level))

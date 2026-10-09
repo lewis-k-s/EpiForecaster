@@ -126,9 +126,7 @@ def _write_csv(data_dir: Path, rows: list[dict[str, object]]) -> Path:
     return path
 
 
-def _make_config(
-    tmp_path: Path, start: datetime, end: datetime
-) -> PreprocessingConfig:
+def _make_config(tmp_path: Path, start: datetime, end: datetime) -> PreprocessingConfig:
     # PreprocessingConfig.__post_init__ validates that data_dir, cases_file
     # and mobility_path exist and creates output_path.
     data_dir = tmp_path / "data"
@@ -141,9 +139,7 @@ def _make_config(
         data_dir=str(data_dir),
         cases_file=str(cases_file),
         mobility_path=str(mobility_path),
-        wastewater_file="",
         population_file="",
-        region_metadata_file="",
         start_date=start,
         end_date=end,
         output_path=str(tmp_path / "out"),
@@ -171,7 +167,11 @@ def processed(tmp_path: Path) -> xr.Dataset:
 class TestABSAdmissionsProcessor:
     def test_weekly_placement_and_coords(self, processed: xr.Dataset) -> None:
         dates = pd.to_datetime(processed["date"].values)
-        assert list(dates) == [pd.Timestamp("2021-06-07"), pd.Timestamp("2021-06-14"), pd.Timestamp("2021-06-21")]
+        assert list(dates) == [
+            pd.Timestamp("2021-06-07"),
+            pd.Timestamp("2021-06-14"),
+            pd.Timestamp("2021-06-21"),
+        ]
         # week_end is the aligned Sunday coordinate
         week_ends = pd.to_datetime(processed["week_end"].values)
         np.testing.assert_array_equal((week_ends - dates).days, [6, 6, 6])
@@ -191,7 +191,9 @@ class TestABSAdmissionsProcessor:
             processed["mask"].sel(abs_id="002").values, [False, True, True]
         )
 
-    def test_zero_reported_is_observed_missing_is_not(self, processed: xr.Dataset) -> None:
+    def test_zero_reported_is_observed_missing_is_not(
+        self, processed: xr.Dataset
+    ) -> None:
         # ABS 001 week 1 reports a zero-case stratum: value 0, mask True
         zero = processed.sel(date="2021-06-14", abs_id="001")
         assert zero["value"].item() == 0.0
@@ -314,7 +316,9 @@ class TestABSAdmissionsProcessor:
         with pytest.raises(FileNotFoundError):
             ABSAdmissionsProcessor(config).process(tmp_path / "data")
 
-    def test_to_obs_store_roundtrip(self, tmp_path: Path, processed: xr.Dataset) -> None:
+    def test_to_obs_store_roundtrip(
+        self, tmp_path: Path, processed: xr.Dataset
+    ) -> None:
         store = tmp_path / "stores" / "obs_admissions.zarr"
         to_obs_store(processed, store)
         assert store.exists()
@@ -328,7 +332,8 @@ class TestABSAdmissionsProcessor:
             loaded["abs_id"].values, processed["abs_id"].values
         )
         np.testing.assert_array_equal(
-            pd.to_datetime(loaded["date"].values), pd.to_datetime(processed["date"].values)
+            pd.to_datetime(loaded["date"].values),
+            pd.to_datetime(processed["date"].values),
         )
         np.testing.assert_array_equal(
             pd.to_datetime(loaded["week_end"].values),
@@ -356,9 +361,7 @@ def test_integration_real_files_within_vintage_drift(tmp_path: Path) -> None:
         data_dir="data/files",
         cases_file=str(ABS_CSV),
         mobility_path="data/files",
-        wastewater_file="",
         population_file="",
-        region_metadata_file="",
         start_date=datetime(2020, 3, 1),
         end_date=datetime(2021, 5, 9),
         output_path=str(tmp_path / "out"),

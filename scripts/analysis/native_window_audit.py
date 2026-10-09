@@ -44,6 +44,8 @@ def main():
                 mobility_enabled=config.native.mobility_enabled,
                 wastewater_enabled=config.native.wastewater_enabled,
                 wastewater_filename=config.native.wastewater_filename,
+                deaths_filename=config.native.deaths_filename,
+                mortality_features_enabled=config.native.mortality_features_enabled,
                 include_vaccination=config.native.include_vaccination,
                 include_od_context=True,
             ),
