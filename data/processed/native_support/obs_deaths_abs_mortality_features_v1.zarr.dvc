@@ -1,0 +1,6 @@
+outs:
+- md5: aef38cedab7eaf4c2be11e6be7f970ff.dir
+  size: 2190244
+  nfiles: 43
+  hash: md5
+  path: obs_deaths_abs_mortality_features_v1.zarr
