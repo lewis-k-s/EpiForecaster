@@ -59,6 +59,8 @@ def _clinical_burden(
     real_path: Path,
     graph_population: dict[tuple[str, str], float],
     cutoff: np.datetime64,
+    *,
+    deaths_filename: str,
 ) -> dict[tuple[str, str], float]:
     burden: dict[tuple[str, str], float] = {}
     cases = xr.open_zarr(real_path)[["cases", "cases_mask"]]
@@ -77,7 +79,7 @@ def _clinical_burden(
         )
     for source_type, filename, dim_name in (
         ("abs", "obs_admissions.zarr", "abs_id"),
-        ("abs", "obs_deaths_abs_excess.zarr", "abs_id"),
+        ("abs", deaths_filename, "abs_id"),
     ):
         dataset = xr.open_zarr(root / filename)
         # Weekly totals become available only after the complete reporting week.
@@ -129,7 +131,11 @@ def build_inventory(
         if np.isfinite(population)
     }
     burden = _clinical_burden(
-        root, Path(config.data.dataset_path), graph_population, cutoff
+        root,
+        Path(config.data.dataset_path),
+        graph_population,
+        cutoff,
+        deaths_filename=config.native.deaths_filename,
     )
     overlap = pd.read_parquet(root / "overlap_edges.parquet")
     clinical_geography: dict[tuple[str, str], str] = {}

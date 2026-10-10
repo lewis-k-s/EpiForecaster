@@ -3,6 +3,7 @@
 from dataclasses import replace
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ import xarray as xr
 import yaml
 
 from data.native_batch import collate_native_batch
+from data.build_native_source_sets import build_inventory
 from data.native_dataset import NativeDatasetConfig, NativeSupportDataset
 from data.preprocess.processors.native_mortality_features_processor import (
     MortalityFeaturesConfig,
@@ -93,6 +95,47 @@ def test_feature_asset_roundtrip_preserves_targets_and_rejects_overwrite(
         write_native_mortality_features(parent, output)
     with pytest.raises(ValueError, match="positive integers"):
         MortalityFeaturesConfig(lag_days=0)
+
+
+@pytest.mark.parametrize(
+    "deaths_filename", ["obs_deaths_abs_excess.zarr", "mortality.zarr"]
+)
+def test_source_inventory_uses_configured_mortality_asset(
+    tmp_path, monkeypatch, deaths_filename
+) -> None:
+    _write_native_root(tmp_path)
+    enabled = deaths_filename == "mortality.zarr"
+    if enabled:
+        parent_path = tmp_path / "obs_deaths_abs_excess.zarr"
+        with xr.open_zarr(parent_path) as opened:
+            enriched = add_native_mortality_features(
+                opened.load(), MortalityFeaturesConfig()
+            )
+        write_native_mortality_features(enriched, tmp_path / deaths_filename)
+        # Match staging: the selected mortality asset is the only available version.
+        parent_path.rename(tmp_path / "unstaged_parent.zarr")
+    config = EpiForecasterConfig.load(
+        Path(__file__).resolve().parents[1] / "configs/train_epifor_smoke.yaml",
+        overrides=[
+            f"native.root={tmp_path}",
+            f"data.dataset_path={tmp_path / 'real_with_id.zarr'}",
+            f"native.deaths_filename={deaths_filename}",
+            f"native.mortality_features_enabled={str(enabled).lower()}",
+            "native.wastewater_enabled=false",
+            f"model.input_window_length={L}",
+            f"model.forecast_horizon={H}",
+        ],
+    )
+    # Hold the calendar boundary fixed to test masked burden and asset selection.
+    monkeypatch.setattr(
+        "data.build_native_source_sets.freeze_calendar_split",
+        lambda *_args, **_kwargs: SimpleNamespace(validation_start_origin=20),
+    )
+    records, queries, _grid = build_inventory(config)
+    assert {q.head for q in queries} == {"cases", "hosp", "deaths"}
+    burden = {(r.source_type, r.source_id): r.target_burden for r in records}
+    # Two fully reported admission weeks (10 + 12), plus 20 daily deaths (2 each).
+    assert burden[("abs", "101")] == pytest.approx(62)
 
 
 @pytest.mark.parametrize("include_vaccination", [False, True])
