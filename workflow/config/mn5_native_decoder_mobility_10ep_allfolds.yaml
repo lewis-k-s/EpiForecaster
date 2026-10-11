@@ -1,0 +1,46 @@
+extends:
+- workflow/config/mn5_ablation.yaml
+ablation:
+  study_name: native_decoder_mobility_10ep_allfolds_v1
+  campaign: configs/campaigns/native_decoder_mobility_10ep_allfolds_v1.yaml
+  workers: 4
+  closeout_signal_seconds: 1800
+  timeout_s: 27000
+  sampler_seed: 42
+  smoketest: false
+  requeue_running: false
+resources:
+  allocation:
+    qos: acc_bscls
+    tasks: 4
+    gres: gpu:4
+    runtime: 480
+dvc:
+  targets:
+  - data/processed/real_with_id_v3.zarr.dvc
+  - data/processed/native_support/native_graph.zarr.dvc
+  - data/processed/native_support/obs_admissions.zarr.dvc
+  - data/processed/native_support/obs_deaths_abs_mortality_features_v1.zarr.dvc
+  - data/processed/native_support/obs_wastewater_causal_v2.zarr.dvc
+  - data/processed/native_support/od_mitma.zarr.dvc
+  - data/processed/native_support/edar_catchment_edges.parquet.dvc
+  - data/processed/native_support/overlap_edges.parquet.dvc
+provenance:
+  reference_run: native-mortality-10ep-20261009-b
+  campaign_intent: Compare SIR and direct decoding with mobility on and off over
+    all ten native source folds. Use the V3 clinical input, published mortality
+    features, all four heads, paired model seed 42, and ten full epochs.
+  mortality_features:
+    pointer: data/processed/native_support/obs_deaths_abs_mortality_features_v1.zarr.dvc
+    dvc_md5: aef38cedab7eaf4c2be11e6be7f970ff.dir
+    dataset_sha256: 53f0383aebee647429fdf5fb60a8973998eaf4d6a023e1a3e856c2bede7da80f
+    producing_run_id: native-mortality-features-20261009-b
+  source_fold_policy:
+    schema: native_source_sets.v4
+    split_seed: 42
+    num_folds: 10
+    reference_run: native-mortality-10ep-20261009-b
+    assignments_sha256: 4c5cf89094f37374f40f8a9d53c250386eac7d9be8be1513fae65aecec3dbdb9
+    test_fold: run_index
+    validation_fold: (run_index + 1) % 10
+    training_folds: remaining eight folds

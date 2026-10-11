@@ -119,6 +119,60 @@ def test_structured_campaign_compiles_condition_fold_seed_matrix(
     assert len(worker.expected_trial_identities(campaign)) == 8
 
 
+def test_native_decoder_mobility_allfolds_campaign_contract() -> None:
+    from itertools import product
+
+    from data.native_source_sets import rotating_fold_roles
+    from models.configs import EpiForecasterConfig
+    from scripts.workflow.config_templates import load_config_template
+    from scripts.workflow.run_config import validate_mn5_allocation
+
+    workflow = load_config_template(
+        "workflow/config/mn5_native_decoder_mobility_10ep_allfolds.yaml"
+    )
+    assert validate_mn5_allocation(workflow)["tasks"] == 4
+    assert workflow["ablation"]["smoketest"] is False
+    campaign = worker.load_campaign(Path(workflow["ablation"]["campaign"]))
+    queue = worker.build_trial_queue(campaign)
+    expected = {
+        (condition, fold, 42)
+        for condition, fold in product(
+            (
+                "sir_mobility_on",
+                "sir_mobility_off",
+                "direct_mobility_on",
+                "direct_mobility_off",
+            ),
+            range(10),
+        )
+    }
+    assert len(queue) == len(expected)
+    assert {(row["condition"], row["fold"], row["seed"]) for row in queue} == expected
+    assert campaign.crossval_num_folds == 10
+    roles = [rotating_fold_roles(fold, 10) for fold in campaign.fold_indices]
+    assert {role.test_fold for role in roles} == set(range(10))
+    assert {role.validation_fold for role in roles} == set(range(10))
+    assert all(len(role.train_folds) == 8 for role in roles)
+    for condition in campaign.conditions:
+        overrides = worker._deep_merge(campaign.fixed_overrides, condition.overrides)
+        config = EpiForecasterConfig.load(
+            str(campaign.base_config), overrides=worker._as_cli_overrides(overrides)
+        )
+        assert config.native.decoder == condition.name.split("_")[0]
+        assert config.native.mobility_enabled == condition.name.endswith("_on")
+        assert config.native.mortality_features_enabled
+        assert config.training.epochs == 10
+        assert config.training.max_batches is None
+        assert config.training.early_stopping_patience is None
+        assert config.training.run_final_evaluation
+        assert config.evaluation.epoch_diagnostics
+        assert config.evaluation.minimum_validation_origins >= 56
+        pointer = f"{config.native.root}/{config.native.deaths_filename}.dvc"
+        assert pointer in workflow["dvc"]["targets"]
+        assert Path(pointer).is_file()
+        assert f"{config.data.dataset_path}.dvc" in workflow["dvc"]["targets"]
+
+
 def test_native_decoder_mobility_campaign_end_to_end(tmp_path: Path) -> None:
     """Run the real four-arm queue through selected-checkpoint test reduction."""
     import json

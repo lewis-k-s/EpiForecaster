@@ -59,6 +59,24 @@ before use. New runs should use a general template and an explicit checkpoint.
 The generic evaluation template requires its checkpoint to be filled before
 preparation.
 
+## Full native decoder and mobility coverage
+
+`mn5_native_decoder_mobility_10ep_allfolds.yaml` runs SIR and direct decoding
+with mobility on and off on the V3 clinical data and published mortality
+features. The campaign evaluates all ten native source folds with model seed
+42: four conditions times ten folds gives 40 runs. Each run uses ten full
+epochs and final validation/test evaluation.
+
+Native source membership uses the version-4 deterministic assignment policy
+and split seed 42. Fold `r` is the test fold, `(r + 1) % 10` is the validation
+fold, and the remaining eight folds are training folds. Thus every eligible
+source is held out for test once and validation once per condition. Calendar
+purging and eligibility still apply to query targets.
+
+The allocation uses four GPU workers, 20 CPUs per worker, and an eight-hour
+budget. Its final 30 minutes are reserved for controlled closeout. The exact
+40-identity matrix and finite held-out metrics are required for completion.
+
 ## Drafts with unpublished inputs
 
 `drafts/mn5_native_mortality_10ep.yaml` records the proposed mortality feature
