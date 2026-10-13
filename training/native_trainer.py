@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import random
+import shutil
 import time
 import json
 from collections.abc import Iterator, Mapping, Sequence
@@ -977,6 +978,23 @@ class NativeTrainer(NativeRuntime):
             raise ValueError("Native resume forecaster configuration differs")
         previous = record["config"]
         current = self.config.to_dict()
+        extension_rate = self.config.training.resume_extension_learning_rate
+        extending = self.config.training.epochs > previous["training"]["epochs"]
+        if extending:
+            if (
+                extension_rate is None
+                or not math.isfinite(extension_rate)
+                or extension_rate <= 0
+            ):
+                raise ValueError(
+                    "Native resume training.epochs differs; extension requires a positive resume_extension_learning_rate"
+                )
+            if previous["training"]["batch_size"] != self.config.training.batch_size:
+                raise ValueError("Native epoch extension requires the same batch size")
+        elif extension_rate is not None:
+            raise ValueError(
+                "resume_extension_learning_rate requires an increased epoch budget"
+            )
         if record["split_provenance"] != self.split_provenance:
             raise ValueError("Native resume split input identity differs")
         if record["split_asset"] is not None and self.source_sets is not None:
@@ -1002,7 +1020,6 @@ class NativeTrainer(NativeRuntime):
             if saved != active:
                 raise ValueError(f"Native resume {block} configuration differs")
         for name in (
-            "epochs",
             "max_batches",
             "optimizer",
             "learning_rate",
@@ -1016,23 +1033,51 @@ class NativeTrainer(NativeRuntime):
         ):
             if previous["training"][name] != current["training"][name]:
                 raise ValueError(f"Native resume training.{name} differs")
+        if (
+            not extending
+            and previous["training"]["epochs"] != current["training"]["epochs"]
+        ):
+            raise ValueError("Native resume training.epochs differs")
         if previous["evaluation"] != current["evaluation"]:
             raise ValueError("Native resume evaluation configuration differs")
         self.start_epoch = int(record["epoch"]) + 1
         if not 0 < self.start_epoch < self.config.training.epochs:
             raise ValueError("Native resume checkpoint has no remaining epochs")
-        if record["best_val_selection_score"] is None or (
-            record["validation_epoch_trace"][-1]["selection_score"]
-            != record["best_val_selection_score"]
-        ):
-            raise ValueError(
-                "Native continuation requires a best-validation checkpoint"
-            )
         completed_batches = record["train_objective_trace"]
         if len(completed_batches) != self.start_epoch or int(
             record["global_step"]
         ) != sum(len(epoch_batches) for epoch_batches in completed_batches):
             raise ValueError("Native resume completed-step history differs")
+        best_record = record
+        best_path = path
+        if record["selected_step"] != record["global_step"]:
+            configured_best = self.config.training.resume_best_checkpoint_path
+            if configured_best is None:
+                raise ValueError(
+                    "Final checkpoint resume requires resume_best_checkpoint_path"
+                )
+            best_path = Path(configured_best)
+            best_record = torch.load(best_path, map_location="cpu", weights_only=False)
+            for name in (
+                "schema_version",
+                "forecaster_config",
+                "config",
+                "split_provenance",
+                "precision_signature",
+                "selected_epoch",
+                "selected_step",
+                "best_val_selection_score",
+            ):
+                if best_record[name] != record[name]:
+                    raise ValueError(f"Native resume best checkpoint {name} differs")
+            if best_record["global_step"] != record["selected_step"]:
+                raise ValueError(
+                    "Native resume best checkpoint is not the selected state"
+                )
+        if record["best_val_selection_score"] is None:
+            raise ValueError(
+                "Native continuation requires a validation-selected checkpoint"
+            )
         if previous["training"]["batch_size"] != self.config.training.batch_size:
             logger.info(
                 "Native resume batch size %d -> %d; preserving scheduler state, "
@@ -1052,6 +1097,19 @@ class NativeTrainer(NativeRuntime):
             raise ValueError("Native resume scheduler differs")
         if self.scheduler is not None:
             self.scheduler.load_state_dict(scheduler_state)
+        if extending:
+            for group in self.optimizer.param_groups:
+                group["lr"] = extension_rate
+                group["initial_lr"] = extension_rate
+            self.scheduler = create_scheduler(
+                self.optimizer,
+                scheduler_type=self.config.training.scheduler_type,
+                total_steps=(self.config.training.epochs - self.start_epoch)
+                * self.steps_per_epoch,
+                warmup_steps=0,
+                eta_min=self.config.training.min_learning_rate,
+                epochs=self.config.training.epochs - self.start_epoch,
+            )
         self.global_step = int(record["global_step"])
         self.best_val_selection_score = record["best_val_selection_score"]
         self.best_val_selection_metric = record["best_val_selection_metric"]
@@ -1065,7 +1123,7 @@ class NativeTrainer(NativeRuntime):
         self.best_val_series_metrics = dict(record["best_val_series_metrics"])
         self.best_state = {
             key: value.detach().cpu().clone()
-            for key, value in self.model.state_dict().items()
+            for key, value in best_record["model_state_dict"].items()
         }
         self.validation_epoch_trace = list(record["validation_epoch_trace"])
         self.train_epoch_trace = list(record.get("train_epoch_trace", []))
@@ -1077,12 +1135,7 @@ class NativeTrainer(NativeRuntime):
         )
         self.resumed_train_trace = list(record["train_objective_trace"])
         self.resumed_val_trace = list(record["val_wis_trace"])
-        self._save_checkpoint(
-            self.start_epoch - 1,
-            is_best=True,
-            train_trace=self.resumed_train_trace,
-            val_trace=self.resumed_val_trace,
-        )
+        shutil.copyfile(best_path, self.checkpoint_dir / _BEST_CHECKPOINT_NAME)
         logger.info(
             "Native resume: completed epochs=%d global_step=%d; continuing to epoch %d",
             self.start_epoch,

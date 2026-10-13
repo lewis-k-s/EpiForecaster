@@ -732,3 +732,79 @@ def test_native_resume_restores_schedule_and_continues_epoch_history(
     incompatible.training.resume_checkpoint_path = str(checkpoint)
     with pytest.raises(ValueError, match="training.epochs differs"):
         NativeTrainer(incompatible, model_id="resume_bad_schedule")
+
+
+@pytest.mark.parametrize(
+    "decoder,mobility", [("sir", True), ("direct", True), ("direct", False)]
+)
+def test_final_checkpoint_extension_keeps_optimizer_and_prior_best(
+    tmp_path, monkeypatch, decoder, mobility
+):
+    _write_native_root(tmp_path)
+    config = _artifact_config(tmp_path)
+    config.training.epochs = 2
+    config.native.decoder = decoder
+    config.native.mobility_enabled = mobility
+    parent = NativeTrainer(config, model_id="extension_parent")
+    evaluate = parent._evaluate_epoch
+
+    def declining_validation(epoch):
+        metrics = evaluate(epoch)
+        metrics["selection_score"] = 1.0 + epoch
+        return metrics
+
+    monkeypatch.setattr(parent, "_evaluate_epoch", declining_validation)
+    parent.run()
+    final_path = parent.checkpoint_dir / "final_model.pt"
+    best_path = parent.checkpoint_dir / "best_model.pt"
+    final = torch.load(final_path, map_location="cpu", weights_only=False)
+    best = torch.load(best_path, map_location="cpu", weights_only=False)
+    assert final["selected_epoch"] == 1 and final["epoch"] == 1
+    child_config = _artifact_config(tmp_path)
+    child_config.training.epochs = 4
+    child_config.native.decoder = decoder
+    child_config.native.mobility_enabled = mobility
+    child_config.training.resume_checkpoint_path = str(final_path)
+    child_config.training.resume_best_checkpoint_path = str(best_path)
+    child_config.training.resume_extension_learning_rate = 1e-4
+    child = NativeTrainer(child_config, model_id="extension_child")
+    assert child.start_epoch == 2
+    assert child.global_step == final["global_step"]
+    assert child.optimizer.param_groups[0]["lr"] == 1e-4
+    assert child.scheduler.T_max == 2 * child.steps_per_epoch
+    for name, parameter in child.model.state_dict().items():
+        torch.testing.assert_close(parameter, final["model_state_dict"][name])
+        torch.testing.assert_close(
+            child.best_state[name], best["model_state_dict"][name]
+        )
+    original_state = final["optimizer_state_dict"]["state"]
+    restored_state = child.optimizer.state_dict()["state"]
+    for key in original_state:
+        for field in original_state[key]:
+            torch.testing.assert_close(
+                restored_state[key][field], original_state[key][field]
+            )
+    evaluate_child = child._evaluate_epoch
+
+    def no_new_best(epoch):
+        metrics = evaluate_child(epoch)
+        metrics["selection_score"] = 10.0 + epoch
+        return metrics
+
+    monkeypatch.setattr(child, "_evaluate_epoch", no_new_best)
+    child.run()
+    saved = torch.load(
+        child.checkpoint_dir / "final_model.pt", map_location="cpu", weights_only=False
+    )
+    assert saved["epoch"] == 3 and len(saved["validation_epoch_trace"]) == 4
+    assert child.global_step == final["global_step"] + 2 * child.steps_per_epoch
+    assert child.optimizer.param_groups[0]["lr"] == pytest.approx(
+        config.training.min_learning_rate
+    )
+    retained = torch.load(
+        child.checkpoint_dir / "best_model.pt", map_location="cpu", weights_only=False
+    )
+    assert retained["global_step"] == best["global_step"]
+    child_config.training.resume_best_checkpoint_path = None
+    with pytest.raises(ValueError, match="resume_best_checkpoint_path"):
+        NativeTrainer(child_config, model_id="extension_missing_best")

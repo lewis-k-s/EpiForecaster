@@ -1047,6 +1047,8 @@ class TrainingParams:
     weight_decay: float = 1.0e-5
     init_checkpoint_path: str | None = None
     resume_checkpoint_path: str | None = None
+    resume_best_checkpoint_path: str | None = None
+    resume_extension_learning_rate: float | None = None
     scheduler_type: str = "cosine"
     warmup_steps: int = 0
     min_learning_rate: float = 0.0

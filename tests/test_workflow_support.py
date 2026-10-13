@@ -659,9 +659,12 @@ def test_evaluation_resolves_pinned_checkpoint_in_runtime_run_namespace(
     assert captured["checkpoint"] == pinned.resolve()
 
 
-@pytest.mark.parametrize("checkpoint_mode", ["init", "resume"])
+@pytest.mark.parametrize(
+    "checkpoint_mode,prior_best", [("init", False), ("resume", False), ("resume", True)]
+)
 def test_prepare_run_pins_training_initialization_checkpoint(
     checkpoint_mode: str,
+    prior_best: bool,
     tmp_path: Path,
 ) -> None:
     run_root = tmp_path / "runs/fine-tune"
@@ -692,6 +695,10 @@ def test_prepare_run_pins_training_initialization_checkpoint(
     }
     config.pop("optuna")
     config.pop("promotion")
+    if prior_best:
+        best = external_checkpoint.with_name("prior_best.pt")
+        best.write_bytes(b"prior best checkpoint")
+        config["training"]["resume_best_checkpoint"] = str(best)
     config_path = run_root / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(config))
@@ -712,6 +719,13 @@ def test_prepare_run_pins_training_initialization_checkpoint(
     assert manifest["identity"][f"{checkpoint_mode}_checkpoint_sha256"] == (
         run_support.sha256_file(pinned)
     )
+    if prior_best:
+        pinned_best = run_root / "inputs/training_resume_best_checkpoint.pt"
+        assert pinned_best.read_bytes() == b"prior best checkpoint"
+        assert not pinned_best.stat().st_mode & 0o222
+        assert manifest["training_input"]["best_checkpoint"][
+            "checkpoint_sha256"
+        ] == run_support.sha256_file(pinned_best)
 
 
 def test_production_workflow_stages_native_graph_and_abs_deaths() -> None:
@@ -1997,9 +2011,12 @@ def test_train_model_records_deterministic_checkpoint(
     ]
 
 
-@pytest.mark.parametrize("checkpoint_mode", ["init", "resume"])
+@pytest.mark.parametrize(
+    "checkpoint_mode,prior_best", [("init", False), ("resume", False), ("resume", True)]
+)
 def test_train_model_uses_validated_pinned_initialization_checkpoint(
     checkpoint_mode: str,
+    prior_best: bool,
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -2021,10 +2038,25 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
         }
     }
     config_path = run_root / "config.yaml"
+    best_metadata = {}
+    if prior_best:
+        pinned_best = run_root / "inputs/training_resume_best_checkpoint.pt"
+        pinned_best.write_bytes(b"prior best")
+        config["training"]["resume_best_checkpoint"] = "/gpfs/pretrain/prior_best.pt"
+        best_metadata = {
+            "best_checkpoint": {
+                "checkpoint_sha256": run_support.sha256_file(pinned_best)
+            }
+        }
     config_path.write_text(yaml.safe_dump(config))
     (run_root / "manifest.yaml").write_text(
         yaml.safe_dump(
-            {"training_input": {"checkpoint_sha256": run_support.sha256_file(pinned)}}
+            {
+                "training_input": {
+                    "checkpoint_sha256": run_support.sha256_file(pinned),
+                    **best_metadata,
+                }
+            }
         )
     )
     captured: dict[str, object] = {}
@@ -2043,6 +2075,11 @@ def test_train_model_uses_validated_pinned_initialization_checkpoint(
     command = captured["command"]
     expected_override = f"training.{checkpoint_mode}_checkpoint_path={pinned}"
     assert expected_override in command
+    if prior_best:
+        assert f"training.resume_best_checkpoint_path={pinned_best}" in command
+        pinned_best.write_bytes(b"corrupt")
+        with pytest.raises(ValueError, match="prior best checkpoint failed validation"):
+            run_support.train_model(config_path, source_root, run_root)
 
 
 @pytest.mark.parametrize(

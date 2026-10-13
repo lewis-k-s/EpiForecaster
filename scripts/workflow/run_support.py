@@ -364,6 +364,16 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
                 label="Training resume",
             )
             identity["resume_checkpoint_sha256"] = training_input["checkpoint_sha256"]
+            configured_best = config["training"].get("resume_best_checkpoint")
+            if configured_best is not None:
+                training_input["best_checkpoint"] = pin_checkpoint(
+                    Path(str(configured_best)),
+                    run_root / "inputs/training_resume_best_checkpoint.pt",
+                    label="Training prior best",
+                )
+                identity["resume_best_checkpoint_sha256"] = training_input[
+                    "best_checkpoint"
+                ]["checkpoint_sha256"]
 
     evaluation_input = None
     training_evidence_input = None
@@ -705,6 +715,18 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         ):
             raise ValueError("Pinned training resume checkpoint failed validation")
         overrides.append(f"training.resume_checkpoint_path={pinned_resume_checkpoint}")
+        if training.get("resume_best_checkpoint") is not None:
+            pinned_best = run_root / "inputs/training_resume_best_checkpoint.pt"
+            expected_best = manifest["training_input"]["best_checkpoint"][
+                "checkpoint_sha256"
+            ]
+            if (
+                not pinned_best.is_file()
+                or pinned_best.is_symlink()
+                or sha256_file(pinned_best) != expected_best
+            ):
+                raise ValueError("Pinned prior best checkpoint failed validation")
+            overrides.append(f"training.resume_best_checkpoint_path={pinned_best}")
     for override in overrides:
         command.extend(["--override", override])
 

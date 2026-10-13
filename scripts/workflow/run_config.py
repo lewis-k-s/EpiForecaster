@@ -377,6 +377,22 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 raise ValueError(f"training.{field} must be one safe path component")
         init_checkpoint = training.get("init_checkpoint")
         resume_checkpoint = training.get("resume_checkpoint")
+        resume_best_checkpoint = training.get("resume_best_checkpoint")
+        if resume_best_checkpoint is not None:
+            if (
+                resume_checkpoint is None
+                or not Path(str(resume_best_checkpoint)).is_absolute()
+            ):
+                raise ValueError(
+                    "training.resume_best_checkpoint requires an absolute resume checkpoint"
+                )
+            if (
+                Path(str(resume_best_checkpoint)).parent
+                != Path(str(resume_checkpoint)).parent
+            ):
+                raise ValueError(
+                    "Resume and best checkpoints must share a producer directory"
+                )
         if init_checkpoint is not None and resume_checkpoint is not None:
             raise ValueError(
                 "training init_checkpoint and resume_checkpoint are mutually exclusive"

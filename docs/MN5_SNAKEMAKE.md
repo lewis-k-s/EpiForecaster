@@ -41,6 +41,20 @@ Independent evaluation checks the checkpoint identities and has no trainer
 resume lifecycle. Final evaluation honors `training.run_final_evaluation`;
 the DAG sets it to false and owns the canonical evaluation exports.
 
+For an epoch-budget extension, use a new immutable `train` run with
+`training.resume_checkpoint` set to the producer's final checkpoint and
+`training.resume_best_checkpoint` set to its selected best checkpoint. Both
+files must be in the same producer directory; preparation pins and hashes each
+file. Set the total `training.epochs` in the training overrides and provide a
+positive `training.resume_extension_learning_rate`. The trainer restores final
+weights, optimizer moments, completed-step history, and validation history. It
+starts a new scheduler segment for the remaining epochs without warmup and
+retains the prior selected checkpoint if the added epochs do not improve it.
+Batch size and scientific data/model/evaluation settings must match the parent.
+Older checkpoints lack RNG state, so dropout and worker RNG restart from the
+configured seed. This is a documented continuation, not a bitwise replay of an
+uninterrupted longer run. A same-budget resume keeps its saved scheduler state.
+
 The `mn5_native_wastewater_history_repair.yaml` preprocessing template rebuilds
 only `history_log1p` from the pinned parent Zarr's raw concentration and detection
 limits. It uses the parent's fixed filter parameters. QA checks all other

@@ -68,6 +68,8 @@ if WORKFLOW_KIND == "train" and config["training"].get("init_checkpoint") is not
     PREPARE_OUTPUTS.append(str(PINNED_TRAINING_INIT_CHECKPOINT))
 if WORKFLOW_KIND == "train" and config["training"].get("resume_checkpoint") is not None:
     PREPARE_OUTPUTS.append(str(PINNED_TRAINING_RESUME_CHECKPOINT))
+    if config["training"].get("resume_best_checkpoint") is not None:
+        PREPARE_OUTPUTS.append(str(RUN_ROOT / "inputs/training_resume_best_checkpoint.pt"))
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
 WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"
