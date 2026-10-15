@@ -296,6 +296,10 @@ class TestDiscoverRunsSynthOnly:
             def release_shared_sparse_topology(self):
                 self.shared_sparse_topology = None
 
+            def release_dense_mobility(self):
+                self.preloaded_mobility = None
+                self.mobility_mask = None
+
         created: list[FakeDataset] = []
 
         def make_dataset(**kwargs):

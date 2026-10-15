@@ -16,6 +16,7 @@ from constants import (
     EDAR_BIOMARKER_VARIANTS,
 )
 from data import dtypes as dtype_utils
+from data.context_assembly import pack_bool_last_dim
 from data.epi_batch import _replace_non_finite
 from models.configs import EpiForecasterConfig
 from utils.logging import suppress_zarr_warnings
@@ -253,6 +254,9 @@ class EpiDataset(Dataset):
             self.mobility_preprocessor = MobilityPreprocessor(mp_config)
         else:
             self.mobility_preprocessor = mobility_preprocessor
+
+        # Compact [T, N_ctx, N_ctx] graph weights; set by release_dense_mobility().
+        self.graph_mobility_weights: torch.Tensor | None = None
 
         if (preloaded_mobility is None) != (mobility_mask is None):
             raise ValueError(
@@ -660,7 +664,10 @@ class EpiDataset(Dataset):
         target_index = torch.arange(target_count).unsqueeze(0)
         # Targets observe themselves regardless of adjacency source.
         neighbor_table[time_index, target_index, positions.unsqueeze(0)] = True
-        self.context_neigh_table = neighbor_table
+        # Boolean (time, target_slot, ctx_pos) tables are stored bit-packed
+        # along ctx_pos; context assembly unpacks only the gathered rows.
+        self.context_node_count = int(node_ids.numel())
+        self.context_neigh_table = pack_bool_last_dim(neighbor_table.contiguous())
 
         if self._precomputed_k_hop_masks:
             # Stack per-timestep (N_all, N_all) reachability masks (dict keyed
@@ -675,7 +682,7 @@ class EpiDataset(Dataset):
             )
             k_hop = k_hop.index_select(2, node_ids)
             k_hop[time_index, target_index, positions.unsqueeze(0)] = True
-            self.context_khop_table = k_hop.contiguous()
+            self.context_khop_table = pack_bool_last_dim(k_hop.contiguous())
         else:
             self.context_khop_table = None
 
@@ -740,6 +747,45 @@ class EpiDataset(Dataset):
         if self.shared_sparse_topology is not None:
             self.shared_sparse_topology = None
             logger.info("Released shared full sparse topology")
+
+    def release_dense_mobility(self) -> None:
+        """Keep only the mobility state that training reads after init.
+
+        Dense ``(T, N, N)`` mobility weights, the edge mask, the per-timestep
+        adjacency cache and the k-hop masks are only needed to build the
+        context tables. Training then reads the weights between graph nodes
+        (``inject_gpu_mobility``) and the prebuilt context tables. This keeps
+        the masked float16 weights restricted to graph nodes, laid out exactly
+        as ``inject_gpu_mobility`` slices them, and drops everything else.
+
+        Call it only on datasets whose dense tensors are not shared with other
+        datasets that are built later. Tensors that another dataset still holds
+        stay alive through that dataset.
+        """
+        self._adjacency_cache = {}
+        self._precomputed_k_hop_masks = {}
+        if self.config.model.graph_adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            # Static adjacency does not read dynamic weights after init.
+            return
+        if self.graph_mobility_weights is not None:
+            return
+        if self.preloaded_mobility is None or self.mobility_mask is None:
+            raise RuntimeError("Dense mobility was released without graph weights")
+        node_ids = torch.where(self._get_graph_node_mask())[0]
+        rows = node_ids.unsqueeze(-1)
+        weights = self.preloaded_mobility[:, rows, node_ids]
+        mask = self.mobility_mask[:, rows, node_ids]
+        self.graph_mobility_weights = weights.masked_fill(~mask, 0.0)
+        self.preloaded_mobility = None
+        self.mobility_mask = None
+        logger.info(
+            "Released dense mobility for run %s; kept graph weights %s (%.2f MB)",
+            self.run_id,
+            tuple(self.graph_mobility_weights.shape),
+            self.graph_mobility_weights.numel()
+            * self.graph_mobility_weights.element_size()
+            / 1e6,
+        )
 
     def __del__(self) -> None:
         """Cleanup zarr dataset on garbage collection.

@@ -449,6 +449,9 @@ def build_curriculum_datasets(
                 run_id=s_run,
                 region_embedding_store=region_embedding_store,
             )
+            # Release before the next run is built so peak memory holds one
+            # dense run plus the compact state of the runs built so far.
+            s_ds.release_dense_mobility()
             synth_datasets.append(s_ds)
 
         train_dataset = ConcatDataset(synth_datasets)
@@ -479,6 +482,8 @@ def build_curriculum_datasets(
             region_embedding_store=region_embedding_store,
         )
 
+        # Val/test keep the scaler run's dense tensors alive by reference.
+        synth_scaler_ds.release_dense_mobility()
         synth_scaler_ds.release_shared_sparse_topology()
         val_dataset.release_shared_sparse_topology()
         test_dataset.release_shared_sparse_topology()
@@ -550,6 +555,9 @@ def build_curriculum_datasets(
     synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
     synth_mobility_preprocessor = synth_scaler_ds.mobility_preprocessor
 
+    # Synthetic runs share no dense tensors with the real val/test datasets.
+    synth_scaler_ds.release_dense_mobility()
+
     synth_datasets = []
     for s_run in synth_runs:
         if s_run == synth_scaler_run:
@@ -578,6 +586,7 @@ def build_curriculum_datasets(
             run_id=s_run,
             region_embedding_store=region_embedding_store,
         )
+        s_ds.release_dense_mobility()
         synth_datasets.append(s_ds)
 
     train_dataset = ConcatDataset([real_train_ds] + synth_datasets)

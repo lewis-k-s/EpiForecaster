@@ -2,11 +2,39 @@
 Training utilities for the EpiForecaster project.
 """
 
+import weakref
+from collections import OrderedDict
+
 import torch
 from data.epi_batch import EpiBatch
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
 STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
+
+# Each dataset caches its full-run adjacency and context tables on the device
+# (~1 GB per 945-region, 455-day run). Curriculum training interleaves chunks
+# from every run, so unbounded caches grow with the run count. Keep at most this
+# many datasets resident; an evicted dataset rebuilds its cache on next use.
+MAX_DEVICE_CACHED_DATASETS = 4
+_device_cached_datasets: OrderedDict[int, weakref.ReferenceType] = OrderedDict()
+
+
+def _retain_device_caches(base_ds: object) -> None:
+    """Mark ``base_ds`` as most recently used and evict the least recent."""
+    key = id(base_ds)
+    existing = _device_cached_datasets.pop(key, None)
+    if existing is not None and existing() is not base_ds:
+        existing = None
+    _device_cached_datasets[key] = existing or weakref.ref(base_ds)
+    while len(_device_cached_datasets) > MAX_DEVICE_CACHED_DATASETS:
+        _, ref = _device_cached_datasets.popitem(last=False)
+        evicted = ref()
+        if evicted is None:
+            continue
+        for name in ("_gpu_mobility_cache", "_context_device_cache"):
+            cache = getattr(evicted, name, None)
+            if cache:
+                cache.clear()
 
 
 def drop_nowcast(prediction: torch.Tensor, horizon: int | None = None) -> torch.Tensor:
@@ -153,6 +181,8 @@ def inject_gpu_mobility(
             source_adjacency = getattr(base_ds, "spatial_knn_adjacency", None)
         if source_adjacency is None:
             return
+    elif getattr(base_ds, "graph_mobility_weights", None) is not None:
+        source_adjacency = None
     elif (
         not hasattr(base_ds, "preloaded_mobility") or base_ds.preloaded_mobility is None
     ):
@@ -160,6 +190,7 @@ def inject_gpu_mobility(
     else:
         source_adjacency = base_ds.preloaded_mobility
 
+    _retain_device_caches(base_ds)
     # Cache GPU mobility directly on the dataset object keyed by device
     if not hasattr(base_ds, "_gpu_mobility_cache"):
         base_ds._gpu_mobility_cache = {}
@@ -177,6 +208,10 @@ def inject_gpu_mobility(
             )
             total_t = base_ds.preloaded_mobility.shape[0]
             sliced_mob = sliced_mob.unsqueeze(0).expand(total_t, -1, -1)
+        elif source_adjacency is None:
+            # Released dataset: weights are already masked and restricted to
+            # graph nodes in the same [TotalT, N_ctx, N_ctx] source-major layout.
+            sliced_mob = base_ds.graph_mobility_weights.to(MODEL_PARAM_DTYPE)
         else:
             # Slice original CPU tensor to context nodes: resulting size [TotalT, N_ctx, N_ctx]
             # Using unsqueeze is faster and creates an intermediate of correct shape directly
@@ -187,6 +222,7 @@ def inject_gpu_mobility(
             if mobility_mask is not None:
                 sliced_mask = mobility_mask[:, node_ids.unsqueeze(-1), node_ids]
                 sliced_mob = sliced_mob.masked_fill(~sliced_mask, 0.0)
+        if adjacency_source not in STATIC_GRAPH_ADJACENCY_SOURCES:
             # Canonical OD weights are [origin, destination]. Dense GNN rows are
             # destinations receiving messages from source columns.
             sliced_mob = sliced_mob.transpose(-1, -2)
@@ -249,6 +285,7 @@ def inject_context_features(
     ):
         return
 
+    _retain_device_caches(base_ds)
     assembly_device = device if device.type == "cuda" else torch.device("cpu")
     mob_batch.x_dense = assemble_context_features(
         base_ds,
