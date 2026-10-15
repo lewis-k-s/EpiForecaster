@@ -1,0 +1,137 @@
+env: "mn5"
+
+# Production synthetic pretraining config for the closed-loop reactive corpus
+# epiforecaster_sirhd_v1_netcdf_d9c5bae_20261015_reactive_n100 (100 Reactive
+# profiles + 100 no-policy Baseline twins). Latent targets are the generator's
+# model-aligned sirhd_* partition. Stage-2 fine-tuning should use
+# train_epifor_mn5_full.yaml with training.init_checkpoint_path set to the best
+# checkpoint from this run.
+#
+# Sizing: one epoch is about ten times the 20-run reporting-v1 epoch
+# (~4.2M examples, ~131k batches, ~3.1 h at the measured compiled throughput).
+# Four epochs keep the cycle well inside one acc_bscls allocation.
+
+data:
+  dataset_path: data/processed/synthetic_sirhd_v1_d9c5bae_reactive_n100_holt_damped.nc
+  region2vec_path: outputs/region_embeddings/region_embeddings.pt
+  use_valid_targets: true
+  # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.
+  # Keep positive flows; max_neighbors performs the intended graph sparsification.
+  mobility_min_flow_raw: 0.0
+  mobility_weight_clip_max: 8.0
+  min_history_observed_fraction: 0.5
+  min_horizon_observed_fraction: 0.5
+  window_stride: 7
+  sample_ordering: "time"
+  run_id_chunk_size: 1
+
+model:
+  strict: false
+  type:
+    cases: true
+    regions: true
+    biomarkers: true
+    mobility: true
+  params:
+    mobility_embedding_dim: 32
+    region_embedding_dim: 64
+    gnn_module: "gcn"
+    include_day_of_week: true
+    include_holidays: true
+    include_lockdown_severity: true
+    input_window_length: 60
+    forecast_horizon: 28
+    max_neighbors: 20
+    gnn_depth: 2
+    sir_physics:
+      dt: 1.0
+      enforce_nonnegativity: true
+      enforce_mass_conservation: true
+      beta_min: 0.01
+      beta_max: 2.0
+      gamma_min: 0.05
+      gamma_max: 0.5
+      mortality_min: 0.0001
+      mortality_max: 0.05
+      residual_clip: 10000.0
+    observation_heads:
+      delta_forecasting: true
+      relevant_source_hosp: hospitalization_flow
+      relevant_source_ww: I
+      relevant_source_cases: I
+      relevant_source_deaths: death_flow
+
+output:
+  experiment_name: mn5_epiforecaster_sirhd_v1_reactive_n100_pretrain
+  log_dir: outputs/training
+  write_granular_eval: false
+  wandb_mode: offline
+  wandb_tags: [mn5, synth, pretrain, sirhd-v1, reactive-n100, continuous-observations]
+
+training:
+  compile: true
+  compile_mode: "reduce-overhead"
+  compile_dynamic: false
+  compile_fullgraph: false
+  compile_backward: true
+  seed: 42
+  split_seed: 42
+  device: "cuda"
+  init_checkpoint_path: null
+  batch_size: 32
+  shuffle_train_batches: true
+  gradient_accumulation_steps: 1
+  gradient_clip_value: 5.0
+  early_stopping_patience: 5
+  nan_loss_patience: 5
+  epochs: 4
+  learning_rate: 0.001
+  weight_decay: 1.0e-05
+  warmup_steps: 100
+  num_workers: 4
+  val_workers: 2
+  prefetch_factor: 2
+  pin_memory: true
+
+  progress_log_frequency: 100
+
+  grad_norm_log_frequency: 500
+  pathway_gradient_frequency: 500
+  gradient_snapshot_frequency: 0
+  gradient_snapshot_top_k: 5
+  gradient_vanishing_threshold: 1.0e-8
+  gradient_exploding_threshold: 1.0e2
+
+  split_strategy: "node"
+
+  val_split: 0.2
+  test_split: 0.1
+
+  profiler:
+    enabled: true
+    wait_steps: 5
+    warmup_steps: 1
+    active_steps: 2
+    profile_epochs: [1]
+    record_memory: false
+    log_dir: auto
+  plot_forecasts: true
+  num_forecast_samples: 3
+  loss:
+    name: "joint_inference"
+    joint:
+      observation_loss: nll
+      latent:
+        total_weight: 0.01
+        scaling: "none"
+        require_complete_targets: true
+
+  curriculum:
+    enabled: true
+    active_runs: -1          # Use all available synthetic runs each epoch
+    chunk_size: 512
+    run_sampling: "round_robin"
+    schedule:
+      - start_epoch: 0
+        end_epoch: 4         # Must match training.epochs
+        synth_ratio: 1.0     # All synthetic, no real data

@@ -1,0 +1,57 @@
+# Synthetic-pretraining MN5 workflow for the 200-run closed-loop reactive
+# corpus. Per-run paths and provenance fields are injected by
+# scripts/workflow/mn5_workflow.sh.
+#
+# Prerequisite: promote the processed-dataset pointer published by
+# mn5_preprocess_sirhd_v1_reactive_n100.yaml into data/processed/.
+#
+# KNOWN LIMIT: synthetic-only training preloads dense mobility for every run
+# (~1.22 GB per run: float16 weights + bool mask over 455 x 945 x 945), so 200
+# runs need ~244 GB of host memory. The single-task ACC contract (20 CPUs, one
+# GPU) provides ~120 GiB. Do not submit this config until per-run mobility
+# memory is reduced or the allocation contract changes.
+#
+# Sizing: four epochs at ~3.1 h each plus dataset construction and test
+# evaluation; 1440 minutes leaves about 2x margin because an incomplete
+# training attempt restarts from its initial state.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: train
+  target: train_evaluate
+
+dvc:
+  targets:
+    - data/processed/synthetic_sirhd_v1_d9c5bae_reactive_n100_holt_damped.nc.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+  provenance_targets:
+    - data/files/epiforecaster_sirhd_v1_netcdf_d9c5bae_reactive_n100.nc.dvc
+
+training:
+  base_config: configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml
+  experiment_name: synthetic-pretrain-sirhd-v1-reactive-n100
+  model_id: model
+  max_batches: null
+  overrides:
+    - output.save_checkpoints=true
+    - training.run_final_evaluation=false
+
+evaluation:
+  split: test
+  granular: true
+  overrides:
+    - training.val_workers=2
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 1440
