@@ -126,11 +126,7 @@ SOURCE_RESOLUTION_DIR = (
     / "outputs/loss_research/loss-type-full-coverage-v2"
     / "source_resolution_bundle/source_resolution_analysis"
 )
-NEIGHBOR_STORY_DIR = (
-    ROOT
-    / "outputs/loss_research/loss-type-full-coverage-v2"
-    / "presentation_revision/neighbor_stories"
-)
+NEIGHBOR_STORY_DIR = ROOT / "outputs/reports/loss_type_full_coverage_v2_neighbor_stories"
 GEOJSON_PATH = ROOT / "data/files/geo/fl_municipios_catalonia.geojson"
 
 TEAL = "#087f76"
@@ -820,7 +816,7 @@ finish(figure,"10_factor_associations")
 | Original report and bundle receipt | `source_resolution_bundle/report/`, `source_resolution_bundle/bundle_manifest.json` |
 | Revised source | `docs/research/loss_type_full_coverage_mobility_update.qmd` |
 | Revised HTML and PNG/SVG figures | `outputs/loss_research/loss-type-full-coverage-v2/presentation_revision/` |
-| Exploratory neighbor data and script | `presentation_revision/neighbor_stories/`; `scripts/analysis/screen_mobility_neighbor_stories.py` |
+| Exploratory neighbor data and script | `outputs/reports/loss_type_full_coverage_v2_neighbor_stories/`; `scripts/analysis/screen_mobility_neighbor_stories.py` |
 
 Paths beginning with `source_resolution_bundle/` are relative to `outputs/loss_research/loss-type-full-coverage-v2/`. The source bundle retains the full diagnostic inputs and script. This report presents the ABS source check and ABS case-label projection from those outputs.
 

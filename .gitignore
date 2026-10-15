@@ -114,3 +114,6 @@ WATCHDOG.yml
 
 # Cluster-local notes
 PROD_RUN.md
+
+# Quarto render of docs/research/loss_type_full_coverage_mobility_update.qmd
+/loss_type_full_coverage_mobility_update.html

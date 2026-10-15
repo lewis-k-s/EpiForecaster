@@ -31,7 +31,7 @@ ABS_SOURCE = (
     ROOT.parent / "dasymetric_mob/data/raw/COVID-19__Persones_hospitalitzades.csv"
 )
 ABS_MAPPING = ROOT.parent / "dasymetric_mob/data/output/abs_to_municipality_mapping.csv"
-OUTPUT = CAMPAIGN / "presentation_revision/neighbor_stories"
+OUTPUT = ROOT / "outputs/reports/loss_type_full_coverage_v2_neighbor_stories"
 
 STORIES = (
     {
