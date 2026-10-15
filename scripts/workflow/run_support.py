@@ -91,6 +91,8 @@ def write_dependency_contract(
         "promotion": ("promotion", "dvc"),
         "preprocessing": ("preprocessing", "dvc"),
     }
+    if stage == "ablation" and config["workflow"]["kind"] == "ablation_suite":
+        stage_sections["ablation"] = ("ablation_suite",)
     if stage not in stage_sections:
         raise ValueError(f"Unknown dependency stage: {stage}")
 
@@ -296,6 +298,10 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     }
     if isinstance(study_config, dict):
         identity["study_name"] = study_config["study_name"]
+    if "ablation_suite" in config:
+        identity["study_names"] = [
+            study["study_name"] for study in config["ablation_suite"]["studies"]
+        ]
     if isinstance(crossval_config, dict):
         identity["crossval_campaign_id"] = crossval_config["campaign_id"]
 
@@ -409,6 +415,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "crossval",
         "optuna",
         "ablation",
+        "ablation_suite",
         "promotion",
         "provenance",
     ):
@@ -1754,6 +1761,7 @@ def finalize_ablation(
     config_path: Path,
     run_root: Path,
     journal_path: Path,
+    study_name: str | None = None,
 ) -> Path:
     """Validate a completed ablation queue and generate its aggregate reports."""
     import optuna
@@ -1761,9 +1769,24 @@ def finalize_ablation(
     from optuna.storages.journal import JournalFileBackend
 
     from scripts.hpo.ablation_worker import is_study_complete, load_campaign
+    from evaluation.ablation_probabilistic_analysis import campaign_analysis_spec
 
     config = load_yaml(config_path)
-    ablation = config["ablation"]
+    if study_name is None:
+        ablation = config["ablation"]
+        output_dir = run_root / "outputs/ablation_analysis"
+        stale_marker = run_root / ".state/workers_complete.done"
+        marker = run_root / ".state/ablation.done"
+    else:
+        studies = config["ablation_suite"]["studies"]
+        ablation = next(
+            (study for study in studies if study["study_name"] == study_name), None
+        )
+        if ablation is None:
+            raise ValueError(f"Unknown ablation suite study: {study_name}")
+        output_dir = run_root / "outputs/ablation_analysis" / study_name
+        stale_marker = run_root / ".state/ablation_suite" / f"{study_name}.workers.done"
+        marker = run_root / ".state/ablation_suite" / f"{study_name}.done"
     smoketest = bool(ablation.get("smoketest", False))
     study = optuna.load_study(
         study_name=str(ablation["study_name"]),
@@ -1772,6 +1795,15 @@ def finalize_ablation(
     campaign = load_campaign(Path(str(ablation["campaign"])))
     if not is_study_complete(study, campaign, smoketest=smoketest):
         state_counts = Counter(trial.state.name for trial in study.trials)
+        # The worker rule's completion marker is meaningless while the identity
+        # matrix is incomplete; drop it so the next attach re-runs workers and
+        # queue initialization re-enqueues the missing identities.
+        if stale_marker.exists():
+            stale_marker.unlink()
+            print(
+                f"Removed stale workers completion marker: {stale_marker}",
+                file=sys.stderr,
+            )
         raise RuntimeError(
             "Ablation workers exited before the complete campaign identity matrix was "
             f"terminal: {dict(sorted(state_counts.items()))}"
@@ -1779,7 +1811,6 @@ def finalize_ablation(
 
     campaign_id = campaign.campaign_id
     training_dir = run_root / "outputs/training" / campaign_id
-    output_dir = run_root / "outputs/ablation_analysis"
     command = [
         sys.executable,
         "-m",
@@ -1795,15 +1826,24 @@ def finalize_ablation(
         "--study-name",
         study.study_name,
     ]
+    reuse_evidence_dir = ablation.get("reuse_evidence_dir")
+    if reuse_evidence_dir is not None:
+        command.extend(["--reuse-evidence-dir", str(reuse_evidence_dir)])
     if smoketest:
         command.append("--smoketest")
     _run(command)
 
-    required_artifacts = [
-        output_dir / "seed_coverage_report.csv",
-        output_dir / "ablation_run_context.csv",
-        output_dir / "ablation_metrics_aggregated.csv",
-    ]
+    if campaign_analysis_spec(campaign) is not None:
+        required_artifacts = [
+            output_dir / "campaign_completeness_manifest.csv",
+            output_dir / "condition_scorecard.csv",
+        ]
+    else:
+        required_artifacts = [
+            output_dir / "seed_coverage_report.csv",
+            output_dir / "ablation_run_context.csv",
+            output_dir / "ablation_metrics_aggregated.csv",
+        ]
     missing = [path for path in required_artifacts if not path.is_file()]
     if missing:
         rendered = ", ".join(str(path) for path in missing)
@@ -1836,7 +1876,6 @@ def finalize_ablation(
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
-    marker = run_root / ".state/ablation.done"
     write_json(
         marker,
         {
@@ -1848,6 +1887,40 @@ def finalize_ablation(
         },
     )
     return marker
+
+
+def finalize_ablation_suite(config_path: Path, run_root: Path) -> Path:
+    """Bind all completed campaign analyses to one suite manifest."""
+    config = load_yaml(config_path)
+    studies = config["ablation_suite"]["studies"]
+    entries = []
+    for study in studies:
+        name = str(study["study_name"])
+        path = run_root / "outputs/ablation_analysis" / name / "ablation_manifest.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"Ablation suite study is incomplete: {path}")
+        manifest = json.loads(path.read_text())
+        if manifest["study_name"] != name:
+            raise ValueError(f"Ablation suite study identity mismatch: {path}")
+        entries.append(
+            {
+                "study_name": name,
+                "campaign_id": manifest["campaign_id"],
+                "campaign_sha256": manifest["campaign_sha256"],
+                "manifest": str(path.relative_to(run_root)),
+                "manifest_sha256": sha256_file(path),
+            }
+        )
+    output = run_root / "outputs/ablation_analysis/suite_manifest.json"
+    write_json(
+        output,
+        {
+            "schema_version": 1,
+            "studies": entries,
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return output
 
 
 def complete_workflow(
@@ -2352,6 +2425,10 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_ablation_parser.add_argument("--config", type=Path, required=True)
     finalize_ablation_parser.add_argument("--run-root", type=Path, required=True)
     finalize_ablation_parser.add_argument("--journal", type=Path, required=True)
+    finalize_ablation_parser.add_argument("--study-name")
+    finalize_suite_parser = subparsers.add_parser("finalize-ablation-suite")
+    finalize_suite_parser.add_argument("--config", type=Path, required=True)
+    finalize_suite_parser.add_argument("--run-root", type=Path, required=True)
 
     complete = subparsers.add_parser("complete")
     complete.add_argument("--config", type=Path, required=True)
@@ -2401,7 +2478,9 @@ def main() -> None:
     elif args.command == "cleanup-study":
         cleanup_study_checkpoints(args.config, args.run_root)
     elif args.command == "finalize-ablation":
-        finalize_ablation(args.config, args.run_root, args.journal)
+        finalize_ablation(args.config, args.run_root, args.journal, args.study_name)
+    elif args.command == "finalize-ablation-suite":
+        finalize_ablation_suite(args.config, args.run_root)
     elif args.command == "complete":
         complete_workflow(
             args.config,

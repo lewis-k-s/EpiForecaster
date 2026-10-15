@@ -1685,6 +1685,29 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
 
 
+def test_ablation_suite_manifest_requires_both_studies(tmp_path: Path) -> None:
+    config = {
+        "ablation_suite": {
+            "studies": [{"study_name": "temporal"}, {"study_name": "spatial"}]
+        }
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    temporal = tmp_path / "outputs/ablation_analysis/temporal/ablation_manifest.json"
+    temporal.parent.mkdir(parents=True)
+    temporal.write_text(
+        json.dumps(
+            {
+                "study_name": "temporal",
+                "campaign_id": "temporal",
+                "campaign_sha256": "a" * 64,
+            }
+        )
+    )
+    with pytest.raises(FileNotFoundError, match="spatial"):
+        run_support.finalize_ablation_suite(config_path, tmp_path)
+
+
 @pytest.mark.integration
 def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     tmp_path: Path,

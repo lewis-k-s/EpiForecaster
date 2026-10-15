@@ -43,6 +43,7 @@ WORKFLOW_KINDS = {
     "evaluate",
     "hpo",
     "ablation",
+    "ablation_suite",
     "crossval",
     "preprocess",
 }
@@ -51,6 +52,7 @@ WORKFLOW_TARGETS = {
     "evaluate": {"evaluate"},
     "hpo": {"hpo"},
     "ablation": {"ablation"},
+    "ablation_suite": {"ablation_suite"},
     "crossval": {"crossval"},
     "preprocess": {"preprocess"},
 }
@@ -300,6 +302,7 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         "evaluate": ("evaluation",),
         "hpo": ("optuna", "evaluation", "promotion"),
         "ablation": ("ablation",),
+        "ablation_suite": ("ablation_suite",),
         "crossval": ("crossval", "evaluation"),
         "preprocess": ("preprocessing",),
     }[kind]
@@ -398,6 +401,49 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             or timeout_s <= 0
         ):
             raise ValueError("ablation.timeout_s must be a positive integer")
+    elif kind == "ablation_suite":
+        suite = workflow_config["ablation_suite"]
+        studies = suite.get("studies")
+        if not isinstance(studies, list) or len(studies) < 2:
+            raise ValueError("ablation_suite.studies must contain at least two studies")
+        names: set[str] = set()
+        campaigns: set[str] = set()
+        for study in studies:
+            if not isinstance(study, dict):
+                raise ValueError("Each ablation suite study must be a mapping")
+            name = study.get("study_name")
+            if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+                raise ValueError(
+                    "Ablation suite study_name must be a safe path component"
+                )
+            if name in names:
+                raise ValueError(f"Duplicate ablation suite study_name: {name}")
+            names.add(name)
+            campaign = _safe_relative_path(
+                str(study.get("campaign", "")), field="ablation suite campaign"
+            ).as_posix()
+            if campaign in campaigns:
+                raise ValueError(f"Duplicate ablation suite campaign: {campaign}")
+            campaigns.add(campaign)
+            workers = study.get("workers")
+            if (
+                not isinstance(workers, int)
+                or isinstance(workers, bool)
+                or workers != 4
+            ):
+                raise ValueError("Each ablation suite study must use four workers")
+        closeout = suite.get("closeout_signal_seconds")
+        if not isinstance(closeout, int) or isinstance(closeout, bool) or closeout < 60:
+            raise ValueError(
+                "ablation_suite.closeout_signal_seconds must be at least 60"
+            )
+        timeout_s = suite.get("timeout_s")
+        if (
+            not isinstance(timeout_s, int)
+            or isinstance(timeout_s, bool)
+            or timeout_s <= 0
+        ):
+            raise ValueError("ablation_suite.timeout_s must be a positive integer")
     elif kind == "crossval":
         crossval = workflow_config["crossval"]
         for field in (
@@ -460,6 +506,9 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     elif kind == "ablation":
         workload = workflow_config.get("ablation")
         workload_name = "ablation"
+    elif kind == "ablation_suite":
+        workload = {"workers": 4}
+        workload_name = "ablation_suite"
     elif kind == "crossval":
         folds = workflow_config["crossval"].get("folds")
         workload = {"workers": min(folds, 4) if isinstance(folds, int) else folds}
@@ -504,6 +553,12 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "ablation.timeout_s must equal resources.allocation.runtime "
                 "minus ablation.closeout_signal_seconds"
+            )
+    if kind == "ablation_suite":
+        suite = workflow_config["ablation_suite"]
+        if suite["timeout_s"] != runtime * 60 - suite["closeout_signal_seconds"]:
+            raise ValueError(
+                "ablation_suite.timeout_s must equal allocation runtime minus closeout"
             )
     if mismatches:
         details = ", ".join(
@@ -715,6 +770,8 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
             "closeout_signal_seconds",
             document["ablation"]["closeout_signal_seconds"]
             if workflow_kind(document) == "ablation"
+            else document["ablation_suite"]["closeout_signal_seconds"]
+            if workflow_kind(document) == "ablation_suite"
             else 0,
         ),
     ]
