@@ -2509,7 +2509,7 @@ def test_transferred_runner_attaches_without_sbatch(
         text=True,
     )
 
-    assert result.stdout.startswith("attached:98765:")
+    assert result.stdout.startswith("coordinator-finished:0:")
     attempt_id = result.stdout.strip().split(":", 2)[2]
     attempt_root = run_root / ".state/executions" / attempt_id
     for _ in range(100):
@@ -2520,7 +2520,8 @@ def test_transferred_runner_attaches_without_sbatch(
     assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
     assert "mode\texisting-allocation\n" in (attempt_root / "binding.tsv").read_text()
     assert "--jobid=98765" in srun_calls.read_text()
-    assert "--external-launcher" in srun_calls.read_text()
+    assert "--job-name=snakemake-coordinator" in srun_calls.read_text()
+    assert "--overlap" in srun_calls.read_text()
     assert not (tmp_path / "sbatch.calls").exists()
     assert (
         run_root.parent / "by-slurm" / "98765" / "test-run" / attempt_id
@@ -2548,6 +2549,8 @@ def test_container_coordinator_preserves_capacity_and_completion(
     singularity = fake_bin / "singularity"
     singularity.write_text(
         "#!/bin/bash\nset -euo pipefail\n"
+        'if [ "$1" = buildcfg ]; then printf "SESSIONDIR=%s\\n" '
+        '"${TMPDIR:-/tmp}/singularity/mnt/session"; exit 0; fi\n'
         'printf "%s\\n" "$@" >"$CAPTURE.container"\n'
         'test "$1" = exec\nshift\n'
         'while [ "$#" -gt 0 ]; do\n'
@@ -2821,8 +2824,9 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
         not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
     )
     assert "--mem" not in coordinator
-    assert "--external-launcher" in remote_runner
-    assert "attach-worker" in remote_runner
+    assert "launch_coordinator_step" in remote_runner
+    assert "--overlap" in remote_runner
+    assert "probe-worker" in remote_runner
     assert "acc_interactive" in remote_runner
     assert "active_attempt_status" in remote_runner
     assert "--dvc-project-root" not in container_exec
@@ -2905,6 +2909,72 @@ def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert not (marker_root / "000.done").exists()
     assert "outcome=continuation" in (marker_root / "000.partial").read_text()
+
+
+@pytest.mark.parametrize(
+    ("journal_status", "expected_exit", "continuation"),
+    [(0, 0, False), (75, 75, True), (1, 1, False)],
+)
+def test_parallel_launcher_uses_journal_after_worker_receipts(
+    tmp_path: Path, journal_status: int, expected_exit: int, continuation: bool
+) -> None:
+    source_root = tmp_path / "source"
+    workflow_root = source_root / "scripts/workflow"
+    workflow_root.mkdir(parents=True)
+    launcher = workflow_root / "launch_parallel_workers.sh"
+    shutil.copy2(REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh", launcher)
+    checker = workflow_root / "mn5_container_exec.sh"
+    checker.write_text('#!/bin/bash\nexit "$FAKE_JOURNAL_STATUS"\n')
+    checker.chmod(0o755)
+    (workflow_root / "run_parallel_worker.sh").write_text("#!/bin/bash\nexit 0\n")
+    (workflow_root / "run_parallel_worker.sh").chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "srun").write_text(
+        '#!/bin/bash\nif [[ " $* " == *" --cpus-per-task=1 "* ]]; then\n'
+        '  exit "$FAKE_JOURNAL_STATUS"\nfi\nexit 0\n'
+    )
+    (fake_bin / "srun").chmod(0o755)
+    run_root = tmp_path / "run"
+    marker_root = run_root / ".state/workers/ablation_test"
+    marker_root.mkdir(parents=True)
+    (marker_root / "000.partial").write_text("outcome=continuation\n")
+
+    result = subprocess.run(
+        [
+            str(launcher),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(tmp_path / "runtime.sif"),
+            "--workers",
+            "1",
+            "--cpus-per-task",
+            "20",
+            "--worker-group",
+            "ablation_test",
+            "--",
+            "python",
+            "-m",
+            "scripts.hpo.ablation_worker",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "FAKE_JOURNAL_STATUS": str(journal_status),
+            "SLURM_JOB_NUM_NODES": "1",
+            "SLURM_NTASKS": "1",
+            "SLURM_CPUS_PER_TASK": "20",
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+
+    assert result.returncode == expected_exit
+    assert (run_root / ".state/continuation.required").exists() == continuation
 
 
 def test_snapshot_rejects_dvc_mount_parent_missing_from_inventory(

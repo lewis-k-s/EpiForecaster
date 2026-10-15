@@ -325,6 +325,9 @@ main() {
   fi
   load_singularity
   create_scratch
+  export TMPDIR="$SCRATCH_ROOT/tmp"
+  export APPTAINER_TMPDIR="$SCRATCH_ROOT/tmp"
+  export SINGULARITY_TMPDIR="$SCRATCH_ROOT/tmp"
   trap cleanup EXIT
 
   configure_shared_binds

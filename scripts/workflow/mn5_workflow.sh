@@ -293,10 +293,9 @@ report_coordinator_launch() {
       result="${result#active:}"
       echo "Snakemake coordinator is already active: ${result%%:*} (${result#*:})"
       ;;
-    attached:*)
-      result="${result#attached:}"
-      echo "Attached Snakemake coordinator to allocation ${result%%:*}"
-      echo "Execution attempt: ${result#*:}"
+    coordinator-finished:*)
+      result="${result#coordinator-finished:}"
+      echo "Snakemake coordinator exited with status ${result%%:*} (attempt ${result#*:})"
       ;;
     complete)
       echo "Workflow is already complete: $run_id"
@@ -321,24 +320,20 @@ start_run() {
   echo "Run root: $root"
 }
 
-# Attach the prepared run to an existing compatible interactive allocation.
 start_interactive_run() {
   local run_id="$1"
   local allocation_job_id="${2:-}"
-  local root result
+  local root
 
   validate_run_id "$run_id"
   root="$(run_root "$run_id")"
   if [ -n "$allocation_job_id" ]; then
-    result="$(operate_run "$run_id" attach "$allocation_job_id")"
+    invoke_run_runner "$root" attach "$allocation_job_id"
   else
-    result="$(operate_run "$run_id" attach)"
+    invoke_run_runner "$root" attach
   fi
-
-  report_coordinator_launch "$result" "$run_id"
   echo "Run root: $root"
 }
-
 # Show authoritative scheduler state, durable completion state, and recent logs.
 show_status() {
   operate_run "$1" status

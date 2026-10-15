@@ -540,10 +540,20 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         for key, value in expected.items()
         if allocation.get(key) != value
     }
-    qos = allocation.get("qos")
-    if qos not in {"acc_bscls", "acc_debug"}:
-        mismatches["qos"] = (qos, "acc_bscls or acc_debug")
     runtime = allocation.get("runtime")
+    qos = allocation.get("qos")
+    if qos not in {"acc_bscls", "acc_debug", "acc_interactive"}:
+        mismatches["qos"] = (qos, "acc_bscls, acc_debug, or acc_interactive")
+    if qos == "acc_interactive" and expected_tasks > 2:
+        mismatches["tasks"] = (
+            expected_tasks,
+            "at most 2 for acc_interactive's 40-CPU ceiling",
+        )
+    if qos == "acc_interactive" and isinstance(runtime, int) and runtime > 120:
+        mismatches["runtime"] = (
+            runtime,
+            "at most 120 minutes for acc_interactive",
+        )
     if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
         mismatches["runtime"] = (runtime, "positive integer minutes")
     if kind == "ablation":
