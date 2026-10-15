@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -23,6 +24,10 @@ import yaml
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
+from evaluation.ablation_probabilistic_analysis import (
+    build_probabilistic_campaign_outputs,
+    campaign_analysis_spec,
+)
 from scripts.hpo.ablation_worker import (
     AblationCampaign,
     expected_trial_identities,
@@ -75,7 +80,8 @@ class AblationRun:
     run_dir: Path
     seed: int | None
     fold: int | None = None
-
+    granular_path: Path | None = None
+    campaign_identity: dict[str, Any] | None = None
 
 def _run_label(run: AblationRun) -> str:
     return f"{run.experiment_dir.name}/{run.run_dir.name}"
@@ -219,6 +225,80 @@ def collect_ablation_runs(
             )
 
     return ablation_runs, campaigns_found
+
+
+def collect_reuse_evidence_runs(bundle_dir: Path) -> dict[str, list[AblationRun]]:
+    """Load receipt-bound historical calibration outputs from an external bundle."""
+    manifest_path = bundle_dir / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise ValueError("reuse evidence manifest records must be a list")
+    runs: dict[str, list[AblationRun]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("reuse evidence record must be a mapping")
+        files = record.get("evidence_files")
+        if not isinstance(files, list):
+            raise ValueError("reuse evidence record lacks evidence_files")
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError("reuse evidence file entry must be a mapping")
+            path = bundle_dir / str(item.get("path", ""))
+            expected_hash = item.get("sha256")
+            if (
+                not path.is_file()
+                or not isinstance(expected_hash, str)
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash
+            ):
+                raise ValueError(f"reuse evidence file failed integrity verification: {path}")
+        granular = next(
+            (
+                bundle_dir / item["path"]
+                for item in files
+                if isinstance(item, dict)
+                and str(item.get("path", "")).endswith("/test_granular.parquet")
+            ),
+            None,
+        )
+        training_config = next(
+            (
+                bundle_dir / item["path"]
+                for item in files
+                if isinstance(item, dict)
+                and str(item.get("path", "")).endswith("/config.yaml")
+            ),
+            None,
+        )
+        if granular is None or training_config is None:
+            raise ValueError("reuse evidence record lacks granular output or config")
+        condition, seed, fold = (
+            record.get("condition"),
+            record.get("seed"),
+            record.get("fold"),
+        )
+        if not isinstance(condition, str) or not isinstance(seed, int) or not isinstance(fold, int):
+            raise ValueError("reuse evidence record has invalid identity")
+        run_dir = training_config.parent
+        runs.setdefault(condition, []).append(
+            AblationRun(
+                ablation=condition,
+                campaign_id=str(payload["campaign_id"]),
+                experiment_dir=bundle_dir,
+                run_dir=run_dir,
+                seed=seed,
+                fold=fold,
+                granular_path=granular,
+                campaign_identity={
+                    "campaign_id": payload["campaign_id"],
+                    "campaign_sha256": payload["campaign_sha256"],
+                    "condition": condition,
+                    "seed": seed,
+                    "fold": fold,
+                },
+            )
+        )
+    return runs
 
 
 def build_seed_coverage_report(
@@ -677,6 +757,8 @@ def compute_seed_matched_baseline_deltas(
 
 def _campaign_output_identity(run: AblationRun) -> dict[str, Any]:
     """Load the immutable identity sidecar emitted by the campaign worker."""
+    if run.campaign_identity is not None:
+        return run.campaign_identity
     identity_path = run.run_dir / "campaign_identity.json"
     if not identity_path.is_file():
         raise ValueError(f"{_run_label(run)}: missing campaign_identity.json")
@@ -746,9 +828,13 @@ def validate_campaign_trials(
             errors.append(
                 f"{identity}: COMPLETE trial provenance does not match declaration"
             )
-        if attrs.get("optuna_value_purpose") != "validation_selection_coordination":
+        if attrs.get("optuna_value_purpose") not in {
+            "validation_selection_coordination",
+            "provenance_verified_checkpoint_reuse",
+        }:
             errors.append(
-                f"{identity}: COMPLETE trial value is not validation-selection coordination"
+                f"{identity}: COMPLETE trial value is not validation-selection "
+                "coordination or provenance-verified checkpoint reuse"
             )
         selection_metric = attrs.get("best_val_selection_metric")
         selection_value = attrs.get("best_val_selection_value")
@@ -812,6 +898,7 @@ def validate_campaign_outputs(
     expected = expected_trial_identities(campaign, smoketest=smoketest)
     observed: dict[tuple[str, int, int | None], list[AblationRun]] = {}
     errors: list[str] = []
+    probabilistic = campaign_analysis_spec(campaign) is not None
     for condition, runs in ablation_runs.items():
         for run in runs:
             if run.seed is None:
@@ -836,17 +923,18 @@ def validate_campaign_outputs(
                 errors.append(
                     f"{_run_label(run)}: campaign output provenance does not match declaration"
                 )
-            errors.extend(
-                _aggregate_metric_table_errors(
-                    load_test_metrics(run.run_dir),
-                    primary_metric=campaign.primary_metric,
-                    label=_run_label(run),
-                    require_finite_primary_metric=campaign.completeness_requirements[
-                        "require_finite_primary_metric"
-                    ],
-                    allow_nonfinite_zero_support=smoketest,
+            if not probabilistic:
+                errors.extend(
+                    _aggregate_metric_table_errors(
+                        load_test_metrics(run.run_dir),
+                        primary_metric=campaign.primary_metric,
+                        label=_run_label(run),
+                        require_finite_primary_metric=campaign.completeness_requirements[
+                            "require_finite_primary_metric"
+                        ],
+                        allow_nonfinite_zero_support=smoketest,
+                    )
                 )
-            )
     missing = expected - observed.keys()
     duplicates = {
         identity: runs for identity, runs in observed.items() if len(runs) != 1
@@ -904,6 +992,12 @@ def main() -> int:
         help="Glob pattern for ablation experiment directories",
     )
     parser.add_argument(
+        "--reuse-evidence-dir",
+        type=Path,
+        default=None,
+        help="Read-only external bundle containing receipt-verified reused outputs.",
+    )
+    parser.add_argument(
         "--smoketest",
         action="store_true",
         help="Validate the declaration-owned bounded smoke identity matrix.",
@@ -950,6 +1044,10 @@ def main() -> int:
         experiment_pattern=args.experiment_pattern,
         campaign_id=campaign_id,
     )
+    if args.reuse_evidence_dir is not None:
+        reuse_runs = collect_reuse_evidence_runs(args.reuse_evidence_dir)
+        for condition, runs in reuse_runs.items():
+            ablation_runs.setdefault(condition, []).extend(runs)
 
     if not ablation_runs:
         logger.error("No ablation runs found")
@@ -978,6 +1076,21 @@ def main() -> int:
     except (ValueError, KeyError, optuna.exceptions.OptunaError) as exc:
         logger.error("%s", exc)
         return 1
+    try:
+        probabilistic_outputs = build_probabilistic_campaign_outputs(
+            declaration,
+            ablation_runs,
+        )
+    except ValueError as exc:
+        logger.error("Probabilistic campaign analysis failed: %s", exc)
+        return 1
+    for stem, frame in probabilistic_outputs.items():
+        path = args.output_dir / f"{stem}.csv"
+        frame.to_csv(path, index=False)
+        logger.info("Saved probabilistic campaign evidence to %s", path)
+    if campaign_analysis_spec(declaration) is not None:
+        return 0
+
 
     seed_coverage_df = build_seed_coverage_report(ablation_runs)
     seed_coverage_path = args.output_dir / "seed_coverage_report.csv"
