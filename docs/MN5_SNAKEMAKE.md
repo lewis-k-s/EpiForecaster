@@ -173,13 +173,15 @@ consumes those per-trial artifacts.
 
 ### Declarative ablation campaigns
 
-`configs/campaigns/ablation_default_v1.yaml` is the versioned scientific
+`configs/campaigns/ablation_default_v2.yaml` is the versioned scientific
 authority for the production ablation matrix. It names the baseline, hypotheses,
 fixed structured overrides, the allowed hydrated-config difference paths for every
 condition, paired model seeds, the persisted representative 10-fold split manifest,
 metrics, budget policy, and completeness and provenance requirements.
-`workflow/config/mn5_ablation.yaml` only supplies execution resources, study name,
-and that campaign path.
+`workflow/config/mn5_ablation.yaml` supplies only execution resources, study name,
+and that campaign path. Every scientific loss, objective, mobility, signal, or
+architecture ablation must use this declarative campaign interface; ad hoc
+single-run matrices are acceptance or historical-reproduction interfaces only.
 
 Before work is queued, every condition is hydrated through
 `EpiForecasterConfig`, including model-parameter promotion and explicit defaults.
@@ -188,27 +190,47 @@ outside their declared paths. `equal_budget_policy.paths` is a non-empty list of
 resolved configuration paths (currently `training.epochs` and
 `training.max_batches`) whose values must be identical for every condition.
 
-`ablation_default_v1.yaml` uses the persisted ten-fold manifest but evaluates three
-coverage-selected folds (`[1, 4, 5]`) and two paired model seeds (`[42, 43]`) by
-default. The selected folds hold out 48 regions: 33 Barcelona, 7 Girona, 4 Lleida,
-and 4 Tarragona. This keeps geographic coverage while reducing the production matrix
-to `28 conditions × 3 folds × 2 seeds = 168` identities. The same model seed is used
-for every condition within each fold, so paired contrasts control initialization,
-DataLoader-order, and other stochastic-training variation. `training.split_seed` does
-not change these persisted fold memberships.
+Production campaigns evaluate every fold in the persisted manifest. The canonical
+10-fold manifest places all 161 valid target regions in the held-out test role
+exactly once per condition and paired model seed. `ablation_default_v2.yaml`
+therefore declares folds `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]` and two paired seeds
+`[42, 43]`, giving `28 conditions × 10 folds × 2 seeds = 560` identities. Each
+identity evaluates its complete eligible held-out support: all observed targets,
+forecast horizons, and target dates admitted by the campaign split and masks.
+Production ranking cannot use a selected regional or temporal subset.
 
-The default matrix is a screening study. Its results can justify a follow-up that
-expands the declared fold or seed replicates. `smoke_fold_indices` (`[1, 4]`) are a
-strict subset of the production folds. The checked-in
-`workflow/config/mn5_ablation_coverage_smoke.yaml` runs every default condition and
-paired model seed over that bounded subset with small batches; it is an ACC integration
-acceptance check, not a production estimate. Bounded smoke validation still requires
-the exact identity matrix, terminal trials, and provenance, but permits an undefined
-primary row when a target has zero observed opportunities. The smaller
+The same model seed is used for every condition within each fold, so paired
+contrasts control initialization, DataLoader order, and other stochastic-training
+variation. `training.split_seed` does not change persisted fold membership. Analysis
+must report the aggregate endpoint together with matched deltas by target, region,
+horizon, fold, and seed; the distribution and fraction of regions improved or
+worsened; and predeclared mobility-context strata for mobility contrasts. These
+regional effects are descriptive unless source sharing and temporal dependence are
+modeled explicitly.
+
+`ablation_default_v1.yaml` is retained only as the historical three-fold screening
+declaration. It is not a production campaign for new scientific estimates.
+`smoke_fold_indices` (`[1, 4]`) remain a strict subset of the v2 production folds.
+The checked-in `workflow/config/mn5_ablation_coverage_smoke.yaml` runs every
+default condition and paired model seed over that bounded subset with small batches;
+it is an ACC integration acceptance check, not a production estimate. The smaller
 `ablation_smoke_v1.yaml` remains the eight-identity infrastructure smoke. Both
-campaigns are expanded in memory; the workflow never generates per-run YAML files. A
-campaign with fold indices must declare an existing persisted split manifest, and
-undeclared resolved-config drift fails before a worker starts training.
+smoke campaigns require their exact declared identity matrix, terminal trials, and
+provenance, but they cannot support model-selection claims. Campaigns are expanded
+in memory; the workflow never generates per-run YAML files. A campaign with fold
+indices must declare an existing persisted split manifest, and undeclared
+resolved-config drift fails before a worker starts training.
+
+An `ablation_suite` config groups distinct campaigns in one immutable run and
+one four-GPU Slurm allocation. The suite runs each campaign in listed order,
+with four workers per campaign. Each study keeps a separate journal, worker
+receipts, and analysis directory. The suite manifest records both campaign
+manifests and their hashes. A later batch submission of the same run resumes
+the first incomplete study. The campaigns retain their own split and scoring
+contracts; a temporal campaign and a spatial campaign do not share trials.
+The Student-t CRPS suite fixes 50 epochs and disables early stopping for both
+paired mobility conditions. Four temporal studies have distinct fit cutoffs
+and 28-day scored blocks. Its spatial study includes all ten persisted folds.
 
 ### Ablation allocation closeout
 

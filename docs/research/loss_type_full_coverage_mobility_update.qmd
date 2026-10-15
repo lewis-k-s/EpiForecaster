@@ -1,0 +1,827 @@
+---
+title: "Probabilistic forecasts show consistent mobility gains"
+date: "2026-09-28"
+format:
+  html:
+    toc: true
+    toc-title: ""
+    toc-location: left
+    toc-depth: 2
+    embed-resources: true
+    html-math-method: mathjax
+    theme: cosmo
+    fig-align: center
+    grid:
+      body-width: 1050px
+      sidebar-width: 210px
+      margin-width: 0px
+jupyter: python3
+execute:
+  echo: false
+  warning: false
+  error: false
+---
+
+<style>
+body { color: #20333e; }
+#quarto-sidebar-toc-left #toc-title { display: none; }
+h1.title { font-size: 2.3rem; line-height: 1.12; }
+h2 { margin-top: 2.6rem; font-size: 1.65rem; }
+h3 { margin-top: 1.6rem; font-size: 1.25rem; }
+.quarto-figure img { width: 100%; height: auto; }
+.cell-output-display { max-width: 100%; overflow-x: auto; }
+table { width: 100%; font-size: .94rem; font-variant-numeric: tabular-nums; }
+thead { border-bottom: 2px solid #526673; }
+td, th { padding: .55rem .65rem !important; }
+figcaption, .note { color: #526673; font-size: .9rem; }
+details { margin: 1.4rem 0; padding: .8rem 0; border-top: 1px solid #d8e0e4; }
+summary { cursor: pointer; font-weight: 600; color: #263f5e; }
+.math.display { overflow-x: auto; }
+code { overflow-wrap: anywhere; }
+@media print { details { display: block; } #TOC { display: none; } }
+</style>
+
+Point forecasts assessed with MAE and RMSE did not show consistent mobility uplift across a representative set of regions. In contrast, using probabilistic forecasts, mobility now lowers the primary WIS score in all four distribution–loss pairs. This is a score result. The selected target timelines below still show large level errors and weak response to changes in observed values.
+
+| Main result | Evidence |
+|---|---:|
+| Reduction in equal-target WIS | **1.83–4.32%** |
+| Paired fold–seed blocks improved | **14–17 of 20**, per configuration |
+| Most consistent target gains | **Cases and wastewater: 4 / 4** |
+| High incoming-flow regions improved | **70.4%** |
+
+## Metrics for probabilistic forecasting
+
+The model predicts a location $\mu(x)$ and scale $s(x)>0$ in transformed target space. Normal and Student-t distributions share this interface; Student-t allows heavier tails.
+
+$$
+Y\mid x\sim\mathcal N(\mu(x),s(x)^2)
+\qquad\text{or}\qquad
+Y\mid x=\mu(x)+s(x)T,\quad T\sim t_{5}.
+$$
+
+**Train with NLL or CRPS; compare all models with WIS. Lower is better for every score.**
+
+| Score | What it measures |
+|---|---|
+| NLL — negative log-likelihood | Density assigned to the observation; penalizes confident misses. |
+| CRPS — continuous ranked probability score | Distance between the forecast CDF and the observed outcome. |
+| WIS — weighted interval score | Interval width plus penalties for observations outside the intervals. |
+
+For observation $y$, predictive density $p$, CDF $F$, and median $m$:
+
+$$
+\operatorname{NLL}(p,y)=-\log p(y),
+\qquad
+\operatorname{CRPS}(F,y)=\int_{-\infty}^{\infty}
+\left[F(z)-\mathbf 1\{y\leq z\}\right]^2\,dz.
+$$
+
+$$
+\operatorname{WIS}(F,y)=
+\frac{\tfrac12|y-m|+\sum_{k=1}^{K}\tfrac{\alpha_k}{2}
+\operatorname{IS}_{\alpha_k}(l_k,u_k;y)}{K+\tfrac12},
+$$
+$$
+\operatorname{IS}_{\alpha}(l,u;y)=(u-l)
++\frac{2}{\alpha}(l-y)\mathbf 1\{y<l\}
++\frac{2}{\alpha}(y-u)\mathbf 1\{y>u\}.
+$$
+
+WIS intervals used: $K=11$: 10–90% in 10-point steps, plus 95% and 98%. 
+WIS approximates CRPS and scores both interval width and missed observations ([Bracher et al., 2021](https://doi.org/10.1371/journal.pcbi.1008618)).
+
+```{python}
+#| label: setup
+#| include: false
+from __future__ import annotations
+
+from pathlib import Path
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.lines import Line2D
+import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr, spearmanr
+from IPython.display import display
+
+
+def repository_root(start: Path) -> Path:
+    """Find the project root when Quarto executes from a document directory."""
+    for candidate in (start, *start.parents):
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    raise FileNotFoundError("Could not find the EpiForecaster project root")
+
+
+ROOT = repository_root(Path.cwd())
+ANALYSIS_DIR = (
+    ROOT
+    / "outputs/loss_research/loss-type-full-coverage-v2/source_resolution_bundle/ablation_analysis"
+)
+SOURCE_RESOLUTION_DIR = (
+    ROOT
+    / "outputs/loss_research/loss-type-full-coverage-v2"
+    / "source_resolution_bundle/source_resolution_analysis"
+)
+NEIGHBOR_STORY_DIR = (
+    ROOT
+    / "outputs/loss_research/loss-type-full-coverage-v2"
+    / "presentation_revision/neighbor_stories"
+)
+GEOJSON_PATH = ROOT / "data/files/geo/fl_municipios_catalonia.geojson"
+
+TEAL = "#087f76"
+TEAL_LIGHT = "#dcefeb"
+RED = "#b45c28"
+RED_LIGHT = "#f6dfdc"
+NAVY = "#263f5e"
+AMBER = "#b97916"
+GREY = "#d9d7ce"
+INK = "#172524"
+
+plt.rcParams.update(
+    {
+        "figure.dpi": 120,
+        "axes.titlesize": 14,
+        "axes.titleweight": "semibold",
+        "axes.labelcolor": INK,
+        "axes.edgecolor": GREY,
+        "xtick.color": "#45534f",
+        "ytick.color": "#45534f",
+        "font.size": 12,
+    }
+)
+
+LOSS_SPECS = [
+    ("Normal CRPS", "normal:crps"),
+    ("Normal NLL", "normal:nll"),
+    ("Student-t CRPS", "student_t:crps"),
+    ("Student-t NLL", "student_t:nll"),
+]
+BASELINE = "normal:crps:mobility_off"
+TARGET_ORDER = ["cases", "deaths", "hospitalizations", "wastewater"]
+
+scorecard = pd.read_csv(ANALYSIS_DIR / "condition_scorecard.csv")
+head_scorecard = pd.read_csv(ANALYSIS_DIR / "condition_head_scorecard.csv")
+fold_deltas = pd.read_csv(ANALYSIS_DIR / "paired_fold_seed_deltas.csv")
+region_deltas = pd.read_csv(
+    ANALYSIS_DIR / "paired_region_deltas.csv",
+    dtype={"region_id": str},
+)
+completeness = pd.read_csv(ANALYSIS_DIR / "campaign_completeness_manifest.csv")
+region_deltas["region_id"] = region_deltas["region_id"].str.zfill(5)
+case_projection_summary = pd.read_csv(
+    SOURCE_RESOLUTION_DIR / "cases_projection_mobility_summary.csv"
+)
+hospital_source_summary = pd.read_csv(
+    SOURCE_RESOLUTION_DIR / "hospital_native_source_summary.csv"
+)
+regional_factor_values = pd.read_csv(
+    SOURCE_RESOLUTION_DIR / "regional_factor_values.csv",
+    dtype={"region_id": str},
+)
+regional_factor_associations = pd.read_csv(
+    SOURCE_RESOLUTION_DIR / "regional_factor_associations.csv"
+)
+regional_factor_configuration_associations = pd.read_csv(
+    SOURCE_RESOLUTION_DIR / "regional_factor_configuration_associations.csv"
+)
+
+assert {"native", "abs_projection"} <= set(case_projection_summary["support"])
+assert len(hospital_source_summary) == len(LOSS_SPECS)
+
+assert len(completeness) == 160
+assert completeness["valid"].all()
+
+FIGURE_DIR = ROOT / "outputs/loss_research/loss-type-full-coverage-v2/presentation_revision/figures"
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_COLORS = [TEAL, NAVY, AMBER, "#855b97"]
+CONFIG_MARKERS = ["o", "s", "D", "^"]
+GAIN_CMAP = LinearSegmentedColormap.from_list("gain", [RED, "#ffffff", TEAL])
+
+def finish(figure, name):
+    figure.savefig(FIGURE_DIR / f"{name}.svg", bbox_inches="tight")
+    figure.savefig(FIGURE_DIR / f"{name}.png", dpi=200, bbox_inches="tight")
+    plt.show()
+    plt.close(figure)
+
+def clean(axis, direction="x"):
+    axis.set_axisbelow(True)
+    axis.grid(axis=direction, color="#e3e8eb", linewidth=0.7)
+    axis.spines[["top", "right"]].set_visible(False)
+
+def show_table(frame, formats=None):
+    display(frame.style.format(formats or {}).hide(axis="index"))
+```
+
+## Mobility gains across all four configurations {#mobility-improves-performance-across-every-loss-configuration}
+
+```{python}
+#| label: mobility-summary
+#| include: false
+score_lookup = scorecard.set_index("condition")
+fold_keys = ["fold", "seed", "target"]
+baseline_fold = (
+    fold_deltas[fold_keys]
+    .drop_duplicates()
+    .assign(
+        condition=BASELINE,
+        wis_delta=0.0,
+        crps_delta=0.0,
+        nll_delta=0.0,
+        abs_error_delta=0.0,
+    )
+)
+fold_all = pd.concat([fold_deltas, baseline_fold], ignore_index=True)
+fold_pivot = fold_all.pivot(
+    index=fold_keys,
+    columns="condition",
+    values="wis_delta",
+)
+
+mobility_rows = []
+for label, prefix in LOSS_SPECS:
+    off = f"{prefix}:mobility_off"
+    on = f"{prefix}:mobility_on"
+    wis_off = score_lookup.loc[off, "mean_target_wis_mean"]
+    wis_on = score_lookup.loc[on, "mean_target_wis_mean"]
+    block_delta = (
+        fold_pivot[on] - fold_pivot[off]
+    ).groupby(level=["fold", "seed"]).mean()
+    mobility_rows.append(
+        {
+            "loss_type": label,
+            "wis_off": wis_off,
+            "wis_on": wis_on,
+            "wis_delta": wis_on - wis_off,
+            "relative_change_pct": 100 * (wis_on / wis_off - 1),
+            "blocks_improved": int((block_delta < 0).sum()),
+            "blocks_total": len(block_delta),
+            "block_median_delta": block_delta.median(),
+        }
+    )
+
+mobility_summary = pd.DataFrame(mobility_rows)
+```
+
+```{python}
+#| label: fig-mobility-gain
+#| fig-cap: "Each bar compares mobility on with off within the same distribution and training score. Full calibration support; all four targets have equal weight."
+#| fig-alt: "Each bar compares mobility on with off within the same distribution and training score. Full calibration support; all four targets have equal weight."
+#| out-width: "100%"
+figure, axis = plt.subplots(figsize=(9, 3.8), constrained_layout=True)
+y = np.arange(4)
+gains = -mobility_summary["relative_change_pct"].to_numpy()
+axis.barh(y, gains, color=TEAL, height=0.48)
+axis.set_yticks(y, mobility_summary["loss_type"])
+axis.invert_yaxis()
+axis.set_xlim(0, 5.1)
+axis.set_xlabel("Reduction in equal-target WIS (%) → mobility helps")
+for i, value in enumerate(gains):
+    axis.text(value + .10, i, f"{value:.2f}%", va="center", fontweight="bold")
+clean(axis)
+finish(figure, "01_overall_mobility_gain")
+```
+
+```{python}
+#| label: overall-table
+#| echo: false
+show_table(mobility_summary.assign(
+    Gain=-mobility_summary["wis_delta"],
+    Blocks=mobility_summary["blocks_improved"].astype(str)+" / "+mobility_summary["blocks_total"].astype(str),
+)[["loss_type", "wis_off", "wis_on", "Gain", "Blocks"]].rename(columns={
+    "loss_type":"Configuration", "wis_off":"WIS off", "wis_on":"WIS on", "Gain":"WIS gain", "Blocks":"Blocks improved"
+}), {"WIS off":"{:.5f}", "WIS on":"{:.5f}", "WIS gain":"{:+.5f}"})
+```
+
+## Cases and wastewater drive the gain {#which-observation-head-benefits-most}
+
+```{python}
+#| label: head-effects-data
+#| include: false
+head_lookup = head_scorecard.set_index(["condition", "target"])["wis_mean"]
+head_rows = []
+for label, prefix in LOSS_SPECS:
+    for target in TARGET_ORDER:
+        off = head_lookup.loc[(f"{prefix}:mobility_off", target)]
+        on = head_lookup.loc[(f"{prefix}:mobility_on", target)]
+        head_rows.append(
+            {
+                "loss_type": label,
+                "target": target,
+                "mobility_gain": off - on,
+            }
+        )
+head_effects = pd.DataFrame(head_rows)
+head_matrix = head_effects.pivot(
+    index="target",
+    columns="loss_type",
+    values="mobility_gain",
+).loc[TARGET_ORDER, [label for label, _ in LOSS_SPECS]]
+head_summary = (
+    head_effects.groupby("target", as_index=False)
+    .agg(
+        mean_gain=("mobility_gain", "mean"),
+        median_gain=("mobility_gain", "median"),
+        configurations_improved=("mobility_gain", lambda values: int((values > 0).sum())),
+    )
+    .set_index("target")
+    .loc[TARGET_ORDER]
+    .reset_index()
+)
+```
+
+```{python}
+#| label: fig-target-gains
+#| fig-cap: "Each mark is one configuration. Cases and wastewater improve in 4/4 comparisons; hospitalizations and deaths improve in 2/4. Absolute gains are in transformed target units."
+#| fig-alt: "Each mark is one configuration. Cases and wastewater improve in 4/4 comparisons; hospitalizations and deaths improve in 2/4. Absolute gains are in transformed target units."
+#| out-width: "100%"
+figure, axis = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
+order = ["wastewater", "cases", "hospitalizations", "deaths"]
+for i, ((label, _), color, marker) in enumerate(zip(LOSS_SPECS, CONFIG_COLORS, CONFIG_MARKERS, strict=True)):
+    values = head_matrix.loc[order, label]
+    axis.scatter(values, np.arange(4)+(i-1.5)*.15, color=color, marker=marker, s=70, label=label, zorder=3)
+axis.axvline(0, color=INK, linewidth=1)
+axis.set_yticks(np.arange(4), [t.capitalize() for t in order])
+axis.invert_yaxis()
+axis.set_xlim(-.025, .06)
+axis.set_xlabel("WIS gain (off − on) → mobility helps")
+axis.legend(frameon=False, ncol=2, loc="lower right", fontsize=10)
+clean(axis)
+finish(figure, "02_target_gains")
+```
+
+```{python}
+#| label: target-table
+#| echo: false
+show_table(head_summary.set_index("target").loc[order].reset_index()[["target", "mean_gain", "configurations_improved"]].rename(columns={"target":"Target", "mean_gain":"Mean WIS gain", "configurations_improved":"Configurations improved / 4"}), {"Mean WIS gain":"{:+.4f}"})
+```
+
+## Larger gains in high incoming-flow regions {#incoming-flow-tertiles-explain-where-mobility-helps}
+
+```{python}
+#| label: region-effects-data
+#| include: false
+region_keys = ["seed", "fold", "region_id"]
+baseline_region = (
+    region_deltas[
+        region_keys + ["mean_incoming_flow_raw", "mobility_context"]
+    ]
+    .drop_duplicates()
+    .assign(
+        condition=BASELINE,
+        mean_target_wis_delta=0.0,
+        crps_delta=0.0,
+        nll_delta=0.0,
+        abs_error_delta=0.0,
+    )
+)
+region_all = pd.concat([region_deltas, baseline_region], ignore_index=True)
+region_pivot = region_all.pivot(
+    index=region_keys,
+    columns="condition",
+    values="mean_target_wis_delta",
+)
+region_meta = (
+    region_all.drop_duplicates(region_keys)
+    .set_index(region_keys)[["mean_incoming_flow_raw", "mobility_context"]]
+)
+
+region_effect_rows = []
+for label, prefix in LOSS_SPECS:
+    gain = -(
+        region_pivot[f"{prefix}:mobility_on"]
+        - region_pivot[f"{prefix}:mobility_off"]
+    )
+    frame = pd.DataFrame({"mobility_gain": gain}).join(region_meta).reset_index()
+    frame["loss_type"] = label
+    region_effect_rows.append(frame)
+
+region_effects = pd.concat(region_effect_rows, ignore_index=True)
+region_summary = (
+    region_effects.groupby("region_id", as_index=False)
+    .agg(
+        mean_incoming_flow_raw=("mean_incoming_flow_raw", "first"),
+        mobility_context=("mobility_context", "first"),
+        mobility_gain=("mobility_gain", "mean"),
+        mobility_gain_median=("mobility_gain", "median"),
+        improved_fraction=("mobility_gain", lambda values: (values > 0).mean()),
+    )
+)
+region_summary["log_incoming"] = np.log1p(
+    region_summary["mean_incoming_flow_raw"]
+)
+
+tertile_order = ["low", "middle", "high"]
+tertile_summary = (
+    region_summary.groupby("mobility_context")
+    .agg(
+        regions=("region_id", "size"),
+        mean_gain=("mobility_gain", "mean"),
+        median_gain=("mobility_gain", "median"),
+        improved_fraction=("mobility_gain", lambda values: (values > 0).mean()),
+    )
+    .reindex(tertile_order)
+)
+```
+
+```{python}
+#| label: fig-region-distribution
+#| fig-cap: "One dot per region, averaged across two seeds and four configurations. Boxes show the median and middle 50%; whiskers extend to 1.5×IQR. These are descriptive distributions, not confidence intervals."
+#| fig-alt: "One dot per region, averaged across two seeds and four configurations. Boxes show the median and middle 50%; whiskers extend to 1.5×IQR. These are descriptive distributions, not confidence intervals."
+#| out-width: "100%"
+rng = np.random.default_rng(52)
+figure, axis = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
+tertile_colors = {"low":"#9babb4", "middle":"#58788b", "high":TEAL}
+box_data = [region_summary.loc[region_summary.mobility_context == group, "mobility_gain"].to_numpy() for group in tertile_order]
+box = axis.boxplot(box_data, positions=np.arange(3), widths=.48, patch_artist=True, showfliers=False,
+                   medianprops={"color":INK, "linewidth":1.8})
+for i, (values, patch, group) in enumerate(zip(box_data, box["boxes"], tertile_order, strict=True)):
+    patch.set_facecolor("#eff3f4")
+    patch.set_alpha(.4)
+    patch.set_edgecolor(tertile_colors[group])
+    axis.scatter(i+rng.uniform(-.16,.16,len(values)), values, s=26, alpha=.7, color=tertile_colors[group], edgecolor="white", linewidth=.4, zorder=3)
+    axis.scatter(i, tertile_summary.loc[group, "mean_gain"], marker="D", s=90, color=INK, edgecolor="white", zorder=4)
+axis.axhline(0,color=INK,linewidth=1)
+axis.set_xticks(range(3), [f"{g.capitalize()} flow\n(n = {int(tertile_summary.loc[g, 'regions'])})" for g in tertile_order])
+axis.set_ylabel("Mean WIS gain per region (off − on)")
+axis.legend(handles=[Line2D([0],[0],color="none",marker="D",markerfacecolor=INK,label="Group mean")],frameon=False,loc="upper left")
+clean(axis,"y")
+finish(figure, "04_regional_distribution")
+```
+
+```{python}
+#| label: region-table
+#| echo: false
+show_table(tertile_summary.reset_index().rename(columns={"mobility_context":"Incoming flow", "regions":"Regions", "mean_gain":"Mean WIS gain", "median_gain":"Median gain", "improved_fraction":"Regions improved"}), {"Mean WIS gain":"{:+.4f}", "Median gain":"{:+.4f}", "Regions improved":"{:.1%}"})
+```
+
+High incoming flow is associated with larger gains, but does not guarantee improvement. Shared sources and spatial dependence limit inference from these regional summaries.
+
+## Source geography changes the clinical result {#source-resolution-changes-the-apparent-clinical-effects}
+
+Hospital labels originate in ABS health areas and are projected to municipalities for training. If we aggregate municipal predictive locations back to ABS counts and compare point errors against ABS ground truth we can observe increased performance when mobility data is included in training.
+
+```{python}
+#| label: source-resolution-data
+#| include: false
+config_order = [prefix for _, prefix in LOSS_SPECS]
+config_labels = {prefix: label for label, prefix in LOSS_SPECS}
+
+case_projection_summary["config_key"] = (
+    case_projection_summary["family"] + ":" + case_projection_summary["objective"]
+)
+hospital_source_summary["config_key"] = (
+    hospital_source_summary["family"] + ":" + hospital_source_summary["objective"]
+)
+case_projection_plot = (
+    case_projection_summary.assign(
+        config=lambda frame: frame["config_key"].map(config_labels),
+        support_label=lambda frame: frame["support"].map(
+            {
+                "native": "Native municipal cases",
+                "abs_projection": "Cases projected through ABS",
+            }
+        ),
+    )
+    .set_index(["config_key", "support"])
+    .reindex(
+        pd.MultiIndex.from_product(
+            [config_order, ["native", "abs_projection"]],
+            names=["config_key", "support"],
+        )
+    )
+    .reset_index()
+)
+hospital_source_plot = (
+    hospital_source_summary.assign(
+        config=lambda frame: frame["config_key"].map(config_labels),
+    )
+    .set_index("config_key")
+    .loc[config_order]
+    .reset_index()
+)
+```
+
+### Hospitalizations: consistent source-level gains {#hospitalizations-mobility-uplift-at-the-native-abs-source}
+
+```{python}
+#| label: fig-hospital-source
+#| fig-cap: "Positive bars favor mobility. Panels use different scores and support: this is a diagnostic comparison, not an isolated geography effect. Source rate-MAE uses log(1 + rate per 100,000)."
+#| fig-alt: "Positive bars favor mobility. Panels use different scores and support: this is a diagnostic comparison, not an isolated geography effect. Source rate-MAE uses log(1 + rate per 100,000)."
+#| out-width: "100%"
+def source_panels(frame, native_title, name):
+    figure, axes = plt.subplots(1, 2, figsize=(10, 3.8), sharey=True, constrained_layout=True)
+    for axis, metric, title in zip(axes, ["municipal_wis_relative_gain_pct", "rate_mae_relative_gain_pct"], ["Municipal WIS", native_title], strict=True):
+        values = frame[metric].to_numpy()
+        axis.barh(np.arange(4), values, color=[TEAL if v >= 0 else RED for v in values], height=.5)
+        axis.axvline(0, color=INK, linewidth=1)
+        axis.set_title(title, loc="left")
+        axis.set_xlim(-8, 10)
+        axis.set_xticks([-8, -4, 0, 4, 8])
+        axis.set_xlabel("Relative gain (%)")
+        for i, value in enumerate(values):
+            axis.text(value+(.18 if value>=0 else -.18),i,f"{value:+.2f}%",ha="left" if value>=0 else "right",va="center",fontsize=11)
+        clean(axis)
+    axes[0].set_yticks(range(4), [label for label, _ in LOSS_SPECS])
+    axes[0].invert_yaxis()
+    finish(figure, name)
+source_panels(hospital_source_plot, "Native ABS rate-MAE", "05_hospital_source")
+```
+
+**Source rate-MAE improves in 4/4 configurations.** The source check includes 85 scored ABS areas, 339 source–date observations and 16 paired fold–seed blocks per configuration.
+
+In comparison, the source resolution for our deaths series is comarcas, and re-projection is harder because comarcas span 8× more municipalities by median intersections and 11.7× more after weighting than ABS zones, while median allocation skewness is similar.
+
+### Projection control: cases-to-ABS projection removes existing mobility gain {#cases-a-projection-control-that-loses-mobility-uplift}
+
+Keep forecasts fixed and project only the case labels through ABS. Both scores remain municipal WIS.
+
+```{python}
+#| label: fig-case-projection
+#| fig-cap: "Lines connect the same model configuration across label constructions. Native labels retain mobility gains in all four configurations; ABS projection removes the gain in three."
+#| fig-alt: "Native case labels favor mobility in all four configurations; labels projected through ABS favor mobility in one."
+#| out-width: "100%"
+figure, axis = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
+case_supports=["native", "abs_projection"]
+for i, ((label,prefix),color,marker) in enumerate(zip(LOSS_SPECS,CONFIG_COLORS,CONFIG_MARKERS,strict=True)):
+    rows=case_projection_plot.loc[case_projection_plot.config_key == prefix].set_index("support").loc[case_supports]
+    axis.plot(range(2),rows.wis_gain,marker=marker,color=color,linewidth=1.5,markersize=7,label=label)
+axis.axhline(0,color=INK,linewidth=1)
+axis.set_xticks(range(2),["Native municipal\nlabels","Labels projected\nthrough ABS"])
+axis.set_ylabel("Case WIS gain (off − on)")
+axis.legend(frameon=False,ncol=2,loc="lower left",fontsize=10)
+clean(axis,"y")
+finish(figure, "07_case_projection")
+```
+
+| Case label construction | Mean WIS gain | Configurations improved |
+|---|---:|---:|
+| Native municipality | +0.00972 | 4 / 4 |
+| Projected through ABS | −0.00891 | 1 / 4 |
+
+## Neighborhood timelines reveal forecast limitations {#neighborhood-timelines}
+
+These examples were selected after scoring. They show the full **1 November–30 December 2020 input window** before the forecast origin, followed by held-out target forecasts. The previous figure reduced this history to four December summaries. Barberà has 58 observed case days in the 60-day window; Amposta has nine wastewater measurements and El Prat ABS 183 has nine weekly hospital observations. Mobility improves the score in these examples, but the forecasts have level and trajectory errors. A WIS gain can come from a level or interval change without following the observed rise or fall. The lines do not identify which neighbor information the model used or establish a transmission route.
+
+```{python}
+#| label: neighbor-story-data
+#| include: false
+neighbor_history = pd.read_csv(NEIGHBOR_STORY_DIR / "neighbor_case_history.csv")
+incoming_links = pd.read_csv(NEIGHBOR_STORY_DIR / "incoming_links.csv")
+story_forecasts = pd.read_csv(NEIGHBOR_STORY_DIR / "forecast_timeline.csv")
+story_scores = pd.read_csv(NEIGHBOR_STORY_DIR / "paired_score_summary.csv")
+target_history = pd.read_csv(NEIGHBOR_STORY_DIR / "target_history.csv")
+target_anchors = pd.read_csv(NEIGHBOR_STORY_DIR / "target_anchors.csv")
+story_order = [
+    "Barberà del Vallès cases",
+    "Amposta wastewater",
+    "El Prat ABS 183 hospitalizations",
+]
+assert set(story_order) == set(story_scores.story)
+```
+
+```{python}
+#| label: fig-neighbor-stories
+#| fig-cap: "Left: daily observed cases (faint points) and trailing seven-day means across the full 60-day model input window. Link labels show mean incoming trips per day during 1–29 December. Right: all available target observations during the input window, the last observed or re-projected input value, and held-out observations and mean forecasts across four distribution–loss settings and two seeds. January case points are non-overlapping seven-day means; wastewater and ABS hospital points are weekly observations. The vertical line marks the 30 December forecast origin. The ABS hospital forecast is re-projected from municipal predictions."
+#| fig-alt: "Three rows show 60 days of neighbor case history beside the full available target history and January forecasts. Barberà and Amposta forecasts change much less than the observed targets. El Prat ABS 183 forecasts remain far below observed hospital counts."
+#| out-width: "100%"
+figure, axes = plt.subplots(3, 2, figsize=(13, 11), constrained_layout=True)
+neighbor_colors = [NAVY, AMBER]
+input_ticks = pd.to_datetime(["2020-11-01", "2020-11-15", "2020-12-01", "2020-12-15", "2020-12-30"])
+forecast_ticks = pd.to_datetime(["2020-11-01", "2020-11-15", "2020-12-01", "2020-12-15", "2020-12-30", "2021-01-13", "2021-01-27"])
+for row, story in enumerate(story_order):
+    left, right = axes[row]
+    history = neighbor_history.loc[neighbor_history.story.eq(story)]
+    links = incoming_links.loc[incoming_links.story.eq(story)].set_index("origin_id")
+    for index, (_, series) in enumerate(history.groupby("region_id", sort=False)):
+        series = series.sort_values("date")
+        if series.role.iloc[0] == "target":
+            label, color, style = "Target cases", "#697b84", "--"
+        else:
+            link = links.loc[int(series.region_id.iloc[0])]
+            label = f"{series.name.iloc[0]} ({link.mean_incoming_trips_per_day:.0f}/day)"
+            color, style = neighbor_colors[(index - 1) % len(neighbor_colors)], "-"
+        dates = pd.to_datetime(series.date)
+        left.scatter(dates, series.cases_log1p_rate_observed, s=8, color=color, alpha=.20)
+        left.plot(dates, series.cases_7day_mean, color=color, linestyle=style, linewidth=2, label=label)
+    left.set_title(story, loc="left")
+    left.set_xticks(input_ticks, [date.strftime("%-d %b") for date in input_ticks])
+    left.set_xlim(pd.Timestamp("2020-10-31"), pd.Timestamp("2020-12-31"))
+    left.set_ylabel("Observed cases\nlog(1 + rate/100k)")
+    left.legend(frameon=False, fontsize=8, loc="upper left")
+    clean(left, "y")
+
+    forecast = story_forecasts.loc[story_forecasts.story.eq(story)]
+    prior = target_history.loc[target_history.story.eq(story)].sort_values("date")
+    anchor = target_anchors.loc[target_anchors.story.eq(story)].iloc[0]
+    off = forecast.loc[~forecast.mobility].sort_values("week")
+    on = forecast.loc[forecast.mobility].sort_values("week")
+    assert len(off) == len(on) == 4
+    prior_dates = pd.to_datetime(prior.date)
+    if row == 0:
+        right.scatter(prior_dates, prior.observed, s=11, color="#697b84", alpha=.35)
+        right.plot(prior_dates, prior.seven_day_mean, linestyle="--", color="#697b84", linewidth=1.8, label="Input cases: 7-day mean")
+    else:
+        right.plot(prior_dates, prior.observed, marker="o", linestyle="--", color="#697b84", linewidth=1.8, label="Target history")
+    right.scatter(pd.Timestamp(anchor.date), anchor.value, marker="X", s=70, color=NAVY, zorder=5, label="Last input value" if row < 2 else "Re-projected input")
+    forecast_dates = pd.to_datetime(off.last_date)
+    right.plot(forecast_dates, off.observed, marker="o", color=INK, linewidth=2, label="Held-out observed")
+    right.plot(forecast_dates, off.forecast, marker="s", color=RED, linewidth=2, label="Mobility off")
+    right.plot(forecast_dates, on.forecast, marker="D", color=TEAL, linewidth=2, label="Mobility on")
+    right.axvline(pd.Timestamp("2020-12-30"), color="#697b84", linewidth=1, linestyle=":")
+    right.set_xticks(forecast_ticks, [date.strftime("%-d %b") for date in forecast_ticks])
+    right.set_xlim(pd.Timestamp("2020-10-31"), pd.Timestamp("2021-01-29"))
+    right.set_ylabel("ABS weekly counts" if row == 2 else "Transformed target value")
+    right.legend(frameon=False, fontsize=8, loc="best")
+    clean(right, "y")
+axes[0, 0].set_title("Barberà del Vallès cases · incoming history", loc="left")
+axes[0, 1].set_title("Target history, forecast and observation", loc="left")
+finish(figure, "11_neighbor_stories")
+```
+
+```{python}
+#| label: neighbor-story-table
+#| echo: false
+story_table = story_scores.set_index("story").loc[story_order].reset_index()
+story_table["score"] = ["Municipal WIS", "Municipal WIS", "Native ABS rate-MAE"]
+show_table(
+    story_table.rename(columns={
+        "story": "Example", "paired_rows": "Paired rows",
+        "mean_gain": "Mean gain (off − on)",
+        "fraction_improved": "Rows improved", "score": "Score",
+    })[["Example", "Score", "Paired rows", "Mean gain (off − on)", "Rows improved"]],
+    {"Mean gain (off − on)": "{:+.3f}", "Rows improved": "{:.1%}"},
+)
+```
+
+**Level and shape remain weak.** Barberà's observed weekly case value rises by **0.49** from 6 to 13 January, while the mean mobility-on forecast rises by **0.02**. Across the eight individual mobility-on fits, the forecast change ranges from **−0.03 to +0.05**, so averaging does not explain the flat line. Amposta's observed wastewater value rises by **0.69** from 4 to 18 January; mobility-on rises by **0.11** on average, with individual changes from **−0.14 to +0.32**. At El Prat ABS 183, the processed municipal input re-projected to ABS is **6.92** on 28 December, versus **11** native observed hospitalizations. The mobility-on forecast is **5.67** for 4 January, versus **14** observed. It rises initially, then stays near eight counts while the observations fall from 16 to 11. Amposta's target-case history has only three observed days in each of the second and third December weeks.
+
+These plots do not establish or rule out a horizon-zero calibration fault. The inspected run config requests `delta_forecasting` with `last_valid_step` anchoring, and the current local implementation anchors the municipal point nowcast when its observation mask is present. This review has no saved horizon-zero forecast rows and has not reconciled that implementation with every deployed bundle, including reused checkpoints. The first plotted case value is a seven-day mean; the first plotted wastewater and hospital observations are at later weekly horizons. The hospital ABS re-projection also changes the measurement support. Separate checks are needed for the nowcast, first forecast step, source projection, distribution scale, and forecast-horizon response. These selected examples do **not** yet show that neighbor behavior produces a forecast that follows the target trajectory.
+
+## Supporting detail
+
+<details>
+<summary>Geography and the flow–gain association</summary>
+
+```{python}
+#| label: regional-map-data
+#| include: false
+municipalities = gpd.read_file(GEOJSON_PATH)
+municipalities["id"] = municipalities["id"].astype(str).str.zfill(5)
+map_data = municipalities.merge(
+    region_summary,
+    left_on="id",
+    right_on="region_id",
+    how="inner",
+    validate="one_to_one",
+)
+assert len(map_data) == 161
+
+pearson = pearsonr(map_data["log_incoming"], map_data["mobility_gain"])
+spearman = spearmanr(
+    map_data["mean_incoming_flow_raw"],
+    map_data["mobility_gain"],
+)
+```
+
+```{python}
+#| label: fig-regional-maps
+#| fig-cap: "Grey municipalities lie outside the 161-region evaluation support. Full color ranges are shown; the gain scale is centered on zero."
+#| fig-alt: "Grey municipalities lie outside the 161-region evaluation support. Full color ranges are shown; the gain scale is centered on zero."
+#| out-width: "100%"
+figure, axes = plt.subplots(1, 2, figsize=(10, 5.4), constrained_layout=True)
+limit=float(np.abs(map_data.mobility_gain).max())
+for axis,column,title,cmap,norm in zip(axes,["log_incoming","mobility_gain"],["Incoming flow","Mean WIS gain"],["YlGnBu",GAIN_CMAP],[None,TwoSlopeNorm(vmin=-limit,vcenter=0,vmax=limit)],strict=True):
+    municipalities.plot(ax=axis,color="#e4e7e9",edgecolor="white",linewidth=.15)
+    map_data.plot(ax=axis,column=column,cmap=cmap,norm=norm,edgecolor="white",linewidth=.2,legend=True,
+                  legend_kwds={"orientation":"horizontal","shrink":.8,"label":"log(1 + incoming raw flow)" if column=="log_incoming" else "WIS gain (off − on)"})
+    axis.set_title(title,loc="left")
+    axis.set_axis_off()
+finish(figure,"08_regional_maps")
+```
+
+```{python}
+#| label: fig-flow-scatter
+#| fig-cap: "One point per region. The positive association is modest and descriptive; no independence-based significance claim is made."
+#| fig-alt: "One point per region. The positive association is modest and descriptive; no independence-based significance claim is made."
+#| out-width: "100%"
+figure, axis=plt.subplots(figsize=(9,4.6),constrained_layout=True)
+for group in tertile_order:
+    rows=map_data.loc[map_data.mobility_context==group]
+    axis.scatter(rows.log_incoming,rows.mobility_gain,s=34,color=tertile_colors[group],alpha=.75,label=group.capitalize(),edgecolor="white",linewidth=.4)
+axis.axhline(0,color=INK,linewidth=1)
+axis.set_xlabel("log(1 + mean incoming raw flow)")
+axis.set_ylabel("Mean WIS gain (off − on)")
+axis.set_title(f"Pearson r = {pearson.statistic:.2f}   ·   Spearman ρ = {spearman.statistic:.2f}", loc="left", fontsize=12)
+axis.legend(title="Incoming-flow tertile",frameon=False,loc="lower right")
+clean(axis,"both")
+finish(figure,"09_flow_association")
+```
+
+```{python}
+#| label: top-incoming-regions
+#| tbl-cap: "Highest incoming-flow municipalities in the evaluated 161-region support. Mobility gain is averaged across four loss configurations and two seeds."
+top_incoming = (
+    map_data.nlargest(12, "mean_incoming_flow_raw")
+    [["name", "mean_incoming_flow_raw", "mobility_gain", "mobility_context"]]
+    .rename(
+        columns={
+            "name": "Municipality",
+            "mean_incoming_flow_raw": "Mean incoming raw flow",
+            "mobility_gain": "Mean WIS mobility gain",
+            "mobility_context": "Tertile",
+        }
+    )
+)
+top_incoming.style.format(
+    {
+        "Mean incoming raw flow": "{:,.0f}",
+        "Mean WIS mobility gain": "{:+.4f}",
+    }
+).hide(axis="index")
+```
+
+</details>
+
+<details>
+<summary>Exploratory factor screen</summary>
+
+Active incoming and outgoing degree have associations close to incoming flow. These correlated factors do not establish a distinct mechanism.
+
+```{python}
+#| label: regional-factor-association-data
+#| include: false
+factor_labels = {
+    "log_incoming_flow": "log incoming flow",
+    "incoming_active_degree": "incoming active degree (≥10)",
+    "outgoing_active_degree": "outgoing active degree (≥10)",
+    "log_population": "log population",
+    "log_density": "log population density",
+    "incoming_peak_to_mean": "incoming peak / mean",
+    "distance_barcelona_km": "distance to Barcelona",
+    "neighbor_degree": "static neighbor degree",
+}
+factor_order = [
+    "log_incoming_flow",
+    "incoming_active_degree",
+    "outgoing_active_degree",
+    "log_population",
+    "log_density",
+    "incoming_peak_to_mean",
+    "distance_barcelona_km",
+    "neighbor_degree",
+]
+factor_plot = regional_factor_associations.set_index("factor").loc[factor_order].copy()
+factor_plot["label"] = factor_plot.index.map(factor_labels)
+factor_plot = factor_plot.iloc[::-1]
+```
+
+```{python}
+#| label: fig-factor-associations
+#| fig-cap: "Exploratory correlations across 161 regions. Positive values associate larger factor values with greater mobility gain; shared spatial and source structure limits inference."
+#| fig-alt: "Exploratory correlations across 161 regions. Positive values associate larger factor values with greater mobility gain; shared spatial and source structure limits inference."
+#| out-width: "100%"
+figure,axis=plt.subplots(figsize=(9,4.8),constrained_layout=True)
+y=np.arange(len(factor_plot))
+axis.barh(y,factor_plot.spearman_rho,color=[TEAL if v>=0 else RED for v in factor_plot.spearman_rho],height=.6)
+axis.axvline(0,color=INK,linewidth=1)
+axis.set_yticks(y,factor_plot.label)
+axis.set_xlim(-.19,.27)
+axis.set_xlabel("Spearman ρ with regional WIS gain")
+for i,value in enumerate(factor_plot.spearman_rho):
+    axis.text(value+(.008 if value>=0 else -.008),i,f"{value:+.2f}",va="center",ha="left" if value>=0 else "right",fontsize=11)
+clean(axis)
+finish(figure,"10_factor_associations")
+```
+
+</details>
+
+<details>
+<summary>Scope, source checks and reproducibility</summary>
+
+- Full spatial coverage means the 161 valid target regions, not all Catalan municipalities. Shared clinical sources, wastewater plants and time blocks prevent treating regional rows as independent replicates.
+- Native ABS scoring reaches 85 zones across 339 source–date observations.
+- The native hospitalization source file is an external diagnostic input, not a raw input declared in the immutable training campaign. The case control reconstructs canonical native WIS within $3.88\times10^{-7}$.
+- The neighborhood examples are post hoc. December case history comes from the campaign dataset; incoming links come from its mobility matrix. The ABS 183 plot uses the existing re-projected source forecast table.
+- Presentation favors short prose; key values are labeled on plots or placed in adjacent tables.
+- This revision presents existing ABS and case-projection diagnostics. No forecasts were regenerated, models retrained, or confirmation data scored.
+
+| Receipt | Value |
+|---|---|
+| Campaign | `loss_type_full_coverage_v2` |
+| Campaign SHA-256 | `3a40a5cddddeeda15337c8f8ab314817eab2a5955ed6891bae1c528c5eb418a9` |
+| Completed identities | 160; 48 verified checkpoint reuses, 112 newly trained |
+| Frozen campaign evidence | `source_resolution_bundle/ablation_analysis/` |
+| Source checks and factor screen | `source_resolution_bundle/source_resolution_analysis/` |
+| Original report and bundle receipt | `source_resolution_bundle/report/`, `source_resolution_bundle/bundle_manifest.json` |
+| Revised source | `docs/research/loss_type_full_coverage_mobility_update.qmd` |
+| Revised HTML and PNG/SVG figures | `outputs/loss_research/loss-type-full-coverage-v2/presentation_revision/` |
+| Exploratory neighbor data and script | `presentation_revision/neighbor_stories/`; `scripts/analysis/screen_mobility_neighbor_stories.py` |
+
+Paths beginning with `source_resolution_bundle/` are relative to `outputs/loss_research/loss-type-full-coverage-v2/`. The source bundle retains the full diagnostic inputs and script. This report presents the ABS source check and ABS case-label projection from those outputs.
+
+</details>

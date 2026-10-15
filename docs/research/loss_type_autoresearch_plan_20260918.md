@@ -439,3 +439,53 @@ The final deliverable is a reproducible recommendation with:
 Production-default changes and operational alert deployment are separate from
 the research result. Keep the chosen research configuration explicit and
 reviewable before any later cutover.
+
+## 10. Post-loop requirements for successor campaigns
+
+The completed `loss-type-research-v1` protocol and its artifacts remain frozen
+historical records. The following requirements supersede its three-fold Stage B
+design for any new loss, mobility, or other EpiForecaster ablation:
+
+1. **Campaign-only execution.** Every scientific ablation is a checked-in
+   declarative campaign under `configs/campaigns/` and runs through the canonical
+   MN5 ablation workflow. Per-run template generation is limited to bounded
+   acceptance or exact historical reproduction and cannot select a winner.
+2. **Complete spatial coverage from the first scientific estimate.** Every
+   condition and paired seed runs all ten folds in
+   `representative_10fold_mobility_refined.json`. All 161 valid target regions
+   therefore enter the held-out test role exactly once per condition and seed.
+   A fold subset cannot be used to rank or eliminate an ablation.
+3. **Complete declared test support.** Each fold is evaluated over every
+   eligible target date, forecast horizon, observed head, and target region in
+   the campaign's declared held-out test set. Regional or temporal subsampling
+   is permitted only for scientifically ineligible smoke runs.
+4. **Matched completeness before ranking.** Analysis starts only after the exact
+   `condition × fold × paired-seed` identity matrix is complete and baseline and
+   candidate outputs have matched observed support. Missing regions, dates,
+   horizons, or heads make the comparison incomplete rather than silently
+   changing its population.
+5. **Heterogeneity is a required result.** Report the aggregate endpoint and
+   paired deltas by target, region, horizon, fold, and seed. Include the
+   distribution of regional effects and the fraction of eligible regions
+   improved or worsened. Mobility comparisons additionally predeclare
+   mobility-context strata so that gains concentrated in strongly connected
+   regions are not hidden by a pooled mean.
+6. **Calibration remains out of sample.** A calibrator or decision threshold is
+   never fitted and scored on the same observations. Use a separate declared
+   calibration role or a frozen cross-fitting design without shrinking the
+   scientific evaluation to a selected spatial subset.
+7. **Claims match the evaluation population.** Full-fold retrospective
+   evaluation supports conclusions about the complete declared historical test
+   set. A separate outer temporal holdout is required only for a confirmation
+   claim and must be named separately; a small development slice must not be
+   described as the full test set.
+8. **Dependence-aware uncertainty.** Full regional coverage does not make
+   municipalities or folds independent. Retain temporal blocking and shared
+   source grouping for intervals. Region-level effects are descriptive unless
+   an explicit dependence model supports inference.
+
+The successor loop cannot launch until the campaign analyzer can consume the
+probabilistic endpoint used for selection and emit the required region-level,
+head-level, horizon-level, fold-level, and seed-level matched evidence. The v1
+point ranking remains useful for choosing comparison arms, but it is not a
+full-coverage ablation result.
