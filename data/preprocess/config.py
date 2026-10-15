@@ -185,6 +185,10 @@ class PreprocessingConfig:
     # The SHA-256 is of the canonical contract JSON embedded in the corpus.
     synthetic_state_space_schema_version: str = "epiforecaster_sirhd_v1"
     synthetic_state_space_contract_sha256: str | None = None
+    # Parity QA sample for corpora that store both the dense and the
+    # factorized mobility layouts: runs and dates spread over the corpus.
+    synthetic_mobility_parity_runs: int = 4
+    synthetic_mobility_parity_dates: int = 4
     hospitalizations_file: str | None = None
     # Conservative availability shift for weekly totals stamped at week start.
     hospitalizations_reporting_lag_days: int = 0
@@ -409,6 +413,12 @@ class PreprocessingConfig:
 
         if self.mobility_chunk_size <= 0:
             raise ValueError("mobility_chunk_size must be positive")
+
+        if self.synthetic_mobility_parity_runs <= 0:
+            raise ValueError("synthetic_mobility_parity_runs must be positive")
+
+        if self.synthetic_mobility_parity_dates <= 0:
+            raise ValueError("synthetic_mobility_parity_dates must be positive")
 
         if self.memory_limit_gb <= 0:
             raise ValueError("memory_limit_gb must be positive")

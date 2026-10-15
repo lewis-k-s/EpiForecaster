@@ -11,9 +11,11 @@ contains pre-computed concentrations without flow rate information.
 
 import hashlib
 import json
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+import dask.array as da
 import numpy as np
 import xarray as xr
 
@@ -63,13 +65,47 @@ LEGACY_PRIMITIVE_LATENT_NAMES = (
 # bounds the fraction-space rounding error well below this tolerance.
 SIRHD_PARTITION_ATOL = 1e-4
 
+# Factorized mobility layout (EpiSim writer): one base edge series per mobility
+# profile plus the per-run, per-region NPI reduction. The dense per-run tensor
+# follows from these by the rule named in MOBILITY_REDUCTION_RULE_ATTR.
+FACTORIZED_MOBILITY_SCHEMA = {
+    "mobility_base_edges": ("profile", "date", "edge"),
+    "edge_origin": ("edge",),
+    "edge_destination": ("edge",),
+    "synthetic_profile_id": ("run_id",),
+    "npi_mobility_reduction": ("run_id", "date", "region_id"),
+}
+MOBILITY_REDUCTION_RULE_ATTR = "mobility_reduction_rule"
+MOBILITY_REDUCTION_RULE_NAME = "max_endpoint_self_loop"
+MOBILITY_REDUCTION_RULE_VERSION = 1
+NO_PROFILE_ID = -1
+# Same bounds as the EpiSim parity checker (python/check_factorized_mobility.py).
+MOBILITY_PARITY_ATOL = 1e-6
+MOBILITY_ROW_SUM_ATOL = 1e-4
+
+# Per-run scalars passed through to the processed dataset.
+SYNTHETIC_PER_RUN_METADATA = (
+    "synthetic_sparsity_level",
+    "synthetic_observation_density_scale",
+)
+# Corpus identity attributes recorded in the processed dataset provenance.
+SYNTHETIC_PROVENANCE_ATTRS = (
+    "simulation_source_commit",
+    "source_commit",
+    "reporting_profile",
+    "reporting_config_sha256",
+    "storage_profile_name",
+    "model_facing_targets",
+    "audit_only_variables",
+)
+
 SYNTHETIC_ZARR_SCHEMA = {
     "required_vars": {
         "cases": ("run_id", "date", "region_id"),
         "population": ("run_id", "region_id"),
     },
     "mobility_alternatives": [
-        ("mobility_time_varying", ("run_id", "origin", "destination", "date")),
+        ("mobility_time_varying", ("run_id", "date", "origin", "target")),
         ("mobility_base", ("origin", "target")),
         ("mobility_kappa0", ("run_id", "date")),
     ],
@@ -92,8 +128,141 @@ SYNTHETIC_ZARR_SCHEMA = {
         },
         SIRHD_DEATH_FLOW_SOURCE: ("run_id", DEATH_INTERVAL_COORD, "region_id"),
         "synthetic_sparsity_level": ("run_id",),
+        "synthetic_observation_density_scale": ("run_id",),
     },
 }
+
+
+def parse_mobility_reduction_rule(attrs: dict[str, Any]) -> dict[str, Any]:
+    """Parse the corpus mobility reduction rule and require v1 of the known rule.
+
+    Only ``name`` and ``version`` select the behaviour. The ``formula`` and
+    ``day_alignment`` fields are documentation.
+    """
+    if MOBILITY_REDUCTION_RULE_ATTR not in attrs:
+        raise ValueError(
+            "Factorized mobility requires the global attribute "
+            f"'{MOBILITY_REDUCTION_RULE_ATTR}'."
+        )
+    rule = json.loads(str(attrs[MOBILITY_REDUCTION_RULE_ATTR]))
+    if not isinstance(rule, dict):
+        raise ValueError(f"'{MOBILITY_REDUCTION_RULE_ATTR}' must be a JSON object.")
+    name = rule.get("name")
+    version = rule.get("version")
+    if name != MOBILITY_REDUCTION_RULE_NAME:
+        raise ValueError(
+            f"Unsupported mobility reduction rule name {name!r}; expected "
+            f"{MOBILITY_REDUCTION_RULE_NAME!r}."
+        )
+    if isinstance(version, bool) or version != MOBILITY_REDUCTION_RULE_VERSION:
+        raise ValueError(
+            f"Unsupported mobility reduction rule version {version!r} for "
+            f"{MOBILITY_REDUCTION_RULE_NAME!r}; expected "
+            f"{MOBILITY_REDUCTION_RULE_VERSION}."
+        )
+    return rule
+
+
+def validate_mobility_edges(
+    edge_origin: np.ndarray, edge_destination: np.ndarray, n_regions: int
+) -> None:
+    """Require a unique, in-range edge list with an origin self-loop per row."""
+    if edge_origin.shape != edge_destination.shape or edge_origin.ndim != 1:
+        raise ValueError("edge_origin and edge_destination must be equal 1-D arrays.")
+    for name, values in (
+        ("edge_origin", edge_origin),
+        ("edge_destination", edge_destination),
+    ):
+        if values.size and (values.min() < 0 or values.max() >= n_regions):
+            raise ValueError(
+                f"{name} must hold zero-based region_id positions in [0, {n_regions})."
+            )
+    flat = edge_origin.astype(np.int64) * n_regions + edge_destination
+    if np.unique(flat).size != flat.size:
+        raise ValueError("Factorized mobility edge list contains duplicate edges.")
+    off = edge_origin != edge_destination
+    has_self = np.zeros(n_regions, dtype=bool)
+    has_self[edge_origin[~off]] = True
+    missing = np.unique(edge_origin[off][~has_self[edge_origin[off]]])
+    if missing.size:
+        raise ValueError(
+            "Every origin with off-diagonal edges needs a self-loop edge to "
+            f"receive the removed weight; missing for positions {missing[:10].tolist()}."
+        )
+
+
+def apply_max_endpoint_self_loop(
+    base: np.ndarray,
+    reduction: np.ndarray,
+    edge_origin: np.ndarray,
+    edge_destination: np.ndarray,
+) -> np.ndarray:
+    """Apply ``max_endpoint_self_loop`` v1 to a ``(date, edge)`` base series.
+
+    Each off-diagonal edge (i -> j) keeps ``base * (1 - max(m_i, m_j))`` and
+    the removed weight moves to the self-loop of the origin ``i``, so row sums
+    stay unchanged. ``reduction`` is ``(date, region)``. The float32 steps
+    follow the EpiSim writer so that rebuilt values match the stored dense
+    tensor to float32 rounding.
+    """
+    n_dates, n_regions = reduction.shape
+    out = base.astype(np.float32, copy=True)
+    reduction = reduction.astype(np.float32, copy=False)
+    off = edge_origin != edge_destination
+    off_origin = edge_origin[off]
+    self_edges = np.flatnonzero(~off)
+
+    factor = np.float32(1.0) - np.maximum(
+        reduction[:, off_origin], reduction[:, edge_destination[off]]
+    )
+    removed = out[:, off] * (np.float32(1.0) - factor)
+    out[:, off] -= removed
+
+    day_offsets = np.arange(n_dates, dtype=np.int64)[:, None] * n_regions
+    moved = np.bincount(
+        (day_offsets + off_origin[None, :]).ravel(),
+        weights=removed.ravel(),
+        minlength=n_dates * n_regions,
+    ).reshape(n_dates, n_regions)
+    out[:, self_edges] += moved[:, edge_origin[self_edges]].astype(np.float32)
+    return out
+
+
+def reconstruct_mobility_block(
+    base: np.ndarray,
+    reduction: np.ndarray,
+    *,
+    edge_origin: np.ndarray,
+    edge_destination: np.ndarray,
+    n_regions: int,
+) -> np.ndarray:
+    """Rebuild one ``(date, origin, destination)`` dense block for one run."""
+    base = np.asarray(base, dtype=np.float32)
+    reduction = np.asarray(reduction, dtype=np.float32)
+    if not np.isfinite(base).all() or (base < 0).any():
+        raise ValueError("mobility_base_edges must be finite and nonnegative.")
+    if (
+        not np.isfinite(reduction).all()
+        or (reduction < 0).any()
+        or (reduction > 1).any()
+    ):
+        raise ValueError("npi_mobility_reduction must be finite and in [0, 1].")
+    edges = apply_max_endpoint_self_loop(base, reduction, edge_origin, edge_destination)
+    dense = np.zeros((base.shape[0], n_regions, n_regions), dtype=np.float32)
+    dense[:, edge_origin, edge_destination] = edges
+    return dense
+
+
+def _spread_positions(size: int, count: int) -> np.ndarray:
+    """Return up to ``count`` deterministic positions spread over ``size``."""
+    return np.unique(np.linspace(0, size - 1, min(count, size)).round().astype(int))
+
+
+def _split_attr_list(value: Any) -> list[str]:
+    """Split a comma-separated global attribute into names."""
+    if value is None:
+        return []
+    return [name.strip() for name in str(value).split(",") if name.strip()]
 
 
 class SyntheticProcessor:
@@ -120,6 +289,8 @@ class SyntheticProcessor:
             ValueError: If wastewater_flow_mode is not "concentration"
         """
         self.config = config
+        # Mobility layout, reduction rule and QA of the last _extract_mobility.
+        self.mobility_provenance: dict[str, Any] = {}
 
         # Synthetic data contains concentrations, not flow
         if config.wastewater_flow_mode != "concentration":
@@ -163,10 +334,11 @@ class SyntheticProcessor:
 
         # Validate schema before extraction
         self._validate_schema(ds)
+        self._validate_model_facing_roles(ds)
 
-        synthetic_sparsity_level = None
-        if "synthetic_sparsity_level" in ds:
-            synthetic_sparsity_level = ds["synthetic_sparsity_level"]
+        per_run_metadata = {
+            name: ds[name] for name in SYNTHETIC_PER_RUN_METADATA if name in ds
+        }
 
         # EDAR returns tuple (flow_xr, censor_xr) for shared processing path
         edar_flow, edar_censor = self._extract_edar(ds)
@@ -197,10 +369,75 @@ class SyntheticProcessor:
         if latent_sird is not None:
             result["latent_sird"] = latent_sird
 
-        if synthetic_sparsity_level is not None:
-            result["synthetic_sparsity_level"] = synthetic_sparsity_level
+        result.update(per_run_metadata)
+        result["synthetic_corpus_provenance"] = self._corpus_provenance(ds)
 
         return result
+
+    def _corpus_provenance(self, ds: xr.Dataset) -> dict[str, Any]:
+        """Collect corpus identity attributes and the mobility layout QA."""
+        return {
+            **{
+                name: str(ds.attrs[name])
+                for name in SYNTHETIC_PROVENANCE_ATTRS
+                if name in ds.attrs
+            },
+            **self.mobility_provenance,
+        }
+
+    def _model_facing_variables(self, ds: xr.Dataset) -> set[str]:
+        """Names of the corpus variables that this processor reads as model data."""
+        names = {"cases", "population"}
+        names.update(SYNTHETIC_ZARR_SCHEMA["edar_biomarkers"])
+        names.update(SYNTHETIC_ZARR_SCHEMA["edar_lod"])
+        for candidates in (
+            ("hospitalizations_raw", "hospitalizations"),
+            ("deaths_raw", "deaths"),
+        ):
+            names.update(next(([n] for n in candidates if n in ds), []))
+        if any(name in ds for name in SIRHD_STOCK_SOURCES.values()):
+            names.update(SIRHD_STOCK_SOURCES.values())
+            names.add(SIRHD_DEATH_FLOW_SOURCE)
+        if self._has_factorized_mobility(ds):
+            names.update(FACTORIZED_MOBILITY_SCHEMA)
+        elif "mobility_time_varying" in ds:
+            names.add("mobility_time_varying")
+        else:
+            names.update(("mobility_base", "mobility_kappa0"))
+        return {name for name in names if name in ds}
+
+    def _validate_model_facing_roles(self, ds: xr.Dataset) -> None:
+        """Reject corpora whose audit-only variables would become model data.
+
+        ``audit_only_variables`` (global attribute) and ``role=audit_only``
+        (variable attribute) mark stocks such as the primitive latent_*_true
+        compartments. When the corpus lists ``model_facing_targets``, the
+        latent supervision bundle must be part of it.
+        """
+        audit_only = set(_split_attr_list(ds.attrs.get("audit_only_variables")))
+        audit_only.update(
+            name
+            for name in ds.data_vars
+            if str(ds[name].attrs.get("role", "")) == "audit_only"
+        )
+        overlap = sorted(self._model_facing_variables(ds) & audit_only)
+        if overlap:
+            raise ValueError(
+                f"Synthetic corpus marks model-facing variables {overlap} as "
+                "audit-only; they must not be used as model inputs or targets."
+            )
+
+        if "model_facing_targets" not in ds.attrs:
+            return
+        declared = set(_split_attr_list(ds.attrs["model_facing_targets"]))
+        if any(name in ds for name in SIRHD_STOCK_SOURCES.values()):
+            required = {*SIRHD_STOCK_SOURCES.values(), SIRHD_DEATH_FLOW_SOURCE}
+            missing = sorted(required - declared)
+            if missing:
+                raise ValueError(
+                    f"Latent supervision variables {missing} are not listed in "
+                    "the corpus model_facing_targets attribute."
+                )
 
     def _resolve_synthetic_store_path(self, synthetic_path: str) -> str:
         """Resolve wrapper directories that contain the actual data store."""
@@ -395,8 +632,20 @@ class SyntheticProcessor:
                     f"expected {expected_dims}"
                 )
 
-        # Mobility: at least one format must be present
+        # Mobility: at least one format must be present. A partial factorized
+        # layout is an error even when a dense layout is also present.
+        factorized_present = [n for n in FACTORIZED_MOBILITY_SCHEMA if n in ds]
         mobility_ok = False
+        if factorized_present:
+            for var_name, expected_dims in FACTORIZED_MOBILITY_SCHEMA.items():
+                if var_name not in ds:
+                    errors.append(f"Missing factorized mobility variable: '{var_name}'")
+                elif ds[var_name].dims != expected_dims:
+                    errors.append(
+                        f"Factorized mobility variable '{var_name}' has dims "
+                        f"{ds[var_name].dims}, expected {expected_dims}"
+                    )
+            mobility_ok = True
         for var_name, expected_dims in SYNTHETIC_ZARR_SCHEMA["mobility_alternatives"]:
             if var_name in ds:
                 if set(ds[var_name].dims) == set(expected_dims):
@@ -404,8 +653,9 @@ class SyntheticProcessor:
                     break
         if not mobility_ok:
             errors.append(
-                "No valid mobility format found. Expected either "
-                "'mobility_time_varying' with dims (run_id, origin, destination, date) "
+                "No valid mobility format found. Expected the factorized layout "
+                f"{sorted(FACTORIZED_MOBILITY_SCHEMA)}, "
+                "'mobility_time_varying' with dims (run_id, date, origin, target), "
                 "or 'mobility_base' + 'mobility_kappa0' with dims "
                 "(origin, target) and (run_id, date)."
             )
@@ -741,20 +991,40 @@ class SyntheticProcessor:
 
         return age_da
 
+    @staticmethod
+    def _has_factorized_mobility(ds: xr.Dataset) -> bool:
+        return all(name in ds for name in FACTORIZED_MOBILITY_SCHEMA)
+
     def _extract_mobility(self, ds: xr.Dataset) -> xr.Dataset:
         """Extract mobility data from synthetic dataset.
 
-        Supports two formats:
-        1. New: mobility_time_varying (pre-computed with kappa0 applied)
-        2. Legacy: mobility_base + mobility_kappa0 (factorized format)
+        Supports three formats, in order of preference:
+        1. Factorized edges: mobility_base_edges per profile plus
+           npi_mobility_reduction per run, rebuilt lazily by the corpus
+           mobility_reduction_rule. When mobility_time_varying is also present,
+           a sample of runs and dates is checked for parity against it.
+        2. Dense: mobility_time_varying (rows are origins).
+        3. Legacy: mobility_base + mobility_kappa0.
 
         Preserves run_id dimension.
         Returns dataset with dimensions (run_id, date, origin, destination).
         """
         print("Extracting mobility...")
 
+        if self._has_factorized_mobility(ds):
+            mobility = self._reconstruct_factorized_mobility(ds)
+            self.mobility_provenance["mobility_qa"] = self._check_factorized_mobility(
+                ds, mobility
+            )
+            print(
+                f"  ✓ Rebuilt mobility lazily for {mobility.sizes['run_id']} runs: "
+                f"{mobility.shape}, chunks {mobility.data.chunksize}"
+            )
+            return mobility.to_dataset(name="mobility")
+
         # Check for time-varying format (new synthetic data)
         if "mobility_time_varying" in ds:
+            self.mobility_provenance = {"mobility_layout": "dense_time_varying"}
             print("  Found mobility_time_varying (pre-computed format)")
             mobility = ds["mobility_time_varying"]
 
@@ -779,6 +1049,7 @@ class SyntheticProcessor:
 
         # Fall back to factorized format (legacy synthetic data)
         print("  Using factorized format (mobility_base + mobility_kappa0)")
+        self.mobility_provenance = {"mobility_layout": "legacy_base_kappa0"}
 
         mobility_base = ds["mobility_base"]  # (origin, target)
         mobility_kappa0 = ds["mobility_kappa0"]  # (run_id, date)
@@ -827,6 +1098,202 @@ class SyntheticProcessor:
             f"  ✓ Reconstructed mobility tensor with {num_runs} runs: {mobility_reconstructed.shape}"
         )
         return mobility_ds
+
+    def _mobility_profile_positions(self, ds: xr.Dataset) -> np.ndarray:
+        """Map each run to its position on the ``profile`` coordinate."""
+        run_ids = ds["run_id"].values
+        profile_ids = np.asarray(ds["synthetic_profile_id"].values).astype(np.int64)
+        without_profile = run_ids[profile_ids == NO_PROFILE_ID]
+        if without_profile.size:
+            raise ValueError(
+                "Factorized mobility needs a profile for every run, but "
+                f"synthetic_profile_id is {NO_PROFILE_ID} for runs "
+                f"{without_profile[:10].tolist()}."
+            )
+        profile_values = np.asarray(ds["profile"].values).astype(np.int64)
+        position_by_profile = {int(p): k for k, p in enumerate(profile_values)}
+        unknown = sorted(
+            {int(p) for p in profile_ids if int(p) not in position_by_profile}
+        )
+        if unknown:
+            raise ValueError(
+                f"synthetic_profile_id values {unknown[:10]} are not on the "
+                "mobility_base_edges profile coordinate."
+            )
+        return np.array([position_by_profile[int(p)] for p in profile_ids])
+
+    def _reconstruct_factorized_mobility(self, ds: xr.Dataset) -> xr.DataArray:
+        """Build a lazy ``(run_id, date, origin, destination)`` mobility tensor.
+
+        Each dask block holds one run and one date chunk, so the dense tensor
+        never exists in memory as a whole.
+        """
+        print("  Found factorized mobility (mobility_base_edges + reduction)")
+        rule = parse_mobility_reduction_rule(ds.attrs)
+        region_ids = ds[REGION_COORD].values
+        n_regions = len(region_ids)
+        edge_origin = np.asarray(ds["edge_origin"].values).astype(np.int64)
+        edge_destination = np.asarray(ds["edge_destination"].values).astype(np.int64)
+        validate_mobility_edges(edge_origin, edge_destination, n_regions)
+        profile_positions = self._mobility_profile_positions(ds)
+
+        reduction = self._crop_to_processing_dates(
+            ds["npi_mobility_reduction"].transpose(
+                "run_id", TEMPORAL_COORD, REGION_COORD
+            )
+        )
+        dates = reduction[TEMPORAL_COORD].values
+        if dates.size == 0:
+            raise ValueError("No npi_mobility_reduction dates in temporal range")
+        base = ds["mobility_base_edges"]
+        missing_dates = np.setdiff1d(dates, base[TEMPORAL_COORD].values)
+        if missing_dates.size:
+            raise ValueError(
+                f"mobility_base_edges lacks {missing_dates.size} processed "
+                f"date(s) starting {missing_dates[0]}."
+            )
+        base = base.sel({TEMPORAL_COORD: dates})
+
+        date_chunk = min(self.config.date_chunk_size, dates.size)
+        base_data = base.chunk({"profile": 1, TEMPORAL_COORD: date_chunk, "edge": -1})
+        reduction_data = reduction.chunk(
+            {"run_id": 1, TEMPORAL_COORD: date_chunk, REGION_COORD: -1}
+        )
+        block_fn = partial(
+            reconstruct_mobility_block,
+            edge_origin=edge_origin,
+            edge_destination=edge_destination,
+            n_regions=n_regions,
+        )
+        runs = [
+            da.blockwise(
+                block_fn,
+                "tij",
+                base_data.data[profile_position],
+                "te",
+                reduction_data.data[run_position],
+                "tn",
+                new_axes={"i": n_regions, "j": n_regions},
+                concatenate=True,
+                dtype=np.float32,
+                meta=np.empty((0, 0, 0), dtype=np.float32),
+            )
+            for run_position, profile_position in enumerate(profile_positions)
+        ]
+        mobility = xr.DataArray(
+            da.stack(runs, axis=0),
+            dims=("run_id", TEMPORAL_COORD, "origin", "destination"),
+            coords={
+                "run_id": ds["run_id"].values,
+                TEMPORAL_COORD: dates,
+                "origin": region_ids,
+                "destination": region_ids,
+            },
+            name="mobility",
+        )
+        self.mobility_provenance = {
+            "mobility_layout": "factorized_edges",
+            "mobility_reduction_rule": json.dumps(
+                rule, sort_keys=True, separators=(",", ":")
+            ),
+        }
+        return mobility
+
+    def _check_factorized_mobility(
+        self, ds: xr.Dataset, mobility: xr.DataArray
+    ) -> dict[str, Any]:
+        """QA a spread sample of runs and dates of the rebuilt mobility.
+
+        Rows must keep the base row sum of 1. When the corpus also stores
+        ``mobility_time_varying`` (rows are origins), the rebuilt values must
+        match it within ``MOBILITY_PARITY_ATOL``. The error against the
+        transposed dense tensor is recorded as an orientation diagnostic.
+        """
+        run_positions = _spread_positions(
+            mobility.sizes["run_id"], self.config.synthetic_mobility_parity_runs
+        )
+        date_positions = _spread_positions(
+            mobility.sizes[TEMPORAL_COORD], self.config.synthetic_mobility_parity_dates
+        )
+        sample_dates = mobility[TEMPORAL_COORD].values[date_positions]
+        dense = None
+        if "mobility_time_varying" in ds:
+            dense = ds["mobility_time_varying"].transpose(
+                "run_id", TEMPORAL_COORD, "origin", "target"
+            )
+            for dim in ("origin", "target"):
+                if dim in dense.coords and not np.array_equal(
+                    dense[dim].values.astype(str),
+                    mobility["origin"].values.astype(str),
+                ):
+                    raise ValueError(
+                        f"mobility_time_varying '{dim}' labels differ from region_id."
+                    )
+
+        rows = []
+        for run_position in run_positions:
+            rebuilt = np.asarray(
+                mobility.isel(
+                    run_id=int(run_position), **{TEMPORAL_COORD: date_positions}
+                ).values,
+                dtype=np.float64,
+            )
+            row = {
+                "run_id": str(mobility["run_id"].values[run_position]),
+                "max_row_sum_error": float(np.abs(rebuilt.sum(axis=2) - 1.0).max()),
+            }
+            if dense is not None:
+                stored = np.asarray(
+                    dense.isel(run_id=int(run_position))
+                    .sel({TEMPORAL_COORD: sample_dates})
+                    .values,
+                    dtype=np.float64,
+                )
+                row["max_abs_error"] = float(np.abs(rebuilt - stored).max())
+                row["swapped_max_abs_error"] = float(
+                    np.abs(rebuilt - stored.transpose(0, 2, 1)).max()
+                )
+            rows.append(row)
+
+        qa: dict[str, Any] = {
+            "sample_dates": [
+                str(np.datetime_as_string(d, unit="D")) for d in sample_dates
+            ],
+            "row_sum_atol": MOBILITY_ROW_SUM_ATOL,
+            "max_row_sum_error": max(r["max_row_sum_error"] for r in rows),
+            "dense_parity_checked": dense is not None,
+            "runs": rows,
+        }
+        if dense is not None:
+            qa["parity_atol"] = MOBILITY_PARITY_ATOL
+            qa["max_abs_error"] = max(r["max_abs_error"] for r in rows)
+            qa["swapped_max_abs_error"] = max(r["swapped_max_abs_error"] for r in rows)
+
+        if qa["max_row_sum_error"] > MOBILITY_ROW_SUM_ATOL:
+            raise ValueError(
+                "Rebuilt mobility rows must sum to 1; maximum row-sum error was "
+                f"{qa['max_row_sum_error']:.6g} (atol={MOBILITY_ROW_SUM_ATOL})."
+            )
+        if dense is not None and qa["max_abs_error"] > MOBILITY_PARITY_ATOL:
+            raise ValueError(
+                "Factorized mobility does not match mobility_time_varying: "
+                f"maximum absolute error {qa['max_abs_error']:.6g} "
+                f"(atol={MOBILITY_PARITY_ATOL}); error against the transposed "
+                f"dense tensor {qa['swapped_max_abs_error']:.6g}."
+            )
+        if dense is not None:
+            print(
+                "  ✓ Mobility layout parity on "
+                f"{len(rows)} runs x {len(sample_dates)} dates: "
+                f"max |rebuilt - dense| = {qa['max_abs_error']:.3g}, "
+                f"transposed = {qa['swapped_max_abs_error']:.3g}"
+            )
+        else:
+            print(
+                f"  ✓ Rebuilt mobility row sums on {len(rows)} runs x "
+                f"{len(sample_dates)} dates (max error {qa['max_row_sum_error']:.3g})"
+            )
+        return qa
 
     def _extract_edar(self, ds: xr.Dataset) -> tuple[xr.DataArray, xr.DataArray]:
         """

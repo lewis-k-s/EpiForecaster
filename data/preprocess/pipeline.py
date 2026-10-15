@@ -27,9 +27,16 @@ from .processors.deaths_processor import DeathsProcessor
 from .processors.edar_processor import EDARProcessor
 from .processors.hospitalizations_processor import HospitalizationsProcessor
 from .processors.mobility_processor import MobilityProcessor
-from .processors.synthetic_processor import SyntheticProcessor
+from .processors.synthetic_processor import (
+    SYNTHETIC_PER_RUN_METADATA,
+    SyntheticProcessor,
+)
 from .processors.temporal_covariates_processor import TemporalCovariatesProcessor
 from .processors.vaccination_processor import VaccinationProcessor
+
+# Processed-dataset attribute with the synthetic corpus identity and the
+# mobility layout QA from SyntheticProcessor.
+SYNTHETIC_CORPUS_PROVENANCE_ATTR = "synthetic_corpus_provenance_json"
 
 
 class OfflinePreprocessingPipeline:
@@ -149,14 +156,21 @@ class OfflinePreprocessingPipeline:
                 dataset=alignment_result,
             )
 
-            if "synthetic_sparsity_level" in processed_data:
-                sparsity = processed_data["synthetic_sparsity_level"]
-                if "run_id" in sparsity.dims and "run_id" in alignment_result.coords:
-                    sparsity = sparsity.reindex(
+            for name in SYNTHETIC_PER_RUN_METADATA:
+                if name not in processed_data:
+                    continue
+                metadata = processed_data[name]
+                if "run_id" in metadata.dims and "run_id" in alignment_result.coords:
+                    metadata = metadata.reindex(
                         run_id=alignment_result["run_id"].values
                     )
-                alignment_result["synthetic_sparsity_level"] = sparsity
-                print("  ✓ Preserved synthetic_sparsity_level metadata")
+                alignment_result[name] = metadata
+                print(f"  ✓ Preserved {name} metadata")
+
+            if "synthetic_corpus_provenance" in processed_data:
+                alignment_result.attrs[SYNTHETIC_CORPUS_PROVENANCE_ATTR] = json.dumps(
+                    processed_data["synthetic_corpus_provenance"], sort_keys=True
+                )
 
             # Only chunk run_id dimension for memory efficiency
             # Other dimensions are kept unchunked to avoid performance warnings
@@ -517,6 +531,10 @@ class OfflinePreprocessingPipeline:
                 sort_keys=True,
             ),
         }
+        if SYNTHETIC_CORPUS_PROVENANCE_ATTR in aligned_dataset.attrs:
+            dataset_attrs[SYNTHETIC_CORPUS_PROVENANCE_ATTR] = aligned_dataset.attrs[
+                SYNTHETIC_CORPUS_PROVENANCE_ATTR
+            ]
 
         # Convert continuous variables to the configured storage precision.
         continuous_dtype = self.config.continuous_storage_dtype
