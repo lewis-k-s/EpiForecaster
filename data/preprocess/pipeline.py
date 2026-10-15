@@ -391,11 +391,23 @@ class OfflinePreprocessingPipeline:
         total_per_region = cases_da["date"].size
         density = valid_count / total_per_region
 
-        # Create boolean mask
-        valid_mask = density >= density_threshold
+        rolling_days = self.config.valid_target_rolling_days
+        if rolling_days is None:
+            valid_mask = density >= density_threshold
+        else:
+            end_date = self.config.valid_target_qualifying_end_date
+            qualifying = coverage_source
+            if end_date is not None:
+                qualifying = qualifying.sel(date=slice(None, end_date))
+            if qualifying.sizes["date"] < rolling_days:
+                raise ValueError("Not enough dates for rolling target selection")
+            observed_days = qualifying.rolling(date=rolling_days).sum()
+            valid_mask = (
+                observed_days >= self.config.valid_target_min_observed_days
+            ).any(dim="date")
 
         print(
-            f"  (run_id, region) pairs with density >= {density_threshold}: {valid_mask.sum()}/{valid_mask.size}"
+            f"  (run_id, region) pairs meeting target selection: {valid_mask.sum()}/{valid_mask.size}"
         )
         # Compute mean for printing (dask arrays need compute() before formatting)
         avg_density = density.mean().compute()

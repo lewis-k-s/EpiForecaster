@@ -154,6 +154,33 @@ class TestPipelineOptionalSources:
 
 
 class TestPipelineMasksAndMetadata:
+    def test_rolling_target_selection_uses_observed_mask_and_end_date(
+        self, mock_config
+    ):
+        dates = pd.date_range("2020-01-01", periods=12)
+        observed = np.zeros((1, 12, 3), dtype=bool)
+        observed[0, 2:5, 0] = True
+        observed[0, 9:12, 1] = True
+        observed[0, 1, 2] = True
+        observed[0, 4, 2] = True
+        observed[0, 7, 2] = True
+        dataset = xr.Dataset(
+            {
+                "cases": (("run_id", "date", REGION_COORD), np.ones((1, 12, 3))),
+                "cases_mask": (("run_id", "date", REGION_COORD), observed),
+            },
+            coords={"run_id": ["real"], "date": dates, REGION_COORD: ["A", "B", "C"]},
+        )
+        mock_config.valid_target_rolling_days = 5
+        mock_config.valid_target_min_observed_days = 3
+        mock_config.valid_target_qualifying_end_date = "2020-01-08"
+
+        selected = OfflinePreprocessingPipeline(mock_config)._compute_valid_targets_mask(
+            dataset
+        )
+
+        assert selected.sel(run_id="real").values.tolist() == [1, 0, 0]
+
     def test_compute_valid_targets_mask(self, mock_config):
         """Test valid_targets density threshold behavior."""
         pipeline = OfflinePreprocessingPipeline(mock_config)

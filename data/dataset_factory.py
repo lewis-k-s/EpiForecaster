@@ -1000,6 +1000,22 @@ def _build_research_splits(
         horizon=config.model.forecast_horizon,
     )
     all_nodes = list(range(aligned.sizes[REGION_COORD]))
+    target_nodes = all_nodes
+    if config.data.use_valid_targets:
+        if "valid_targets" not in aligned:
+            raise ValueError("Research dataset lacks valid_targets")
+        valid_targets = aligned["valid_targets"]
+        if "run_id" in valid_targets.dims:
+            valid_targets = valid_targets.any(dim="run_id")
+        valid_mask = np.asarray(valid_targets.values, dtype=bool)
+        if valid_mask.shape != (len(all_nodes),) or not valid_mask.any():
+            raise ValueError("Research valid_targets mask is empty or malformed")
+        target_nodes = [node for node in all_nodes if valid_mask[node]]
+        logger.info(
+            "Research valid_targets filter: %d/%d target regions",
+            len(target_nodes),
+            len(all_nodes),
+        )
     if config.training.crossval_enabled:
         train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(
             config=config,
@@ -1007,7 +1023,7 @@ def _build_research_splits(
             run_id=config.data.run_id,
         )
     else:
-        train_nodes = val_nodes = test_nodes = all_nodes
+        train_nodes = val_nodes = test_nodes = target_nodes
     train = EpiDataset(
         config=config,
         target_nodes=train_nodes,
