@@ -1,0 +1,14 @@
+md5: 78a449b262d538dfd21d8e358386db90
+frozen: true
+deps:
+- path: 
+    data/datasets/epiforecaster_sirhd_v1_netcdf_d9c5bae_20261015_reactive_n100/epiforecaster_sirhd_v1_training.nc
+  repo:
+    url: ../EpiSim.jl
+    rev: cd60c25
+    rev_lock: cd60c2524856ec69f4927b2cb71702d15809d50a
+outs:
+- md5: a30e21844967255fa43a15157e49ccfa
+  size: 133926669691
+  hash: md5
+  path: epiforecaster_sirhd_v1_netcdf_d9c5bae_reactive_n100.nc
