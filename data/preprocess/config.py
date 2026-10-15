@@ -181,6 +181,10 @@ class PreprocessingConfig:
 
     # Optional data paths
     synthetic_path: str | None = None
+    # Generator state-space contract required for synthetic latent supervision.
+    # The SHA-256 is of the canonical contract JSON embedded in the corpus.
+    synthetic_state_space_schema_version: str = "epiforecaster_sirhd_v1"
+    synthetic_state_space_contract_sha256: str | None = None
     hospitalizations_file: str | None = None
     # Conservative availability shift for weekly totals stamped at week start.
     hospitalizations_reporting_lag_days: int = 0
@@ -276,6 +280,15 @@ class PreprocessingConfig:
             self.smoothing = SmoothingConfig(**self.smoothing)
         if not isinstance(self.source_provenance, dict):
             raise ValueError("source_provenance must be a dictionary")
+        contract_sha256 = self.synthetic_state_space_contract_sha256
+        if contract_sha256 is not None and (
+            len(contract_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in contract_sha256)
+        ):
+            raise ValueError(
+                "synthetic_state_space_contract_sha256 must be a lowercase "
+                "hexadecimal SHA-256 digest"
+            )
         self._validate_paths()
         self._validate_temporal_parameters()
         self._validate_processing_options()

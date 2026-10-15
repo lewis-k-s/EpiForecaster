@@ -11,10 +11,15 @@ wastewater_file: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc
 population_file: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc"
 region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
 
+# The first corpus date (2020-02-09) has no destination-dated death interval.
+start_date: "2020-02-10"
 end_date: "2021-05-09"
-dataset_name: "synthetic_netcdf_smoke_2run"
+dataset_name: "synthetic_netcdf_smoke_2run_sirhd_partition"
 vaccination_file: null
 continuous_storage_dtype: "float32"
+
+synthetic_state_space_schema_version: "epiforecaster_sirhd_v1"
+synthetic_state_space_contract_sha256: "d8837d63a35a36c1d095184d58c622880b78c5f4ee85d83370c9e9dac6ffe582"
 
 temporal_covariates:
   holiday_calendar_file: "data/files/catalonia_preprocessing_inputs_v1/catalonia_holidays.csv"

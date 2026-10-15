@@ -16,7 +16,7 @@ dvc:
 
 preprocessing:
   base_config: configs/production_only/preprocess_mn5_synth_netcdf_smoke.yaml
-  dataset_name: synthetic_netcdf_smoke_2run
+  dataset_name: synthetic_netcdf_smoke_2run_sirhd_partition
   expected_run_count: 2
   required_variables:
     - cases

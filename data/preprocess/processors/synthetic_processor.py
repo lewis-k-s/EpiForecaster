@@ -9,7 +9,10 @@ Synthetic data MUST use concentration mode (not total_flow) because it
 contains pre-computed concentrations without flow rate information.
 """
 
+import hashlib
+import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import xarray as xr
@@ -36,6 +39,30 @@ ZARR_ENCODING_KEYS_TO_CLEAR = {
 LATENT_DEATH_FLOW_ALIGNMENT_ATOL = 1e-8
 LATENT_DEATH_FLOW_ALIGNMENT_RTOL = 1e-5
 
+# Processed latent target name -> generator model-aligned SIRHD stock. The
+# generator defines sirhd_I as E+A+I+PH+PD and sirhd_H as HR+HD; the primitive
+# latent_*_true stocks are audit-only and must not be used as SIRHD targets.
+SIRHD_STOCK_SOURCES = {
+    "latent_S_true": "sirhd_S",
+    "latent_I_true": "sirhd_I",
+    "latent_H_true": "sirhd_H",
+    "latent_R_true": "sirhd_R",
+    "latent_D_true": "sirhd_D",
+}
+SIRHD_DEATH_FLOW_SOURCE = "sirhd_death_flow"
+DEATH_INTERVAL_COORD = "death_interval_date"
+LEGACY_PRIMITIVE_LATENT_NAMES = (
+    "latent_S_true",
+    "latent_I_true",
+    "latent_H_true",
+    "latent_hospitalized_true",
+    "latent_R_true",
+    "latent_D_true",
+)
+# The five stocks partition the population. Float32 storage of each stock
+# bounds the fraction-space rounding error well below this tolerance.
+SIRHD_PARTITION_ATOL = 1e-4
+
 SYNTHETIC_ZARR_SCHEMA = {
     "required_vars": {
         "cases": ("run_id", "date", "region_id"),
@@ -59,12 +86,11 @@ SYNTHETIC_ZARR_SCHEMA = {
         "hospitalizations": ("run_id", "date", "region_id"),
         "deaths_raw": ("run_id", "date", "region_id"),
         "deaths": ("run_id", "date", "region_id"),
-        "latent_S_true": ("run_id", "region_id", "date"),
-        "latent_I_true": ("run_id", "region_id", "date"),
-        "latent_H_true": ("run_id", "region_id", "date"),
-        "latent_R_true": ("run_id", "region_id", "date"),
-        "latent_D_true": ("run_id", "region_id", "date"),
-        "deaths_true": ("run_id", "region_id", "date"),
+        **{
+            source_name: ("run_id", "date", "region_id")
+            for source_name in SIRHD_STOCK_SOURCES.values()
+        },
+        SIRHD_DEATH_FLOW_SOURCE: ("run_id", DEATH_INTERVAL_COORD, "region_id"),
         "synthetic_sparsity_level": ("run_id",),
     },
 }
@@ -403,24 +429,31 @@ class SyntheticProcessor:
                     f"expected {expected_dims}"
                 )
 
-        latent_bundle_names = (
-            "latent_S_true",
-            "latent_I_true",
-            "latent_R_true",
-            "latent_D_true",
-        )
-        if all(name in ds for name in latent_bundle_names):
-            expected_flow_dims = SYNTHETIC_ZARR_SCHEMA["optional_vars"]["deaths_true"]
-            if "deaths_true" not in ds:
+        stock_names = tuple(SIRHD_STOCK_SOURCES.values())
+        present_stocks = [name for name in stock_names if name in ds]
+        if present_stocks:
+            bundle_names = (*stock_names, SIRHD_DEATH_FLOW_SOURCE)
+            for name in bundle_names:
+                expected_dims = SYNTHETIC_ZARR_SCHEMA["optional_vars"][name]
+                if name not in ds:
+                    errors.append(
+                        f"Missing required variable: '{name}'. The latent SIRHD "
+                        "supervision bundle requires all five model-aligned "
+                        "stocks and the destination-dated death flow."
+                    )
+                elif set(ds[name].dims) != set(expected_dims):
+                    errors.append(
+                        f"Variable '{name}' has dims {ds[name].dims}, "
+                        f"expected {expected_dims} for latent supervision"
+                    )
+        else:
+            legacy = [name for name in LEGACY_PRIMITIVE_LATENT_NAMES if name in ds]
+            if legacy:
                 errors.append(
-                    "Missing required variable: 'deaths_true'. The latent "
-                    "S/I/R/D supervision bundle requires continuous "
-                    "mechanistic daily death flow."
-                )
-            elif set(ds["deaths_true"].dims) != set(expected_flow_dims):
-                errors.append(
-                    f"Variable 'deaths_true' has dims {ds['deaths_true'].dims}, "
-                    f"expected {expected_flow_dims} for latent supervision"
+                    f"Primitive latent stocks {legacy} are present without the "
+                    "model-aligned sirhd_* partition. Primitive stocks are not "
+                    "SIRHD targets; regenerate the corpus under the "
+                    "epiforecaster_sirhd_v1 state-space contract."
                 )
 
         if errors:
@@ -874,59 +907,98 @@ class SyntheticProcessor:
         print(f"  ✓ Extracted population with {num_runs} runs: {pop.shape}")
         return pop
 
-    def _extract_latent_sird(self, ds: xr.Dataset) -> xr.Dataset | None:
-        """Extract latent SIRHD compartments normalized to fraction space."""
-        required_latent_names = (
-            "latent_S_true",
-            "latent_I_true",
-            "latent_R_true",
-            "latent_D_true",
-        )
-        optional_latent_aliases = {
-            "latent_H_true": ("latent_H_true", "latent_hospitalized_true")
-        }
-        missing = [name for name in required_latent_names if name not in ds]
-        if missing:
-            print(
-                "  Warning: latent SIRHD variables missing from synthetic dataset; "
-                f"skipping latent supervision targets: {missing}"
+    def _validate_state_space_contract(self, ds: xr.Dataset) -> dict[str, Any]:
+        """Require the generator state-space contract pinned by the config."""
+        expected_version = self.config.synthetic_state_space_schema_version
+        expected_sha256 = self.config.synthetic_state_space_contract_sha256
+        if expected_sha256 is None:
+            raise ValueError(
+                "Latent SIRHD supervision requires "
+                "synthetic_state_space_contract_sha256 in the preprocessing config."
             )
-            return None
 
-        if "population" not in ds:
+        missing_attrs = [
+            name
+            for name in (
+                "state_space_schema_version",
+                "state_space_contract_json",
+                "state_space_contract_sha256",
+            )
+            if name not in ds.attrs
+        ]
+        if missing_attrs:
+            raise ValueError(
+                f"Synthetic corpus lacks state-space contract attributes: {missing_attrs}"
+            )
+
+        contract = json.loads(str(ds.attrs["state_space_contract_json"]))
+        canonical = json.dumps(
+            contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        observed_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
+        if observed_sha256 != str(ds.attrs["state_space_contract_sha256"]):
+            raise ValueError(
+                "Embedded state-space contract JSON does not match its recorded "
+                f"SHA-256: {observed_sha256} != "
+                f"{ds.attrs['state_space_contract_sha256']}"
+            )
+        if observed_sha256 != expected_sha256:
+            raise ValueError(
+                "Synthetic state-space contract SHA-256 differs from the "
+                f"preprocessing config: {observed_sha256} != {expected_sha256}"
+            )
+
+        versions = {
+            str(ds.attrs["state_space_schema_version"]),
+            str(contract.get("state_space_schema_version")),
+        }
+        if versions != {expected_version}:
+            raise ValueError(
+                f"Synthetic state-space schema versions {sorted(versions)} differ "
+                f"from the expected {expected_version!r}"
+            )
+
+        expected_stocks = set(SIRHD_STOCK_SOURCES.values())
+        if set(contract.get("aggregation_map", {})) != expected_stocks:
+            raise ValueError(
+                "State-space contract aggregation map must define exactly "
+                f"{sorted(expected_stocks)}"
+            )
+        print(
+            f"  ✓ State-space contract {expected_version} "
+            f"(sha256={observed_sha256[:12]})"
+        )
+        return contract
+
+    def _crop_to_processing_dates(self, data: xr.DataArray) -> xr.DataArray:
+        start_date = np.datetime64(self.config.start_date)
+        end_date = np.datetime64(self.config.end_date)
+        time_mask = (data[TEMPORAL_COORD] >= start_date) & (
+            data[TEMPORAL_COORD] <= end_date
+        )
+        return data.isel({TEMPORAL_COORD: time_mask})
+
+    def _extract_latent_sird(self, ds: xr.Dataset) -> xr.Dataset | None:
+        """Extract the model-aligned SIRHD partition in population fractions."""
+        if not any(name in ds for name in SIRHD_STOCK_SOURCES.values()):
             print(
-                "  Warning: population missing from synthetic dataset; "
+                "  Warning: sirhd_* stocks missing from synthetic dataset; "
                 "skipping latent supervision targets."
             )
             return None
 
-        if "deaths_true" not in ds:
-            raise ValueError(
-                "Latent S/I/R/D supervision requires 'deaths_true' as the "
-                "continuous mechanistic daily death-flow target."
-            )
-
-        latent_sources = {name: name for name in required_latent_names}
-        for canonical_name, aliases in optional_latent_aliases.items():
-            source_name = next((alias for alias in aliases if alias in ds), None)
-            if source_name is not None:
-                latent_sources[canonical_name] = source_name
+        contract = self._validate_state_space_contract(ds)
 
         print("Extracting latent SIRHD targets...")
-        start_date = np.datetime64(self.config.start_date)
-        end_date = np.datetime64(self.config.end_date)
         population = (
             ds["population"].rename({"region_id": REGION_COORD}).astype(np.float32)
         )
         population = population.where(population > 0)
         latent_vars: dict[str, xr.DataArray] = {}
 
-        for name, source_name in latent_sources.items():
+        for name, source_name in SIRHD_STOCK_SOURCES.items():
             latent = ds[source_name].transpose("run_id", TEMPORAL_COORD, REGION_COORD)
-            time_mask = (latent[TEMPORAL_COORD] >= start_date) & (
-                latent[TEMPORAL_COORD] <= end_date
-            )
-            latent = latent.isel({TEMPORAL_COORD: time_mask}).astype(np.float32)
+            latent = self._crop_to_processing_dates(latent).astype(np.float32)
             latent_values = np.asarray(latent.values)
             if not np.isfinite(latent_values).all() or (latent_values < 0).any():
                 raise ValueError(
@@ -946,26 +1018,65 @@ class SyntheticProcessor:
                 )
             latent_vars[name] = latent_fraction
 
-        death_flow = ds["deaths_true"].transpose("run_id", TEMPORAL_COORD, REGION_COORD)
+        partition_total = sum(
+            np.asarray(latent_vars[name].values, dtype=np.float64)
+            for name in SIRHD_STOCK_SOURCES
+        )
+        partition_error = float(np.max(np.abs(partition_total - 1.0)))
+        if partition_error > SIRHD_PARTITION_ATOL:
+            raise ValueError(
+                "sirhd_* stocks must partition the population; maximum "
+                f"|S+I+H+R+D-1| was {partition_error:.6g} "
+                f"(atol={SIRHD_PARTITION_ATOL})."
+            )
+
+        audit_stocks = contract.get("audit_only_stock_variables", {})
+        for stock in contract.get("applicability", {}).get("required_zero_stocks", []):
+            variable_name = audit_stocks.get(stock)
+            if variable_name is None or variable_name not in ds:
+                continue
+            audit = self._crop_to_processing_dates(ds[variable_name])
+            if float(np.nanmax(np.abs(np.asarray(audit.values)))) != 0.0:
+                raise ValueError(
+                    f"State-space contract requires zero '{variable_name}' stock."
+                )
+
+        death_flow = ds[SIRHD_DEATH_FLOW_SOURCE].rename(
+            {DEATH_INTERVAL_COORD: TEMPORAL_COORD}
+        )
+        death_flow = death_flow.transpose("run_id", TEMPORAL_COORD, REGION_COORD)
+        processed_dates = latent_vars["latent_D_true"][TEMPORAL_COORD].values
+        undefined = np.setdiff1d(processed_dates, death_flow[TEMPORAL_COORD].values)
+        if undefined.size:
+            raise ValueError(
+                f"'{SIRHD_DEATH_FLOW_SOURCE}' has no destination-dated interval for "
+                f"{undefined.size} processed date(s) starting {undefined[0]}; "
+                "start processing at least one day after the first corpus date."
+            )
+        death_flow = death_flow.sel({TEMPORAL_COORD: processed_dates})
         death_flow_values = np.asarray(death_flow.values)
         if not np.isfinite(death_flow_values).all():
-            raise ValueError("'deaths_true' must contain only finite values.")
+            raise ValueError(
+                f"'{SIRHD_DEATH_FLOW_SOURCE}' must contain only finite values."
+            )
         if (death_flow_values < 0).any():
-            raise ValueError("'deaths_true' must contain only nonnegative values.")
+            raise ValueError(
+                f"'{SIRHD_DEATH_FLOW_SOURCE}' must contain only nonnegative values."
+            )
 
-        death_flow = death_flow.isel({TEMPORAL_COORD: time_mask})
-        positive_flow = np.asarray(death_flow.values) > 0
+        positive_flow = death_flow_values > 0
         death_flow = death_flow.astype(np.float32)
         death_flow_fraction = (death_flow / population).astype(np.float32)
         death_flow_fraction_values = np.asarray(death_flow_fraction.values)
         if not np.isfinite(death_flow_fraction_values).all():
             raise ValueError(
-                "'deaths_true' produced non-finite latent death-flow fractions."
+                f"'{SIRHD_DEATH_FLOW_SOURCE}' produced non-finite latent "
+                "death-flow fractions."
             )
         if not np.all(death_flow_fraction_values[positive_flow] > 0):
             raise ValueError(
-                "Positive 'deaths_true' values must remain positive after float32 "
-                "population-fraction normalization."
+                f"Positive '{SIRHD_DEATH_FLOW_SOURCE}' values must remain positive "
+                "after float32 population-fraction normalization."
             )
 
         latent_d_difference = latent_vars["latent_D_true"].diff(TEMPORAL_COORD)
@@ -992,19 +1103,18 @@ class SyntheticProcessor:
                 )
             )
             raise ValueError(
-                "'deaths_true' must align with destination-dated "
-                "latent_D_true.diff(date) after float32 normalization; "
+                f"'{SIRHD_DEATH_FLOW_SOURCE}' must align with destination-dated "
+                "sirhd_D.diff(date) after float32 normalization; "
                 f"maximum absolute error was {max_error:.6g} "
                 f"(atol={LATENT_DEATH_FLOW_ALIGNMENT_ATOL}, "
                 f"rtol={LATENT_DEATH_FLOW_ALIGNMENT_RTOL})."
             )
         latent_vars["latent_death_flow_true"] = death_flow_fraction
 
-        num_runs = len(ds.run_id)
-        example_name = required_latent_names[0]
         print(
             "  ✓ Extracted latent SIRHD targets with "
-            f"{num_runs} runs: {latent_vars[example_name].shape}"
+            f"{len(ds.run_id)} runs: {latent_vars['latent_S_true'].shape} "
+            f"(partition error {partition_error:.3g})"
         )
         return xr.Dataset(latent_vars)
 
