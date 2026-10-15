@@ -1,0 +1,31 @@
+run: {}
+source: {}
+container: {}
+workflow:
+  kind: ablation
+  target: ablation
+dvc:
+  targets:
+  - data/files/mobility.zarr.dvc
+  - outputs/loss_research/loss-type-temporal-v1/real_loss_fit20200821_v1.nc.dvc
+  - outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc
+ablation:
+  study_name: loss_type_temporal_v1
+  campaign: configs/campaigns/loss_type_temporal_v1.yaml
+  workers: 2
+  recover_stale_running: true
+  closeout_signal_seconds: 1200
+  timeout_s: 6000
+  sampler_seed: 52
+  smoketest: false
+  requeue_running: false
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 2
+    cpus_per_task: 20
+    gres: gpu:2
+    runtime: 120

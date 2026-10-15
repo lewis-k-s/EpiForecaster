@@ -1,0 +1,70 @@
+data_dir: outputs/loss_research/loss-type-research-v1/raw_inputs
+cases_file: outputs/loss_research/loss-type-research-v1/raw_inputs/Registre_de_casos_de_COVID-19_a_Catalunya_per_municipi_i_sexe.csv
+deaths_file: outputs/loss_research/loss-type-research-v1/raw_inputs/deaths_municipality.csv
+hospitalizations_file: outputs/loss_research/loss-type-research-v1/raw_inputs/hospitalizations_municipality.csv
+vaccination_file: outputs/loss_research/loss-type-research-v1/raw_inputs/vaccination_municipality.csv
+wastewater_file: outputs/loss_research/loss-type-research-v1/raw_inputs/wastewater_biomarkers_icra.csv
+region_metadata_file: outputs/loss_research/loss-type-research-v1/raw_inputs/edar_muni_edges.nc
+population_file: outputs/loss_research/loss-type-research-v1/raw_inputs/fl_population_por_municipis.csv
+mobility_path: data/files/mobility.zarr
+start_date: '2020-03-01'
+end_date: '2021-05-09'
+min_flow_threshold: 10
+wastewater_flow_mode: concentration
+alignment_strategy: interpolate
+target_dataset: cases
+crop_datasets: true
+validate_alignment: true
+generate_alignment_report: true
+output_path: outputs/loss_research/loss-type-temporal-v1/preprocessing
+dataset_name: real_loss_fit20200821_v1
+compression: blosc
+num_workers: 4
+chunk_size: 14
+run_id_chunk_size: 5
+date_chunk_size: 30
+mobility_chunk_size: 100
+memory_limit_gb: 8.0
+temporal_covariates:
+  include_day_of_week: true
+  include_holidays: true
+  include_lockdown_severity: true
+  holiday_calendar_file: outputs/loss_research/loss-type-research-v1/raw_inputs/catalonia_holidays.csv
+smoothing:
+  clinical_method: kalman_v2
+  wastewater_method: tobit_kalman_v2
+  missing_policy: predict
+  momentum_decay: 0.5
+  momentum_max_steps: 4
+  innovation_clip_sigma: 2.5
+  reentry_gain_cap: 0.35
+  reentry_steps: 2
+  process_var_floor: 1.0e-06
+  measurement_var_floor: 1.0e-06
+  holt_alpha: 0.3
+  holt_beta: 0.05
+  holt_phi: 0.9
+  holt_missing_trend_decay: 0.85
+  parameter_fit_end_date: '2020-08-21'
+  parameter_fit_mode: per_series
+graph_options:
+  edge_strategy: knn
+  k_neighbors: 8
+  distance_threshold: 50.0
+  include_self_loops: false
+validation_options:
+  max_missing_percentage: 0.15
+  min_data_coverage: 0.75
+  outlier_detection: true
+  outlier_threshold: 3.0
+  temporal_consistency_check: true
+  spatial_consistency_check: true
+  generate_plots: true
+continuous_storage_dtype: float32
+hospitalizations_reporting_lag_days: 7
+source_provenance:
+  causal_preprocessing_contract: loss-research-v1
+  parameter_fit_end_date: '2020-08-21'
+  vintage_limitation: revised_historical_data_without_release_vintages
+  raw_input_manifest_sha256: e4183983d7525ce7fcf6d8cf5e9b4fcf134a0674c86a51ffcd4d3cde6a3054ac
+  parameter_fit_mode: per_series

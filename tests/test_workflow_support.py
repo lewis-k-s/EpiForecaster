@@ -131,15 +131,15 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
     }
 
 
-def test_coverage_smoke_exercises_default_campaign_subset() -> None:
+def test_coverage_smoke_exercises_full_campaign_subset() -> None:
     smoke = yaml.safe_load(
         (REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml").read_text()
     )
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
     assert smoke["ablation"] == {
-        "study_name": "epiforecaster_ablation_default_smoke_v1",
-        "campaign": "configs/campaigns/ablation_default_v1.yaml",
+        "study_name": "epiforecaster_ablation_default_smoke_v2",
+        "campaign": "configs/campaigns/ablation_default_v2.yaml",
         "workers": 2,
         "closeout_signal_seconds": 600,
         "timeout_s": 6000,
@@ -1683,6 +1683,54 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert "seed_coverage_report.csv" in result.stdout
     assert "--workers 4" in result.stdout
     assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
+
+
+def test_student_t_crps_suite_uses_one_four_gpu_allocation_and_two_studies(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_config(run_root, REPO_ROOT)
+    template = yaml.safe_load(
+        (
+            REPO_ROOT / "workflow/config/mn5_loss_type_student_t_crps_suite_v2.yaml"
+        ).read_text()
+    )
+    config["workflow"].update(template["workflow"])
+    config["dvc"]["targets"] = template["dvc"]["targets"]
+    config["ablation_suite"] = template["ablation_suite"]
+    config["resources"] = template["resources"]
+    config.pop("optuna")
+    config.pop("evaluation")
+    config.pop("promotion")
+    assert run_config.validate_mn5_allocation(config)["gres"] == "gpu:4"
+    for study in config["ablation_suite"]["studies"]:
+        campaign = yaml.safe_load((REPO_ROOT / study["campaign"]).read_text())
+        assert campaign["fixed_overrides"]["training"]["epochs"] == 50
+        assert (
+            campaign["fixed_overrides"]["training"]["early_stopping_patience"] is None
+        )
+        assert {item["name"] for item in campaign["conditions"]} == {
+            "student_t:crps:mobility_off",
+            "student_t:crps:mobility_on",
+        }
+        if campaign["analysis"]["evaluation_design"] == "spatial":
+            assert campaign["cross_validation"]["fold_indices"] == list(range(10))
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("rule launch_suite_study_workers:") == 5
+    assert result.stdout.count("--workers 4") == 5
+    for stamp in ("20200821", "20200918", "20201016", "20201113"):
+        assert (
+            f"loss_type_temporal_fit{stamp}_student_t_crps_v2.journal" in result.stdout
+        )
+    assert "loss_type_spatial_student_t_crps_v2.journal" in result.stdout
+    assert "suite_manifest.json" in result.stdout
 
 
 def test_ablation_suite_manifest_requires_both_studies(tmp_path: Path) -> None:

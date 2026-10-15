@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "protocol_id": "loss-type-temporal-fit20200821-v2",
+  "source_audit_status": "complete",
+  "source_audit": "docs/research/loss_data_audit_20260918.md",
+  "required_preprocessing_contract": "loss-research-v1",
+  "minimum_label_gap_days": 28,
+  "confirmation_claim": "retrospective_previously_studied_period",
+  "uncertainty_cluster": "all_regions_in_contiguous_target_date_blocks_at_least_28_days",
+  "roles": {
+    "fit": {
+      "label_start": "2020-05-01",
+      "label_end": "2020-08-21"
+    },
+    "selection": {
+      "label_start": "2020-09-19",
+      "label_end": "2020-10-21"
+    },
+    "calibration": {
+      "label_start": "2020-11-19",
+      "label_end": "2020-12-16"
+    },
+    "confirmation": {
+      "label_start": "2021-04-08",
+      "label_end": "2021-05-09"
+    }
+  }
+}

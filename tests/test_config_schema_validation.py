@@ -5,7 +5,7 @@ import pytest
 from data.preprocess.config import PreprocessingConfig
 from models.configs import EpiForecasterConfig, ObservationHeadConfig
 from training.region2vec_trainer import RegionTrainerConfig
-from scripts.hpo.ablation_worker import load_campaign
+from scripts.hpo.ablation_worker import build_trial_queue, load_campaign
 
 
 CONFIG_ROOT = Path("configs")
@@ -40,7 +40,7 @@ def test_ablation_campaign_configs_parse(campaign_path):
 
 def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
     """Delay-family ablations stay normalized and diagnosable."""
-    campaign = load_campaign(Path("configs/campaigns/ablation_default_v1.yaml"))
+    campaign = load_campaign(Path("configs/campaigns/ablation_default_v2.yaml"))
     conditions = campaign.conditions_by_name
 
     assert {
@@ -84,6 +84,19 @@ def test_default_ablation_campaign_uses_gamma_for_clinical_delay_arms():
             }
         }
     }
+
+
+def test_default_ablation_campaign_covers_every_manifest_fold():
+    campaign = load_campaign(Path("configs/campaigns/ablation_default_v2.yaml"))
+
+    assert campaign.crossval_num_folds is not None
+    assert campaign.fold_indices == tuple(range(campaign.crossval_num_folds))
+    assert campaign.completeness_requirements["require_full_manifest_folds"] is True
+    assert len(build_trial_queue(campaign)) == (
+        len(campaign.conditions)
+        * campaign.crossval_num_folds
+        * len(campaign.paired_model_seeds)
+    )
 
 
 @pytest.mark.epiforecaster
@@ -161,6 +174,7 @@ def test_corrected_sirhd_preprocessing_has_versioned_artifact_identity():
     )
     assert config["smoothing"]["clinical_method"] == "holt_damped"
     assert config["continuous_storage_dtype"] == "float32"
+
 
 @pytest.mark.epiforecaster
 @pytest.mark.parametrize("value", [0.0, -1.5])

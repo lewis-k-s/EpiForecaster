@@ -1,0 +1,1534 @@
+{
+  "campaign_id": "loss_type_full_coverage_v2",
+  "campaign_sha256": "3a40a5cddddeeda15337c8f8ab314817eab2a5955ed6891bae1c528c5eb418a9",
+  "current_git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+  "expected_identities": 160,
+  "historical_identities_found": 48,
+  "historical_root": "outputs/loss_research/loss-type-research-v1/screen",
+  "missing_historical_identities": [
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_off",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "normal:crps:mobility_on",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_off",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "normal:nll:mobility_on",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_off",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:crps:mobility_on",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_off",
+      "fold": 9,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 0,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 0,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 2,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 2,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 3,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 3,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 6,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 6,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 7,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 7,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 8,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 8,
+      "seed": 53
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 9,
+      "seed": 52
+    },
+    {
+      "condition": "student_t:nll:mobility_on",
+      "fold": 9,
+      "seed": 53
+    }
+  ],
+  "records": [
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "a38990a461393956c0ec0dd04bbcba0ee2be09527cfe825546bcbc7d9275ab52",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "583cf0df92c74e16a8a3cba8d8a4adc3d2d84629338f9e39d5a10454dee9d74d",
+      "condition": "normal:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "56faf16b8eb5286e097b2f64984f879ffd68712e3cc933dc88d2f786421a31b4",
+      "old_run_identity": "loss-b-normal-crps-m0-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "d0fe8160a8c47fcabfa7741d82defb217b984e7653d3a52753a90111863d47de",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "99301e96c86fb8cce5c15ab5147229d4b78df37c1d4d8b6ebe1c2a90d2fe0bad",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "45018309f295322a7f512f018f0979d5cc39f85388caff3669e5bfea830ec442",
+      "condition": "normal:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "d5dcd23e74c21c5f67791864cef108feb3dc50375c08df0e89ee19f75ddc9e25",
+      "old_run_identity": "loss-b-normal-crps-m0-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "24867baea29a80f96271bd374159c8c46e0aad99f9f11eefda72573d6974ef3c",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "5e08eecdf0bf5fe20b7af867305768a2b716c6ec997d77df9be17dc902d490c2",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "8c87181f9762848625fee901e421b53f11f2e2c930c6f81c7250cdf3546bdfcc",
+      "condition": "normal:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "b92364260dacbdb233187cb950f0fbdddbfa476985b19137a3f87236a9dfd73d",
+      "old_run_identity": "loss-b-normal-crps-m0-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "aeca84aef00fa538e3fa1a0edd77fef25eec85b482cb34497db39225b6017c30",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "85848d70fae4d907641fd46dedcc33ec87a0b4d564e75c3da2179b204b8aa64d",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "eed4e75690fa5fedda30ef2cced228021511b9b6428e5c955b770d01746b9956",
+      "condition": "normal:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "9d2bc5d7e49c4834a7af9b40f86a80361363b30740941201a3c26a5ed0f865a2",
+      "old_run_identity": "loss-b-normal-crps-m0-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "4360f271b751fd83d6cef01a72ef1cff1d7d73b172675e831528cde12e41c535",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "434a82c83337c305f18af4aa81321e43086dd7704d2627df73bf7334232e7dbc",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "fc995754e4be16a7912dbef07079ec3b24bf16ffd166b960a84f974ffa3f5371",
+      "condition": "normal:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "4687c74969ca11194c14a6a4845a2d1271a200b140057f4d448857bf07c19e7a",
+      "old_run_identity": "loss-b-normal-crps-m0-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "32396de87f24cabd3dfb9c1cef1ff4875ff0ce4648f66c90014ec7d00345100b",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "e7617038bf538bb99c3cbdffdc1fac16bad6074392fad30dac215e4b544c9565",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "3e8d4825ce0cf884bc19d35614b1bfd79b0ac35e8049d6c68491141f07c2623d",
+      "condition": "normal:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m0-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "2683c9da5c4c27a7be8665dee1aede7780ff885192434239bfc8d21a4c7244f7",
+      "old_run_identity": "loss-b-normal-crps-m0-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m0-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "bcf790c0351076bd92ff15e5e4ae4bf3cc8d21052c06a055ad75300434ecdf5f",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "ce300c78e9f00ea83a39f85a3e87b2ee4725ef560e1bea98f316d0444dc471d4",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "ee07e4f9c5a2927d5bea75f06472b0d03cd6dfa56fb217ab0016148cd6fa29c1",
+      "condition": "normal:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "5a51e49cfb1129c7b7210cd96c5d6c67f05670bd63df271de898f9dfc3691bfc",
+      "old_run_identity": "loss-b-normal-crps-m1-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "056ac6785eb2fe7649db36fd7cc62fc62d80b8cc1abd85ed1b702aae32f0014a",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "699c05805324ae62df4480ef6e404055518fdd32f08114146e5e3d01046b44bd",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "b03fdb76ede07682bc89f0cbc8a4ef73814febaf2b0ee8f686c52d594fb850e5",
+      "condition": "normal:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "b7f096bfff2fd504e8ff131ac140ada0e5797e571f3e6c67821367cd2871cc6c",
+      "old_run_identity": "loss-b-normal-crps-m1-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "7a354dbbc4c7f8a429ced21fa82606b3523443d499abf05fbdb0e789ba38d065",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "2fc7a980ae52b28a9254934e74736f068c8a9fa0f284c00965beee284b9aef12",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "716c8bc0b05d18c873929ed36eda6af8cd6cce4bc863d50c2d3982b7a8aeb510",
+      "condition": "normal:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "88406ee6a7a54d9da1f36bc7cf8205dfd1aba94587e09f7df1530cb413a3d455",
+      "old_run_identity": "loss-b-normal-crps-m1-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "c7f793d3a40dae19edfb5fb518d92b56f6ed88428367e94755ab5944e70657de",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "20905608ffb3c0380373695e211a8e44e3e3ba0028ba7c7dd14bc943fcab972a",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "e04678682e5e184597d5dd13d128a06ff0540c5cb6fd1783cc15ea661cfd36d4",
+      "condition": "normal:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "6f426497344f98fc293a2db8255e9fe08f9bfba56d9da04c7f608ca6cd942485",
+      "old_run_identity": "loss-b-normal-crps-m1-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "4a087aa091886fff511d741a0bb915cbca5b22afaebe88b68466763f9bf09f63",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "92e1515b018f307ce78cd82e75aa35ed0b8505e48a754f2d2bb85ce6bec8a7f5",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "15eb3b529519cc73b88e8b0090e5af775f88892d6fba492b6ff4fc1fe3468958",
+      "condition": "normal:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "21625457ed3771e90dbe8831f31612bcff10a715e696d029d2c65ef3455506a7",
+      "old_run_identity": "loss-b-normal-crps-m1-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "f7f3ba6d59ea00e9bd64e97f7852eeb4bf14081ddb6acb13d7142cbd0f43b9a4",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "7dbef5ad31c23db62b1f1e589c496f35678e1fd3b2a507a01e1cf48758b2f6b9",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "ba0736f3c77088557d7ce79845c8822d53e6550ac9133af5ec3ab589c0bf42ce",
+      "condition": "normal:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-crps-m1-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "4dc41a1ade50d0814dac6417aad17b3dc72fc230d1280e4a68f642ff7adbb66e",
+      "old_run_identity": "loss-b-normal-crps-m1-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-crps-m1-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "1a564f3aafa7216a09608a3b58f2f41b269bd38eb63944c14bc5f27b2d7945eb",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "26474e26fe3b1b52534858c1483e5c373beef721c70a69bb558d33f10a590736",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "92e111a98163f2d07ba2b75d5fc889b231e23a5a797d50ae197ebf4cecb4a2fb",
+      "condition": "normal:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "2c59d09cdfee4fb395d9536587c2bba04f93a5d6dd3ebc8d9f51b2d429af78e8",
+      "old_run_identity": "loss-b-normal-nll-m0-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "6b14f73fce94286b9eb243d8f169877e2248cfc816d9d79ad4afd17ce59a34fd",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "5dcad8d7234411b6016550594d3e9554d3059b3961da216a6d76352484bd4bc6",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "7e88aaa95760886a545664d912aad3223dafbe6fec1f5f8eaa0caa0f7555cb25",
+      "condition": "normal:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "c433d3458c8e706421cabcb03b93855563ad12566de3e622dbd08a541aeff219",
+      "old_run_identity": "loss-b-normal-nll-m0-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "c0f2a9cf5151bbd79ad0325a22a3e298c345a22c8c828743f5738e1f8ee75cb5",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "71c38e462b3748abd3764601fc1dc1540e4317549cfed4290493ca4ee9c74ce5",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "72c3bc8a427de83984b80a47783732e869e6075ed37b8165557cd29c9a292292",
+      "condition": "normal:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "fc3b963d9cf6c521e4977448ede0cc3caead49af71c3e53f79390631b76ffffe",
+      "old_run_identity": "loss-b-normal-nll-m0-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "fb1759692b330e38293890e2da99f388253d4ed3f415cd5893762dd36c85af19",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "aec50ed45bf91f53cb3aeff5d088cdb9472cb6bc079f469796db9f35ead088b2",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "43e429f00a278b171a803c650d58740b3aae38809cbf1902d1c9e00865396ae0",
+      "condition": "normal:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "fc3b1b115a4e380d1ae60fdfc07adfd86bc8c05875a026108a0efa17d971f854",
+      "old_run_identity": "loss-b-normal-nll-m0-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "c93d9b07d64526d54d45ef1ba68857510e1f2d37328aea1be4c52db35a66c781",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "0666a162a27d663326669dc9a7957ce3a0ca1f1d01af681bbf391874b6f1294d",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "479771bb81c24a756a4ff4d4daf5efb499a0f28c5029c5a3ffc22d42183dc335",
+      "condition": "normal:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "70be070d39769564dc1909366501ece033c06b336555b209fef4e4ea8b859bd5",
+      "old_run_identity": "loss-b-normal-nll-m0-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "12598e1a0a2a4d8b0e06c50fca9ea90b2ee49bc64c0c8dfab355d9f36c9f3aef",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "13a721c88d63ed02d3ec6011f4140bef32e74a292692247c956f7229b5811490",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "bc7f0b304cfee05538a7e571a7c7d00864348ee40b90cab2c91bb33c1ca35496",
+      "condition": "normal:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m0-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "33120cb9c427ba438062dfa8aba5f28f7cccb6848be90461f66ffcec71502122",
+      "old_run_identity": "loss-b-normal-nll-m0-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m0-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "038c2ed6b04de7324db2d9a12faac6a80d4ab8c72590a0ff1e655c82660f1a6b",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "bb69d75b0a3ac3831c24ebadef81e816aa28e21640d5e48872db891714375b80",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "6a8d48cfb38d1c6fd9fb3565c662d134af024a1483ead6bf6f028b73c9d1f9fc",
+      "condition": "normal:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "64a1672c19b1a082e398edb0ca95985f874537b0077d6ebca9f19312abf8755b",
+      "old_run_identity": "loss-b-normal-nll-m1-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "719e577fa90b3d078161444f73e9da324489bd685935889fa7a8733ce66f08da",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "32704a89614b30a5403a26c179764fa311502a6641d766068637e1ac1b5e97a1",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "2c40d0799c5afb230cabac1129f0c00f2d879912ffb9f95d01812ad7daae6ea1",
+      "condition": "normal:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "406c6c3c10c88e775aa315ba312a4f4cc67fc88de20f8b7946b6ce955fb636ad",
+      "old_run_identity": "loss-b-normal-nll-m1-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "1a9d1ab1662060c7d12df51e223e277b091cd4d8a1fb2eee5108d06a66d6f3a3",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "d99897e5b189474db86558cc798dce6fb84569a6c20f52fc156a917852312e47",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "1a5fc398f439cc1e50c0f9e4ea36b664a812b21a13cecb0a648eb08270b3f4fd",
+      "condition": "normal:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "233ab1f8ee5209006e03047ca6ef842d0ebfa0d9ca2e6833e5465399f2f48bb9",
+      "old_run_identity": "loss-b-normal-nll-m1-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "be3197a456a52e5c78a3b18b21643ab4ffeeb8ed6c2870bd9848515ab3671d8d",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "0c224e08a0782c20ebbe1d957e46d27979a38d9aad2e1bc0982caa9603f8c39a",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "df44e2372288cbac54685e4d05e785d12d509ccbcd913325fdc44f75e3c843dd",
+      "condition": "normal:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "19bab68ee7c8e520a2361592721989bf03bfdf4e8592428f078c4746119a63c8",
+      "old_run_identity": "loss-b-normal-nll-m1-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "7ff95ba91220fae4c6b59a4bb80d59524ab0fccf8a697d9c3544caefb06b3f68",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "7a6b5a33c99345b550e1af98f1b3dfda26b83e15caa450985861dd4516473e78",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "34527191839e51b9ef07c42f1915e68470877c797f9dcdf77136daf6b64a2542",
+      "condition": "normal:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "979499c2fc3ce0a0360d3e64c6acc6246d423155be802f7233a321ec47cd9018",
+      "old_run_identity": "loss-b-normal-nll-m1-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "21027540dcdd778ff4565725d0753b6a6ac1b7453e93b46fd13669fd24f795d9",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "5049d55d84c6d5744a8ffc1975e7cf922461029eac22e7981b4f27b1509177fa",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "479f42b7f04a96af99e1bc604aacf1a010209baad89534fe469d5ad2dd2647bd",
+      "condition": "normal:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-normal-nll-m1-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "97e0c65ace632fc7d1134c34b3bc7a3fbd809da19d90ca0667e1cd56b12c5184",
+      "old_run_identity": "loss-b-normal-nll-m1-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/normal-nll-m1-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "6d27ccd0ab6bfb25ec25cb63593aee06bf8a57deb30f112d15afc7e6f8a4ba56",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "3e084967891f2596869f02e5faf4bb378c08f722fb4d13b0e4e2eb2269aeec0f",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "211c0d84a7c7c597212775b3d7c7b6ea37617040443f10f380ae5bd5a8992b1e",
+      "condition": "student_t:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "f9a4576aff608cf2c10c436367f403adaac8212d509c2dd0a63859771815a49a",
+      "old_run_identity": "loss-b-student_t-crps-m0-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "495b88726b2d5e4c0cfa1431207c7e3d64d5752e2df3a8eea09c5dca7388a8c4",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "ca87ab931cb9981045210c4f12bce245ebf59082ce52622af0de21af1e37344f",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "36572400526bcc3a737b9123474f604e2607cb95cad92a0bed6a9024f4ab90b1",
+      "condition": "student_t:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "fc7f13ea33964eed90553e300f3821f4aecc3f39b62ba61d1875c035ec0cb557",
+      "old_run_identity": "loss-b-student_t-crps-m0-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "9ea65062f3c9b71f52f5ec6c2f2194b35ce9fc7114c050f215312023c3707b5d",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "65b51b62c33b74a9a2dd0e586e93d67757e5cf890e85621f4cc23f97e5a4ac4c",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "5e5263cc28f7bde78c520e73146a334ad30deae0f8d600f507e6ce21af7b4275",
+      "condition": "student_t:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "03604a2b93abfc2c2bd2445d9dc991597cdf37ad0837e276b3bedd4dabb73a89",
+      "old_run_identity": "loss-b-student_t-crps-m0-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "12e4e7263cf2ad2582ced78ee7be83c4c33de331ea70816e98126f4b0836de0b",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "dcda3ee105a1d520a7230776059a98b0f9a68d0bc0299fbf1ef63b767d82eff8",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "bb891efc32f25d2e47f27b24c04ebd0067624300321cfa7d7b90bf7d3a8d5e4c",
+      "condition": "student_t:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "a93c91b13b7629a6ca1e4856e74f4aed80de80740c1c8334d0985ded63e62452",
+      "old_run_identity": "loss-b-student_t-crps-m0-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "524ff4f0857427eb8c9f9c01be8ae004412e2027db2ff09d4138d73d0991db1d",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "cd864bc164c54235cde1d4a6f408695d0db2cf21ca1064ed17f1961d3f967f63",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "3eb35809a71e5e5dbd61137b4167f55f6f9543c6a94292cde2a0394e66cd54fd",
+      "condition": "student_t:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "961964552b98b7b9d98968f0256bb49329f90161dcec411a346697b438498848",
+      "old_run_identity": "loss-b-student_t-crps-m0-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "86953bfc91557eb639c8bd3ccc857f30b73f51158277d75ebdfc32937f748f4d",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "6019748087f142bc1ab66ae157ef7fdb0031a57b1777fd5c98d2e68227efe8b3",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "cfcac41e8684ad774c828641f182afcd0f7e13e6e669719c00372613f59249cb",
+      "condition": "student_t:crps:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m0-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "583298cc15112dc724d07d41ac64c18ec62a4c27501848d4507116e9a7b9ed69",
+      "old_run_identity": "loss-b-student_t-crps-m0-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m0-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "5ecccb0d29ba85a6fcd4a617032672692c7448627409367afc1bfaa36c53349c",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "776699824f575c5aca4dbede871ba71d2f268f672f8472a4784a84697b89f3d4",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "e973b7648ad61daca00a1caf69b6c6f53e4b227a7ba1435fe74fb96db7a3527d",
+      "condition": "student_t:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "08a24f303b026c87d9ab07b2afa2066787f7aedae8a38867df7aaf7ce0a38f56",
+      "old_run_identity": "loss-b-student_t-crps-m1-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "240e3a0b19e3bb6d64dad761914fde85f67b5945bd4cc4861bd7413ebe9b91c9",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "e2df9e86ec0bcd099eaec4db7e7dc417912567f158ecc267a8b36a19159ece60",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "481131f4a4d491f30a94c8f9da08b235ee279abc03990d8ad6191a9b2f92d893",
+      "condition": "student_t:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "20c274a5530be2d28c039ff530eedb574f6710f299dc3eea9d9802c27e73115b",
+      "old_run_identity": "loss-b-student_t-crps-m1-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "86b821a388970202b0cdfe79d47c61013ab09a4df2f68c1d9c17ace6a7a7ebcc",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "c959e4a7f7d32c627f1bf4166dfbfce6580b0d844a0423881ff9f1d016e9dee3",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "1ced151bb118d82f15274d298a33e782014d2e88af8ea85d22b817e422dcac6b",
+      "condition": "student_t:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "35347798165c4fa6c245f391aa346ae4c04d07bfe49ee9cdc494ff67aa56dd3d",
+      "old_run_identity": "loss-b-student_t-crps-m1-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "ca42f17d5d758db1fe1c6e6feea288b17dff58981d8bf7adbc3921af5f79c1ea",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "ed6d03b17f9e600c351be724fbb13046665a19b7d3207573c4be0c2e2730eb68",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "ae3157344784f4eff8a8fb21da8c7369c24c53438fc7bf9c2962ef3f8e470600",
+      "condition": "student_t:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "ff1d340130222aa650a45d5f21f3e13a45902597bdf0e6423d0bdf2e6ea353f2",
+      "old_run_identity": "loss-b-student_t-crps-m1-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "75fd8b2958c92d71c75d5e3c420c55f0f948951665e2f484d7e33992baee7264",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "147bf8a5575a994fe51bc7bc4ddaaad5c349e0c13dc6794acec99e5d1ddf8a92",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "240ffe13856540e28ae7dc1668c83c61b51f39dbdfa1dc1b35a6fa22c6b1cd6b",
+      "condition": "student_t:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "4a8e6ce91401927b4958a2181bc14f3e9635bfeca17a6fcfa72cf28dd19f3841",
+      "old_run_identity": "loss-b-student_t-crps-m1-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "f68b4cac433d877fddf952c80ac04544e696591b961382438a7c07c65d427f7e",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "5b9ad9ca72b584ee75d8c4f9e9e07d6e4b6d16bb651977ad768f290456f10cbb",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "6657e4a92b6c2b9b7aa85c807cb79d27575797025befbc0e390c022db840395e",
+      "condition": "student_t:crps:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-crps-m1-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "e88afd337e40e738f40bc8ec6e825f4d495b0ba472bd0235caaf98ca74d2ca60",
+      "old_run_identity": "loss-b-student_t-crps-m1-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-crps-m1-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "8cbcc5aab4a38a3924020ac21d8f810082800f0b67df3818d3177ad28571136d",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "8e99783cc98131b7b6815d350b1ad568e78e31870a3befee30f2f7fd164b7c55",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "7db38acfad4f62424d0e0362dd29c177012c340d856637acdb4368abdd304856",
+      "condition": "student_t:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "7c776ecba35451241880de30e4d7813a334b6e268bdf4e5a58e61b7249cf6433",
+      "old_run_identity": "loss-b-student_t-nll-m0-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "dc137ef7c05ef5c3adbd2cee9e11527dc0db25810c873fd7bf9b16490bd7c9f4",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "95488665a2265465c81c30f99208bf0fabb3b9a1dfa55f035c66e58bc21cb23a",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "f76ea90a2c96db11b40909bce36a9297c5c1af83e5ed4eba97d70777df2bf79c",
+      "condition": "student_t:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "2f4dd503fea5cee3f51aafc271577f7f58a761ba25635f9919282596718f9df6",
+      "old_run_identity": "loss-b-student_t-nll-m0-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "2c8941435409d99366c74a206f0efc280dda815696b5f0eda4173de546dbf60e",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "40af59a30e3c2ced393c1098f6ba7d2bf8529404da227bf25dad62b2aa984bf3",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "616e3d3f8a3cd3c285dbb2f87be3f50ef37e9378ce91c688f190c80224431dc9",
+      "condition": "student_t:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "22e1e5117f9840e17c1213166d14ce140ff9ec5bf54ce9f2e24c1f2da17f125d",
+      "old_run_identity": "loss-b-student_t-nll-m0-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "b1fe8357bf774f76abb560784f416eb56a89d4eaa167ca693f82d371920c55f9",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "1d31ef59f51691f4107d55abc513d5719cd8599eb46480b3b7eced9d802d1d3c",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "77af54f3e2b3e0c6f642ee0476964eea6a2ba18e17f991bdd3d473bd4486628d",
+      "condition": "student_t:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "19f928be2202ec69c90e171f0f6f0608a8577044bceb80b72f382514a3f12b68",
+      "old_run_identity": "loss-b-student_t-nll-m0-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "c58ed50aeb018169465b925697e7baa49ac29e63fcd3896f7ad21173e42d447e",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "426c3e60ebd3a40ea6266bc2ebd1fac9ac6bd37efaf6cfcb880c4d2e53738000",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "8efd297b5fa083cc070441347eb05d6b0a69e52f8796b9ba1a4487b12063295e",
+      "condition": "student_t:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "7f0c2eb3d8e786dd9c8fdecc5ac674ee4e93dee5f913a1076aa91e0829e2501a",
+      "old_run_identity": "loss-b-student_t-nll-m0-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "7ccfb15e5f337051052848770ff78c9b15a8e5dd2ed1f5212f1c89450cbb470a",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "65bc71a9e49e99098fdde6c5bd159132fb44b32dc086a9fc97dda171b2359973",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "4a4ab6224e77a2698c2d1afd4918aaeb97dd3ae082448e6563518a6ab63280e6",
+      "condition": "student_t:nll:mobility_off",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m0-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "31fde5fba8c4d035afa1800a73655247c63d9f5451f402bd7b9ddd1ee5a4df46",
+      "old_run_identity": "loss-b-student_t-nll-m0-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m0-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "812856f5da1786d81f480a01ea676acf44594dff446d46e332689f6f465ec272",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f1-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "22129ca1f5b54d8f1203993cd7db7ceeaa08f428618ce4173856afcd06f3175e",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "70c81c80d865d430b8fabc667f082941901abf7a681861224d7a5ccdcda5251f",
+      "condition": "student_t:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f1-s52/config.yaml",
+      "hydrated_training_config_sha256": "442aa4977cc11bbc0559b86a150d6d3c38d9ecdda9d93ebe0b8be76596680683",
+      "old_run_identity": "loss-b-student_t-nll-m1-f1-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "ed3c4764e082f6e9ffd1d30ab95864b8388c4db18625dfeea7770aa05767024b",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f1-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "e42c91ecdc7d7560d0313e8956b385a90dee40a191f219684e8d0a3ac2af60a6",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "58fe8ca2384757781c4a357ecea06f69c875c53a7d5ce6a7123d50b99ec9e58a",
+      "condition": "student_t:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 1,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f1-s53/config.yaml",
+      "hydrated_training_config_sha256": "0fdac1a617a66789a0c65ed684b83b2f6434c7c55d89040acc91609e0c773695",
+      "old_run_identity": "loss-b-student_t-nll-m1-f1-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f1-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "8d2d811ab99251bade3c9973f8fb81f913833c9442cbc07693107647959e2542",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f4-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "a19125034dec9736990374793be436c2dc3295c3df6b75b9bee96322c5efca46",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "a4ededac6c4c27245bddd2300f340e07cc93f5ac4e5097f5cc8b1f97bf3c9145",
+      "condition": "student_t:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f4-s52/config.yaml",
+      "hydrated_training_config_sha256": "4c8768913ab13ec215946468fefa1b844e91fe3d8b342986756d074bcbcf6b38",
+      "old_run_identity": "loss-b-student_t-nll-m1-f4-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "59aec369c59145f863331f3d186b8f4c9658e3040a8cb16e2c346a21829abe7b",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f4-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "6147cc1ff0ee761a03533fce22f3e3ad506118c8b37b0fbbcda412681c8e5f3d",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "411cc43eb99cc6ad27334bf86296b37e007cf6803cafebfea6329d240d1cc0d2",
+      "condition": "student_t:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 4,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f4-s53/config.yaml",
+      "hydrated_training_config_sha256": "839280632abac59791421f7e38bef18f01ebd52c3706f02db1d75ed2b56c1620",
+      "old_run_identity": "loss-b-student_t-nll-m1-f4-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f4-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "ea7a14ad3e247a72828f951931dc7d51db99c78202949dceeb37d06a4e301cb1",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f5-s52/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "b86a4df5b4589f5a3b15f62813c1907ea00bf680e206f9a1fd2d90022ae51378",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s52-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "810fd934c947e71745139f11d25e886d6bcebf1f06ce1212804673cfa6f5c857",
+      "condition": "student_t:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s52-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f5-s52/config.yaml",
+      "hydrated_training_config_sha256": "87c810228eda6c035a5df9f4a31e152b7edc2203b64f52e78c770c43499b8e04",
+      "old_run_identity": "loss-b-student_t-nll-m1-f5-s52-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s52-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 52,
+      "source_bundle_sha256": "2b976bdefdc6733647c3060a066880ea8b2f2321038ea525400ff0c5a0822783",
+      "status": "reusable"
+    },
+    {
+      "checkpoint_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f5-s53/checkpoints/best_model.pt",
+      "checkpoint_selection_metric": "mean_target_wis",
+      "checkpoint_sha256": "d90dec52e329ab640b35cba04b8eea4871f42cbf74d330b5fda098028828a7a5",
+      "completion_receipt": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s53-r1/local_artifact_verification.json",
+      "completion_receipt_sha256": "d62428c2352ceaba1d7615c6fcfa44ee70e7a50f7131c38b76a0ee8c4e3a16b4",
+      "condition": "student_t:nll:mobility_on",
+      "dataset_dvc_md5": "b5b684d5b9f31369895589c413f39291",
+      "fold": 5,
+      "git_sha": "b5fdff0971e74de8bacac333ddbfd473aab4b8e1",
+      "historical_training_config": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s53-r1/artifacts/training/loss-type-research-v1/loss-b-student_t-nll-m1-f5-s53/config.yaml",
+      "hydrated_training_config_sha256": "36531ad0f1618349eb36f2ae98d1ad2f0ba005e0d54b3a37b89b47b98c0c6d76",
+      "old_run_identity": "loss-b-student_t-nll-m1-f5-s53-r1",
+      "old_run_path": "outputs/loss_research/loss-type-research-v1/screen/student_t-nll-m1-f5-s53-r1",
+      "region2vec_dvc_md5": "e04ff23fe17dbbb245315798fd7cd887",
+      "rejection_reasons": [],
+      "seed": 53,
+      "source_bundle_sha256": "fd8790788f57afbb7cdbac6f8db6dcb720a85bf98944a2d29692179f02007e7d",
+      "status": "reusable"
+    }
+  ],
+  "reusable_identities": 48,
+  "schema_version": 1
+}

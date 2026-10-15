@@ -602,3 +602,37 @@ def test_failed_trial_requeue_receives_study_and_identity(
     assert calls[0][0] is study
     assert calls[0][1] == worker.trial_identity(study.trials[0])
     assert calls[0][2] == worker.FAILED_ATTEMPT_BUDGET
+
+
+def test_smoke_declared_full_validation_is_not_clamped_to_two_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = worker.load_campaign(
+        Path("configs/campaigns/loss_type_spatial_smoke_v3.yaml")
+    )
+    captured: list[str] = []
+
+    def load_config(_path: str, *, overrides: list[str]):
+        captured.extend(overrides)
+        return SimpleNamespace(output=SimpleNamespace(log_dir=""))
+
+    class Trainer:
+        experiment_dir = None
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self) -> dict[str, object]:
+            return {
+                "best_val_selection_score": 0.5,
+                "best_val_selection_metric": "mean_target_wis",
+            }
+
+    monkeypatch.setattr(worker.EpiForecasterConfig, "load", load_config)
+    monkeypatch.setattr(worker, "EpiForecasterTrainer", Trainer)
+    trial = optuna.create_study().ask()
+
+    worker.objective(trial, campaign=campaign, run_root=tmp_path, smoketest=True)
+
+    assert "training.max_batches=null" in captured
+    assert "training.max_batches=2" not in captured
