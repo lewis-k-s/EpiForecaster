@@ -39,8 +39,11 @@ STATE_SPACE_CONTRACT_SHA256 = hashlib.sha256(
 ).hexdigest()
 
 
-def _write_minimal_synthetic_zarr(
-    path,
+def _write_minimal_synthetic_zarr(path, **kwargs):
+    _minimal_synthetic_dataset(**kwargs).to_zarr(path, mode="w", zarr_format=2)
+
+
+def _minimal_synthetic_dataset(
     *,
     run_ids,
     dates,
@@ -55,7 +58,7 @@ def _write_minimal_synthetic_zarr(
     contract_json=STATE_SPACE_CONTRACT_JSON,
     contract_sha256=STATE_SPACE_CONTRACT_SHA256,
 ):
-    """Write a corpus that starts one day before ``dates``.
+    """Build a corpus that starts one day before ``dates``.
 
     The extra leading corpus day gives every requested processing date a
     destination-dated death-flow interval, as in the generator contract.
@@ -181,8 +184,7 @@ def _write_minimal_synthetic_zarr(
                 "state_space_contract_sha256": contract_sha256,
             }
         )
-
-    ds.to_zarr(path, mode="w", zarr_format=2)
+    return ds
 
 
 def _write_region_metadata(path, *, region_ids, edar_ids):
