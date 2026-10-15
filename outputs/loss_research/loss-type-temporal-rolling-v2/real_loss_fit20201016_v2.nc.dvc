@@ -1,0 +1,5 @@
+outs:
+- md5: 7768736acf3e8eb96e101d1858c448bd
+  size: 297504329
+  hash: md5
+  path: real_loss_fit20201016_v2.nc
