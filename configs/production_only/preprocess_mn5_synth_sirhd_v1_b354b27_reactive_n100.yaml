@@ -1,0 +1,65 @@
+# Closed-loop reactive SIRHD corpus for synthetic latent-supervision pretraining:
+# epiforecaster_sirhd_v1_netcdf_b354b27_20261015_reactive_n100 (200 runs:
+# 100 Reactive profiles + 100 no-policy Baseline twins, 945 regions).
+#
+# Same 200 simulations as d9c5bae, re-merged by EpiSim.jl b354b27 with
+# factorized mobility (mobility_base_edges + npi_mobility_reduction, rule
+# max_endpoint_self_loop v1), handoff manifests and per-run sparsity. It
+# replaces the d9c5bae dataset identity. SyntheticProcessor rebuilds mobility
+# from the factorized layout and checks parity against mobility_time_varying.
+#
+# Generator QA: qa_passed=false. The EpiSim owner accepted the two failed gates
+# incidence_p90_over_p10 (5.25 < 8) and policy_release_fraction (0.479 < 0.5)
+# on 2026-10-18 (qa_acceptance.json). The workflow honours the waiver only for
+# exactly these gates and this handoff manifest SHA-256.
+
+base_config: "preprocess_mn5_synth.yaml"
+
+env: "mn5"
+synthetic_path: "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc"
+cases_file: "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc"
+mobility_path: "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc"
+wastewater_file: "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc"
+population_file: "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc"
+region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
+
+# The corpus starts on 2020-02-09. sirhd_death_flow is destination-dated, so its
+# first interval ends on 2020-02-10; the first corpus date has no death-flow
+# target and is excluded rather than filled.
+start_date: "2020-02-10"
+end_date: "2021-05-09"
+dataset_name: "synthetic_sirhd_v1_b354b27_reactive_n100_holt_damped"
+vaccination_file: null
+continuous_storage_dtype: "float32"
+
+synthetic_state_space_schema_version: "epiforecaster_sirhd_v1"
+synthetic_state_space_contract_sha256: "d8837d63a35a36c1d095184d58c622880b78c5f4ee85d83370c9e9dac6ffe582"
+
+temporal_covariates:
+  holiday_calendar_file: "data/files/catalonia_preprocessing_inputs_v1/catalonia_holidays.csv"
+
+smoothing:
+  clinical_method: "holt_damped"
+
+source_provenance:
+  generator_repository: "EpiSim.jl"
+  generator_source_commit: "b354b27fdc8bc5d6092e926bffbe3c44cf671f41"
+  simulation_source_commit: "d9c5bae998bf666cd9022cd019d3e195d36cb17e"
+  generator_dvc_commit: "ec5127383b7e27c7e606d9f5fb4460a9f7d2c783"
+  generator_bundle: "epiforecaster_sirhd_v1_netcdf_b354b27_20261015_reactive_n100"
+  replaces_bundle: "epiforecaster_sirhd_v1_netcdf_d9c5bae_20261015_reactive_n100"
+  raw_corpus_dvc_md5: "a5a2ba99cd5c154353c368b33b73dea0"
+  raw_corpus_bytes: 173027666192
+  raw_corpus_physical_file_sha256: "59ef2e556fc73276c2c7887421830982a52fd4a67cc83c3e2f134bbcc8bcbf44"
+  raw_corpus_logical_dataset_sha256: "c8847396740dbf1b330f72f5475a18eb514cc7dde40185fbba4fe4539a4be5cf"
+  raw_corpus_origin_path: "/gpfs/projects/bsc08/shared_projects/MePreCiSa/synthetic_episim_reactive_20261012/runs/reactive_merge_b354b27_20261015_n100/raw_synthetic_observations.nc"
+  state_space_schema_version: "epiforecaster_sirhd_v1"
+  state_space_contract_sha256: "d8837d63a35a36c1d095184d58c622880b78c5f4ee85d83370c9e9dac6ffe582"
+  storage_profile_name: "epiforecaster_sirhd_v1_netcdf_training_v2"
+  storage_profile_sha256: "c94b1c42bb1318ad2f002bd2c8eb0e8c94bf37e5498e92dfcaa7ec98f738ca4b"
+  reporting_profile: "sirhd_pretraining_reporting_v2"
+  reporting_config_sha256: "3fef29b5bc09f298557ee90a7e79787d530e14a12a55054b603e63c039e642c8"
+  mobility_reduction_rule: "max_endpoint_self_loop v1"
+  handoff_manifest_sha256: "019f329acd8c5e906cc2efaf1d5111522c5bccbbe50f7e97921d453f607de9da"
+  handoff_qa_acceptance_sha256: "91266e6f2c6c4c6a66c68d8bace54af2ad4a06a1e2f9aa51689924897012b73d"
+  generation_slurm_jobs: "simulate=47332261 merge=47341859 dvc_hash=47492731"

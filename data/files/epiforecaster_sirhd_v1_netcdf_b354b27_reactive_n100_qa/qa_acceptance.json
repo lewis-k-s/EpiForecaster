@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "decision": "accepted for EpiForecaster pretraining with the failed gates listed below",
+  "decided_by": "EpiSim.jl project owner (user decision in the build session)",
+  "date": "2026-10-18",
+  "generated_qa_passed": false,
+  "handoff_manifest_sha256": "019f329acd8c5e906cc2efaf1d5111522c5bccbbe50f7e97921d453f607de9da",
+  "accepted_failed_gates": [
+    {
+      "gate": "incidence_p90_over_p10",
+      "observed": 5.250528452926475,
+      "criterion": ">= 8x spread in infections per capita"
+    },
+    {
+      "gate": "policy_release_fraction",
+      "observed": 0.4787234042553192,
+      "criterion": ">= 0.5 of policy runs fully lift restrictions at least once"
+    }
+  ],
+  "note": "handoff_manifest.json is left exactly as the merge job wrote it (qa_passed=false). This file records the waiver; it does not change the automated verdict."
+}

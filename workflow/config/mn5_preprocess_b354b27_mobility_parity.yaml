@@ -1,0 +1,72 @@
+# Bounded MN5 acceptance of the factorized mobility loader on the real b354b27
+# corpus. It preprocesses all 200 runs over a 60-day window and checks the
+# rebuilt mobility against mobility_time_varying on every run and 20 dates
+# (synthetic_mobility_parity_runs/dates in the base config). The target
+# preprocess_qa stops after dataset QA and publishes nothing.
+#
+# Result: outputs/preprocessing/qa.json, key synthetic_corpus_provenance.
+# mobility_qa holds max_abs_error, swapped_max_abs_error and max_row_sum_error.
+#
+# Runtime: staging verifies the 173 GB raw object by MD5 (the DVC cache entry is
+# a hard link to the storage object, so nothing is copied), then ~60/455 of the
+# full-corpus I/O plus one dense chunk decompression per run for the parity
+# sample. 180 minutes leaves margin.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: preprocess
+  target: preprocess_qa
+
+dvc:
+  targets:
+    - data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc
+    - data/files/catalonia_preprocessing_inputs_v1.dvc
+  provenance_targets: []
+
+preprocessing:
+  base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_mobility_parity.yaml
+  dataset_name: synthetic_sirhd_v1_b354b27_mobility_parity_qa
+  expected_run_count: 200
+  handoff_manifest: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/handoff_manifest.json
+  handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/qa_acceptance.json
+  required_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  float32_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  nonnegative_variables:
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 180
