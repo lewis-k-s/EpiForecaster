@@ -1125,6 +1125,67 @@ def _processed_dataset_qa(
     }
 
 
+def _synthetic_corpus_provenance(dataset: Any) -> dict[str, Any] | None:
+    """Return the processed synthetic corpus identity and mobility layout QA."""
+    from data.preprocess.pipeline import SYNTHETIC_CORPUS_PROVENANCE_ATTR
+
+    value = dataset.attrs.get(SYNTHETIC_CORPUS_PROVENANCE_ATTR)
+    return json.loads(str(value)) if value is not None else None
+
+
+def _handoff_qa_acceptance(
+    source_root: Path,
+    workflow_config: dict[str, Any],
+    handoff: dict[str, Any],
+    handoff_sha256: str,
+) -> dict[str, Any]:
+    """Accept a failed generator handoff only under an exact owner waiver.
+
+    The waiver must name this handoff manifest by SHA-256 and list exactly the
+    gates that the handoff reports as failed, with the same observed values.
+    """
+    acceptance_value = workflow_config["preprocessing"].get("handoff_qa_acceptance")
+    if acceptance_value is None:
+        raise ValueError("Synthetic generator handoff QA did not pass")
+    relative = Path(str(acceptance_value))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("preprocessing.handoff_qa_acceptance must be source-relative")
+    acceptance_path = (source_root / relative).resolve(strict=True)
+    acceptance_path.relative_to(source_root.resolve(strict=True))
+    acceptance = json.loads(acceptance_path.read_text())
+    if acceptance.get("handoff_manifest_sha256") != handoff_sha256:
+        raise ValueError(
+            "Handoff QA acceptance names a different handoff manifest SHA-256"
+        )
+    if acceptance.get("generated_qa_passed") is not False:
+        raise ValueError("Handoff QA acceptance must record generated_qa_passed=false")
+    failed = {
+        str(gate["gate"]): gate["observed"]
+        for gate in handoff.get("qa_gates", [])
+        if gate.get("passed") is not True
+    }
+    accepted = {
+        str(gate["gate"]): gate["observed"]
+        for gate in acceptance.get("accepted_failed_gates", [])
+    }
+    if not failed:
+        raise ValueError(
+            "Synthetic generator handoff QA did not pass and lists no failed gates"
+        )
+    if accepted != failed:
+        raise ValueError(
+            "Handoff QA acceptance must list exactly the failed gates with their "
+            f"observed values: failed={failed}, accepted={accepted}"
+        )
+    return {
+        "path": relative.as_posix(),
+        "sha256": sha256_file(acceptance_path),
+        "decision": acceptance.get("decision"),
+        "date": acceptance.get("date"),
+        "accepted_failed_gates": sorted(accepted),
+    }
+
+
 def _handoff_provenance_qa(
     source_root: Path,
     workflow_config: dict[str, Any],
@@ -1141,8 +1202,6 @@ def _handoff_provenance_qa(
     handoff_path = (source_root / relative).resolve(strict=True)
     handoff_path.relative_to(source_root.resolve(strict=True))
     handoff = json.loads(handoff_path.read_text())
-    if handoff.get("qa_passed") is not True:
-        raise ValueError("Synthetic generator handoff QA did not pass")
     handoff_sha256 = sha256_file(handoff_path)
     expected_sha256 = effective_config.get("source_provenance", {}).get(
         "handoff_manifest_sha256"
@@ -1151,6 +1210,14 @@ def _handoff_provenance_qa(
         raise ValueError(
             "Synthetic generator handoff manifest SHA-256 does not match the "
             "preprocessing source contract"
+        )
+    acceptance = None
+    if handoff.get("qa_passed") is not True:
+        acceptance = _handoff_qa_acceptance(
+            source_root,
+            workflow_config,
+            handoff,
+            handoff_sha256,
         )
     expected_run_ids = [str(value) for value in handoff.get("run_ids", [])]
     observed_run_ids = [str(value) for value in dataset["run_id"].values]
@@ -1173,7 +1240,8 @@ def _handoff_provenance_qa(
     return {
         "path": relative.as_posix(),
         "sha256": handoff_sha256,
-        "qa_passed": True,
+        "qa_passed": acceptance is None,
+        "qa_acceptance": acceptance,
         "run_ids": expected_run_ids,
         "seeds": seeds,
         "seed_by_run": seed_by_run,
@@ -1233,6 +1301,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
                 effective,
                 dataset,
             ),
+            "synthetic_corpus_provenance": _synthetic_corpus_provenance(dataset),
             "effective_config": str(effective_config),
             "effective_config_sha256": sha256_file(attempt_config),
             "source_config": str(source_config.relative_to(source_root)),

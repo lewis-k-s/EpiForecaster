@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 
 import numpy as np
+import pytest
 import xarray as xr
 import yaml
 
@@ -136,6 +137,94 @@ def test_handoff_provenance_qa_retains_run_ids_and_seeds(tmp_path: Path) -> None
     assert qa["run_ids"] == ["run_b", "run_a"]
     assert qa["seeds"] == {"synthetic_reporting_seed": [22, 11]}
     assert qa["seed_by_run"] == {"synthetic_reporting_seed": {"run_b": 22, "run_a": 11}}
+
+
+def _failed_handoff_with_waiver(tmp_path: Path) -> tuple[Path, dict, dict]:
+    source_root = tmp_path / "source"
+    qa_root = source_root / "data/files/qa"
+    qa_root.mkdir(parents=True)
+    handoff_path = qa_root / "handoff_manifest.json"
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "qa_passed": False,
+                "qa_gates": [
+                    {"gate": "multi_wave_fraction", "observed": 0.37, "passed": True},
+                    {
+                        "gate": "incidence_p90_over_p10",
+                        "observed": 5.25,
+                        "passed": False,
+                    },
+                    {
+                        "gate": "policy_release_fraction",
+                        "observed": 0.48,
+                        "passed": False,
+                    },
+                ],
+                "run_ids": ["run_a"],
+                "seeds": {"simulation_seed": [7]},
+            }
+        )
+    )
+    acceptance = {
+        "generated_qa_passed": False,
+        "handoff_manifest_sha256": run_support.sha256_file(handoff_path),
+        "decision": "accepted",
+        "date": "2026-10-18",
+        "accepted_failed_gates": [
+            {"gate": "incidence_p90_over_p10", "observed": 5.25},
+            {"gate": "policy_release_fraction", "observed": 0.48},
+        ],
+    }
+    config = _preprocess_workflow()
+    config["preprocessing"]["handoff_manifest"] = "data/files/qa/handoff_manifest.json"
+    config["preprocessing"]["handoff_qa_acceptance"] = (
+        "data/files/qa/qa_acceptance.json"
+    )
+    return source_root, config, acceptance
+
+
+def test_failed_handoff_requires_exact_owner_waiver(tmp_path: Path) -> None:
+    source_root, config, acceptance = _failed_handoff_with_waiver(tmp_path)
+    acceptance_path = source_root / "data/files/qa/qa_acceptance.json"
+    dataset = xr.Dataset(coords={"run_id": ["run_a"]})
+
+    acceptance_path.write_text(json.dumps(acceptance))
+    qa = run_support._handoff_provenance_qa(source_root, config, {}, dataset)
+    assert qa is not None
+    assert qa["qa_passed"] is False
+    assert qa["qa_acceptance"]["accepted_failed_gates"] == [
+        "incidence_p90_over_p10",
+        "policy_release_fraction",
+    ]
+
+    partial = dict(
+        acceptance, accepted_failed_gates=acceptance["accepted_failed_gates"][:1]
+    )
+    acceptance_path.write_text(json.dumps(partial))
+    with pytest.raises(ValueError, match="exactly the failed gates"):
+        run_support._handoff_provenance_qa(source_root, config, {}, dataset)
+
+    stale = dict(acceptance, handoff_manifest_sha256="0" * 64)
+    acceptance_path.write_text(json.dumps(stale))
+    with pytest.raises(ValueError, match="different handoff manifest"):
+        run_support._handoff_provenance_qa(source_root, config, {}, dataset)
+
+    del config["preprocessing"]["handoff_qa_acceptance"]
+    with pytest.raises(ValueError, match="handoff QA did not pass"):
+        run_support._handoff_provenance_qa(source_root, config, {}, dataset)
+
+
+def test_preprocess_qa_target_requires_handoff_for_waiver() -> None:
+    config = _preprocess_workflow()
+    config["workflow"]["target"] = "preprocess_qa"
+    assert run_config.workflow_target(config) == "preprocess_qa"
+
+    config["preprocessing"]["handoff_qa_acceptance"] = (
+        "data/files/qa/qa_acceptance.json"
+    )
+    with pytest.raises(ValueError, match="requires preprocessing.handoff_manifest"):
+        run_config.validate_workflow_contract(config)
 
 
 def test_publish_preprocessed_dataset_writes_run_owned_pointer(

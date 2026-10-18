@@ -228,7 +228,11 @@ elif WORKFLOW_KIND == "preprocess":
     )
     PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
     PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
-    DEFAULT_TERMINAL = PREPROCESSING_RECEIPT
+    DEFAULT_TERMINAL = (
+        PREPROCESSING_DONE
+        if WORKFLOW_TARGET == "preprocess_qa"
+        else PREPROCESSING_RECEIPT
+    )
 
 
 def crossval_fold_command(stage, fold):

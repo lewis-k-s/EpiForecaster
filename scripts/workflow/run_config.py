@@ -52,7 +52,8 @@ WORKFLOW_TARGETS = {
     "hpo": {"hpo"},
     "ablation": {"ablation"},
     "crossval": {"crossval"},
-    "preprocess": {"preprocess"},
+    # preprocess_qa stops after dataset QA and publishes nothing.
+    "preprocess": {"preprocess", "preprocess_qa"},
 }
 SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
     ".agents",
@@ -323,6 +324,18 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             if handoff_path.is_absolute() or ".." in handoff_path.parts:
                 raise ValueError(
                     "preprocessing.handoff_manifest must be a source-relative path"
+                )
+        qa_acceptance = preprocessing.get("handoff_qa_acceptance")
+        if qa_acceptance is not None:
+            if handoff_manifest is None:
+                raise ValueError(
+                    "preprocessing.handoff_qa_acceptance requires "
+                    "preprocessing.handoff_manifest"
+                )
+            acceptance_path = Path(str(qa_acceptance))
+            if acceptance_path.is_absolute() or ".." in acceptance_path.parts:
+                raise ValueError(
+                    "preprocessing.handoff_qa_acceptance must be a source-relative path"
                 )
 
     evaluation = workflow_config.get("evaluation", {})

@@ -50,3 +50,8 @@ elif WORKFLOW_KIND == "preprocess":
     rule preprocess:
         input:
             str(PREPROCESSING_RECEIPT)
+
+
+    rule preprocess_qa:
+        input:
+            str(PREPROCESSING_DONE)
