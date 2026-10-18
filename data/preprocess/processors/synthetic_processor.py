@@ -83,10 +83,12 @@ NO_PROFILE_ID = -1
 MOBILITY_PARITY_ATOL = 1e-6
 MOBILITY_ROW_SUM_ATOL = 1e-4
 
-# Per-run scalars passed through to the processed dataset.
+# Per-run scalars passed through to the processed dataset. The profile ID
+# pairs each Reactive run with its no-policy Baseline twin.
 SYNTHETIC_PER_RUN_METADATA = (
     "synthetic_sparsity_level",
     "synthetic_observation_density_scale",
+    "synthetic_profile_id",
 )
 # Corpus identity attributes recorded in the processed dataset provenance.
 SYNTHETIC_PROVENANCE_ATTRS = (

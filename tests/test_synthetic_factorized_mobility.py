@@ -331,6 +331,7 @@ def test_unpadded_run_ids_round_trip(tmp_path):
     np.testing.assert_array_equal(
         result["synthetic_observation_density_scale"].values, [0.5, 2.0]
     )
+    np.testing.assert_array_equal(result["synthetic_profile_id"].values, [3, 17])
 
 
 @pytest.mark.epiforecaster
@@ -380,6 +381,10 @@ def test_pipeline_end_to_end_factorized_netcdf(tmp_path):
         np.testing.assert_array_equal(
             ds["synthetic_observation_density_scale"].sel(run_id=RUN_IDS).values,
             [1.0, 0.5, 2.0],
+        )
+        # Twins share a profile ID in the processed dataset.
+        np.testing.assert_array_equal(
+            ds["synthetic_profile_id"].sel(run_id=RUN_IDS).values, PROFILE_IDS
         )
         provenance = json.loads(ds.attrs["synthetic_corpus_provenance_json"])
     assert provenance["mobility_layout"] == "factorized_edges"
