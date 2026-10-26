@@ -334,6 +334,71 @@ def test_unpadded_run_ids_round_trip(tmp_path):
     np.testing.assert_array_equal(result["synthetic_profile_id"].values, [3, 17])
 
 
+def _seed_above_population(path, run_id):
+    """Rewrite ``path`` so ``run_id`` seeds more infected than its population.
+
+    In region 0, S becomes negative on every date and I absorbs the difference,
+    so the S + I + H + R + D partition still equals the population.
+    """
+    with xr.open_dataset(path, engine="netcdf4") as source:
+        ds = source.load()
+    run = int(np.nonzero(ds["run_id"].values == run_id)[0][0])
+    s = ds["sirhd_S"].values
+    i = ds["sirhd_I"].values
+    excess = np.float32(0.1) * ds["population"].values[run, 0]
+    i[run, :, 0] += s[run, :, 0] + excess
+    s[run, :, 0] = -excess
+    ds.to_netcdf(path, engine="netcdf4")
+
+
+@pytest.mark.epiforecaster
+def test_declared_run_exclusion_drops_invalid_run_and_records_reason(tmp_path):
+    path = tmp_path / "raw.nc"
+    _write_factorized_corpus(path)
+    _seed_above_population(path, "baseline_3")
+    reason = "S negative: initial seeding larger than the region population"
+
+    with pytest.raises(ValueError, match="'sirhd_S' must contain only finite"):
+        _processor(tmp_path, path).process(str(path))
+
+    processor = SyntheticProcessor(
+        _make_config(
+            tmp_path,
+            path,
+            options={
+                "date_chunk_size": 2,
+                "synthetic_run_exclusions": {"baseline_3": reason},
+            },
+        )
+    )
+    result = processor.process(str(path))
+
+    assert sorted(result["mobility"]["mobility"].run_id.values.tolist()) == [
+        "reactive_17",
+        "reactive_3",
+    ]
+    assert "baseline_3" not in result["latent_sird"].run_id.values
+    assert result["synthetic_corpus_provenance"]["run_exclusions"] == [
+        {"run_id": "baseline_3", "reason": reason}
+    ]
+
+
+@pytest.mark.epiforecaster
+def test_run_exclusion_must_name_a_corpus_run(tmp_path):
+    path = tmp_path / "raw.nc"
+    _write_factorized_corpus(path)
+    processor = SyntheticProcessor(
+        _make_config(
+            tmp_path,
+            path,
+            options={"synthetic_run_exclusions": {"reactive_99": "typo"}},
+        )
+    )
+
+    with pytest.raises(ValueError, match=r"absent from the corpus: \['reactive_99'\]"):
+        processor.process(str(path))
+
+
 @pytest.mark.epiforecaster
 def test_rejects_audit_only_model_target(tmp_path):
     path = tmp_path / "raw.nc"

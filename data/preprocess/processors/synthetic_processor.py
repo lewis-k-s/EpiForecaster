@@ -334,6 +334,8 @@ class SyntheticProcessor:
             print(f"Filtered to {len(ds.run_id)} runs: {ds.run_id.values}")
             print()
 
+        ds = self._exclude_runs(ds)
+
         # Validate schema before extraction
         self._validate_schema(ds)
         self._validate_model_facing_roles(ds)
@@ -376,14 +378,37 @@ class SyntheticProcessor:
 
         return result
 
+    def _exclude_runs(self, ds: xr.Dataset) -> xr.Dataset:
+        """Drop the config-declared runs; each must exist in the corpus."""
+        exclusions = self.config.synthetic_run_exclusions
+        if not exclusions:
+            return ds
+        run_ids = ds["run_id"].values.astype(str)
+        missing = sorted(set(exclusions) - set(run_ids))
+        if missing:
+            raise ValueError(
+                f"synthetic_run_exclusions names runs absent from the corpus: {missing}"
+            )
+        ds = ds.isel(run_id=~np.isin(run_ids, list(exclusions)))
+        for run_id, reason in sorted(exclusions.items()):
+            print(f"  Excluded run {run_id}: {reason}")
+        print(f"  {len(ds.run_id)} runs remain after exclusions")
+        return ds
+
     def _corpus_provenance(self, ds: xr.Dataset) -> dict[str, Any]:
-        """Collect corpus identity attributes and the mobility layout QA."""
+        """Collect corpus identity, run exclusions and the mobility layout QA."""
         return {
             **{
                 name: str(ds.attrs[name])
                 for name in SYNTHETIC_PROVENANCE_ATTRS
                 if name in ds.attrs
             },
+            "run_exclusions": [
+                {"run_id": run_id, "reason": reason}
+                for run_id, reason in sorted(
+                    self.config.synthetic_run_exclusions.items()
+                )
+            ],
             **self.mobility_provenance,
         }
 

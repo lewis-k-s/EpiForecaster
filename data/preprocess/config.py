@@ -189,6 +189,9 @@ class PreprocessingConfig:
     # factorized mobility layouts: runs and dates spread over the corpus.
     synthetic_mobility_parity_runs: int = 4
     synthetic_mobility_parity_dates: int = 4
+    # Synthetic runs dropped before extraction, as {run_id: reason}. Every
+    # listed run must exist in the corpus; the reasons go to the provenance.
+    synthetic_run_exclusions: dict[str, str] = field(default_factory=dict)
     hospitalizations_file: str | None = None
     # Conservative availability shift for weekly totals stamped at week start.
     hospitalizations_reporting_lag_days: int = 0
@@ -419,6 +422,18 @@ class PreprocessingConfig:
 
         if self.synthetic_mobility_parity_dates <= 0:
             raise ValueError("synthetic_mobility_parity_dates must be positive")
+
+        if not isinstance(self.synthetic_run_exclusions, dict) or not all(
+            isinstance(run_id, str)
+            and run_id.strip()
+            and isinstance(reason, str)
+            and reason.strip()
+            for run_id, reason in self.synthetic_run_exclusions.items()
+        ):
+            raise ValueError(
+                "synthetic_run_exclusions must map non-empty run IDs to "
+                "non-empty reasons"
+            )
 
         if self.memory_limit_gb <= 0:
             raise ValueError("memory_limit_gb must be positive")
