@@ -140,7 +140,19 @@ validate_dispatch_request() {
     echo "Dispatch request contains an invalid SHA-256 identity" >&2
     return 1
   fi
-  if [ "$NODES" != "1" ] \
+  if [ "$PARTITION" = "gpp" ]; then
+    # CPU-only preprocessing: one task, memory scales with the CPU count.
+    if [ "$WORKFLOW_KIND" != "preprocess" ] \
+      || [ "$NODES" != "1" ] \
+      || [ "$TASKS" != "1" ] \
+      || [[ ! "$CPUS_PER_TASK" =~ ^[1-9][0-9]*$ ]] \
+      || [ "$CPUS_PER_TASK" -gt 112 ] \
+      || [ "$GRES" != "none" ] \
+      || [[ "$QOS" != gp_bscls && "$QOS" != gp_debug ]]; then
+      echo "Dispatch request violates the MN5 single-node GPP allocation contract" >&2
+      return 1
+    fi
+  elif [ "$NODES" != "1" ] \
     || [[ ! "$TASKS" =~ ^[1-4]$ ]] \
     || [ "$CPUS_PER_TASK" != "20" ] \
     || [ "$GRES" != "gpu:$TASKS" ]; then

@@ -6,7 +6,8 @@ and scheduler observation, load and follow the `mn5-cluster-usage` skill.
 
 Snakemake is the production entry point for MN5 preprocessing, training,
 evaluation, cross-validation, HPO, ablation, and artifact promotion. Each
-workflow uses one ACC-node allocation. Snakemake runs as an
+workflow uses one ACC-node allocation; preprocessing may use one GPP node
+instead. Snakemake runs as an
 allocation-internal lightweight coordinator and launches scientific work as
 one or more `srun` job steps.
 
@@ -39,6 +40,22 @@ Single training and evaluation use `N=1`. HPO and ablation use their configured
 worker count. Cross-validation uses up to `N` concurrent folds, with ten folds
 and four GPUs in the production template. `N` must be between one and four.
 The coordinator sets the Snakemake CPU, job, and GPU limits from the allocation.
+
+Preprocessing runs no GPU step, so a `workflow.kind: preprocess` config may
+request one GPP node instead:
+
+```text
+partition=gpp
+qos=gp_bscls or gp_debug
+nodes=1
+tasks=1
+cpus_per_task=1..112
+(no gres)
+```
+
+GPP grants about 1.87 GB of memory per CPU, so `cpus_per_task` sizes the
+memory of the step. The dispatcher passes `--gres=none` to override the GPU
+default in the coordinator batch header. `run-interactive` remains ACC-only.
 
 The batch shell owns the allocation and runs the lightweight Snakemake manager.
 A parallel worker rule launches:

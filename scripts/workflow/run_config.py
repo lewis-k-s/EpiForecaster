@@ -25,6 +25,10 @@ ALLOCATION_FIELDS = (
     "gres",
     "runtime",
 )
+# CPU-only preprocessing may run on one GPP node; GPP has 112 cores per node.
+GPP_QOS = {"gp_bscls", "gp_debug"}
+GPP_MAX_CPUS_PER_TASK = 112
+GPP_GRES = "none"
 DISPATCH_REQUEST_SCHEMA_VERSION = 1
 RESEARCH_OUTPUT_FILES = (
     "research_fit_cases.parquet",
@@ -445,8 +449,55 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     return kind
 
 
+def _validate_gpp_allocation(allocation: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Validate a one-task GPP allocation for CPU-only preprocessing.
+
+    GPP grants memory per allocated CPU, so cpus_per_task sizes both the core
+    count and the memory of the step. The dispatcher passes ``--gres=none``.
+    """
+    if kind != "preprocess":
+        raise ValueError(
+            "GPP allocations are supported only for workflow.kind='preprocess'"
+        )
+    if "gres" in allocation or "gpu" in allocation or "gpus" in allocation:
+        raise ValueError("A GPP allocation must not request GPUs or gres")
+    expected = {"account": "bsc08", "nodes": 1, "tasks": 1}
+    mismatches = {
+        key: (allocation.get(key), value)
+        for key, value in expected.items()
+        if allocation.get(key) != value
+    }
+    qos = allocation.get("qos")
+    if qos not in GPP_QOS:
+        mismatches["qos"] = (qos, " or ".join(sorted(GPP_QOS)))
+    cpus = allocation.get("cpus_per_task")
+    if (
+        not isinstance(cpus, int)
+        or isinstance(cpus, bool)
+        or not 1 <= cpus <= GPP_MAX_CPUS_PER_TASK
+    ):
+        mismatches["cpus_per_task"] = (cpus, f"integer 1..{GPP_MAX_CPUS_PER_TASK}")
+    runtime = allocation.get("runtime")
+    if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
+        mismatches["runtime"] = (runtime, "positive integer minutes")
+    if mismatches:
+        details = ", ".join(
+            f"{key}={actual!r} (expected {expected_value!r})"
+            for key, (actual, expected_value) in mismatches.items()
+        )
+        raise ValueError(f"Invalid MN5 single-node GPP allocation: {details}")
+    return {
+        field: (GPP_GRES if field == "gres" else allocation[field])
+        for field in ALLOCATION_FIELDS
+    }
+
+
 def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
-    """Validate the one-node ACC allocation for the selected workflow kind."""
+    """Validate the one-node allocation for the selected workflow kind.
+
+    ACC is the default for every kind. Preprocessing may instead use one GPP
+    task, because it runs no GPU step.
+    """
     resources = workflow_config.get("resources")
     if not isinstance(resources, dict):
         raise ValueError("Workflow config must define a resources mapping")
@@ -467,6 +518,8 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         )
 
     kind = validate_workflow_contract(workflow_config)
+    if allocation.get("partition") == "gpp":
+        return _validate_gpp_allocation(allocation, kind)
     if kind == "hpo":
         workload = workflow_config.get("optuna")
         workload_name = "optuna"

@@ -11,6 +11,7 @@ import sys
 import time
 import tomllib
 from importlib.metadata import version
+from collections.abc import Callable
 from pathlib import Path
 
 import optuna
@@ -813,6 +814,74 @@ def test_mn5_allocation_rejects_noncanonical_topology(
     config["resources"]["allocation"][field] = value
 
     with pytest.raises(ValueError, match=re.escape(message)):
+        run_config.validate_mn5_allocation(config)
+
+
+def _gpp_preprocess_allocation(config: dict) -> None:
+    config["workflow"]["kind"] = "preprocess"
+    config["workflow"]["target"] = "preprocess"
+    config["preprocessing"] = {
+        "base_config": "configs/production_only/preprocess.yaml",
+        "dataset_name": "synthetic_smoke",
+    }
+    config["resources"]["allocation"] = {
+        "account": "bsc08",
+        "partition": "gpp",
+        "qos": "gp_bscls",
+        "nodes": 1,
+        "tasks": 1,
+        "cpus_per_task": 112,
+        "runtime": 600,
+    }
+
+
+def test_mn5_allocation_accepts_cpu_only_gpp_preprocessing(tmp_path: Path) -> None:
+    config = _workflow_config(tmp_path / "run", tmp_path / "run/source")
+    _gpp_preprocess_allocation(config)
+
+    allocation = run_config.validate_mn5_allocation(config)
+
+    assert allocation["partition"] == "gpp"
+    assert allocation["cpus_per_task"] == 112
+    assert allocation["gres"] == "none"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"gres": "gpu:1"}, "must not request GPUs"),
+        ({"cpus_per_task": 113}, "cpus_per_task=113"),
+        ({"qos": "acc_bscls"}, "qos='acc_bscls'"),
+        ({"tasks": 2}, "tasks=2"),
+        ({"mem_mb": 1000}, "explicit memory"),
+    ],
+)
+def test_mn5_gpp_allocation_rejects_noncanonical_requests(
+    tmp_path: Path,
+    change: dict,
+    message: str,
+) -> None:
+    config = _workflow_config(tmp_path / "run", tmp_path / "run/source")
+    _gpp_preprocess_allocation(config)
+    config["resources"]["allocation"].update(change)
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        run_config.validate_mn5_allocation(config)
+
+
+def test_mn5_gpp_allocation_is_preprocessing_only(tmp_path: Path) -> None:
+    config = _workflow_config(tmp_path / "run", tmp_path / "run/source")
+    config["resources"]["allocation"] = {
+        "account": "bsc08",
+        "partition": "gpp",
+        "qos": "gp_bscls",
+        "nodes": 1,
+        "tasks": 1,
+        "cpus_per_task": 112,
+        "runtime": 60,
+    }
+
+    with pytest.raises(ValueError, match="only for workflow.kind='preprocess'"):
         run_config.validate_mn5_allocation(config)
 
 
@@ -2201,6 +2270,7 @@ def _make_remote_run_staging(
     tmp_path: Path,
     *,
     token: str,
+    configure: Callable[[dict], None] | None = None,
 ) -> tuple[Path, Path, dict[str, str]]:
     """Create a faithful local staging bundle for the transferred runner."""
     run_parent = tmp_path / "runs"
@@ -2253,6 +2323,8 @@ def _make_remote_run_staging(
     }
     config["workflow"]["snakemake_bin"] = str(snakemake_bin)
     config["workflow"]["snakemake_version"] = version("snakemake")
+    if configure is not None:
+        configure(config)
     config_path = staging / "config.yaml"
     config_path.write_text(yaml.safe_dump(config))
     run_config.write_dispatch_request(config_path, state / "dispatch.tsv")
@@ -2435,6 +2507,45 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     assert (
         run_root.parent / "by-slurm" / "12345" / "test-run" / attempt_id
     ).resolve() == run_root
+
+
+def test_transferred_runner_submits_gpp_preprocessing_without_gpus(
+    tmp_path: Path,
+) -> None:
+    staging, run_root, env = _make_remote_run_staging(
+        tmp_path, token="gpp", configure=_gpp_preprocess_allocation
+    )
+    subprocess.run(
+        [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
+        check=True,
+    )
+    fake_bin = tmp_path / "bin"
+    calls = tmp_path / "sbatch.calls"
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        '#!/bin/bash\nprintf \'%s\\n\' "$*" >>"$CALLS_FILE"\n'
+        "printf '12345;cluster\\n'\n"
+    )
+    sbatch.chmod(0o755)
+    env = env | {"PATH": f"{fake_bin}:{env['PATH']}", "CALLS_FILE": str(calls)}
+
+    subprocess.run(
+        [str(run_root / "source/scripts/workflow/remote_run.sh"), "submit"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    call = calls.read_text().splitlines()[0]
+    assert "--partition=gpp" in call
+    assert "--qos=gp_bscls" in call
+    assert "--ntasks=1" in call
+    assert "--cpus-per-task=112" in call
+    # Overrides the GPU default in the coordinator sbatch header.
+    assert "--gres=none" in call
+    assert "--mem" not in call
 
 
 def test_transferred_runner_attaches_without_sbatch(
