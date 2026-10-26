@@ -13,7 +13,13 @@
 # Mobility is rebuilt lazily from the factorized layout; I/O is of the same
 # order as the dense d9c5bae run (200 x 455 x 945 x 945 float32 rebuilt and
 # written, plus the parity sample read from mobility_time_varying). Run the
-# bounded mn5_preprocess_b354b27_mobility_parity.yaml first.
+# bounded mn5_preprocess_b354b27_mobility_parity.yaml first (passed on
+# 2026-10-18, job 47493871).
+#
+# Preprocessing runs no GPU step, so it uses one full GPP node. The NetCDF write
+# is serialized (single-threaded HDF5), so the CPU count buys memory, not speed:
+# 112 CPUs give ~209 GB. The 60-day, 200-run parity run peaked at 55 GiB with a
+# 200 x 20 parity sample; this run keeps the default 4 x 4 sample.
 
 run: {}
 source: {}
@@ -66,10 +72,9 @@ preprocessing:
 resources:
   allocation:
     account: bsc08
-    partition: acc
-    qos: acc_bscls
+    partition: gpp
+    qos: gp_bscls
     nodes: 1
     tasks: 1
-    cpus_per_task: 20
-    gres: gpu:1
+    cpus_per_task: 112
     runtime: 600
