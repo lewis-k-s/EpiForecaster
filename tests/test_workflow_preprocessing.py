@@ -139,6 +139,48 @@ def test_handoff_provenance_qa_retains_run_ids_and_seeds(tmp_path: Path) -> None
     assert qa["seed_by_run"] == {"synthetic_reporting_seed": {"run_b": 22, "run_a": 11}}
 
 
+def test_handoff_qa_accepts_exactly_the_declared_run_exclusions(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    handoff_path = source_root / "data/files/qa/handoff_manifest.json"
+    handoff_path.parent.mkdir(parents=True)
+    handoff_path.write_text(
+        json.dumps(
+            {
+                "qa_passed": True,
+                "run_ids": ["run_a", "run_b", "run_c"],
+                "seeds": {"simulation_seed": [1, 2, 3]},
+            }
+        )
+    )
+    config = _preprocess_workflow()
+    config["preprocessing"]["handoff_manifest"] = "data/files/qa/handoff_manifest.json"
+    reason = "S negative: seeding larger than the region population"
+    effective = {"synthetic_run_exclusions": {"run_b": reason}}
+
+    def qa(run_ids: list[str], exclusions: dict) -> dict | None:
+        dataset = xr.Dataset(coords={"run_id": run_ids})
+        return run_support._handoff_provenance_qa(
+            source_root, config, {"synthetic_run_exclusions": exclusions}, dataset
+        )
+
+    record = qa(["run_a", "run_c"], effective["synthetic_run_exclusions"])
+    assert record is not None
+    assert record["run_ids"] == ["run_a", "run_c"]
+    assert record["handoff_run_ids"] == ["run_a", "run_b", "run_c"]
+    assert record["excluded_runs"] == [{"run_id": "run_b", "reason": reason}]
+    assert record["seed_by_run"] == {"simulation_seed": {"run_a": 1, "run_c": 3}}
+
+    # An undeclared missing run, or a declared run left in, is rejected.
+    with pytest.raises(ValueError, match="minus the declared exclusions"):
+        qa(["run_a"], effective["synthetic_run_exclusions"])
+    with pytest.raises(ValueError, match="minus the declared exclusions"):
+        qa(["run_a", "run_b", "run_c"], effective["synthetic_run_exclusions"])
+    with pytest.raises(ValueError, match=r"absent from the generator handoff"):
+        qa(["run_a", "run_c"], {"run_b": reason, "run_z": "typo"})
+
+
 def _failed_handoff_with_waiver(tmp_path: Path) -> tuple[Path, dict, dict]:
     source_root = tmp_path / "source"
     qa_root = source_root / "data/files/qa"

@@ -1219,22 +1219,38 @@ def _handoff_provenance_qa(
             handoff,
             handoff_sha256,
         )
-    expected_run_ids = [str(value) for value in handoff.get("run_ids", [])]
+    handoff_run_ids = [str(value) for value in handoff.get("run_ids", [])]
+    # Config-declared exclusions are the only runs allowed to be missing.
+    exclusions = effective_config.get("synthetic_run_exclusions") or {}
+    unknown_exclusions = sorted(set(exclusions) - set(handoff_run_ids))
+    if unknown_exclusions:
+        raise ValueError(
+            "synthetic_run_exclusions names runs absent from the generator "
+            f"handoff: {unknown_exclusions}"
+        )
+    expected_run_ids = [
+        run_id for run_id in handoff_run_ids if run_id not in exclusions
+    ]
     observed_run_ids = [str(value) for value in dataset["run_id"].values]
     if sorted(expected_run_ids) != sorted(observed_run_ids):
         raise ValueError(
-            "Processed run IDs differ from the synthetic generator handoff"
+            "Processed run IDs differ from the synthetic generator handoff "
+            "minus the declared exclusions"
         )
     seeds = handoff.get("seeds")
     if not isinstance(seeds, dict) or not seeds:
         raise ValueError("Synthetic generator handoff has no seed record")
     for name, values in seeds.items():
-        if not isinstance(values, list) or len(values) != len(expected_run_ids):
+        if not isinstance(values, list) or len(values) != len(handoff_run_ids):
             raise ValueError(
                 f"Synthetic generator seed vector {name!r} does not match run count"
             )
     seed_by_run = {
-        name: dict(zip(expected_run_ids, values, strict=True))
+        name: {
+            run_id: seed
+            for run_id, seed in zip(handoff_run_ids, values, strict=True)
+            if run_id not in exclusions
+        }
         for name, values in seeds.items()
     }
     return {
@@ -1243,6 +1259,11 @@ def _handoff_provenance_qa(
         "qa_passed": acceptance is None,
         "qa_acceptance": acceptance,
         "run_ids": expected_run_ids,
+        "handoff_run_ids": handoff_run_ids,
+        "excluded_runs": [
+            {"run_id": run_id, "reason": str(exclusions[run_id])}
+            for run_id in sorted(exclusions)
+        ],
         "seeds": seeds,
         "seed_by_run": seed_by_run,
         "corpus_full_tree_sha256": handoff.get("corpus_full_tree_sha256"),
