@@ -1284,10 +1284,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     preprocessing = config["preprocessing"]
     source_config = source_root / Path(str(preprocessing["base_config"]))
     effective = _load_preprocessing_document(source_config, source_root)
-    output_root = run_root / "outputs/preprocessing"
-    effective_config = output_root / "effective_config.yaml"
-    output_marker = output_root / ".preprocessed.done"
-    qa_path = output_root / "qa.json"
+    output_marker = run_root / "outputs/preprocessing/.preprocessed.done"
     attempts = run_root / ".state/attempts/preprocessing"
     identity = {"config_sha256": sha256_file(config_path), "effective": effective}
     # Normalize YAML dates for the JSON receipt comparison on a later attempt.
@@ -1295,26 +1292,66 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     if restore_attempt(attempts, identity, run_root):
         return output_marker
     attempt = new_attempt(attempts)
-    effective["output_path"] = str(attempt / "dataset")
+    # Node-local output keeps the write, the post-write read-back, QA and the
+    # SHA-256 off shared GPFS; one sequential copy then moves the result into
+    # the attempt. The container /tmp is the step's node-local scratch.
+    node_local_output = bool(preprocessing.get("node_local_output", False))
+    local_root = (
+        Path(tempfile.mkdtemp(prefix="epiforecaster-preprocess-"))
+        if node_local_output
+        else None
+    )
+    try:
+        return _run_preprocessing_attempt(
+            config,
+            effective,
+            attempt,
+            identity,
+            run_root,
+            source_root,
+            source_config,
+            local_root,
+        )
+    finally:
+        if local_root is not None:
+            shutil.rmtree(local_root, ignore_errors=True)
+
+
+def _run_preprocessing_attempt(
+    config: dict[str, Any],
+    effective: dict[str, Any],
+    attempt: Path,
+    identity: dict[str, Any],
+    run_root: Path,
+    source_root: Path,
+    source_config: Path,
+    local_root: Path | None,
+) -> Path:
+    output_root = run_root / "outputs/preprocessing"
+    effective_config = output_root / "effective_config.yaml"
+    output_marker = output_root / ".preprocessed.done"
+    qa_path = output_root / "qa.json"
+    build_root = attempt if local_root is None else local_root
+    effective["output_path"] = str(build_root / "dataset")
     attempt_config = attempt / "effective_config.yaml"
     write_yaml(attempt_config, effective)
 
     from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
 
     pipeline_config = PreprocessingConfig.from_file(attempt_config)
-    attempt_dataset = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
+    built_dataset = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
         strict=True
     )
-    attempt_dataset.relative_to(attempt.resolve(strict=True))
-    if attempt_dataset.is_symlink() or not attempt_dataset.is_file():
+    built_dataset.relative_to(build_root.resolve(strict=True))
+    if built_dataset.is_symlink() or not built_dataset.is_file():
         raise ValueError(
-            f"Preprocessing output must be a regular NetCDF file: {attempt_dataset}"
+            f"Preprocessing output must be a regular NetCDF file: {built_dataset}"
         )
     dataset_path = output_root / f"{preprocessing_dataset_name(config)}.nc"
 
     import xarray as xr
 
-    dataset = xr.open_dataset(attempt_dataset, engine="netcdf4")
+    dataset = xr.open_dataset(built_dataset, engine="netcdf4")
     try:
         qa_record = {
             "schema_version": 2,
@@ -1336,6 +1373,17 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
         }
     finally:
         dataset.close()
+    dataset_sha256 = sha256_file(built_dataset)
+    if local_root is None:
+        attempt_dataset = built_dataset
+    else:
+        attempt_dataset = attempt / "dataset" / built_dataset.name
+        attempt_dataset.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(built_dataset, attempt_dataset)
+        if attempt_dataset.stat().st_size != built_dataset.stat().st_size:
+            raise ValueError(
+                f"Copy of the node-local dataset is incomplete: {attempt_dataset}"
+            )
     attempt_qa = attempt / "qa.json"
     attempt_marker = attempt / ".preprocessed.done"
     write_json(attempt_qa, qa_record)
@@ -1343,7 +1391,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
         attempt_marker,
         {
             "dataset": str(dataset_path),
-            "dataset_sha256": sha256_file(attempt_dataset),
+            "dataset_sha256": dataset_sha256,
             "qa": str(qa_path),
             "qa_sha256": sha256_file(attempt_qa),
         },

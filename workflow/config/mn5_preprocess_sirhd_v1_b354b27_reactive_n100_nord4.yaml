@@ -30,6 +30,9 @@ preprocessing:
   base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_reactive_n100.yaml
   dataset_name: synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped
   expected_run_count: 198
+  # Nord4's ~200 GB SSD already holds the 173 GB staged input, so the
+  # ~118 GB output is written to GPFS.
+  node_local_output: false
   handoff_manifest: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/handoff_manifest.json
   handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/qa_acceptance.json
   required_variables:

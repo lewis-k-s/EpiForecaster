@@ -41,6 +41,9 @@ preprocessing:
   base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_reactive_n100.yaml
   dataset_name: synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped
   expected_run_count: 198
+  # GPP NVMe (~960 GB) holds the staged 173 GB input and the ~118 GB output,
+  # so write, read back, QA and hash the dataset node-locally.
+  node_local_output: true
   handoff_manifest: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/handoff_manifest.json
   handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/qa_acceptance.json
   required_variables:

@@ -246,6 +246,63 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
     assert calls[0].read_bytes() == b"partial"
 
 
+def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monkeypatch):
+    import data.preprocess
+
+    run = tmp_path / "run"
+    source = tmp_path / "source"
+    local_tmp = tmp_path / "node-local"
+    for path in (run, source, local_tmp):
+        path.mkdir()
+    (source / "preprocess.yaml").write_text("dataset_name: tiny\n")
+    config_path = run / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"kind": "preprocess"},
+                "preprocessing": {
+                    "base_config": "preprocess.yaml",
+                    "dataset_name": "tiny",
+                    "node_local_output": True,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(run_support, "validate_workflow_contract", lambda config: None)
+    monkeypatch.setattr(run_support.tempfile, "tempdir", str(local_tmp))
+    monkeypatch.setattr(
+        data.preprocess.PreprocessingConfig,
+        "from_file",
+        lambda path: SimpleNamespace(**yaml.safe_load(path.read_text())),
+    )
+    built: list[Path] = []
+
+    class Pipeline:
+        def __init__(self, config):
+            self.config = config
+
+        def run(self):
+            path = Path(self.config.output_path) / "tiny-dated.nc"
+            path.parent.mkdir(parents=True)
+            xr.Dataset({"cases": ("date", [1.0, 2.0])}).to_netcdf(path)
+            built.append(path)
+            return path
+
+    monkeypatch.setattr(data.preprocess, "OfflinePreprocessingPipeline", Pipeline)
+    monkeypatch.setattr(
+        run_support, "_processed_dataset_qa", lambda *args: {"ok": True}
+    )
+    monkeypatch.setattr(run_support, "_handoff_provenance_qa", lambda *args: None)
+
+    marker = run_support.run_preprocessing(config_path, source, run)
+
+    assert built[0].is_relative_to(local_tmp)
+    output = run / "outputs/preprocessing/tiny.nc"
+    record = json.loads(marker.read_text())
+    assert record["dataset_sha256"] == run_support.sha256_file(output)
+    assert not any(local_tmp.iterdir())
+
+
 def _cache_environment(tmp_path):
     run = tmp_path / "run"
     source = tmp_path / "source"

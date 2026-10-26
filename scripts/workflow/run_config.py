@@ -336,6 +336,8 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 raise ValueError(
                     "preprocessing.handoff_manifest must be a source-relative path"
                 )
+        if not isinstance(preprocessing.get("node_local_output", False), bool):
+            raise ValueError("preprocessing.node_local_output must be Boolean")
         qa_acceptance = preprocessing.get("handoff_qa_acceptance")
         if qa_acceptance is not None:
             if handoff_manifest is None:
@@ -482,11 +484,7 @@ def _validate_cpu_allocation(allocation: dict[str, Any], kind: str) -> dict[str,
     if qos not in allowed_qos:
         mismatches["qos"] = (qos, " or ".join(sorted(allowed_qos)))
     cpus = allocation.get("cpus_per_task")
-    if (
-        not isinstance(cpus, int)
-        or isinstance(cpus, bool)
-        or not 1 <= cpus <= max_cpus
-    ):
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or not 1 <= cpus <= max_cpus:
         mismatches["cpus_per_task"] = (cpus, f"integer 1..{max_cpus}")
     runtime = allocation.get("runtime")
     if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
