@@ -104,7 +104,8 @@ load_singularity() {
   for candidate in \
     "${SINGULARITY_MODULE:-singularity/4.1.5}" \
     "Singularity/4.1.5" \
-    "SingularityCE/4.1.5"; do
+    "SingularityCE/4.1.5" \
+    "singularity/4.1.0"; do
     if module load "$candidate" >/dev/null 2>&1; then
       loaded=1
       break
@@ -112,7 +113,7 @@ load_singularity() {
   done
 
   if [ "$loaded" -ne 1 ]; then
-    echo "Unable to load Singularity 4.1.5 module" >&2
+    echo "Unable to load a Singularity 4.1 module (4.1.5 on MN5, 4.1.0 on Nord4)" >&2
     return 1
   fi
 }

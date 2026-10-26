@@ -885,6 +885,45 @@ def test_mn5_gpp_allocation_is_preprocessing_only(tmp_path: Path) -> None:
         run_config.validate_mn5_allocation(config)
 
 
+def test_mn5_allocation_accepts_cpu_only_nord4_preprocessing(tmp_path: Path) -> None:
+    config = _workflow_config(tmp_path / "run", tmp_path / "run/source")
+    _gpp_preprocess_allocation(config)
+    config["resources"]["allocation"].update(
+        {"partition": "main", "qos": "bsc_ls", "cpus_per_task": 48}
+    )
+
+    allocation = run_config.validate_mn5_allocation(config)
+
+    assert allocation["partition"] == "main"
+    assert allocation["cpus_per_task"] == 48
+    assert allocation["gres"] == "none"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"gres": "gpu:1"}, "must not request GPUs"),
+        ({"cpus_per_task": 49}, "cpus_per_task=49"),
+        ({"qos": "gp_bscls"}, "qos='gp_bscls'"),
+        ({"tasks": 2}, "tasks=2"),
+    ],
+)
+def test_mn5_nord4_allocation_rejects_noncanonical_requests(
+    tmp_path: Path,
+    change: dict,
+    message: str,
+) -> None:
+    config = _workflow_config(tmp_path / "run", tmp_path / "run/source")
+    _gpp_preprocess_allocation(config)
+    config["resources"]["allocation"].update(
+        {"partition": "main", "qos": "bsc_ls", "cpus_per_task": 48}
+    )
+    config["resources"]["allocation"].update(change)
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        run_config.validate_mn5_allocation(config)
+
+
 def test_mn5_allocation_scales_with_study_worker_count(tmp_path: Path) -> None:
     config = _workflow_config(tmp_path / "run", tmp_path / "run/source")
     config["optuna"]["workers"] = 2
@@ -2544,6 +2583,50 @@ def test_transferred_runner_submits_gpp_preprocessing_without_gpus(
     assert "--ntasks=1" in call
     assert "--cpus-per-task=112" in call
     # Overrides the GPU default in the coordinator sbatch header.
+    assert "--gres=none" in call
+    assert "--mem" not in call
+
+
+def _nord4_preprocess_allocation(config: dict) -> None:
+    _gpp_preprocess_allocation(config)
+    config["resources"]["allocation"].update(
+        {"partition": "main", "qos": "bsc_ls", "cpus_per_task": 48}
+    )
+
+
+def test_transferred_runner_submits_nord4_preprocessing_without_gpus(
+    tmp_path: Path,
+) -> None:
+    staging, run_root, env = _make_remote_run_staging(
+        tmp_path, token="nord4", configure=_nord4_preprocess_allocation
+    )
+    subprocess.run(
+        [str(staging / "source/scripts/workflow/remote_run.sh"), "publish"],
+        env=env,
+        check=True,
+    )
+    fake_bin = tmp_path / "bin"
+    calls = tmp_path / "sbatch.calls"
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        '#!/bin/bash\nprintf \'%s\\n\' "$*" >>"$CALLS_FILE"\n'
+        "printf '12345;cluster\\n'\n"
+    )
+    sbatch.chmod(0o755)
+    env = env | {"PATH": f"{fake_bin}:{env['PATH']}", "CALLS_FILE": str(calls)}
+
+    subprocess.run(
+        [str(run_root / "source/scripts/workflow/remote_run.sh"), "submit"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    call = calls.read_text().splitlines()[0]
+    assert "--partition=main" in call
+    assert "--qos=bsc_ls" in call
+    assert "--cpus-per-task=48" in call
     assert "--gres=none" in call
     assert "--mem" not in call
 
