@@ -84,6 +84,7 @@ load_singularity() {
     for profile_script in \
       /etc/profile.d/00-bsc.sh \
       /etc/profile.d/01-module.sh \
+      /etc/profile.d/01-modules.sh \
       /apps/modules/LMOD/8.7/lmod/8.7/init/profile; do
       if [ -r "$profile_script" ]; then
         # shellcheck disable=SC1090
