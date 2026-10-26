@@ -137,10 +137,21 @@ validate_arguments() {
 
 # Load the site module only when Singularity is absent from the current PATH.
 load_singularity() {
+  local status=0
+
+  # Site profile scripts and the Nord4 module function read unset variables
+  # and return non-zero, so the module section runs without errexit/nounset.
+  set +eu
+  load_singularity_module
+  status=$?
+  set -eu
+  return "$status"
+}
+
+load_singularity_module() {
   local profile_script candidate loaded=0
 
   if ! command -v module >/dev/null 2>&1; then
-    set +u
     for profile_script in \
       /etc/profile.d/00-bsc.sh \
       /etc/profile.d/01-module.sh \
@@ -154,7 +165,6 @@ load_singularity() {
         break
       fi
     done
-    set -u
   fi
 
   if command -v singularity >/dev/null 2>&1; then
