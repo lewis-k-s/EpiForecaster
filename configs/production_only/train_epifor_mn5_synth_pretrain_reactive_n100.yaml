@@ -1,8 +1,9 @@
 env: "mn5"
 
 # Production synthetic pretraining config for the closed-loop reactive corpus
-# epiforecaster_sirhd_v1_netcdf_d9c5bae_20261015_reactive_n100 (100 Reactive
-# profiles + 100 no-policy Baseline twins). Latent targets are the generator's
+# epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100 (99 Reactive profiles +
+# 99 no-policy Baseline twins; the profile-13 pair is excluded because its seed
+# exceeded the region population). Latent targets are the generator's
 # model-aligned sirhd_* partition. Stage-2 fine-tuning should use
 # train_epifor_mn5_full.yaml with training.init_checkpoint_path set to the best
 # checkpoint from this run.
@@ -12,7 +13,7 @@ env: "mn5"
 # Four epochs keep the cycle well inside one acc_bscls allocation.
 
 data:
-  dataset_path: data/processed/synthetic_sirhd_v1_d9c5bae_reactive_n100_holt_damped.nc
+  dataset_path: data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.nc
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.

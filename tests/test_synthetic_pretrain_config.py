@@ -295,20 +295,62 @@ def test_reactive_preprocessing_pins_state_space_contract() -> None:
     )
 
 
-def test_reactive_pretraining_consumes_reactive_corpus() -> None:
-    workflow = yaml.safe_load(
-        Path("workflow/config/mn5_synth_pretrain_reactive_n100.yaml").read_text()
-    )
+B354B27_RAW_POINTER = (
+    "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc"
+)
+B354B27_PROCESSED_PATH = (
+    "data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.nc"
+)
+
+
+def test_b354b27_processed_pointer_pins_published_dataset() -> None:
+    pointer = yaml.safe_load(Path(f"{B354B27_PROCESSED_PATH}.dvc").read_text())
+
+    (output,) = pointer["outs"]
+    assert output["md5"] == "946dae8597ffe4fce705b0ddedf2131d"
+    assert output["size"] == 117834036904
+    assert output["path"] == Path(B354B27_PROCESSED_PATH).name
+
+
+@pytest.mark.parametrize(
+    "workflow_path",
+    [
+        "workflow/config/mn5_synth_pretrain_reactive_n100.yaml",
+        "workflow/config/mn5_synth_pretrain_reactive_n100_interactive_debug.yaml",
+    ],
+)
+def test_reactive_pretraining_consumes_reactive_corpus(workflow_path: str) -> None:
+    workflow = yaml.safe_load(Path(workflow_path).read_text())
     training = EpiForecasterConfig.load(
         Path(workflow["training"]["base_config"]),
         overrides=workflow["training"]["overrides"],
     )
 
     assert validate_workflow_contract(workflow) == "train"
-    assert f"{REACTIVE_PROCESSED_PATH}.dvc" in workflow["dvc"]["targets"]
-    assert workflow["dvc"]["provenance_targets"] == [REACTIVE_RAW_POINTER]
-    assert training.data.dataset_path == REACTIVE_PROCESSED_PATH
+    assert f"{B354B27_PROCESSED_PATH}.dvc" in workflow["dvc"]["targets"]
+    assert workflow["dvc"]["provenance_targets"] == [B354B27_RAW_POINTER]
+    assert training.data.dataset_path == B354B27_PROCESSED_PATH
     assert training.data.mobility_min_flow_raw == 0.0
     assert training.training.loss.joint.latent.total_weight > 0.0
     (phase,) = training.training.curriculum.schedule
     assert phase.end_epoch == training.training.epochs
+
+
+def test_reactive_interactive_debug_keeps_production_loader_settings() -> None:
+    workflow = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_synth_pretrain_reactive_n100_interactive_debug.yaml"
+        ).read_text()
+    )
+    base = EpiForecasterConfig.load(Path(workflow["training"]["base_config"]))
+    debug = EpiForecasterConfig.load(
+        Path(workflow["training"]["base_config"]),
+        overrides=workflow["training"]["overrides"],
+    )
+
+    assert workflow["workflow"]["target"] == "train"
+    assert workflow["training"]["max_batches"] == 300
+    assert debug.training.compile is False
+    assert debug.training.profiler.enabled is False
+    for field in ("batch_size", "num_workers", "prefetch_factor", "pin_memory"):
+        assert getattr(debug.training, field) == getattr(base.training, field)
