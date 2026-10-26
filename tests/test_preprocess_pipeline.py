@@ -367,6 +367,41 @@ class TestPipelineStorage:
         finally:
             saved.close()
 
+    def test_postwrite_summary_streams_saved_mobility(
+        self, mock_config, tmp_path, capsys
+    ):
+        """The read-back counts must not load the full mobility tensor."""
+        regions = ["r1", "r2", "r3"]
+        mobility = np.ones((2, 4, 3, 3), dtype=np.float32)
+        mobility[1, 2] = np.nan
+        path = tmp_path / "saved.nc"
+        xr.Dataset(
+            {
+                "mobility": (("run_id", "date", "origin", "destination"), mobility),
+                "cases": (("run_id", "date", REGION_COORD), np.ones((2, 4, 3))),
+            },
+            coords={
+                "run_id": ["a", "b"],
+                "date": pd.date_range("2022-01-01", periods=4),
+                "origin": regions,
+                "destination": regions,
+                REGION_COORD: regions,
+            },
+        ).to_netcdf(path, engine="netcdf4")
+        opened: list[xr.Dataset] = []
+        real_open = xr.open_dataset
+
+        def recording_open(*args, **kwargs):
+            ds = real_open(*args, **kwargs)
+            opened.append(ds)
+            return ds
+
+        with patch("data.preprocess.pipeline.xr.open_dataset", recording_open):
+            OfflinePreprocessingPipeline(mock_config)._log_postwrite_summary(path)
+
+        assert opened[0]["mobility"].chunks is not None
+        assert "Verified mobility data: 63 non-null values" in capsys.readouterr().out
+
 
 class TestPreprocessingConfigValidation:
     def test_invalid_continuous_storage_dtype_raises(self, mock_config):

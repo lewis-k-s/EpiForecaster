@@ -780,8 +780,12 @@ class OfflinePreprocessingPipeline:
                     print(f"Sample coords [{label}]: {dim} == {ref} -> {coords_match}")
 
     def _log_postwrite_summary(self, dataset_path: Path) -> None:
-        """Verify the saved dataset is valid (e.g., mobility not all NaN)."""
-        ds = xr.open_dataset(dataset_path, engine="netcdf4")
+        """Verify the saved dataset is valid (e.g., mobility not all NaN).
+
+        The file is opened with its on-disk chunks so the non-null counts
+        stream; an unchunked open would load the full mobility tensor.
+        """
+        ds = xr.open_dataset(dataset_path, engine="netcdf4", chunks={})
         try:
             if "mobility" in ds:
                 # Check a sample to ensure data was preserved (not all NaN)
