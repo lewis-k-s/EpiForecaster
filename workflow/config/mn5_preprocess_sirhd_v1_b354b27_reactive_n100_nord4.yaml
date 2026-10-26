@@ -1,0 +1,71 @@
+# Nord4 twin of mn5_preprocess_sirhd_v1_b354b27_reactive_n100.yaml: the same
+# 198-run b354b27 preprocess (profile-13 twins excluded), dispatched to the
+# Nord4 scheduler (COMPUTE_HOST=n4), which has its own queue but shares the
+# same GPFS run root, container and DVC storage with MN5.
+#
+# One exclusive Nord4 main node: 48 Skylake cores and about 94 GB of memory.
+# The NetCDF write is single-threaded HDF5, so the core count does not set the
+# speed. The post-write read-back of mobility is streamed (50d7e25), so the
+# step no longer holds the mobility tensor in memory. The runtime is longer
+# than on GPP because Skylake cores are slower.
+#
+# Science inputs and outputs are identical to the GPP config; only the
+# scheduler binding differs.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: preprocess
+  target: preprocess
+
+dvc:
+  targets:
+    - data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc
+    - data/files/catalonia_preprocessing_inputs_v1.dvc
+  provenance_targets: []
+
+preprocessing:
+  base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_reactive_n100.yaml
+  dataset_name: synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped
+  expected_run_count: 198
+  handoff_manifest: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/handoff_manifest.json
+  handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/qa_acceptance.json
+  required_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  float32_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  nonnegative_variables:
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+
+resources:
+  allocation:
+    account: bsc08
+    partition: main
+    qos: bsc_ls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 48
+    runtime: 1440
