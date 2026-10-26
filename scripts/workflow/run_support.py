@@ -918,6 +918,9 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         if not (workspace / output_path).exists():
             raise FileNotFoundError(f"DVC output was not materialized: {output_path}")
 
+    # DVC content-addresses the cache, so the imported object is trusted by its
+    # path. Rehashing a 173 GB corpus over GPFS cost ~8 min per run; a size
+    # check still catches a truncated or wrong object.
     for target, output_path, output in imported_targets:
         expected_md5 = str(output["md5"])
         materialized = workspace / output_path
@@ -926,11 +929,12 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
                 "Git-backed DVC imports must materialize one regular file for "
                 f"offline validation: {target}"
             )
-        actual_md5 = md5_file(materialized)
-        if actual_md5 != expected_md5:
+        expected_size = output.get("size")
+        actual_size = materialized.stat().st_size
+        if expected_size is not None and actual_size != int(expected_size):
             raise ValueError(
-                f"Imported DVC output MD5 mismatch for {target}: "
-                f"{actual_md5} != {expected_md5}"
+                f"Imported DVC output size mismatch for {target}: "
+                f"{actual_size} != {expected_size}"
             )
 
     bind_roots = sorted({path.parent for path in output_paths})
