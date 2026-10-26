@@ -16,10 +16,11 @@
 # bounded mn5_preprocess_b354b27_mobility_parity.yaml first (passed on
 # 2026-10-18, job 47493871).
 #
-# Preprocessing runs no GPU step, so it uses one full GPP node. The NetCDF write
-# is serialized (single-threaded HDF5), so the CPU count buys memory, not speed:
-# 112 CPUs give ~209 GB. The 60-day, 200-run parity run peaked at 55 GiB with a
-# 200 x 20 parity sample; this run keeps the default 4 x 4 sample.
+# Preprocessing runs no GPU step, so it uses GPP. The NetCDF write is
+# serialized (single-threaded HDF5), so the CPU count buys memory, not speed:
+# 64 CPUs give ~120 GB. The 55 GiB peak of the 60-day parity run came from an
+# unchunked post-write read-back of mobility (now streamed); without it, memory
+# no longer holds the mobility tensor.
 
 run: {}
 source: {}
@@ -76,5 +77,5 @@ resources:
     qos: gp_bscls
     nodes: 1
     tasks: 1
-    cpus_per_task: 112
+    cpus_per_task: 64
     runtime: 600
