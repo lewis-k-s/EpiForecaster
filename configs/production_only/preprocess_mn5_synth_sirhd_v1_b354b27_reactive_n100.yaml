@@ -12,6 +12,11 @@
 # incidence_p90_over_p10 (5.25 < 8) and policy_release_fraction (0.479 < 0.5)
 # on 2026-10-18 (qa_acceptance.json). The workflow honours the waiver only for
 # exactly these gates and this handoff manifest SHA-256.
+#
+# Profile 13 (13_Baseline and 13_Reactive) is excluded: its seeding puts more
+# infected than people into region 17162, so sirhd_S < 0 for 37 dates. The
+# dataset therefore has 198 runs (99 profiles). The strict latent checks stay
+# on for every other run. Found by job 48046366 on 2026-10-26.
 
 base_config: "preprocess_mn5_synth.yaml"
 
@@ -28,9 +33,13 @@ region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_ed
 # target and is excluded rather than filled.
 start_date: "2020-02-10"
 end_date: "2021-05-09"
-dataset_name: "synthetic_sirhd_v1_b354b27_reactive_n100_holt_damped"
+dataset_name: "synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped"
 vaccination_file: null
 continuous_storage_dtype: "float32"
+
+synthetic_run_exclusions:
+  "13_Baseline": "sirhd_S negative in region 17162 for 37 dates (2020-02-09..2020-03-16): initial seeding (I0=259.4) exceeds the region population (236)"
+  "13_Reactive": "sirhd_S negative in region 17162 for 37 dates (2020-02-09..2020-03-16): initial seeding (I0=259.4) exceeds the region population (236)"
 
 synthetic_state_space_schema_version: "epiforecaster_sirhd_v1"
 synthetic_state_space_contract_sha256: "d8837d63a35a36c1d095184d58c622880b78c5f4ee85d83370c9e9dac6ffe582"

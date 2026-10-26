@@ -8,7 +8,8 @@
 #
 # The generator handoff has qa_passed=false. Preprocessing accepts it only with
 # the committed owner waiver, which must name this handoff SHA-256 and exactly
-# its failed gates. Run IDs and seed vectors are checked against the handoff.
+# its failed gates. Run IDs and seed vectors are checked against the handoff
+# minus the two declared profile-13 exclusions (198 runs).
 #
 # Mobility is rebuilt lazily from the factorized layout; I/O is of the same
 # order as the dense d9c5bae run (200 x 455 x 945 x 945 float32 rebuilt and
@@ -38,8 +39,8 @@ dvc:
 
 preprocessing:
   base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_reactive_n100.yaml
-  dataset_name: synthetic_sirhd_v1_b354b27_reactive_n100_holt_damped
-  expected_run_count: 200
+  dataset_name: synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped
+  expected_run_count: 198
   handoff_manifest: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/handoff_manifest.json
   handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/qa_acceptance.json
   required_variables:

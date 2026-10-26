@@ -29,7 +29,9 @@ dvc:
 preprocessing:
   base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_mobility_parity.yaml
   dataset_name: synthetic_sirhd_v1_b354b27_mobility_parity_qa
-  expected_run_count: 200
+  # The base config now excludes the profile-13 twins; job 47493871 ran
+  # on all 200 runs before that exclusion existed.
+  expected_run_count: 198
   handoff_manifest: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/handoff_manifest.json
   handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100_qa/qa_acceptance.json
   required_variables:
