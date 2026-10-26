@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import errno
 import fcntl
 import hashlib
 import importlib.metadata
@@ -1402,15 +1403,25 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
                 "Preprocessing publication already exists for this run"
             )
         destination.rmdir()
+    # Stage next to the dataset on the shared filesystem and hard-link it.
+    # Node-local /tmp may be smaller than the dataset (118 GB for b354b27 on
+    # Nord4), and DVC moves the payload into the shared cache anyway.
     scratch_staging = Path(
-        tempfile.mkdtemp(prefix=f"epiforecaster-publication-{os.getpid()}-")
+        tempfile.mkdtemp(prefix=f".publication.staging-{os.getpid()}-", dir=output_root)
     )
     payload = scratch_staging / publication_payload
     commit_staging = output_root / f".publication.commit-{os.getpid()}"
     try:
-        shutil.copy2(dataset, payload)
-        if sha256_file(payload) != str(marker["dataset_sha256"]):
-            raise ValueError("Publication staging changed the processed dataset")
+        try:
+            os.link(dataset, payload)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copy2(dataset, payload)
+            if sha256_file(payload) != str(marker["dataset_sha256"]):
+                raise ValueError(
+                    "Publication staging changed the processed dataset"
+                ) from None
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
         _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)

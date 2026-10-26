@@ -344,12 +344,16 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
         return original_copy2(*args, **kwargs)
 
     monkeypatch.setattr(run_support.shutil, "copy2", observe_copy2)
+    staged_inodes: list[tuple[Path, int]] = []
 
     def fake_run(command: list[str], *, cwd: Path | None = None, **_: object) -> None:
         assert cwd is not None
         if command[1:3] == ["init", "--no-scm"]:
             (cwd / ".dvc").mkdir()
         elif command[1:3] == ["add", "synthetic_smoke.nc"]:
+            staged_inodes.append(
+                (cwd.parent, (cwd / "synthetic_smoke.nc").stat().st_ino)
+            )
             (cwd / "synthetic_smoke.nc.dvc").write_text(
                 yaml.safe_dump(
                     {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.nc"}]}
@@ -367,6 +371,11 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     assert not (receipt_path.parent / "synthetic_smoke.nc").exists()
     assert (run_root / ".state/preprocessed_published.done").is_file()
     assert len(observed_copy_calls) >= 1
+    # The payload is hard-linked beside the dataset, not copied to /tmp.
+    output_root = run_root / "outputs/preprocessing"
+    dataset_inode = (output_root / "dataset.nc").stat().st_ino
+    assert staged_inodes == [(output_root, dataset_inode)]
+    assert not list(output_root.glob(".publication.staging-*"))
 
 
 def test_publish_preprocessed_dataset_rejects_nonempty_publication(
