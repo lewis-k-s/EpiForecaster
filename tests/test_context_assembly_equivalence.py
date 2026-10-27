@@ -120,11 +120,9 @@ def _legacy_item_features(dataset: EpiDataset, idx: int) -> torch.Tensor:
             feat.append(dataset.precomputed_ww[global_t, node_ids].unsqueeze(-1))
             feat.append(dataset.precomputed_ww_mask[global_t, node_ids].unsqueeze(-1))
         x = torch.cat(feat, dim=-1)
-        if (
-            dataset.config.model.gnn_depth > 0
-            and global_t in dataset._precomputed_k_hop_masks
-        ):
-            k_hop_mask = dataset._precomputed_k_hop_masks[global_t][target_idx]
+        if dataset._target_k_hop_reach is not None:
+            target_slot = list(dataset.target_nodes).index(target_idx)
+            k_hop_mask = dataset._target_k_hop_reach[global_t, target_slot]
             local_k_hop_mask = k_hop_mask[node_ids].clone()
             local_k_hop_mask[local_target_idx] = True
             x = torch.where(

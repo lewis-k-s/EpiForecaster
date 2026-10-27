@@ -568,47 +568,23 @@ def test_k_hop_masking_sample_ordering(tmp_path, sample_ordering):
 
 @pytest.mark.epiforecaster
 def test_k_hop_reachability_cache(tmp_path):
-    """Verify that _k_hop_cache is populated correctly."""
+    """Verify that the target k-hop reachability is precomputed correctly."""
     zarr_path = tmp_path / "cache.zarr"
     _write_chain_dataset(str(zarr_path), num_nodes=4, periods=10)
 
     config = _make_config(str(zarr_path), gnn_depth=2)
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
 
-    # Access an item to populate the cache
-    _ = dataset[0]
-
-    # Check that cache has entries for time steps
-    assert hasattr(dataset, "_precomputed_k_hop_masks"), (
-        "Dataset should have _precomputed_k_hop_masks"
-    )
-
-    # With gnn_depth=2, we should have cache entries for all time steps
-    cache_keys = list(dataset._precomputed_k_hop_masks.keys())
-    assert len(cache_keys) > 0, "Cache should be populated"
-
-    # Each key should be an integer (time_step)
-    for key in cache_keys:
-        assert isinstance(key, int), f"Cache key should be int, got {type(key)}"
+    # With gnn_depth=2, every timestep has one row per target node.
+    reach = dataset._target_k_hop_reach
+    assert reach is not None
+    assert reach.shape == (10, 1, 4), f"Unexpected reach shape {reach.shape}"
 
     # Verify reachability for a specific case
     # For chain 0-1-2-3 at time 0:
     # - 1-hop from node 0: {1}
     # - 2-hop from node 0: {1, 2}
-    time_step = 0
-
-    assert time_step in dataset._precomputed_k_hop_masks, (
-        f"Cache key {time_step} should exist"
-    )
-
-    reach_matrix = dataset._precomputed_k_hop_masks[time_step]
-    # reach_matrix is (N, N) where reach[i, j] is True if j is within k-hop of i
-    assert reach_matrix.shape == (4, 4), (
-        f"Reach matrix should be (4, 4), got {reach_matrix.shape}"
-    )
-
-    # Check reachability from node 0
-    reach_from_0 = reach_matrix[0]
+    reach_from_0 = reach[0, 0]
     # Node 0 should not be in its own k-hop (diagonal is False)
     assert not reach_from_0[0], "Diagonal should be False (self excluded)"
     # Node 1 should be reachable (1-hop)

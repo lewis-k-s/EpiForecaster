@@ -304,17 +304,16 @@ class EpiDataset(Dataset):
             # Reuse shared tensors from another dataset (e.g., train -> val/test)
             self.preloaded_mobility = preloaded_mobility
             self.mobility_mask = mobility_mask
-            for time_step in range(self.preloaded_mobility.shape[0]):
-                weights_t = self.preloaded_mobility[time_step]
-                mask_t = self.mobility_mask[time_step]
-                if torch.any(weights_t[~mask_t] != 0):
-                    raise ValueError(
-                        "Shared mobility weights must be zero outside mobility_mask"
-                    )
-                if not torch.isfinite(weights_t).all() or torch.any(weights_t < 0):
-                    raise ValueError(
-                        "Shared mobility weights must be finite and nonnegative"
-                    )
+            if torch.any(self.preloaded_mobility.masked_fill(self.mobility_mask, 0)):
+                raise ValueError(
+                    "Shared mobility weights must be zero outside mobility_mask"
+                )
+            if not torch.isfinite(self.preloaded_mobility).all() or torch.any(
+                self.preloaded_mobility < 0
+            ):
+                raise ValueError(
+                    "Shared mobility weights must be finite and nonnegative"
+                )
             logger.info(
                 f"Reusing shared mobility tensor: {self.preloaded_mobility.shape}, "
                 f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
@@ -390,10 +389,10 @@ class EpiDataset(Dataset):
         # Each entry is a (N,) tensor with local indices or -1 for non-context nodes
         self._global_to_local_cache: dict[int, torch.Tensor] = {}
 
-        # Precomputed k-hop reachability masks for all timesteps
-        # Dict mapping time_step -> (N, N) boolean tensor
+        # Precomputed k-hop reachability rows of the target nodes for all
+        # timesteps: (T, n_targets, N) boolean, rows in target_nodes order.
         # This replaces on-demand computation to eliminate CPU bottleneck in __getitem__
-        self._precomputed_k_hop_masks: dict[int, torch.Tensor] = {}
+        self._target_k_hop_reach: torch.Tensor | None = None
 
         # Setup biomarker preprocessor
         if biomarker_preprocessor is None:
@@ -584,7 +583,7 @@ class EpiDataset(Dataset):
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
         # This moves expensive matrix operations from per-sample to startup time
         # Must be done after _temporal_coords is set but before dataset is closed
-        self._precomputed_k_hop_masks = self._precompute_k_hop_masks()
+        self._target_k_hop_reach = self._precompute_target_k_hop_reach()
 
         # Extract sparsity level once during initialization (before dataset is closed)
         # Dataset is already filtered to a single run, so synthetic_sparsity_level is a scalar
@@ -702,18 +701,10 @@ class EpiDataset(Dataset):
         neighbor_table[time_index, target_index, positions.unsqueeze(0)] = True
         self.context_neigh_table = neighbor_table
 
-        if self._precomputed_k_hop_masks:
-            # Stack per-timestep (N_all, N_all) reachability masks (dict keyed
-            # by timestep), restrict columns to context nodes ->
-            # (T, T_n, N_ctx), matching the neighbor table layout.
-            k_hop = torch.stack(
-                [
-                    mask.index_select(0, targets)
-                    for mask in self._precomputed_k_hop_masks.values()
-                ],
-                dim=0,
-            )
-            k_hop = k_hop.index_select(2, node_ids)
+        if self._target_k_hop_reach is not None:
+            # Restrict (T, T_n, N_all) target reachability columns to context
+            # nodes -> (T, T_n, N_ctx), matching the neighbor table layout.
+            k_hop = self._target_k_hop_reach.index_select(2, node_ids)
             k_hop[time_index, target_index, positions.unsqueeze(0)] = True
             self.context_khop_table = k_hop.contiguous()
         else:
@@ -1755,11 +1746,8 @@ class EpiDataset(Dataset):
         khop_mask[target_idx] = True
 
         # Fast path: reuse precomputed per-target k-hop masks if available.
-        if self._precomputed_k_hop_masks:
-            for reach in self._precomputed_k_hop_masks.values():
-                if target_idx.numel() == 0:
-                    break
-                khop_mask = khop_mask | reach[target_idx].any(dim=0)
+        if self._target_k_hop_reach is not None:
+            khop_mask = khop_mask | self._target_k_hop_reach.any(dim=1).any(dim=0)
         else:
             # Fallback path for safety if precomputed masks are unavailable.
             for time_step in range(len(self._temporal_coords)):
@@ -1776,19 +1764,20 @@ class EpiDataset(Dataset):
         khop_mask[target_idx] = True
         return khop_mask
 
-    def _precompute_k_hop_masks(self) -> dict[int, torch.Tensor]:
-        """Precompute k-hop reachability masks for all timesteps at startup.
+    def _precompute_target_k_hop_reach(self) -> torch.Tensor | None:
+        """Precompute target k-hop reachability for all timesteps at startup.
 
         This moves expensive CPU matrix operations from per-sample __getitem__
         to initialization time, eliminating the 67% data loading bottleneck.
         Masks are stored as CPU tensors and shared across forked workers.
 
         Returns:
-            Dict mapping time_step -> (N, N) boolean tensor where
-            mask[target_idx, node_idx] = True if node is within k-hop of target
+            (T, n_targets, N) boolean tensor where reach[t, slot, node] is True
+            if node is within k hops of target_nodes[slot] at timestep t, or
+            None when gnn_depth is 0.
         """
         if self.config.model.gnn_depth <= 0:
-            return {}
+            return None
 
         gnn_depth = self.config.model.gnn_depth
         logger.info(
@@ -1796,28 +1785,26 @@ class EpiDataset(Dataset):
             f"(depth={gnn_depth}, nodes={self.num_nodes})..."
         )
 
-        masks = {}
+        targets = torch.tensor(self.target_nodes, dtype=torch.long)
+        rows = []
         for time_step in range(len(self._temporal_coords)):
-            # Get adjacency for this timestep
             adjacency = self._get_adjacency_at_time(time_step)
 
-            # Rows receive from source columns; each boolean product adds one hop.
-            # O(T * depth * N^3), paid once at init.
-            reach = adjacency.clone()
+            # Rows receive from source columns; each boolean product adds one
+            # hop. Only target rows are kept, and (R @ A)[targets] equals
+            # R[targets] @ A, so O(T * depth * n_targets * N^2) at init.
+            reach = adjacency.index_select(0, targets)
             if gnn_depth > 1:
                 adj_f = adjacency.to(torch.float32)
-                reach_f = reach.to(torch.float32)
                 for _ in range(1, gnn_depth):
-                    new_reach = (reach_f @ adj_f) > 0
-                    reach = reach | new_reach
-                    reach_f = reach.to(torch.float32)
+                    reach = reach | ((reach.to(torch.float32) @ adj_f) > 0)
+            rows.append(reach)
 
-            # Exclude self (diagonal = False)
-            reach.fill_diagonal_(False)
-            masks[time_step] = reach
-
-        logger.info(f"K-hop mask precomputation complete: {len(masks)} masks")
-        return masks
+        reach = torch.stack(rows)
+        # Exclude self.
+        reach[:, torch.arange(targets.numel()), targets] = False
+        logger.info(f"K-hop mask precomputation complete: {reach.shape[0]} masks")
+        return reach
 
     def __repr__(self) -> str:
         """String representation of the dataset."""
