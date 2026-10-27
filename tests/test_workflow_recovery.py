@@ -17,6 +17,7 @@ import pytest
 import xarray as xr
 import yaml
 
+from data.preprocess.zarr_layout import write_dataset
 from scripts.workflow import attempts, run_support
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -218,13 +219,13 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
             self.config = config
 
         def run(self):
-            path = Path(self.config.output_path) / "tiny-dated.nc"
+            path = Path(self.config.output_path) / "tiny-dated.zarr.zip"
             path.parent.mkdir(parents=True)
             calls.append(path)
             if len(calls) == 1:
                 path.write_bytes(b"partial")
                 raise RuntimeError("preempted")
-            xr.Dataset({"cases": ("date", [1.0, 2.0])}).to_netcdf(path)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
             return path
 
     monkeypatch.setattr(data.preprocess, "OfflinePreprocessingPipeline", Pipeline)
@@ -235,7 +236,7 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
     with pytest.raises(RuntimeError, match="preempted"):
         run_support.run_preprocessing(config_path, source, run)
     marker = run_support.run_preprocessing(config_path, source, run)
-    output = run / "outputs/preprocessing/tiny.nc"
+    output = run / "outputs/preprocessing/tiny.zarr.zip"
     original = output.read_bytes()
     for path in output.parent.iterdir():
         path.unlink()
@@ -282,9 +283,9 @@ def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monke
             self.config = config
 
         def run(self):
-            path = Path(self.config.output_path) / "tiny-dated.nc"
+            path = Path(self.config.output_path) / "tiny-dated.zarr.zip"
             path.parent.mkdir(parents=True)
-            xr.Dataset({"cases": ("date", [1.0, 2.0])}).to_netcdf(path)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
             built.append(path)
             return path
 
@@ -297,7 +298,7 @@ def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monke
     marker = run_support.run_preprocessing(config_path, source, run)
 
     assert built[0].is_relative_to(local_tmp)
-    output = run / "outputs/preprocessing/tiny.nc"
+    output = run / "outputs/preprocessing/tiny.zarr.zip"
     record = json.loads(marker.read_text())
     assert record["dataset_sha256"] == run_support.sha256_file(output)
     assert not any(local_tmp.iterdir())

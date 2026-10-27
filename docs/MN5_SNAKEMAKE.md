@@ -177,7 +177,7 @@ for training, while the raw synthetic Zarr is a provenance-only DVC target.
 
 The corrected 20-run corpus uses
 `workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml`. The immutable
-run owns the processed NetCDF, QA record, generated DVC pointer, and publication
+run owns the processed dataset, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
@@ -290,8 +290,16 @@ Publication uses atomic hard links within the run filesystem, so large payloads
 do not require a second copy. Keep attempt directories for the lifetime of the
 run: they contain the training logs, dynamics, and recovery evidence. Incomplete
 training attempts restart from the configured initial state; completed folds
-are reused. Preprocessing declares `<dataset_name>.nc` as a DAG output, and
+are reused. Preprocessing declares `<dataset_name>.zarr.zip` as a DAG output, and
 publication depends on that file as well as its QA evidence.
+
+Processed datasets are sharded Zarr v3 stores packed into one uncompressed
+ZIP64 file (`data/preprocess/zarr_layout.py`, layout `synthetic-zarr-v1`).
+Each per-run variable has one shard per run, so `preprocessing.write_workers`
+processes write runs in parallel and verify each run by read-back. DVC tracks
+the packed file as one object. `python -m data.preprocess.convert_netcdf`
+converts an earlier NetCDF output without changing its values. See
+`docs/SYNTHETIC_ZARR_LAYOUT.md`.
 
 ## Prepare and submit
 

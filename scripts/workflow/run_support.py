@@ -46,6 +46,10 @@ from training.training_dynamics import (
     load_training_dynamics_identity,
 )
 
+# Packed sharded Zarr store (data.preprocess.zarr_layout.ZARR_ZIP_SUFFIX).
+# Kept local so host-side commands do not import the scientific stack.
+PROCESSED_DATASET_SUFFIX = ".zarr.zip"
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -1284,6 +1288,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     preprocessing = config["preprocessing"]
     source_config = source_root / Path(str(preprocessing["base_config"]))
     effective = _load_preprocessing_document(source_config, source_root)
+    effective["write_workers"] = int(preprocessing.get("write_workers", 1))
     output_marker = run_root / "outputs/preprocessing/.preprocessed.done"
     attempts = run_root / ".state/attempts/preprocessing"
     identity = {"config_sha256": sha256_file(config_path), "effective": effective}
@@ -1345,13 +1350,15 @@ def _run_preprocessing_attempt(
     built_dataset.relative_to(build_root.resolve(strict=True))
     if built_dataset.is_symlink() or not built_dataset.is_file():
         raise ValueError(
-            f"Preprocessing output must be a regular NetCDF file: {built_dataset}"
+            f"Preprocessing output must be a regular packed Zarr file: {built_dataset}"
         )
-    dataset_path = output_root / f"{preprocessing_dataset_name(config)}.nc"
+    dataset_path = (
+        output_root / f"{preprocessing_dataset_name(config)}{PROCESSED_DATASET_SUFFIX}"
+    )
 
-    import xarray as xr
+    from data.epi_dataset import open_processed_dataset
 
-    dataset = xr.open_dataset(built_dataset, engine="netcdf4")
+    dataset = open_processed_dataset(built_dataset)
     try:
         qa_record = {
             "schema_version": 2,
@@ -1425,15 +1432,15 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     """Publish a QA-passed dataset as a run-owned DVC pointer."""
     config = load_yaml(config_path)
     dataset_name = preprocessing_dataset_name(config)
-    dataset_pointer = f"{dataset_name}.nc.dvc"
-    publication_payload = f"{dataset_name}.nc"
+    dataset_pointer = f"{dataset_name}{PROCESSED_DATASET_SUFFIX}.dvc"
+    publication_payload = f"{dataset_name}{PROCESSED_DATASET_SUFFIX}"
     output_root = run_root / "outputs/preprocessing"
     marker_path = output_root / ".preprocessed.done"
     marker = json.loads(marker_path.read_text())
     dataset = Path(str(marker["dataset"])).resolve(strict=True)
     dataset.relative_to(output_root.resolve(strict=True))
     if dataset.is_symlink() or not dataset.is_file():
-        raise ValueError("Preprocessed dataset must be a non-symlink NetCDF file")
+        raise ValueError("Preprocessed dataset must be a non-symlink packed Zarr file")
     if sha256_file(dataset) != str(marker["dataset_sha256"]):
         raise ValueError("Preprocessed dataset changed after QA")
     qa_path = Path(str(marker["qa"])).resolve(strict=True)

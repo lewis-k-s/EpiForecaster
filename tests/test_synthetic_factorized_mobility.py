@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from data.epi_dataset import open_processed_dataset
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
 from data.preprocess.processors.synthetic_processor import (
     SyntheticProcessor,
@@ -436,7 +437,7 @@ def test_pipeline_end_to_end_factorized_netcdf(tmp_path):
 
     output_path = OfflinePreprocessingPipeline(config).run()
 
-    with xr.open_dataset(output_path, engine="netcdf4") as ds:
+    with open_processed_dataset(output_path) as ds:
         mobility = ds["mobility"].sel(
             run_id=RUN_IDS, origin=REGION_IDS, destination=REGION_IDS
         )

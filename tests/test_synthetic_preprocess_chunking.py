@@ -8,6 +8,7 @@ import pytest
 import warnings
 import xarray as xr
 
+from data.epi_dataset import open_processed_dataset
 from data.preprocess.processors.synthetic_processor import SyntheticProcessor
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
 from tests.dataset_test_helpers import make_preprocessing_config
@@ -828,13 +829,11 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_dataset(output_path, engine="netcdf4")
+    saved = open_processed_dataset(output_path)
 
-    chunks = saved["edar_biomarker_N1_mask"].encoding.get("chunksizes")
-    assert chunks is not None
-    assert chunks[0] == min(config.run_id_chunk_size, len(run_ids))
-    assert chunks[1] == len(dates)
-    assert chunks[2] == len(region_ids)
+    # One shard per run, whatever the in-memory run_id chunking.
+    shards = saved["edar_biomarker_N1_mask"].encoding.get("shards")
+    assert shards == (1, len(dates), len(region_ids))
 
     saved.close()
 
@@ -870,7 +869,7 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
     output_path = pipeline.run()
 
-    ds = xr.open_dataset(output_path, engine="netcdf4")
+    ds = open_processed_dataset(output_path)
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
@@ -943,7 +942,7 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_dataset(output_path, engine="netcdf4")
+    saved = open_processed_dataset(output_path)
 
     saved_mob = saved["mobility"].isel(
         run_id=0, date=0, origin=slice(0, 2), destination=slice(0, 2)

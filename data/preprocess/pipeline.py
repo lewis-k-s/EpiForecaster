@@ -11,9 +11,7 @@ from dataclasses import asdict
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any
 
-import dask
 import numpy as np
 import xarray as xr
 import yaml
@@ -21,6 +19,7 @@ import yaml
 from data import dtypes as dtype_utils
 from .config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
 from .utils import load_csv_with_string_ids
+from .zarr_layout import ZARR_ZIP_SUFFIX, RunWriteResult, write_dataset
 from .processors.alignment_processor import AlignmentProcessor
 from .processors.catalonia_cases_processor import CataloniaCasesProcessor
 from .processors.deaths_processor import DeathsProcessor
@@ -448,7 +447,7 @@ class OfflinePreprocessingPipeline:
         """Save aligned dataset to processed dir."""
         print("Saving aligned dataset to processed dir...")
         aligned_dataset_path = Path(self.config.output_path) / (
-            self.config.dataset_name + ".nc"
+            self.config.dataset_name + ZARR_ZIP_SUFFIX
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -605,9 +604,8 @@ class OfflinePreprocessingPipeline:
                 positive_preservation, sort_keys=True
             )
 
-        # Convert boolean variables to int8 for NetCDF4 compatibility.
-        # NetCDF4 has no native boolean type; xarray reads int8 masks back
-        # and consumers cast to torch.bool when building tensors.
+        # Store masks as int8: consumers cast them to torch.bool, and the
+        # processed contract has used int8 masks since the NetCDF layout.
         bool_vars = {
             name: var.astype(np.int8)
             for name, var in rechunked_dataset.data_vars.items()
@@ -615,13 +613,11 @@ class OfflinePreprocessingPipeline:
         }
         if bool_vars:
             rechunked_dataset = rechunked_dataset.assign(bool_vars)
-            print(f"  Converted {len(bool_vars)} boolean variables to int8 for NetCDF")
+            print(f"  Converted {len(bool_vars)} boolean variables to int8")
 
-        # NetCDF4 does not support float16. If the configured storage dtype is
-        # float16 (legacy zarr default), upcast all continuous variables to
-        # float32 before writing.
+        # Keep continuous values in float32. float16 makes small positive
+        # synthetic mobility flows (down to ~1e-20) zero.
         if continuous_dtype == "float16":
-            continuous_dtype = np.float32
             upcast_vars = {
                 name: var.astype(np.float32)
                 for name, var in rechunked_dataset.data_vars.items()
@@ -629,47 +625,14 @@ class OfflinePreprocessingPipeline:
             }
             if upcast_vars:
                 rechunked_dataset = rechunked_dataset.assign(upcast_vars)
-                print(
-                    f"  Upcast {len(upcast_vars)} float16 variables to float32 for NetCDF"
-                )
+                print(f"  Upcast {len(upcast_vars)} float16 variables to float32")
 
-        # Build NetCDF encoding: preserve chunking layout and apply zlib
-        # compression.  Each variable gets chunksizes matching the dask
-        # chunking computed above, plus lossless zlib level 4.
-        encoding: dict[str, dict[str, Any]] = {}
-        for var_name, var in rechunked_dataset.data_vars.items():
-            chunksizes = []
-            for dim in var.dims:
-                dim_size = var.sizes[dim]
-                if dim == "run_id":
-                    chunksizes.append(min(self.config.run_id_chunk_size, dim_size))
-                elif dim == "date":
-                    chunksizes.append(min(self.config.date_chunk_size, dim_size))
-                elif dim in ("origin", "destination", "region_id"):
-                    chunksizes.append(min(self.config.mobility_chunk_size, dim_size))
-                else:
-                    chunksizes.append(dim_size)
-            entry: dict[str, Any] = {
-                "chunksizes": tuple(chunksizes),
-                "zlib": True,
-                "complevel": 4,
-            }
-            # Integer types must not pair with zlib/fletcher in netCDF4
-            if var.dtype.kind in ("i", "u"):
-                entry = {"chunksizes": tuple(chunksizes)}
-            encoding[var_name] = entry
-
-        # NetCDF4 input and output share a non-thread-safe HDF5 backend.  A
-        # threaded Dask write can deadlock while it reads raw NetCDF chunks and
-        # writes the processed file.  Serialize this boundary explicitly.
-        with dask.config.set(scheduler="single-threaded"):
-            rechunked_dataset.to_netcdf(
-                aligned_dataset_path,
-                mode="w",
-                encoding=encoding,
-                engine="netcdf4",
-            )
-        self._log_postwrite_summary(aligned_dataset_path)
+        results = write_dataset(
+            rechunked_dataset,
+            aligned_dataset_path,
+            workers=self.config.write_workers,
+        )
+        self._log_postwrite_summary(results)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
 
@@ -779,31 +742,19 @@ class OfflinePreprocessingPipeline:
                     )
                     print(f"Sample coords [{label}]: {dim} == {ref} -> {coords_match}")
 
-    def _log_postwrite_summary(self, dataset_path: Path) -> None:
-        """Verify the saved dataset is valid (e.g., mobility not all NaN).
+    @staticmethod
+    def _log_postwrite_summary(results: list[RunWriteResult]) -> None:
+        """Check the per-run non-null counts that the Zarr writers reported.
 
-        The file is opened with its on-disk chunks so the non-null counts
-        stream; an unchunked open would load the full mobility tensor.
+        Each writer verified its regions by read-back, so the summary does not
+        read the packed store again.
         """
-        ds = xr.open_dataset(dataset_path, engine="netcdf4", chunks={})
-        try:
-            if "mobility" in ds:
-                # Check a sample to ensure data was preserved (not all NaN)
-                sample = ds["mobility"].isel(
-                    self._default_sample_indexer(ds["mobility"])
-                )
-                if hasattr(sample, "compute"):
-                    sample = sample.compute()
-                if bool(sample.isnull().all()):
-                    raise ValueError(
-                        "Saved mobility sample is all NaN; preprocessing failed."
-                    )
-                non_null_count = ds["mobility"].notnull().sum().compute()
-                print(
-                    f"  Verified mobility data: {non_null_count.values} non-null values"
-                )
-            if "cases" in ds:
-                non_null_count = ds["cases"].notnull().sum().compute()
-                print(f"  Verified cases data: {non_null_count.values} non-null values")
-        finally:
-            ds.close()
+        for name in ("mobility", "cases"):
+            counts = [
+                result.non_null[name] for result in results if name in result.non_null
+            ]
+            if not counts:
+                continue
+            if name == "mobility" and sum(counts) == 0:
+                raise ValueError("Saved mobility is all NaN; preprocessing failed.")
+            print(f"  Verified {name} data: {sum(counts)} non-null values")

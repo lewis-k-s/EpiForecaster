@@ -338,6 +338,22 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 )
         if not isinstance(preprocessing.get("node_local_output", False), bool):
             raise ValueError("preprocessing.node_local_output must be Boolean")
+        write_workers = preprocessing.get("write_workers", 1)
+        cpus = (
+            workflow_config.get("resources", {})
+            .get("allocation", {})
+            .get("cpus_per_task")
+        )
+        if (
+            not isinstance(write_workers, int)
+            or isinstance(write_workers, bool)
+            or write_workers < 1
+            or (isinstance(cpus, int) and write_workers > cpus)
+        ):
+            raise ValueError(
+                "preprocessing.write_workers must be an integer between 1 and "
+                "resources.allocation.cpus_per_task"
+            )
         qa_acceptance = preprocessing.get("handoff_qa_acceptance")
         if qa_acceptance is not None:
             if handoff_manifest is None:

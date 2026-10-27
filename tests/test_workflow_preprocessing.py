@@ -350,13 +350,13 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
         assert cwd is not None
         if command[1:3] == ["init", "--no-scm"]:
             (cwd / ".dvc").mkdir()
-        elif command[1:3] == ["add", "synthetic_smoke.nc"]:
+        elif command[1:3] == ["add", "synthetic_smoke.zarr.zip"]:
             staged_inodes.append(
-                (cwd.parent, (cwd / "synthetic_smoke.nc").stat().st_ino)
+                (cwd.parent, (cwd / "synthetic_smoke.zarr.zip").stat().st_ino)
             )
-            (cwd / "synthetic_smoke.nc.dvc").write_text(
+            (cwd / "synthetic_smoke.zarr.zip.dvc").write_text(
                 yaml.safe_dump(
-                    {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.nc"}]}
+                    {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.zarr.zip"}]}
                 )
             )
 
@@ -367,8 +367,8 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     receipt = json.loads(receipt_path.read_text())
     assert receipt["dvc_md5"] == "published.md5"
     assert receipt["input_dvc_hashes"] == {"data/files/raw.zarr.dvc": "raw.dir"}
-    assert (receipt_path.parent / "synthetic_smoke.nc.dvc").is_file()
-    assert not (receipt_path.parent / "synthetic_smoke.nc").exists()
+    assert (receipt_path.parent / "synthetic_smoke.zarr.zip.dvc").is_file()
+    assert not (receipt_path.parent / "synthetic_smoke.zarr.zip").exists()
     assert (run_root / ".state/preprocessed_published.done").is_file()
     assert len(observed_copy_calls) >= 1
     # The payload is hard-linked beside the dataset, not copied to /tmp.

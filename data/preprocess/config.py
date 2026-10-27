@@ -158,6 +158,8 @@ class PreprocessingConfig:
         chunk_sizes: Custom chunk sizes for Zarr arrays
 
         num_workers: Number of parallel workers for processing
+        write_workers: Processes that compute and write runs of the packed
+            Zarr output (one run per task)
         chunk_size: Chunk size for processing large files
         memory_limit_gb: Memory limit for processing (GB)
 
@@ -242,6 +244,8 @@ class PreprocessingConfig:
     num_workers: int = 4
     chunk_size: int = 1000
     run_id_chunk_size: int = 5  # Chunk size for run_id dimension
+    # Processes that compute and write runs of the packed Zarr output.
+    write_workers: int = 1
     date_chunk_size: int = 30  # Chunk size for date dimension in zarr output
     mobility_chunk_size: int = (
         100  # Chunk size for spatial dims (origin/destination/region_id)
@@ -411,6 +415,9 @@ class PreprocessingConfig:
         if self.run_id_chunk_size <= 0:
             raise ValueError("run_id_chunk_size must be positive")
 
+        if self.write_workers <= 0:
+            raise ValueError("write_workers must be positive")
+
         if self.date_chunk_size <= 0:
             raise ValueError("date_chunk_size must be positive")
 
@@ -555,7 +562,7 @@ class PreprocessingConfig:
 
     def get_dataset_filename(self) -> str:
         """Generate standardized filename for the processed dataset."""
-        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.nc"
+        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.zarr.zip"
 
     def get_output_dataset_path(self) -> Path:
         """Get full path for the output dataset."""

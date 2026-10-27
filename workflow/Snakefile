@@ -220,11 +220,13 @@ elif WORKFLOW_KIND == "preprocess":
     PREPROCESSING_DATASET_NAME = preprocessing_dataset_name(config)
     PREPROCESSING_ROOT = RUN_ROOT / "outputs/preprocessing"
     PREPROCESSING_EFFECTIVE_CONFIG = PREPROCESSING_ROOT / "effective_config.yaml"
-    PREPROCESSING_DATASET = PREPROCESSING_ROOT / f"{PREPROCESSING_DATASET_NAME}.nc"
+    PREPROCESSING_DATASET = (
+        PREPROCESSING_ROOT / f"{PREPROCESSING_DATASET_NAME}.zarr.zip"
+    )
     PREPROCESSING_QA = PREPROCESSING_ROOT / "qa.json"
     PREPROCESSING_DONE = PREPROCESSING_ROOT / ".preprocessed.done"
     PREPROCESSING_POINTER = (
-        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.nc.dvc"
+        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.zarr.zip.dvc"
     )
     PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
     PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
