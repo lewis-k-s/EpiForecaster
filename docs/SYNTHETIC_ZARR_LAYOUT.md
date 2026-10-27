@@ -1,6 +1,6 @@
 # Synthetic dataset Zarr layout plan
 
-Status: proposal (2026-10-27). Branch: `agent/synthetic-zarr-layout`.
+Status: phase 1 implemented (2026-10-27). Branch: `agent/synthetic-zarr-layout`.
 
 This plan replaces the processed synthetic NetCDF4 file with a sharded Zarr v3
 store that is packed into one file. The goals are:
@@ -258,6 +258,33 @@ needs both.
 | 3 | Precision validation (section 6) | Mantissa bits decided and recorded |
 | 4 | EpiSim raw output in the same layout | A raw corpus is accepted by the handoff QA; parallel read in preprocessing |
 | 5 | Lazy loader (section 7) | 198-run pretraining starts within the ACC memory limit; peak RSS measured on a compute node |
+
+## 9. Phase 1 result
+
+`python -m data.preprocess.convert_netcdf` converted the b354b27 NetCDF dataset
+on `alogin3` (MN5 job 48106107, `acc_interactive`, SATA SSD, 12 workers):
+
+| Item | Value |
+| --- | --- |
+| Runs written and verified by read-back | 198 of 198 |
+| Conversion time (write, read-back, pack) | 1403 s |
+| Packed size | 114.33 GB (NetCDF: 117.83 GB) |
+| ZIP members | 5,997 |
+| One run of mobility, NetCDF / packed Zarr | 6.9-9.2 s / 1.5-2.8 s |
+| Peak memory, 12 workers | about 43 GB |
+
+Spot checks after packing: dimensions, variable set, attributes, run IDs,
+three runs of mobility, and the `latent_I_true`, `cases_mask`, `population`,
+`valid_targets` and `temporal_covariates` arrays are identical to the NetCDF
+dataset.
+
+The packed file was on node-local disk only and was not published. A
+published Zarr dataset must come from a workflow run (phase 2).
+
+The per-run time (about 85 s for each worker) is much higher than the
+single-thread mobility codec cost (about 18 s). Profile the worker before
+phase 2: the source NetCDF read through Dask and the per-variable region
+writes are the likely costs.
 
 ## 9. Open decisions
 
