@@ -631,6 +631,7 @@ class OfflinePreprocessingPipeline:
             rechunked_dataset,
             aligned_dataset_path,
             workers=self.config.write_workers,
+            bitround_keepbits=self.config.bitround_keepbits,
         )
         self._log_postwrite_summary(results)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")

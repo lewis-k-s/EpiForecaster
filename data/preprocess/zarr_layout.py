@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+import json
 import multiprocessing
 from pathlib import Path
 import shutil
@@ -33,6 +34,7 @@ MOBILITY_DIMS = ("origin", "destination")
 # Blosc buffer limit and lets one run decode on several threads.
 MOBILITY_DATE_CHUNK = 65
 COMPRESSOR = {"cname": "zstd", "clevel": 5, "shuffle": "shuffle"}
+FLOAT32_MANTISSA_BITS = 23
 
 
 def is_zarr_zip(path: Path | str) -> bool:
@@ -45,6 +47,46 @@ def open_zarr_zip(path: Path | str, **kwargs: Any) -> xr.Dataset:
     # Consolidated metadata is not part of the Zarr v3 specification; the
     # per-array metadata in a local ZIP file is cheap to read.
     return xr.open_zarr(store, consolidated=False, **kwargs)
+
+
+def bitround(values: np.ndarray, keepbits: int) -> np.ndarray:
+    """Round float32 values to ``keepbits`` mantissa bits (round half to even).
+
+    The dropped bits become zero, so the compressor removes them. The float32
+    exponent range does not change; NaN and infinite values stay as they are.
+    """
+    if values.dtype != np.float32:
+        raise TypeError(f"BitRound needs float32 values, not {values.dtype}")
+    if not 0 < keepbits < FLOAT32_MANTISSA_BITS:
+        raise ValueError(f"keepbits must be in 1..{FLOAT32_MANTISSA_BITS - 1}")
+    maskbits = FLOAT32_MANTISSA_BITS - keepbits
+    bits = values.view(np.uint32)
+    half_quantum = np.uint32((1 << (maskbits - 1)) - 1)
+    lowest_kept = (bits >> np.uint32(maskbits)) & np.uint32(1)
+    mask = np.uint32((0xFFFFFFFF >> maskbits) << maskbits)
+    rounded = ((bits + lowest_kept + half_quantum) & mask).view(np.float32)
+    return np.where(np.isfinite(values), rounded, values)
+
+
+def apply_bitround(dataset: xr.Dataset, keepbits: dict[str, int]) -> xr.Dataset:
+    """Round the named float32 variables and record the bits in their attrs."""
+    rounded = {}
+    for name, bits in keepbits.items():
+        if name not in dataset.data_vars:
+            raise KeyError(f"BitRound variable {name!r} is not in the dataset")
+        var = dataset[name]
+        if var.dtype != np.float32:
+            raise TypeError(f"BitRound variable {name!r} is {var.dtype}, not float32")
+        result = xr.apply_ufunc(
+            bitround,
+            var,
+            kwargs={"keepbits": bits},
+            dask="parallelized",
+            output_dtypes=[np.float32],
+            keep_attrs=True,
+        )
+        rounded[name] = result.assign_attrs(bitround_keepbits=bits)
+    return dataset.assign(rounded)
 
 
 def is_per_run(var: xr.DataArray) -> bool:
@@ -182,14 +224,16 @@ def write_dataset(
     destination: Path,
     *,
     workers: int,
+    bitround_keepbits: dict[str, int] | None = None,
     count_variables: tuple[str, ...] = ("mobility", "cases"),
     log: Callable[[str], None] = print,
 ) -> list[RunWriteResult]:
     """Write ``dataset`` to ``destination`` (``*.zarr.zip``) in parallel.
 
     Workers compute and write one run at a time and verify each written region
-    by read-back before the store is packed. Returns the per-run results in
-    run order.
+    by read-back before the store is packed. ``bitround_keepbits`` maps float32
+    variables to the mantissa bits to keep; the read-back compares against the
+    rounded values. Returns the per-run results in run order.
     """
     global _WORKER_DATASET, _WORKER_STORE, _WORKER_VARIABLES, _WORKER_COUNT_VARIABLES
     destination = Path(destination)
@@ -202,10 +246,13 @@ def write_dataset(
         shutil.rmtree(store)
     destination.unlink(missing_ok=True)
 
+    keepbits = dict(sorted((bitround_keepbits or {}).items()))
+    dataset = apply_bitround(dataset, keepbits)
     dataset = with_variable_length_strings(dataset).assign_attrs(
         zarr_layout_version=LAYOUT_VERSION,
         zarr_compressor=f"blosc-{COMPRESSOR['cname']}-{COMPRESSOR['clevel']}-"
         f"{COMPRESSOR['shuffle']}",
+        zarr_bitround_keepbits_json=json.dumps(keepbits),
     )
     # Data held in memory is written with the template; dask-backed data is
     # written below, per run or as a whole variable. Those writes use computed

@@ -11,6 +11,7 @@ import xarray as xr
 from data.epi_dataset import open_processed_dataset
 from data.preprocess.processors.synthetic_processor import SyntheticProcessor
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
+from data.preprocess.zarr_layout import pack_store, with_variable_length_strings
 from tests.dataset_test_helpers import make_preprocessing_config
 
 
@@ -259,6 +260,39 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
     assert "latent_S_true_mask" not in latent_sird
     assert "latent_H_true_mask" not in latent_sird
     assert len(cases.run_id) == 2
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_reads_packed_zarr_corpus_like_zarr_directory(tmp_path):
+    kwargs = dict(
+        run_ids=np.array(["synth_a", "synth_b"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1", "r2", "r3"], dtype="U10"),
+        edar_ids=np.array(["e1", "e2"], dtype="U10"),
+    )
+    directory = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(directory, **kwargs)
+    # The EpiSim raw layout: Zarr v3, variable-length strings, packed ZIP64.
+    staging = tmp_path / "raw_synth_v3.zarr"
+    with_variable_length_strings(_minimal_synthetic_dataset(**kwargs)).to_zarr(
+        staging, mode="w", zarr_format=3, consolidated=False
+    )
+    packed = tmp_path / "raw_synth.zarr.zip"
+    pack_store(staging, packed)
+
+    config = _make_config(tmp_path, directory)
+    processor = SyntheticProcessor(config)
+    assert processor._resolve_synthetic_store_path(str(packed)) == str(packed)
+    expected = processor.process(str(directory))
+    actual = SyntheticProcessor(_make_config(tmp_path, packed)).process(str(packed))
+
+    assert list(actual["cases"].run_id.values) == ["synth_a", "synth_b"]
+    for group in ("cases", "mobility", "latent_sird"):
+        for name, var in expected[group].data_vars.items():
+            assert np.array_equal(
+                actual[group][name].values, var.values, equal_nan=True
+            ), (group, name)
+    assert np.array_equal(actual["population"].values, expected["population"].values)
 
 
 @pytest.mark.epiforecaster

@@ -160,6 +160,8 @@ class PreprocessingConfig:
         num_workers: Number of parallel workers for processing
         write_workers: Processes that compute and write runs of the packed
             Zarr output (one run per task)
+        bitround_keepbits: Float32 variables to round before the write, mapped
+            to the mantissa bits to keep (1-22). Empty means no rounding.
         chunk_size: Chunk size for processing large files
         memory_limit_gb: Memory limit for processing (GB)
 
@@ -246,6 +248,8 @@ class PreprocessingConfig:
     run_id_chunk_size: int = 5  # Chunk size for run_id dimension
     # Processes that compute and write runs of the packed Zarr output.
     write_workers: int = 1
+    # Mantissa bits to keep per float32 output variable; empty is lossless.
+    bitround_keepbits: dict[str, int] = field(default_factory=dict)
     date_chunk_size: int = 30  # Chunk size for date dimension in zarr output
     mobility_chunk_size: int = (
         100  # Chunk size for spatial dims (origin/destination/region_id)
@@ -417,6 +421,12 @@ class PreprocessingConfig:
 
         if self.write_workers <= 0:
             raise ValueError("write_workers must be positive")
+
+        for name, bits in self.bitround_keepbits.items():
+            if isinstance(bits, bool) or not isinstance(bits, int) or not 0 < bits < 23:
+                raise ValueError(
+                    f"bitround_keepbits[{name!r}] must be an integer from 1 to 22"
+                )
 
         if self.date_chunk_size <= 0:
             raise ValueError("date_chunk_size must be positive")

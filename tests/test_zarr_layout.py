@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from data.epi_dataset import open_processed_dataset
 from data.preprocess.zarr_layout import (
     LAYOUT_VERSION,
     MOBILITY_DATE_CHUNK,
+    bitround,
     build_encoding,
     open_zarr_zip,
     write_dataset,
@@ -166,6 +168,110 @@ def test_convert_netcdf_keeps_values_and_records_source(tmp_path):
     assert saved.attrs["converted_from_dvc_md5"] == "abc123"
 
 
+def test_bitround_keeps_the_requested_mantissa_bits():
+    rng = np.random.default_rng(3)
+    values = np.concatenate(
+        [
+            rng.random(10_000, dtype=np.float32),
+            np.array([0.0, -0.0, 5.7e-20, 0.68, -1.5], np.float32),
+            np.array([np.nan, np.inf, -np.inf], np.float32),
+        ]
+    )
+    for keepbits in (7, 10, 12):
+        rounded = bitround(values, keepbits)
+        finite = np.isfinite(values)
+        assert rounded.dtype == np.float32
+        # Every dropped mantissa bit is zero.
+        dropped = (1 << (23 - keepbits)) - 1
+        assert not np.any(rounded[finite].view(np.uint32) & dropped)
+        # Round to nearest: the error is at most half a quantum.
+        nonzero = finite & (values != 0)
+        relative = np.abs(rounded[nonzero] - values[nonzero]) / np.abs(values[nonzero])
+        assert relative.max() <= 2.0 ** -(keepbits + 1)
+        assert rounded[np.isnan(values)].size == 1
+        assert np.isnan(rounded[np.isnan(values)]).all()
+        assert np.array_equal(rounded[np.isinf(values)], values[np.isinf(values)])
+        # The float32 exponent range is kept: small flows do not become zero.
+        assert rounded[values == np.float32(5.7e-20)][0] > 0
+
+
+def test_bitround_matches_float16_precision_at_ten_bits():
+    # 10 kept bits equal the float16 mantissa, so a float16 cast after the
+    # rounding gives the same values as a direct cast (normal float16 range).
+    values = np.random.default_rng(5).uniform(1e-3, 0.7, 50_000).astype(np.float32)
+    assert np.array_equal(
+        bitround(values, 10).astype(np.float16), values.astype(np.float16)
+    )
+
+
+def test_bitround_rounds_half_to_even():
+    one_plus_half_quantum = np.array([1.0 + 2.0**-11], np.float32)
+    assert bitround(one_plus_half_quantum, 10)[0] == np.float32(1.0)
+    # 1.5 quanta above 1.0: the tie goes to the even neighbour, 1 + 2 quanta.
+    three_halves_up = np.array([1.0 + 3 * 2.0**-11], np.float32)
+    assert bitround(three_halves_up, 10)[0] == np.float32(1.0 + 2.0**-9)
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_write_dataset_applies_bitround_and_records_bits(tmp_path, workers):
+    source = _dataset()
+    destination = tmp_path / "tiny.zarr.zip"
+
+    write_dataset(
+        source.chunk({"run_id": 1}),
+        destination,
+        workers=workers,
+        bitround_keepbits={"mobility": 10},
+    )
+
+    saved = open_zarr_zip(destination)
+    expected = bitround(source.mobility.values, 10)
+    assert np.array_equal(saved.mobility.values, expected, equal_nan=True)
+    assert np.isnan(saved.mobility.values[0, 0, 0, 0])
+    assert saved.mobility.attrs["bitround_keepbits"] == 10
+    assert json.loads(saved.attrs["zarr_bitround_keepbits_json"]) == {"mobility": 10}
+    # Variables without rounding are unchanged.
+    assert np.array_equal(saved.cases.values, source.cases.values)
+    assert "bitround_keepbits" not in saved.cases.attrs
+
+
+def test_write_dataset_rejects_bitround_on_non_float32(tmp_path):
+    with pytest.raises(TypeError, match="population"):
+        write_dataset(
+            _dataset(),
+            tmp_path / "tiny.zarr.zip",
+            workers=1,
+            bitround_keepbits={"population": 10},
+        )
+
+
+def test_convert_netcdf_rounds_and_subsets_runs(tmp_path):
+    from data.preprocess.convert_netcdf import convert, parse_bitround
+
+    source = _dataset()
+    netcdf = tmp_path / "tiny.nc"
+    source.to_netcdf(netcdf, engine="netcdf4")
+    destination = tmp_path / "tiny.zarr.zip"
+
+    convert(
+        netcdf,
+        destination,
+        workers=1,
+        source_dvc_md5=None,
+        bitround_keepbits=parse_bitround(["mobility=7"]),
+        runs=2,
+    )
+
+    saved = open_zarr_zip(destination)
+    assert saved.sizes["run_id"] == 2
+    assert np.array_equal(
+        saved.mobility.values, bitround(source.mobility.values[:2], 7), equal_nan=True
+    )
+    assert saved.attrs["converted_run_subset"] == "first 2 runs"
+    with pytest.raises(ValueError, match="NAME=BITS"):
+        parse_bitround(["mobility"])
+
+
 def _preprocess_workflow(write_workers: object) -> dict:
     return {
         "workflow": {"kind": "preprocess"},
@@ -197,3 +303,24 @@ def _preprocess_workflow(write_workers: object) -> dict:
 def test_workflow_rejects_invalid_write_workers(value):
     with pytest.raises(ValueError, match="write_workers"):
         validate_workflow_contract(_preprocess_workflow(value))
+
+
+@pytest.mark.parametrize("bits", [0, 23, True, "10"])
+def test_preprocessing_config_rejects_invalid_bitround_bits(tmp_path, bits):
+    from tests.dataset_test_helpers import make_preprocessing_config
+
+    with pytest.raises(ValueError, match="bitround_keepbits"):
+        make_preprocessing_config(
+            tmp_path, options={"bitround_keepbits": {"mobility": bits}}
+        )
+
+
+def test_b354b27_preprocess_config_rounds_mobility_to_float16_precision():
+    from data.preprocess.config import PreprocessingConfig
+
+    loaded = PreprocessingConfig._load_config_dict(
+        Path(__file__).resolve().parents[1]
+        / "configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_reactive_n100.yaml",
+        seen_paths=set(),
+    )
+    assert loaded["bitround_keepbits"] == {"mobility": 10}

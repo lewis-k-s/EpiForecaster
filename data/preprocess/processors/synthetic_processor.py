@@ -22,6 +22,7 @@ import xarray as xr
 from constants import EDAR_BIOMARKER_PREFIX, EDAR_BIOMARKER_VARIANTS
 
 from ..config import REGION_COORD, TEMPORAL_COORD, PreprocessingConfig
+from ..zarr_layout import is_zarr_zip, open_zarr_zip
 from .temporal_covariates_processor import TemporalCovariatesProcessor
 
 ZARR_ENCODING_KEYS_TO_CLEAR = {
@@ -472,8 +473,8 @@ class SyntheticProcessor:
         if not path.exists():
             raise FileNotFoundError(f"Synthetic data path does not exist: {path}")
 
-        # Direct NetCDF file
-        if path.is_file() and path.suffix == ".nc":
+        # Direct NetCDF file or packed Zarr store
+        if path.is_file() and (path.suffix == ".nc" or is_zarr_zip(path)):
             return str(path)
 
         # Direct Zarr directory
@@ -505,8 +506,15 @@ class SyntheticProcessor:
         This method detects such conflicts, drops the conflicting variables,
         and re-loads them with corrected coordinates.
         """
-        is_netcdf = Path(resolved_path).is_file()
         chunks = {"run_id": self.config.run_id_chunk_size}
+        if is_zarr_zip(resolved_path):
+            # Packed EpiSim corpus (episim-raw-zarr-v1): one run_id size for
+            # every array, so the legacy LoD repair below does not apply.
+            ds = open_zarr_zip(resolved_path, chunks=chunks)
+            self._clear_source_zarr_encodings(ds)
+            ds = self._strip_run_id_padding(ds)
+            return self._normalize_mobility_dims(ds)
+        is_netcdf = Path(resolved_path).is_file()
         try:
             if is_netcdf:
                 ds = xr.open_dataset(resolved_path, engine="netcdf4", chunks=chunks)
