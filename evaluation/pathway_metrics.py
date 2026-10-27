@@ -238,7 +238,9 @@ class _TorchWindowSpearmanAccumulator:
     """Accumulate masked, tie-aware Spearman values."""
 
     def __init__(self, *, device: torch.device) -> None:
-        self.sum = torch.tensor(0.0, device=device)
+        self.device = device
+        # Per-batch (correlations, eligible) rows, summed once in finalize.
+        self.correlation_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.count = torch.tensor(0.0, device=device)
         self.total_window_count = torch.tensor(0, device=device, dtype=torch.long)
         self.candidate_window_count = torch.tensor(0, device=device, dtype=torch.long)
@@ -326,15 +328,23 @@ class _TorchWindowSpearmanAccumulator:
         self.total_window_count += prediction_rows.shape[0]
         self.candidate_window_count += candidate.sum()
         self.count += eligible.sum()
+        # Keep rows on the device; selecting them here would sync every batch.
+        self.correlation_batches.append((correlations, eligible))
+
+    def correlation_sum(self) -> torch.Tensor:
+        """Return the float32 sum of all eligible correlations in update order."""
+        if not self.correlation_batches:
+            return torch.tensor(0.0, device=self.device)
+        correlations = torch.cat([batch for batch, _ in self.correlation_batches])
+        eligible = torch.cat([rows for _, rows in self.correlation_batches])
         # Preserve the legacy row-wise float32 addition order. Ineligible rows
         # added zero, so only eligible rows change the sum. NumPy accumulate adds
         # strictly in sequence, unlike a device reduction or a CPU cumsum.
-        eligible_correlations = correlations[eligible].detach().cpu().numpy()
-        if eligible_correlations.size:
-            running = np.concatenate(
-                [self.sum.detach().cpu().numpy().reshape(1), eligible_correlations]
-            )
-            self.sum.fill_(float(np.add.accumulate(running, dtype=np.float32)[-1]))
+        running = np.concatenate(
+            [np.zeros(1, dtype=np.float32), correlations[eligible].cpu().numpy()]
+        )
+        total = np.add.accumulate(running, dtype=np.float32)[-1]
+        return torch.tensor(float(total), device=self.device)
 
     def finalize(self) -> WindowSpearmanMetricResult:
         total_count = int(self.total_window_count.item())
@@ -342,7 +352,7 @@ class _TorchWindowSpearmanAccumulator:
         eligible_count = int(self.count.item())
         return WindowSpearmanMetricResult(
             mean=(
-                float((self.sum / self.count).item())
+                float((self.correlation_sum() / self.count).item())
                 if eligible_count > 0
                 else float("nan")
             ),
