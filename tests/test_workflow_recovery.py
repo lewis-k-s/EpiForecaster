@@ -574,3 +574,21 @@ def test_cache_cleanup_waits_for_scientific_readers(tmp_path):
         assert process.returncode == 0, stdout + stderr
         assert _clean_cache(run, env).returncode == 0
     assert not (tmp_path / "cache/12345/run").exists()
+
+
+def test_node_input_cache_lives_under_the_job_tmpdir(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts/workflow/node_input_cache.sh"
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{script}"; node_cache_run_root /runs/example',
+        ],
+        env={"TMPDIR": str(tmp_path), "SLURM_JOB_ID": "123", "PATH": "/usr/bin:/bin"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == f"{tmp_path}/epiforecaster/inputs/123/example"

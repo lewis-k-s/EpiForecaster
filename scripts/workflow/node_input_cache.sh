@@ -3,7 +3,9 @@
 # Allocation-local immutable inputs. Source this file from the container wrapper.
 node_cache_run_root() {
   local base
-  base="${EPIFORECASTER_NODE_CACHE_ROOT:-/scratch/tmp/${USER:-unknown}/epiforecaster/inputs}"
+  # Under the job TMPDIR (/scratch/tmp/<jobid> on MN5), so Slurm removes the
+  # copy when the allocation ends even if the step is cancelled.
+  base="${EPIFORECASTER_NODE_CACHE_ROOT:-${TMPDIR:-/scratch/tmp}/epiforecaster/inputs}"
   printf '%s/%s/%s\n' "$base" "${SLURM_JOB_ID:?An allocation is required for shared inputs}" "$(basename "$1")"
 }
 
