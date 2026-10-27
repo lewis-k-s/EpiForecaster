@@ -17,11 +17,12 @@
 # bounded mn5_preprocess_b354b27_mobility_parity.yaml first (passed on
 # 2026-10-18, job 47493871).
 #
-# Preprocessing runs no GPU step, so it uses GPP. The NetCDF write is
-# serialized (single-threaded HDF5), so the CPU count buys memory, not speed:
-# 64 CPUs give ~120 GB. The 55 GiB peak of the 60-day parity run came from an
-# unchunked post-write read-back of mobility (now streamed); without it, memory
-# no longer holds the mobility tensor.
+# Preprocessing runs no GPU step, so it uses GPP. The output is packed sharded
+# Zarr (docs/SYNTHETIC_ZARR_LAYOUT.md): write_workers processes rebuild and
+# write one run each, and mobility is rounded to 10 mantissa bits
+# (bitround_keepbits in the base config). The 8-run test converted in about
+# 60 s with 8 workers, so 240 minutes leave a wide margin for input staging,
+# validation, the write and QA.
 
 run: {}
 source: {}
@@ -86,4 +87,4 @@ resources:
     nodes: 1
     tasks: 1
     cpus_per_task: 64
-    runtime: 600
+    runtime: 240
