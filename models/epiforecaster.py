@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import torch
 from einops import rearrange
@@ -589,6 +590,31 @@ class EpiForecaster(nn.Module):
                 - model_outputs: Dict from forward() with predictions and latents
                 - targets_dict: Dict with target tensors for loss computation
         """
+        inputs = self.forward_inputs(
+            batch_data=batch_data,
+            region_embeddings=region_embeddings,
+            mask_cases=mask_cases,
+            mask_ww=mask_ww,
+            mask_hosp=mask_hosp,
+            mask_deaths=mask_deaths,
+        )
+        return self.forward(**inputs), self.batch_targets(batch_data)
+
+    def forward_inputs(
+        self,
+        *,
+        batch_data: EpiBatch,
+        region_embeddings: torch.Tensor | None = None,
+        mask_cases: bool = False,
+        mask_ww: bool = False,
+        mask_hosp: bool = False,
+        mask_deaths: bool = False,
+    ) -> dict[str, Any]:
+        """Apply input ablations and return the keyword arguments for forward().
+
+        Callers that hold a torch.compile wrapper pass these to the wrapper, so
+        the compiled forward runs instead of this module's eager one.
+        """
         mask_ablated_inputs(
             batch_data,
             mask_cases=mask_cases,
@@ -612,25 +638,25 @@ class EpiForecaster(nn.Module):
         # Extract temporal covariates if present
         temporal_covariates = batch_data.temporal_covariates
 
-        # Forward pass
-        model_outputs = self.forward(
-            hosp_hist=batch_data.hosp_hist,
-            deaths_hist=batch_data.deaths_hist,
-            cases_hist=batch_data.cases_hist,
-            biomarkers_hist=batch_data.bio_node,
-            ww_hist=batch_data.ww_hist,
-            ww_hist_mask=batch_data.ww_hist_mask,
-            mob_graphs=mob_batch,
-            target_nodes=target_nodes,
-            region_embeddings=region_embeddings,
-            population=batch_data.population,
-            temporal_covariates=temporal_covariates,
-            vaccination_hist=batch_data.vaccination_hist,
-        )
+        return {
+            "hosp_hist": batch_data.hosp_hist,
+            "deaths_hist": batch_data.deaths_hist,
+            "cases_hist": batch_data.cases_hist,
+            "biomarkers_hist": batch_data.bio_node,
+            "ww_hist": batch_data.ww_hist,
+            "ww_hist_mask": batch_data.ww_hist_mask,
+            "mob_graphs": mob_batch,
+            "target_nodes": target_nodes,
+            "region_embeddings": region_embeddings,
+            "population": batch_data.population,
+            "temporal_covariates": temporal_covariates,
+            "vaccination_hist": batch_data.vaccination_hist,
+        }
 
-        # Prepare targets dict
-        # Joint inference targets: WW, Hosp, Cases, Deaths with per-target masks
-        targets_dict = {
+    @staticmethod
+    def batch_targets(batch_data: EpiBatch) -> dict[str, torch.Tensor | None]:
+        """Joint inference targets (WW, Hosp, Cases, Deaths) with per-target masks."""
+        return {
             "ww": batch_data.ww_target,
             "hosp": batch_data.hosp_target,
             "cases": batch_data.cases_target,
@@ -646,8 +672,6 @@ class EpiForecaster(nn.Module):
             "cases_mask": batch_data.cases_target_mask,
             "deaths_mask": batch_data.deaths_target_mask,
         }
-
-        return model_outputs, targets_dict
 
     def _process_mobility_sequence_pyg(
         self,

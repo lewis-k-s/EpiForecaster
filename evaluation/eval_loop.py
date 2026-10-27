@@ -542,7 +542,10 @@ def evaluate_loader(
 
     model_was_training = model.training
     model.eval()
-    forward_model = cast(EpiForecaster, model)
+    # A torch.compile wrapper exposes the module's methods, but forward_batch
+    # would then run the eager forward. Prepare inputs on the module and call
+    # the wrapper so evaluation uses the compiled forward.
+    forward_model = cast(EpiForecaster, getattr(model, "_orig_mod", model))
     dataset_config = getattr(dataset, "config", None)
     prefetch_factor = (
         dataset_config.training.prefetch_factor if dataset_config is not None else None
@@ -580,7 +583,7 @@ def evaluate_loader(
                     )
 
                 current_stage = "forward_batch"
-                model_outputs, targets_dict = forward_model.forward_batch(
+                forward_inputs = forward_model.forward_inputs(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
                     mask_cases=criterion.mask_input_cases,
@@ -588,6 +591,8 @@ def evaluate_loader(
                     mask_hosp=criterion.mask_input_hosp,
                     mask_deaths=criterion.mask_input_deaths,
                 )
+                model_outputs = model(**forward_inputs)
+                targets_dict = forward_model.batch_targets(batch_data)
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",

@@ -55,6 +55,16 @@ class _DummyModel(torch.nn.Module):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         return batch_data.model_outputs, batch_data.targets_dict
 
+    def forward_inputs(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return {"batch_data": batch_data}
+
+    def forward(self, batch_data):  # noqa: ANN001
+        return batch_data.model_outputs
+
+    @staticmethod
+    def batch_targets(batch_data):  # noqa: ANN001
+        return batch_data.targets_dict
+
 
 def _make_batch() -> SimpleNamespace:
     batch = SimpleNamespace(
@@ -504,6 +514,9 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
 
 class _ExplodingModel(_DummyModel):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        raise RuntimeError("boom")
+
+    def forward(self, batch_data):  # noqa: ANN001
         raise RuntimeError("boom")
 
 
@@ -1029,6 +1042,16 @@ class _KernelMetricModel(torch.nn.Module):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         return batch_data.model_outputs, batch_data.targets_dict
 
+    def forward_inputs(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return {"batch_data": batch_data}
+
+    def forward(self, batch_data):  # noqa: ANN001
+        return batch_data.model_outputs
+
+    @staticmethod
+    def batch_targets(batch_data):  # noqa: ANN001
+        return batch_data.targets_dict
+
 
 class _CompiledWrapper(torch.nn.Module):
     """Stand-in for torch.compile's OptimizedModule (_orig_mod attribute)."""
@@ -1041,6 +1064,9 @@ class _CompiledWrapper(torch.nn.Module):
         return self._orig_mod.forward_batch(
             batch_data, region_embeddings=region_embeddings, **kwargs
         )
+
+    def forward(self, **kwargs):  # noqa: ANN003
+        return self._orig_mod(**kwargs)
 
 
 def _campaign_heads() -> dict[str, ClinicalObservationHead]:
