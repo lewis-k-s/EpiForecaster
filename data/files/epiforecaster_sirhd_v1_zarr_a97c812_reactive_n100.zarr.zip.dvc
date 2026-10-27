@@ -1,0 +1,14 @@
+md5: a179b4afe904b9a6ef3d3232768bca7a
+frozen: true
+deps:
+- path: 
+    data/datasets/epiforecaster_sirhd_v1_zarr_a97c812_20261027_reactive_n100/epiforecaster_sirhd_v1_training.zarr.zip
+  repo:
+    url: ../EpiSim.jl
+    rev: 323d78a
+    rev_lock: 323d78a2c2064ad31d077a939d83e3c3a2837a6f
+outs:
+- md5: cfdd2a02c7a81a8f9e008339b693b1a5
+  size: 46612607993
+  hash: md5
+  path: epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip

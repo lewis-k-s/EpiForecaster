@@ -354,3 +354,71 @@ def test_reactive_interactive_debug_keeps_production_loader_settings() -> None:
     assert debug.training.profiler.enabled is False
     for field in ("batch_size", "num_workers", "prefetch_factor", "pin_memory"):
         assert getattr(debug.training, field) == getattr(base.training, field)
+
+
+A97C812_RAW_POINTER = (
+    "data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip.dvc"
+)
+A97C812_QA_DIR = Path("data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100_qa")
+A97C812_DATASET_NAME = "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped"
+
+
+def test_a97c812_raw_pointer_pins_seed_capped_zarr_corpus() -> None:
+    pointer = yaml.safe_load(Path(A97C812_RAW_POINTER).read_text())
+
+    assert pointer["frozen"] is True
+    (dependency,) = pointer["deps"]
+    assert dependency["repo"]["url"] == "../EpiSim.jl"
+    assert dependency["repo"]["rev_lock"] == "323d78a2c2064ad31d077a939d83e3c3a2837a6f"
+    (output,) = pointer["outs"]
+    assert output["md5"] == "cfdd2a02c7a81a8f9e008339b693b1a5"
+    assert output["size"] == 46612607993
+    assert not Path(A97C812_RAW_POINTER.removesuffix(".dvc")).exists()
+
+
+def test_a97c812_preprocessing_uses_full_handoff_without_exclusions() -> None:
+    import json
+
+    from scripts.workflow.run_support import sha256_file
+
+    workflow = yaml.safe_load(
+        Path(
+            "workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml"
+        ).read_text()
+    )
+    preprocessing = workflow["preprocessing"]
+    config = PreprocessingConfig._load_config_dict(
+        Path(preprocessing["base_config"]), seen_paths=set()
+    )
+    provenance = config["source_provenance"]
+    handoff_path = Path(preprocessing["handoff_manifest"])
+    handoff = json.loads(handoff_path.read_text())
+    acceptance = json.loads(Path(preprocessing["handoff_qa_acceptance"]).read_text())
+
+    assert validate_workflow_contract(workflow) == "preprocess"
+    assert handoff_path.parent == A97C812_QA_DIR
+    assert A97C812_RAW_POINTER in workflow["dvc"]["targets"]
+    assert config["synthetic_path"] == A97C812_RAW_POINTER.removesuffix(".dvc")
+    assert preprocessing["dataset_name"] == config["dataset_name"]
+    assert config["dataset_name"] == A97C812_DATASET_NAME
+    assert "synthetic_run_exclusions" not in config
+    assert preprocessing["expected_run_count"] == len(handoff["run_ids"]) == 200
+    assert config["bitround_keepbits"] == {"mobility": 10}
+    assert config["synthetic_state_space_contract_sha256"] == SIRHD_V1_CONTRACT_SHA256
+    assert handoff["dense_mobility"].startswith("omitted")
+    assert handoff["seed_cap"]["rule"] == "max_seed_half_region_population"
+    assert provenance["raw_corpus_dvc_md5"] == "cfdd2a02c7a81a8f9e008339b693b1a5"
+    assert (
+        provenance["raw_corpus_physical_file_sha256"]
+        == (handoff["corpus_physical_file_sha256"])
+    )
+    assert (
+        provenance["raw_corpus_logical_dataset_sha256"]
+        == (handoff["corpus_logical_dataset_sha256"])
+    )
+    assert provenance["generator_source_commit"] == handoff["source_commit"]
+    assert provenance["handoff_manifest_sha256"] == sha256_file(handoff_path)
+    assert acceptance["handoff_manifest_sha256"] == sha256_file(handoff_path)
+    assert provenance["handoff_qa_acceptance_sha256"] == sha256_file(
+        Path(preprocessing["handoff_qa_acceptance"])
+    )

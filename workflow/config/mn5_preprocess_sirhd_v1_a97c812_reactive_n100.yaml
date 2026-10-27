@@ -1,0 +1,85 @@
+# Immutable full-corpus preprocessing for the 200-run seed-capped closed-loop
+# reactive corpus epiforecaster_sirhd_v1_zarr_a97c812_20261027_reactive_n100.
+# The run publishes a new DVC object and leaves the generated pointer in its
+# immutable publication directory for reviewed promotion to this repository.
+#
+# The raw object cfdd2a02c7a81a8f9e008339b693b1a5 must be hard-linked from the
+# EpiSim.jl DVC store into EpiForecaster-DVC/storage on GPFS (no copy).
+#
+# The generator handoff has qa_passed=false. Preprocessing accepts it only with
+# the committed owner waiver, which must name this handoff SHA-256 and exactly
+# its failed gates. Run IDs and seed vectors are checked against the full
+# handoff (200 runs, no exclusions).
+#
+# The raw corpus has no dense mobility_time_varying; mobility is rebuilt lazily
+# from the factorized layout. Preprocessing runs no GPU step, so it uses GPP.
+# The output is packed sharded Zarr (docs/SYNTHETIC_ZARR_LAYOUT.md):
+# write_workers processes rebuild and write one run each, and mobility is
+# rounded to 10 mantissa bits (bitround_keepbits in the base config). The
+# 198-run b354b27 rebuild took 28.5 minutes with 12 workers (peak 62.7 GiB),
+# so 240 minutes leave a wide margin.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: preprocess
+  target: preprocess
+
+dvc:
+  targets:
+    - data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip.dvc
+    - data/files/catalonia_preprocessing_inputs_v1.dvc
+  provenance_targets: []
+
+preprocessing:
+  base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_a97c812_reactive_n100.yaml
+  dataset_name: synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped
+  expected_run_count: 200
+  # GPP NVMe (~960 GB) holds the staged 47 GB input, the Zarr staging
+  # directory and the packed output (~72 GB each), so write, QA and hash the
+  # dataset node-locally.
+  node_local_output: true
+  # One run per worker at ~6 GB each; 12 workers fit the 64-CPU share of
+  # GPP memory (2 GB per CPU).
+  write_workers: 12
+  handoff_manifest: data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100_qa/handoff_manifest.json
+  handoff_qa_acceptance: data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100_qa/qa_acceptance.json
+  required_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  float32_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  nonnegative_variables:
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+
+resources:
+  allocation:
+    account: bsc08
+    partition: gpp
+    qos: gp_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 64
+    runtime: 240
