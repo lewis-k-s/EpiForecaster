@@ -262,9 +262,14 @@ def _spread_positions(size: int, count: int) -> np.ndarray:
 
 
 def _split_attr_list(value: Any) -> list[str]:
-    """Split a comma-separated global attribute into names."""
+    """Split a comma-separated global attribute into names.
+
+    Zarr attributes keep JSON lists, which NetCDF stores as strings.
+    """
     if value is None:
         return []
+    if isinstance(value, list | tuple | np.ndarray):
+        return [str(name).strip() for name in value if str(name).strip()]
     return [name.strip() for name in str(value).split(",") if name.strip()]
 
 

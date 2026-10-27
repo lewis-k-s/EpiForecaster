@@ -9,7 +9,10 @@ import warnings
 import xarray as xr
 
 from data.epi_dataset import open_processed_dataset
-from data.preprocess.processors.synthetic_processor import SyntheticProcessor
+from data.preprocess.processors.synthetic_processor import (
+    SyntheticProcessor,
+    _split_attr_list,
+)
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
 from data.preprocess.zarr_layout import pack_store, with_variable_length_strings
 from tests.dataset_test_helpers import make_preprocessing_config
@@ -989,3 +992,10 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     assert float(saved_mob.max()) <= expected_log_value + 0.01
 
     saved.close()
+
+
+def test_split_attr_list_accepts_netcdf_strings_and_zarr_lists():
+    assert _split_attr_list("cases, deaths") == ["cases", "deaths"]
+    assert _split_attr_list(["cases", " deaths"]) == ["cases", "deaths"]
+    assert _split_attr_list("S") == _split_attr_list(["S"]) == ["S"]
+    assert _split_attr_list(None) == []
