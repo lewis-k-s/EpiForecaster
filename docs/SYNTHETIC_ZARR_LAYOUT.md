@@ -1,6 +1,7 @@
 # Synthetic dataset Zarr layout plan
 
-Status: phase 1 implemented (2026-10-27). Branch: `agent/synthetic-zarr-layout`.
+Status: phase 1 implemented; mobility BitRound (10 bits) implemented and
+smoke-tested (2026-10-27). Branch: `agent/synthetic-zarr-layout`.
 
 This plan replaces the processed synthetic NetCDF4 file with a sharded Zarr v3
 store that is packed into one file. The goals are:
@@ -127,8 +128,8 @@ Notes on the layout:
   overhead makes them larger than the raw data.
 - **BitRound:** apply it explicitly in the preprocessing code, before the
   write, and record the mantissa bits in the variable attributes. Any Zarr
-  reader can read the result. The default is no rounding until section 6
-  selects a value.
+  reader can read the result. The default is no rounding; the b354b27 config
+  rounds mobility to 10 bits (section 10).
 - **Data type:** keep float32 for continuous values.
   - Do not store float16, because positive synthetic flows go down to 5.7e-20
     and float16 makes them zero.
@@ -286,7 +287,45 @@ single-thread mobility codec cost (about 18 s). Profile the worker before
 phase 2: the source NetCDF read through Dask and the per-variable region
 writes are the likely costs.
 
-## 9. Open decisions
+## 10. Mobility rounding and training smoke
+
+`preprocessing.bitround_keepbits` rounds named float32 variables before the
+write (round half to even). The read-back compares against the rounded values,
+and the bits are in the variable attribute `bitround_keepbits` and the store
+attribute `zarr_bitround_keepbits_json`. The b354b27 config rounds `mobility`
+to 10 bits. That is the float16 mantissa that the trainer uses
+(`STORAGE_DTYPES["continuous"]`), so the model input is the same except at
+float16 subnormals. The float32 exponent range stays, so small positive flows
+stay positive.
+
+Test on the first 8 runs of b354b27, converted on `alogin3` (MN5 job
+48127780, 8 workers):
+
+| Item | Lossless | BitRound 10 |
+| --- | ---: | ---: |
+| Packed size | 4.63 GB | 2.89 GB (-38%) |
+| Conversion time | 61 s | 58 s |
+| Validation joint loss after 200 steps | 0.7258 | 0.7246 |
+| Validation mean target CRPS | 0.3401 | 0.3396 |
+
+Input fidelity on 3 runs, with the trainer's transforms
+(`mobility_min_flow_raw = 0`, clip at 8, float16 cast):
+
+- edge-mask changes: 0;
+- relative error of the stored values: maximum 4.9e-4, median 1.7e-4;
+- equal float16 weights: 99.5%; the largest difference is 6e-8, which is one
+  float16 subnormal step;
+- changed top-20 incoming-neighbour sets: 4e-5 to 1e-4 of the
+  (date, destination) pairs.
+
+The trainer built each run from the packed store in about 11 s (NetCDF: about
+30 s). It trained at about 406 samples/s, without compilation, on one H100.
+
+Real data is not affected. Its mobility is already float16 and this rounding
+applies only to synthetic outputs. Rounding below 10 bits still needs the
+model-fidelity check in section 6.
+
+## 11. Open decisions
 
 - Inner chunk length along `date` for mobility (65 proposed). This value sets
   the parallelism of a single-run decode.
