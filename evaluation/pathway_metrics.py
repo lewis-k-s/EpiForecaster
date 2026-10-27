@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 _EPSILON = 1.0e-12
@@ -325,15 +326,15 @@ class _TorchWindowSpearmanAccumulator:
         self.total_window_count += prediction_rows.shape[0]
         self.candidate_window_count += candidate.sum()
         self.count += eligible.sum()
-        zero = torch.zeros((), device=correlations.device, dtype=correlations.dtype)
-        for correlation, row_eligible in zip(
-            correlations,
-            eligible,
-            strict=True,
-        ):
-            # Preserve the legacy row-wise float32 addition order without
-            # synchronizing Python on each eligibility predicate.
-            self.sum += torch.where(row_eligible, correlation, zero)
+        # Preserve the legacy row-wise float32 addition order. Ineligible rows
+        # added zero, so only eligible rows change the sum. NumPy accumulate adds
+        # strictly in sequence, unlike a device reduction or a CPU cumsum.
+        eligible_correlations = correlations[eligible].detach().cpu().numpy()
+        if eligible_correlations.size:
+            running = np.concatenate(
+                [self.sum.detach().cpu().numpy().reshape(1), eligible_correlations]
+            )
+            self.sum.fill_(float(np.add.accumulate(running, dtype=np.float32)[-1]))
 
     def finalize(self) -> WindowSpearmanMetricResult:
         total_count = int(self.total_window_count.item())
