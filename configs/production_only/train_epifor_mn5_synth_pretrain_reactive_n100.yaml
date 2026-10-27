@@ -13,7 +13,7 @@ env: "mn5"
 # Four epochs keep the cycle well inside one acc_bscls allocation.
 
 data:
-  dataset_path: data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.nc
+  dataset_path: data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.zarr.zip
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
   # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.

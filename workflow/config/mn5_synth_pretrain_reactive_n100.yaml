@@ -23,7 +23,7 @@ workflow:
 
 dvc:
   targets:
-    - data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.nc.dvc
+    - data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
     - data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc

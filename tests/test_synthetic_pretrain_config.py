@@ -298,17 +298,15 @@ def test_reactive_preprocessing_pins_state_space_contract() -> None:
 B354B27_RAW_POINTER = (
     "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc"
 )
-B354B27_PROCESSED_PATH = (
-    "data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.nc"
-)
+B354B27_PROCESSED_PATH = "data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.zarr.zip"
 
 
 def test_b354b27_processed_pointer_pins_published_dataset() -> None:
     pointer = yaml.safe_load(Path(f"{B354B27_PROCESSED_PATH}.dvc").read_text())
 
     (output,) = pointer["outs"]
-    assert output["md5"] == "946dae8597ffe4fce705b0ddedf2131d"
-    assert output["size"] == 117834036904
+    assert output["md5"] == "8308952213e3700693e349a9b2371399"
+    assert output["size"] == 71369022411
     assert output["path"] == Path(B354B27_PROCESSED_PATH).name
 
 

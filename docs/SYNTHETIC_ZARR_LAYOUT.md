@@ -325,6 +325,30 @@ Real data is not affected. Its mobility is already float16 and this rounding
 applies only to synthetic outputs. Rounding below 10 bits still needs the
 model-fidelity check in section 6.
 
+### Full b354b27 rebuild
+
+Run `b354b27-zarr-br10-20261027` (job 48128720, GPP, source d98807b)
+rebuilt the 198-run dataset from the raw NetCDF with `bitround_keepbits:
+{mobility: 10}` and 12 write workers.
+
+| Item | Value |
+| --- | ---: |
+| Preprocessing step | 28 min 33 s, peak 62.7 GiB |
+| Publication step | 4 min 38 s |
+| Packed size | 71,369,022,411 bytes (NetCDF: 117,834,036,904) |
+| DVC md5 | `8308952213e3700693e349a9b2371399` |
+
+Validation job 48158598 compared the packed dataset with the published
+NetCDF dataset (md5 `946dae85…`). Dimensions, variables, coordinates and
+static arrays are identical. Every per-run variable of all 198 runs is
+identical, and mobility equals BitRound(NetCDF mobility, 10). The only new
+attributes are the `zarr_*` store attributes and the mobility attribute
+`bitround_keepbits`. The check took 10 minutes with 12 worker processes.
+
+Open the NetCDF reference in each worker after the workers start (spawn).
+An earlier attempt forked 20 workers after the parent had opened the file
+through HDF5, and no worker completed a run in 3 hours.
+
 ## 11. Open decisions
 
 - Inner chunk length along `date` for mobility (65 proposed). This value sets
