@@ -58,6 +58,32 @@ _STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
 
 StaticCovariates = dict[str, torch.Tensor]
 
+# Full-dataset series that do not depend on the split's nodes or time range.
+# Train builds them once; val and test datasets reuse them.
+SHARED_SERIES_ATTRS = (
+    "biomarker_data_start",
+    "precomputed_hosp_hist",
+    "precomputed_deaths_hist",
+    "precomputed_cases_hist",
+    "precomputed_hosp",
+    "precomputed_hosp_mask",
+    "precomputed_ww",
+    "precomputed_ww_mask",
+    "precomputed_cases_target",
+    "precomputed_cases_mask",
+    "precomputed_deaths",
+    "precomputed_deaths_mask",
+    "precomputed_S_target",
+    "precomputed_I_target",
+    "precomputed_H_target",
+    "precomputed_R_target",
+    "precomputed_D_target",
+    "precomputed_death_flow_target",
+    "precomputed_biomarkers",
+    "precomputed_vaccination_hist",
+    "temporal_covariates",
+)
+
 
 @dataclass
 class SharedSparseTopology:
@@ -132,6 +158,7 @@ class EpiDataset(Dataset):
         time_range: tuple[int, int] | None = None,
         run_id: str | None = None,
         region_embedding_store: RegionEmbeddingStore | None = None,
+        shared_series: dict[str, torch.Tensor | None] | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
@@ -163,15 +190,6 @@ class EpiDataset(Dataset):
 
         self.num_nodes = self._dataset[REGION_COORD].size
 
-        # Load biomarker data start offset if available
-        if "biomarker_data_start" in self._dataset:
-            self.biomarker_data_start = torch.from_numpy(
-                self._dataset["biomarker_data_start"].values
-            ).to(torch.long)
-        else:
-            # Fallback: all regions have data starting at index 0
-            self.biomarker_data_start = torch.zeros(self.num_nodes, dtype=torch.long)
-
         self.biomarker_variants = self._get_biomarker_variants()
 
         # Setup clinical series preprocessors for 3-channel [value, mask, age] format
@@ -180,69 +198,91 @@ class EpiDataset(Dataset):
             age_max=14,
         )
 
-        # Precompute hospitalizations (3-channel)
-        self.hosp_preprocessor = ClinicalSeriesPreprocessor(
-            config=clinical_config,
-            var_name="hospitalizations",
-        )
-        self.precomputed_hosp_hist = self.hosp_preprocessor.preprocess_dataset(
-            self._dataset,
-            population=self._dataset.get("population"),
-        )
-        self.precomputed_hosp_hist[..., 0] = _replace_non_finite(
-            self.precomputed_hosp_hist[..., 0]
-        )
+        if shared_series is not None:
+            if set(shared_series) != set(SHARED_SERIES_ATTRS):
+                raise ValueError("shared_series must contain every SHARED_SERIES_ATTRS")
+            # Shared biomarkers were scaled by the source dataset's fitted scaler.
+            if biomarker_preprocessor is None:
+                raise ValueError(
+                    "shared_series requires the fitted biomarker_preprocessor"
+                )
+            for name, value in shared_series.items():
+                setattr(self, name, value)
+        else:
+            # Load biomarker data start offset if available
+            if "biomarker_data_start" in self._dataset:
+                self.biomarker_data_start = torch.from_numpy(
+                    self._dataset["biomarker_data_start"].values
+                ).to(torch.long)
+            else:
+                # Fallback: all regions have data starting at index 0
+                self.biomarker_data_start = torch.zeros(
+                    self.num_nodes, dtype=torch.long
+                )
 
-        # Precompute deaths (3-channel)
-        self.deaths_preprocessor = ClinicalSeriesPreprocessor(
-            config=clinical_config,
-            var_name="deaths",
-        )
-        self.precomputed_deaths_hist = self.deaths_preprocessor.preprocess_dataset(
-            self._dataset,
-            population=self._dataset.get("population"),
-        )
-        self.precomputed_deaths_hist[..., 0] = _replace_non_finite(
-            self.precomputed_deaths_hist[..., 0]
-        )
+            # Precompute hospitalizations (3-channel)
+            hosp_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="hospitalizations",
+            )
+            self.precomputed_hosp_hist = hosp_preprocessor.preprocess_dataset(
+                self._dataset,
+                population=self._dataset.get("population"),
+            )
+            self.precomputed_hosp_hist[..., 0] = _replace_non_finite(
+                self.precomputed_hosp_hist[..., 0]
+            )
 
-        # Precompute reported cases (3-channel)
-        self.cases_preprocessor = ClinicalSeriesPreprocessor(
-            config=clinical_config,
-            var_name="cases",
-        )
-        self.precomputed_cases_hist = self.cases_preprocessor.preprocess_dataset(
-            self._dataset,
-            population=self._dataset.get("population"),
-        )
-        self.precomputed_cases_hist[..., 0] = _replace_non_finite(
-            self.precomputed_cases_hist[..., 0]
-        )
+            # Precompute deaths (3-channel)
+            deaths_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="deaths",
+            )
+            self.precomputed_deaths_hist = deaths_preprocessor.preprocess_dataset(
+                self._dataset,
+                population=self._dataset.get("population"),
+            )
+            self.precomputed_deaths_hist[..., 0] = _replace_non_finite(
+                self.precomputed_deaths_hist[..., 0]
+            )
 
-        # Precompute joint inference targets + masks (1D for loss computation).
-        # Clinical targets use log1p(per-100k), while wastewater targets stay in
-        # measurement space (log1p on raw concentration/proxy values).
-        self.precomputed_hosp, self.precomputed_hosp_mask = (
-            self._precompute_joint_target("hospitalizations", per_100k=True)
-        )
-        self.precomputed_ww, self.precomputed_ww_mask = (
-            self._precompute_wastewater_target()
-        )
-        # Reported cases and deaths (optional, default to all-missing if not in dataset)
-        self.precomputed_cases_target, self.precomputed_cases_mask = (
-            self._precompute_joint_target("cases", per_100k=True)
-        )
-        self.precomputed_deaths, self.precomputed_deaths_mask = (
-            self._precompute_joint_target("deaths", per_100k=True)
-        )
-        self.precomputed_S_target = self._precompute_latent_target("latent_S_true")
-        self.precomputed_I_target = self._precompute_latent_target("latent_I_true")
-        self.precomputed_H_target = self._precompute_latent_target("latent_H_true")
-        self.precomputed_R_target = self._precompute_latent_target("latent_R_true")
-        self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
-        self.precomputed_death_flow_target = self._precompute_latent_target(
-            "latent_death_flow_true"
-        )
+            # Precompute reported cases (3-channel)
+            cases_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="cases",
+            )
+            self.precomputed_cases_hist = cases_preprocessor.preprocess_dataset(
+                self._dataset,
+                population=self._dataset.get("population"),
+            )
+            self.precomputed_cases_hist[..., 0] = _replace_non_finite(
+                self.precomputed_cases_hist[..., 0]
+            )
+
+            # Precompute joint inference targets + masks (1D for loss computation).
+            # Clinical targets use log1p(per-100k), while wastewater targets stay in
+            # measurement space (log1p on raw concentration/proxy values).
+            self.precomputed_hosp, self.precomputed_hosp_mask = (
+                self._precompute_joint_target("hospitalizations", per_100k=True)
+            )
+            self.precomputed_ww, self.precomputed_ww_mask = (
+                self._precompute_wastewater_target()
+            )
+            # Reported cases and deaths (optional, default to all-missing if not in dataset)
+            self.precomputed_cases_target, self.precomputed_cases_mask = (
+                self._precompute_joint_target("cases", per_100k=True)
+            )
+            self.precomputed_deaths, self.precomputed_deaths_mask = (
+                self._precompute_joint_target("deaths", per_100k=True)
+            )
+            self.precomputed_S_target = self._precompute_latent_target("latent_S_true")
+            self.precomputed_I_target = self._precompute_latent_target("latent_I_true")
+            self.precomputed_H_target = self._precompute_latent_target("latent_H_true")
+            self.precomputed_R_target = self._precompute_latent_target("latent_R_true")
+            self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
+            self.precomputed_death_flow_target = self._precompute_latent_target(
+                "latent_death_flow_true"
+            )
 
         # Setup mobility preprocessor
         if mobility_preprocessor is None:
@@ -396,68 +436,68 @@ class EpiDataset(Dataset):
         else:
             self.biomarker_preprocessor = biomarker_preprocessor
 
-        # Precompute biomarkers for the entire dataset
-        # This returns a (TotalTime, NumNodes, 4 * variants) tensor: per variant
-        # the channels are [value, mask, censor, age], concatenated on the last axis.
-        if self.biomarker_variants:
-            self.precomputed_biomarkers = torch.from_numpy(
-                self.biomarker_preprocessor.preprocess_dataset(self._dataset)
-            ).to(dtype_utils.STORAGE_DTYPES["continuous"])
-            self.precomputed_biomarkers[..., 0::4] = _replace_non_finite(
-                self.precomputed_biomarkers[..., 0::4]
-            )
-        else:
-            T_total = len(self._dataset[TEMPORAL_COORD])
-            # 4 channels per variant: value, mask, censor, age
-            channel_count = max(1, len(self.biomarker_variants)) * 4
-            # channels: value=0, mask=0, censor=0, age=1
-            dummy = torch.zeros(
-                (T_total, self.num_nodes, channel_count),
-                dtype=dtype_utils.STORAGE_DTYPES["continuous"],
-            )
-            # For 4-channel layout [value, mask, censor, age], age is at indices 3, 7, 11, ...
-            for idx in range(3, channel_count, 4):
-                dummy[:, :, idx] = 1.0
-            self.precomputed_biomarkers = dummy
+        if shared_series is None:
+            # Precompute biomarkers for the entire dataset
+            # This returns a (TotalTime, NumNodes, 4 * variants) tensor: per variant
+            # the channels are [value, mask, censor, age], concatenated on the last axis.
+            if self.biomarker_variants:
+                self.precomputed_biomarkers = torch.from_numpy(
+                    self.biomarker_preprocessor.preprocess_dataset(self._dataset)
+                ).to(dtype_utils.STORAGE_DTYPES["continuous"])
+                self.precomputed_biomarkers[..., 0::4] = _replace_non_finite(
+                    self.precomputed_biomarkers[..., 0::4]
+                )
+            else:
+                T_total = len(self._dataset[TEMPORAL_COORD])
+                # 4 channels per variant: value, mask, censor, age
+                channel_count = max(1, len(self.biomarker_variants)) * 4
+                # channels: value=0, mask=0, censor=0, age=1
+                dummy = torch.zeros(
+                    (T_total, self.num_nodes, channel_count),
+                    dtype=dtype_utils.STORAGE_DTYPES["continuous"],
+                )
+                # For 4-channel layout [value, mask, censor, age], age is at indices 3, 7, 11, ...
+                for idx in range(3, channel_count, 4):
+                    dummy[:, :, idx] = 1.0
+                self.precomputed_biomarkers = dummy
 
-        # Precompute vaccination rate (3-channel) if enabled and available
-        if (
-            self.config.model.include_vaccination
-            and "vaccination_rate" in self._dataset.data_vars
-        ):
-            vaccination_preprocessor = ClinicalSeriesPreprocessor(
-                config=clinical_config,
-                var_name="vaccination_rate",
-            )
-            self.precomputed_vaccination_hist = (
-                vaccination_preprocessor.preprocess_dataset(self._dataset)
-            )
-            self.precomputed_vaccination_hist[..., 0] = _replace_non_finite(
-                self.precomputed_vaccination_hist[..., 0]
-            )
-            logger.info(
-                f"Loaded vaccination history: shape={self.precomputed_vaccination_hist.shape}"
-            )
-        else:
-            self.precomputed_vaccination_hist = None
+            # Precompute vaccination rate (3-channel) if enabled and available
+            if (
+                self.config.model.include_vaccination
+                and "vaccination_rate" in self._dataset.data_vars
+            ):
+                vaccination_preprocessor = ClinicalSeriesPreprocessor(
+                    config=clinical_config,
+                    var_name="vaccination_rate",
+                )
+                self.precomputed_vaccination_hist = (
+                    vaccination_preprocessor.preprocess_dataset(self._dataset)
+                )
+                self.precomputed_vaccination_hist[..., 0] = _replace_non_finite(
+                    self.precomputed_vaccination_hist[..., 0]
+                )
+                logger.info(
+                    f"Loaded vaccination history: shape={self.precomputed_vaccination_hist.shape}"
+                )
+            else:
+                self.precomputed_vaccination_hist = None
 
-        # Load temporal covariates if available in dataset
-        if "temporal_covariates" in self._dataset:
-            self.temporal_covariates = torch.from_numpy(
-                self._dataset["temporal_covariates"].values
-            ).to(dtype_utils.STORAGE_DTYPES["continuous"])
-            self.temporal_covariates = _replace_non_finite(self.temporal_covariates)
-            self.temporal_covariates_dim = self.temporal_covariates.shape[1]
-            logger.info(
-                f"Loaded temporal covariates: shape={self.temporal_covariates.shape}"
-            )
-        else:
-            T_total = len(self._dataset[TEMPORAL_COORD])
-            self.temporal_covariates = torch.zeros(
-                (T_total, 0), dtype=dtype_utils.STORAGE_DTYPES["continuous"]
-            )
-            self.temporal_covariates_dim = 0
-            logger.warn("No temporal covariates found in dataset")
+            # Load temporal covariates if available in dataset
+            if "temporal_covariates" in self._dataset:
+                self.temporal_covariates = torch.from_numpy(
+                    self._dataset["temporal_covariates"].values
+                ).to(dtype_utils.STORAGE_DTYPES["continuous"])
+                self.temporal_covariates = _replace_non_finite(self.temporal_covariates)
+                logger.info(
+                    f"Loaded temporal covariates: shape={self.temporal_covariates.shape}"
+                )
+            else:
+                T_total = len(self._dataset[TEMPORAL_COORD])
+                self.temporal_covariates = torch.zeros(
+                    (T_total, 0), dtype=dtype_utils.STORAGE_DTYPES["continuous"]
+                )
+                logger.warn("No temporal covariates found in dataset")
+        self.temporal_covariates_dim = self.temporal_covariates.shape[1]
 
         self.region_embeddings = (
             region_embedding_store.embeddings
@@ -734,6 +774,11 @@ class EpiDataset(Dataset):
             except Exception:
                 pass
             self._dataset = None
+
+    @property
+    def shared_series(self) -> dict[str, torch.Tensor | None]:
+        """Split-independent series for reuse by datasets on the same source."""
+        return {name: getattr(self, name) for name in SHARED_SERIES_ATTRS}
 
     def release_shared_sparse_topology(self) -> None:
         """Drop shared full sparse topology after split-specific pruning."""

@@ -829,6 +829,7 @@ def _build_standard_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         shared_sparse_topology=shared_sparse_topology,
         region_embedding_store=region_embedding_store,
     )
@@ -841,6 +842,7 @@ def _build_standard_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         shared_sparse_topology=shared_sparse_topology,
         region_embedding_store=region_embedding_store,
     )
@@ -945,6 +947,7 @@ def _build_temporal_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         time_range=(train_end, val_end),
         region_embedding_store=region_embedding_store,
     )
@@ -957,6 +960,7 @@ def _build_temporal_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         time_range=(val_end, test_end),
         region_embedding_store=region_embedding_store,
     )
@@ -1044,6 +1048,7 @@ def _build_research_splits(
             mobility_preprocessor=train.mobility_preprocessor,
             preloaded_mobility=train.preloaded_mobility,
             mobility_mask=train.mobility_mask,
+            shared_series=train.shared_series,
         )
         datasets.append(dataset)
     for role, dataset in zip(

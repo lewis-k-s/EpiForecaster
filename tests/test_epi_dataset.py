@@ -4,7 +4,7 @@ import numpy as np
 import xarray as xr
 from unittest.mock import patch
 from models.configs import EpiForecasterConfig, DataConfig, ModelConfig, ModelVariant
-from data.epi_dataset import EpiDataset
+from data.epi_dataset import SHARED_SERIES_ATTRS, EpiDataset
 from data.epi_batch import collate_epiforecaster_batch
 from utils.precision_policy import MODEL_PARAM_DTYPE
 from tests.dataset_test_helpers import context_features_for_item
@@ -236,6 +236,51 @@ class TestEpiDataset:
             item = ds[0]
             features = context_features_for_item(ds, item)
             assert features.shape[1] == ds._graph_node_ids.numel()
+
+    def test_shared_series_match_a_fresh_build(self, config, mock_xarray_dataset):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            train = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+            shared_kwargs = {
+                "config": config,
+                "target_nodes": [2],
+                "context_nodes": [0, 1, 2],
+                "biomarker_preprocessor": train.biomarker_preprocessor,
+                "mobility_preprocessor": train.mobility_preprocessor,
+                "preloaded_mobility": train.preloaded_mobility,
+                "mobility_mask": train.mobility_mask,
+            }
+            fresh = EpiDataset(**shared_kwargs)
+            shared = EpiDataset(**shared_kwargs, shared_series=train.shared_series)
+
+        for name in SHARED_SERIES_ATTRS:
+            value = getattr(shared, name)
+            # Reused without a copy, and equal to what the dataset would build.
+            assert value is getattr(train, name)
+            if value is not None:
+                assert torch.equal(value, getattr(fresh, name))
+        assert shared.temporal_covariates_dim == fresh.temporal_covariates_dim
+        assert len(shared) == len(fresh)
+        for index in range(len(fresh)):
+            for key, value in fresh[index].items():
+                if isinstance(value, torch.Tensor):
+                    assert torch.equal(shared[index][key], value), key
+
+    def test_shared_series_require_fitted_biomarker_preprocessor(
+        self, config, mock_xarray_dataset
+    ):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            train = EpiDataset(config=config, target_nodes=[0], context_nodes=[0])
+            with pytest.raises(ValueError, match="biomarker_preprocessor"):
+                EpiDataset(
+                    config=config,
+                    target_nodes=[1],
+                    context_nodes=[0, 1],
+                    shared_series=train.shared_series,
+                )
 
     def test_invalid_window(self, config, mock_xarray_dataset):
         with patch.object(

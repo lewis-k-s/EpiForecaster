@@ -132,6 +132,7 @@ def test_dataset_factory_enforces_role_ranges_and_reuses_fit_scalers(
                 "mobility_preprocessor",
                 "preloaded_mobility",
                 "mobility_mask",
+                "shared_series",
             ]:
                 setattr(self, field, kwargs.get(field, object()))
             created.append(self)
@@ -172,6 +173,7 @@ def test_dataset_factory_enforces_role_ranges_and_reuses_fit_scalers(
     for ds in [result.val, result.test]:
         assert ds.biomarker_preprocessor is result.train.biomarker_preprocessor
         assert ds.mobility_preprocessor is result.train.mobility_preprocessor
+        assert ds.shared_series is result.train.shared_series
     expected_nodes = [2] if crossval else [0, 2]
     assert result.test.kwargs["target_nodes"] == expected_nodes
     assert result.test.kwargs["context_nodes"] == [0, 1, 2]
