@@ -293,10 +293,35 @@ def stage_source_files(
     return sorted(selected, key=lambda path: path.as_posix())
 
 
+def _require_stale_recovery(options: dict[str, Any], *, field: str) -> None:
+    """Rolling allocations must recover trials killed with their allocation.
+
+    A wall-time kill leaves its trial RUNNING in the journal. Without recovery
+    the identity is never claimed again and the campaign exits pending forever.
+    """
+    if options.get("recover_stale_running") is not True:
+        raise ValueError(
+            f"{field}.recover_stale_running must be true: a trial killed at the "
+            "allocation wall time otherwise stays RUNNING and blocks completion"
+        )
+
+
+def _validate_container_pin(workflow_config: dict[str, Any]) -> None:
+    container = workflow_config.get("container") or {}
+    if not isinstance(container, dict):
+        raise ValueError("container must be a mapping")
+    pin = container.get("expected_sha256")
+    if pin is not None and (
+        not isinstance(pin, str) or re.fullmatch(r"[0-9a-f]{64}", pin) is None
+    ):
+        raise ValueError("container.expected_sha256 must be 64 lowercase hex digits")
+
+
 def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     """Validate mode-specific configuration before snapshot transfer."""
     kind = workflow_kind(workflow_config)
     workflow_target(workflow_config)
+    _validate_container_pin(workflow_config)
     required_sections = {
         "train": ("training", "evaluation"),
         "evaluate": ("evaluation",),
@@ -394,6 +419,7 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             raise ValueError(
                 "ablation.closeout_signal_seconds must be an integer of at least 60"
             )
+        _require_stale_recovery(ablation, field="ablation")
         timeout_s = ablation.get("timeout_s")
         if (
             not isinstance(timeout_s, int)
@@ -425,6 +451,7 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             if campaign in campaigns:
                 raise ValueError(f"Duplicate ablation suite campaign: {campaign}")
             campaigns.add(campaign)
+            _require_stale_recovery(study, field=f"ablation_suite study {name}")
             workers = study.get("workers")
             if (
                 not isinstance(workers, int)
@@ -828,6 +855,53 @@ def verify_snapshot(config_path: Path, source_root: Path, file_list_path: Path) 
     return actual
 
 
+def parse_build_metadata(text: str) -> dict[str, str]:
+    """Parse the ``key=value`` build sidecar written by the SIF assembler."""
+    metadata: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip():
+            metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def verify_container_identity(
+    *,
+    resolved_sif: str,
+    metadata_text: str,
+    observed_sha256: str,
+    uv_lock_sha256: str,
+    expected_sha256: str | None = None,
+) -> None:
+    """Require the runtime image to match the bundle's dependency lock.
+
+    The image alias can point at an image built from an older ``uv.lock``. The
+    assembler records the lock hash in the build sidecar, so compare it with the
+    lock that travels in the source bundle.
+    """
+    metadata = parse_build_metadata(metadata_text)
+    recorded_sif = metadata.get("sif_sha256")
+    if recorded_sif is not None and recorded_sif != observed_sha256:
+        raise ValueError(
+            f"Container build metadata sif_sha256 {recorded_sif} does not match "
+            f"the observed image digest {observed_sha256}: {resolved_sif}"
+        )
+    if expected_sha256 is not None and expected_sha256 != observed_sha256:
+        raise ValueError(
+            f"Container {resolved_sif} has digest {observed_sha256}, but the "
+            f"template pins container.expected_sha256={expected_sha256}"
+        )
+    image_lock = metadata.get("uv_lock_sha256")
+    if image_lock != uv_lock_sha256:
+        raise ValueError(
+            f"Container {resolved_sif} was built from uv.lock "
+            f"{image_lock or '(unrecorded)'}, but the source bundle uv.lock is "
+            f"{uv_lock_sha256}. Set REMOTE_CONTAINER_SIF to the digest-named "
+            "epiforecaster-runtime-<build_key>.sif image whose .build.txt lists "
+            f"uv_lock_sha256={uv_lock_sha256}."
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -855,6 +929,13 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--source-root", type=Path, required=True)
     verify.add_argument("--file-list", type=Path, required=True)
+
+    container = subparsers.add_parser("verify-container")
+    container.add_argument("--config", type=Path, required=True)
+    container.add_argument("--resolved-sif", required=True)
+    container.add_argument("--metadata-file", type=Path, required=True)
+    container.add_argument("--observed-sha256", required=True)
+    container.add_argument("--uv-lock", type=Path, required=True)
     return parser
 
 
@@ -885,6 +966,19 @@ def main() -> None:
         print("\t".join(str(allocation[field]) for field in ALLOCATION_FIELDS))
     elif args.command == "verify":
         print(verify_snapshot(args.config, args.source_root, args.file_list))
+    elif args.command == "verify-container":
+        document = yaml.safe_load(args.config.read_text())
+        pin = (document.get("container") or {}).get("expected_sha256")
+        try:
+            verify_container_identity(
+                resolved_sif=args.resolved_sif,
+                metadata_text=args.metadata_file.read_text(),
+                observed_sha256=args.observed_sha256,
+                uv_lock_sha256=hashlib.sha256(args.uv_lock.read_bytes()).hexdigest(),
+                expected_sha256=pin,
+            )
+        except ValueError as error:
+            raise SystemExit(f"error: {error}") from error
 
 
 if __name__ == "__main__":

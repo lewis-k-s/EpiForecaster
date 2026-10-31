@@ -1,6 +1,6 @@
 schema_version: 1
 campaign_id: epiforecaster_ablation_v1
-stage: ablation
+stage: ablation_smoke
 hypothesis: Paired interventions isolate each declared architectural, loss, signal, and delay-kernel choice from the fixed production baseline.
 base_config: configs/production_only/train_epifor_mn5_full.yaml
 baseline_condition: baseline

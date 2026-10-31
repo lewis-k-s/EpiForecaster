@@ -147,6 +147,26 @@ verify_remote_container() {
     return 1
   fi
   TOOLING_KEY="sif-sha256:$observed_sha"
+  CONTAINER_SHA256="$observed_sha"
+}
+
+# Require the image build metadata to match the uv.lock of the source bundle and
+# the optional container.expected_sha256 pin of the rendered config.
+verify_container_lock_identity() {
+  local resolved_sif="$1"
+  local bundle_root="$2"
+  local metadata_file="$3"
+
+  if ! remote_exec cat "${resolved_sif}.build.txt" >"$metadata_file"; then
+    echo "Container build metadata is missing: ${resolved_sif}.build.txt" >&2
+    return 1
+  fi
+  uv run --no-sync python -m scripts.workflow.run_config verify-container \
+    --config "$bundle_root/config.yaml" \
+    --resolved-sif "$resolved_sif" \
+    --metadata-file "$metadata_file" \
+    --observed-sha256 "$CONTAINER_SHA256" \
+    --uv-lock "$bundle_root/source/uv.lock"
 }
 
 # Render the effective config, source snapshot, and byte inventory directly
@@ -225,6 +245,12 @@ prepare_run() {
   bundle_root="$tmp_dir/bundle"
 
   if ! render_run_bundle "$run_id" "$root" "$resolved_sif" "$bundle_root"; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+
+  if ! verify_container_lock_identity \
+    "$resolved_sif" "$bundle_root" "$tmp_dir/container-build.txt"; then
     rm -rf -- "$tmp_dir"
     return 1
   fi

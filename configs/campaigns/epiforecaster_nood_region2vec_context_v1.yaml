@@ -46,6 +46,7 @@ completeness_requirements:
   require_exact_identity_matrix: true
   require_terminal_trials: true
   require_finite_primary_metric: true
+  require_full_manifest_folds: true
 provenance_requirements:
   require_campaign_sha256: true
   require_output_identity: true

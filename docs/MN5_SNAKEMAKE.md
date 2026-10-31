@@ -68,7 +68,10 @@ Ablation workers compile a checked-in declarative campaign into a deterministic
 `condition × fold × paired-model-seed` queue.  Optuna's JournalStorage is
 strictly durable coordination: it performs no TPE or design sampling. Analysis
 runs only after the exact declared identity matrix is terminal and provenance
-matched; it uses run-level aggregate metrics and never pools granular windows.
+matched; the campaign endpoint and the fold/seed-paired deltas come from run-level
+aggregate metrics and never pool granular windows. Granular rows feed only
+descriptive region, horizon, and target breakdowns, and any invalid prediction
+(non-finite location or scale, or scale of zero or less) stops the analysis.
 
 ## Storage and identity
 
@@ -119,6 +122,12 @@ Dirty worktrees are supported. Preparation copies tracked and non-ignored
 untracked files to an isolated snapshot, hashes and transfers those bytes via
 `dt`, verifies them remotely, and makes the source and config read-only. DVC
 pointers travel with source; DVC payloads are rejected from the source bundle.
+
+Preparation also checks the SIF against the source. The SIF metadata sidecar
+must record the SHA-256 of the snapshot's `uv.lock`; otherwise prepare stops
+and names the image to use. `.cluster/mn5.conf` defaults to the digest-named
+image, not to the `epiforecaster-runtime.sif` alias. A template can pin
+`container.expected_sha256`; a different SIF digest then stops preparation.
 
 ## Environments and data
 
@@ -243,20 +252,40 @@ does not write `workers_complete.done` or run campaign analysis for that
 allocation. Submit the same immutable run again to continue its exact identity
 matrix; existing terminal trials are retained.
 
+The wrapper scripts ignore `SIGUSR1`, so only the Python worker handles it.
+The launcher removes `.state/continuation.required` and old rank receipts when
+it starts. It writes the marker again, with the current attempt ID, only after
+a close-out. The coordinator accepts a marker of its own attempt only. It then
+exits 0 and records `exit_code 75` in `completed.tsv`, and `status` shows
+`coordinator=closeout`. Code 75 means that the queue still holds work.
+
 Optuna values always minimize the validation-selection coordination value and
 record its actual metric name and value on the trial. They are not the campaign
 primary endpoint: the analyzer alone applies the campaign-declared held-out
-primary metric and direction to aggregate artifacts. Recovery marks stale
-`RUNNING` attempts terminal before enqueuing a replacement. Failed or pruned
+primary metric and direction to aggregate artifacts. Every ablation config
+must set `recover_stale_running: true`. Recovery marks stale `RUNNING`
+attempts terminal before enqueuing a replacement. Up to three such recoveries
+per identity do not count toward the failed-attempt budget.
+
+A `reuse_receipt` is accepted record by record. A record is reused only when its
+dataset and region-embedding DVC hashes, SIF digest and hydrated training config
+hash equal those of the executing run, and its source bundle hash equals the
+run's or is listed in the campaign field `reuse.allow_code_identities`. The
+worker writes the decision to `outputs/training/reuse_acceptance.json`;
+rejected identities are trained again. Failed or pruned
 historical attempts are retained, but completion requires no nonterminal attempt,
 exactly one `COMPLETE` trial, and exactly one canonical output per scientific
 identity.
 
 Each output sidecar must agree with its persisted config: `fold` is `null`
 unless cross-validation is enabled. Every canonical output has a non-empty
-aggregate metric table with `target` and the campaign primary metric; those
-run-level aggregate rows, rather than granular windows, are the sole inputs to
-campaign endpoint aggregation.
+aggregate metric table with `target` and the campaign primary metric
+(`mean_target_wis` is a column of `test_main_model_aggregate_metrics.csv`, the
+equal-head mean of per-head WIS from the evaluation pipeline). Those run-level
+aggregate rows, rather than granular windows, are the sole inputs to campaign
+endpoint aggregation and to the paired fold/seed deltas. Reused runs must supply
+this aggregate table in the evidence bundle, and the analyzer checks their
+recorded identity against the bundled `config.yaml`.
 
 Each data, training, evaluation, cross-validation, HPO, ablation, selection,
 and promotion contract fingerprints the same complete scientific source
@@ -320,6 +349,11 @@ bash scripts/workflow/mn5_workflow.sh run-interactive \
 Omit the allocation ID only when exactly one compatible `acc_interactive`
 allocation is active. The adapter attaches the immutable workflow to that
 allocation and never calls `sbatch`.
+
+The coordinator step runs detached (`setsid nohup`, no stdin), so an SSH or VPN
+drop does not stop it. `launcher.pid` holds the PID of this detached step. The
+allocation must have at least the requested runtime left, or the close-out
+lead time plus 60 seconds for runs with close-out.
 
 The selected public target is immutable after preparation. Choose `train` or
 `train_evaluate` in the template's `workflow.target` before `prepare`; `run`

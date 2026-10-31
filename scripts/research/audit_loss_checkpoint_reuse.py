@@ -6,24 +6,26 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from models.configs import EpiForecasterConfig
-from scripts.hpo.ablation_worker import AblationCampaign, load_campaign
+from scripts.hpo.ablation_worker import (
+    AblationCampaign,
+    hydrated_training_config,
+    load_campaign,
+    _without_evaluation_controls,
+)
 
+PROTOCOL_PATH = Path("configs/research/loss_protocol_v1.yaml")
 IDENTITY_PATTERN = re.compile(
     r"^(?P<family>normal|student_t)-(?P<objective>nll|crps)-m(?P<mobility>[01])"
-    r"-f(?P<fold>\d+)-s(?P<seed>\d+)-r\d+$"
+    r"-f(?P<fold>\d+)-s(?P<seed>\d+)(?:-r\d+)?$"
 )
-TRAINING_ONLY_EXCLUSIONS = {
-    ("output",),
-    ("training", "run_final_evaluation"),
-    ("training", "plot_forecasts"),
-}
+# Dirty paths that cannot change training behavior.
+CLEAN_DIRTY_PREFIXES = ("docs/", "tex/")
 
 
 def _sha256(path: Path) -> str:
@@ -34,63 +36,21 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _overrides(mapping: dict[str, Any], prefix: tuple[str, ...] = ()) -> list[str]:
-    values: list[str] = []
-    for key, value in mapping.items():
-        path = (*prefix, key)
-        if isinstance(value, dict):
-            values.extend(_overrides(value, path))
-        else:
-            values.append(f"{'.'.join(path)}={json.dumps(value, separators=(',', ':'))}")
-    return values
-
-
-def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
-    merged = json.loads(json.dumps(base))
-    for key, value in patch.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _without_evaluation_controls(config: dict[str, Any]) -> dict[str, Any]:
-    normalized = json.loads(json.dumps(config))
-    for path in TRAINING_ONLY_EXCLUSIONS:
-        cursor: Any = normalized
-        for part in path[:-1]:
-            if not isinstance(cursor, dict):
-                break
-            cursor = cursor.get(part)
-        if isinstance(cursor, dict):
-            cursor.pop(path[-1], None)
-    return normalized
-
-
 def _condition_name(match: re.Match[str]) -> str:
     mobility = "on" if match["mobility"] == "1" else "off"
     return f"{match['family']}:{match['objective']}:mobility_{mobility}"
 
 
-def _campaign_config(
-    campaign: AblationCampaign,
-    *,
-    condition: str,
-    fold: int,
-    seed: int,
-) -> dict[str, Any]:
-    condition_overrides = campaign.conditions_by_name[condition].overrides
-    merged = _deep_merge(campaign.fixed_overrides, condition_overrides)
-    overrides = _overrides(merged)
-    overrides.extend(
-        [
-            f"training.seed={seed}",
-            f"training.crossval_fold_index={fold}",
-            "output.write_granular_eval=true",
-        ]
-    )
-    return EpiForecasterConfig.load(str(campaign.base_config), overrides=overrides).to_dict()
+def _dirty_training_paths(status_lines: list[str]) -> list[str]:
+    """Return porcelain-status paths outside the prefixes that cannot affect training."""
+    offending: list[str] = []
+    for line in status_lines:
+        # Porcelain v1: two status columns, one space, then the path. A rename
+        # lists "old -> new"; both sides must be harmless.
+        for path in str(line)[3:].split(" -> "):
+            if not path.strip('"').startswith(CLEAN_DIRTY_PREFIXES):
+                offending.append(path)
+    return offending
 
 
 def _trained_config(run_dir: Path) -> tuple[dict[str, Any], Path]:
@@ -107,11 +67,20 @@ def audit_reuse(
     *,
     campaign: AblationCampaign,
     historical_root: Path,
-    current_git_sha: str,
+    source_bundle_sha256: str,
+    container_digest: str,
+    protocol_path: Path = PROTOCOL_PATH,
 ) -> dict[str, Any]:
-    """Return immutable receipt records; never mutates historical artifacts."""
-    expected_dataset = "b5b684d5b9f31369895589c413f39291"
-    expected_region2vec = "e04ff23fe17dbbb245315798fd7cd887"
+    """Return immutable receipt records; never mutates historical artifacts.
+
+    ``source_bundle_sha256`` and ``container_digest`` are the identities of the
+    deployed run that will reuse the checkpoints, not of this checkout.
+    """
+    protocol = yaml.safe_load(protocol_path.read_text(encoding="utf-8"))
+    expected_dataset = str(protocol["data"]["research_dataset_dvc_md5"])
+    expected_region2vec = str(protocol["data"]["region2vec_dvc_md5"])
+    allowed_code = set(campaign.allowed_reuse_code_identities) | {source_bundle_sha256}
+    expected_container = container_digest.removeprefix("sha256:")
     records: list[dict[str, Any]] = []
     expected = {
         (condition.name, fold, seed)
@@ -153,25 +122,25 @@ def audit_reuse(
             reasons.append("historical_completion_receipt_not_scientific")
         identity = manifest.get("identity", {})
         dvc_hashes = identity.get("dvc_hashes", {})
-        if dvc_hashes.get(
-            "outputs/loss_research/loss-type-research-v1/real_loss_fit20200930_v1.nc.dvc"
-        ) != expected_dataset:
-            reasons.append("dataset_dvc_identity_mismatch")
-        if dvc_hashes.get(
-            "outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc"
-        ) != expected_region2vec:
-            reasons.append("region2vec_dvc_identity_mismatch")
-        if identity.get("git_sha") != current_git_sha:
-            reasons.append("git_source_identity_mismatch")
-        dirty_paths = receipt.get("source", {}).get("git_status", [])
-        if any(not str(value).removeprefix(" M ").startswith(("docs/", "tex")) for value in dirty_paths):
-            reasons.append("historical_dirty_training_source_unverified")
-        expected_config = _campaign_config(
-            campaign,
-            condition=condition,
-            fold=fold,
-            seed=seed,
+        expected_config = hydrated_training_config(
+            campaign, condition=condition, fold=fold, seed=seed
         )
+        dataset_target = f"{expected_config['data']['dataset_path']}.dvc"
+        region2vec_target = f"{expected_config['data']['region2vec_path']}.dvc"
+        if dvc_hashes.get(dataset_target) != expected_dataset:
+            reasons.append("dataset_dvc_identity_mismatch")
+        if dvc_hashes.get(region2vec_target) != expected_region2vec:
+            reasons.append("region2vec_dvc_identity_mismatch")
+        historical_bundle = identity.get("source_snapshot_sha256")
+        if historical_bundle not in allowed_code:
+            reasons.append("source_bundle_identity_mismatch")
+        historical_container = str(identity.get("container_digest", "")).removeprefix(
+            "sha256:"
+        )
+        if historical_container != expected_container:
+            reasons.append("container_digest_mismatch")
+        if _dirty_training_paths(receipt.get("source", {}).get("git_status", [])):
+            reasons.append("historical_dirty_training_source_unverified")
         expected_identity = _without_evaluation_controls(expected_config)
         trained_identity = _without_evaluation_controls(trained)
         if expected_identity != trained_identity:
@@ -189,12 +158,9 @@ def audit_reuse(
                 "old_run_path": str(run_dir),
                 "source_bundle_sha256": identity.get("source_snapshot_sha256"),
                 "git_sha": identity.get("git_sha"),
-                "dataset_dvc_md5": dvc_hashes.get(
-                    "outputs/loss_research/loss-type-research-v1/real_loss_fit20200930_v1.nc.dvc"
-                ),
-                "region2vec_dvc_md5": dvc_hashes.get(
-                    "outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc"
-                ),
+                "container_digest": identity.get("container_digest"),
+                "dataset_dvc_md5": dvc_hashes.get(dataset_target),
+                "region2vec_dvc_md5": dvc_hashes.get(region2vec_target),
                 "hydrated_training_config_sha256": hashlib.sha256(
                     json.dumps(expected_identity, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest(),
@@ -211,7 +177,8 @@ def audit_reuse(
         "schema_version": 1,
         "campaign_id": campaign.campaign_id,
         "campaign_sha256": campaign.sha256,
-        "current_git_sha": current_git_sha,
+        "expected_source_bundle_sha256": source_bundle_sha256,
+        "expected_container_digest": expected_container,
         "historical_root": str(historical_root),
         "expected_identities": len(expected),
         "historical_identities_found": len(records),
@@ -237,22 +204,40 @@ def main() -> None:
         default=Path("outputs/loss_research/loss-type-research-v1/screen"),
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--source-bundle-sha256",
+        required=True,
+        help="source_snapshot_sha256 of the deployed run that will reuse the checkpoints",
+    )
+    parser.add_argument(
+        "--container-digest",
+        required=True,
+        help="Container SIF sha256 of the deployed run that will reuse the checkpoints",
+    )
+    parser.add_argument("--protocol", type=Path, default=PROTOCOL_PATH)
     args = parser.parse_args()
     campaign = load_campaign(args.campaign)
-    current_git_sha = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True
-    ).strip()
     receipt = audit_reuse(
         campaign=campaign,
         historical_root=args.historical_root,
-        current_git_sha=current_git_sha,
+        source_bundle_sha256=args.source_bundle_sha256,
+        container_digest=args.container_digest,
+        protocol_path=args.protocol,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(
         f"{receipt['reusable_identities']} reusable / {receipt['historical_identities_found']} "
         f"historical identities; {receipt['expected_identities'] - receipt['reusable_identities']} new training identities"
     )
+    if receipt["historical_identities_found"] == 0:
+        print(
+            f"error: no historical run under {args.historical_root} matches the campaign",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

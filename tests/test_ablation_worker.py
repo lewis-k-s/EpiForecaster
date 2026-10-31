@@ -40,12 +40,14 @@ def _write_campaign(
     smoke_folds: list[int] | None = None,
     allowed_paths: list[str] | None = None,
     require_full_manifest_folds: bool = False,
+    stage: str = "ablation_smoke",
+    extra: dict[str, object] | None = None,
 ) -> Path:
     base = Path("configs/train_epifor_smoke.yaml").resolve()
     campaign: dict[str, object] = {
         "schema_version": 1,
         "campaign_id": "campaign-test",
-        "stage": "ablation",
+        "stage": stage,
         "hypothesis": "Structured conditions are paired.",
         "base_config": str(base),
         "baseline_condition": "baseline",
@@ -86,6 +88,7 @@ def _write_campaign(
             "require_output_identity": True,
         },
     }
+    campaign.update(extra or {})
     if folds is not None:
         manifest = tmp_path / "splits.json"
         manifest.write_text(
@@ -307,7 +310,7 @@ def test_study_completion_rejects_running_attempt_after_complete(
         )
         for params in worker.build_trial_queue(campaign)
     ]
-    study = SimpleNamespace(trials=complete_trials)
+    study = SimpleNamespace(trials=complete_trials, user_attrs={})
 
     assert worker.is_study_complete(study, campaign)
 
@@ -423,7 +426,7 @@ def test_journal_completion_status_rejects_duplicate_complete_trial(
         )
         for params in worker.build_trial_queue(campaign)
     ]
-    study = SimpleNamespace(trials=trials)
+    study = SimpleNamespace(trials=trials, user_attrs={})
     assert worker.study_completion_status(study, campaign) == "complete"
 
     trials.append(
@@ -636,3 +639,35 @@ def test_smoke_declared_full_validation_is_not_clamped_to_two_batches(
 
     assert "training.max_batches=null" in captured
     assert "training.max_batches=2" not in captured
+
+
+def test_campaign_stage_is_validated(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="stage must be one of"):
+        worker.load_campaign(_write_campaign(tmp_path, stage="exploratory"))
+
+
+def test_ablation_stage_with_folds_requires_full_manifest_coverage(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="require_full_manifest_folds"):
+        worker.load_campaign(_write_campaign(tmp_path, folds=[0, 1], stage="ablation"))
+
+    campaign = worker.load_campaign(
+        _write_campaign(
+            tmp_path, folds=[0, 1], stage="ablation", require_full_manifest_folds=True
+        )
+    )
+    assert campaign.stage == "ablation"
+
+
+def test_ablation_stage_requires_two_conditions_and_two_seeds(tmp_path: Path) -> None:
+    path = _write_campaign(tmp_path, stage="ablation")
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    document["paired_model_seeds"] = [42]
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="two paired seeds"):
+        worker.load_campaign(path)
+    document["stage"] = "ablation_smoke"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    assert worker.load_campaign(path).stage == "ablation_smoke"

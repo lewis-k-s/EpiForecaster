@@ -250,7 +250,12 @@ def ablation_worker_arguments(
         arguments.append("--requeue-running")
     if options.get("reuse_receipt") is not None:
         arguments.extend(
-            ["--reuse-receipt", CONTAINER_SOURCE / str(options["reuse_receipt"])]
+            [
+                "--reuse-receipt",
+                CONTAINER_SOURCE / str(options["reuse_receipt"]),
+                "--run-manifest",
+                CONTAINER_RUN / "manifest.yaml",
+            ]
         )
     if options.get("recover_stale_running", False):
         arguments.append("--recover-stale-running")

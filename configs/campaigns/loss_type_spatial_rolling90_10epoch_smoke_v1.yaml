@@ -1,6 +1,6 @@
 schema_version: 1
 campaign_id: loss_type_spatial_rolling90_10epoch_smoke_v1
-stage: ablation
+stage: ablation_smoke
 hypothesis: Bounded ten-epoch mobility-on training check with a wider spatial target
   cohort.
 base_config: configs/production_only/train_epifor_mn5_full.yaml

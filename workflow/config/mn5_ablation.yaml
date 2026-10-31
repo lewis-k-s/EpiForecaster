@@ -24,6 +24,7 @@ ablation:
   timeout_s: 21600
   sampler_seed: 42
   smoketest: false
+  recover_stale_running: true
   requeue_running: false
 
 resources:

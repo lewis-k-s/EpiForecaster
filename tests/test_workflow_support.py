@@ -118,6 +118,7 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
         "sampler_seed": 42,
         "smoketest": True,
         "requeue_running": False,
+        "recover_stale_running": True,
     }
     assert smoke["resources"]["allocation"] == {
         "account": "bsc08",
@@ -146,6 +147,7 @@ def test_coverage_smoke_exercises_full_campaign_subset() -> None:
         "sampler_seed": 42,
         "smoketest": True,
         "requeue_running": False,
+        "recover_stale_running": True,
     }
     assert smoke["resources"]["allocation"] == {
         "account": "bsc08",
@@ -433,6 +435,7 @@ def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> No
         "workers": 4,
         "timeout_s": 3000,
         "closeout_signal_seconds": 600,
+        "recover_stale_running": True,
     }
     config_path = tmp_path / "ablation-config.yaml"
     config["container"] = {
@@ -1079,7 +1082,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
             {
                 "schema_version": 1,
                 "campaign_id": "campaign-a",
-                "stage": "ablation",
+                "stage": "ablation_smoke",
                 "hypothesis": "paired conditions",
                 "base_config": str(base_config),
                 "baseline_condition": "baseline",
@@ -2974,19 +2977,23 @@ def test_parallel_launcher_uses_journal_after_worker_receipts(
     checker = workflow_root / "mn5_container_exec.sh"
     checker.write_text('#!/bin/bash\nexit "$FAKE_JOURNAL_STATUS"\n')
     checker.chmod(0o755)
-    (workflow_root / "run_parallel_worker.sh").write_text("#!/bin/bash\nexit 0\n")
+    run_root = tmp_path / "run"
+    marker_root = run_root / ".state/workers/ablation_test"
+    marker_root.mkdir(parents=True)
+    # The launcher clears stale receipts, so the rank publishes a fresh one.
+    (workflow_root / "run_parallel_worker.sh").write_text(
+        f"#!/bin/bash\necho outcome=continuation >{marker_root}/000.partial\n"
+    )
     (workflow_root / "run_parallel_worker.sh").chmod(0o755)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "srun").write_text(
         '#!/bin/bash\nif [[ " $* " == *" --cpus-per-task=1 "* ]]; then\n'
-        '  exit "$FAKE_JOURNAL_STATUS"\nfi\nexit 0\n'
+        '  exit "$FAKE_JOURNAL_STATUS"\nfi\n'
+        'for a in "$@"; do case "$a" in *run_parallel_worker.sh) "$a";; esac; done\n'
+        "exit 0\n"
     )
     (fake_bin / "srun").chmod(0o755)
-    run_root = tmp_path / "run"
-    marker_root = run_root / ".state/workers/ablation_test"
-    marker_root.mkdir(parents=True)
-    (marker_root / "000.partial").write_text("outcome=continuation\n")
 
     result = subprocess.run(
         [

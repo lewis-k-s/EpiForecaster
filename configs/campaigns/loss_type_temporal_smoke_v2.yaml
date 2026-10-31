@@ -1,6 +1,6 @@
 schema_version: 1
 campaign_id: loss_type_temporal_smoke_v2
-stage: ablation
+stage: ablation_smoke
 hypothesis: Bounded acceptance smoke for the temporal split and paired mobility paths.
 base_config: configs/production_only/train_epifor_mn5_full.yaml
 baseline_condition: normal:crps:mobility_off

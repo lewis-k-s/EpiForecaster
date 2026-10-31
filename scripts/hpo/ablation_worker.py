@@ -12,6 +12,7 @@ import json
 import logging
 import signal
 import os
+import re
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -44,6 +45,12 @@ TERMINAL_TRIAL_STATES = {
 }
 
 CLOSEOUT_EXIT_CODE = 75
+CAMPAIGN_STAGES = frozenset({"ablation", "ablation_smoke"})
+STALE_RECOVERED_ATTR = "ablation_stale_recovered_trials"
+# Attempts killed with their allocation (wall time, node loss) are not model
+# failures. They stop consuming nothing only up to this bound per identity, so
+# a trial that always kills its worker still ends in a retry-budget error.
+STALE_RECOVERY_BUDGET = 3
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,7 @@ class AblationCampaign:
     equal_budget_policy: EqualBudgetPolicy
     completeness_requirements: dict[str, Any]
     provenance_requirements: dict[str, Any]
+    allowed_reuse_code_identities: tuple[str, ...] = ()
 
     @property
     def has_folds(self) -> bool:
@@ -509,6 +517,38 @@ def load_campaign(path: Path) -> AblationCampaign:
                 f"{list(expected_folds)}, got {list(fold_indices)}"
             )
 
+    stage = _string(root["stage"], field="stage")
+    if stage not in CAMPAIGN_STAGES:
+        raise ValueError(
+            f"stage must be one of {sorted(CAMPAIGN_STAGES)}, got {stage!r}"
+        )
+    if stage == "ablation":
+        if fold_indices and not require_full_manifest_folds:
+            raise ValueError(
+                "stage 'ablation' with folds requires "
+                "completeness_requirements.require_full_manifest_folds: true; "
+                "use stage 'ablation_smoke' for bounded fold subsets"
+            )
+        if len(conditions) < 2:
+            raise ValueError("stage 'ablation' requires at least two conditions")
+        if len(seeds) < 2:
+            raise ValueError("stage 'ablation' requires at least two paired seeds")
+    allowed_reuse_code_identities: tuple[str, ...] = ()
+    if root.get("reuse") is not None:
+        reuse = _mapping(root["reuse"], field="reuse")
+        if set(reuse) != {"allow_code_identities"}:
+            raise ValueError("reuse must contain only allow_code_identities")
+        allowed_reuse_code_identities = _string_list(
+            reuse["allow_code_identities"], field="reuse.allow_code_identities"
+        )
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in allowed_reuse_code_identities
+        ):
+            raise ValueError(
+                "reuse.allow_code_identities must be source bundle SHA-256 digests"
+            )
+
     primary_name = _string(primary.get("name"), field="metrics.primary.name")
     primary_direction = _string(
         primary.get("direction"), field="metrics.primary.direction"
@@ -533,7 +573,7 @@ def load_campaign(path: Path) -> AblationCampaign:
         path=path,
         sha256=hashlib.sha256(_canonical_json(root).encode("utf-8")).hexdigest(),
         campaign_id=campaign_id,
-        stage=_string(root["stage"], field="stage"),
+        stage=stage,
         hypothesis=_string(root["hypothesis"], field="hypothesis"),
         base_config=base_config,
         baseline_condition=_string(
@@ -563,6 +603,7 @@ def load_campaign(path: Path) -> AblationCampaign:
         provenance_requirements=_mapping(
             root["provenance_requirements"], field="provenance_requirements"
         ),
+        allowed_reuse_code_identities=allowed_reuse_code_identities,
     )
     _validate_conditions(
         base_config=base_config,
@@ -658,13 +699,230 @@ def _mark_running_attempt_failed(study: optuna.Study, trial_number: int) -> None
     study.tell(trial_number, state=optuna.trial.TrialState.FAIL)
 
 
+def _terminalize_stale_attempt(study: optuna.Study, trial_number: int) -> None:
+    """Fail a RUNNING attempt left by a dead allocation and mark it as infrastructure.
+
+    The mark keeps wall-time kills out of the model-failure retry budget.
+    """
+    recorded = {int(value) for value in study.user_attrs.get(STALE_RECOVERED_ATTR, [])}
+    recorded.add(trial_number)
+    study.set_user_attr(STALE_RECOVERED_ATTR, sorted(recorded))
+    _mark_running_attempt_failed(study, trial_number)
+
+
+def _budgeted_failures(
+    study: optuna.Study, attempts: list[optuna.trial.FrozenTrial]
+) -> int:
+    """Count failed attempts that consume the retry budget of one identity."""
+    stale = {int(value) for value in study.user_attrs.get(STALE_RECOVERED_ATTR, [])}
+    failed = [
+        trial
+        for trial in attempts
+        if trial.state
+        in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
+    ]
+    if not stale:
+        return len(failed)
+    infrastructure = sum(trial.number in stale for trial in failed)
+    return (
+        len(failed)
+        - infrastructure
+        + max(0, infrastructure - STALE_RECOVERY_BUDGET)
+    )
+
+
+TRAINING_ONLY_EXCLUSIONS = (
+    ("output",),
+    ("training", "run_final_evaluation"),
+    ("training", "plot_forecasts"),
+)
+
+
+def _deep_merge(base: dict[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
+    merged = json.loads(json.dumps(base))
+    for key, value in patch.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _without_evaluation_controls(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(config))
+    for path in TRAINING_ONLY_EXCLUSIONS:
+        cursor: Any = normalized
+        for part in path[:-1]:
+            if not isinstance(cursor, dict):
+                break
+            cursor = cursor.get(part)
+        if isinstance(cursor, dict):
+            cursor.pop(path[-1], None)
+    return normalized
+
+
+def hydrated_training_config(
+    campaign: AblationCampaign, *, condition: str, fold: int, seed: int
+) -> dict[str, Any]:
+    """Resolve the canonical training config of one identity (receipt contract)."""
+    merged = _deep_merge(
+        campaign.fixed_overrides, campaign.conditions_by_name[condition].overrides
+    )
+    overrides = _as_cli_overrides(merged)
+    overrides.extend(
+        [
+            f"training.seed={seed}",
+            f"training.crossval_fold_index={fold}",
+            "output.write_granular_eval=true",
+        ]
+    )
+    return EpiForecasterConfig.load(
+        str(campaign.base_config), overrides=overrides
+    ).to_dict()
+
+
+def hydrated_training_config_sha256(
+    campaign: AblationCampaign, *, condition: str, fold: int, seed: int
+) -> str:
+    """Hash the training-relevant hydrated config; evaluation controls excluded."""
+    identity = _without_evaluation_controls(
+        hydrated_training_config(campaign, condition=condition, fold=fold, seed=seed)
+    )
+    return hashlib.sha256(_canonical_json(identity).encode()).hexdigest()
+
+
+def _bare_sha256(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value.removeprefix("sha256:") or None
+
+
+@dataclass(frozen=True)
+class ExecutionIdentity:
+    """Code, container and input identities of the executing immutable run."""
+
+    source_bundle_sha256: str
+    container_digest: str
+    dvc_md5_by_output: Mapping[str, str]
+
+
+def load_execution_identity(manifest_path: Path) -> ExecutionIdentity:
+    """Read the identities that prepare wrote into the run manifest."""
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    identity = _mapping(manifest.get("identity"), field="manifest.identity")
+    targets = _mapping(
+        _mapping(manifest.get("dvc"), field="manifest.dvc").get("targets"),
+        field="manifest.dvc.targets",
+    )
+    source = _bare_sha256(identity.get("source_snapshot_sha256"))
+    container = _bare_sha256(identity.get("container_digest"))
+    if source is None or container is None:
+        raise ValueError(
+            "run manifest lacks source_snapshot_sha256 or container_digest identity"
+        )
+    return ExecutionIdentity(
+        source_bundle_sha256=source,
+        container_digest=container,
+        dvc_md5_by_output={
+            Path(str(target["output"])).as_posix(): str(target["md5"])
+            for target in targets.values()
+            if isinstance(target, Mapping) and "output" in target and "md5" in target
+        },
+    )
+
+
+def reuse_rejection_reasons(
+    record: Mapping[str, Any],
+    *,
+    campaign: AblationCampaign,
+    execution: ExecutionIdentity,
+) -> list[str]:
+    """Return why a reuse record is not valid for this run; empty means accepted."""
+    reasons: list[str] = []
+    if record.get("status") != "reusable":
+        reasons.append("audit_status_not_reusable")
+    try:
+        condition, seed, fold = (
+            str(record["condition"]),
+            int(record["seed"]),
+            int(record["fold"]),
+        )
+        hydrated = hydrated_training_config(
+            campaign, condition=condition, fold=fold, seed=seed
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return [*reasons, f"identity_unresolvable:{type(exc).__name__}"]
+    expected_hash = hashlib.sha256(
+        _canonical_json(_without_evaluation_controls(hydrated)).encode()
+    ).hexdigest()
+    if record.get("hydrated_training_config_sha256") != expected_hash:
+        reasons.append("hydrated_training_config_mismatch")
+    for field, config_key in (
+        ("dataset_dvc_md5", "dataset_path"),
+        ("region2vec_dvc_md5", "region2vec_path"),
+    ):
+        path = hydrated.get("data", {}).get(config_key)
+        executing = (
+            execution.dvc_md5_by_output.get(Path(str(path)).as_posix())
+            if path is not None
+            else None
+        )
+        if field == "region2vec_dvc_md5" and record.get(field) is None:
+            continue
+        if executing is None or record.get(field) != executing:
+            reasons.append(f"{field}_mismatch")
+    if _bare_sha256(record.get("container_digest")) != execution.container_digest:
+        reasons.append("container_digest_mismatch")
+    code = _bare_sha256(record.get("source_bundle_sha256"))
+    if code != execution.source_bundle_sha256 and (
+        code is None or code not in campaign.allowed_reuse_code_identities
+    ):
+        reasons.append("source_bundle_not_allowed")
+    return reasons
+
+
+def _write_reuse_acceptance(
+    path: Path,
+    *,
+    campaign: AblationCampaign,
+    execution: ExecutionIdentity,
+    accepted: list[dict[str, Any]],
+    rejected: list[dict[str, Any]],
+) -> None:
+    """Persist the acceptance decision; identical for every worker rank."""
+    document = {
+        "schema_version": 1,
+        "campaign_id": campaign.campaign_id,
+        "campaign_sha256": campaign.sha256,
+        "execution_source_bundle_sha256": execution.source_bundle_sha256,
+        "execution_container_digest": execution.container_digest,
+        "allowed_code_identities": list(campaign.allowed_reuse_code_identities),
+        "accepted": accepted,
+        "rejected": rejected,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
 def load_reuse_identities(
     receipt_path: Path | None,
     campaign: AblationCampaign,
+    execution: ExecutionIdentity | None = None,
+    acceptance_path: Path | None = None,
 ) -> set[tuple[str, int, int | None]]:
-    """Load only provenance-verified historical identities for queue completion."""
+    """Accept only historical identities that match this run's code and inputs.
+
+    Records that fail any identity check are logged, written to the acceptance
+    receipt, and left out so the campaign trains them again.
+    """
     if receipt_path is None:
         return set()
+    if execution is None:
+        raise ValueError("checkpoint reuse requires the executing run identity")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if (
         receipt.get("campaign_id") != campaign.campaign_id
@@ -672,13 +930,40 @@ def load_reuse_identities(
     ):
         raise ValueError("checkpoint reuse receipt does not match campaign identity")
     expected = expected_trial_identities(campaign)
-    identities = {
-        (str(item["condition"]), int(item["seed"]), int(item["fold"]))
-        for item in receipt.get("records", [])
-        if item.get("status") == "reusable"
-    }
-    if not identities.issubset(expected):
-        raise ValueError("checkpoint reuse receipt contains undeclared identities")
+    identities: set[tuple[str, int, int | None]] = set()
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for item in receipt.get("records", []):
+        identity = (str(item["condition"]), int(item["seed"]), int(item["fold"]))
+        if identity not in expected:
+            raise ValueError("checkpoint reuse receipt contains undeclared identities")
+        reasons = reuse_rejection_reasons(item, campaign=campaign, execution=execution)
+        entry = {
+            "condition": identity[0],
+            "seed": identity[1],
+            "fold": identity[2],
+        }
+        if reasons:
+            rejected.append({**entry, "reasons": reasons})
+        else:
+            identities.add(identity)
+            accepted.append(entry)
+    if rejected:
+        logger.warning(
+            "Rejected %d of %d checkpoint reuse records; they will be retrained: %s",
+            len(rejected),
+            len(rejected) + len(accepted),
+            json.dumps(rejected, sort_keys=True),
+        )
+    logger.info("Accepted %d checkpoint reuse records", len(accepted))
+    if acceptance_path is not None:
+        _write_reuse_acceptance(
+            acceptance_path,
+            campaign=campaign,
+            execution=execution,
+            accepted=accepted,
+            rejected=rejected,
+        )
     return identities
 
 
@@ -752,14 +1037,14 @@ def initialize_study_queue(
                     and trial.state == optuna.trial.TrialState.RUNNING
                     and allocation_id != active_allocation_id
                 ):
-                    _mark_running_attempt_failed(study, trial.number)
+                    _terminalize_stale_attempt(study, trial.number)
         elif requeue_running:
             for trial in tuple(study.trials):
                 if (
                     trial_identity(trial) in expected
                     and trial.state == optuna.trial.TrialState.RUNNING
                 ):
-                    _mark_running_attempt_failed(study, trial.number)
+                    _terminalize_stale_attempt(study, trial.number)
         if reuse_identities:
             _record_reused_trials(study, campaign, reuse_identities)
         attempts_by_identity: dict[
@@ -782,14 +1067,7 @@ def initialize_study_queue(
                 continue
             if any(attempt.state not in TERMINAL_TRIAL_STATES for attempt in attempts):
                 continue
-            if (
-                sum(
-                    attempt.state
-                    in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
-                    for attempt in attempts
-                )
-                >= FAILED_ATTEMPT_BUDGET
-            ):
+            if _budgeted_failures(study, attempts) >= FAILED_ATTEMPT_BUDGET:
                 continue
             replacements.append(params)
         for params in replacements:
@@ -837,11 +1115,7 @@ def study_completion_status(
             trial.state == optuna.trial.TrialState.COMPLETE for trial in attempts
         )
         active = sum(trial.state not in TERMINAL_TRIAL_STATES for trial in attempts)
-        failed = sum(
-            trial.state
-            in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
-            for trial in attempts
-        )
+        failed = _budgeted_failures(study, attempts)
         if complete > 1 or active > 1 or (complete and active):
             raise ValueError(f"Journal has duplicate attempts for {identity}")
         if not complete:
@@ -918,11 +1192,7 @@ def _reenqueue_incomplete_identities(
             continue
         if any(trial.state not in TERMINAL_TRIAL_STATES for trial in attempts):
             continue
-        failed = sum(
-            trial.state
-            in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
-            for trial in attempts
-        )
+        failed = _budgeted_failures(study, attempts)
         if failed >= attempts_budget:
             logger.warning(
                 "Identity %s exhausted its %d-attempt budget; leaving it failed",
@@ -949,23 +1219,18 @@ def _reenqueue_failed_identity(
     attempts_budget: int,
 ) -> None:
     """Requeue a transiently failed identity so the session does not drain early."""
-    attempts = [
-        trial
-        for trial in study.trials
-        if trial_identity(trial) == identity
-        and trial.state
-        in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
-    ]
+    attempts = [trial for trial in study.trials if trial_identity(trial) == identity]
+    failed = _budgeted_failures(study, attempts)
     has_complete = any(
         trial.state == optuna.trial.TrialState.COMPLETE
         for trial in study.trials
         if trial_identity(trial) == identity
     )
-    if has_complete or len(attempts) >= attempts_budget:
+    if has_complete or failed >= attempts_budget:
         logger.warning(
             "Identity %s has %d failed attempts; leaving it failed",
             identity,
-            len(attempts),
+            failed,
         )
         return
     if any(
@@ -977,7 +1242,7 @@ def _reenqueue_failed_identity(
     logger.warning(
         "Re-enqueued failed identity %s (attempt %d of %d)",
         identity,
-        len(attempts) + 1,
+        failed + 1,
         attempts_budget,
     )
 
@@ -1192,6 +1457,12 @@ def objective(
     "--reuse-receipt", type=click.Path(exists=True, path_type=Path), default=None
 )
 @click.option("--recover-stale-running", is_flag=True, default=False)
+@click.option(
+    "--run-manifest",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Run manifest.yaml; defaults to <run-root>/../../manifest.yaml.",
+)
 def main(
     campaign: Path,
     study_name: str,
@@ -1205,6 +1476,7 @@ def main(
     check_complete: bool,
     reuse_receipt: Path | None,
     recover_stale_running: bool,
+    run_manifest: Path | None,
 ) -> None:
     if check_complete:
         declaration = load_campaign(campaign)
@@ -1240,13 +1512,25 @@ def main(
             "coordination values"
         )
     queue_lock_path = journal_file.with_suffix(f"{journal_file.suffix}.queue.lock")
+    execution: ExecutionIdentity | None = None
+    acceptance_path: Path | None = None
+    if reuse_receipt is not None:
+        manifest_path = (
+            run_manifest
+            if run_manifest is not None
+            else run_root.parent.parent / "manifest.yaml"
+        )
+        execution = load_execution_identity(manifest_path)
+        acceptance_path = run_root / "reuse_acceptance.json"
     initialize_study_queue(
         study=study,
         campaign=declaration,
         lock_path=queue_lock_path,
         smoketest=smoketest,
         requeue_running=requeue_running,
-        reuse_identities=load_reuse_identities(reuse_receipt, declaration),
+        reuse_identities=load_reuse_identities(
+            reuse_receipt, declaration, execution, acceptance_path
+        ),
         recover_stale_running=recover_stale_running,
         active_allocation_id=active_allocation_id,
     )

@@ -1,6 +1,6 @@
 schema_version: 1
 campaign_id: loss_type_spatial_rolling90_paired10_v1
-stage: ablation
+stage: ablation_smoke
 hypothesis: Matched mobility on and off comparison across every spatial fold for the
   wider 45-of-90-day target cohort.
 base_config: configs/production_only/train_epifor_mn5_full.yaml
