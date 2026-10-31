@@ -103,8 +103,8 @@ def _write_pointer(
 
 
 def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml").read_text()
+    smoke = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml"
     )
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
@@ -133,8 +133,8 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
 
 
 def test_coverage_smoke_exercises_full_campaign_subset() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml").read_text()
+    smoke = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml"
     )
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
@@ -1604,10 +1604,8 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
 ) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("train", run_root)
-    profiled = yaml.safe_load(
-        (
-            REPO_ROOT / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
-        ).read_text()
+    profiled = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
     )
     config["workflow"] = profiled["workflow"]
     config["training"] = profiled["training"]
@@ -1641,8 +1639,8 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
 def test_preprocessing_publication_launches_a_host_slurm_step(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("preprocess", run_root)
-    template = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_loss_research_preprocess.yaml").read_text()
+    template = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_loss_research_preprocess.yaml"
     )
     config["workflow"].update(template["workflow"])
     config["dvc"].update(template["dvc"])

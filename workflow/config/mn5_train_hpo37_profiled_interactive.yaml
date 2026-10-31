@@ -6,28 +6,16 @@
 # The selected data.mobility_threshold=1.0 parameter predates the raw-flow
 # contract cutover and is expressed here as data.mobility_min_flow_raw=1.0.
 # Per-run paths and provenance fields are injected by mn5_workflow.sh.
-
-run: {}
-source: {}
-container: {}
+extends: mn5_train_smoke.yaml
 
 workflow:
-  kind: train
   target: train
-
-dvc:
-  targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
-    - outputs/region_embeddings/region_embeddings.pt.dvc
 
 provenance:
   training_evidence_retention: dvc
 
 training:
-  base_config: configs/production_only/train_epifor_mn5_full.yaml
   experiment_name: hpo37-profiled-interactive
-  model_id: model
   max_batches: null
   overrides:
     - data.mobility_min_flow_raw=1.0
@@ -54,18 +42,10 @@ training:
     - training.run_final_evaluation=false
 
 evaluation:
-  split: test
   granular: true
   overrides:
     - training.val_workers=2
 
 resources:
   allocation:
-    account: bsc08
-    partition: acc
-    qos: acc_bscls
-    nodes: 1
-    tasks: 1
-    cpus_per_task: 20
-    gres: gpu:1
     runtime: 45

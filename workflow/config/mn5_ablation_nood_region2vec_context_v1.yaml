@@ -1,10 +1,4 @@
-run: {}
-source: {}
-container: {}
-
-workflow:
-  kind: ablation
-  target: ablation
+extends: mn5_ablation.yaml
 
 dvc:
   targets:
@@ -15,21 +9,4 @@ dvc:
 ablation:
   study_name: epiforecaster_nood_region2vec_context_v1
   campaign: configs/campaigns/epiforecaster_nood_region2vec_context_v1.yaml
-  workers: 4
-  closeout_signal_seconds: 3600
-  timeout_s: 21600
   sampler_seed: 52
-  smoketest: false
-  recover_stale_running: true
-  requeue_running: false
-
-resources:
-  allocation:
-    account: bsc08
-    partition: acc
-    qos: acc_bscls
-    nodes: 1
-    tasks: 4
-    cpus_per_task: 20
-    gres: gpu:4
-    runtime: 420

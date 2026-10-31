@@ -1,35 +1,5 @@
-run: {}
-source: {}
-container: {}
-workflow:
-  kind: preprocess
-  target: preprocess
-dvc:
-  targets:
-  - outputs/loss_research/loss-type-research-v1/raw_inputs.dvc
-  - data/files/mobility.zarr.dvc
-  provenance_targets: []
+extends: mn5_loss_type_spatial_v1_preprocess.yaml
+
 preprocessing:
   base_config: configs/production_only/preprocess_mn5_loss_type_temporal_v1.yaml
   dataset_name: real_loss_fit20200821_v1
-  expected_run_count: 1
-  required_variables:
-  - cases
-  - hospitalizations
-  - deaths
-  - edar_biomarker_N1
-  float32_variables:
-  - cases
-  - hospitalizations
-  - deaths
-  - edar_biomarker_N1
-resources:
-  allocation:
-    account: bsc08
-    partition: acc
-    qos: acc_debug
-    nodes: 1
-    tasks: 1
-    cpus_per_task: 20
-    gres: gpu:1
-    runtime: 90

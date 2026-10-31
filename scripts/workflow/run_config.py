@@ -673,6 +673,49 @@ def git_identity(
     }
 
 
+MAX_TEMPLATE_EXTENDS_DEPTH = 4
+
+
+def _merge_template(parent: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
+    """Deep-merge mappings; the child wins and lists or scalars are replaced."""
+    merged = dict(parent)
+    for key, value in child.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_template(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_template(template_path: Path, _chain: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Load one template and resolve its `extends` chain into one mapping.
+
+    `extends` is a path relative to the extending file. The resolved mapping
+    never contains the `extends` key, so rendered configs stay standalone.
+    """
+    resolved_path = template_path.resolve()
+    if resolved_path in _chain:
+        raise ValueError(f"Workflow template extends cycle at {template_path}")
+    if len(_chain) >= MAX_TEMPLATE_EXTENDS_DEPTH:
+        raise ValueError(
+            f"Workflow template extends depth exceeds "
+            f"{MAX_TEMPLATE_EXTENDS_DEPTH}: {template_path}"
+        )
+    document = yaml.safe_load(template_path.read_text())
+    if not isinstance(document, dict):
+        raise ValueError(f"Workflow template must be a mapping: {template_path}")
+    parent_ref = document.pop("extends", None)
+    if parent_ref is None:
+        return document
+    if not isinstance(parent_ref, str):
+        raise ValueError(f"Workflow template extends must be a path: {template_path}")
+    parent_path = template_path.parent / parent_ref
+    if not parent_path.is_file():
+        raise ValueError(f"Workflow template parent not found: {parent_path}")
+    parent = load_template(parent_path, (*_chain, resolved_path))
+    return _merge_template(parent, document)
+
+
 def render_config(
     *,
     template_path: Path,
@@ -698,9 +741,7 @@ def render_config(
     else:
         snapshot_template = snapshot_root / relative_template
 
-    document = yaml.safe_load(snapshot_template.read_text())
-    if not isinstance(document, dict):
-        raise ValueError(f"Workflow template must be a mapping: {template_path}")
+    document = load_template(snapshot_template)
 
     validate_code_data_separation(snapshot_root, paths, document)
     validate_workflow_contract(document)

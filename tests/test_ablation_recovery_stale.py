@@ -9,21 +9,21 @@ import pytest
 import yaml
 
 from scripts.hpo import ablation_worker as worker
-from scripts.workflow.run_config import validate_workflow_contract
+from scripts.workflow.run_config import load_template, validate_workflow_contract
 from tests.test_ablation_worker import _write_campaign
 
 TEMPLATES = sorted(Path("workflow/config").glob("*.yaml"))
 
 
 def _kind(path: Path) -> str:
-    return yaml.safe_load(path.read_text(encoding="utf-8"))["workflow"]["kind"]
+    return load_template(path)["workflow"]["kind"]
 
 
 def test_every_ablation_template_enables_stale_recovery() -> None:
     ablation_templates = [path for path in TEMPLATES if _kind(path) == "ablation"]
     assert ablation_templates
     for path in ablation_templates:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        document = load_template(path)
         assert document["ablation"]["recover_stale_running"] is True, path.name
 
 

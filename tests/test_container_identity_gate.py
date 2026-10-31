@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from scripts.workflow.run_config import (
+    load_template,
     parse_build_metadata,
     validate_mn5_allocation,
     validate_workflow_contract,
@@ -87,7 +88,7 @@ def test_every_workflow_template_passes_the_contract_and_allocation_checks() -> 
     assert templates
     checked = 0
     for path in templates:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        document = load_template(path)
         # Copy-and-fill templates are incomplete by design.
         if ".template." in path.name or (
             document["workflow"]["kind"] == "evaluate"

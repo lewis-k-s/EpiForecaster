@@ -1,31 +1,6 @@
-run: {}
-source: {}
-container: {}
-workflow:
-  kind: ablation
-  target: ablation
-dvc:
-  targets:
-  - data/files/mobility.zarr.dvc
-  - outputs/loss_research/loss-type-spatial-rolling90-v1/real_loss_spatial_rolling90_v1.nc.dvc
-  - outputs/region_embeddings_no_mobility/region_embeddings.pt.dvc
+extends: mn5_loss_type_spatial_rolling90_paired10_v1.yaml
+
 ablation:
   study_name: loss_type_spatial_rolling90_10epoch_smoke_v1
   campaign: configs/campaigns/loss_type_spatial_rolling90_10epoch_smoke_v1.yaml
-  workers: 1
-  recover_stale_running: true
-  closeout_signal_seconds: 1200
-  timeout_s: 6000
-  sampler_seed: 52
   smoketest: true
-  requeue_running: false
-resources:
-  allocation:
-    account: bsc08
-    partition: acc
-    qos: acc_interactive
-    nodes: 1
-    tasks: 1
-    cpus_per_task: 20
-    gres: gpu:1
-    runtime: 120
