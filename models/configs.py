@@ -1215,6 +1215,15 @@ class TrainingParams:
         }:
             raise ValueError(f"Unsupported selection_metric: {self.selection_metric!r}")
         if (
+            self.retain_best_crps_checkpoint
+            and self.loss.joint.observation_loss not in {"nll", "crps", "wis"}
+        ):
+            raise ValueError(
+                "retain_best_crps_checkpoint requires a probabilistic "
+                "observation_loss (nll, crps, or wis), got "
+                f"{self.loss.joint.observation_loss!r}"
+            )
+        if (
             not self.selection_required_heads
             or len(set(self.selection_required_heads))
             != len(self.selection_required_heads)

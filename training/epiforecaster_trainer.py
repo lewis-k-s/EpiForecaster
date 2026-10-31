@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import platform
+import random
 import re
 import time
 from collections import defaultdict
@@ -278,6 +279,9 @@ class EpiForecasterTrainer:
     The trainer is designed to be model-agnostic, with variant-specific behavior controlled through model configuration.
     """
 
+    # Set on resume under selection_metric=auto; checked on first validation.
+    _resume_selection_metric: str | None = None
+
     def __init__(
         self,
         config: EpiForecasterConfig,
@@ -305,8 +309,6 @@ class EpiForecasterTrainer:
         # Set random seeds for reproducibility (CPU only).
         # CUDA-specific seeding is deferred until after DataLoader workers are forked.
         if config.training.seed is not None:
-            import random
-
             random.seed(config.training.seed)
             np.random.seed(config.training.seed)
             torch.manual_seed(config.training.seed)
@@ -1020,7 +1022,8 @@ class EpiForecasterTrainer:
         self._persist_run_config(experiment_dir)
         self._persist_mobility_diagnostics(experiment_dir)
         self._persist_latent_scale_state(experiment_dir)
-        self._persist_latent_gradient_probe(experiment_dir)
+        if self.config.training.pathway_gradient_frequency > 0:
+            self._persist_latent_gradient_probe(experiment_dir)
 
         self.experiment_dir = experiment_dir
 
@@ -1260,6 +1263,15 @@ class EpiForecasterTrainer:
             "best_val_selection_metric",
             getattr(self, "best_val_selection_metric", _SELECTION_METRIC_NAME),
         )
+        if np.isfinite(self.best_val_selection_score):
+            selection_metric = self.config.training.selection_metric
+            if selection_metric == "auto":
+                # Auto resolves from the first validation pass; compare then.
+                self._resume_selection_metric = self.best_val_selection_metric
+            else:
+                self._validate_resumed_selection_metric(selection_metric)
+        self.patience_counter = int(checkpoint.get("patience_counter", 0))
+        self._restore_rng_state(checkpoint.get("rng_state"))
         self.best_val_joint_loss = checkpoint.get(
             "best_val_joint_loss",
             checkpoint.get(
@@ -1272,6 +1284,33 @@ class EpiForecasterTrainer:
             default_selection_metric=self.best_val_selection_metric,
         )
         self._status(f"Resumed from checkpoint: {checkpoint_path}")
+
+    def _validate_resumed_selection_metric(self, current_metric: str) -> None:
+        """Reject a resume whose selection metric differs from the checkpoint."""
+        self._resume_selection_metric, saved = None, self._resume_selection_metric
+        if saved is None:
+            saved = self.best_val_selection_metric
+        if saved != current_metric:
+            raise ValueError(
+                "Resume selection metric mismatch: checkpoint best score uses "
+                f"{saved!r} but the current run selects on {current_metric!r}"
+            )
+
+    @staticmethod
+    def _capture_rng_state() -> dict[str, Any]:
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+
+    @staticmethod
+    def _restore_rng_state(state: dict[str, Any] | None) -> None:
+        if state is None:
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
 
     def _validate_checkpoint_latent_scale_state(
         self, checkpoint: dict[str, Any]
@@ -1550,8 +1589,8 @@ class EpiForecasterTrainer:
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
 
-            if self.config.training.retain_best_crps_checkpoint:
-                self._maybe_save_crps_checkpoint(epoch, val_loss, val_metrics)
+            if self._resume_selection_metric is not None:
+                self._validate_resumed_selection_metric(val_selection_metric)
 
             # Learning rate scheduling (if per-epoch)
             if self.scheduler and self.config.training.scheduler_type == "step":
@@ -1638,6 +1677,11 @@ class EpiForecasterTrainer:
             self.training_history["epoch_times"].append(
                 float(time.time() - epoch_started_at)
             )
+
+            # Auxiliary CRPS checkpoint runs after the primary bookkeeping so it
+            # records this epoch's selection state.
+            if self.config.training.retain_best_crps_checkpoint:
+                self._maybe_save_crps_checkpoint(epoch, val_loss, val_metrics)
 
             _prev_val_loss = val_loss
 
@@ -3201,7 +3245,8 @@ class EpiForecasterTrainer:
                 self._grad_norm_groups["mobility_gnn"].append(param)
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
-                self._latent_gradient_probe_names.append(name)
+                # torch.compile prefixes names with _orig_mod.; keep identity stable.
+                self._latent_gradient_probe_names.append(name.replace("_orig_mod.", ""))
             elif observation_head_name is not None:
                 self._grad_norm_groups[
                     f"observation_head_{observation_head_name}"
@@ -3449,12 +3494,19 @@ class EpiForecasterTrainer:
     def _maybe_save_crps_checkpoint(
         self, epoch: int, val_loss: float, metrics: dict
     ) -> None:
-        score, name = compute_validation_selection_score(
-            metrics,
-            observation_loss=self.criterion.observation_loss,
-            selection_metric="mean_target_crps",
-            required_heads=self.config.training.selection_required_heads,
-        )
+        try:
+            score, name = compute_validation_selection_score(
+                metrics,
+                observation_loss=self.criterion.observation_loss,
+                selection_metric="mean_target_crps",
+                required_heads=self.config.training.selection_required_heads,
+            )
+        except ValueError as error:
+            self._status(
+                f"Skipped auxiliary CRPS checkpoint at epoch {epoch}: {error}",
+                logging.WARNING,
+            )
+            return
         if score < self.best_val_crps:
             self.best_val_crps = score
             if self.config.output.save_checkpoints:
@@ -3498,6 +3550,8 @@ class EpiForecasterTrainer:
             "best_val_selection_metric": self.best_val_selection_metric,
             "best_val_joint_loss": self.best_val_joint_loss,
             "best_val_series_metrics": self.best_val_series_metrics,
+            "patience_counter": self.patience_counter,
+            "rng_state": self._capture_rng_state(),
             "config": self._get_config_for_save(),
             "residual_schedule_state": self._active_residual_schedule_state,
             "training_history": self.training_history,
