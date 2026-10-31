@@ -3,7 +3,7 @@ name = "EpiForecaster"
 version = "0.1.0"
 description = "Graph Neural Network for Mobility-Based Epidemiological Forecasting"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
   # PyTorch and PyTorch Geometric
   "torch>=2.0.0",
@@ -102,7 +102,7 @@ include = [
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 88
 lint.select = [
   "E",   # pycodestyle errors
@@ -129,7 +129,7 @@ lint.ignore = [
 
 [tool.black]
 line-length = 88
-target-version = ["py311"]
+target-version = ["py313"]
 include = '\.pyi?$'
 
 [tool.pyright]
@@ -160,7 +160,7 @@ exclude = [
   # Evaluation has torch.utils.data.Dataset protocol issues
   "**/evaluation/epiforecaster_eval.py",
 ]
-pythonVersion = "3.11"
+pythonVersion = "3.13"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportUnknownMemberType = "none"

@@ -128,7 +128,7 @@ install_tooling() {
     --frozen \
     --only-group workflow \
     --no-install-project \
-    --python 3.11
+    --python 3.13
 
   PYTHONDONTWRITEBYTECODE=1 "$ENVIRONMENT/bin/snakemake" --version
   installed="$(snakemake_probe)"

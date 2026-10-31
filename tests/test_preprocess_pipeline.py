@@ -68,7 +68,9 @@ class TestPipelineSourceSelection:
         processed = pipeline._load_raw_sources()
 
         assert MockSynthetic.called
-        assert MockSynthetic.return_value.process.called_with("synthetic_data.zarr")
+        MockSynthetic.return_value.process.assert_called_once_with(
+            "synthetic_data.zarr"
+        )
         assert "edar" in processed
         assert processed["hospitalizations"] is None
         assert processed["deaths"] is None

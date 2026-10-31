@@ -25,7 +25,7 @@ fi
 
 base_key="${base_digest:0:20}"
 base_root="$CONTAINER_ROOT/bases"
-base_sif="$base_root/uv-python311-bookworm-$base_key.sif"
+base_sif="$base_root/uv-python313-bookworm-$base_key.sif"
 context_root="$BUILD_ROOT/context"
 prefix_root="$BUILD_ROOT/prefix"
 cache_root="$UV_CACHE_ROOT"
@@ -54,7 +54,7 @@ materialize_base_sif() {
     return 0
   fi
 
-  temporary="$base_root/.uv-python311-bookworm-$base_key-$$.sif"
+  temporary="$base_root/.uv-python313-bookworm-$base_key-$$.sif"
   trap 'rm -f "$temporary"' EXIT
   singularity pull "$temporary" "docker://$BASE_IMAGE_REF"
   singularity inspect "$temporary" >/dev/null
@@ -83,7 +83,7 @@ reuse_ready_bundle() {
 load_singularity
 
 mkdir -p "$base_root" "$cache_root" "$temporary_root"
-exec 9>"$base_root/.uv-python311-bookworm-$base_key.lock"
+exec 9>"$base_root/.uv-python313-bookworm-$base_key.lock"
 flock 9
 export SINGULARITY_CACHEDIR="$cache_root/singularity"
 export SINGULARITY_LOCALCACHEDIR="$cache_root/singularity-local"
@@ -122,7 +122,7 @@ singularity exec --cleanenv \
   UV_PYTHON_DOWNLOADS=never \
   uv sync \
   --frozen \
-  --python /usr/local/bin/python3.11 \
+  --python /usr/local/bin/python3.13 \
   --no-install-project \
   --no-default-groups \
   --group workflow
@@ -131,7 +131,7 @@ singularity exec --cleanenv \
   --bind "$prefix_root:/opt/epiforecaster:ro" \
   "$base_sif" \
   /opt/epiforecaster/.venv/bin/python -c \
-  'import sys; assert sys.version_info[:2] == (3, 11); import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("locked dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
+  'import sys; assert sys.version_info[:2] == (3, 13); import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("locked dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
 
 chmod -R a-w "$prefix_root"
 printf '%s\n' \

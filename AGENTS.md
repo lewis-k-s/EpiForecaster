@@ -41,7 +41,7 @@ uv run main --help  # entrypoint cli.py
 
 ## Coding Style & Naming Conventions
 
-- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
+- Python 3.13+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
 - Indentation: 4 spaces; no tabs. Imports sorted (Ruff isort rules).
 - Naming: modules `snake_case.py`, classes `PascalCase`, functions/vars `snake_case`, constants `UPPER_SNAKE_CASE`.
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.

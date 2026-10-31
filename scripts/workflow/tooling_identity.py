@@ -13,7 +13,7 @@ def workflow_tooling_key(lock_path: Path, bootstrap_path: Path) -> str:
     bootstrap_digest = hashlib.sha256(bootstrap_path.read_bytes()).hexdigest()
     material = "\n".join(
         (
-            "python=3.11",
+            "python=3.13",
             "dependency_group=workflow",
             f"uv.lock={lock_digest}",
             f"bootstrap={bootstrap_digest}",

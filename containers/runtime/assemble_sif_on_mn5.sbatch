@@ -135,7 +135,7 @@ install_runtime_launchers() {
   for console_script in "$PREFIX_ROOT/.venv/bin/"*; do
     script_name="${console_script##*/}"
     case "$script_name" in
-      activate* | deactivate.bat | python | python3 | python3.11)
+      activate* | deactivate.bat | python | python3 | python3.13)
         continue
         ;;
     esac
@@ -224,7 +224,7 @@ singularity exec --cleanenv "$scratch_sif" sh -c '
   test "$(command -v dvc)" = /usr/local/bin/dvc
 '
 singularity exec --cleanenv "$scratch_sif" python -c \
-  'import sys; assert sys.version_info[:2] == (3, 11); assert sys.prefix == "/opt/epiforecaster/.venv"; import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
+  'import sys; assert sys.version_info[:2] == (3, 13); assert sys.prefix == "/opt/epiforecaster/.venv"; import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
 singularity exec --cleanenv "$scratch_sif" git --version
 singularity exec --cleanenv "$scratch_sif" dvc --version
 singularity exec --cleanenv "$scratch_sif" snakemake --version

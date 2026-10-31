@@ -2242,7 +2242,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "torch.cuda.is_available()" in batch
     assert "uv sync" in fetch
     assert "--frozen" in fetch
-    assert "--python /usr/local/bin/python3.11" in fetch
+    assert "--python /usr/local/bin/python3.13" in fetch
     assert "--group workflow" in fetch
     assert "--group runtime" not in fetch
     assert "UV_CONCURRENT_INSTALLS=1" in fetch
