@@ -4,9 +4,10 @@ import numpy as np
 import xarray as xr
 from unittest.mock import patch
 from models.configs import EpiForecasterConfig, DataConfig, ModelConfig, ModelVariant
-from data.epi_dataset import EpiDataset
+from data.epi_dataset import SHARED_SERIES_ATTRS, EpiDataset
 from data.epi_batch import collate_epiforecaster_batch
 from utils.precision_policy import MODEL_PARAM_DTYPE
+from tests.dataset_test_helpers import context_features_for_item
 
 
 class TestEpiDataset:
@@ -89,6 +90,94 @@ class TestEpiDataset:
             assert ds.num_nodes == 5
             assert len(ds) > 0
 
+    def test_temporal_scaler_excludes_future_values_and_is_reused(
+        self, config, mock_xarray_dataset
+    ):
+        dataset = mock_xarray_dataset.copy(deep=True)
+        values = np.full((30, 5), 2.0, dtype=np.float32)
+        values[15:] = 1000.0
+        name = "edar_biomarker_N1"
+        for suffix, data in (
+            ("", values),
+            ("_mask", np.ones_like(values)),
+            ("_censor", np.zeros_like(values)),
+            ("_age", np.zeros_like(values)),
+        ):
+            dataset[f"{name}{suffix}"] = (("date", "region_id"), data)
+        with patch.object(EpiDataset, "load_canonical_dataset", return_value=dataset):
+            train = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1],
+                time_range=(0, 15),
+            )
+            validation = EpiDataset(
+                config=config,
+                target_nodes=[2],
+                context_nodes=[0, 1, 2],
+                time_range=(15, 30),
+                biomarker_preprocessor=train.biomarker_preprocessor,
+                mobility_preprocessor=train.mobility_preprocessor,
+            )
+        assert train.biomarker_preprocessor.scaler_params.center[name] == 2.0
+        assert validation.biomarker_preprocessor is train.biomarker_preprocessor
+        assert validation.biomarker_preprocessor.scaler_params.center[name] == 2.0
+
+    def test_supervision_targets_preserve_small_positive_float32_values(
+        self, config, mock_xarray_dataset
+    ):
+        dataset = mock_xarray_dataset.copy(deep=True)
+        tiny = np.full(
+            dataset["cases"].shape,
+            1e-12,
+            dtype=np.float32,
+        )
+        for name in ("cases", "hospitalizations", "deaths"):
+            dataset[name] = (("date", "region_id"), tiny.copy())
+        for name in (
+            "edar_biomarker_N1",
+            "edar_biomarker_N2",
+            "edar_biomarker_IP4",
+        ):
+            dataset[name] = (("date", "region_id"), tiny.copy())
+            dataset[f"{name}_mask"] = (
+                ("date", "region_id"),
+                np.ones_like(tiny, dtype=bool),
+            )
+            dataset[f"{name}_censor"] = (
+                ("date", "region_id"),
+                np.zeros_like(tiny, dtype=np.uint8),
+            )
+            dataset[f"{name}_age"] = (
+                ("date", "region_id"),
+                np.ones_like(tiny, dtype=np.uint8),
+            )
+        for name in (
+            "latent_S_true",
+            "latent_I_true",
+            "latent_H_true",
+            "latent_R_true",
+            "latent_D_true",
+        ):
+            dataset[name] = (("date", "region_id"), tiny.copy())
+
+        with patch.object(EpiDataset, "load_canonical_dataset", return_value=dataset):
+            epi_dataset = EpiDataset(
+                config=config,
+                target_nodes=[0, 1],
+                context_nodes=[0, 1, 2],
+            )
+
+        assert epi_dataset.precomputed_cases_target.dtype == torch.float32
+        assert epi_dataset.precomputed_hosp.dtype == torch.float32
+        assert epi_dataset.precomputed_deaths.dtype == torch.float32
+        assert epi_dataset.precomputed_ww.dtype == torch.float32
+        assert epi_dataset.precomputed_I_target is not None
+        assert epi_dataset.precomputed_I_target.dtype == torch.float32
+        assert bool((epi_dataset.precomputed_cases_target > 0).all())
+        assert bool((epi_dataset.precomputed_ww > 0).all())
+        assert bool((epi_dataset.precomputed_I_target > 0).all())
+
     def test_getitem_shapes(self, config, mock_xarray_dataset):
         with patch.object(
             EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
@@ -104,10 +193,33 @@ class TestEpiDataset:
             L = config.model.input_window_length
 
             assert item["hosp_hist"].shape == (L, 3)
-            assert item["mob_x"].shape[2] >= 9
+            features = context_features_for_item(ds, item)
+            assert features.shape[0] == L
+            assert features.shape[2] >= 9
+            assert int(item["window_start"]) >= 0
+            assert ds.context_feature_ww is None
 
-            assert "mob_t" in item
-            assert item["mob_t"].shape == (L,)
+    def test_large_population_remains_finite_and_exact(
+        self, config, mock_xarray_dataset
+    ):
+        populations = np.array([1_686_208, 100_000, 65_505, 65_504, 26])
+        mock_xarray_dataset["population"] = (("region_id",), populations)
+
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            ds = EpiDataset(
+                config=config,
+                target_nodes=[0],
+                context_nodes=[0, 1],
+            )
+
+            population = ds.node_static_covariates["Pop"]
+            assert population.dtype == torch.float32
+            assert torch.isfinite(population).all()
+            torch.testing.assert_close(
+                population, torch.from_numpy(populations).float()
+            )
 
     def test_feature_masking(self, config, mock_xarray_dataset):
         with patch.object(
@@ -119,10 +231,91 @@ class TestEpiDataset:
                 context_nodes=[0, 1, 2, 3, 4],
             )
 
-            assert len(ds._precomputed_k_hop_masks) > 0
+            assert ds._target_k_hop_reach is not None
 
             item = ds[0]
-            assert item["mob_x"].shape[1] == ds.num_nodes
+            features = context_features_for_item(ds, item)
+            assert features.shape[1] == ds._graph_node_ids.numel()
+
+    def test_shared_series_match_a_fresh_build(self, config, mock_xarray_dataset):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            train = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+            shared_kwargs = {
+                "config": config,
+                "target_nodes": [2],
+                "context_nodes": [0, 1, 2],
+                "biomarker_preprocessor": train.biomarker_preprocessor,
+                "mobility_preprocessor": train.mobility_preprocessor,
+                "preloaded_mobility": train.preloaded_mobility,
+                "mobility_mask": train.mobility_mask,
+            }
+            fresh = EpiDataset(**shared_kwargs)
+            shared = EpiDataset(**shared_kwargs, shared_series=train.shared_series)
+
+        for name in SHARED_SERIES_ATTRS:
+            value = getattr(shared, name)
+            # Reused without a copy, and equal to what the dataset would build.
+            assert value is getattr(train, name)
+            if value is not None:
+                assert torch.equal(value, getattr(fresh, name))
+        assert shared.temporal_covariates_dim == fresh.temporal_covariates_dim
+        assert len(shared) == len(fresh)
+        for index in range(len(fresh)):
+            for key, value in fresh[index].items():
+                if isinstance(value, torch.Tensor):
+                    assert torch.equal(shared[index][key], value), key
+
+    @pytest.mark.parametrize(
+        ("corrupt", "message"),
+        [
+            ("outside_mask", "zero outside mobility_mask"),
+            ("non_finite", "finite and nonnegative"),
+            ("negative", "finite and nonnegative"),
+        ],
+    )
+    def test_shared_mobility_rejects_invalid_weights(
+        self, config, mock_xarray_dataset, corrupt, message
+    ):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            train = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+            weights = train.preloaded_mobility.clone()
+            mask = train.mobility_mask
+            # Corrupt the last edge so a check that stops early would miss it.
+            edges = torch.nonzero(~mask if corrupt == "outside_mask" else mask)
+            assert edges.numel() > 0
+            weights[tuple(edges[-1].tolist())] = {
+                "outside_mask": 1.0,
+                "non_finite": float("inf"),
+                "negative": -1.0,
+            }[corrupt]
+            with pytest.raises(ValueError, match=message):
+                EpiDataset(
+                    config=config,
+                    target_nodes=[2],
+                    context_nodes=[0, 1, 2],
+                    biomarker_preprocessor=train.biomarker_preprocessor,
+                    preloaded_mobility=weights,
+                    mobility_mask=mask,
+                )
+
+    def test_shared_series_require_fitted_biomarker_preprocessor(
+        self, config, mock_xarray_dataset
+    ):
+        with patch.object(
+            EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
+        ):
+            train = EpiDataset(config=config, target_nodes=[0], context_nodes=[0])
+            with pytest.raises(ValueError, match="biomarker_preprocessor"):
+                EpiDataset(
+                    config=config,
+                    target_nodes=[1],
+                    context_nodes=[0, 1],
+                    shared_series=train.shared_series,
+                )
 
     def test_invalid_window(self, config, mock_xarray_dataset):
         with patch.object(
@@ -165,7 +358,7 @@ class TestEpiDataset:
             assert torch.isfinite(item["cases_hist"][..., 0]).all()
             assert torch.isfinite(item["bio_node"][..., 0::4]).all()
             assert torch.isfinite(item["temporal_covariates"]).all()
-            assert torch.isfinite(item["mob_x"]).all()
+            assert torch.isfinite(context_features_for_item(ds, item)).all()
 
     def test_collate_sanitizes_non_finite_value_channels(
         self, config, mock_xarray_dataset
@@ -186,7 +379,9 @@ class TestEpiDataset:
             item_a["cases_hist"][0, 0] = float("-inf")
             item_a["bio_node"][0, 0] = float("nan")
             item_a["temporal_covariates"][0, 0] = float("nan")
-            item_a["mob_x"][0, 0, 0] = float("inf")
+
+            # Dense features are assembled lazily; dirty table values must be
+            ds.context_feature_clinical[0, 0, 0] = float("inf")
 
             batch = collate_epiforecaster_batch(
                 [item_a, item_b], require_region_index=False
@@ -197,6 +392,10 @@ class TestEpiDataset:
             assert torch.isfinite(batch.cases_hist).all()
             assert torch.isfinite(batch.bio_node).all()
             assert torch.isfinite(batch.temporal_covariates).all()
+
+            from utils.training_utils import inject_context_features
+
+            inject_context_features(batch, ds, torch.device("cpu"))
             assert torch.isfinite(batch.mob_batch.x_dense).all()
             assert batch.hosp_hist.dtype == MODEL_PARAM_DTYPE
             assert batch.deaths_hist.dtype == MODEL_PARAM_DTYPE
@@ -216,9 +415,7 @@ class TestEpiDataset:
             assert batch.deaths_target_mask.dtype == MODEL_PARAM_DTYPE
             assert batch.mob_batch.x_dense.dtype == MODEL_PARAM_DTYPE
 
-    def test_collate_reuses_shared_mob_real_node_idx(
-        self, config, mock_xarray_dataset
-    ):
+    def test_collate_reuses_shared_mob_real_node_idx(self, config, mock_xarray_dataset):
         with patch.object(
             EpiDataset, "load_canonical_dataset", return_value=mock_xarray_dataset
         ):

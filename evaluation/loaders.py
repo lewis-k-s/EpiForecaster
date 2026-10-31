@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -20,9 +21,17 @@ from torch.utils.data import ConcatDataset
 from data.dataset_factory import build_datasets
 from data.epi_batch import collate_epiforecaster_batch
 from data.epi_dataset import EpiDataset
-from models.configs import EpiForecasterConfig
+from models.configs import (
+    EpiForecasterConfig,
+    ResidualScheduleConfig,
+    resolve_residual_schedule_phase,
+)
 from models.epiforecaster import EpiForecaster
-from utils.checkpoint_compat import initialize_missing_distribution_parameters
+from utils.checkpoint_compat import (
+    initialize_missing_distribution_parameters,
+    initialize_missing_frozen_gamma_metadata,
+    migrate_legacy_frozen_clinical_gamma_keys,
+)
 from utils.device import prefetch_enabled, resolve_device
 
 logger = logging.getLogger(__name__)
@@ -105,6 +114,7 @@ def load_model_from_checkpoint(
         )
 
     config_raw = checkpoint["config"]
+    saved_config = config_raw
 
     # Handle backwards compatibility: old checkpoints have pickled EpiForecasterConfig,
     # new checkpoints have plain dicts (robust to config class changes)
@@ -112,14 +122,24 @@ def load_model_from_checkpoint(
         # New format: plain dict (YAML-compatible)
         config = EpiForecasterConfig.from_dict(config_raw)
     elif isinstance(config_raw, EpiForecasterConfig):
-        # Old format: pickled EpiForecasterConfig (for backwards compatibility)
-        config = config_raw
+        # Old format: pickled EpiForecasterConfig. Rehydrate through the
+        # current schema so newly added config blocks gain their defaults.
+        config = EpiForecasterConfig.from_dict(config_raw.to_dict())
     else:
         raise ValueError(
             f"Checkpoint config has invalid type: {type(config_raw).__name__}. "
             f"Expected EpiForecasterConfig or dict. "
             f"Please check that the checkpoint was created with a compatible version."
         )
+    checkpoint_schedule_dict = (
+        config_raw.get("training", {}).get("residual_schedule")
+        if isinstance(config_raw, dict)
+        else (
+            asdict(config_raw.training.residual_schedule)
+            if hasattr(config_raw.training, "residual_schedule")
+            else None
+        )
+    )
 
     # Apply overrides BEFORE model creation (for architecture-affecting params)
     if overrides:
@@ -156,6 +176,21 @@ def load_model_from_checkpoint(
         state_dict=state_dict,
         model_state_dict=model.state_dict(),
     )
+    state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+        state_dict=state_dict,
+        model_state_dict=model.state_dict(),
+        saved_config=saved_config,
+    )
+    if migrated_gamma_keys:
+        logger.info(
+            "Migrated %d legacy frozen clinical Gamma kernel keys",
+            len(migrated_gamma_keys),
+        )
+    state_dict, _initialized_gamma_metadata = initialize_missing_frozen_gamma_metadata(
+        state_dict=state_dict,
+        model_state_dict=model.state_dict(),
+        saved_config=saved_config,
+    )
     state_dict, initialized_distribution_keys = (
         initialize_missing_distribution_parameters(
             state_dict=state_dict,
@@ -168,8 +203,93 @@ def load_model_from_checkpoint(
             len(initialized_distribution_keys),
         )
     model.load_state_dict(state_dict)
+    _restore_residual_budget(
+        model=model,
+        checkpoint_schedule_dict=checkpoint_schedule_dict,
+        checkpoint=checkpoint,
+    )
     model.to(resolve_device(device))
     return model, config, checkpoint
+
+
+def _restore_residual_budget(
+    *,
+    model: EpiForecaster,
+    checkpoint_schedule_dict: dict[str, Any] | None,
+    checkpoint: dict[str, Any],
+) -> None:
+    """Restore the checkpointed residual log-location budget fail-closed.
+
+    ``checkpoint_schedule_dict`` is the schedule saved inside the checkpoint
+    itself (before evaluation overrides). ``None`` denotes a legacy checkpoint
+    predating residual schedules; it evaluates with the unrestricted legacy
+    residual path only when it carries no schedule provenance.
+    """
+    if checkpoint_schedule_dict is None:
+        saved_state = checkpoint.get("residual_schedule_state")
+        if saved_state is not None:
+            raise ValueError(
+                "Legacy checkpoint carries residual schedule provenance "
+                f"without a residual schedule: {saved_state!r}"
+            )
+        return
+
+    schedule = ResidualScheduleConfig(**checkpoint_schedule_dict)
+    saved_state = checkpoint.get("residual_schedule_state")
+    if not schedule.enabled:
+        if saved_state is not None and saved_state != {
+            "enabled": False,
+            "phase_index": None,
+            "phase_start_epoch": None,
+            "phase_end_epoch": None,
+            "effective_max_log_location_fraction": None,
+        }:
+            raise ValueError(
+                "Checkpoint carries a disabled residual schedule with "
+                f"contradictory provenance: {saved_state!r}"
+            )
+        return
+
+    if saved_state is None:
+        raise ValueError(
+            "Checkpoint was trained with an enabled residual schedule but "
+            "carries no residual_schedule_state provenance; refusing to "
+            "evaluate with an unknown residual budget."
+        )
+    saved_epoch = int(checkpoint.get("epoch", -1))
+    expected_index, expected_phase = resolve_residual_schedule_phase(
+        schedule,
+        saved_epoch,
+    )
+    expected_state = {
+        "enabled": expected_phase is not None,
+        "phase_index": expected_index,
+        "phase_start_epoch": (
+            None if expected_phase is None else expected_phase.start_epoch
+        ),
+        "phase_end_epoch": (
+            None if expected_phase is None else expected_phase.end_epoch
+        ),
+        "effective_max_log_location_fraction": (
+            None
+            if expected_phase is None
+            else float(expected_phase.max_log_location_fraction)
+        ),
+    }
+    if saved_state != expected_state:
+        raise ValueError(
+            "Checkpoint residual schedule provenance is inconsistent with "
+            f"the saved epoch {saved_epoch}: checkpoint={saved_state!r}, "
+            f"expected={expected_state!r}"
+        )
+    model.set_observation_residual_max_log_location_fraction(
+        saved_state["effective_max_log_location_fraction"]
+    )
+    logger.info(
+        "Restored residual log-location budget "
+        "max_log_location_fraction=%s from checkpoint provenance",
+        saved_state["effective_max_log_location_fraction"],
+    )
 
 
 def build_loader_from_config(
@@ -258,7 +378,7 @@ def build_loader_from_config(
     else:
         resolved_num_workers = min(max(0, avail_cores), resolved_worker_cfg)
 
-    resolved_batch = batch_size or config.training.batch_size
+    resolved_batch = batch_size or config.training.eval_batch_size
     resolved_device = resolve_device(device)
     resolved_pin_memory = (
         bool(config.training.pin_memory) if pin_memory is None else bool(pin_memory)

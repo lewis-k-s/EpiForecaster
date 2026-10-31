@@ -87,17 +87,9 @@ def _record_training_dynamics_attrs(
         identity["status"],
     )
     return identity
+
+
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
-
-# Global flag for signal handling
-_shutdown_requested = False
-
-
-def _handle_shutdown(signum: int, frame: Any) -> None:
-    """Handle SLURM termination signals gracefully."""
-    global _shutdown_requested
-    logger.warning(f"Received signal {signum}, requesting graceful shutdown...")
-    _shutdown_requested = True
 
 
 def _categorical_choices(choices: tuple[Any, ...] | list[Any]) -> tuple[Any, ...]:
@@ -231,29 +223,8 @@ def suggest_epiforecaster_params(
     overrides["training.weight_decay"] = trial.suggest_float(
         "training.weight_decay", 1e-8, 1e-3, log=True
     )
-    # NOTE: batch_size is NOT swept - fixed at base config value (32 works well).
-    # Previously we swept batch/grad_accum combos, but gradient_accumulation_steps
-    # is now hardcoded to 1 in the trainer and batch_size 32 has proven optimal.
-    # Leaving commented for reference:
-    # valid_batch_grad_combos: list[tuple[int, int]] = [
-    #     (8, 1),  # effective 8
-    #     (8, 2),  # effective 16
-    #     (8, 4),  # effective 32
-    #     (16, 1),  # effective 16
-    #     (16, 2),  # effective 32
-    #     (32, 1),  # effective 32
-    # ]
-    # combo = trial.suggest_categorical(
-    #     "training.batch_grad_combo",
-    #     _categorical_choices(valid_batch_grad_combos),
-    # )
-    # batch_size, grad_accum = _parse_batch_grad_combo(combo)
-    # overrides["training.batch_size"] = batch_size
-    # overrides["training.gradient_accumulation_steps"] = grad_accum
-    # # Early stopping affects compute/overfit tradeoff; keep it moderate.
-    # overrides["training.early_stopping_patience"] = trial.suggest_int(
-    #     "training.early_stopping_patience", 5, 20
-    # )
+    # NOTE: batch_size is NOT swept - fixed at base config value (32 works well);
+    # gradient_accumulation_steps is hardcoded to 1 in the trainer.
 
     # --- data knobs (high leverage; affect effective signal/noise) ---
 

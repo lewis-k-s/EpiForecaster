@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from models.configs import ResidualScheduleConfig
+
 import pytest
 import torch
-
 from training.epiforecaster_trainer import EpiForecasterTrainer
 
 
@@ -92,13 +93,19 @@ def test_resolve_model_id_env_override_has_priority(monkeypatch) -> None:
 
 
 @pytest.mark.epiforecaster
-def test_resume_from_checkpoint_loads_state(tmp_path) -> None:
+def test_resume_from_legacy_checkpoint_without_residual_schedule_loads_state(
+    tmp_path,
+) -> None:
     from utils.precision_policy import PrecisionPolicy
 
     checkpoint_path = tmp_path / "checkpoint.pt"
 
     config = SimpleNamespace(
-        training=SimpleNamespace(resume_checkpoint_path=checkpoint_path),
+        training=SimpleNamespace(
+            resume_checkpoint_path=checkpoint_path,
+            selection_metric="auto",
+            residual_schedule=ResidualScheduleConfig(),
+        ),
         output=SimpleNamespace(
             log_dir=str(tmp_path),
             experiment_name="exp",

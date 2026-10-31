@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,6 +24,7 @@ from typing import Any
 
 import yaml
 
+from scripts.workflow.attempts import complete_attempt, new_attempt, restore_attempt
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
@@ -32,6 +34,10 @@ from scripts.hpo.trial_artifacts import (
     TRIAL_DIR_ATTR,
     best_model_path,
     trial_directory,
+)
+from scripts.workflow.run_config import (
+    preprocessing_dataset_name,
+    validate_workflow_contract,
 )
 from training.training_dynamics import (
     DYNAMICS_ARTIFACT_NAME,
@@ -83,7 +89,10 @@ def write_dependency_contract(
         "crossval": ("crossval", "evaluation"),
         "selection": ("optuna",),
         "promotion": ("promotion", "dvc"),
+        "preprocessing": ("preprocessing", "dvc"),
     }
+    if stage == "ablation" and config["workflow"]["kind"] == "ablation_suite":
+        stage_sections["ablation"] = ("ablation_suite",)
     if stage not in stage_sections:
         raise ValueError(f"Unknown dependency stage: {stage}")
 
@@ -136,6 +145,25 @@ def dvc_output(pointer_path: Path) -> dict[str, Any]:
     return output
 
 
+def is_dvc_import(pointer_path: Path) -> bool:
+    """Return whether a DVC pointer has a Git-backed import dependency."""
+    document = load_yaml(pointer_path)
+    dependencies = document.get("deps", [])
+    return any(
+        isinstance(dependency, dict) and isinstance(dependency.get("repo"), dict)
+        for dependency in dependencies
+    )
+
+
+def md5_file(path: Path) -> str:
+    """Return the content MD5 for a DVC-tracked regular file."""
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -167,6 +195,7 @@ def _container_digest(container: dict[str, Any]) -> str:
 
 def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     config = load_yaml(config_path)
+    validate_workflow_contract(config)
     configured_run = Path(str(config["run"]["root"]))
     configured_source = Path(str(config["run"]["source_root"]))
     if configured_run != run_root or configured_source != source_root:
@@ -188,6 +217,7 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "outputs",
         "outputs/training",
         "outputs/evaluation",
+        "outputs/preprocessing",
     ):
         (run_root / relative).mkdir(parents=True, exist_ok=True)
 
@@ -268,51 +298,78 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     }
     if isinstance(study_config, dict):
         identity["study_name"] = study_config["study_name"]
+    if "ablation_suite" in config:
+        identity["study_names"] = [
+            study["study_name"] for study in config["ablation_suite"]["studies"]
+        ]
     if isinstance(crossval_config, dict):
         identity["crossval_campaign_id"] = crossval_config["campaign_id"]
-    evaluation_input = None
-    if workflow_kind == "evaluate":
-        configured_checkpoint = Path(str(config["evaluation"]["checkpoint"]))
+
+    def pin_checkpoint(
+        configured_checkpoint: Path,
+        pinned_checkpoint: Path,
+        *,
+        label: str,
+    ) -> dict[str, str]:
         if configured_checkpoint.is_symlink():
             raise ValueError(
-                "Evaluation input checkpoint must not be a symlink: "
+                f"{label} input checkpoint must not be a symlink: "
                 f"{configured_checkpoint}"
             )
         resolved_checkpoint = configured_checkpoint.resolve(strict=True)
         if not resolved_checkpoint.is_file():
             raise ValueError(
-                "Evaluation input checkpoint must resolve to a regular file: "
+                f"{label} input checkpoint must resolve to a regular file: "
                 f"{configured_checkpoint}"
             )
         checkpoint_sha256 = sha256_file(resolved_checkpoint)
-        pinned_checkpoint = run_root / "inputs/evaluation_checkpoint.pt"
         pinned_checkpoint.parent.mkdir(parents=True, exist_ok=True)
         if pinned_checkpoint.exists():
             if pinned_checkpoint.is_symlink() or not pinned_checkpoint.is_file():
                 raise ValueError(
-                    "Pinned evaluation checkpoint must be a regular non-symlink "
-                    f"file: {pinned_checkpoint}"
+                    f"Pinned {label.lower()} checkpoint must be a regular "
+                    f"non-symlink file: {pinned_checkpoint}"
                 )
             if sha256_file(pinned_checkpoint) != checkpoint_sha256:
                 raise ValueError(
-                    "Pinned evaluation checkpoint conflicts with configured input: "
-                    f"{pinned_checkpoint}"
+                    f"Pinned {label.lower()} checkpoint conflicts with configured "
+                    f"input: {pinned_checkpoint}"
                 )
         else:
             temporary_checkpoint = pinned_checkpoint.with_suffix(".pt.partial")
             shutil.copyfile(resolved_checkpoint, temporary_checkpoint)
             if sha256_file(temporary_checkpoint) != checkpoint_sha256:
                 temporary_checkpoint.unlink(missing_ok=True)
-                raise ValueError("Evaluation checkpoint changed while being pinned")
+                raise ValueError(f"{label} checkpoint changed while being pinned")
             temporary_checkpoint.chmod(0o444)
             temporary_checkpoint.replace(pinned_checkpoint)
-        identity["input_checkpoint_sha256"] = checkpoint_sha256
-        evaluation_input = {
+        return {
             "configured_checkpoint": str(configured_checkpoint),
             "resolved_checkpoint": str(resolved_checkpoint),
             "pinned_checkpoint": str(pinned_checkpoint),
+            "pinned_checkpoint_relative": str(pinned_checkpoint.relative_to(run_root)),
             "checkpoint_sha256": checkpoint_sha256,
         }
+
+    training_input = None
+    if workflow_kind == "train":
+        configured_init_checkpoint = config["training"].get("init_checkpoint")
+        if configured_init_checkpoint is not None:
+            training_input = pin_checkpoint(
+                Path(str(configured_init_checkpoint)),
+                run_root / "inputs/training_init_checkpoint.pt",
+                label="Training initialization",
+            )
+            identity["init_checkpoint_sha256"] = training_input["checkpoint_sha256"]
+
+    evaluation_input = None
+    if workflow_kind == "evaluate":
+        evaluation_input = pin_checkpoint(
+            Path(str(config["evaluation"]["checkpoint"])),
+            run_root / "inputs/evaluation_checkpoint.pt",
+            label="Evaluation",
+        )
+        identity["input_checkpoint_sha256"] = evaluation_input["checkpoint_sha256"]
 
     manifest = {
         "schema_version": 1,
@@ -354,9 +411,11 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
     for section in (
         "training",
         "evaluation",
+        "preprocessing",
         "crossval",
         "optuna",
         "ablation",
+        "ablation_suite",
         "promotion",
         "provenance",
     ):
@@ -364,6 +423,8 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
             manifest[section] = config[section]
     if evaluation_input is not None:
         manifest["evaluation_input"] = evaluation_input
+    if training_input is not None:
+        manifest["training_input"] = training_input
     manifest_path = run_root / "manifest.yaml"
     write_yaml(manifest_path, manifest)
     prepared_path = run_root / ".state/prepared.done"
@@ -435,6 +496,19 @@ def train_model(config_path: Path, source_root: Path, run_root: Path) -> Path:
         "output.save_checkpoints=true",
         "training.run_final_evaluation=false",
     ]
+    if training.get("init_checkpoint") is not None:
+        pinned_init_checkpoint = run_root / "inputs/training_init_checkpoint.pt"
+        manifest = load_yaml(run_root / "manifest.yaml")
+        expected_sha256 = str(manifest["training_input"]["checkpoint_sha256"])
+        if (
+            not pinned_init_checkpoint.is_file()
+            or pinned_init_checkpoint.is_symlink()
+            or sha256_file(pinned_init_checkpoint) != expected_sha256
+        ):
+            raise ValueError(
+                "Pinned training initialization checkpoint failed validation"
+            )
+        overrides.append(f"training.init_checkpoint_path={pinned_init_checkpoint}")
     for override in overrides:
         command.extend(["--override", override])
 
@@ -520,19 +594,30 @@ def train_crossval_fold(
         )
     fold_config = _crossval_fold_config(config, fold)
     fold_root = _crossval_fold_root(config, run_root, fold)
-    if fold_root.exists():
-        raise FileExistsError(f"Cross-validation fold already exists: {fold_root}")
-    fold_root.mkdir(parents=True)
+    attempts = run_root / ".state/attempts/crossval" / f"fold-{fold:03d}/training"
+    identity = {
+        "config_sha256": sha256_file(config_path),
+        "split_sha256": sha256_file(split_manifest),
+        "fold": fold,
+    }
+    fold_training_manifest = fold_root / "fold_training_manifest.json"
+    if restore_attempt(attempts, identity, run_root):
+        return fold_training_manifest
+    attempt = new_attempt(attempts)
+    attempt_config = attempt / "config.yaml"
+    write_yaml(attempt_config, fold_config)
+    train_model(attempt_config, source_root, attempt)
+    attempt_checkpoint, attempt_model_root = training_artifact_paths(
+        fold_config, attempt
+    )
+    attempt_training_manifest = attempt_model_root / "training_manifest.json"
+    training_record = json.loads(attempt_training_manifest.read_text())
     fold_config_path = fold_root / "config.yaml"
-    write_yaml(fold_config_path, fold_config)
-
-    train_model(fold_config_path, source_root, fold_root)
     checkpoint, model_root = training_artifact_paths(fold_config, fold_root)
     training_manifest = model_root / "training_manifest.json"
-    training_record = json.loads(training_manifest.read_text())
-    fold_training_manifest = fold_root / "fold_training_manifest.json"
+    attempt_manifest = attempt / "fold_training_manifest.json"
     write_json(
-        fold_training_manifest,
+        attempt_manifest,
         {
             "schema_version": 1,
             "campaign_id": str(options["campaign_id"]),
@@ -543,12 +628,23 @@ def train_crossval_fold(
             "split_manifest_sha256": sha256_file(split_manifest),
             "config": str(fold_config_path),
             "checkpoint": str(checkpoint),
-            "checkpoint_sha256": sha256_file(checkpoint),
+            "checkpoint_sha256": sha256_file(attempt_checkpoint),
             "training_manifest": str(training_manifest),
-            "training_manifest_sha256": sha256_file(training_manifest),
+            "training_manifest_sha256": sha256_file(attempt_training_manifest),
             "training_dynamics": training_record["training_dynamics"],
             "completed_at": datetime.now(UTC).isoformat(),
         },
+    )
+    complete_attempt(
+        attempt,
+        identity,
+        {
+            checkpoint: attempt_checkpoint,
+            training_manifest: attempt_training_manifest,
+            fold_config_path: attempt_config,
+            fold_training_manifest: attempt_manifest,
+        },
+        run_root,
     )
     return fold_training_manifest
 
@@ -592,14 +688,25 @@ def evaluate_crossval_fold(
             f"Cross-validation training manifest failed SHA-256: {training_manifest}"
         )
 
-    evaluation_manifest = evaluate_configured_model(
+    attempts = run_root / ".state/attempts/crossval" / f"fold-{fold:03d}/evaluation"
+    identity = {
+        "config_sha256": sha256_file(config_path),
+        "training_sha256": sha256_file(training_fold_manifest_path),
+        "fold": fold,
+    }
+    fold_manifest = fold_root / "fold_manifest.json"
+    if restore_attempt(attempts, identity, run_root):
+        return fold_manifest
+    attempt = new_attempt(attempts)
+    attempt_evaluation_manifest = evaluate_configured_model(
         fold_config_path,
-        fold_root,
+        attempt,
         checkpoint,
     )
-    fold_manifest = fold_root / "fold_manifest.json"
+    evaluation_manifest = fold_root / "outputs/evaluation/evaluation_manifest.json"
+    attempt_manifest = attempt / "fold_manifest.json"
     write_json(
-        fold_manifest,
+        attempt_manifest,
         {
             "schema_version": 1,
             "campaign_id": str(options["campaign_id"]),
@@ -614,10 +721,17 @@ def evaluate_crossval_fold(
             "training_fold_manifest": str(training_fold_manifest_path),
             "training_fold_manifest_sha256": sha256_file(training_fold_manifest_path),
             "evaluation_manifest": str(evaluation_manifest),
-            "evaluation_manifest_sha256": sha256_file(evaluation_manifest),
+            "evaluation_manifest_sha256": sha256_file(attempt_evaluation_manifest),
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
+    artifacts = {
+        fold_root / path.relative_to(attempt): path
+        for path in (attempt / "outputs/evaluation").rglob("*")
+        if path.is_file()
+    }
+    artifacts[fold_manifest] = attempt_manifest
+    complete_attempt(attempt, identity, artifacts, run_root)
     return fold_manifest
 
 
@@ -766,6 +880,7 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         _run(["dvc", "init", "--no-scm"], cwd=workspace)
 
     targets: list[str] = []
+    imported_targets: list[tuple[str, Path, dict[str, Any]]] = []
     output_paths: list[Path] = []
     for target_value in config["dvc"]["targets"]:
         target = Path(str(target_value))
@@ -776,12 +891,18 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         output = dvc_output(source_pointer)
         output_relative = target.parent / str(output["path"])
         output_paths.append(output_relative)
-        targets.append(target.as_posix())
+        target_name = target.as_posix()
+        targets.append(target_name)
+        if is_dvc_import(source_pointer):
+            imported_targets.append((target_name, output_relative, output))
 
     remote = Path(str(config["dvc"]["remote"]))
     cache = Path(str(config["dvc"]["cache"]))
     _run(["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)], cwd=workspace)
     _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=workspace)
+    # Keep DVC's SQLite/index state off the quota-constrained cluster home.
+    # A relative path is resolved inside this run's isolated DVC workspace.
+    _run(["dvc", "config", "core.site_cache_dir", ".dvc/tmp"], cwd=workspace)
     _run(["dvc", "config", "cache.dir", str(cache)], cwd=workspace)
     _run(["dvc", "config", "cache.shared", "group"], cwd=workspace)
     _run(["dvc", "config", "cache.type", "symlink"], cwd=workspace)
@@ -792,11 +913,32 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
     finally:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
-    _run(["dvc", "status", *targets], cwd=workspace)
+    status_targets = [
+        target
+        for target in targets
+        if target not in {item[0] for item in imported_targets}
+    ]
+    if status_targets:
+        _run(["dvc", "status", *status_targets], cwd=workspace)
 
     for output_path in output_paths:
         if not (workspace / output_path).exists():
             raise FileNotFoundError(f"DVC output was not materialized: {output_path}")
+
+    for target, output_path, output in imported_targets:
+        expected_md5 = str(output["md5"])
+        materialized = workspace / output_path
+        if expected_md5.endswith(".dir") or not materialized.is_file():
+            raise ValueError(
+                "Git-backed DVC imports must materialize one regular file for "
+                f"offline validation: {target}"
+            )
+        actual_md5 = md5_file(materialized)
+        if actual_md5 != expected_md5:
+            raise ValueError(
+                f"Imported DVC output MD5 mismatch for {target}: "
+                f"{actual_md5} != {expected_md5}"
+            )
 
     bind_roots = sorted({path.parent for path in output_paths})
     for bind_root in bind_roots:
@@ -831,6 +973,402 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         {"data_manifest": str(data_manifest), **data_record},
     )
     return output_paths
+
+
+def _load_preprocessing_document(
+    config_path: Path,
+    source_root: Path,
+) -> dict[str, Any]:
+    """Load a source-owned preprocessing config and its local base configs."""
+    resolved = config_path.resolve(strict=True)
+    source = source_root.resolve(strict=True)
+    resolved.relative_to(source)
+    document = load_yaml(resolved)
+    base_config = document.pop("base_config", None)
+    if base_config is None:
+        return document
+    base_path = Path(str(base_config))
+    if base_path.is_absolute() or ".." in base_path.parts:
+        raise ValueError(
+            "Preprocessing base_config must stay inside the source snapshot"
+        )
+    parent = _load_preprocessing_document(resolved.parent / base_path, source_root)
+    return _deep_merge(parent, document)
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _processed_dataset_qa(
+    dataset: Any,
+    workflow_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the declared processed-data contract with labeled arrays."""
+    import numpy as np
+
+    preprocessing = workflow_config["preprocessing"]
+    if not dataset.data_vars:
+        raise ValueError("Processed dataset contains no data variables")
+    empty_dimensions = {
+        name: int(size) for name, size in dataset.sizes.items() if int(size) <= 0
+    }
+    if empty_dimensions:
+        raise ValueError(f"Processed dataset has empty dimensions: {empty_dimensions}")
+
+    expected_run_count = preprocessing.get("expected_run_count")
+    if expected_run_count is not None:
+        actual_run_count = int(dataset.sizes.get("run_id", 0))
+        if actual_run_count != int(expected_run_count):
+            raise ValueError(
+                "Processed dataset run count differs from the workflow contract: "
+                f"{actual_run_count} != {expected_run_count}"
+            )
+
+    required_variables = [
+        str(value) for value in preprocessing.get("required_variables", [])
+    ]
+    missing = sorted(set(required_variables) - set(dataset.data_vars))
+    if missing:
+        raise ValueError(f"Processed dataset is missing required variables: {missing}")
+
+    float32_variables = [
+        str(value) for value in preprocessing.get("float32_variables", [])
+    ]
+    wrong_dtypes = {
+        name: str(dataset[name].dtype)
+        for name in float32_variables
+        if name in dataset and dataset[name].dtype != np.dtype("float32")
+    }
+    if wrong_dtypes:
+        raise ValueError(
+            f"Processed continuous variables are not float32: {wrong_dtypes}"
+        )
+
+    nonnegative_variables = [
+        str(value) for value in preprocessing.get("nonnegative_variables", [])
+    ]
+    variable_qa: dict[str, dict[str, Any]] = {}
+    for name in sorted(set(float32_variables) | set(nonnegative_variables)):
+        if name not in dataset:
+            continue
+        values = np.asarray(dataset[name].values)
+        finite = np.isfinite(values)
+        finite_count = int(finite.sum())
+        nonfinite_count = int(values.size - finite_count)
+        negative_count = int((values[finite] < 0).sum())
+        if name in nonnegative_variables and (nonfinite_count or negative_count):
+            raise ValueError(
+                f"Processed variable {name!r} has {nonfinite_count} non-finite "
+                f"and {negative_count} negative values"
+            )
+        variable_qa[name] = {
+            "dtype": str(values.dtype),
+            "finite_count": finite_count,
+            "nonfinite_count": nonfinite_count,
+            "negative_count": negative_count,
+            "positive_count": int((values[finite] > 0).sum()),
+        }
+
+    flow_alignment: dict[str, Any] | None = None
+    if {"latent_D_true", "latent_death_flow_true"} <= set(dataset.data_vars):
+        cumulative_difference = dataset["latent_D_true"].diff("date")
+        destination_flow = dataset["latent_death_flow_true"].sel(
+            date=cumulative_difference["date"]
+        )
+        difference_values = np.asarray(cumulative_difference.values)
+        flow_values = np.asarray(destination_flow.values)
+        comparable = np.isfinite(difference_values) & np.isfinite(flow_values)
+        absolute_error = np.abs(difference_values[comparable] - flow_values[comparable])
+        max_absolute_error = float(absolute_error.max()) if absolute_error.size else 0.0
+        if not np.allclose(
+            difference_values[comparable],
+            flow_values[comparable],
+            rtol=1e-5,
+            atol=1e-8,
+        ):
+            raise ValueError(
+                "Processed latent death flow is not destination-aligned with "
+                f"latent_D_true.diff(date); max error={max_absolute_error:.8g}"
+            )
+        flow_alignment = {
+            "comparison_count": int(comparable.sum()),
+            "max_absolute_error": max_absolute_error,
+            "rtol": 1e-5,
+            "atol": 1e-8,
+        }
+
+    preservation_json = dataset.attrs.get("positive_clinical_preservation_json")
+    positive_preservation = (
+        json.loads(str(preservation_json)) if preservation_json is not None else None
+    )
+    if positive_preservation is not None:
+        for name, record in positive_preservation.items():
+            if int(record["zeroed_raw_positive_count"]) != 0:
+                raise ValueError(
+                    f"Processed {name!r} lost positive raw observations according "
+                    "to persisted preprocessing evidence"
+                )
+            if int(record["processed_positive_count"]) < int(
+                record["raw_positive_count"]
+            ):
+                raise ValueError(
+                    f"Processed {name!r} has fewer positive values than the raw "
+                    "positive count"
+                )
+
+    return {
+        "dimensions": {name: int(size) for name, size in dataset.sizes.items()},
+        "data_variables": sorted(dataset.data_vars),
+        "variable_qa": variable_qa,
+        "latent_death_flow_alignment": flow_alignment,
+        "positive_clinical_preservation": positive_preservation,
+    }
+
+
+def _handoff_provenance_qa(
+    source_root: Path,
+    workflow_config: dict[str, Any],
+    effective_config: dict[str, Any],
+    dataset: Any,
+) -> dict[str, Any] | None:
+    """Validate and retain the generator handoff identity and seed record."""
+    handoff_value = workflow_config["preprocessing"].get("handoff_manifest")
+    if handoff_value is None:
+        return None
+    relative = Path(str(handoff_value))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("preprocessing.handoff_manifest must be source-relative")
+    handoff_path = (source_root / relative).resolve(strict=True)
+    handoff_path.relative_to(source_root.resolve(strict=True))
+    handoff = json.loads(handoff_path.read_text())
+    if handoff.get("qa_passed") is not True:
+        raise ValueError("Synthetic generator handoff QA did not pass")
+    handoff_sha256 = sha256_file(handoff_path)
+    expected_sha256 = effective_config.get("source_provenance", {}).get(
+        "handoff_manifest_sha256"
+    )
+    if expected_sha256 and handoff_sha256 != str(expected_sha256):
+        raise ValueError(
+            "Synthetic generator handoff manifest SHA-256 does not match the "
+            "preprocessing source contract"
+        )
+    expected_run_ids = [str(value) for value in handoff.get("run_ids", [])]
+    observed_run_ids = [str(value) for value in dataset["run_id"].values]
+    if sorted(expected_run_ids) != sorted(observed_run_ids):
+        raise ValueError(
+            "Processed run IDs differ from the synthetic generator handoff"
+        )
+    seeds = handoff.get("seeds")
+    if not isinstance(seeds, dict) or not seeds:
+        raise ValueError("Synthetic generator handoff has no seed record")
+    for name, values in seeds.items():
+        if not isinstance(values, list) or len(values) != len(expected_run_ids):
+            raise ValueError(
+                f"Synthetic generator seed vector {name!r} does not match run count"
+            )
+    seed_by_run = {
+        name: dict(zip(expected_run_ids, values, strict=True))
+        for name, values in seeds.items()
+    }
+    return {
+        "path": relative.as_posix(),
+        "sha256": handoff_sha256,
+        "qa_passed": True,
+        "run_ids": expected_run_ids,
+        "seeds": seeds,
+        "seed_by_run": seed_by_run,
+        "corpus_full_tree_sha256": handoff.get("corpus_full_tree_sha256"),
+        "corpus_metadata_tree_sha256": handoff.get("corpus_metadata_tree_sha256"),
+        "reporting_config_sha256": handoff.get("reporting_config_sha256"),
+    }
+
+
+def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> Path:
+    """Build and QA a processed dataset inside one immutable run root."""
+    config = load_yaml(config_path)
+    validate_workflow_contract(config)
+    preprocessing = config["preprocessing"]
+    source_config = source_root / Path(str(preprocessing["base_config"]))
+    effective = _load_preprocessing_document(source_config, source_root)
+    output_root = run_root / "outputs/preprocessing"
+    effective_config = output_root / "effective_config.yaml"
+    output_marker = output_root / ".preprocessed.done"
+    qa_path = output_root / "qa.json"
+    attempts = run_root / ".state/attempts/preprocessing"
+    identity = {"config_sha256": sha256_file(config_path), "effective": effective}
+    # Normalize YAML dates for the JSON receipt comparison on a later attempt.
+    identity = json.loads(json.dumps(identity, default=str))
+    if restore_attempt(attempts, identity, run_root):
+        return output_marker
+    attempt = new_attempt(attempts)
+    effective["output_path"] = str(attempt / "dataset")
+    attempt_config = attempt / "effective_config.yaml"
+    write_yaml(attempt_config, effective)
+
+    from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
+
+    pipeline_config = PreprocessingConfig.from_file(attempt_config)
+    attempt_dataset = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
+        strict=True
+    )
+    attempt_dataset.relative_to(attempt.resolve(strict=True))
+    if attempt_dataset.is_symlink() or not attempt_dataset.is_file():
+        raise ValueError(
+            f"Preprocessing output must be a regular NetCDF file: {attempt_dataset}"
+        )
+    dataset_path = output_root / f"{preprocessing_dataset_name(config)}.nc"
+
+    import xarray as xr
+
+    dataset = xr.open_dataset(attempt_dataset, engine="netcdf4")
+    try:
+        qa_record = {
+            "schema_version": 2,
+            "dataset": str(dataset_path),
+            "dataset_relative": str(dataset_path.relative_to(run_root)),
+            **_processed_dataset_qa(dataset, config),
+            "generator_handoff": _handoff_provenance_qa(
+                source_root,
+                config,
+                effective,
+                dataset,
+            ),
+            "effective_config": str(effective_config),
+            "effective_config_sha256": sha256_file(attempt_config),
+            "source_config": str(source_config.relative_to(source_root)),
+            "source_config_sha256": sha256_file(source_config),
+            "completed_at": datetime.now(UTC).isoformat(),
+        }
+    finally:
+        dataset.close()
+    attempt_qa = attempt / "qa.json"
+    attempt_marker = attempt / ".preprocessed.done"
+    write_json(attempt_qa, qa_record)
+    write_json(
+        attempt_marker,
+        {
+            "dataset": str(dataset_path),
+            "dataset_sha256": sha256_file(attempt_dataset),
+            "qa": str(qa_path),
+            "qa_sha256": sha256_file(attempt_qa),
+        },
+    )
+    complete_attempt(
+        attempt,
+        identity,
+        {
+            dataset_path: attempt_dataset,
+            effective_config: attempt_config,
+            qa_path: attempt_qa,
+            output_marker: attempt_marker,
+        },
+        run_root,
+    )
+    return output_marker
+
+
+def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
+    """Publish a QA-passed dataset as a run-owned DVC pointer."""
+    config = load_yaml(config_path)
+    dataset_name = preprocessing_dataset_name(config)
+    dataset_pointer = f"{dataset_name}.nc.dvc"
+    publication_payload = f"{dataset_name}.nc"
+    output_root = run_root / "outputs/preprocessing"
+    marker_path = output_root / ".preprocessed.done"
+    marker = json.loads(marker_path.read_text())
+    dataset = Path(str(marker["dataset"])).resolve(strict=True)
+    dataset.relative_to(output_root.resolve(strict=True))
+    if dataset.is_symlink() or not dataset.is_file():
+        raise ValueError("Preprocessed dataset must be a non-symlink NetCDF file")
+    if sha256_file(dataset) != str(marker["dataset_sha256"]):
+        raise ValueError("Preprocessed dataset changed after QA")
+    qa_path = Path(str(marker["qa"])).resolve(strict=True)
+    if sha256_file(qa_path) != str(marker["qa_sha256"]):
+        raise ValueError("Preprocessing QA record changed before publication")
+
+    destination = output_root / "publication"
+    if destination.exists():
+        if (
+            destination.is_symlink()
+            or not destination.is_dir()
+            or any(destination.iterdir())
+        ):
+            raise FileExistsError(
+                "Preprocessing publication already exists for this run"
+            )
+        destination.rmdir()
+    scratch_staging = Path(
+        tempfile.mkdtemp(prefix=f"epiforecaster-publication-{os.getpid()}-")
+    )
+    payload = scratch_staging / publication_payload
+    commit_staging = output_root / f".publication.commit-{os.getpid()}"
+    try:
+        shutil.copy2(dataset, payload)
+        if sha256_file(payload) != str(marker["dataset_sha256"]):
+            raise ValueError("Publication staging changed the processed dataset")
+        remote = Path(str(config["dvc"]["remote"]))
+        cache = Path(str(config["dvc"]["cache"]))
+        _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)
+        _run(
+            ["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)],
+            cwd=scratch_staging,
+        )
+        _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=scratch_staging)
+        _run(["dvc", "config", "cache.dir", str(cache)], cwd=scratch_staging)
+        _run(["dvc", "config", "cache.shared", "group"], cwd=scratch_staging)
+        _run(["dvc", "config", "cache.type", "symlink"], cwd=scratch_staging)
+        lock_handle = _with_cache_lock(cache)
+        try:
+            _run(["dvc", "add", publication_payload], cwd=scratch_staging)
+            _run(["dvc", "push", dataset_pointer], cwd=scratch_staging)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        pointer = scratch_staging / dataset_pointer
+        pointer_identity = dvc_output(pointer)
+        receipt = {
+            "schema_version": 1,
+            "run_id": str(config["run"]["id"]),
+            "source_git_sha": str(config["source"]["git_sha"]),
+            "source_snapshot_sha256": str(config["source"]["source_snapshot_sha256"]),
+            "config_sha256": sha256_file(config_path),
+            "container_sif": str(config["container"]["sif"]),
+            "container_digest": _container_digest(config["container"]),
+            "input_dvc_hashes": {
+                target: str(record["md5"])
+                for target, record in json.loads(
+                    (run_root / ".state/data_manifest.json").read_text()
+                )["targets"].items()
+            },
+            "dvc_pointer": dataset_pointer,
+            "dvc_md5": str(pointer_identity["md5"]),
+            "dataset_sha256": str(marker["dataset_sha256"]),
+            "qa": str(qa_path),
+            "qa_sha256": str(marker["qa_sha256"]),
+            "published_at": datetime.now(UTC).isoformat(),
+        }
+        commit_staging.mkdir()
+        shutil.copy2(pointer, commit_staging / dataset_pointer)
+        write_json(commit_staging / "receipt.json", receipt)
+        commit_staging.rename(destination)
+    except Exception:
+        shutil.rmtree(commit_staging, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(scratch_staging, ignore_errors=True)
+    receipt_path = destination / "receipt.json"
+    write_json(
+        run_root / ".state/preprocessed_published.done",
+        {"receipt": str(receipt_path), "receipt_sha256": sha256_file(receipt_path)},
+    )
+    return receipt_path
 
 
 def resolve_best_trial_artifacts(
@@ -1034,6 +1572,122 @@ def evaluate_best(
     return evaluation_manifest
 
 
+def evaluate_research_model(
+    config_path: Path,
+    run_root: Path,
+    checkpoint_path: Path,
+) -> Path:
+    """Evaluate development roles and publish one complete research attempt."""
+    import torch
+    from data.research_roles import load_role_manifest
+    from evaluation.research_pipeline import write_research_outputs
+    from models.configs import EpiForecasterConfig
+    from scripts.workflow.run_config import RESEARCH_OUTPUT_FILES
+
+    workflow_config = load_yaml(config_path)
+    validate_workflow_contract(workflow_config)
+    evaluation = workflow_config["evaluation"]
+    overrides = [str(value) for value in evaluation.get("overrides", [])]
+    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = EpiForecasterConfig.from_dict(saved["config"])
+    original_joint = config.training.loss.joint
+    config = EpiForecasterConfig.apply_overrides(config, overrides)
+    if config.training.loss.joint != original_joint:
+        raise ValueError(
+            "Research evaluation cannot change the trained observation objective"
+        )
+    if (
+        config.training.split_strategy != "research"
+        or config.training.research_evaluation_role != "calibration"
+        or config.training.research_confirmation_enabled
+    ):
+        raise ValueError(
+            "Development research requires protected selection/calibration roles"
+        )
+    role_path = config.training.research_role_manifest_path
+    if role_path is None:
+        raise ValueError("Research evaluation requires a role manifest")
+    manifest, role_hash = load_role_manifest(role_path)
+    checkpoint_hash = sha256_file(checkpoint_path)
+    identity = {
+        "config_sha256": sha256_file(config_path),
+        "checkpoint_sha256": checkpoint_hash,
+        "role_manifest_sha256": role_hash,
+    }
+    attempts = run_root / ".state/attempts/research_evaluation"
+    destination = run_root / "outputs/evaluation"
+    if restore_attempt(attempts, identity, run_root):
+        return destination / "evaluation_manifest.json"
+    attempt = new_attempt(attempts)
+    output = attempt / "outputs/evaluation"
+    selection_manifest = evaluate_best(checkpoint_path, output, "val", overrides, True)
+    shutil.copy2(selection_manifest, output / "selection_evaluation_manifest.json")
+    evaluate_best(checkpoint_path, output / "calibration", "test", overrides, True)
+    write_research_outputs(
+        config=config,
+        manifest=manifest,
+        checkpoint_sha256=checkpoint_hash,
+        selection_path=output / "val_granular.parquet",
+        calibration_path=output / "calibration/test_granular.parquet",
+        output_dir=output,
+    )
+    required = {
+        "val_summary.json",
+        "val_node_metrics.csv",
+        "val_node_metrics_per_head.csv",
+        "val_granular.parquet",
+        *RESEARCH_OUTPUT_FILES,
+    }
+    missing = sorted(name for name in required if not (output / name).is_file())
+    if missing:
+        raise FileNotFoundError(f"Research evaluation is incomplete: {missing}")
+    artifacts = sorted(
+        path
+        for path in output.rglob("*")
+        if path.is_file() and path not in {selection_manifest, output / ".done"}
+    )
+    write_json(
+        selection_manifest,
+        {
+            "schema_version": 1,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_sha256": checkpoint_hash,
+            "split": "val",
+            "granular": True,
+            "research_outputs": True,
+            "role_manifest_sha256": role_hash,
+            "data_roles": {"val": "selection", "test": "calibration"},
+            "artifacts": [
+                {
+                    "path": str(path.relative_to(output)),
+                    "sha256": sha256_file(path),
+                    "required": str(path.relative_to(output)) in required,
+                }
+                for path in artifacts
+            ],
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    write_json(
+        output / ".done",
+        {
+            "evaluation_manifest": str(destination / "evaluation_manifest.json"),
+            "checkpoint_sha256": checkpoint_hash,
+        },
+    )
+    complete_attempt(
+        attempt,
+        identity,
+        {
+            destination / path.relative_to(output): path
+            for path in output.rglob("*")
+            if path.is_file()
+        },
+        run_root,
+    )
+    return destination / "evaluation_manifest.json"
+
+
 def evaluate_configured_model(
     config_path: Path,
     run_root: Path,
@@ -1056,8 +1710,24 @@ def evaluate_configured_model(
         evaluation_input = manifest.get("evaluation_input")
         if not isinstance(evaluation_input, dict):
             raise ValueError("Run manifest is missing the pinned evaluation input")
-        expected_path = Path(str(evaluation_input["pinned_checkpoint"]))
-        if resolved_checkpoint != expected_path.resolve(strict=True):
+        expected_relative = Path(str(evaluation_input["pinned_checkpoint_relative"]))
+        if expected_relative.is_absolute() or ".." in expected_relative.parts:
+            raise ValueError(
+                "Pinned evaluation checkpoint must be run-relative: "
+                f"{expected_relative}"
+            )
+        expected_path = run_root / expected_relative
+        if expected_path.is_symlink():
+            raise ValueError(
+                "Pinned evaluation checkpoint must be a regular non-symlink file: "
+                f"{expected_path}"
+            )
+        expected_resolved = expected_path.resolve(strict=True)
+        if not expected_resolved.is_file():
+            raise ValueError(
+                f"Pinned evaluation checkpoint must be a regular file: {expected_path}"
+            )
+        if resolved_checkpoint != expected_resolved:
             raise ValueError(
                 "Evaluation-only workflow must consume its pinned checkpoint: "
                 f"expected {expected_path}, got {resolved_checkpoint}"
@@ -1065,6 +1735,8 @@ def evaluate_configured_model(
         expected_sha256 = str(evaluation_input["checkpoint_sha256"])
         if sha256_file(resolved_checkpoint) != expected_sha256:
             raise ValueError("Pinned evaluation checkpoint failed SHA-256 validation")
+    if evaluation.get("research_outputs", False):
+        return evaluate_research_model(config_path, run_root, resolved_checkpoint)
     return evaluate_best(
         resolved_checkpoint,
         run_root / "outputs/evaluation",
@@ -1078,33 +1750,56 @@ def finalize_ablation(
     config_path: Path,
     run_root: Path,
     journal_path: Path,
+    study_name: str | None = None,
 ) -> Path:
     """Validate a completed ablation queue and generate its aggregate reports."""
     import optuna
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend
 
-    from scripts.hpo.ablation_worker import is_study_complete, resolve_ablation_plan
+    from scripts.hpo.ablation_worker import is_study_complete, load_campaign
+    from evaluation.ablation_probabilistic_analysis import campaign_analysis_spec
 
     config = load_yaml(config_path)
-    ablation = config["ablation"]
+    if study_name is None:
+        ablation = config["ablation"]
+        output_dir = run_root / "outputs/ablation_analysis"
+        stale_marker = run_root / ".state/workers_complete.done"
+        marker = run_root / ".state/ablation.done"
+    else:
+        studies = config["ablation_suite"]["studies"]
+        ablation = next(
+            (study for study in studies if study["study_name"] == study_name), None
+        )
+        if ablation is None:
+            raise ValueError(f"Unknown ablation suite study: {study_name}")
+        output_dir = run_root / "outputs/ablation_analysis" / study_name
+        stale_marker = run_root / ".state/ablation_suite" / f"{study_name}.workers.done"
+        marker = run_root / ".state/ablation_suite" / f"{study_name}.done"
+    smoketest = bool(ablation.get("smoketest", False))
     study = optuna.load_study(
         study_name=str(ablation["study_name"]),
         storage=JournalStorage(JournalFileBackend(str(journal_path))),
     )
-    seeds = [int(seed) for seed in ablation["seeds"]]
-    requested = ablation.get("ablations")
-    plan = resolve_ablation_plan(None if requested is None else str(requested))
-    if not is_study_complete(study, seeds, plan):
+    campaign = load_campaign(Path(str(ablation["campaign"])))
+    if not is_study_complete(study, campaign, smoketest=smoketest):
         state_counts = Counter(trial.state.name for trial in study.trials)
+        # The worker rule's completion marker is meaningless while the identity
+        # matrix is incomplete; drop it so the next attach re-runs workers and
+        # queue initialization re-enqueues the missing identities.
+        if stale_marker.exists():
+            stale_marker.unlink()
+            print(
+                f"Removed stale workers completion marker: {stale_marker}",
+                file=sys.stderr,
+            )
         raise RuntimeError(
-            "Ablation workers exited before the complete seed/ablation matrix was "
+            "Ablation workers exited before the complete campaign identity matrix was "
             f"terminal: {dict(sorted(state_counts.items()))}"
         )
 
-    campaign_id = str(ablation["campaign_id"])
+    campaign_id = campaign.campaign_id
     training_dir = run_root / "outputs/training" / campaign_id
-    output_dir = run_root / "outputs/ablation_analysis"
     command = [
         sys.executable,
         "-m",
@@ -1113,22 +1808,31 @@ def finalize_ablation(
         str(training_dir),
         "--output-dir",
         str(output_dir),
-        "--campaign-id",
-        campaign_id,
-        "--seed-coverage",
-        "strict",
-        "--expected-seeds",
-        ",".join(str(seed) for seed in seeds),
+        "--campaign",
+        str(campaign.path),
+        "--journal",
+        str(journal_path),
+        "--study-name",
+        study.study_name,
     ]
-    if requested is not None:
-        command.extend(["--include-ablations", ",".join(plan)])
+    reuse_evidence_dir = ablation.get("reuse_evidence_dir")
+    if reuse_evidence_dir is not None:
+        command.extend(["--reuse-evidence-dir", str(reuse_evidence_dir)])
+    if smoketest:
+        command.append("--smoketest")
     _run(command)
 
-    required_artifacts = [
-        output_dir / "seed_coverage_report.csv",
-        output_dir / "ablation_run_context.csv",
-        output_dir / "ablation_metrics_aggregated.csv",
-    ]
+    if campaign_analysis_spec(campaign) is not None:
+        required_artifacts = [
+            output_dir / "campaign_completeness_manifest.csv",
+            output_dir / "condition_scorecard.csv",
+        ]
+    else:
+        required_artifacts = [
+            output_dir / "seed_coverage_report.csv",
+            output_dir / "ablation_run_context.csv",
+            output_dir / "ablation_metrics_aggregated.csv",
+        ]
     missing = [path for path in required_artifacts if not path.is_file()]
     if missing:
         rendered = ", ".join(str(path) for path in missing)
@@ -1147,6 +1851,7 @@ def finalize_ablation(
             "schema_version": 1,
             "study_name": study.study_name,
             "campaign_id": campaign_id,
+            "campaign_sha256": campaign.sha256,
             "journal": str(journal_path),
             "trial_count": len(study.trials),
             "artifacts": [
@@ -1160,17 +1865,51 @@ def finalize_ablation(
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
-    marker = run_root / ".state/ablation.done"
     write_json(
         marker,
         {
             "ablation_manifest": str(ablation_manifest),
             "study_name": study.study_name,
+            "campaign_sha256": campaign.sha256,
             "trial_count": len(study.trials),
             "completed_at": datetime.now(UTC).isoformat(),
         },
     )
     return marker
+
+
+def finalize_ablation_suite(config_path: Path, run_root: Path) -> Path:
+    """Bind all completed campaign analyses to one suite manifest."""
+    config = load_yaml(config_path)
+    studies = config["ablation_suite"]["studies"]
+    entries = []
+    for study in studies:
+        name = str(study["study_name"])
+        path = run_root / "outputs/ablation_analysis" / name / "ablation_manifest.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"Ablation suite study is incomplete: {path}")
+        manifest = json.loads(path.read_text())
+        if manifest["study_name"] != name:
+            raise ValueError(f"Ablation suite study identity mismatch: {path}")
+        entries.append(
+            {
+                "study_name": name,
+                "campaign_id": manifest["campaign_id"],
+                "campaign_sha256": manifest["campaign_sha256"],
+                "manifest": str(path.relative_to(run_root)),
+                "manifest_sha256": sha256_file(path),
+            }
+        )
+    output = run_root / "outputs/ablation_analysis/suite_manifest.json"
+    write_json(
+        output,
+        {
+            "schema_version": 1,
+            "studies": entries,
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return output
 
 
 def complete_workflow(
@@ -1412,9 +2151,7 @@ def retain_training_evidence(
         training["experiment_name"], field="training.experiment_name"
     )
     model_id = _safe_component(training["model_id"], field="training.model_id")
-    destination = (
-        run_root / "evidence/training" / experiment_name / model_id
-    )
+    destination = run_root / "evidence/training" / experiment_name / model_id
     if destination.exists():
         raise FileExistsError(
             "Training evidence destination already exists and will not be "
@@ -1624,6 +2361,13 @@ def build_parser() -> argparse.ArgumentParser:
     train = subparsers.add_parser("train")
     runtime_paths(train)
 
+    preprocess = subparsers.add_parser("preprocess")
+    runtime_paths(preprocess)
+
+    publish_preprocessed = subparsers.add_parser("publish-preprocessed")
+    publish_preprocessed.add_argument("--config", type=Path, required=True)
+    publish_preprocessed.add_argument("--run-root", type=Path, required=True)
+
     crossval_train_fold = subparsers.add_parser("crossval-train-fold")
     runtime_paths(crossval_train_fold)
     crossval_train_fold.add_argument("--fold", type=int, required=True)
@@ -1670,6 +2414,10 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_ablation_parser.add_argument("--config", type=Path, required=True)
     finalize_ablation_parser.add_argument("--run-root", type=Path, required=True)
     finalize_ablation_parser.add_argument("--journal", type=Path, required=True)
+    finalize_ablation_parser.add_argument("--study-name")
+    finalize_suite_parser = subparsers.add_parser("finalize-ablation-suite")
+    finalize_suite_parser.add_argument("--config", type=Path, required=True)
+    finalize_suite_parser.add_argument("--run-root", type=Path, required=True)
 
     complete = subparsers.add_parser("complete")
     complete.add_argument("--config", type=Path, required=True)
@@ -1686,6 +2434,10 @@ def main() -> None:
         stage_dvc(args.config, args.source_root, args.run_root)
     elif args.command == "train":
         train_model(args.config, args.source_root, args.run_root)
+    elif args.command == "preprocess":
+        run_preprocessing(args.config, args.source_root, args.run_root)
+    elif args.command == "publish-preprocessed":
+        publish_preprocessed_dataset(args.config, args.run_root)
     elif args.command == "crossval-train-fold":
         train_crossval_fold(args.config, args.source_root, args.run_root, args.fold)
     elif args.command == "crossval-evaluate-fold":
@@ -1715,7 +2467,9 @@ def main() -> None:
     elif args.command == "cleanup-study":
         cleanup_study_checkpoints(args.config, args.run_root)
     elif args.command == "finalize-ablation":
-        finalize_ablation(args.config, args.run_root, args.journal)
+        finalize_ablation(args.config, args.run_root, args.journal, args.study_name)
+    elif args.command == "finalize-ablation-suite":
+        finalize_ablation_suite(args.config, args.run_root)
     elif args.command == "complete":
         complete_workflow(
             args.config,

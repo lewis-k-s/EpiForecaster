@@ -18,6 +18,7 @@ from typing import Any, cast
 import wandb
 
 from data.epi_dataset import EpiDataset
+from data.latent_supervision import latent_scales_from_checkpoint
 from evaluation.eval_loop import _ensure_wandb_run, eval_checkpoint, evaluate_loader
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.losses import get_loss_from_config
@@ -104,6 +105,7 @@ def evaluate_checkpoint_topk_forecasts(
     try:
         criterion = get_loss_from_config(
             config.training.loss,
+            latent_scales=latent_scales_from_checkpoint(checkpoint),
             data_config=config.data,
             observation_heads_config=config.model.observation_heads,
             input_window_length=config.model.input_window_length,
@@ -119,6 +121,9 @@ def evaluate_checkpoint_topk_forecasts(
             split_name=split.capitalize(),
             node_metrics_csv_path=eval_csv_path,
             node_metrics_target=node_metrics_target,
+            relevant_source_mapping=(
+                config.model.observation_heads.relevant_source_mapping()
+            ),
         )
     except Exception as exc:  # pragma: no cover - evaluation best-effort
         logger.warning(f"[eval] Metrics evaluation failed: {exc}")

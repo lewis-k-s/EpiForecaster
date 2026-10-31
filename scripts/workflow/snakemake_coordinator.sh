@@ -6,7 +6,7 @@
 set -euo pipefail
 
 RUN_ROOT="${1:?run root is required}"
-SNAKEMAKE_BIN="${2:?Snakemake executable is required}"
+CONTAINER_SIF="${2:?container SIF is required}"
 EXPECTED_TASKS="${3:?expected task count is required}"
 EXPECTED_CPUS_PER_TASK="${4:?expected CPUs per task is required}"
 EXECUTION_MODE="${5:?execution mode is required}"
@@ -19,10 +19,16 @@ write_completion() {
   local temporary="$receipt.$$"
 
   trap - EXIT
+  local cache_script="$RUN_ROOT/source/scripts/workflow/node_input_cache.sh"
+  if [ -f "$cache_script" ] && command -v srun >/dev/null 2>&1; then
+    srun --nodes=1 --ntasks=1 --cpus-per-task=1 --exact \
+      bash "$cache_script" clean "$RUN_ROOT" \
+      || echo "Warning: allocation input cache cleanup failed" >&2
+  fi
   if [ ! -f "$receipt" ]; then
     printf '%s\n' \
       $'schema_version\t1' \
-      "exit_code"$'\t'"$status" \
+      "exit_code"$'\t'"${RECEIPT_EXIT_CODE:-$status}" \
       "completed_at"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       >"$temporary"
     mv "$temporary" "$receipt"
@@ -33,7 +39,10 @@ write_completion() {
 validate_allocation() {
   test -d "$RUN_ROOT/source"
   test -r "$RUN_ROOT/config.yaml"
-  test -x "$SNAKEMAKE_BIN"
+  if [ ! -f "$CONTAINER_SIF" ]; then
+    echo "Missing coordinator SIF: $CONTAINER_SIF" >&2
+    return 2
+  fi
   test -d "$ATTEMPT_ROOT"
 
   if [ "$EXECUTION_MODE" != "batch" ] \
@@ -50,21 +59,96 @@ validate_allocation() {
       return 2
     fi
   else
-    if [ "${SLURM_NNODES:-}" != "1" ] \
-      || [ "${SLURM_NTASKS:-}" != "$EXPECTED_TASKS" ]; then
-      echo "External launcher does not expose the validated one-node, $EXPECTED_TASKS-task allocation" >&2
+    if [ "${SLURM_NNODES:-}" != "1" ]; then
+      echo "External launcher does not expose the validated one-node allocation" >&2
       return 2
     fi
-    # The special external-launcher step omits these batch-shell variables.
-    # The snapshot-owned adapter has already validated the containing
-    # allocation through scontrol, so publish its sealed capacity to rules.
+    # The special external-launcher step is one lightweight coordinator task;
+    # it does not expose the parent allocation's scientific task count or CPU
+    # shape. The snapshot-owned adapter already validated and sealed that
+    # capacity through scontrol, so publish it to child workflow rules.
     export SLURM_JOB_NUM_NODES=1
+    export SLURM_NTASKS="$EXPECTED_TASKS"
     export SLURM_CPUS_PER_TASK="$EXPECTED_CPUS_PER_TASK"
   fi
 }
 
 trap write_completion EXIT
 validate_allocation
+
+load_singularity() {
+  local profile_script candidate loaded=0
+
+  if ! command -v module >/dev/null 2>&1; then
+    set +u
+    for profile_script in \
+      /etc/profile.d/00-bsc.sh \
+      /etc/profile.d/01-module.sh \
+      /apps/modules/LMOD/8.7/lmod/8.7/init/profile; do
+      if [ -r "$profile_script" ]; then
+        # shellcheck disable=SC1090
+        source "$profile_script"
+      fi
+      if command -v module >/dev/null 2>&1; then
+        break
+      fi
+    done
+    set -u
+  fi
+
+  if command -v singularity >/dev/null 2>&1; then
+    return 0
+  fi
+
+  module load EB/apps >/dev/null 2>&1 || true
+  for candidate in \
+    "${SINGULARITY_MODULE:-singularity/4.1.5}" \
+    "Singularity/4.1.5" \
+    "SingularityCE/4.1.5"; do
+    if module load "$candidate" >/dev/null 2>&1; then
+      loaded=1
+      break
+    fi
+  done
+
+  if [ "$loaded" -ne 1 ]; then
+    echo "Unable to load Singularity 4.1.5 module" >&2
+    return 1
+  fi
+}
+
+bootstrap_singularity_sessiondir() {
+  local session_root="${TMPDIR:-/tmp}/singularity/mnt/session"
+
+  mkdir -p "$session_root"
+  if [ ! -d "$session_root" ] || [ ! -x "$session_root" ]; then
+    echo "Singularity runtime session path is not usable: $session_root" >&2
+    return 1
+  fi
+}
+
+bootstrap_singularity_sessiondir
+
+load_singularity
+
+ensure_singularity_sessiondir() {
+  local session_dir
+
+  session_dir="$(
+    singularity buildcfg | awk -F= '$1 == "SESSIONDIR" { print $2; exit }'
+  )"
+  if [[ "$session_dir" != /* ]]; then
+    echo "Singularity SESSIONDIR must be an absolute path: $session_dir" >&2
+    return 1
+  fi
+  mkdir -p "$session_dir"
+  if [ ! -d "$session_dir" ] || [ ! -x "$session_dir" ]; then
+    echo "Singularity SESSIONDIR is not usable: $session_dir" >&2
+    return 1
+  fi
+}
+
+ensure_singularity_sessiondir
 
 # Only one coordinator may mutate a run's Snakemake metadata at a time.
 exec 9>"$RUN_ROOT/.state/coordinator.run.lock"
@@ -94,10 +178,73 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$RUN_ROOT/source"
 export XDG_CACHE_HOME="$RUN_ROOT/.cache"
 
-"$SNAKEMAKE_BIN" \
+container_args=(
+  exec
+  --cleanenv
+  --containall
+  --bind "$RUN_ROOT:$RUN_ROOT:rw"
+  --bind "$(dirname "$CONTAINER_SIF"):$(dirname "$CONTAINER_SIF"):ro"
+  --bind /usr/bin/srun:/usr/bin/srun:ro
+  --bind /usr/lib64/slurm:/usr/lib64/slurm:ro
+  --bind /usr/lib64/libmunge.so.2.0.1:/usr/lib64/libmunge.so.2.0.1:ro
+  --bind /usr/lib64/libmunge.so.2:/usr/lib64/libmunge.so.2:ro
+  --bind /etc/slurm:/etc/slurm:ro
+  --bind /etc/passwd:/etc/passwd:ro
+  --bind /etc/group:/etc/group:ro
+  --bind /run/munge:/run/munge:ro
+  --env "PATH=/opt/epiforecaster/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+  --env "PYTHONDONTWRITEBYTECODE=1"
+  --env "PYTHONPATH=$RUN_ROOT/source"
+  --env "XDG_CACHE_HOME=$RUN_ROOT/.cache"
+  --env "TMPDIR=/tmp"
+  --pwd "$RUN_ROOT"
+)
+
+# Site plugins differ between MN5 nodes. Mount only installed plugin trees.
+for optional_site_path in /opt/.snoopy/lib /opt/EAR/current; do
+  if [ -d "$optional_site_path" ]; then
+    container_args+=(--bind "$optional_site_path:$optional_site_path:ro")
+  fi
+done
+
+# Clean environments do not automatically preserve the allocation identity
+# needed by the host srun client exposed above.
+while IFS= read -r variable_name; do
+  container_args+=(--env "$variable_name=${!variable_name}")
+done < <(compgen -A variable SLURM_)
+for variable_name in EPIFORECASTER_EXECUTION_MODE EPIFORECASTER_EXECUTION_ATTEMPT_ID; do
+  container_args+=(--env "$variable_name=${!variable_name}")
+done
+
+
+# Keep the host shell alive so completion and cache cleanup always run.
+set +e
+singularity "${container_args[@]}" "$CONTAINER_SIF" /usr/local/bin/snakemake \
   --snakefile "$RUN_ROOT/source/workflow/Snakefile" \
   --configfile "$RUN_ROOT/config.yaml" \
   --workflow-profile "$RUN_ROOT/source/workflow/profiles/mn5" \
   --directory "$RUN_ROOT" \
   --runtime-source-cache-path "$RUN_ROOT/.snakemake/source-cache" \
+  --cores "$((EXPECTED_TASKS * EXPECTED_CPUS_PER_TASK))" \
+  --jobs "$EXPECTED_TASKS" \
+  --resources "gpu=$EXPECTED_TASKS" \
   "$@"
+workflow_status=$?
+set -e
+
+# A rolling allocation closes out with every worker rank publishing a
+# continuation receipt while the queue still holds identities. Snakemake must
+# keep workers_complete.done absent so the next allocation re-runs the worker
+# rule, but this coordinator should end the allocation cleanly rather than
+# surfacing the designed close-out as a workflow failure.
+# Only a marker written by this attempt counts; an older one is stale. The
+# receipt records the distinct close-out code 75, not success.
+if [ "$workflow_status" -ne 0 ] \
+  && grep -qxF "attempt_id"$'\t'"$EPIFORECASTER_EXECUTION_ATTEMPT_ID" \
+    "$RUN_ROOT/.state/continuation.required" 2>/dev/null \
+  && [ ! -f "$RUN_ROOT/.state/workers_complete.done" ]; then
+  echo "Rolling allocation close-out: queue not drained; continuation required"
+  RECEIPT_EXIT_CODE=75
+  exit 0
+fi
+exit "$workflow_status"

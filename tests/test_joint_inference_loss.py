@@ -30,7 +30,7 @@ def test_physics_residual_not_trivially_zero_when_constraints_bind():
 
 def test_joint_inference_latent_loss_zero_when_latents_absent():
     """Latent SIRHD supervision is absent when no latent targets are provided."""
-    loss_fn = JointInferenceLoss(w_sird_supervision=1.0)
+    loss_fn = JointInferenceLoss(latent_total_weight=1.0)
 
     model_outputs = {
         "pred_ww": torch.zeros(2, 3),
@@ -136,7 +136,7 @@ def test_get_loss_from_config_resolves_history_and_horizon_thresholds() -> None:
 
 def test_joint_inference_latent_loss_uses_dense_finite_targets():
     """Synthetic latent supervision is dense and skips only non-finite targets."""
-    loss_fn = JointInferenceLoss(w_sird_supervision=1.0)
+    loss_fn = JointInferenceLoss(latent_total_weight=1.0)
 
     S_prediction = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
     model_outputs = {
@@ -173,7 +173,7 @@ def test_joint_inference_latent_loss_uses_dense_finite_targets():
 
 def test_joint_inference_latent_h_loss_uses_dense_target():
     """Latent H supervision should use H targets when present."""
-    loss_fn = JointInferenceLoss(w_sird_supervision=1.0)
+    loss_fn = JointInferenceLoss(latent_total_weight=1.0)
 
     H_prediction = torch.tensor([[0.2, 0.4, 0.6]])
     model_outputs = {
@@ -208,9 +208,167 @@ def test_joint_inference_latent_h_loss_uses_dense_target():
     assert torch.isclose(loss, torch.tensor((0.04 + 0.16 + 0.36) / 3.0))
 
 
+def test_joint_inference_uses_destination_dated_death_flow_target():
+    """The fifth latent task is death flow, not cumulative D."""
+    loss_fn = JointInferenceLoss(latent_total_weight=1.0)
+
+    flow_prediction = torch.tensor([[0.2, 0.4]])
+    model_outputs = {
+        "pred_ww": torch.zeros_like(flow_prediction),
+        "pred_hosp": torch.zeros_like(flow_prediction),
+        "pred_cases": torch.zeros_like(flow_prediction),
+        "pred_deaths": torch.zeros_like(flow_prediction),
+        "death_flow": flow_prediction,
+        "D_trajectory": torch.full((1, 3), 100.0),
+    }
+    targets = {
+        "ww": None,
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "S_target": None,
+        "I_target": None,
+        "H_target": None,
+        "R_target": None,
+        "D_target": torch.zeros(1, 3),
+        "death_flow_target": torch.zeros_like(flow_prediction),
+        "ww_mask": None,
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+
+    components = loss_fn.compute_components(model_outputs, targets)
+
+    expected = torch.tensor((0.2**2 + 0.4**2) / 2.0)
+    assert torch.isclose(components["latent_death_flow"], expected)
+    assert torch.isclose(components["sird_supervision"], expected)
+    assert torch.isclose(components["total"], expected)
+
+
+def _complete_latent_case(
+    *, i_prediction: torch.Tensor, i_target: torch.Tensor
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | None]]:
+    state_zero = torch.zeros_like(i_prediction)
+    flow_zero = torch.zeros(i_prediction.shape[0], i_prediction.shape[1] - 1)
+    outputs = {
+        "pred_ww": state_zero,
+        "pred_hosp": state_zero,
+        "pred_cases": state_zero,
+        "pred_deaths": flow_zero,
+        "S_trajectory": state_zero,
+        "I_trajectory": i_prediction,
+        "H_trajectory": state_zero,
+        "R_trajectory": state_zero,
+        "death_flow": flow_zero,
+    }
+    targets = {
+        "ww": None,
+        "hosp": None,
+        "cases": None,
+        "deaths": None,
+        "S_target": state_zero,
+        "I_target": i_target,
+        "H_target": state_zero,
+        "R_target": state_zero,
+        "death_flow_target": flow_zero,
+        "ww_mask": None,
+        "hosp_mask": None,
+        "cases_mask": None,
+        "deaths_mask": None,
+    }
+    return outputs, targets
+
+
+@pytest.mark.parametrize(
+    ("scaling", "expected"),
+    [
+        ("std", 1.0),
+        ("asinh", math.asinh(1.0) ** 2),
+    ],
+)
+def test_joint_inference_applies_fixed_i_scale_in_fp32(scaling, expected):
+    weights = {name: 0.0 for name in ("s", "i", "h", "r", "death_flow")}
+    weights["i"] = 1.0
+    scales = {name: 2.0 for name in weights}
+    loss_fn = JointInferenceLoss(
+        latent_total_weight=1.0,
+        latent_scaling=scaling,
+        latent_component_weights=weights,
+        latent_scales=scales,
+        latent_require_complete_targets=True,
+    )
+    outputs, targets = _complete_latent_case(
+        i_prediction=torch.full((1, 3), 2.0, dtype=torch.bfloat16),
+        i_target=torch.zeros(1, 3, dtype=torch.bfloat16),
+    )
+
+    components = loss_fn.compute_components(outputs, targets)
+
+    assert components["latent_i"].dtype == torch.float32
+    assert components["latent_i"].item() == pytest.approx(expected)
+    assert components["latent_i_raw"].item() == pytest.approx(4.0)
+    assert components["latent_i_weighted"].item() == pytest.approx(expected)
+    assert components["total"].item() == pytest.approx(expected)
+
+
+def test_joint_inference_asinh_keeps_s_and_r_on_standard_scale():
+    weights = {name: 0.0 for name in ("s", "i", "h", "r", "death_flow")}
+    weights["s"] = 1.0
+    scales = {name: 2.0 for name in weights}
+    loss_fn = JointInferenceLoss(
+        latent_total_weight=1.0,
+        latent_scaling="asinh",
+        latent_component_weights=weights,
+        latent_scales=scales,
+        latent_require_complete_targets=True,
+    )
+    outputs, targets = _complete_latent_case(
+        i_prediction=torch.zeros(1, 3),
+        i_target=torch.zeros(1, 3),
+    )
+    outputs["S_trajectory"] = torch.full((1, 3), 2.0)
+
+    components = loss_fn.compute_components(outputs, targets)
+
+    assert components["latent_s"].item() == pytest.approx(1.0)
+
+
+def test_joint_inference_complete_latent_contract_rejects_missing_target():
+    loss_fn = JointInferenceLoss(
+        latent_total_weight=1.0,
+        latent_require_complete_targets=True,
+    )
+    outputs, targets = _complete_latent_case(
+        i_prediction=torch.zeros(1, 3),
+        i_target=torch.zeros(1, 3),
+    )
+    targets["H_target"] = None
+
+    with pytest.raises(ValueError, match="missing.*H_target"):
+        loss_fn.compute_components(outputs, targets)
+
+
+def test_joint_inference_complete_latent_loss_compiles_without_graph_breaks():
+    # A value-dependent branch splits the compiled training step, which broke
+    # CUDA graph replay; target values are validated once per split instead.
+    loss_fn = JointInferenceLoss(
+        latent_total_weight=1.0,
+        latent_require_complete_targets=True,
+    )
+    outputs, targets = _complete_latent_case(
+        i_prediction=torch.zeros(2, 3),
+        i_target=torch.ones(2, 3),
+    )
+
+    explanation = torch._dynamo.explain(loss_fn.compute_components)(outputs, targets)
+
+    assert explanation.graph_break_count == 0, explanation.break_reasons
+
+
 def test_joint_inference_loss_all_masked_keeps_grad_graph():
     """Regression test: all-masked batches must still allow backward()."""
-    loss_fn = JointInferenceLoss(w_sird_supervision=0.0)
+    loss_fn = JointInferenceLoss(latent_total_weight=0.0)
 
     pred_ww = torch.randn(2, 3, requires_grad=True)
     pred_hosp = torch.randn(2, 3, requires_grad=True)
@@ -249,7 +407,7 @@ def test_joint_inference_loss_all_masked_keeps_grad_graph():
 
 def test_joint_inference_loss_ignores_nonfinite_targets_under_mask():
     """Regression test: NaN/Inf targets outside valid mask must not contaminate loss."""
-    loss_fn = JointInferenceLoss(w_sird_supervision=0.0)
+    loss_fn = JointInferenceLoss(latent_total_weight=0.0)
 
     pred_ww = torch.tensor([[1.0, 2.0, 3.0]], requires_grad=True)
     model_outputs = {
@@ -288,7 +446,7 @@ def test_joint_inference_loss_cross_device(accelerator_device):
     """
     loss_fn = JointInferenceLoss(
         obs_weight_sum=3.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
     )
 
     # Model outputs on accelerator (simulates GPU forward pass)
@@ -324,7 +482,7 @@ def test_joint_inference_loss_zero_weight_head_not_poisoned_by_nonfinite_output(
     """Disabled heads should not poison total loss through zero-initialization anchors."""
     loss_fn = JointInferenceLoss(
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
     )
 
     model_outputs = {
@@ -351,7 +509,7 @@ def test_joint_inference_loss_zero_weight_head_not_poisoned_by_nonfinite_output(
 
 
 def test_joint_inference_obs_active_mask_from_masks() -> None:
-    loss_fn = JointInferenceLoss(w_sird_supervision=0.0)
+    loss_fn = JointInferenceLoss(latent_total_weight=0.0)
     model_outputs = {
         "pred_ww": torch.zeros(1, 2),
         "pred_hosp": torch.zeros(1, 2),
@@ -376,7 +534,7 @@ def test_joint_inference_obs_active_mask_from_masks() -> None:
 
 
 def test_joint_inference_compute_components_train_matches_default() -> None:
-    loss_fn = JointInferenceLoss(w_sird_supervision=0.2)
+    loss_fn = JointInferenceLoss(latent_total_weight=0.2)
     model_outputs = {
         "pred_ww": torch.tensor([[0.2, 0.4]]),
         "pred_hosp": torch.tensor([[0.1, 0.3]]),
@@ -414,7 +572,7 @@ def test_joint_inference_compute_components_train_matches_default() -> None:
 
 def test_joint_inference_obs_active_mask_respects_min_observed() -> None:
     loss_fn = JointInferenceLoss(
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         ww_min_observed=2,
         disable_hosp=True,
         disable_cases=True,
@@ -447,7 +605,7 @@ def test_joint_inference_obs_active_mask_respects_min_observed() -> None:
 def test_joint_inference_n_eff_is_diagnostic_only() -> None:
     loss_fn = JointInferenceLoss(
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -481,7 +639,7 @@ def test_joint_inference_n_eff_is_diagnostic_only() -> None:
 def test_joint_inference_observation_loss_means_over_observed_points() -> None:
     loss_fn = JointInferenceLoss(
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -537,7 +695,7 @@ def test_joint_inference_observation_loss_type(
     loss_fn = JointInferenceLoss(
         observation_loss=observation_loss,
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -570,7 +728,7 @@ def test_joint_inference_normal_nll_uses_distribution_params() -> None:
     loss_fn = JointInferenceLoss(
         observation_loss="nll",
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -605,7 +763,7 @@ def test_joint_inference_normal_nll_preserves_negative_values_and_gradient() -> 
     loss_fn = JointInferenceLoss(
         observation_loss="nll",
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -640,7 +798,7 @@ def test_joint_inference_normal_crps_uses_distribution_params() -> None:
     loss_fn = JointInferenceLoss(
         observation_loss="crps",
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -672,7 +830,7 @@ def test_joint_inference_rmse_observation_loss_is_zero_for_exact_match() -> None
     loss_fn = JointInferenceLoss(
         observation_loss="rmse",
         obs_weight_sum=1.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,
@@ -702,7 +860,7 @@ def test_joint_inference_rmse_observation_loss_is_zero_for_exact_match() -> None
 
 
 def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:
-    loss_fn = JointInferenceLoss(w_sird_supervision=0.0, hosp_min_observed=2)
+    loss_fn = JointInferenceLoss(latent_total_weight=0.0, hosp_min_observed=2)
     model_outputs = {
         "pred_ww": torch.zeros(1, 3),
         "pred_hosp": torch.zeros(1, 3),
@@ -739,7 +897,7 @@ def test_joint_inference_shared_supervision_matches_obs_active_mask() -> None:
 
 def test_ww_supervision_requires_history_and_horizon_coverage() -> None:
     loss_fn = JointInferenceLoss(
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
         disable_hosp=True,
         disable_cases=True,
         disable_deaths=True,

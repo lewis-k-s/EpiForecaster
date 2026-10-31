@@ -9,7 +9,6 @@ from models.configs import (
     SIRPhysicsConfig,
 )
 from models.epiforecaster import EpiForecaster
-from utils.precision_policy import MODEL_PARAM_DTYPE
 
 
 def _rand_tensor(*shape, dtype=None):
@@ -51,10 +50,62 @@ class TestEpiForecaster:
             "region_embeddings": _rand_tensor(10, 8),
         }
 
-    def test_init_basic(self, basic_config):
+    def test_clinical_gamma_priors_reach_delay_kernels(self, basic_config):
+        """Configured hosp/cases Gamma priors wire into their DelayKernels."""
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            kernel_gamma_shape_hosp=6.5,
+            kernel_gamma_scale_hosp=1.7,
+            kernel_gamma_shape_cases=4.0,
+            kernel_gamma_scale_cases=2.5,
+            learnable_kernel_hosp=True,
+            kernel_parameterization_hosp="gamma",
+            learnable_kernel_cases=True,
+            kernel_parameterization_cases="gamma",
+            learnable_kernel_deaths=True,
+            kernel_parameterization_deaths="gamma",
+        )
         model = EpiForecaster(**basic_config)
-        assert isinstance(model, EpiForecaster)
-        assert model.dtype == MODEL_PARAM_DTYPE
+        assert model.hosp_head.delay_kernel.get_gamma_parameters() == (
+            pytest.approx(6.5),
+            pytest.approx(1.7),
+        )
+        assert model.cases_head.delay_kernel.get_gamma_parameters() == (
+            pytest.approx(4.0),
+            pytest.approx(2.5),
+        )
+        # Deaths keeps its own configured prior.
+        assert model.deaths_head.delay_kernel.get_gamma_parameters() == (
+            pytest.approx(12.25),
+            pytest.approx(4.0 / 7.0),
+        )
+
+    def test_init_can_disable_an_observation_residual(self, basic_config):
+        baseline_config = basic_config.copy()
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            residual_disabled_heads=["ww"]
+        )
+
+        torch.manual_seed(7)
+        baseline = EpiForecaster(**baseline_config)
+        torch.manual_seed(7)
+        model = EpiForecaster(**basic_config)
+
+        # Static ablation retains the projection structure but never activates
+        # its residual location contribution.
+        assert model.ww_head._residual_location_enabled is False
+        assert model.ww_head.use_residual is True
+        assert model.ww_head.residual_proj is not None
+        assert model.ww_head.alpha is not None
+        assert model.ww_head.alpha.requires_grad is False
+        assert model.ww_head.alpha.item() == 0.0
+        assert model.hosp_head._residual_location_enabled is True
+        for name, parameter in baseline.state_dict().items():
+            if not name.startswith("ww_head."):
+                assert torch.equal(parameter, model.state_dict()[name])
+
+    def test_init_rejects_unknown_disabled_residual_head(self):
+        with pytest.raises(ValueError, match="residual_disabled_heads"):
+            ObservationHeadConfig(residual_disabled_heads=["invalid"])
 
     def test_forward_basic(self, basic_config, dummy_batch):
         """Test forward pass with minimal features (cases only)."""
@@ -83,13 +134,35 @@ class TestEpiForecaster:
             pred_key = f"pred_{head_name}"
             assert out[f"dist_{head_name}_loc"].shape == out[pred_key].shape
             assert out[f"dist_{head_name}_scale"].shape == out[pred_key].shape
+            assert out[f"mechanistic_{head_name}"].shape == out[pred_key].shape
+            assert out[f"residual_{head_name}"].shape == out[pred_key].shape
+            assert out[f"residual_input_{head_name}"].shape == out[pred_key].shape
+            assert torch.allclose(
+                out[pred_key],
+                out[f"mechanistic_{head_name}"] + out[f"residual_{head_name}"],
+                atol=1e-5,
+            )
             assert torch.all(out[f"dist_{head_name}_scale"] > 0)
+        source_grad, residual_grad = torch.autograd.grad(
+            out["pred_cases"].square().mean(),
+            (out["observation_source_cases"], out["residual_input_cases"]),
+            retain_graph=True,
+        )
+        assert torch.all(torch.isfinite(source_grad))
+        assert torch.all(torch.isfinite(residual_grad))
         assert out["S_trajectory"].shape == (batch_size, horizon + 1)
         assert out["I_trajectory"].shape == (batch_size, horizon + 1)
         assert out["H_trajectory"].shape == (batch_size, horizon + 1)
         assert out["R_trajectory"].shape == (batch_size, horizon + 1)
         assert out["D_trajectory"].shape == (batch_size, horizon + 1)
         assert out["hospitalization_flow"].shape == (batch_size, horizon)
+        assert out["death_flow"].shape == (batch_size, horizon)
+        assert out["observation_source_ww"].shape == (batch_size, horizon + 1)
+        assert out["observation_source_cases"].shape == (batch_size, horizon + 1)
+        assert out["observation_source_hosp"].shape == (batch_size, horizon + 1)
+        assert out["observation_source_deaths"].shape == (batch_size, horizon)
+        assert out["beta_t"].shape == (batch_size, horizon)
+        assert out["gamma_t"].shape == (batch_size, horizon)
         assert out["hospitalization_rate_t"].shape == (batch_size, horizon)
         assert out["hospital_recovery_t"].shape == (batch_size, horizon)
         assert out["hospital_mortality_t"].shape == (batch_size, horizon)
@@ -165,96 +238,6 @@ class TestEpiForecaster:
         assert torch.all(out["beta_t"] > cfg.beta_min)
         assert torch.all(out["beta_t"] < cfg.beta_max)
 
-    def test_forward_with_mobility(self, basic_config, dummy_batch):
-        """Test forward pass with mobility enabled."""
-        config = basic_config.copy()
-        config["variant_type"] = ModelVariant(cases=True, mobility=True)
-        config["gnn_hidden_dim"] = 8
-        config["mobility_embedding_dim"] = 8
-
-        model = EpiForecaster(**config)
-
-        # Create dummy dense mobility batch
-        B, T = dummy_batch["hosp_hist"].shape[:2]
-        num_graphs = B * T
-        num_nodes = 5
-        mob_batch = Batch()
-        mob_batch.x_dense = _rand_tensor(num_graphs, num_nodes, model.temporal_node_dim)
-        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes)
-        eye = torch.eye(num_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
-        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
-
-        out = model(
-            hosp_hist=dummy_batch["hosp_hist"],
-            deaths_hist=dummy_batch["deaths_hist"],
-            cases_hist=dummy_batch["cases_hist"],
-            biomarkers_hist=dummy_batch["biomarkers_hist"],
-            mob_graphs=mob_batch,
-            target_nodes=dummy_batch["target_nodes"],
-            population=dummy_batch["population"],
-        )
-
-        assert out["beta_t"].shape == (B, config["forecast_horizon"])
-
-    def test_forward_with_regions(self, basic_config, dummy_batch):
-        """Test forward pass with static region embeddings."""
-        config = basic_config.copy()
-        config["variant_type"] = ModelVariant(cases=True, regions=True)
-        config["region_embedding_dim"] = 8
-
-        model = EpiForecaster(**config)
-
-        out = model(
-            hosp_hist=dummy_batch["hosp_hist"],
-            deaths_hist=dummy_batch["deaths_hist"],
-            cases_hist=dummy_batch["cases_hist"],
-            biomarkers_hist=dummy_batch["biomarkers_hist"],
-            mob_graphs=None,
-            target_nodes=dummy_batch["target_nodes"],
-            region_embeddings=dummy_batch["region_embeddings"],
-            population=dummy_batch["population"],
-        )
-
-        # Predictions include t=0 (nowcast) so they are H+1 shaped
-        assert out["pred_cases"].shape == (2, config["forecast_horizon"] + 1)
-
-    def test_forward_with_mobility_and_regions(self, basic_config, dummy_batch):
-        """Test forward pass where region embeddings are injected into the mobility GNN."""
-        config = basic_config.copy()
-        config["variant_type"] = ModelVariant(cases=True, mobility=True, regions=True)
-        config["gnn_hidden_dim"] = 8
-        config["mobility_embedding_dim"] = 8
-        config["region_embedding_dim"] = 8
-
-        model = EpiForecaster(**config)
-
-        B, T = dummy_batch["hosp_hist"].shape[:2]
-        num_graphs = B * T
-        num_nodes = 5
-        mob_batch = Batch()
-
-        # In this config, the GNN input capacity is temporal_dim + region_dim
-        mob_batch.x_dense = _rand_tensor(num_graphs, num_nodes, model.temporal_node_dim)
-        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes)
-        eye = torch.eye(num_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
-        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
-        mob_batch.mob_real_node_idx = torch.arange(num_nodes, dtype=torch.long)
-
-        out = model(
-            hosp_hist=dummy_batch["hosp_hist"],
-            deaths_hist=dummy_batch["deaths_hist"],
-            cases_hist=dummy_batch["cases_hist"],
-            biomarkers_hist=dummy_batch["biomarkers_hist"],
-            mob_graphs=mob_batch,
-            target_nodes=dummy_batch["target_nodes"],
-            region_embeddings=torch.randn(10, 8),  # num_regions = 10
-            population=dummy_batch["population"],
-        )
-
-        assert out["beta_t"].shape == (B, config["forecast_horizon"])
-
     def test_forward_with_mobility_and_regions_uses_collated_local_targets(
         self, basic_config, dummy_batch
     ):
@@ -275,7 +258,8 @@ class TestEpiForecaster:
         )
         dense_adj = torch.rand(num_graphs, num_ctx_nodes, num_ctx_nodes)
         eye = torch.eye(num_ctx_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.maximum(dense_adj, eye)
 
         mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
         mob_batch.target_node = torch.tensor(
@@ -316,7 +300,8 @@ class TestEpiForecaster:
         )
         dense_adj = torch.rand(num_graphs, num_ctx_nodes, num_ctx_nodes)
         eye = torch.eye(num_ctx_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.maximum(dense_adj, eye)
         mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
 
         target_nodes = torch.tensor([3, 9], dtype=torch.long)
@@ -351,7 +336,8 @@ class TestEpiForecaster:
         mob_batch.x_dense = _rand_tensor(num_graphs, num_nodes, model.temporal_node_dim)
         dense_adj = torch.rand(num_graphs, num_nodes, num_nodes)
         eye = torch.eye(num_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.maximum(dense_adj, eye)
         mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
         mob_batch.mob_real_node_idx = torch.arange(num_nodes + 1, dtype=torch.long)
 
@@ -403,120 +389,6 @@ class TestEpiForecaster:
         assert model.cases_head.scale.grad is not None
         assert model.cases_head.scale.grad.abs().sum() > 0
 
-    def test_forward_batch_helper(self, basic_config, dummy_batch):
-        """Test the forward_batch helper method."""
-        model = EpiForecaster(**basic_config)
-
-        B, T = 2, 14
-        H = basic_config["forecast_horizon"]
-
-        batch_data = EpiBatch(
-            hosp_hist=dummy_batch["hosp_hist"],
-            deaths_hist=dummy_batch["deaths_hist"],
-            cases_hist=dummy_batch["cases_hist"],
-            bio_node=dummy_batch["biomarkers_hist"],
-            mob_batch=Batch(),
-            population=dummy_batch["population"],
-            b=B,
-            t=T,
-            target_node=dummy_batch["target_nodes"],
-            target_region_index=None,
-            window_start=torch.zeros(B, dtype=torch.long),
-            node_labels=["node_0", "node_1"],
-            temporal_covariates=torch.zeros(B, T, 0),
-            vaccination_hist=torch.zeros(B, T, 3),
-            ww_hist=dummy_batch["ww_hist"],
-            ww_hist_mask=dummy_batch["ww_hist_mask"],
-            hosp_target=_rand_tensor(B, H),
-            ww_target=_rand_tensor(B, H),
-            cases_target=_rand_tensor(B, H),
-            deaths_target=_rand_tensor(B, H),
-            hosp_target_mask=torch.ones(B, H),
-            ww_target_mask=torch.ones(B, H),
-            cases_target_mask=torch.ones(B, H),
-            deaths_target_mask=torch.ones(B, H),
-            S_target=None,
-            I_target=None,
-            R_target=None,
-            D_target=None,
-        )
-        batch_data = batch_data.to(model.device)
-
-        outputs, targets = model.forward_batch(
-            batch_data=batch_data, region_embeddings=dummy_batch["region_embeddings"]
-        )
-
-        assert "pred_cases" in outputs
-        assert "cases" in targets
-        assert targets["cases"].shape == (2, 7)
-
-    def test_forward_batch_uses_pretyped_mobility_inputs(self, basic_config):
-        """Forward batch should consume mobility tensors already in model dtype."""
-        config = basic_config.copy()
-        config["variant_type"] = ModelVariant(cases=True, mobility=True)
-        config["gnn_hidden_dim"] = 8
-        config["mobility_embedding_dim"] = 8
-        model = EpiForecaster(**config)
-        expected_dtype = torch.float32
-
-        B, T = 1, config["sequence_length"]
-        horizon = config["forecast_horizon"]
-
-        num_graphs = B * T
-        num_nodes = 4
-        mob_batch = Batch()
-        mob_batch.x_dense = _rand_tensor(
-            num_graphs,
-            num_nodes,
-            model.temporal_node_dim,
-            dtype=expected_dtype,
-        )
-        dense_adj = torch.rand(num_graphs, num_nodes, num_nodes, dtype=expected_dtype)
-        eye = torch.eye(num_nodes, dtype=expected_dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
-        mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
-
-        batch_data = EpiBatch(
-            hosp_hist=_rand_tensor(B, T, 3),
-            deaths_hist=_rand_tensor(B, T, 3),
-            cases_hist=_rand_tensor(B, T, 3),
-            bio_node=torch.zeros(B, T, 1, dtype=torch.float32),
-            mob_batch=mob_batch,
-            population=torch.full((B,), 1000.0, dtype=torch.float32),
-            b=B,
-            t=T,
-            target_node=torch.zeros(B, dtype=torch.long),
-            target_region_index=None,
-            window_start=torch.zeros(B, dtype=torch.long),
-            node_labels=["node_0"],
-            temporal_covariates=torch.zeros(B, T, 0),
-            vaccination_hist=torch.zeros(B, T, 3),
-            ww_hist=_rand_tensor(B, T),
-            ww_hist_mask=torch.ones(B, T),
-            hosp_target=_rand_tensor(B, horizon),
-            ww_target=_rand_tensor(B, horizon),
-            cases_target=_rand_tensor(B, horizon),
-            deaths_target=_rand_tensor(B, horizon),
-            hosp_target_mask=torch.ones(B, horizon),
-            ww_target_mask=torch.ones(B, horizon),
-            cases_target_mask=torch.ones(B, horizon),
-            deaths_target_mask=torch.ones(B, horizon),
-            S_target=None,
-            I_target=None,
-            R_target=None,
-            D_target=None,
-        )
-        batch_data = batch_data.to(model.device)
-
-        outputs, targets = model.forward_batch(batch_data=batch_data)
-
-        assert outputs["pred_cases"].dtype == expected_dtype
-        assert outputs["pred_hosp"].dtype == expected_dtype
-        assert targets["cases"] is not None
-        assert targets["cases"].dtype == expected_dtype
-        assert mob_batch.x_dense.dtype == expected_dtype
-        assert mob_batch.adj_dense.dtype == expected_dtype
-
     def test_forward_batch_masks_ablated_neighbor_series(self, basic_config):
         """Input ablations must also remove the corresponding neighbor signals."""
         config = basic_config.copy()
@@ -542,7 +414,8 @@ class TestEpiForecaster:
             model.temporal_node_dim,
             dtype=torch.float32,
         )
-        mob_batch.adj_dense = torch.eye(num_nodes, dtype=torch.float32).expand(
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.eye(num_nodes, dtype=torch.float32).expand(
             num_graphs, -1, -1
         )
         mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)

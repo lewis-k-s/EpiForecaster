@@ -151,7 +151,7 @@ def _make_gradnorm_stub_trainer(*, update_every: int) -> EpiForecasterTrainer:
     )
     trainer.criterion = JointInferenceLoss(
         obs_weight_sum=0.95,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
     )
     trainer.gradnorm_controller = GradNormController(
         warmup_steps=0,

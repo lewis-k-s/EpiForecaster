@@ -1,8 +1,9 @@
 # Example configuration for Region2Vec-style region embedding training.
 
 data:
-  zarr_path: "outputs/region_graph/region_graph.zarr"
+  zarr_path: "../outputs/region_graph/region_graph.zarr"
   normalize_features: true
+  use_mobility_flows: true
 
 encoder:
   hidden_dim: 128

@@ -449,3 +449,25 @@ def test_split_nodes_by_ratio_crossval_handles_sparse_strata(tmp_path: Path) -> 
     train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(config)
 
     assert len(train_nodes) + len(val_nodes) + len(test_nodes) == 100
+
+
+@pytest.mark.epiforecaster
+def test_biomarker_split_rejects_multiple_run_slices() -> None:
+    from data.dataset_factory import _resolve_biomarker_split_features
+
+    dataset = xr.Dataset(
+        {
+            "edar_biomarker_N1_mask": (
+                ("run_id", "date", "region_id"),
+                np.ones((2, 3, 4), dtype=bool),
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="leading dimension 2"):
+        _resolve_biomarker_split_features(
+            dataset,
+            total_nodes=4,
+            valid_nodes=np.arange(4),
+            num_bins=2,
+        )

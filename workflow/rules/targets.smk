@@ -40,7 +40,19 @@ elif WORKFLOW_KIND == "ablation":
             str(ABLATION_MANIFEST)
 
 
+elif WORKFLOW_KIND == "ablation_suite":
+    rule ablation_suite:
+        input:
+            str(SUITE_MANIFEST)
+
+
 elif WORKFLOW_KIND == "crossval":
     rule crossval:
         input:
             str(CROSSVAL_MANIFEST)
+
+
+elif WORKFLOW_KIND == "preprocess":
+    rule preprocess:
+        input:
+            str(PREPROCESSING_RECEIPT)

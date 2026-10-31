@@ -370,3 +370,54 @@ class TestStrictnessRefactor:
         assert r1_flag == 2.0, (
             f"Missing site should be flagged as Missing (2.0), got {r1_flag}"
         )
+
+
+@pytest.mark.parametrize("head", ["cases", "hospitalizations", "deaths", "ww"])
+def test_processor_parameter_fit_uses_only_declared_training_dates(
+    minimal_config, head
+):
+    from data.preprocess.processors.deaths_processor import DeathsProcessor
+
+    minimal_config.smoothing.parameter_fit_end_date = "2022-01-10"
+    values = np.exp(np.sin(np.arange(30) / 3) + 2)
+    values[3] = np.nan
+    dates = pd.date_range("2022-01-01", periods=30)
+    if head == "ww":
+        frame = pd.DataFrame(
+            {
+                "date": dates,
+                "edar_id": "E1",
+                "variant": "N1",
+                "total_covid_flow": values,
+                "limit_flow": 1.0,
+            }
+        )
+        processor = EDARProcessor(minimal_config)
+        apply = processor._apply_tobit_kalman
+        column = "total_covid_flow"
+    else:
+        classes = {
+            "cases": CataloniaCasesProcessor,
+            "hospitalizations": HospitalizationsProcessor,
+            "deaths": DeathsProcessor,
+        }
+        frame = pd.DataFrame({"date": dates, "municipality_code": "001", head: values})
+        processor = classes[head](minimal_config)
+        apply = processor._apply_kalman_smoothing
+        column = head
+    changed = frame.copy()
+    changed.loc[20:, column] *= 1000
+    a, b = apply(frame), apply(changed)
+    np.testing.assert_array_equal(a[column].to_numpy()[:20], b[column].to_numpy()[:20])
+
+
+def test_weekly_hospitalizations_can_be_delayed_until_week_is_complete(minimal_config):
+    from pathlib import Path
+
+    root = Path(minimal_config.data_dir)
+    pd.DataFrame(
+        {"data_inici": ["03/01/2022"], "municipality_code": ["001"], "casos_muni": [12]}
+    ).to_csv(root / "hospitalizations_municipality.csv", index=False)
+    minimal_config.hospitalizations_reporting_lag_days = 7
+    result = HospitalizationsProcessor(minimal_config)._load_raw_data(root)
+    assert result["week_start"].tolist() == [pd.Timestamp("2022-01-10")]

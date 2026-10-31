@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from evaluation.selection_scores import compute_validation_selection_score
+
 _TARGET_AGGREGATE_COLUMNS = [
     "model",
     "target",
@@ -19,6 +21,30 @@ _TARGET_AGGREGATE_COLUMNS = [
     "observed_count_median",
     "observed_count_iqr",
 ]
+_PROBABILISTIC_AGGREGATE_METRICS = (
+    "wis",
+    "crps",
+    "nll",
+    "probabilistic_effective_count",
+    "invalid_prediction_count",
+    "scale_floor_count",
+    "coverage_50",
+    "coverage_80",
+    "coverage_95",
+    "interval_width_50",
+    "interval_width_80",
+    "interval_width_95",
+)
+_TARGET_AGGREGATE_COLUMNS += [
+    f"{metric}_{suffix}"
+    for metric in _PROBABILISTIC_AGGREGATE_METRICS
+    for suffix in ("median", "iqr")
+]
+# Campaign primary endpoint: the equal-head mean of per-head WIS, with the same
+# validity rule as ``compute_validation_selection_score`` in the trainer.
+_PRIMARY_ENDPOINT_COLUMN = "mean_target_wis"
+_TARGET_AGGREGATE_COLUMNS.append(_PRIMARY_ENDPOINT_COLUMN)
+_ENDPOINT_HEADS = ("ww", "hosp", "cases", "deaths")
 
 _JOINT_AGGREGATE_COLUMNS = [
     "model",
@@ -70,6 +96,20 @@ def _median_and_iqr(value: float) -> tuple[float, float]:
     return float("nan"), float("nan")
 
 
+def _mean_target_wis(eval_metrics: dict[str, Any]) -> float:
+    """Equal-target WIS with the checkpoint-selection rule; NaN when invalid."""
+    try:
+        score, _ = compute_validation_selection_score(
+            eval_metrics,
+            observation_loss="wis",
+            selection_metric="mean_target_wis",
+            required_heads=_ENDPOINT_HEADS,
+        )
+    except ValueError:
+        return float("nan")
+    return score
+
+
 def build_main_model_target_aggregate(
     eval_metrics: dict[str, Any],
     model_name: str = "epiforecaster",
@@ -101,6 +141,7 @@ def build_main_model_target_aggregate(
         },
     }
 
+    mean_target_wis = _mean_target_wis(eval_metrics)
     rows: list[dict[str, Any]] = []
     for target_name, key_map in target_to_keys.items():
         row: dict[str, Any] = {
@@ -113,6 +154,22 @@ def build_main_model_target_aggregate(
             median, iqr = _median_and_iqr(value)
             row[f"{metric_name}_median"] = median
             row[f"{metric_name}_iqr"] = iqr
+        head = {
+            "hospitalizations": "hosp",
+            "wastewater": "ww",
+            "cases": "cases",
+            "deaths": "deaths",
+        }[target_name]
+        for metric_name in _PROBABILISTIC_AGGREGATE_METRICS:
+            key = f"{metric_name}_{head}"
+            if metric_name in {"wis", "crps", "nll"} or metric_name.startswith(
+                "interval_width_"
+            ):
+                key += "_log1p_per_100k"
+            median, iqr = _median_and_iqr(_finite_or_nan(eval_metrics.get(key)))
+            row[f"{metric_name}_median"] = median
+            row[f"{metric_name}_iqr"] = iqr
+        row[_PRIMARY_ENDPOINT_COLUMN] = mean_target_wis
         rows.append(row)
 
     return pd.DataFrame(rows, columns=_TARGET_AGGREGATE_COLUMNS)

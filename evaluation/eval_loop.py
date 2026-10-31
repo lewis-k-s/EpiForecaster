@@ -17,6 +17,7 @@ import wandb
 from torch.utils.data import DataLoader
 
 from data.epi_dataset import EpiDataset
+from data.latent_supervision import latent_scales_from_checkpoint
 from evaluation.granular_export import (
     GRANULAR_SCHEMA_VERSION,
     GranularEvalWriter,
@@ -25,14 +26,25 @@ from evaluation.granular_export import (
     write_granular_metadata_sidecar,
 )
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
+from evaluation.latent_diagnostics import build_latent_diagnostic_protocols
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from evaluation.metrics import (
     ProbabilisticMetricResult,
     TorchDistributionMetricAccumulator,
     TorchMaskedMetricAccumulator,
 )
+from evaluation.pathway_metrics import (
+    ObservationLatentMetricResult,
+    PathwayMetricResult,
+    TorchLatentCoherenceAccumulator,
+    TorchLatentProtocolAccumulator,
+    TorchObservationLatentCoherenceAccumulator,
+    TorchPathwayMetricAccumulator,
+    WindowSpearmanMetricResult,
+)
 from models.configs import EpiForecasterConfig
 from models.epiforecaster import EpiForecaster
+from models.observation_heads import DelayKernel, SheddingConvolution
 from utils.device import (
     iter_device_ready_batches,
     prefetch_enabled,
@@ -61,24 +73,77 @@ _HEAD_CANONICAL_NAMES = {
     "cases": "cases",
     "deaths": "deaths",
 }
+_DEFAULT_RELEVANT_SOURCE_MAPPING = {
+    "hosp": "hospitalization_flow",
+    "ww": "I",
+    "cases": "I",
+    "deaths": "death_flow",
+}
+_RELEVANT_SOURCE_OUTPUT_KEYS = {
+    "hospitalization_flow": "hospitalization_flow",
+    "H": "H_trajectory",
+    "I": "I_trajectory",
+    "death_flow": "death_flow",
+    "D": "D_trajectory",
+}
+_ALLOWED_RELEVANT_SOURCES = {
+    "hosp": {"hospitalization_flow", "H"},
+    "ww": {"I"},
+    "cases": {"I"},
+    "deaths": {"death_flow", "D"},
+}
+
+
+def _resolve_relevant_source_mapping(
+    relevant_source_mapping: dict[str, str] | None,
+) -> dict[str, str]:
+    if relevant_source_mapping is None:
+        return dict(_DEFAULT_RELEVANT_SOURCE_MAPPING)
+
+    expected_heads = set(_HEAD_CANONICAL_NAMES)
+    actual_heads = set(relevant_source_mapping)
+    if actual_heads != expected_heads:
+        raise ValueError(
+            "relevant_source_mapping must define exactly "
+            f"{sorted(expected_heads)}, got {sorted(actual_heads)}"
+        )
+
+    resolved = dict(relevant_source_mapping)
+    for head_name, source_name in resolved.items():
+        allowed_sources = _ALLOWED_RELEVANT_SOURCES[head_name]
+        if source_name not in allowed_sources:
+            raise ValueError(
+                f"Relevant source for {head_name!r} must be one of "
+                f"{sorted(allowed_sources)}, got {source_name!r}"
+            )
+    return resolved
+
+
+def _forecast_aligned_output(
+    model_outputs: dict[str, torch.Tensor],
+    key: str,
+    horizon: int,
+) -> torch.Tensor | None:
+    value = model_outputs.get(key)
+    if value is None:
+        return None
+    return drop_nowcast(value, horizon)
 
 
 def _accumulate_per_head_node_metrics(
     *,
+    accumulator: dict[str, dict[int, dict[str, float]]],
     target_name: str,
     target_nodes: torch.Tensor,
     diff: torch.Tensor,
     abs_diff: torch.Tensor,
     weights: torch.Tensor,
-    accumulator: dict[str, dict[int, dict[str, float]]],
 ) -> None:
-    canonical_target = _HEAD_CANONICAL_NAMES[target_name]
-    target_stats = accumulator.setdefault(canonical_target, {})
+    target_stats = accumulator.setdefault(target_name, {})
     target_node_ids = target_nodes.detach().cpu().tolist()
     per_sample_abs_sum = (abs_diff * weights).sum(dim=1).detach().cpu().tolist()
     per_sample_sq_sum = ((diff**2) * weights).sum(dim=1).detach().cpu().tolist()
     per_sample_count = (weights > 0).sum(dim=1).detach().cpu().tolist()
-
     for node_id, abs_sum, sq_sum, observed_count in zip(
         target_node_ids,
         per_sample_abs_sum,
@@ -173,6 +238,10 @@ def _add_probabilistic_metrics(
 ) -> None:
     metrics[f"nll_{head_name}_log1p_per_100k"] = summary.nll
     metrics[f"crps_{head_name}_log1p_per_100k"] = summary.crps
+    metrics[f"wis_{head_name}_log1p_per_100k"] = summary.wis
+    metrics[f"wis_{head_name}_per_h"] = summary.wis_per_h
+    metrics[f"invalid_prediction_count_{head_name}"] = summary.invalid_prediction_count
+    metrics[f"scale_floor_count_{head_name}"] = summary.scale_floor_count
     metrics[f"nll_{head_name}_per_h"] = summary.nll_per_h
     metrics[f"crps_{head_name}_per_h"] = summary.crps_per_h
     metrics[f"probabilistic_effective_count_{head_name}"] = summary.effective_count
@@ -187,6 +256,136 @@ def _add_probabilistic_metrics(
         metrics[f"interval_width_{level_name}_{head_name}_per_h"] = (
             summary.interval_width_per_h_by_level[level_name]
         )
+
+
+def _add_pathway_metrics(
+    *,
+    metrics: dict[str, Any],
+    head_name: str,
+    summary: PathwayMetricResult,
+    mechanistic_probabilistic_summary: ProbabilisticMetricResult,
+) -> None:
+    prefix = f"pathway_{head_name}"
+    metrics[f"{prefix}_observed_count"] = summary.observed_count
+    metrics[f"{prefix}_effective_count"] = summary.effective_count
+    metrics[f"{prefix}_mean_abs_mechanistic_log1p_per_100k"] = (
+        summary.mean_abs_mechanistic
+    )
+    metrics[f"{prefix}_mean_abs_residual_log1p_per_100k"] = summary.mean_abs_residual
+    metrics[f"{prefix}_residual_abs_fraction"] = summary.residual_abs_fraction
+    metrics[f"{prefix}_residual_to_mechanistic_abs_ratio"] = (
+        summary.residual_to_mechanistic_abs_ratio
+    )
+    metrics[f"{prefix}_mechanistic_variance"] = summary.mechanistic_variance
+    metrics[f"{prefix}_residual_variance"] = summary.residual_variance
+    metrics[f"{prefix}_full_variance"] = summary.full_variance
+    metrics[f"{prefix}_mechanistic_variance_share"] = summary.mechanistic_variance_share
+    metrics[f"{prefix}_residual_variance_share"] = summary.residual_variance_share
+    metrics[f"{prefix}_mechanistic_only_mae_log1p_per_100k"] = (
+        summary.mechanistic_only_mae
+    )
+    metrics[f"{prefix}_mechanistic_only_rmse_log1p_per_100k"] = (
+        summary.mechanistic_only_rmse
+    )
+    metrics[f"{prefix}_mechanistic_only_nll_log1p_per_100k"] = (
+        mechanistic_probabilistic_summary.nll
+    )
+    metrics[f"{prefix}_mechanistic_only_crps_log1p_per_100k"] = (
+        mechanistic_probabilistic_summary.crps
+    )
+    metrics[f"{prefix}_reconstruction_max_abs_error"] = (
+        summary.reconstruction_max_abs_error
+    )
+
+
+def _add_window_spearman_metrics(
+    *,
+    metrics: dict[str, Any],
+    prefix: str,
+    summary: WindowSpearmanMetricResult,
+) -> None:
+    metrics[f"{prefix}_mean_window_spearman"] = summary.mean
+    metrics[f"{prefix}_window_spearman_total_count"] = summary.total_count
+    metrics[f"{prefix}_window_spearman_candidate_count"] = summary.candidate_count
+    metrics[f"{prefix}_window_spearman_eligible_count"] = summary.eligible_count
+    metrics[f"{prefix}_window_spearman_candidate_fraction"] = summary.candidate_fraction
+    metrics[f"{prefix}_window_spearman_eligible_fraction"] = summary.eligible_fraction
+    metrics[f"{prefix}_window_spearman_eligible_given_candidate_fraction"] = (
+        summary.eligible_given_candidate_fraction
+    )
+
+
+def _add_observation_latent_metrics(
+    *,
+    metrics: dict[str, Any],
+    head_name: str,
+    summary: ObservationLatentMetricResult,
+) -> None:
+    prefix = f"observation_latent_{head_name}"
+    metrics[f"{prefix}_observed_count"] = summary.observed_count
+    _add_window_spearman_metrics(
+        metrics=metrics,
+        prefix=f"{prefix}_full",
+        summary=summary.full_window_spearman,
+    )
+    _add_window_spearman_metrics(
+        metrics=metrics,
+        prefix=f"{prefix}_mechanistic_only",
+        summary=summary.mechanistic_only_window_spearman,
+    )
+
+
+def _add_delay_kernel_metrics(
+    *,
+    metrics: dict[str, Any],
+    model: torch.nn.Module,
+) -> None:
+    """Add final kernel-state diagnostics for the observation heads.
+
+    Run-level model-state metrics for ``test_summary.json``; the granular row
+    schema is unaffected. Clinical heads route through ``DelayKernel`` and the
+    wastewater head through ``SheddingConvolution``; both expose the same
+    normalized-kernel and Gamma diagnostics.
+    """
+    model = getattr(model, "_orig_mod", model)
+    kernels: dict[str, DelayKernel | SheddingConvolution] = {}
+    for head_name in ("hosp", "cases", "deaths"):
+        kernel = getattr(
+            getattr(model, f"{head_name}_head", None), "delay_kernel", None
+        )
+        if isinstance(kernel, DelayKernel):
+            kernels[head_name] = kernel
+    ww_kernel = getattr(getattr(model, "ww_head", None), "shedding_conv", None)
+    if isinstance(ww_kernel, SheddingConvolution):
+        kernels["ww"] = ww_kernel
+    for head_name, kernel in kernels.items():
+        if kernel.parameterization not in {"simplex", "gamma"}:
+            continue
+        trainable_count = sum(
+            parameter.numel()
+            for parameter in kernel.parameters()
+            if parameter.requires_grad
+        )
+        metrics[f"kernel_{head_name}_trainable_parameter_count"] = trainable_count
+        metrics[f"kernel_{head_name}_mean_delay_days"] = kernel.get_mean_delay()
+        metrics[f"kernel_{head_name}_delay_std_days"] = kernel.get_delay_std()
+        if kernel.parameterization == "gamma":
+            shape, scale = kernel.get_gamma_parameters()
+            metrics[f"kernel_{head_name}_gamma_shape"] = shape
+            metrics[f"kernel_{head_name}_gamma_scale"] = scale
+            boundary_hits = kernel.get_gamma_boundary_hits()
+            metrics[f"kernel_{head_name}_gamma_shape_lower_bound_hit"] = int(
+                boundary_hits["shape_lower"]
+            )
+            metrics[f"kernel_{head_name}_gamma_shape_upper_bound_hit"] = int(
+                boundary_hits["shape_upper"]
+            )
+            metrics[f"kernel_{head_name}_gamma_scale_lower_bound_hit"] = int(
+                boundary_hits["scale_lower"]
+            )
+            metrics[f"kernel_{head_name}_gamma_scale_upper_bound_hit"] = int(
+                boundary_hits["scale_upper"]
+            )
 
 
 def evaluate_loader(
@@ -205,6 +404,7 @@ def evaluate_loader(
     granular_csv_path: Path | None = None,
     granular_eval_format: str | None = None,
     granular_metadata: dict[str, Any] | None = None,
+    relevant_source_mapping: dict[str, str] | None = None,
     output_csv_path: Path | None = None,
     node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
@@ -228,6 +428,9 @@ def evaluate_loader(
         granular_csv_path: Deprecated alias for granular_output_path
         granular_eval_format: Optional output format override ("parquet" or "csv")
         granular_metadata: Optional metadata to write alongside granular output
+        relevant_source_mapping: Exact target-to-mechanistic-source mapping used
+            for quantitative observation-latent coherence metrics and persisted
+            qualitative plot overlays. This does not alter pathway attribution.
         output_csv_path: Deprecated alias for node_metrics_csv_path
         node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
@@ -248,13 +451,27 @@ def evaluate_loader(
             f"Unknown node_metrics_target {node_metrics_target!r}; expected one of "
             f"{tuple(_HEAD_CANONICAL_NAMES.values())}."
         )
+    resolved_relevant_sources = _resolve_relevant_source_mapping(
+        relevant_source_mapping
+    )
 
-    # Device-local accumulators - avoid sync until end
+    # Device-local accumulators - avoid sync until end. A compiled model also
+    # gets compiled metric steps: eager updates launch hundreds of tiny kernels
+    # per batch, which made validation cost more than training.
+    compile_metrics = hasattr(model, "_orig_mod") and device.type == "cuda"
     total_loss = torch.tensor(0.0, device=device)
-    hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    ww_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    cases_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    deaths_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    hosp_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    ww_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    cases_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    deaths_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
     distribution_metric_kwargs = {
         "device": device,
         "horizon": horizon,
@@ -262,6 +479,7 @@ def evaluate_loader(
         "distribution_df": criterion.distribution_df,
         "scale_floor": criterion.distribution_scale_floor,
         "interval_levels": criterion.interval_levels,
+        "compile_step": compile_metrics,
     }
     hosp_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
     ww_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
@@ -271,6 +489,31 @@ def evaluate_loader(
     deaths_prob_metrics = TorchDistributionMetricAccumulator(
         **distribution_metric_kwargs
     )
+    pathway_metrics = {
+        head_name: TorchPathwayMetricAccumulator(
+            device=device, compile_step=compile_metrics
+        )
+        for head_name in _HEAD_CANONICAL_NAMES
+    }
+    observation_latent_metrics = {
+        head_name: TorchObservationLatentCoherenceAccumulator(
+            device=device, compile_step=compile_metrics
+        )
+        for head_name in _HEAD_CANONICAL_NAMES
+    }
+    mechanistic_prob_metrics = {
+        head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
+        for head_name in _HEAD_CANONICAL_NAMES
+    }
+    latent_metrics = TorchLatentCoherenceAccumulator(
+        device=device, compile_step=compile_metrics
+    )
+    latent_diagnostic_metrics = {
+        protocol: TorchLatentProtocolAccumulator(
+            protocol=protocol, device=device, compile_step=compile_metrics
+        )
+        for protocol in ("oracle_x0", "teacher_forced_one_step")
+    }
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
@@ -285,10 +528,16 @@ def evaluate_loader(
     loss_latent_i_sum = torch.tensor(0.0, device=device)
     loss_latent_h_sum = torch.tensor(0.0, device=device)
     loss_latent_r_sum = torch.tensor(0.0, device=device)
-    loss_latent_d_sum = torch.tensor(0.0, device=device)
+    loss_latent_death_flow_sum = torch.tensor(0.0, device=device)
+    latent_loss_tasks = ("s", "i", "h", "r", "death_flow")
+    loss_latent_raw_sums = {
+        task: torch.tensor(0.0, device=device) for task in latent_loss_tasks
+    }
+    loss_latent_component_weighted_sums = {
+        task: torch.tensor(0.0, device=device) for task in latent_loss_tasks
+    }
 
     per_head_node_metrics: dict[str, dict[int, dict[str, float]]] = {}
-
     num_batches = len(loader)
     eval_iter = loader
     effective_log_every = max(1, log_every)
@@ -313,7 +562,10 @@ def evaluate_loader(
 
     model_was_training = model.training
     model.eval()
-    forward_model = cast(EpiForecaster, model)
+    # A torch.compile wrapper exposes the module's methods, but forward_batch
+    # would then run the eager forward. Prepare inputs on the module and call
+    # the wrapper so evaluation uses the compiled forward.
+    forward_model = cast(EpiForecaster, getattr(model, "_orig_mod", model))
     dataset_config = getattr(dataset, "config", None)
     prefetch_factor = (
         dataset_config.training.prefetch_factor if dataset_config is not None else None
@@ -351,7 +603,7 @@ def evaluate_loader(
                     )
 
                 current_stage = "forward_batch"
-                model_outputs, targets_dict = forward_model.forward_batch(
+                forward_inputs = forward_model.forward_inputs(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
                     mask_cases=criterion.mask_input_cases,
@@ -359,6 +611,8 @@ def evaluate_loader(
                     mask_hosp=criterion.mask_input_hosp,
                     mask_deaths=criterion.mask_input_deaths,
                 )
+                model_outputs = model(**forward_inputs)
+                targets_dict = forward_model.batch_targets(batch_data)
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -397,7 +651,14 @@ def evaluate_loader(
                 loss_latent_i_sum += components["latent_i"].detach()
                 loss_latent_h_sum += components["latent_h"].detach()
                 loss_latent_r_sum += components["latent_r"].detach()
-                loss_latent_d_sum += components["latent_d"].detach()
+                loss_latent_death_flow_sum += components["latent_death_flow"].detach()
+                for task in latent_loss_tasks:
+                    loss_latent_raw_sums[task] += components[
+                        f"latent_{task}_raw"
+                    ].detach()
+                    loss_latent_component_weighted_sums[task] += components[
+                        f"latent_{task}_weighted"
+                    ].detach()
                 loss_ww_weighted_sum += components["ww_weighted"].detach()
                 loss_hosp_weighted_sum += components["hosp_weighted"].detach()
                 loss_cases_weighted_sum += components["cases_weighted"].detach()
@@ -405,6 +666,22 @@ def evaluate_loader(
                 loss_sird_supervision_weighted_sum += components[
                     "sird_supervision_weighted"
                 ].detach()
+                latent_metrics.update(
+                    model_outputs=model_outputs,
+                    targets=targets_dict,
+                )
+                for protocol, (
+                    diagnostic_predictions,
+                    diagnostic_targets,
+                ) in build_latent_diagnostic_protocols(
+                    model=forward_model,
+                    model_outputs=model_outputs,
+                    targets=targets_dict,
+                ).items():
+                    latent_diagnostic_metrics[protocol].update(
+                        predictions=diagnostic_predictions,
+                        targets=diagnostic_targets,
+                    )
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -443,12 +720,12 @@ def evaluate_loader(
                     target_nodes = batch_data.target_node
 
                     _accumulate_per_head_node_metrics(
-                        target_name="hosp",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["hosp"],
                         target_nodes=target_nodes,
                         diff=_unused_diff,
                         abs_diff=abs_diff,
                         weights=weights,
-                        accumulator=per_head_node_metrics,
                     )
                     hosp_loc, hosp_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -462,6 +739,43 @@ def evaluate_loader(
                         observed_mask=hosp_mask,
                         sample_weights=hosp_weights,
                     )
+                    hosp_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_hosp",
+                        int(hosp_targets.shape[1]),
+                    )
+                    hosp_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_hosp",
+                        int(hosp_targets.shape[1]),
+                    )
+                    hosp_relevant_source_name = resolved_relevant_sources["hosp"]
+                    hosp_relevant_source = _forecast_aligned_output(
+                        model_outputs,
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[hosp_relevant_source_name],
+                        int(hosp_targets.shape[1]),
+                    )
+                    observation_latent_metrics["hosp"].update(
+                        full_prediction=pred_hosp,
+                        relevant_latent=hosp_relevant_source,
+                        weights=hosp_weights,
+                        mechanistic_projection=hosp_mechanistic,
+                    )
+                    if hosp_mechanistic is not None and hosp_residual is not None:
+                        pathway_metrics["hosp"].update(
+                            full=hosp_loc,
+                            mechanistic=hosp_mechanistic,
+                            residual=hosp_residual,
+                            targets=hosp_targets,
+                            weights=hosp_weights,
+                        )
+                        mechanistic_prob_metrics["hosp"].update(
+                            loc=hosp_mechanistic,
+                            scale=hosp_scale,
+                            targets=hosp_targets,
+                            observed_mask=hosp_mask,
+                            sample_weights=hosp_weights,
+                        )
 
                     if granular_writer is not None:
                         granular_writer.write_rows(
@@ -472,7 +786,16 @@ def evaluate_loader(
                             weights=weights,
                             nll=hosp_prob_batch.nll,
                             crps=hosp_prob_batch.crps,
+                            wis=hosp_prob_batch.wis,
+                            distribution_loc=hosp_loc,
+                            distribution_scale=hosp_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=hosp_prob_batch.intervals,
+                            mechanistic_predictions=hosp_mechanistic,
+                            residual_contributions=hosp_residual,
+                            relevant_latent_name=hosp_relevant_source_name,
+                            relevant_latent_values=hosp_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -485,6 +808,9 @@ def evaluate_loader(
                         hosp_loc,
                         hosp_scale,
                         hosp_prob_batch,
+                        hosp_mechanistic,
+                        hosp_residual,
+                        hosp_relevant_source,
                     )
                 del pred_hosp, hosp_targets, hosp_mask, hosp_weights
 
@@ -504,12 +830,12 @@ def evaluate_loader(
                         sample_weights=ww_weights,
                     )
                     _accumulate_per_head_node_metrics(
-                        target_name="ww",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["ww"],
                         target_nodes=batch_data.target_node,
                         diff=ww_diff,
                         abs_diff=ww_abs_diff,
                         weights=ww_effective_weights,
-                        accumulator=per_head_node_metrics,
                     )
                     ww_loc, ww_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -523,6 +849,43 @@ def evaluate_loader(
                         observed_mask=ww_mask,
                         sample_weights=ww_weights,
                     )
+                    ww_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_ww",
+                        int(ww_targets.shape[1]),
+                    )
+                    ww_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_ww",
+                        int(ww_targets.shape[1]),
+                    )
+                    ww_relevant_source_name = resolved_relevant_sources["ww"]
+                    ww_relevant_source = _forecast_aligned_output(
+                        model_outputs,
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[ww_relevant_source_name],
+                        int(ww_targets.shape[1]),
+                    )
+                    observation_latent_metrics["ww"].update(
+                        full_prediction=pred_ww,
+                        relevant_latent=ww_relevant_source,
+                        weights=ww_weights,
+                        mechanistic_projection=ww_mechanistic,
+                    )
+                    if ww_mechanistic is not None and ww_residual is not None:
+                        pathway_metrics["ww"].update(
+                            full=ww_loc,
+                            mechanistic=ww_mechanistic,
+                            residual=ww_residual,
+                            targets=ww_targets,
+                            weights=ww_weights,
+                        )
+                        mechanistic_prob_metrics["ww"].update(
+                            loc=ww_mechanistic,
+                            scale=ww_scale,
+                            targets=ww_targets,
+                            observed_mask=ww_mask,
+                            sample_weights=ww_weights,
+                        )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -532,7 +895,16 @@ def evaluate_loader(
                             weights=ww_effective_weights,
                             nll=ww_prob_batch.nll,
                             crps=ww_prob_batch.crps,
+                            wis=ww_prob_batch.wis,
+                            distribution_loc=ww_loc,
+                            distribution_scale=ww_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=ww_prob_batch.intervals,
+                            mechanistic_predictions=ww_mechanistic,
+                            residual_contributions=ww_residual,
+                            relevant_latent_name=ww_relevant_source_name,
+                            relevant_latent_values=ww_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -544,6 +916,9 @@ def evaluate_loader(
                         ww_loc,
                         ww_scale,
                         ww_prob_batch,
+                        ww_mechanistic,
+                        ww_residual,
+                        ww_relevant_source,
                     )
                 del pred_ww, ww_targets, ww_mask, ww_weights
 
@@ -565,12 +940,12 @@ def evaluate_loader(
                         )
                     )
                     _accumulate_per_head_node_metrics(
-                        target_name="cases",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["cases"],
                         target_nodes=batch_data.target_node,
                         diff=cases_diff,
                         abs_diff=cases_abs_diff,
                         weights=cases_effective_weights,
-                        accumulator=per_head_node_metrics,
                     )
                     cases_loc, cases_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -584,6 +959,43 @@ def evaluate_loader(
                         observed_mask=cases_mask,
                         sample_weights=cases_weights,
                     )
+                    cases_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_cases",
+                        int(cases_targets.shape[1]),
+                    )
+                    cases_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_cases",
+                        int(cases_targets.shape[1]),
+                    )
+                    cases_relevant_source_name = resolved_relevant_sources["cases"]
+                    cases_relevant_source = _forecast_aligned_output(
+                        model_outputs,
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[cases_relevant_source_name],
+                        int(cases_targets.shape[1]),
+                    )
+                    observation_latent_metrics["cases"].update(
+                        full_prediction=pred_cases,
+                        relevant_latent=cases_relevant_source,
+                        weights=cases_weights,
+                        mechanistic_projection=cases_mechanistic,
+                    )
+                    if cases_mechanistic is not None and cases_residual is not None:
+                        pathway_metrics["cases"].update(
+                            full=cases_loc,
+                            mechanistic=cases_mechanistic,
+                            residual=cases_residual,
+                            targets=cases_targets,
+                            weights=cases_weights,
+                        )
+                        mechanistic_prob_metrics["cases"].update(
+                            loc=cases_mechanistic,
+                            scale=cases_scale,
+                            targets=cases_targets,
+                            observed_mask=cases_mask,
+                            sample_weights=cases_weights,
+                        )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -593,7 +1005,16 @@ def evaluate_loader(
                             weights=cases_effective_weights,
                             nll=cases_prob_batch.nll,
                             crps=cases_prob_batch.crps,
+                            wis=cases_prob_batch.wis,
+                            distribution_loc=cases_loc,
+                            distribution_scale=cases_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=cases_prob_batch.intervals,
+                            mechanistic_predictions=cases_mechanistic,
+                            residual_contributions=cases_residual,
+                            relevant_latent_name=cases_relevant_source_name,
+                            relevant_latent_values=cases_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -605,6 +1026,9 @@ def evaluate_loader(
                         cases_loc,
                         cases_scale,
                         cases_prob_batch,
+                        cases_mechanistic,
+                        cases_residual,
+                        cases_relevant_source,
                     )
                 del pred_cases, cases_targets, cases_mask, cases_weights
 
@@ -626,12 +1050,12 @@ def evaluate_loader(
                         )
                     )
                     _accumulate_per_head_node_metrics(
-                        target_name="deaths",
+                        accumulator=per_head_node_metrics,
+                        target_name=_HEAD_CANONICAL_NAMES["deaths"],
                         target_nodes=batch_data.target_node,
                         diff=deaths_diff,
                         abs_diff=deaths_abs_diff,
                         weights=deaths_effective_weights,
-                        accumulator=per_head_node_metrics,
                     )
                     deaths_loc, deaths_scale = criterion._get_head_distribution_params(
                         model_outputs,
@@ -645,6 +1069,43 @@ def evaluate_loader(
                         observed_mask=deaths_mask,
                         sample_weights=deaths_weights,
                     )
+                    deaths_mechanistic = _forecast_aligned_output(
+                        model_outputs,
+                        "mechanistic_deaths",
+                        int(deaths_targets.shape[1]),
+                    )
+                    deaths_residual = _forecast_aligned_output(
+                        model_outputs,
+                        "residual_deaths",
+                        int(deaths_targets.shape[1]),
+                    )
+                    deaths_relevant_source_name = resolved_relevant_sources["deaths"]
+                    deaths_relevant_source = _forecast_aligned_output(
+                        model_outputs,
+                        _RELEVANT_SOURCE_OUTPUT_KEYS[deaths_relevant_source_name],
+                        int(deaths_targets.shape[1]),
+                    )
+                    observation_latent_metrics["deaths"].update(
+                        full_prediction=pred_deaths,
+                        relevant_latent=deaths_relevant_source,
+                        weights=deaths_weights,
+                        mechanistic_projection=deaths_mechanistic,
+                    )
+                    if deaths_mechanistic is not None and deaths_residual is not None:
+                        pathway_metrics["deaths"].update(
+                            full=deaths_loc,
+                            mechanistic=deaths_mechanistic,
+                            residual=deaths_residual,
+                            targets=deaths_targets,
+                            weights=deaths_weights,
+                        )
+                        mechanistic_prob_metrics["deaths"].update(
+                            loc=deaths_mechanistic,
+                            scale=deaths_scale,
+                            targets=deaths_targets,
+                            observed_mask=deaths_mask,
+                            sample_weights=deaths_weights,
+                        )
                     if granular_writer is not None:
                         granular_writer.write_rows(
                             batch_data=batch_data,
@@ -654,7 +1115,16 @@ def evaluate_loader(
                             weights=deaths_effective_weights,
                             nll=deaths_prob_batch.nll,
                             crps=deaths_prob_batch.crps,
+                            wis=deaths_prob_batch.wis,
+                            distribution_loc=deaths_loc,
+                            distribution_scale=deaths_scale,
+                            distribution_family=criterion.distribution_family,
+                            distribution_df=criterion.distribution_df,
                             intervals=deaths_prob_batch.intervals,
+                            mechanistic_predictions=deaths_mechanistic,
+                            residual_contributions=deaths_residual,
+                            relevant_latent_name=deaths_relevant_source_name,
+                            relevant_latent_values=deaths_relevant_source,
                             temporal_coords=temporal_coords,
                             region_ids=region_ids,
                             region_labels=region_labels,
@@ -666,6 +1136,9 @@ def evaluate_loader(
                         deaths_loc,
                         deaths_scale,
                         deaths_prob_batch,
+                        deaths_mechanistic,
+                        deaths_residual,
+                        deaths_relevant_source,
                     )
                 del pred_deaths, deaths_targets, deaths_mask, deaths_weights
                 current_stage = "granular_write_complete"
@@ -697,7 +1170,6 @@ def evaluate_loader(
         if model_was_training:
             model.train()
 
-    # Final sync - transfer metrics to CPU once
     mean_loss = (total_loss / max(1, processed_batches)).item()
     hosp_summary = hosp_metrics.finalize()
     ww_summary = ww_metrics.finalize()
@@ -707,6 +1179,24 @@ def evaluate_loader(
     ww_prob_summary = ww_prob_metrics.finalize()
     cases_prob_summary = cases_prob_metrics.finalize()
     deaths_prob_summary = deaths_prob_metrics.finalize()
+    pathway_summaries = {
+        head_name: accumulator.finalize()
+        for head_name, accumulator in pathway_metrics.items()
+    }
+    mechanistic_prob_summaries = {
+        head_name: accumulator.finalize()
+        for head_name, accumulator in mechanistic_prob_metrics.items()
+    }
+    observation_latent_summaries = {
+        head_name: accumulator.finalize()
+        for head_name, accumulator in observation_latent_metrics.items()
+    }
+    latent_summary = latent_metrics.finalize()
+    latent_diagnostic_summary = {
+        key: value
+        for accumulator in latent_diagnostic_metrics.values()
+        for key, value in accumulator.finalize().items()
+    }
 
     node_mae_by_target: dict[str, dict[int, float]] = {}
     node_mae_count_by_target: dict[str, dict[int, int]] = {}
@@ -762,6 +1252,7 @@ def evaluate_loader(
         }
         if granular_metadata is not None:
             per_head_metadata.update(granular_metadata)
+        per_head_metadata["relevant_source_mapping"] = resolved_relevant_sources
         write_metadata_sidecar(
             per_head_node_metrics_csv_path,
             per_head_metadata,
@@ -796,6 +1287,7 @@ def evaluate_loader(
         }
         if granular_metadata is not None:
             metadata.update(granular_metadata)
+        metadata["relevant_source_mapping"] = resolved_relevant_sources
         write_granular_metadata_sidecar(
             granular_output_path,
             metadata,
@@ -853,7 +1345,9 @@ def evaluate_loader(
         "loss_latent_i": (loss_latent_i_sum / max(1, processed_batches)).item(),
         "loss_latent_h": (loss_latent_h_sum / max(1, processed_batches)).item(),
         "loss_latent_r": (loss_latent_r_sum / max(1, processed_batches)).item(),
-        "loss_latent_d": (loss_latent_d_sum / max(1, processed_batches)).item(),
+        "loss_latent_death_flow": (
+            loss_latent_death_flow_sum / max(1, processed_batches)
+        ).item(),
         "loss_ww_weighted": (loss_ww_weighted_sum / max(1, processed_batches)).item(),
         "loss_hosp_weighted": (
             loss_hosp_weighted_sum / max(1, processed_batches)
@@ -868,6 +1362,18 @@ def evaluate_loader(
             loss_sird_supervision_weighted_sum / max(1, processed_batches)
         ).item(),
     }
+    for task in latent_loss_tasks:
+        metrics[f"loss_latent_{task}_raw"] = (
+            loss_latent_raw_sums[task] / max(1, processed_batches)
+        ).item()
+        metrics[f"loss_latent_{task}_component_weighted"] = (
+            loss_latent_component_weighted_sums[task] / max(1, processed_batches)
+        ).item()
+        metrics[f"loss_latent_{task}_total_weighted"] = (
+            criterion.latent_total_weight
+            * loss_latent_component_weighted_sums[task]
+            / max(1, processed_batches)
+        ).item()
     _add_probabilistic_metrics(
         metrics=metrics,
         head_name="hosp",
@@ -888,6 +1394,22 @@ def evaluate_loader(
         head_name="deaths",
         summary=deaths_prob_summary,
     )
+    for head_name in _HEAD_CANONICAL_NAMES:
+        _add_pathway_metrics(
+            metrics=metrics,
+            head_name=head_name,
+            summary=pathway_summaries[head_name],
+            mechanistic_probabilistic_summary=mechanistic_prob_summaries[head_name],
+        )
+    for head_name in _HEAD_CANONICAL_NAMES:
+        _add_observation_latent_metrics(
+            metrics=metrics,
+            head_name=head_name,
+            summary=observation_latent_summaries[head_name],
+        )
+    metrics.update(latent_summary)
+    metrics.update(latent_diagnostic_summary)
+    _add_delay_kernel_metrics(metrics=metrics, model=model)
 
     logger.info("EVAL COMPLETE")
     return mean_loss, metrics, node_mae_by_target
@@ -1001,7 +1523,7 @@ def eval_checkpoint(
         split,
         config.data.dataset_path,
         resolved_device,
-        batch_size if batch_size is not None else config.training.batch_size,
+        batch_size if batch_size is not None else config.training.eval_batch_size,
         num_workers if num_workers is not None else "config",
         (
             prefetch_factor
@@ -1044,6 +1566,7 @@ def eval_checkpoint(
 
     criterion = get_loss_from_config(
         config.training.loss,
+        latent_scales=latent_scales_from_checkpoint(checkpoint),
         data_config=config.data,
         observation_heads_config=config.model.observation_heads,
         input_window_length=config.model.input_window_length,
@@ -1091,6 +1614,9 @@ def eval_checkpoint(
                 "eval_prefetch_factor": loader.prefetch_factor,
                 "eval_pin_memory": bool(loader.pin_memory),
             },
+            relevant_source_mapping=(
+                config.model.observation_heads.relevant_source_mapping()
+            ),
         )
     except Exception:
         logger.exception("[eval] Metrics evaluation failed")

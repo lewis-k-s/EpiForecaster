@@ -26,13 +26,35 @@ ALLOCATION_FIELDS = (
     "runtime",
 )
 DISPATCH_REQUEST_SCHEMA_VERSION = 1
-WORKFLOW_KINDS = {"train", "evaluate", "hpo", "ablation", "crossval"}
+RESEARCH_OUTPUT_FILES = (
+    "research_fit_cases.parquet",
+    "research_calibration.json",
+    "research_scored.parquet",
+    "research_summary.json",
+    "research_events.parquet",
+    "research_events.json",
+    "calibration/test_summary.json",
+    "calibration/test_node_metrics.csv",
+    "calibration/test_node_metrics_per_head.csv",
+    "calibration/test_granular.parquet",
+)
+WORKFLOW_KINDS = {
+    "train",
+    "evaluate",
+    "hpo",
+    "ablation",
+    "ablation_suite",
+    "crossval",
+    "preprocess",
+}
 WORKFLOW_TARGETS = {
     "train": {"train", "train_evaluate"},
     "evaluate": {"evaluate"},
     "hpo": {"hpo"},
     "ablation": {"ablation"},
+    "ablation_suite": {"ablation_suite"},
     "crossval": {"crossval"},
+    "preprocess": {"preprocess"},
 }
 SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
     ".agents",
@@ -46,7 +68,7 @@ SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
     "vendor",
 }
 SCIENTIFIC_SOURCE_FILES = {"cli.py", "pyproject.toml", "uv.lock"}
-SCIENTIFIC_SOURCE_SUFFIXES = {".py", ".sh", ".smk", ".toml", ".yaml", ".yml"}
+SCIENTIFIC_SOURCE_SUFFIXES = {".py", ".sh", ".smk", ".toml", ".yaml", ".yml", ".json"}
 DEPENDENCY_STAGES = {
     "data",
     "training",
@@ -56,6 +78,7 @@ DEPENDENCY_STAGES = {
     "crossval",
     "selection",
     "promotion",
+    "preprocessing",
 }
 
 
@@ -172,6 +195,21 @@ def validate_code_data_separation(
             "DVC payloads must not be included in the relocatable source bundle: "
             f"{included}"
         )
+    missing_bind_roots = sorted(
+        {
+            payload.parent
+            for payload in payloads.values()
+            if payload.parent != Path(".")
+            and not any(payload.parent in path.parents for path in selected)
+        },
+        key=lambda path: path.as_posix(),
+    )
+    if missing_bind_roots:
+        raise ValueError(
+            "DVC mount parents must exist in the source inventory; place the "
+            "pointer beside its payload: "
+            + ", ".join(path.as_posix() for path in missing_bind_roots)
+        )
     return payloads
 
 
@@ -196,6 +234,20 @@ def workflow_target(workflow_config: dict[str, Any]) -> str:
             f"workflow.target for kind={kind!r} must be one of {supported}: {target!r}"
         )
     return str(target)
+
+
+def preprocessing_dataset_name(workflow_config: dict[str, Any]) -> str:
+    """Return the safe output dataset stem for a preprocessing run."""
+    if workflow_kind(workflow_config) != "preprocess":
+        raise ValueError("preprocessing.dataset_name is valid only for preprocess runs")
+    preprocessing = workflow_config["preprocessing"]
+    value = str(preprocessing.get("dataset_name", ""))
+    path = Path(value)
+    if not value or path.name != value or value in {".", ".."} or path.suffix:
+        raise ValueError(
+            "preprocessing.dataset_name must be one safe filename stem without a suffix"
+        )
+    return value
 
 
 def scientific_source_files(paths: list[Path]) -> list[Path]:
@@ -241,20 +293,78 @@ def stage_source_files(
     return sorted(selected, key=lambda path: path.as_posix())
 
 
+def _require_stale_recovery(options: dict[str, Any], *, field: str) -> None:
+    """Rolling allocations must recover trials killed with their allocation.
+
+    A wall-time kill leaves its trial RUNNING in the journal. Without recovery
+    the identity is never claimed again and the campaign exits pending forever.
+    """
+    if options.get("recover_stale_running") is not True:
+        raise ValueError(
+            f"{field}.recover_stale_running must be true: a trial killed at the "
+            "allocation wall time otherwise stays RUNNING and blocks completion"
+        )
+
+
+def _validate_container_pin(workflow_config: dict[str, Any]) -> None:
+    container = workflow_config.get("container") or {}
+    if not isinstance(container, dict):
+        raise ValueError("container must be a mapping")
+    pin = container.get("expected_sha256")
+    if pin is not None and (
+        not isinstance(pin, str) or re.fullmatch(r"[0-9a-f]{64}", pin) is None
+    ):
+        raise ValueError("container.expected_sha256 must be 64 lowercase hex digits")
+
+
 def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     """Validate mode-specific configuration before snapshot transfer."""
     kind = workflow_kind(workflow_config)
     workflow_target(workflow_config)
+    _validate_container_pin(workflow_config)
     required_sections = {
         "train": ("training", "evaluation"),
         "evaluate": ("evaluation",),
         "hpo": ("optuna", "evaluation", "promotion"),
         "ablation": ("ablation",),
+        "ablation_suite": ("ablation_suite",),
         "crossval": ("crossval", "evaluation"),
+        "preprocess": ("preprocessing",),
     }[kind]
     for section in required_sections:
         if not isinstance(workflow_config.get(section), dict):
             raise ValueError(f"workflow.kind={kind!r} requires a {section} mapping")
+
+    if kind == "preprocess":
+        preprocessing = workflow_config["preprocessing"]
+        base_config = Path(str(preprocessing.get("base_config", "")))
+        if (
+            not base_config.parts
+            or base_config.is_absolute()
+            or ".." in base_config.parts
+        ):
+            raise ValueError("preprocessing.base_config must be a source-relative path")
+        preprocessing_dataset_name(workflow_config)
+        handoff_manifest = preprocessing.get("handoff_manifest")
+        if handoff_manifest is not None:
+            handoff_path = Path(str(handoff_manifest))
+            if handoff_path.is_absolute() or ".." in handoff_path.parts:
+                raise ValueError(
+                    "preprocessing.handoff_manifest must be a source-relative path"
+                )
+
+    evaluation = workflow_config.get("evaluation", {})
+    research_outputs = evaluation.get("research_outputs", False)
+    if not isinstance(research_outputs, bool):
+        raise ValueError("evaluation.research_outputs must be Boolean")
+    if research_outputs and (
+        kind not in {"train", "evaluate", "crossval"}
+        or evaluation.get("split") != "val"
+        or evaluation.get("granular") is not True
+    ):
+        raise ValueError(
+            "Research outputs require train/evaluate/crossval with split=val and granular=true"
+        )
 
     provenance = workflow_config.get("provenance", {})
     if not isinstance(provenance, dict):
@@ -279,6 +389,18 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             value = str(training[field])
             if Path(value).name != value or value in {".", ".."}:
                 raise ValueError(f"training.{field} must be one safe path component")
+        init_checkpoint = training.get("init_checkpoint")
+        if init_checkpoint is not None and not Path(str(init_checkpoint)).is_absolute():
+            raise ValueError(
+                "training.init_checkpoint must be an absolute GPFS path when provided"
+            )
+        require_init_checkpoint = training.get("require_init_checkpoint", False)
+        if not isinstance(require_init_checkpoint, bool):
+            raise ValueError("training.require_init_checkpoint must be a boolean")
+        if require_init_checkpoint and init_checkpoint is None:
+            raise ValueError(
+                "training.init_checkpoint is required by this workflow template"
+            )
     elif kind == "evaluate":
         checkpoint = workflow_config["evaluation"].get("checkpoint")
         if checkpoint is None or not Path(str(checkpoint)).is_absolute():
@@ -286,6 +408,69 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 "evaluation.checkpoint must be an absolute GPFS path for an "
                 "evaluation-only workflow"
             )
+    elif kind == "ablation":
+        ablation = workflow_config["ablation"]
+        closeout_signal_seconds = ablation.get("closeout_signal_seconds")
+        if (
+            not isinstance(closeout_signal_seconds, int)
+            or isinstance(closeout_signal_seconds, bool)
+            or closeout_signal_seconds < 60
+        ):
+            raise ValueError(
+                "ablation.closeout_signal_seconds must be an integer of at least 60"
+            )
+        _require_stale_recovery(ablation, field="ablation")
+        timeout_s = ablation.get("timeout_s")
+        if (
+            not isinstance(timeout_s, int)
+            or isinstance(timeout_s, bool)
+            or timeout_s <= 0
+        ):
+            raise ValueError("ablation.timeout_s must be a positive integer")
+    elif kind == "ablation_suite":
+        suite = workflow_config["ablation_suite"]
+        studies = suite.get("studies")
+        if not isinstance(studies, list) or len(studies) < 2:
+            raise ValueError("ablation_suite.studies must contain at least two studies")
+        names: set[str] = set()
+        campaigns: set[str] = set()
+        for study in studies:
+            if not isinstance(study, dict):
+                raise ValueError("Each ablation suite study must be a mapping")
+            name = study.get("study_name")
+            if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+                raise ValueError(
+                    "Ablation suite study_name must be a safe path component"
+                )
+            if name in names:
+                raise ValueError(f"Duplicate ablation suite study_name: {name}")
+            names.add(name)
+            campaign = _safe_relative_path(
+                str(study.get("campaign", "")), field="ablation suite campaign"
+            ).as_posix()
+            if campaign in campaigns:
+                raise ValueError(f"Duplicate ablation suite campaign: {campaign}")
+            campaigns.add(campaign)
+            _require_stale_recovery(study, field=f"ablation_suite study {name}")
+            workers = study.get("workers")
+            if (
+                not isinstance(workers, int)
+                or isinstance(workers, bool)
+                or workers != 4
+            ):
+                raise ValueError("Each ablation suite study must use four workers")
+        closeout = suite.get("closeout_signal_seconds")
+        if not isinstance(closeout, int) or isinstance(closeout, bool) or closeout < 60:
+            raise ValueError(
+                "ablation_suite.closeout_signal_seconds must be at least 60"
+            )
+        timeout_s = suite.get("timeout_s")
+        if (
+            not isinstance(timeout_s, int)
+            or isinstance(timeout_s, bool)
+            or timeout_s <= 0
+        ):
+            raise ValueError("ablation_suite.timeout_s must be a positive integer")
     elif kind == "crossval":
         crossval = workflow_config["crossval"]
         for field in (
@@ -348,6 +533,9 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     elif kind == "ablation":
         workload = workflow_config.get("ablation")
         workload_name = "ablation"
+    elif kind == "ablation_suite":
+        workload = {"workers": 4}
+        workload_name = "ablation_suite"
     elif kind == "crossval":
         folds = workflow_config["crossval"].get("folds")
         workload = {"workers": min(folds, 4) if isinstance(folds, int) else folds}
@@ -379,12 +567,36 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         for key, value in expected.items()
         if allocation.get(key) != value
     }
-    qos = allocation.get("qos")
-    if qos not in {"acc_bscls", "acc_debug"}:
-        mismatches["qos"] = (qos, "acc_bscls or acc_debug")
     runtime = allocation.get("runtime")
+    qos = allocation.get("qos")
+    if qos not in {"acc_bscls", "acc_debug", "acc_interactive"}:
+        mismatches["qos"] = (qos, "acc_bscls, acc_debug, or acc_interactive")
+    if qos == "acc_interactive" and expected_tasks > 2:
+        mismatches["tasks"] = (
+            expected_tasks,
+            "at most 2 for acc_interactive's 40-CPU ceiling",
+        )
+    if qos == "acc_interactive" and isinstance(runtime, int) and runtime > 120:
+        mismatches["runtime"] = (
+            runtime,
+            "at most 120 minutes for acc_interactive",
+        )
     if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
         mismatches["runtime"] = (runtime, "positive integer minutes")
+    if kind == "ablation":
+        ablation = workflow_config["ablation"]
+        expected_timeout_s = runtime * 60 - ablation["closeout_signal_seconds"]
+        if ablation["timeout_s"] != expected_timeout_s:
+            raise ValueError(
+                "ablation.timeout_s must equal resources.allocation.runtime "
+                "minus ablation.closeout_signal_seconds"
+            )
+    if kind == "ablation_suite":
+        suite = workflow_config["ablation_suite"]
+        if suite["timeout_s"] != runtime * 60 - suite["closeout_signal_seconds"]:
+            raise ValueError(
+                "ablation_suite.timeout_s must equal allocation runtime minus closeout"
+            )
     if mismatches:
         details = ", ".join(
             f"{key}={actual!r} (expected {expected_value!r})"
@@ -461,6 +673,49 @@ def git_identity(
     }
 
 
+MAX_TEMPLATE_EXTENDS_DEPTH = 4
+
+
+def _merge_template(parent: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
+    """Deep-merge mappings; the child wins and lists or scalars are replaced."""
+    merged = dict(parent)
+    for key, value in child.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_template(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_template(template_path: Path, _chain: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Load one template and resolve its `extends` chain into one mapping.
+
+    `extends` is a path relative to the extending file. The resolved mapping
+    never contains the `extends` key, so rendered configs stay standalone.
+    """
+    resolved_path = template_path.resolve()
+    if resolved_path in _chain:
+        raise ValueError(f"Workflow template extends cycle at {template_path}")
+    if len(_chain) >= MAX_TEMPLATE_EXTENDS_DEPTH:
+        raise ValueError(
+            f"Workflow template extends depth exceeds "
+            f"{MAX_TEMPLATE_EXTENDS_DEPTH}: {template_path}"
+        )
+    document = yaml.safe_load(template_path.read_text())
+    if not isinstance(document, dict):
+        raise ValueError(f"Workflow template must be a mapping: {template_path}")
+    parent_ref = document.pop("extends", None)
+    if parent_ref is None:
+        return document
+    if not isinstance(parent_ref, str):
+        raise ValueError(f"Workflow template extends must be a path: {template_path}")
+    parent_path = template_path.parent / parent_ref
+    if not parent_path.is_file():
+        raise ValueError(f"Workflow template parent not found: {parent_path}")
+    parent = load_template(parent_path, (*_chain, resolved_path))
+    return _merge_template(parent, document)
+
+
 def render_config(
     *,
     template_path: Path,
@@ -486,9 +741,7 @@ def render_config(
     else:
         snapshot_template = snapshot_root / relative_template
 
-    document = yaml.safe_load(snapshot_template.read_text())
-    if not isinstance(document, dict):
-        raise ValueError(f"Workflow template must be a mapping: {template_path}")
+    document = load_template(snapshot_template)
 
     validate_code_data_separation(snapshot_root, paths, document)
     validate_workflow_contract(document)
@@ -591,6 +844,14 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
         ("workflow_kind", workflow_kind(document)),
         ("workflow_target", workflow_target(document)),
         *[(field, allocation[field]) for field in ALLOCATION_FIELDS],
+        (
+            "closeout_signal_seconds",
+            document["ablation"]["closeout_signal_seconds"]
+            if workflow_kind(document) == "ablation"
+            else document["ablation_suite"]["closeout_signal_seconds"]
+            if workflow_kind(document) == "ablation_suite"
+            else 0,
+        ),
     ]
     request = {field: _dispatch_field(value, field=field) for field, value in fields}
 
@@ -635,6 +896,53 @@ def verify_snapshot(config_path: Path, source_root: Path, file_list_path: Path) 
     return actual
 
 
+def parse_build_metadata(text: str) -> dict[str, str]:
+    """Parse the ``key=value`` build sidecar written by the SIF assembler."""
+    metadata: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip():
+            metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def verify_container_identity(
+    *,
+    resolved_sif: str,
+    metadata_text: str,
+    observed_sha256: str,
+    uv_lock_sha256: str,
+    expected_sha256: str | None = None,
+) -> None:
+    """Require the runtime image to match the bundle's dependency lock.
+
+    The image alias can point at an image built from an older ``uv.lock``. The
+    assembler records the lock hash in the build sidecar, so compare it with the
+    lock that travels in the source bundle.
+    """
+    metadata = parse_build_metadata(metadata_text)
+    recorded_sif = metadata.get("sif_sha256")
+    if recorded_sif is not None and recorded_sif != observed_sha256:
+        raise ValueError(
+            f"Container build metadata sif_sha256 {recorded_sif} does not match "
+            f"the observed image digest {observed_sha256}: {resolved_sif}"
+        )
+    if expected_sha256 is not None and expected_sha256 != observed_sha256:
+        raise ValueError(
+            f"Container {resolved_sif} has digest {observed_sha256}, but the "
+            f"template pins container.expected_sha256={expected_sha256}"
+        )
+    image_lock = metadata.get("uv_lock_sha256")
+    if image_lock != uv_lock_sha256:
+        raise ValueError(
+            f"Container {resolved_sif} was built from uv.lock "
+            f"{image_lock or '(unrecorded)'}, but the source bundle uv.lock is "
+            f"{uv_lock_sha256}. Set REMOTE_CONTAINER_SIF to the digest-named "
+            "epiforecaster-runtime-<build_key>.sif image whose .build.txt lists "
+            f"uv_lock_sha256={uv_lock_sha256}."
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -662,6 +970,13 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--source-root", type=Path, required=True)
     verify.add_argument("--file-list", type=Path, required=True)
+
+    container = subparsers.add_parser("verify-container")
+    container.add_argument("--config", type=Path, required=True)
+    container.add_argument("--resolved-sif", required=True)
+    container.add_argument("--metadata-file", type=Path, required=True)
+    container.add_argument("--observed-sha256", required=True)
+    container.add_argument("--uv-lock", type=Path, required=True)
     return parser
 
 
@@ -692,6 +1007,19 @@ def main() -> None:
         print("\t".join(str(allocation[field]) for field in ALLOCATION_FIELDS))
     elif args.command == "verify":
         print(verify_snapshot(args.config, args.source_root, args.file_list))
+    elif args.command == "verify-container":
+        document = yaml.safe_load(args.config.read_text())
+        pin = (document.get("container") or {}).get("expected_sha256")
+        try:
+            verify_container_identity(
+                resolved_sif=args.resolved_sif,
+                metadata_text=args.metadata_file.read_text(),
+                observed_sha256=args.observed_sha256,
+                uv_lock_sha256=hashlib.sha256(args.uv_lock.read_bytes()).hexdigest(),
+                expected_sha256=pin,
+            )
+        except ValueError as error:
+            raise SystemExit(f"error: {error}") from error
 
 
 if __name__ == "__main__":

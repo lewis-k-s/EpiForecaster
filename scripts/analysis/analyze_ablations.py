@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -17,8 +18,22 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import optuna
 import pandas as pd
 import yaml
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
+
+from evaluation.ablation_probabilistic_analysis import (
+    build_probabilistic_campaign_outputs,
+    campaign_analysis_spec,
+)
+from scripts.hpo.ablation_worker import (
+    AblationCampaign,
+    expected_trial_identities,
+    load_campaign,
+    trial_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +79,9 @@ class AblationRun:
     experiment_dir: Path
     run_dir: Path
     seed: int | None
-
+    fold: int | None = None
+    granular_path: Path | None = None
+    campaign_identity: dict[str, Any] | None = None
 
 def _run_label(run: AblationRun) -> str:
     return f"{run.experiment_dir.name}/{run.run_dir.name}"
@@ -72,15 +89,6 @@ def _run_label(run: AblationRun) -> str:
 
 def _has_test_metrics(run: AblationRun) -> bool:
     return (run.run_dir / "test_main_model_aggregate_metrics.csv").exists()
-
-
-def _parse_csv_set(raw: str | None, *, cast_type: type = str) -> set[Any] | None:
-    if raw is None:
-        return None
-    values = [item.strip() for item in raw.split(",") if item.strip()]
-    if not values:
-        return set()
-    return {cast_type(value) for value in values}
 
 
 def parse_experiment_name(experiment_name: str) -> tuple[str | None, str] | None:
@@ -137,15 +145,26 @@ def load_run_config(run_dir: Path) -> dict[str, Any]:
 def get_run_seed(run_dir: Path) -> int | None:
     """Extract training seed from run config if available."""
     try:
-        config = load_run_config(run_dir)
+        seed = _nested_get(load_run_config(run_dir), ("training", "seed"))
     except ValueError:
         return None
-
-    seed = _nested_get(config, ("training", "seed"))
-    if seed is None:
-        return None
     try:
-        return int(seed)
+        return int(seed) if seed is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_run_fold(run_dir: Path) -> int | None:
+    """Extract a fold only from a persisted cross-validation run."""
+    try:
+        training = _nested_get(load_run_config(run_dir), ("training",))
+    except ValueError:
+        return None
+    if not isinstance(training, dict) or training.get("crossval_enabled") is not True:
+        return None
+    fold = training.get("crossval_fold_index")
+    try:
+        return int(fold) if fold is not None else None
     except (TypeError, ValueError):
         return None
 
@@ -194,18 +213,92 @@ def collect_ablation_runs(
 
         existing = ablation_runs.setdefault(ablation, [])
         for run_dir in run_dirs:
-            seed = get_run_seed(run_dir)
             existing.append(
                 AblationRun(
                     ablation=ablation,
                     campaign_id=experiment_campaign_id,
                     experiment_dir=experiment_dir,
                     run_dir=run_dir,
-                    seed=seed,
+                    seed=get_run_seed(run_dir),
+                    fold=get_run_fold(run_dir),
                 )
             )
 
     return ablation_runs, campaigns_found
+
+
+def collect_reuse_evidence_runs(bundle_dir: Path) -> dict[str, list[AblationRun]]:
+    """Load receipt-bound historical calibration outputs from an external bundle."""
+    manifest_path = bundle_dir / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise ValueError("reuse evidence manifest records must be a list")
+    runs: dict[str, list[AblationRun]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("reuse evidence record must be a mapping")
+        files = record.get("evidence_files")
+        if not isinstance(files, list):
+            raise ValueError("reuse evidence record lacks evidence_files")
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError("reuse evidence file entry must be a mapping")
+            path = bundle_dir / str(item.get("path", ""))
+            expected_hash = item.get("sha256")
+            if (
+                not path.is_file()
+                or not isinstance(expected_hash, str)
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash
+            ):
+                raise ValueError(f"reuse evidence file failed integrity verification: {path}")
+        granular = next(
+            (
+                bundle_dir / item["path"]
+                for item in files
+                if isinstance(item, dict)
+                and str(item.get("path", "")).endswith("/test_granular.parquet")
+            ),
+            None,
+        )
+        training_config = next(
+            (
+                bundle_dir / item["path"]
+                for item in files
+                if isinstance(item, dict)
+                and str(item.get("path", "")).endswith("/config.yaml")
+            ),
+            None,
+        )
+        if granular is None or training_config is None:
+            raise ValueError("reuse evidence record lacks granular output or config")
+        condition, seed, fold = (
+            record.get("condition"),
+            record.get("seed"),
+            record.get("fold"),
+        )
+        if not isinstance(condition, str) or not isinstance(seed, int) or not isinstance(fold, int):
+            raise ValueError("reuse evidence record has invalid identity")
+        run_dir = training_config.parent
+        runs.setdefault(condition, []).append(
+            AblationRun(
+                ablation=condition,
+                campaign_id=str(payload["campaign_id"]),
+                experiment_dir=bundle_dir,
+                run_dir=run_dir,
+                seed=seed,
+                fold=fold,
+                granular_path=granular,
+                campaign_identity={
+                    "campaign_id": payload["campaign_id"],
+                    "campaign_sha256": payload["campaign_sha256"],
+                    "condition": condition,
+                    "seed": seed,
+                    "fold": fold,
+                },
+            )
+        )
+    return runs
 
 
 def build_seed_coverage_report(
@@ -371,81 +464,6 @@ def build_neighborhood_context_report(run_context_df: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame(records)
 
 
-def validate_seed_coverage(
-    ablation_runs: dict[str, list[AblationRun]],
-    baseline_name: str,
-    *,
-    included_ablations: set[str] | None = None,
-    expected_seeds: set[int] | None = None,
-) -> None:
-    """Assert a complete one-run-per-seed block across selected ablations."""
-    if included_ablations is None:
-        included_ablations = set(ablation_runs)
-    else:
-        included_ablations = set(included_ablations)
-    included_ablations.add(baseline_name)
-
-    missing_ablations = sorted(
-        ablation for ablation in included_ablations if ablation not in ablation_runs
-    )
-    errors: list[str] = []
-    if missing_ablations:
-        errors.append(f"missing ablations: {', '.join(missing_ablations)}")
-
-    metrics_by_ablation: dict[str, dict[int, list[AblationRun]]] = {}
-    for ablation in sorted(included_ablations):
-        runs = ablation_runs.get(ablation, [])
-        by_seed: dict[int, list[AblationRun]] = {}
-        unseeded_metric_runs = [
-            run for run in runs if run.seed is None and _has_test_metrics(run)
-        ]
-        if unseeded_metric_runs:
-            errors.append(
-                f"{ablation}: metric-bearing runs with missing seed "
-                f"{[_run_label(run) for run in unseeded_metric_runs]}"
-            )
-        for run in runs:
-            if run.seed is None or not _has_test_metrics(run):
-                continue
-            by_seed.setdefault(run.seed, []).append(run)
-        metrics_by_ablation[ablation] = by_seed
-
-    if expected_seeds is None:
-        expected_seeds = set().union(
-            *(set(seed_runs) for seed_runs in metrics_by_ablation.values())
-        )
-    expected_seeds = set(expected_seeds)
-
-    if not expected_seeds:
-        errors.append("no expected seeds resolved from metric-bearing runs")
-
-    for ablation in sorted(included_ablations):
-        by_seed = metrics_by_ablation.get(ablation, {})
-        present_seeds = set(by_seed)
-        missing_seeds = sorted(expected_seeds - present_seeds)
-        extra_seeds = sorted(present_seeds - expected_seeds)
-        duplicate_seeds = sorted(
-            seed for seed, seed_runs in by_seed.items() if len(seed_runs) > 1
-        )
-
-        if missing_seeds:
-            errors.append(f"{ablation}: missing metric-bearing seeds {missing_seeds}")
-        if extra_seeds:
-            errors.append(f"{ablation}: unexpected metric-bearing seeds {extra_seeds}")
-        if duplicate_seeds:
-            duplicate_details = ", ".join(
-                f"{seed} -> {[_run_label(run) for run in by_seed[seed]]}"
-                for seed in duplicate_seeds
-            )
-            errors.append(
-                f"{ablation}: duplicate metric-bearing seeds {duplicate_details}"
-            )
-
-    if errors:
-        message = "\n".join(f"- {error}" for error in errors)
-        raise ValueError(f"Seed coverage validation failed:\n{message}")
-
-
 def validate_ablation_run_consistency(
     ablation: str,
     runs: list[AblationRun],
@@ -522,8 +540,15 @@ def aggregate_ablation_metrics(
         metrics_list: list[pd.DataFrame] = []
         for run in runs:
             df = load_test_metrics(run.run_dir)
-            if df is not None:
-                metrics_list.append(df)
+            if df is None:
+                continue
+            if df.empty:
+                raise ValueError(f"{_run_label(run)}: aggregate metric table is empty")
+            if "target" not in df.columns:
+                raise ValueError(
+                    f"{_run_label(run)}: aggregate metric table missing required column 'target'"
+                )
+            metrics_list.append(df)
 
         if not metrics_list:
             logger.warning(f"No valid metrics found for ablation: {ablation_name}")
@@ -535,7 +560,7 @@ def aggregate_ablation_metrics(
             record: dict[str, Any] = {
                 "model": ablation_name,
                 "target": target,
-                "folds": len(metrics_list),
+                "run_count": len(metrics_list),
             }
 
             for metric in METRICS:
@@ -609,12 +634,7 @@ def compute_seed_matched_baseline_deltas(
     ablation_runs: dict[str, list[AblationRun]],
     baseline_name: str = "baseline",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Compute baseline deltas using only seed-matched run pairs.
-
-    Returns:
-        pairwise_df: one record per (ablation run, baseline run, target, seed)
-        summary_df: aggregated mean/std deltas per (ablation, target)
-    """
+    """Compute baseline deltas only for identical seed and persisted fold pairs."""
     baseline_runs = ablation_runs.get(baseline_name, [])
     if not baseline_runs:
         logger.warning(
@@ -623,22 +643,20 @@ def compute_seed_matched_baseline_deltas(
         )
         return pd.DataFrame(), pd.DataFrame()
 
-    baseline_by_seed: dict[int, AblationRun] = {}
+    baseline_by_identity: dict[tuple[int, int | None], AblationRun] = {}
     for run in baseline_runs:
         if run.seed is None:
             continue
-        if run.seed in baseline_by_seed:
+        identity = (run.seed, run.fold)
+        if identity in baseline_by_identity:
             logger.warning(
-                "Multiple baseline runs for seed=%s; keeping %s/%s",
-                run.seed,
-                baseline_by_seed[run.seed].experiment_dir.name,
-                baseline_by_seed[run.seed].run_dir.name,
+                "Multiple baseline runs for seed/fold=%s; keeping first", identity
             )
             continue
-        baseline_by_seed[run.seed] = run
+        baseline_by_identity[identity] = run
 
-    if not baseline_by_seed:
-        logger.warning("No baseline runs with extractable seed found")
+    if not baseline_by_identity:
+        logger.warning("No baseline runs with extractable paired identity found")
         return pd.DataFrame(), pd.DataFrame()
 
     pairwise_records: list[dict[str, Any]] = []
@@ -649,7 +667,7 @@ def compute_seed_matched_baseline_deltas(
         for run in runs:
             if run.seed is None:
                 continue
-            baseline_run = baseline_by_seed.get(run.seed)
+            baseline_run = baseline_by_identity.get((run.seed, run.fold))
             if baseline_run is None:
                 continue
 
@@ -674,6 +692,7 @@ def compute_seed_matched_baseline_deltas(
                     "model": ablation,
                     "target": target,
                     "seed": run.seed,
+                    "fold": run.fold,
                     "baseline_run": f"{baseline_run.experiment_dir.name}/{baseline_run.run_dir.name}",
                     "ablation_run": f"{run.experiment_dir.name}/{run.run_dir.name}",
                 }
@@ -736,10 +755,265 @@ def compute_seed_matched_baseline_deltas(
     return pairwise_df, summary_df
 
 
+def _campaign_output_identity(run: AblationRun) -> dict[str, Any]:
+    """Load the immutable identity sidecar emitted by the campaign worker."""
+    if run.campaign_identity is not None:
+        return run.campaign_identity
+    identity_path = run.run_dir / "campaign_identity.json"
+    if not identity_path.is_file():
+        raise ValueError(f"{_run_label(run)}: missing campaign_identity.json")
+    try:
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"{_run_label(run)}: invalid campaign identity: {exc}"
+        ) from exc
+    if not isinstance(identity, dict):
+        raise ValueError(f"{_run_label(run)}: campaign identity must be an object")
+    return identity
+
+
+def validate_campaign_trials(
+    campaign: AblationCampaign,
+    *,
+    journal_path: Path,
+    study_name: str,
+    smoketest: bool = False,
+) -> None:
+    """Require one completed trial per declared production or smoke identity."""
+    study = optuna.load_study(
+        study_name=study_name,
+        storage=JournalStorage(JournalFileBackend(str(journal_path))),
+    )
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
+    observed: dict[tuple[str, int, int | None], list[optuna.trial.FrozenTrial]] = {}
+    errors: list[str] = []
+    for trial in study.trials:
+        identity = trial_identity(trial)
+        if identity is None:
+            errors.append(f"trial {trial.number}: missing campaign identity")
+            continue
+        if identity not in expected:
+            errors.append(f"trial {trial.number}: unexpected identity {identity}")
+            continue
+        observed.setdefault(identity, []).append(trial)
+        if trial.state not in {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.FAIL,
+            optuna.trial.TrialState.PRUNED,
+        }:
+            errors.append(f"{identity}: nonterminal trial state {trial.state.name}")
+
+    for identity in sorted(expected):
+        attempts = observed.get(identity, [])
+        complete_attempts = [
+            trial
+            for trial in attempts
+            if trial.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if len(complete_attempts) != 1:
+            errors.append(
+                f"{identity}: expected exactly one COMPLETE trial, found "
+                f"{len(complete_attempts)}"
+            )
+            continue
+        attrs = complete_attempts[0].user_attrs
+        if (
+            attrs.get("campaign_sha256") != campaign.sha256
+            or attrs.get("campaign_id") != campaign.campaign_id
+            or attrs.get("campaign_condition") != identity[0]
+            or attrs.get("campaign_seed") != identity[1]
+            or attrs.get("campaign_fold") != identity[2]
+        ):
+            errors.append(
+                f"{identity}: COMPLETE trial provenance does not match declaration"
+            )
+        if attrs.get("optuna_value_purpose") not in {
+            "validation_selection_coordination",
+            "provenance_verified_checkpoint_reuse",
+        }:
+            errors.append(
+                f"{identity}: COMPLETE trial value is not validation-selection "
+                "coordination or provenance-verified checkpoint reuse"
+            )
+        selection_metric = attrs.get("best_val_selection_metric")
+        selection_value = attrs.get("best_val_selection_value")
+        if not isinstance(selection_metric, str) or not selection_metric:
+            errors.append(f"{identity}: COMPLETE trial lacks selection metric metadata")
+        if (
+            not isinstance(selection_value, (int, float))
+            or isinstance(selection_value, bool)
+            or not np.isfinite(float(selection_value))
+        ):
+            errors.append(
+                f"{identity}: COMPLETE trial lacks finite selection value metadata"
+            )
+    if errors:
+        raise ValueError("Campaign trial validation failed:\n- " + "\n- ".join(errors))
+
+
+def _aggregate_metric_table_errors(
+    metrics: pd.DataFrame | None,
+    *,
+    primary_metric: str,
+    label: str,
+    require_finite_primary_metric: bool,
+    allow_nonfinite_zero_support: bool = False,
+) -> list[str]:
+    if metrics is None:
+        return [f"{label}: missing aggregate metric table"]
+    if metrics.empty:
+        return [f"{label}: aggregate metric table is empty"]
+    missing_columns = [
+        column for column in ("target", primary_metric) if column not in metrics.columns
+    ]
+    if missing_columns:
+        return [
+            f"{label}: aggregate metric table missing required column(s): "
+            f"{', '.join(missing_columns)}"
+        ]
+    if require_finite_primary_metric:
+        primary_values = pd.to_numeric(metrics[primary_metric], errors="coerce")
+        nonfinite = ~np.isfinite(primary_values.to_numpy(dtype=float))
+        if nonfinite.any() and allow_nonfinite_zero_support:
+            if "observed_count_median" not in metrics.columns:
+                return [f"{label}: nonfinite primary metric {primary_metric!r}"]
+            observed_counts = pd.to_numeric(
+                metrics["observed_count_median"], errors="coerce"
+            )
+            zero_support = observed_counts.to_numpy(dtype=float) == 0.0
+            nonfinite = nonfinite & ~zero_support
+        if nonfinite.any():
+            return [f"{label}: nonfinite primary metric {primary_metric!r}"]
+    return []
+
+
+def _override_leaves(
+    overrides: dict[str, Any], prefix: tuple[str, ...] = ()
+) -> list[tuple[tuple[str, ...], Any]]:
+    leaves: list[tuple[tuple[str, ...], Any]] = []
+    for key, value in overrides.items():
+        if isinstance(value, dict) and value:
+            leaves.extend(_override_leaves(value, (*prefix, str(key))))
+        else:
+            leaves.append(((*prefix, str(key)), value))
+    return leaves
+
+
+def _reuse_config_identity_errors(
+    campaign: AblationCampaign, condition: str, run: AblationRun
+) -> list[str]:
+    """Compare a reused run's recorded identity with its own bundled config."""
+    label = _run_label(run)
+    try:
+        config = load_run_config(run.run_dir)
+    except ValueError as exc:
+        return [f"{label}: reuse config unreadable: {exc}"]
+    errors: list[str] = []
+    identity = run.campaign_identity or {}
+    if get_run_seed(run.run_dir) != identity.get("seed"):
+        errors.append(f"{label}: bundled config seed does not match recorded identity")
+    if get_run_fold(run.run_dir) != identity.get("fold"):
+        errors.append(f"{label}: bundled config fold does not match recorded identity")
+    expected_name = f"mn5_ablation__{campaign.campaign_id}__{condition}"
+    if _nested_get(config, ("output", "experiment_name")) != expected_name:
+        errors.append(f"{label}: bundled config experiment name does not match")
+    condition_spec = campaign.conditions_by_name.get(condition)
+    overrides = [*_override_leaves(campaign.fixed_overrides)]
+    if condition_spec is not None:
+        overrides += _override_leaves(condition_spec.overrides)
+    for path, expected in overrides:
+        if _nested_get(config, path) != expected:
+            errors.append(
+                f"{label}: bundled config {'.'.join(path)} does not match declaration"
+            )
+    return errors
+
+
+def validate_campaign_outputs(
+    campaign: AblationCampaign,
+    ablation_runs: dict[str, list[AblationRun]],
+    *,
+    smoketest: bool = False,
+) -> None:
+    """Require exactly one aggregate-metric output for every declared identity."""
+    expected = expected_trial_identities(campaign, smoketest=smoketest)
+    observed: dict[tuple[str, int, int | None], list[AblationRun]] = {}
+    errors: list[str] = []
+    for condition, runs in ablation_runs.items():
+        for run in runs:
+            if run.seed is None:
+                errors.append(f"{_run_label(run)}: output config has no training.seed")
+                continue
+            identity = _campaign_output_identity(run)
+            fold_value = identity.get("fold")
+            if fold_value is not None and (
+                not isinstance(fold_value, int) or isinstance(fold_value, bool)
+            ):
+                errors.append(f"{_run_label(run)}: campaign identity fold is invalid")
+                continue
+            logical_identity = (condition, run.seed, fold_value)
+            observed.setdefault(logical_identity, []).append(run)
+            if (
+                identity.get("campaign_sha256") != campaign.sha256
+                or identity.get("campaign_id") != campaign.campaign_id
+                or identity.get("condition") != condition
+                or identity.get("seed") != run.seed
+                or fold_value != run.fold
+            ):
+                errors.append(
+                    f"{_run_label(run)}: campaign output provenance does not match declaration"
+                )
+            if run.campaign_identity is not None:
+                errors.extend(_reuse_config_identity_errors(campaign, condition, run))
+            errors.extend(
+                _aggregate_metric_table_errors(
+                    load_test_metrics(run.run_dir),
+                    primary_metric=campaign.primary_metric,
+                    label=_run_label(run),
+                    require_finite_primary_metric=campaign.completeness_requirements[
+                        "require_finite_primary_metric"
+                    ],
+                    allow_nonfinite_zero_support=smoketest,
+                )
+            )
+    missing = expected - observed.keys()
+    duplicates = {
+        identity: runs for identity, runs in observed.items() if len(runs) != 1
+    }
+    extras = observed.keys() - expected
+    if missing:
+        errors.append(f"missing output identities: {sorted(missing)}")
+    if duplicates:
+        errors.append(f"duplicate output identities: {sorted(duplicates)}")
+    if extras:
+        errors.append(f"unexpected output identities: {sorted(extras)}")
+    if errors:
+        raise ValueError("Campaign output validation failed:\n- " + "\n- ".join(errors))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Aggregate ablation study results",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--campaign",
+        type=Path,
+        required=True,
+        help="Checked-in declarative campaign YAML used to compile required identities.",
+    )
+    parser.add_argument(
+        "--journal",
+        type=Path,
+        required=True,
+        help="JournalStorage file containing the coordinated campaign trials.",
+    )
+    parser.add_argument(
+        "--study-name",
+        type=str,
+        required=True,
+        help="JournalStorage study name for this campaign.",
     )
     parser.add_argument(
         "--training-dir",
@@ -750,20 +1024,8 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/reports/ablation_analysis"),
-        help="Output directory for aggregated results (default: outputs/reports/ablation_analysis)",
-    )
-    parser.add_argument(
-        "--baseline",
-        type=str,
-        default="baseline",
-        help="Name of baseline ablation (default: baseline)",
-    )
-    parser.add_argument(
-        "--campaign-id",
-        type=str,
         default=None,
-        help="Only analyze runs from this campaign ID (default: all matching pattern)",
+        help="Output directory (default: outputs/reports/ablation_cv_<campaign_id>)",
     )
     parser.add_argument(
         "--experiment-pattern",
@@ -772,49 +1034,15 @@ def main() -> int:
         help="Glob pattern for ablation experiment directories",
     )
     parser.add_argument(
-        "--include-ablations",
-        type=str,
+        "--reuse-evidence-dir",
+        type=Path,
         default=None,
-        help=(
-            "Comma-separated candidate ablations to include in the analysis. "
-            "Baseline is always included. Defaults to all discovered ablations."
-        ),
+        help="Read-only external bundle containing receipt-verified reused outputs.",
     )
     parser.add_argument(
-        "--assert-consistent-config",
-        dest="assert_consistent_config",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Assert run config consistency per ablation (default: enabled)",
-    )
-    parser.add_argument(
-        "--seed-coverage",
-        choices=("off", "warn", "strict"),
-        default="warn",
-        help=(
-            "Seed coverage policy for metric-bearing runs. 'strict' fails before "
-            "aggregation when selected ablations do not have exactly one run per "
-            "expected seed (default: warn)."
-        ),
-    )
-    parser.add_argument(
-        "--seed-coverage-ablations",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated ablations to include in seed coverage validation. "
-            "Baseline is always included. Defaults to all discovered ablations."
-        ),
-    )
-    parser.add_argument(
-        "--expected-seeds",
-        type=str,
-        default=None,
-        help=(
-            "Comma-separated expected seeds for seed coverage validation "
-            "(for example: 42,43,44,45,46). Defaults to the union of selected "
-            "metric-bearing seeds."
-        ),
+        "--smoketest",
+        action="store_true",
+        help="Validate the declaration-owned bounded smoke identity matrix.",
     )
     parser.add_argument(
         "-v",
@@ -828,27 +1056,40 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    try:
+        declaration = load_campaign(args.campaign)
+    except ValueError as exc:
+        logger.error("Invalid campaign declaration: %s", exc)
+        return 1
+    campaign_id = declaration.campaign_id
+    baseline_name = declaration.baseline_condition
+    logger.info(
+        "Held-out campaign primary endpoint is aggregate %s (%s); "
+        "Optuna values are validation-selection coordination only",
+        declaration.primary_metric,
+        declaration.primary_direction,
+    )
 
-    # Determine default output directory based on campaign_id
-    if (
-        args.output_dir == Path("outputs/reports/ablation_analysis")
-        and args.campaign_id
-    ):
-        args.output_dir = Path("outputs/reports") / f"ablation_cv_{args.campaign_id}"
+    # Determine default output directory from the declaration, not a CLI override.
+    if args.output_dir is None:
+        args.output_dir = Path("outputs/reports") / f"ablation_cv_{campaign_id}"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(
-        "Scanning %s for pattern '%s' (campaign_id=%s)",
+        "Scanning %s for declared campaign_id=%s",
         args.training_dir,
-        args.experiment_pattern,
-        args.campaign_id,
+        campaign_id,
     )
     ablation_runs, campaigns_found = collect_ablation_runs(
         args.training_dir,
         experiment_pattern=args.experiment_pattern,
-        campaign_id=args.campaign_id,
+        campaign_id=campaign_id,
     )
+    if args.reuse_evidence_dir is not None:
+        reuse_runs = collect_reuse_evidence_runs(args.reuse_evidence_dir)
+        for condition, runs in reuse_runs.items():
+            ablation_runs.setdefault(condition, []).extend(runs)
 
     if not ablation_runs:
         logger.error("No ablation runs found")
@@ -862,25 +1103,36 @@ def main() -> int:
     if campaigns_found:
         logger.info("Campaigns found: %s", ", ".join(sorted(campaigns_found)))
 
-    include_ablations = _parse_csv_set(args.include_ablations)
-    if include_ablations is not None:
-        include_ablations.add(args.baseline)
-        excluded_ablations = sorted(set(ablation_runs) - include_ablations)
-        ablation_runs = {
-            ablation: runs
-            for ablation, runs in ablation_runs.items()
-            if ablation in include_ablations
-        }
-        logger.info(
-            "Filtered analysis to %d ablations: %s",
-            len(ablation_runs),
-            ", ".join(sorted(ablation_runs)),
+    try:
+        validate_campaign_trials(
+            declaration,
+            journal_path=args.journal,
+            study_name=args.study_name,
+            smoketest=args.smoketest,
         )
-        if excluded_ablations:
-            logger.info(
-                "Excluded ablations from focused analysis: %s",
-                ", ".join(excluded_ablations),
-            )
+        validate_campaign_outputs(
+            declaration,
+            ablation_runs,
+            smoketest=args.smoketest,
+        )
+    except (ValueError, KeyError, optuna.exceptions.OptunaError) as exc:
+        logger.error("%s", exc)
+        return 1
+    try:
+        probabilistic_outputs = build_probabilistic_campaign_outputs(
+            declaration,
+            ablation_runs,
+        )
+    except ValueError as exc:
+        logger.error("Probabilistic campaign analysis failed: %s", exc)
+        return 1
+    for stem, frame in probabilistic_outputs.items():
+        path = args.output_dir / f"{stem}.csv"
+        frame.to_csv(path, index=False)
+        logger.info("Saved probabilistic campaign evidence to %s", path)
+    if campaign_analysis_spec(declaration) is not None:
+        return 0
+
 
     seed_coverage_df = build_seed_coverage_report(ablation_runs)
     seed_coverage_path = args.output_dir / "seed_coverage_report.csv"
@@ -901,36 +1153,17 @@ def main() -> int:
             neighborhood_context_path,
         )
 
-    if args.seed_coverage != "off":
-        try:
-            validate_seed_coverage(
-                ablation_runs,
-                baseline_name=args.baseline,
-                included_ablations=_parse_csv_set(args.seed_coverage_ablations),
-                expected_seeds=_parse_csv_set(args.expected_seeds, cast_type=int),
-            )
-            logger.info("Seed coverage validation passed")
-        except ValueError as exc:
-            if args.seed_coverage == "strict":
-                logger.error("%s", exc)
-                return 1
-            logger.warning("%s", exc)
-
     logger.info("Aggregating metrics...")
     aggregated_df = aggregate_ablation_metrics(
         ablation_runs,
-        assert_consistent_config=args.assert_consistent_config,
+        assert_consistent_config=True,
     )
-    if aggregated_df.empty:
-        logger.error("No metrics could be aggregated")
-        return 1
-
     aggregated_path = args.output_dir / "ablation_metrics_aggregated.csv"
     aggregated_df.to_csv(aggregated_path, index=False)
     logger.info(f"Saved aggregated metrics to {aggregated_path}")
 
     logger.info("Computing deltas from baseline...")
-    deltas_df = compute_baseline_deltas(aggregated_df, baseline_name=args.baseline)
+    deltas_df = compute_baseline_deltas(aggregated_df, baseline_name=baseline_name)
     if not deltas_df.empty:
         deltas_path = args.output_dir / "ablation_metrics_deltas.csv"
         deltas_df.to_csv(deltas_path, index=False)
@@ -939,7 +1172,7 @@ def main() -> int:
     logger.info("Computing seed-matched deltas from baseline...")
     seed_pairwise_df, seed_matched_df = compute_seed_matched_baseline_deltas(
         ablation_runs,
-        baseline_name=args.baseline,
+        baseline_name=baseline_name,
     )
     if not seed_pairwise_df.empty:
         seed_pairwise_path = (
@@ -953,63 +1186,9 @@ def main() -> int:
         seed_matched_df.to_csv(seed_matched_path, index=False)
         logger.info(f"Saved seed-matched summary deltas to {seed_matched_path}")
 
-    # Cross-head impact analysis
-    logger.info("Computing cross-head impact analysis...")
-    try:
-        from scripts.analysis.analyze_cross_head_impact import compute_cross_head_impact
-
-        cross_head_result = compute_cross_head_impact(
-            args.training_dir,
-            args.campaign_id,
-            split="test",
-        )
-
-        if cross_head_result is not None:
-            pairwise_df, mean_matrix, (std_matrix, count_matrix) = cross_head_result
-
-            # Save cross-head matrices
-            cross_head_dir = args.output_dir / "cross_head"
-            cross_head_dir.mkdir(exist_ok=True)
-
-            pairwise_path = cross_head_dir / "cross_head_pairwise.csv"
-            pairwise_df.to_csv(pairwise_path, index=False)
-
-            mean_matrix.to_csv(cross_head_dir / "cross_head_mean_matrix.csv")
-            std_matrix.to_csv(cross_head_dir / "cross_head_std_matrix.csv")
-            count_matrix.to_csv(cross_head_dir / "cross_head_count_matrix.csv")
-
-            logger.info(f"Saved cross-head analysis to {cross_head_dir}")
-
-            cross_head_success = True
-        else:
-            logger.warning("Cross-head impact analysis returned no data")
-            cross_head_success = False
-    except Exception as exc:
-        logger.warning(f"Cross-head impact analysis failed: {exc}")
-        cross_head_success = False
-
-    # Granular Comparison Suite
-    if args.campaign_id:
-        logger.info("Running granular comparison suite...")
-        try:
-            from dataviz.granular_comparison import compare_ablation_suite
-
-            candidate_ablations = [
-                m for m in aggregated_df["model"].unique() if m != args.baseline
-            ]
-
-            granular_dir = args.output_dir / "granular_comparison"
-            compare_ablation_suite(
-                training_dir=args.training_dir,
-                campaign_id=args.campaign_id,
-                baseline_ablation=args.baseline,
-                candidate_ablations=candidate_ablations,
-                output_dir=granular_dir,
-                split="test",
-            )
-            logger.info(f"Saved granular comparison suite to {granular_dir}")
-        except Exception as exc:
-            logger.warning(f"Granular comparison suite failed: {exc}")
+    # Non-probabilistic campaigns aggregate only per-run aggregate metric
+    # tables. Probabilistic campaigns take the endpoint and fold/seed deltas
+    # from run-level aggregates; granular rows feed descriptive breakdowns only.
 
     logger.info("Generating ablation plots...")
     try:
@@ -1017,7 +1196,6 @@ def main() -> int:
             plot_ablation_comparison,
             plot_ablation_deltas_heatmap,
             plot_ablation_summary_grid,
-            plot_cross_head_impact_heatmap,
             plot_head_ablation_heatmap,
             plot_mobility_ablation_heatmap,
             plot_neighborhood_aggregation_heatmap,
@@ -1027,13 +1205,13 @@ def main() -> int:
         plot_ablation_comparison(
             aggregated_path,
             output_dir=args.output_dir,
-            baseline_name=args.baseline,
+            baseline_name=baseline_name,
         )
         plot_ablation_summary_grid(
             aggregated_path,
             deltas_csv=deltas_path if not deltas_df.empty else None,
             output_dir=args.output_dir,
-            baseline_name=args.baseline,
+            baseline_name=baseline_name,
         )
         heatmap_df = seed_matched_df if not seed_matched_df.empty else deltas_df
         heatmap_csv = (
@@ -1048,7 +1226,7 @@ def main() -> int:
                         heatmap_csv,
                         output_dir=args.output_dir,
                         metric=metric,
-                        baseline_name=args.baseline,
+                        baseline_name=baseline_name,
                     )
                 except ValueError as exc:
                     logger.warning("Skipping %s delta heatmap: %s", metric, exc)
@@ -1056,20 +1234,20 @@ def main() -> int:
                 heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
-                baseline_name=args.baseline,
+                baseline_name=baseline_name,
             )
             plot_mobility_ablation_heatmap(
                 heatmap_csv,
                 output_dir=args.output_dir,
                 metric="mae",
-                baseline_name=args.baseline,
+                baseline_name=baseline_name,
             )
             try:
                 plot_head_ablation_heatmap(
                     heatmap_csv,
                     output_dir=args.output_dir,
                     metric="mae",
-                    baseline_name=args.baseline,
+                    baseline_name=baseline_name,
                 )
             except ValueError as exc:
                 logger.warning("Skipping head ablation heatmap: %s", exc)
@@ -1078,13 +1256,7 @@ def main() -> int:
                 seed_matched_path,
                 seed_pairwise_path,
                 output_dir=args.output_dir / "seed_matched_diagnostics",
-                baseline_name=args.baseline,
-            )
-        if cross_head_success:
-            plot_cross_head_impact_heatmap(
-                cross_head_dir / "cross_head_mean_matrix.csv",
-                std_csv=cross_head_dir / "cross_head_std_matrix.csv",
-                output_dir=cross_head_dir,
+                baseline_name=baseline_name,
             )
     except Exception as exc:
         logger.warning(f"Ablation plot generation failed: {exc}")
@@ -1108,10 +1280,6 @@ def main() -> int:
         print(f"  - {seed_pairwise_path.name}")
     if not seed_matched_df.empty:
         print(f"  - {seed_matched_path.name}")
-    if cross_head_success:
-        print("  - cross_head/")
-        print("    - cross_head_mean_matrix.csv")
-        print("    - cross_head_pairwise.csv")
 
     print("\n" + "-" * 80)
     print("Sample of aggregated metrics (MAE means):")

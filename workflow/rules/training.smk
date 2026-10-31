@@ -12,6 +12,8 @@ if WORKFLOW_KIND == "train":
             marker=str(TRAINING_DONE),
         threads:
             CPUS_PER_TASK
+        resources:
+            gpu=1
         log:
             str(RUN_ROOT / "logs/train_model.log")
         params:
@@ -92,6 +94,7 @@ if WORKFLOW_KIND == "train":
                     dvc_mode="push",
                     cpus=CPUS_PER_TASK,
                     promotion_root=str(RUN_ROOT / "evidence"),
+                    host_step=True,
                 )
             shell:
                 "{params.command} > {log:q} 2>&1"

@@ -1,0 +1,37 @@
+# Corrected SIRHD reporting corpus for synthetic latent-supervision pretraining.
+#
+# This is a new immutable dataset identity. It does not replace
+# synthetic_full_holt_damped.zarr or its DVC pointer (legacy zarr output).
+
+base_config: "preprocess_mn5_synth.yaml"
+
+env: "mn5"
+synthetic_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+cases_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+mobility_path: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+wastewater_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+population_file: "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
+
+end_date: "2021-05-09"
+dataset_name: "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2"
+vaccination_file: null
+continuous_storage_dtype: "float32"
+
+temporal_covariates:
+  holiday_calendar_file: "data/files/catalonia_preprocessing_inputs_v1/catalonia_holidays.csv"
+
+smoothing:
+  clinical_method: "holt_damped"
+
+source_provenance:
+  generator_source_commit: "cb6b4e5ed7dcf3b1a0b23a15ac5a2377e09857c1"
+  generator_source_archive_sha256: "1bed6fc3aae43be2b5f352fff792b13733e59548a4be64a8047294ec2a42d16e"
+  raw_corpus_full_tree_sha256: "490da9d143f3ad483f95791ece3120218dc0e99aa2c0c623465565130f2b021c"
+  raw_corpus_metadata_tree_sha256: "3f87cf6277077b60425bde0d229737eb020a2e46f165e399cdcc8ef4d73c0117"
+  raw_zmetadata_sha256: "dfc535a9c1a3378378afeb0d5a9794640a5ae10fb896a079f82a5989e51a725f"
+  reporting_config_sha256: "1fd4608c63b43c1e007da56de8365e8334a5330ad1098fbe6b95bd27a7fa1ab2"
+  handoff_manifest_sha256: "ecdc3658e070f73c077b865c1679909a3c8b81c727df154ae24e0a6889310f13"
+  handoff_qa_dvc_md5: "59af8a3b0f88cb52a841127b68c12c89.dir"
+  reporting_profile: "sirhd_pretraining_reporting_v1"
+  metadata_input_dvc_md5: "47c8130c5a5ec33a8a662d0982e4de2a.dir"

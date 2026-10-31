@@ -41,7 +41,7 @@ uv run main --help  # entrypoint cli.py
 
 ## Coding Style & Naming Conventions
 
-- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
+- Python 3.13+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
 - Indentation: 4 spaces; no tabs. Imports sorted (Ruff isort rules).
 - Naming: modules `snake_case.py`, classes `PascalCase`, functions/vars `snake_case`, constants `UPPER_SNAKE_CASE`.
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.
@@ -98,13 +98,68 @@ Substantive EpiForecaster training and evaluation use the immutable MN5
 Snakemake workflow. Do not introduce additional local EpiForecaster training
 configs as alternate production interfaces.
 
+### Ablation Campaign Coverage
+
+- Every scientific EpiForecaster ablation, including loss, objective, mobility,
+  signal, and architecture comparisons, must be a checked-in declarative
+  campaign under `configs/campaigns/` and run through the MN5 ablation workflow.
+  Ad hoc single-run matrices are limited to acceptance or historical
+  reproduction and are not eligible for scientific ranking.
+- A production ablation campaign must declare every fold in the persisted
+  representative manifest. Each condition and paired model seed must therefore
+  evaluate every valid target region exactly once across the complete fold
+  matrix. Fold subsets are permitted only for explicitly bounded smoke
+  campaigns and cannot support model-selection claims.
+- Evaluate the complete held-out test support declared by the campaign: all
+  eligible target regions, observed targets, forecast horizons, and target
+  dates. Do not select a regional or temporal subset for a production estimate.
+  If an outer temporal holdout is retained for confirmation, name it separately
+  rather than describing a development subset as the full test set.
+- Ablation analysis must preserve heterogeneous effects. In addition to the
+  aggregate endpoint, report matched deltas by target, region, forecast
+  horizon, fold, and seed, plus the distribution and fraction of regions
+  improved or worsened. For mobility contrasts, include predeclared
+  mobility-context strata. A pooled mean alone is insufficient.
+- Full spatial coverage does not make municipalities, shared wastewater plants,
+  or allocated clinical sources independent. Inferential intervals must retain
+  source grouping and temporal blocking; region-level deltas are descriptive
+  unless their dependence model is explicit.
+
 ### Remote MN5 Cluster Work
 
 All remote model operations use `scripts/workflow/mn5_workflow.sh` and are
-encapsulated in the **`mn5-dispatch`** skill. **Load that skill** before remote
-preparation, transfer, submission, monitoring, or artifact inspection.
+governed by the **`mn5-cluster-usage`** skill. **Load that skill** before remote
+preparation, transfer, submission, monitoring, or artifact inspection; it
+defines endpoint and allocation policy, while this repository's launcher and
+`docs/MN5_SNAKEMAKE.md` define the immutable workflow contract.
 
 > **WARNING**: Do not run configs in `configs/production_only/` locally. They require GPU cluster resources. See `configs/production_only/README.md`.
+
+### Immutable Deployment and Artifact Model
+
+Do not assume a GPFS project or run directory is a Git checkout. Cluster
+execution separates:
+
+1. the authoritative local Git checkout where source changes are developed;
+2. an immutable deployed source bundle used by a particular cluster run;
+3. a versioned run root containing configuration, manifests, logs, seeds, and
+   execution state;
+4. generated scientific artifacts such as checkpoints and Zarr datasets; and
+5. downstream DVC pointers and materializations.
+
+For an existing run, treat its manifest and deployed-bundle hashes as the
+authority for the code and inputs that produced its artifacts. A local checkout
+is authoritative for new development, but it must not be assumed to match an
+old deployment merely because paths or filenames agree. Reconcile Git commit,
+source-bundle hash, configuration, container or environment identity, seeds,
+input identities, and artifact hashes where available. If the run lacks enough
+metadata to establish this identity, report a provenance limitation rather
+than inferring one.
+
+Never patch or overwrite an immutable deployed bundle, run root, or generated
+artifact in place. Make changes in a Git branch, validate them, then create a
+new immutable bundle and versioned run. Preserve the existing run and record
+the new code, configuration, environment, seed, input, and output identities.
 
 ## Paper Workflow
 
@@ -126,7 +181,7 @@ preparation, transfer, submission, monitoring, or artifact inspection.
 - `git checkout` is denied by permissions. Use `git switch` for branch switching and `git restore` for discarding file changes instead.
 - Do not chain git commands with `&&` (e.g. `git add ... && git commit ...`). The permissions system matches against the full command string, so chaining breaks pattern matching. Use separate bash calls instead.
 - New features and refactors are assumed to be 'cutover' implementations, not preserving backwards compatibility with previous behavior, unless specified otherwise.
-- Prefer `uv run` for execution and CLI commands over ad-hoc commands; update `pyproject.toml` if adding deps.
+- Prefer `uv run` for project test suites, CLI commands, scripts, and workflow execution; update `pyproject.toml` if adding deps.
 - Do not modify `data/` inputs or commit large `outputs/`. Place generated artifacts in `outputs/` and ignore by default.
 - Keep patches minimal and consistent with existing style; avoid unrelated refactors. If heavy compute is required, add flags and default to lightweight settings.
 - Use configuration-driven development: copy and modify templates from the `configs/` directory or provide CLI level overrides with dot-path syntax like `--override model.strict=true` rather than hardcoding parameters.

@@ -3,8 +3,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 import xarray as xr
 
+from data.epi_dataset import EpiDataset, EpiDatasetItem
 from data.preprocess.config import PreprocessingConfig, REGION_COORD, TEMPORAL_COORD
 from models.configs import DataConfig, EpiForecasterConfig, ModelConfig
 
@@ -224,3 +226,21 @@ def make_preprocessing_config(
     }
     config_kwargs.update(options or {})
     return PreprocessingConfig(**config_kwargs)
+
+
+def context_features_for_item(
+    dataset: EpiDataset, item: EpiDatasetItem
+) -> torch.Tensor:
+    """Assemble ``(L, N_ctx, F)`` dense features for one item on CPU."""
+    from data.context_assembly import assemble_context_features
+
+    window_starts = torch.tensor([item["window_start"]], dtype=torch.long)
+    positions = torch.tensor([int(item["mob_target_node_idx"])], dtype=torch.long)
+    features = assemble_context_features(
+        dataset,
+        window_starts,
+        positions,
+        torch.device("cpu"),
+    )
+    history_length = dataset.config.model.input_window_length
+    return features.reshape(history_length, -1, features.shape[-1])

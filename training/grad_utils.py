@@ -31,17 +31,15 @@ def compute_gradient_norms_and_clip(
     sird_sq_sum = torch.tensor(0.0, device=device)
     encoder_sq_sum = torch.tensor(0.0, device=device)
     other_sq_sum = torch.tensor(0.0, device=device)
-
-    all_grads: list[torch.Tensor] = []
+    global_sq_sum = torch.tensor(0.0, device=device)
 
     for group_name, params in grad_norm_groups.items():
         for param in params:
             if param.grad is None:
                 continue
 
-            grad = param.grad.detach()
-            all_grads.append(grad)
-            sq_norm = grad.pow(2).sum()
+            sq_norm = param.grad.detach().pow(2).sum()
+            global_sq_sum += sq_norm
 
             if should_log:
                 if group_name == "mobility_gnn":
@@ -59,12 +57,7 @@ def compute_gradient_norms_and_clip(
                 else:
                     other_sq_sum += sq_norm
 
-    if all_grads:
-        global_norm = torch.linalg.vector_norm(
-            torch.stack([g.pow(2).sum() for g in all_grads]).sum().sqrt()
-        )
-    else:
-        global_norm = torch.tensor(0.0, device=device)
+    global_norm = global_sq_sum.sqrt()
 
     if global_norm > clip_value:
         torch.nn.utils.clip_grad_norm_(
@@ -80,9 +73,7 @@ def compute_gradient_norms_and_clip(
             "gradnorm_other": float(other_sq_sum.sqrt().item()),
             build_gradnorm_obs_key("ww"): float(head_sq_sums["ww"].sqrt().item()),
             build_gradnorm_obs_key("hosp"): float(head_sq_sums["hosp"].sqrt().item()),
-            build_gradnorm_obs_key("cases"): float(
-                head_sq_sums["cases"].sqrt().item()
-            ),
+            build_gradnorm_obs_key("cases"): float(head_sq_sums["cases"].sqrt().item()),
             build_gradnorm_obs_key("deaths"): float(
                 head_sq_sums["deaths"].sqrt().item()
             ),

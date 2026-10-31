@@ -15,6 +15,8 @@ import evaluation.eval_loop as eval_loop_module
 from dataviz.granular_comparison import compare_granular_csvs
 from evaluation.eval_loop import eval_checkpoint, evaluate_loader
 from evaluation.losses import JointInferenceLoss
+from models.configs import ObservationHeadConfig
+from models.observation_heads import ClinicalObservationHead, WastewaterObservationHead
 from tests.eval_test_helpers import make_granular_row, write_granular_fixture
 
 
@@ -53,6 +55,16 @@ class _DummyModel(torch.nn.Module):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         return batch_data.model_outputs, batch_data.targets_dict
 
+    def forward_inputs(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return {"batch_data": batch_data}
+
+    def forward(self, batch_data):  # noqa: ANN001
+        return batch_data.model_outputs
+
+    @staticmethod
+    def batch_targets(batch_data):  # noqa: ANN001
+        return batch_data.targets_dict
+
 
 def _make_batch() -> SimpleNamespace:
     batch = SimpleNamespace(
@@ -77,6 +89,55 @@ def _make_batch() -> SimpleNamespace:
                 [[1.0, 0.0], [1.0, 0.0]],
                 dtype=torch.float32,
             ),
+            "mechanistic_hosp": torch.tensor(
+                [[0.0, 0.75, 2.0], [0.0, 1.0, 2.5]],
+                dtype=torch.float32,
+            ),
+            "residual_hosp": torch.tensor(
+                [[0.0, 0.25, 0.5], [0.0, 0.5, 0.5]],
+                dtype=torch.float32,
+            ),
+            "mechanistic_ww": torch.tensor(
+                [[0.0, 0.3, 0.25], [0.0, 0.4, 0.45]],
+                dtype=torch.float32,
+            ),
+            "residual_ww": torch.tensor(
+                [[0.0, 0.1, 0.15], [0.0, 0.1, 0.05]],
+                dtype=torch.float32,
+            ),
+            "mechanistic_cases": torch.tensor(
+                [[0.0, 2.5, 3.5], [0.0, 4.0, 5.0]],
+                dtype=torch.float32,
+            ),
+            "residual_cases": torch.tensor(
+                [[0.0, 0.5, 0.5], [0.0, 1.0, 1.0]],
+                dtype=torch.float32,
+            ),
+            "mechanistic_deaths": torch.tensor(
+                [[0.75, 0.25], [0.8, 0.2]],
+                dtype=torch.float32,
+            ),
+            "residual_deaths": torch.tensor(
+                [[0.25, -0.25], [0.2, -0.2]],
+                dtype=torch.float32,
+            ),
+            "S_trajectory": torch.full((2, 3), 0.7, dtype=torch.float32),
+            "I_trajectory": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "H_trajectory": torch.full((2, 3), 0.05, dtype=torch.float32),
+            "R_trajectory": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "D_trajectory": torch.full((2, 3), 0.05, dtype=torch.float32),
+            "hospitalization_flow": torch.tensor(
+                [[0.02, 0.03], [0.04, 0.05]],
+                dtype=torch.float32,
+            ),
+            "death_flow": torch.zeros((2, 2), dtype=torch.float32),
+            "observation_source_hosp": torch.tensor(
+                [[0.0, 0.02, 0.03], [0.0, 0.04, 0.05]],
+                dtype=torch.float32,
+            ),
+            "observation_source_ww": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "observation_source_cases": torch.full((2, 3), 0.1, dtype=torch.float32),
+            "observation_source_deaths": torch.zeros((2, 2), dtype=torch.float32),
             "physics_residual": torch.zeros((2, 2), dtype=torch.float32),
         },
         targets_dict={
@@ -128,7 +189,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     model = _DummyModel()
     batch = _make_batch()
     loader = _DummyLoader([batch])
-    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0)
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0)
 
     baseline_loss, baseline_metrics, baseline_node_mae = evaluate_loader(
         model=model,
@@ -137,6 +198,45 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         horizon=2,
         device=torch.device("cpu"),
     )
+    assert baseline_metrics["observation_latent_hosp_observed_count"] == 4
+    for pathway in ("full", "mechanistic_only"):
+        prefix = f"observation_latent_hosp_{pathway}"
+        assert baseline_metrics[f"{prefix}_mean_window_spearman"] == pytest.approx(1.0)
+        assert baseline_metrics[f"{prefix}_window_spearman_total_count"] == 2
+        assert baseline_metrics[f"{prefix}_window_spearman_candidate_count"] == 2
+        assert baseline_metrics[f"{prefix}_window_spearman_eligible_count"] == 2
+        assert baseline_metrics[f"{prefix}_window_spearman_candidate_fraction"] == (
+            pytest.approx(1.0)
+        )
+        assert baseline_metrics[f"{prefix}_window_spearman_eligible_fraction"] == (
+            pytest.approx(1.0)
+        )
+        assert baseline_metrics[
+            f"{prefix}_window_spearman_eligible_given_candidate_fraction"
+        ] == pytest.approx(1.0)
+    assert "observation_latent_hosp_mean_window_spearman" not in baseline_metrics
+    assert (
+        "observation_latent_hosp_mean_window_mechanistic_spearman"
+        not in baseline_metrics
+    )
+    zero_eligible_prefix = "observation_latent_ww_full"
+    assert math.isnan(baseline_metrics[f"{zero_eligible_prefix}_mean_window_spearman"])
+    assert baseline_metrics[f"{zero_eligible_prefix}_window_spearman_total_count"] == 2
+    assert (
+        baseline_metrics[f"{zero_eligible_prefix}_window_spearman_candidate_count"] == 1
+    )
+    assert (
+        baseline_metrics[f"{zero_eligible_prefix}_window_spearman_eligible_count"] == 0
+    )
+    assert baseline_metrics[
+        f"{zero_eligible_prefix}_window_spearman_candidate_fraction"
+    ] == pytest.approx(0.5)
+    assert baseline_metrics[
+        f"{zero_eligible_prefix}_window_spearman_eligible_fraction"
+    ] == pytest.approx(0.0)
+    assert baseline_metrics[
+        f"{zero_eligible_prefix}_window_spearman_eligible_given_candidate_fraction"
+    ] == pytest.approx(0.0)
 
     granular_output = tmp_path / "eval_granular.parquet"
     per_head_csv = tmp_path / "eval_node_metrics_per_head.csv"
@@ -177,10 +277,21 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
         "target_date",
         "observed",
         "prediction",
+        "mechanistic_prediction",
+        "residual_contribution",
+        "relevant_latent_name",
+        "relevant_latent_value",
         "abs_error",
         "sq_error",
         "nll",
         "crps",
+        "wis",
+        "distribution_loc",
+        "distribution_scale",
+        "distribution_family",
+        "distribution_df",
+        "observed_mask",
+        "observation_weight",
         "interval_low_50",
         "interval_high_50",
         "covered_50",
@@ -217,6 +328,10 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert hosp_row["target_date"] == "2024-01-04T00:00:00"
     assert hosp_row["observed"] == pytest.approx(1.0)
     assert hosp_row["prediction"] == pytest.approx(1.0)
+    assert hosp_row["mechanistic_prediction"] == pytest.approx(0.75)
+    assert hosp_row["residual_contribution"] == pytest.approx(0.25)
+    assert hosp_row["relevant_latent_name"] == "hospitalization_flow"
+    assert hosp_row["relevant_latent_value"] == pytest.approx(0.02)
     assert hosp_row["abs_error"] == pytest.approx(0.0)
     assert math.isfinite(hosp_row["nll"])
     assert math.isfinite(hosp_row["crps"])
@@ -231,7 +346,7 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert fallback_row["region_label"] == "08002"
 
     meta = pd.read_json(granular_output.with_suffix(".parquet.meta.json"), typ="series")
-    assert meta["schema_version"] == "2"
+    assert meta["schema_version"] == "4"
     assert meta["granular_eval_format"] == "parquet"
     assert bool(meta["observed_only"]) is True
     assert meta["max_batches"] == 50
@@ -242,6 +357,12 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert "node_split_population_bins" in meta.index
     assert "val_split" in meta.index
     assert "test_split" in meta.index
+    assert meta["relevant_source_mapping"] == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
 
     per_head_df = pd.read_csv(per_head_csv, dtype={"region_id": str})
     assert list(per_head_df.columns) == [
@@ -279,6 +400,54 @@ def test_evaluate_loader_writes_granular_parquet_without_changing_metrics(
     assert per_head_meta["dataset_path"] == "/tmp/dummy-dataset.zarr"
     assert per_head_meta["run_id"] == "real"
     assert per_head_meta["split"] == "eval"
+    assert per_head_meta["relevant_source_mapping"] == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
+
+
+def test_evaluate_loader_uses_configured_compartment_plot_sources(
+    tmp_path: Path,
+) -> None:
+    granular_csv = tmp_path / "configured_sources.csv"
+    evaluate_loader(
+        model=_DummyModel(),
+        loader=_DummyLoader([_make_batch()]),
+        criterion=JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0),
+        horizon=2,
+        device=torch.device("cpu"),
+        granular_output_path=granular_csv,
+        granular_eval_format="csv",
+        relevant_source_mapping={
+            "hosp": "H",
+            "ww": "I",
+            "cases": "I",
+            "deaths": "D",
+        },
+    )
+
+    rows = pd.read_csv(granular_csv)
+    hosp_row = rows[
+        (rows["target"] == "hospitalizations") & (rows["horizon"] == 1)
+    ].iloc[0]
+    assert hosp_row["relevant_latent_name"] == "H"
+    assert hosp_row["relevant_latent_value"] == pytest.approx(0.05)
+
+    deaths_row = rows[(rows["target"] == "deaths") & (rows["horizon"] == 1)].iloc[0]
+    assert deaths_row["relevant_latent_name"] == "D"
+    assert deaths_row["relevant_latent_value"] == pytest.approx(0.05)
+
+    metadata = json.loads(
+        granular_csv.with_suffix(".csv.meta.json").read_text(encoding="utf-8")
+    )
+    assert metadata["relevant_source_mapping"] == {
+        "hosp": "H",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "D",
+    }
 
 
 def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
@@ -287,7 +456,7 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
     model = _DummyModel()
     batch = _make_batch()
     loader = _DummyLoader([batch])
-    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0)
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0)
     granular_csv = tmp_path / "eval_granular.csv"
 
     evaluate_loader(
@@ -314,10 +483,21 @@ def test_evaluate_loader_csv_opt_in_writes_legacy_granular_csv(
         "target_date",
         "observed",
         "prediction",
+        "mechanistic_prediction",
+        "residual_contribution",
+        "relevant_latent_name",
+        "relevant_latent_value",
         "abs_error",
         "sq_error",
         "nll",
         "crps",
+        "wis",
+        "distribution_loc",
+        "distribution_scale",
+        "distribution_family",
+        "distribution_df",
+        "observed_mask",
+        "observation_weight",
         "interval_low_50",
         "interval_high_50",
         "covered_50",
@@ -336,6 +516,9 @@ class _ExplodingModel(_DummyModel):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         raise RuntimeError("boom")
 
+    def forward(self, batch_data):  # noqa: ANN001
+        raise RuntimeError("boom")
+
 
 def test_evaluate_loader_logs_batch_context_on_failure(
     caplog: pytest.LogCaptureFixture,
@@ -343,7 +526,7 @@ def test_evaluate_loader_logs_batch_context_on_failure(
     model = _ExplodingModel()
     batch = _make_batch()
     loader = _DummyLoader([batch])
-    criterion = JointInferenceLoss(obs_weight_sum=4.0, w_sird_supervision=0.0)
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0)
 
     with caplog.at_level(logging.INFO):
         with pytest.raises(RuntimeError, match="boom"):
@@ -376,7 +559,7 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
         model=SimpleNamespace(
             forecast_horizon=2,
             input_window_length=3,
-            observation_heads=SimpleNamespace(distribution_scale_floor=1.0e-3),
+            observation_heads=ObservationHeadConfig(),
         ),
         output=SimpleNamespace(
             write_granular_eval=True,
@@ -500,6 +683,12 @@ def test_eval_checkpoint_threads_eval_overrides_to_loader_and_evaluator(
     )
     assert captured["evaluate_kwargs"]["granular_metadata"]["eval_pin_memory"] is False
     assert captured["evaluate_kwargs"]["node_metrics_target"] == "hospitalizations"
+    assert captured["evaluate_kwargs"]["relevant_source_mapping"] == {
+        "hosp": "hospitalization_flow",
+        "ww": "I",
+        "cases": "I",
+        "deaths": "death_flow",
+    }
 
 
 def test_compare_granular_csvs_strict_join_and_aggregates(tmp_path: Path) -> None:
@@ -839,3 +1028,172 @@ def test_compare_granular_csvs_fails_when_no_common_targets(tmp_path: Path) -> N
             candidate_csv=candidate_csv,
             output_dir=tmp_path / "compare",
         )
+
+
+class _KernelMetricModel(torch.nn.Module):
+    """Dummy model carrying real observation heads for kernel diagnostics."""
+
+    def __init__(self, heads: dict[str, torch.nn.Module]) -> None:
+        super().__init__()
+        for name, head in heads.items():
+            setattr(self, f"{name}_head", head)
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+    def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return batch_data.model_outputs, batch_data.targets_dict
+
+    def forward_inputs(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return {"batch_data": batch_data}
+
+    def forward(self, batch_data):  # noqa: ANN001
+        return batch_data.model_outputs
+
+    @staticmethod
+    def batch_targets(batch_data):  # noqa: ANN001
+        return batch_data.targets_dict
+
+
+class _CompiledWrapper(torch.nn.Module):
+    """Stand-in for torch.compile's OptimizedModule (_orig_mod attribute)."""
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self._orig_mod = model
+
+    def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return self._orig_mod.forward_batch(
+            batch_data, region_embeddings=region_embeddings, **kwargs
+        )
+
+    def forward(self, **kwargs):  # noqa: ANN003
+        return self._orig_mod(**kwargs)
+
+
+def _campaign_heads() -> dict[str, ClinicalObservationHead]:
+    return {
+        "hosp": ClinicalObservationHead(
+            kernel_length=21,
+            gamma_shape=5.0,
+            gamma_scale=2.0,
+            learnable_kernel=False,
+            kernel_parameterization="gamma",
+        ),
+        "cases": ClinicalObservationHead(
+            kernel_length=14,
+            learnable_kernel=True,
+            kernel_parameterization="simplex",
+        ),
+        "deaths": ClinicalObservationHead(
+            kernel_length=21,
+            gamma_shape=12.25,
+            gamma_scale=4.0 / 7.0,
+            learnable_kernel=True,
+            kernel_parameterization="gamma",
+        ),
+    }
+
+
+def test_add_delay_kernel_metrics_fixed_simplex_and_gamma() -> None:
+    from evaluation.eval_loop import _add_delay_kernel_metrics
+
+    metrics: dict[str, object] = {}
+    _add_delay_kernel_metrics(
+        metrics=metrics, model=_KernelMetricModel(_campaign_heads())
+    )
+
+    # Frozen Gamma hospitalization kernel: zero kernel DOF plus Gamma state.
+    assert metrics["kernel_hosp_trainable_parameter_count"] == 0
+    assert metrics["kernel_hosp_mean_delay_days"] == pytest.approx(10.0, abs=1.0)
+    assert metrics["kernel_hosp_delay_std_days"] > 0.0
+    assert metrics["kernel_hosp_gamma_shape"] == pytest.approx(5.0)
+    assert metrics["kernel_hosp_gamma_scale"] == pytest.approx(2.0)
+    for bound in (
+        "shape_lower",
+        "shape_upper",
+        "scale_lower",
+        "scale_upper",
+    ):
+        assert metrics[f"kernel_hosp_gamma_{bound}_bound_hit"] == 0
+
+    # Learnable simplex cases kernel: one DOF per lag, no Gamma keys.
+    assert metrics["kernel_cases_trainable_parameter_count"] == 14
+    assert metrics["kernel_cases_mean_delay_days"] > 0.0
+    assert metrics["kernel_cases_delay_std_days"] >= 0.0
+    assert not any(key.startswith("kernel_cases_gamma") for key in metrics)
+
+    # Learnable Gamma deaths kernel: two raw coordinates and finite summary
+    # diagnostics under the open-interior bounded transform.
+    assert metrics["kernel_deaths_trainable_parameter_count"] == 2
+    assert math.isfinite(metrics["kernel_deaths_gamma_shape"])
+    assert math.isfinite(metrics["kernel_deaths_gamma_scale"])
+    assert math.isfinite(metrics["kernel_deaths_mean_delay_days"])
+    assert math.isfinite(metrics["kernel_deaths_delay_std_days"])
+    assert metrics["kernel_deaths_gamma_shape"] == pytest.approx(12.25)
+    assert metrics["kernel_deaths_gamma_scale"] == pytest.approx(4.0 / 7.0)
+    assert not any(
+        metrics[f"kernel_deaths_gamma_{bound}_bound_hit"]
+        for bound in ("shape_lower", "shape_upper", "scale_lower", "scale_upper")
+    )
+
+    # No wastewater kernel metrics: the WW head was absent from this model.
+    assert not any(key.startswith("kernel_ww") for key in metrics)
+
+
+def test_add_delay_kernel_metrics_reports_wastewater_gamma() -> None:
+    from evaluation.eval_loop import _add_delay_kernel_metrics
+
+    ww_head = WastewaterObservationHead(
+        kernel_length=35,
+        learnable_kernel=True,
+        kernel_parameterization="gamma",
+        gamma_shape=2.0,
+        gamma_scale=6.0,
+        residual_dim=0,
+    )
+    metrics: dict[str, object] = {}
+    _add_delay_kernel_metrics(
+        metrics=metrics, model=_KernelMetricModel({"ww": ww_head})
+    )
+
+    assert metrics["kernel_ww_trainable_parameter_count"] == 2
+    assert metrics["kernel_ww_gamma_shape"] == pytest.approx(2.0)
+    assert metrics["kernel_ww_gamma_scale"] == pytest.approx(6.0)
+    # Literature-anchored prior: mean 12 d, CV 0.7 → std 8.4 d.
+    assert metrics["kernel_ww_mean_delay_days"] == pytest.approx(12.0, abs=1.5)
+    assert metrics["kernel_ww_delay_std_days"] == pytest.approx(8.4, abs=2.0)
+    assert not any(
+        metrics[f"kernel_ww_gamma_{bound}_bound_hit"]
+        for bound in ("shape_lower", "shape_upper", "scale_lower", "scale_upper")
+    )
+
+
+def test_add_delay_kernel_metrics_unwraps_compiled_models() -> None:
+    from evaluation.eval_loop import _add_delay_kernel_metrics
+
+    metrics: dict[str, object] = {}
+    _add_delay_kernel_metrics(
+        metrics=metrics,
+        model=_CompiledWrapper(
+            _KernelMetricModel({"cases": _campaign_heads()["cases"]})
+        ),
+    )
+    assert metrics["kernel_cases_trainable_parameter_count"] == 14
+    assert not any(key.startswith("kernel_hosp") for key in metrics)
+
+
+def test_evaluate_loader_emits_delay_kernel_metrics(tmp_path: Path) -> None:
+    model = _KernelMetricModel(_campaign_heads())
+    loader = _DummyLoader([_make_batch()])
+    criterion = JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0)
+
+    _, metrics, _ = evaluate_loader(
+        model=model,
+        loader=loader,
+        criterion=criterion,
+        horizon=2,
+        device=torch.device("cpu"),
+    )
+    assert metrics["kernel_hosp_gamma_shape"] == pytest.approx(5.0)
+    assert metrics["kernel_hosp_trainable_parameter_count"] == 0
+    assert metrics["kernel_cases_trainable_parameter_count"] == 14
+    assert metrics["kernel_deaths_gamma_shape"] == pytest.approx(12.25)

@@ -27,6 +27,7 @@ def _make_config() -> SimpleNamespace:
             val_workers=0,
             test_workers=0,
             batch_size=4,
+            eval_batch_size=4,
             pin_memory=False,
             prefetch_factor=None,
         ),

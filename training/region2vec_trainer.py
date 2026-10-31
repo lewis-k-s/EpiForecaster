@@ -52,10 +52,12 @@ class RegionDataConfig:
     Attributes:
         zarr_path: Path to zarr file containing features/edges/flows/ids.
         normalize_features: Whether to L2-normalize feature rows.
+        use_mobility_flows: Whether to load and use mobility flow supervision.
     """
 
     zarr_path: Path
     normalize_features: bool = True
+    use_mobility_flows: bool = True
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], base_dir: Path) -> RegionDataConfig:
@@ -70,6 +72,7 @@ class RegionDataConfig:
         return cls(
             zarr_path=zarr_path,
             normalize_features=raw.get("normalize_features", True),
+            use_mobility_flows=raw.get("use_mobility_flows", True),
         )
 
 
@@ -469,11 +472,17 @@ class Region2VecTrainer:
         # Load required data
         self.features = self.dataset.get_all_features()
         self.edge_index = self.dataset.get_edge_index()
-        raw_flow_matrix = self.dataset.get_flow_matrix()
-        self.flow_source = self.dataset.flow_source or (
-            "mobility" if raw_flow_matrix is not None else "adjacency"
-        )
-        self.flow_matrix = raw_flow_matrix if self.flow_source == "mobility" else None
+        if config.data.use_mobility_flows:
+            raw_flow_matrix = self.dataset.get_flow_matrix()
+            self.flow_source = self.dataset.flow_source or (
+                "mobility" if raw_flow_matrix is not None else "adjacency"
+            )
+            self.flow_matrix = (
+                raw_flow_matrix if self.flow_source == "mobility" else None
+            )
+        else:
+            self.flow_source = "disabled"
+            self.flow_matrix = None
         self.region_ids = self.dataset.get_region_ids()
 
         self.num_nodes = self.features.size(0)
@@ -741,6 +750,9 @@ class Region2VecTrainer:
             "feature_dim": self.feature_dim,
             "edges": int(self.edge_index.size(1)),
             "flow_matrix": "available" if self.flow_matrix is not None else "missing",
+            "mobility_flows": (
+                "enabled" if self.config.data.use_mobility_flows else "disabled"
+            ),
             "embedding_dim": self.config.encoder.embedding_dim,
             "device": str(self.device),
             "epochs": self.config.training.epochs,
@@ -1016,7 +1028,8 @@ class Region2VecTrainer:
         if self.config.loss.loss_type == "community":
             if self.flow_matrix is None:
                 raise ValueError(
-                    "Community loss requires a flow matrix. Provide `flow_path` in the config data section."
+                    "Community loss requires mobility flows. Set "
+                    "data.use_mobility_flows=true or loss.loss_type=spatial."
                 )
             return CommunityOrientedLoss(
                 temperature=self.config.loss.temperature,

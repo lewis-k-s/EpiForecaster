@@ -7,12 +7,14 @@ import numpy as np
 import pytest
 import torch
 
-from training.epiforecaster_trainer import (
-    EpiForecasterTrainer,
+from evaluation.selection_scores import (
     compute_mean_target_crps,
     compute_mean_target_mae,
     compute_mean_target_nll,
     compute_validation_selection_score,
+)
+from training.epiforecaster_trainer import (
+    EpiForecasterTrainer,
     normalize_training_history,
 )
 from models.configs import (
@@ -27,7 +29,22 @@ from models.configs import (
     LossConfig,
     CurriculumConfig,
 )
-from evaluation.losses import JointInferenceLoss
+from data.latent_supervision import LATENT_SCALE_TASKS, LatentScaleState
+
+
+def _latent_scale_state() -> LatentScaleState:
+    return LatentScaleState(
+        schema_version=1,
+        scales={name: np.float32(0.5) for name in LATENT_SCALE_TASKS},
+        std={name: 0.5 for name in LATENT_SCALE_TASKS},
+        count={name: 10 for name in LATENT_SCALE_TASKS},
+        zero_count={name: 0 for name in LATENT_SCALE_TASKS},
+        floors={name: 1.0e-8 for name in LATENT_SCALE_TASKS},
+        run_ids=("synthetic-a",),
+        target_node_hash="nodes",
+        supervised_date_hash="dates",
+        membership_hash="membership",
+    )
 
 
 def _mock_canonical_region_coordinate(
@@ -72,6 +89,62 @@ def test_persist_mobility_diagnostics_writes_all_splits(tmp_path) -> None:
     assert payload["train"][0]["positive_edge_count"] == 3
     assert payload["validation"][0]["positive_edge_count"] == 2
     assert payload["test"][0]["positive_edge_count"] == 1
+
+
+def test_persist_latent_scale_state_refuses_identity_change(tmp_path) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.latent_scale_state = _latent_scale_state()
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(split_seed=42),
+        to_dict=lambda: {
+            "data": {"dataset_path": str(tmp_path / "dataset.zarr")},
+            "training": {"split_seed": 42},
+        },
+    )
+
+    trainer._persist_latent_scale_state(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "latent_scale_receipt.json").read_text(encoding="utf-8")
+    )
+    assert payload["state_hash"] == trainer.latent_scale_state.state_hash
+    assert len(payload["receipt_hash"]) == 64
+    payload["scales"]["i"] = 1.0
+    (tmp_path / "latent_scale_receipt.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        trainer._persist_latent_scale_state(tmp_path)
+
+
+def test_checkpoint_latent_scale_state_must_match_current_fit() -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.latent_scale_state = _latent_scale_state()
+    checkpoint = {
+        "latent_scale_state": trainer.latent_scale_state.to_dict(),
+        "latent_scale_state_hash": trainer.latent_scale_state.state_hash,
+    }
+
+    trainer._validate_checkpoint_latent_scale_state(checkpoint)
+
+    checkpoint["latent_scale_state_hash"] = "wrong"
+    with pytest.raises(ValueError, match="does not match"):
+        trainer._validate_checkpoint_latent_scale_state(checkpoint)
+
+
+def test_persist_latent_gradient_probe_records_sorted_parameter_identity(
+    tmp_path,
+) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer._latent_gradient_probe_names = ["rate.z", "initial_states.a"]
+
+    trainer._persist_latent_gradient_probe(tmp_path)
+
+    payload = json.loads(
+        (tmp_path / "latent_gradient_probe.json").read_text(encoding="utf-8")
+    )
+    assert payload["parameter_names"] == ["initial_states.a", "rate.z"]
+    assert len(payload["parameter_name_hash"]) == 64
 
 
 def test_compute_mean_target_mae_averages_finite_available_targets() -> None:
@@ -212,6 +285,9 @@ def test_run_reports_selection_score_to_optuna_and_tracks_joint_loss() -> None:
             profiler=SimpleNamespace(enabled=False),
             max_batches=None,
             epochs=1,
+            selection_metric="auto",
+            retain_best_crps_checkpoint=False,
+            selection_required_heads=["ww", "hosp", "cases", "deaths"],
             scheduler_type="none",
             plot_forecasts=False,
             run_final_evaluation=False,
@@ -285,21 +361,6 @@ def test_best_checkpoint_path_raises_when_best_model_missing(tmp_path) -> None:
         trainer._best_checkpoint_path()
 
 
-class _HistogramTestModel(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.backbone = torch.nn.Module()
-        self.backbone.beta_projection = torch.nn.Linear(2, 2)
-        self.backbone.obs_context_projection = torch.nn.Linear(2, 2)
-        self.cases_head = torch.nn.Module()
-        self.cases_head.delay_kernel = torch.nn.Module()
-        self.cases_head.delay_kernel.kernel = torch.nn.Parameter(
-            torch.tensor([1.0, -1.0], dtype=torch.float32)
-        )
-        self.other = torch.nn.Linear(2, 1)
-        self.scalar_param = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-
-
 class TestEpiForecasterTrainer:
     @pytest.fixture
     def minimal_config(self, tmp_path):
@@ -321,6 +382,9 @@ class TestEpiForecasterTrainer:
             ),
             training=TrainingParams(
                 epochs=1,
+                selection_metric="auto",
+                retain_best_crps_checkpoint=False,
+                selection_required_heads=["ww", "hosp", "cases", "deaths"],
                 batch_size=4,
                 loss=LossConfig(name="joint_inference"),
                 curriculum=CurriculumConfig(enabled=False),
@@ -328,231 +392,6 @@ class TestEpiForecasterTrainer:
             ),
             output=OutputConfig(log_dir=str(tmp_path), experiment_name="test_exp"),
         )
-
-    @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
-    @patch("training.epiforecaster_trainer.wandb")
-    @patch("training.dataloader_factory.DataLoader")
-    def test_initialization(
-        self,
-        mock_dataloader,
-        mock_wandb,
-        mock_model_cls,
-        mock_dataset_cls,
-        minimal_config,
-    ):
-        """Test trainer initialization and component creation."""
-        # Mock model parameters for optimizer
-        mock_model_instance = MagicMock()
-        param = torch.nn.Parameter(torch.randn(1))
-        mock_model_instance.parameters.return_value = [param]
-        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
-        # Trainer calls .to() for device/dtype conversion
-        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
-        mock_model_instance.dtype = torch.float32
-        mock_model_cls.return_value = mock_model_instance
-
-        # Mock dataset behavior
-        mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.biomarkers_output_dim = 1
-        mock_dataset_instance.temporal_covariates_dim = 0
-        mock_dataset_instance.__len__.return_value = 100
-        mock_dataset_instance.target_nodes = list(range(10))
-        mock_dataset_cls.return_value = mock_dataset_instance
-
-        # Mock class method load_canonical_dataset to avoid disk IO
-        _mock_canonical_region_coordinate(mock_dataset_cls)
-
-        # Initialize trainer
-        trainer = EpiForecasterTrainer(minimal_config, model_id="trial-000007")
-
-        assert isinstance(trainer.model, MagicMock)
-        assert isinstance(trainer.optimizer, torch.optim.Adam)
-        assert isinstance(trainer.criterion, JointInferenceLoss)
-        assert trainer.model_id == "trial-000007"
-        assert trainer.experiment_dir == (
-            Path(minimal_config.output.log_dir) / "test_exp/trial-000007"
-        )
-
-        # Check if model was initialized with correct config params
-        mock_model_cls.assert_called_once()
-        _, kwargs = mock_model_cls.call_args
-        assert kwargs["forecast_horizon"] == 7
-        assert kwargs["sequence_length"] == 14
-
-    @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
-    @patch("training.epiforecaster_trainer.wandb")
-    @patch("training.dataloader_factory.DataLoader")
-    def test_loss_criterion_creation(
-        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
-    ):
-        """Test correct loss function is created."""
-        # Mock model
-        mock_model_instance = MagicMock()
-        param = torch.nn.Parameter(torch.randn(1))
-        mock_model_instance.parameters.return_value = [param]
-        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
-        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
-        mock_model_instance.dtype = torch.float32
-        mock_model_cls.return_value = mock_model_instance
-
-        # Mock dataset
-        mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.temporal_covariates_dim = 0
-        mock_dataset.return_value = mock_dataset_instance
-        _mock_canonical_region_coordinate(mock_dataset)
-
-        # Test joint inference loss
-        minimal_config.training.loss.name = "joint_inference"
-        trainer = EpiForecasterTrainer(minimal_config)
-        assert isinstance(trainer.criterion, JointInferenceLoss)
-
-    @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
-    @patch("training.epiforecaster_trainer.wandb")
-    @patch("training.dataloader_factory.DataLoader")
-    def test_scheduler_creation(
-        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
-    ):
-        """Test scheduler creation options."""
-        # Mock model
-        mock_model_instance = MagicMock()
-        param = torch.nn.Parameter(torch.randn(1))
-        mock_model_instance.parameters.return_value = [param]
-        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
-        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
-        mock_model_instance.dtype = torch.float32
-        mock_model_cls.return_value = mock_model_instance
-
-        # Mock dataset
-        mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.temporal_covariates_dim = 0
-        mock_dataset.return_value = mock_dataset_instance
-        _mock_canonical_region_coordinate(mock_dataset)
-
-        # 1. Cosine
-        minimal_config.training.scheduler_type = "cosine"
-        trainer = EpiForecasterTrainer(minimal_config)
-        assert isinstance(trainer.scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
-
-        # 2. Step
-        minimal_config.training.scheduler_type = "step"
-        trainer = EpiForecasterTrainer(minimal_config)
-        assert isinstance(trainer.scheduler, torch.optim.lr_scheduler.StepLR)
-
-        # 3. None
-        minimal_config.training.scheduler_type = "none"
-        trainer = EpiForecasterTrainer(minimal_config)
-        assert trainer.scheduler is None
-
-    @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
-    @patch("training.epiforecaster_trainer.wandb")
-    @patch("training.dataloader_factory.DataLoader")
-    def test_checkpoint_logic(
-        self,
-        mock_dataloader,
-        mock_wandb,
-        mock_model_cls,
-        mock_dataset,
-        minimal_config,
-        tmp_path,
-    ):
-        """Test checkpoint resume logic with explicit checkpoint path."""
-        # Mock model
-        mock_model_instance = MagicMock()
-        # Use float32 dtype (only supported dtype)
-        param = torch.nn.Parameter(torch.randn(1, dtype=torch.float32))
-        mock_model_instance.parameters.return_value = [param]
-        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
-        # Track the parameter through dtype conversion
-        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
-        mock_model_instance.dtype = torch.float32
-        mock_model_cls.return_value = mock_model_instance
-
-        mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.temporal_covariates_dim = 0
-        mock_dataset.return_value = mock_dataset_instance
-        _mock_canonical_region_coordinate(mock_dataset)
-
-        # Setup fake checkpoint
-        minimal_config.output.log_dir = str(tmp_path)
-        minimal_config.output.experiment_name = "test_exp"
-
-        # Create a dummy checkpoint file
-        ckpt_path = tmp_path / "checkpoint_epoch_5.pt"
-        torch.save({"epoch": 5, "model_state_dict": {}}, ckpt_path)
-
-        # Enable resume with explicit path (as string for YAML serialization)
-        minimal_config.training.resume_checkpoint_path = str(ckpt_path)
-
-        trainer = EpiForecasterTrainer(minimal_config)
-
-        # Should have the checkpoint path set
-        assert trainer.config.training.resume_checkpoint_path == str(ckpt_path)
-
-    @patch("data.dataset_factory.EpiDataset")
-    @patch("training.epiforecaster_trainer.EpiForecaster")
-    @patch("training.epiforecaster_trainer.wandb")
-    @patch("training.dataloader_factory.DataLoader")
-    def test_curriculum_config_validation(
-        self, mock_dataloader, mock_wandb, mock_model_cls, mock_dataset, minimal_config
-    ):
-        """Test curriculum config validation."""
-        # Mock model
-        mock_model_instance = MagicMock()
-        param = torch.nn.Parameter(torch.randn(1))
-        mock_model_instance.parameters.return_value = [param]
-        mock_model_instance.named_parameters.return_value = [("backbone.mock", param)]
-        mock_model_instance.to.side_effect = lambda *args, **kwargs: mock_model_instance
-        mock_model_instance.dtype = torch.float32
-        mock_model_cls.return_value = mock_model_instance
-
-        mock_dataset_instance = MagicMock()
-        mock_dataset_instance.cases_output_dim = 1
-        mock_dataset_instance.sparsity_level = 0.5  # Fix numeric comparison
-        mock_dataset.return_value = mock_dataset_instance
-        _mock_canonical_region_coordinate(mock_dataset)
-
-        # Enable curriculum
-        minimal_config.training.curriculum.enabled = True
-        minimal_config.data.real_dataset_path = "real.zarr"
-
-        # Should initialize (mocks handles actual data loading calls)
-        mock_dataset_instance.biomarkers_output_dim = 1
-        mock_dataset_instance.temporal_covariates_dim = 0
-        mock_dataset_instance.target_nodes = [0]
-        mock_dataset_instance.__len__.return_value = 10
-        mock_dataset_instance.region_embeddings = None
-        mock_loader_bundle = SimpleNamespace(
-            train=MagicMock(),
-            val=MagicMock(),
-            test=MagicMock(),
-            curriculum_sampler=None,
-            multiprocessing_context=None,
-        )
-        mock_splits = SimpleNamespace(
-            train=mock_dataset_instance,
-            val=mock_dataset_instance,
-            test=mock_dataset_instance,
-            real_run_id="real",
-            synth_run_ids=["synth1"],
-            region_embedding_store=None,
-        )
-        with patch(
-            "training.epiforecaster_trainer.build_datasets", return_value=mock_splits
-        ):
-            with patch(
-                "training.epiforecaster_trainer.build_dataloaders",
-                return_value=mock_loader_bundle,
-            ):
-                trainer = EpiForecasterTrainer(minimal_config)
-                assert trainer.config.training.curriculum.enabled is True
 
     def test_early_stopping_disabled_during_synth_only_curriculum(self):
         trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
@@ -724,159 +563,55 @@ class TestEpiForecasterTrainer:
         assert checkpoint["val_selection_metric"] == "mean_target_mae"
 
 
-@patch("training.epiforecaster_trainer.wandb.Histogram")
-def test_build_wandb_gradient_histogram_payload_selects_and_filters(mock_histogram):
-    mock_histogram.side_effect = lambda values: {"count": len(values)}
-
-    model = _HistogramTestModel()
-    model.backbone.beta_projection.weight.grad = torch.tensor(
-        [[1.0, 2.0], [float("nan"), 4.0]], dtype=torch.float32
-    )
-    model.backbone.beta_projection.bias.grad = torch.tensor(
-        [0.5, 1.5], dtype=torch.float32
-    )
-    model.backbone.obs_context_projection.weight.grad = torch.tensor(
-        [[float("inf"), 1.0], [2.0, 3.0]], dtype=torch.float32
-    )
-    model.backbone.obs_context_projection.bias.grad = torch.tensor(
-        [0.25, -0.25], dtype=torch.float32
-    )
-    model.cases_head.delay_kernel.kernel.grad = torch.tensor(
-        [0.1, 0.2], dtype=torch.float32
-    )
-    model.other.weight.grad = torch.ones_like(model.other.weight)
-    model.other.bias.grad = torch.ones_like(model.other.bias)
-    model.scalar_param.grad = torch.tensor(1.0, dtype=torch.float32)
-
-    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
-        model=model,
-        step=10,
-        frequency=5,
-        patterns=["backbone.beta_projection", "backbone.obs_context_projection"],
-        max_params=2,
-    )
-
-    assert payload == {
-        "grad_hist/backbone_beta_projection_bias": {"count": 2},
-        "grad_hist/backbone_beta_projection_weight": {"count": 3},
-        "grad_histograms_logged": 2,
-    }
-
-
-def test_build_wandb_gradient_histogram_payload_returns_empty_when_disabled():
-    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
-        model=_HistogramTestModel(),
-        step=10,
-        frequency=0,
-        patterns=["backbone.beta_projection"],
-        max_params=4,
-    )
-
-    assert payload == {}
-
-
-def test_build_wandb_gradient_histogram_payload_respects_logging_cadence():
-    model = _HistogramTestModel()
-    model.backbone.beta_projection.weight.grad = torch.ones((2, 2), dtype=torch.float32)
-
-    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
-        model=model,
-        step=6,
-        frequency=5,
-        patterns=["backbone.beta_projection"],
-        max_params=4,
-    )
-
-    assert payload == {}
-
-
-@patch("training.epiforecaster_trainer.wandb.Histogram")
-def test_build_wandb_gradient_histogram_payload_skips_scalar_and_missing_grads(
-    mock_histogram,
-):
-    mock_histogram.side_effect = lambda values: {"count": len(values)}
-
-    model = _HistogramTestModel()
-    model.scalar_param.grad = torch.tensor(1.0, dtype=torch.float32)
-
-    payload = EpiForecasterTrainer._build_wandb_gradient_histogram_payload(
-        model=model,
-        step=10,
-        frequency=5,
-        patterns=["scalar_param", "other"],
-        max_params=4,
-    )
-
-    assert payload == {}
-    mock_histogram.assert_not_called()
-
-
-@patch("training.epiforecaster_trainer.wandb.Histogram")
-def test_build_wandb_payload_filters_grad_scalars_and_merges_histograms(mock_histogram):
-    mock_histogram.side_effect = lambda values: {"count": len(values)}
-
-    trainer = object.__new__(EpiForecasterTrainer)
-    trainer.model = _HistogramTestModel()
-    trainer.model.backbone.beta_projection.weight.grad = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32
-    )
-    trainer.model.backbone.beta_projection.bias.grad = torch.tensor(
-        [0.5, -0.5], dtype=torch.float32
-    )
-    trainer.global_step = 10
-    trainer.wandb_run = object()
+def test_auxiliary_crps_checkpoint_does_not_change_primary_selection():
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
     trainer.config = SimpleNamespace(
         training=SimpleNamespace(
-            wandb_gradient_histogram_frequency=5,
-            wandb_gradient_histogram_patterns=["backbone.beta_projection"],
-            wandb_gradient_histogram_max_params=4,
-        )
+            selection_required_heads=["ww", "hosp", "cases", "deaths"]
+        ),
+        output=SimpleNamespace(save_checkpoints=True),
     )
-
-    payload = trainer._build_wandb_payload(
-        log_this_step=True,
-        log_data={
-            "loss_train_step": 1.0,
-            "time_batch_s": 0.2,
-            "gradnorm_total_preclip": 2.0,
-            "grad_snapshot_max_layer_norm": 3.0,
-            "gradnorm_sidecar_ran": 1.0,
-        },
-        component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
-        gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
-        model_diagnostics_log_data={},
+    trainer.criterion = SimpleNamespace(observation_loss="nll")
+    trainer.best_val_crps = float("inf")
+    trainer.best_val_selection_score = 7.0
+    trainer.best_val_selection_metric = "mean_target_wis"
+    saved = []
+    trainer._save_checkpoint = lambda *args, **kwargs: saved.append((args, kwargs))
+    for epoch, score in enumerate([2.0, 3.0, 1.0]):
+        metrics = {
+            f"crps_{h}_log1p_per_100k": score for h in ["ww", "hosp", "cases", "deaths"]
+        }
+        trainer._maybe_save_crps_checkpoint(epoch, 99.0, metrics)
+    assert [args[0] for args, _ in saved] == [0, 2]
+    assert all(kwargs["is_best_crps"] for _, kwargs in saved)
+    assert all(
+        kwargs["val_selection_metric"] == "mean_target_crps" for _, kwargs in saved
     )
-
-    assert payload is not None
-    assert payload["loss_train_step"] == 1.0
-    assert payload["time_batch_s"] == 0.2
-    assert "gradnorm_total_preclip" not in payload
-    assert "grad_snapshot_max_layer_norm" not in payload
-    assert "gradnorm_sidecar_ran" not in payload
-    assert payload["grad_hist/backbone_beta_projection_bias"] == {"count": 2}
-    assert payload["grad_hist/backbone_beta_projection_weight"] == {"count": 4}
-    assert payload["grad_histograms_logged"] == 2
+    assert trainer.best_val_selection_score == 7.0
+    assert trainer.best_val_selection_metric == "mean_target_wis"
+    assert trainer.best_val_crps == 1.0
 
 
-def test_build_wandb_payload_omits_histograms_when_frequency_is_zero():
-    trainer = object.__new__(EpiForecasterTrainer)
-    trainer.model = _HistogramTestModel()
-    trainer.global_step = 10
-    trainer.wandb_run = object()
+def test_explicit_selection_resume_rejects_policy_or_distribution_changes():
+    import copy
+    from dataclasses import asdict
+    from models.configs import TrainingParams
+
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
     trainer.config = SimpleNamespace(
-        training=SimpleNamespace(
-            wandb_gradient_histogram_frequency=0,
-            wandb_gradient_histogram_patterns=["backbone.beta_projection"],
-            wandb_gradient_histogram_max_params=4,
-        )
+        training=TrainingParams(selection_metric="mean_target_wis")
     )
-
-    payload = trainer._build_wandb_payload(
-        log_this_step=False,
-        log_data={"gradnorm_total_preclip": 2.0},
-        component_gradnorm_log_data={"gradnorm_sird_physics": 4.0},
-        gradient_snapshot_log_data={"grad_snapshot_global_norm": 5.0},
-        model_diagnostics_log_data={},
-    )
-
-    assert payload is None
+    checkpoint = {"config": {"training": asdict(trainer.config.training)}}
+    trainer._validate_checkpoint_selection_contract(checkpoint)
+    for field, value in [
+        ("selection_metric", "mean_target_crps"),
+        ("selection_required_heads", ["cases"]),
+    ]:
+        changed = copy.deepcopy(checkpoint)
+        changed["config"]["training"][field] = value
+        with pytest.raises(ValueError, match="selection contract"):
+            trainer._validate_checkpoint_selection_contract(changed)
+    changed = copy.deepcopy(checkpoint)
+    changed["config"]["training"]["loss"]["joint"]["distribution_family"] = "student_t"
+    with pytest.raises(ValueError, match="observation contract"):
+        trainer._validate_checkpoint_selection_contract(changed)

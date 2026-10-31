@@ -1,7 +1,9 @@
 executor: local
-jobs: 1
+jobs: 4
 cores: 80
 latency-wait: 60
 rerun-incomplete: true
 printshellcmds: true
 keep-going: false
+resources:
+  gpu: 4

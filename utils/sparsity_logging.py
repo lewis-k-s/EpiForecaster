@@ -53,14 +53,10 @@ def compute_batch_sparsity(batch: dict[str, Any]) -> dict[str, torch.Tensor]:
                 B = batch.get("B", hist.shape[0])
                 sparsity[name] = torch.zeros(B, device=hist.device)
 
-    # Biomarker sparsity from BioNode tensor
-    # Layout: 4 channels per variant (value, mask, censor, age) + has_data
-    # Mask is at index 1 for each variant, plus index 4 for has_data
+    # Variant masks: 1, 5, ..., 4V-3; trailing has_data is excluded.
     if "BioNode" in batch and batch["BioNode"] is not None:
         bio = batch["BioNode"]
         if bio.dim() == 3 and bio.shape[-1] >= 2:
-            # Mask channels are at indices 1, 5, 9, ... (every 4th starting from 1)
-            # Plus index 4 for has_data (last channel after all variants)
             mask_indices = list(range(1, bio.shape[-1], 4))  # [1, 5, 9, ...]
             if bio.shape[-1] > max(mask_indices, default=0):
                 mask_channels = bio[:, :, mask_indices]  # (B, L, num_variants)

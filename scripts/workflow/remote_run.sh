@@ -37,6 +37,7 @@ TASKS=""
 CPUS_PER_TASK=""
 GRES=""
 RUNTIME=""
+CLOSEOUT_SIGNAL_SECONDS=""
 
 usage() {
   cat <<EOF
@@ -96,6 +97,7 @@ load_dispatch_request() {
       cpus_per_task) CPUS_PER_TASK="$value" ;;
       gres) GRES="$value" ;;
       runtime) RUNTIME="$value" ;;
+      closeout_signal_seconds) CLOSEOUT_SIGNAL_SECONDS="$value" ;;
       *)
         echo "Unknown dispatch request field: $field" >&2
         return 1
@@ -113,7 +115,7 @@ validate_dispatch_request() {
     SOURCE_SNAPSHOT_SHA256 CONFIG_SHA256 CONTAINER_SIF \
     CONTAINER_DIGEST_FILE TOOLING_KEY TOOLING_PYTHON SNAKEMAKE_BIN \
     SNAKEMAKE_VERSION WORKFLOW_KIND WORKFLOW_TARGET ACCOUNT PARTITION QOS \
-    NODES TASKS CPUS_PER_TASK GRES RUNTIME; do
+    NODES TASKS CPUS_PER_TASK GRES RUNTIME CLOSEOUT_SIGNAL_SECONDS; do
     if [ -z "${!field}" ]; then
       echo "Dispatch request is missing $field" >&2
       return 1
@@ -143,6 +145,10 @@ validate_dispatch_request() {
     || [ "$CPUS_PER_TASK" != "20" ] \
     || [ "$GRES" != "gpu:$TASKS" ]; then
     echo "Dispatch request violates the MN5 single-node allocation contract" >&2
+    return 1
+  fi
+  if ! [[ "$CLOSEOUT_SIGNAL_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "Dispatch request contains an invalid close-out signal duration" >&2
     return 1
   fi
 }
@@ -200,6 +206,12 @@ container_exec() {
   shift
 
   load_singularity
+  # Login nodes do not provide the compute-node /scratch/tmp session path.
+  # Keep short-lived Singularity state with the staged run during validation.
+  export TMPDIR="$BUNDLE_ROOT/.cache/singularity-tmp"
+  mkdir -p "$TMPDIR/singularity/mnt/session"
+  export SINGULARITY_TMPDIR="$TMPDIR"
+  export APPTAINER_TMPDIR="$SINGULARITY_TMPDIR"
   singularity exec \
     --cleanenv \
     --containall \
@@ -338,6 +350,9 @@ publish_bundle() {
     "$RUN_ROOT/.state/dispatch.tsv.sha256"
 
   mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/outputs" "$RUN_ROOT/.state/workers"
+  # Container verification may leave only disposable cache and session files
+  # in the staging leaf. They are not part of the immutable run payload.
+  rm -rf -- "$BUNDLE_ROOT/.cache"
   rmdir "$BUNDLE_ROOT"
   chmod 0444 "$PUBLISH_RESERVATION/owner"
   chmod 0555 "$PUBLISH_RESERVATION"
@@ -380,6 +395,9 @@ run_snakemake() {
     --workflow-profile "$SOURCE_ROOT/workflow/profiles/mn5" \
     --directory "$RUN_ROOT" \
     --runtime-source-cache-path "$RUN_ROOT/.snakemake/source-cache" \
+    --cores "$((TASKS * CPUS_PER_TASK))" \
+    --jobs "$TASKS" \
+    --resources "gpu=$TASKS" \
     "$@"
 }
 
@@ -554,29 +572,35 @@ submit_run() {
 
   attempt_id="$(new_attempt batch)"
   attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
-  job_id="$(
-    sbatch --parsable \
-      --chdir="$RUN_ROOT" \
-      --output="$RUN_ROOT/logs/snakemake-%j.out" \
-      --error="$RUN_ROOT/logs/snakemake-%j.err" \
-      --open-mode=append \
-      --account="$ACCOUNT" \
-      --partition="$PARTITION" \
-      --qos="$QOS" \
-      --nodes="$NODES" \
-      --ntasks="$TASKS" \
-      --ntasks-per-node="$TASKS" \
-      --cpus-per-task="$CPUS_PER_TASK" \
-      --gres="$GRES" \
-      --time="$RUNTIME" \
-      "$coordinator" \
-      "$RUN_ROOT" \
-      "$CONTAINER_SIF" \
-      "$TASKS" \
-      "$CPUS_PER_TASK" \
-      batch \
-      "$attempt_root"
-  )"
+  local -a submit_arguments=(
+    "--chdir=$RUN_ROOT"
+    "--output=$RUN_ROOT/logs/snakemake-%j.out"
+    "--error=$RUN_ROOT/logs/snakemake-%j.err"
+    "--open-mode=append"
+    "--account=$ACCOUNT"
+    "--partition=$PARTITION"
+    "--qos=$QOS"
+    "--nodes=$NODES"
+    "--ntasks=$TASKS"
+    "--ntasks-per-node=$TASKS"
+    "--cpus-per-task=$CPUS_PER_TASK"
+    "--gres=$GRES"
+    "--time=$RUNTIME"
+  )
+  if [ "$CLOSEOUT_SIGNAL_SECONDS" -gt 0 ]; then
+    submit_arguments+=("--signal=USR1@$CLOSEOUT_SIGNAL_SECONDS")
+  fi
+  submit_arguments+=(
+    "$coordinator"
+    "$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
+    "$RUN_ROOT"
+    "$CONTAINER_SIF"
+    "$TASKS"
+    "$CPUS_PER_TASK"
+    batch
+    "$attempt_root"
+  )
+  job_id="$(sbatch --parsable "${submit_arguments[@]}")"
   job_id="${job_id%%;*}"
 
   write_attempt_binding "$attempt_id" batch "$job_id"
@@ -604,7 +628,7 @@ discover_interactive_allocation() {
 validate_interactive_allocation() {
   local job_id="$1"
   local record state user_id account qos partition nodes tasks cpus alloc_tres
-  local gpu_count required_cpus end_time end_epoch now_epoch remaining_seconds
+  local gpu_count required_cpus end_time end_epoch now_epoch remaining_seconds minimum_seconds
 
   record="$(scontrol show job -o "$job_id")"
   state="$(job_field "$record" JobState)"
@@ -648,8 +672,15 @@ validate_interactive_allocation() {
   end_epoch="$(date -d "$end_time" +%s)"
   now_epoch="$(date -u +%s)"
   remaining_seconds=$((end_epoch - now_epoch))
-  if [ "$remaining_seconds" -lt $((RUNTIME * 60)) ]; then
-    echo "Allocation $job_id has insufficient remaining wall time for $RUNTIME minutes" >&2
+  # Close-out runs need the signal lead plus a margin. Other kinds have no
+  # close-out, so they need the full requested runtime.
+  if [ "$CLOSEOUT_SIGNAL_SECONDS" -gt 0 ]; then
+    minimum_seconds=$((CLOSEOUT_SIGNAL_SECONDS + 60))
+  else
+    minimum_seconds=$((RUNTIME * 60))
+  fi
+  if [ "$remaining_seconds" -lt "$minimum_seconds" ]; then
+    echo "Allocation $job_id has insufficient remaining wall time for closeout" >&2
     return 1
   fi
 
@@ -663,31 +694,118 @@ validate_interactive_allocation() {
     "observed_end_time"$'\t'"$end_time"
 }
 
-attach_worker() {
+# Startup probe payload: run on the allocated compute node inside an ordinary
+# Slurm step before any campaign attempt is created or activated.
+probe_worker() {
+  local step_id="${SLURM_STEP_ID:-}"
+  local session_dir
+
+  if ! [[ "$step_id" =~ ^[0-9]+$ ]]; then
+    echo "Startup probe has no numeric Slurm step identity" >&2
+    return 1
+  fi
+  echo "probe_step_id=$step_id"
+  if [ "$(hostname -s)" != "${SLURMD_NODENAME%%.*}" ]; then
+    echo "Startup probe is not executing on the allocated node" >&2
+    return 1
+  fi
+  if [ ! -d /scratch ] || [ ! -x /scratch ]; then
+    echo "/scratch is not usable on the allocated node" >&2
+    return 1
+  fi
+  load_singularity
+  # SingularityCE resolves its runtime session root from TMPDIR, and Slurm
+  # sets TMPDIR=/scratch/tmp inside allocation steps. Materialize both the
+  # buildcfg-declared and TMPDIR-derived session paths on this step host.
+  session_dir="$(
+    singularity buildcfg 2>/dev/null \
+      | awk -F= '$1 == "SESSIONDIR" { print $2; exit }'
+  )"
+  if [[ "$session_dir" != /* ]]; then
+    echo "Singularity SESSIONDIR must be an absolute path: $session_dir" >&2
+    return 1
+  fi
+  mkdir -p "$session_dir" "${TMPDIR:-/tmp}/singularity/mnt/session"
+  if [ ! -d "$session_dir" ] || [ ! -x "$session_dir" ]; then
+    echo "Singularity SESSIONDIR is not usable: $session_dir" >&2
+    return 1
+  fi
+  if [ ! -d "${TMPDIR:-/tmp}/singularity/mnt/session" ]; then
+    echo "Singularity runtime session path is not usable under TMPDIR" >&2
+    return 1
+  fi
+  echo "probe_sessiondir=$session_dir"
+
+  # Full immutable verification and the SIF no-op both execute here on the
+  # allocated node, never on the login host that owns the salloc control tty.
+  require_published_run
+  singularity exec --cleanenv --containall "$CONTAINER_SIF" /usr/bin/true
+  echo "probe_sif_noop=ok"
+}
+
+# Run the startup probe as an ordinary zero-GPU one-CPU step of the allocation.
+run_startup_probe() {
+  local job_id="$1"
+
+  srun \
+    --jobid="$job_id" \
+    --job-name=epiforecaster-startup-probe \
+    --nodes=1 \
+    --ntasks=1 \
+    --cpus-per-task=1 \
+    --gres=none \
+    --exact \
+    --kill-on-bad-exit=1 \
+    --chdir="$RUN_ROOT" \
+    "$SCRIPT_PATH" probe-worker \
+    >"$RUN_ROOT/.state/probe.$job_id.out" \
+    2>"$RUN_ROOT/.state/probe.$job_id.err"
+}
+
+# Launch the coordinator as an ordinary zero-GPU overlapping step, detached
+# from the caller's terminal so an SSH or VPN drop cannot hang it up. The
+# detached PID is the launcher PID. Wait for its exit, which keeps the
+# allocation-owning shell tied to the coordinator lifetime.
+launch_coordinator_step() {
   local job_id="$1"
   local attempt_id="$2"
   local attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
   local coordinator="$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
-  local status
+  local pid status
+  local -a detach=(nohup)
 
-  require_published_run
   test -x "$coordinator"
   test -f "$attempt_root/binding.tsv"
+  if command -v setsid >/dev/null 2>&1; then
+    detach=(setsid nohup)
+  fi
 
-  set +e
-  srun \
+  "${detach[@]}" srun \
     --jobid="$job_id" \
-    --external-launcher \
-    --open-mode=append \
-    --output="$attempt_root/coordinator.out" \
-    --error="$attempt_root/coordinator.err" \
+    --job-name=snakemake-coordinator \
+    --nodes=1 \
+    --ntasks=1 \
+    --cpus-per-task=1 \
+    --gres=none \
+    --exact \
+    --overlap \
+    --kill-on-bad-exit=1 \
+    --chdir="$RUN_ROOT" \
     "$coordinator" \
     "$RUN_ROOT" \
-    "$SNAKEMAKE_BIN" \
+    "$CONTAINER_SIF" \
     "$TASKS" \
     "$CPUS_PER_TASK" \
     existing-allocation \
-    "$attempt_root"
+    "$attempt_root" \
+    </dev/null \
+    >"$attempt_root/coordinator.out" \
+    2>"$attempt_root/coordinator.err" &
+  pid=$!
+  printf '%s\n' "$pid" >"$attempt_root/launcher.pid"
+
+  set +e
+  wait "$pid"
   status=$?
   set -e
   record_launcher_completion "$attempt_root" "$status"
@@ -696,9 +814,10 @@ attach_worker() {
 
 attach_run() {
   local job_id="${1:-}"
-  local active compatibility attempt_id attempt_root launcher_pid
+  local active compatibility attempt_id attempt_root status
 
-  require_published_run
+  # Login-side checks only: no Singularity runs on the salloc control host.
+  require_published_location
   exec 9>"$RUN_ROOT/.state/coordinator.launch.lock"
   flock 9
 
@@ -720,6 +839,12 @@ attach_run() {
   fi
   compatibility="$(validate_interactive_allocation "$job_id")"
 
+  if ! run_startup_probe "$job_id"; then
+    echo "Startup probe failed for allocation $job_id:" >&2
+    tail -n 20 "$RUN_ROOT/.state/probe.$job_id.err" >&2 || true
+    return 1
+  fi
+
   attempt_id="$(new_attempt existing-allocation)"
   attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
   write_attempt_binding \
@@ -730,13 +855,10 @@ attach_run() {
   activate_attempt "$attempt_id"
   link_attempt_to_allocation "$job_id" "$attempt_id"
 
-  nohup "$SCRIPT_PATH" attach-worker "$job_id" "$attempt_id" \
-    >"$attempt_root/launcher.out" \
-    2>"$attempt_root/launcher.err" \
-    </dev/null 9>&- &
-  launcher_pid=$!
-  printf '%s\n' "$launcher_pid" >"$attempt_root/launcher.pid"
-  printf 'attached:%s:%s' "$job_id" "$attempt_id"
+  status=0
+  launch_coordinator_step "$job_id" "$attempt_id" || status=$?
+  printf 'coordinator-finished:%s:%s' "$status" "$attempt_id"
+  return "$status"
 }
 
 show_status() {
@@ -759,7 +881,12 @@ show_status() {
     elif [ -f "$attempt_root/completed.tsv" ]; then
       exit_code="$(binding_value "$attempt_root/completed.tsv" exit_code)"
       step_id="$(cat "$attempt_root/coordinator.step_id" 2>/dev/null || true)"
-      echo "coordinator=terminal exit_code=$exit_code allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
+      # Code 75 is the designed close-out: the queue still holds work.
+      if [ "$exit_code" = "75" ]; then
+        echo "coordinator=closeout exit_code=75 continuation_required=true allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
+      else
+        echo "coordinator=terminal exit_code=$exit_code allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
+      fi
     else
       echo "coordinator=not-active allocation_job_id=$job_id mode=$mode attempt_id=$attempt_id"
     fi
@@ -826,9 +953,9 @@ main() {
       [ "$#" -le 1 ] || return 2
       attach_run "${1:-}"
       ;;
-    attach-worker)
-      [ "$#" -eq 2 ] || return 2
-      attach_worker "$1" "$2"
+    probe-worker)
+      [ "$#" -eq 0 ] || return 2
+      probe_worker
       ;;
     status)
       [ "$#" -eq 0 ] || return 2

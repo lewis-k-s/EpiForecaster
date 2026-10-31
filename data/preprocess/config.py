@@ -47,6 +47,10 @@ class TemporalCovariatesConfig:
 class SmoothingConfig:
     """Configuration for offline causal smoothing."""
 
+    # Inclusive end of parameter fitting. None retains legacy full-series fitting.
+    parameter_fit_end_date: str | None = None
+    # Fixed variances avoid learning preprocessing parameters from held-out regions.
+    parameter_fit_mode: str = "per_series"
     clinical_method: str = "kalman_v2"
     wastewater_method: str = "tobit_kalman_v2"
     missing_policy: str = "predict"
@@ -63,6 +67,10 @@ class SmoothingConfig:
     holt_missing_trend_decay: float = 0.85
 
     def __post_init__(self):
+        if self.parameter_fit_end_date is not None:
+            datetime.strptime(self.parameter_fit_end_date, "%Y-%m-%d")
+        if self.parameter_fit_mode not in {"per_series", "fixed"}:
+            raise ValueError("parameter_fit_mode must be 'per_series' or 'fixed'")
         valid_clinical = {"kalman_v2", "holt_damped"}
         valid_wastewater = {"tobit_kalman_v2"}
         valid_missing = {"predict", "momentum"}
@@ -150,6 +158,7 @@ class PreprocessingConfig:
         output_path: Directory path for processed dataset
         dataset_name: Human-readable name for the dataset
         compression: Compression algorithm for Zarr storage
+        continuous_storage_dtype: Storage dtype for continuous output variables
         chunk_sizes: Custom chunk sizes for Zarr arrays
 
         num_workers: Number of parallel workers for processing
@@ -159,6 +168,7 @@ class PreprocessingConfig:
         graph_options: Graph construction options
         validation_options: Validation and quality control options
         smoothing: Causal smoothing method and robustness controls
+        source_provenance: Immutable upstream source and corpus identities
     """
 
     # Required fields (no defaults)
@@ -176,6 +186,8 @@ class PreprocessingConfig:
     # Optional data paths
     synthetic_path: str | None = None
     hospitalizations_file: str | None = None
+    # Conservative availability shift for weekly totals stamped at week start.
+    hospitalizations_reporting_lag_days: int = 7
     deaths_file: str | None = None  # Deaths data (comarca-level)
     catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
     vaccination_file: str | None = None  # Municipality-level COVID vaccination data
@@ -205,9 +217,13 @@ class PreprocessingConfig:
     min_density_threshold: float = (
         0.5  # Minimum data density (non-NaN fraction) for a region to be valid
     )
+    valid_target_rolling_days: int | None = None
+    valid_target_min_observed_days: int | None = None
+    valid_target_qualifying_end_date: str | None = None
 
     # Output configuration
     compression: str = "blosc"
+    continuous_storage_dtype: str = "float32"
     chunk_sizes: dict[str, list[int]] | None = None
 
     # Alignment and validation options
@@ -253,6 +269,7 @@ class PreprocessingConfig:
 
     temporal_covariates: TemporalCovariatesConfig | None = None
     smoothing: SmoothingConfig = field(default_factory=SmoothingConfig)
+    source_provenance: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -260,8 +277,22 @@ class PreprocessingConfig:
             self.temporal_covariates = TemporalCovariatesConfig(
                 **self.temporal_covariates
             )
+        if self.hospitalizations_reporting_lag_days < 0:
+            raise ValueError("hospitalizations_reporting_lag_days must be non-negative")
+        rolling = self.valid_target_rolling_days
+        minimum = self.valid_target_min_observed_days
+        if (rolling is None) != (minimum is None):
+            raise ValueError("Both rolling target selection fields are required")
+        if rolling is not None and (rolling <= 0 or minimum <= 0 or minimum > rolling):
+            raise ValueError("Rolling target selection requires 0 < minimum <= days")
+        if self.valid_target_qualifying_end_date is not None:
+            if rolling is None:
+                raise ValueError("Rolling target selection is required for an end date")
+            datetime.strptime(self.valid_target_qualifying_end_date, "%Y-%m-%d")
         if isinstance(self.smoothing, dict):
             self.smoothing = SmoothingConfig(**self.smoothing)
+        if not isinstance(self.source_provenance, dict):
+            raise ValueError("source_provenance must be a dictionary")
         self._validate_paths()
         self._validate_temporal_parameters()
         self._validate_processing_options()
@@ -386,6 +417,13 @@ class PreprocessingConfig:
         if self.memory_limit_gb <= 0:
             raise ValueError("memory_limit_gb must be positive")
 
+        valid_storage_dtypes = {"float16", "float32"}
+        if self.continuous_storage_dtype not in valid_storage_dtypes:
+            raise ValueError(
+                "continuous_storage_dtype must be one of "
+                f"{sorted(valid_storage_dtypes)}"
+            )
+
     def _validate_graph_options(self):
         """Validate graph construction options."""
         valid_strategies = ["knn", "distance_threshold", "delaunay"]
@@ -496,7 +534,7 @@ class PreprocessingConfig:
 
     def get_dataset_filename(self) -> str:
         """Generate standardized filename for the processed dataset."""
-        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.zarr"
+        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.nc"
 
     def get_output_dataset_path(self) -> Path:
         """Get full path for the output dataset."""

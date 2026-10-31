@@ -113,10 +113,8 @@ validate_arguments() {
       fi
       ;;
     push)
-      if [ -z "$DVC_REMOTE" ] \
-        || [ -z "$DVC_CACHE" ] \
-        || [ -z "$PROMOTION_ROOT" ]; then
-        echo "DVC push mode requires remote, cache, and promotion paths" >&2
+      if [ -z "$DVC_REMOTE" ] || [ -z "$DVC_CACHE" ]; then
+        echo "DVC push mode requires remote and cache paths" >&2
         return 2
       fi
       ;;
@@ -224,6 +222,14 @@ configure_shared_binds() {
     "$SCRATCH_ROOT/tmp:/tmp:rw"
   )
 
+  # Publication receipts read the immutable SIF digest from inside the
+  # contained runtime. The SIF itself is an execution input, not a bind, so
+  # expose its immutable directory. File binds cannot create missing parent
+  # directories on all MN5 container mounts.
+  if [ -f "${SIF}.sha256" ]; then
+    BINDS+=("$(dirname "$SIF"):$(dirname "$SIF"):ro")
+  fi
+
   if [ "${#INPUT_PATHS[@]}" -gt 0 ]; then
     for input_path in "${INPUT_PATHS[@]}"; do
       if [ ! -e "$input_path" ] || [ -L "$input_path" ]; then
@@ -243,44 +249,25 @@ configure_shared_binds() {
     push)
       test -d "$DVC_REMOTE"
       test -d "$DVC_CACHE"
-      mkdir -p "$PROMOTION_ROOT"
-      BINDS+=(
-        "$DVC_REMOTE:$DVC_REMOTE:rw"
-        "$DVC_CACHE:$DVC_CACHE:rw"
-        "$PROMOTION_ROOT:$PROMOTION_ROOT:rw"
-      )
+      BINDS+=("$DVC_REMOTE:$DVC_REMOTE:rw" "$DVC_CACHE:$DVC_CACHE:rw")
+      if [ -n "$PROMOTION_ROOT" ]; then
+        mkdir -p "$PROMOTION_ROOT"
+        BINDS+=("$PROMOTION_ROOT:$PROMOTION_ROOT:rw")
+      fi
       ;;
   esac
 }
 
-# Overlay each materialized DVC root from rank-local scratch as read-only data.
+# Use one read-only copy per allocation, shared across ranks and stages.
 stage_dvc_inputs() {
-  local bind_roots_file dvc_workspace bind_root staged
-
   if [ "$STAGE_DATA" -ne 1 ]; then
     return 0
   fi
-
-  bind_roots_file="$RUN_ROOT/.state/dvc_bind_roots.txt"
-  dvc_workspace="$RUN_ROOT/.state/dvc-workspace"
-  test -f "$bind_roots_file"
-  test -d "$dvc_workspace"
-
-  while IFS= read -r bind_root; do
-    [ -n "$bind_root" ] || continue
-    if [ ! -d "$SOURCE_ROOT/$bind_root" ]; then
-      echo "DVC bind root is absent from source snapshot: $bind_root" >&2
-      return 1
-    fi
-
-    staged="$SCRATCH_ROOT/staged/$bind_root"
-    mkdir -p "$staged"
-    rsync -a "$SOURCE_ROOT/$bind_root/" "$staged/"
-    rsync -aL "$dvc_workspace/$bind_root/" "$staged/"
-    BINDS+=("$staged:/workspace/source/$bind_root:ro")
-  done <"$bind_roots_file"
-
-  echo "Staged DVC inputs at $SCRATCH_ROOT/staged"
+  test -f "$RUN_ROOT/.state/dvc_bind_roots.txt"
+  test -d "$RUN_ROOT/.state/dvc-workspace"
+  # shellcheck source=scripts/workflow/node_input_cache.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/node_input_cache.sh"
+  stage_shared_input_cache
 }
 
 # Construct the container invocation as an argument array without shell eval.
@@ -301,7 +288,8 @@ configure_singularity_arguments() {
   SINGULARITY_ARGS+=(
     --env "PATH=$container_path"
     --env "PYTHONPATH=/workspace/source"
-    --env "HOME=/tmp"
+    --env "PYTHONFAULTHANDLER=1"
+    --env "PYTHONUNBUFFERED=1"
     --env "XDG_CACHE_HOME=/tmp/.cache"
     --env "MPLCONFIGDIR=/tmp/matplotlib"
     --env "TMPDIR=/tmp"
@@ -314,6 +302,8 @@ configure_singularity_arguments() {
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     SINGULARITY_ARGS+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
   fi
+  # Execute the verified immutable SIF directly from shared GPFS. Node-local
+  # image staging is deferred until its end-to-end cost is benchmarked.
   SINGULARITY_ARGS+=(--pwd /workspace/source "$SIF")
 }
 
@@ -321,14 +311,37 @@ configure_singularity_arguments() {
 main() {
   parse_arguments "$@"
   validate_arguments
+  if [ "$STAGE_DATA" -eq 1 ]; then
+    # Hold a shared lease on an open descriptor for the whole scientific step.
+    # No flock child process exists, so a step signal cannot kill the lease.
+    # shellcheck source=scripts/workflow/node_input_cache.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/node_input_cache.sh"
+    local cache_root
+    cache_root="$(node_cache_run_root "$RUN_ROOT")"
+    mkdir -p "$cache_root"
+    exec 8>"$cache_root/.usage.lock"
+    flock -s 8
+  fi
   load_singularity
   create_scratch
+  export TMPDIR="$SCRATCH_ROOT/tmp"
+  export APPTAINER_TMPDIR="$SCRATCH_ROOT/tmp"
+  export SINGULARITY_TMPDIR="$SCRATCH_ROOT/tmp"
   trap cleanup EXIT
 
   configure_shared_binds
   stage_dvc_inputs
   configure_singularity_arguments
-  singularity "${SINGULARITY_ARGS[@]}" "${SCIENTIFIC_COMMAND[@]}"
+  if singularity "${SINGULARITY_ARGS[@]}" "${SCIENTIFIC_COMMAND[@]}"; then
+    return 0
+  else
+    local scientific_status=$?
+    return "$scientific_status"
+  fi
 }
 
+# Slurm sends the close-out signal to every process of the step. Only the
+# scientific process handles it, so this wrapper ignores it. An ignored signal
+# stays ignored across exec; Python replaces it with its own handler.
+trap '' USR1
 main "$@"

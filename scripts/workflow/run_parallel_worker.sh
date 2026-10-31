@@ -9,6 +9,7 @@ CPUS=""
 WORKER_GROUP=""
 WORKER_OFFSET="0"
 SCIENTIFIC_COMMAND=()
+CONTINUATION_EXIT_CODE=75
 
 # Print the per-rank worker interface.
 usage() {
@@ -98,9 +99,10 @@ render_worker_arguments() {
   done
 }
 
-# Publish one completion marker atomically after successful container execution.
-publish_completion_marker() {
+# Publish one atomic receipt after container execution reaches a terminal worker state.
+publish_worker_receipt() {
   local marker="$1"
+  local outcome="$2"
   local temporary
 
   temporary="$marker.${SLURM_JOB_ID:-local}.${SLURM_STEP_ID:-step}.$WORKER_INDEX"
@@ -109,13 +111,28 @@ publish_completion_marker() {
     "worker_id=$WORKER_INDEX" \
     "job_id=${SLURM_JOB_ID:-}" \
     "step_id=${SLURM_STEP_ID:-}" \
+    "outcome=$outcome" \
     "completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$temporary"
   mv "$temporary" "$marker"
 }
 
-# Execute one rank and publish its durable success receipt.
+# Publish one completion marker atomically after successful container execution.
+publish_completion_marker() {
+  local marker="$1"
+
+  publish_worker_receipt "$marker" complete
+}
+
+# Publish one continuation receipt without claiming that the worker completed.
+publish_continuation_marker() {
+  local marker="$1"
+
+  publish_worker_receipt "$marker" continuation
+}
+
+# Execute one rank and publish its durable terminal receipt.
 main() {
-  local worker_id marker
+  local worker_id marker continuation_marker status
 
   parse_arguments "$@"
   validate_arguments
@@ -125,6 +142,7 @@ main() {
   validate_worker_index
   printf -v worker_id '%03d' "$WORKER_INDEX"
   marker="$RUN_ROOT/.state/workers/$WORKER_GROUP/$worker_id.done"
+  continuation_marker="$RUN_ROOT/.state/workers/$WORKER_GROUP/$worker_id.partial"
 
   if [ -s "$marker" ]; then
     echo "Worker $WORKER_GROUP/$worker_id is already complete; skipping"
@@ -133,6 +151,7 @@ main() {
 
   render_worker_arguments
 
+  set +e
   "$SOURCE_ROOT/scripts/workflow/mn5_container_exec.sh" \
     --run-root "$RUN_ROOT" \
     --source-root "$SOURCE_ROOT" \
@@ -141,10 +160,23 @@ main() {
     --nv \
     --cpus "$CPUS" \
     -- env "EPIFORECASTER_WORKER_ID=$WORKER_INDEX" "${WORKER_ARGUMENTS[@]}"
+  status=$?
+  set -e
 
-  publish_completion_marker "$marker"
+  if [ "$status" -eq 0 ]; then
+    publish_completion_marker "$marker"
+    return 0
+  fi
+  if [ "$status" -eq "$CONTINUATION_EXIT_CODE" ]; then
+    publish_continuation_marker "$continuation_marker"
+    return 0
+  fi
+  return "$status"
 }
 
 WORKER_INDEX=""
 WORKER_ARGUMENTS=()
+# The close-out signal is for the scientific process only; see
+# mn5_container_exec.sh.
+trap '' USR1
 main "$@"

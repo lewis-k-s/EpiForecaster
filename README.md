@@ -109,7 +109,8 @@ Training, evaluation, cross-validation, HPO, and ablation run through the
 immutable Snakemake/DVC interface in `scripts/workflow/mn5_workflow.sh`.
 It prepares a per-run source snapshot and submits one containing ACC allocation;
 there is no mutable remote checkout or direct model SBATCH interface. See
-`docs/MN5_SNAKEMAKE.md` and load the `mn5-dispatch` skill before remote work.
+`docs/MN5_SNAKEMAKE.md` and load the `mn5-cluster-usage` skill before remote
+work.
 
 The installation provides the standalone `preprocess`, `train`, `eval`, and
 `plot` entrypoints, plus the grouped `main` command.

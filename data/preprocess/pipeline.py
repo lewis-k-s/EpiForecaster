@@ -9,8 +9,11 @@ process.
 
 from dataclasses import asdict
 from datetime import datetime
+import json
 from pathlib import Path
+from typing import Any
 
+import dask
 import numpy as np
 import xarray as xr
 import yaml
@@ -388,11 +391,23 @@ class OfflinePreprocessingPipeline:
         total_per_region = cases_da["date"].size
         density = valid_count / total_per_region
 
-        # Create boolean mask
-        valid_mask = density >= density_threshold
+        rolling_days = self.config.valid_target_rolling_days
+        if rolling_days is None:
+            valid_mask = density >= density_threshold
+        else:
+            end_date = self.config.valid_target_qualifying_end_date
+            qualifying = coverage_source
+            if end_date is not None:
+                qualifying = qualifying.sel(date=slice(None, end_date))
+            if qualifying.sizes["date"] < rolling_days:
+                raise ValueError("Not enough dates for rolling target selection")
+            observed_days = qualifying.rolling(date=rolling_days).sum()
+            valid_mask = (
+                observed_days >= self.config.valid_target_min_observed_days
+            ).any(dim="date")
 
         print(
-            f"  (run_id, region) pairs with density >= {density_threshold}: {valid_mask.sum()}/{valid_mask.size}"
+            f"  (run_id, region) pairs meeting target selection: {valid_mask.sum()}/{valid_mask.size}"
         )
         # Compute mean for printing (dask arrays need compute() before formatting)
         avg_density = density.mean().compute()
@@ -431,7 +446,7 @@ class OfflinePreprocessingPipeline:
         """Save aligned dataset to processed dir."""
         print("Saving aligned dataset to processed dir...")
         aligned_dataset_path = Path(self.config.output_path) / (
-            self.config.dataset_name + ".zarr"
+            self.config.dataset_name + ".nc"
         )
         aligned_dataset_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -501,16 +516,22 @@ class OfflinePreprocessingPipeline:
         # Metadata attrs are assigned after dtype conversion because we rebuild the
         # Dataset object there and would otherwise drop attrs.
         dataset_attrs = {
-            "log_transformed": True,
-            "population_norm": True,
+            "log_transformed": 1,
+            "population_norm": 1,
             "smoothing_clinical_method": self.config.smoothing.clinical_method,
             "smoothing_wastewater_method": self.config.smoothing.wastewater_method,
             "smoothing_missing_policy": self.config.smoothing.missing_policy,
+            "continuous_storage_dtype": self.config.continuous_storage_dtype,
             "preprocessing_config_yaml": self._serialize_config_yaml(),
+            "source_provenance_yaml": yaml.safe_dump(
+                self.config.source_provenance,
+                default_flow_style=False,
+                sort_keys=True,
+            ),
         }
 
-        # Convert float64 to float16 to reduce storage and memory usage
-        # Uses centralized dtype constants from utils/dtypes.py
+        # Convert continuous variables to the configured storage precision.
+        continuous_dtype = self.config.continuous_storage_dtype
         print("Optimizing dtypes for storage efficiency...")
         converted_dict = {}
         for var_name, var in rechunked_dataset.data_vars.items():
@@ -541,26 +562,27 @@ class OfflinePreprocessingPipeline:
             elif var_name == "population":
                 new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["population"])
                 print(f"  {var_name}: {old_dtype} -> int32")
-            # Temporal covariates: float32 -> float16 for consistency
+            # Temporal covariates use the configured continuous precision.
             elif var_name == "temporal_covariates" and var.dtype == np.float32:
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: float32 -> float16")
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: float32 -> {continuous_dtype}")
             elif var_name == "vaccination_rate" and var.dtype in (
                 np.float32,
                 np.float64,
             ):
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: {old_dtype} -> float16")
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
             elif var_name.startswith("latent_") and var.dtype in (
                 np.float32,
                 np.float64,
             ):
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: {old_dtype} -> float16")
-            # Generic float64 -> float16 (continuous values) - check LAST
-            elif var.dtype == np.float64:
-                new_var = var.astype(dtype_utils.NUMPY_STORAGE_DTYPES["continuous"])
-                print(f"  {var_name}: float64 -> float16")
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
+            # Generic float values not caught above (float16 from raw zarr
+            # mobility, float64 from log1p) — convert to storage precision.
+            elif var.dtype in (np.float16, np.float64):
+                new_var = var.astype(continuous_dtype)
+                print(f"  {var_name}: {old_dtype} -> {continuous_dtype}")
 
             converted_dict[var_name] = new_var
         rechunked_dataset = xr.Dataset(
@@ -568,44 +590,121 @@ class OfflinePreprocessingPipeline:
             coords=rechunked_dataset.coords,
             attrs=dataset_attrs,
         )
+        if self.config.synthetic_path:
+            positive_preservation = self._validate_positive_clinical_preservation(
+                raw_aligned=aligned_dataset,
+                processed=rechunked_dataset,
+            )
+            rechunked_dataset.attrs["positive_clinical_preservation_json"] = json.dumps(
+                positive_preservation, sort_keys=True
+            )
 
-        # Clear conflicting encodings from data variables and coordinates.
-        # This is the canonical cleanup point — after dtype conversion rebuilds the
-        # Dataset, source-Zarr v3 encodings may still linger on variables/coords.
-        v3_encoding_keys = {
-            "chunks",  # old chunk sizes conflict with rechunking
-            "preferred_chunks",
-            "compressors",  # v3 uses tuple of codecs
-            "compressor",  # clear both styles
-            "filters",  # v3 uses tuple of filters
-            "serializer",  # v3-specific
-            "object_codec",  # v3-specific
-            "shards",  # v3-specific
+        # Convert boolean variables to int8 for NetCDF4 compatibility.
+        # NetCDF4 has no native boolean type; xarray reads int8 masks back
+        # and consumers cast to torch.bool when building tensors.
+        bool_vars = {
+            name: var.astype(np.int8)
+            for name, var in rechunked_dataset.data_vars.items()
+            if var.dtype == np.bool_
         }
-        for var_name in rechunked_dataset.data_vars:
-            var = rechunked_dataset.data_vars[var_name]
-            for key in v3_encoding_keys:
-                var.encoding.pop(key, None)
+        if bool_vars:
+            rechunked_dataset = rechunked_dataset.assign(bool_vars)
+            print(f"  Converted {len(bool_vars)} boolean variables to int8 for NetCDF")
 
-        for coord_name in rechunked_dataset.coords:
-            coord = rechunked_dataset.coords[coord_name]
-            for key in v3_encoding_keys:
-                coord.encoding.pop(key, None)
+        # NetCDF4 does not support float16. If the configured storage dtype is
+        # float16 (legacy zarr default), upcast all continuous variables to
+        # float32 before writing.
+        if continuous_dtype == "float16":
+            continuous_dtype = np.float32
+            upcast_vars = {
+                name: var.astype(np.float32)
+                for name, var in rechunked_dataset.data_vars.items()
+                if var.dtype == np.float16
+            }
+            if upcast_vars:
+                rechunked_dataset = rechunked_dataset.assign(upcast_vars)
+                print(
+                    f"  Upcast {len(upcast_vars)} float16 variables to float32 for NetCDF"
+                )
 
-        # Save with uniform chunking, using Zarr v2 for NFS stability
-        # align_chunks=True allows xarray to handle chunk alignment when source
-        # and target chunk sizes differ (e.g., when reading from Zarr with different chunks)
-        rechunked_dataset.to_zarr(
-            aligned_dataset_path,
-            mode="w",
-            zarr_format=2,  # Use v2 for better NFS compatibility
-            align_chunks=True,  # True to handle chunk alignment automatically
-            safe_chunks=True,  # True to prevent data corruption from partial chunks
-            consolidated=True,  # True for better metadata performance
-        )
+        # Build NetCDF encoding: preserve chunking layout and apply zlib
+        # compression.  Each variable gets chunksizes matching the dask
+        # chunking computed above, plus lossless zlib level 4.
+        encoding: dict[str, dict[str, Any]] = {}
+        for var_name, var in rechunked_dataset.data_vars.items():
+            chunksizes = []
+            for dim in var.dims:
+                dim_size = var.sizes[dim]
+                if dim == "run_id":
+                    chunksizes.append(min(self.config.run_id_chunk_size, dim_size))
+                elif dim == "date":
+                    chunksizes.append(min(self.config.date_chunk_size, dim_size))
+                elif dim in ("origin", "destination", "region_id"):
+                    chunksizes.append(min(self.config.mobility_chunk_size, dim_size))
+                else:
+                    chunksizes.append(dim_size)
+            entry: dict[str, Any] = {
+                "chunksizes": tuple(chunksizes),
+                "zlib": True,
+                "complevel": 4,
+            }
+            # Integer types must not pair with zlib/fletcher in netCDF4
+            if var.dtype.kind in ("i", "u"):
+                entry = {"chunksizes": tuple(chunksizes)}
+            encoding[var_name] = entry
+
+        # NetCDF4 input and output share a non-thread-safe HDF5 backend.  A
+        # threaded Dask write can deadlock while it reads raw NetCDF chunks and
+        # writes the processed file.  Serialize this boundary explicitly.
+        with dask.config.set(scheduler="single-threaded"):
+            rechunked_dataset.to_netcdf(
+                aligned_dataset_path,
+                mode="w",
+                encoding=encoding,
+                engine="netcdf4",
+            )
         self._log_postwrite_summary(aligned_dataset_path)
         print(f"  ✓ Aligned dataset saved to {aligned_dataset_path}")
         return aligned_dataset_path
+
+    @staticmethod
+    def _validate_positive_clinical_preservation(
+        *,
+        raw_aligned: xr.Dataset,
+        processed: xr.Dataset,
+    ) -> dict[str, dict[str, int]]:
+        """Require positive synthetic clinical observations to stay positive."""
+        evidence: dict[str, dict[str, int]] = {}
+        for variable in ("cases", "hospitalizations", "deaths"):
+            if variable not in raw_aligned or variable not in processed:
+                continue
+            raw = raw_aligned[variable]
+            positive = np.isfinite(raw) & (raw > 0)
+            positive_count = int(positive.sum().compute().item())
+            if positive_count == 0:
+                continue
+            output = processed[variable]
+            invalid = positive & (~np.isfinite(output) | (output <= 0))
+            invalid_count = int(invalid.sum().compute().item())
+            if invalid_count > 0:
+                raise ValueError(
+                    f"{invalid_count} of {positive_count} positive raw synthetic "
+                    f"'{variable}' observations did not remain positive after "
+                    "preprocessing."
+                )
+            processed_positive_count = int(
+                (np.isfinite(output) & (output > 0)).sum().compute().item()
+            )
+            evidence[variable] = {
+                "raw_positive_count": positive_count,
+                "processed_positive_count": processed_positive_count,
+                "zeroed_raw_positive_count": invalid_count,
+            }
+            print(
+                f"  ✓ Positive preservation: {variable} "
+                f"({positive_count} positive observations)"
+            )
+        return evidence
 
     def _serialize_config_yaml(self) -> str:
         """Serialize full preprocessing config as YAML for dataset provenance."""
@@ -676,7 +775,7 @@ class OfflinePreprocessingPipeline:
 
     def _log_postwrite_summary(self, dataset_path: Path) -> None:
         """Verify the saved dataset is valid (e.g., mobility not all NaN)."""
-        ds = xr.open_zarr(dataset_path)
+        ds = xr.open_dataset(dataset_path, engine="netcdf4")
         try:
             if "mobility" in ds:
                 # Check a sample to ensure data was preserved (not all NaN)

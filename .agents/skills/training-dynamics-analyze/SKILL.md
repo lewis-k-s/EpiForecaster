@@ -11,7 +11,7 @@ Produce `report.html`. Do not stop after generating the evidence bundle.
 
 Never auto-select a latest experiment. Resolve the exact immutable run and model,
 fold, or trial directory requested by the user. For MN5 discovery or artifact
-transfer, load `mn5-dispatch`.
+transfer, load `mn5-cluster-usage`.
 
 Prefer a model/trial directory or `training_dynamics_manifest.json`; these retain
 status, cadence, feature flags, row count, and artifact SHA-256. A direct JSONL

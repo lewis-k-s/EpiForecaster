@@ -525,9 +525,8 @@ def _fit_var_joint(
     if n_targets < 2 or n_obs < 6:
         return None
 
-    # AIC lag selection over a feasible range. VAR.fit selects the best lag by
-    # the information criterion, replacing the old fixed lag=1 policy that
-    # systematically mis-specified the dynamics.
+    # AIC lag selection over a feasible range; VAR.fit picks the best lag by
+    # the information criterion.
     max_feasible_lags = min(int(maxlags), max(1, n_obs - n_targets - 1))
     if max_feasible_lags < 1:
         return None

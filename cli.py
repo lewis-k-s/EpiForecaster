@@ -318,7 +318,7 @@ cli.add_command(plot_cli, name="plot")
     type=click.Path(path_type=Path),
     default=None,
     help=(
-        "Optional legacy path for granular per-example error rows; "
+        "Optional path for granular per-example error rows; "
         "format is inferred from suffix."
     ),
 )
@@ -382,6 +382,14 @@ cli.add_command(plot_cli, name="plot")
     help="Also save a joint SIRHD latent trajectory figure for selected forecasts.",
 )
 @click.option(
+    "--include-relevant-latent",
+    is_flag=True,
+    help=(
+        "Overlay each target's relevant mechanistic source from canonical granular "
+        "evaluation rows."
+    ),
+)
+@click.option(
     "--node-metric-target",
     type=click.Choice(
         ["hospitalizations", "wastewater", "cases", "deaths"],
@@ -415,6 +423,7 @@ def eval_epiforecaster(
     compare_baselines: Path | None,
     selection_mode: str,
     include_sird_latents: bool,
+    include_relevant_latent: bool,
     node_metric_target: str,
     compare_evals: bool,
 ):
@@ -430,7 +439,9 @@ def eval_epiforecaster(
     try:
         per_head_node_metrics_csv: Path | None = None
         effective_overrides = list(override)
-        write_granular_eval = bool(granular or granular_csv is not None)
+        write_granular_eval = bool(
+            granular or granular_csv is not None or include_relevant_latent
+        )
 
         if not any(item.startswith("output.write_granular_eval=") for item in override):
             effective_overrides.append(
@@ -613,6 +624,8 @@ def eval_epiforecaster(
                 output_path=output,
                 log_dir=log_dir,
                 include_sird_latents=include_sird_latents,
+                include_relevant_latent=include_relevant_latent,
+                granular_eval_path=granular_csv,
             )
 
             # Step 4: Show results
@@ -660,6 +673,9 @@ def eval_epiforecaster(
                     per_head_node_metrics_csv=per_head_node_metrics_csv,
                     output_dir=per_head_node_metrics_csv.parent,
                     samples_per_quartile=4,
+                    model=eval_result["model"],
+                    config=eval_result["config"],
+                    loader=eval_result["loader"],
                 )
             except Exception as e:
                 click.echo(f"Warning: Per-head eval plotting failed: {e}")
@@ -953,6 +969,14 @@ def eval_baselines(
     help="Also save a joint SIRHD latent trajectory figure for selected forecasts.",
 )
 @click.option(
+    "--include-relevant-latent",
+    is_flag=True,
+    help=(
+        "Overlay each target's relevant mechanistic source from canonical granular "
+        "evaluation rows."
+    ),
+)
+@click.option(
     "--node-metric-target",
     type=click.Choice(
         ["hospitalizations", "wastewater", "cases", "deaths"],
@@ -974,6 +998,7 @@ def plot_forecasts(
     override: tuple[str, ...],
     granular_csv: Path | None,
     include_sird_latents: bool,
+    include_relevant_latent: bool,
     node_metric_target: str,
 ):
     """Generate forecast plots from checkpoint with flexible node selection.
@@ -1044,10 +1069,11 @@ def plot_forecasts(
             select_worst_windows_by_loss,
         )
         from evaluation.losses import get_loss_from_config
+        from data.latent_supervision import latent_scales_from_checkpoint
 
         click.echo(f"Loading checkpoint: {checkpoint}")
         overrides = list(override) if override else None
-        model, config, _ckpt = load_model_from_checkpoint(
+        model, config, loaded_checkpoint = load_model_from_checkpoint(
             checkpoint, device=device, overrides=overrides
         )
         click.echo(
@@ -1068,6 +1094,7 @@ def plot_forecasts(
             click.echo(f"Running mini-eval for {strategy} selection...")
             criterion = get_loss_from_config(
                 config.training.loss,
+                latent_scales=latent_scales_from_checkpoint(loaded_checkpoint),
                 data_config=config.data,
                 observation_heads_config=config.model.observation_heads,
                 input_window_length=config.model.input_window_length,
@@ -1082,6 +1109,9 @@ def plot_forecasts(
                 region_embeddings=region_embeddings,
                 split_name=split.capitalize(),
                 node_metrics_target=node_metric_target,
+                relevant_source_mapping=(
+                    config.model.observation_heads.relevant_source_mapping()
+                ),
             )
 
         if strategy == "random":
@@ -1137,12 +1167,24 @@ def plot_forecasts(
             for group_name, group_specs in window_groups.items():
                 click.echo(f"  {group_name}: {len(group_specs)} windows")
         else:
+            assert node_groups is not None
             total_nodes = sum(len(v) for v in node_groups.values())
             click.echo(f"Selected {total_nodes} nodes via {strategy}:")
             for group_name, group_nodes in node_groups.items():
                 click.echo(f"  {group_name}: {len(group_nodes)} nodes")
 
         click.echo(f"Generating plots (window={window})...")
+        if include_relevant_latent:
+            if granular_csv is None:
+                granular_csv = (
+                    checkpoint.parent.parent
+                    / config.output.resolve_granular_eval_filename(split=split)
+                )
+            if not granular_csv.exists():
+                raise click.ClickException(
+                    "Relevant-latent overlays require canonical granular eval rows, "
+                    f"not found: {granular_csv}"
+                )
         generate_forecast_plots(
             model=model,
             loader=loader,
@@ -1151,6 +1193,8 @@ def plot_forecasts(
             window=window,
             output_path=output,
             include_sird_latents=include_sird_latents,
+            include_relevant_latent=include_relevant_latent,
+            granular_eval_path=granular_csv,
         )
 
         if output is not None:

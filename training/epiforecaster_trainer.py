@@ -9,10 +9,12 @@ The trainer works with the EpiForecaster model.
 """
 
 import importlib
+import hashlib
 import json
 import logging
 import os
 import platform
+import random
 import re
 import time
 from collections import defaultdict
@@ -33,10 +35,19 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from data.dataset_factory import build_datasets
 from data.epi_batch import EpiBatch
+from data.latent_supervision import (
+    LatentScaleState,
+    fit_latent_scale_state,
+    validate_complete_latent_targets,
+)
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.eval_loop import evaluate_loader
 from evaluation.losses import JointInferenceLoss
-from models.configs import EpiForecasterConfig
+from evaluation.selection_scores import (
+    _SELECTION_METRIC_NAME,
+    compute_validation_selection_score,
+)
+from models.configs import EpiForecasterConfig, resolve_residual_schedule_phase
 from models.epiforecaster import EpiForecaster
 from training.dataloader_factory import (
     build_dataloaders,
@@ -44,6 +55,12 @@ from training.dataloader_factory import (
 )
 from training.gradnorm import GradNormController
 from training.optim_factory import create_optimizer, create_scheduler
+from training.pathway_gradients import (
+    compute_latent_parameter_gradient_metrics,
+    compute_latent_variation_metrics,
+    compute_pathway_gradient_metrics,
+    should_probe_pathway_gradients,
+)
 from training.training_dynamics import TrainingDynamicsWriter
 from utils.device import (
     iter_device_ready_batches,
@@ -77,7 +94,11 @@ from utils.console import (
     format_component_gradnorm_status,
     format_train_progress_status,
 )
-from utils.checkpoint_compat import initialize_missing_distribution_parameters
+from utils.checkpoint_compat import (
+    initialize_missing_distribution_parameters,
+    initialize_missing_frozen_gamma_metadata,
+    migrate_legacy_frozen_clinical_gamma_keys,
+)
 from training.grad_utils import (
     compute_gradient_norms_and_clip,
     should_log_gradnorm_components,
@@ -103,98 +124,15 @@ _PER_SERIES_METRIC_KEYS = [
     "crps_hosp_log1p_per_100k",
     "crps_cases_log1p_per_100k",
     "crps_deaths_log1p_per_100k",
+    "wis_ww_log1p_per_100k",
+    "wis_hosp_log1p_per_100k",
+    "wis_cases_log1p_per_100k",
+    "wis_deaths_log1p_per_100k",
     "r2_ww_log1p_per_100k",
     "r2_hosp_log1p_per_100k",
     "r2_cases_log1p_per_100k",
     "r2_deaths_log1p_per_100k",
 ]
-_TARGET_MAE_METRIC_KEYS = [
-    "mae_ww_log1p_per_100k",
-    "mae_hosp_log1p_per_100k",
-    "mae_cases_log1p_per_100k",
-    "mae_deaths_log1p_per_100k",
-]
-_TARGET_CRPS_METRIC_KEYS = [
-    "crps_ww_log1p_per_100k",
-    "crps_hosp_log1p_per_100k",
-    "crps_cases_log1p_per_100k",
-    "crps_deaths_log1p_per_100k",
-]
-_TARGET_NLL_METRIC_KEYS = [
-    "nll_ww_log1p_per_100k",
-    "nll_hosp_log1p_per_100k",
-    "nll_cases_log1p_per_100k",
-    "nll_deaths_log1p_per_100k",
-]
-_SELECTION_METRIC_NAME = "mean_target_mae"
-_CRPS_SELECTION_METRIC_NAME = "mean_target_crps"
-_NLL_SELECTION_METRIC_NAME = "mean_target_nll"
-
-
-def compute_mean_target_mae(metrics: dict[str, Any]) -> float:
-    """Compute the locked validation endpoint score from per-target MAEs."""
-    values: list[float] = []
-    for key in _TARGET_MAE_METRIC_KEYS:
-        value = metrics.get(key)
-        if value is None:
-            continue
-        value_float = float(value)
-        if np.isfinite(value_float):
-            values.append(value_float)
-    if not values:
-        return float("inf")
-    return float(np.mean(values))
-
-
-def compute_mean_target_crps(metrics: dict[str, Any]) -> float:
-    """Compute the validation endpoint score from per-target CRPS."""
-    values: list[float] = []
-    for key in _TARGET_CRPS_METRIC_KEYS:
-        value = metrics.get(key)
-        if value is None:
-            continue
-        value_float = float(value)
-        if np.isfinite(value_float):
-            values.append(value_float)
-    if not values:
-        return float("inf")
-    return float(np.mean(values))
-
-
-def compute_mean_target_nll(metrics: dict[str, Any]) -> float:
-    """Compute the validation endpoint score from per-target NLL."""
-    values: list[float] = []
-    for key in _TARGET_NLL_METRIC_KEYS:
-        value = metrics.get(key)
-        if value is None:
-            continue
-        value_float = float(value)
-        if np.isfinite(value_float):
-            values.append(value_float)
-    if not values:
-        return float("inf")
-    return float(np.mean(values))
-
-
-def compute_validation_selection_score(
-    metrics: dict[str, Any],
-    *,
-    observation_loss: str,
-) -> tuple[float, str]:
-    """Choose the checkpoint-selection score for the current observation loss."""
-    selection_score = compute_mean_target_mae(metrics)
-    selection_metric = _SELECTION_METRIC_NAME
-    if observation_loss in {"nll", "crps"}:
-        crps_selection_score = compute_mean_target_crps(metrics)
-        if np.isfinite(crps_selection_score):
-            selection_score = crps_selection_score
-            selection_metric = _CRPS_SELECTION_METRIC_NAME
-        elif observation_loss == "nll":
-            nll_selection_score = compute_mean_target_nll(metrics)
-            if np.isfinite(nll_selection_score):
-                selection_score = nll_selection_score
-                selection_metric = _NLL_SELECTION_METRIC_NAME
-    return selection_score, selection_metric
 
 
 def normalize_training_history(
@@ -231,6 +169,9 @@ class EpiForecasterTrainer:
     The trainer is designed to be model-agnostic, with variant-specific behavior controlled through model configuration.
     """
 
+    # Set on resume under selection_metric=auto; checked on first validation.
+    _resume_selection_metric: str | None = None
+
     def __init__(
         self,
         config: EpiForecasterConfig,
@@ -258,8 +199,6 @@ class EpiForecasterTrainer:
         # Set random seeds for reproducibility (CPU only).
         # CUDA-specific seeding is deferred until after DataLoader workers are forked.
         if config.training.seed is not None:
-            import random
-
             random.seed(config.training.seed)
             np.random.seed(config.training.seed)
             torch.manual_seed(config.training.seed)
@@ -284,6 +223,7 @@ class EpiForecasterTrainer:
         self.test_dataset = dataset_splits.test
         self.real_run_id = dataset_splits.real_run_id
         self.synth_run_ids = dataset_splits.synth_run_ids
+        self.latent_scale_state = self._fit_latent_scale_state()
 
         # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
         if isinstance(self.train_dataset, ConcatDataset):
@@ -402,6 +342,9 @@ class EpiForecasterTrainer:
             self.region_embeddings = self.region_embeddings.to(self.device)
 
         self.model.to(self.device)
+        # Raw model reference for runtime controls that must bypass the
+        # torch.compile OptimizedModule wrapper.
+        self._residual_schedule_model = self.model
 
         # Apply torch.compile *before* loading checkpoints so that
         # compiled-checkpoint keys (_orig_mod.) match the live model.
@@ -521,6 +464,7 @@ class EpiForecasterTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float("inf")
+        self.best_val_crps = float("inf")
         self.best_val_selection_score = float("inf")
         self.best_val_selection_metric = _SELECTION_METRIC_NAME
         self.best_val_joint_loss = float("inf")
@@ -545,6 +489,8 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx: int | None = None
         self._lr_warmup_remaining: int = 0
         self._lr_warmup_target_lr: float = 0.0  # Target LR to restore after warmup
+        # Active observation-residual budget phase provenance (None = disabled)
+        self._active_residual_schedule_state: dict[str, Any] | None = None
 
         # Initialize gradient debugger (zero overhead when disabled)
         grad_debug_dir = self.config.training.gradient_debug_log_dir
@@ -644,11 +590,13 @@ class EpiForecasterTrainer:
                 )
             )
             self._status(
-                "    - Deaths:     kernel=%s, learnable=%s, mode=%s"
+                "    - Deaths:     kernel=%s, learnable=%s, mode=%s, gamma=(%s, %s)"
                 % (
                     heads.kernel_length_deaths,
                     heads.learnable_kernel_deaths,
                     heads.kernel_parameterization_deaths,
+                    heads.kernel_gamma_shape_deaths,
+                    heads.kernel_gamma_scale_deaths,
                 )
             )
             self._status(
@@ -670,7 +618,8 @@ class EpiForecasterTrainer:
         self._status(
             f"    - Obs weight sum (fixed eval objective): {loss_cfg.gradnorm_obs_weight_sum}"
         )
-        self._status(f"    - SIRHD supervision weight: {loss_cfg.w_sird_supervision}")
+        self._status(f"    - Latent supervision weight: {loss_cfg.latent.total_weight}")
+        self._status(f"    - Latent scaling: {loss_cfg.latent.scaling}")
         self._status("    - n_eff: diagnostic only; no loss scaling")
         if self._gradnorm_enabled:
             self._status(
@@ -880,12 +829,51 @@ class EpiForecasterTrainer:
             warmup_batches=self.config.training.warmup_steps,
         )
 
+    def _fit_latent_scale_state(self) -> LatentScaleState | None:
+        """Fit fixed latent scales from the training split when requested."""
+        latent_config = self.config.training.loss.joint.latent
+        if latent_config.total_weight <= 0:
+            return None
+
+        if latent_config.require_complete_targets:
+            for split in (self.train_dataset, self.val_dataset, self.test_dataset):
+                if split is not None:
+                    validate_complete_latent_targets(split)
+
+        dataset_identity = str(
+            getattr(
+                self,
+                "_original_dataset_path",
+                self.config.data.dataset_path,
+            )
+        )
+        state = fit_latent_scale_state(
+            self.train_dataset,
+            floors=latent_config.scale_floors,
+            dataset_identity=dataset_identity,
+        )
+        self._status(
+            "Fitted latent supervision scales from the training split: "
+            f"mode={latent_config.scaling}, hash={state.state_hash}",
+            logging.INFO,
+        )
+        return state
+
     def _create_criterion(self) -> JointInferenceLoss:
         """Create loss criterion."""
         from evaluation.losses import get_loss_from_config
 
+        latent_scales = (
+            None
+            if self.latent_scale_state is None
+            else {
+                name: float(value)
+                for name, value in self.latent_scale_state.scales.items()
+            }
+        )
         return get_loss_from_config(
             self.config.training.loss,
+            latent_scales=latent_scales,
             data_config=self.config.data,
             observation_heads_config=self.config.model.observation_heads,
             input_window_length=self.config.model.input_window_length,
@@ -923,6 +911,9 @@ class EpiForecasterTrainer:
         experiment_dir.mkdir(parents=True, exist_ok=True)
         self._persist_run_config(experiment_dir)
         self._persist_mobility_diagnostics(experiment_dir)
+        self._persist_latent_scale_state(experiment_dir)
+        if self.config.training.pathway_gradient_frequency > 0:
+            self._persist_latent_gradient_probe(experiment_dir)
 
         self.experiment_dir = experiment_dir
 
@@ -1075,14 +1066,36 @@ class EpiForecasterTrainer:
         if checkpoint_path is None:
             raise ValueError("resume_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self._validate_checkpoint_selection_contract(checkpoint)
+        self.best_val_crps = float(checkpoint.get("best_val_crps", float("inf")))
+        self._validate_checkpoint_latent_scale_state(checkpoint)
+        self._validate_checkpoint_residual_schedule_state(checkpoint)
 
         # Validate checkpoint precision compatibility (rejects FP16 checkpoints)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
 
+        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+            state_dict=checkpoint["model_state_dict"],
+            model_state_dict=self.model.state_dict(),
+            saved_config=checkpoint.get("config"),
+        )
+        if migrated_gamma_keys:
+            self._status(
+                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
+                "kernel keys.",
+                logging.INFO,
+            )
         state_dict, initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
-                state_dict=checkpoint["model_state_dict"],
+                state_dict=state_dict,
                 model_state_dict=self.model.state_dict(),
+            )
+        )
+        state_dict, _initialized_gamma_metadata = (
+            initialize_missing_frozen_gamma_metadata(
+                state_dict=state_dict,
+                model_state_dict=self.model.state_dict(),
+                saved_config=checkpoint.get("config"),
             )
         )
         self.model.load_state_dict(state_dict)
@@ -1140,6 +1153,15 @@ class EpiForecasterTrainer:
             "best_val_selection_metric",
             getattr(self, "best_val_selection_metric", _SELECTION_METRIC_NAME),
         )
+        if np.isfinite(self.best_val_selection_score):
+            selection_metric = self.config.training.selection_metric
+            if selection_metric == "auto":
+                # Auto resolves from the first validation pass; compare then.
+                self._resume_selection_metric = self.best_val_selection_metric
+            else:
+                self._validate_resumed_selection_metric(selection_metric)
+        self.patience_counter = int(checkpoint.get("patience_counter", 0))
+        self._restore_rng_state(checkpoint.get("rng_state"))
         self.best_val_joint_loss = checkpoint.get(
             "best_val_joint_loss",
             checkpoint.get(
@@ -1153,6 +1175,52 @@ class EpiForecasterTrainer:
         )
         self._status(f"Resumed from checkpoint: {checkpoint_path}")
 
+    def _validate_resumed_selection_metric(self, current_metric: str) -> None:
+        """Reject a resume whose selection metric differs from the checkpoint."""
+        self._resume_selection_metric, saved = None, self._resume_selection_metric
+        if saved is None:
+            saved = self.best_val_selection_metric
+        if saved != current_metric:
+            raise ValueError(
+                "Resume selection metric mismatch: checkpoint best score uses "
+                f"{saved!r} but the current run selects on {current_metric!r}"
+            )
+
+    @staticmethod
+    def _capture_rng_state() -> dict[str, Any]:
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+
+    @staticmethod
+    def _restore_rng_state(state: dict[str, Any] | None) -> None:
+        if state is None:
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+
+    def _validate_checkpoint_latent_scale_state(
+        self, checkpoint: dict[str, Any]
+    ) -> None:
+        """Reject resume or final evaluation with a different fitted scale state."""
+        latent_scale_state = getattr(self, "latent_scale_state", None)
+        expected_state = (
+            None if latent_scale_state is None else latent_scale_state.to_dict()
+        )
+        expected_hash = (
+            None if latent_scale_state is None else latent_scale_state.state_hash
+        )
+        checkpoint_state = checkpoint.get("latent_scale_state")
+        checkpoint_hash = checkpoint.get("latent_scale_state_hash")
+        if checkpoint_state != expected_state or checkpoint_hash != expected_hash:
+            raise ValueError(
+                "Checkpoint latent scale state does not match the current training "
+                "split and latent supervision configuration."
+            )
+
     def _initialize_model_from_checkpoint(self) -> None:
         from utils.precision_policy import validate_old_checkpoint_compatible
 
@@ -1161,10 +1229,28 @@ class EpiForecasterTrainer:
             raise ValueError("init_checkpoint_path is not set")
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+            state_dict=checkpoint["model_state_dict"],
+            model_state_dict=self.model.state_dict(),
+            saved_config=checkpoint.get("config"),
+        )
+        if migrated_gamma_keys:
+            self._status(
+                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
+                "kernel keys.",
+                logging.INFO,
+            )
         state_dict, _initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
-                state_dict=checkpoint["model_state_dict"],
+                state_dict=state_dict,
                 model_state_dict=self.model.state_dict(),
+            )
+        )
+        state_dict, _initialized_gamma_metadata = (
+            initialize_missing_frozen_gamma_metadata(
+                state_dict=state_dict,
+                model_state_dict=self.model.state_dict(),
+                saved_config=checkpoint.get("config"),
             )
         )
         self.model.load_state_dict(state_dict)
@@ -1384,12 +1470,17 @@ class EpiForecasterTrainer:
                 compute_validation_selection_score(
                     val_metrics,
                     observation_loss=self.criterion.observation_loss,
+                    selection_metric=self.config.training.selection_metric,
+                    required_heads=self.config.training.selection_required_heads,
                 )
             )
 
             self._log_epoch(
                 split_name="Val", loss=val_loss, metrics=val_metrics, epoch=epoch
             )
+
+            if self._resume_selection_metric is not None:
+                self._validate_resumed_selection_metric(val_selection_metric)
 
             # Learning rate scheduling (if per-epoch)
             if self.scheduler and self.config.training.scheduler_type == "step":
@@ -1476,6 +1567,11 @@ class EpiForecasterTrainer:
             self.training_history["epoch_times"].append(
                 float(time.time() - epoch_started_at)
             )
+
+            # Auxiliary CRPS checkpoint runs after the primary bookkeeping so it
+            # records this epoch's selection state.
+            if self.config.training.retain_best_crps_checkpoint:
+                self._maybe_save_crps_checkpoint(epoch, val_loss, val_metrics)
 
             _prev_val_loss = val_loss
 
@@ -1670,6 +1766,143 @@ class EpiForecasterTrainer:
         self._last_curriculum_phase_idx = current_idx
         return transition
 
+    def _apply_residual_schedule_for_epoch(self, epoch: int) -> None:
+        """Apply the configured observation-residual budget for ``epoch``.
+
+        Must be called once per epoch before the first batch. Disabled
+        schedules restore the unrestricted legacy residual path.
+        """
+        phase_index, phase = resolve_residual_schedule_phase(
+            self.config.training.residual_schedule,
+            epoch,
+        )
+        effective_max_log_location_fraction: float | None = (
+            None if phase is None else float(phase.max_log_location_fraction)
+        )
+        self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
+            effective_max_log_location_fraction
+        )
+        self._active_residual_schedule_state = {
+            "enabled": phase is not None,
+            "phase_index": phase_index,
+            "phase_start_epoch": None if phase is None else phase.start_epoch,
+            "phase_end_epoch": None if phase is None else phase.end_epoch,
+            "effective_max_log_location_fraction": (
+                effective_max_log_location_fraction
+            ),
+        }
+        if phase is not None:
+            phase_epochs = f"{phase.start_epoch}-{phase.end_epoch - 1}"
+            if phase_index == len(self.config.training.residual_schedule.schedule) - 1:
+                phase_epochs += " and onward"
+            self._status(
+                f"Residual schedule phase {phase_index} (epochs {phase_epochs}): "
+                "residual log-location budget "
+                f"{effective_max_log_location_fraction:.2f} of mechanistic "
+                "log location",
+                logging.INFO,
+            )
+
+    def _validate_checkpoint_residual_schedule_state(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> None:
+        """Reject resume when the residual schedule disagrees with the checkpoint.
+
+        The schedule is scientific behavior: changing it across a resume
+        would silently change the residual policy that produced the checkpoint
+        weights. Legacy checkpoints without any schedule state may only resume
+        into a disabled schedule.
+        """
+        saved_config = checkpoint.get("config")
+        saved_training = (
+            saved_config.get("training", {}) if isinstance(saved_config, dict) else None
+        )
+        saved_schedule = (
+            saved_training.get("residual_schedule")
+            if isinstance(saved_training, dict)
+            else None
+        )
+        current_schedule = {
+            "enabled": self.config.training.residual_schedule.enabled,
+            "schedule": [
+                {
+                    "start_epoch": phase.start_epoch,
+                    "end_epoch": phase.end_epoch,
+                    "max_log_location_fraction": phase.max_log_location_fraction,
+                }
+                for phase in self.config.training.residual_schedule.schedule
+            ],
+        }
+        # A checkpoint without a schedule block predates this feature. It is
+        # valid only when it also has no schedule provenance and resumes into
+        # the unrestricted legacy path.
+        legacy_checkpoint = saved_schedule is None
+        saved_state = checkpoint.get("residual_schedule_state")
+        if legacy_checkpoint:
+            if saved_state is not None:
+                raise ValueError(
+                    "Legacy checkpoint carries residual schedule provenance "
+                    f"without a residual schedule: {saved_state!r}"
+                )
+            if current_schedule["enabled"]:
+                raise ValueError(
+                    "Legacy checkpoint without residual schedule state may only "
+                    "resume into a disabled residual schedule."
+                )
+            return
+        if saved_schedule != current_schedule:
+            raise ValueError(
+                "Checkpoint residual schedule does not match the configured "
+                f"schedule: checkpoint={saved_schedule!r}, "
+                f"configured={current_schedule!r}"
+            )
+        if not self.config.training.residual_schedule.enabled:
+            canonical_disabled = {
+                "enabled": False,
+                "phase_index": None,
+                "phase_start_epoch": None,
+                "phase_end_epoch": None,
+                "effective_max_log_location_fraction": None,
+            }
+            if saved_state is not None and saved_state != canonical_disabled:
+                raise ValueError(
+                    "Checkpoint carries a disabled residual schedule with "
+                    f"contradictory provenance: {saved_state!r}"
+                )
+            return
+        if saved_state is None:
+            raise ValueError(
+                "Residual schedule is enabled but the checkpoint carries no "
+                "residual_schedule_state provenance; refusing to resume."
+            )
+        saved_epoch = int(checkpoint.get("epoch", -1))
+        expected_index, expected_phase = resolve_residual_schedule_phase(
+            self.config.training.residual_schedule,
+            saved_epoch,
+        )
+        expected_state = {
+            "enabled": expected_phase is not None,
+            "phase_index": expected_index,
+            "phase_start_epoch": (
+                None if expected_phase is None else expected_phase.start_epoch
+            ),
+            "phase_end_epoch": (
+                None if expected_phase is None else expected_phase.end_epoch
+            ),
+            "effective_max_log_location_fraction": (
+                None
+                if expected_phase is None
+                else float(expected_phase.max_log_location_fraction)
+            ),
+        }
+        if saved_state != expected_state:
+            raise ValueError(
+                "Checkpoint residual schedule provenance is inconsistent with "
+                f"the saved epoch {saved_epoch}: checkpoint={saved_state!r}, "
+                f"expected={expected_state!r}"
+            )
+
     def _training_step_impl(self, batch_data: EpiBatch) -> torch.Tensor:
         """Pure training step: forward + backward only.
 
@@ -1854,6 +2087,74 @@ class EpiForecasterTrainer:
         )
         return log_data
 
+    def _pathway_gradient_sidecar(
+        self,
+        batch_data: EpiBatch,
+        *,
+        actual_update_global_norm_preclip: torch.Tensor,
+    ) -> dict[str, torch.Tensor | float]:
+        """Probe observation-loss gradients through mechanistic and residual paths."""
+        frequency = self.config.training.pathway_gradient_frequency
+        if not should_probe_pathway_gradients(self.global_step, frequency):
+            return {}
+
+        sidecar_start_time = time.time()
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.precision_policy.autocast_dtype,
+            enabled=self.precision_policy.autocast_enabled,
+        ):
+            model_outputs, targets_dict = self.model.forward_batch(
+                batch_data=batch_data,
+                region_embeddings=self.region_embeddings,
+                mask_cases=self.criterion.mask_input_cases,
+                mask_ww=self.criterion.mask_input_ww,
+                mask_hosp=self.criterion.mask_input_hosp,
+                mask_deaths=self.criterion.mask_input_deaths,
+            )
+            components = self.criterion.compute_components_train(
+                model_outputs,
+                targets_dict,
+                batch_data,
+            )
+
+        metrics: dict[str, torch.Tensor | float] = {
+            "pathgrad_sidecar_ran": torch.ones((), device=self.device),
+        }
+        head_names = ("ww", "hosp", "cases", "deaths")
+        for head_name in head_names:
+            metrics.update(
+                compute_pathway_gradient_metrics(
+                    head_name=head_name,
+                    loss=components[head_name],
+                    mechanistic_source=model_outputs[f"observation_source_{head_name}"],
+                    residual_input=model_outputs[f"residual_input_{head_name}"],
+                    retain_graph=True,
+                )
+            )
+        metrics.update(
+            compute_latent_variation_metrics(
+                model_outputs=model_outputs,
+                targets=targets_dict,
+            )
+        )
+        metrics.update(
+            compute_latent_parameter_gradient_metrics(
+                components=components,
+                selected_parameters=self._grad_norm_groups["sird"],
+                all_parameters=[
+                    parameter
+                    for parameter in self.model.parameters()
+                    if parameter.requires_grad
+                ],
+                latent_total_weight=self.criterion.latent_total_weight,
+                clip_value=self.config.training.gradient_clip_value,
+                actual_update_global_norm_preclip=(actual_update_global_norm_preclip),
+            )
+        )
+        metrics["pathgrad_sidecar_time_s"] = time.time() - sidecar_start_time
+        return metrics
+
     @staticmethod
     def _build_targets_dict(
         batch_data: EpiBatch,
@@ -1869,6 +2170,7 @@ class EpiForecasterTrainer:
             "H_target": batch_data.H_target,
             "R_target": batch_data.R_target,
             "D_target": batch_data.D_target,
+            "death_flow_target": batch_data.death_flow_target,
             "ww_mask": batch_data.ww_target_mask,
             "hosp_mask": batch_data.hosp_target_mask,
             "cases_mask": batch_data.cases_target_mask,
@@ -2042,11 +2344,17 @@ class EpiForecasterTrainer:
         self, batch_data: EpiBatch
     ) -> tuple[str, dict[str, float]]:
         """Build optional SIRHD loss detail text and metrics for step logging."""
-        if self.criterion.w_sird_supervision <= 0:
+        if self.criterion.latent_total_weight <= 0:
             return "", {}
         if all(
             getattr(batch_data, key, None) is None
-            for key in ("S_target", "I_target", "H_target", "R_target", "D_target")
+            for key in (
+                "S_target",
+                "I_target",
+                "H_target",
+                "R_target",
+                "death_flow_target",
+            )
         ):
             return "", {}
 
@@ -2072,21 +2380,35 @@ class EpiForecasterTrainer:
 
         sird_raw = float(components["sird_supervision"])
         sird_weighted = float(components["sird_supervision_weighted"])
+        metrics = {
+            build_loss_key(split="train", component="sird_supervision"): sird_raw,
+            build_loss_key(
+                split="train",
+                component="sird_supervision",
+                weighted=True,
+            ): sird_weighted,
+        }
+        for task in ("s", "i", "h", "r", "death_flow"):
+            component = f"latent_{task}"
+            metrics[f"loss_train_{component}_raw"] = float(
+                components[f"{component}_raw"]
+            )
+            metrics[f"loss_train_{component}_scaled"] = float(components[component])
+            metrics[f"loss_train_{component}_total_weighted"] = float(
+                self.criterion.latent_total_weight * components[f"{component}_weighted"]
+            )
         return (
             f" | SIRHD: {sird_raw:.4g} (w={sird_weighted:.4g})",
-            {
-                build_loss_key(split="train", component="sird_supervision"): sird_raw,
-                build_loss_key(
-                    split="train",
-                    component="sird_supervision",
-                    weighted=True,
-                ): sird_weighted,
-            },
+            metrics,
         )
 
     def _train_epoch(self) -> float:
         """Train for one epoch."""
         self.model.train()
+
+        # Apply the observation-residual budget once per epoch, before any
+        # batch. Orthogonal to the data curriculum and its LR-transition logic.
+        self._apply_residual_schedule_for_epoch(self.current_epoch)
 
         # Update Curriculum
         if self.curriculum_sampler is not None:
@@ -2271,6 +2593,11 @@ class EpiForecasterTrainer:
                         foreach=True,
                     )
 
+                pathway_gradient_log_data = self._pathway_gradient_sidecar(
+                    batch_data,
+                    actual_update_global_norm_preclip=grad_norm,
+                )
+
                 # Optimizer step and gradient zeroing (common to both paths)
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -2406,7 +2733,11 @@ class EpiForecasterTrainer:
                     else float("inf")
                 )
                 log_frequency = self.config.training.progress_log_frequency
-                log_this_step = should_log_step(self.global_step, 1, log_frequency)
+                log_this_step = should_log_step(
+                    self.global_step,
+                    1,
+                    log_frequency,
+                ) or bool(pathway_gradient_log_data)
 
                 log_data = build_train_step_log_data(
                     lr=lr,
@@ -2420,6 +2751,7 @@ class EpiForecasterTrainer:
                     gradient_snapshot_log_data=gradient_snapshot_log_data,
                     model_diagnostics_log_data=model_diagnostics_log_data,
                 )
+                log_data.update(pathway_gradient_log_data)
 
                 if log_this_step:
                     # Use detach() instead of item() - wandb handles tensor conversion
@@ -2474,7 +2806,7 @@ class EpiForecasterTrainer:
                         self.config.training.gradient_clip_value
                     )
                     gradnorm_total_preclip = float(grad_norm.detach().cpu().item())
-                    dynamics_values = {
+                    dynamics_values: dict[str, Any] = {
                         key.replace("/", "_"): value
                         for key, value in log_data.items()
                         if key != "epoch"
@@ -2486,6 +2818,38 @@ class EpiForecasterTrainer:
                                 1.0,
                                 gradient_clip_threshold
                                 / max(gradnorm_total_preclip, 1.0e-12),
+                            ),
+                        }
+                    )
+                    dynamics_values.update(
+                        {
+                            "residual_schedule_enabled": bool(
+                                self._active_residual_schedule_state is not None
+                                and self._active_residual_schedule_state["enabled"]
+                            ),
+                            "residual_schedule_phase_index": (
+                                self._active_residual_schedule_state["phase_index"]
+                                if self._active_residual_schedule_state is not None
+                                else None
+                            ),
+                            "residual_schedule_phase_start_epoch": (
+                                self._active_residual_schedule_state[
+                                    "phase_start_epoch"
+                                ]
+                                if self._active_residual_schedule_state is not None
+                                else None
+                            ),
+                            "residual_schedule_phase_end_epoch": (
+                                self._active_residual_schedule_state["phase_end_epoch"]
+                                if self._active_residual_schedule_state is not None
+                                else None
+                            ),
+                            "residual_schedule_effective_max_log_location_fraction": (
+                                self._active_residual_schedule_state[
+                                    "effective_max_log_location_fraction"
+                                ]
+                                if self._active_residual_schedule_state is not None
+                                else None
                             ),
                         }
                     )
@@ -2597,10 +2961,38 @@ class EpiForecasterTrainer:
         checkpoint_path = self._best_checkpoint_path()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         validate_old_checkpoint_compatible(checkpoint, self.precision_policy)
+        self._validate_checkpoint_latent_scale_state(checkpoint)
+        # The best checkpoint may come from an earlier residual-schedule
+        # phase than the final epoch; the budget buffer is non-persistent,
+        # so restore it from checkpoint provenance before evaluating.
+        self._validate_checkpoint_residual_schedule_state(checkpoint)
+        residual_state = checkpoint.get("residual_schedule_state")
+        if residual_state is not None:
+            self._residual_schedule_model.set_observation_residual_max_log_location_fraction(
+                residual_state["effective_max_log_location_fraction"]
+            )
+        state_dict, migrated_gamma_keys = migrate_legacy_frozen_clinical_gamma_keys(
+            state_dict=checkpoint["model_state_dict"],
+            model_state_dict=self.model.state_dict(),
+            saved_config=checkpoint.get("config"),
+        )
+        if migrated_gamma_keys:
+            self._status(
+                f"Migrated {len(migrated_gamma_keys)} legacy frozen clinical Gamma "
+                "kernel keys.",
+                logging.INFO,
+            )
         state_dict, _initialized_distribution_keys = (
             initialize_missing_distribution_parameters(
-                state_dict=checkpoint["model_state_dict"],
+                state_dict=state_dict,
                 model_state_dict=self.model.state_dict(),
+            )
+        )
+        state_dict, _initialized_gamma_metadata = (
+            initialize_missing_frozen_gamma_metadata(
+                state_dict=state_dict,
+                model_state_dict=self.model.state_dict(),
+                saved_config=checkpoint.get("config"),
             )
         )
         self.model.load_state_dict(state_dict)
@@ -2656,6 +3048,9 @@ class EpiForecasterTrainer:
             max_batches=self.config.training.max_batches,
             granular_output_path=granular_output_path,
             granular_eval_format=self.config.output.granular_eval_format,
+            relevant_source_mapping=(
+                self.config.model.observation_heads.relevant_source_mapping()
+            ),
             granular_metadata={
                 "batch_size": loader.batch_size,
                 "checkpoint_path": checkpoint_path,
@@ -2672,6 +3067,12 @@ class EpiForecasterTrainer:
                 "window_stride": int(self.config.data.window_stride),
             },
         )
+        # Each evaluation pass leaves ~1 GiB of new free segments that the
+        # caching allocator never reuses, so reserved memory grows every epoch.
+        # This frees only this process's unused cache (safe under MPS).
+        # expandable_segments would avoid this but breaks cudagraph trees.
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Store node MAE for forecast plotting
         self._last_node_mae = node_mae_dict
@@ -2723,6 +3124,7 @@ class EpiForecasterTrainer:
                 f"observation_head_{head}": [] for head in GradNormController.task_names
             },
         }
+        self._latent_gradient_probe_names: list[str] = []
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
@@ -2733,6 +3135,8 @@ class EpiForecasterTrainer:
                 self._grad_norm_groups["mobility_gnn"].append(param)
             elif any(proj in name for proj in sird_projections):
                 self._grad_norm_groups["sird"].append(param)
+                # torch.compile prefixes names with _orig_mod.; keep identity stable.
+                self._latent_gradient_probe_names.append(name.replace("_orig_mod.", ""))
             elif observation_head_name is not None:
                 self._grad_norm_groups[
                     f"observation_head_{observation_head_name}"
@@ -2800,6 +3204,90 @@ class EpiForecasterTrainer:
         diagnostics_path = run_dir / "mobility_initialization_diagnostics.json"
         diagnostics_path.write_text(
             json.dumps(payload, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _persist_latent_scale_state(self, run_dir: Path) -> None:
+        """Persist fitted scales and their training membership identity."""
+        if self.latent_scale_state is None:
+            return
+        config_payload = self._get_config_for_save()
+        config_encoded = json.dumps(
+            config_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        dataset_path = Path(str(config_payload["data"]["dataset_path"]))
+        dvc_pointer_path = Path(f"{dataset_path}.dvc")
+        dvc_pointer_sha256 = None
+        if dvc_pointer_path.is_file():
+            dvc_pointer_sha256 = hashlib.sha256(
+                dvc_pointer_path.read_bytes()
+            ).hexdigest()
+        payload = {
+            "state_hash": self.latent_scale_state.state_hash,
+            "algorithm": "unique_train_node_date_population_std_float64_v1",
+            "units": {
+                "s": "population_fraction",
+                "i": "population_fraction",
+                "h": "population_fraction",
+                "r": "population_fraction",
+                "death_flow": "population_fraction_per_model_step",
+            },
+            "split_seed": self.config.training.split_seed,
+            "dataset_path": str(dataset_path),
+            "dataset_dvc_pointer": (
+                str(dvc_pointer_path) if dvc_pointer_path.is_file() else None
+            ),
+            "dataset_dvc_pointer_sha256": dvc_pointer_sha256,
+            "config_sha256": hashlib.sha256(config_encoded.encode("utf-8")).hexdigest(),
+            **self.latent_scale_state.to_dict(),
+        }
+        receipt_encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        payload["receipt_hash"] = hashlib.sha256(
+            receipt_encoded.encode("utf-8")
+        ).hexdigest()
+        scale_path = run_dir / "latent_scale_receipt.json"
+        if scale_path.exists():
+            existing = json.loads(scale_path.read_text(encoding="utf-8"))
+            if existing != payload:
+                raise ValueError(
+                    "Existing latent scale state does not match the current "
+                    f"training split: {scale_path}"
+                )
+            return
+        scale_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def _persist_latent_gradient_probe(self, run_dir: Path) -> None:
+        """Persist the exact X0 and rate parameter subset used by telemetry."""
+        names = sorted(self._latent_gradient_probe_names)
+        encoded = json.dumps(names, separators=(",", ":"), ensure_ascii=True)
+        payload = {
+            "schema_version": 1,
+            "selection": "x0_and_rate_projection_parameters",
+            "parameter_names": names,
+            "parameter_name_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        }
+        probe_path = run_dir / "latent_gradient_probe.json"
+        if probe_path.exists():
+            existing = json.loads(probe_path.read_text(encoding="utf-8"))
+            if existing != payload:
+                raise ValueError(
+                    "Existing latent gradient probe does not match the current model: "
+                    f"{probe_path}"
+                )
+            return
+        probe_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
 
@@ -2871,6 +3359,55 @@ class EpiForecasterTrainer:
 
         return config_dict
 
+    def _validate_checkpoint_selection_contract(self, checkpoint: dict) -> None:
+        if self.config.training.selection_metric == "auto":
+            return
+        saved = checkpoint.get("config", {}).get("training", {})
+        selection = {
+            "selection_metric": self.config.training.selection_metric,
+            "selection_required_heads": self.config.training.selection_required_heads,
+        }
+        for key, value in selection.items():
+            if saved.get(key) != value:
+                raise ValueError(f"Checkpoint selection contract mismatch: {key}")
+        saved_joint = saved.get("loss", {}).get("joint", {})
+        current_joint = self.config.training.loss.joint
+        observation = {
+            "observation_loss": current_joint.observation_loss,
+            "distribution_family": current_joint.distribution_family,
+            "distribution_df": current_joint.distribution_df,
+        }
+        for key, value in observation.items():
+            if saved_joint.get(key) != value:
+                raise ValueError(f"Checkpoint observation contract mismatch: {key}")
+
+    def _maybe_save_crps_checkpoint(
+        self, epoch: int, val_loss: float, metrics: dict
+    ) -> None:
+        try:
+            score, name = compute_validation_selection_score(
+                metrics,
+                observation_loss=self.criterion.observation_loss,
+                selection_metric="mean_target_crps",
+                required_heads=self.config.training.selection_required_heads,
+            )
+        except ValueError as error:
+            self._status(
+                f"Skipped auxiliary CRPS checkpoint at epoch {epoch}: {error}",
+                logging.WARNING,
+            )
+            return
+        if score < self.best_val_crps:
+            self.best_val_crps = score
+            if self.config.output.save_checkpoints:
+                self._save_checkpoint(
+                    epoch,
+                    val_loss,
+                    val_selection_score=score,
+                    val_selection_metric=name,
+                    is_best_crps=True,
+                )
+
     def _save_checkpoint(
         self,
         epoch: int,
@@ -2879,6 +3416,7 @@ class EpiForecasterTrainer:
         val_selection_metric: str | None = None,
         is_best: bool = False,
         is_final: bool = False,
+        is_best_crps: bool = False,
     ):
         """Save model checkpoint."""
         from utils.precision_policy import create_precision_signature
@@ -2897,13 +3435,27 @@ class EpiForecasterTrainer:
             "val_selection_score": val_selection_score,
             "val_selection_metric": val_selection_metric,
             "best_val_loss": self.best_val_loss,
+            "best_val_crps": self.best_val_crps,
             "best_val_selection_score": self.best_val_selection_score,
             "best_val_selection_metric": self.best_val_selection_metric,
             "best_val_joint_loss": self.best_val_joint_loss,
             "best_val_series_metrics": self.best_val_series_metrics,
+            "patience_counter": self.patience_counter,
+            "rng_state": self._capture_rng_state(),
             "config": self._get_config_for_save(),
+            "residual_schedule_state": self._active_residual_schedule_state,
             "training_history": self.training_history,
             "precision_signature": create_precision_signature(self.precision_policy),
+            "latent_scale_state": (
+                None
+                if self.latent_scale_state is None
+                else self.latent_scale_state.to_dict()
+            ),
+            "latent_scale_state_hash": (
+                None
+                if self.latent_scale_state is None
+                else self.latent_scale_state.state_hash
+            ),
         }
 
         if self.scheduler:
@@ -2919,7 +3471,9 @@ class EpiForecasterTrainer:
                 gradnorm_optimizer.state_dict()
             )
 
-        if is_best or is_final:
+        if is_best_crps:
+            filename = "best_crps_model.pt"
+        elif is_best or is_final:
             filename = "best_model.pt" if is_best else "final_model.pt"
         else:
             filename = f"checkpoint_epoch_{epoch:04d}.pt"

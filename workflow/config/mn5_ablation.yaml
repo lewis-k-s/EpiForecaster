@@ -1,5 +1,5 @@
-# Paired-seed Optuna ablation workflow. The worker count controls the number of
-# concurrent ranks; the study queue controls ablation/seed assignment.
+# Declarative paired-seed campaign. Workers coordinate its fixed identity matrix
+# through JournalStorage; Optuna never samples ablation design parameters.
 
 run: {}
 source: {}
@@ -16,18 +16,15 @@ dvc:
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 ablation:
-  study_name: epiforecaster_ablation_v1
-  campaign_id: epiforecaster_ablation_v1
-  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  study_name: epiforecaster_ablation_v2
+  campaign: configs/campaigns/ablation_default_v2.yaml
   workers: 4
-  seeds: [42, 43, 44, 45, 46]
-  ablations: null
-  overrides: []
-  # Full registry: 28 ablations x 5 seeds / 4 workers = 35 trials per worker.
-  trials_per_worker: 35
-  timeout_s: 17100
+  # One-hour Slurm close-out is reserved for active trials and finalization.
+  closeout_signal_seconds: 3600
+  timeout_s: 21600
   sampler_seed: 42
   smoketest: false
+  recover_stale_running: true
   requeue_running: false
 
 resources:

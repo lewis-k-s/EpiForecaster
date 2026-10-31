@@ -1197,6 +1197,7 @@ def _targets_dict_from_batch(batch_data: Any) -> dict[str, torch.Tensor | None]:
         "H_target": getattr(batch_data, "H_target", None),
         "R_target": getattr(batch_data, "R_target", None),
         "D_target": getattr(batch_data, "D_target", None),
+        "death_flow_target": getattr(batch_data, "death_flow_target", None),
         "ww_mask": getattr(batch_data, "ww_target_mask", None),
         "hosp_mask": getattr(batch_data, "hosp_target_mask", None),
         "cases_mask": getattr(batch_data, "cases_target_mask", None),

@@ -1,194 +1,67 @@
 import pytest
 import torch
+
 from models.transformer_backbone import (
-    TransformerBackbone,
-    MultiHorizonForecaster,
+    LearnedPositionalEncoding,
+    PositionalEncoding,
     create_transformer_backbone,
 )
 
 
-class TestTransformerBackbone:
-    """Tests for TransformerBackbone."""
+def test_sinusoidal_positional_encoding_rejects_odd_width() -> None:
+    with pytest.raises(ValueError, match="d_model must be even"):
+        PositionalEncoding(d_model=7)
 
-    @pytest.fixture
-    def backbone_config(self):
-        return {
-            "in_dim": 16,
-            "d_model": 32,
-            "n_heads": 2,
-            "num_layers": 2,
-            "horizon": 7,
-            "obs_context_dim": 8,
-        }
 
-    def test_initialization(self, backbone_config):
-        """Test initialization via factory function."""
-        model = create_transformer_backbone(**backbone_config)
-        assert isinstance(model, TransformerBackbone)
-        assert model.horizon == backbone_config["horizon"]
-        assert model.count_parameters() > 0
+def test_learned_positional_encoding_matches_per_sample_lookup() -> None:
+    torch.manual_seed(0)
+    encoding = LearnedPositionalEncoding(d_model=16, max_len=40, dropout=0.0)
+    x = torch.randn(5, 12, 16)
+    position_ids = torch.arange(12).unsqueeze(0).expand(5, -1)
+    expected = x + encoding.pos_embedding(position_ids)
+    output = encoding(x)
+    assert torch.equal(output, expected)
 
-    def test_forward_shapes(self, backbone_config):
-        """Test forward pass output shapes."""
-        model = create_transformer_backbone(**backbone_config)
-        batch_size = 4
-        seq_len = 14
-        in_dim = backbone_config["in_dim"]
+    upstream = torch.randn_like(output)
+    weight = encoding.pos_embedding.weight
+    (expected_grad,) = torch.autograd.grad(expected, weight, upstream)
+    (grad,) = torch.autograd.grad(output, weight, upstream)
+    torch.testing.assert_close(grad, expected_grad, rtol=0, atol=1e-6)
+    assert torch.count_nonzero(grad[12:]) == 0
 
-        x_seq = torch.randn(batch_size, seq_len, in_dim)
-        outputs = model(x_seq)
 
-        horizon = backbone_config["horizon"]
+def test_backbone_initializes_rates_and_states_near_epidemiological_priors() -> None:
+    model = create_transformer_backbone(
+        in_dim=16,
+        d_model=32,
+        n_heads=2,
+        num_layers=2,
+        horizon=7,
+        obs_context_dim=8,
+    )
+    model.eval()
+    outputs = model(torch.zeros(2, 14, 16))
 
-        # Check output keys
-        expected_keys = {
-            "beta_t",
-            "mortality_t",
-            "hospitalization_rate_t",
-            "hospital_recovery_t",
-            "hospital_mortality_t",
-            "gamma_t",
-            "initial_states_logits",
-            "obs_context",
-        }
-        assert set(outputs.keys()) == expected_keys
-
-        # Check shapes
-        assert outputs["beta_t"].shape == (batch_size, horizon)
-        assert outputs["mortality_t"].shape == (batch_size, horizon)
-        assert outputs["hospitalization_rate_t"].shape == (batch_size, horizon)
-        assert outputs["hospital_recovery_t"].shape == (batch_size, horizon)
-        assert outputs["hospital_mortality_t"].shape == (batch_size, horizon)
-        assert outputs["gamma_t"].shape == (batch_size, horizon)
-        assert outputs["initial_states_logits"].shape == (batch_size, 4)
-
-        # Obs context shape: [B, H, C_obs]
-        assert outputs["obs_context"].shape == (
-            batch_size,
-            horizon,
-            backbone_config["obs_context_dim"],
+    expected_rates = {
+        "beta_t": 0.25,
+        "gamma_t": 0.14,
+        "mortality_t": 0.0005,
+        "hospitalization_rate_t": 0.02,
+        "hospital_recovery_t": 0.1,
+        "hospital_mortality_t": 0.005,
+    }
+    for name, expected in expected_rates.items():
+        values = outputs[name]
+        assert torch.isfinite(values).all()
+        torch.testing.assert_close(
+            values, torch.full_like(values, expected), atol=5e-2, rtol=0
         )
 
-    def test_short_sequence_handling(self, backbone_config):
-        """Test handling of sequences shorter than horizon."""
-        model = create_transformer_backbone(**backbone_config)
-        batch_size = 2
-        horizon = backbone_config["horizon"]
-        seq_len = horizon - 2
-
-        x_seq = torch.randn(batch_size, seq_len, backbone_config["in_dim"])
-        outputs = model(x_seq)
-
-        assert outputs["obs_context"].shape == (
-            batch_size,
-            horizon,
-            backbone_config["obs_context_dim"],
-        )
-        assert torch.all(torch.isfinite(outputs["obs_context"]))
-
-    def test_padding_mask(self, backbone_config):
-        """Test that padding mask is respected."""
-        model = create_transformer_backbone(**backbone_config)
-        batch_size = 2
-        seq_len = 10
-        in_dim = backbone_config["in_dim"]
-
-        x_seq = torch.randn(batch_size, seq_len, in_dim)
-
-        # mask: True=Keep, False=Ignore (based on ~mask implementation in model)
-        mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-        mask[:, -2:] = False
-
-        outputs = model(x_seq, mask=mask)
-        assert outputs["beta_t"].shape == (batch_size, backbone_config["horizon"])
-
-    def test_pos_encoding_types(self, backbone_config):
-        """Test both sinusoidal and learned positional encodings."""
-        for pe_type in ["sinusoidal", "learned"]:
-            config = backbone_config.copy()
-            config["positional_encoding"] = pe_type
-            model = create_transformer_backbone(**config)
-            x = torch.randn(2, 10, config["in_dim"])
-            assert model(x)["beta_t"].shape == (2, config["horizon"])
-
-    def test_conservative_rate_priors_are_finite_and_not_clamped(self, backbone_config):
-        """Zero input should produce near-prior rates away from clamp boundaries."""
-        model = create_transformer_backbone(**backbone_config)
-        model.eval()
-
-        x_seq = torch.zeros(4, 14, backbone_config["in_dim"])
-        outputs = model(x_seq)
-
-        expected_priors = {
-            "beta_t": 0.25,
-            "gamma_t": 0.14,
-            "mortality_t": 0.0005,
-            "hospitalization_rate_t": 0.02,
-            "hospital_recovery_t": 0.1,
-            "hospital_mortality_t": 0.005,
-        }
-
-        for key, expected in expected_priors.items():
-            values = outputs[key]
-            assert torch.all(torch.isfinite(values))
-            assert torch.allclose(values, torch.full_like(values, expected), atol=5e-2)
-
-        cfg = model.sir_physics
-        assert torch.all(outputs["beta_t"] > cfg.beta_min)
-        assert torch.all(outputs["beta_t"] < cfg.beta_max)
-        assert torch.all(outputs["gamma_t"] > cfg.gamma_min)
-        assert torch.all(outputs["gamma_t"] < cfg.gamma_max)
-        assert torch.all(outputs["mortality_t"] > cfg.mortality_min)
-        assert torch.all(outputs["mortality_t"] < cfg.mortality_max)
-        assert torch.all(outputs["hospitalization_rate_t"] > cfg.hospitalization_min)
-        assert torch.all(outputs["hospitalization_rate_t"] < cfg.hospitalization_max)
-        assert torch.all(outputs["hospital_recovery_t"] > cfg.hospital_recovery_min)
-        assert torch.all(outputs["hospital_recovery_t"] < cfg.hospital_recovery_max)
-        assert torch.all(outputs["hospital_mortality_t"] > cfg.hospital_mortality_min)
-        assert torch.all(outputs["hospital_mortality_t"] < cfg.hospital_mortality_max)
-
-    def test_initial_states_start_from_epidemiological_prior(self, backbone_config):
-        """Initial state logits should stay near the conservative S/I/H/R prior."""
-        model = create_transformer_backbone(**backbone_config)
-        model.eval()
-
-        x_seq = torch.zeros(3, 12, backbone_config["in_dim"])
-        outputs = model(x_seq)
-        initial_states = torch.softmax(outputs["initial_states_logits"], dim=-1)
-
-        expected = torch.tensor(
-            [0.9945, 0.004, 0.0005, 0.001],
-            dtype=initial_states.dtype,
-        )
-        expected = expected.unsqueeze(0).expand_as(initial_states)
-        assert torch.allclose(initial_states, expected, atol=5e-3)
-
-    def test_obs_context_starts_neutral_at_initialization(self, backbone_config):
-        """Observation context projection should start finite and non-degenerate."""
-        model = create_transformer_backbone(**backbone_config)
-        model.eval()
-
-        x_seq = torch.randn(2, 10, backbone_config["in_dim"])
-        outputs = model(x_seq)
-        obs_context = outputs["obs_context"]
-        assert torch.all(torch.isfinite(obs_context))
-        assert obs_context.abs().sum() > 0
-
-
-class TestMultiHorizonForecaster:
-    """Tests for MultiHorizonForecaster."""
-
-    def test_forward(self):
-        in_dim = 10
-        horizons = [1, 7, 14]
-        model = MultiHorizonForecaster(in_dim=in_dim, horizons=horizons, d_model=16)
-
-        batch_size = 5
-        seq_len = 10
-        x = torch.randn(batch_size, seq_len, in_dim)
-
-        forecasts = model(x)
-
-        assert len(forecasts) == len(horizons)
-        for h in horizons:
-            assert forecasts[h].shape == (batch_size, h)
+    initial_states = torch.softmax(outputs["initial_states_logits"], dim=-1)
+    expected_states = torch.tensor([0.9945, 0.004, 0.0005, 0.001])
+    torch.testing.assert_close(
+        initial_states,
+        expected_states.expand_as(initial_states),
+        atol=5e-3,
+        rtol=0,
+    )

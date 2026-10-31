@@ -46,6 +46,77 @@ class ProfilerConfig:
     with_stack: bool = False
 
 
+_LATENT_TASKS = ("s", "i", "h", "r", "death_flow")
+
+
+@dataclass
+class LatentSupervisionConfig:
+    """Configuration for synthetic mechanistic latent supervision."""
+
+    total_weight: float = 0.0
+    scaling: str = "none"
+    component_weights: dict[str, float] = field(
+        default_factory=lambda: {name: 0.2 for name in _LATENT_TASKS}
+    )
+    scale_floors: dict[str, float] = field(
+        default_factory=lambda: {name: 1.0e-8 for name in _LATENT_TASKS}
+    )
+    require_complete_targets: bool = True
+
+    def __post_init__(self) -> None:
+        self.scaling = self.scaling.lower()
+        valid_scaling = {"none", "std", "asinh"}
+        if self.scaling not in valid_scaling:
+            raise ValueError(
+                f"latent.scaling must be one of {sorted(valid_scaling)}, "
+                f"got {self.scaling!r}"
+            )
+        if not math.isfinite(self.total_weight) or self.total_weight < 0:
+            raise ValueError(
+                "latent.total_weight must be finite and non-negative, "
+                f"got {self.total_weight}"
+            )
+
+        expected_tasks = set(_LATENT_TASKS)
+        if set(self.component_weights) != expected_tasks:
+            raise ValueError(
+                "latent.component_weights must contain exactly "
+                f"{sorted(expected_tasks)}, got {sorted(self.component_weights)}"
+            )
+        if set(self.scale_floors) != expected_tasks:
+            raise ValueError(
+                "latent.scale_floors must contain exactly "
+                f"{sorted(expected_tasks)}, got {sorted(self.scale_floors)}"
+            )
+
+        normalized_weights = {
+            name: float(value) for name, value in self.component_weights.items()
+        }
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in normalized_weights.values()
+        ):
+            raise ValueError(
+                "latent.component_weights values must be finite and non-negative"
+            )
+        weight_sum = sum(normalized_weights.values())
+        if not math.isclose(weight_sum, 1.0, rel_tol=0.0, abs_tol=1.0e-8):
+            raise ValueError(
+                f"latent.component_weights values must sum to 1.0, got {weight_sum}"
+            )
+        self.component_weights = normalized_weights
+
+        normalized_floors = {
+            name: float(value) for name, value in self.scale_floors.items()
+        }
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in normalized_floors.values()
+        ):
+            raise ValueError("latent.scale_floors values must be finite and positive")
+        self.scale_floors = normalized_floors
+
+
 @dataclass
 class JointLossConfig:
     """Loss weights for joint inference training."""
@@ -74,9 +145,7 @@ class JointLossConfig:
     gradnorm_probe: str = "obs_context"
     gradnorm_min_weight: float = 1.0e-3
     gradnorm_obs_weight_sum: float = 0.95
-    # Fixed weight for synthetic latent S/I/R/D supervision.
-    # Latent supervision auto-disables when latent targets are absent.
-    w_sird_supervision: float = 0.05
+    latent: LatentSupervisionConfig = field(default_factory=LatentSupervisionConfig)
     # Optional target-level ablation toggles for observation losses.
     disable_ww: bool = False
     disable_hosp: bool = False
@@ -91,12 +160,14 @@ class JointLossConfig:
     def __post_init__(self) -> None:
         valid_schemes = {"none", "gradnorm"}
         valid_probes = {"obs_context"}
-        valid_observation_losses = {"mse", "rmse", "mae", "nll", "crps"}
+        valid_observation_losses = {"mse", "rmse", "mae", "nll", "crps", "wis"}
         valid_distribution_families = {"normal", "student_t"}
         self.observation_loss = self.observation_loss.lower()
         self.distribution_family = self.distribution_family.lower()
         self.adaptive_scheme = self.adaptive_scheme.lower()
         self.gradnorm_probe = self.gradnorm_probe.lower()
+        if isinstance(self.latent, (dict, DictConfig)):
+            self.latent = LatentSupervisionConfig(**dict(self.latent))
         if self.observation_loss not in valid_observation_losses:
             raise ValueError(
                 "observation_loss must be one of "
@@ -108,11 +179,6 @@ class JointLossConfig:
                 "distribution_family must be one of "
                 f"{sorted(valid_distribution_families)}, "
                 f"got {self.distribution_family!r}"
-            )
-        if self.observation_loss == "crps" and self.distribution_family != "normal":
-            raise ValueError(
-                "observation_loss='crps' currently requires "
-                "distribution_family='normal'"
             )
         if self.adaptive_scheme not in valid_schemes:
             raise ValueError(
@@ -132,7 +198,6 @@ class JointLossConfig:
             )
 
         for name, value in [
-            ("w_sird_supervision", self.w_sird_supervision),
             ("gradnorm_alpha", self.gradnorm_alpha),
             ("gradnorm_weight_lr", self.gradnorm_weight_lr),
             ("gradnorm_ema_decay", self.gradnorm_ema_decay),
@@ -142,6 +207,8 @@ class JointLossConfig:
         ]:
             if value < 0:
                 raise ValueError(f"{name} must be non-negative, got {value}")
+        if not math.isfinite(self.distribution_df):
+            raise ValueError("distribution_df must be finite")
         if self.distribution_family == "student_t" and self.distribution_df <= 2.0:
             raise ValueError(
                 "distribution_df must be > 2 for student_t intervals, "
@@ -245,6 +312,10 @@ class CurriculumConfig:
     chunk_size: int = 512
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
+    # Build each batch from one window start of one run (replaces chunk_size
+    # chunks). The GCN then needs T adjacency matrices per batch, not B*T. A
+    # short group is filled with repeats drawn from the same group.
+    window_start_batches: bool = False
     # List of phase configs defining the curriculum schedule
     schedule: list[CurriculumPhaseConfig] = field(default_factory=list)
 
@@ -271,6 +342,130 @@ class CurriculumConfig:
                     raise ValueError(
                         f"Curriculum phases {i} and {j} have overlapping epoch ranges"
                     )
+
+
+@dataclass
+class ResidualSchedulePhaseConfig:
+    """Configuration for one observation-residual log-location budget phase."""
+
+    start_epoch: int
+    end_epoch: int
+    # Maximum |residual log location| as a fraction of |mechanistic log location|.
+    # Clinical locations use log1p(per-100k) units.
+    max_log_location_fraction: float
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("start_epoch", self.start_epoch),
+            ("end_epoch", self.end_epoch),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer epoch, got {value!r}")
+        if self.start_epoch < 0:
+            raise ValueError(f"start_epoch ({self.start_epoch}) must be non-negative")
+        if self.start_epoch >= self.end_epoch:
+            raise ValueError(
+                f"start_epoch ({self.start_epoch}) must be less than end_epoch "
+                f"({self.end_epoch})"
+            )
+        if isinstance(self.max_log_location_fraction, bool) or not math.isfinite(
+            self.max_log_location_fraction
+        ):
+            raise ValueError(
+                "max_log_location_fraction must be a finite value, got "
+                f"{self.max_log_location_fraction!r}"
+            )
+        if not 0.0 <= self.max_log_location_fraction <= 1.0:
+            raise ValueError(
+                "max_log_location_fraction must be in [0, 1], got "
+                f"{self.max_log_location_fraction}"
+            )
+
+
+@dataclass
+class ResidualScheduleConfig:
+    """Observation-residual log-location budget from ``training.residual_schedule``.
+
+    This schedule is independent of the data curriculum: it controls the
+    absolute residual log-location each observation head may add as a fraction
+    of its absolute mechanistic log-location, per training epoch. Clinical
+    locations are in log1p(per-100k) units.
+    ``max_log_location_fraction=0.0`` is an exact residual lockout that keeps
+    the mechanistic path fully active.
+    """
+
+    enabled: bool = False
+    schedule: list[ResidualSchedulePhaseConfig] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        hydrated: list[ResidualSchedulePhaseConfig] = []
+        for phase in self.schedule:
+            if isinstance(phase, (dict, DictConfig)):
+                hydrated.append(ResidualSchedulePhaseConfig(**dict(phase)))
+            else:
+                hydrated.append(phase)
+        self.schedule = hydrated
+
+        if not self.enabled:
+            if self.schedule:
+                raise ValueError(
+                    "residual_schedule.schedule must be empty when "
+                    "residual_schedule.enabled is false"
+                )
+            return
+
+        if not self.schedule:
+            raise ValueError(
+                "residual_schedule.schedule must not be empty when "
+                "residual_schedule.enabled is true"
+            )
+        if self.schedule[0].start_epoch != 0:
+            raise ValueError(
+                "The first residual schedule phase must start at epoch 0, "
+                f"got start_epoch={self.schedule[0].start_epoch}"
+            )
+        # Phase indices are checkpoint provenance. Phases form a single,
+        # contiguous partition beginning at epoch 0; the final phase remains
+        # active for every subsequent epoch.
+        for index, (previous, current) in enumerate(
+            zip(self.schedule, self.schedule[1:], strict=False),
+            start=1,
+        ):
+            if current.start_epoch != previous.end_epoch:
+                raise ValueError(
+                    "Residual schedule phases must be contiguous: phase "
+                    f"{index} starts at epoch {current.start_epoch}, but phase "
+                    f"{index - 1} ends at epoch {previous.end_epoch}"
+                )
+
+
+def resolve_residual_schedule_phase(
+    schedule: ResidualScheduleConfig,
+    epoch: int,
+) -> tuple[int | None, ResidualSchedulePhaseConfig | None]:
+    """Resolve the active residual log-location budget phase for ``epoch``.
+
+    Returns ``(phase_index, phase)``. A disabled schedule resolves to
+    ``(None, None)``. Enabled phases are contiguous from epoch 0, and the
+    final phase persists after its ``end_epoch``.
+    """
+    if epoch < 0:
+        raise ValueError(f"epoch must be non-negative, got {epoch}")
+    if not schedule.enabled:
+        return None, None
+
+    active_index: int | None = None
+    for index, phase in enumerate(schedule.schedule):
+        if phase.start_epoch <= epoch:
+            active_index = index
+        if phase.start_epoch <= epoch < phase.end_epoch:
+            return index, phase
+    if active_index is None:
+        raise ValueError(
+            "Residual schedule does not cover epoch "
+            f"{epoch}; the first phase must start at epoch 0"
+        )
+    return active_index, schedule.schedule[active_index]
 
 
 @dataclass
@@ -395,6 +590,29 @@ class ObservationHeadConfig:
     kernel_parameterization_hosp: str = "simplex"
     kernel_parameterization_cases: str = "simplex"
     kernel_parameterization_deaths: str = "simplex"
+    # Gamma(shape, scale) prior for the wastewater shedding kernel. The
+    # SARS-CoV-2 shedding literature anchors near mean 12 d with CV 0.7,
+    # i.e. shape ~2.04 and scale ~6.09 d.
+    kernel_gamma_shape_ww: float = 2.0
+    kernel_gamma_scale_ww: float = 6.0
+    # Deaths prior: mean 7 d, sd 2 d. Chosen in commit 0b021f2 to match the
+    # synthetic generator's death delay (3-epoch single-seed synthetic smoke
+    # runs gamma-deaths-fixed-matched-01 / gamma-deaths-gamma2p-01). Not
+    # validated on real data. Ignored when kernel_mlp_deaths is true.
+    # Gamma(shape, scale) prior for the deaths delay kernel. This initializes
+    # its simplex weights by default and initializes the explicit two-parameter
+    # Gamma family when selected.
+    kernel_gamma_shape_deaths: float = 12.25
+    kernel_gamma_scale_deaths: float = 0.5714285714285714
+    # Gamma(shape, scale) prior for the hospitalization delay kernel.
+    # Gamma(5, 2) is the long-standing ClinicalObservationHead initializer
+    # (mean delay 10 days); this field makes that implicit prior explicit.
+    kernel_gamma_shape_hosp: float = 5.0
+    kernel_gamma_scale_hosp: float = 2.0
+    # Gamma(shape, scale) prior for the cases delay kernel, matching the same
+    # shared ClinicalObservationHead initializer.
+    kernel_gamma_shape_cases: float = 5.0
+    kernel_gamma_scale_cases: float = 2.0
     kernel_mlp_ww: bool = False
     kernel_mlp_hosp: bool = False
     kernel_mlp_cases: bool = False
@@ -413,6 +631,9 @@ class ObservationHeadConfig:
     residual_hidden_dim: int = 32
     residual_layers: int = 2
     residual_dropout: float = 0.1
+    # Heads in this set have no direct observation-context residual path. The
+    # mechanistic signal and its learnable delay/scale remain active.
+    residual_disabled_heads: list[str] = field(default_factory=list)
 
     # Observation context dimension
     obs_context_dim: int = 96
@@ -420,6 +641,23 @@ class ObservationHeadConfig:
     # Structural continuity
     delta_forecasting: bool = False
     anchor_mode: str = "last_valid_step"
+
+    # Mechanistic source persisted for target-aligned qualitative plots. This is
+    # intentionally separate from the source consumed by each observation head:
+    # changing a plot overlay must not change the model or pathway attribution.
+    relevant_source_hosp: str = "hospitalization_flow"
+    relevant_source_ww: str = "I"
+    relevant_source_cases: str = "I"
+    relevant_source_deaths: str = "death_flow"
+
+    def relevant_source_mapping(self) -> dict[str, str]:
+        """Return the canonical target-to-mechanistic-source plot mapping."""
+        return {
+            "hosp": self.relevant_source_hosp,
+            "ww": self.relevant_source_ww,
+            "cases": self.relevant_source_cases,
+            "deaths": self.relevant_source_deaths,
+        }
 
     def __post_init__(self) -> None:
         for name, value in [
@@ -430,20 +668,65 @@ class ObservationHeadConfig:
         ]:
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
-        for name, value in [
-            ("kernel_parameterization_ww", self.kernel_parameterization_ww),
-            ("kernel_parameterization_hosp", self.kernel_parameterization_hosp),
-            ("kernel_parameterization_cases", self.kernel_parameterization_cases),
-            ("kernel_parameterization_deaths", self.kernel_parameterization_deaths),
+        # Wastewater routes through SheddingConvolution and the clinical heads
+        # through DelayKernel; both support the bounded Gamma family.
+        for name, value, allowed in [
+            (
+                "kernel_parameterization_ww",
+                self.kernel_parameterization_ww,
+                {"simplex", "free", "gamma"},
+            ),
+            (
+                "kernel_parameterization_hosp",
+                self.kernel_parameterization_hosp,
+                {"simplex", "free", "gamma"},
+            ),
+            (
+                "kernel_parameterization_cases",
+                self.kernel_parameterization_cases,
+                {"simplex", "free", "gamma"},
+            ),
+            (
+                "kernel_parameterization_deaths",
+                self.kernel_parameterization_deaths,
+                {"simplex", "free", "gamma"},
+            ),
         ]:
-            if value not in {"simplex", "free"}:
+            if value not in allowed:
                 raise ValueError(
-                    f"{name} must be one of {{'simplex', 'free'}}, got {value!r}"
+                    f"{name} must be one of {sorted(allowed)}, got {value!r}"
+                )
+        # These boxes mirror the smooth open-interval Gamma transforms in
+        # observation_heads.py. Validate priors at config load so frozen Gamma
+        # kernels cannot bypass their declared scientific family.
+        for name, value, lower, upper in [
+            ("kernel_gamma_shape_ww", self.kernel_gamma_shape_ww, 1.0, 30.0),
+            ("kernel_gamma_scale_ww", self.kernel_gamma_scale_ww, 0.2, 15.0),
+            ("kernel_gamma_shape_hosp", self.kernel_gamma_shape_hosp, 1.0, 30.0),
+            ("kernel_gamma_scale_hosp", self.kernel_gamma_scale_hosp, 0.1, 5.0),
+            ("kernel_gamma_shape_cases", self.kernel_gamma_shape_cases, 1.0, 30.0),
+            ("kernel_gamma_scale_cases", self.kernel_gamma_scale_cases, 0.1, 5.0),
+            ("kernel_gamma_shape_deaths", self.kernel_gamma_shape_deaths, 1.0, 30.0),
+            ("kernel_gamma_scale_deaths", self.kernel_gamma_scale_deaths, 0.1, 5.0),
+        ]:
+            if not math.isfinite(value) or not lower < value < upper:
+                raise ValueError(
+                    f"{name} must be finite and strictly inside ({lower}, {upper}), "
+                    f"got {value}"
                 )
         if self.residual_scale < 0:
             raise ValueError(
                 f"residual_scale must be non-negative, got {self.residual_scale}"
             )
+        invalid_residual_heads = set(self.residual_disabled_heads).difference(
+            {"ww", "hosp", "cases", "deaths"}
+        )
+        if invalid_residual_heads:
+            raise ValueError(
+                "residual_disabled_heads must contain only 'ww', 'hosp', 'cases', "
+                f"or 'deaths', got {sorted(invalid_residual_heads)!r}"
+            )
+
         if self.residual_hidden_dim <= 0:
             raise ValueError(
                 f"residual_hidden_dim must be positive, got {self.residual_hidden_dim}"
@@ -475,6 +758,20 @@ class ObservationHeadConfig:
                 "distribution_scale_floor must be positive, "
                 f"got {self.distribution_scale_floor}"
             )
+
+        valid_relevant_sources = {
+            "hosp": {"hospitalization_flow", "H"},
+            "ww": {"I"},
+            "cases": {"I"},
+            "deaths": {"death_flow", "D"},
+        }
+        for head_name, source_name in self.relevant_source_mapping().items():
+            if source_name not in valid_relevant_sources[head_name]:
+                raise ValueError(
+                    f"relevant_source_{head_name} must be one of "
+                    f"{sorted(valid_relevant_sources[head_name])}, "
+                    f"got {source_name!r}"
+                )
 
         valid_modes = {"additive", "modulation"}
         if self.residual_mode not in valid_modes:
@@ -616,9 +913,7 @@ class ModelConfig:
     input_window_length: int
     forecast_horizon: int
 
-    # DEPRECATED: Now uses full graphs with k-hop feature masking
-    # max_neighbors is kept for config compatibility but not used
-    # Neighborhood size is determined by gnn_depth
+    # Unused: kept for config compatibility; gnn_depth determines neighborhood size.
     max_neighbors: int
 
     # -- graph params --#
@@ -631,7 +926,10 @@ class ModelConfig:
     # -- dimensionality --#
     # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
     biomarkers_dim: int = 13
-    cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
+    # Clinical input width: 3 series x (value, mask, age) = 9, plus one column
+    # per mobility lag when data.use_imported_risk is true. The dataset raises
+    # when this value does not match its actual width.
+    cases_dim: int = 9
     # GNN depth determines message passing depth AND feature masking radius
     # - gnn_depth=0: No masking (all nodes contribute)
     # - gnn_depth=1: 1-hop neighbors (direct neighbors only)
@@ -745,6 +1043,8 @@ class TrainingParams:
     epochs: int = 100
     seed: int | None = 42  # Random seed for reproducibility (None = non-deterministic)
     batch_size: int = 32
+    # Batch size of the validation and test loaders; null means batch_size.
+    eval_batch_size: int | None = None
     # Preserve sample_ordering within each batch and shuffle batch order each epoch.
     # When False, training iterates through batches in deterministic dataset order.
     shuffle_train_batches: bool = True
@@ -760,13 +1060,22 @@ class TrainingParams:
     min_learning_rate: float = 0.0
     gradient_clip_value: float = 5.0
     early_stopping_patience: int | None = 10  # None = disabled
+    # General training can select by objective; research pins a common metric.
+    selection_metric: str = "auto"
+    retain_best_crps_checkpoint: bool = False
+    selection_required_heads: list[str] = field(
+        default_factory=lambda: ["ww", "hosp", "cases", "deaths"]
+    )
     nan_loss_patience: int | None = None
     val_split: float = 0.2
     test_split: float = 0.1
     # Split strategy: "node" (default, region holdouts) or "time" (temporal splits)
     split_strategy: str = "node"
+    research_role_manifest_path: str | None = None
+    research_evaluation_role: str = "calibration"
+    research_confirmation_enabled: bool = False
     # Node split strategy when split_strategy="node".
-    # - "random": seeded shuffle across valid regions (legacy behavior)
+    # - "random": seeded shuffle across valid regions
     # - "stratified": preserve population and wastewater-source representation
     # - "crossval": fold-based biomarker-aware held-out regions
     node_split_strategy: str = "random"
@@ -794,6 +1103,10 @@ class TrainingParams:
     # When enabled, uses mixed synthetic/real data sampling
     # When disabled, uses single run_id from data config
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    # Observation-residual budget schedule (independent of the data curriculum).
+    residual_schedule: ResidualScheduleConfig = field(
+        default_factory=ResidualScheduleConfig
+    )
     device: str = "auto"
     num_workers: int = 4
     val_workers: int = 4
@@ -820,6 +1133,9 @@ class TrainingParams:
         3  # Number of samples per category (best, worst, random)
     )
     grad_norm_log_frequency: int = 100
+    # Periodic eager probe of observation-loss gradients at the mechanistic source
+    # and residual-location input. Zero disables the diagnostic sidecar.
+    pathway_gradient_frequency: int = 0
     progress_log_frequency: int = (
         10  # Log progress every N steps to reduce CPU-GPU sync
     )
@@ -891,9 +1207,44 @@ class TrainingParams:
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
+        if self.eval_batch_size is None:
+            self.eval_batch_size = self.batch_size
+        if self.eval_batch_size < 1:
+            raise ValueError(
+                f"eval_batch_size must be >= 1, got {self.eval_batch_size}"
+            )
+        if self.selection_metric not in {
+            "auto",
+            "mean_target_wis",
+            "mean_target_crps",
+            "mean_target_nll",
+            "mean_target_mae",
+        }:
+            raise ValueError(f"Unsupported selection_metric: {self.selection_metric!r}")
+        if (
+            self.retain_best_crps_checkpoint
+            and self.loss.joint.observation_loss not in {"nll", "crps", "wis"}
+        ):
+            raise ValueError(
+                "retain_best_crps_checkpoint requires a probabilistic "
+                "observation_loss (nll, crps, or wis), got "
+                f"{self.loss.joint.observation_loss!r}"
+            )
+        if (
+            not self.selection_required_heads
+            or len(set(self.selection_required_heads))
+            != len(self.selection_required_heads)
+            or set(self.selection_required_heads) - {"ww", "hosp", "cases", "deaths"}
+        ):
+            raise ValueError(
+                "selection_required_heads must name unique observation heads"
+            )
         if isinstance(self.curriculum, (dict, DictConfig)):
             curriculum_dict = cast(dict[str, Any], self.curriculum)
             self.curriculum = CurriculumConfig(**curriculum_dict)
+        if isinstance(self.residual_schedule, (dict, DictConfig)):
+            residual_schedule_dict = cast(dict[str, Any], self.residual_schedule)
+            self.residual_schedule = ResidualScheduleConfig(**residual_schedule_dict)
         if isinstance(self.profiler, (dict, DictConfig)):
             profiler_dict = cast(dict[str, Any], self.profiler)
             self.profiler = ProfilerConfig(**profiler_dict)
@@ -906,12 +1257,29 @@ class TrainingParams:
             )
 
         # Validate split_strategy
-        valid_strategies = {"node", "time"}
+        valid_strategies = {"node", "time", "research"}
         if self.split_strategy not in valid_strategies:
             raise ValueError(
                 f"Invalid split_strategy: {self.split_strategy}. "
                 f"Valid options: {sorted(valid_strategies)}"
             )
+
+        if self.split_strategy == "research":
+            if not self.research_role_manifest_path:
+                raise ValueError("Research splits require research_role_manifest_path")
+            if self.curriculum.enabled:
+                raise ValueError("Research roles do not support curriculum mixing")
+            if self.research_evaluation_role not in {"calibration", "confirmation"}:
+                raise ValueError(
+                    "Research evaluation role must be calibration or confirmation"
+                )
+            if (
+                self.research_evaluation_role == "confirmation"
+                and not self.research_confirmation_enabled
+            ):
+                raise ValueError(
+                    "Confirmation requires an explicit frozen-finalist configuration"
+                )
 
         valid_node_split_strategies = {"random", "stratified", "crossval"}
         if self.node_split_strategy not in valid_node_split_strategies:
@@ -988,6 +1356,11 @@ class TrainingParams:
         if self.warmup_steps < 0:
             raise ValueError(
                 f"warmup_steps must be non-negative, got {self.warmup_steps}"
+            )
+        if self.pathway_gradient_frequency < 0:
+            raise ValueError(
+                "pathway_gradient_frequency must be non-negative, "
+                f"got {self.pathway_gradient_frequency}"
             )
         if self.min_learning_rate < 0:
             raise ValueError(
@@ -1316,6 +1689,10 @@ class EpiForecasterConfig:
         if "curriculum" in training_dict:
             training_dict["curriculum"] = CurriculumConfig(
                 **training_dict["curriculum"]
+            )
+        if "residual_schedule" in training_dict:
+            training_dict["residual_schedule"] = ResidualScheduleConfig(
+                **training_dict["residual_schedule"]
             )
 
         return cls(

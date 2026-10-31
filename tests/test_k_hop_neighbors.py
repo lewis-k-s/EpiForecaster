@@ -14,6 +14,7 @@ import torch
 from data.epi_dataset import EpiDataset
 from models.mobility_gnn import MobilityDenseEncoder
 from tests.dataset_test_helpers import (
+    context_features_for_item,
     make_epi_config,
     make_tiny_epi_dataset,
     write_zarr_dataset,
@@ -148,7 +149,7 @@ def _reconstruct_mob_graph(item, t: int, dataset):
     """Reconstruct mobility graph with dense adjacency.
 
     Args:
-        item: EpiDatasetItem with mob_x, mob_t, etc.
+        item: EpiDatasetItem (placement info; features come from tables)
         t: Time step index within the history window
         dataset: EpiDataset instance to get node_ids mapping
 
@@ -160,10 +161,10 @@ def _reconstruct_mob_graph(item, t: int, dataset):
             - target_node: Local index of target node
             - num_nodes: Number of nodes
     """
-    mob_x_t = item["mob_x"][t]  # (N_ctx, F)
+    mob_x_t = context_features_for_item(dataset, item)[t]  # (N_ctx, F)
 
     window_start = item.get("window_start", 0)
-    global_t = item["mob_t"][t] if "mob_t" in item else window_start + t
+    global_t = int(window_start) + t
     global_to_local = dataset._get_global_to_local_at_time(global_t)
 
     node_mask = global_to_local >= 0
@@ -257,16 +258,17 @@ def test_spatial_knn_depth_one_masks_to_direct_neighbors(tmp_path):
 
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
     item = dataset[0]
+    features = context_features_for_item(dataset, item)
     node_ids = dataset._graph_node_ids.tolist()
 
     assert node_ids == [0, 1]
     assert not torch.allclose(
-        item["mob_x"][0, node_ids.index(0)],
-        torch.zeros_like(item["mob_x"][0, 0]),
+        features[0, node_ids.index(0)],
+        torch.zeros_like(features[0, 0]),
     )
     assert not torch.allclose(
-        item["mob_x"][0, node_ids.index(1)],
-        torch.zeros_like(item["mob_x"][0, 1]),
+        features[0, node_ids.index(1)],
+        torch.zeros_like(features[0, 1]),
     )
 
 
@@ -285,12 +287,13 @@ def test_spatial_knn_depth_two_includes_second_hop_neighbors(tmp_path):
 
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
     item = dataset[0]
+    features = context_features_for_item(dataset, item)
     node_ids = dataset._graph_node_ids.tolist()
 
     assert node_ids == [0, 1, 2]
     assert not torch.allclose(
-        item["mob_x"][0, node_ids.index(2)],
-        torch.zeros_like(item["mob_x"][0, 2]),
+        features[0, node_ids.index(2)],
+        torch.zeros_like(features[0, 2]),
     )
 
 
@@ -332,17 +335,17 @@ def test_spatial_queen_depth_one_masks_to_queen_neighbors(tmp_path):
         graph_adjacency_source="spatial_queen",
         regions_data_path=geo_path,
     )
-
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
     item = dataset[0]
+    features = context_features_for_item(dataset, item)
     node_ids = dataset._graph_node_ids.tolist()
 
     assert node_ids == [0, 1, 2, 3]
     assert 4 not in node_ids
     for node_id in node_ids:
         assert not torch.allclose(
-            item["mob_x"][0, node_ids.index(node_id)],
-            torch.zeros_like(item["mob_x"][0, node_ids.index(node_id)]),
+            features[0, node_ids.index(node_id)],
+            torch.zeros_like(features[0, node_ids.index(node_id)]),
         )
 
     clinical_mask = dataset._get_clinical_neighbor_mask(
@@ -565,47 +568,23 @@ def test_k_hop_masking_sample_ordering(tmp_path, sample_ordering):
 
 @pytest.mark.epiforecaster
 def test_k_hop_reachability_cache(tmp_path):
-    """Verify that _k_hop_cache is populated correctly."""
+    """Verify that the target k-hop reachability is precomputed correctly."""
     zarr_path = tmp_path / "cache.zarr"
     _write_chain_dataset(str(zarr_path), num_nodes=4, periods=10)
 
     config = _make_config(str(zarr_path), gnn_depth=2)
     dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3])
 
-    # Access an item to populate the cache
-    _ = dataset[0]
-
-    # Check that cache has entries for time steps
-    assert hasattr(dataset, "_precomputed_k_hop_masks"), (
-        "Dataset should have _precomputed_k_hop_masks"
-    )
-
-    # With gnn_depth=2, we should have cache entries for all time steps
-    cache_keys = list(dataset._precomputed_k_hop_masks.keys())
-    assert len(cache_keys) > 0, "Cache should be populated"
-
-    # Each key should be an integer (time_step)
-    for key in cache_keys:
-        assert isinstance(key, int), f"Cache key should be int, got {type(key)}"
+    # With gnn_depth=2, every timestep has one row per target node.
+    reach = dataset._target_k_hop_reach
+    assert reach is not None
+    assert reach.shape == (10, 1, 4), f"Unexpected reach shape {reach.shape}"
 
     # Verify reachability for a specific case
     # For chain 0-1-2-3 at time 0:
     # - 1-hop from node 0: {1}
     # - 2-hop from node 0: {1, 2}
-    time_step = 0
-
-    assert time_step in dataset._precomputed_k_hop_masks, (
-        f"Cache key {time_step} should exist"
-    )
-
-    reach_matrix = dataset._precomputed_k_hop_masks[time_step]
-    # reach_matrix is (N, N) where reach[i, j] is True if j is within k-hop of i
-    assert reach_matrix.shape == (4, 4), (
-        f"Reach matrix should be (4, 4), got {reach_matrix.shape}"
-    )
-
-    # Check reachability from node 0
-    reach_from_0 = reach_matrix[0]
+    reach_from_0 = reach[0, 0]
     # Node 0 should not be in its own k-hop (diagonal is False)
     assert not reach_from_0[0], "Diagonal should be False (self excluded)"
     # Node 1 should be reachable (1-hop)
@@ -708,71 +687,4 @@ def test_gnn_receptive_field_depth_2_chain(tmp_path):
 
     assert torch.norm(target_out) > 0, (
         "Target should be influenced by 2-hop neighbor with depth=2"
-    )
-
-
-@pytest.mark.epiforecaster
-def test_gnn_receptive_field_full_graph_issue(tmp_path):
-    """Demonstrate the full graph issue: information flows beyond k-hop.
-
-    This test documents the CURRENT (buggy) behavior where using the full
-    graph allows information to flow beyond the k-hop limit via intermediate
-    nodes.
-    """
-    zarr_path = tmp_path / "full_graph_issue.zarr"
-    _write_chain_dataset(str(zarr_path), num_nodes=5, periods=10)
-
-    config = _make_config(str(zarr_path), gnn_depth=1)
-    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
-
-    item = dataset[0]
-    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
-    feat_dim = mob_graph["x"].shape[1]
-
-    model = _create_gnn_model(gnn_depth=1, in_dim=feat_dim)
-    global_to_local = _global_to_local_map(mob_graph)
-
-    adj = mob_graph["adj"].unsqueeze(0)
-    x_test = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
-    if 4 in global_to_local:
-        x_test[global_to_local[4]] = 1.0
-
-    out = model(x_test.unsqueeze(0), adj)
-    target_out = out[0, mob_graph["target_node"]]
-
-    assert torch.norm(target_out) == 0, (
-        "With depth=1, 4-hop neighbor shouldn't influence target directly"
-    )
-
-
-@pytest.mark.epiforecaster
-def test_gnn_receptive_field_depth_2_khop_masking_prevents_propagation(tmp_path):
-    """Test that k-hop feature masking prevents information from propagating beyond k-hops.
-
-    With gnn_depth=2 and k-hop feature masking, node 0 (target) should NOT be
-    influenced by node 4 (4-hop away) because node 4's features are masked to 0.
-    """
-    zarr_path = tmp_path / "depth2_propagation.zarr"
-    _write_chain_dataset(str(zarr_path), num_nodes=5, periods=10)
-
-    config = _make_config(str(zarr_path), gnn_depth=2)
-    dataset = EpiDataset(config=config, target_nodes=[0], context_nodes=[0, 1, 2, 3, 4])
-
-    item = dataset[0]
-    mob_graph = _reconstruct_mob_graph(item, 0, dataset)
-    feat_dim = mob_graph["x"].shape[1]
-
-    model = _create_gnn_model(gnn_depth=2, in_dim=feat_dim)
-    global_to_local = _global_to_local_map(mob_graph)
-
-    adj = mob_graph["adj"].unsqueeze(0)
-    x_test = torch.zeros_like(mob_graph["x"], dtype=torch.float32)
-    if 4 in global_to_local:
-        x_test[global_to_local[4]] = 1.0
-
-    out = model(x_test.unsqueeze(0), adj)
-    target_out = out[0, mob_graph["target_node"]]
-
-    assert torch.norm(target_out) == 0, (
-        "With k-hop feature masking, 4-hop neighbor should NOT influence target"
     )

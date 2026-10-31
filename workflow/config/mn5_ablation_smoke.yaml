@@ -1,0 +1,18 @@
+# Bounded declarative-campaign acceptance workflow. Per-run paths and provenance
+# fields are injected by scripts/workflow/mn5_workflow.sh.
+extends: mn5_ablation.yaml
+
+ablation:
+  study_name: epiforecaster_ablation_smoke_v1
+  campaign: configs/campaigns/ablation_smoke_v1.yaml
+  workers: 2
+  trials_per_worker: 4
+  closeout_signal_seconds: 300
+  timeout_s: 3300
+  smoketest: true
+
+resources:
+  allocation:
+    tasks: 2
+    gres: gpu:2
+    runtime: 60

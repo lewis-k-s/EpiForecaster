@@ -29,6 +29,16 @@ class _DummyModel(torch.nn.Module):
     def forward_batch(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
         return batch_data.model_outputs, batch_data.targets_dict
 
+    def forward_inputs(self, batch_data, region_embeddings=None, **kwargs):  # noqa: ANN001
+        return {"batch_data": batch_data}
+
+    def forward(self, batch_data):  # noqa: ANN001
+        return batch_data.model_outputs
+
+    @staticmethod
+    def batch_targets(batch_data):  # noqa: ANN001
+        return batch_data.targets_dict
+
 
 def test_distribution_metric_accumulator_preserves_negative_nll() -> None:
     accumulator = TorchDistributionMetricAccumulator(device=torch.device("cpu"))
@@ -78,7 +88,7 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
     loader = _DummyLoader([batch])
     criterion = JointInferenceLoss(
         obs_weight_sum=4.0,
-        w_sird_supervision=0.0,
+        latent_total_weight=0.0,
     )
     _loss, metrics, _node_mae = evaluate_loader(
         model=model,

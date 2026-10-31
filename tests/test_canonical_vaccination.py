@@ -12,8 +12,6 @@ from dataviz.canonical_vaccination import (
     compute_daily_summary,
     compute_municipality_summary,
     generate_report,
-    ordered_geo_regions,
-    select_choropleth_dates,
     vaccination_period,
 )
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
@@ -73,21 +71,6 @@ def test_vaccination_period_uses_mask_any_observation() -> None:
     assert end == pd.Timestamp("2021-01-18")
 
 
-def test_select_choropleth_dates_returns_16_evenly_spaced_dates() -> None:
-    dates = pd.date_range("2021-01-03", periods=32, freq="D")
-    selected = select_choropleth_dates(
-        dates,
-        pd.Timestamp("2021-01-03"),
-        pd.Timestamp("2021-02-03"),
-        n=16,
-    )
-
-    assert len(selected) == 16
-    assert selected[0] == pd.Timestamp("2021-01-03")
-    assert selected[-1] == pd.Timestamp("2021-02-03")
-    assert all(a <= b for a, b in zip(selected, selected[1:]))
-
-
 def test_summary_stats_include_weighted_rate_and_milestones() -> None:
     ds = _tiny_dataset()
     start, end = vaccination_period(ds[MASK_VAR])
@@ -106,27 +89,15 @@ def test_summary_stats_include_weighted_rate_and_milestones() -> None:
     assert daily.iloc[0]["observed_municipality_count"] == 1
 
     row = municipality.set_index("region_id").loc["08001"]
-    assert np.isclose(row["final_rate"], ds[RATE_VAR].isel({TEMPORAL_COORD: -1, REGION_COORD: 0}).item())
+    assert np.isclose(
+        row["final_rate"],
+        ds[RATE_VAR].isel({TEMPORAL_COORD: -1, REGION_COORD: 0}).item(),
+    )
     assert row["first_observed_date"] == "2021-01-03"
     assert row["last_observed_date"] == "2021-01-18"
     assert row["days_to_10_percent"] == 2.0
     assert row["days_to_25_percent"] == 6.0
     assert row["days_to_50_percent"] == 14.0
-
-
-def test_ordered_geo_regions_preserves_order_and_reports_missing() -> None:
-    gdf = gpd.GeoDataFrame(
-        {
-            "id": ["08002", "08001"],
-            "geometry": [box(1, 0, 2, 1), box(0, 0, 1, 1)],
-        },
-        crs="EPSG:4326",
-    )
-
-    ordered, missing = ordered_geo_regions(gdf, ["08001", "08003", "08002"])
-
-    assert ordered["region_id"].tolist() == ["08001", "08002"]
-    assert missing == ["08003"]
 
 
 def test_generate_report_writes_expected_artifacts(tmp_path: Path) -> None:
@@ -149,6 +120,8 @@ def test_generate_report_writes_expected_artifacts(tmp_path: Path) -> None:
         assert path.stat().st_size > 0
 
     daily = pd.read_csv(artifacts["daily_summary"])
-    municipality = pd.read_csv(artifacts["municipality_summary"], dtype={"region_id": str})
+    municipality = pd.read_csv(
+        artifacts["municipality_summary"], dtype={"region_id": str}
+    )
     assert len(daily) == 16
     assert set(municipality["region_id"]) == {"08001", "08002", "08003"}

@@ -20,7 +20,9 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
-def fit_kalman_params(series: pd.Series) -> tuple[float, float]:
+def fit_kalman_params(
+    series: pd.Series, *, fit_end_date: str | None = None
+) -> tuple[float, float]:
     """
     Fit Kalman filter process/measurement variances from time series data.
 
@@ -37,6 +39,13 @@ def fit_kalman_params(series: pd.Series) -> tuple[float, float]:
     Raises:
         ValueError: If no finite positive observations available for fitting
     """
+    if fit_end_date is not None:
+        import pandas as pd
+
+        if not isinstance(series.index, pd.DatetimeIndex):
+            raise ValueError("Dated Kalman fitting requires a DatetimeIndex")
+        cutoff = pd.Timestamp(fit_end_date)
+        series = series.loc[series.index < cutoff + pd.Timedelta(days=1)]
     series = series.where(series > 0)
     series_log = np.log(series)
 
@@ -200,14 +209,11 @@ class KalmanSmoother:
         Returns:
             Tuple of (filtered_log_values, flags)
             flags: 0=observed, 2=missing
+            Steps before the first observation are NaN with flag 2.
         """
         values = np.asarray(values, dtype=float).reshape(-1)
         finite_mask = np.isfinite(values) & (values > 0)
         flags = np.where(finite_mask, 0, 2).astype(int).tolist()
-
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
 
         filtered: list[float] = []
 
@@ -216,6 +222,10 @@ class KalmanSmoother:
             pred_var = self.state_var + self.process_var
 
             if not np.isfinite(value) or value <= 0:
+                if not self.initialized:
+                    # No observation has arrived yet: no state estimate exists.
+                    filtered.append(float("nan"))
+                    continue
                 self._apply_missing_update(pred_state=pred_state, pred_var=pred_var)
                 filtered.append(float(self.state))
                 continue
@@ -372,11 +382,6 @@ class TobitKalmanSmoother:
         values = np.asarray(values, dtype=float).reshape(-1)
         limits = np.asarray(limits, dtype=float).reshape(-1)
 
-        finite_mask = np.isfinite(values) & (values > 0)
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
-
         for value, limit in zip(values, limits, strict=False):
             pred_state = self.state
             pred_var = self.state_var + self.process_var
@@ -467,20 +472,17 @@ class DampedHoltSmoother:
         Returns:
             Tuple of (filtered_log_values, flags)
             flags: 0=observed, 2=missing
+            Steps before the first observation are NaN with flag 2.
         """
         values = np.asarray(values, dtype=float).reshape(-1)
         finite_mask = np.isfinite(values) & (values > 0)
         flags = np.where(finite_mask, 0, 2).astype(int).tolist()
 
-        if finite_mask.any():
-            first_value = float(np.log(values[finite_mask][0] + 1e-9))
-            self._initialize(first_value)
-
         filtered: list[float] = []
         for value in values:
             if not np.isfinite(value) or value <= 0:
                 if not self.initialized:
-                    filtered.append(0.0)
+                    filtered.append(float("nan"))
                     continue
                 pred_level = self.level + self.phi * self.trend
                 self.level = float(pred_level)

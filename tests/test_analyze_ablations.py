@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import optuna
 import pandas as pd
 import pytest
 import yaml
 
+from optuna.distributions import CategoricalDistribution
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
+from optuna.trial import create_trial
+
 from scripts.analysis.analyze_ablations import (
+    AblationRun,
+    main,
     aggregate_ablation_metrics,
     build_neighborhood_context_report,
     build_run_context_report,
     collect_ablation_runs,
     compute_baseline_deltas,
+    compute_seed_matched_baseline_deltas,
+    get_run_fold,
     parse_experiment_name,
+    validate_campaign_outputs,
+    validate_campaign_trials,
 )
+from scripts.hpo.ablation_worker import load_campaign
 
 
 def _write_run(
@@ -134,7 +148,7 @@ def test_aggregate_accepts_seed_only_variation(tmp_path: Path) -> None:
     df = aggregate_ablation_metrics(ablation_runs, assert_consistent_config=True)
 
     assert len(df) == 1
-    assert df.iloc[0]["folds"] == 2
+    assert df.iloc[0]["run_count"] == 2
 
 
 def test_compute_baseline_deltas_includes_absolute_columns() -> None:
@@ -296,6 +310,525 @@ def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:
     deltas = compute_baseline_deltas(aggregated, baseline_name="baseline")
 
     assert set(aggregated["model"]) == {"baseline", "no_sir_loss"}
-    assert (aggregated["folds"] == 2).all()
+    assert (aggregated["run_count"] == 2).all()
+    assert "folds" not in aggregated.columns
     assert len(deltas) == 1
     assert deltas.iloc[0]["model"] == "no_sir_loss"
+
+
+def test_campaign_analysis_requires_exact_provenanced_paired_fold_identities(
+    tmp_path: Path,
+) -> None:
+    base_config = Path("configs/train_epifor_smoke.yaml").resolve()
+    split_manifest = tmp_path / "splits.json"
+    split_manifest.write_text(
+        json.dumps({"num_folds": 2, "folds": []}) + "\n",
+        encoding="utf-8",
+    )
+    campaign_path = tmp_path / "campaign.yaml"
+    campaign_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "paired-folds",
+                "stage": "ablation",
+                "hypothesis": "paired deltas retain fold identity",
+                "base_config": str(base_config),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    },
+                    {
+                        "name": "mobility:off",
+                        "hypothesis": "intervention",
+                        "overrides": {"model": {"type": {"mobility": False}}},
+                        "allowed_difference_paths": ["model.type.mobility"],
+                    },
+                ],
+                "paired_model_seeds": [42, 43],
+                "cross_validation": {
+                    "split_manifest": str(split_manifest),
+                    "fold_indices": [0, 1],
+                },
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                    "require_full_manifest_folds": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    campaign = load_campaign(campaign_path)
+    journal = tmp_path / "study.journal"
+    study = optuna.create_study(
+        study_name="paired-folds",
+        storage=JournalStorage(JournalFileBackend(str(journal))),
+        direction="minimize",
+    )
+    distributions = {
+        "condition": CategoricalDistribution(["baseline", "mobility:off"]),
+        "seed": CategoricalDistribution([42, 43]),
+        "fold": CategoricalDistribution([0, 1]),
+    }
+    for condition in ("baseline", "mobility:off"):
+        for fold in (0, 1):
+            for seed in (42, 43):
+                run_dir = _write_run(
+                    tmp_path,
+                    f"mn5_ablation__paired-folds__{condition}",
+                    f"{condition}-{fold}-{seed}",
+                    seed=seed,
+                    metric_offset=0.1 if condition == "mobility:off" else 0.0,
+                )
+                config = yaml.safe_load((run_dir / "config.yaml").read_text())
+                config["training"]["crossval_enabled"] = True
+                config["training"]["crossval_fold_index"] = fold
+                (run_dir / "config.yaml").write_text(
+                    yaml.safe_dump(config),
+                    encoding="utf-8",
+                )
+                (run_dir / "campaign_identity.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "campaign_sha256": campaign.sha256,
+                            "campaign_id": campaign.campaign_id,
+                            "condition": condition,
+                            "seed": seed,
+                            "fold": fold,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                study.add_trial(
+                    create_trial(
+                        params={"condition": condition, "seed": seed, "fold": fold},
+                        distributions=distributions,
+                        value=1.0,
+                        user_attrs={
+                            "campaign_sha256": campaign.sha256,
+                            "campaign_id": campaign.campaign_id,
+                            "campaign_condition": condition,
+                            "campaign_seed": seed,
+                            "campaign_fold": fold,
+                            "optuna_value_purpose": "validation_selection_coordination",
+                            "best_val_selection_metric": "validation_loss",
+                            "best_val_selection_value": 1.0,
+                        },
+                    )
+                )
+    study.add_trial(
+        create_trial(
+            params={"condition": "baseline", "seed": 42, "fold": 0},
+            distributions=distributions,
+            state=optuna.trial.TrialState.FAIL,
+        )
+    )
+
+    runs, _ = collect_ablation_runs(
+        tmp_path,
+        experiment_pattern="mn5_ablation__*__*",
+        campaign_id=campaign.campaign_id,
+    )
+    validate_campaign_trials(campaign, journal_path=journal, study_name="paired-folds")
+    validate_campaign_outputs(campaign, runs)
+    pairwise, summary = compute_seed_matched_baseline_deltas(runs)
+
+    assert len(pairwise) == 4
+    assert set(pairwise["fold"]) == {0, 1}
+    assert summary.iloc[0]["pairs"] == 4
+
+    study.add_trial(
+        create_trial(
+            params={"condition": "baseline", "seed": 42, "fold": 0},
+            distributions=distributions,
+            state=optuna.trial.TrialState.RUNNING,
+        )
+    )
+    with pytest.raises(ValueError, match="nonterminal trial state RUNNING"):
+        validate_campaign_trials(
+            campaign, journal_path=journal, study_name="paired-folds"
+        )
+
+
+def test_nonfolded_output_identity_uses_none_fold(tmp_path: Path) -> None:
+    campaign_path = tmp_path / "campaign.yaml"
+    campaign_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "nonfolded",
+                "stage": "ablation_smoke",
+                "hypothesis": "non-folded campaigns have no fold identity",
+                "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {"training": {"epochs": 1}},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    }
+                ],
+                "paired_model_seeds": [42],
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    campaign = load_campaign(campaign_path)
+    run_dir = _write_run(
+        tmp_path,
+        "mn5_ablation__nonfolded__baseline",
+        "seed-42",
+        seed=42,
+    )
+    config = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))
+    config["training"]["crossval_enabled"] = False
+    config["training"]["crossval_fold_index"] = 3
+    (run_dir / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    (run_dir / "campaign_identity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "campaign_sha256": campaign.sha256,
+                "campaign_id": campaign.campaign_id,
+                "condition": "baseline",
+                "seed": 42,
+                "fold": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runs, _ = collect_ablation_runs(
+        tmp_path,
+        experiment_pattern="mn5_ablation__*__*",
+        campaign_id=campaign.campaign_id,
+    )
+
+    assert get_run_fold(run_dir) is None
+    validate_campaign_outputs(campaign, runs)
+
+
+def test_campaign_outputs_reject_empty_or_missing_required_metric_columns(
+    tmp_path: Path,
+) -> None:
+    campaign_path = tmp_path / "campaign.yaml"
+    campaign_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "empty-metrics",
+                "stage": "ablation_smoke",
+                "hypothesis": "metric contracts fail closed",
+                "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {"training": {"epochs": 1}},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    }
+                ],
+                "paired_model_seeds": [42],
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    campaign = load_campaign(campaign_path)
+    run_dir = _write_run(
+        tmp_path,
+        "mn5_ablation__empty-metrics__baseline",
+        "seed-42",
+        seed=42,
+    )
+    (run_dir / "campaign_identity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "campaign_sha256": campaign.sha256,
+                "campaign_id": campaign.campaign_id,
+                "condition": "baseline",
+                "seed": 42,
+                "fold": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame(columns=["target", "mae_median"]).to_csv(
+        run_dir / "test_main_model_aggregate_metrics.csv",
+        index=False,
+    )
+    runs, _ = collect_ablation_runs(
+        tmp_path,
+        experiment_pattern="mn5_ablation__*__*",
+        campaign_id=campaign.campaign_id,
+    )
+
+    with pytest.raises(ValueError, match="aggregate metric table is empty"):
+        validate_campaign_outputs(campaign, runs)
+
+    pd.DataFrame({"target": ["cases"]}).to_csv(
+        run_dir / "test_main_model_aggregate_metrics.csv",
+        index=False,
+    )
+    with pytest.raises(ValueError, match="mae_median"):
+        validate_campaign_outputs(campaign, runs)
+
+    pd.DataFrame({"mae_median": [1.0]}).to_csv(
+        run_dir / "test_main_model_aggregate_metrics.csv",
+        index=False,
+    )
+    with pytest.raises(ValueError, match="target"):
+        validate_campaign_outputs(campaign, runs)
+
+    pd.DataFrame(
+        {
+            "target": ["wastewater"],
+            "mae_median": [float("nan")],
+            "observed_count_median": [1.0],
+        }
+    ).to_csv(
+        run_dir / "test_main_model_aggregate_metrics.csv",
+        index=False,
+    )
+    with pytest.raises(ValueError, match="nonfinite primary metric"):
+        validate_campaign_outputs(campaign, runs)
+    with pytest.raises(ValueError, match="nonfinite primary metric"):
+        validate_campaign_outputs(campaign, runs, smoketest=True)
+
+    pd.DataFrame(
+        {
+            "target": ["wastewater"],
+            "mae_median": [float("nan")],
+            "observed_count_median": [0.0],
+        }
+    ).to_csv(
+        run_dir / "test_main_model_aggregate_metrics.csv",
+        index=False,
+    )
+    validate_campaign_outputs(campaign, runs, smoketest=True)
+
+    campaign_document = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+    campaign_document["completeness_requirements"]["require_finite_primary_metric"] = (
+        False
+    )
+    campaign_path.write_text(
+        yaml.safe_dump(campaign_document),
+        encoding="utf-8",
+    )
+    campaign = load_campaign(campaign_path)
+    output_identity_path = run_dir / "campaign_identity.json"
+    output_identity = json.loads(output_identity_path.read_text(encoding="utf-8"))
+    output_identity["campaign_sha256"] = campaign.sha256
+    output_identity_path.write_text(json.dumps(output_identity), encoding="utf-8")
+
+    validate_campaign_outputs(campaign, runs)
+
+
+def _reuse_campaign(tmp_path: Path):
+    path = tmp_path / "reuse_campaign.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "reuse-id",
+                "stage": "ablation_smoke",
+                "hypothesis": "reuse identity is read from the bundled config",
+                "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    },
+                    {
+                        "name": "mobility:off",
+                        "hypothesis": "intervention",
+                        "overrides": {"model": {"type": {"mobility": False}}},
+                        "allowed_difference_paths": ["model.type.mobility"],
+                    },
+                ],
+                "paired_model_seeds": [42],
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return load_campaign(path)
+
+
+def _reuse_runs(tmp_path: Path, campaign, *, mutate=None) -> dict:
+    runs = {}
+    for condition in ("baseline", "mobility:off"):
+        experiment = f"mn5_ablation__reuse-id__{condition}"
+        run_dir = _write_run(tmp_path, experiment, "run", seed=42)
+        config = yaml.safe_load((run_dir / "config.yaml").read_text())
+        if condition == "mobility:off":
+            config["model"] = {"type": {"mobility": False}}
+        if mutate is not None:
+            mutate(condition, config)
+        (run_dir / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        runs[condition] = [
+            AblationRun(
+                ablation=condition,
+                campaign_id="reuse-id",
+                experiment_dir=run_dir.parent,
+                run_dir=run_dir,
+                seed=42,
+                fold=None,
+                campaign_identity={
+                    "campaign_id": campaign.campaign_id,
+                    "campaign_sha256": campaign.sha256,
+                    "condition": condition,
+                    "seed": 42,
+                    "fold": None,
+                },
+            )
+        ]
+    return runs
+
+
+def test_reuse_identity_is_checked_against_bundled_config(tmp_path: Path) -> None:
+    campaign = _reuse_campaign(tmp_path)
+    validate_campaign_outputs(campaign, _reuse_runs(tmp_path, campaign))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda c, cfg: cfg["training"].update(seed=99), "config seed"),
+        (
+            lambda c, cfg: cfg["training"].update(
+                crossval_enabled=True, crossval_fold_index=3
+            ),
+            "config fold",
+        ),
+        (
+            lambda c, cfg: cfg["output"].update(experiment_name="other"),
+            "experiment name",
+        ),
+        (
+            lambda c, cfg: (
+                cfg.update(model={"type": {"mobility": True}})
+                if c == "mobility:off"
+                else None
+            ),
+            "model.type.mobility",
+        ),
+    ],
+)
+def test_reuse_identity_rejects_config_mismatch(
+    tmp_path: Path, mutate, message: str
+) -> None:
+    campaign = _reuse_campaign(tmp_path)
+    runs = _reuse_runs(tmp_path, campaign, mutate=mutate)
+    with pytest.raises(ValueError, match=message):
+        validate_campaign_outputs(campaign, runs)
+
+
+def test_explicit_default_output_dir_is_not_redirected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _reuse_campaign(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "analyze_ablations",
+            "--campaign",
+            str(campaign.path),
+            "--journal",
+            str(tmp_path / "j"),
+            "--study-name",
+            "s",
+            "--training-dir",
+            str(tmp_path / "missing"),
+            "--output-dir",
+            "outputs/reports/ablation_analysis",
+        ],
+    )
+    assert main() == 1  # no runs found, after the output directory is chosen
+    assert (tmp_path / "outputs/reports/ablation_analysis").is_dir()
+    assert not (tmp_path / "outputs/reports/ablation_cv_reuse-id").exists()

@@ -1,0 +1,69 @@
+# Region2Vec training without mobility-flow supervision.
+
+data:
+  zarr_path: "../outputs/region_graph/region_graph.zarr"
+  normalize_features: true
+  use_mobility_flows: false
+
+encoder:
+  hidden_dim: 128
+  embedding_dim: 64
+  num_layers: 2
+  dropout: 0.2
+  aggregation: "mean"
+  activation: "relu"
+  hidden_norm: "layer"
+  sage_normalize: false
+  residual: true
+  normalize: true
+
+training:
+  epochs: 200
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  device: "auto"
+  log_every: 10
+  gradient_clip: 1.0
+  seed: 42
+  checkpoint_every: 0
+  lr_scheduler: "plateau"
+  lr_patience: 15
+  lr_factor: 0.5
+  lr_threshold: 0.0001
+  train_until_plateau: true
+  max_lr_reductions: 3
+  early_stopping_patience: 0
+  early_stopping_min_delta: 0.0001
+
+sampling:
+  positive_pairs: 0
+  negative_pairs: 0
+  hop_pairs: 0
+  min_flow_threshold: 5.0
+  hop_threshold: 2
+  max_hops: 5
+
+loss:
+  loss_type: "spatial"
+  spatial_weight: 1.0
+  autocorr_weight: 0.5
+  ratio_weight: 0.0
+  hop_weight: 0.0
+  temperature: 0.1
+  margin: 1.0
+
+output:
+  output_dir: "outputs/region_embeddings_no_mobility"
+  log_dir: "outputs/region_training"
+  experiment_name: "region_embeddings_no_mobility"
+  embedding_filename: "region_embeddings.pt"
+  metrics_filename: "region_training_metrics.json"
+  cluster_labels_filename: "region_clusters.json"
+  save_numpy: true
+  wandb_mode: "disabled"
+
+clustering:
+  enabled: true
+  num_clusters: 14
+  linkage: "ward"
+  compute_connectivity: true

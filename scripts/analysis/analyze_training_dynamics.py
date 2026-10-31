@@ -930,6 +930,18 @@ def analyze_training_dynamics(
     }
 
 
+def _value_axis_scale(
+    values: list[float],
+    *,
+    signed: bool,
+) -> tuple[str, dict[str, float | str]]:
+    if signed and any(value <= 0 for value in values):
+        return "symlog", {"linthresh": 1e-2}
+    if signed:
+        return "log", {}
+    return "log", {"nonpositive": "clip"}
+
+
 def _write_loss_figure(data: dict[str, Any], output_path: Path) -> bool:
     loss = data["loss"]
     series = loss.get("series", [])
@@ -983,6 +995,10 @@ def _write_loss_figure(data: dict[str, Any], output_path: Path) -> bool:
         xlabel="Optimizer step",
         ylabel="Training loss",
     )
+    # Normal NLL can legitimately cross zero, so retain its sign while giving
+    # sub-unit magnitudes logarithmic visual resolution.
+    scale, scale_options = _value_axis_scale(values, signed=True)
+    axis.set_yscale(scale, **scale_options)
     axis.grid(alpha=0.2)
     axis.legend()
     figure.tight_layout()
@@ -1027,6 +1043,8 @@ def _write_gradient_figure(data: dict[str, Any], output_path: Path) -> bool:
         xlabel="Optimizer step",
         ylabel="Gradient norm",
     )
+    scale, scale_options = _value_axis_scale(norms, signed=False)
+    axis.set_yscale(scale, **scale_options)
     axis.grid(alpha=0.2)
     axis.legend()
     figure.tight_layout()

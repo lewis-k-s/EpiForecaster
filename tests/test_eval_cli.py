@@ -47,10 +47,14 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
     output_dir.mkdir()
     captured: dict[str, object] = {}
     groups = {"Q1 (Best MAE)": [0], "Q4 (Worst MAE)": [1]}
+    eval_result = make_eval_result(
+        num_forecast_samples=2,
+        node_mae={0: 0.1, 1: 0.2},
+    )
     install_eval_cli_harness(
         monkeypatch,
         captured,
-        eval_result=make_eval_result(num_forecast_samples=2, node_mae={0: 0.1, 1: 0.2}),
+        eval_result=eval_result,
         node_groups=groups,
     )
 
@@ -84,6 +88,9 @@ def test_eval_cli_uses_output_directory_for_all_artifacts(
         output_dir / "test_node_metrics_per_head.csv"
     )
     assert per_head_kwargs["output_dir"] == output_dir
+    assert per_head_kwargs["model"] is eval_result["model"]
+    assert per_head_kwargs["config"] is eval_result["config"]
+    assert per_head_kwargs["loader"] is eval_result["loader"]
 
 
 def test_eval_cli_creates_missing_output_directory_for_all_artifacts(
@@ -128,6 +135,35 @@ def test_eval_cli_granular_flag_enables_auto_granular_output(
     assert eval_kwargs["granular_output_path"] == output_dir / "test_granular.parquet"
     assert eval_kwargs["granular_eval_format"] is None
     assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
+
+
+def test_eval_cli_relevant_latent_toggle_enables_granular_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_path = make_checkpoint(tmp_path)
+    output_dir = tmp_path / "eval_outputs"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+    install_eval_cli_harness(monkeypatch, captured)
+
+    result = _invoke_eval(
+        checkpoint_path,
+        output_dir,
+        "--include-relevant-latent",
+    )
+
+    assert result.exit_code == 0, result.output
+    eval_kwargs = captured["eval_checkpoint_kwargs"]
+    assert eval_kwargs["granular_output_path"] == (
+        output_dir / "test_granular.parquet"
+    )
+    assert "output.write_granular_eval=true" in eval_kwargs["overrides"]
+    plot_kwargs = captured["generate_forecast_plots_kwargs"]
+    assert plot_kwargs["include_relevant_latent"] is True
+    assert plot_kwargs["granular_eval_path"] == (
+        output_dir / "test_granular.parquet"
+    )
 
 
 def test_eval_cli_writes_machine_readable_summary(

@@ -1,0 +1,23 @@
+# Smoke validation config for NetCDF4 raw synthetic input.
+# Uses the 5-run dense smoke corpus from the upstream NetCDF cutover.
+
+base_config: "preprocess_mn5_synth.yaml"
+
+env: "mn5"
+synthetic_path: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc"
+cases_file: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc"
+mobility_path: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc"
+wastewater_file: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc"
+population_file: "data/files/epiforecaster_sirhd_v1_netcdf_c3d4810_smoke_2run.nc"
+region_metadata_file: "data/files/catalonia_preprocessing_inputs_v1/edar_muni_edges.nc"
+
+end_date: "2021-05-09"
+dataset_name: "synthetic_netcdf_smoke_2run"
+vaccination_file: null
+continuous_storage_dtype: "float32"
+
+temporal_covariates:
+  holiday_calendar_file: "data/files/catalonia_preprocessing_inputs_v1/catalonia_holidays.csv"
+
+smoothing:
+  clinical_method: "holt_damped"

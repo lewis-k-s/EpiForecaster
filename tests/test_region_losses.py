@@ -81,6 +81,45 @@ class TestRegionLosses:
 
         loss_dict = loss_fn(embeddings, flow, edge_index)
         assert "total_loss" in loss_dict
+        assert torch.isfinite(loss_dict["total_loss"])
+        assert loss_dict["contrastive_loss"] >= 0
+
+    def test_spatial_only_positive_weights_and_loss_are_bounded(self, edge_index):
+        """Near-identical embeddings must not drive the loss below zero."""
+        embeddings = torch.arange(80, dtype=torch.float32).reshape(10, 8) * 1e-8
+        loss_fn = SpatialOnlyLoss()
+
+        positive_pairs, positive_weights = loss_fn._get_knn_positive_pairs(embeddings)
+        negative_pairs, negative_weights = loss_fn._get_distance_negative_pairs(
+            edge_index, embeddings.size(0)
+        )
+        loss = loss_fn._compute_contrastive_loss(
+            embeddings,
+            positive_pairs,
+            positive_weights,
+            negative_pairs,
+            negative_weights,
+        )
+
+        assert torch.all(positive_weights > 0)
+        assert torch.all(positive_weights <= 1)
+        assert torch.isfinite(loss)
+        assert loss >= 0
+
+    def test_spatial_only_contrastive_loss_is_non_negative(self):
+        """Identical positives and opposite negatives have zero bounded loss."""
+        embeddings = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0]])
+        loss_fn = SpatialOnlyLoss()
+
+        loss = loss_fn._compute_contrastive_loss(
+            embeddings,
+            positive_pairs=torch.tensor([[0], [1]]),
+            positive_weights=torch.ones(1),
+            negative_pairs=torch.tensor([[0], [2]]),
+            negative_weights=torch.ones(1),
+        )
+
+        assert loss == 0
 
     def test_weight_creation(self, edge_index):
         """Test creation of PySAL weights from edge_index."""

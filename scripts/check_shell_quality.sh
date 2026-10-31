@@ -9,7 +9,7 @@ set -euo pipefail
 REQUIRED_SHFMT_VERSION="v3.13.1"
 
 MAINTAINED_SHELL_FILES=(
-  containers/runtime/build_sif.sbatch
+  containers/runtime/assemble_sif_on_mn5.sbatch
   containers/runtime/build_sif_on_mn5.sh
   containers/runtime/fetch_runtime_deps_on_wifi.sh
   scripts/check_shell_quality.sh
@@ -19,14 +19,13 @@ MAINTAINED_SHELL_FILES=(
   scripts/workflow/mn5_container_exec.sh
   scripts/workflow/mn5_workflow.sh
   scripts/workflow/remote_run.sh
-  scripts/workflow/remote_tooling.sh
   scripts/workflow/run_parallel_worker.sh
   scripts/workflow/snakemake_coordinator.sbatch
   spells.sh
 )
 
 FORMATTED_BASH_FILES=(
-  containers/runtime/build_sif.sbatch
+  containers/runtime/assemble_sif_on_mn5.sbatch
   containers/runtime/build_sif_on_mn5.sh
   containers/runtime/fetch_runtime_deps_on_wifi.sh
   scripts/check_shell_quality.sh
@@ -36,7 +35,6 @@ FORMATTED_BASH_FILES=(
   scripts/workflow/mn5_container_exec.sh
   scripts/workflow/mn5_workflow.sh
   scripts/workflow/remote_run.sh
-  scripts/workflow/remote_tooling.sh
   scripts/workflow/run_parallel_worker.sh
   scripts/workflow/snakemake_coordinator.sbatch
 )

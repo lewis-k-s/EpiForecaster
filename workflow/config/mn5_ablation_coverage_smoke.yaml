@@ -1,0 +1,17 @@
+# Bounded all-arm acceptance for the full production matrix. The campaign owns
+# all ten production folds and its two-fold smoke subset; this config changes
+# execution resources only.
+extends: mn5_ablation.yaml
+
+ablation:
+  study_name: epiforecaster_ablation_default_smoke_v2
+  workers: 2
+  closeout_signal_seconds: 600
+  timeout_s: 6000
+  smoketest: true
+
+resources:
+  allocation:
+    tasks: 2
+    gres: gpu:2
+    runtime: 110

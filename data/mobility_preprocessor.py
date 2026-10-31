@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 import xarray as xr
 
 from .preprocess.config import TEMPORAL_COORD
@@ -54,13 +55,21 @@ class MobilityPreprocessor:
         if not np.isfinite(threshold_raw) or threshold_raw < 0:
             raise ValueError("min_flow_raw must be finite and non-negative")
 
-        values = np.asarray(stored_log_flow)
+        # Torch runs these full-tensor passes on all intra-op threads.
+        values_np = np.asarray(stored_log_flow)
+        values = torch.as_tensor(values_np)
+        # Torch compares in the tensor dtype, NumPy in float64. Round the
+        # threshold up onto the dtype grid so both select the same edges.
         threshold_log = np.log1p(threshold_raw)
-        edge_mask = np.isfinite(values) & (values > 0.0) & (values >= threshold_log)
+        threshold = np.asarray(threshold_log, dtype=values_np.dtype)
+        if threshold < threshold_log:
+            threshold = np.nextafter(threshold, np.inf, dtype=values_np.dtype)
+        edge_mask = (
+            torch.isfinite(values) & (values > 0.0) & (values >= threshold.item())
+        )
         if values.ndim >= 2 and values.shape[-2] == values.shape[-1]:
-            diagonal = np.arange(values.shape[-1])
-            edge_mask[..., diagonal, diagonal] = False
-        return edge_mask
+            edge_mask.diagonal(dim1=-2, dim2=-1).fill_(False)
+        return edge_mask.numpy()
 
     def transform_edge_weights(
         self,
@@ -76,23 +85,18 @@ class MobilityPreprocessor:
                 f"{values.shape} and {mask.shape}"
             )
 
-        finite_nonnegative = np.nan_to_num(
-            values.astype(np.float32, copy=False),
+        finite_nonnegative = torch.nan_to_num(
+            torch.as_tensor(values).to(torch.float32),
             nan=0.0,
             posinf=self.config.weight_clip_max,
             neginf=0.0,
-        )
-        finite_nonnegative = np.clip(
-            finite_nonnegative,
-            0.0,
-            self.config.weight_clip_max,
-        )
-        weights = np.where(mask, finite_nonnegative, 0.0).astype(np.float32)
-        if not np.isfinite(weights).all() or np.any(weights < 0):
+        ).clamp_(0.0, self.config.weight_clip_max)
+        weights = torch.where(torch.as_tensor(mask), finite_nonnegative, 0.0)
+        if not torch.isfinite(weights).all() or (weights < 0).any():
             raise ValueError(
                 "Mobility weight transform must produce finite nonnegative values"
             )
-        return weights
+        return weights.numpy()
 
     def preprocess_dataset(self, dataset: xr.Dataset) -> np.ndarray:
         """Select and transform a full canonical mobility tensor."""
@@ -136,18 +140,20 @@ class MobilityPreprocessor:
         Returns:
             Array of shape (T, N, len(lags)) containing imported risk features.
         """
-        if not lags:
-            if cases.ndim == 2:
-                T, N = cases.shape
-            else:
-                T, N, _ = cases.shape
-            return np.zeros((T, N, 0), dtype=np.float32)
-
-        # Ensure cases is (T, N, 1)
+        # Ensure cases is (T, N, 1); reject extra trailing channels up front so
+        # every return path (including the empty-lag one) enforces the contract.
         if cases.ndim == 2:
             cases = cases[..., None]
 
-        T, N, _ = cases.shape
+        T, N, channels = cases.shape
+        if channels != 1:
+            raise ValueError(
+                "cases must be (T, N) or (T, N, 1) for imported risk; "
+                f"got trailing dimension {channels}"
+            )
+
+        if not lags:
+            return np.zeros((T, N, 0), dtype=np.float32)
 
         # Normalize mobility (incoming flow normalization)
         # Sum over origins (axis -2) for each destination

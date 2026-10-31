@@ -16,7 +16,7 @@
 ### `train_epifor_mn5_synth_pretrain.yaml`
 - Production synthetic pretraining on processed synthetic data
 - Invoked only through `workflow/config/mn5_synth_pretrain.yaml`
-- Enables direct latent `S/I/R/D` supervision for stage-1 pretraining
+- Enables direct latent `S/I/H/R/death_flow` supervision for stage-1 pretraining
 
 ### `preprocess_mn5_synth.yaml`
 - Canonical MN5 synthetic preprocessing base
@@ -26,9 +26,26 @@
 - Produces the canonical processed pretraining dataset
 - Inherits the MN5 synthetic preprocessing base
 
+### `preprocess_mn5_synth_sirhd_reporting_v1.yaml`
+- Produces the versioned corrected SIRHD reporting corpus
+- Preserves the legacy raw and processed DVC artifacts under separate names
+- Must be bound to the hash-verified `cb6b4e5` raw Zarr in its immutable run
+- Keeps clinical observations as continuous expected reported counts: calibration
+  is defined in `log1p(count / population * 100000)` space, then stored in raw
+  count units and transformed downstream without rounding or integerization
+- Represents missingness only through masks and NaNs, keeps mechanistic
+  population states in float32, and stores wastewater as raw concentration for
+  exactly one downstream `log1p`
+- Uses float32 processed supervision so small positive clinical expectations and
+  latent fractions cannot underflow back to zero
+
 ## Intended Usage
 
-These configs should only be run through an immutable MN5 Snakemake workflow:
+Training and evaluation configs run through the immutable MN5 Snakemake
+workflow. Preprocessing is the upstream DVC-producing boundary: run it from an
+immutable source bundle in a versioned MN5 run root, validate the generated
+Zarr, and publish a new DVC pointer without modifying the source bundle or an
+existing artifact.
 
 ```bash
 # Single training (default workflow target)
@@ -53,6 +70,24 @@ bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
 bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
   --config workflow/config/mn5_synth_pretrain.yaml
 ```
+
+The reporting-v1 pretraining study uses fail-closed templates for initialized
+fine-tuning. Copy
+`workflow/config/mn5_synth_pretrain_finetune_smoke.template.yaml` for the
+bounded real-data smoke, or
+`workflow/config/mn5_synth_pretrain_finetune.template.yaml` for the substantive
+treatment. Set `training.init_checkpoint` to the absolute GPFS checkpoint from
+the accepted corrected-corpus pretraining run before immutable preparation.
+The workflow validator rejects either template while that field is null, so it
+cannot silently execute as a second from-scratch control.
+
+Use `workflow/config/mn5_synth_pretrain_control_smoke.yaml` as the exactly
+matched from-scratch smoke. For corrected-corpus cross-evaluation of a control,
+pretrained, or fine-tuned checkpoint, copy
+`workflow/config/mn5_sirhd_reporting_v1_checkpoint_evaluate.template.yaml` and
+set its absolute `evaluation.checkpoint`. Preparation pins and hashes both
+training initialization and evaluation checkpoints into their new immutable
+run roots.
 
 The default target is single training. Pin `train_evaluate` or `evaluate` in a
 complete workflow config before preparation when evaluation is required. Use

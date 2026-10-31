@@ -54,6 +54,10 @@ date_chunk_size: 30 # Chunk size for date dimension in zarr output
 mobility_chunk_size: 100 # Chunk size for spatial dims (origin/destination)
 memory_limit_gb: 8.0
 
+# Weekly hospital totals are stamped at week start; 7 removes the future leak.
+hospitalizations_reporting_lag_days: 7
+continuous_storage_dtype: "float32"
+
 temporal_covariates:
   include_day_of_week: true
   include_holidays: true

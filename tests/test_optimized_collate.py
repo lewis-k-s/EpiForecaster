@@ -1,121 +1,109 @@
-import torch
-import pytest
-from torch_geometric.data import Data, Batch
+"""Tests for the lightweight mobility placement container."""
 
+import pytest
+import torch
+
+from data.epi_dataset import EpiDatasetItem
 from data.epi_batch import optimized_collate_graphs
 
-# Mocking the structures for the test
-# We want to simulate the BEFORE and AFTER states of the refactor
-# to ensure they produce the same result.
+
+SHARED_NODES = torch.tensor([4, 5, 6], dtype=torch.long)
 
 
-def mock_getitem_old(L=3, num_nodes=5):
-    """Simulate the old __getitem__ returning list[Data]."""
-    mob_graphs = []
-    for t in range(L):
-        # Create random features and edges
-        x = torch.randn(num_nodes, 2)
-        edge_index = torch.randint(0, num_nodes, (2, 10))
-        edge_weight = torch.rand(10)
-
-        data = Data(x=x, edge_index=edge_index, edge_weight=edge_weight)
-        data.num_nodes = num_nodes
-        data.target_node = torch.tensor([0], dtype=torch.long)
-        data.node_ids = torch.arange(num_nodes)
-        data.time_id = torch.tensor([t], dtype=torch.long)
-        mob_graphs.append(data)
-
-    return {"mob": mob_graphs}
-
-
-def mock_collate_old(batch):
-    """Simulate the old collate function using Batch.from_data_list."""
-    import itertools
-
-    graph_list = list(itertools.chain.from_iterable(item["mob"] for item in batch))
-    mob_batch = Batch.from_data_list(graph_list)
-    return mob_batch
+def _make_item(
+    window_start: int, target_pos: int = 0, run_id="real", L: int = 3
+) -> EpiDatasetItem:
+    return {
+        "node_label": "n",
+        "region_id": str(target_pos),
+        "target_node": target_pos,
+        "window_start": window_start,
+        "bio_node": torch.zeros(L, 1),
+        "hosp_hist": torch.zeros(L, 3),
+        "deaths_hist": torch.zeros(L, 3),
+        "cases_hist": torch.zeros(L, 3),
+        "mob_target_node_idx": torch.tensor(target_pos, dtype=torch.long),
+        "mob_real_node_idx": SHARED_NODES,
+        "population": torch.tensor(1.0),
+        "run_id": run_id,
+        "target_region_index": None,
+        "temporal_covariates": torch.zeros(L, 2),
+        "vaccination_hist": torch.zeros(L, 3),
+        "ww_hist": torch.zeros(L),
+        "ww_hist_mask": torch.zeros(L),
+        "hosp_target": torch.zeros(1),
+        "ww_target": torch.zeros(1),
+        "cases_target": torch.zeros(1),
+        "deaths_target": torch.zeros(1),
+        "hosp_target_mask": torch.zeros(1),
+        "ww_target_mask": torch.zeros(1),
+        "cases_target_mask": torch.zeros(1),
+        "deaths_target_mask": torch.zeros(1),
+        "S_target": None,
+        "I_target": None,
+        "H_target": None,
+        "R_target": None,
+        "D_target": None,
+        "death_flow_target": None,
+    }
 
 
 @pytest.mark.epiforecaster
-def test_manual_batching_equivalence():
-    """Verify that manual batching produces identical results to Batch.from_data_list."""
+def test_placement_tensors_follow_batch_order() -> None:
+    B, L = 3, 3
+    items = [_make_item(window_start=10 * b, target_pos=b) for b in range(B)]
+    mob_batch = optimized_collate_graphs(items)
 
-    # Setup parameters
-    B = 4
-    L = 3
-    num_nodes = 5
-    F = 2
+    assert not hasattr(mob_batch, "x_dense")
+    assert mob_batch.global_t.shape == (B * L,)
+    expected_global_t = torch.cat([torch.arange(10 * b, 10 * b + L) for b in range(B)])
+    assert torch.equal(mob_batch.global_t, expected_global_t)
 
-    # Generate raw data for the batch
-    raw_data = []
-    for b in range(B):
-        sample = []
-        for t in range(L):
-            x = torch.randn(num_nodes, F)
-            # Random edges (self loops included for simplicity)
-            edge_index = torch.randint(0, num_nodes, (2, 10))
-            edge_weight = torch.rand(10)
-            sample.append((x, edge_index, edge_weight))
-        raw_data.append(sample)
-
-    # 1. Create Old Format Batch
-    old_batch_input = []
-    for b in range(B):
-        mob_graphs = []
-        for t in range(L):
-            x, ei, ew = raw_data[b][t]
-            data = Data(x=x, edge_index=ei, edge_weight=ew)
-            data.num_nodes = num_nodes
-            data.target_node = torch.tensor([0], dtype=torch.long)  # Dummy
-            data.node_ids = torch.arange(num_nodes)  # Dummy
-            data.time_id = torch.tensor([t], dtype=torch.long)  # Dummy
-            mob_graphs.append(data)
-        old_batch_input.append({"mob": mob_graphs})
-
-    old_result = mock_collate_old(old_batch_input)
-
-    # 2. Create New Format Batch (Manual Batching Logic)
-
-    new_batch_input = []
-    for b in range(B):
-        mob_x_list = []
-        mob_ei_list = []
-        mob_ew_list = []
-        for t in range(L):
-            x, ei, ew = raw_data[b][t]
-            mob_x_list.append(x)
-            mob_ei_list.append(ei)
-            mob_ew_list.append(ew)
-
-        item = {
-            "mob_x": torch.stack(mob_x_list),  # (L, N, F)
-            "mob_edge_index": mob_ei_list,
-            "mob_edge_weight": mob_ew_list,
-            "mob_t": torch.arange(L),
-            "mob_target_node_idx": 0,  # Dummy
-        }
-        new_batch_input.append(item)
-
-    # Use the ACTUAL function
-    new_result = optimized_collate_graphs(new_batch_input)
-
-    # 3. Compare Results (dense cutover)
-    # old_result.x is [B*L*N, F] while new_result.x_dense is [B*L, N, F]
-    old_x_dense = old_result.x.view(B * L, num_nodes, F)
-    assert torch.allclose(old_x_dense, new_result.x_dense)
-
-    # The new result no longer computes adj_dense here, it just passes mob_t
-    assert hasattr(new_result, "global_t")
-    assert new_result.global_t.shape == (B * L,)
-
-    # Check target_node reconstruction
-    # Old result has target_node from Batch.from_data_list (concatenated list of tensors)
-    # New result has it constructed from mob_target_node_idx and repeated over time.
-    assert torch.equal(old_result.target_node, new_result.target_node)
-
-    print("Verification successful!")
+    expected_targets = torch.arange(B).repeat_interleave(L)
+    assert torch.equal(mob_batch.target_node, expected_targets)
 
 
-if __name__ == "__main__":
-    test_manual_batching_equivalence()
+@pytest.mark.epiforecaster
+def test_homogeneous_run_id_is_attached() -> None:
+    items = [_make_item(0), _make_item(5)]
+    mob_batch = optimized_collate_graphs(items)
+    assert getattr(mob_batch, "run_id", None) == "real"
+
+
+@pytest.mark.epiforecaster
+def test_heterogeneous_or_missing_run_id_stays_none() -> None:
+    mixed = [_make_item(0, run_id="a"), _make_item(1, run_id="b")]
+    assert getattr(optimized_collate_graphs(mixed), "run_id", None) is None
+
+    missing = [
+        {
+            "window_start": 0,
+            "temporal_covariates": torch.zeros(2, 0),
+            "mob_target_node_idx": torch.tensor(0),
+        },
+        {
+            "window_start": 1,
+            "temporal_covariates": torch.zeros(2, 0),
+            "mob_target_node_idx": torch.tensor(0),
+        },
+    ]
+    assert getattr(optimized_collate_graphs(missing), "run_id", None) is None
+
+
+@pytest.mark.epiforecaster
+def test_shared_context_nodes_must_be_identical_objects() -> None:
+    item_a = _make_item(0)
+    item_b = _make_item(1)
+    item_b["mob_real_node_idx"] = item_b["mob_real_node_idx"].clone()
+    with pytest.raises(ValueError, match="same cached tensor"):
+        optimized_collate_graphs([item_a, item_b])
+
+
+@pytest.mark.epiforecaster
+def test_shared_window_start_emits_one_time_row() -> None:
+    B, L = 3, 3
+    items = [_make_item(window_start=7, target_pos=b) for b in range(B)]
+    mob_batch = optimized_collate_graphs(items)
+
+    assert torch.equal(mob_batch.global_t, torch.arange(7, 7 + L))
+    assert mob_batch.target_node.shape == (B * L,)

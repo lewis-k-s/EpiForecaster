@@ -30,6 +30,12 @@ ZARR_ENCODING_KEYS_TO_CLEAR = {
     "shards",
 }
 
+# Float32 cumulative-state differencing has small rounding error relative to the
+# continuous generator flow. This tolerance is applied in normalized fraction
+# space after cropping to the configured processing interval.
+LATENT_DEATH_FLOW_ALIGNMENT_ATOL = 1e-8
+LATENT_DEATH_FLOW_ALIGNMENT_RTOL = 1e-5
+
 SYNTHETIC_ZARR_SCHEMA = {
     "required_vars": {
         "cases": ("run_id", "date", "region_id"),
@@ -58,6 +64,7 @@ SYNTHETIC_ZARR_SCHEMA = {
         "latent_H_true": ("run_id", "region_id", "date"),
         "latent_R_true": ("run_id", "region_id", "date"),
         "latent_D_true": ("run_id", "region_id", "date"),
+        "deaths_true": ("run_id", "region_id", "date"),
         "synthetic_sparsity_level": ("run_id",),
     },
 }
@@ -103,7 +110,7 @@ class SyntheticProcessor:
         Load and extract synthetic data from bundled zarr.
 
         Args:
-            synthetic_path: Path to raw_synthetic_observations.zarr
+            synthetic_path: Path to raw_synthetic_observations (.nc or .zarr)
             run_filter: Optional list of run_ids to include. If None, includes all runs.
 
         Returns:
@@ -116,7 +123,7 @@ class SyntheticProcessor:
         resolved_store_path = self._resolve_synthetic_store_path(synthetic_path)
         print(f"Resolved synthetic zarr group: {resolved_store_path}")
 
-        ds = self._open_synthetic_zarr(resolved_store_path)
+        ds = self._open_synthetic_data(resolved_store_path)
         print(ds)
         print()
 
@@ -170,11 +177,16 @@ class SyntheticProcessor:
         return result
 
     def _resolve_synthetic_store_path(self, synthetic_path: str) -> str:
-        """Resolve wrapper directories that contain the actual Zarr group."""
+        """Resolve wrapper directories that contain the actual data store."""
         path = Path(synthetic_path)
         if not path.exists():
-            raise FileNotFoundError(f"Synthetic zarr path does not exist: {path}")
+            raise FileNotFoundError(f"Synthetic data path does not exist: {path}")
 
+        # Direct NetCDF file
+        if path.is_file() and path.suffix == ".nc":
+            return str(path)
+
+        # Direct Zarr directory
         if (path / ".zgroup").exists() or (path / ".zattrs").exists():
             return str(path)
 
@@ -189,26 +201,33 @@ class SyntheticProcessor:
             return str(nested_candidates[0])
         if len(nested_candidates) > 1:
             raise ValueError(
-                "Synthetic zarr wrapper contains multiple nested zarr groups; "
+                "Synthetic data wrapper contains multiple nested zarr groups; "
                 f"cannot choose automatically: {[c.name for c in nested_candidates]}"
             )
         return str(path)
 
-    def _open_synthetic_zarr(self, resolved_path: str) -> xr.Dataset:
-        """Open synthetic zarr, handling inconsistent run_id dimensions.
+    def _open_synthetic_data(self, resolved_path: str) -> xr.Dataset:
+        """Open synthetic data (NetCDF or Zarr), handling inconsistent run_id
+        dimensions.
 
-        Some synthetic zarrs have variables with conflicting run_id sizes
+        Some synthetic datasets have variables with conflicting run_id sizes
         (e.g., LoD arrays with run_id=2 while others have run_id=8).
         This method detects such conflicts, drops the conflicting variables,
         and re-loads them with corrected coordinates.
         """
+        is_netcdf = Path(resolved_path).is_file()
         chunks = {"run_id": self.config.run_id_chunk_size}
         try:
-            ds = xr.open_zarr(
-                resolved_path,
-                chunks=chunks,  # type: ignore[arg-type]
-            )
-            self._clear_source_zarr_encodings(ds)
+            if is_netcdf:
+                ds = xr.open_dataset(resolved_path, engine="netcdf4", chunks=chunks)
+            else:
+                ds = xr.open_zarr(
+                    resolved_path,
+                    chunks=chunks,  # type: ignore[arg-type]
+                )
+                self._clear_source_zarr_encodings(ds)
+            ds = self._strip_run_id_padding(ds)
+            ds = self._normalize_mobility_dims(ds)
             return ds
         except ValueError as e:
             if "conflicting sizes" not in str(e):
@@ -238,12 +257,22 @@ class SyntheticProcessor:
                 f"  Note: dropping {len(conflicting_vars)} variables with "
                 f"conflicting run_id size: {conflicting_vars}"
             )
-            ds = xr.open_zarr(
-                resolved_path,
-                drop_variables=conflicting_vars,
-                chunks=chunks,  # type: ignore[arg-type]
-            )
-            self._clear_source_zarr_encodings(ds)
+            if is_netcdf:
+                ds = xr.open_dataset(
+                    resolved_path,
+                    engine="netcdf4",
+                    chunks=chunks,
+                    drop_variables=conflicting_vars,
+                )
+            else:
+                ds = xr.open_zarr(
+                    resolved_path,
+                    drop_variables=conflicting_vars,
+                    chunks=chunks,  # type: ignore[arg-type]
+                )
+                self._clear_source_zarr_encodings(ds)
+            ds = self._strip_run_id_padding(ds)
+            ds = self._normalize_mobility_dims(ds)
 
             # Re-add dropped LoD variables with corrected run_id coords
             if run_id_size is not None:
@@ -274,6 +303,40 @@ class SyntheticProcessor:
             print(ds)
             print()
             return ds
+
+    @staticmethod
+    def _strip_run_id_padding(dataset: xr.Dataset) -> xr.Dataset:
+        """Strip whitespace padding from ``run_id`` fixed-width string coordinates.
+
+        Synthetic zarr stores ``run_id`` as ``<U50`` (right-padded to 50 chars).
+        NetCDF4 uses vlen strings that may also carry trailing spaces.
+        The generator handoff manifest stores clean stripped strings.  Stripping
+        at the earliest entry point lets clean values propagate through the
+        entire pipeline and pass provenance QA.
+        """
+        if "run_id" in dataset.coords:
+            raw = dataset["run_id"].values.astype("U")
+            stripped = np.char.strip(raw)
+            dataset = dataset.assign_coords(run_id=stripped)
+        return dataset
+
+    @staticmethod
+    def _normalize_mobility_dims(dataset: xr.Dataset) -> xr.Dataset:
+        """Rename NetCDF mobility dimension names to the canonical forms.
+
+        Upstream NetCDF output uses ``in_region_id``/``out_region_id`` for the
+        OD matrix spatial dims, while legacy zarr used ``origin``/``target``.
+        Rename to ``origin``/``target`` so downstream extraction works
+        identically regardless of source format.
+        """
+        rename_map: dict[str, str] = {}
+        if "in_region_id" in dataset.dims and "origin" not in dataset.dims:
+            rename_map["in_region_id"] = "origin"
+        if "out_region_id" in dataset.dims and "target" not in dataset.dims:
+            rename_map["out_region_id"] = "target"
+        if rename_map:
+            dataset = dataset.rename(rename_map)
+        return dataset
 
     def _clear_source_zarr_encodings(self, dataset: xr.Dataset) -> None:
         """Remove inherited source chunk/compressor encodings from opened Zarr vars."""
@@ -338,6 +401,26 @@ class SyntheticProcessor:
                 errors.append(
                     f"LoD '{var_name}' has dims {ds[var_name].dims}, "
                     f"expected {expected_dims}"
+                )
+
+        latent_bundle_names = (
+            "latent_S_true",
+            "latent_I_true",
+            "latent_R_true",
+            "latent_D_true",
+        )
+        if all(name in ds for name in latent_bundle_names):
+            expected_flow_dims = SYNTHETIC_ZARR_SCHEMA["optional_vars"]["deaths_true"]
+            if "deaths_true" not in ds:
+                errors.append(
+                    "Missing required variable: 'deaths_true'. The latent "
+                    "S/I/R/D supervision bundle requires continuous "
+                    "mechanistic daily death flow."
+                )
+            elif set(ds["deaths_true"].dims) != set(expected_flow_dims):
+                errors.append(
+                    f"Variable 'deaths_true' has dims {ds['deaths_true'].dims}, "
+                    f"expected {expected_flow_dims} for latent supervision"
                 )
 
         if errors:
@@ -495,7 +578,14 @@ class SyntheticProcessor:
 
         # Bucket: 0→0, (0,0.2]→1, (0.2,0.5]→2, >0.5→3
         kappa0_np = kappa0_aligned.values  # (run_id, date)
-        bucketed = np.digitize(kappa0_np, bins=[0.0, 0.2, 0.5]).astype(np.float32)
+        # ``right=True`` is required for the documented closed upper bounds:
+        # 0 -> 0, (0, 0.2] -> 1, (0.2, 0.5] -> 2, >0.5 -> 3.
+        # The default boundary convention incorrectly maps exactly zero to 1.
+        bucketed = np.digitize(
+            kappa0_np,
+            bins=np.asarray([0.0, 0.2, 0.5], dtype=kappa0_np.dtype),
+            right=True,
+        ).astype(np.float32)
 
         # Build lockdown severity DataArray (run_id, date, 1)
         lockdown_da = xr.DataArray(
@@ -810,6 +900,12 @@ class SyntheticProcessor:
             )
             return None
 
+        if "deaths_true" not in ds:
+            raise ValueError(
+                "Latent S/I/R/D supervision requires 'deaths_true' as the "
+                "continuous mechanistic daily death-flow target."
+            )
+
         latent_sources = {name: name for name in required_latent_names}
         for canonical_name, aliases in optional_latent_aliases.items():
             source_name = next((alias for alias in aliases if alias in ds), None)
@@ -831,11 +927,78 @@ class SyntheticProcessor:
                 latent[TEMPORAL_COORD] <= end_date
             )
             latent = latent.isel({TEMPORAL_COORD: time_mask}).astype(np.float32)
+            latent_values = np.asarray(latent.values)
+            if not np.isfinite(latent_values).all() or (latent_values < 0).any():
+                raise ValueError(
+                    f"'{source_name}' must contain only finite, nonnegative states."
+                )
 
             # The model roll-forward runs in fraction space with N=1.0, so
             # normalize raw synthetic counts by population during preprocessing.
             latent_fraction = (latent / population).astype(np.float32)
+            latent_fraction_values = np.asarray(latent_fraction.values)
+            if (
+                not np.isfinite(latent_fraction_values).all()
+                or (latent_fraction_values < 0).any()
+            ):
+                raise ValueError(
+                    f"'{source_name}' produced invalid population fractions."
+                )
             latent_vars[name] = latent_fraction
+
+        death_flow = ds["deaths_true"].transpose("run_id", TEMPORAL_COORD, REGION_COORD)
+        death_flow_values = np.asarray(death_flow.values)
+        if not np.isfinite(death_flow_values).all():
+            raise ValueError("'deaths_true' must contain only finite values.")
+        if (death_flow_values < 0).any():
+            raise ValueError("'deaths_true' must contain only nonnegative values.")
+
+        death_flow = death_flow.isel({TEMPORAL_COORD: time_mask})
+        positive_flow = np.asarray(death_flow.values) > 0
+        death_flow = death_flow.astype(np.float32)
+        death_flow_fraction = (death_flow / population).astype(np.float32)
+        death_flow_fraction_values = np.asarray(death_flow_fraction.values)
+        if not np.isfinite(death_flow_fraction_values).all():
+            raise ValueError(
+                "'deaths_true' produced non-finite latent death-flow fractions."
+            )
+        if not np.all(death_flow_fraction_values[positive_flow] > 0):
+            raise ValueError(
+                "Positive 'deaths_true' values must remain positive after float32 "
+                "population-fraction normalization."
+            )
+
+        latent_d_difference = latent_vars["latent_D_true"].diff(TEMPORAL_COORD)
+        destination_flow = death_flow_fraction.sel(
+            {TEMPORAL_COORD: latent_d_difference[TEMPORAL_COORD]}
+        )
+        destination_values = np.asarray(destination_flow.values)
+        latent_difference_values = np.asarray(latent_d_difference.values)
+        comparable = np.isfinite(destination_values) & np.isfinite(
+            latent_difference_values
+        )
+        if comparable.any() and not np.allclose(
+            destination_values[comparable],
+            latent_difference_values[comparable],
+            rtol=LATENT_DEATH_FLOW_ALIGNMENT_RTOL,
+            atol=LATENT_DEATH_FLOW_ALIGNMENT_ATOL,
+        ):
+            max_error = float(
+                np.nanmax(
+                    np.abs(
+                        destination_values[comparable]
+                        - latent_difference_values[comparable]
+                    )
+                )
+            )
+            raise ValueError(
+                "'deaths_true' must align with destination-dated "
+                "latent_D_true.diff(date) after float32 normalization; "
+                f"maximum absolute error was {max_error:.6g} "
+                f"(atol={LATENT_DEATH_FLOW_ALIGNMENT_ATOL}, "
+                f"rtol={LATENT_DEATH_FLOW_ALIGNMENT_RTOL})."
+            )
+        latent_vars["latent_death_flow_true"] = death_flow_fraction
 
         num_runs = len(ds.run_id)
         example_name = required_latent_names[0]

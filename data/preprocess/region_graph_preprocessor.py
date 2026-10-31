@@ -201,7 +201,12 @@ class RegionGraphPreprocessor:
             return None
 
         try:
-            with xr.open_zarr(str(mobility_path), decode_coords="all") as ds:
+            path = Path(mobility_path)
+            engine = "netcdf4" if path.suffix == ".nc" else None
+            open_fn = xr.open_dataset if path.suffix == ".nc" else xr.open_zarr
+            with open_fn(
+                str(path), decode_coords="all", **({"engine": engine} if engine else {})
+            ) as ds:
                 var_name = self._detect_mobility_variable(ds)
                 mobility = ds[var_name]
                 rename_dims: dict[str, str] = {}

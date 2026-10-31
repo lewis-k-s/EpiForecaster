@@ -3,10 +3,13 @@
 from pathlib import Path
 import shlex
 import sys
+import yaml
 
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
 from scripts.workflow.run_config import (
+    RESEARCH_OUTPUT_FILES,
+    preprocessing_dataset_name,
     validate_mn5_allocation,
     workflow_kind,
     workflow_target,
@@ -54,9 +57,12 @@ HOST_PYTHON = Path(sys.executable)
 PREPARED = RUN_ROOT / ".state/prepared.done"
 MANIFEST = RUN_ROOT / "manifest.yaml"
 PINNED_EVALUATION_CHECKPOINT = RUN_ROOT / "inputs/evaluation_checkpoint.pt"
+PINNED_TRAINING_INIT_CHECKPOINT = RUN_ROOT / "inputs/training_init_checkpoint.pt"
 PREPARE_OUTPUTS = [str(PREPARED), str(MANIFEST)]
 if WORKFLOW_KIND == "evaluate":
     PREPARE_OUTPUTS.append(str(PINNED_EVALUATION_CHECKPOINT))
+if WORKFLOW_KIND == "train" and config["training"].get("init_checkpoint") is not None:
+    PREPARE_OUTPUTS.append(str(PINNED_TRAINING_INIT_CHECKPOINT))
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"
 WORKERS_COMPLETE = RUN_ROOT / ".state/workers_complete.done"
@@ -75,7 +81,9 @@ ACTIVE_STAGES = {
     "evaluate": ("data", "evaluation"),
     "hpo": ("data", "hpo", "selection", "evaluation", "promotion"),
     "ablation": ("data", "ablation"),
+    "ablation_suite": ("data", "ablation"),
     "crossval": ("data", "crossval", "evaluation"),
+    "preprocess": ("data", "preprocessing"),
 }[WORKFLOW_KIND]
 STAGE_SOURCES = {
     stage: dependency_sources(SOURCE_ROOT, SOURCE_INVENTORY, config, stage)
@@ -107,6 +115,9 @@ EVALUATION_ARTIFACTS = [
 ]
 if bool(config.get("evaluation", {}).get("granular", False)):
     EVALUATION_ARTIFACTS.append(str(EVALUATION_GRANULAR))
+
+if config.get("evaluation", {}).get("research_outputs", False):
+    EVALUATION_ARTIFACTS.extend(str(EVALUATION_DIR / name) for name in RESEARCH_OUTPUT_FILES)
 
 if WORKFLOW_KIND == "train":
     training = config["training"]
@@ -179,13 +190,46 @@ elif WORKFLOW_KIND == "ablation":
     CONTAINER_JOURNAL = CONTAINER_RUN / "optuna" / f"{STUDY_NAME}.journal"
     ABLATION_OUTPUT_DIR = RUN_ROOT / "outputs/ablation_analysis"
     ABLATION_MANIFEST = ABLATION_OUTPUT_DIR / "ablation_manifest.json"
-    ABLATION_REQUIRED = [
-        ABLATION_OUTPUT_DIR / "seed_coverage_report.csv",
-        ABLATION_OUTPUT_DIR / "ablation_run_context.csv",
-        ABLATION_OUTPUT_DIR / "ablation_metrics_aggregated.csv",
-    ]
+    campaign_document = yaml.safe_load(
+        (SOURCE_ROOT / str(ablation_config["campaign"])).read_text(encoding="utf-8")
+    )
+    if campaign_document.get("analysis", {}).get("kind") == "probabilistic_full_coverage":
+        ABLATION_REQUIRED = [
+            ABLATION_OUTPUT_DIR / "campaign_completeness_manifest.csv",
+            ABLATION_OUTPUT_DIR / "condition_scorecard.csv",
+        ]
+    else:
+        ABLATION_REQUIRED = [
+            ABLATION_OUTPUT_DIR / "seed_coverage_report.csv",
+            ABLATION_OUTPUT_DIR / "ablation_run_context.csv",
+            ABLATION_OUTPUT_DIR / "ablation_metrics_aggregated.csv",
+        ]
     ABLATION_DONE = RUN_ROOT / ".state/ablation.done"
     DEFAULT_TERMINAL = ABLATION_MANIFEST
+elif WORKFLOW_KIND == "ablation_suite":
+    suite = config["ablation_suite"]
+    SUITE_STUDIES = {study["study_name"]: study for study in suite["studies"]}
+    SUITE_NAMES = list(SUITE_STUDIES)
+    for study_name, study in SUITE_STUDIES.items():
+        campaign_path = SOURCE_ROOT / str(study["campaign"])
+        campaign_document = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+        if campaign_document.get("campaign_id") != study_name:
+            raise ValueError(
+                f"Ablation suite study {study_name} must match its campaign_id"
+            )
+    SUITE_ROOT = RUN_ROOT / "outputs/ablation_analysis"
+    SUITE_MANIFEST = SUITE_ROOT / "suite_manifest.json"
+    DEFAULT_TERMINAL = SUITE_MANIFEST
+
+    def suite_previous_manifest(name):
+        index = SUITE_NAMES.index(name)
+        if index == 0:
+            return []
+        return [str(SUITE_ROOT / SUITE_NAMES[index - 1] / "ablation_manifest.json")]
+
+    def suite_worker_arguments(name):
+        options = {**SUITE_STUDIES[name], "timeout_s": suite["timeout_s"]}
+        return ablation_worker_arguments(config, options)
 elif WORKFLOW_KIND == "crossval":
     crossval_config = config["crossval"]
     STUDY_WORKERS = int(crossval_config["folds"])
@@ -200,9 +244,47 @@ elif WORKFLOW_KIND == "crossval":
         CROSSVAL_OUTPUT_DIR / f"{EVALUATION_SPLIT}_aggregate_metrics.csv"
     )
     CROSSVAL_MANIFEST = CROSSVAL_OUTPUT_DIR / "crossval_manifest.json"
-    CROSSVAL_TRAINING_COMPLETE = RUN_ROOT / ".state/crossval_training_complete.done"
+    CROSSVAL_FOLD_ROOT = CROSSVAL_OUTPUT_DIR / "fold-{fold}"
+    CROSSVAL_EVALUATION_ARTIFACTS = [
+        str(CROSSVAL_FOLD_ROOT / "outputs/evaluation" / Path(path).name)
+        for path in EVALUATION_ARTIFACTS
+    ]
     CROSSVAL_DONE = RUN_ROOT / ".state/crossval.done"
     DEFAULT_TERMINAL = CROSSVAL_MANIFEST
+elif WORKFLOW_KIND == "preprocess":
+    PREPROCESSING_DATASET_NAME = preprocessing_dataset_name(config)
+    PREPROCESSING_ROOT = RUN_ROOT / "outputs/preprocessing"
+    PREPROCESSING_EFFECTIVE_CONFIG = PREPROCESSING_ROOT / "effective_config.yaml"
+    PREPROCESSING_DATASET = PREPROCESSING_ROOT / f"{PREPROCESSING_DATASET_NAME}.nc"
+    PREPROCESSING_QA = PREPROCESSING_ROOT / "qa.json"
+    PREPROCESSING_DONE = PREPROCESSING_ROOT / ".preprocessed.done"
+    PREPROCESSING_POINTER = (
+        PREPROCESSING_ROOT / "publication" / f"{PREPROCESSING_DATASET_NAME}.nc.dvc"
+    )
+    PREPROCESSING_RECEIPT = PREPROCESSING_ROOT / "publication/receipt.json"
+    PREPROCESSING_PUBLISHED = RUN_ROOT / ".state/preprocessed_published.done"
+    DEFAULT_TERMINAL = PREPROCESSING_RECEIPT
+
+
+def crossval_fold_command(stage, fold):
+    arguments = [
+        str(value).replace("{worker_id}", fold)
+        for value in crossval_worker_arguments(stage)
+    ]
+    return slurm_step(
+        container_command(
+            arguments,
+            run_root=RUN_ROOT,
+            source_root=SOURCE_ROOT,
+            sif=SIF,
+            dvc_remote=DVC_REMOTE,
+            dvc_cache=DVC_CACHE,
+            stage_data=True,
+            nv=True,
+            cpus=CPUS_PER_TASK,
+        ),
+        CPUS_PER_TASK,
+    )
 
 
 def dependency_command(stage):
@@ -237,4 +319,5 @@ include: "rules/training.smk"
 include: "rules/evaluation.smk"
 include: "rules/studies.smk"
 include: "rules/promotion.smk"
+include: "rules/preprocessing.smk"
 include: "rules/targets.smk"

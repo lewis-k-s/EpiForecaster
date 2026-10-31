@@ -18,7 +18,7 @@ REMOTE_CONTAINER_ROOT="${REMOTE_CONTAINER_ROOT:?REMOTE_CONTAINER_ROOT must be co
 REMOTE_CONTAINER_BUILD_ROOT="${REMOTE_CONTAINER_BUILD_ROOT:-$REMOTE_WORKFLOW_PROJECT_ROOT/container-builds}"
 REMOTE_CONTAINER_BASE_IMAGE_REF="${REMOTE_CONTAINER_BASE_IMAGE_REF:?REMOTE_CONTAINER_BASE_IMAGE_REF must be configured}"
 FETCH_SCRIPT="$SCRIPT_DIR/fetch_runtime_deps_on_wifi.sh"
-SBATCH_SCRIPT="$SCRIPT_DIR/build_sif.sbatch"
+ASSEMBLY_SCRIPT="$SCRIPT_DIR/assemble_sif_on_mn5.sbatch"
 VPN_HELPER="${WORKVPN_HELPER:-/Users/lewis/.codex/skills/workvpn/vpn}"
 
 # Reservation state is global because the EXIT trap runs after command failure.
@@ -309,7 +309,7 @@ for required in \
   "$REPO_ROOT/pyproject.toml" \
   "$REPO_ROOT/uv.lock" \
   "$FETCH_SCRIPT" \
-  "$SBATCH_SCRIPT"; do
+  "$ASSEMBLY_SCRIPT"; do
   test -f "$required"
 done
 uv lock --check --project "$REPO_ROOT" >/dev/null
@@ -319,7 +319,7 @@ dependency_key="$({
   for input in \
     "$REPO_ROOT/uv.lock" \
     "$FETCH_SCRIPT" \
-    "$SBATCH_SCRIPT"; do
+    "$ASSEMBLY_SCRIPT"; do
     printf '%s=%s\n' "${input#"$REPO_ROOT/"}" "$(sha256_file "$input")"
   done
 } | sha256_stream)"
@@ -401,7 +401,8 @@ if [ -f "$REPO_ROOT/README.md" ]; then
   rsync -a "$REPO_ROOT/README.md" "$TRANSFER_HOST:$request_root/context/"
 fi
 rsync -a "$FETCH_SCRIPT" "$TRANSFER_HOST:$request_root/fetch_runtime_deps_on_wifi.sh"
-rsync -a "$SBATCH_SCRIPT" "$TRANSFER_HOST:$request_root/build_sif.sbatch"
+rsync -a "$ASSEMBLY_SCRIPT" \
+  "$TRANSFER_HOST:$request_root/assemble_sif_on_mn5.sbatch"
 
 if [ -x "$VPN_HELPER" ]; then
   "$VPN_HELPER" wait 60
@@ -436,7 +437,7 @@ if [ -n "$interactive_job_id" ]; then
     "$dependency_key" \
     "$lock_sha256" \
     "$REMOTE_CONTAINER_ROOT" \
-    "$request_root/build_sif.sbatch"
+    "$request_root/assemble_sif_on_mn5.sbatch"
   remote_function_on \
     "$COMPUTE_HOST" \
     remote_cleanup_dispatch \
@@ -476,7 +477,7 @@ submission="$(
     "$dependency_key" \
     "$lock_sha256" \
     "$REMOTE_CONTAINER_ROOT" \
-    "$request_root/build_sif.sbatch"
+    "$request_root/assemble_sif_on_mn5.sbatch"
 )"
 remote_function_on \
   "$COMPUTE_HOST" \

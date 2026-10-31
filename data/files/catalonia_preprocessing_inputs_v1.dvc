@@ -1,0 +1,15 @@
+md5: ef234042732b730f6da8825651503f5d
+frozen: true
+deps:
+- md5: 47c8130c5a5ec33a8a662d0982e4de2a.dir
+  size: 111370290
+  nfiles: 29
+  hash: md5
+  path:
+    /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/preprocessing_inputs/catalonia_preprocessing_inputs_v1_20260728
+outs:
+- md5: 47c8130c5a5ec33a8a662d0982e4de2a.dir
+  size: 111370290
+  nfiles: 29
+  hash: md5
+  path: catalonia_preprocessing_inputs_v1

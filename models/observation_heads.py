@@ -34,6 +34,20 @@ _OBS_CLAMP_MAX = 1.0e12
 # to track whether this stabilization starts constraining learned kernels.
 _KERNEL_LOGIT_CLAMP_MIN = -30.0
 _KERNEL_LOGIT_CLAMP_MAX = 30.0
+# Conservative bounds for the two-parameter learnable Gamma delay kernel.
+# They keep the reported-delay family epidemiologically plausible
+# (mean 3-150 days at these extremes) while preventing runaway shapes.
+_GAMMA_SHAPE_MIN = 1.0
+_GAMMA_SHAPE_MAX = 30.0
+_GAMMA_SCALE_MIN = 0.1
+_GAMMA_SCALE_MAX = 5.0
+# Wastewater shedding priors need a longer scale box than clinical reporting
+# delays: the SARS-CoV-2 shedding literature anchors near a mean of 12 days
+# with CV ~0.7 (shape ~2, scale ~6). Shape shares the clinical [1, 30] box so
+# the shedding density stays zero at the moment of infection.
+_GAMMA_SCALE_WW_MIN = 0.2
+_GAMMA_SCALE_WW_MAX = 15.0
+_GAMMA_RAW_SANITIZE_LIMIT = 15.0
 
 
 def _sanitize_free_kernel_weights(weights: torch.Tensor) -> torch.Tensor:
@@ -107,6 +121,105 @@ def _inverse_softplus_scalar(value: float, eps: float = 1e-8) -> float:
     return float(_inverse_softplus(model_scalar(value), eps=eps).item())
 
 
+def _sanitize_gamma_raw(raw: torch.Tensor) -> torch.Tensor:
+    """Bound Gamma coordinates while retaining finite-coordinate recovery gradients."""
+    finite_raw = torch.nan_to_num(
+        raw.float(),
+        nan=0.0,
+        posinf=_GAMMA_RAW_SANITIZE_LIMIT,
+        neginf=-_GAMMA_RAW_SANITIZE_LIMIT,
+    )
+    bounded_raw = finite_raw.clamp(
+        min=-_GAMMA_RAW_SANITIZE_LIMIT,
+        max=_GAMMA_RAW_SANITIZE_LIMIT,
+    )
+    # Keep forward values in the range where sigmoid is representable in
+    # float32. The straight-through derivative lets optimization recover a
+    # finite coordinate that was loaded beyond this safety limit.
+    return finite_raw + (bounded_raw - finite_raw).detach()
+
+
+def _bounded_sigmoid(raw: torch.Tensor, *, lower: float, upper: float) -> torch.Tensor:
+    """Map a finite raw coordinate smoothly into the open interval ``(lower, upper)``."""
+    return lower + (upper - lower) * torch.sigmoid(_sanitize_gamma_raw(raw))
+
+
+def _inverse_bounded_sigmoid(value: float, *, lower: float, upper: float) -> float:
+    """Return the raw coordinate whose bounded sigmoid is exactly ``value``."""
+    if not math.isfinite(value) or not lower < value < upper:
+        raise ValueError(
+            f"Gamma prior must be finite and strictly inside ({lower}, {upper}), "
+            f"got {value}"
+        )
+    fraction = (value - lower) / (upper - lower)
+    return math.log(fraction) - math.log1p(-fraction)
+
+
+def _causal_conv1d(
+    trajectory: torch.Tensor, kernel_weights: torch.Tensor
+) -> torch.Tensor:
+    """Causal convolution [B, T] × [K] → [B, T] float32."""
+    time_steps = trajectory.size(1)
+    flipped = torch.flip(kernel_weights, dims=[0])
+    out = F.conv1d(
+        torch.nan_to_num(trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0).unsqueeze(
+            1
+        ),
+        flipped.view(1, 1, -1),
+        padding=kernel_weights.numel() - 1,
+    )
+    return out[:, :, :time_steps].squeeze(1)
+
+
+def _normalized_gamma_pdf_kernel(
+    shape: torch.Tensor, scale: torch.Tensor, length: int
+) -> torch.Tensor:
+    """Compute the normalized Gamma PDF kernel at integer lags ``0..length-1``.
+
+    Differentiable with respect to ``shape`` and ``scale`` so the
+    two-parameter Gamma kernel trains end to end.
+    """
+    x = torch.arange(length, device=shape.device, dtype=torch.float32)
+
+    # Gamma PDF: x^(shape-1) * exp(-x/scale) / (scale^shape * Gamma(shape))
+    # Softmax normalizes its log PDF without a hard cutoff, preserving
+    # gradients when the finite support catches only a distribution tail.
+    log_gamma_pdf = (
+        (shape - 1) * torch.log(x + _KERNEL_EPS)  # avoid log(0)
+        - x / scale  # exp(-x/scale)
+        - shape * torch.log(scale)  # scale^shape
+        - torch.lgamma(shape)  # Gamma(shape)
+    )
+    return torch.softmax(
+        torch.nan_to_num(
+            log_gamma_pdf,
+            nan=0.0,
+            posinf=_EXP_CLAMP_MAX,
+            neginf=_EXP_CLAMP_MIN,
+        ),
+        dim=0,
+    )
+
+
+def _gamma_boundary_hit_flags(
+    shape: float,
+    scale: float,
+    *,
+    shape_bounds: tuple[float, float],
+    scale_bounds: tuple[float, float],
+    atol: float,
+) -> dict[str, bool]:
+    """Report Gamma boundary proximity in normalized open-interval coordinates."""
+    shape_coordinate = (shape - shape_bounds[0]) / (shape_bounds[1] - shape_bounds[0])
+    scale_coordinate = (scale - scale_bounds[0]) / (scale_bounds[1] - scale_bounds[0])
+    return {
+        "shape_lower": shape_coordinate <= atol,
+        "shape_upper": shape_coordinate >= 1.0 - atol,
+        "scale_lower": scale_coordinate <= atol,
+        "scale_upper": scale_coordinate >= 1.0 - atol,
+    }
+
+
 def _init_distribution_scale_proj(
     layer: nn.Linear,
     *,
@@ -120,6 +233,158 @@ def _init_distribution_scale_proj(
         layer.bias.fill_(_inverse_softplus_scalar(margin))
 
 
+# Sentinel stored in the residual-log-location budget buffer: the runtime
+# schedule is inactive and the legacy unrestricted residual path applies.
+_RESIDUAL_LOG_LOCATION_FRACTION_UNBOUNDED = -1.0
+
+
+def _apply_residual_log_location_fraction_bound(
+    residual_log_location: torch.Tensor,
+    mechanistic_log_location: torch.Tensor,
+    max_log_location_fraction_buffer: torch.Tensor,
+) -> torch.Tensor:
+    """Bound residual log location relative to mechanistic log location.
+
+    ``max_log_location_fraction_buffer`` is a scalar runtime buffer: the
+    unbounded sentinel restores the unrestricted legacy residual, ``0.0`` is
+    an exact residual lockout, and values in ``(0, 1]`` cap the contribution
+    at ``max_log_location_fraction * |mechanistic_log_location|`` through a
+    tanh squash. The limit is detached, so the bound never trades
+    mechanistic-path gradients for residual headroom. A strict relative bound
+    means a zero mechanistic log location admits no residual correction.
+    Clinical log locations use log1p(per-100k) units.
+    """
+    fraction = max_log_location_fraction_buffer.clamp_min(0.0)
+    limit = fraction * mechanistic_log_location.detach().abs()
+    safe_limit = torch.where(limit > 0.0, limit, torch.ones_like(limit))
+    bounded = limit * torch.tanh(residual_log_location / safe_limit)
+    budgeted = torch.where(
+        fraction == 0.0,
+        torch.zeros_like(residual_log_location),
+        bounded,
+    )
+    return torch.where(
+        max_log_location_fraction_buffer < 0.0,
+        residual_log_location,
+        budgeted,
+    )
+
+
+def _bound_composed_residual(
+    components: dict[str, torch.Tensor],
+    max_log_location_fraction_buffer: torch.Tensor,
+) -> None:
+    """Bound the composed residual contribution to the prediction log location.
+
+    Applies the same detached relative bound to the actual anchored residual
+    contribution in ``residual_loc`` and recomposes ``loc`` so the exact
+    decomposition ``loc = mechanistic_loc + residual_loc`` is preserved. The
+    unbounded sentinel keeps the original composition bit-identical; the
+    branch is a tensor select so compiled graphs never specialize on the
+    runtime budget value.
+    """
+    mechanistic_log_location = components["mechanistic_loc"]
+    with _autocast_disabled_for(mechanistic_log_location):
+        bounded = _apply_residual_log_location_fraction_bound(
+            residual_log_location=components["residual_loc"],
+            mechanistic_log_location=mechanistic_log_location,
+            max_log_location_fraction_buffer=max_log_location_fraction_buffer,
+        )
+        recomposed_loc = mechanistic_log_location + bounded
+    unbounded = max_log_location_fraction_buffer < 0.0
+    components["loc"] = torch.where(unbounded, components["loc"], recomposed_loc)
+    components["residual_loc"] = torch.where(
+        unbounded, components["residual_loc"], bounded
+    )
+
+
+def _register_residual_log_location_fraction_buffer(module: nn.Module) -> None:
+    """Register the non-persistent residual log-location budget buffer."""
+    module.register_buffer(
+        "_residual_max_log_location_fraction",
+        model_scalar(_RESIDUAL_LOG_LOCATION_FRACTION_UNBOUNDED),
+        persistent=False,
+    )
+
+
+def _set_residual_log_location_fraction_buffer(
+    module: nn.Module,
+    max_log_location_fraction: float | None,
+) -> None:
+    """Validate and copy a residual log-location budget into the runtime buffer."""
+    if max_log_location_fraction is None:
+        value = _RESIDUAL_LOG_LOCATION_FRACTION_UNBOUNDED
+    else:
+        if (
+            not math.isfinite(max_log_location_fraction)
+            or not 0.0 <= max_log_location_fraction <= 1.0
+        ):
+            raise ValueError(
+                "residual max_log_location_fraction must be a finite value in "
+                f"[0, 1] or None, got {max_log_location_fraction!r}"
+            )
+        value = float(max_log_location_fraction)
+    buffer = module.get_buffer("_residual_max_log_location_fraction")
+    with torch.no_grad():
+        buffer.fill_(value)
+
+
+def _compose_observation_prediction(
+    *,
+    mechanistic_raw: torch.Tensor,
+    residual_raw: torch.Tensor,
+    delta_forecasting: bool,
+    anchor_mode: str,
+    last_observed: torch.Tensor | None,
+    last_observed_mask: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """Compose an exact mechanistic-plus-residual observation decomposition.
+
+    For anchored delta forecasts, the mechanistic output is the prediction obtained
+    with the residual path disabled. The residual contribution is defined as the
+    exact difference between the full and residual-disabled predictions, including
+    interactions with the non-negativity clamp.
+    """
+    full_raw = mechanistic_raw + residual_raw
+    full = full_raw
+    mechanistic = mechanistic_raw
+
+    if (
+        delta_forecasting
+        and anchor_mode != "disabled"
+        and last_observed is not None
+        and last_observed_mask is not None
+    ):
+        valid_mask = (last_observed_mask > 0.5).unsqueeze(1)
+        last_obs_safe = torch.nan_to_num(
+            last_observed,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).unsqueeze(1)
+        full_anchored = torch.clamp(
+            last_obs_safe + full_raw - full_raw[:, 0:1],
+            min=0.0,
+        )
+        mechanistic_anchored = torch.clamp(
+            last_obs_safe + mechanistic_raw - mechanistic_raw[:, 0:1],
+            min=0.0,
+        )
+        full = torch.where(valid_mask, full_anchored, full_raw)
+        mechanistic = torch.where(
+            valid_mask,
+            mechanistic_anchored,
+            mechanistic_raw,
+        )
+
+    residual = full - mechanistic
+    return {
+        "loc": full,
+        "mechanistic_loc": mechanistic,
+        "residual_loc": residual,
+    }
+
+
 class DelayKernel(nn.Module):
     """
     Causal delay kernel for clinical observations (cases, hospitalizations, deaths).
@@ -131,7 +396,8 @@ class DelayKernel(nn.Module):
     Physics:
         - Causal: Output at time t only depends on I_{t-k:t} (no future leakage)
         - Normalized: Kernel sums to 1 (probabilistic interpretation)
-        - Gamma-distributed: Default kernel follows Gamma(shape, scale) distribution
+        - Gamma-distributed: ``parameterization="gamma"`` uses a bounded,
+          two-parameter Gamma(shape, scale) family
 
     Default initialization (Gamma(5, 2)):
         - Mean delay: shape × scale = 10 days
@@ -145,7 +411,11 @@ class DelayKernel(nn.Module):
         learnable: If True, kernel weights are trainable; if False, frozen
         parameterization: Kernel parameterization mode. "simplex" enforces
             positivity and sum-to-one normalization; "free" learns unconstrained
-            signed weights initialized from the same gamma prior.
+            signed weights initialized from the same gamma prior; "gamma" learns
+            a two-parameter Gamma(shape, scale) delay distribution whose PDF is
+            re-normalized over the kernel support at every forward pass. Its
+            shape and scale use a smooth transform into conservative
+            epidemiological bounds.
     """
 
     def __init__(
@@ -163,25 +433,51 @@ class DelayKernel(nn.Module):
         self.learnable = learnable
         self.parameterization = parameterization
 
-        if self.parameterization not in {"simplex", "free"}:
+        if self.parameterization not in {"simplex", "free", "gamma"}:
             raise ValueError(
-                "parameterization must be one of {'simplex', 'free'}, "
+                "parameterization must be one of {'simplex', 'free', 'gamma'}, "
                 f"got {self.parameterization!r}"
             )
 
-        # Initialize kernel weights with Gamma distribution
-        kernel_weights = self._init_gamma_kernel(
-            kernel_length, gamma_shape, gamma_scale
-        )
-
-        if learnable:
-            if self.parameterization == "simplex":
-                kernel_param = _inverse_softplus(kernel_weights)
-            else:
-                kernel_param = kernel_weights
-            self.kernel = nn.Parameter(kernel_param)
+        if learnable and self.parameterization == "gamma":
+            # Two raw coordinates transform smoothly into the bounded Gamma
+            # family. The logit inverse preserves the configured prior exactly.
+            self.gamma_shape_raw = nn.Parameter(
+                model_scalar(
+                    _inverse_bounded_sigmoid(
+                        gamma_shape,
+                        lower=_GAMMA_SHAPE_MIN,
+                        upper=_GAMMA_SHAPE_MAX,
+                    )
+                )
+            )
+            self.gamma_scale_raw = nn.Parameter(
+                model_scalar(
+                    _inverse_bounded_sigmoid(
+                        gamma_scale,
+                        lower=_GAMMA_SCALE_MIN,
+                        upper=_GAMMA_SCALE_MAX,
+                    )
+                )
+            )
         else:
-            self.register_buffer("kernel", kernel_weights)
+            # Initialize kernel weights with Gamma distribution
+            kernel_weights = self._init_gamma_kernel(
+                kernel_length, gamma_shape, gamma_scale
+            )
+
+            if learnable:
+                if self.parameterization == "simplex":
+                    kernel_param = _inverse_softplus(kernel_weights)
+                else:
+                    kernel_param = kernel_weights
+                self.kernel = nn.Parameter(kernel_param)
+            elif self.parameterization == "gamma":
+                self.register_buffer("gamma_kernel", kernel_weights)
+                self.register_buffer("gamma_shape_value", model_scalar(gamma_shape))
+                self.register_buffer("gamma_scale_value", model_scalar(gamma_scale))
+            else:
+                self.register_buffer("kernel", kernel_weights)
 
         logger.debug(
             f"Initialized DelayKernel: length={kernel_length}, "
@@ -193,22 +489,27 @@ class DelayKernel(nn.Module):
         self, length: int, shape: float, scale: float
     ) -> torch.Tensor:
         """Initialize kernel with Gamma distribution PDF values."""
-        # Compute Gamma PDF at integer positions
-        x = torch.arange(length, dtype=MODEL_PARAM_DTYPE)
+        return self._compute_gamma_kernel(model_scalar(shape), model_scalar(scale))
 
-        # Gamma PDF: x^(shape-1) * exp(-x/scale) / (scale^shape * Gamma(shape))
-        # Using log-space for numerical stability
-        log_gamma_pdf = (
-            (shape - 1) * torch.log(x + 1e-8)  # x^(shape-1), avoid log(0)
-            - x / scale  # exp(-x/scale)
-            - shape * math.log(scale)  # scale^shape
-            - math.lgamma(shape)  # Gamma(shape)
+    def _compute_gamma_kernel(
+        self, shape: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the normalized Gamma PDF kernel at integer lags."""
+        return _normalized_gamma_pdf_kernel(shape, scale, self.kernel_length)
+
+    def _current_gamma_parameters(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return finite Gamma parameters strictly inside their epidemiological bounds."""
+        shape = _bounded_sigmoid(
+            self.gamma_shape_raw,
+            lower=_GAMMA_SHAPE_MIN,
+            upper=_GAMMA_SHAPE_MAX,
         )
-
-        kernel = torch.exp(log_gamma_pdf)
-        kernel = _safe_normalize(kernel)
-
-        return kernel
+        scale = _bounded_sigmoid(
+            self.gamma_scale_raw,
+            lower=_GAMMA_SCALE_MIN,
+            upper=_GAMMA_SCALE_MAX,
+        )
+        return shape, scale
 
     def forward(self, I_trajectory: torch.Tensor) -> torch.Tensor:
         """
@@ -231,38 +532,37 @@ class DelayKernel(nn.Module):
         batch_size, time_steps = I_trajectory.shape
 
         with _autocast_disabled_for(I_trajectory):
-            if self.learnable and self.parameterization == "simplex":
+            if self.learnable and self.parameterization == "gamma":
+                shape, scale = self._current_gamma_parameters()
+                kernel_weights = self._compute_gamma_kernel(shape, scale)
+            elif self.learnable and self.parameterization == "simplex":
                 kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
                 kernel_weights = _safe_normalize(kernel_weights)
             elif self.learnable:
                 kernel_weights = _sanitize_free_kernel_weights(self.kernel)
+            elif self.parameterization == "gamma":
+                kernel_weights = self.gamma_kernel
             else:
                 kernel_weights = self.kernel
-            flipped_kernel = torch.flip(kernel_weights, dims=[0])
-
-            I_reshaped = torch.nan_to_num(
-                I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            kernel_reshaped = flipped_kernel.view(1, 1, -1)
-
-            output = F.conv1d(
-                I_reshaped,
-                kernel_reshaped,
-                padding=self.kernel_length - 1,
-                groups=1,
-            )
-            output = output[:, :, :time_steps].squeeze(1)
+            output = _causal_conv1d(I_trajectory, kernel_weights)
         return output.to(I_trajectory.dtype)
 
     def get_kernel_weights(self) -> torch.Tensor:
         """Get current kernel weights in forward-space order."""
-        if self.learnable and self.parameterization == "simplex":
+        if self.learnable and self.parameterization == "gamma":
+            shape, scale = self._current_gamma_parameters()
+            kernel_weights = self._compute_gamma_kernel(shape, scale)
+            output_dtype = self.gamma_shape_raw.dtype
+        elif self.learnable and self.parameterization == "simplex":
             kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
             kernel_weights = _safe_normalize(kernel_weights)
             output_dtype = self.kernel.dtype
         elif self.learnable:
             kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             output_dtype = self.kernel.dtype
+        elif self.parameterization == "gamma":
+            kernel_weights = self.gamma_kernel
+            output_dtype = kernel_weights.dtype
         else:
             kernel_weights = self.kernel
             output_dtype = kernel_weights.dtype
@@ -270,13 +570,58 @@ class DelayKernel(nn.Module):
 
     def get_mean_delay(self) -> float:
         """Compute mean delay in days based on current kernel."""
-        if self.parameterization != "simplex":
-            raise ValueError("mean delay is only defined for simplex kernels")
+        if self.parameterization not in {"simplex", "gamma"}:
+            raise ValueError("mean delay is only defined for normalized kernels")
         weights = self.get_kernel_weights()
         positions = torch.arange(
             len(weights), device=weights.device, dtype=torch.float32
         )
         return (weights.float() * positions).sum().item()
+
+    def get_delay_std(self) -> float:
+        """Compute the delay standard deviation in days of the current kernel."""
+        if self.parameterization not in {"simplex", "gamma"}:
+            raise ValueError("delay std is only defined for normalized kernels")
+        weights = self.get_kernel_weights().float()
+        positions = torch.arange(len(weights), device=weights.device)
+        mean = (weights * positions).sum()
+        return (weights * (positions - mean).square()).sum().sqrt().item()
+
+    def get_gamma_parameters(self) -> tuple[float, float]:
+        """Return the current (shape, scale) of a gamma-parameterized kernel."""
+        if self.parameterization != "gamma":
+            raise ValueError("gamma parameters are only defined for gamma kernels")
+        if not self.learnable:
+            if hasattr(self, "gamma_shape_value"):
+                return (
+                    float(self.gamma_shape_value.item()),
+                    float(self.gamma_scale_value.item()),
+                )
+            return float(self.gamma_shape), float(self.gamma_scale)
+        shape, scale = self._current_gamma_parameters()
+        return float(shape.item()), float(scale.item())
+
+    def get_gamma_boundary_hits(self, *, atol: float = 1.0e-6) -> dict[str, bool]:
+        """Report Gamma boundary proximity in normalized open-interval coordinates.
+
+        Learnable Gamma parameters use an open-interior transform, so they never
+        exactly equal a closed epidemiological bound. The legacy ``*_bound_hit``
+        metric names therefore mean that the normalized coordinate is within
+        ``atol`` of zero or one; this gives the same scale-independent definition
+        for shape and scale.
+        """
+        if self.parameterization != "gamma":
+            raise ValueError("boundary hits are only defined for gamma kernels")
+        if not math.isfinite(atol) or not 0.0 <= atol < 0.5:
+            raise ValueError(f"atol must be finite and in [0, 0.5), got {atol}")
+        shape, scale = self.get_gamma_parameters()
+        return _gamma_boundary_hit_flags(
+            shape,
+            scale,
+            shape_bounds=(_GAMMA_SHAPE_MIN, _GAMMA_SHAPE_MAX),
+            scale_bounds=(_GAMMA_SCALE_MIN, _GAMMA_SCALE_MAX),
+            atol=atol,
+        )
 
     def __repr__(self) -> str:
         return (
@@ -313,7 +658,12 @@ class SheddingConvolution(nn.Module):
         learnable_kernel: If True, shedding profile is trainable
         learnable_scale: If True, sensitivity scale is trainable
         kernel_parameterization: "simplex" for positive normalized kernels,
-            "free" for unconstrained signed kernels with gamma priming
+            "free" for unconstrained signed kernels with gamma priming,
+            "gamma" for a bounded two-parameter Gamma(shape, scale) shedding
+            distribution renormalized over the kernel support at every pass
+        gamma_shape: Shape prior for the "gamma" shedding family
+        gamma_scale: Scale prior (days) for the "gamma" shedding family; the
+            wastewater box admits longer scales than the clinical delay box
     """
 
     def __init__(
@@ -324,31 +674,67 @@ class SheddingConvolution(nn.Module):
         learnable_scale: bool = True,
         kernel_parameterization: str = "simplex",
         strict: bool = True,
+        gamma_shape: float = 2.0,
+        gamma_scale: float = 6.0,
     ):
         super().__init__()
         self.kernel_length = kernel_length
+        self.gamma_shape = gamma_shape
+        self.gamma_scale = gamma_scale
         self.learnable_kernel = learnable_kernel
         self.learnable_scale = learnable_scale
-        self.kernel_parameterization = kernel_parameterization
+        self.parameterization = kernel_parameterization
         self.strict = strict
 
-        if self.kernel_parameterization not in {"simplex", "free"}:
+        if self.parameterization not in {"simplex", "free", "gamma"}:
             raise ValueError(
-                "kernel_parameterization must be one of {'simplex', 'free'}, "
-                f"got {self.kernel_parameterization!r}"
+                "kernel_parameterization must be one of "
+                "{'simplex', 'free', 'gamma'}, "
+                f"got {self.parameterization!r}"
             )
 
-        # Initialize shedding kernel with biologically-informed profile
-        kernel_weights = self._init_shedding_kernel(kernel_length)
-
-        if learnable_kernel:
-            if self.kernel_parameterization == "simplex":
-                kernel_param = _inverse_softplus(kernel_weights)
-            else:
-                kernel_param = kernel_weights
-            self.kernel = nn.Parameter(kernel_param)
+        if learnable_kernel and self.parameterization == "gamma":
+            # Two raw coordinates transform smoothly into the bounded shedding
+            # Gamma family. The logit inverse preserves the configured prior.
+            self.gamma_shape_raw = nn.Parameter(
+                model_scalar(
+                    _inverse_bounded_sigmoid(
+                        gamma_shape,
+                        lower=_GAMMA_SHAPE_MIN,
+                        upper=_GAMMA_SHAPE_MAX,
+                    )
+                )
+            )
+            self.gamma_scale_raw = nn.Parameter(
+                model_scalar(
+                    _inverse_bounded_sigmoid(
+                        gamma_scale,
+                        lower=_GAMMA_SCALE_WW_MIN,
+                        upper=_GAMMA_SCALE_WW_MAX,
+                    )
+                )
+            )
         else:
-            self.register_buffer("kernel", kernel_weights)
+            if self.parameterization == "gamma":
+                kernel_weights = _normalized_gamma_pdf_kernel(
+                    model_scalar(gamma_shape), model_scalar(gamma_scale), kernel_length
+                )
+            else:
+                # Initialize shedding kernel with biologically-informed profile
+                kernel_weights = self._init_shedding_kernel(kernel_length)
+
+            if learnable_kernel:
+                if self.parameterization == "simplex":
+                    kernel_param = _inverse_softplus(kernel_weights)
+                else:
+                    kernel_param = kernel_weights
+                self.kernel = nn.Parameter(kernel_param)
+            elif self.parameterization == "gamma":
+                self.register_buffer("gamma_kernel", kernel_weights)
+                self.register_buffer("gamma_shape_value", model_scalar(gamma_shape))
+                self.register_buffer("gamma_scale_value", model_scalar(gamma_scale))
+            else:
+                self.register_buffer("kernel", kernel_weights)
 
         # Sensitivity scale (absorbs FlowPerCapita and measurement characteristics)
         if sensitivity_scale <= 0:
@@ -444,27 +830,19 @@ class SheddingConvolution(nn.Module):
                 population = population.unsqueeze(1).expand(-1, time_steps)
 
         with _autocast_disabled_for(I_trajectory):
-            if self.learnable_kernel and self.kernel_parameterization == "simplex":
+            if self.learnable_kernel and self.parameterization == "gamma":
+                shape, scale = self._current_gamma_parameters()
+                kernel_weights = self._compute_gamma_kernel(shape, scale)
+            elif self.learnable_kernel and self.parameterization == "simplex":
                 kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
                 kernel_weights = _safe_normalize(kernel_weights)
             elif self.learnable_kernel:
                 kernel_weights = _sanitize_free_kernel_weights(self.kernel)
+            elif self.parameterization == "gamma":
+                kernel_weights = self.gamma_kernel
             else:
                 kernel_weights = self.kernel
-            flipped_kernel = torch.flip(kernel_weights, dims=[0])
-
-            I_reshaped = torch.nan_to_num(
-                I_trajectory.float(), nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            kernel_reshaped = flipped_kernel.view(1, 1, -1)
-
-            total_shedding = F.conv1d(
-                I_reshaped,
-                kernel_reshaped,
-                padding=self.kernel_length - 1,
-                groups=1,
-            )
-            total_shedding = total_shedding[:, :, :time_steps].squeeze(1)
+            total_shedding = _causal_conv1d(I_trajectory, kernel_weights)
 
             population_f32 = population.float().clamp_min(_KERNEL_EPS)
             viral_concentration = total_shedding / population_f32
@@ -478,19 +856,94 @@ class SheddingConvolution(nn.Module):
 
         return viral_concentration.to(I_trajectory.dtype)
 
+    def _compute_gamma_kernel(
+        self, shape: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the normalized Gamma PDF kernel at integer lags."""
+        return _normalized_gamma_pdf_kernel(shape, scale, self.kernel_length)
+
+    def _current_gamma_parameters(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return finite Gamma parameters strictly inside the shedding bounds."""
+        shape = _bounded_sigmoid(
+            self.gamma_shape_raw,
+            lower=_GAMMA_SHAPE_MIN,
+            upper=_GAMMA_SHAPE_MAX,
+        )
+        scale = _bounded_sigmoid(
+            self.gamma_scale_raw,
+            lower=_GAMMA_SCALE_WW_MIN,
+            upper=_GAMMA_SCALE_WW_MAX,
+        )
+        return shape, scale
+
     def get_kernel_weights(self) -> torch.Tensor:
         """Get current shedding kernel weights in forward-space order."""
-        if self.learnable_kernel and self.kernel_parameterization == "simplex":
+        if self.learnable_kernel and self.parameterization == "gamma":
+            shape, scale = self._current_gamma_parameters()
+            kernel_weights = self._compute_gamma_kernel(shape, scale)
+            output_dtype = self.gamma_shape_raw.dtype
+        elif self.learnable_kernel and self.parameterization == "simplex":
             kernel_weights = F.softplus(_sanitize_kernel_logits(self.kernel))
             kernel_weights = _safe_normalize(kernel_weights)
             output_dtype = self.kernel.dtype
         elif self.learnable_kernel:
             kernel_weights = _sanitize_free_kernel_weights(self.kernel)
             output_dtype = self.kernel.dtype
+        elif self.parameterization == "gamma":
+            kernel_weights = self.gamma_kernel
+            output_dtype = kernel_weights.dtype
         else:
             kernel_weights = self.kernel
             output_dtype = kernel_weights.dtype
         return kernel_weights.to(output_dtype)
+
+    def get_mean_delay(self) -> float:
+        """Compute mean shedding delay in days."""
+        if self.parameterization not in {"simplex", "gamma"}:
+            raise ValueError("mean delay is only defined for normalized kernels")
+        weights = self.get_kernel_weights()
+        positions = torch.arange(
+            len(weights), device=weights.device, dtype=torch.float32
+        )
+        return (weights.float() * positions).sum().item()
+
+    def get_delay_std(self) -> float:
+        """Compute the shedding delay standard deviation in days."""
+        if self.parameterization not in {"simplex", "gamma"}:
+            raise ValueError("delay std is only defined for normalized kernels")
+        weights = self.get_kernel_weights().float()
+        positions = torch.arange(len(weights), device=weights.device)
+        mean = (weights * positions).sum()
+        return (weights * (positions - mean).square()).sum().sqrt().item()
+
+    def get_gamma_parameters(self) -> tuple[float, float]:
+        """Return the current (shape, scale) of a gamma-parameterized kernel."""
+        if self.parameterization != "gamma":
+            raise ValueError("gamma parameters are only defined for gamma kernels")
+        if not self.learnable_kernel:
+            if hasattr(self, "gamma_shape_value"):
+                return (
+                    float(self.gamma_shape_value.item()),
+                    float(self.gamma_scale_value.item()),
+                )
+            return float(self.gamma_shape), float(self.gamma_scale)
+        shape, scale = self._current_gamma_parameters()
+        return float(shape.item()), float(scale.item())
+
+    def get_gamma_boundary_hits(self, *, atol: float = 1.0e-6) -> dict[str, bool]:
+        """Report Gamma boundary proximity in normalized open-interval coordinates."""
+        if self.parameterization != "gamma":
+            raise ValueError("boundary hits are only defined for gamma kernels")
+        if not math.isfinite(atol) or not 0.0 <= atol < 0.5:
+            raise ValueError(f"atol must be finite and in [0, 0.5), got {atol}")
+        shape, scale = self.get_gamma_parameters()
+        return _gamma_boundary_hit_flags(
+            shape,
+            scale,
+            shape_bounds=(_GAMMA_SHAPE_MIN, _GAMMA_SHAPE_MAX),
+            scale_bounds=(_GAMMA_SCALE_WW_MIN, _GAMMA_SCALE_WW_MAX),
+            atol=atol,
+        )
 
     def get_sensitivity_scale(self) -> torch.Tensor:
         """Get positive sensitivity scale."""
@@ -510,19 +963,12 @@ class SheddingConvolution(nn.Module):
             f"SheddingConvolution(length={self.kernel_length}, "
             f"sensitivity_scale={self.get_sensitivity_scale().item():.4f}, "
             f"learnable_kernel={self.learnable_kernel}, learnable_scale={self.learnable_scale}, "
-            f"kernel_parameterization={self.kernel_parameterization})"
+            f"kernel_parameterization={self.parameterization})"
         )
 
 
 class MLPKernel(nn.Module):
-    """Pointwise MLP replacing the causal delay/shedding kernel convolution.
-
-    Instead of a fixed-shape kernel applied via ``F.conv1d``, this module
-    extracts a sliding window of the input trajectory and passes each window
-    through a small MLP (Linear → GELU → Linear).  The final layer is
-    zero-initialised for conservative startup (matching the residual-path
-    pattern used elsewhere).
-    """
+    """MLP over causal [B, T, K] windows with optional static population."""
 
     def __init__(
         self,
@@ -549,15 +995,19 @@ class MLPKernel(nn.Module):
     ) -> torch.Tensor:
         B, T = I_trajectory.shape
         with _autocast_disabled_for(I_trajectory):
-            padded = F.pad(I_trajectory.float(), (self.kernel_length - 1, 0))  # causal
+            padded = F.pad(I_trajectory.float(), (self.kernel_length - 1, 0))
             windows = padded.unfold(1, self.kernel_length, 1)  # [B, T, K]
             if self.include_population and population is not None:
-                pop = population.float()
-                if pop.ndim == 2:
-                    pop = pop[:, :1]  # [B, 1] – same pop for all timesteps
-                pop = pop.unsqueeze(-1).expand(B, T, -1)  # [B, T, 1]
+                if population.shape[0] != B:
+                    raise ValueError(
+                        "population batch dimension must match I_trajectory: "
+                        f"{population.shape[0]} != {B}"
+                    )
+                pop = population.float().reshape(B, -1)[:, :1]
+                pop = pop.unsqueeze(-1).expand(B, T, -1)
                 windows = torch.cat([windows, pop], dim=-1)
-            return self.mlp(windows).squeeze(-1).to(I_trajectory.dtype)  # [B, T]
+            output = self.mlp(windows).squeeze(-1)
+        return output.to(I_trajectory.dtype)  # [B, T]
 
 
 class ClinicalObservationHead(nn.Module):
@@ -589,11 +1039,15 @@ class ClinicalObservationHead(nn.Module):
         gamma_scale: Gamma scale parameter for kernel init
         learnable_kernel: If True, delay kernel is trainable
         kernel_parameterization: "simplex" for positive normalized kernels,
-            "free" for unconstrained signed kernels with gamma priming
+            "free" for unconstrained signed kernels with gamma priming, "gamma"
+            for the two-parameter learnable Gamma delay family
         scale_init: Initial scale for per-100k conversion (default 1.0)
         learnable_scale: If True, scale is trainable
         residual_dim: Dimension of observation context for residual
         alpha_init: Initial weight for residual connection
+        residual_enabled: When False, retain the residual projection but freeze its
+            contribution at zero.
+
     """
 
     def __init__(
@@ -607,6 +1061,7 @@ class ClinicalObservationHead(nn.Module):
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
+        residual_enabled: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
         kernel_mlp: bool = False,
@@ -642,17 +1097,25 @@ class ClinicalObservationHead(nn.Module):
         self.learnable_scale = learnable_scale
 
         # Residual connection from observation context
+        # Residual projections always exist when context is available. Disabling a
+        # head freezes its zero-valued contribution without changing downstream
+        # parameter initialization or predictive-scale conditioning.
         self.use_residual = residual_dim > 0
         if self.use_residual:
             self.residual_proj = nn.Linear(residual_dim, 1)
             _small_xavier_linear(self.residual_proj, gain=0.1)
-            if learnable_scale:
+            if learnable_scale and residual_enabled:
                 self.alpha = nn.Parameter(model_scalar(alpha_init))
             else:
-                self.register_buffer("alpha", model_scalar(alpha_init))
+                self.register_buffer(
+                    "alpha", model_scalar(alpha_init if residual_enabled else 0.0)
+                )
         else:
             self.residual_proj = None
             self.alpha = None
+        # Immutable static disable: survives checkpoint alpha state loading.
+        self._residual_location_enabled = residual_enabled
+        _register_residual_log_location_fraction_buffer(self)
 
         self.log_distribution_scale = nn.Parameter(
             torch.log(
@@ -673,7 +1136,9 @@ class ClinicalObservationHead(nn.Module):
 
         logger.info(
             f"Initialized ClinicalObservationHead: scale_init={scale_init}, "
-            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}, "
+            f"learnable_scale={learnable_scale}, "
+            f"residual_location_enabled={self._residual_location_enabled}, "
+            f"residual_projection_present={self.residual_proj is not None}, "
             f"delta_forecasting={self.delta_forecasting}, anchor_mode={self.anchor_mode}"
         )
 
@@ -700,6 +1165,21 @@ class ClinicalObservationHead(nn.Module):
         Formula:
             pred = log1p(I_delayed × 100,000 × scale) + alpha × residual(obs_context)
         """
+        return self.forward_components(
+            I_trajectory=I_trajectory,
+            obs_context=obs_context,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )["loc"]
+
+    def forward_components(
+        self,
+        I_trajectory: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return the full, mechanistic-only, and residual prediction components."""
         out_dtype = I_trajectory.dtype
         with _autocast_disabled_for(I_trajectory):
             delayed_infections = self.delay_kernel(I_trajectory.to(torch.float32))
@@ -714,39 +1194,45 @@ class ClinicalObservationHead(nn.Module):
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            pred_log = torch.log1p(scaled)
+            mechanistic_raw = torch.log1p(scaled)
 
-        # Add residual from observation context if provided
+        # Pre-bound residual raw: the parameter-side intermediate probed by
+        # pathway-gradient telemetry. A statically disabled head contributes
+        # an exact zero regardless of any loaded alpha state.
+        residual_raw = torch.zeros_like(mechanistic_raw)
         if (
-            self.use_residual
+            self._residual_location_enabled
+            and self.use_residual
             and obs_context is not None
             and self.residual_proj is not None
         ):
             residual = self.residual_proj(obs_context).squeeze(-1)
-            if residual.dtype != pred_log.dtype:
-                residual = residual.to(pred_log.dtype)
+            if residual.dtype != mechanistic_raw.dtype:
+                residual = residual.to(mechanistic_raw.dtype)
             alpha = self.get_alpha()
             if alpha is not None:
-                if alpha.dtype != pred_log.dtype:
-                    alpha = alpha.to(pred_log.dtype)
-                pred_log = pred_log + alpha * residual
+                if alpha.dtype != mechanistic_raw.dtype:
+                    alpha = alpha.to(mechanistic_raw.dtype)
+                residual_raw = alpha * residual
 
-        if (
-            self.delta_forecasting
-            and self.anchor_mode != "disabled"
-            and last_observed is not None
-            and last_observed_mask is not None
-        ):
-            h0 = pred_log[:, 0:1]  # [B, 1]
-            delta = pred_log - h0
-            valid_mask = (last_observed_mask > 0.5).unsqueeze(1)  # [B, 1]
-            last_obs_safe = torch.nan_to_num(
-                last_observed, nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            anchored_pred = torch.clamp(last_obs_safe + delta, min=0.0)
-            pred_log = torch.where(valid_mask, anchored_pred, pred_log)
-
-        return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
+        components = _compose_observation_prediction(
+            mechanistic_raw=mechanistic_raw,
+            residual_raw=residual_raw,
+            delta_forecasting=self.delta_forecasting,
+            anchor_mode=self.anchor_mode,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )
+        _bound_composed_residual(
+            components,
+            self.get_buffer("_residual_max_log_location_fraction"),
+        )
+        output_components = {
+            key: value if value.dtype == out_dtype else value.to(out_dtype)
+            for key, value in components.items()
+        }
+        output_components["residual_input"] = residual_raw
+        return output_components
 
     def forward_distribution(
         self,
@@ -756,14 +1242,15 @@ class ClinicalObservationHead(nn.Module):
         last_observed_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
-        loc = self.forward(
+        components = self.forward_components(
             I_trajectory=I_trajectory,
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
         )
+        loc = components["loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
-        return {"loc": loc, "scale": scale}
+        return {**components, "scale": scale}
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
@@ -781,6 +1268,24 @@ class ClinicalObservationHead(nn.Module):
                 neginf=-1.0,
             )
         return self.alpha
+
+    def set_residual_max_log_location_fraction(
+        self,
+        max_log_location_fraction: float | None,
+    ) -> None:
+        """Set this head's residual log-location budget.
+
+        ``None`` restores the unrestricted legacy residual, ``0.0`` is an
+        exact lockout, and values in ``(0, 1]`` cap the residual contribution
+        relative to the mechanistic log-location magnitude. This does not
+        change ``residual_disabled_heads`` semantics: a statically disabled
+        head keeps its exact zero contribution even though its projection
+        module remains present for structural compatibility.
+        """
+        _set_residual_log_location_fraction_buffer(
+            self,
+            max_log_location_fraction,
+        )
 
     def get_distribution_scale(
         self,
@@ -819,6 +1324,9 @@ class WastewaterObservationHead(nn.Module):
         4. Optionally add a residual correction from observation context
 
     Args:
+        residual_enabled: When False, retain the residual projection but freeze its
+            contribution at zero.
+
         kernel_length: Length of shedding kernel (default 14 days)
         scale_init: Initial scale for per-100k conversion (default 1.0)
         learnable_kernel: If True, shedding profile is trainable
@@ -833,9 +1341,12 @@ class WastewaterObservationHead(nn.Module):
         scale_init: float = 1.0,
         learnable_kernel: bool = True,
         kernel_parameterization: str = "simplex",
+        gamma_shape: float = 2.0,
+        gamma_scale: float = 6.0,
         learnable_scale: bool = True,
         residual_dim: int = 0,
         alpha_init: float = 0.1,
+        residual_enabled: bool = True,
         strict: bool = True,
         delta_forecasting: bool = False,
         anchor_mode: str = "last_valid_step",
@@ -863,6 +1374,8 @@ class WastewaterObservationHead(nn.Module):
                 sensitivity_scale=1.0,  # Fixed, we'll handle scaling separately
                 learnable_kernel=learnable_kernel,
                 kernel_parameterization=kernel_parameterization,
+                gamma_shape=gamma_shape,
+                gamma_scale=gamma_scale,
                 learnable_scale=False,  # We handle scale separately
                 strict=strict,
             )
@@ -874,18 +1387,25 @@ class WastewaterObservationHead(nn.Module):
             self.register_buffer("scale", model_scalar(scale_init))
         self.learnable_scale = learnable_scale
 
-        # Residual connection from observation context
+        # See ClinicalObservationHead: a disabled residual keeps the same
+        # projections but has an exact, non-learnable zero contribution.
         self.use_residual = residual_dim > 0
         if self.use_residual:
             self.residual_proj = nn.Linear(residual_dim, 1)
             _small_xavier_linear(self.residual_proj, gain=0.1)
-            if learnable_scale:
+            if learnable_scale and residual_enabled:
                 self.alpha = nn.Parameter(model_scalar(alpha_init))
             else:
-                self.register_buffer("alpha", model_scalar(alpha_init))
+                self.register_buffer(
+                    "alpha", model_scalar(alpha_init if residual_enabled else 0.0)
+                )
         else:
             self.residual_proj = None
             self.alpha = None
+
+        # Immutable static disable: survives checkpoint alpha state loading.
+        self._residual_location_enabled = residual_enabled
+        _register_residual_log_location_fraction_buffer(self)
 
         self.log_distribution_scale = nn.Parameter(
             torch.log(
@@ -906,7 +1426,9 @@ class WastewaterObservationHead(nn.Module):
 
         logger.info(
             f"Initialized WastewaterObservationHead: scale_init={scale_init}, "
-            f"learnable_scale={learnable_scale}, use_residual={self.use_residual}, "
+            f"learnable_scale={learnable_scale}, "
+            f"residual_location_enabled={self._residual_location_enabled}, "
+            f"residual_projection_present={self.residual_proj is not None}, "
             f"delta_forecasting={self.delta_forecasting}, anchor_mode={self.anchor_mode}"
         )
 
@@ -936,6 +1458,23 @@ class WastewaterObservationHead(nn.Module):
             viral_load = conv(I, shedding_kernel) / population
             pred = log1p(viral_load × 100,000 × scale) + alpha × residual(obs_context)
         """
+        return self.forward_components(
+            I_trajectory=I_trajectory,
+            population=population,
+            obs_context=obs_context,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )["loc"]
+
+    def forward_components(
+        self,
+        I_trajectory: torch.Tensor,
+        population: torch.Tensor,
+        obs_context: torch.Tensor | None = None,
+        last_observed: torch.Tensor | None = None,
+        last_observed_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return the full, mechanistic-only, and residual prediction components."""
         out_dtype = I_trajectory.dtype
         viral_load = self.shedding_conv(I_trajectory.to(torch.float32), population)
 
@@ -951,39 +1490,45 @@ class WastewaterObservationHead(nn.Module):
                 posinf=_OBS_CLAMP_MAX,
                 neginf=0.0,
             ).clamp(min=0.0, max=_OBS_CLAMP_MAX)
-            pred_log = torch.log1p(scaled)
+            mechanistic_raw = torch.log1p(scaled)
 
-        # Add residual from observation context if provided
+        # Pre-bound residual raw: the parameter-side intermediate probed by
+        # pathway-gradient telemetry. A statically disabled head contributes
+        # an exact zero regardless of any loaded alpha state.
+        residual_raw = torch.zeros_like(mechanistic_raw)
         if (
-            self.use_residual
+            self._residual_location_enabled
+            and self.use_residual
             and obs_context is not None
             and self.residual_proj is not None
         ):
             residual = self.residual_proj(obs_context).squeeze(-1)
-            if residual.dtype != pred_log.dtype:
-                residual = residual.to(pred_log.dtype)
+            if residual.dtype != mechanistic_raw.dtype:
+                residual = residual.to(mechanistic_raw.dtype)
             alpha = self.get_alpha()
             if alpha is not None:
-                if alpha.dtype != pred_log.dtype:
-                    alpha = alpha.to(pred_log.dtype)
-                pred_log = pred_log + alpha * residual
+                if alpha.dtype != mechanistic_raw.dtype:
+                    alpha = alpha.to(mechanistic_raw.dtype)
+                residual_raw = alpha * residual
 
-        if (
-            self.delta_forecasting
-            and self.anchor_mode != "disabled"
-            and last_observed is not None
-            and last_observed_mask is not None
-        ):
-            h0 = pred_log[:, 0:1]  # [B, 1]
-            delta = pred_log - h0
-            valid_mask = (last_observed_mask > 0.5).unsqueeze(1)  # [B, 1]
-            last_obs_safe = torch.nan_to_num(
-                last_observed, nan=0.0, posinf=0.0, neginf=0.0
-            ).unsqueeze(1)
-            anchored_pred = torch.clamp(last_obs_safe + delta, min=0.0)
-            pred_log = torch.where(valid_mask, anchored_pred, pred_log)
-
-        return pred_log if pred_log.dtype == out_dtype else pred_log.to(out_dtype)
+        components = _compose_observation_prediction(
+            mechanistic_raw=mechanistic_raw,
+            residual_raw=residual_raw,
+            delta_forecasting=self.delta_forecasting,
+            anchor_mode=self.anchor_mode,
+            last_observed=last_observed,
+            last_observed_mask=last_observed_mask,
+        )
+        _bound_composed_residual(
+            components,
+            self.get_buffer("_residual_max_log_location_fraction"),
+        )
+        output_components = {
+            key: value if value.dtype == out_dtype else value.to(out_dtype)
+            for key, value in components.items()
+        }
+        output_components["residual_input"] = residual_raw
+        return output_components
 
     def forward_distribution(
         self,
@@ -994,15 +1539,16 @@ class WastewaterObservationHead(nn.Module):
         last_observed_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return predictive distribution parameters in log1p(per-100k) space."""
-        loc = self.forward(
+        components = self.forward_components(
             I_trajectory=I_trajectory,
             population=population,
             obs_context=obs_context,
             last_observed=last_observed,
             last_observed_mask=last_observed_mask,
         )
+        loc = components["loc"]
         scale = self.get_distribution_scale(obs_context=obs_context, like=loc)
-        return {"loc": loc, "scale": scale}
+        return {**components, "scale": scale}
 
     def get_scale(self) -> torch.Tensor:
         """Get positive scale parameter."""
@@ -1020,6 +1566,20 @@ class WastewaterObservationHead(nn.Module):
                 neginf=-1.0,
             )
         return self.alpha
+
+    def set_residual_max_log_location_fraction(
+        self,
+        max_log_location_fraction: float | None,
+    ) -> None:
+        """Set this head's residual log-location budget.
+
+        See
+        ``ClinicalObservationHead.set_residual_max_log_location_fraction``.
+        """
+        _set_residual_log_location_fraction_buffer(
+            self,
+            max_log_location_fraction,
+        )
 
     def get_distribution_scale(
         self,

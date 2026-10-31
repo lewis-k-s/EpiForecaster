@@ -240,9 +240,12 @@ def _resolve_biomarker_split_features(
     for mask_var in mask_vars:
         mask_values = np.asarray(aligned_dataset[mask_var].values)
         if mask_values.ndim == 3:
-            mask_values = mask_values.reshape(
-                mask_values.shape[-2], mask_values.shape[-1]
-            )
+            if mask_values.shape[0] != 1:
+                raise ValueError(
+                    f"{mask_var} must be (T, N) or (1, T, N) for biomarker-aware "
+                    f"splits; got leading dimension {mask_values.shape[0]}"
+                )
+            mask_values = mask_values[0]
         if mask_values.ndim != 2 or mask_values.shape[-1] != total_nodes:
             raise ValueError(
                 f"{mask_var} must be a 2D time-by-region array for biomarker-aware splits"
@@ -826,6 +829,7 @@ def _build_standard_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         shared_sparse_topology=shared_sparse_topology,
         region_embedding_store=region_embedding_store,
     )
@@ -838,6 +842,7 @@ def _build_standard_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         shared_sparse_topology=shared_sparse_topology,
         region_embedding_store=region_embedding_store,
     )
@@ -942,6 +947,7 @@ def _build_temporal_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         time_range=(train_end, val_end),
         region_embedding_store=region_embedding_store,
     )
@@ -954,6 +960,7 @@ def _build_temporal_splits(
         mobility_preprocessor=fitted_mobility_preprocessor,
         preloaded_mobility=shared_mobility,
         mobility_mask=shared_mobility_mask,
+        shared_series=train_dataset.shared_series,
         time_range=(val_end, test_end),
         region_embedding_store=region_embedding_store,
     )
@@ -962,6 +969,104 @@ def _build_temporal_splits(
         train=train_dataset,
         val=val_dataset,
         test=test_dataset,
+        region_embedding_store=region_embedding_store,
+    )
+
+
+def _build_research_splits(
+    config: EpiForecasterConfig, region_embedding_store: RegionEmbeddingStore | None
+) -> DatasetSplits:
+    """Build four-role temporal research with protected confirmation labels.
+
+    The test loader is explicitly calibration until a frozen-finalist config
+    enables confirmation. Standard validation remains the selection role.
+    """
+    from data.research_roles import (
+        load_role_manifest,
+        research_time_ranges,
+        validate_preprocessing_role,
+    )
+
+    manifest_path = config.training.research_role_manifest_path
+    if manifest_path is None:
+        raise ValueError("Research role manifest is required")
+    manifest, role_hash = load_role_manifest(manifest_path)
+    aligned = EpiDataset.load_canonical_dataset(
+        Path(config.data.dataset_path),
+        run_id=config.data.run_id,
+        run_id_chunk_size=config.data.run_id_chunk_size,
+    )
+    validate_preprocessing_role(aligned.attrs, manifest)
+    ranges = research_time_ranges(
+        aligned[TEMPORAL_COORD].values,
+        manifest,
+        input_window=config.model.input_window_length,
+        horizon=config.model.forecast_horizon,
+    )
+    all_nodes = list(range(aligned.sizes[REGION_COORD]))
+    target_nodes = all_nodes
+    if config.data.use_valid_targets:
+        if "valid_targets" not in aligned:
+            raise ValueError("Research dataset lacks valid_targets")
+        valid_targets = aligned["valid_targets"]
+        if "run_id" in valid_targets.dims:
+            valid_targets = valid_targets.any(dim="run_id")
+        valid_mask = np.asarray(valid_targets.values, dtype=bool)
+        if valid_mask.shape != (len(all_nodes),) or not valid_mask.any():
+            raise ValueError("Research valid_targets mask is empty or malformed")
+        target_nodes = [node for node in all_nodes if valid_mask[node]]
+        logger.info(
+            "Research valid_targets filter: %d/%d target regions",
+            len(target_nodes),
+            len(all_nodes),
+        )
+    if config.training.crossval_enabled:
+        train_nodes, val_nodes, test_nodes = split_nodes_by_ratio(
+            config=config,
+            dataset_path=Path(config.data.dataset_path),
+            run_id=config.data.run_id,
+        )
+    else:
+        train_nodes = val_nodes = test_nodes = target_nodes
+    train = EpiDataset(
+        config=config,
+        target_nodes=train_nodes,
+        context_nodes=all_nodes,
+        time_range=ranges["fit"],
+        region_embedding_store=region_embedding_store,
+    )
+    evaluation_role = config.training.research_evaluation_role
+    datasets = []
+    for role, nodes in [("selection", val_nodes), (evaluation_role, test_nodes)]:
+        dataset = EpiDataset(
+            config=config,
+            target_nodes=nodes,
+            context_nodes=all_nodes,
+            time_range=ranges[role],
+            region_embedding_store=region_embedding_store,
+            biomarker_preprocessor=train.biomarker_preprocessor,
+            mobility_preprocessor=train.mobility_preprocessor,
+            preloaded_mobility=train.preloaded_mobility,
+            mobility_mask=train.mobility_mask,
+            shared_series=train.shared_series,
+        )
+        datasets.append(dataset)
+    for role, dataset in zip(
+        ("fit", "selection", evaluation_role), (train, *datasets), strict=True
+    ):
+        if not len(dataset):
+            raise ValueError(f"Research role {role} has no eligible samples")
+        logger.info(
+            "Research role %s: manifest=%s, range=%s, samples=%d",
+            role,
+            role_hash,
+            ranges[role],
+            len(dataset),
+        )
+    return DatasetSplits(
+        train=train,
+        val=datasets[0],
+        test=datasets[1],
         region_embedding_store=region_embedding_store,
     )
 
@@ -981,6 +1086,9 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
         DatasetSplits with train/val/test datasets and optional curriculum metadata
     """
     region_embedding_store = _build_region_embedding_store(config)
+
+    if config.training.split_strategy == "research":
+        return _build_research_splits(config, region_embedding_store)
 
     if config.training.split_strategy == "time":
         train_end: str = config.training.train_end_date or ""

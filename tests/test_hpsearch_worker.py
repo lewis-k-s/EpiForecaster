@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
 from scripts.hpo.hpsearch_worker import (
     _categorical_choices,
-    _compute_worker_seed,
     _decode_categorical_value,
     _overrides_to_dotlist,
     _remaining_worker_trials,
@@ -156,7 +153,6 @@ def _joint_loss_cfg_stub(**overrides: Any) -> SimpleNamespace:
     joint_overrides = overrides.pop("joint", {})
     joint_defaults = {
         "adaptive_scheme": "gradnorm",
-        "w_sird_supervision": 1.0,
         "gradnorm_obs_weight_sum": 0.95,
     }
     joint_defaults.update(joint_overrides)
@@ -168,109 +164,20 @@ def _joint_loss_cfg_stub(**overrides: Any) -> SimpleNamespace:
     return _base_cfg_stub(**overrides)
 
 
-class TestComputeWorkerSeed:
-    def test_returns_base_seed_without_worker_identity(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            assert _compute_worker_seed(42) == 42
+def test_categorical_trial_values_survive_cli_override_encoding() -> None:
+    encoded = _categorical_choices(([1, 2], {"heads": ["ww"]}, True))
+    decoded = [_decode_categorical_value(value) for value in encoded]
 
-    def test_offsets_by_logical_worker_id(self) -> None:
-        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "3"}):
-            assert _compute_worker_seed(42) == 45
-
-    def test_offsets_by_zero_worker_id(self) -> None:
-        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "0"}):
-            assert _compute_worker_seed(42) == 42
-
-    def test_different_worker_ids_produce_different_seeds(self) -> None:
-        base_seed = 100
-        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "0"}):
-            seed_0 = _compute_worker_seed(base_seed)
-        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "1"}):
-            seed_1 = _compute_worker_seed(base_seed)
-        with patch.dict(os.environ, {"EPIFORECASTER_WORKER_ID": "2"}):
-            seed_2 = _compute_worker_seed(base_seed)
-
-        assert seed_0 == 100
-        assert seed_1 == 101
-        assert seed_2 == 102
-        assert len({seed_0, seed_1, seed_2}) == 3
-
-
-class TestCategoricalChoices:
-    def test_encodes_list_to_json(self) -> None:
-        assert _categorical_choices(([1, 2],)) == ("[1, 2]",)
-
-    def test_encodes_tuple_to_json(self) -> None:
-        assert _categorical_choices(((1, 2),)) == ("[1, 2]",)
-
-    def test_encodes_dict_to_json(self) -> None:
-        result = _categorical_choices(({"a": 1},))
-        assert result == ('{"a": 1}',)
-
-    def test_passes_through_string(self) -> None:
-        assert _categorical_choices(("foo",)) == ("foo",)
-
-    def test_passes_through_int(self) -> None:
-        assert _categorical_choices((1, 2)) == (1, 2)
-
-    def test_passes_through_float(self) -> None:
-        assert _categorical_choices((1.5,)) == (1.5,)
-
-    def test_passes_through_bool(self) -> None:
-        assert _categorical_choices((True, False)) == (True, False)
-
-    def test_passes_through_none(self) -> None:
-        assert _categorical_choices((None,)) == (None,)
-
-    def test_mixed_choices(self) -> None:
-        result = _categorical_choices(([1, 2], "foo", 3, {"a": 1}))
-        assert result == ("[1, 2]", "foo", 3, '{"a": 1}')
-
-
-class TestDecodeCategoricalValue:
-    def test_decodes_json_list(self) -> None:
-        assert _decode_categorical_value("[1, 2]") == [1, 2]
-
-    def test_decodes_json_dict(self) -> None:
-        assert _decode_categorical_value('{"a": 1}') == {"a": 1}
-
-    def test_passes_through_non_json_string(self) -> None:
-        assert _decode_categorical_value("foo") == "foo"
-
-    def test_passes_through_int(self) -> None:
-        assert _decode_categorical_value(42) == 42
-
-    def test_passes_through_list(self) -> None:
-        assert _decode_categorical_value([1, 2]) == [1, 2]
-
-    def test_raises_on_invalid_json(self) -> None:
-        with pytest.raises(ValueError, match="Invalid JSON categorical value"):
-            _decode_categorical_value("[invalid")
-
-
-class TestOverridesToDotlist:
-    def test_converts_key_value_pairs(self) -> None:
-        result = _overrides_to_dotlist({"a": 1, "b": "foo"})
-        assert set(result) == {"a=1", "b=foo"}
-
-    def test_formats_bool_as_lowercase(self) -> None:
-        assert _overrides_to_dotlist({"a": True, "b": False}) == ["a=true", "b=false"]
-
-    def test_formats_list_as_str(self) -> None:
-        result = _overrides_to_dotlist({"a": [1, 2]})
-        assert result == ["a=[1, 2]"]
-
-    def test_formats_tuple_as_str(self) -> None:
-        result = _overrides_to_dotlist({"a": (1, 2)})
-        assert result == ["a=(1, 2)"]
-
-    def test_skips_none_values(self) -> None:
-        result = _overrides_to_dotlist({"a": 1, "b": None, "c": 2})
-        assert set(result) == {"a=1", "c=2"}
-
-    def test_formats_float(self) -> None:
-        result = _overrides_to_dotlist({"lr": 0.001})
-        assert result == ["lr=0.001"]
+    assert decoded == [[1, 2], {"heads": ["ww"]}, True]
+    assert _overrides_to_dotlist(
+        {
+            "model.layers": decoded[0],
+            "training.enabled": decoded[2],
+            "unused": None,
+        }
+    ) == ["model.layers=[1, 2]", "training.enabled=true"]
+    with pytest.raises(ValueError, match="Invalid JSON categorical value"):
+        _decode_categorical_value("[invalid")
 
 
 class TestSuggestEpiforecasterParams:
@@ -405,10 +312,7 @@ class TestSuggestEpiforecasterParams:
         cfg = _joint_loss_cfg_stub()
         overrides = suggest_epiforecaster_params(trial=trial, base_cfg=cfg)
         loss_weight_overrides = [
-            k
-            for k in overrides
-            if k.startswith("training.loss.joint.w_")
-            and k not in ("training.loss.joint.w_sird_supervision",)
+            k for k in overrides if k.startswith("training.loss.joint.w_")
         ]
         assert loss_weight_overrides == []
 

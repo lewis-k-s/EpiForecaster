@@ -4,6 +4,7 @@ import torch
 from types import SimpleNamespace
 
 from data.epi_dataset import EpiDataset
+from data.epi_batch import collate_epiforecaster_batch
 from data.region_embedding_store import RegionEmbeddingStore
 from tests.dataset_test_helpers import (
     make_epi_config,
@@ -172,7 +173,8 @@ def test_dynamic_mask_is_shared_by_clinical_topology_and_gpu_adjacency(
         expected_weights,
         torch.eye(len(node_ids)),
     )
-    assert torch.allclose(batch.mob_batch.adj_dense[0].float(), expected_weights)
+    adjacency = batch.mob_batch.adj_table[batch.mob_batch.adj_time_ids]
+    assert torch.allclose(adjacency[0].float(), expected_weights)
 
 
 @pytest.mark.epiforecaster
@@ -241,6 +243,55 @@ def test_getitem_values(tmp_path):
             torch.full_like(cases_hist[..., 2], expected_age),
             atol=1e-3,
         )
+
+
+@pytest.mark.epiforecaster
+def test_getitem_aligns_death_flow_and_rebases_cumulative_d(tmp_path):
+    zarr_path = tmp_path / "latent_death_flow.zarr"
+    periods = 8
+    dataset_source = make_tiny_epi_dataset(periods=periods)
+    time_index = np.arange(periods, dtype=np.float32)
+    cumulative_d = np.stack((time_index * 0.1, time_index * 0.2), axis=-1)[None, ...]
+    death_flow = np.stack(
+        (
+            np.concatenate(([0.0], np.full(periods - 1, 0.1, dtype=np.float32))),
+            np.concatenate(([0.0], np.full(periods - 1, 0.2, dtype=np.float32))),
+        ),
+        axis=-1,
+    )[None, ...]
+    latent_dims = ("run_id", "date", "region_id")
+    dataset_source["latent_D_true"] = (latent_dims, cumulative_d)
+    dataset_source["latent_death_flow_true"] = (latent_dims, death_flow)
+    write_zarr_dataset(dataset_source, zarr_path)
+
+    config = _make_config(str(zarr_path))
+    dataset = EpiDataset(config=config, target_nodes=[0, 1], context_nodes=[0, 1])
+
+    item = dataset[0]
+    target_node = item["target_node"]
+    expected_flow = 0.1 if target_node == 0 else 0.2
+
+    assert item["D_target"] is not None
+    assert item["death_flow_target"] is not None
+    assert item["D_target"].shape == (config.model.forecast_horizon + 1,)
+    assert item["death_flow_target"].shape == (config.model.forecast_horizon,)
+    assert item["D_target"][0].item() == pytest.approx(0.0)
+    assert torch.allclose(
+        item["D_target"],
+        torch.tensor([0.0, expected_flow, 2.0 * expected_flow]),
+    )
+    assert torch.allclose(
+        item["death_flow_target"],
+        torch.full((config.model.forecast_horizon,), expected_flow),
+    )
+
+    batch = collate_epiforecaster_batch(
+        [dataset[0], dataset[1]], require_region_index=False
+    )
+    assert batch.D_target is not None
+    assert batch.death_flow_target is not None
+    assert batch.D_target.shape == (2, config.model.forecast_horizon + 1)
+    assert batch.death_flow_target.shape == (2, config.model.forecast_horizon)
 
 
 @pytest.mark.epiforecaster
@@ -343,6 +394,7 @@ def test_imported_risk_gating(tmp_path):
     config2 = deepcopy(config)
     config2.data.use_imported_risk = True
     config2.data.mobility_lags = [1, 7]
+    config2.model.cases_dim = 11
 
     dataset2 = EpiDataset(config=config2, target_nodes=[0, 1], context_nodes=[0, 1])
     assert dataset2.cases_output_dim == 11  # 9 + 2 lags

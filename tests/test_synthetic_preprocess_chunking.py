@@ -1,3 +1,5 @@
+import json
+
 import dask.array as da
 import numpy as np
 import pandas as pd
@@ -18,6 +20,8 @@ def _write_minimal_synthetic_zarr(
     region_ids,
     edar_ids,
     latent_h_name="latent_H_true",
+    include_deaths_true=True,
+    death_flow_offset=0.0,
 ):
     rng = np.random.default_rng(123)
 
@@ -80,8 +84,13 @@ def _write_minimal_synthetic_zarr(
         dims=("run_id", "region_id", "date"),
         coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
     )
+    death_flow_values = rng.random((len(run_ids), len(region_ids), len(dates))).astype(
+        np.float32
+    )
+    death_flow_values[:, :, 0] = 0.0
+    latent_d_values = np.cumsum(death_flow_values, axis=2, dtype=np.float32)
     latent_d = xr.DataArray(
-        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32),
+        latent_d_values,
         dims=("run_id", "region_id", "date"),
         coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
     )
@@ -102,21 +111,27 @@ def _write_minimal_synthetic_zarr(
         edar_vars[f"edar_biomarker_{variant}"] = biomarker
         edar_vars[f"limit_of_detection_{variant}"] = lod
 
-    ds = xr.Dataset(
-        {
-            "cases": cases,
-            "cases_mask": cases_mask,
-            "mobility_base": mobility_base,
-            "mobility_kappa0": mobility_kappa0,
-            "population": population,
-            "latent_S_true": latent_s,
-            "latent_I_true": latent_i,
-            latent_h_name: latent_h,
-            "latent_R_true": latent_r,
-            "latent_D_true": latent_d,
-            **edar_vars,
-        }
-    )
+    data_vars = {
+        "cases": cases,
+        "cases_mask": cases_mask,
+        "mobility_base": mobility_base,
+        "mobility_kappa0": mobility_kappa0,
+        "population": population,
+        "latent_S_true": latent_s,
+        "latent_I_true": latent_i,
+        latent_h_name: latent_h,
+        "latent_R_true": latent_r,
+        "latent_D_true": latent_d,
+        **edar_vars,
+    }
+    if include_deaths_true:
+        data_vars["deaths_true"] = xr.DataArray(
+            death_flow_values + death_flow_offset,
+            dims=("run_id", "region_id", "date"),
+            coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
+        )
+
+    ds = xr.Dataset(data_vars)
 
     ds.to_zarr(path, mode="w", zarr_format=2)
 
@@ -177,9 +192,130 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
     assert population.dims == ("run_id", "region_id")
     assert latent_sird["latent_S_true"].dims == ("run_id", "date", "region_id")
     assert latent_sird["latent_H_true"].dims == ("run_id", "date", "region_id")
+    assert latent_sird["latent_death_flow_true"].dims == (
+        "run_id",
+        "date",
+        "region_id",
+    )
+    assert latent_sird["latent_death_flow_true"].dtype == np.float32
     assert "latent_S_true_mask" not in latent_sird
     assert "latent_H_true_mask" not in latent_sird
     assert len(cases.run_id) == 2
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_opens_zarr_directory_with_nc_suffix(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.nc"
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+    edar_ids = np.array(["e1"], dtype="U10")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=run_ids,
+        dates=dates,
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+
+    dataset = SyntheticProcessor(
+        _make_config(tmp_path, synthetic_path)
+    )._open_synthetic_data(str(synthetic_path))
+    try:
+        assert dataset.sizes["run_id"] == 1
+    finally:
+        dataset.close()
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_normalizes_continuous_death_flow(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    run_ids = np.array(["synth_a"], dtype="U50")
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    region_ids = np.array(["r1", "r2"], dtype="U10")
+    edar_ids = np.array(["e1"], dtype="U10")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=run_ids,
+        dates=dates,
+        region_ids=region_ids,
+        edar_ids=edar_ids,
+    )
+
+    result = SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+        str(synthetic_path)
+    )
+    raw = xr.open_zarr(synthetic_path)
+    try:
+        expected = (
+            raw["deaths_true"].transpose("run_id", "date", "region_id")
+            / raw["population"]
+        ).astype(np.float32)
+        actual = result["latent_sird"]["latent_death_flow_true"]
+        np.testing.assert_allclose(actual.values, expected.values)
+        assert np.any(actual.values > 0)
+    finally:
+        raw.close()
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_requires_death_flow_for_latent_bundle(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        include_deaths_true=False,
+    )
+
+    with pytest.raises(ValueError, match="latent S/I/R/D supervision bundle"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    ("death_flow_offset", "message"),
+    [(-2.0, "nonnegative"), (np.nan, "finite")],
+)
+def test_synthetic_processor_rejects_invalid_death_flow(
+    tmp_path, death_flow_offset, message
+):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        death_flow_offset=death_flow_offset,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_rejects_misaligned_death_flow(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        death_flow_offset=0.25,
+    )
+
+    with pytest.raises(ValueError, match="destination-dated"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
 
 
 @pytest.mark.epiforecaster
@@ -261,6 +397,40 @@ def test_synthetic_processor_includes_temporal_covariates(tmp_path):
         "is_holiday",
     ]
     np.testing.assert_array_equal(temporal_covariates["date"].values, dates.values)
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_kappa0_lockdown_buckets_include_zero_and_upper_bounds(tmp_path):
+    config = _make_config(tmp_path, synthetic_path=tmp_path / "raw_synth.zarr")
+    config.temporal_covariates.include_lockdown_severity = True
+    processor = SyntheticProcessor(config)
+
+    dates = pd.date_range("2020-01-01", periods=6, freq="D")
+    config.end_date = dates[-1].to_pydatetime()
+    base_covariates = xr.DataArray(
+        np.zeros((6, 3), dtype=np.float32),
+        dims=("date", "covariate"),
+        coords={
+            "date": dates,
+            "covariate": ["dow_sin", "dow_cos", "is_holiday"],
+        },
+    )
+    raw_ds = xr.Dataset(
+        {
+            "mobility_kappa0": xr.DataArray(
+                np.array([[0.0, 0.1, 0.2, 0.3, 0.5, 0.6]], dtype=np.float32),
+                dims=("run_id", "date"),
+                coords={"run_id": ["synth_a"], "date": dates},
+            )
+        }
+    )
+
+    result = processor._inject_kappa0_lockdown(base_covariates, raw_ds)
+
+    np.testing.assert_array_equal(
+        result.sel(covariate="lockdown_severity").values,
+        np.array([[0.0, 1.0, 1.0, 2.0, 2.0, 3.0]], dtype=np.float32),
+    )
 
 
 @pytest.mark.epiforecaster
@@ -457,9 +627,9 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_zarr(output_path)
+    saved = xr.open_dataset(output_path, engine="netcdf4")
 
-    chunks = saved["edar_biomarker_N1_mask"].encoding.get("chunks")
+    chunks = saved["edar_biomarker_N1_mask"].encoding.get("chunksizes")
     assert chunks is not None
     assert chunks[0] == min(config.run_id_chunk_size, len(run_ids))
     assert chunks[1] == len(dates)
@@ -469,6 +639,7 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
 
 
 @pytest.mark.epiforecaster
+@pytest.mark.integration
 def test_pipeline_end_to_end_synthetic(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
     region_metadata_path = tmp_path / "edar_map.nc"
@@ -493,11 +664,12 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
 
     config = _make_config(tmp_path, synthetic_path)
     config.region_metadata_file = str(region_metadata_path)
+    config.continuous_storage_dtype = "float32"
 
     pipeline = OfflinePreprocessingPipeline(config)
     output_path = pipeline.run()
 
-    ds = xr.open_zarr(output_path)
+    ds = xr.open_dataset(output_path, engine="netcdf4")
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
@@ -516,7 +688,26 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     ]
     assert ds["mobility"].dims[0] == "run_id"
     assert len(ds["run_id"]) == len(run_ids)
+    case_values = ds["cases"].values
+    case_mask = ds["cases_mask"].values
+    assert case_values.dtype == np.float32
+    assert np.all(case_values[case_mask] > 0)
+    preservation = json.loads(ds.attrs["positive_clinical_preservation_json"])
+    assert preservation["cases"]["raw_positive_count"] > 0
+    assert preservation["cases"]["zeroed_raw_positive_count"] == 0
     ds.close()
+
+
+@pytest.mark.epiforecaster
+def test_positive_clinical_preservation_rejects_zeroed_positive_value():
+    raw = xr.Dataset({"cases": xr.DataArray([0.25, np.nan], dims=("date",))})
+    processed = xr.Dataset({"cases": xr.DataArray([0.0, np.nan], dims=("date",))})
+
+    with pytest.raises(ValueError, match="positive raw synthetic 'cases'"):
+        OfflinePreprocessingPipeline._validate_positive_clinical_preservation(
+            raw_aligned=raw,
+            processed=processed,
+        )
 
 
 @pytest.mark.epiforecaster
@@ -551,7 +742,7 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_zarr(output_path)
+    saved = xr.open_dataset(output_path, engine="netcdf4")
 
     saved_mob = saved["mobility"].isel(
         run_id=0, date=0, origin=slice(0, 2), destination=slice(0, 2)

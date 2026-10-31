@@ -1,16 +1,18 @@
 env: "mn5"
 
-# Production synthetic pretraining config.
-# Mirrors the MN5 full training template but targets the processed synthetic
-# dataset and enables direct latent SIRD supervision for stage-1 pretraining.
+# Production synthetic pretraining config for the corrected continuous
+# SIRHD reporting-v1 corpus. Mirrors the MN5 full training template and enables
+# direct latent SIRHD supervision for stage-1 pretraining.
 # Stage-2 fine-tuning should use train_epifor_mn5_full.yaml with
 # training.init_checkpoint_path set to the best checkpoint from this run.
 
 data:
-  dataset_path: data/processed/synthetic_full_holt_damped.zarr
+  dataset_path: data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.nc
   region2vec_path: outputs/region_embeddings/region_embeddings.pt
   use_valid_targets: true
-  mobility_min_flow_raw: 10.0
+  # Synthetic mobility is a fractional matrix (validated max < 1), not raw trips.
+  # Keep positive flows; max_neighbors performs the intended graph sparsification.
+  mobility_min_flow_raw: 0.0
   mobility_weight_clip_max: 8.0
   min_history_observed_fraction: 0.5
   min_horizon_observed_fraction: 0.5
@@ -49,13 +51,17 @@ model:
       residual_clip: 10000.0
     observation_heads:
       delta_forecasting: true
+      relevant_source_hosp: hospitalization_flow
+      relevant_source_ww: I
+      relevant_source_cases: I
+      relevant_source_deaths: death_flow
 
 output:
-  experiment_name: mn5_epiforecaster_synth_pretrain
+  experiment_name: mn5_epiforecaster_sirhd_reporting_v1_pretrain
   log_dir: outputs/training
   write_granular_eval: false
   wandb_mode: offline
-  wandb_tags: [mn5, synth, pretrain]
+  wandb_tags: [mn5, synth, pretrain, sirhd-reporting-v1, continuous-observations]
 
 training:
   compile: true
@@ -85,6 +91,7 @@ training:
   progress_log_frequency: 100
 
   grad_norm_log_frequency: 500
+  pathway_gradient_frequency: 500
   gradient_snapshot_frequency: 0
   gradient_snapshot_top_k: 5
   gradient_vanishing_threshold: 1.0e-8
@@ -109,7 +116,10 @@ training:
     name: "joint_inference"
     joint:
       observation_loss: nll
-      w_sird_supervision: 0.01
+      latent:
+        total_weight: 0.01
+        scaling: "none"
+        require_complete_targets: true
 
   curriculum:
     enabled: true

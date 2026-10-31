@@ -27,7 +27,8 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
-from scripts.workflow import run_config, run_support, tooling_identity
+from scripts.workflow import run_config, run_support
+from workflow.common import container_command, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
     load_training_dynamics_identity,
@@ -101,101 +102,79 @@ def _write_pointer(
     )
 
 
-def test_mn5_smoke_uses_short_single_gpu_debug_workload() -> None:
-    production = yaml.safe_load((REPO_ROOT / "workflow/config/mn5.yaml").read_text())
-    smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
+def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
+    smoke = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml"
+    )
 
-    assert smoke["workflow"] == production["workflow"]
-    assert smoke["dvc"] == production["dvc"]
-    assert smoke["promotion"] == production["promotion"]
-    assert smoke["optuna"]["base_config"] == production["optuna"]["base_config"]
-    assert smoke["optuna"]["workers"] == 1
-    assert smoke["optuna"]["trials_per_worker"] == 1
-    assert smoke["optuna"]["timeout_s"] == 300
-    assert smoke["optuna"]["epochs"] == 1
-    assert smoke["optuna"]["max_batches"] == 1
-    assert "training.compile=false" in smoke["optuna"]["overrides"]
-    assert smoke["evaluation"]["overrides"] == [
-        "training.max_batches=1",
-        "training.compile=false",
-        "training.val_workers=1",
-        "training.test_workers=1",
-    ]
-    assert smoke["resources"]["allocation"] == {
-        "account": "bsc08",
-        "partition": "acc",
-        "qos": "acc_debug",
-        "nodes": 1,
-        "tasks": 1,
-        "cpus_per_task": 20,
-        "gres": "gpu:1",
-        "runtime": 20,
+    assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
+    assert smoke["ablation"] == {
+        "study_name": "epiforecaster_ablation_smoke_v1",
+        "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
+        "workers": 2,
+        "trials_per_worker": 4,
+        "closeout_signal_seconds": 300,
+        "timeout_s": 3300,
+        "sampler_seed": 42,
+        "smoketest": True,
+        "requeue_running": False,
+        "recover_stale_running": True,
     }
-
-
-def test_probabilistic_smoke_reuses_short_debug_shape_with_normal_nll() -> None:
-    smoke = yaml.safe_load((REPO_ROOT / "workflow/config/mn5_smoke.yaml").read_text())
-    probabilistic = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
-    )
-
-    assert probabilistic["workflow"] == smoke["workflow"]
-    assert probabilistic["dvc"] == smoke["dvc"]
-    assert probabilistic["evaluation"] == smoke["evaluation"]
-    assert probabilistic["resources"] == smoke["resources"]
-    for field in (
-        "workers",
-        "trials_per_worker",
-        "timeout_s",
-        "epochs",
-        "max_batches",
-    ):
-        assert probabilistic["optuna"][field] == smoke["optuna"][field]
-    assert (
-        "training.loss.joint.observation_loss=nll"
-        in probabilistic["optuna"]["overrides"]
-    )
-    assert (
-        "training.loss.joint.distribution_family=normal"
-        in probabilistic["optuna"]["overrides"]
-    )
-
-
-def test_probabilistic_batch_smoke_only_changes_qos() -> None:
-    debug = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke.yaml").read_text()
-    )
-    batch = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_probabilistic_smoke_batch.yaml").read_text()
-    )
-
-    debug["resources"]["allocation"]["qos"] = "acc_bscls"
-    assert batch == debug
-
-
-def test_single_training_smoke_composes_training_and_evaluation() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_train_smoke.yaml").read_text()
-    )
-
-    assert smoke["workflow"] == {"kind": "train", "target": "train_evaluate"}
-    assert smoke["training"]["max_batches"] == 10
-    assert "training.num_workers=1" in smoke["training"]["overrides"]
-    assert "training.val_workers=1" in smoke["training"]["overrides"]
-    assert "training.test_workers=1" in smoke["training"]["overrides"]
-    assert "training.run_final_evaluation=false" in smoke["training"]["overrides"]
-    assert "training.compile=false" in smoke["training"]["overrides"]
-    assert smoke["evaluation"]["split"] == "test"
     assert smoke["resources"]["allocation"] == {
         "account": "bsc08",
         "partition": "acc",
         "qos": "acc_bscls",
         "nodes": 1,
-        "tasks": 1,
+        "tasks": 2,
         "cpus_per_task": 20,
-        "gres": "gpu:1",
+        "gres": "gpu:2",
         "runtime": 60,
     }
+
+
+def test_coverage_smoke_exercises_full_campaign_subset() -> None:
+    smoke = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml"
+    )
+
+    assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
+    assert smoke["ablation"] == {
+        "study_name": "epiforecaster_ablation_default_smoke_v2",
+        "campaign": "configs/campaigns/ablation_default_v2.yaml",
+        "workers": 2,
+        "closeout_signal_seconds": 600,
+        "timeout_s": 6000,
+        "sampler_seed": 42,
+        "smoketest": True,
+        "requeue_running": False,
+        "recover_stale_running": True,
+    }
+    assert smoke["resources"]["allocation"] == {
+        "account": "bsc08",
+        "partition": "acc",
+        "qos": "acc_bscls",
+        "nodes": 1,
+        "tasks": 2,
+        "cpus_per_task": 20,
+        "gres": "gpu:2",
+        "runtime": 110,
+    }
+
+
+def test_ablation_timeout_reserves_the_declared_slurm_closeout() -> None:
+    config = yaml.safe_load(
+        (REPO_ROOT / "workflow/config/mn5_ablation.yaml").read_text()
+    )
+
+    assert run_config.validate_mn5_allocation(config)["runtime"] == 420
+    assert config["ablation"]["timeout_s"] == (
+        config["resources"]["allocation"]["runtime"] * 60
+        - config["ablation"]["closeout_signal_seconds"]
+    )
+
+    config["ablation"]["timeout_s"] -= 1
+    with pytest.raises(ValueError, match="closeout_signal_seconds"):
+        run_config.validate_mn5_allocation(config)
 
 
 def _workflow_config(run_root: Path, source_root: Path) -> dict:
@@ -402,22 +381,6 @@ def test_relocatable_bundle_rejects_tracked_dvc_payload(tmp_path: Path) -> None:
         )
 
 
-def test_workflow_tooling_key_tracks_lockfile_and_bootstrap(tmp_path: Path) -> None:
-    lock = tmp_path / "uv.lock"
-    bootstrap = tmp_path / "remote_tooling.sh"
-    lock.write_text("version = 1\n")
-    bootstrap.write_text("#!/bin/bash\n")
-
-    initial = tooling_identity.workflow_tooling_key(lock, bootstrap)
-
-    assert initial == tooling_identity.workflow_tooling_key(lock, bootstrap)
-    lock.write_text("version = 2\n")
-    changed_lock = tooling_identity.workflow_tooling_key(lock, bootstrap)
-    assert initial != changed_lock
-    bootstrap.write_text("#!/bin/bash\nset -e\n")
-    assert changed_lock != tooling_identity.workflow_tooling_key(lock, bootstrap)
-
-
 def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/test-run"
     source_root = run_root / "source"
@@ -443,6 +406,32 @@ def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     assert request["config_sha256"] == run_support.sha256_file(config_path)
     assert dispatch_path.with_suffix(".tsv.sha256").is_file()
     assert "snakemake_arg" not in request
+
+
+def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/test-run"
+    source_root = run_root / "source"
+    config = _workflow_config(run_root, source_root)
+    config["workflow"]["kind"] = "ablation"
+    config["ablation"] = {
+        "study_name": "test-ablation",
+        "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
+        "workers": 4,
+        "timeout_s": 3000,
+        "closeout_signal_seconds": 600,
+        "recover_stale_running": True,
+    }
+    config_path = tmp_path / "ablation-config.yaml"
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    dispatch_path = tmp_path / "ablation-dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    request = run_config.write_dispatch_request(config_path, dispatch_path)
+
+    assert request["closeout_signal_seconds"] == "600"
 
 
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
@@ -591,6 +580,10 @@ def test_prepare_run_pins_evaluation_checkpoint_bytes(
     assert pinned.read_bytes() == b"original checkpoint"
     assert not pinned.stat().st_mode & 0o222
     assert manifest["evaluation_input"]["pinned_checkpoint"] == str(pinned)
+    assert (
+        manifest["evaluation_input"]["pinned_checkpoint_relative"]
+        == "inputs/evaluation_checkpoint.pt"
+    )
     assert manifest["evaluation_input"]["checkpoint_sha256"] == expected_hash
 
     external_checkpoint.write_bytes(b"later mutation")
@@ -604,6 +597,106 @@ def test_prepare_run_pins_evaluation_checkpoint_bytes(
     run_support.evaluate_configured_model(config_path, run_root, pinned)
     assert captured["checkpoint"] == pinned
     assert run_support.sha256_file(pinned) == expected_hash
+
+
+def test_evaluation_resolves_pinned_checkpoint_in_runtime_run_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "workspace/run"
+    pinned = run_root / "inputs/evaluation_checkpoint.pt"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_bytes(b"checkpoint")
+    config_path = run_root / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"kind": "evaluate"},
+                "evaluation": {
+                    "split": "test",
+                    "overrides": [],
+                    "granular": True,
+                },
+            }
+        )
+    )
+    (run_root / "manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "evaluation_input": {
+                    "pinned_checkpoint": (
+                        "/gpfs/project/runs/evaluate/inputs/evaluation_checkpoint.pt"
+                    ),
+                    "pinned_checkpoint_relative": "inputs/evaluation_checkpoint.pt",
+                    "checkpoint_sha256": run_support.sha256_file(pinned),
+                }
+            }
+        )
+    )
+    captured: dict[str, Path] = {}
+
+    def fake_evaluate(checkpoint_path, output_dir, split, overrides, granular):
+        captured["checkpoint"] = checkpoint_path
+        return output_dir / "evaluation_manifest.json"
+
+    monkeypatch.setattr(run_support, "evaluate_best", fake_evaluate)
+
+    run_support.evaluate_configured_model(config_path, run_root, pinned)
+
+    assert captured["checkpoint"] == pinned.resolve()
+
+
+def test_prepare_run_pins_training_initialization_checkpoint(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/fine-tune"
+    source_root = run_root / "source"
+    _write_pointer(
+        source_root,
+        "data/files/raw.zarr.dvc",
+        md5="raw.dir",
+        output_name="raw.zarr",
+    )
+    _write_pointer(
+        source_root,
+        "data/processed/processed.zarr.dvc",
+        md5="processed.dir",
+        output_name="processed.zarr",
+    )
+    external_checkpoint = tmp_path / "pretrain/best_model.pt"
+    external_checkpoint.parent.mkdir()
+    external_checkpoint.write_bytes(b"pretrained checkpoint")
+    config = _workflow_config(run_root, source_root)
+    config["workflow"].update({"kind": "train", "target": "train_evaluate"})
+    config["training"] = {
+        "base_config": "configs/production_only/train_epifor_mn5_full.yaml",
+        "experiment_name": "fine-tune",
+        "model_id": "model",
+        "init_checkpoint": str(external_checkpoint),
+        "overrides": [],
+    }
+    config.pop("optuna")
+    config.pop("promotion")
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_published_run_contract(run_root, config_path, config)
+    config_path.chmod(0o444)
+    source_root.chmod(0o555)
+
+    try:
+        manifest_path = run_support.prepare_run(config_path, source_root, run_root)
+    finally:
+        source_root.chmod(0o755)
+
+    pinned = run_root / "inputs/training_init_checkpoint.pt"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    assert pinned.read_bytes() == b"pretrained checkpoint"
+    assert not pinned.stat().st_mode & 0o222
+    assert manifest["training_input"]["pinned_checkpoint"] == str(pinned)
+    assert manifest["identity"]["init_checkpoint_sha256"] == (
+        run_support.sha256_file(pinned)
+    )
 
 
 def test_production_workflow_tracks_required_region_embedding() -> None:
@@ -631,7 +724,6 @@ def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> No
     assert Path("workflow/Snakefile") in paths
     assert Path("scripts/workflow/mn5_container_exec.sh") in paths
     assert Path("scripts/workflow/remote_run.sh") in paths
-    assert Path("scripts/workflow/remote_tooling.sh") in paths
     assert set(payloads) == {
         Path("data/files/mobility.zarr.dvc"),
         Path("data/processed/real_with_id.zarr.dvc"),
@@ -658,7 +750,8 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     launcher = (REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh").read_text()
 
     assert profile["executor"] == "local"
-    assert profile["jobs"] == 1
+    assert profile["jobs"] == 4
+    assert profile["resources"]["gpu"] == 4
     assert profile["cores"] == 80
     assert not any(key.startswith("slurm-") for key in profile)
     allocation = workflow["resources"]["allocation"]
@@ -681,7 +774,7 @@ def test_mn5_profile_uses_one_preallocated_acc_node() -> None:
     assert '--cpus-per-task="$CPUS_PER_TASK"' in launcher
     assert "--gpus-per-task=1" in launcher
     assert "--kill-on-bad-exit=1" in launcher
-    assert 'exec "$SCRIPT_DIR/snakemake_coordinator.sh" "$@"' in coordinator
+    assert 'exec "$COORDINATOR" "$@"' in coordinator
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in shared_coordinator
     assert "--mem" not in coordinator
     assert "--mem" not in launcher
@@ -965,15 +1058,63 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
         storage=storage,
         direction="minimize",
     )
-    ablations = ["baseline", "mobility:off"]
+    base_config = Path("configs/train_epifor_smoke.yaml").resolve()
+    campaign_path = tmp_path / "campaign.yaml"
+    campaign_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "campaign-a",
+                "stage": "ablation_smoke",
+                "hypothesis": "paired conditions",
+                "base_config": str(base_config),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    },
+                    {
+                        "name": "mobility:off",
+                        "hypothesis": "intervention",
+                        "overrides": {"model": {"type": {"mobility": False}}},
+                        "allowed_difference_paths": ["model.type.mobility"],
+                    },
+                ],
+                "paired_model_seeds": [42],
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            }
+        )
+    )
+    conditions = ["baseline", "mobility:off"]
     distributions = {
-        "ablation": optuna.distributions.CategoricalDistribution(ablations),
+        "condition": optuna.distributions.CategoricalDistribution(conditions),
         "seed": optuna.distributions.CategoricalDistribution([42]),
     }
-    for ablation in ablations:
+    for condition in conditions:
         study.add_trial(
             optuna.trial.create_trial(
-                params={"ablation": ablation, "seed": 42},
+                params={"condition": condition, "seed": 42},
                 distributions=distributions,
                 value=1.0,
             )
@@ -981,12 +1122,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
 
     run_root = tmp_path / "run"
     config = {
-        "ablation": {
-            "study_name": "ablation-study",
-            "campaign_id": "campaign-a",
-            "seeds": [42],
-            "ablations": "baseline mobility:off",
-        }
+        "ablation": {"study_name": "ablation-study", "campaign": str(campaign_path)}
     }
     config_path = run_root / "config.yaml"
     config_path.parent.mkdir(parents=True)
@@ -1010,6 +1146,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
     manifest = json.loads(
         (run_root / "outputs/ablation_analysis/ablation_manifest.json").read_text()
     )
+    assert manifest["campaign_sha256"]
     assert [artifact["path"] for artifact in manifest["artifacts"]] == [
         "ablation_metrics_aggregated.csv",
         "ablation_run_context.csv",
@@ -1020,6 +1157,12 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
         "-m",
         "scripts.analysis.analyze_ablations",
     ]
+    assert captured["command"][captured["command"].index("--campaign") + 1] == str(
+        campaign_path.resolve()
+    )
+    assert captured["command"][captured["command"].index("--journal") + 1] == str(
+        journal
+    )
 
 
 def test_finalize_crossval_validates_folds_and_aggregates_scalar_metrics(
@@ -1338,6 +1481,7 @@ def _workflow_mode_config(kind: str, run_root: Path) -> dict:
     return config
 
 
+@pytest.mark.integration
 def test_snakefile_builds_expected_dag(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_config(run_root, REPO_ROOT)
@@ -1359,9 +1503,10 @@ def test_snakefile_builds_expected_dag(tmp_path: Path) -> None:
     assert "--gpus-per-task=1" in result.stdout
     assert "training.run_final_evaluation=false" in result.stdout
     assert "complete_workflow" in result.stdout
-    assert re.search(r"^total\s+14$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+15$", result.stdout, re.MULTILINE)
 
 
+@pytest.mark.integration
 def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     tmp_path: Path,
 ) -> None:
@@ -1407,6 +1552,7 @@ def test_single_training_dag_has_distinct_train_and_evaluate_entities(
     assert "evaluation_manifest.json" in composed_result.stdout
 
 
+@pytest.mark.integration
 def test_single_training_smoke_default_dag_reaches_evaluation(
     tmp_path: Path,
 ) -> None:
@@ -1436,6 +1582,74 @@ def test_single_training_smoke_default_dag_reaches_evaluation(
     assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
 
 
+def test_profiled_training_dag_retains_one_dvc_evidence_pack(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_mode_config("train", run_root)
+    profiled = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_train_smoke.yaml"
+    )
+    profiled["workflow"]["target"] = "train"
+    profiled["provenance"] = {"training_evidence_retention": "dvc"}
+    profiled["evaluation"]["granular"] = True
+    config["workflow"] = profiled["workflow"]
+    config["training"] = profiled["training"]
+    config["evaluation"] = profiled["evaluation"]
+    config["provenance"] = profiled["provenance"]
+    config["resources"] = profiled["resources"]
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "export_training_provenance" in result.stdout
+    assert "retain_training_evidence" in result.stdout
+    assert "dvc push artifacts.dvc" not in result.stdout
+    assert "retain-training-evidence" in result.stdout
+    retention_commands = [
+        line
+        for line in result.stdout.splitlines()
+        if "Shell command:" in line and "retain-training-evidence" in line
+    ]
+    assert len(retention_commands) == 1
+    assert retention_commands[0].startswith("Shell command: srun ")
+    assert "retention.json" in result.stdout
+    assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
+
+
+@pytest.mark.integration
+def test_preprocessing_publication_launches_a_host_slurm_step(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_mode_config("preprocess", run_root)
+    template = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml"
+    )
+    config["workflow"].update(template["workflow"])
+    config["dvc"].update(template["dvc"])
+    for key in ["preprocessing", "resources"]:
+        config[key] = template[key]
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+    assert result.returncode == 0, result.stdout + result.stderr
+    publication_commands = [
+        line
+        for line in result.stdout.splitlines()
+        if "Shell command:" in line and "publish-preprocessed" in line
+    ]
+    assert len(publication_commands) == 1
+    assert publication_commands[0].startswith("Shell command: srun ")
+    assert "--cpus-per-task=20" in publication_commands[0]
+    assert "--gpus-per-task" not in publication_commands[0]
+
+
+@pytest.mark.integration
 def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     tmp_path: Path,
 ) -> None:
@@ -1455,9 +1669,99 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert "ablation_manifest.json" in result.stdout
     assert "seed_coverage_report.csv" in result.stdout
     assert "--workers 4" in result.stdout
-    assert re.search(r"^total\s+8$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
 
 
+def test_ablation_suite_uses_one_four_gpu_allocation_and_one_study_each(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_config(run_root, REPO_ROOT)
+    studies = [
+        {
+            "study_name": "epiforecaster_ablation_smoke_v1",
+            "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
+        },
+        {
+            "study_name": "epiforecaster_ablation_v2",
+            "campaign": "configs/campaigns/ablation_default_v2.yaml",
+        },
+    ]
+    load_targets = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation.yaml"
+    )["dvc"]["targets"]
+    config["workflow"].update(kind="ablation_suite", target="ablation_suite")
+    config["ablation_suite"] = {
+        "closeout_signal_seconds": 1200,
+        "timeout_s": 6000,
+        "studies": [
+            {
+                **study,
+                "workers": 4,
+                "recover_stale_running": True,
+                "sampler_seed": 52,
+                "smoketest": False,
+                "requeue_running": False,
+            }
+            for study in studies
+        ],
+    }
+    config["dvc"]["targets"] = load_targets
+    config["resources"] = {
+        "allocation": {
+            "account": "bsc08",
+            "partition": "acc",
+            "qos": "acc_debug",
+            "nodes": 1,
+            "tasks": 4,
+            "cpus_per_task": 20,
+            "gres": "gpu:4",
+            "runtime": 120,
+        }
+    }
+    config.pop("optuna")
+    config.pop("evaluation")
+    config.pop("promotion")
+    assert run_config.validate_mn5_allocation(config)["gres"] == "gpu:4"
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("rule launch_suite_study_workers:") == len(studies)
+    assert result.stdout.count("--workers 4") == len(studies)
+    for study in studies:
+        assert f"{study['study_name']}.journal" in result.stdout
+    assert "suite_manifest.json" in result.stdout
+
+
+def test_ablation_suite_manifest_requires_both_studies(tmp_path: Path) -> None:
+    config = {
+        "ablation_suite": {
+            "studies": [{"study_name": "temporal"}, {"study_name": "spatial"}]
+        }
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    temporal = tmp_path / "outputs/ablation_analysis/temporal/ablation_manifest.json"
+    temporal.parent.mkdir(parents=True)
+    temporal.write_text(
+        json.dumps(
+            {
+                "study_name": "temporal",
+                "campaign_id": "temporal",
+                "campaign_sha256": "a" * 64,
+            }
+        )
+    )
+    with pytest.raises(FileNotFoundError, match="spatial"):
+        run_support.finalize_ablation_suite(config_path, tmp_path)
+
+
+@pytest.mark.integration
 def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     tmp_path: Path,
 ) -> None:
@@ -1471,20 +1775,22 @@ def test_crossval_dag_uses_one_rank_per_fold_and_one_finalizer(
     result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "train_crossval_folds" in result.stdout
-    assert "evaluate_crossval_folds" in result.stdout
+    assert "train_crossval_fold" in result.stdout
+    assert "evaluate_crossval_fold" in result.stdout
     assert "finalize_crossval" in result.stdout
-    assert "--worker-group crossval-training" in result.stdout
-    assert "--worker-group crossval-evaluation" in result.stdout
-    assert "--workers 10" in result.stdout
-    assert (
-        "--fold '{worker_id}'" in result.stdout or "--fold {worker_id}" in result.stdout
-    )
+    assert "--worker-group crossval-training" not in result.stdout
+    assert "--workers 10" not in result.stdout
+    assert "--fold 000" in result.stdout
+    assert "--fold 009" in result.stdout
+    assert "fold_training_manifest.json" in result.stdout
+    assert "best_model.pt" in result.stdout
+    assert "gpu=1" in result.stdout
     assert "test_fold_metrics.csv" in result.stdout
     assert "test_aggregate_metrics.csv" in result.stdout
-    assert re.search(r"^total\s+10$", result.stdout, re.MULTILINE)
+    assert re.search(r"^total\s+28$", result.stdout, re.MULTILINE)
 
 
+@pytest.mark.integration
 def test_evaluation_only_dag_pins_checkpoint_inside_the_run(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("evaluate", run_root)
@@ -1560,6 +1866,25 @@ def test_every_stage_depends_on_the_complete_scientific_source_bundle() -> None:
     expected = run_config.scientific_source_files(paths)
     for stage in run_config.DEPENDENCY_STAGES:
         assert run_config.stage_source_files(paths, config, stage) == expected
+
+
+def test_research_role_changes_invalidate_stage_fingerprints(tmp_path: Path) -> None:
+    from workflow.common import dependency_sources, source_fingerprint
+
+    roles = Path("roles/research_roles.json")
+    folds = Path("configs/crossval/folds.json")
+    for relative in [roles, folds]:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"version": 1}')
+    for stage in ["training", "evaluation"]:
+        sources = dependency_sources(tmp_path, [roles, folds], {}, stage)
+        assert set(sources) == {str(tmp_path / roles), str(tmp_path / folds)}
+        for relative in [roles, folds]:
+            before = source_fingerprint(tmp_path, sources)
+            path = tmp_path / relative
+            path.write_text(path.read_text() + "\n")
+            assert source_fingerprint(tmp_path, sources) != before
 
 
 def test_evaluation_writes_and_hashes_required_artifact_contract(
@@ -1658,6 +1983,52 @@ def test_train_model_records_deterministic_checkpoint(
         "--max-batches",
         "2",
     ]
+
+
+def test_train_model_uses_validated_pinned_initialization_checkpoint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    base_config = source_root / "configs/train.yaml"
+    base_config.parent.mkdir(parents=True)
+    base_config.write_text("env: test\n")
+    pinned = run_root / "inputs/training_init_checkpoint.pt"
+    pinned.parent.mkdir(parents=True)
+    pinned.write_bytes(b"pretrained")
+    config = {
+        "training": {
+            "base_config": "configs/train.yaml",
+            "experiment_name": "fine-tune",
+            "model_id": "model",
+            "init_checkpoint": "/gpfs/pretrain/best_model.pt",
+            "overrides": [],
+        }
+    }
+    config_path = run_root / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    (run_root / "manifest.yaml").write_text(
+        yaml.safe_dump(
+            {"training_input": {"checkpoint_sha256": run_support.sha256_file(pinned)}}
+        )
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(command, *, cwd=None, env=None):
+        captured["command"] = command
+        checkpoint, _ = run_support.training_artifact_paths(config, run_root)
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"fine-tuned")
+        _complete_training_dynamics(checkpoint.parents[1])
+
+    monkeypatch.setattr(run_support, "_run", fake_run)
+
+    run_support.train_model(config_path, source_root, run_root)
+
+    command = captured["command"]
+    expected_override = f"training.init_checkpoint_path={pinned}"
+    assert expected_override in command
 
 
 @pytest.mark.parametrize(
@@ -1843,7 +2214,7 @@ def test_dependency_groups_keep_runtime_and_workflow_contracts_explicit() -> Non
 
 
 def test_container_build_is_source_independent_and_batch_validated() -> None:
-    batch = (REPO_ROOT / "containers/runtime/build_sif.sbatch").read_text()
+    batch = (REPO_ROOT / "containers/runtime/assemble_sif_on_mn5.sbatch").read_text()
     dispatcher = (REPO_ROOT / "containers/runtime/build_sif_on_mn5.sh").read_text()
     fetch = (REPO_ROOT / "containers/runtime/fetch_runtime_deps_on_wifi.sh").read_text()
 
@@ -1876,11 +2247,12 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "torch.cuda.is_available()" in batch
     assert "uv sync" in fetch
     assert "--frozen" in fetch
-    assert "--python /usr/local/bin/python3.11" in fetch
+    assert "--python /usr/local/bin/python3.13" in fetch
     assert "--group workflow" in fetch
     assert "--group runtime" not in fetch
     assert "UV_CONCURRENT_INSTALLS=1" in fetch
     assert "UV_LINK_MODE=copy" in fetch
+    assert 'UV_CACHE_ROOT="${UV_CACHE_ROOT:-/scratch/tmp/' in fetch
     assert '"$prefix_root/.venv/bin/python"' in fetch
     assert "sha256sum -c" in dispatcher
     assert "remote_bash" not in dispatcher
@@ -1898,6 +2270,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert 'grep -Fxq "dependency_key=$dependency_key"' in dispatcher
     assert 'mkdir "$request_root/dispatching"' in dispatcher
     assert 'exec 9>"$request_root/submit.lock"' in dispatcher
+    assert "build_sif.sbatch" not in dispatcher
 
 
 def _make_remote_run_staging(
@@ -2125,6 +2498,10 @@ def test_transferred_runner_submission_is_idempotent_and_pinned(
     assert "--gres=gpu:4" in call_lines[0]
     assert "--mem" not in call_lines[0]
     assert "--cores" not in call_lines[0]
+    assert (
+        str(run_root / "source/scripts/workflow/snakemake_coordinator.sh")
+        in call_lines[0]
+    )
     assert (run_root / ".state/coordinator.job_id").read_text() == "12345\n"
     attempt_id = (run_root / ".state/active_execution").read_text().strip()
     attempt_root = run_root / ".state/executions" / attempt_id
@@ -2185,7 +2562,7 @@ def test_transferred_runner_attaches_without_sbatch(
         text=True,
     )
 
-    assert result.stdout.startswith("attached:98765:")
+    assert result.stdout.startswith("coordinator-finished:0:")
     attempt_id = result.stdout.strip().split(":", 2)[2]
     attempt_root = run_root / ".state/executions" / attempt_id
     for _ in range(100):
@@ -2196,15 +2573,18 @@ def test_transferred_runner_attaches_without_sbatch(
     assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
     assert "mode\texisting-allocation\n" in (attempt_root / "binding.tsv").read_text()
     assert "--jobid=98765" in srun_calls.read_text()
-    assert "--external-launcher" in srun_calls.read_text()
+    assert "--job-name=snakemake-coordinator" in srun_calls.read_text()
+    assert "--overlap" in srun_calls.read_text()
     assert not (tmp_path / "sbatch.calls").exists()
     assert (
         run_root.parent / "by-slurm" / "98765" / "test-run" / attempt_id
     ).resolve() == run_root
 
 
-def test_external_launcher_coordinator_exports_validated_capacity(
-    tmp_path: Path,
+@pytest.mark.parametrize("mode", ["batch", "existing-allocation"])
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_container_coordinator_preserves_capacity_and_completion(
+    tmp_path: Path, mode: str, exit_code: int
 ) -> None:
     run_root = tmp_path / "run"
     attempt_root = run_root / ".state/executions/attempt"
@@ -2213,39 +2593,77 @@ def test_external_launcher_coordinator_exports_validated_capacity(
     source_root.mkdir()
     (run_root / "config.yaml").write_text("{}\n")
     capture = tmp_path / "capacity.txt"
-    snakemake = tmp_path / "snakemake"
-    snakemake.write_text(
-        "#!/bin/bash\n"
-        'printf "%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_CPUS_PER_TASK" '
-        '>"$CAPTURE"\n'
+    sif = tmp_path / "runtime.sif"
+    sif.touch()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    # Only the container runtime is executable on the host. The in-container
+    # Snakemake path deliberately does not exist in this test fixture.
+    singularity = fake_bin / "singularity"
+    singularity.write_text(
+        "#!/bin/bash\nset -euo pipefail\n"
+        'if [ "$1" = buildcfg ]; then printf "SESSIONDIR=%s\\n" '
+        '"${TMPDIR:-/tmp}/singularity/mnt/session"; exit 0; fi\n'
+        'printf "%s\\n" "$@" >"$CAPTURE.container"\n'
+        'test "$1" = exec\nshift\n'
+        'while [ "$#" -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        "    --cleanenv|--containall) shift ;;\n"
+        "    --bind|--pwd) shift 2 ;;\n"
+        '    --env) export "$2"; shift 2 ;;\n'
+        "    *) break ;;\n"
+        "  esac\ndone\n"
+        'test "$1" = "$EXPECTED_SIF"\nshift\n'
+        'test "$1" = /usr/local/bin/snakemake\nshift\n'
+        'printf "%s\\t%s\\t%s\\n" "$SLURM_JOB_NUM_NODES" "$SLURM_NTASKS" '
+        '"$SLURM_CPUS_PER_TASK" >"$CAPTURE"\n'
+        'printf "%s\\n" "$@" >"$CAPTURE.args"\n'
+        'printf "%s\\n" "$EPIFORECASTER_EXECUTION_MODE" >"$CAPTURE.mode"\n'
+        f"exit {exit_code}\n"
     )
-    snakemake.chmod(0o755)
+    singularity.chmod(0o755)
     coordinator = REPO_ROOT / "scripts/workflow/snakemake_coordinator.sh"
     env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "CAPTURE": str(capture),
+        "EXPECTED_SIF": str(sif),
         "SLURM_JOB_ID": "98765",
         "SLURM_STEP_ID": "7",
         "SLURM_NNODES": "1",
-        "SLURM_NTASKS": "1",
+        "SLURM_JOB_NUM_NODES": "1",
+        "SLURM_NTASKS": "2" if mode == "batch" else "1",
+        "SLURM_CPUS_PER_TASK": "20",
     }
-
-    subprocess.run(
-        [
-            str(coordinator),
-            str(run_root),
-            str(snakemake),
-            "1",
-            "20",
-            "existing-allocation",
-            str(attempt_root),
-        ],
+    result = subprocess.run(
+        [str(coordinator), str(run_root), str(sif), "2", "20", mode, str(attempt_root)],
         env=env,
-        check=True,
+        capture_output=True,
+        text=True,
     )
-
-    assert capture.read_text() == "1\t20\n"
-    assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
+    assert result.returncode == exit_code, result.stderr
+    assert capture.read_text() == "1\t2\t20\n"
+    assert Path(f"{capture}.mode").read_text().strip() == mode
+    container_arguments = Path(f"{capture}.container").read_text().splitlines()
+    assert f"{sif.parent}:{sif.parent}:ro" in container_arguments
+    arguments = Path(f"{capture}.args").read_text().splitlines()
+    assert arguments[arguments.index("--cores") + 1] == "40"
+    assert arguments[arguments.index("--jobs") + 1] == "2"
+    assert arguments[arguments.index("--resources") + 1] == "gpu=2"
+    assert f"exit_code\t{exit_code}\n" in (attempt_root / "completed.tsv").read_text()
     assert (attempt_root / "coordinator.step_id").read_text() == "7\n"
+
+
+def test_slurm_step_disables_cpu_binding_for_existing_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EPIFORECASTER_EXECUTION_MODE", raising=False)
+    batch_step = slurm_step("echo batch", 20)
+
+    monkeypatch.setenv("EPIFORECASTER_EXECUTION_MODE", "existing-allocation")
+    interactive_step = slurm_step("echo interactive", 20)
+
+    assert "--cpu-bind=none" not in batch_step
+    assert "--cpu-bind=none" in interactive_step
 
 
 @pytest.mark.parametrize("command", ["run", "dry-run"])
@@ -2312,6 +2730,111 @@ def test_container_wrapper_preserves_scientific_exit_status(tmp_path: Path) -> N
     assert not (scratch / "epiforecaster" / run_root.name / "local_batch_0").exists()
 
 
+def test_run_scoped_dvc_push_uses_parent_workspace_bind(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    remote = tmp_path / "remote"
+    cache = tmp_path / "cache"
+    run_root.mkdir()
+    source_root.mkdir()
+    remote.mkdir()
+    cache.mkdir()
+
+    command = container_command(
+        ["python", "-m", "scripts.workflow.run_support", "retain-training-evidence"],
+        run_root=run_root,
+        source_root=source_root,
+        sif=str(tmp_path / "runtime.sif"),
+        dvc_remote=str(remote),
+        dvc_cache=str(cache),
+        dvc_mode="push",
+        promotion_root=str(run_root / "evidence"),
+    )
+
+    assert "--promotion-root" not in shlex.split(command)
+
+    global_promotion_command = container_command(
+        ["python", "-m", "scripts.workflow.run_support", "promote"],
+        run_root=run_root,
+        source_root=source_root,
+        sif=str(tmp_path / "runtime.sif"),
+        dvc_remote=str(remote),
+        dvc_cache=str(cache),
+        dvc_mode="push",
+        promotion_root=str(tmp_path / "promoted"),
+    )
+
+    global_parts = shlex.split(global_promotion_command)
+    promotion_index = global_parts.index("--promotion-root")
+    assert global_parts[promotion_index + 1] == str(tmp_path / "promoted")
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+def test_container_wrapper_avoids_run_scoped_child_bind_for_dvc_push(
+    tmp_path: Path,
+    sidecar: bool,
+) -> None:
+    run_root = tmp_path / "run"
+    source_root = tmp_path / "source"
+    remote = tmp_path / "remote"
+    cache = tmp_path / "cache"
+    fake_bin = tmp_path / "bin"
+    scratch = tmp_path / "scratch"
+    capture = tmp_path / "singularity-arguments.txt"
+    sif = tmp_path / "runtime.sif"
+    for directory in (run_root, source_root, remote, cache, fake_bin, scratch):
+        directory.mkdir()
+    sif.touch()
+
+    if sidecar:
+        Path(f"{sif}.sha256").write_text("a" * 64 + "  runtime.sif\n")
+
+    singularity = fake_bin / "singularity"
+    singularity.write_text('#!/bin/bash\nprintf "%s\\n" "$@" >"$CAPTURE"\n')
+    singularity.chmod(0o755)
+    wrapper = REPO_ROOT / "scripts/workflow/mn5_container_exec.sh"
+    env = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "TMPDIR": str(scratch),
+        "CAPTURE": str(capture),
+    }
+
+    subprocess.run(
+        [
+            "bash",
+            str(wrapper),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(sif),
+            "--dvc-mode",
+            "push",
+            "--dvc-remote",
+            str(remote),
+            "--dvc-cache",
+            str(cache),
+            "--",
+            "scientific-command",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+    )
+
+    binds = [
+        line
+        for line in capture.read_text().splitlines()
+        if line.startswith(f"{run_root}:")
+    ]
+    assert binds == [f"{run_root}:/workspace/run:rw"]
+    arguments = capture.read_text().splitlines()
+    assert "HOME=/tmp" not in arguments
+    assert (f"{sif.parent}:{sif.parent}:ro" in arguments) is sidecar
+    assert f"{sif}.sha256:{sif}.sha256:ro" not in arguments
+
+
 def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     dispatcher = (REPO_ROOT / "scripts/workflow/mn5_workflow.sh").read_text()
     remote_runner = (REPO_ROOT / "scripts/workflow/remote_run.sh").read_text()
@@ -2329,12 +2852,10 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "declare -f" not in dispatcher
     assert "remote_function" not in dispatcher
     assert "remote_run.sh" in dispatcher
-    assert "remote_tooling.sh" not in dispatcher
     assert 'staging_root="$REMOTE_WORKFLOW_RUN_ROOT/.staging-' in dispatcher
     assert "--dispatch-file" in dispatcher
     assert "uv sync" not in dispatcher
     assert "uv sync" not in remote_runner
-    assert "scripts.workflow.tooling_identity" not in dispatcher
     assert 'REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"' in dispatcher
     assert 'TOOLING_KEY="sif-sha256:$observed_sha"' in dispatcher
     assert "executor_commit=" not in dispatcher
@@ -2343,19 +2864,20 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "workflow/config/mn5_train.yaml" in dispatcher
     assert "$RUN_ROOT/.state/workflow.done" in remote_runner
     assert "sbatch --parsable" in remote_runner
-    assert '--ntasks="$TASKS"' in remote_runner
-    assert '--cpus-per-task="$CPUS_PER_TASK"' in remote_runner
-    assert '--gres="$GRES"' in remote_runner
+    assert '"--ntasks=$TASKS"' in remote_runner
+    assert '"--cpus-per-task=$CPUS_PER_TASK"' in remote_runner
+    assert '"--gres=$GRES"' in remote_runner
+    assert '"--signal=USR1@$CLOSEOUT_SIGNAL_SECONDS"' in remote_runner
     assert '"$TASKS"' in remote_runner
     assert '"$CPUS_PER_TASK"' in remote_runner
-
     assert (
         '"$@"'
         not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
     )
     assert "--mem" not in coordinator
-    assert "--external-launcher" in remote_runner
-    assert "attach-worker" in remote_runner
+    assert "launch_coordinator_step" in remote_runner
+    assert "--overlap" in remote_runner
+    assert "probe-worker" in remote_runner
     assert "acc_interactive" in remote_runner
     assert "active_attempt_status" in remote_runner
     assert "--dvc-project-root" not in container_exec
@@ -2373,7 +2895,8 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "trap - EXIT" in container_exec
     assert 'chmod -R u+w "$SCRATCH_ROOT"' in container_exec
     assert 'exit "$status"' in container_exec
-    assert 'exec "$SCRIPT_DIR/snakemake_coordinator.sh" "$@"' in coordinator
+    assert 'exec "$COORDINATOR" "$@"' in coordinator
+    assert '"$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"' in remote_runner
     assert 'exec 9>"$RUN_ROOT/.state/coordinator.run.lock"' in shared_coordinator
     assert "EPIFORECASTER_EXECUTION_MODE" in shared_coordinator
     assert "#SBATCH --ntasks=4" in coordinator
@@ -2385,3 +2908,150 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "--kill-on-bad-exit=1" in launcher
     assert 'WORKER_INDEX="${SLURM_PROCID:' in worker
     assert "EPIFORECASTER_WORKER_ID=$WORKER_INDEX" in worker
+
+
+def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    workflow_root = source_root / "scripts/workflow"
+    workflow_root.mkdir(parents=True)
+    worker_script = workflow_root / "run_parallel_worker.sh"
+    shutil.copy2(
+        REPO_ROOT / "scripts/workflow/run_parallel_worker.sh",
+        worker_script,
+    )
+    container_exec = workflow_root / "mn5_container_exec.sh"
+    container_exec.write_text('#!/bin/bash\nexit "$FAKE_STATUS"\n')
+    container_exec.chmod(0o755)
+    run_root = tmp_path / "run"
+    marker_root = run_root / ".state/workers/ablation"
+    marker_root.mkdir(parents=True)
+
+    result = subprocess.run(
+        [
+            str(worker_script),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(tmp_path / "runtime.sif"),
+            "--cpus",
+            "20",
+            "--worker-group",
+            "ablation",
+            "--worker-offset",
+            "0",
+            "--",
+            "echo",
+            "unused",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "FAKE_STATUS": "75",
+            "SLURM_JOB_ID": "12345",
+            "SLURM_STEP_ID": "0",
+            "SLURM_PROCID": "0",
+        },
+    )
+
+    assert result.returncode == 0
+    assert not (marker_root / "000.done").exists()
+    assert "outcome=continuation" in (marker_root / "000.partial").read_text()
+
+
+@pytest.mark.parametrize(
+    ("journal_status", "expected_exit", "continuation"),
+    [(0, 0, False), (75, 75, True), (1, 1, False)],
+)
+def test_parallel_launcher_uses_journal_after_worker_receipts(
+    tmp_path: Path, journal_status: int, expected_exit: int, continuation: bool
+) -> None:
+    source_root = tmp_path / "source"
+    workflow_root = source_root / "scripts/workflow"
+    workflow_root.mkdir(parents=True)
+    launcher = workflow_root / "launch_parallel_workers.sh"
+    shutil.copy2(REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh", launcher)
+    checker = workflow_root / "mn5_container_exec.sh"
+    checker.write_text('#!/bin/bash\nexit "$FAKE_JOURNAL_STATUS"\n')
+    checker.chmod(0o755)
+    run_root = tmp_path / "run"
+    marker_root = run_root / ".state/workers/ablation_test"
+    marker_root.mkdir(parents=True)
+    # The launcher clears stale receipts, so the rank publishes a fresh one.
+    (workflow_root / "run_parallel_worker.sh").write_text(
+        f"#!/bin/bash\necho outcome=continuation >{marker_root}/000.partial\n"
+    )
+    (workflow_root / "run_parallel_worker.sh").chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "srun").write_text(
+        '#!/bin/bash\nif [[ " $* " == *" --cpus-per-task=1 "* ]]; then\n'
+        '  exit "$FAKE_JOURNAL_STATUS"\nfi\n'
+        'for a in "$@"; do case "$a" in *run_parallel_worker.sh) "$a";; esac; done\n'
+        "exit 0\n"
+    )
+    (fake_bin / "srun").chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(launcher),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(tmp_path / "runtime.sif"),
+            "--workers",
+            "1",
+            "--cpus-per-task",
+            "20",
+            "--worker-group",
+            "ablation_test",
+            "--",
+            "python",
+            "-m",
+            "scripts.hpo.ablation_worker",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "FAKE_JOURNAL_STATUS": str(journal_status),
+            "SLURM_JOB_NUM_NODES": "1",
+            "SLURM_NTASKS": "1",
+            "SLURM_CPUS_PER_TASK": "20",
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+
+    assert result.returncode == expected_exit
+    assert (run_root / ".state/continuation.required").exists() == continuation
+
+
+def test_snapshot_rejects_dvc_mount_parent_missing_from_inventory(
+    tmp_path: Path,
+) -> None:
+    pointer = tmp_path / "raw.dvc"
+    pointer.write_text(
+        yaml.safe_dump({"outs": [{"md5": "a.dir", "path": "inputs/raw/data"}]})
+    )
+    config = {"dvc": {"targets": ["raw.dvc"]}}
+    with pytest.raises(ValueError, match="DVC mount parents"):
+        run_config.validate_code_data_separation(tmp_path, [Path("raw.dvc")], config)
+    parent = tmp_path / "inputs/raw"
+    parent.mkdir(parents=True)
+    # A directory that only exists locally is not enough for the source bundle.
+    with pytest.raises(ValueError, match="DVC mount parents"):
+        run_config.validate_code_data_separation(tmp_path, [Path("raw.dvc")], config)
+    pointer.rename(parent / "data.dvc")
+    (parent / "data.dvc").write_text(
+        yaml.safe_dump({"outs": [{"md5": "a.dir", "path": "data"}]})
+    )
+    relative = Path("inputs/raw/data.dvc")
+    assert run_config.validate_code_data_separation(
+        tmp_path, [relative], {"dvc": {"targets": [str(relative)]}}
+    ) == {relative: Path("inputs/raw/data")}

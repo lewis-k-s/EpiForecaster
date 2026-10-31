@@ -11,7 +11,6 @@ from dataviz.canonical_input_comparison import (
     SourceSpec,
     generate_canonical_input_comparison,
     load_canonical_source,
-    make_canonical_input_comparison_figure,
     restrict_sources_to_shared_time_range,
     select_comparison_windows,
 )
@@ -89,7 +88,10 @@ def _write_dataset(
                 np.zeros(shape, dtype=np.float32),
             ),
             "edar_has_source": ((REGION_COORD,), source_mask.astype(np.int8)),
-            "population": ((REGION_COORD,), np.array([1000, 1200, 900])[: len(region_ids)]),
+            "population": (
+                (REGION_COORD,),
+                np.array([1000, 1200, 900])[: len(region_ids)],
+            ),
             "valid_targets": (
                 ("run_id", REGION_COORD),
                 np.ones((len(run_ids), len(region_ids)), dtype=np.int8),
@@ -104,7 +106,9 @@ def _write_dataset(
     ds.to_zarr(path, zarr_format=2)
 
 
-def test_select_comparison_windows_uses_shared_regions_and_overlap(tmp_path: Path) -> None:
+def test_select_comparison_windows_uses_shared_regions_and_overlap(
+    tmp_path: Path,
+) -> None:
     real_path = tmp_path / "real.zarr"
     synth_path = tmp_path / "synth.zarr"
     _write_dataset(
@@ -144,72 +148,10 @@ def test_select_comparison_windows_uses_shared_regions_and_overlap(tmp_path: Pat
     assert len(selections) == 2
     assert {selection.region_id for selection in selections} == {"08001", "08002"}
     assert all(len(selection.window_dates) == 4 for selection in selections)
-    assert all(str(selection.window_dates[0].date()) >= "2020-03-01" for selection in selections)
-
-
-def test_make_canonical_input_comparison_figure_returns_expected_axes() -> None:
-    window_dates = pd.date_range("2020-03-01", periods=5, freq="D")
-    grouped_samples = [
-        [
-            {
-                "source_label": "real",
-                "region_id": "08001",
-                "window_dates": window_dates,
-                "comparison_score": 20.0,
-                "cases_series": np.arange(5, dtype=np.float32),
-                "cases_age": np.linspace(0, 1, 5, dtype=np.float32),
-                "cases_obs_mask_full": np.ones(5, dtype=np.float32),
-                "hosp_series": np.arange(5, dtype=np.float32) + 10,
-                "hosp_age": np.linspace(0, 1, 5, dtype=np.float32),
-                "hosp_obs_mask_full": np.ones(5, dtype=np.float32),
-                "deaths_series": np.arange(5, dtype=np.float32) + 20,
-                "deaths_age": np.linspace(0, 1, 5, dtype=np.float32),
-                "deaths_obs_mask_full": np.ones(5, dtype=np.float32),
-                "biomarkers": {
-                    "N1": {
-                        "value": np.arange(5, dtype=np.float32) + 30,
-                        "mask": np.ones(5, dtype=np.float32),
-                        "censor": np.zeros(5, dtype=np.float32),
-                        "age": np.linspace(0, 1, 5, dtype=np.float32),
-                    }
-                },
-                "ww_series": np.arange(5, dtype=np.float32) + 30,
-                "ww_obs_mask_full": np.ones(5, dtype=np.float32),
-            },
-            {
-                "source_label": "synth",
-                "region_id": "08001",
-                "window_dates": window_dates,
-                "comparison_score": 20.0,
-                "cases_series": np.arange(5, dtype=np.float32) + 1,
-                "cases_age": np.linspace(0, 1, 5, dtype=np.float32),
-                "cases_obs_mask_full": np.ones(5, dtype=np.float32),
-                "hosp_series": np.arange(5, dtype=np.float32) + 11,
-                "hosp_age": np.linspace(0, 1, 5, dtype=np.float32),
-                "hosp_obs_mask_full": np.ones(5, dtype=np.float32),
-                "deaths_series": np.arange(5, dtype=np.float32) + 21,
-                "deaths_age": np.linspace(0, 1, 5, dtype=np.float32),
-                "deaths_obs_mask_full": np.ones(5, dtype=np.float32),
-                "biomarkers": {
-                    "N1": {
-                        "value": np.arange(5, dtype=np.float32) + 31,
-                        "mask": np.ones(5, dtype=np.float32),
-                        "censor": np.zeros(5, dtype=np.float32),
-                        "age": np.linspace(0, 1, 5, dtype=np.float32),
-                    }
-                },
-                "ww_series": np.arange(5, dtype=np.float32) + 31,
-                "ww_obs_mask_full": np.ones(5, dtype=np.float32),
-            },
-        ]
-    ]
-
-    fig = make_canonical_input_comparison_figure(grouped_samples, window_length=5)
-    try:
-        assert fig is not None
-        assert len(fig.axes) == 8
-    finally:
-        fig.clf()
+    assert all(
+        str(selection.window_dates[0].date()) >= "2020-03-01"
+        for selection in selections
+    )
 
 
 def test_generate_canonical_input_comparison_writes_outputs(tmp_path: Path) -> None:

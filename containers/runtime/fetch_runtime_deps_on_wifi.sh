@@ -11,7 +11,7 @@ DEPENDENCY_KEY="${DEPENDENCY_KEY:?DEPENDENCY_KEY must be set}"
 UV_LOCK_SHA256="${UV_LOCK_SHA256:?UV_LOCK_SHA256 must be set}"
 BUILD_ROOT="${BUILD_ROOT:?BUILD_ROOT must be set}"
 CONTAINER_ROOT="${CONTAINER_ROOT:?CONTAINER_ROOT must be set}"
-UV_CACHE_ROOT="${UV_CACHE_ROOT:-$BUILD_ROOT/uv-cache}"
+UV_CACHE_ROOT="${UV_CACHE_ROOT:-/scratch/tmp/${USER:-unknown}/epiforecaster-container-cache/$DEPENDENCY_KEY}"
 
 if [[ ! "$BASE_IMAGE_REF" =~ @sha256:([0-9a-f]{64})$ ]]; then
   echo "BASE_IMAGE_REF must be pinned to an amd64 manifest digest" >&2
@@ -25,7 +25,7 @@ fi
 
 base_key="${base_digest:0:20}"
 base_root="$CONTAINER_ROOT/bases"
-base_sif="$base_root/uv-python311-bookworm-$base_key.sif"
+base_sif="$base_root/uv-python313-bookworm-$base_key.sif"
 context_root="$BUILD_ROOT/context"
 prefix_root="$BUILD_ROOT/prefix"
 cache_root="$UV_CACHE_ROOT"
@@ -54,7 +54,7 @@ materialize_base_sif() {
     return 0
   fi
 
-  temporary="$base_root/.uv-python311-bookworm-$base_key-$$.sif"
+  temporary="$base_root/.uv-python313-bookworm-$base_key-$$.sif"
   trap 'rm -f "$temporary"' EXIT
   singularity pull "$temporary" "docker://$BASE_IMAGE_REF"
   singularity inspect "$temporary" >/dev/null
@@ -83,11 +83,10 @@ reuse_ready_bundle() {
 load_singularity
 
 mkdir -p "$base_root" "$cache_root" "$temporary_root"
-exec 9>"$base_root/.uv-python311-bookworm-$base_key.lock"
+exec 9>"$base_root/.uv-python313-bookworm-$base_key.lock"
 flock 9
-exec 8>"$cache_root/.uv-sync.lock"
 export SINGULARITY_CACHEDIR="$cache_root/singularity"
-export SINGULARITY_LOCALCACHEDIR="/scratch/tmp/$USER/epiforecaster-$DEPENDENCY_KEY"
+export SINGULARITY_LOCALCACHEDIR="$cache_root/singularity-local"
 export SINGULARITY_TMPDIR="$temporary_root"
 export TMPDIR="$temporary_root"
 mkdir -p \
@@ -108,7 +107,6 @@ fi
 test -f "$context_root/pyproject.toml"
 test -f "$context_root/uv.lock"
 mkdir -p "$prefix_root/.venv" "$cache_root/uv"
-flock 8
 
 singularity exec --cleanenv \
   --bind "$context_root:/workspace/source:ro" \
@@ -124,7 +122,7 @@ singularity exec --cleanenv \
   UV_PYTHON_DOWNLOADS=never \
   uv sync \
   --frozen \
-  --python /usr/local/bin/python3.11 \
+  --python /usr/local/bin/python3.13 \
   --no-install-project \
   --no-default-groups \
   --group workflow
@@ -133,7 +131,7 @@ singularity exec --cleanenv \
   --bind "$prefix_root:/opt/epiforecaster:ro" \
   "$base_sif" \
   /opt/epiforecaster/.venv/bin/python -c \
-  'import sys; assert sys.version_info[:2] == (3, 11); import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("locked dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
+  'import sys; assert sys.version_info[:2] == (3, 13); import dvc, geopandas, netCDF4, optuna, snakemake, torch, torch_geometric, xarray, zarr; print("locked dependency imports: ok", sys.version, snakemake.__version__, torch.__version__)'
 
 chmod -R a-w "$prefix_root"
 printf '%s\n' \
