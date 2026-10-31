@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import functools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +16,59 @@ from evaluation.distribution_scores import (
 
 _EPSILON = 1e-6
 _VALUE_CLAMP = 1.0e6
+
+MetricSums = dict[str, torch.Tensor]
+
+
+def _batch_input(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        value = value.contiguous()
+        if value.ndim > 0:
+            torch._dynamo.maybe_mark_dynamic(value, 0)
+        return value
+    if isinstance(value, tuple):
+        return tuple(_batch_input(item) for item in value)
+    return value
+
+
+@functools.cache
+def compiled_metric_step(step: Callable, **compile_options: object) -> Callable:
+    """Return one shared ``torch.compile`` wrapper for a pure metric step.
+
+    A step takes the running sums as a dict and returns new sums, so the
+    compiled graph holds no in-place state or Python side effects. The
+    wrapper is shared, so all heads and splits reuse the same graphs.
+
+    Heads pass contiguous tensors or views of wider nowcast tensors, and the
+    last batch is smaller. Contiguous inputs with a dynamic batch dim let one
+    graph serve all of them; static guards gave five graphs per step. Python
+    constants (for example the Student-t df) stay specialized.
+    """
+    compiled = torch.compile(step, **compile_options)
+
+    @functools.wraps(step)
+    def run(*args: object, **kwargs: object) -> object:
+        return compiled(*(_batch_input(arg) for arg in args), **kwargs)
+
+    return run
+
+
+def distinct_metric_sums(sums: MetricSums) -> MetricSums:
+    """Give every key its own tensor.
+
+    Dynamo guards on tensors shared between keys. The first step returns
+    distinct tensors, so shared initial zeros would force one more compile.
+    """
+    return {name: value.clone() for name, value in sums.items()}
+
+
+def _clean_values(value: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(
+        value.float(),
+        nan=0.0,
+        posinf=_VALUE_CLAMP,
+        neginf=-_VALUE_CLAMP,
+    ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
 
 
 def _compute_per_horizon_metrics(
@@ -121,26 +176,89 @@ def standard_interval_half_width(
     return float(stats.t.ppf(quantile, distribution_df))
 
 
+def _masked_metric_step(
+    sums: MetricSums,
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    observed_mask: torch.Tensor | None,
+    sample_weights: torch.Tensor | None,
+) -> tuple[MetricSums, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Add one batch to ``sums``; return (sums, diff, abs_diff, effective_mask)."""
+    pred = _clean_values(predictions)
+    target = _clean_values(targets)
+
+    finite_target = torch.isfinite(targets.float()).to(pred.dtype)
+    if sample_weights is not None:
+        mask = (
+            torch.nan_to_num(
+                sample_weights.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(min=0.0)
+            * finite_target
+        )
+    elif observed_mask is None:
+        mask = finite_target
+    else:
+        mask = (
+            torch.nan_to_num(
+                observed_mask.float(),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(min=0.0, max=1.0)
+            * finite_target
+        ).to(pred.dtype)
+
+    diff = pred - target
+    abs_diff = diff.abs()
+    weighted_abs_error = abs_diff * mask
+    weighted_sq_error = (diff**2) * mask
+    new_sums = {
+        "mae": sums["mae"] + weighted_abs_error.sum(),
+        "mse": sums["mse"] + weighted_sq_error.sum(),
+        "weight": sums["weight"] + mask.sum(),
+        "target": sums["target"] + (target * mask).sum(),
+        "target_sq": sums["target_sq"] + ((target**2) * mask).sum(),
+        "observed": sums["observed"] + (mask > 0).sum(),
+    }
+    if "per_h_mae" in sums:
+        new_sums["per_h_mae"] = sums["per_h_mae"] + weighted_abs_error.sum(dim=0)
+        new_sums["per_h_mse"] = sums["per_h_mse"] + weighted_sq_error.sum(dim=0)
+        new_sums["per_h_count"] = sums["per_h_count"] + mask.sum(dim=0)
+    return new_sums, diff, abs_diff, mask
+
+
 class TorchMaskedMetricAccumulator:
     """Accumulate masked metrics; per-horizon mode requires [B, H]."""
 
-    def __init__(self, *, device: torch.device, horizon: int | None = None):
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        horizon: int | None = None,
+        compile_step: bool = False,
+    ):
         self.device = device
         self.horizon = horizon
-        self.mae_sum = torch.tensor(0.0, device=device)
-        self.mse_sum = torch.tensor(0.0, device=device)
-        self.weight_sum = torch.tensor(0.0, device=device)
-        self.target_weighted_sum = torch.tensor(0.0, device=device)
-        self.target_weighted_sq_sum = torch.tensor(0.0, device=device)
-        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
-        self.per_h_mae_sum = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.per_h_mse_sum = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.per_h_count_sum = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
+        zero = torch.tensor(0.0, device=device)
+        self.sums: MetricSums = {
+            "mae": zero,
+            "mse": zero,
+            "weight": zero,
+            "target": zero,
+            "target_sq": zero,
+            "observed": torch.tensor(0, device=device, dtype=torch.long),
+        }
+        if horizon is not None:
+            zeros = torch.zeros(horizon, device=device)
+            self.sums.update(per_h_mae=zeros, per_h_mse=zeros, per_h_count=zeros)
+        self.sums = distinct_metric_sums(self.sums)
+        self._step = (
+            compiled_metric_step(_masked_metric_step)
+            if compile_step
+            else _masked_metric_step
         )
 
     def update(
@@ -151,67 +269,13 @@ class TorchMaskedMetricAccumulator:
         sample_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update accumulators and return cleaned (diff, abs_diff, effective_mask)."""
-        pred = torch.nan_to_num(
-            predictions.float(),
-            nan=0.0,
-            posinf=_VALUE_CLAMP,
-            neginf=-_VALUE_CLAMP,
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        target = torch.nan_to_num(
-            targets.float(),
-            nan=0.0,
-            posinf=_VALUE_CLAMP,
-            neginf=-_VALUE_CLAMP,
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-
-        finite_target = torch.isfinite(targets.float()).to(pred.dtype)
-        if sample_weights is not None:
-            mask = (
-                torch.nan_to_num(
-                    sample_weights.float(),
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                ).clamp(min=0.0)
-                * finite_target
-            )
-        elif observed_mask is None:
-            mask = finite_target
-        else:
-            mask = (
-                torch.nan_to_num(
-                    observed_mask.float(),
-                    nan=0.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                ).clamp(min=0.0, max=1.0)
-                * finite_target
-            ).to(pred.dtype)
-
-        diff = pred - target
-        abs_diff = diff.abs()
-        weighted_abs_error = abs_diff * mask
-        weighted_sq_error = (diff**2) * mask
-        mask_sum = mask.sum()
-        self.mae_sum += weighted_abs_error.sum()
-        self.mse_sum += weighted_sq_error.sum()
-        self.weight_sum += mask_sum
-        self.target_weighted_sum += (target * mask).sum()
-        self.target_weighted_sq_sum += ((target**2) * mask).sum()
-        self.observed_count += (mask > 0).sum()
-
-        if self.horizon is not None:
-            assert self.per_h_mae_sum is not None
-            assert self.per_h_mse_sum is not None
-            assert self.per_h_count_sum is not None
-            self.per_h_mae_sum += weighted_abs_error.sum(dim=0)
-            self.per_h_mse_sum += weighted_sq_error.sum(dim=0)
-            self.per_h_count_sum += mask.sum(dim=0)
-
+        self.sums, diff, abs_diff, mask = self._step(
+            self.sums, predictions, targets, observed_mask, sample_weights
+        )
         return diff, abs_diff, mask
 
     def finalize(self) -> MaskedMetricResult:
-        if float(self.weight_sum.item()) <= 0:
+        if float(self.sums["weight"].item()) <= 0:
             return MaskedMetricResult(
                 mae=float("nan"),
                 rmse=float("nan"),
@@ -222,36 +286,176 @@ class TorchMaskedMetricAccumulator:
                 rmse_per_h=[],
             )
 
-        weight_sum = self.weight_sum.clamp_min(1e-8)
-        mae = (self.mae_sum / weight_sum).item()
-        rmse = math.sqrt((self.mse_sum / weight_sum).item())
-        ss_res = self.mse_sum.item()
+        weight_sum = self.sums["weight"].clamp_min(1e-8)
+        mae = (self.sums["mae"] / weight_sum).item()
+        rmse = math.sqrt((self.sums["mse"] / weight_sum).item())
+        ss_res = self.sums["mse"].item()
         ss_tot = (
-            self.target_weighted_sq_sum - (self.target_weighted_sum**2) / weight_sum
+            self.sums["target_sq"] - (self.sums["target"] ** 2) / weight_sum
         ).item()
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
         mae_per_h: list[float] = []
         rmse_per_h: list[float] = []
         if self.horizon is not None:
-            assert self.per_h_mae_sum is not None
-            assert self.per_h_mse_sum is not None
-            assert self.per_h_count_sum is not None
             mae_per_h, rmse_per_h = _compute_per_horizon_metrics(
-                abs_sum=self.per_h_mae_sum,
-                mse_sum=self.per_h_mse_sum,
-                count_sum=self.per_h_count_sum,
+                abs_sum=self.sums["per_h_mae"],
+                mse_sum=self.sums["per_h_mse"],
+                count_sum=self.sums["per_h_count"],
             )
 
         return MaskedMetricResult(
             mae=mae,
             rmse=rmse,
             r2=r2,
-            observed_count=int(self.observed_count.item()),
-            effective_count=float(self.weight_sum.item()),
+            observed_count=int(self.sums["observed"].item()),
+            effective_count=float(self.sums["weight"].item()),
             mae_per_h=mae_per_h,
             rmse_per_h=rmse_per_h,
         )
+
+
+def _distribution_effective_mask(
+    *,
+    targets: torch.Tensor,
+    observed_mask: torch.Tensor | None,
+    sample_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    finite_target = torch.isfinite(targets.float()).to(dtype=torch.float32)
+    if sample_weights is not None:
+        mask = torch.nan_to_num(
+            sample_weights.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp(min=0.0)
+    elif observed_mask is None:
+        mask = finite_target
+    else:
+        mask = torch.nan_to_num(
+            observed_mask.float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(min=0.0, max=1.0)
+    return mask * finite_target
+
+
+def _distribution_nll(
+    *,
+    loc: torch.Tensor,
+    scale: torch.Tensor,
+    target: torch.Tensor,
+    distribution_family: str,
+    distribution_df: float,
+) -> torch.Tensor:
+    if distribution_family == "normal":
+        z = (target - loc) / scale
+        return 0.5 * z**2 + torch.log(scale) + 0.5 * math.log(2.0 * math.pi)
+
+    df = torch.as_tensor(distribution_df, dtype=loc.dtype, device=loc.device)
+    dist = torch.distributions.StudentT(df, loc=loc, scale=scale)
+    return -dist.log_prob(target)
+
+
+def _distribution_metric_step(
+    sums: MetricSums,
+    loc: torch.Tensor,
+    scale: torch.Tensor,
+    targets: torch.Tensor,
+    observed_mask: torch.Tensor | None,
+    sample_weights: torch.Tensor | None,
+    *,
+    distribution_family: str,
+    distribution_df: float,
+    scale_floor: float,
+    wis_half_widths: torch.Tensor,
+    interval_half_widths: dict[str, torch.Tensor],
+) -> tuple[MetricSums, ProbabilisticBatchMetrics]:
+    """Add one batch of probabilistic scores to ``sums``."""
+    loc_clean = _clean_values(loc)
+    scale_clean = torch.nan_to_num(
+        scale.float(),
+        nan=scale_floor,
+        posinf=_VALUE_CLAMP,
+        neginf=scale_floor,
+    ).clamp(min=scale_floor, max=_VALUE_CLAMP)
+    target_clean = _clean_values(targets).to(loc_clean.device)
+    mask = _distribution_effective_mask(
+        targets=targets,
+        observed_mask=observed_mask,
+        sample_weights=sample_weights,
+    ).to(loc_clean.device)
+    active = mask > 0
+    invalid = (~torch.isfinite(loc) | ~torch.isfinite(scale) | (scale <= 0)) & active
+    per_h = "per_h_nll" in sums
+
+    nll = torch.nan_to_num(
+        _distribution_nll(
+            loc=loc_clean,
+            scale=scale_clean,
+            target=target_clean,
+            distribution_family=distribution_family,
+            distribution_df=distribution_df,
+        ),
+        nan=_VALUE_CLAMP,
+        posinf=_VALUE_CLAMP,
+        neginf=-_VALUE_CLAMP,
+    ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
+    if distribution_family == "normal":
+        crps = _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
+    else:
+        crps = student_t_crps(loc_clean, scale_clean, target_clean, distribution_df)
+    wis = distribution_wis(loc_clean, scale_clean, target_clean, wis_half_widths)
+    weighted_nll = nll * mask
+    weighted_crps = crps * mask
+    weighted_wis = wis * mask
+
+    new_sums = {
+        "nll": sums["nll"] + weighted_nll.sum(),
+        "crps": sums["crps"] + weighted_crps.sum(),
+        "wis": sums["wis"] + weighted_wis.sum(),
+        "weight": sums["weight"] + mask.sum(),
+        "observed": sums["observed"] + active.sum(),
+        "invalid": sums["invalid"] + invalid.sum(),
+        "scale_floor": sums["scale_floor"] + ((scale <= scale_floor) & active).sum(),
+    }
+    if per_h:
+        new_sums["per_h_nll"] = sums["per_h_nll"] + weighted_nll.sum(dim=0)
+        new_sums["per_h_crps"] = sums["per_h_crps"] + weighted_crps.sum(dim=0)
+        new_sums["per_h_wis"] = sums["per_h_wis"] + weighted_wis.sum(dim=0)
+        new_sums["per_h_weight"] = sums["per_h_weight"] + mask.sum(dim=0)
+
+    intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for level_name, standard_half_width in interval_half_widths.items():
+        half_width = scale_clean * standard_half_width.to(scale_clean.dtype)
+        low = loc_clean - half_width
+        high = loc_clean + half_width
+        intervals[level_name] = (low, high)
+        covered = ((target_clean >= low) & (target_clean <= high)).to(mask.dtype)
+        weighted_covered = covered * mask
+        weighted_width = (high - low).clamp_min(0.0) * mask
+        new_sums[f"coverage_{level_name}"] = (
+            sums[f"coverage_{level_name}"] + weighted_covered.sum()
+        )
+        new_sums[f"width_{level_name}"] = (
+            sums[f"width_{level_name}"] + weighted_width.sum()
+        )
+        if per_h:
+            new_sums[f"per_h_coverage_{level_name}"] = sums[
+                f"per_h_coverage_{level_name}"
+            ] + weighted_covered.sum(dim=0)
+            new_sums[f"per_h_width_{level_name}"] = sums[
+                f"per_h_width_{level_name}"
+            ] + weighted_width.sum(dim=0)
+
+    return new_sums, ProbabilisticBatchMetrics(
+        nll=nll,
+        crps=crps,
+        wis=wis,
+        intervals=intervals,
+        weights=mask,
+    )
 
 
 class TorchDistributionMetricAccumulator:
@@ -266,6 +470,7 @@ class TorchDistributionMetricAccumulator:
         distribution_df: float = 5.0,
         scale_floor: float = 1.0e-3,
         interval_levels: list[float] | tuple[float, ...] = (0.5, 0.8, 0.95),
+        compile_step: bool = False,
     ) -> None:
         self.device = device
         self.horizon = horizon
@@ -302,107 +507,39 @@ class TorchDistributionMetricAccumulator:
                 self.level_names, self.interval_levels, strict=True
             )
         }
-
-        self.nll_sum = torch.tensor(0.0, device=device)
-        self.nll_weight_sum = torch.tensor(0.0, device=device)
-        self.crps_sum = torch.tensor(0.0, device=device)
-        self.crps_weight_sum = torch.tensor(0.0, device=device)
-        self.wis_sum = torch.tensor(0.0, device=device)
-        self.invalid_prediction_count = torch.tensor(0, device=device, dtype=torch.long)
-        self.scale_floor_count = torch.tensor(0, device=device, dtype=torch.long)
         self.wis_half_widths = torch.tensor(
             standard_wis_half_widths(self.distribution_family, self.distribution_df),
             device=device,
             dtype=torch.float32,
         )
-        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
-        self.per_h_nll_sum = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.per_h_nll_count = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.per_h_crps_sum = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.per_h_crps_count = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.per_h_wis_sum = (
-            torch.zeros(horizon, device=device) if horizon is not None else None
-        )
-        self.coverage_sum = {
-            level_name: torch.tensor(0.0, device=device)
-            for level_name in self.level_names
-        }
-        self.interval_width_sum = {
-            level_name: torch.tensor(0.0, device=device)
-            for level_name in self.level_names
-        }
-        self.interval_weight_sum = {
-            level_name: torch.tensor(0.0, device=device)
-            for level_name in self.level_names
-        }
-        self.per_h_coverage_sum = {
-            level_name: torch.zeros(horizon, device=device)
-            for level_name in self.level_names
-            if horizon is not None
-        }
-        self.per_h_interval_width_sum = {
-            level_name: torch.zeros(horizon, device=device)
-            for level_name in self.level_names
-            if horizon is not None
-        }
-        self.per_h_interval_count = {
-            level_name: torch.zeros(horizon, device=device)
-            for level_name in self.level_names
-            if horizon is not None
-        }
 
-    def _effective_mask(
-        self,
-        *,
-        targets: torch.Tensor,
-        observed_mask: torch.Tensor | None,
-        sample_weights: torch.Tensor | None,
-    ) -> torch.Tensor:
-        finite_target = torch.isfinite(targets.float()).to(dtype=torch.float32)
-        if sample_weights is not None:
-            mask = torch.nan_to_num(
-                sample_weights.float(),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).clamp(min=0.0)
-        elif observed_mask is None:
-            mask = finite_target
-        else:
-            mask = torch.nan_to_num(
-                observed_mask.float(),
-                nan=0.0,
-                posinf=1.0,
-                neginf=0.0,
-            ).clamp(min=0.0, max=1.0)
-        return mask * finite_target
-
-    def _nll(
-        self,
-        *,
-        loc: torch.Tensor,
-        scale: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.distribution_family == "normal":
-            z = (target - loc) / scale
-            return 0.5 * z**2 + torch.log(scale) + 0.5 * math.log(2.0 * math.pi)
-
-        df = torch.as_tensor(
-            self.distribution_df,
-            dtype=loc.dtype,
-            device=loc.device,
+        zero = torch.tensor(0.0, device=device)
+        zero_count = torch.tensor(0, device=device, dtype=torch.long)
+        self.sums: MetricSums = {
+            "nll": zero,
+            "crps": zero,
+            "wis": zero,
+            "weight": zero,
+            "observed": zero_count,
+            "invalid": zero_count,
+            "scale_floor": zero_count,
+        }
+        for level_name in self.level_names:
+            self.sums[f"coverage_{level_name}"] = zero
+            self.sums[f"width_{level_name}"] = zero
+        if horizon is not None:
+            zeros = torch.zeros(horizon, device=device)
+            for name in ("nll", "crps", "wis", "weight"):
+                self.sums[f"per_h_{name}"] = zeros
+            for level_name in self.level_names:
+                self.sums[f"per_h_coverage_{level_name}"] = zeros
+                self.sums[f"per_h_width_{level_name}"] = zeros
+        self.sums = distinct_metric_sums(self.sums)
+        self._step = (
+            compiled_metric_step(_distribution_metric_step)
+            if compile_step
+            else _distribution_metric_step
         )
-        dist = torch.distributions.StudentT(df, loc=loc, scale=scale)
-        return -dist.log_prob(target)
 
     def update(
         self,
@@ -413,106 +550,20 @@ class TorchDistributionMetricAccumulator:
         observed_mask: torch.Tensor | None,
         sample_weights: torch.Tensor | None = None,
     ) -> ProbabilisticBatchMetrics:
-        loc_clean = torch.nan_to_num(
-            loc.float(),
-            nan=0.0,
-            posinf=_VALUE_CLAMP,
-            neginf=-_VALUE_CLAMP,
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        scale_clean = torch.nan_to_num(
-            scale.float(),
-            nan=self.scale_floor,
-            posinf=_VALUE_CLAMP,
-            neginf=self.scale_floor,
-        ).clamp(min=self.scale_floor, max=_VALUE_CLAMP)
-        target_clean = torch.nan_to_num(
-            targets.float(),
-            nan=0.0,
-            posinf=_VALUE_CLAMP,
-            neginf=-_VALUE_CLAMP,
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        target_clean = target_clean.to(loc_clean.device)
-        mask = self._effective_mask(
-            targets=targets,
-            observed_mask=observed_mask,
-            sample_weights=sample_weights,
-        ).to(loc_clean.device)
-        invalid = (~torch.isfinite(loc) | ~torch.isfinite(scale) | (scale <= 0)) & (
-            mask > 0
+        self.sums, batch = self._step(
+            self.sums,
+            loc,
+            scale,
+            targets,
+            observed_mask,
+            sample_weights,
+            distribution_family=self.distribution_family,
+            distribution_df=self.distribution_df,
+            scale_floor=self.scale_floor,
+            wis_half_widths=self.wis_half_widths,
+            interval_half_widths=self.interval_half_widths,
         )
-        self.invalid_prediction_count += invalid.sum()
-        self.scale_floor_count += ((scale <= self.scale_floor) & (mask > 0)).sum()
-
-        nll = torch.nan_to_num(
-            self._nll(loc=loc_clean, scale=scale_clean, target=target_clean),
-            nan=_VALUE_CLAMP,
-            posinf=_VALUE_CLAMP,
-            neginf=-_VALUE_CLAMP,
-        ).clamp(min=-_VALUE_CLAMP, max=_VALUE_CLAMP)
-        weighted_nll = nll * mask
-        mask_sum = mask.sum()
-        mask_per_h = mask.sum(dim=0) if self.horizon is not None else None
-        self.nll_sum += weighted_nll.sum()
-        self.nll_weight_sum += mask_sum
-        self.observed_count += (mask > 0).sum()
-
-        if self.distribution_family == "normal":
-            crps = _normal_crps(loc=loc_clean, scale=scale_clean, target=target_clean)
-        else:
-            crps = student_t_crps(
-                loc_clean, scale_clean, target_clean, self.distribution_df
-            )
-        weighted_crps = crps * mask
-        self.crps_sum += weighted_crps.sum()
-        self.crps_weight_sum += mask_sum
-        wis = distribution_wis(
-            loc_clean, scale_clean, target_clean, self.wis_half_widths
-        )
-        self.wis_sum += (wis * mask).sum()
-
-        if self.horizon is not None:
-            assert self.per_h_nll_sum is not None
-            assert self.per_h_nll_count is not None
-            assert mask_per_h is not None
-            self.per_h_nll_sum += weighted_nll.sum(dim=0)
-            self.per_h_nll_count += mask_per_h
-            assert self.per_h_crps_sum is not None
-            assert self.per_h_crps_count is not None
-            assert self.per_h_wis_sum is not None
-            self.per_h_crps_sum += weighted_crps.sum(dim=0)
-            self.per_h_crps_count += mask_per_h
-            self.per_h_wis_sum += (wis * mask).sum(dim=0)
-
-        intervals: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        for level_name in self.level_names:
-            half_width = scale_clean * self.interval_half_widths[level_name].to(
-                scale_clean.dtype
-            )
-            low = loc_clean - half_width
-            high = loc_clean + half_width
-            intervals[level_name] = (low, high)
-            covered = ((target_clean >= low) & (target_clean <= high)).to(
-                dtype=mask.dtype
-            )
-            width = (high - low).clamp_min(0.0)
-            weighted_covered = covered * mask
-            weighted_width = width * mask
-            self.coverage_sum[level_name] += weighted_covered.sum()
-            self.interval_width_sum[level_name] += weighted_width.sum()
-            self.interval_weight_sum[level_name] += mask_sum
-            if self.horizon is not None:
-                assert mask_per_h is not None
-                self.per_h_coverage_sum[level_name] += weighted_covered.sum(dim=0)
-                self.per_h_interval_width_sum[level_name] += weighted_width.sum(dim=0)
-                self.per_h_interval_count[level_name] += mask_per_h
-
-        return ProbabilisticBatchMetrics(
-            nll=nll,
-            crps=crps,
-            wis=wis,
-            intervals=intervals,
-            weights=mask,
-        )
+        return batch
 
     @staticmethod
     def _mean_from_sums(
@@ -524,14 +575,11 @@ class TorchDistributionMetricAccumulator:
             return float("nan")
         return float((numerator / denominator.clamp_min(1e-8)).item())
 
-    def _per_h_from_sums(
-        self,
-        *,
-        numerator: torch.Tensor | None,
-        denominator: torch.Tensor | None,
-    ) -> list[float]:
-        if self.horizon is None or numerator is None or denominator is None:
+    def _per_h_from_sums(self, name: str) -> list[float]:
+        if self.horizon is None:
             return []
+        numerator = self.sums[f"per_h_{name}"]
+        denominator = self.sums["per_h_weight"]
         out = torch.full_like(numerator, float("nan"))
         valid = denominator > 0
         if torch.any(valid):
@@ -539,59 +587,46 @@ class TorchDistributionMetricAccumulator:
         return out.tolist()
 
     def finalize(self) -> ProbabilisticMetricResult:
+        weight_sum = self.sums["weight"]
         coverage_by_level: dict[str, float] = {}
         interval_width_by_level: dict[str, float] = {}
         coverage_per_h_by_level: dict[str, list[float]] = {}
         interval_width_per_h_by_level: dict[str, list[float]] = {}
         for level_name in self.level_names:
-            weight_sum = self.interval_weight_sum[level_name]
             coverage_by_level[level_name] = self._mean_from_sums(
-                numerator=self.coverage_sum[level_name],
+                numerator=self.sums[f"coverage_{level_name}"],
                 denominator=weight_sum,
             )
             interval_width_by_level[level_name] = self._mean_from_sums(
-                numerator=self.interval_width_sum[level_name],
+                numerator=self.sums[f"width_{level_name}"],
                 denominator=weight_sum,
             )
             coverage_per_h_by_level[level_name] = self._per_h_from_sums(
-                numerator=self.per_h_coverage_sum.get(level_name),
-                denominator=self.per_h_interval_count.get(level_name),
+                f"coverage_{level_name}"
             )
             interval_width_per_h_by_level[level_name] = self._per_h_from_sums(
-                numerator=self.per_h_interval_width_sum.get(level_name),
-                denominator=self.per_h_interval_count.get(level_name),
+                f"width_{level_name}"
             )
 
+        invalid_prediction_count = int(self.sums["invalid"].item())
         return ProbabilisticMetricResult(
             nll=self._mean_from_sums(
-                numerator=self.nll_sum,
-                denominator=self.nll_weight_sum,
+                numerator=self.sums["nll"], denominator=weight_sum
             ),
             crps=self._mean_from_sums(
-                numerator=self.crps_sum,
-                denominator=self.crps_weight_sum,
+                numerator=self.sums["crps"], denominator=weight_sum
             ),
-            wis=self._mean_from_sums(
-                numerator=self.wis_sum, denominator=self.nll_weight_sum
-            )
-            if self.invalid_prediction_count.item() == 0
+            wis=self._mean_from_sums(numerator=self.sums["wis"], denominator=weight_sum)
+            if invalid_prediction_count == 0
             else float("nan"),
-            invalid_prediction_count=int(self.invalid_prediction_count.item()),
-            scale_floor_count=int(self.scale_floor_count.item()),
-            observed_count=int(self.observed_count.item()),
-            effective_count=float(self.nll_weight_sum.item()),
-            nll_per_h=self._per_h_from_sums(
-                numerator=self.per_h_nll_sum,
-                denominator=self.per_h_nll_count,
-            ),
-            crps_per_h=self._per_h_from_sums(
-                numerator=self.per_h_crps_sum,
-                denominator=self.per_h_crps_count,
-            ),
-            wis_per_h=self._per_h_from_sums(
-                numerator=self.per_h_wis_sum, denominator=self.per_h_nll_count
-            )
-            if self.invalid_prediction_count.item() == 0
+            invalid_prediction_count=invalid_prediction_count,
+            scale_floor_count=int(self.sums["scale_floor"].item()),
+            observed_count=int(self.sums["observed"].item()),
+            effective_count=float(weight_sum.item()),
+            nll_per_h=self._per_h_from_sums("nll"),
+            crps_per_h=self._per_h_from_sums("crps"),
+            wis_per_h=self._per_h_from_sums("wis")
+            if invalid_prediction_count == 0
             else [float("nan")] * (self.horizon or 0),
             coverage_by_level=coverage_by_level,
             interval_width_by_level=interval_width_by_level,

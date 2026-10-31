@@ -6,6 +6,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from evaluation.metrics import (
+    MetricSums,
+    compiled_metric_step,
+    distinct_metric_sums,
+)
+
 _EPSILON = 1.0e-12
 _VALUE_CLAMP = 1.0e6
 
@@ -58,26 +64,91 @@ class PathwayMetricResult:
     reconstruction_max_abs_error: float
 
 
+_PATHWAY_PARTS = ("full", "mechanistic", "residual")
+
+
+def _pathway_metric_step(
+    sums: MetricSums,
+    full: torch.Tensor,
+    mechanistic: torch.Tensor,
+    residual: torch.Tensor,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+) -> MetricSums:
+    finite = (
+        torch.isfinite(full.float())
+        & torch.isfinite(mechanistic.float())
+        & torch.isfinite(residual.float())
+        & torch.isfinite(targets.float())
+    )
+    effective_weights = torch.nan_to_num(
+        weights.float(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).clamp_min(0.0) * finite.to(dtype=torch.float32)
+    full_clean = _clean(full)
+    mechanistic_clean = _clean(mechanistic)
+    residual_clean = _clean(residual)
+    targets_clean = _clean(targets)
+    mechanistic_error = mechanistic_clean - targets_clean
+    active = effective_weights > 0
+    reconstruction_error = (full_clean - mechanistic_clean - residual_clean).abs()
+    batch_reconstruction_max = torch.where(
+        active,
+        reconstruction_error,
+        sums["reconstruction_max"],
+    ).max()
+
+    new_sums = {
+        "weight": sums["weight"] + effective_weights.sum(),
+        "observed": sums["observed"] + active.sum(),
+        "abs_mechanistic": sums["abs_mechanistic"]
+        + (mechanistic_clean.abs() * effective_weights).sum(),
+        "abs_residual": sums["abs_residual"]
+        + (residual_clean.abs() * effective_weights).sum(),
+        "mechanistic_error_abs": sums["mechanistic_error_abs"]
+        + (mechanistic_error.abs() * effective_weights).sum(),
+        "mechanistic_error_sq": sums["mechanistic_error_sq"]
+        + (mechanistic_error.square() * effective_weights).sum(),
+        "reconstruction_max": torch.maximum(
+            sums["reconstruction_max"], batch_reconstruction_max
+        ),
+    }
+    for name, value in zip(
+        _PATHWAY_PARTS, (full_clean, mechanistic_clean, residual_clean), strict=True
+    ):
+        new_sums[name] = sums[name] + (value * effective_weights).sum()
+        new_sums[f"{name}_sq"] = (
+            sums[f"{name}_sq"] + (value.square() * effective_weights).sum()
+        )
+    return new_sums
+
+
 class TorchPathwayMetricAccumulator:
     """Accumulate observation-head pathway diagnostics on the evaluation device."""
 
-    def __init__(self, *, device: torch.device) -> None:
+    def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:
         self.device = device
-        self.weight_sum = torch.tensor(0.0, device=device)
-        self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
-        self.abs_mechanistic_sum = torch.tensor(0.0, device=device)
-        self.abs_residual_sum = torch.tensor(0.0, device=device)
-        self.mechanistic_error_abs_sum = torch.tensor(0.0, device=device)
-        self.mechanistic_error_sq_sum = torch.tensor(0.0, device=device)
-        self.reconstruction_max_abs_error = torch.tensor(0.0, device=device)
-        self.weighted_sums = {
-            name: torch.tensor(0.0, device=device)
-            for name in ("full", "mechanistic", "residual")
+        zero = torch.tensor(0.0, device=device)
+        self.sums: MetricSums = {
+            "weight": zero,
+            "observed": torch.tensor(0, device=device, dtype=torch.long),
+            "abs_mechanistic": zero,
+            "abs_residual": zero,
+            "mechanistic_error_abs": zero,
+            "mechanistic_error_sq": zero,
+            "reconstruction_max": zero,
         }
-        self.weighted_sq_sums = {
-            name: torch.tensor(0.0, device=device)
-            for name in ("full", "mechanistic", "residual")
-        }
+        for name in _PATHWAY_PARTS:
+            self.sums[name] = zero
+            self.sums[f"{name}_sq"] = zero
+        self.sums = distinct_metric_sums(self.sums)
+        self._step = (
+            compiled_metric_step(_pathway_metric_step)
+            if compile_step
+            else _pathway_metric_step
+        )
 
     def update(
         self,
@@ -88,57 +159,10 @@ class TorchPathwayMetricAccumulator:
         targets: torch.Tensor,
         weights: torch.Tensor,
     ) -> None:
-        finite = (
-            torch.isfinite(full.float())
-            & torch.isfinite(mechanistic.float())
-            & torch.isfinite(residual.float())
-            & torch.isfinite(targets.float())
-        )
-        effective_weights = torch.nan_to_num(
-            weights.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0) * finite.to(dtype=torch.float32)
-        full_clean = _clean(full)
-        mechanistic_clean = _clean(mechanistic)
-        residual_clean = _clean(residual)
-        targets_clean = _clean(targets)
-
-        self.weight_sum += effective_weights.sum()
-        self.observed_count += (effective_weights > 0).sum()
-        self.abs_mechanistic_sum += (mechanistic_clean.abs() * effective_weights).sum()
-        self.abs_residual_sum += (residual_clean.abs() * effective_weights).sum()
-        mechanistic_error = mechanistic_clean - targets_clean
-        self.mechanistic_error_abs_sum += (
-            mechanistic_error.abs() * effective_weights
-        ).sum()
-        self.mechanistic_error_sq_sum += (
-            mechanistic_error.square() * effective_weights
-        ).sum()
-
-        active = effective_weights > 0
-        reconstruction_error = (full_clean - mechanistic_clean - residual_clean).abs()
-        batch_reconstruction_max = torch.where(
-            active,
-            reconstruction_error,
-            self.reconstruction_max_abs_error,
-        ).max()
-        self.reconstruction_max_abs_error = torch.maximum(
-            self.reconstruction_max_abs_error,
-            batch_reconstruction_max,
-        )
-
-        for name, value in (
-            ("full", full_clean),
-            ("mechanistic", mechanistic_clean),
-            ("residual", residual_clean),
-        ):
-            self.weighted_sums[name] += (value * effective_weights).sum()
-            self.weighted_sq_sums[name] += (value.square() * effective_weights).sum()
+        self.sums = self._step(self.sums, full, mechanistic, residual, targets, weights)
 
     def finalize(self) -> PathwayMetricResult:
-        effective_count = float(self.weight_sum.item())
+        effective_count = float(self.sums["weight"].item())
         if effective_count <= 0:
             nan = float("nan")
             return PathwayMetricResult(
@@ -159,17 +183,19 @@ class TorchPathwayMetricAccumulator:
             )
 
         mean_abs_mechanistic = float(
-            (self.abs_mechanistic_sum / self.weight_sum).item()
+            (self.sums["abs_mechanistic"] / self.sums["weight"]).item()
         )
-        mean_abs_residual = float((self.abs_residual_sum / self.weight_sum).item())
+        mean_abs_residual = float(
+            (self.sums["abs_residual"] / self.sums["weight"]).item()
+        )
         variances: dict[str, float] = {}
-        for name in self.weighted_sums:
-            mean = self.weighted_sums[name] / self.weight_sum
-            variance = self.weighted_sq_sums[name] / self.weight_sum - mean.square()
+        for name in _PATHWAY_PARTS:
+            mean = self.sums[name] / self.sums["weight"]
+            variance = self.sums[f"{name}_sq"] / self.sums["weight"] - mean.square()
             variances[name] = float(variance.clamp_min(0.0).item())
 
         return PathwayMetricResult(
-            observed_count=int(self.observed_count.item()),
+            observed_count=int(self.sums["observed"].item()),
             effective_count=effective_count,
             mean_abs_mechanistic=mean_abs_mechanistic,
             mean_abs_residual=mean_abs_residual,
@@ -193,14 +219,14 @@ class TorchPathwayMetricAccumulator:
                 variances["full"],
             ),
             mechanistic_only_mae=float(
-                (self.mechanistic_error_abs_sum / self.weight_sum).item()
+                (self.sums["mechanistic_error_abs"] / self.sums["weight"]).item()
             ),
             mechanistic_only_rmse=float(
-                torch.sqrt(self.mechanistic_error_sq_sum / self.weight_sum).item()
+                torch.sqrt(
+                    self.sums["mechanistic_error_sq"] / self.sums["weight"]
+                ).item()
             ),
-            reconstruction_max_abs_error=float(
-                self.reconstruction_max_abs_error.item()
-            ),
+            reconstruction_max_abs_error=float(self.sums["reconstruction_max"].item()),
         )
 
 
@@ -234,16 +260,91 @@ class WindowSpearmanMetricResult:
     eligible_given_candidate_fraction: float
 
 
+def _window_spearman_step(
+    counts: MetricSums,
+    prediction: torch.Tensor,
+    reference: torch.Tensor,
+    valid: torch.Tensor,
+) -> tuple[MetricSums, torch.Tensor, torch.Tensor]:
+    """Score each window row; return (counts, correlations, eligible)."""
+    # Flatten all leading dimensions; rank each horizon row independently.
+    prediction_rows = prediction.float().reshape(-1, prediction.shape[-1])
+    reference_rows = reference.float().reshape(-1, reference.shape[-1])
+    valid_rows = valid.reshape(-1, valid.shape[-1]).bool()
+    valid_count = valid_rows.sum(dim=-1)
+    candidate = valid_count >= 2
+
+    row_count, horizon = prediction_rows.shape
+    # Sort invalid sentinel indices last, then gather compact valid rows.
+    column_index = torch.arange(
+        horizon,
+        device=prediction_rows.device,
+    ).expand(row_count, horizon)
+    compacted_index = (
+        torch.where(valid_rows, column_index, horizon)
+        .sort(dim=-1)
+        .values.clamp_max(horizon - 1)
+    )
+    compacted_valid = column_index < valid_count.unsqueeze(-1)
+    prediction_compact = prediction_rows.gather(dim=-1, index=compacted_index)
+    reference_compact = reference_rows.gather(dim=-1, index=compacted_index)
+    prediction_ranks = _masked_average_tie_ranks(
+        prediction_compact,
+        compacted_valid,
+    )
+    reference_ranks = _masked_average_tie_ranks(
+        reference_compact,
+        compacted_valid,
+    )
+
+    # Center over each row's own valid prefix with masked sums, so rows of
+    # every window size are scored at once without a host sync.
+    valid_weight = compacted_valid.to(prediction_ranks.dtype)
+    window_size = valid_count.clamp_min(1).unsqueeze(-1).to(valid_weight.dtype)
+    prediction_centered = (
+        prediction_ranks
+        - (prediction_ranks * valid_weight).sum(dim=-1, keepdim=True) / window_size
+    ) * valid_weight
+    reference_centered = (
+        reference_ranks
+        - (reference_ranks * valid_weight).sum(dim=-1, keepdim=True) / window_size
+    ) * valid_weight
+    denominator = torch.sqrt(
+        prediction_centered.square().sum(dim=-1)
+        * reference_centered.square().sum(dim=-1)
+    )
+    eligible = candidate & (denominator > _EPSILON)
+    correlations = torch.where(
+        eligible,
+        (prediction_centered * reference_centered).sum(dim=-1)
+        / denominator.clamp_min(_EPSILON),
+        0.0,
+    ).to(prediction_rows.dtype)
+    new_counts = {
+        "total": counts["total"] + row_count,
+        "candidate": counts["candidate"] + candidate.sum(),
+        "eligible": counts["eligible"] + eligible.sum(),
+    }
+    return new_counts, correlations, eligible
+
+
 class _TorchWindowSpearmanAccumulator:
     """Accumulate masked, tie-aware Spearman values."""
 
-    def __init__(self, *, device: torch.device) -> None:
+    def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:
         self.device = device
         # Per-batch (correlations, eligible) rows, summed once in finalize.
         self.correlation_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
-        self.count = torch.tensor(0.0, device=device)
-        self.total_window_count = torch.tensor(0, device=device, dtype=torch.long)
-        self.candidate_window_count = torch.tensor(0, device=device, dtype=torch.long)
+        self.counts: MetricSums = {
+            "total": torch.tensor(0, device=device, dtype=torch.long),
+            "candidate": torch.tensor(0, device=device, dtype=torch.long),
+            "eligible": torch.tensor(0.0, device=device),
+        }
+        self._step = (
+            compiled_metric_step(_window_spearman_step)
+            if compile_step
+            else _window_spearman_step
+        )
 
     def update(
         self,
@@ -256,63 +357,16 @@ class _TorchWindowSpearmanAccumulator:
             raise ValueError(
                 "Prediction, reference, and validity mask must have identical shapes."
             )
-        # Flatten all leading dimensions; rank each horizon row independently.
-        prediction_rows = prediction.float().reshape(-1, prediction.shape[-1])
-        reference_rows = reference.float().reshape(-1, reference.shape[-1])
-        valid_rows = valid.reshape(-1, valid.shape[-1]).bool()
-        valid_count = valid_rows.sum(dim=-1)
-        candidate = valid_count >= 2
+        self.record(*self._step(self.counts, prediction, reference, valid))
 
-        row_count, horizon = prediction_rows.shape
-        # Sort invalid sentinel indices last, then gather compact valid rows.
-        column_index = torch.arange(
-            horizon,
-            device=prediction_rows.device,
-        ).expand(row_count, horizon)
-        compacted_index = (
-            torch.where(valid_rows, column_index, horizon)
-            .sort(dim=-1)
-            .values.clamp_max(horizon - 1)
-        )
-        compacted_valid = column_index < valid_count.unsqueeze(-1)
-        prediction_compact = prediction_rows.gather(dim=-1, index=compacted_index)
-        reference_compact = reference_rows.gather(dim=-1, index=compacted_index)
-        prediction_ranks = _masked_average_tie_ranks(
-            prediction_compact,
-            compacted_valid,
-        )
-        reference_ranks = _masked_average_tie_ranks(
-            reference_compact,
-            compacted_valid,
-        )
-
-        # Center over each row's own valid prefix with masked sums, so rows of
-        # every window size are scored at once without a host sync.
-        valid_weight = compacted_valid.to(prediction_ranks.dtype)
-        window_size = valid_count.clamp_min(1).unsqueeze(-1).to(valid_weight.dtype)
-        prediction_centered = (
-            prediction_ranks
-            - (prediction_ranks * valid_weight).sum(dim=-1, keepdim=True) / window_size
-        ) * valid_weight
-        reference_centered = (
-            reference_ranks
-            - (reference_ranks * valid_weight).sum(dim=-1, keepdim=True) / window_size
-        ) * valid_weight
-        denominator = torch.sqrt(
-            prediction_centered.square().sum(dim=-1)
-            * reference_centered.square().sum(dim=-1)
-        )
-        eligible = candidate & (denominator > _EPSILON)
-        correlations = torch.where(
-            eligible,
-            (prediction_centered * reference_centered).sum(dim=-1)
-            / denominator.clamp_min(_EPSILON),
-            0.0,
-        ).to(prediction_rows.dtype)
-
-        self.total_window_count += prediction_rows.shape[0]
-        self.candidate_window_count += candidate.sum()
-        self.count += eligible.sum()
+    def record(
+        self,
+        counts: MetricSums,
+        correlations: torch.Tensor,
+        eligible: torch.Tensor,
+    ) -> None:
+        """Store the result of a ``_window_spearman_step`` run by a caller."""
+        self.counts = counts
         # Keep rows on the device; selecting them here would sync every batch.
         self.correlation_batches.append((correlations, eligible))
 
@@ -332,12 +386,12 @@ class _TorchWindowSpearmanAccumulator:
         return torch.tensor(float(total), device=self.device)
 
     def finalize(self) -> WindowSpearmanMetricResult:
-        total_count = int(self.total_window_count.item())
-        candidate_count = int(self.candidate_window_count.item())
-        eligible_count = int(self.count.item())
+        total_count = int(self.counts["total"].item())
+        candidate_count = int(self.counts["candidate"].item())
+        eligible_count = int(self.counts["eligible"].item())
         return WindowSpearmanMetricResult(
             mean=(
-                float((self.correlation_sum() / self.count).item())
+                float((self.correlation_sum() / self.counts["eligible"]).item())
                 if eligible_count > 0
                 else float("nan")
             ),
@@ -354,22 +408,90 @@ class _TorchWindowSpearmanAccumulator:
         )
 
 
+def _latent_pair_step(
+    sums: MetricSums,
+    spearman_counts: MetricSums,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[MetricSums, MetricSums, torch.Tensor, torch.Tensor]:
+    """Add one batch of finite prediction-target pairs to ``sums``."""
+    pred_f32 = prediction.float()
+    target_f32 = target.float()
+    pred_finite = torch.isfinite(pred_f32)
+    finite = pred_finite & torch.isfinite(target_f32)
+    pred = _clean(pred_f32)
+    truth = _clean(target_f32)
+    error = pred - truth
+    reduce_dims = tuple(range(finite.ndim - 1))
+    new_sums = {
+        "pred_finite": sums["pred_finite"] + pred_finite.sum(),
+        "pred_negative": sums["pred_negative"] + (pred_finite & (pred_f32 < 0)).sum(),
+        "count": sums["count"] + finite.sum(),
+        "abs_error": sums["abs_error"] + torch.where(finite, error.abs(), 0.0).sum(),
+        "sq_error": sums["sq_error"] + torch.where(finite, error.square(), 0.0).sum(),
+        "pred": sums["pred"] + torch.where(finite, pred, 0.0).sum(),
+        "target": sums["target"] + torch.where(finite, truth, 0.0).sum(),
+        "pred_sq": sums["pred_sq"] + torch.where(finite, pred.square(), 0.0).sum(),
+        "target_sq": sums["target_sq"] + torch.where(finite, truth.square(), 0.0).sum(),
+        "cross": sums["cross"] + torch.where(finite, pred * truth, 0.0).sum(),
+        "horizon_count": sums["horizon_count"] + finite.float().sum(dim=reduce_dims),
+        "horizon_abs_error": sums["horizon_abs_error"]
+        + torch.where(finite, error.abs(), 0.0).sum(dim=reduce_dims),
+        "horizon_sq_error": sums["horizon_sq_error"]
+        + torch.where(finite, error.square(), 0.0).sum(dim=reduce_dims),
+    }
+    new_counts, correlations, eligible = _window_spearman_step(
+        spearman_counts, pred_f32, target_f32, finite
+    )
+    # A batch without finite pairs does not count toward the window total.
+    new_counts["total"] = torch.where(
+        finite.any(), new_counts["total"], spearman_counts["total"]
+    )
+    return new_sums, new_counts, correlations, eligible
+
+
+def _prediction_sign_step(sums: MetricSums, prediction: torch.Tensor) -> MetricSums:
+    pred_f32 = prediction.float()
+    pred_finite = torch.isfinite(pred_f32)
+    return {
+        **sums,
+        "pred_finite": sums["pred_finite"] + pred_finite.sum(),
+        "pred_negative": sums["pred_negative"] + (pred_finite & (pred_f32 < 0)).sum(),
+    }
+
+
 class _TorchLatentPairAccumulator:
-    def __init__(self, *, device: torch.device) -> None:
-        self.count = torch.tensor(0.0, device=device)
-        self.abs_error_sum = torch.tensor(0.0, device=device)
-        self.sq_error_sum = torch.tensor(0.0, device=device)
-        self.pred_sum = torch.tensor(0.0, device=device)
-        self.target_sum = torch.tensor(0.0, device=device)
-        self.pred_sq_sum = torch.tensor(0.0, device=device)
-        self.target_sq_sum = torch.tensor(0.0, device=device)
-        self.cross_sum = torch.tensor(0.0, device=device)
-        self.pred_finite_count = torch.tensor(0.0, device=device)
-        self.pred_negative_count = torch.tensor(0.0, device=device)
-        self.horizon_abs_error_sum: torch.Tensor | None = None
-        self.horizon_sq_error_sum: torch.Tensor | None = None
-        self.horizon_count: torch.Tensor | None = None
+    def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:
+        self.device = device
+        zero = torch.tensor(0.0, device=device)
+        self.sums: MetricSums = {
+            name: zero
+            for name in (
+                "pred_finite",
+                "pred_negative",
+                "count",
+                "abs_error",
+                "sq_error",
+                "pred",
+                "target",
+                "pred_sq",
+                "target_sq",
+                "cross",
+            )
+        }
+        self.sums = distinct_metric_sums(self.sums)
+        self.horizon: int | None = None
         self.window_spearman = _TorchWindowSpearmanAccumulator(device=device)
+        self._pair_step = (
+            compiled_metric_step(_latent_pair_step)
+            if compile_step
+            else _latent_pair_step
+        )
+        self._sign_step = (
+            compiled_metric_step(_prediction_sign_step)
+            if compile_step
+            else _prediction_sign_step
+        )
 
     def update(
         self,
@@ -377,66 +499,34 @@ class _TorchLatentPairAccumulator:
         prediction: torch.Tensor,
         target: torch.Tensor | None,
     ) -> None:
-        pred_f32 = prediction.float()
-        pred_finite = torch.isfinite(pred_f32)
-        self.pred_finite_count += pred_finite.sum()
-        self.pred_negative_count += (pred_finite & (pred_f32 < 0)).sum()
         if target is None:
+            self.sums = self._sign_step(self.sums, prediction)
             return
 
-        target_f32 = target.float()
-        finite = pred_finite & torch.isfinite(target_f32)
-        count = finite.sum()
-        if not count.any():
-            return
-        pred = _clean(pred_f32)[finite]
-        truth = _clean(target_f32)[finite]
-        error_full = _clean(pred_f32) - _clean(target_f32)
-        error = error_full[finite]
-        self.count += count
-        self.abs_error_sum += error.abs().sum()
-        self.sq_error_sum += error.square().sum()
-        self.pred_sum += pred.sum()
-        self.target_sum += truth.sum()
-        self.pred_sq_sum += pred.square().sum()
-        self.target_sq_sum += truth.square().sum()
-        self.cross_sum += (pred * truth).sum()
-        reduce_dims = tuple(range(finite.ndim - 1))
-        horizon_count = finite.float().sum(dim=reduce_dims)
-        horizon_abs_error = torch.where(finite, error_full.abs(), 0.0).sum(
-            dim=reduce_dims
-        )
-        horizon_sq_error = torch.where(finite, error_full.square(), 0.0).sum(
-            dim=reduce_dims
-        )
-        if self.horizon_count is None:
-            self.horizon_count = torch.zeros_like(horizon_count)
-            self.horizon_abs_error_sum = torch.zeros_like(horizon_abs_error)
-            self.horizon_sq_error_sum = torch.zeros_like(horizon_sq_error)
-        if self.horizon_count.shape != horizon_count.shape:
+        horizon = prediction.shape[-1]
+        if self.horizon is None:
+            self.horizon = horizon
+            zeros = torch.zeros(horizon, device=self.device)
+            for name in ("horizon_count", "horizon_abs_error", "horizon_sq_error"):
+                self.sums[name] = zeros
+            self.sums = distinct_metric_sums(self.sums)
+        if self.horizon != horizon:
             raise ValueError(
                 "Latent metric horizon changed between evaluation batches."
             )
-        self.horizon_count += horizon_count
-        assert self.horizon_abs_error_sum is not None
-        assert self.horizon_sq_error_sum is not None
-        self.horizon_abs_error_sum += horizon_abs_error
-        self.horizon_sq_error_sum += horizon_sq_error
-
-        self.window_spearman.update(
-            prediction=pred_f32,
-            reference=target_f32,
-            valid=finite,
+        self.sums, counts, correlations, eligible = self._pair_step(
+            self.sums, self.window_spearman.counts, prediction, target
         )
+        self.window_spearman.record(counts, correlations, eligible)
 
     def finalize(self) -> LatentMetricResult:
-        pred_finite_count = float(self.pred_finite_count.item())
+        pred_finite_count = float(self.sums["pred_finite"].item())
         negative_fraction = (
-            float((self.pred_negative_count / self.pred_finite_count).item())
+            float((self.sums["pred_negative"] / self.sums["pred_finite"]).item())
             if pred_finite_count > 0
             else float("nan")
         )
-        count = int(self.count.item())
+        count = int(self.sums["count"].item())
         if count <= 0:
             return LatentMetricResult(
                 count=0,
@@ -454,43 +544,42 @@ class _TorchLatentPairAccumulator:
                 nonnegative_violation_fraction=negative_fraction,
             )
 
-        pred_mean = self.pred_sum / self.count
-        target_mean = self.target_sum / self.count
-        pred_variance = (self.pred_sq_sum / self.count - pred_mean.square()).clamp_min(
-            0.0
-        )
-        target_variance = (
-            self.target_sq_sum / self.count - target_mean.square()
+        sums = self.sums
+        pred_mean = sums["pred"] / sums["count"]
+        target_mean = sums["target"] / sums["count"]
+        pred_variance = (
+            sums["pred_sq"] / sums["count"] - pred_mean.square()
         ).clamp_min(0.0)
-        covariance = self.cross_sum / self.count - pred_mean * target_mean
+        target_variance = (
+            sums["target_sq"] / sums["count"] - target_mean.square()
+        ).clamp_min(0.0)
+        covariance = sums["cross"] / sums["count"] - pred_mean * target_mean
         denominator = torch.sqrt(pred_variance * target_variance)
         pearson = (
             float((covariance / denominator).item())
             if float(denominator.item()) > _EPSILON
             else float("nan")
         )
-        mae = float((self.abs_error_sum / self.count).item())
+        mae = float((sums["abs_error"] / sums["count"]).item())
         prediction_std = float(torch.sqrt(pred_variance).item())
         target_std = float(torch.sqrt(target_variance).item())
-        assert self.horizon_count is not None
-        assert self.horizon_abs_error_sum is not None
-        assert self.horizon_sq_error_sum is not None
-        valid_horizon = self.horizon_count > 0
+        horizon_count = sums["horizon_count"]
+        valid_horizon = horizon_count > 0
         horizon_mae_tensor = torch.where(
             valid_horizon,
-            self.horizon_abs_error_sum / self.horizon_count.clamp_min(1),
-            torch.full_like(self.horizon_count, float("nan")),
+            sums["horizon_abs_error"] / horizon_count.clamp_min(1),
+            torch.full_like(horizon_count, float("nan")),
         )
         horizon_rmse_tensor = torch.where(
             valid_horizon,
-            torch.sqrt(self.horizon_sq_error_sum / self.horizon_count.clamp_min(1)),
-            torch.full_like(self.horizon_count, float("nan")),
+            torch.sqrt(sums["horizon_sq_error"] / horizon_count.clamp_min(1)),
+            torch.full_like(horizon_count, float("nan")),
         )
         window_spearman = self.window_spearman.finalize()
         return LatentMetricResult(
             count=count,
             mae=mae,
-            rmse=float(torch.sqrt(self.sq_error_sum / self.count).item()),
+            rmse=float(torch.sqrt(sums["sq_error"] / sums["count"]).item()),
             pearson=pearson,
             mae_over_target_std=_safe_ratio(mae, target_std),
             prediction_std=prediction_std,
@@ -511,14 +600,52 @@ class ObservationLatentMetricResult:
     mechanistic_only_window_spearman: WindowSpearmanMetricResult
 
 
+def _observation_latent_step(
+    observed_count: torch.Tensor,
+    full_counts: MetricSums,
+    mechanistic_counts: MetricSums,
+    full_prediction: torch.Tensor,
+    relevant_latent: torch.Tensor,
+    weights: torch.Tensor,
+    mechanistic_projection: torch.Tensor | None,
+) -> tuple[
+    torch.Tensor,
+    tuple[MetricSums, torch.Tensor, torch.Tensor],
+    tuple[MetricSums, torch.Tensor, torch.Tensor] | None,
+]:
+    full_prediction_f32 = full_prediction.float()
+    latent_f32 = relevant_latent.float()
+    weights_f32 = weights.float()
+    observed = (
+        torch.isfinite(latent_f32) & torch.isfinite(weights_f32) & (weights_f32 > 0)
+    )
+    full_valid = observed & torch.isfinite(full_prediction_f32)
+    full = _window_spearman_step(
+        full_counts, full_prediction_f32, latent_f32, full_valid
+    )
+    mechanistic = None
+    if mechanistic_projection is not None:
+        mechanistic_f32 = mechanistic_projection.float()
+        mechanistic_valid = observed & torch.isfinite(mechanistic_f32)
+        mechanistic = _window_spearman_step(
+            mechanistic_counts, mechanistic_f32, latent_f32, mechanistic_valid
+        )
+    return observed_count + observed.sum(), full, mechanistic
+
+
 class TorchObservationLatentCoherenceAccumulator:
     """Measure full and mechanistic-only forecast movement against latent sources."""
 
-    def __init__(self, *, device: torch.device) -> None:
+    def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:
         self.observed_count = torch.tensor(0, device=device, dtype=torch.long)
         self.full_window_spearman = _TorchWindowSpearmanAccumulator(device=device)
         self.mechanistic_only_window_spearman = _TorchWindowSpearmanAccumulator(
             device=device
+        )
+        self._step = (
+            compiled_metric_step(_observation_latent_step)
+            if compile_step
+            else _observation_latent_step
         )
 
     def update(
@@ -539,32 +666,25 @@ class TorchObservationLatentCoherenceAccumulator:
                 "Full prediction, relevant latent, and weights must have identical "
                 "shapes."
             )
-        full_prediction_f32 = full_prediction.float()
-        latent_f32 = relevant_latent.float()
-        weights_f32 = weights.float()
-        observed = (
-            torch.isfinite(latent_f32) & torch.isfinite(weights_f32) & (weights_f32 > 0)
-        )
-        full_valid = observed & torch.isfinite(full_prediction_f32)
-        self.observed_count += observed.sum()
-        self.full_window_spearman.update(
-            prediction=full_prediction_f32,
-            reference=latent_f32,
-            valid=full_valid,
-        )
-        if mechanistic_projection is not None:
-            if mechanistic_projection.shape != full_prediction.shape:
-                raise ValueError(
-                    "Mechanistic projection and full prediction must have identical "
-                    "shapes."
-                )
-            mechanistic_f32 = mechanistic_projection.float()
-            mechanistic_valid = observed & torch.isfinite(mechanistic_f32)
-            self.mechanistic_only_window_spearman.update(
-                prediction=mechanistic_f32,
-                reference=latent_f32,
-                valid=mechanistic_valid,
+        if (
+            mechanistic_projection is not None
+            and mechanistic_projection.shape != full_prediction.shape
+        ):
+            raise ValueError(
+                "Mechanistic projection and full prediction must have identical shapes."
             )
+        self.observed_count, full, mechanistic = self._step(
+            self.observed_count,
+            self.full_window_spearman.counts,
+            self.mechanistic_only_window_spearman.counts,
+            full_prediction,
+            relevant_latent,
+            weights,
+            mechanistic_projection,
+        )
+        self.full_window_spearman.record(*full)
+        if mechanistic is not None:
+            self.mechanistic_only_window_spearman.record(*mechanistic)
 
     def finalize(self) -> ObservationLatentMetricResult:
         return ObservationLatentMetricResult(
@@ -574,6 +694,115 @@ class TorchObservationLatentCoherenceAccumulator:
                 self.mechanistic_only_window_spearman.finalize()
             ),
         )
+
+
+def _latent_coherence_step(
+    sums: MetricSums,
+    trajectories: tuple[torch.Tensor, ...],
+    target_trajectories: tuple[torch.Tensor, ...] | None,
+    death_flow: torch.Tensor | None,
+    hospitalization_flow: torch.Tensor | None,
+    physics_residual: torch.Tensor | None,
+) -> MetricSums:
+    """Add one batch of structural SIRHD diagnostics to ``sums``.
+
+    Masked sums replace boolean selection, so the step has no host sync.
+    """
+    sums = dict(sums)
+    states = [trajectory.float() for trajectory in trajectories]
+    model_mass_finite = torch.stack([torch.isfinite(state) for state in states]).all(
+        dim=0
+    )
+    model_mass = torch.stack([_clean(state) for state in states]).sum(dim=0)
+    # Errors are nonnegative, so a zero fill keeps the running max unchanged.
+    model_mass_error = torch.where(model_mass_finite, (model_mass - 1.0).abs(), 0.0)
+    sums["model_mass_error"] = sums["model_mass_error"] + model_mass_error.sum()
+    sums["model_mass_error_max"] = torch.maximum(
+        sums["model_mass_error_max"], model_mass_error.max()
+    )
+    sums["model_mass_count"] = sums["model_mass_count"] + model_mass_finite.sum()
+
+    if target_trajectories is not None:
+        target_states = [target.float() for target in target_trajectories]
+        target_mass_finite = torch.stack(
+            [torch.isfinite(target) for target in target_states]
+        ).all(dim=0)
+        target_mass = torch.stack([_clean(target) for target in target_states]).sum(
+            dim=0
+        )
+        sums["target_mass"] = (
+            sums["target_mass"]
+            + torch.where(target_mass_finite, target_mass, 0.0).sum()
+        )
+        sums["target_mass_min"] = torch.minimum(
+            sums["target_mass_min"],
+            torch.where(target_mass_finite, target_mass, float("inf")).min(),
+        )
+        sums["target_mass_max"] = torch.maximum(
+            sums["target_mass_max"],
+            torch.where(target_mass_finite, target_mass, float("-inf")).max(),
+        )
+        sums["target_mass_gap"] = (
+            sums["target_mass_gap"]
+            + torch.where(target_mass_finite, (target_mass - 1.0).abs(), 0.0).sum()
+        )
+        sums["target_mass_count"] = sums["target_mass_count"] + target_mass_finite.sum()
+        model_target_finite = model_mass_finite & target_mass_finite
+        sums["model_target_mass_error"] = (
+            sums["model_target_mass_error"]
+            + torch.where(
+                model_target_finite, (model_mass - target_mass).abs(), 0.0
+            ).sum()
+        )
+        sums["model_target_mass_count"] = (
+            sums["model_target_mass_count"] + model_target_finite.sum()
+        )
+
+    if death_flow is None:
+        return sums
+    death_trajectory = states[-1]
+    death_flow_f32 = death_flow.float()
+    death_delta = death_trajectory[:, 1:] - death_trajectory[:, :-1]
+    transition_finite = torch.isfinite(death_delta) & torch.isfinite(death_flow_f32)
+    sums["death_transition_error"] = (
+        sums["death_transition_error"]
+        + torch.where(
+            transition_finite, (_clean(death_delta) - _clean(death_flow_f32)).abs(), 0.0
+        ).sum()
+    )
+    sums["death_transition_count"] = (
+        sums["death_transition_count"] + transition_finite.sum()
+    )
+    sums["death_monotonic_violation"] = (
+        sums["death_monotonic_violation"]
+        + (transition_finite & (death_delta < 0)).sum()
+    )
+
+    for name, flow_tensor in (
+        ("hospitalization", hospitalization_flow),
+        ("death", death_flow),
+    ):
+        if flow_tensor is None:
+            continue
+        flow = flow_tensor.float()
+        finite = torch.isfinite(flow)
+        sums[f"{name}_flow_finite"] = sums[f"{name}_flow_finite"] + finite.sum()
+        sums[f"{name}_flow_negative"] = (
+            sums[f"{name}_flow_negative"] + (finite & (flow < 0)).sum()
+        )
+
+    if physics_residual is None:
+        return sums
+    residual = physics_residual.float()
+    residual_finite = torch.isfinite(residual)
+    sums["physics_residual_abs"] = (
+        sums["physics_residual_abs"]
+        + torch.where(residual_finite, residual.abs(), 0.0).sum()
+    )
+    sums["physics_residual_count"] = (
+        sums["physics_residual_count"] + residual_finite.sum()
+    )
+    return sums
 
 
 class TorchLatentCoherenceAccumulator:
@@ -597,34 +826,42 @@ class TorchLatentCoherenceAccumulator:
         "death_flow": ("death_flow", "death_flow_target"),
     }
 
-    def __init__(self, *, device: torch.device) -> None:
+    def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:
         self.latents = {
-            name: _TorchLatentPairAccumulator(device=device)
+            name: _TorchLatentPairAccumulator(device=device, compile_step=compile_step)
             for name in self._LATENT_KEYS
         }
-        self.model_mass_error_sum = torch.tensor(0.0, device=device)
-        self.model_mass_error_max = torch.tensor(0.0, device=device)
-        self.model_mass_count = torch.tensor(0.0, device=device)
-        self.target_exported_mass_sum = torch.tensor(0.0, device=device)
-        self.target_exported_mass_min = torch.tensor(float("inf"), device=device)
-        self.target_exported_mass_max = torch.tensor(float("-inf"), device=device)
-        self.target_exported_mass_gap_sum = torch.tensor(0.0, device=device)
-        self.target_exported_mass_count = torch.tensor(0.0, device=device)
-        self.model_target_exported_mass_error_sum = torch.tensor(0.0, device=device)
-        self.model_target_exported_mass_count = torch.tensor(0.0, device=device)
-        self.death_transition_error_sum = torch.tensor(0.0, device=device)
-        self.death_transition_count = torch.tensor(0.0, device=device)
-        self.death_monotonic_violation_count = torch.tensor(0.0, device=device)
-        self.flow_finite_counts = {
-            name: torch.tensor(0.0, device=device)
-            for name in ("hospitalization", "death")
+        zero = torch.tensor(0.0, device=device)
+        self.sums: MetricSums = {
+            name: zero
+            for name in (
+                "model_mass_error",
+                "model_mass_error_max",
+                "model_mass_count",
+                "target_mass",
+                "target_mass_gap",
+                "target_mass_count",
+                "model_target_mass_error",
+                "model_target_mass_count",
+                "death_transition_error",
+                "death_transition_count",
+                "death_monotonic_violation",
+                "hospitalization_flow_finite",
+                "hospitalization_flow_negative",
+                "death_flow_finite",
+                "death_flow_negative",
+                "physics_residual_abs",
+                "physics_residual_count",
+            )
         }
-        self.flow_negative_counts = {
-            name: torch.tensor(0.0, device=device)
-            for name in ("hospitalization", "death")
-        }
-        self.physics_residual_abs_sum = torch.tensor(0.0, device=device)
-        self.physics_residual_count = torch.tensor(0.0, device=device)
+        self.sums["target_mass_min"] = torch.tensor(float("inf"), device=device)
+        self.sums["target_mass_max"] = torch.tensor(float("-inf"), device=device)
+        self.sums = distinct_metric_sums(self.sums)
+        self._step = (
+            compiled_metric_step(_latent_coherence_step)
+            if compile_step
+            else _latent_coherence_step
+        )
 
     def update(
         self,
@@ -646,104 +883,23 @@ class TorchLatentCoherenceAccumulator:
             for prediction_key, _target_key in self._STATE_KEYS.values()
         ):
             return
-        trajectories = [
-            model_outputs[prediction_key].float()
-            for prediction_key, _target_key in self._STATE_KEYS.values()
-        ]
-        model_mass_finite = torch.stack(
-            [torch.isfinite(trajectory) for trajectory in trajectories]
-        ).all(dim=0)
-        model_mass = torch.stack(
-            [_clean(trajectory) for trajectory in trajectories]
-        ).sum(dim=0)
-        if model_mass_finite.any():
-            model_mass_error = (model_mass[model_mass_finite] - 1.0).abs()
-            self.model_mass_error_sum += model_mass_error.sum()
-            self.model_mass_error_max = torch.maximum(
-                self.model_mass_error_max,
-                model_mass_error.max(),
-            )
-            self.model_mass_count += model_mass_finite.sum()
-
         target_trajectories = [
             targets.get(target_key)
             for _prediction_key, target_key in self._STATE_KEYS.values()
         ]
-        if all(isinstance(target, torch.Tensor) for target in target_trajectories):
-            target_tensors = [
-                target.float()
-                for target in target_trajectories
-                if isinstance(target, torch.Tensor)
-            ]
-            target_mass_finite = torch.stack(
-                [torch.isfinite(target) for target in target_tensors]
-            ).all(dim=0)
-            target_mass = torch.stack(
-                [_clean(target) for target in target_tensors]
-            ).sum(dim=0)
-            if target_mass_finite.any():
-                finite_target_mass = target_mass[target_mass_finite]
-                self.target_exported_mass_sum += finite_target_mass.sum()
-                self.target_exported_mass_min = torch.minimum(
-                    self.target_exported_mass_min,
-                    finite_target_mass.min(),
-                )
-                self.target_exported_mass_max = torch.maximum(
-                    self.target_exported_mass_max,
-                    finite_target_mass.max(),
-                )
-                self.target_exported_mass_gap_sum += (
-                    (finite_target_mass - 1.0).abs().sum()
-                )
-                self.target_exported_mass_count += target_mass_finite.sum()
-
-            model_target_finite = model_mass_finite & target_mass_finite
-            if model_target_finite.any():
-                model_target_error = (
-                    model_mass[model_target_finite] - target_mass[model_target_finite]
-                ).abs()
-                self.model_target_exported_mass_error_sum += model_target_error.sum()
-                self.model_target_exported_mass_count += model_target_finite.sum()
-
-        death_trajectory = model_outputs["D_trajectory"].float()
-        death_flow_tensor = model_outputs.get("death_flow")
-        if death_flow_tensor is None:
-            return
-        death_flow = death_flow_tensor.float()
-        death_delta = death_trajectory[:, 1:] - death_trajectory[:, :-1]
-        transition_finite = torch.isfinite(death_delta) & torch.isfinite(death_flow)
-        if transition_finite.any():
-            transition_error = (_clean(death_delta) - _clean(death_flow))[
-                transition_finite
-            ].abs()
-            self.death_transition_error_sum += transition_error.sum()
-            self.death_transition_count += transition_finite.sum()
-            self.death_monotonic_violation_count += (
-                death_delta[transition_finite] < 0
-            ).sum()
-
-        for name, key in (
-            ("hospitalization", "hospitalization_flow"),
-            ("death", "death_flow"),
-        ):
-            flow_tensor = model_outputs.get(key)
-            if flow_tensor is None:
-                continue
-            flow = flow_tensor.float()
-            finite = torch.isfinite(flow)
-            self.flow_finite_counts[name] += finite.sum()
-            self.flow_negative_counts[name] += (finite & (flow < 0)).sum()
-
-        physics_residual_tensor = model_outputs.get("physics_residual")
-        if physics_residual_tensor is None:
-            return
-        physics_residual = physics_residual_tensor.float()
-        physics_finite = torch.isfinite(physics_residual)
-        if physics_finite.any():
-            self.physics_residual_abs_sum += (
-                physics_residual[physics_finite].abs().sum()
-            )
-            self.physics_residual_count += physics_finite.sum()
+        self.sums = self._step(
+            self.sums,
+            tuple(
+                model_outputs[prediction_key]
+                for prediction_key, _target_key in self._STATE_KEYS.values()
+            ),
+            tuple(target_trajectories)
+            if all(isinstance(target, torch.Tensor) for target in target_trajectories)
+            else None,
+            model_outputs.get("death_flow"),
+            model_outputs.get("hospitalization_flow"),
+            model_outputs.get("physics_residual"),
+        )
 
     @staticmethod
     def _fraction(numerator: torch.Tensor, denominator: torch.Tensor) -> float:
@@ -787,50 +943,48 @@ class TorchLatentCoherenceAccumulator:
                     rmse
                 )
 
-        model_mass_count = float(self.model_mass_count.item())
+        model_mass_count = float(self.sums["model_mass_count"].item())
         metrics["latent_model_sirhd_mass_error_from_one_mae"] = (
-            float((self.model_mass_error_sum / self.model_mass_count).item())
+            float(
+                (self.sums["model_mass_error"] / self.sums["model_mass_count"]).item()
+            )
             if model_mass_count > 0
             else float("nan")
         )
         metrics["latent_model_sirhd_mass_error_from_one_max"] = (
-            float(self.model_mass_error_max.item())
+            float(self.sums["model_mass_error_max"].item())
             if model_mass_count > 0
             else float("nan")
         )
-        target_mass_count = float(self.target_exported_mass_count.item())
+        target_mass_count = float(self.sums["target_mass_count"].item())
         metrics["latent_target_exported_sirhd_mass_mean"] = (
-            float(
-                (self.target_exported_mass_sum / self.target_exported_mass_count).item()
-            )
+            float((self.sums["target_mass"] / self.sums["target_mass_count"]).item())
             if target_mass_count > 0
             else float("nan")
         )
         metrics["latent_target_exported_sirhd_mass_min"] = (
-            float(self.target_exported_mass_min.item())
+            float(self.sums["target_mass_min"].item())
             if target_mass_count > 0
             else float("nan")
         )
         metrics["latent_target_exported_sirhd_mass_max"] = (
-            float(self.target_exported_mass_max.item())
+            float(self.sums["target_mass_max"].item())
             if target_mass_count > 0
             else float("nan")
         )
         metrics["latent_target_exported_sirhd_mass_gap_from_one_mae"] = (
             float(
-                (
-                    self.target_exported_mass_gap_sum / self.target_exported_mass_count
-                ).item()
+                (self.sums["target_mass_gap"] / self.sums["target_mass_count"]).item()
             )
             if target_mass_count > 0
             else float("nan")
         )
-        model_target_mass_count = float(self.model_target_exported_mass_count.item())
+        model_target_mass_count = float(self.sums["model_target_mass_count"].item())
         metrics["latent_model_vs_target_exported_sirhd_mass_mae"] = (
             float(
                 (
-                    self.model_target_exported_mass_error_sum
-                    / self.model_target_exported_mass_count
+                    self.sums["model_target_mass_error"]
+                    / self.sums["model_target_mass_count"]
                 ).item()
             )
             if model_target_mass_count > 0
@@ -838,23 +992,31 @@ class TorchLatentCoherenceAccumulator:
         )
         metrics["latent_death_transition_mae"] = (
             float(
-                (self.death_transition_error_sum / self.death_transition_count).item()
+                (
+                    self.sums["death_transition_error"]
+                    / self.sums["death_transition_count"]
+                ).item()
             )
-            if float(self.death_transition_count.item()) > 0
+            if float(self.sums["death_transition_count"].item()) > 0
             else float("nan")
         )
         metrics["latent_death_monotonic_violation_fraction"] = self._fraction(
-            self.death_monotonic_violation_count,
-            self.death_transition_count,
+            self.sums["death_monotonic_violation"],
+            self.sums["death_transition_count"],
         )
         for name in ("hospitalization", "death"):
             metrics[f"latent_{name}_flow_negative_fraction"] = self._fraction(
-                self.flow_negative_counts[name],
-                self.flow_finite_counts[name],
+                self.sums[f"{name}_flow_negative"],
+                self.sums[f"{name}_flow_finite"],
             )
         metrics["latent_physics_residual_mae"] = (
-            float((self.physics_residual_abs_sum / self.physics_residual_count).item())
-            if float(self.physics_residual_count.item()) > 0
+            float(
+                (
+                    self.sums["physics_residual_abs"]
+                    / self.sums["physics_residual_count"]
+                ).item()
+            )
+            if float(self.sums["physics_residual_count"].item()) > 0
             else float("nan")
         )
         return metrics
@@ -871,10 +1033,13 @@ class TorchLatentProtocolAccumulator:
         "death_flow": ("death_flow", "death_flow_target"),
     }
 
-    def __init__(self, *, protocol: str, device: torch.device) -> None:
+    def __init__(
+        self, *, protocol: str, device: torch.device, compile_step: bool = False
+    ) -> None:
         self.protocol = protocol
         self.latents = {
-            task: _TorchLatentPairAccumulator(device=device) for task in self._KEYS
+            task: _TorchLatentPairAccumulator(device=device, compile_step=compile_step)
+            for task in self._KEYS
         }
 
     def update(

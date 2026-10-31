@@ -455,12 +455,23 @@ def evaluate_loader(
         relevant_source_mapping
     )
 
-    # Device-local accumulators - avoid sync until end
+    # Device-local accumulators - avoid sync until end. A compiled model also
+    # gets compiled metric steps: eager updates launch hundreds of tiny kernels
+    # per batch, which made validation cost more than training.
+    compile_metrics = hasattr(model, "_orig_mod") and device.type == "cuda"
     total_loss = torch.tensor(0.0, device=device)
-    hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    ww_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    cases_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    deaths_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    hosp_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    ww_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    cases_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    deaths_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
     distribution_metric_kwargs = {
         "device": device,
         "horizon": horizon,
@@ -468,6 +479,7 @@ def evaluate_loader(
         "distribution_df": criterion.distribution_df,
         "scale_floor": criterion.distribution_scale_floor,
         "interval_levels": criterion.interval_levels,
+        "compile_step": compile_metrics,
     }
     hosp_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
     ww_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
@@ -478,20 +490,28 @@ def evaluate_loader(
         **distribution_metric_kwargs
     )
     pathway_metrics = {
-        head_name: TorchPathwayMetricAccumulator(device=device)
+        head_name: TorchPathwayMetricAccumulator(
+            device=device, compile_step=compile_metrics
+        )
         for head_name in _HEAD_CANONICAL_NAMES
     }
     observation_latent_metrics = {
-        head_name: TorchObservationLatentCoherenceAccumulator(device=device)
+        head_name: TorchObservationLatentCoherenceAccumulator(
+            device=device, compile_step=compile_metrics
+        )
         for head_name in _HEAD_CANONICAL_NAMES
     }
     mechanistic_prob_metrics = {
         head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
         for head_name in _HEAD_CANONICAL_NAMES
     }
-    latent_metrics = TorchLatentCoherenceAccumulator(device=device)
+    latent_metrics = TorchLatentCoherenceAccumulator(
+        device=device, compile_step=compile_metrics
+    )
     latent_diagnostic_metrics = {
-        protocol: TorchLatentProtocolAccumulator(protocol=protocol, device=device)
+        protocol: TorchLatentProtocolAccumulator(
+            protocol=protocol, device=device, compile_step=compile_metrics
+        )
         for protocol in ("oracle_x0", "teacher_forced_one_step")
     }
     loss_ww_sum = torch.tensor(0.0, device=device)
