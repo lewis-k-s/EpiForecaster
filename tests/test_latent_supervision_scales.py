@@ -10,6 +10,7 @@ from data.latent_supervision import (
     LATENT_SCALE_TASKS,
     fit_latent_scale_state,
     latent_scales_from_checkpoint,
+    validate_complete_latent_targets,
 )
 
 
@@ -104,6 +105,36 @@ def test_scale_fit_excludes_nonfinite_targets_and_applies_positive_floors():
     assert state.zero_count["s"] == 3
     assert state.count["death_flow"] == 2
     assert state.zero_count["death_flow"] == 2
+
+
+@pytest.mark.epiforecaster
+def test_complete_target_check_ignores_values_outside_supervised_windows():
+    values = np.array(
+        [
+            [np.nan, -1.0],
+            [0.0, np.nan],
+            [1.0, -1.0],
+            [3.0, np.nan],
+            [5.0, -1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    validate_complete_latent_targets(_ConcatLike(_dataset(values=values)))
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize("invalid_value", [np.nan, -1.0])
+def test_complete_target_check_rejects_invalid_supervised_value(invalid_value):
+    dataset = _dataset()
+    death_flow = dataset.precomputed_death_flow_target.clone()
+    death_flow[4, 0] = invalid_value
+    dataset.precomputed_death_flow_target = death_flow
+
+    with pytest.raises(
+        ValueError, match="finite and nonnegative.*precomputed_death_flow_target"
+    ):
+        validate_complete_latent_targets(dataset)
 
 
 @pytest.mark.epiforecaster

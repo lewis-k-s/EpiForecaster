@@ -19,7 +19,6 @@ MAINTAINED_SHELL_FILES=(
   scripts/workflow/mn5_container_exec.sh
   scripts/workflow/mn5_workflow.sh
   scripts/workflow/remote_run.sh
-  scripts/workflow/remote_tooling.sh
   scripts/workflow/run_parallel_worker.sh
   scripts/workflow/snakemake_coordinator.sbatch
   spells.sh
@@ -36,7 +35,6 @@ FORMATTED_BASH_FILES=(
   scripts/workflow/mn5_container_exec.sh
   scripts/workflow/mn5_workflow.sh
   scripts/workflow/remote_run.sh
-  scripts/workflow/remote_tooling.sh
   scripts/workflow/run_parallel_worker.sh
   scripts/workflow/snakemake_coordinator.sbatch
 )

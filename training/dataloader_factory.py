@@ -153,7 +153,7 @@ def build_dataloaders(
     val_persistent_workers = training_config.persistent_workers and val_num_workers > 0
     val_loader_kwargs: dict[str, Any] = {
         "dataset": val_dataset,
-        "batch_size": training_config.batch_size,
+        "batch_size": training_config.eval_batch_size,
         "shuffle": False,
         "num_workers": val_num_workers,
         "pin_memory": pin_memory,
@@ -172,7 +172,7 @@ def build_dataloaders(
     )
     test_loader_kwargs: dict[str, Any] = {
         "dataset": test_dataset,
-        "batch_size": training_config.batch_size,
+        "batch_size": training_config.eval_batch_size,
         "shuffle": False,
         "num_workers": test_num_workers,
         "pin_memory": pin_memory,

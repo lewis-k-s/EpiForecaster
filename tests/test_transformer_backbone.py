@@ -1,12 +1,33 @@
 import pytest
 import torch
 
-from models.transformer_backbone import PositionalEncoding, create_transformer_backbone
+from models.transformer_backbone import (
+    LearnedPositionalEncoding,
+    PositionalEncoding,
+    create_transformer_backbone,
+)
 
 
 def test_sinusoidal_positional_encoding_rejects_odd_width() -> None:
     with pytest.raises(ValueError, match="d_model must be even"):
         PositionalEncoding(d_model=7)
+
+
+def test_learned_positional_encoding_matches_per_sample_lookup() -> None:
+    torch.manual_seed(0)
+    encoding = LearnedPositionalEncoding(d_model=16, max_len=40, dropout=0.0)
+    x = torch.randn(5, 12, 16)
+    position_ids = torch.arange(12).unsqueeze(0).expand(5, -1)
+    expected = x + encoding.pos_embedding(position_ids)
+    output = encoding(x)
+    assert torch.equal(output, expected)
+
+    upstream = torch.randn_like(output)
+    weight = encoding.pos_embedding.weight
+    (expected_grad,) = torch.autograd.grad(expected, weight, upstream)
+    (grad,) = torch.autograd.grad(output, weight, upstream)
+    torch.testing.assert_close(grad, expected_grad, rtol=0, atol=1e-6)
+    assert torch.count_nonzero(grad[12:]) == 0
 
 
 def test_backbone_initializes_rates_and_states_near_epidemiological_priors() -> None:

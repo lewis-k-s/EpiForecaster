@@ -2,24 +2,48 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
 
 from einops import repeat
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
-
-def pack_bool_last_dim(mask: torch.Tensor) -> torch.Tensor:
-    """Pack a CPU bool tensor along its last axis into uint8 bytes (8x smaller)."""
-    packed = np.packbits(mask.numpy(), axis=-1, bitorder="little")
-    return torch.from_numpy(packed)
+_BIT_WEIGHTS = torch.tensor([1 << bit for bit in range(8)], dtype=torch.uint8)
 
 
-def unpack_bool_last_dim(packed: torch.Tensor, width: int) -> torch.Tensor:
-    """Invert ``pack_bool_last_dim`` on any device: [..., ceil(W/8)] -> [..., W]."""
-    shifts = torch.arange(8, dtype=torch.uint8, device=packed.device)
-    bits = torch.bitwise_and(torch.bitwise_right_shift(packed.unsqueeze(-1), shifts), 1)
-    return bits.flatten(-2)[..., :width].to(torch.bool)
+def pack_mask_bits(mask: torch.Tensor) -> torch.Tensor:
+    """Pack a bool mask along its last dim into uint8 bytes (8 entries each)."""
+    pad = -mask.shape[-1] % 8
+    if pad:
+        mask = torch.nn.functional.pad(mask, (0, pad))
+    groups = mask.reshape(*mask.shape[:-1], -1, 8).to(torch.uint8)
+    return (groups * _BIT_WEIGHTS.to(mask.device)).sum(dim=-1, dtype=torch.uint8)
+
+
+def unpack_mask_bits(packed: torch.Tensor, size: int) -> torch.Tensor:
+    """Invert ``pack_mask_bits``: uint8 [..., ceil(size/8)] -> bool [..., size]."""
+    weights = _BIT_WEIGHTS.to(packed.device)
+    bits = (packed.unsqueeze(-1) & weights) != 0
+    return bits.reshape(*packed.shape[:-1], -1)[..., :size]
+
+
+def target_positions_in_context(
+    node_ids: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Return each target's position in the sorted context node list.
+
+    Runs once when the context tables are built, so the per-batch assembly path
+    needs no device-to-host check. Raises when a target is missing from the
+    context nodes or listed twice.
+    """
+    positions = torch.searchsorted(node_ids, targets)
+    in_range = positions < node_ids.numel()
+    found = in_range & (node_ids[positions.clamp(max=node_ids.numel() - 1)] == targets)
+    if not bool(found.all()) or torch.unique(targets).numel() != targets.numel():
+        raise ValueError(
+            "Batch target is not part of the dataset's target list; "
+            "context tables cannot be indexed for it."
+        )
+    return positions
 
 
 def assemble_context_features(
@@ -57,15 +81,10 @@ def assemble_context_features(
     target_slots = tables["context_target_slot_by_position"].index_select(
         0, target_positions
     )
-    if int(target_slots.min()) < 0:
-        raise ValueError(
-            "Batch target is not part of the dataset's target list; "
-            "context tables cannot be indexed for it."
-        )
 
+    # The neighbor and k-hop tables are bit-packed along the context axis.
+    context_size = tables["context_target_slot_by_position"].numel()
     history_length = int(getattr(dataset, "config").model.input_window_length)
-    # Neighbor and k-hop tables are bit-packed along the context axis.
-    context_width = int(getattr(dataset, "context_node_count"))
     # (S, 1) + (1, L) -> (S, L) absolute table indices per graph step,
     # flattened to (S * L,) in the same sample-major order as the outputs.
     time_grid = (
@@ -82,8 +101,8 @@ def assemble_context_features(
         clinical_window = clinical[time_grid]
         # Pair each graph's timestep with its target slot in the
         # (time, target_slot, ctx_pos) table -> (S * L, N_ctx) mask.
-        neighbor_mask = unpack_bool_last_dim(
-            tables["context_neigh_table"][time_grid, target_slots], context_width
+        neighbor_mask = unpack_mask_bits(
+            tables["context_neigh_table"][time_grid, target_slots], context_size
         )
         blocks.append(
             torch.where(
@@ -118,7 +137,7 @@ def assemble_context_features(
     k_hop = tables.get("context_khop_table")
     if k_hop is not None:
         # Same (time, target_slot) lookup -> (S * L, N_ctx) keep-mask.
-        keep_mask = unpack_bool_last_dim(k_hop[time_grid, target_slots], context_width)
+        keep_mask = unpack_mask_bits(k_hop[time_grid, target_slots], context_size)
         features = torch.where(
             keep_mask.unsqueeze(-1),
             features,

@@ -200,6 +200,35 @@ def fit_latent_scale_state(
     )
 
 
+def validate_complete_latent_targets(dataset: _LatentScaleDataset | object) -> None:
+    """Reject missing, non-finite, or negative latent targets in supervised windows.
+
+    The loss cannot branch on target values without breaking the compiled
+    training graph, so the complete-target contract is checked once per split.
+    """
+    for run in _flatten_datasets(dataset):
+        state_dates_by_node, flow_dates_by_node = _supervised_dates_by_node(run)
+        invalid = []
+        for attribute, dates_by_node in (
+            ("precomputed_S_target", state_dates_by_node),
+            ("precomputed_I_target", state_dates_by_node),
+            ("precomputed_H_target", state_dates_by_node),
+            ("precomputed_R_target", state_dates_by_node),
+            ("precomputed_death_flow_target", flow_dates_by_node),
+        ):
+            values = _required_target(run, attribute).detach().cpu().numpy()
+            for node, dates in dates_by_node.items():
+                window = values[np.asarray(dates, dtype=np.int64), node]
+                if not (np.isfinite(window).all() and (window >= 0).all()):
+                    invalid.append(attribute)
+                    break
+        if invalid:
+            raise ValueError(
+                "Complete latent supervision targets must be finite and "
+                f"nonnegative; invalid {invalid} in run {run.run_id!r}"
+            )
+
+
 def latent_scales_from_checkpoint(
     checkpoint: Mapping[str, Any],
 ) -> dict[str, float] | None:

@@ -909,32 +909,14 @@ class JointInferenceLoss(nn.Module):
                 for _component_name, _task_name, _output_key, target_key in self._LATENT_COMPONENTS
                 if targets.get(target_key) is None
             ]
+            # Target values are validated once per split by
+            # data.latent_supervision.validate_complete_latent_targets; a
+            # value-dependent branch here would break the compiled graph.
             if self.latent_require_complete_targets and missing_targets:
                 raise ValueError(
                     "Complete latent supervision requires all five targets; "
                     f"missing {missing_targets}"
                 )
-            if self.latent_require_complete_targets:
-                invalid_targets = []
-                for (
-                    _component_name,
-                    _task_name,
-                    _output_key,
-                    target_key,
-                ) in self._LATENT_COMPONENTS:
-                    target = targets[target_key]
-                    assert isinstance(target, torch.Tensor)
-                    target_f32 = target.float()
-                    if (
-                        not torch.isfinite(target_f32).all()
-                        or not (target_f32 >= 0).all()
-                    ):
-                        invalid_targets.append(target_key)
-                if invalid_targets:
-                    raise ValueError(
-                        "Complete latent supervision targets must be finite and "
-                        f"nonnegative; invalid {invalid_targets}"
-                    )
 
             active_components: list[tuple[str, str]] = []
             for (

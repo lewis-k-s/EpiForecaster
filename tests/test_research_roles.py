@@ -111,6 +111,7 @@ def test_dataset_factory_enforces_role_ranges_and_reuses_fit_scalers(
         )
     }
     aligned = xr.Dataset(
+        {"valid_targets": (("region_id",), [True, False, True])},
         coords={
             "date": pd.date_range("2020-03-01", "2021-05-09"),
             "region_id": ["a", "b", "c"],
@@ -131,6 +132,7 @@ def test_dataset_factory_enforces_role_ranges_and_reuses_fit_scalers(
                 "mobility_preprocessor",
                 "preloaded_mobility",
                 "mobility_mask",
+                "shared_series",
             ]:
                 setattr(self, field, kwargs.get(field, object()))
             created.append(self)
@@ -151,7 +153,12 @@ def test_dataset_factory_enforces_role_ranges_and_reuses_fit_scalers(
     )
     config = SimpleNamespace(
         training=training,
-        data=SimpleNamespace(dataset_path="unused", run_id="real", run_id_chunk_size=1),
+        data=SimpleNamespace(
+            dataset_path="unused",
+            run_id="real",
+            run_id_chunk_size=1,
+            use_valid_targets=True,
+        ),
         model=SimpleNamespace(input_window_length=60, forecast_horizon=28),
     )
     result = factory._build_research_splits(config, None)
@@ -166,8 +173,10 @@ def test_dataset_factory_enforces_role_ranges_and_reuses_fit_scalers(
     for ds in [result.val, result.test]:
         assert ds.biomarker_preprocessor is result.train.biomarker_preprocessor
         assert ds.mobility_preprocessor is result.train.mobility_preprocessor
-    expected_nodes = [2] if crossval else [0, 1, 2]
+        assert ds.shared_series is result.train.shared_series
+    expected_nodes = [2] if crossval else [0, 2]
     assert result.test.kwargs["target_nodes"] == expected_nodes
+    assert result.test.kwargs["context_nodes"] == [0, 1, 2]
 
 
 def test_confirmation_cannot_be_enabled_by_a_role_name_alone():

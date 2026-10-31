@@ -262,8 +262,10 @@ def inject_gpu_mobility(
             logger.error(msg)
             raise RuntimeError(msg)
 
-    # Reconstruct adj_dense inside the batch!
-    mob_batch.adj_dense = gpu_mob[global_t_gpu]
+    # The model gathers adj_table[adj_time_ids] inside its compiled forward, so
+    # the [B*T, N, N] adjacency is not materialized (or prefetched) outside it.
+    mob_batch.adj_table = gpu_mob
+    mob_batch.adj_time_ids = global_t_gpu
 
 
 def inject_context_features(
@@ -317,8 +319,8 @@ def ensure_mobility_adj_dense_ready(
     if mob_batch is None:
         raise ValueError(f"Missing 'mob_batch' in batch data{suffix}.")
 
-    if not hasattr(mob_batch, "adj_dense") or mob_batch.adj_dense is None:
+    if getattr(mob_batch, "adj_table", None) is None:
         raise ValueError(
-            "Missing 'mob_batch.adj_dense' before compiled forward"
+            "Missing 'mob_batch.adj_table' before compiled forward"
             f"{suffix}. Ensure inject_gpu_mobility() (or equivalent prep) runs first."
         )

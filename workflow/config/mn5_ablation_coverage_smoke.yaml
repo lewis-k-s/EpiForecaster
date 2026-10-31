@@ -1,38 +1,17 @@
-# Bounded all-arm acceptance for the reduced production matrix. The campaign owns
-# three coverage-selected folds and its two-fold smoke subset; this config changes
+# Bounded all-arm acceptance for the full production matrix. The campaign owns
+# all ten production folds and its two-fold smoke subset; this config changes
 # execution resources only.
-
-run: {}
-source: {}
-container: {}
-
-workflow:
-  kind: ablation
-  target: ablation
-
-dvc:
-  targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
-    - outputs/region_embeddings/region_embeddings.pt.dvc
+extends: mn5_ablation.yaml
 
 ablation:
-  study_name: epiforecaster_ablation_default_smoke_v1
-  campaign: configs/campaigns/ablation_default_v1.yaml
+  study_name: epiforecaster_ablation_default_smoke_v2
   workers: 2
   closeout_signal_seconds: 600
   timeout_s: 6000
-  sampler_seed: 42
   smoketest: true
-  requeue_running: false
 
 resources:
   allocation:
-    account: bsc08
-    partition: acc
-    qos: acc_bscls
-    nodes: 1
     tasks: 2
-    cpus_per_task: 20
     gres: gpu:2
     runtime: 110

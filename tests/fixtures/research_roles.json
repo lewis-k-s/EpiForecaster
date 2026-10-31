@@ -1,8 +1,7 @@
 {
   "schema_version": 1,
-  "protocol_id": "loss-type-research-v1",
+  "protocol_id": "test-research-roles",
   "source_audit_status": "complete",
-  "source_audit": "docs/research/loss_data_audit_20260918.md",
   "required_preprocessing_contract": "loss-research-v1",
   "minimum_label_gap_days": 28,
   "confirmation_claim": "retrospective_previously_studied_period",

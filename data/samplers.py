@@ -292,6 +292,9 @@ class EpidemicCurriculumSampler(BatchSampler):
     ) -> list[list[list[int]]]:
         streams: list[list[list[int]]] = []
         for dataset_idx in dataset_indices:
+            if self.config.window_start_batches:
+                streams.extend(self._window_start_streams(dataset_idx, rng))
+                continue
             indices = self._get_indices_for_dataset(dataset_idx)
             chunks = self._chunk_indices(indices, self.config.chunk_size)
             rng.shuffle(chunks)
@@ -300,6 +303,27 @@ class EpidemicCurriculumSampler(BatchSampler):
                 if chunk_batches:
                     streams.append(chunk_batches)
         rng.shuffle(streams)
+        return streams
+
+    def _window_start_streams(
+        self,
+        dataset_idx: int,
+        rng: random.Random,
+    ) -> list[list[list[int]]]:
+        """One stream per window start; every batch is full and shares the start."""
+        offset = self.dataset_offsets[dataset_idx]
+        groups: dict[int, list[int]] = {}
+        for local_idx, start in enumerate(
+            self.sub_datasets[dataset_idx].sample_window_starts()
+        ):
+            groups.setdefault(start, []).append(local_idx + offset)
+
+        streams: list[list[list[int]]] = []
+        for group in groups.values():
+            batches = self._chunk_indices(group, self.batch_size)
+            tail = batches[-1]
+            tail.extend(rng.choices(group, k=self.batch_size - len(tail)))
+            streams.append(batches)
         return streams
 
     @staticmethod
@@ -436,14 +460,15 @@ class EpidemicCurriculumSampler(BatchSampler):
             return []
 
         # -1 means "use all available synthetic runs"
-        n_active = n_synth if self.state.active_runs < 0 else min(n_synth, self.state.active_runs)
+        n_active = (
+            n_synth
+            if self.state.active_runs < 0
+            else min(n_synth, self.state.active_runs)
+        )
 
         if self.config.run_sampling == "round_robin":
             start_idx = (self.state.epoch * n_active) % n_synth
-            return [
-                available_synth[(start_idx + i) % n_synth]
-                for i in range(n_active)
-            ]
+            return [available_synth[(start_idx + i) % n_synth] for i in range(n_active)]
 
         rng = self._rng_for_epoch()
         return rng.sample(available_synth, n_active)

@@ -184,17 +184,18 @@ class HospitalizationsProcessor:
                 # Fit Kalman parameters from observed data only
                 fit_series = muni_data["hospitalizations"].where(lambda s: s > 0)
 
-                try:
-                    process_var, measurement_var = fit_kalman_params(
-                        fit_series,
-                        fit_end_date=self.config.smoothing.parameter_fit_end_date,
-                    )
-                except Exception as e:
-                    print(
-                        f"    ! Falling back to configured variances for {muni_code}: {e}"
-                    )
-                    process_var = fallback_process
-                    measurement_var = fallback_measure
+                process_var = fallback_process
+                measurement_var = fallback_measure
+                if self.config.smoothing.parameter_fit_mode == "per_series":
+                    try:
+                        process_var, measurement_var = fit_kalman_params(
+                            fit_series,
+                            fit_end_date=self.config.smoothing.parameter_fit_end_date,
+                        )
+                    except Exception as e:
+                        print(
+                            f"    ! Falling back to configured variances for {muni_code}: {e}"
+                        )
 
                 smoother = KalmanSmoother(
                     process_var=process_var,

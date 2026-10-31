@@ -20,7 +20,7 @@ def config():
         "configs/train_epifor_smoke.yaml",
         overrides=[
             "training.split_strategy=research",
-            "training.research_role_manifest_path=configs/research/loss_roles_v1.json",
+            "training.research_role_manifest_path=tests/fixtures/research_roles.json",
             "model.forecast_horizon=28",
         ],
     )
@@ -28,7 +28,7 @@ def config():
 
 @pytest.fixture
 def manifest():
-    return json.loads(Path("configs/research/loss_roles_v1.json").read_text())
+    return json.loads(Path("tests/fixtures/research_roles.json").read_text())
 
 
 @pytest.mark.parametrize("crossval", [False, True])
@@ -80,7 +80,7 @@ def test_research_evaluation_publishes_complete_attempt_and_restores(
     monkeypatch, tmp_path, config, fail
 ):
     workflow = yaml.safe_load(
-        Path("workflow/config/mn5_loss_score_acceptance.yaml").read_text()
+        Path("workflow/config/mn5_train.yaml").read_text()
     )
     workflow["evaluation"].update(
         split="val", granular=True, research_outputs=True, overrides=[]
@@ -145,7 +145,7 @@ def test_research_evaluation_publishes_complete_attempt_and_restores(
 )
 def test_research_workflow_rejects_incomplete_contract(change):
     workflow = yaml.safe_load(
-        Path("workflow/config/mn5_loss_score_acceptance.yaml").read_text()
+        Path("workflow/config/mn5_train.yaml").read_text()
     )
     workflow["evaluation"].update(split="val", granular=True, research_outputs=True)
     workflow["evaluation"].update(change)

@@ -28,7 +28,7 @@ write_completion() {
   if [ ! -f "$receipt" ]; then
     printf '%s\n' \
       $'schema_version\t1' \
-      "exit_code"$'\t'"$status" \
+      "exit_code"$'\t'"${RECEIPT_EXIT_CODE:-$status}" \
       "completed_at"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       >"$temporary"
     mv "$temporary" "$receipt"
@@ -129,7 +129,38 @@ load_singularity_module() {
   fi
 }
 
+bootstrap_singularity_sessiondir() {
+  local session_root="${TMPDIR:-/tmp}/singularity/mnt/session"
+
+  mkdir -p "$session_root"
+  if [ ! -d "$session_root" ] || [ ! -x "$session_root" ]; then
+    echo "Singularity runtime session path is not usable: $session_root" >&2
+    return 1
+  fi
+}
+
+bootstrap_singularity_sessiondir
+
 load_singularity
+
+ensure_singularity_sessiondir() {
+  local session_dir
+
+  session_dir="$(
+    singularity buildcfg | awk -F= '$1 == "SESSIONDIR" { print $2; exit }'
+  )"
+  if [[ "$session_dir" != /* ]]; then
+    echo "Singularity SESSIONDIR must be an absolute path: $session_dir" >&2
+    return 1
+  fi
+  mkdir -p "$session_dir"
+  if [ ! -d "$session_dir" ] || [ ! -x "$session_dir" ]; then
+    echo "Singularity SESSIONDIR is not usable: $session_dir" >&2
+    return 1
+  fi
+}
+
+ensure_singularity_sessiondir
 
 # Only one coordinator may mutate a run's Snakemake metadata at a time.
 exec 9>"$RUN_ROOT/.state/coordinator.run.lock"
@@ -199,6 +230,7 @@ done
 
 
 # Keep the host shell alive so completion and cache cleanup always run.
+set +e
 singularity "${container_args[@]}" "$CONTAINER_SIF" /usr/local/bin/snakemake \
   --snakefile "$RUN_ROOT/source/workflow/Snakefile" \
   --configfile "$RUN_ROOT/config.yaml" \
@@ -209,3 +241,22 @@ singularity "${container_args[@]}" "$CONTAINER_SIF" /usr/local/bin/snakemake \
   --jobs "$EXPECTED_TASKS" \
   --resources "gpu=$EXPECTED_TASKS" \
   "$@"
+workflow_status=$?
+set -e
+
+# A rolling allocation closes out with every worker rank publishing a
+# continuation receipt while the queue still holds identities. Snakemake must
+# keep workers_complete.done absent so the next allocation re-runs the worker
+# rule, but this coordinator should end the allocation cleanly rather than
+# surfacing the designed close-out as a workflow failure.
+# Only a marker written by this attempt counts; an older one is stale. The
+# receipt records the distinct close-out code 75, not success.
+if [ "$workflow_status" -ne 0 ] \
+  && grep -qxF "attempt_id"$'\t'"$EPIFORECASTER_EXECUTION_ATTEMPT_ID" \
+    "$RUN_ROOT/.state/continuation.required" 2>/dev/null \
+  && [ ! -f "$RUN_ROOT/.state/workers_complete.done" ]; then
+  echo "Rolling allocation close-out: queue not drained; continuation required"
+  RECEIPT_EXIT_CODE=75
+  exit 0
+fi
+exit "$workflow_status"

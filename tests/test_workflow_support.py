@@ -28,7 +28,7 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
-from scripts.workflow import run_config, run_support, tooling_identity
+from scripts.workflow import run_config, run_support
 from workflow.common import container_command, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
@@ -104,8 +104,8 @@ def _write_pointer(
 
 
 def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml").read_text()
+    smoke = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_smoke.yaml"
     )
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
@@ -119,6 +119,7 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
         "sampler_seed": 42,
         "smoketest": True,
         "requeue_running": False,
+        "recover_stale_running": True,
     }
     assert smoke["resources"]["allocation"] == {
         "account": "bsc08",
@@ -132,21 +133,22 @@ def test_ablation_smoke_uses_bounded_declarative_matrix() -> None:
     }
 
 
-def test_coverage_smoke_exercises_default_campaign_subset() -> None:
-    smoke = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml").read_text()
+def test_coverage_smoke_exercises_full_campaign_subset() -> None:
+    smoke = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation_coverage_smoke.yaml"
     )
 
     assert smoke["workflow"] == {"kind": "ablation", "target": "ablation"}
     assert smoke["ablation"] == {
-        "study_name": "epiforecaster_ablation_default_smoke_v1",
-        "campaign": "configs/campaigns/ablation_default_v1.yaml",
+        "study_name": "epiforecaster_ablation_default_smoke_v2",
+        "campaign": "configs/campaigns/ablation_default_v2.yaml",
         "workers": 2,
         "closeout_signal_seconds": 600,
         "timeout_s": 6000,
         "sampler_seed": 42,
         "smoketest": True,
         "requeue_running": False,
+        "recover_stale_running": True,
     }
     assert smoke["resources"]["allocation"] == {
         "account": "bsc08",
@@ -380,22 +382,6 @@ def test_relocatable_bundle_rejects_tracked_dvc_payload(tmp_path: Path) -> None:
         )
 
 
-def test_workflow_tooling_key_tracks_lockfile_and_bootstrap(tmp_path: Path) -> None:
-    lock = tmp_path / "uv.lock"
-    bootstrap = tmp_path / "remote_tooling.sh"
-    lock.write_text("version = 1\n")
-    bootstrap.write_text("#!/bin/bash\n")
-
-    initial = tooling_identity.workflow_tooling_key(lock, bootstrap)
-
-    assert initial == tooling_identity.workflow_tooling_key(lock, bootstrap)
-    lock.write_text("version = 2\n")
-    changed_lock = tooling_identity.workflow_tooling_key(lock, bootstrap)
-    assert initial != changed_lock
-    bootstrap.write_text("#!/bin/bash\nset -e\n")
-    assert changed_lock != tooling_identity.workflow_tooling_key(lock, bootstrap)
-
-
 def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/test-run"
     source_root = run_root / "source"
@@ -434,6 +420,7 @@ def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> No
         "workers": 4,
         "timeout_s": 3000,
         "closeout_signal_seconds": 600,
+        "recover_stale_running": True,
     }
     config_path = tmp_path / "ablation-config.yaml"
     config["container"] = {
@@ -738,7 +725,6 @@ def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> No
     assert Path("workflow/Snakefile") in paths
     assert Path("scripts/workflow/mn5_container_exec.sh") in paths
     assert Path("scripts/workflow/remote_run.sh") in paths
-    assert Path("scripts/workflow/remote_tooling.sh") in paths
     assert set(payloads) == {
         Path("data/files/mobility.zarr.dvc"),
         Path("data/processed/real_with_id.zarr.dvc"),
@@ -1187,7 +1173,7 @@ def test_finalize_ablation_runs_analysis_only_after_complete_matrix(
             {
                 "schema_version": 1,
                 "campaign_id": "campaign-a",
-                "stage": "ablation",
+                "stage": "ablation_smoke",
                 "hypothesis": "paired conditions",
                 "base_config": str(base_config),
                 "baseline_condition": "baseline",
@@ -1709,11 +1695,12 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
 ) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("train", run_root)
-    profiled = yaml.safe_load(
-        (
-            REPO_ROOT / "workflow/config/mn5_train_hpo37_profiled_interactive.yaml"
-        ).read_text()
+    profiled = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_train_smoke.yaml"
     )
+    profiled["workflow"]["target"] = "train"
+    profiled["provenance"] = {"training_evidence_retention": "dvc"}
+    profiled["evaluation"]["granular"] = True
     config["workflow"] = profiled["workflow"]
     config["training"] = profiled["training"]
     config["evaluation"] = profiled["evaluation"]
@@ -1746,8 +1733,8 @@ def test_profiled_training_dag_retains_one_dvc_evidence_pack(
 def test_preprocessing_publication_launches_a_host_slurm_step(tmp_path: Path) -> None:
     run_root = tmp_path / "run"
     config = _workflow_mode_config("preprocess", run_root)
-    template = yaml.safe_load(
-        (REPO_ROOT / "workflow/config/mn5_loss_research_preprocess.yaml").read_text()
+    template = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml"
     )
     config["workflow"].update(template["workflow"])
     config["dvc"].update(template["dvc"])
@@ -1791,6 +1778,95 @@ def test_ablation_dag_uses_shared_worker_step_and_post_worker_finalizer(
     assert "seed_coverage_report.csv" in result.stdout
     assert "--workers 4" in result.stdout
     assert re.search(r"^total\s+9$", result.stdout, re.MULTILINE)
+
+
+def test_ablation_suite_uses_one_four_gpu_allocation_and_one_study_each(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "run"
+    config = _workflow_config(run_root, REPO_ROOT)
+    studies = [
+        {
+            "study_name": "epiforecaster_ablation_smoke_v1",
+            "campaign": "configs/campaigns/ablation_smoke_v1.yaml",
+        },
+        {
+            "study_name": "epiforecaster_ablation_v2",
+            "campaign": "configs/campaigns/ablation_default_v2.yaml",
+        },
+    ]
+    load_targets = run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_ablation.yaml"
+    )["dvc"]["targets"]
+    config["workflow"].update(kind="ablation_suite", target="ablation_suite")
+    config["ablation_suite"] = {
+        "closeout_signal_seconds": 1200,
+        "timeout_s": 6000,
+        "studies": [
+            {
+                **study,
+                "workers": 4,
+                "recover_stale_running": True,
+                "sampler_seed": 52,
+                "smoketest": False,
+                "requeue_running": False,
+            }
+            for study in studies
+        ],
+    }
+    config["dvc"]["targets"] = load_targets
+    config["resources"] = {
+        "allocation": {
+            "account": "bsc08",
+            "partition": "acc",
+            "qos": "acc_debug",
+            "nodes": 1,
+            "tasks": 4,
+            "cpus_per_task": 20,
+            "gres": "gpu:4",
+            "runtime": 120,
+        }
+    }
+    config.pop("optuna")
+    config.pop("evaluation")
+    config.pop("promotion")
+    assert run_config.validate_mn5_allocation(config)["gres"] == "gpu:4"
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_source_inventory(run_root)
+
+    result = _run_workflow_dry_run(config_path, run_root, tmp_path / "home")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count("rule launch_suite_study_workers:") == len(studies)
+    assert result.stdout.count("--workers 4") == len(studies)
+    for study in studies:
+        assert f"{study['study_name']}.journal" in result.stdout
+    assert "suite_manifest.json" in result.stdout
+
+
+def test_ablation_suite_manifest_requires_both_studies(tmp_path: Path) -> None:
+    config = {
+        "ablation_suite": {
+            "studies": [{"study_name": "temporal"}, {"study_name": "spatial"}]
+        }
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    temporal = tmp_path / "outputs/ablation_analysis/temporal/ablation_manifest.json"
+    temporal.parent.mkdir(parents=True)
+    temporal.write_text(
+        json.dumps(
+            {
+                "study_name": "temporal",
+                "campaign_id": "temporal",
+                "campaign_sha256": "a" * 64,
+            }
+        )
+    )
+    with pytest.raises(FileNotFoundError, match="spatial"):
+        run_support.finalize_ablation_suite(config_path, tmp_path)
 
 
 @pytest.mark.integration
@@ -1903,7 +1979,7 @@ def test_every_stage_depends_on_the_complete_scientific_source_bundle() -> None:
 def test_research_role_changes_invalidate_stage_fingerprints(tmp_path: Path) -> None:
     from workflow.common import dependency_sources, source_fingerprint
 
-    roles = Path("configs/research/loss_roles_v1.json")
+    roles = Path("roles/research_roles.json")
     folds = Path("configs/crossval/folds.json")
     for relative in [roles, folds]:
         path = tmp_path / relative
@@ -2279,7 +2355,7 @@ def test_container_build_is_source_independent_and_batch_validated() -> None:
     assert "torch.cuda.is_available()" in batch
     assert "uv sync" in fetch
     assert "--frozen" in fetch
-    assert "--python /usr/local/bin/python3.11" in fetch
+    assert "--python /usr/local/bin/python3.13" in fetch
     assert "--group workflow" in fetch
     assert "--group runtime" not in fetch
     assert "UV_CONCURRENT_INSTALLS=1" in fetch
@@ -2680,7 +2756,7 @@ def test_transferred_runner_attaches_without_sbatch(
         text=True,
     )
 
-    assert result.stdout.startswith("attached:98765:")
+    assert result.stdout.startswith("coordinator-finished:0:")
     attempt_id = result.stdout.strip().split(":", 2)[2]
     attempt_root = run_root / ".state/executions" / attempt_id
     for _ in range(100):
@@ -2691,7 +2767,8 @@ def test_transferred_runner_attaches_without_sbatch(
     assert "exit_code\t0\n" in (attempt_root / "completed.tsv").read_text()
     assert "mode\texisting-allocation\n" in (attempt_root / "binding.tsv").read_text()
     assert "--jobid=98765" in srun_calls.read_text()
-    assert "--external-launcher" in srun_calls.read_text()
+    assert "--job-name=snakemake-coordinator" in srun_calls.read_text()
+    assert "--overlap" in srun_calls.read_text()
     assert not (tmp_path / "sbatch.calls").exists()
     assert (
         run_root.parent / "by-slurm" / "98765" / "test-run" / attempt_id
@@ -2719,6 +2796,8 @@ def test_container_coordinator_preserves_capacity_and_completion(
     singularity = fake_bin / "singularity"
     singularity.write_text(
         "#!/bin/bash\nset -euo pipefail\n"
+        'if [ "$1" = buildcfg ]; then printf "SESSIONDIR=%s\\n" '
+        '"${TMPDIR:-/tmp}/singularity/mnt/session"; exit 0; fi\n'
         'printf "%s\\n" "$@" >"$CAPTURE.container"\n'
         'test "$1" = exec\nshift\n'
         'while [ "$#" -gt 0 ]; do\n'
@@ -2967,12 +3046,10 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "declare -f" not in dispatcher
     assert "remote_function" not in dispatcher
     assert "remote_run.sh" in dispatcher
-    assert "remote_tooling.sh" not in dispatcher
     assert 'staging_root="$REMOTE_WORKFLOW_RUN_ROOT/.staging-' in dispatcher
     assert "--dispatch-file" in dispatcher
     assert "uv sync" not in dispatcher
     assert "uv sync" not in remote_runner
-    assert "scripts.workflow.tooling_identity" not in dispatcher
     assert 'REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"' in dispatcher
     assert 'TOOLING_KEY="sif-sha256:$observed_sha"' in dispatcher
     assert "executor_commit=" not in dispatcher
@@ -2992,8 +3069,9 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
         not in remote_runner.split("submit_run()", 1)[1].split("show_status()", 1)[0]
     )
     assert "--mem" not in coordinator
-    assert "--external-launcher" in remote_runner
-    assert "attach-worker" in remote_runner
+    assert "launch_coordinator_step" in remote_runner
+    assert "--overlap" in remote_runner
+    assert "probe-worker" in remote_runner
     assert "acc_interactive" in remote_runner
     assert "active_attempt_status" in remote_runner
     assert "--dvc-project-root" not in container_exec
@@ -3076,6 +3154,76 @@ def test_parallel_worker_publishes_continuation_receipt(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert not (marker_root / "000.done").exists()
     assert "outcome=continuation" in (marker_root / "000.partial").read_text()
+
+
+@pytest.mark.parametrize(
+    ("journal_status", "expected_exit", "continuation"),
+    [(0, 0, False), (75, 75, True), (1, 1, False)],
+)
+def test_parallel_launcher_uses_journal_after_worker_receipts(
+    tmp_path: Path, journal_status: int, expected_exit: int, continuation: bool
+) -> None:
+    source_root = tmp_path / "source"
+    workflow_root = source_root / "scripts/workflow"
+    workflow_root.mkdir(parents=True)
+    launcher = workflow_root / "launch_parallel_workers.sh"
+    shutil.copy2(REPO_ROOT / "scripts/workflow/launch_parallel_workers.sh", launcher)
+    checker = workflow_root / "mn5_container_exec.sh"
+    checker.write_text('#!/bin/bash\nexit "$FAKE_JOURNAL_STATUS"\n')
+    checker.chmod(0o755)
+    run_root = tmp_path / "run"
+    marker_root = run_root / ".state/workers/ablation_test"
+    marker_root.mkdir(parents=True)
+    # The launcher clears stale receipts, so the rank publishes a fresh one.
+    (workflow_root / "run_parallel_worker.sh").write_text(
+        f"#!/bin/bash\necho outcome=continuation >{marker_root}/000.partial\n"
+    )
+    (workflow_root / "run_parallel_worker.sh").chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "srun").write_text(
+        '#!/bin/bash\nif [[ " $* " == *" --cpus-per-task=1 "* ]]; then\n'
+        '  exit "$FAKE_JOURNAL_STATUS"\nfi\n'
+        'for a in "$@"; do case "$a" in *run_parallel_worker.sh) "$a";; esac; done\n'
+        "exit 0\n"
+    )
+    (fake_bin / "srun").chmod(0o755)
+
+    result = subprocess.run(
+        [
+            str(launcher),
+            "--run-root",
+            str(run_root),
+            "--source-root",
+            str(source_root),
+            "--sif",
+            str(tmp_path / "runtime.sif"),
+            "--workers",
+            "1",
+            "--cpus-per-task",
+            "20",
+            "--worker-group",
+            "ablation_test",
+            "--",
+            "python",
+            "-m",
+            "scripts.hpo.ablation_worker",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ
+        | {
+            "FAKE_JOURNAL_STATUS": str(journal_status),
+            "SLURM_JOB_NUM_NODES": "1",
+            "SLURM_NTASKS": "1",
+            "SLURM_CPUS_PER_TASK": "20",
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+
+    assert result.returncode == expected_exit
+    assert (run_root / ".state/continuation.required").exists() == continuation
 
 
 def test_snapshot_rejects_dvc_mount_parent_missing_from_inventory(

@@ -41,7 +41,7 @@ uv run main --help  # entrypoint cli.py
 
 ## Coding Style & Naming Conventions
 
-- Python 3.11+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
+- Python 3.13+. Format with Black (88 chars). Lint with Ruff; type-check with Pyright.
 - Indentation: 4 spaces; no tabs. Imports sorted (Ruff isort rules).
 - Naming: modules `snake_case.py`, classes `PascalCase`, functions/vars `snake_case`, constants `UPPER_SNAKE_CASE`.
 - Prefer type hints, dataclasses where appropriate, and small, pure functions.
@@ -97,6 +97,33 @@ Key local entry points:
 Substantive EpiForecaster training and evaluation use the immutable MN5
 Snakemake workflow. Do not introduce additional local EpiForecaster training
 configs as alternate production interfaces.
+
+### Ablation Campaign Coverage
+
+- Every scientific EpiForecaster ablation, including loss, objective, mobility,
+  signal, and architecture comparisons, must be a checked-in declarative
+  campaign under `configs/campaigns/` and run through the MN5 ablation workflow.
+  Ad hoc single-run matrices are limited to acceptance or historical
+  reproduction and are not eligible for scientific ranking.
+- A production ablation campaign must declare every fold in the persisted
+  representative manifest. Each condition and paired model seed must therefore
+  evaluate every valid target region exactly once across the complete fold
+  matrix. Fold subsets are permitted only for explicitly bounded smoke
+  campaigns and cannot support model-selection claims.
+- Evaluate the complete held-out test support declared by the campaign: all
+  eligible target regions, observed targets, forecast horizons, and target
+  dates. Do not select a regional or temporal subset for a production estimate.
+  If an outer temporal holdout is retained for confirmation, name it separately
+  rather than describing a development subset as the full test set.
+- Ablation analysis must preserve heterogeneous effects. In addition to the
+  aggregate endpoint, report matched deltas by target, region, forecast
+  horizon, fold, and seed, plus the distribution and fraction of regions
+  improved or worsened. For mobility contrasts, include predeclared
+  mobility-context strata. A pooled mean alone is insufficient.
+- Full spatial coverage does not make municipalities, shared wastewater plants,
+  or allocated clinical sources independent. Inferential intervals must retain
+  source grouping and temporal blocking; region-level deltas are descriptive
+  unless their dependence model is explicit.
 
 ### Remote MN5 Cluster Work
 

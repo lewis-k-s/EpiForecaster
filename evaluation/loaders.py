@@ -378,7 +378,7 @@ def build_loader_from_config(
     else:
         resolved_num_workers = min(max(0, avail_cores), resolved_worker_cfg)
 
-    resolved_batch = batch_size or config.training.batch_size
+    resolved_batch = batch_size or config.training.eval_batch_size
     resolved_device = resolve_device(device)
     resolved_pin_memory = (
         bool(config.training.pin_memory) if pin_memory is None else bool(pin_memory)

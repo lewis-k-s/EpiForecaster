@@ -69,14 +69,16 @@ class EDARProcessor:
             censored_mask = np.isfinite(limits) & (values <= limits)
             fit_series = fit_series.mask(censored_mask)
 
-            try:
-                process_var, measurement_var = fit_kalman_params(
-                    fit_series,
-                    fit_end_date=self.config.smoothing.parameter_fit_end_date,
-                )
-            except (ValueError, RuntimeError):
-                process_var = fallback_process
-                measurement_var = fallback_measure
+            process_var = fallback_process
+            measurement_var = fallback_measure
+            if self.config.smoothing.parameter_fit_mode == "per_series":
+                try:
+                    process_var, measurement_var = fit_kalman_params(
+                        fit_series,
+                        fit_end_date=self.config.smoothing.parameter_fit_end_date,
+                    )
+                except (ValueError, RuntimeError):
+                    pass
 
             filter_model = TobitKalmanSmoother(
                 process_var=process_var,
@@ -561,6 +563,10 @@ class EDARProcessor:
             DataFrame with top 2 variants per site
         """
         assert not wastewater_df.empty, "No wastewater data to select variants from"
+        if self.config.smoothing.parameter_fit_mode == "fixed":
+            # The fixed spatial protocol keeps every declared input variant.
+            # Prevalence ranking would otherwise use held-out source data.
+            return wastewater_df
 
         # Count non-null viral_load entries per (edar_id, variant)
         # Filter valid entries first

@@ -349,22 +349,21 @@ def test_joint_inference_complete_latent_contract_rejects_missing_target():
         loss_fn.compute_components(outputs, targets)
 
 
-@pytest.mark.parametrize("invalid_value", [float("nan"), -1.0])
-def test_joint_inference_complete_latent_contract_rejects_invalid_target(
-    invalid_value,
-):
+def test_joint_inference_complete_latent_loss_compiles_without_graph_breaks():
+    # A value-dependent branch splits the compiled training step, which broke
+    # CUDA graph replay; target values are validated once per split instead.
     loss_fn = JointInferenceLoss(
         latent_total_weight=1.0,
         latent_require_complete_targets=True,
     )
     outputs, targets = _complete_latent_case(
-        i_prediction=torch.zeros(1, 3),
-        i_target=torch.zeros(1, 3),
+        i_prediction=torch.zeros(2, 3),
+        i_target=torch.ones(2, 3),
     )
-    targets["I_target"][0, 1] = invalid_value
 
-    with pytest.raises(ValueError, match="finite and nonnegative.*I_target"):
-        loss_fn.compute_components(outputs, targets)
+    explanation = torch._dynamo.explain(loss_fn.compute_components)(outputs, targets)
+
+    assert explanation.graph_break_count == 0, explanation.break_reasons
 
 
 def test_joint_inference_loss_all_masked_keeps_grad_graph():

@@ -219,8 +219,11 @@ def hpo_worker_arguments(config: dict[str, Any]) -> list[object]:
     return arguments
 
 
-def ablation_worker_arguments(config: dict[str, Any]) -> list[object]:
-    options = config["ablation"]
+def ablation_worker_arguments(
+    config: dict[str, Any], options: dict[str, Any] | None = None
+) -> list[object]:
+    if options is None:
+        options = config["ablation"]
     study_name = str(options["study_name"])
     arguments: list[object] = [
         "python",
@@ -245,4 +248,15 @@ def ablation_worker_arguments(config: dict[str, Any]) -> list[object]:
         arguments.append("--smoketest")
     if options.get("requeue_running", False):
         arguments.append("--requeue-running")
+    if options.get("reuse_receipt") is not None:
+        arguments.extend(
+            [
+                "--reuse-receipt",
+                CONTAINER_SOURCE / str(options["reuse_receipt"]),
+                "--run-manifest",
+                CONTAINER_RUN / "manifest.yaml",
+            ]
+        )
+    if options.get("recover_stale_running", False):
+        arguments.append("--recover-stale-running")
     return arguments

@@ -67,6 +67,7 @@ def test_build_main_model_target_aggregate_schema_and_mapping() -> None:
         )
         for suffix in ("median", "iqr")
     ]
+    expected_columns.append("mean_target_wis")
     assert list(df.columns) == expected_columns
     assert list(df["target"]) == ["hospitalizations", "wastewater", "cases", "deaths"]
     assert (df["model"] == "epiforecaster").all()
@@ -77,6 +78,20 @@ def test_build_main_model_target_aggregate_schema_and_mapping() -> None:
     ww_row = df[df["target"] == "wastewater"].iloc[0]
     assert ww_row["mae_median"] == pytest.approx(1.1)
     assert ww_row["observed_count_median"] == pytest.approx(12.0)
+
+
+def test_mean_target_wis_is_equal_head_mean_and_fails_closed() -> None:
+    metrics = {
+        f"wis_{head}_log1p_per_100k": value
+        for head, value in zip(("ww", "hosp", "cases", "deaths"), (1.0, 2.0, 3.0, 6.0))
+    }
+    df = build_main_model_target_aggregate(eval_metrics=metrics)
+    assert df["mean_target_wis"].eq(3.0).all()
+
+    invalid = {**metrics, "invalid_prediction_count_cases": 1}
+    assert build_main_model_target_aggregate(invalid)["mean_target_wis"].isna().all()
+    missing = {k: v for k, v in metrics.items() if "deaths" not in k}
+    assert build_main_model_target_aggregate(missing)["mean_target_wis"].isna().all()
 
 
 def test_build_main_model_target_aggregate_missing_metrics_are_nan() -> None:

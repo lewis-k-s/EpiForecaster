@@ -258,7 +258,8 @@ class TestEpiForecaster:
         )
         dense_adj = torch.rand(num_graphs, num_ctx_nodes, num_ctx_nodes)
         eye = torch.eye(num_ctx_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.maximum(dense_adj, eye)
 
         mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
         mob_batch.target_node = torch.tensor(
@@ -299,7 +300,8 @@ class TestEpiForecaster:
         )
         dense_adj = torch.rand(num_graphs, num_ctx_nodes, num_ctx_nodes)
         eye = torch.eye(num_ctx_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.maximum(dense_adj, eye)
         mob_batch.mob_real_node_idx = torch.tensor([7, 3, 9], dtype=torch.long)
 
         target_nodes = torch.tensor([3, 9], dtype=torch.long)
@@ -334,7 +336,8 @@ class TestEpiForecaster:
         mob_batch.x_dense = _rand_tensor(num_graphs, num_nodes, model.temporal_node_dim)
         dense_adj = torch.rand(num_graphs, num_nodes, num_nodes)
         eye = torch.eye(num_nodes, dtype=dense_adj.dtype).unsqueeze(0)
-        mob_batch.adj_dense = torch.maximum(dense_adj, eye)
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.maximum(dense_adj, eye)
         mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)
         mob_batch.mob_real_node_idx = torch.arange(num_nodes + 1, dtype=torch.long)
 
@@ -411,7 +414,8 @@ class TestEpiForecaster:
             model.temporal_node_dim,
             dtype=torch.float32,
         )
-        mob_batch.adj_dense = torch.eye(num_nodes, dtype=torch.float32).expand(
+        mob_batch.adj_time_ids = torch.arange(num_graphs)
+        mob_batch.adj_table = torch.eye(num_nodes, dtype=torch.float32).expand(
             num_graphs, -1, -1
         )
         mob_batch.target_node = torch.zeros(num_graphs, dtype=torch.long)

@@ -124,6 +124,53 @@ verify_worker_receipts() {
   done
 }
 
+# Worker receipts describe rank exit, while the journal describes campaign work.
+check_ablation_completion() {
+  local status
+
+  if [ "${SCIENTIFIC_COMMAND[0]}" != "python" ] \
+    || [ "${SCIENTIFIC_COMMAND[1]:-}" != "-m" ] \
+    || [ "${SCIENTIFIC_COMMAND[2]:-}" != "scripts.hpo.ablation_worker" ]; then
+    return 0
+  fi
+
+  set +e
+  srun \
+    --nodes=1 \
+    --ntasks=1 \
+    --cpus-per-task=1 \
+    --gres=none \
+    --exact \
+    --kill-on-bad-exit=1 \
+    "$SOURCE_ROOT/scripts/workflow/mn5_container_exec.sh" \
+    --run-root "$RUN_ROOT" \
+    --source-root "$SOURCE_ROOT" \
+    --sif "$SIF" \
+    --cpus 1 \
+    -- "${SCIENTIFIC_COMMAND[@]}" --check-complete
+  status=$?
+  set -e
+
+  case "$status" in
+    0) CONTINUATION_REQUIRED=0 ;;
+    75) CONTINUATION_REQUIRED=1 ;;
+    *) return "$status" ;;
+  esac
+}
+
+# Receipts describe one allocation. The ablation queue is the source of truth
+# for remaining work, so stale rank receipts must not skip a rank.
+reset_worker_receipts() {
+  local marker_root="$1"
+
+  rm -f "$marker_root"/*.partial
+  if [ "${SCIENTIFIC_COMMAND[0]}" = "python" ] \
+    && [ "${SCIENTIFIC_COMMAND[1]:-}" = "-m" ] \
+    && [ "${SCIENTIFIC_COMMAND[2]:-}" = "scripts.hpo.ablation_worker" ]; then
+    rm -f "$marker_root"/*.done
+  fi
+}
+
 # Launch one gang-scheduled worker step and validate all rank receipts.
 main() {
   local worker_script marker_root worker_offset remaining wave_workers
@@ -136,6 +183,9 @@ main() {
   marker_root="$RUN_ROOT/.state/workers/$WORKER_GROUP"
   test -x "$worker_script"
   mkdir -p "$RUN_ROOT/logs" "$marker_root"
+  # A step failure must not leave the marker of an earlier allocation behind.
+  rm -f "$RUN_ROOT/.state/continuation.required"
+  reset_worker_receipts "$marker_root"
 
   worker_offset=0
   while [ "$worker_offset" -lt "$WORKERS" ]; do
@@ -169,7 +219,15 @@ main() {
   done
 
   verify_worker_receipts "$marker_root"
+  check_ablation_completion
   if [ "$CONTINUATION_REQUIRED" -eq 1 ]; then
+    printf '%s\n' \
+      $'schema_version\t1' \
+      "attempt_id"$'\t'"${EPIFORECASTER_EXECUTION_ATTEMPT_ID:-}" \
+      "continued_at"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      >"$RUN_ROOT/.state/continuation.required.$$"
+    mv "$RUN_ROOT/.state/continuation.required.$$" \
+      "$RUN_ROOT/.state/continuation.required"
     echo "Ablation worker close-out completed; continuation is required" >&2
     return 75
   fi

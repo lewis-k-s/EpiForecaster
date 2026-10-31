@@ -132,11 +132,10 @@ class LearnedPositionalEncoding(nn.Module):
         Returns:
             Tensor with positional encoding added [batch_size, seq_len, d_model]
         """
-        batch_size, seq_len, _ = x.shape
-        position_ids = (
-            torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-        )
-        pos_embeddings = self.pos_embedding(position_ids)
+        # Broadcast the leading rows instead of a per-sample lookup. The lookup's
+        # backward adds the batch into each row with atomics, which makes training
+        # irreproducible; the broadcast reduces the batch in a fixed order.
+        pos_embeddings = self.pos_embedding.weight[: x.shape[1]].unsqueeze(0)
         return self.dropout(x + pos_embeddings)
 
 

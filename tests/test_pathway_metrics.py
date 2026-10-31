@@ -436,7 +436,7 @@ def test_window_spearman_matches_row_loop_bitwise(device: torch.device) -> None:
         candidate_count += batch_candidates
         eligible_count += batch_eligible
 
-    assert torch.equal(accumulator.sum, legacy_sum)
+    assert torch.equal(accumulator.correlation_sum(), legacy_sum)
     result = accumulator.finalize()
     expected_mean = (
         float((legacy_sum / eligible_count).item())

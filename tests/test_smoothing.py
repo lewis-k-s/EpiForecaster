@@ -117,7 +117,7 @@ class TestKalmanSmoother:
 
         assert len(filtered) == 10
         assert all(f == 2 for f in flags)
-        assert all(np.isfinite(f) for f in filtered)
+        assert all(np.isnan(f) for f in filtered)
 
 
 class TestTobitKalmanSmoother:
@@ -213,7 +213,7 @@ class TestDampedHoltSmoother:
         filtered, flags = smoother.filter_series(values)
 
         assert flags == [2, 2, 2]
-        assert all(np.isfinite(v) for v in filtered)
+        assert all(np.isnan(v) for v in filtered)
 
 
 class TestSmoothingRegressionQuality:
@@ -303,3 +303,21 @@ def test_kalman_parameter_cutoff_excludes_future_values():
     )
     with pytest.raises(ValueError, match="DatetimeIndex"):
         fit_kalman_params(series.reset_index(drop=True), fit_end_date=cutoff)
+
+
+@pytest.mark.parametrize("kind", ["kalman", "holt"])
+def test_leading_missing_is_nan_with_missing_flag(kind):
+    def make():
+        if kind == "kalman":
+            return KalmanSmoother(process_var=0.05, measurement_var=0.5)
+        return DampedHoltSmoother()
+
+    values = np.array([np.nan, np.nan, np.nan, 50.0, 60.0, np.nan, 70.0])
+    filtered, flags = make().filter_series(values)
+    assert np.isnan(filtered[:3]).all()
+    assert flags[:3] == [2, 2, 2]
+    assert flags[3:] == [0, 0, 2, 0]
+    assert np.isfinite(filtered[3:]).all()
+    # Output after the first observation equals the series without leading gap.
+    trimmed, _ = make().filter_series(values[3:])
+    np.testing.assert_allclose(filtered[3:], trimmed)

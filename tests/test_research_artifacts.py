@@ -15,7 +15,7 @@ from evaluation.research_events import score_research_events
 from scripts.workflow.run_config import RESEARCH_OUTPUT_FILES
 
 
-ROLES = Path("configs/research/loss_roles_v1.json")
+ROLES = Path("tests/fixtures/research_roles.json")
 CHECKPOINT_HASH = "a" * 64
 
 

@@ -1,7 +1,7 @@
 schema_version: 1
-campaign_id: epiforecaster_ablation_v1
+campaign_id: epiforecaster_ablation_v2
 stage: ablation
-hypothesis: Paired interventions isolate each declared architectural, loss, signal, and delay-kernel choice from the fixed production baseline.
+hypothesis: Paired interventions isolate each declared architectural, loss, signal, and delay-kernel choice from the fixed production baseline over every valid target region.
 base_config: configs/production_only/train_epifor_mn5_full.yaml
 baseline_condition: baseline
 fixed_overrides: {}
@@ -128,9 +128,10 @@ conditions:
 paired_model_seeds: [42, 43]
 cross_validation:
   split_manifest: configs/crossval/representative_10fold_mobility_refined.json
-  # Three folds selected for aggregate regional coverage: 33 Barcelona, 7 Girona,
-  # 4 Lleida, and 4 Tarragona held-out regions; 48 total.
-  fold_indices: [1, 4, 5]
+  # Production estimates cover every manifest fold, so all 161 valid target regions
+  # appear in the held-out test role exactly once per condition and model seed.
+  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  # The smoke subset exercises routing only and is scientifically ineligible.
   smoke_fold_indices: [1, 4]
 metrics:
   primary: {name: mae_median, direction: minimize}
@@ -143,6 +144,7 @@ completeness_requirements:
   require_exact_identity_matrix: true
   require_terminal_trials: true
   require_finite_primary_metric: true
+  require_full_manifest_folds: true
 provenance_requirements:
   require_campaign_sha256: true
   require_output_identity: true

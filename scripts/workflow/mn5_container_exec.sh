@@ -323,20 +323,22 @@ configure_singularity_arguments() {
 main() {
   parse_arguments "$@"
   validate_arguments
-  if [ "$STAGE_DATA" -eq 1 ] && [ "${EPIFORECASTER_INPUT_CACHE_LEASED:-}" != "$RUN_ROOT" ]; then
-    # Hold the lease in a parent process for the whole scientific step.
+  if [ "$STAGE_DATA" -eq 1 ]; then
+    # Hold a shared lease on an open descriptor for the whole scientific step.
+    # No flock child process exists, so a step signal cannot kill the lease.
     # shellcheck source=scripts/workflow/node_input_cache.sh
     source "$(dirname "${BASH_SOURCE[0]}")/node_input_cache.sh"
     local cache_root
     cache_root="$(node_cache_run_root "$RUN_ROOT")"
     mkdir -p "$cache_root"
-    flock -s "$cache_root/.usage.lock" \
-      env "EPIFORECASTER_INPUT_CACHE_LEASED=$RUN_ROOT" \
-      bash "${BASH_SOURCE[0]}" "$@"
-    return $?
+    exec 8>"$cache_root/.usage.lock"
+    flock -s 8
   fi
   load_singularity
   create_scratch
+  export TMPDIR="$SCRATCH_ROOT/tmp"
+  export APPTAINER_TMPDIR="$SCRATCH_ROOT/tmp"
+  export SINGULARITY_TMPDIR="$SCRATCH_ROOT/tmp"
   trap cleanup EXIT
 
   configure_shared_binds
@@ -350,4 +352,8 @@ main() {
   fi
 }
 
+# Slurm sends the close-out signal to every process of the step. Only the
+# scientific process handles it, so this wrapper ignores it. An ignored signal
+# stays ignored across exec; Python replaces it with its own handler.
+trap '' USR1
 main "$@"

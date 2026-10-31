@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 import torch
 from einops import rearrange
@@ -589,6 +590,31 @@ class EpiForecaster(nn.Module):
                 - model_outputs: Dict from forward() with predictions and latents
                 - targets_dict: Dict with target tensors for loss computation
         """
+        inputs = self.forward_inputs(
+            batch_data=batch_data,
+            region_embeddings=region_embeddings,
+            mask_cases=mask_cases,
+            mask_ww=mask_ww,
+            mask_hosp=mask_hosp,
+            mask_deaths=mask_deaths,
+        )
+        return self.forward(**inputs), self.batch_targets(batch_data)
+
+    def forward_inputs(
+        self,
+        *,
+        batch_data: EpiBatch,
+        region_embeddings: torch.Tensor | None = None,
+        mask_cases: bool = False,
+        mask_ww: bool = False,
+        mask_hosp: bool = False,
+        mask_deaths: bool = False,
+    ) -> dict[str, Any]:
+        """Apply input ablations and return the keyword arguments for forward().
+
+        Callers that hold a torch.compile wrapper pass these to the wrapper, so
+        the compiled forward runs instead of this module's eager one.
+        """
         mask_ablated_inputs(
             batch_data,
             mask_cases=mask_cases,
@@ -612,25 +638,25 @@ class EpiForecaster(nn.Module):
         # Extract temporal covariates if present
         temporal_covariates = batch_data.temporal_covariates
 
-        # Forward pass
-        model_outputs = self.forward(
-            hosp_hist=batch_data.hosp_hist,
-            deaths_hist=batch_data.deaths_hist,
-            cases_hist=batch_data.cases_hist,
-            biomarkers_hist=batch_data.bio_node,
-            ww_hist=batch_data.ww_hist,
-            ww_hist_mask=batch_data.ww_hist_mask,
-            mob_graphs=mob_batch,
-            target_nodes=target_nodes,
-            region_embeddings=region_embeddings,
-            population=batch_data.population,
-            temporal_covariates=temporal_covariates,
-            vaccination_hist=batch_data.vaccination_hist,
-        )
+        return {
+            "hosp_hist": batch_data.hosp_hist,
+            "deaths_hist": batch_data.deaths_hist,
+            "cases_hist": batch_data.cases_hist,
+            "biomarkers_hist": batch_data.bio_node,
+            "ww_hist": batch_data.ww_hist,
+            "ww_hist_mask": batch_data.ww_hist_mask,
+            "mob_graphs": mob_batch,
+            "target_nodes": target_nodes,
+            "region_embeddings": region_embeddings,
+            "population": batch_data.population,
+            "temporal_covariates": temporal_covariates,
+            "vaccination_hist": batch_data.vaccination_hist,
+        }
 
-        # Prepare targets dict
-        # Joint inference targets: WW, Hosp, Cases, Deaths with per-target masks
-        targets_dict = {
+    @staticmethod
+    def batch_targets(batch_data: EpiBatch) -> dict[str, torch.Tensor | None]:
+        """Joint inference targets (WW, Hosp, Cases, Deaths) with per-target masks."""
+        return {
             "ww": batch_data.ww_target,
             "hosp": batch_data.hosp_target,
             "cases": batch_data.cases_target,
@@ -647,8 +673,6 @@ class EpiForecaster(nn.Module):
             "deaths_mask": batch_data.deaths_target_mask,
         }
 
-        return model_outputs, targets_dict
-
     def _process_mobility_sequence_pyg(
         self,
         mob_batch: Batch,
@@ -663,11 +687,10 @@ class EpiForecaster(nn.Module):
                 "Mobility processing requested but MobilityGNN is not enabled."
             )
 
-        node_emb = self._get_mobility_node_embeddings(mob_batch, region_embeddings)
-        mobility_embeddings = self._gather_target_mobility_embeddings(
-            node_emb, mob_batch, B, T, target_nodes
+        target_embeddings = self._get_mobility_node_embeddings(
+            mob_batch, B, T, target_nodes, region_embeddings
         )
-        return mobility_embeddings
+        return rearrange(target_embeddings, "(b t) d -> b t d", b=B, t=T)
 
     def _get_temporal_node_dim(self) -> int:
         """Compute temporal node dimension based on enabled variants."""
@@ -722,20 +745,28 @@ class EpiForecaster(nn.Module):
         return prediction
 
     def _get_mobility_node_embeddings(
-        self, mob_batch: Batch, region_embeddings: torch.Tensor | None = None
+        self,
+        mob_batch: Batch,
+        B: int,
+        T: int,
+        target_nodes: torch.Tensor,
+        region_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run dense GNN encoder on mobility batch."""
-        if not hasattr(mob_batch, "x_dense") or not hasattr(mob_batch, "adj_dense"):
+        """Run dense GNN encoder on mobility batch; return [G, D] target rows."""
+        x_dense = getattr(mob_batch, "x_dense", None)
+        adj_table = getattr(mob_batch, "adj_table", None)
+        adj_time_ids = getattr(mob_batch, "adj_time_ids", None)
+        if x_dense is None or adj_table is None or adj_time_ids is None:
             raise ValueError(
-                "Mobility batch missing dense graph tensors x_dense/adj_dense."
+                "Mobility batch missing dense graph tensors "
+                "x_dense/adj_table/adj_time_ids."
             )
-
-        x_dense = mob_batch.x_dense  # type: ignore[attr-defined]
-        adj_dense = mob_batch.adj_dense  # type: ignore[attr-defined]
-        if x_dense is None or adj_dense is None:
-            raise ValueError(
-                "Mobility batch has null dense graph tensors x_dense/adj_dense."
-            )
+        # [T_total, N, N] table -> [G, N, N]; gathered here so a compiled
+        # forward can fuse it with the GCN normalization.
+        adj_dense = adj_table[adj_time_ids]
+        target_local = self._target_local_indices(
+            mob_batch, x_dense, B, T, target_nodes
+        )
 
         # Optional: Inject region embeddings into GNN node features
         if self.variant_type.regions and region_embeddings is not None:
@@ -787,23 +818,18 @@ class EpiForecaster(nn.Module):
                 f"{self.mobility_gnn.layers[0].in_channels}"
             )
 
-        return self.mobility_gnn(x_dense, adj_dense)
+        return self.mobility_gnn(x_dense, adj_dense, target_index=target_local)
 
-    def _gather_target_mobility_embeddings(
+    def _target_local_indices(
         self,
-        node_emb: torch.Tensor,
         mob_batch: Batch,
+        x_dense: torch.Tensor,
         B: int,
         T: int,
         target_nodes: torch.Tensor,
     ) -> torch.Tensor:
-        """Gather [G, N, D] targets; G=B*T in sample-major collate order."""
-        if node_emb.ndim != 3:
-            raise ValueError(
-                f"Expected dense node embeddings [G, N, D], got shape {tuple(node_emb.shape)}"
-            )
-
-        num_graphs = node_emb.size(0)
+        """Local target node per graph [G]; G=B*T in sample-major collate order."""
+        num_graphs, num_nodes = x_dense.shape[0], x_dense.shape[1]
         expected_graphs = B * T
         if num_graphs != expected_graphs:
             raise ValueError(
@@ -813,7 +839,7 @@ class EpiForecaster(nn.Module):
 
         if hasattr(mob_batch, "target_node") and mob_batch.target_node is not None:
             target_local = mob_batch.target_node.reshape(-1).to(
-                node_emb.device, dtype=torch.long
+                x_dense.device, dtype=torch.long
             )
         # Fallback: recover per-graph targets by matching real node ids.
         elif (
@@ -822,11 +848,11 @@ class EpiForecaster(nn.Module):
         ):
             real_nodes = torch.as_tensor(
                 mob_batch.mob_real_node_idx,
-                device=node_emb.device,
+                device=x_dense.device,
                 dtype=torch.long,
             ).reshape(-1)
             target_global = target_nodes.to(
-                node_emb.device, dtype=torch.long
+                x_dense.device, dtype=torch.long
             ).repeat_interleave(T)
             matches = real_nodes.unsqueeze(0) == target_global.unsqueeze(1)
             match_counts = matches.sum(dim=1)
@@ -844,17 +870,14 @@ class EpiForecaster(nn.Module):
             raise ValueError("Mobility batch missing target indices.")
 
         if self.strict:
-            max_local_idx = node_emb.shape[1] - 1
+            max_local_idx = num_nodes - 1
             if (target_local < 0).any() or (target_local > max_local_idx).any():
                 raise RuntimeError(
                     f"target_local indices out of bounds. "
                     f"Max allowed: {max_local_idx}, Min found: {target_local.min().item()}, "
                     f"Max found: {target_local.max().item()}"
                 )
-        graph_ids = torch.arange(num_graphs, device=node_emb.device)
-        # Paired indexing selects target_local[g] from graph g.
-        target_embeddings = node_emb[graph_ids, target_local]
-        return rearrange(target_embeddings, "(b t) d -> b t d", b=B, t=T)
+        return target_local
 
     def to(self, *args, **kwargs):
         """Override to update cached device/dtype when model is moved."""

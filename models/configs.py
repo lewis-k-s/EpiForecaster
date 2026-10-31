@@ -312,6 +312,10 @@ class CurriculumConfig:
     chunk_size: int = 512
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
+    # Build each batch from one window start of one run (replaces chunk_size
+    # chunks). The GCN then needs T adjacency matrices per batch, not B*T. A
+    # short group is filled with repeats drawn from the same group.
+    window_start_batches: bool = False
     # List of phase configs defining the curriculum schedule
     schedule: list[CurriculumPhaseConfig] = field(default_factory=list)
 
@@ -591,6 +595,10 @@ class ObservationHeadConfig:
     # i.e. shape ~2.04 and scale ~6.09 d.
     kernel_gamma_shape_ww: float = 2.0
     kernel_gamma_scale_ww: float = 6.0
+    # Deaths prior: mean 7 d, sd 2 d. Chosen in commit 0b021f2 to match the
+    # synthetic generator's death delay (3-epoch single-seed synthetic smoke
+    # runs gamma-deaths-fixed-matched-01 / gamma-deaths-gamma2p-01). Not
+    # validated on real data. Ignored when kernel_mlp_deaths is true.
     # Gamma(shape, scale) prior for the deaths delay kernel. This initializes
     # its simplex weights by default and initializes the explicit two-parameter
     # Gamma family when selected.
@@ -918,7 +926,10 @@ class ModelConfig:
     # -- dimensionality --#
     # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
     biomarkers_dim: int = 13
-    cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
+    # Clinical input width: 3 series x (value, mask, age) = 9, plus one column
+    # per mobility lag when data.use_imported_risk is true. The dataset raises
+    # when this value does not match its actual width.
+    cases_dim: int = 9
     # GNN depth determines message passing depth AND feature masking radius
     # - gnn_depth=0: No masking (all nodes contribute)
     # - gnn_depth=1: 1-hop neighbors (direct neighbors only)
@@ -1032,6 +1043,8 @@ class TrainingParams:
     epochs: int = 100
     seed: int | None = 42  # Random seed for reproducibility (None = non-deterministic)
     batch_size: int = 32
+    # Batch size of the validation and test loaders; null means batch_size.
+    eval_batch_size: int | None = None
     # Preserve sample_ordering within each batch and shuffle batch order each epoch.
     # When False, training iterates through batches in deterministic dataset order.
     shuffle_train_batches: bool = True
@@ -1194,6 +1207,12 @@ class TrainingParams:
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
+        if self.eval_batch_size is None:
+            self.eval_batch_size = self.batch_size
+        if self.eval_batch_size < 1:
+            raise ValueError(
+                f"eval_batch_size must be >= 1, got {self.eval_batch_size}"
+            )
         if self.selection_metric not in {
             "auto",
             "mean_target_wis",
@@ -1202,6 +1221,15 @@ class TrainingParams:
             "mean_target_mae",
         }:
             raise ValueError(f"Unsupported selection_metric: {self.selection_metric!r}")
+        if (
+            self.retain_best_crps_checkpoint
+            and self.loss.joint.observation_loss not in {"nll", "crps", "wis"}
+        ):
+            raise ValueError(
+                "retain_best_crps_checkpoint requires a probabilistic "
+                "observation_loss (nll, crps, or wis), got "
+                f"{self.loss.joint.observation_loss!r}"
+            )
         if (
             not self.selection_required_heads
             or len(set(self.selection_required_heads))

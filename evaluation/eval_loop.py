@@ -455,12 +455,23 @@ def evaluate_loader(
         relevant_source_mapping
     )
 
-    # Device-local accumulators - avoid sync until end
+    # Device-local accumulators - avoid sync until end. A compiled model also
+    # gets compiled metric steps: eager updates launch hundreds of tiny kernels
+    # per batch, which made validation cost more than training.
+    compile_metrics = hasattr(model, "_orig_mod") and device.type == "cuda"
     total_loss = torch.tensor(0.0, device=device)
-    hosp_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    ww_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    cases_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
-    deaths_metrics = TorchMaskedMetricAccumulator(device=device, horizon=horizon)
+    hosp_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    ww_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    cases_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
+    deaths_metrics = TorchMaskedMetricAccumulator(
+        device=device, horizon=horizon, compile_step=compile_metrics
+    )
     distribution_metric_kwargs = {
         "device": device,
         "horizon": horizon,
@@ -468,6 +479,7 @@ def evaluate_loader(
         "distribution_df": criterion.distribution_df,
         "scale_floor": criterion.distribution_scale_floor,
         "interval_levels": criterion.interval_levels,
+        "compile_step": compile_metrics,
     }
     hosp_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
     ww_prob_metrics = TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
@@ -478,20 +490,28 @@ def evaluate_loader(
         **distribution_metric_kwargs
     )
     pathway_metrics = {
-        head_name: TorchPathwayMetricAccumulator(device=device)
+        head_name: TorchPathwayMetricAccumulator(
+            device=device, compile_step=compile_metrics
+        )
         for head_name in _HEAD_CANONICAL_NAMES
     }
     observation_latent_metrics = {
-        head_name: TorchObservationLatentCoherenceAccumulator(device=device)
+        head_name: TorchObservationLatentCoherenceAccumulator(
+            device=device, compile_step=compile_metrics
+        )
         for head_name in _HEAD_CANONICAL_NAMES
     }
     mechanistic_prob_metrics = {
         head_name: TorchDistributionMetricAccumulator(**distribution_metric_kwargs)
         for head_name in _HEAD_CANONICAL_NAMES
     }
-    latent_metrics = TorchLatentCoherenceAccumulator(device=device)
+    latent_metrics = TorchLatentCoherenceAccumulator(
+        device=device, compile_step=compile_metrics
+    )
     latent_diagnostic_metrics = {
-        protocol: TorchLatentProtocolAccumulator(protocol=protocol, device=device)
+        protocol: TorchLatentProtocolAccumulator(
+            protocol=protocol, device=device, compile_step=compile_metrics
+        )
         for protocol in ("oracle_x0", "teacher_forced_one_step")
     }
     loss_ww_sum = torch.tensor(0.0, device=device)
@@ -542,7 +562,10 @@ def evaluate_loader(
 
     model_was_training = model.training
     model.eval()
-    forward_model = cast(EpiForecaster, model)
+    # A torch.compile wrapper exposes the module's methods, but forward_batch
+    # would then run the eager forward. Prepare inputs on the module and call
+    # the wrapper so evaluation uses the compiled forward.
+    forward_model = cast(EpiForecaster, getattr(model, "_orig_mod", model))
     dataset_config = getattr(dataset, "config", None)
     prefetch_factor = (
         dataset_config.training.prefetch_factor if dataset_config is not None else None
@@ -580,7 +603,7 @@ def evaluate_loader(
                     )
 
                 current_stage = "forward_batch"
-                model_outputs, targets_dict = forward_model.forward_batch(
+                forward_inputs = forward_model.forward_inputs(
                     batch_data=batch_data,
                     region_embeddings=region_embeddings,
                     mask_cases=criterion.mask_input_cases,
@@ -588,6 +611,8 @@ def evaluate_loader(
                     mask_hosp=criterion.mask_input_hosp,
                     mask_deaths=criterion.mask_input_deaths,
                 )
+                model_outputs = model(**forward_inputs)
+                targets_dict = forward_model.batch_targets(batch_data)
                 if should_log_batch:
                     logger.info(
                         "[eval][progress] split=%s batch=%d/%d stage=%s",
@@ -1498,7 +1523,7 @@ def eval_checkpoint(
         split,
         config.data.dataset_path,
         resolved_device,
-        batch_size if batch_size is not None else config.training.batch_size,
+        batch_size if batch_size is not None else config.training.eval_batch_size,
         num_workers if num_workers is not None else "config",
         (
             prefetch_factor

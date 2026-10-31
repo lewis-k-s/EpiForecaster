@@ -49,6 +49,8 @@ class SmoothingConfig:
 
     # Inclusive end of parameter fitting. None retains legacy full-series fitting.
     parameter_fit_end_date: str | None = None
+    # Fixed variances avoid learning preprocessing parameters from held-out regions.
+    parameter_fit_mode: str = "per_series"
     clinical_method: str = "kalman_v2"
     wastewater_method: str = "tobit_kalman_v2"
     missing_policy: str = "predict"
@@ -67,6 +69,8 @@ class SmoothingConfig:
     def __post_init__(self):
         if self.parameter_fit_end_date is not None:
             datetime.strptime(self.parameter_fit_end_date, "%Y-%m-%d")
+        if self.parameter_fit_mode not in {"per_series", "fixed"}:
+            raise ValueError("parameter_fit_mode must be 'per_series' or 'fixed'")
         valid_clinical = {"kalman_v2", "holt_damped"}
         valid_wastewater = {"tobit_kalman_v2"}
         valid_missing = {"predict", "momentum"}
@@ -198,7 +202,7 @@ class PreprocessingConfig:
     synthetic_run_exclusions: dict[str, str] = field(default_factory=dict)
     hospitalizations_file: str | None = None
     # Conservative availability shift for weekly totals stamped at week start.
-    hospitalizations_reporting_lag_days: int = 0
+    hospitalizations_reporting_lag_days: int = 7
     deaths_file: str | None = None  # Deaths data (comarca-level)
     catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
     vaccination_file: str | None = None  # Municipality-level COVID vaccination data
@@ -228,10 +232,13 @@ class PreprocessingConfig:
     min_density_threshold: float = (
         0.5  # Minimum data density (non-NaN fraction) for a region to be valid
     )
+    valid_target_rolling_days: int | None = None
+    valid_target_min_observed_days: int | None = None
+    valid_target_qualifying_end_date: str | None = None
 
     # Output configuration
     compression: str = "blosc"
-    continuous_storage_dtype: str = "float16"
+    continuous_storage_dtype: str = "float32"
     chunk_sizes: dict[str, list[int]] | None = None
 
     # Alignment and validation options
@@ -291,6 +298,16 @@ class PreprocessingConfig:
             )
         if self.hospitalizations_reporting_lag_days < 0:
             raise ValueError("hospitalizations_reporting_lag_days must be non-negative")
+        rolling = self.valid_target_rolling_days
+        minimum = self.valid_target_min_observed_days
+        if (rolling is None) != (minimum is None):
+            raise ValueError("Both rolling target selection fields are required")
+        if rolling is not None and (rolling <= 0 or minimum <= 0 or minimum > rolling):
+            raise ValueError("Rolling target selection requires 0 < minimum <= days")
+        if self.valid_target_qualifying_end_date is not None:
+            if rolling is None:
+                raise ValueError("Rolling target selection is required for an end date")
+            datetime.strptime(self.valid_target_qualifying_end_date, "%Y-%m-%d")
         if isinstance(self.smoothing, dict):
             self.smoothing = SmoothingConfig(**self.smoothing)
         if not isinstance(self.source_provenance, dict):

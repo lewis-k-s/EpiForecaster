@@ -16,7 +16,7 @@ from constants import (
     EDAR_BIOMARKER_VARIANTS,
 )
 from data import dtypes as dtype_utils
-from data.context_assembly import pack_bool_last_dim
+from data.context_assembly import pack_mask_bits, target_positions_in_context
 from data.epi_batch import _replace_non_finite
 from models.configs import EpiForecasterConfig
 from utils.logging import suppress_zarr_warnings
@@ -61,6 +61,32 @@ _SPATIAL_KNN_CRS = "EPSG:25831"
 _STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
 
 StaticCovariates = dict[str, torch.Tensor]
+
+# Full-dataset series that do not depend on the split's nodes or time range.
+# Train builds them once; val and test datasets reuse them.
+SHARED_SERIES_ATTRS = (
+    "biomarker_data_start",
+    "precomputed_hosp_hist",
+    "precomputed_deaths_hist",
+    "precomputed_cases_hist",
+    "precomputed_hosp",
+    "precomputed_hosp_mask",
+    "precomputed_ww",
+    "precomputed_ww_mask",
+    "precomputed_cases_target",
+    "precomputed_cases_mask",
+    "precomputed_deaths",
+    "precomputed_deaths_mask",
+    "precomputed_S_target",
+    "precomputed_I_target",
+    "precomputed_H_target",
+    "precomputed_R_target",
+    "precomputed_D_target",
+    "precomputed_death_flow_target",
+    "precomputed_biomarkers",
+    "precomputed_vaccination_hist",
+    "temporal_covariates",
+)
 
 
 @dataclass
@@ -136,6 +162,7 @@ class EpiDataset(Dataset):
         time_range: tuple[int, int] | None = None,
         run_id: str | None = None,
         region_embedding_store: RegionEmbeddingStore | None = None,
+        shared_series: dict[str, torch.Tensor | None] | None = None,
     ):
         self.aligned_data_path = Path(config.data.dataset_path).resolve()
         self.config = config
@@ -167,15 +194,6 @@ class EpiDataset(Dataset):
 
         self.num_nodes = self._dataset[REGION_COORD].size
 
-        # Load biomarker data start offset if available
-        if "biomarker_data_start" in self._dataset:
-            self.biomarker_data_start = torch.from_numpy(
-                self._dataset["biomarker_data_start"].values
-            ).to(torch.long)
-        else:
-            # Fallback: all regions have data starting at index 0
-            self.biomarker_data_start = torch.zeros(self.num_nodes, dtype=torch.long)
-
         self.biomarker_variants = self._get_biomarker_variants()
 
         # Setup clinical series preprocessors for 3-channel [value, mask, age] format
@@ -184,69 +202,91 @@ class EpiDataset(Dataset):
             age_max=14,
         )
 
-        # Precompute hospitalizations (3-channel)
-        self.hosp_preprocessor = ClinicalSeriesPreprocessor(
-            config=clinical_config,
-            var_name="hospitalizations",
-        )
-        self.precomputed_hosp_hist = self.hosp_preprocessor.preprocess_dataset(
-            self._dataset,
-            population=self._dataset.get("population"),
-        )
-        self.precomputed_hosp_hist[..., 0] = _replace_non_finite(
-            self.precomputed_hosp_hist[..., 0]
-        )
+        if shared_series is not None:
+            if set(shared_series) != set(SHARED_SERIES_ATTRS):
+                raise ValueError("shared_series must contain every SHARED_SERIES_ATTRS")
+            # Shared biomarkers were scaled by the source dataset's fitted scaler.
+            if biomarker_preprocessor is None:
+                raise ValueError(
+                    "shared_series requires the fitted biomarker_preprocessor"
+                )
+            for name, value in shared_series.items():
+                setattr(self, name, value)
+        else:
+            # Load biomarker data start offset if available
+            if "biomarker_data_start" in self._dataset:
+                self.biomarker_data_start = torch.from_numpy(
+                    self._dataset["biomarker_data_start"].values
+                ).to(torch.long)
+            else:
+                # Fallback: all regions have data starting at index 0
+                self.biomarker_data_start = torch.zeros(
+                    self.num_nodes, dtype=torch.long
+                )
 
-        # Precompute deaths (3-channel)
-        self.deaths_preprocessor = ClinicalSeriesPreprocessor(
-            config=clinical_config,
-            var_name="deaths",
-        )
-        self.precomputed_deaths_hist = self.deaths_preprocessor.preprocess_dataset(
-            self._dataset,
-            population=self._dataset.get("population"),
-        )
-        self.precomputed_deaths_hist[..., 0] = _replace_non_finite(
-            self.precomputed_deaths_hist[..., 0]
-        )
+            # Precompute hospitalizations (3-channel)
+            hosp_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="hospitalizations",
+            )
+            self.precomputed_hosp_hist = hosp_preprocessor.preprocess_dataset(
+                self._dataset,
+                population=self._dataset.get("population"),
+            )
+            self.precomputed_hosp_hist[..., 0] = _replace_non_finite(
+                self.precomputed_hosp_hist[..., 0]
+            )
 
-        # Precompute reported cases (3-channel)
-        self.cases_preprocessor = ClinicalSeriesPreprocessor(
-            config=clinical_config,
-            var_name="cases",
-        )
-        self.precomputed_cases_hist = self.cases_preprocessor.preprocess_dataset(
-            self._dataset,
-            population=self._dataset.get("population"),
-        )
-        self.precomputed_cases_hist[..., 0] = _replace_non_finite(
-            self.precomputed_cases_hist[..., 0]
-        )
+            # Precompute deaths (3-channel)
+            deaths_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="deaths",
+            )
+            self.precomputed_deaths_hist = deaths_preprocessor.preprocess_dataset(
+                self._dataset,
+                population=self._dataset.get("population"),
+            )
+            self.precomputed_deaths_hist[..., 0] = _replace_non_finite(
+                self.precomputed_deaths_hist[..., 0]
+            )
 
-        # Precompute joint inference targets + masks (1D for loss computation).
-        # Clinical targets use log1p(per-100k), while wastewater targets stay in
-        # measurement space (log1p on raw concentration/proxy values).
-        self.precomputed_hosp, self.precomputed_hosp_mask = (
-            self._precompute_joint_target("hospitalizations", per_100k=True)
-        )
-        self.precomputed_ww, self.precomputed_ww_mask = (
-            self._precompute_wastewater_target()
-        )
-        # Reported cases and deaths (optional, default to all-missing if not in dataset)
-        self.precomputed_cases_target, self.precomputed_cases_mask = (
-            self._precompute_joint_target("cases", per_100k=True)
-        )
-        self.precomputed_deaths, self.precomputed_deaths_mask = (
-            self._precompute_joint_target("deaths", per_100k=True)
-        )
-        self.precomputed_S_target = self._precompute_latent_target("latent_S_true")
-        self.precomputed_I_target = self._precompute_latent_target("latent_I_true")
-        self.precomputed_H_target = self._precompute_latent_target("latent_H_true")
-        self.precomputed_R_target = self._precompute_latent_target("latent_R_true")
-        self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
-        self.precomputed_death_flow_target = self._precompute_latent_target(
-            "latent_death_flow_true"
-        )
+            # Precompute reported cases (3-channel)
+            cases_preprocessor = ClinicalSeriesPreprocessor(
+                config=clinical_config,
+                var_name="cases",
+            )
+            self.precomputed_cases_hist = cases_preprocessor.preprocess_dataset(
+                self._dataset,
+                population=self._dataset.get("population"),
+            )
+            self.precomputed_cases_hist[..., 0] = _replace_non_finite(
+                self.precomputed_cases_hist[..., 0]
+            )
+
+            # Precompute joint inference targets + masks (1D for loss computation).
+            # Clinical targets use log1p(per-100k), while wastewater targets stay in
+            # measurement space (log1p on raw concentration/proxy values).
+            self.precomputed_hosp, self.precomputed_hosp_mask = (
+                self._precompute_joint_target("hospitalizations", per_100k=True)
+            )
+            self.precomputed_ww, self.precomputed_ww_mask = (
+                self._precompute_wastewater_target()
+            )
+            # Reported cases and deaths (optional, default to all-missing if not in dataset)
+            self.precomputed_cases_target, self.precomputed_cases_mask = (
+                self._precompute_joint_target("cases", per_100k=True)
+            )
+            self.precomputed_deaths, self.precomputed_deaths_mask = (
+                self._precompute_joint_target("deaths", per_100k=True)
+            )
+            self.precomputed_S_target = self._precompute_latent_target("latent_S_true")
+            self.precomputed_I_target = self._precompute_latent_target("latent_I_true")
+            self.precomputed_H_target = self._precompute_latent_target("latent_H_true")
+            self.precomputed_R_target = self._precompute_latent_target("latent_R_true")
+            self.precomputed_D_target = self._precompute_latent_target("latent_D_true")
+            self.precomputed_death_flow_target = self._precompute_latent_target(
+                "latent_death_flow_true"
+            )
 
         # Setup mobility preprocessor
         if mobility_preprocessor is None:
@@ -271,17 +311,16 @@ class EpiDataset(Dataset):
             # Reuse shared tensors from another dataset (e.g., train -> val/test)
             self.preloaded_mobility = preloaded_mobility
             self.mobility_mask = mobility_mask
-            for time_step in range(self.preloaded_mobility.shape[0]):
-                weights_t = self.preloaded_mobility[time_step]
-                mask_t = self.mobility_mask[time_step]
-                if torch.any(weights_t[~mask_t] != 0):
-                    raise ValueError(
-                        "Shared mobility weights must be zero outside mobility_mask"
-                    )
-                if not torch.isfinite(weights_t).all() or torch.any(weights_t < 0):
-                    raise ValueError(
-                        "Shared mobility weights must be finite and nonnegative"
-                    )
+            if torch.any(self.preloaded_mobility.masked_fill(self.mobility_mask, 0)):
+                raise ValueError(
+                    "Shared mobility weights must be zero outside mobility_mask"
+                )
+            if not torch.isfinite(self.preloaded_mobility).all() or torch.any(
+                self.preloaded_mobility < 0
+            ):
+                raise ValueError(
+                    "Shared mobility weights must be finite and nonnegative"
+                )
             logger.info(
                 f"Reusing shared mobility tensor: {self.preloaded_mobility.shape}, "
                 f"{self.preloaded_mobility.element_size() * self.preloaded_mobility.numel() / 1e6:.2f} MB"
@@ -357,10 +396,10 @@ class EpiDataset(Dataset):
         # Each entry is a (N,) tensor with local indices or -1 for non-context nodes
         self._global_to_local_cache: dict[int, torch.Tensor] = {}
 
-        # Precomputed k-hop reachability masks for all timesteps
-        # Dict mapping time_step -> (N, N) boolean tensor
+        # Precomputed k-hop reachability rows of the target nodes for all
+        # timesteps: (T, n_targets, N) boolean, rows in target_nodes order.
         # This replaces on-demand computation to eliminate CPU bottleneck in __getitem__
-        self._precomputed_k_hop_masks: dict[int, torch.Tensor] = {}
+        self._target_k_hop_reach: torch.Tensor | None = None
 
         # Setup biomarker preprocessor
         if biomarker_preprocessor is None:
@@ -403,68 +442,68 @@ class EpiDataset(Dataset):
         else:
             self.biomarker_preprocessor = biomarker_preprocessor
 
-        # Precompute biomarkers for the entire dataset
-        # This returns a (TotalTime, NumNodes, 4 * variants) tensor: per variant
-        # the channels are [value, mask, censor, age], concatenated on the last axis.
-        if self.biomarker_variants:
-            self.precomputed_biomarkers = torch.from_numpy(
-                self.biomarker_preprocessor.preprocess_dataset(self._dataset)
-            ).to(dtype_utils.STORAGE_DTYPES["continuous"])
-            self.precomputed_biomarkers[..., 0::4] = _replace_non_finite(
-                self.precomputed_biomarkers[..., 0::4]
-            )
-        else:
-            T_total = len(self._dataset[TEMPORAL_COORD])
-            # 4 channels per variant: value, mask, censor, age
-            channel_count = max(1, len(self.biomarker_variants)) * 4
-            # channels: value=0, mask=0, censor=0, age=1
-            dummy = torch.zeros(
-                (T_total, self.num_nodes, channel_count),
-                dtype=dtype_utils.STORAGE_DTYPES["continuous"],
-            )
-            # For 4-channel layout [value, mask, censor, age], age is at indices 3, 7, 11, ...
-            for idx in range(3, channel_count, 4):
-                dummy[:, :, idx] = 1.0
-            self.precomputed_biomarkers = dummy
+        if shared_series is None:
+            # Precompute biomarkers for the entire dataset
+            # This returns a (TotalTime, NumNodes, 4 * variants) tensor: per variant
+            # the channels are [value, mask, censor, age], concatenated on the last axis.
+            if self.biomarker_variants:
+                self.precomputed_biomarkers = torch.from_numpy(
+                    self.biomarker_preprocessor.preprocess_dataset(self._dataset)
+                ).to(dtype_utils.STORAGE_DTYPES["continuous"])
+                self.precomputed_biomarkers[..., 0::4] = _replace_non_finite(
+                    self.precomputed_biomarkers[..., 0::4]
+                )
+            else:
+                T_total = len(self._dataset[TEMPORAL_COORD])
+                # 4 channels per variant: value, mask, censor, age
+                channel_count = max(1, len(self.biomarker_variants)) * 4
+                # channels: value=0, mask=0, censor=0, age=1
+                dummy = torch.zeros(
+                    (T_total, self.num_nodes, channel_count),
+                    dtype=dtype_utils.STORAGE_DTYPES["continuous"],
+                )
+                # For 4-channel layout [value, mask, censor, age], age is at indices 3, 7, 11, ...
+                for idx in range(3, channel_count, 4):
+                    dummy[:, :, idx] = 1.0
+                self.precomputed_biomarkers = dummy
 
-        # Precompute vaccination rate (3-channel) if enabled and available
-        if (
-            self.config.model.include_vaccination
-            and "vaccination_rate" in self._dataset.data_vars
-        ):
-            vaccination_preprocessor = ClinicalSeriesPreprocessor(
-                config=clinical_config,
-                var_name="vaccination_rate",
-            )
-            self.precomputed_vaccination_hist = (
-                vaccination_preprocessor.preprocess_dataset(self._dataset)
-            )
-            self.precomputed_vaccination_hist[..., 0] = _replace_non_finite(
-                self.precomputed_vaccination_hist[..., 0]
-            )
-            logger.info(
-                f"Loaded vaccination history: shape={self.precomputed_vaccination_hist.shape}"
-            )
-        else:
-            self.precomputed_vaccination_hist = None
+            # Precompute vaccination rate (3-channel) if enabled and available
+            if (
+                self.config.model.include_vaccination
+                and "vaccination_rate" in self._dataset.data_vars
+            ):
+                vaccination_preprocessor = ClinicalSeriesPreprocessor(
+                    config=clinical_config,
+                    var_name="vaccination_rate",
+                )
+                self.precomputed_vaccination_hist = (
+                    vaccination_preprocessor.preprocess_dataset(self._dataset)
+                )
+                self.precomputed_vaccination_hist[..., 0] = _replace_non_finite(
+                    self.precomputed_vaccination_hist[..., 0]
+                )
+                logger.info(
+                    f"Loaded vaccination history: shape={self.precomputed_vaccination_hist.shape}"
+                )
+            else:
+                self.precomputed_vaccination_hist = None
 
-        # Load temporal covariates if available in dataset
-        if "temporal_covariates" in self._dataset:
-            self.temporal_covariates = torch.from_numpy(
-                self._dataset["temporal_covariates"].values
-            ).to(dtype_utils.STORAGE_DTYPES["continuous"])
-            self.temporal_covariates = _replace_non_finite(self.temporal_covariates)
-            self.temporal_covariates_dim = self.temporal_covariates.shape[1]
-            logger.info(
-                f"Loaded temporal covariates: shape={self.temporal_covariates.shape}"
-            )
-        else:
-            T_total = len(self._dataset[TEMPORAL_COORD])
-            self.temporal_covariates = torch.zeros(
-                (T_total, 0), dtype=dtype_utils.STORAGE_DTYPES["continuous"]
-            )
-            self.temporal_covariates_dim = 0
-            logger.warn("No temporal covariates found in dataset")
+            # Load temporal covariates if available in dataset
+            if "temporal_covariates" in self._dataset:
+                self.temporal_covariates = torch.from_numpy(
+                    self._dataset["temporal_covariates"].values
+                ).to(dtype_utils.STORAGE_DTYPES["continuous"])
+                self.temporal_covariates = _replace_non_finite(self.temporal_covariates)
+                logger.info(
+                    f"Loaded temporal covariates: shape={self.temporal_covariates.shape}"
+                )
+            else:
+                T_total = len(self._dataset[TEMPORAL_COORD])
+                self.temporal_covariates = torch.zeros(
+                    (T_total, 0), dtype=dtype_utils.STORAGE_DTYPES["continuous"]
+                )
+                logger.warn("No temporal covariates found in dataset")
+        self.temporal_covariates_dim = self.temporal_covariates.shape[1]
 
         self.region_embeddings = (
             region_embedding_store.embeddings
@@ -507,14 +546,14 @@ class EpiDataset(Dataset):
             expected_clinical_dim += lag_dim
         expected_bio_dim = self.biomarkers_output_dim
 
-        # Note: cases_dim is deprecated, clinical series use fixed 3-channel format
         if self.config.model.cases_dim != expected_clinical_dim:
-            logger.info(
-                "Updating cases_dim from %d to %d (3 clinical series x 3 channels)",
-                self.config.model.cases_dim,
-                expected_clinical_dim,
+            raise ValueError(
+                f"model.cases_dim={self.config.model.cases_dim} does not match "
+                f"the dataset clinical feature width {expected_clinical_dim} "
+                "(3 series x 3 channels, plus one column per mobility lag when "
+                "data.use_imported_risk is true). Set model.params.cases_dim "
+                f"to {expected_clinical_dim}."
             )
-            self.config.model.cases_dim = expected_clinical_dim
         if self.config.model.biomarkers_dim != expected_bio_dim:
             logger.info(
                 "Updating biomarkers_dim from %d to %d based on dataset",
@@ -551,7 +590,7 @@ class EpiDataset(Dataset):
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in __getitem__
         # This moves expensive matrix operations from per-sample to startup time
         # Must be done after _temporal_coords is set but before dataset is closed
-        self._precomputed_k_hop_masks = self._precompute_k_hop_masks()
+        self._target_k_hop_reach = self._precompute_target_k_hop_reach()
 
         # Extract sparsity level once during initialization (before dataset is closed)
         # Dataset is already filtered to a single run, so synthetic_sparsity_level is a scalar
@@ -600,7 +639,8 @@ class EpiDataset(Dataset):
         """Prebuild context tables consumed by ``data.context_assembly``."""
         node_ids = self._graph_node_ids  # (N_ctx,) k-hop closure around targets
         targets = torch.tensor(self.target_nodes, dtype=torch.long)  # (n_targets,)
-        positions = torch.searchsorted(node_ids, targets)  # (n_targets,) ctx slots
+        # (n_targets,) ctx slots; validated once here, not per batch
+        positions = target_positions_in_context(node_ids, targets)
         self.target_local_positions = positions
         # Map a context-node position to its slot in the per-target tables so
         # assembly can translate batch-side local target positions.
@@ -667,25 +707,15 @@ class EpiDataset(Dataset):
         target_index = torch.arange(target_count).unsqueeze(0)
         # Targets observe themselves regardless of adjacency source.
         neighbor_table[time_index, target_index, positions.unsqueeze(0)] = True
-        # Boolean (time, target_slot, ctx_pos) tables are stored bit-packed
-        # along ctx_pos; context assembly unpacks only the gathered rows.
-        self.context_node_count = int(node_ids.numel())
-        self.context_neigh_table = pack_bool_last_dim(neighbor_table.contiguous())
+        # Bit-packed along ctx_pos: (time, target_slot, ceil(N_ctx / 8)) uint8.
+        self.context_neigh_table = pack_mask_bits(neighbor_table)
 
-        if self._precomputed_k_hop_masks:
-            # Stack per-timestep (N_all, N_all) reachability masks (dict keyed
-            # by timestep), restrict columns to context nodes ->
-            # (T, T_n, N_ctx), matching the neighbor table layout.
-            k_hop = torch.stack(
-                [
-                    mask.index_select(0, targets)
-                    for mask in self._precomputed_k_hop_masks.values()
-                ],
-                dim=0,
-            )
-            k_hop = k_hop.index_select(2, node_ids)
+        if self._target_k_hop_reach is not None:
+            # Restrict (T, T_n, N_all) target reachability columns to context
+            # nodes -> (T, T_n, N_ctx), matching the neighbor table layout.
+            k_hop = self._target_k_hop_reach.index_select(2, node_ids)
             k_hop[time_index, target_index, positions.unsqueeze(0)] = True
-            self.context_khop_table = pack_bool_last_dim(k_hop.contiguous())
+            self.context_khop_table = pack_mask_bits(k_hop)
         else:
             self.context_khop_table = None
 
@@ -745,6 +775,11 @@ class EpiDataset(Dataset):
                 pass
             self._dataset = None
 
+    @property
+    def shared_series(self) -> dict[str, torch.Tensor | None]:
+        """Split-independent series for reuse by datasets on the same source."""
+        return {name: getattr(self, name) for name in SHARED_SERIES_ATTRS}
+
     def release_shared_sparse_topology(self) -> None:
         """Drop shared full sparse topology after split-specific pruning."""
         if self.shared_sparse_topology is not None:
@@ -755,7 +790,7 @@ class EpiDataset(Dataset):
         """Keep only the mobility state that training reads after init.
 
         Dense ``(T, N, N)`` mobility weights, the edge mask, the per-timestep
-        adjacency cache and the k-hop masks are only needed to build the
+        adjacency cache are only needed to build the
         context tables. Training then reads the weights between graph nodes
         (``inject_gpu_mobility``) and the prebuilt context tables. This keeps
         the masked float16 weights restricted to graph nodes, laid out exactly
@@ -766,7 +801,6 @@ class EpiDataset(Dataset):
         stay alive through that dataset.
         """
         self._adjacency_cache = {}
-        self._precomputed_k_hop_masks = {}
         if self.config.model.graph_adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
             # Static adjacency does not read dynamic weights after init.
             return
@@ -864,6 +898,10 @@ class EpiDataset(Dataset):
         with the configured stride and filtered by missingness permit.
         """
         return len(self._index_map)
+
+    def sample_window_starts(self) -> list[int]:
+        """Window start of each sample, in index order."""
+        return [start for _, start in self._index_map]
 
     def __getitem__(self, idx: int) -> EpiDatasetItem:
         """Return one ``(target_node, window_start)`` sample.
@@ -1759,11 +1797,8 @@ class EpiDataset(Dataset):
         khop_mask[target_idx] = True
 
         # Fast path: reuse precomputed per-target k-hop masks if available.
-        if self._precomputed_k_hop_masks:
-            for reach in self._precomputed_k_hop_masks.values():
-                if target_idx.numel() == 0:
-                    break
-                khop_mask = khop_mask | reach[target_idx].any(dim=0)
+        if self._target_k_hop_reach is not None:
+            khop_mask = khop_mask | self._target_k_hop_reach.any(dim=1).any(dim=0)
         else:
             # Fallback path for safety if precomputed masks are unavailable.
             for time_step in range(len(self._temporal_coords)):
@@ -1780,19 +1815,20 @@ class EpiDataset(Dataset):
         khop_mask[target_idx] = True
         return khop_mask
 
-    def _precompute_k_hop_masks(self) -> dict[int, torch.Tensor]:
-        """Precompute k-hop reachability masks for all timesteps at startup.
+    def _precompute_target_k_hop_reach(self) -> torch.Tensor | None:
+        """Precompute target k-hop reachability for all timesteps at startup.
 
         This moves expensive CPU matrix operations from per-sample __getitem__
         to initialization time, eliminating the 67% data loading bottleneck.
         Masks are stored as CPU tensors and shared across forked workers.
 
         Returns:
-            Dict mapping time_step -> (N, N) boolean tensor where
-            mask[target_idx, node_idx] = True if node is within k-hop of target
+            (T, n_targets, N) boolean tensor where reach[t, slot, node] is True
+            if node is within k hops of target_nodes[slot] at timestep t, or
+            None when gnn_depth is 0.
         """
         if self.config.model.gnn_depth <= 0:
-            return {}
+            return None
 
         gnn_depth = self.config.model.gnn_depth
         logger.info(
@@ -1800,28 +1836,26 @@ class EpiDataset(Dataset):
             f"(depth={gnn_depth}, nodes={self.num_nodes})..."
         )
 
-        masks = {}
+        targets = torch.tensor(self.target_nodes, dtype=torch.long)
+        rows = []
         for time_step in range(len(self._temporal_coords)):
-            # Get adjacency for this timestep
             adjacency = self._get_adjacency_at_time(time_step)
 
-            # Rows receive from source columns; each boolean product adds one hop.
-            # O(T * depth * N^3), paid once at init.
-            reach = adjacency.clone()
+            # Rows receive from source columns; each boolean product adds one
+            # hop. Only target rows are kept, and (R @ A)[targets] equals
+            # R[targets] @ A, so O(T * depth * n_targets * N^2) at init.
+            reach = adjacency.index_select(0, targets)
             if gnn_depth > 1:
                 adj_f = adjacency.to(torch.float32)
-                reach_f = reach.to(torch.float32)
                 for _ in range(1, gnn_depth):
-                    new_reach = (reach_f @ adj_f) > 0
-                    reach = reach | new_reach
-                    reach_f = reach.to(torch.float32)
+                    reach = reach | ((reach.to(torch.float32) @ adj_f) > 0)
+            rows.append(reach)
 
-            # Exclude self (diagonal = False)
-            reach.fill_diagonal_(False)
-            masks[time_step] = reach
-
-        logger.info(f"K-hop mask precomputation complete: {len(masks)} masks")
-        return masks
+        reach = torch.stack(rows)
+        # Exclude self.
+        reach[:, torch.arange(targets.numel()), targets] = False
+        logger.info(f"K-hop mask precomputation complete: {reach.shape[0]} masks")
+        return reach
 
     def __repr__(self) -> str:
         """String representation of the dataset."""

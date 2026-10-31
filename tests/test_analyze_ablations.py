@@ -14,6 +14,8 @@ from optuna.storages.journal import JournalFileBackend
 from optuna.trial import create_trial
 
 from scripts.analysis.analyze_ablations import (
+    AblationRun,
+    main,
     aggregate_ablation_metrics,
     build_neighborhood_context_report,
     build_run_context_report,
@@ -146,7 +148,7 @@ def test_aggregate_accepts_seed_only_variation(tmp_path: Path) -> None:
     df = aggregate_ablation_metrics(ablation_runs, assert_consistent_config=True)
 
     assert len(df) == 1
-    assert df.iloc[0]["folds"] == 2
+    assert df.iloc[0]["run_count"] == 2
 
 
 def test_compute_baseline_deltas_includes_absolute_columns() -> None:
@@ -308,7 +310,8 @@ def test_end_to_end_campaign_aggregation(tmp_path: Path) -> None:
     deltas = compute_baseline_deltas(aggregated, baseline_name="baseline")
 
     assert set(aggregated["model"]) == {"baseline", "no_sir_loss"}
-    assert (aggregated["folds"] == 2).all()
+    assert (aggregated["run_count"] == 2).all()
+    assert "folds" not in aggregated.columns
     assert len(deltas) == 1
     assert deltas.iloc[0]["model"] == "no_sir_loss"
 
@@ -365,6 +368,7 @@ def test_campaign_analysis_requires_exact_provenanced_paired_fold_identities(
                     "require_exact_identity_matrix": True,
                     "require_terminal_trials": True,
                     "require_finite_primary_metric": True,
+                    "require_full_manifest_folds": True,
                 },
                 "provenance_requirements": {
                     "require_campaign_sha256": True,
@@ -475,7 +479,7 @@ def test_nonfolded_output_identity_uses_none_fold(tmp_path: Path) -> None:
             {
                 "schema_version": 1,
                 "campaign_id": "nonfolded",
-                "stage": "ablation",
+                "stage": "ablation_smoke",
                 "hypothesis": "non-folded campaigns have no fold identity",
                 "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
                 "baseline_condition": "baseline",
@@ -555,7 +559,7 @@ def test_campaign_outputs_reject_empty_or_missing_required_metric_columns(
             {
                 "schema_version": 1,
                 "campaign_id": "empty-metrics",
-                "stage": "ablation",
+                "stage": "ablation_smoke",
                 "hypothesis": "metric contracts fail closed",
                 "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
                 "baseline_condition": "baseline",
@@ -680,3 +684,151 @@ def test_campaign_outputs_reject_empty_or_missing_required_metric_columns(
     output_identity_path.write_text(json.dumps(output_identity), encoding="utf-8")
 
     validate_campaign_outputs(campaign, runs)
+
+
+def _reuse_campaign(tmp_path: Path):
+    path = tmp_path / "reuse_campaign.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "campaign_id": "reuse-id",
+                "stage": "ablation_smoke",
+                "hypothesis": "reuse identity is read from the bundled config",
+                "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
+                "baseline_condition": "baseline",
+                "fixed_overrides": {},
+                "conditions": [
+                    {
+                        "name": "baseline",
+                        "hypothesis": "reference",
+                        "overrides": {},
+                        "allowed_difference_paths": [],
+                    },
+                    {
+                        "name": "mobility:off",
+                        "hypothesis": "intervention",
+                        "overrides": {"model": {"type": {"mobility": False}}},
+                        "allowed_difference_paths": ["model.type.mobility"],
+                    },
+                ],
+                "paired_model_seeds": [42],
+                "metrics": {
+                    "primary": {"name": "mae_median", "direction": "minimize"},
+                    "secondary": [],
+                    "safety": [],
+                    "diagnostic": [],
+                },
+                "equal_budget_policy": {
+                    "paths": ["training.epochs", "training.max_batches"]
+                },
+                "completeness_requirements": {
+                    "require_exact_identity_matrix": True,
+                    "require_terminal_trials": True,
+                    "require_finite_primary_metric": True,
+                },
+                "provenance_requirements": {
+                    "require_campaign_sha256": True,
+                    "require_output_identity": True,
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return load_campaign(path)
+
+
+def _reuse_runs(tmp_path: Path, campaign, *, mutate=None) -> dict:
+    runs = {}
+    for condition in ("baseline", "mobility:off"):
+        experiment = f"mn5_ablation__reuse-id__{condition}"
+        run_dir = _write_run(tmp_path, experiment, "run", seed=42)
+        config = yaml.safe_load((run_dir / "config.yaml").read_text())
+        if condition == "mobility:off":
+            config["model"] = {"type": {"mobility": False}}
+        if mutate is not None:
+            mutate(condition, config)
+        (run_dir / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        runs[condition] = [
+            AblationRun(
+                ablation=condition,
+                campaign_id="reuse-id",
+                experiment_dir=run_dir.parent,
+                run_dir=run_dir,
+                seed=42,
+                fold=None,
+                campaign_identity={
+                    "campaign_id": campaign.campaign_id,
+                    "campaign_sha256": campaign.sha256,
+                    "condition": condition,
+                    "seed": 42,
+                    "fold": None,
+                },
+            )
+        ]
+    return runs
+
+
+def test_reuse_identity_is_checked_against_bundled_config(tmp_path: Path) -> None:
+    campaign = _reuse_campaign(tmp_path)
+    validate_campaign_outputs(campaign, _reuse_runs(tmp_path, campaign))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda c, cfg: cfg["training"].update(seed=99), "config seed"),
+        (
+            lambda c, cfg: cfg["training"].update(
+                crossval_enabled=True, crossval_fold_index=3
+            ),
+            "config fold",
+        ),
+        (
+            lambda c, cfg: cfg["output"].update(experiment_name="other"),
+            "experiment name",
+        ),
+        (
+            lambda c, cfg: (
+                cfg.update(model={"type": {"mobility": True}})
+                if c == "mobility:off"
+                else None
+            ),
+            "model.type.mobility",
+        ),
+    ],
+)
+def test_reuse_identity_rejects_config_mismatch(
+    tmp_path: Path, mutate, message: str
+) -> None:
+    campaign = _reuse_campaign(tmp_path)
+    runs = _reuse_runs(tmp_path, campaign, mutate=mutate)
+    with pytest.raises(ValueError, match=message):
+        validate_campaign_outputs(campaign, runs)
+
+
+def test_explicit_default_output_dir_is_not_redirected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _reuse_campaign(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "analyze_ablations",
+            "--campaign",
+            str(campaign.path),
+            "--journal",
+            str(tmp_path / "j"),
+            "--study-name",
+            "s",
+            "--training-dir",
+            str(tmp_path / "missing"),
+            "--output-dir",
+            "outputs/reports/ablation_analysis",
+        ],
+    )
+    assert main() == 1  # no runs found, after the output directory is chosen
+    assert (tmp_path / "outputs/reports/ablation_analysis").is_dir()
+    assert not (tmp_path / "outputs/reports/ablation_cv_reuse-id").exists()

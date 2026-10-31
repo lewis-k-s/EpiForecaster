@@ -33,6 +33,8 @@ def _make_config(dataset_path: str, gnn_depth: int = 2) -> EpiForecasterConfig:
             "gnn_depth": gnn_depth,
             "gnn_module": "gcn",
             "gnn_hidden_dim": 8,
+            # 3 series x 3 channels plus one imported-risk lag.
+            "cases_dim": 10,
         },
         data_options={
             "use_imported_risk": True,
@@ -120,11 +122,9 @@ def _legacy_item_features(dataset: EpiDataset, idx: int) -> torch.Tensor:
             feat.append(dataset.precomputed_ww[global_t, node_ids].unsqueeze(-1))
             feat.append(dataset.precomputed_ww_mask[global_t, node_ids].unsqueeze(-1))
         x = torch.cat(feat, dim=-1)
-        if (
-            dataset.config.model.gnn_depth > 0
-            and global_t in dataset._precomputed_k_hop_masks
-        ):
-            k_hop_mask = dataset._precomputed_k_hop_masks[global_t][target_idx]
+        if dataset._target_k_hop_reach is not None:
+            target_slot = list(dataset.target_nodes).index(target_idx)
+            k_hop_mask = dataset._target_k_hop_reach[global_t, target_slot]
             local_k_hop_mask = k_hop_mask[node_ids].clone()
             local_k_hop_mask[local_target_idx] = True
             x = torch.where(
@@ -183,3 +183,33 @@ def test_batch_injection_matches_per_item_assembly(tmp_path) -> None:
         [context_features_for_item(dataset, item) for item in items], dim=0
     )
     assert torch.equal(x_dense, per_item)
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize("size", [1, 7, 8, 9, 661])
+def test_mask_bit_packing_round_trips(size: int) -> None:
+    from data.context_assembly import pack_mask_bits, unpack_mask_bits
+
+    generator = torch.Generator().manual_seed(size)
+    mask = torch.rand(3, 4, size, generator=generator) > 0.5
+
+    packed = pack_mask_bits(mask)
+
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (3, 4, -(-size // 8))
+    assert torch.equal(unpack_mask_bits(packed, size), mask)
+    assert torch.equal(unpack_mask_bits(packed[1, 2], size), mask[1, 2])
+
+
+def test_target_positions_in_context_validates_once() -> None:
+    from data.context_assembly import target_positions_in_context
+
+    node_ids = torch.tensor([1, 3, 4, 7])
+    positions = target_positions_in_context(node_ids, torch.tensor([3, 7]))
+    assert positions.tolist() == [1, 3]
+    with pytest.raises(ValueError, match="not part of the dataset's target list"):
+        target_positions_in_context(node_ids, torch.tensor([3, 5]))
+    with pytest.raises(ValueError, match="not part of the dataset's target list"):
+        target_positions_in_context(node_ids, torch.tensor([3, 9]))
+    with pytest.raises(ValueError, match="not part of the dataset's target list"):
+        target_positions_in_context(node_ids, torch.tensor([3, 3]))

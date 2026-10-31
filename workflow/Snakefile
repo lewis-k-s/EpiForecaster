@@ -3,6 +3,7 @@
 from pathlib import Path
 import shlex
 import sys
+import yaml
 
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
@@ -80,6 +81,7 @@ ACTIVE_STAGES = {
     "evaluate": ("data", "evaluation"),
     "hpo": ("data", "hpo", "selection", "evaluation", "promotion"),
     "ablation": ("data", "ablation"),
+    "ablation_suite": ("data", "ablation"),
     "crossval": ("data", "crossval", "evaluation"),
     "preprocess": ("data", "preprocessing"),
 }[WORKFLOW_KIND]
@@ -188,13 +190,46 @@ elif WORKFLOW_KIND == "ablation":
     CONTAINER_JOURNAL = CONTAINER_RUN / "optuna" / f"{STUDY_NAME}.journal"
     ABLATION_OUTPUT_DIR = RUN_ROOT / "outputs/ablation_analysis"
     ABLATION_MANIFEST = ABLATION_OUTPUT_DIR / "ablation_manifest.json"
-    ABLATION_REQUIRED = [
-        ABLATION_OUTPUT_DIR / "seed_coverage_report.csv",
-        ABLATION_OUTPUT_DIR / "ablation_run_context.csv",
-        ABLATION_OUTPUT_DIR / "ablation_metrics_aggregated.csv",
-    ]
+    campaign_document = yaml.safe_load(
+        (SOURCE_ROOT / str(ablation_config["campaign"])).read_text(encoding="utf-8")
+    )
+    if campaign_document.get("analysis", {}).get("kind") == "probabilistic_full_coverage":
+        ABLATION_REQUIRED = [
+            ABLATION_OUTPUT_DIR / "campaign_completeness_manifest.csv",
+            ABLATION_OUTPUT_DIR / "condition_scorecard.csv",
+        ]
+    else:
+        ABLATION_REQUIRED = [
+            ABLATION_OUTPUT_DIR / "seed_coverage_report.csv",
+            ABLATION_OUTPUT_DIR / "ablation_run_context.csv",
+            ABLATION_OUTPUT_DIR / "ablation_metrics_aggregated.csv",
+        ]
     ABLATION_DONE = RUN_ROOT / ".state/ablation.done"
     DEFAULT_TERMINAL = ABLATION_MANIFEST
+elif WORKFLOW_KIND == "ablation_suite":
+    suite = config["ablation_suite"]
+    SUITE_STUDIES = {study["study_name"]: study for study in suite["studies"]}
+    SUITE_NAMES = list(SUITE_STUDIES)
+    for study_name, study in SUITE_STUDIES.items():
+        campaign_path = SOURCE_ROOT / str(study["campaign"])
+        campaign_document = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
+        if campaign_document.get("campaign_id") != study_name:
+            raise ValueError(
+                f"Ablation suite study {study_name} must match its campaign_id"
+            )
+    SUITE_ROOT = RUN_ROOT / "outputs/ablation_analysis"
+    SUITE_MANIFEST = SUITE_ROOT / "suite_manifest.json"
+    DEFAULT_TERMINAL = SUITE_MANIFEST
+
+    def suite_previous_manifest(name):
+        index = SUITE_NAMES.index(name)
+        if index == 0:
+            return []
+        return [str(SUITE_ROOT / SUITE_NAMES[index - 1] / "ablation_manifest.json")]
+
+    def suite_worker_arguments(name):
+        options = {**SUITE_STUDIES[name], "timeout_s": suite["timeout_s"]}
+        return ablation_worker_arguments(config, options)
 elif WORKFLOW_KIND == "crossval":
     crossval_config = config["crossval"]
     STUDY_WORKERS = int(crossval_config["folds"])

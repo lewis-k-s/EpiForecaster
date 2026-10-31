@@ -137,10 +137,103 @@ elif WORKFLOW_KIND == "ablation":
                 dvc_remote=DVC_REMOTE,
                 dvc_cache=DVC_CACHE,
                 cpus=CPUS_PER_TASK,
+                input_paths=(
+                    [str(config["ablation"]["reuse_evidence_dir"])]
+                    if config["ablation"].get("reuse_evidence_dir") is not None
+                    else []
+                ),
                 host_step=True,
+                stage_data=True,
             )
         shell:
             "{params.command} > {log:q} 2>&1"
+
+elif WORKFLOW_KIND == "ablation_suite":
+    rule initialize_suite_study:
+        output:
+            str(RUN_ROOT / "optuna/{study}.journal")
+        wildcard_constraints:
+            study="|".join(SUITE_NAMES)
+        shell:
+            "touch {output:q}"
+
+
+    rule launch_suite_study_workers:
+        input:
+            data=str(DATA_MANIFEST),
+            dependencies=str(DEPENDENCY_CONTRACTS["ablation"]),
+            journal=str(RUN_ROOT / "optuna/{study}.journal"),
+            previous=lambda wildcards: suite_previous_manifest(wildcards.study),
+        output:
+            str(RUN_ROOT / ".state/ablation_suite/{study}.workers.done")
+        wildcard_constraints:
+            study="|".join(SUITE_NAMES)
+        threads:
+            4 * CPUS_PER_TASK
+        resources:
+            gpu=4
+        log:
+            str(RUN_ROOT / "logs/ablation-suite-{study}-workers.log")
+        params:
+            command=lambda wildcards: launch_parallel_workers_command(
+                suite_worker_arguments(wildcards.study),
+                run_root=RUN_ROOT,
+                source_root=SOURCE_ROOT,
+                sif=SIF,
+                workers=4,
+                cpus_per_task=CPUS_PER_TASK,
+                worker_group=f"ablation_{wildcards.study}",
+            )
+        shell:
+            "{params.command} > {log:q} 2>&1 && touch {output:q}"
+
+
+    rule finalize_suite_study:
+        input:
+            workers=str(RUN_ROOT / ".state/ablation_suite/{study}.workers.done"),
+            journal=str(RUN_ROOT / "optuna/{study}.journal"),
+            manifest=str(MANIFEST),
+            dependencies=str(DEPENDENCY_CONTRACTS["ablation"]),
+        output:
+            manifest=str(SUITE_ROOT / "{study}/ablation_manifest.json"),
+            marker=str(RUN_ROOT / ".state/ablation_suite/{study}.done"),
+        wildcard_constraints:
+            study="|".join(SUITE_NAMES)
+        log:
+            str(RUN_ROOT / "logs/ablation-suite-{study}-finalize.log")
+        params:
+            command=lambda wildcards: container_command(
+                [
+                    "python", "-m", "scripts.workflow.run_support", "finalize-ablation",
+                    "--config", CONTAINER_CONFIG,
+                    "--run-root", CONTAINER_RUN,
+                    "--journal", CONTAINER_RUN / "optuna" / f"{wildcards.study}.journal",
+                    "--study-name", wildcards.study,
+                ],
+                run_root=RUN_ROOT,
+                source_root=SOURCE_ROOT,
+                sif=SIF,
+                dvc_remote=DVC_REMOTE,
+                dvc_cache=DVC_CACHE,
+                cpus=CPUS_PER_TASK,
+                host_step=True,
+                stage_data=True,
+            )
+        shell:
+            "{params.command} > {log:q} 2>&1"
+
+
+    rule finalize_ablation_suite:
+        input:
+            [str(SUITE_ROOT / name / "ablation_manifest.json") for name in SUITE_NAMES]
+        output:
+            str(SUITE_MANIFEST)
+        log:
+            str(RUN_ROOT / "logs/finalize-ablation-suite.log")
+        shell:
+            "PYTHONPATH={SOURCE_ROOT:q} {HOST_PYTHON:q} -m scripts.workflow.run_support "
+            "finalize-ablation-suite --config {CONFIG_PATH:q} --run-root {RUN_ROOT:q} "
+            "> {log:q} 2>&1"
 
 elif WORKFLOW_KIND == "crossval":
     rule train_crossval_fold:

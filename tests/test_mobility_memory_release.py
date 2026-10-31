@@ -17,7 +17,7 @@ import pytest
 import torch
 import xarray as xr
 
-from data.context_assembly import pack_bool_last_dim, unpack_bool_last_dim
+from data.context_assembly import pack_mask_bits, unpack_mask_bits
 from data.curriculum_builder import build_curriculum_datasets
 from data.epi_batch import collate_epiforecaster_batch
 from data.epi_dataset import EpiDataset
@@ -70,6 +70,8 @@ def _config(path: Path, *, min_flow_raw: float, clip_max: float):
             "gnn_depth": 2,
             "gnn_module": "gcn",
             "max_neighbors": 3,
+            # 3 series x 3 channels + one imported-risk column per mobility lag.
+            "cases_dim": 10,
         },
         data_options={
             "mobility_min_flow_raw": min_flow_raw,
@@ -146,8 +148,12 @@ def _assert_batches_equal(left, right) -> None:
         _assert_same_value(
             getattr(left, field.name), getattr(right, field.name), field.name
         )
+    _assert_same_value(
+        left.mob_batch.adj_table[left.mob_batch.adj_time_ids],
+        right.mob_batch.adj_table[right.mob_batch.adj_time_ids],
+        "adj_table",
+    )
     for name in (
-        "adj_dense",
         "x_dense",
         "global_t",
         "target_node",
@@ -182,7 +188,6 @@ def test_release_keeps_sampling_order_and_batches_identical(
         assert dataset.mobility_mask is None
         assert dataset.graph_mobility_weights is not None
         assert not dataset._adjacency_cache
-        assert not dataset._precomputed_k_hop_masks
     for dataset in dense.train_dataset.datasets:
         assert dataset.preloaded_mobility is not None
         assert dataset.graph_mobility_weights is None
@@ -230,12 +235,12 @@ def test_release_keeps_shared_eval_tensors_alive(tmp_path: Path) -> None:
 
 @pytest.mark.epiforecaster
 @pytest.mark.parametrize("width", [1, 7, 8, 9, 23])
-def test_bool_packing_round_trips(width: int) -> None:
+def test_mask_bit_packing_round_trips(width: int) -> None:
     mask = torch.from_numpy(np.random.default_rng(width).random((3, 4, width)) > 0.5)
-    packed = pack_bool_last_dim(mask)
+    packed = pack_mask_bits(mask)
     assert packed.dtype == torch.uint8
     assert packed.shape == (3, 4, (width + 7) // 8)
-    assert torch.equal(unpack_bool_last_dim(packed, width), mask)
+    assert torch.equal(unpack_mask_bits(packed, width), mask)
 
 
 class _CachedDataset:
