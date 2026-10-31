@@ -1,6 +1,0 @@
-extends: mn5_loss_type_spatial_rolling90_paired10_v1.yaml
-
-ablation:
-  study_name: loss_type_spatial_rolling90_10epoch_smoke_v1
-  campaign: configs/campaigns/loss_type_spatial_rolling90_10epoch_smoke_v1.yaml
-  smoketest: true

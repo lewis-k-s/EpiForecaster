@@ -16,7 +16,7 @@ from evaluation.research_calibration import (
 
 @pytest.fixture
 def manifest():
-    return json.loads(Path("configs/research/loss_roles_v1.json").read_text())
+    return json.loads(Path("tests/fixtures/research_roles.json").read_text())
 
 
 @pytest.fixture
@@ -226,7 +226,7 @@ def test_pipeline_writes_all_canonical_research_artifacts(
         "configs/train_epifor_smoke.yaml",
         overrides=[
             "training.split_strategy=research",
-            "training.research_role_manifest_path=configs/research/loss_roles_v1.json",
+            "training.research_role_manifest_path=tests/fixtures/research_roles.json",
             "model.forecast_horizon=28",
         ],
     )

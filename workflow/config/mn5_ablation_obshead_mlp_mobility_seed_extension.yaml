@@ -1,5 +1,0 @@
-extends: mn5_ablation_obshead_mlp_mobility.yaml
-
-ablation:
-  study_name: epiforecaster_obshead_mlp_mobility_v1_seed_extension
-  campaign: configs/campaigns/epiforecaster_obshead_mlp_mobility_v1_seed_extension.yaml

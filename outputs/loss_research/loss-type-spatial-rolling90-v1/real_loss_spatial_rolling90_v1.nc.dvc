@@ -1,5 +1,0 @@
-outs:
-- md5: ce164ed008c94c1ce4a33d1b9ededb1e
-  size: 297509147
-  hash: md5
-  path: real_loss_spatial_rolling90_v1.nc

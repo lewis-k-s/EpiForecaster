@@ -610,9 +610,14 @@ def test_failed_trial_requeue_receives_study_and_identity(
 def test_smoke_declared_full_validation_is_not_clamped_to_two_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    campaign = worker.load_campaign(
-        Path("configs/campaigns/loss_type_spatial_smoke_v3.yaml")
+    document = yaml.safe_load(
+        Path("configs/campaigns/ablation_smoke_v1.yaml").read_text()
     )
+    document["fixed_overrides"]["training"]["max_batches"] = None
+    document["smoke_overrides"] = {"training": {"epochs": 1, "max_batches": None}}
+    campaign_path = tmp_path / "campaign.yaml"
+    campaign_path.write_text(yaml.safe_dump(document))
+    campaign = worker.load_campaign(campaign_path)
     captured: list[str] = []
 
     def load_config(_path: str, *, overrides: list[str]):

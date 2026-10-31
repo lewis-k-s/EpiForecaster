@@ -217,8 +217,6 @@ worsened; and predeclared mobility-context strata for mobility contrasts. These
 regional effects are descriptive unless source sharing and temporal dependence are
 modeled explicitly.
 
-`ablation_default_v1.yaml` is retained only as the historical three-fold screening
-declaration. It is not a production campaign for new scientific estimates.
 `smoke_fold_indices` (`[1, 4]`) remain a strict subset of the v2 production folds.
 The checked-in `workflow/config/mn5_ablation_coverage_smoke.yaml` runs every
 default condition and paired model seed over that bounded subset with small batches;
@@ -237,9 +235,6 @@ receipts, and analysis directory. The suite manifest records both campaign
 manifests and their hashes. A later batch submission of the same run resumes
 the first incomplete study. The campaigns retain their own split and scoring
 contracts; a temporal campaign and a spatial campaign do not share trials.
-The Student-t CRPS suite fixes 50 epochs and disables early stopping for both
-paired mobility conditions. Four temporal studies have distinct fit cutoffs
-and 28-day scored blocks. Its spatial study includes all ten persisted folds.
 
 ### Ablation allocation closeout
 
@@ -407,7 +402,7 @@ declared artifacts without rewriting that default receipt. Existing run
 directories and promotion destinations are never overwritten. Do not run
 `dvc gc` while any run or promoted artifact may reference the shared cache.
 
-## Loss research evaluation
+## Research-role evaluation
 
 For a protected research training config, set `evaluation.research_outputs: true`,
 `evaluation.split: val`, and `evaluation.granular: true`. The workflow evaluates

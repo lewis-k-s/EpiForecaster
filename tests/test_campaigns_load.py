@@ -22,15 +22,6 @@ def test_campaign_loads(path: Path) -> None:
             assert campaign.completeness_requirements["require_full_manifest_folds"]
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "loss_type_spatial_smoke_v3",
-        "loss_type_temporal_smoke_v2",
-        "loss_type_spatial_rolling90_10epoch_smoke_v1",
-    ],
-)
-def test_smoke_campaigns_are_labelled_smoke(name: str) -> None:
-    assert load_campaign(Path(f"configs/campaigns/{name}.yaml")).stage == (
-        "ablation_smoke"
-    )
+def test_smoke_campaign_is_labelled_smoke() -> None:
+    campaign = load_campaign(Path("configs/campaigns/ablation_smoke_v1.yaml"))
+    assert campaign.stage == "ablation_smoke"

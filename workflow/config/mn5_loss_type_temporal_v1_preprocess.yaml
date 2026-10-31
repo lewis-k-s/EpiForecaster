@@ -1,5 +1,0 @@
-extends: mn5_loss_type_spatial_v1_preprocess.yaml
-
-preprocessing:
-  base_config: configs/production_only/preprocess_mn5_loss_type_temporal_v1.yaml
-  dataset_name: real_loss_fit20200821_v1
