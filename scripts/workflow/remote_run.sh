@@ -672,7 +672,13 @@ validate_interactive_allocation() {
   end_epoch="$(date -d "$end_time" +%s)"
   now_epoch="$(date -u +%s)"
   remaining_seconds=$((end_epoch - now_epoch))
-  minimum_seconds=$((CLOSEOUT_SIGNAL_SECONDS + 60))
+  # Close-out runs need the signal lead plus a margin. Other kinds have no
+  # close-out, so they need the full requested runtime.
+  if [ "$CLOSEOUT_SIGNAL_SECONDS" -gt 0 ]; then
+    minimum_seconds=$((CLOSEOUT_SIGNAL_SECONDS + 60))
+  else
+    minimum_seconds=$((RUNTIME * 60))
+  fi
   if [ "$remaining_seconds" -lt "$minimum_seconds" ]; then
     echo "Allocation $job_id has insufficient remaining wall time for closeout" >&2
     return 1
@@ -756,20 +762,25 @@ run_startup_probe() {
     2>"$RUN_ROOT/.state/probe.$job_id.err"
 }
 
-# Launch the coordinator as an ordinary zero-GPU overlapping step and wait for
-# its exit so the allocation-owning shell keeps the coordinator lifetime.
+# Launch the coordinator as an ordinary zero-GPU overlapping step, detached
+# from the caller's terminal so an SSH or VPN drop cannot hang it up. The
+# detached PID is the launcher PID. Wait for its exit, which keeps the
+# allocation-owning shell tied to the coordinator lifetime.
 launch_coordinator_step() {
   local job_id="$1"
   local attempt_id="$2"
   local attempt_root="$RUN_ROOT/.state/executions/$attempt_id"
   local coordinator="$SOURCE_ROOT/scripts/workflow/snakemake_coordinator.sh"
-  local status
+  local pid status
+  local -a detach=(nohup)
 
   test -x "$coordinator"
   test -f "$attempt_root/binding.tsv"
+  if command -v setsid >/dev/null 2>&1; then
+    detach=(setsid nohup)
+  fi
 
-  set +e
-  srun \
+  "${detach[@]}" srun \
     --jobid="$job_id" \
     --job-name=snakemake-coordinator \
     --nodes=1 \
@@ -787,8 +798,14 @@ launch_coordinator_step() {
     "$CPUS_PER_TASK" \
     existing-allocation \
     "$attempt_root" \
+    </dev/null \
     >"$attempt_root/coordinator.out" \
-    2>"$attempt_root/coordinator.err"
+    2>"$attempt_root/coordinator.err" &
+  pid=$!
+  printf '%s\n' "$pid" >"$attempt_root/launcher.pid"
+
+  set +e
+  wait "$pid"
   status=$?
   set -e
   record_launcher_completion "$attempt_root" "$status"
@@ -837,7 +854,6 @@ attach_run() {
     "$compatibility"
   activate_attempt "$attempt_id"
   link_attempt_to_allocation "$job_id" "$attempt_id"
-  printf '%s\n' "$$" >"$attempt_root/launcher.pid"
 
   status=0
   launch_coordinator_step "$job_id" "$attempt_id" || status=$?
@@ -865,7 +881,12 @@ show_status() {
     elif [ -f "$attempt_root/completed.tsv" ]; then
       exit_code="$(binding_value "$attempt_root/completed.tsv" exit_code)"
       step_id="$(cat "$attempt_root/coordinator.step_id" 2>/dev/null || true)"
-      echo "coordinator=terminal exit_code=$exit_code allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
+      # Code 75 is the designed close-out: the queue still holds work.
+      if [ "$exit_code" = "75" ]; then
+        echo "coordinator=closeout exit_code=75 continuation_required=true allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
+      else
+        echo "coordinator=terminal exit_code=$exit_code allocation_job_id=$job_id coordinator_step_id=${step_id:-unknown} mode=$mode attempt_id=$attempt_id"
+      fi
     else
       echo "coordinator=not-active allocation_job_id=$job_id mode=$mode attempt_id=$attempt_id"
     fi

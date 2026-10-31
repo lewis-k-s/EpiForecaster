@@ -28,7 +28,7 @@ write_completion() {
   if [ ! -f "$receipt" ]; then
     printf '%s\n' \
       $'schema_version\t1' \
-      "exit_code"$'\t'"$status" \
+      "exit_code"$'\t'"${RECEIPT_EXIT_CODE:-$status}" \
       "completed_at"$'\t'"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       >"$temporary"
     mv "$temporary" "$receipt"
@@ -237,10 +237,14 @@ set -e
 # keep workers_complete.done absent so the next allocation re-runs the worker
 # rule, but this coordinator should end the allocation cleanly rather than
 # surfacing the designed close-out as a workflow failure.
+# Only a marker written by this attempt counts; an older one is stale. The
+# receipt records the distinct close-out code 75, not success.
 if [ "$workflow_status" -ne 0 ] \
-  && [ -s "$RUN_ROOT/.state/continuation.required" ] \
+  && grep -qxF "attempt_id"$'\t'"$EPIFORECASTER_EXECUTION_ATTEMPT_ID" \
+    "$RUN_ROOT/.state/continuation.required" 2>/dev/null \
   && [ ! -f "$RUN_ROOT/.state/workers_complete.done" ]; then
   echo "Rolling allocation close-out: queue not drained; continuation required"
+  RECEIPT_EXIT_CODE=75
   exit 0
 fi
 exit "$workflow_status"

@@ -176,4 +176,7 @@ main() {
 
 WORKER_INDEX=""
 WORKER_ARGUMENTS=()
+# The close-out signal is for the scientific process only; see
+# mn5_container_exec.sh.
+trap '' USR1
 main "$@"
