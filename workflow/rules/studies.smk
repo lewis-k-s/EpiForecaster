@@ -34,6 +34,11 @@ if WORKFLOW_KIND == "hpo":
                 workers=STUDY_WORKERS,
                 cpus_per_task=CPUS_PER_TASK,
                 worker_group="hpo",
+                mps_clients_per_gpu=int(
+                    config.get("resources", {})
+                    .get("allocation", {})
+                    .get("mps_clients_per_gpu", 1)
+                ),
             )
         shell:
             "{params.command} > {log:q} 2>&1 && touch {output.complete:q}"
@@ -100,6 +105,11 @@ elif WORKFLOW_KIND == "ablation":
                 workers=STUDY_WORKERS,
                 cpus_per_task=CPUS_PER_TASK,
                 worker_group="ablation",
+                mps_clients_per_gpu=int(
+                    config.get("resources", {})
+                    .get("allocation", {})
+                    .get("mps_clients_per_gpu", 1)
+                ),
             )
         shell:
             "{params.command} > {log:q} 2>&1 && touch {output.complete:q}"

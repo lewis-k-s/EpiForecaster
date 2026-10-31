@@ -191,6 +191,34 @@ def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
     return dotlist
 
 
+SEARCH_SPACES = ("default", "lr_only", "core")
+CORE_HEAD_D_MODEL_CHOICES = (64, 128, 256)
+
+
+def _suggest_core_params(trial: Any, base_cfg: EpiForecasterConfig) -> dict[str, Any]:
+    """Sample only optimizer and head-capacity knobs; the base config owns the rest."""
+    n_heads = int(base_cfg.model.head_n_heads)
+    incompatible = [v for v in CORE_HEAD_D_MODEL_CHOICES if v % n_heads]
+    if incompatible:
+        raise ValueError(
+            f"head_d_model choices {incompatible} are not divisible by "
+            f"model.head_n_heads={n_heads}"
+        )
+    return {
+        "training.learning_rate": trial.suggest_float(
+            "training.learning_rate", 1e-4, 3e-3, log=True
+        ),
+        "training.weight_decay": trial.suggest_float(
+            "training.weight_decay", 1e-7, 1e-3, log=True
+        ),
+        "model.head_dropout": trial.suggest_float("model.head_dropout", 0.0, 0.3),
+        "model.head_d_model": trial.suggest_categorical(
+            "model.head_d_model", _categorical_choices(CORE_HEAD_D_MODEL_CHOICES)
+        ),
+        "model.head_num_layers": trial.suggest_int("model.head_num_layers", 2, 4),
+    }
+
+
 def suggest_epiforecaster_params(
     *,
     trial: Any,
@@ -204,6 +232,15 @@ def suggest_epiforecaster_params(
     journal is failure-heavy and completion-poor, so we focus on a small set of
     first-order knobs before revisiting startup/init and controller tuning.
     """
+
+    if search_space not in SEARCH_SPACES:
+        raise ValueError(
+            f"Unknown search space {search_space!r}; expected one of {SEARCH_SPACES}"
+        )
+    if search_space == "core":
+        if sample_training_loss_objective:
+            raise ValueError("The core search space does not sample the loss objective")
+        return _suggest_core_params(trial, base_cfg)
 
     overrides: dict[str, Any] = {}
 
@@ -606,7 +643,7 @@ def objective(
 )
 @click.option(
     "--search-space",
-    type=click.Choice(["default", "lr_only"], case_sensitive=False),
+    type=click.Choice(list(SEARCH_SPACES), case_sensitive=False),
     default="default",
     show_default=True,
     help="Named HPO search space to use.",

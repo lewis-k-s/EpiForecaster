@@ -191,6 +191,14 @@ run owns the processed dataset, QA record, generated DVC pointer, and publicatio
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
+The real dataset `real_with_id` is rebuilt with
+`workflow/config/mn5_preprocess_real.yaml` on one `acc_debug` node (120 minutes).
+Raw inputs are the DVC pointers `data/files/catalonia_real_raw_inputs_v1.dvc` and
+`data/files/mobility.zarr.dvc`. The run publishes a packed
+`real_with_id.zarr.zip.dvc` pointer, not the old `real_with_id.zarr.dvc`
+directory pointer. After review, copy it to `data/processed/` and repoint the
+consuming templates and `data.dataset_path` (see the template header).
+
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
 composition when both stages are wanted. Training and HPO trials force
@@ -456,3 +464,18 @@ value and alert thresholds, `event_decision_fixed_0_5`, and nullable
 calibration evidence. It is not a negative alert. Summary JSON contains metric
 counts, support reasons, and horizon-band results. Hospitalization event scores
 remain unsupported until source-level aggregation is defined.
+
+## CUDA MPS worker packing
+
+Set `resources.allocation.mps_clients_per_gpu` to K to run K HPO or ablation
+workers on each GPU. The default is 1 and keeps one worker per GPU. For K above
+1, `gres` is `gpu:G`, the worker count is `G * K`, `tasks` equals the worker
+count, and `cpus_per_task` is `20 * G / tasks`. Only `hpo` and `ablation` kinds
+accept K above 1.
+
+All workers run in one Slurm step that sees all G GPUs. Rank r uses GPU `r // K`,
+selected by UUID. The first rank on each GPU starts one MPS daemon for that GPU
+under the job `TMPDIR`, and stops it after all K ranks on that GPU exit. Each
+worker runs with `singularity exec --contain`, because `--containall` makes
+MPS reject the client. K of 1 keeps `--containall`. Daemon logs are copied to
+`logs/mps/` in the run root.

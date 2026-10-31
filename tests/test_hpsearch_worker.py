@@ -115,6 +115,7 @@ def _base_cfg_stub(**overrides: Any) -> SimpleNamespace:
         include_holidays=True,
         input_window_length=60,
         forecast_horizon=28,
+        head_n_heads=4,
     )
     model_overrides = overrides.pop("model", {})
     model_defaults.update(model_overrides)
@@ -211,6 +212,49 @@ class TestSuggestEpiforecasterParams:
         assert trial.suggest_calls == [
             ("float", "training.learning_rate", (1e-5, 3e-3, True))
         ]
+
+    def test_core_search_space_samples_exactly_five_keys(self) -> None:
+        trial = _StubTrial()
+        overrides = suggest_epiforecaster_params(
+            trial=trial, base_cfg=_mobility_cfg_stub(), search_space="core"
+        )
+        assert set(overrides) == {
+            "training.learning_rate",
+            "training.weight_decay",
+            "model.head_dropout",
+            "model.head_d_model",
+            "model.head_num_layers",
+        }
+        assert {call[1] for call in trial.suggest_calls} == set(overrides)
+        assert trial.suggest_calls == [
+            ("float", "training.learning_rate", (1e-4, 3e-3, True)),
+            ("float", "training.weight_decay", (1e-7, 1e-3, True)),
+            ("float", "model.head_dropout", (0.0, 0.3, False)),
+            ("categorical", "model.head_d_model", (64, 128, 256)),
+            ("int", "model.head_num_layers", (2, 4)),
+        ]
+
+    def test_core_head_d_model_choices_divide_head_count(self) -> None:
+        trial = _StubTrial()
+        suggest_epiforecaster_params(
+            trial=trial, base_cfg=_base_cfg_stub(), search_space="core"
+        )
+        choices = next(
+            c[2] for c in trial.suggest_calls if c[1] == "model.head_d_model"
+        )
+        assert all(value % 4 == 0 for value in choices)
+        with pytest.raises(ValueError, match="not divisible"):
+            suggest_epiforecaster_params(
+                trial=_StubTrial(),
+                base_cfg=_base_cfg_stub(model={"head_n_heads": 5}),
+                search_space="core",
+            )
+
+    def test_unknown_search_space_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Unknown search space"):
+            suggest_epiforecaster_params(
+                trial=_StubTrial(), base_cfg=_base_cfg_stub(), search_space="bogus"
+            )
 
     def test_training_loss_objective_not_sampled_by_default(self) -> None:
         trial = _StubTrial()

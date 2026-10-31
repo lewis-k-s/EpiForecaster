@@ -1,0 +1,37 @@
+# Real-data HPO debug run: 8 workers share 2 GPUs under CUDA MPS (4 clients per
+# GPU) in one 2 h acc_debug allocation. The "core" search space samples only
+# the learning rate, weight decay, and head capacity; the base config owns the
+# rest. HPO has no close-out signal, so timeout_s stops new trials 15 minutes
+# before the allocation ends (7200 - 900 s). A running trial finishes first.
+extends: mn5.yaml
+
+optuna:
+  study_name: epiforecaster_hpo_core_mps_debug_v1
+  workers: 8
+  trials_per_worker: 3
+  timeout_s: 6300
+  epochs: 30
+  pruning_start_epoch: 10
+  search_space: core
+  # Lists replace the parent's list. Eight workers share 40 CPUs, so each
+  # trial gets 2 training and 1 validation loader workers.
+  overrides:
+    - training.run_final_evaluation=false
+    - training.num_workers=2
+    - training.val_workers=1
+
+# Selection uses the validation split only. The test split stays untouched.
+evaluation:
+  split: val
+  granular: false
+
+resources:
+  allocation:
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 8
+    cpus_per_task: 5
+    gres: gpu:2
+    mps_clients_per_gpu: 4
+    runtime: 120
