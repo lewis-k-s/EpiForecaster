@@ -34,7 +34,11 @@ from torch.utils.data import ConcatDataset, DataLoader
 
 from data.dataset_factory import build_datasets
 from data.epi_batch import EpiBatch
-from data.latent_supervision import LatentScaleState, fit_latent_scale_state
+from data.latent_supervision import (
+    LatentScaleState,
+    fit_latent_scale_state,
+    validate_complete_latent_targets,
+)
 from evaluation.aggregate_export import write_main_model_aggregate_csvs
 from evaluation.eval_loop import evaluate_loader
 from evaluation.losses import JointInferenceLoss
@@ -938,6 +942,11 @@ class EpiForecasterTrainer:
         latent_config = self.config.training.loss.joint.latent
         if latent_config.total_weight <= 0:
             return None
+
+        if latent_config.require_complete_targets:
+            for split in (self.train_dataset, self.val_dataset, self.test_dataset):
+                if split is not None:
+                    validate_complete_latent_targets(split)
 
         dataset_identity = str(
             getattr(
