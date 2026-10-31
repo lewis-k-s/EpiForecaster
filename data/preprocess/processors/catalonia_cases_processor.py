@@ -320,8 +320,9 @@ class CataloniaCasesProcessor:
             index="date",
             columns="municipality_code",
             values="cases",
-            aggfunc="sum",
-        ).reindex(date_range, fill_value=0)
+            aggfunc="max",  # one row per (date, municipality); keeps leading NaN
+            dropna=False,
+        ).reindex(date_range)
 
         pivot_mask = daily_df.pivot_table(
             index="date",

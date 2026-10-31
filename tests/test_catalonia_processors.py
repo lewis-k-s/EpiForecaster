@@ -207,3 +207,26 @@ def test_hospitalizations_processor_weekly_data(
     # Jan 9 should have age=7 (1 week since last obs)
     jan_9_age = result.hospitalizations_age.sel(date="2022-01-09")
     assert float(jan_9_age.max()) > 1.0
+
+
+@pytest.mark.parametrize("method", ["kalman_v2", "holt_damped"])
+def test_deaths_leading_missing_days_are_nan(config: PreprocessingConfig, method):
+    import numpy as np
+    import pandas as pd
+
+    config.smoothing.clinical_method = method
+    proc = DeathsProcessor(config)
+    dates = pd.date_range("2022-01-01", periods=6)
+    daily_df = pd.DataFrame(
+        {
+            "date": dates,
+            "municipality_code": "08019",
+            "deaths": [np.nan, np.nan, 3.0, np.nan, 4.0, 2.0],
+        }
+    )
+    smoothed = proc._apply_kalman_smoothing(daily_df)
+    assert smoothed["deaths"].iloc[:2].isna().all()
+    assert smoothed["deaths_missing_flag"].iloc[:2].tolist() == [2.0, 2.0]
+    assert np.isfinite(smoothed["deaths"].iloc[2:]).all()
+    result = proc._create_mask_and_age_channels(smoothed)
+    assert result["deaths_mask"].iloc[:2].tolist() == [0.0, 0.0]

@@ -461,3 +461,20 @@ class TestFullPipeline:
         # Should return empty but valid dataset
         assert "hospitalizations" in result
         assert result["hospitalizations"].sizes["region_id"] == 0
+
+
+@pytest.mark.parametrize("method", ["kalman_v2", "holt_damped"])
+def test_hospitalizations_leading_missing_days_are_nan(mock_config, method):
+    mock_config.smoothing.clinical_method = method
+    proc = HospitalizationsProcessor(mock_config)
+    dates = pd.date_range("2022-01-01", periods=10)
+    values = [np.nan] * 5 + [10.0] + [np.nan] * 3 + [12.0]
+    daily_df = pd.DataFrame(
+        {"date": dates, "municipality_code": "08019", "hospitalizations": values}
+    )
+    smoothed = proc._apply_kalman_smoothing(daily_df)
+    assert smoothed["hospitalizations"].iloc[:5].isna().all()
+    assert smoothed["missing_flag"].iloc[:5].tolist() == [2] * 5
+    assert np.isfinite(smoothed["hospitalizations"].iloc[5:]).all()
+    result = proc._create_mask_and_age_channels(smoothed)
+    assert result["hospitalizations_mask"].iloc[:5].tolist() == [0.0] * 5

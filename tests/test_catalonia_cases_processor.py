@@ -121,3 +121,47 @@ def test_cases_holt_damped_preserves_mask_age_semantics(mock_config):
     assert result.iloc[1]["cases_age"] == 2.0
     assert result.iloc[2]["cases_age"] == 3.0
     assert result.iloc[3]["cases_age"] == 1.0
+
+
+@pytest.mark.parametrize("method", ["kalman_v2", "holt_damped"])
+def test_cases_leading_missing_days_are_nan_and_unmasked(mock_config, method):
+    mock_config.smoothing.clinical_method = method
+    proc = CataloniaCasesProcessor(mock_config)
+    dates = pd.date_range("2022-01-01", periods=6)
+    daily_df = pd.DataFrame(
+        {
+            "date": dates,
+            "municipality_code": "08019",
+            "cases": [0.0, 0.0, 10.0, np.nan, 12.0, 11.0],
+        }
+    )
+    smoothed = proc._apply_kalman_smoothing(daily_df)
+    assert smoothed["cases"].iloc[:2].isna().all()
+    assert smoothed["missing_flag"].iloc[:2].tolist() == [2, 2]
+    assert np.isfinite(smoothed["cases"].iloc[2:]).all()
+    result = proc._create_mask_and_age_channels(smoothed)
+    assert result["cases_mask"].tolist() == [0.0, 0.0, 1.0, 0.0, 1.0, 1.0]
+    assert result["cases_age"].iloc[:2].tolist() == [14.0, 14.0]
+
+
+def test_cases_dataset_keeps_leading_nan(mock_config):
+    mock_config.start_date = datetime(2022, 1, 1)
+    proc = CataloniaCasesProcessor(mock_config)
+    dates = pd.date_range("2022-01-01", periods=4)
+    aggregated = pd.DataFrame(
+        {
+            "date": dates[2:],
+            "municipality_code": "08019",
+            "cases": [10.0, 12.0],
+        }
+    )
+    ds = proc._build_cases_dataset(aggregated, dates)
+    cases = ds["cases"].isel(run_id=0, region_id=0).values
+    assert np.isnan(cases[:2]).all()
+    assert np.isfinite(cases[2:]).all()
+    assert ds["cases_mask"].isel(run_id=0, region_id=0).values.tolist() == [
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+    ]

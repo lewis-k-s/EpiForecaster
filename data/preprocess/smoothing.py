@@ -209,6 +209,7 @@ class KalmanSmoother:
         Returns:
             Tuple of (filtered_log_values, flags)
             flags: 0=observed, 2=missing
+            Steps before the first observation are NaN with flag 2.
         """
         values = np.asarray(values, dtype=float).reshape(-1)
         finite_mask = np.isfinite(values) & (values > 0)
@@ -221,6 +222,10 @@ class KalmanSmoother:
             pred_var = self.state_var + self.process_var
 
             if not np.isfinite(value) or value <= 0:
+                if not self.initialized:
+                    # No observation has arrived yet: no state estimate exists.
+                    filtered.append(float("nan"))
+                    continue
                 self._apply_missing_update(pred_state=pred_state, pred_var=pred_var)
                 filtered.append(float(self.state))
                 continue
@@ -467,6 +472,7 @@ class DampedHoltSmoother:
         Returns:
             Tuple of (filtered_log_values, flags)
             flags: 0=observed, 2=missing
+            Steps before the first observation are NaN with flag 2.
         """
         values = np.asarray(values, dtype=float).reshape(-1)
         finite_mask = np.isfinite(values) & (values > 0)
@@ -476,7 +482,7 @@ class DampedHoltSmoother:
         for value in values:
             if not np.isfinite(value) or value <= 0:
                 if not self.initialized:
-                    filtered.append(0.0)
+                    filtered.append(float("nan"))
                     continue
                 pred_level = self.level + self.phi * self.trend
                 self.level = float(pred_level)
