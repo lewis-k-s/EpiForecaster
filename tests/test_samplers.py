@@ -27,6 +27,9 @@ class _Run(Dataset):
     def __getitem__(self, index: int) -> _Sample:
         return self.samples[index]
 
+    def sample_window_starts(self) -> list[int]:
+        return [sample.window_start for sample in self.samples]
+
 
 def _samples(
     nodes: list[str], starts: range, *, time_major: bool = False
@@ -136,3 +139,39 @@ def test_active_runs_minus_one_selects_every_synthetic_run(run_sampling: str) ->
     )
     assert sampler.real_dataset_indices == []
     assert sorted(sampler._resolve_active_synth_indices(epoch=0)) == list(range(5))
+
+
+def test_window_start_batches_are_full_single_start_and_cover_every_sample() -> None:
+    dataset = ConcatDataset(
+        [
+            _Run("synth_1", _samples(list("abcde"), range(3), time_major=True)),
+            _Run("synth_2", _samples(list("ab"), range(4), time_major=True)),
+        ]
+    )
+    config = CurriculumConfig(
+        enabled=True,
+        active_runs=-1,
+        window_start_batches=True,
+        schedule=[CurriculumPhaseConfig(start_epoch=0, end_epoch=10, synth_ratio=1.0)],
+    )
+    sampler = EpidemicCurriculumSampler(
+        dataset=dataset,
+        batch_size=4,
+        config=config,
+        drop_last=True,
+        real_run_id="",
+        seed=3,
+    )
+    sampler.set_curriculum(0)
+
+    batches = list(sampler)
+
+    seen: set[int] = set()
+    for batch in batches:
+        assert len(batch) == 4
+        assert len({_run_index(dataset, index) for index in batch}) == 1
+        assert len({dataset[index].window_start for index in batch}) == 1
+        seen.update(batch)
+    assert seen == set(range(len(dataset)))
+    # 3 starts of 5 samples -> 2 batches each; 4 starts of 2 samples -> 1 each.
+    assert len(batches) == sampler.num_batches_for_epoch(0) == 10

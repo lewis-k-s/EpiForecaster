@@ -312,6 +312,10 @@ class CurriculumConfig:
     chunk_size: int = 512
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
+    # Build each batch from one window start of one run (replaces chunk_size
+    # chunks). The GCN then needs T adjacency matrices per batch, not B*T. A
+    # short group is filled with repeats drawn from the same group.
+    window_start_batches: bool = False
     # List of phase configs defining the curriculum schedule
     schedule: list[CurriculumPhaseConfig] = field(default_factory=list)
 
@@ -1032,6 +1036,8 @@ class TrainingParams:
     epochs: int = 100
     seed: int | None = 42  # Random seed for reproducibility (None = non-deterministic)
     batch_size: int = 32
+    # Batch size of the validation and test loaders; null means batch_size.
+    eval_batch_size: int | None = None
     # Preserve sample_ordering within each batch and shuffle batch order each epoch.
     # When False, training iterates through batches in deterministic dataset order.
     shuffle_train_batches: bool = True
@@ -1194,6 +1200,12 @@ class TrainingParams:
         if isinstance(self.loss, (dict, DictConfig)):
             loss_dict = cast(dict[str, Any], self.loss)
             self.loss = LossConfig(**loss_dict)
+        if self.eval_batch_size is None:
+            self.eval_batch_size = self.batch_size
+        if self.eval_batch_size < 1:
+            raise ValueError(
+                f"eval_batch_size must be >= 1, got {self.eval_batch_size}"
+            )
         if self.selection_metric not in {
             "auto",
             "mean_target_wis",

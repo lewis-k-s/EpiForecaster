@@ -1503,7 +1503,7 @@ def eval_checkpoint(
         split,
         config.data.dataset_path,
         resolved_device,
-        batch_size if batch_size is not None else config.training.batch_size,
+        batch_size if batch_size is not None else config.training.eval_batch_size,
         num_workers if num_workers is not None else "config",
         (
             prefetch_factor

@@ -179,3 +179,11 @@ def test_latent_scaling_and_obsolete_fields_fail_closed() -> None:
             )
     with pytest.raises(ValueError, match="split_seed"):
         TrainingParams(split_seed=-1)
+
+
+@pytest.mark.epiforecaster
+def test_eval_batch_size_defaults_to_batch_size_and_can_be_set() -> None:
+    assert TrainingParams(batch_size=64).eval_batch_size == 64
+    assert TrainingParams(batch_size=128, eval_batch_size=32).eval_batch_size == 32
+    with pytest.raises(ValueError, match="eval_batch_size"):
+        TrainingParams(eval_batch_size=0)

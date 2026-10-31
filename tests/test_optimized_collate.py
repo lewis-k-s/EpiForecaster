@@ -97,3 +97,13 @@ def test_shared_context_nodes_must_be_identical_objects() -> None:
     item_b["mob_real_node_idx"] = item_b["mob_real_node_idx"].clone()
     with pytest.raises(ValueError, match="same cached tensor"):
         optimized_collate_graphs([item_a, item_b])
+
+
+@pytest.mark.epiforecaster
+def test_shared_window_start_emits_one_time_row() -> None:
+    B, L = 3, 3
+    items = [_make_item(window_start=7, target_pos=b) for b in range(B)]
+    mob_batch = optimized_collate_graphs(items)
+
+    assert torch.equal(mob_batch.global_t, torch.arange(7, 7 + L))
+    assert mob_batch.target_node.shape == (B * L,)

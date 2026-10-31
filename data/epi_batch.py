@@ -136,7 +136,8 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     (see ``utils.training_utils.inject_context_features``). This collate only
     builds placement tensors:
 
-    - global_t: [B*T] global time index per graph
+    - global_t: [B*T] global time index per graph, or [T] when all samples
+      share one window start (graph g then uses global_t[g % T])
     - target_node: [B*T] local target position inside the context node set
     """
     B = len(batch)
@@ -150,6 +151,10 @@ def optimized_collate_graphs(batch: list[EpiDatasetItem]) -> Batch:
     window_starts = torch.tensor(
         [item["window_start"] for item in batch], dtype=torch.long
     )
+    # A shared window start lets the model use T adjacency matrices for all
+    # B*T graphs instead of gathering B copies.
+    if bool((window_starts == window_starts[0]).all()):
+        window_starts = window_starts[:1]
     global_t_dense = (
         window_starts.unsqueeze(-1) + torch.arange(L, dtype=torch.long).unsqueeze(0)
     ).reshape(-1)
