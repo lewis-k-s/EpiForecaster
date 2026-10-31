@@ -1,9 +1,0 @@
-.quarto-figure,
-.quarto-figure > figure,
-.quarto-figure .figure-img {
-  max-width: 100%;
-}
-
-.quarto-figure .figure-img {
-  height: auto;
-}

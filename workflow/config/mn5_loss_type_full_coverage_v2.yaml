@@ -18,7 +18,6 @@ ablation:
   study_name: loss_type_full_coverage_v2
   campaign: configs/campaigns/loss_type_full_coverage_v2.yaml
   workers: 2
-  reuse_receipt: configs/research/loss_type_full_coverage_v2_reuse.json
   recover_stale_running: true
   reuse_evidence_dir: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/reuse-evidence/loss-type-full-coverage-v2/v1
   # Reserve 20 minutes for the active identities and finalization in each rolling allocation.
