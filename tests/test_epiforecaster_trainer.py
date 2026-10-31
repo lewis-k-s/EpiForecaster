@@ -7,12 +7,14 @@ import numpy as np
 import pytest
 import torch
 
-from training.epiforecaster_trainer import (
-    EpiForecasterTrainer,
+from evaluation.selection_scores import (
     compute_mean_target_crps,
     compute_mean_target_mae,
     compute_mean_target_nll,
     compute_validation_selection_score,
+)
+from training.epiforecaster_trainer import (
+    EpiForecasterTrainer,
     normalize_training_history,
 )
 from models.configs import (

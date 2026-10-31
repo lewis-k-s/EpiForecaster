@@ -33,7 +33,7 @@ def _campaign(tmp_path: Path, mobility_path: Path) -> Path:
     document = {
         "schema_version": 1,
         "campaign_id": "probabilistic-test",
-        "stage": "ablation",
+        "stage": "ablation_smoke",
         "hypothesis": "probabilistic metrics retain exact support",
         "base_config": str(Path("configs/train_epifor_smoke.yaml").resolve()),
         "baseline_condition": "baseline",
@@ -127,6 +127,8 @@ def _write_run(
                     "crps": 2.0 + wis_offset,
                     "nll": 3.0 + wis_offset,
                     "abs_error": 4.0 + wis_offset,
+                    "distribution_loc": 0.5,
+                    "distribution_scale": 1.0,
                     "covered_50": True,
                     "covered_80": True,
                     "covered_95": False,
@@ -139,6 +141,16 @@ def _write_run(
                 }
             )
     pd.DataFrame(rows).to_parquet(run_dir / "test_granular.parquet", index=False)
+    pd.DataFrame(
+        {
+            "target": ["hospitalizations", "wastewater", "cases", "deaths"],
+            "mean_target_wis": 10.0 + wis_offset + fold,
+            "wis_median": 1.0 + wis_offset,
+            "crps_median": 2.0 + wis_offset,
+            "nll_median": 3.0 + wis_offset,
+            "invalid_prediction_count_median": 0.0,
+        }
+    ).to_csv(run_dir / "test_main_model_aggregate_metrics.csv", index=False)
     return AblationRun(
         ablation=condition,
         campaign_id="probabilistic-test",
@@ -186,6 +198,7 @@ def test_probabilistic_campaign_outputs_validate_coverage_and_support(
         "condition_scorecard",
         "condition_head_scorecard",
         "paired_fold_seed_deltas",
+        "paired_fold_seed_target_deltas",
         "paired_region_deltas",
         "paired_head_horizon_deltas",
         "regional_effect_distribution",
@@ -194,6 +207,16 @@ def test_probabilistic_campaign_outputs_validate_coverage_and_support(
         "invalid_prediction_support_audit",
     }
     assert len(outputs["campaign_completeness_manifest"]) == 4
+    # Endpoint and paired deltas come from run-level aggregate rows.
+    scorecard = outputs["condition_scorecard"].set_index("condition")
+    assert scorecard.loc["baseline", "mean_target_wis_mean"] == pytest.approx(10.5)
+    assert scorecard.loc["mobility:off", "mean_target_wis_mean"] == pytest.approx(10.75)
+    fold_seed = outputs["paired_fold_seed_deltas"]
+    assert len(fold_seed) == 2
+    assert fold_seed["mean_target_wis_delta"].eq(0.25).all()
+    assert outputs["paired_fold_seed_target_deltas"]["wis_delta"].eq(0.25).all()
+    audit = outputs["invalid_prediction_support_audit"]
+    assert audit["invalid_prediction_count"].eq(0).all()
     assert outputs["paired_region_deltas"]["mean_target_wis_delta"].eq(0.25).all()
     assert outputs["regional_effect_distribution"].iloc[0]["worsened_regions"] == 2
     assert (
@@ -278,3 +301,101 @@ def test_temporal_campaign_uses_all_regions_and_reports_blocks(tmp_path: Path) -
     blocks = outputs["paired_temporal_block_horizon_deltas"]
     assert set(blocks["temporal_block"]) == {0, 1}
     assert blocks["wis_delta"].eq(0.25).all()
+
+
+def _two_condition_runs(tmp_path: Path):
+    mobility_path = tmp_path / "mobility.zarr"
+    xr.Dataset(
+        {"mobility": (("date", "origin", "target"), np.ones((1, 1, 2)))},
+        coords={
+            "date": pd.to_datetime(["2020-05-01"]),
+            "origin": ["origin"],
+            "target": ["r0", "r1"],
+        },
+    ).to_zarr(mobility_path)
+    campaign = load_campaign(_campaign(tmp_path, mobility_path))
+    baseline = [
+        _write_run(tmp_path, "baseline", fold, wis_offset=0.0) for fold in (0, 1)
+    ]
+    candidate = [
+        _write_run(tmp_path, "mobility-off", fold, wis_offset=0.25) for fold in (0, 1)
+    ]
+    for run in candidate:
+        object.__setattr__(run, "ablation", "mobility:off")
+    return campaign, {"baseline": baseline, "mobility:off": candidate}
+
+
+@pytest.mark.parametrize(
+    ("column", "bad_value"),
+    [
+        ("distribution_scale", 0.0),
+        ("distribution_scale", float("nan")),
+        ("distribution_loc", float("inf")),
+    ],
+)
+def test_invalid_predictions_fail_closed_with_run_identity(
+    tmp_path: Path, column: str, bad_value: float
+) -> None:
+    campaign, runs = _two_condition_runs(tmp_path)
+    path = runs["mobility:off"][1].run_dir / "test_granular.parquet"
+    frame = pd.read_parquet(path)
+    frame.loc[[0, 1, 2], column] = bad_value
+    frame.to_parquet(path, index=False)
+
+    with pytest.raises(ValueError, match=r"mobility:off/seed=52/fold=1/fold-1: 3"):
+        build_probabilistic_campaign_outputs(campaign, runs)
+
+
+def test_granular_without_distribution_columns_is_rejected(tmp_path: Path) -> None:
+    campaign, runs = _two_condition_runs(tmp_path)
+    path = runs["baseline"][0].run_dir / "test_granular.parquet"
+    pd.read_parquet(path).drop(columns=["distribution_scale"]).to_parquet(
+        path, index=False
+    )
+    with pytest.raises(ValueError, match="distribution_scale"):
+        build_probabilistic_campaign_outputs(campaign, runs)
+
+
+def test_aggregate_invalid_count_fails_closed(tmp_path: Path) -> None:
+    campaign, runs = _two_condition_runs(tmp_path)
+    path = runs["baseline"][0].run_dir / "test_main_model_aggregate_metrics.csv"
+    table = pd.read_csv(path)
+    table.loc[0, "invalid_prediction_count_median"] = 2.0
+    table.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="invalid predictions"):
+        build_probabilistic_campaign_outputs(campaign, runs)
+
+
+def test_missing_aggregate_table_is_rejected(tmp_path: Path) -> None:
+    campaign, runs = _two_condition_runs(tmp_path)
+    (runs["baseline"][0].run_dir / "test_main_model_aggregate_metrics.csv").unlink()
+    with pytest.raises(ValueError, match="missing canonical aggregate table"):
+        build_probabilistic_campaign_outputs(campaign, runs)
+
+
+def test_probabilistic_campaign_keeps_aggregate_table_checks(tmp_path: Path) -> None:
+    from scripts.analysis.analyze_ablations import validate_campaign_outputs
+
+    campaign, runs = _two_condition_runs(tmp_path)
+    for condition, items in runs.items():
+        for run in items:
+            (run.run_dir / "campaign_identity.json").write_text(
+                json.dumps(
+                    {
+                        "campaign_sha256": campaign.sha256,
+                        "campaign_id": campaign.campaign_id,
+                        "condition": condition,
+                        "seed": 52,
+                        "fold": run.fold,
+                    }
+                ),
+                encoding="utf-8",
+            )
+    for run in [*runs["baseline"], *runs["mobility:off"]]:
+        object.__setattr__(run, "seed", 52)
+    validate_campaign_outputs(campaign, runs)
+
+    path = runs["baseline"][0].run_dir / "test_main_model_aggregate_metrics.csv"
+    pd.read_csv(path).iloc[0:0].to_csv(path, index=False)
+    with pytest.raises(ValueError, match="aggregate metric table is empty"):
+        validate_campaign_outputs(campaign, runs)

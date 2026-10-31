@@ -560,7 +560,7 @@ def aggregate_ablation_metrics(
             record: dict[str, Any] = {
                 "model": ablation_name,
                 "target": target,
-                "folds": len(metrics_list),
+                "run_count": len(metrics_list),
             }
 
             for metric in METRICS:
@@ -888,6 +888,48 @@ def _aggregate_metric_table_errors(
     return []
 
 
+def _override_leaves(
+    overrides: dict[str, Any], prefix: tuple[str, ...] = ()
+) -> list[tuple[tuple[str, ...], Any]]:
+    leaves: list[tuple[tuple[str, ...], Any]] = []
+    for key, value in overrides.items():
+        if isinstance(value, dict) and value:
+            leaves.extend(_override_leaves(value, (*prefix, str(key))))
+        else:
+            leaves.append(((*prefix, str(key)), value))
+    return leaves
+
+
+def _reuse_config_identity_errors(
+    campaign: AblationCampaign, condition: str, run: AblationRun
+) -> list[str]:
+    """Compare a reused run's recorded identity with its own bundled config."""
+    label = _run_label(run)
+    try:
+        config = load_run_config(run.run_dir)
+    except ValueError as exc:
+        return [f"{label}: reuse config unreadable: {exc}"]
+    errors: list[str] = []
+    identity = run.campaign_identity or {}
+    if get_run_seed(run.run_dir) != identity.get("seed"):
+        errors.append(f"{label}: bundled config seed does not match recorded identity")
+    if get_run_fold(run.run_dir) != identity.get("fold"):
+        errors.append(f"{label}: bundled config fold does not match recorded identity")
+    expected_name = f"mn5_ablation__{campaign.campaign_id}__{condition}"
+    if _nested_get(config, ("output", "experiment_name")) != expected_name:
+        errors.append(f"{label}: bundled config experiment name does not match")
+    condition_spec = campaign.conditions_by_name.get(condition)
+    overrides = [*_override_leaves(campaign.fixed_overrides)]
+    if condition_spec is not None:
+        overrides += _override_leaves(condition_spec.overrides)
+    for path, expected in overrides:
+        if _nested_get(config, path) != expected:
+            errors.append(
+                f"{label}: bundled config {'.'.join(path)} does not match declaration"
+            )
+    return errors
+
+
 def validate_campaign_outputs(
     campaign: AblationCampaign,
     ablation_runs: dict[str, list[AblationRun]],
@@ -898,7 +940,6 @@ def validate_campaign_outputs(
     expected = expected_trial_identities(campaign, smoketest=smoketest)
     observed: dict[tuple[str, int, int | None], list[AblationRun]] = {}
     errors: list[str] = []
-    probabilistic = campaign_analysis_spec(campaign) is not None
     for condition, runs in ablation_runs.items():
         for run in runs:
             if run.seed is None:
@@ -923,18 +964,19 @@ def validate_campaign_outputs(
                 errors.append(
                     f"{_run_label(run)}: campaign output provenance does not match declaration"
                 )
-            if not probabilistic:
-                errors.extend(
-                    _aggregate_metric_table_errors(
-                        load_test_metrics(run.run_dir),
-                        primary_metric=campaign.primary_metric,
-                        label=_run_label(run),
-                        require_finite_primary_metric=campaign.completeness_requirements[
-                            "require_finite_primary_metric"
-                        ],
-                        allow_nonfinite_zero_support=smoketest,
-                    )
+            if run.campaign_identity is not None:
+                errors.extend(_reuse_config_identity_errors(campaign, condition, run))
+            errors.extend(
+                _aggregate_metric_table_errors(
+                    load_test_metrics(run.run_dir),
+                    primary_metric=campaign.primary_metric,
+                    label=_run_label(run),
+                    require_finite_primary_metric=campaign.completeness_requirements[
+                        "require_finite_primary_metric"
+                    ],
+                    allow_nonfinite_zero_support=smoketest,
                 )
+            )
     missing = expected - observed.keys()
     duplicates = {
         identity: runs for identity, runs in observed.items() if len(runs) != 1
@@ -982,8 +1024,8 @@ def main() -> int:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/reports/ablation_analysis"),
-        help="Output directory for aggregated results (default: outputs/reports/ablation_analysis)",
+        default=None,
+        help="Output directory (default: outputs/reports/ablation_cv_<campaign_id>)",
     )
     parser.add_argument(
         "--experiment-pattern",
@@ -1029,7 +1071,7 @@ def main() -> int:
     )
 
     # Determine default output directory from the declaration, not a CLI override.
-    if args.output_dir == Path("outputs/reports/ablation_analysis"):
+    if args.output_dir is None:
         args.output_dir = Path("outputs/reports") / f"ablation_cv_{campaign_id}"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1144,9 +1186,9 @@ def main() -> int:
         seed_matched_df.to_csv(seed_matched_path, index=False)
         logger.info(f"Saved seed-matched summary deltas to {seed_matched_path}")
 
-    # Campaign comparisons intentionally aggregate only per-run aggregate metric
-    # tables. Granular windows are not exchangeable observations and are never
-    # pooled by this analysis entry point.
+    # Non-probabilistic campaigns aggregate only per-run aggregate metric
+    # tables. Probabilistic campaigns take the endpoint and fold/seed deltas
+    # from run-level aggregates; granular rows feed descriptive breakdowns only.
 
     logger.info("Generating ablation plots...")
     try:

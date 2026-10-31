@@ -13,7 +13,7 @@ from evaluation.distribution_scores import (
 )
 from evaluation.losses import JointInferenceLoss
 from evaluation.metrics import TorchDistributionMetricAccumulator
-from training.epiforecaster_trainer import compute_validation_selection_score
+from evaluation.selection_scores import compute_validation_selection_score
 
 
 @pytest.mark.parametrize("df", [2.1, 2.5, 3.0, 5.0, 10.0, 30.0, 100.0, 101.0])

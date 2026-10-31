@@ -23,6 +23,9 @@ WIDTH_COLUMNS = (
     ("interval_low_95", "interval_high_95"),
 )
 SUPPORT_COLUMNS = [*GRANULAR_KEY_COLUMNS, "region_id", "target_date"]
+PRIMARY_METRIC = "mean_target_wis"
+AGGREGATE_FILENAME = "test_main_model_aggregate_metrics.csv"
+DISTRIBUTION_COLUMNS = ("distribution_loc", "distribution_scale")
 
 
 def _load_campaign_document(path: Path) -> dict[str, Any]:
@@ -88,6 +91,7 @@ def _read_granular(path: Path) -> pd.DataFrame:
         "observation_weight",
         *PROBABILISTIC_METRICS,
         *INTERVAL_COLUMNS,
+        *DISTRIBUTION_COLUMNS,
         *(column for pair in WIDTH_COLUMNS for column in pair),
     }
     missing = sorted(required.difference(frame.columns))
@@ -118,6 +122,15 @@ def _read_granular(path: Path) -> pd.DataFrame:
         raise ValueError(f"{path}: granular output contains unobserved support")
     if (frame["wis"] < 0).any() or (frame["crps"] < 0).any():
         raise ValueError(f"{path}: WIS and CRPS must be nonnegative")
+    # Same rule as the evaluation metrics: every row here has positive weight,
+    # and a non-finite location, non-finite scale, or scale <= 0 is invalid.
+    loc = pd.to_numeric(frame["distribution_loc"], errors="coerce")
+    scale = pd.to_numeric(frame["distribution_scale"], errors="coerce")
+    frame["invalid_prediction"] = (
+        ~np.isfinite(loc.to_numpy(dtype=float))
+        | ~np.isfinite(scale.to_numpy(dtype=float))
+        | (scale.to_numpy(dtype=float) <= 0)
+    )
     for column in INTERVAL_COLUMNS:
         values = frame[column]
         if not values.isin([True, False, 0, 1]).all():
@@ -217,22 +230,47 @@ def _run_frame(
     return frame
 
 
+def _run_aggregate_scores(run: Any) -> pd.DataFrame:
+    """Read canonical run-level aggregate scores; fail closed on invalid input."""
+    path = run.run_dir / AGGREGATE_FILENAME
+    if not path.is_file():
+        raise ValueError(f"{run.run_dir}: missing canonical aggregate table")
+    table = pd.read_csv(path)
+    required = [
+        "target",
+        PRIMARY_METRIC,
+        "wis_median",
+        "crps_median",
+        "nll_median",
+        "invalid_prediction_count_median",
+    ]
+    missing = [column for column in required if column not in table.columns]
+    if missing:
+        raise ValueError(
+            f"{run.run_dir}: aggregate table missing columns: {', '.join(missing)}"
+        )
+    if set(table["target"]) != set(REQUIRED_HEADS) or table["target"].duplicated().any():
+        raise ValueError(f"{run.run_dir}: aggregate table must hold each required head")
+    values = table[required[1:]].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise ValueError(f"{run.run_dir}: non-finite aggregate score")
+    if (values["invalid_prediction_count_median"] != 0).any():
+        raise ValueError(f"{run.run_dir}: aggregate reports invalid predictions")
+    if values[PRIMARY_METRIC].nunique() != 1:
+        raise ValueError(f"{run.run_dir}: {PRIMARY_METRIC} differs between heads")
+    result = table[["target"]].copy()
+    result[PRIMARY_METRIC] = values[PRIMARY_METRIC]
+    result["wis"] = values["wis_median"]
+    result["crps"] = values["crps_median"]
+    result["nll"] = values["nll_median"]
+    return result
+
+
 def _per_run_head_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     metrics = frame.groupby(
         ["condition", "seed", "fold", "run_id", "target"], sort=True
     )[list(PROBABILISTIC_METRICS)].mean()
     return metrics.reset_index()
-
-
-def _equal_head_metrics(per_head: pd.DataFrame) -> pd.DataFrame:
-    return (
-        per_head.groupby(["condition", "seed", "fold", "run_id"], sort=True)[
-            list(PROBABILISTIC_METRICS)
-        ]
-        .mean()
-        .rename(columns={"wis": "mean_target_wis"})
-        .reset_index()
-    )
 
 
 def _paired_metrics(
@@ -241,6 +279,7 @@ def _paired_metrics(
     *,
     keys: list[str],
     condition: str,
+    metrics: tuple[str, ...] = PROBABILISTIC_METRICS,
 ) -> pd.DataFrame:
     merged = baseline.merge(
         candidate,
@@ -265,7 +304,7 @@ def _paired_metrics(
         )
     ):
         raise ValueError(f"{condition}: paired observed values differ")
-    for metric in PROBABILISTIC_METRICS:
+    for metric in metrics:
         merged[f"{metric}_delta"] = (
             merged[f"{metric}_candidate"] - merged[f"{metric}_baseline"]
         )
@@ -393,6 +432,34 @@ def build_probabilistic_campaign_outputs(
                 }
             )
     granular = pd.concat(frames, ignore_index=True)
+    if campaign.primary_metric != PRIMARY_METRIC:
+        raise ValueError(f"campaign primary metric must be {PRIMARY_METRIC}")
+    invalid_runs = (
+        granular.groupby(["condition", "seed", "fold", "run_id"], sort=True)[
+            "invalid_prediction"
+        ]
+        .sum()
+        .loc[lambda counts: counts > 0]
+    )
+    if not invalid_runs.empty:
+        details = "; ".join(
+            f"{condition}/seed={seed}/fold={fold}/{run_id}: {int(count)}"
+            for (condition, seed, fold, run_id), count in invalid_runs.items()
+        )
+        raise ValueError(f"invalid predictions in endpoint runs: {details}")
+    aggregate_frames = []
+    for condition, runs in sorted(ablation_runs.items()):
+        for run in runs:
+            scores = _run_aggregate_scores(run)
+            scores["condition"] = condition
+            scores["seed"] = run.seed
+            scores["fold"] = -1 if run.fold is None else run.fold
+            scores["run_id"] = run.run_dir.name
+            aggregate_frames.append(scores)
+    run_scores = pd.concat(aggregate_frames, ignore_index=True)
+    run_endpoint = run_scores.drop_duplicates(
+        ["condition", "seed", "fold", "run_id"]
+    )[["condition", "seed", "fold", "run_id", PRIMARY_METRIC]]
     coverage = pd.DataFrame.from_records(coverage_records).sort_values(
         ["condition", "seed", "fold"]
     )
@@ -417,14 +484,11 @@ def build_probabilistic_campaign_outputs(
 
     per_head = _per_run_head_metrics(granular)
     scorecard = (
-        _equal_head_metrics(per_head)
-        .groupby("condition", sort=True)[
-            ["mean_target_wis", "crps", "nll", "abs_error"]
-        ]
+        run_endpoint.groupby("condition", sort=True)[PRIMARY_METRIC]
         .agg(["mean", "std"])
+        .add_prefix(f"{PRIMARY_METRIC}_")
+        .reset_index()
     )
-    scorecard.columns = ["_".join(column) for column in scorecard.columns]
-    scorecard = scorecard.reset_index()
     head_scorecard = per_head.groupby(["condition", "target"], sort=True)[
         list(PROBABILISTIC_METRICS)
     ].agg(["mean", "std"])
@@ -524,13 +588,62 @@ def build_probabilistic_campaign_outputs(
             .mean()
             .reset_index()
         )
-    paired_fold_seed = (
-        paired_rows.groupby(["condition", "fold", "seed", "target"], sort=True)[
-            [f"{metric}_delta" for metric in PROBABILISTIC_METRICS]
-        ]
-        .mean()
-        .reset_index()
-    )
+    # The endpoint and its fold/seed pairing come from run-level aggregates.
+    baseline_endpoint = run_endpoint[run_endpoint["condition"] == baseline_name]
+    baseline_targets = run_scores[run_scores["condition"] == baseline_name]
+    fold_seed: list[pd.DataFrame] = []
+    fold_seed_targets: list[pd.DataFrame] = []
+    for condition in sorted(expected_conditions - {baseline_name}):
+        keys = ["seed", "fold"]
+        endpoint = run_endpoint[run_endpoint["condition"] == condition]
+        paired = _paired_metrics(
+            baseline_endpoint[[*keys, PRIMARY_METRIC]],
+            endpoint[[*keys, PRIMARY_METRIC]],
+            keys=keys,
+            condition=condition,
+            metrics=(PRIMARY_METRIC,),
+        )
+        fold_seed.append(
+            paired.rename(
+                columns={
+                    f"{PRIMARY_METRIC}_baseline": f"baseline_{PRIMARY_METRIC}",
+                    f"{PRIMARY_METRIC}_candidate": f"candidate_{PRIMARY_METRIC}",
+                }
+            )[
+                [
+                    "condition",
+                    "fold",
+                    "seed",
+                    f"baseline_{PRIMARY_METRIC}",
+                    f"candidate_{PRIMARY_METRIC}",
+                    f"{PRIMARY_METRIC}_delta",
+                ]
+            ]
+        )
+        target_keys = ["seed", "fold", "target"]
+        columns = [*target_keys, "wis", "crps", "nll"]
+        target_paired = _paired_metrics(
+            baseline_targets[columns],
+            run_scores[run_scores["condition"] == condition][columns],
+            keys=target_keys,
+            condition=condition,
+            metrics=("wis", "crps", "nll"),
+        )
+        fold_seed_targets.append(
+            target_paired[
+                [
+                    "condition",
+                    "fold",
+                    "seed",
+                    "target",
+                    "wis_delta",
+                    "crps_delta",
+                    "nll_delta",
+                ]
+            ]
+        )
+    paired_fold_seed = pd.concat(fold_seed, ignore_index=True)
+    paired_fold_seed_targets = pd.concat(fold_seed_targets, ignore_index=True)
     paired_regions = pd.concat(region_pairs, ignore_index=True)
     paired_horizons = pd.concat(horizon_pairs, ignore_index=True)
     regional_summary = _regional_summary(paired_regions)
@@ -563,10 +676,10 @@ def build_probabilistic_campaign_outputs(
             targets=("target", "nunique"),
             horizons=("horizon", "nunique"),
             target_dates=("target_date", "nunique"),
+            invalid_prediction_count=("invalid_prediction", "sum"),
         )
         .reset_index()
     )
-    invalid_audit["invalid_prediction_count"] = 0
     invalid_audit["source_measurements_independent"] = False
     invalid_audit["source_dependence_treatment"] = (
         "descriptive_only_no_independent_row_inference"
@@ -576,6 +689,7 @@ def build_probabilistic_campaign_outputs(
         "condition_scorecard": scorecard,
         "condition_head_scorecard": head_scorecard,
         "paired_fold_seed_deltas": paired_fold_seed,
+        "paired_fold_seed_target_deltas": paired_fold_seed_targets,
         "paired_region_deltas": paired_regions,
         "paired_head_horizon_deltas": paired_horizons,
         "regional_effect_distribution": regional_summary,
