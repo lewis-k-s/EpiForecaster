@@ -286,44 +286,29 @@ class _TorchWindowSpearmanAccumulator:
             compacted_valid,
         )
 
-        correlations = torch.zeros(
-            row_count,
-            device=prediction_rows.device,
-            dtype=prediction_rows.dtype,
+        # Center over each row's own valid prefix with masked sums, so rows of
+        # every window size are scored at once without a host sync.
+        valid_weight = compacted_valid.to(prediction_ranks.dtype)
+        window_size = valid_count.clamp_min(1).unsqueeze(-1).to(valid_weight.dtype)
+        prediction_centered = (
+            prediction_ranks
+            - (prediction_ranks * valid_weight).sum(dim=-1, keepdim=True) / window_size
+        ) * valid_weight
+        reference_centered = (
+            reference_ranks
+            - (reference_ranks * valid_weight).sum(dim=-1, keepdim=True) / window_size
+        ) * valid_weight
+        denominator = torch.sqrt(
+            prediction_centered.square().sum(dim=-1)
+            * reference_centered.square().sum(dim=-1)
         )
-        eligible = torch.zeros(
-            row_count,
-            device=prediction_rows.device,
-            dtype=torch.bool,
-        )
-        window_sizes = [
-            int(window_size)
-            for window_size in valid_count.unique().detach().cpu().tolist()
-            if int(window_size) >= 2
-        ]
-        for window_size in window_sizes:
-            prediction_window = prediction_ranks[:, :window_size]
-            reference_window = reference_ranks[:, :window_size]
-            prediction_centered = prediction_window - prediction_window.mean(
-                dim=-1, keepdim=True
-            )
-            reference_centered = reference_window - reference_window.mean(
-                dim=-1, keepdim=True
-            )
-            denominator = torch.sqrt(
-                prediction_centered.square().sum(dim=-1)
-                * reference_centered.square().sum(dim=-1)
-            )
-            window_eligible = (valid_count == window_size) & (denominator > _EPSILON)
-            window_correlation = (prediction_centered * reference_centered).sum(
-                dim=-1
-            ) / denominator.clamp_min(_EPSILON)
-            correlations = torch.where(
-                window_eligible,
-                window_correlation,
-                correlations,
-            )
-            eligible |= window_eligible
+        eligible = candidate & (denominator > _EPSILON)
+        correlations = torch.where(
+            eligible,
+            (prediction_centered * reference_centered).sum(dim=-1)
+            / denominator.clamp_min(_EPSILON),
+            0.0,
+        ).to(prediction_rows.dtype)
 
         self.total_window_count += prediction_rows.shape[0]
         self.candidate_window_count += candidate.sum()
