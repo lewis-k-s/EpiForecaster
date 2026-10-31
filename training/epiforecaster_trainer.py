@@ -3133,6 +3133,12 @@ class EpiForecasterTrainer:
                 "window_stride": int(self.config.data.window_stride),
             },
         )
+        # Each evaluation pass leaves ~1 GiB of new free segments that the
+        # caching allocator never reuses, so reserved memory grows every epoch.
+        # This frees only this process's unused cache (safe under MPS).
+        # expandable_segments would avoid this but breaks cudagraph trees.
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Store node MAE for forecast plotting
         self._last_node_mae = node_mae_dict
