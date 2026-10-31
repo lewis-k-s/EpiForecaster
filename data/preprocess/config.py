@@ -162,6 +162,10 @@ class PreprocessingConfig:
         chunk_sizes: Custom chunk sizes for Zarr arrays
 
         num_workers: Number of parallel workers for processing
+        write_workers: Processes that compute and write runs of the packed
+            Zarr output (one run per task)
+        bitround_keepbits: Float32 variables to round before the write, mapped
+            to the mantissa bits to keep (1-22). Empty means no rounding.
         chunk_size: Chunk size for processing large files
         memory_limit_gb: Memory limit for processing (GB)
 
@@ -185,6 +189,17 @@ class PreprocessingConfig:
 
     # Optional data paths
     synthetic_path: str | None = None
+    # Generator state-space contract required for synthetic latent supervision.
+    # The SHA-256 is of the canonical contract JSON embedded in the corpus.
+    synthetic_state_space_schema_version: str = "epiforecaster_sirhd_v1"
+    synthetic_state_space_contract_sha256: str | None = None
+    # Parity QA sample for corpora that store both the dense and the
+    # factorized mobility layouts: runs and dates spread over the corpus.
+    synthetic_mobility_parity_runs: int = 4
+    synthetic_mobility_parity_dates: int = 4
+    # Synthetic runs dropped before extraction, as {run_id: reason}. Every
+    # listed run must exist in the corpus; the reasons go to the provenance.
+    synthetic_run_exclusions: dict[str, str] = field(default_factory=dict)
     hospitalizations_file: str | None = None
     # Conservative availability shift for weekly totals stamped at week start.
     hospitalizations_reporting_lag_days: int = 7
@@ -238,6 +253,10 @@ class PreprocessingConfig:
     num_workers: int = 4
     chunk_size: int = 1000
     run_id_chunk_size: int = 5  # Chunk size for run_id dimension
+    # Processes that compute and write runs of the packed Zarr output.
+    write_workers: int = 1
+    # Mantissa bits to keep per float32 output variable; empty is lossless.
+    bitround_keepbits: dict[str, int] = field(default_factory=dict)
     date_chunk_size: int = 30  # Chunk size for date dimension in zarr output
     mobility_chunk_size: int = (
         100  # Chunk size for spatial dims (origin/destination/region_id)
@@ -293,6 +312,15 @@ class PreprocessingConfig:
             self.smoothing = SmoothingConfig(**self.smoothing)
         if not isinstance(self.source_provenance, dict):
             raise ValueError("source_provenance must be a dictionary")
+        contract_sha256 = self.synthetic_state_space_contract_sha256
+        if contract_sha256 is not None and (
+            len(contract_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in contract_sha256)
+        ):
+            raise ValueError(
+                "synthetic_state_space_contract_sha256 must be a lowercase "
+                "hexadecimal SHA-256 digest"
+            )
         self._validate_paths()
         self._validate_temporal_parameters()
         self._validate_processing_options()
@@ -408,11 +436,38 @@ class PreprocessingConfig:
         if self.run_id_chunk_size <= 0:
             raise ValueError("run_id_chunk_size must be positive")
 
+        if self.write_workers <= 0:
+            raise ValueError("write_workers must be positive")
+
+        for name, bits in self.bitround_keepbits.items():
+            if isinstance(bits, bool) or not isinstance(bits, int) or not 0 < bits < 23:
+                raise ValueError(
+                    f"bitround_keepbits[{name!r}] must be an integer from 1 to 22"
+                )
+
         if self.date_chunk_size <= 0:
             raise ValueError("date_chunk_size must be positive")
 
         if self.mobility_chunk_size <= 0:
             raise ValueError("mobility_chunk_size must be positive")
+
+        if self.synthetic_mobility_parity_runs <= 0:
+            raise ValueError("synthetic_mobility_parity_runs must be positive")
+
+        if self.synthetic_mobility_parity_dates <= 0:
+            raise ValueError("synthetic_mobility_parity_dates must be positive")
+
+        if not isinstance(self.synthetic_run_exclusions, dict) or not all(
+            isinstance(run_id, str)
+            and run_id.strip()
+            and isinstance(reason, str)
+            and reason.strip()
+            for run_id, reason in self.synthetic_run_exclusions.items()
+        ):
+            raise ValueError(
+                "synthetic_run_exclusions must map non-empty run IDs to "
+                "non-empty reasons"
+            )
 
         if self.memory_limit_gb <= 0:
             raise ValueError("memory_limit_gb must be positive")
@@ -534,7 +589,7 @@ class PreprocessingConfig:
 
     def get_dataset_filename(self) -> str:
         """Generate standardized filename for the processed dataset."""
-        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.nc"
+        return f"{self.dataset_name}_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}.zarr.zip"
 
     def get_output_dataset_path(self) -> Path:
         """Get full path for the output dataset."""

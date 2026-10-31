@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from scripts.workflow import run_support
 
 
-def _write_pointer(path: Path, *, md5: str, output_name: str) -> None:
+def _write_pointer(path: Path, *, md5: str, output_name: str, size: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         yaml.safe_dump(
@@ -15,7 +16,7 @@ def _write_pointer(path: Path, *, md5: str, output_name: str) -> None:
                 "outs": [
                     {
                         "md5": md5,
-                        "size": 1,
+                        "size": size,
                         "hash": "md5",
                         "path": output_name,
                     }
@@ -70,10 +71,12 @@ def test_stage_dvc_keeps_site_cache_inside_workspace(
     ] in commands
 
 
-def test_stage_dvc_validates_git_import_from_the_pinned_output(
+def _stage_git_import(
     monkeypatch,
     tmp_path: Path,
-) -> None:
+    *,
+    pointer_size: int,
+) -> list[list[str]]:
     run_root = tmp_path / "run"
     source_root = run_root / "source"
     pointer = source_root / "data/files/imported.nc.dvc"
@@ -84,6 +87,7 @@ def test_stage_dvc_validates_git_import_from_the_pinned_output(
         pointer,
         md5=run_support.md5_file(payload_path),
         output_name="imported.nc",
+        size=pointer_size,
     )
     document = yaml.safe_load(pointer.read_text())
     document["deps"] = [
@@ -122,6 +126,28 @@ def test_stage_dvc_validates_git_import_from_the_pinned_output(
 
     monkeypatch.setattr(run_support, "_run", fake_run)
 
+    def no_rehash(path: Path) -> str:
+        raise AssertionError(f"staging must not rehash the import: {path}")
+
+    monkeypatch.setattr(run_support, "md5_file", no_rehash)
     run_support.stage_dvc(config_path, source_root, run_root)
+    return commands
+
+
+def test_stage_dvc_trusts_git_import_without_rehashing(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    commands = _stage_git_import(
+        monkeypatch, tmp_path, pointer_size=len(b"pinned-import-object")
+    )
 
     assert not any(command[1] == "status" for command in commands)
+
+
+def test_stage_dvc_rejects_git_import_with_wrong_size(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="size mismatch"):
+        _stage_git_import(monkeypatch, tmp_path, pointer_size=1)

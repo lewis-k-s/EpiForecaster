@@ -17,6 +17,7 @@ import pytest
 import xarray as xr
 import yaml
 
+from data.preprocess.zarr_layout import write_dataset
 from scripts.workflow import attempts, run_support
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -218,24 +219,23 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
             self.config = config
 
         def run(self):
-            path = Path(self.config.output_path) / "tiny-dated.nc"
+            path = Path(self.config.output_path) / "tiny-dated.zarr.zip"
             path.parent.mkdir(parents=True)
             calls.append(path)
             if len(calls) == 1:
                 path.write_bytes(b"partial")
                 raise RuntimeError("preempted")
-            xr.Dataset({"cases": ("date", [1.0, 2.0])}).to_netcdf(path)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
             return path
 
     monkeypatch.setattr(data.preprocess, "OfflinePreprocessingPipeline", Pipeline)
     monkeypatch.setattr(
         run_support, "_processed_dataset_qa", lambda *args: {"ok": True}
     )
-    monkeypatch.setattr(run_support, "_handoff_provenance_qa", lambda *args: None)
     with pytest.raises(RuntimeError, match="preempted"):
         run_support.run_preprocessing(config_path, source, run)
     marker = run_support.run_preprocessing(config_path, source, run)
-    output = run / "outputs/preprocessing/tiny.nc"
+    output = run / "outputs/preprocessing/tiny.zarr.zip"
     original = output.read_bytes()
     for path in output.parent.iterdir():
         path.unlink()
@@ -244,6 +244,62 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
     assert marker.is_file()
     assert len(calls) == 2
     assert calls[0].read_bytes() == b"partial"
+
+
+def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monkeypatch):
+    import data.preprocess
+
+    run = tmp_path / "run"
+    source = tmp_path / "source"
+    local_tmp = tmp_path / "node-local"
+    for path in (run, source, local_tmp):
+        path.mkdir()
+    (source / "preprocess.yaml").write_text("dataset_name: tiny\n")
+    config_path = run / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "workflow": {"kind": "preprocess"},
+                "preprocessing": {
+                    "base_config": "preprocess.yaml",
+                    "dataset_name": "tiny",
+                    "node_local_output": True,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(run_support, "validate_workflow_contract", lambda config: None)
+    monkeypatch.setattr(run_support.tempfile, "tempdir", str(local_tmp))
+    monkeypatch.setattr(
+        data.preprocess.PreprocessingConfig,
+        "from_file",
+        lambda path: SimpleNamespace(**yaml.safe_load(path.read_text())),
+    )
+    built: list[Path] = []
+
+    class Pipeline:
+        def __init__(self, config):
+            self.config = config
+
+        def run(self):
+            path = Path(self.config.output_path) / "tiny-dated.zarr.zip"
+            path.parent.mkdir(parents=True)
+            write_dataset(xr.Dataset({"cases": ("date", [1.0, 2.0])}), path, workers=1)
+            built.append(path)
+            return path
+
+    monkeypatch.setattr(data.preprocess, "OfflinePreprocessingPipeline", Pipeline)
+    monkeypatch.setattr(
+        run_support, "_processed_dataset_qa", lambda *args: {"ok": True}
+    )
+
+    marker = run_support.run_preprocessing(config_path, source, run)
+
+    assert built[0].is_relative_to(local_tmp)
+    output = run / "outputs/preprocessing/tiny.zarr.zip"
+    record = json.loads(marker.read_text())
+    assert record["dataset_sha256"] == run_support.sha256_file(output)
+    assert not any(local_tmp.iterdir())
 
 
 def _cache_environment(tmp_path):
@@ -517,3 +573,21 @@ def test_cache_cleanup_waits_for_scientific_readers(tmp_path):
         assert process.returncode == 0, stdout + stderr
         assert _clean_cache(run, env).returncode == 0
     assert not (tmp_path / "cache/12345/run").exists()
+
+
+def test_node_input_cache_lives_under_the_job_tmpdir(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts/workflow/node_input_cache.sh"
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{script}"; node_cache_run_root /runs/example',
+        ],
+        env={"TMPDIR": str(tmp_path), "SLURM_JOB_ID": "123", "PATH": "/usr/bin:/bin"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == f"{tmp_path}/epiforecaster/inputs/123/example"

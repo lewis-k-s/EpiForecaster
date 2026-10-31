@@ -103,41 +103,6 @@ def test_processed_dataset_qa_validates_destination_dated_flow() -> None:
     }
 
 
-def test_handoff_provenance_qa_retains_run_ids_and_seeds(tmp_path: Path) -> None:
-    source_root = tmp_path / "source"
-    handoff_path = source_root / "data/files/qa/handoff_manifest.json"
-    handoff_path.parent.mkdir(parents=True)
-    handoff = {
-        "qa_passed": True,
-        "run_ids": ["run_b", "run_a"],
-        "seeds": {"synthetic_reporting_seed": [22, 11]},
-        "corpus_full_tree_sha256": "raw-tree",
-        "corpus_metadata_tree_sha256": "metadata-tree",
-        "reporting_config_sha256": "reporting-config",
-    }
-    handoff_path.write_text(json.dumps(handoff))
-    config = _preprocess_workflow()
-    config["preprocessing"]["handoff_manifest"] = "data/files/qa/handoff_manifest.json"
-    dataset = xr.Dataset(coords={"run_id": ["run_b", "run_a"]})
-    effective = {
-        "source_provenance": {
-            "handoff_manifest_sha256": run_support.sha256_file(handoff_path)
-        }
-    }
-
-    qa = run_support._handoff_provenance_qa(
-        source_root,
-        config,
-        effective,
-        dataset,
-    )
-
-    assert qa is not None
-    assert qa["run_ids"] == ["run_b", "run_a"]
-    assert qa["seeds"] == {"synthetic_reporting_seed": [22, 11]}
-    assert qa["seed_by_run"] == {"synthetic_reporting_seed": {"run_b": 22, "run_a": 11}}
-
-
 def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     monkeypatch,
     tmp_path: Path,
@@ -213,15 +178,19 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
         return original_copy2(*args, **kwargs)
 
     monkeypatch.setattr(run_support.shutil, "copy2", observe_copy2)
+    staged_inodes: list[tuple[Path, int]] = []
 
     def fake_run(command: list[str], *, cwd: Path | None = None, **_: object) -> None:
         assert cwd is not None
         if command[1:3] == ["init", "--no-scm"]:
             (cwd / ".dvc").mkdir()
-        elif command[1:3] == ["add", "synthetic_smoke.nc"]:
-            (cwd / "synthetic_smoke.nc.dvc").write_text(
+        elif command[1:3] == ["add", "synthetic_smoke.zarr.zip"]:
+            staged_inodes.append(
+                (cwd.parent, (cwd / "synthetic_smoke.zarr.zip").stat().st_ino)
+            )
+            (cwd / "synthetic_smoke.zarr.zip.dvc").write_text(
                 yaml.safe_dump(
-                    {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.nc"}]}
+                    {"outs": [{"md5": "published.md5", "path": "synthetic_smoke.zarr.zip"}]}
                 )
             )
 
@@ -232,10 +201,15 @@ def test_publish_preprocessed_dataset_writes_run_owned_pointer(
     receipt = json.loads(receipt_path.read_text())
     assert receipt["dvc_md5"] == "published.md5"
     assert receipt["input_dvc_hashes"] == {"data/files/raw.zarr.dvc": "raw.dir"}
-    assert (receipt_path.parent / "synthetic_smoke.nc.dvc").is_file()
-    assert not (receipt_path.parent / "synthetic_smoke.nc").exists()
+    assert (receipt_path.parent / "synthetic_smoke.zarr.zip.dvc").is_file()
+    assert not (receipt_path.parent / "synthetic_smoke.zarr.zip").exists()
     assert (run_root / ".state/preprocessed_published.done").is_file()
     assert len(observed_copy_calls) >= 1
+    # The payload is hard-linked beside the dataset, not copied to /tmp.
+    output_root = run_root / "outputs/preprocessing"
+    dataset_inode = (output_root / "dataset.nc").stat().st_ino
+    assert staged_inodes == [(output_root, dataset_inode)]
+    assert not list(output_root.glob(".publication.staging-*"))
 
 
 def test_publish_preprocessed_dataset_rejects_nonempty_publication(

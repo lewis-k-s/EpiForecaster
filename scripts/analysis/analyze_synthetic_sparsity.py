@@ -12,7 +12,7 @@ Usage:
     python scripts/analysis/analyze_synthetic_sparsity.py [--path PATH]
 
 Args:
-    path: Path to raw_synthetic_observations.zarr (default: data/files/raw_synthetic_observations.nc)
+    path: Path to raw synthetic Zarr store (default: data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip)
 """
 
 import argparse
@@ -21,9 +21,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from data.preprocess.zarr_layout import is_zarr_zip, open_zarr_zip
+
 
 def analyze_synthetic_sparsity(
-    zarr_path: str = "data/files/raw_synthetic_observations.nc",
+    zarr_path: str = "data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip",
 ) -> dict[str, pd.DataFrame]:
     """Analyze sparsity in synthetic data.
 
@@ -38,8 +40,11 @@ def analyze_synthetic_sparsity(
     print("=" * 70)
     print()
 
-    # Load with zarr_format=2 to avoid v2/v3 conflict
-    ds = xr.open_zarr(zarr_path, zarr_format=2)
+    if is_zarr_zip(zarr_path):
+        ds = open_zarr_zip(zarr_path)
+    else:
+        # Load with zarr_format=2 to avoid v2/v3 conflict
+        ds = xr.open_zarr(zarr_path, zarr_format=2)
 
     results = {
         "path": zarr_path,
@@ -279,7 +284,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--path",
         type=str,
-        default="data/files/raw_synthetic_observations.nc",
+        default="data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip",
         help="Path to raw_synthetic_observations.zarr",
     )
     args = parser.parse_args()

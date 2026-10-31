@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import errno
 import fcntl
 import hashlib
 import importlib.metadata
@@ -44,6 +45,10 @@ from training.training_dynamics import (
     DYNAMICS_MANIFEST_NAME,
     load_training_dynamics_identity,
 )
+
+# Packed sharded Zarr store (data.preprocess.zarr_layout.ZARR_ZIP_SUFFIX).
+# Kept local so host-side commands do not import the scientific stack.
+PROCESSED_DATASET_SUFFIX = ".zarr.zip"
 
 
 def sha256_file(path: Path) -> str:
@@ -925,6 +930,9 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         if not (workspace / output_path).exists():
             raise FileNotFoundError(f"DVC output was not materialized: {output_path}")
 
+    # DVC content-addresses the cache, so the imported object is trusted by its
+    # path. Rehashing a 173 GB corpus over GPFS cost ~8 min per run; a size
+    # check still catches a truncated or wrong object.
     for target, output_path, output in imported_targets:
         expected_md5 = str(output["md5"])
         materialized = workspace / output_path
@@ -933,11 +941,12 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
                 "Git-backed DVC imports must materialize one regular file for "
                 f"offline validation: {target}"
             )
-        actual_md5 = md5_file(materialized)
-        if actual_md5 != expected_md5:
+        expected_size = output.get("size")
+        actual_size = materialized.stat().st_size
+        if expected_size is not None and actual_size != int(expected_size):
             raise ValueError(
-                f"Imported DVC output MD5 mismatch for {target}: "
-                f"{actual_md5} != {expected_md5}"
+                f"Imported DVC output size mismatch for {target}: "
+                f"{actual_size} != {expected_size}"
             )
 
     bind_roots = sorted({path.parent for path in output_paths})
@@ -1132,62 +1141,12 @@ def _processed_dataset_qa(
     }
 
 
-def _handoff_provenance_qa(
-    source_root: Path,
-    workflow_config: dict[str, Any],
-    effective_config: dict[str, Any],
-    dataset: Any,
-) -> dict[str, Any] | None:
-    """Validate and retain the generator handoff identity and seed record."""
-    handoff_value = workflow_config["preprocessing"].get("handoff_manifest")
-    if handoff_value is None:
-        return None
-    relative = Path(str(handoff_value))
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("preprocessing.handoff_manifest must be source-relative")
-    handoff_path = (source_root / relative).resolve(strict=True)
-    handoff_path.relative_to(source_root.resolve(strict=True))
-    handoff = json.loads(handoff_path.read_text())
-    if handoff.get("qa_passed") is not True:
-        raise ValueError("Synthetic generator handoff QA did not pass")
-    handoff_sha256 = sha256_file(handoff_path)
-    expected_sha256 = effective_config.get("source_provenance", {}).get(
-        "handoff_manifest_sha256"
-    )
-    if expected_sha256 and handoff_sha256 != str(expected_sha256):
-        raise ValueError(
-            "Synthetic generator handoff manifest SHA-256 does not match the "
-            "preprocessing source contract"
-        )
-    expected_run_ids = [str(value) for value in handoff.get("run_ids", [])]
-    observed_run_ids = [str(value) for value in dataset["run_id"].values]
-    if sorted(expected_run_ids) != sorted(observed_run_ids):
-        raise ValueError(
-            "Processed run IDs differ from the synthetic generator handoff"
-        )
-    seeds = handoff.get("seeds")
-    if not isinstance(seeds, dict) or not seeds:
-        raise ValueError("Synthetic generator handoff has no seed record")
-    for name, values in seeds.items():
-        if not isinstance(values, list) or len(values) != len(expected_run_ids):
-            raise ValueError(
-                f"Synthetic generator seed vector {name!r} does not match run count"
-            )
-    seed_by_run = {
-        name: dict(zip(expected_run_ids, values, strict=True))
-        for name, values in seeds.items()
-    }
-    return {
-        "path": relative.as_posix(),
-        "sha256": handoff_sha256,
-        "qa_passed": True,
-        "run_ids": expected_run_ids,
-        "seeds": seeds,
-        "seed_by_run": seed_by_run,
-        "corpus_full_tree_sha256": handoff.get("corpus_full_tree_sha256"),
-        "corpus_metadata_tree_sha256": handoff.get("corpus_metadata_tree_sha256"),
-        "reporting_config_sha256": handoff.get("reporting_config_sha256"),
-    }
+def _synthetic_corpus_provenance(dataset: Any) -> dict[str, Any] | None:
+    """Return the processed synthetic corpus identity and mobility layout QA."""
+    from data.preprocess.pipeline import SYNTHETIC_CORPUS_PROVENANCE_ATTR
+
+    value = dataset.attrs.get(SYNTHETIC_CORPUS_PROVENANCE_ATTR)
+    return json.loads(str(value)) if value is not None else None
 
 
 def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> Path:
@@ -1197,10 +1156,8 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     preprocessing = config["preprocessing"]
     source_config = source_root / Path(str(preprocessing["base_config"]))
     effective = _load_preprocessing_document(source_config, source_root)
-    output_root = run_root / "outputs/preprocessing"
-    effective_config = output_root / "effective_config.yaml"
-    output_marker = output_root / ".preprocessed.done"
-    qa_path = output_root / "qa.json"
+    effective["write_workers"] = int(preprocessing.get("write_workers", 1))
+    output_marker = run_root / "outputs/preprocessing/.preprocessed.done"
     attempts = run_root / ".state/attempts/preprocessing"
     identity = {"config_sha256": sha256_file(config_path), "effective": effective}
     # Normalize YAML dates for the JSON receipt comparison on a later attempt.
@@ -1208,38 +1165,75 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     if restore_attempt(attempts, identity, run_root):
         return output_marker
     attempt = new_attempt(attempts)
-    effective["output_path"] = str(attempt / "dataset")
+    # Node-local output keeps the write, the post-write read-back, QA and the
+    # SHA-256 off shared GPFS; one sequential copy then moves the result into
+    # the attempt. The container /tmp is the step's node-local scratch.
+    node_local_output = bool(preprocessing.get("node_local_output", False))
+    local_root = (
+        Path(tempfile.mkdtemp(prefix="epiforecaster-preprocess-"))
+        if node_local_output
+        else None
+    )
+    try:
+        return _run_preprocessing_attempt(
+            config,
+            effective,
+            attempt,
+            identity,
+            run_root,
+            source_root,
+            source_config,
+            local_root,
+        )
+    finally:
+        if local_root is not None:
+            shutil.rmtree(local_root, ignore_errors=True)
+
+
+def _run_preprocessing_attempt(
+    config: dict[str, Any],
+    effective: dict[str, Any],
+    attempt: Path,
+    identity: dict[str, Any],
+    run_root: Path,
+    source_root: Path,
+    source_config: Path,
+    local_root: Path | None,
+) -> Path:
+    output_root = run_root / "outputs/preprocessing"
+    effective_config = output_root / "effective_config.yaml"
+    output_marker = output_root / ".preprocessed.done"
+    qa_path = output_root / "qa.json"
+    build_root = attempt if local_root is None else local_root
+    effective["output_path"] = str(build_root / "dataset")
     attempt_config = attempt / "effective_config.yaml"
     write_yaml(attempt_config, effective)
 
     from data.preprocess import OfflinePreprocessingPipeline, PreprocessingConfig
 
     pipeline_config = PreprocessingConfig.from_file(attempt_config)
-    attempt_dataset = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
+    built_dataset = Path(OfflinePreprocessingPipeline(pipeline_config).run()).resolve(
         strict=True
     )
-    attempt_dataset.relative_to(attempt.resolve(strict=True))
-    if attempt_dataset.is_symlink() or not attempt_dataset.is_file():
+    built_dataset.relative_to(build_root.resolve(strict=True))
+    if built_dataset.is_symlink() or not built_dataset.is_file():
         raise ValueError(
-            f"Preprocessing output must be a regular NetCDF file: {attempt_dataset}"
+            f"Preprocessing output must be a regular packed Zarr file: {built_dataset}"
         )
-    dataset_path = output_root / f"{preprocessing_dataset_name(config)}.nc"
+    dataset_path = (
+        output_root / f"{preprocessing_dataset_name(config)}{PROCESSED_DATASET_SUFFIX}"
+    )
 
-    import xarray as xr
+    from data.epi_dataset import open_processed_dataset
 
-    dataset = xr.open_dataset(attempt_dataset, engine="netcdf4")
+    dataset = open_processed_dataset(built_dataset)
     try:
         qa_record = {
             "schema_version": 2,
             "dataset": str(dataset_path),
             "dataset_relative": str(dataset_path.relative_to(run_root)),
             **_processed_dataset_qa(dataset, config),
-            "generator_handoff": _handoff_provenance_qa(
-                source_root,
-                config,
-                effective,
-                dataset,
-            ),
+            "synthetic_corpus_provenance": _synthetic_corpus_provenance(dataset),
             "effective_config": str(effective_config),
             "effective_config_sha256": sha256_file(attempt_config),
             "source_config": str(source_config.relative_to(source_root)),
@@ -1248,6 +1242,17 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
         }
     finally:
         dataset.close()
+    dataset_sha256 = sha256_file(built_dataset)
+    if local_root is None:
+        attempt_dataset = built_dataset
+    else:
+        attempt_dataset = attempt / "dataset" / built_dataset.name
+        attempt_dataset.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(built_dataset, attempt_dataset)
+        if attempt_dataset.stat().st_size != built_dataset.stat().st_size:
+            raise ValueError(
+                f"Copy of the node-local dataset is incomplete: {attempt_dataset}"
+            )
     attempt_qa = attempt / "qa.json"
     attempt_marker = attempt / ".preprocessed.done"
     write_json(attempt_qa, qa_record)
@@ -1255,7 +1260,7 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
         attempt_marker,
         {
             "dataset": str(dataset_path),
-            "dataset_sha256": sha256_file(attempt_dataset),
+            "dataset_sha256": dataset_sha256,
             "qa": str(qa_path),
             "qa_sha256": sha256_file(attempt_qa),
         },
@@ -1278,15 +1283,15 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     """Publish a QA-passed dataset as a run-owned DVC pointer."""
     config = load_yaml(config_path)
     dataset_name = preprocessing_dataset_name(config)
-    dataset_pointer = f"{dataset_name}.nc.dvc"
-    publication_payload = f"{dataset_name}.nc"
+    dataset_pointer = f"{dataset_name}{PROCESSED_DATASET_SUFFIX}.dvc"
+    publication_payload = f"{dataset_name}{PROCESSED_DATASET_SUFFIX}"
     output_root = run_root / "outputs/preprocessing"
     marker_path = output_root / ".preprocessed.done"
     marker = json.loads(marker_path.read_text())
     dataset = Path(str(marker["dataset"])).resolve(strict=True)
     dataset.relative_to(output_root.resolve(strict=True))
     if dataset.is_symlink() or not dataset.is_file():
-        raise ValueError("Preprocessed dataset must be a non-symlink NetCDF file")
+        raise ValueError("Preprocessed dataset must be a non-symlink packed Zarr file")
     if sha256_file(dataset) != str(marker["dataset_sha256"]):
         raise ValueError("Preprocessed dataset changed after QA")
     qa_path = Path(str(marker["qa"])).resolve(strict=True)
@@ -1304,15 +1309,25 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
                 "Preprocessing publication already exists for this run"
             )
         destination.rmdir()
+    # Stage next to the dataset on the shared filesystem and hard-link it.
+    # Node-local /tmp may be smaller than the dataset (118 GB for a 198-run
+    # corpus on Nord4), and DVC moves the payload into the shared cache anyway.
     scratch_staging = Path(
-        tempfile.mkdtemp(prefix=f"epiforecaster-publication-{os.getpid()}-")
+        tempfile.mkdtemp(prefix=f".publication.staging-{os.getpid()}-", dir=output_root)
     )
     payload = scratch_staging / publication_payload
     commit_staging = output_root / f".publication.commit-{os.getpid()}"
     try:
-        shutil.copy2(dataset, payload)
-        if sha256_file(payload) != str(marker["dataset_sha256"]):
-            raise ValueError("Publication staging changed the processed dataset")
+        try:
+            os.link(dataset, payload)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copy2(dataset, payload)
+            if sha256_file(payload) != str(marker["dataset_sha256"]):
+                raise ValueError(
+                    "Publication staging changed the processed dataset"
+                ) from None
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
         _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)

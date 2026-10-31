@@ -21,7 +21,7 @@ DATASET_ROLE_POINTERS = {
     "real": "data/processed/real_with_id.zarr.dvc",
     "synthetic": (
         "data/processed/"
-        "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr.dvc"
+        "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip.dvc"
     ),
 }
 TARGET_HEADS = {

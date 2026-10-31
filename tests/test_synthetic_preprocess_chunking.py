@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import dask.array as da
@@ -7,109 +8,141 @@ import pytest
 import warnings
 import xarray as xr
 
-from data.preprocess.processors.synthetic_processor import SyntheticProcessor
+from data.epi_dataset import open_processed_dataset
+from data.preprocess.processors.synthetic_processor import (
+    SyntheticProcessor,
+    _split_attr_list,
+)
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
+from data.preprocess.zarr_layout import pack_store, with_variable_length_strings
 from tests.dataset_test_helpers import make_preprocessing_config
 
 
-def _write_minimal_synthetic_zarr(
-    path,
+STATE_SPACE_CONTRACT = {
+    "contract_schema_version": 1,
+    "state_space": "SIRHD",
+    "state_space_schema_version": "epiforecaster_sirhd_v1",
+    "units": "persons",
+    "denominator": "population[run_id, region_id]",
+    "primitive_stock_variables": {"I": "latent_I_true", "S": "latent_S_true"},
+    "audit_only_stock_variables": {"CH": "latent_CH_true"},
+    "aggregation_map": {
+        "sirhd_D": ["D"],
+        "sirhd_H": ["HR", "HD"],
+        "sirhd_I": ["E", "A", "I", "PH", "PD"],
+        "sirhd_R": ["R"],
+        "sirhd_S": ["S"],
+    },
+    "applicability": {"required_zero_stocks": ["CH"], "on_violation": "fail"},
+    "timestamp_convention": {"flow": "destination-dated daily interval"},
+}
+STATE_SPACE_CONTRACT_JSON = json.dumps(
+    STATE_SPACE_CONTRACT, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+)
+STATE_SPACE_CONTRACT_SHA256 = hashlib.sha256(
+    STATE_SPACE_CONTRACT_JSON.encode()
+).hexdigest()
+
+
+def _write_minimal_synthetic_zarr(path, **kwargs):
+    _minimal_synthetic_dataset(**kwargs).to_zarr(path, mode="w", zarr_format=2)
+
+
+def _minimal_synthetic_dataset(
     *,
     run_ids,
     dates,
     region_ids,
     edar_ids,
-    latent_h_name="latent_H_true",
-    include_deaths_true=True,
+    include_sirhd=True,
+    include_death_flow=True,
+    include_primitive_latents=True,
     death_flow_offset=0.0,
+    partition_offset=0.0,
+    confined_stock=0.0,
+    contract_json=STATE_SPACE_CONTRACT_JSON,
+    contract_sha256=STATE_SPACE_CONTRACT_SHA256,
 ):
+    """Build a corpus that starts one day before ``dates``.
+
+    The extra leading corpus day gives every requested processing date a
+    destination-dated death-flow interval, as in the generator contract.
+    """
     rng = np.random.default_rng(123)
+    corpus_dates = pd.DatetimeIndex([dates[0] - pd.Timedelta(days=1)]).append(dates)
+    n_runs, n_dates, n_regions = len(run_ids), len(corpus_dates), len(region_ids)
+    clinical_coords = {
+        "run_id": run_ids,
+        "date": corpus_dates,
+        "region_id": region_ids,
+    }
 
     cases = xr.DataArray(
-        rng.random((len(run_ids), len(dates), len(region_ids))),
+        rng.random((n_runs, n_dates, n_regions)),
         dims=("run_id", "date", "region_id"),
-        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+        coords=clinical_coords,
     )
 
     # Required mask channel for clinical series preprocessing
     # cases_age is computed from mask by SyntheticProcessor
     cases_mask = xr.DataArray(
-        rng.random((len(run_ids), len(dates), len(region_ids))) > 0.1,  # ~90% observed
+        rng.random((n_runs, n_dates, n_regions)) > 0.1,  # ~90% observed
         dims=("run_id", "date", "region_id"),
-        coords={"run_id": run_ids, "date": dates, "region_id": region_ids},
+        coords=clinical_coords,
     )
 
     mobility_base = xr.DataArray(
-        rng.random((len(region_ids), len(region_ids))),
+        rng.random((n_regions, n_regions)),
         dims=("origin", "target"),
         coords={"origin": region_ids, "target": region_ids},
     )
 
     mobility_kappa0 = xr.DataArray(
-        rng.random((len(run_ids), len(dates))),
+        rng.random((n_runs, n_dates)),
         dims=("run_id", "date"),
-        coords={"run_id": run_ids, "date": dates},
+        coords={"run_id": run_ids, "date": corpus_dates},
     )
 
+    population_values = rng.integers(500, 1500, size=(n_runs, n_regions))
     population = xr.DataArray(
-        rng.integers(500, 1500, size=(len(run_ids), len(region_ids))).astype(
-            np.float32
-        ),
+        population_values.astype(np.float32),
         dims=("run_id", "region_id"),
         coords={"run_id": run_ids, "region_id": region_ids},
     )
 
-    latent_s = xr.DataArray(
-        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
-        * population.values[:, :, None],
-        dims=("run_id", "region_id", "date"),
-        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
-    )
-    latent_i = xr.DataArray(
-        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
-        * 10.0,
-        dims=("run_id", "region_id", "date"),
-        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
-    )
-    latent_h = xr.DataArray(
-        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
-        * 5.0,
-        dims=("run_id", "region_id", "date"),
-        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
-    )
-    latent_r = xr.DataArray(
-        rng.random((len(run_ids), len(region_ids), len(dates))).astype(np.float32)
-        * population.values[:, :, None]
-        * 0.2,
-        dims=("run_id", "region_id", "date"),
-        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
-    )
-    death_flow_values = rng.random((len(run_ids), len(region_ids), len(dates))).astype(
+    # Exhaustive SIRHD partition in persons: S + I + H + R + D = population.
+    shape = (n_runs, n_dates, n_regions)
+    pop = population_values[:, None, :].astype(np.float64)
+    daily_deaths = rng.random(shape)
+    daily_deaths[:, 0, :] = 0.0
+    stock_d = np.cumsum(daily_deaths, axis=1).astype(np.float32)
+    stock_i = (rng.random(shape) * 10.0).astype(np.float32)
+    stock_h = (rng.random(shape) * 5.0).astype(np.float32)
+    stock_r = (rng.random(shape) * pop * 0.2).astype(np.float32)
+    stock_s = (pop - stock_i - stock_h - stock_r - stock_d + partition_offset).astype(
         np.float32
-    )
-    death_flow_values[:, :, 0] = 0.0
-    latent_d_values = np.cumsum(death_flow_values, axis=2, dtype=np.float32)
-    latent_d = xr.DataArray(
-        latent_d_values,
-        dims=("run_id", "region_id", "date"),
-        coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
     )
 
     edar_vars = {}
     variants = ["N1", "N2", "IP4"]
     for variant in variants:
         biomarker = xr.DataArray(
-            rng.random((len(run_ids), len(dates), len(edar_ids))),
+            rng.random((n_runs, n_dates, len(edar_ids))),
             dims=("run_id", "date", "edar_id"),
-            coords={"run_id": run_ids, "date": dates, "edar_id": edar_ids},
+            coords={"run_id": run_ids, "date": corpus_dates, "edar_id": edar_ids},
         )
         lod = xr.DataArray(
-            rng.random((len(run_ids), len(dates), len(edar_ids))),
+            rng.random((n_runs, n_dates, len(edar_ids))),
             dims=("run_id", "date", "edar_id"),
-            coords={"run_id": run_ids, "date": dates, "edar_id": edar_ids},
+            coords={"run_id": run_ids, "date": corpus_dates, "edar_id": edar_ids},
         )
         edar_vars[f"edar_biomarker_{variant}"] = biomarker
         edar_vars[f"limit_of_detection_{variant}"] = lod
+
+    def stock(values):
+        return xr.DataArray(
+            values, dims=("run_id", "date", "region_id"), coords=clinical_coords
+        )
 
     data_vars = {
         "cases": cases,
@@ -117,23 +150,46 @@ def _write_minimal_synthetic_zarr(
         "mobility_base": mobility_base,
         "mobility_kappa0": mobility_kappa0,
         "population": population,
-        "latent_S_true": latent_s,
-        "latent_I_true": latent_i,
-        latent_h_name: latent_h,
-        "latent_R_true": latent_r,
-        "latent_D_true": latent_d,
         **edar_vars,
     }
-    if include_deaths_true:
-        data_vars["deaths_true"] = xr.DataArray(
-            death_flow_values + death_flow_offset,
-            dims=("run_id", "region_id", "date"),
-            coords={"run_id": run_ids, "region_id": region_ids, "date": dates},
+    if include_primitive_latents:
+        # Primitive symptomatic I is a strict subset of sirhd_I.
+        data_vars["latent_S_true"] = stock(stock_s)
+        data_vars["latent_I_true"] = stock((stock_i * 0.5).astype(np.float32))
+        data_vars["latent_CH_true"] = stock(
+            np.full(shape, confined_stock, dtype=np.float32)
+        )
+    if include_sirhd:
+        data_vars.update(
+            {
+                "sirhd_S": stock(stock_s),
+                "sirhd_I": stock(stock_i),
+                "sirhd_H": stock(stock_h),
+                "sirhd_R": stock(stock_r),
+                "sirhd_D": stock(stock_d),
+            }
+        )
+    if include_sirhd and include_death_flow:
+        data_vars["sirhd_death_flow"] = xr.DataArray(
+            np.diff(stock_d, axis=1) + np.float32(death_flow_offset),
+            dims=("run_id", "death_interval_date", "region_id"),
+            coords={
+                "run_id": run_ids,
+                "death_interval_date": corpus_dates[1:],
+                "region_id": region_ids,
+            },
         )
 
     ds = xr.Dataset(data_vars)
-
-    ds.to_zarr(path, mode="w", zarr_format=2)
+    if include_sirhd:
+        ds.attrs.update(
+            {
+                "state_space_schema_version": "epiforecaster_sirhd_v1",
+                "state_space_contract_json": contract_json,
+                "state_space_contract_sha256": contract_sha256,
+            }
+        )
+    return ds
 
 
 def _write_region_metadata(path, *, region_ids, edar_ids):
@@ -152,13 +208,19 @@ def _make_config(
     *,
     include_temporal_covariates: bool = True,
     holiday_calendar_path=None,
+    options=None,
 ):
     return make_preprocessing_config(
         tmp_path,
         synthetic_path=synthetic_path,
         include_temporal_covariates=include_temporal_covariates,
         holiday_calendar_path=holiday_calendar_path,
-        options={"run_id_chunk_size": 1, "chunk_size": 10},
+        options={
+            "run_id_chunk_size": 1,
+            "chunk_size": 10,
+            "synthetic_state_space_contract_sha256": STATE_SPACE_CONTRACT_SHA256,
+            **(options or {}),
+        },
     )
 
 
@@ -201,6 +263,39 @@ def test_synthetic_processor_preserves_run_id(tmp_path):
     assert "latent_S_true_mask" not in latent_sird
     assert "latent_H_true_mask" not in latent_sird
     assert len(cases.run_id) == 2
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_reads_packed_zarr_corpus_like_zarr_directory(tmp_path):
+    kwargs = dict(
+        run_ids=np.array(["synth_a", "synth_b"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1", "r2", "r3"], dtype="U10"),
+        edar_ids=np.array(["e1", "e2"], dtype="U10"),
+    )
+    directory = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(directory, **kwargs)
+    # The EpiSim raw layout: Zarr v3, variable-length strings, packed ZIP64.
+    staging = tmp_path / "raw_synth_v3.zarr"
+    with_variable_length_strings(_minimal_synthetic_dataset(**kwargs)).to_zarr(
+        staging, mode="w", zarr_format=3, consolidated=False
+    )
+    packed = tmp_path / "raw_synth.zarr.zip"
+    pack_store(staging, packed)
+
+    config = _make_config(tmp_path, directory)
+    processor = SyntheticProcessor(config)
+    assert processor._resolve_synthetic_store_path(str(packed)) == str(packed)
+    expected = processor.process(str(directory))
+    actual = SyntheticProcessor(_make_config(tmp_path, packed)).process(str(packed))
+
+    assert list(actual["cases"].run_id.values) == ["synth_a", "synth_b"]
+    for group in ("cases", "mobility", "latent_sird"):
+        for name, var in expected[group].data_vars.items():
+            assert np.array_equal(
+                actual[group][name].values, var.values, equal_nan=True
+            ), (group, name)
+    assert np.array_equal(actual["population"].values, expected["population"].values)
 
 
 @pytest.mark.epiforecaster
@@ -248,14 +343,67 @@ def test_synthetic_processor_normalizes_continuous_death_flow(tmp_path):
     raw = xr.open_zarr(synthetic_path)
     try:
         expected = (
-            raw["deaths_true"].transpose("run_id", "date", "region_id")
+            raw["sirhd_death_flow"]
+            .rename({"death_interval_date": "date"})
+            .sel(date=dates)
             / raw["population"]
         ).astype(np.float32)
         actual = result["latent_sird"]["latent_death_flow_true"]
-        np.testing.assert_allclose(actual.values, expected.values)
+        np.testing.assert_array_equal(actual["date"].values, dates.values)
+        np.testing.assert_allclose(
+            actual.values, expected.transpose("run_id", "date", "region_id").values
+        )
         assert np.any(actual.values > 0)
     finally:
         raw.close()
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_maps_latents_to_sirhd_partition(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    dates = pd.date_range("2020-01-01", periods=4, freq="D")
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a", "synth_b"], dtype="U50"),
+        dates=dates,
+        region_ids=np.array(["r1", "r2", "r3"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+    )
+
+    latent = SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+        str(synthetic_path)
+    )["latent_sird"]
+    raw = xr.open_zarr(synthetic_path)
+    try:
+        population = raw["population"].astype(np.float32)
+        expected_i = (raw["sirhd_I"].sel(date=dates) / population).astype(np.float32)
+        primitive_i = (raw["latent_I_true"].sel(date=dates) / population).astype(
+            np.float32
+        )
+        np.testing.assert_allclose(latent["latent_I_true"].values, expected_i.values)
+        assert not np.allclose(latent["latent_I_true"].values, primitive_i.values)
+    finally:
+        raw.close()
+
+    total = sum(
+        latent[name].values.astype(np.float64)
+        for name in (
+            "latent_S_true",
+            "latent_I_true",
+            "latent_H_true",
+            "latent_R_true",
+            "latent_D_true",
+        )
+    )
+    np.testing.assert_allclose(total, 1.0, atol=1e-5)
+    assert set(latent.data_vars) == {
+        "latent_S_true",
+        "latent_I_true",
+        "latent_H_true",
+        "latent_R_true",
+        "latent_D_true",
+        "latent_death_flow_true",
+    }
 
 
 @pytest.mark.epiforecaster
@@ -267,10 +415,28 @@ def test_synthetic_processor_requires_death_flow_for_latent_bundle(tmp_path):
         dates=pd.date_range("2020-01-01", periods=4, freq="D"),
         region_ids=np.array(["r1"], dtype="U10"),
         edar_ids=np.array(["e1"], dtype="U10"),
-        include_deaths_true=False,
+        include_death_flow=False,
     )
 
-    with pytest.raises(ValueError, match="latent S/I/R/D supervision bundle"):
+    with pytest.raises(ValueError, match="latent SIRHD supervision bundle"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_rejects_primitive_only_latents(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        include_sirhd=False,
+    )
+
+    with pytest.raises(ValueError, match="Primitive latent stocks"):
         SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
             str(synthetic_path)
         )
@@ -319,30 +485,103 @@ def test_synthetic_processor_rejects_misaligned_death_flow(tmp_path):
 
 
 @pytest.mark.epiforecaster
-def test_synthetic_processor_aliases_latent_hospitalized_target(tmp_path):
+def test_synthetic_processor_rejects_date_without_death_interval(tmp_path):
     synthetic_path = tmp_path / "raw_synth.zarr"
-    run_ids = np.array(["synth_a"], dtype="U50")
-    dates = pd.date_range("2020-01-01", periods=4, freq="D")
-    region_ids = np.array(["r1", "r2"], dtype="U10")
-    edar_ids = np.array(["e1"], dtype="U10")
     _write_minimal_synthetic_zarr(
         synthetic_path,
-        run_ids=run_ids,
-        dates=dates,
-        region_ids=region_ids,
-        edar_ids=edar_ids,
-        latent_h_name="latent_hospitalized_true",
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-02", periods=3, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
     )
 
-    config = _make_config(tmp_path, synthetic_path)
-    processor = SyntheticProcessor(config)
+    # The corpus starts on 2020-01-01, which has no incoming death interval.
+    with pytest.raises(ValueError, match="no destination-dated interval"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
 
-    result = processor.process(str(synthetic_path))
 
-    latent_sird = result["latent_sird"]
-    assert "latent_H_true" in latent_sird
-    assert "latent_hospitalized_true" not in latent_sird
-    assert "latent_H_true_mask" not in latent_sird
+@pytest.mark.epiforecaster
+def test_synthetic_processor_rejects_broken_partition(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        partition_offset=-50.0,
+    )
+
+    with pytest.raises(ValueError, match="partition the population"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
+
+
+@pytest.mark.epiforecaster
+def test_synthetic_processor_rejects_nonzero_confined_stock(tmp_path):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        confined_stock=1.0,
+    )
+
+    with pytest.raises(ValueError, match="requires zero 'latent_CH_true'"):
+        SyntheticProcessor(_make_config(tmp_path, synthetic_path)).process(
+            str(synthetic_path)
+        )
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize(
+    ("writer_options", "config_options", "message"),
+    [
+        ({}, {"synthetic_state_space_contract_sha256": None}, "requires"),
+        ({}, {"synthetic_state_space_contract_sha256": "0" * 64}, "differs from"),
+        (
+            {"contract_json": STATE_SPACE_CONTRACT_JSON.replace("SIRHD", "SIR")},
+            {},
+            "does not match its recorded",
+        ),
+        (
+            {},
+            {"synthetic_state_space_schema_version": "epiforecaster_sirhd_v2"},
+            "schema versions",
+        ),
+    ],
+)
+def test_synthetic_processor_enforces_state_space_contract(
+    tmp_path, writer_options, config_options, message
+):
+    synthetic_path = tmp_path / "raw_synth.zarr"
+    _write_minimal_synthetic_zarr(
+        synthetic_path,
+        run_ids=np.array(["synth_a"], dtype="U50"),
+        dates=pd.date_range("2020-01-01", periods=4, freq="D"),
+        region_ids=np.array(["r1"], dtype="U10"),
+        edar_ids=np.array(["e1"], dtype="U10"),
+        **writer_options,
+    )
+
+    config = _make_config(tmp_path, synthetic_path, options=config_options)
+    with pytest.raises(ValueError, match=message):
+        SyntheticProcessor(config).process(str(synthetic_path))
+
+
+@pytest.mark.epiforecaster
+def test_preprocessing_config_rejects_malformed_contract_sha256(tmp_path):
+    with pytest.raises(ValueError, match="hexadecimal SHA-256"):
+        _make_config(
+            tmp_path,
+            tmp_path / "raw_synth.zarr",
+            options={"synthetic_state_space_contract_sha256": "not-a-digest"},
+        )
 
 
 @pytest.mark.epiforecaster
@@ -627,13 +866,11 @@ def test_pipeline_save_rechunks_run_only(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_dataset(output_path, engine="netcdf4")
+    saved = open_processed_dataset(output_path)
 
-    chunks = saved["edar_biomarker_N1_mask"].encoding.get("chunksizes")
-    assert chunks is not None
-    assert chunks[0] == min(config.run_id_chunk_size, len(run_ids))
-    assert chunks[1] == len(dates)
-    assert chunks[2] == len(region_ids)
+    # One shard per run, whatever the in-memory run_id chunking.
+    shards = saved["edar_biomarker_N1_mask"].encoding.get("shards")
+    assert shards == (1, len(dates), len(region_ids))
 
     saved.close()
 
@@ -669,7 +906,7 @@ def test_pipeline_end_to_end_synthetic(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
     output_path = pipeline.run()
 
-    ds = xr.open_dataset(output_path, engine="netcdf4")
+    ds = open_processed_dataset(output_path)
     assert "run_id" in ds.dims
     assert "mobility" in ds
     assert "temporal_covariates" in ds
@@ -742,7 +979,7 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     pipeline = OfflinePreprocessingPipeline(config)
 
     output_path = pipeline._save_aligned_dataset(aligned_dataset)
-    saved = xr.open_dataset(output_path, engine="netcdf4")
+    saved = open_processed_dataset(output_path)
 
     saved_mob = saved["mobility"].isel(
         run_id=0, date=0, origin=slice(0, 2), destination=slice(0, 2)
@@ -755,3 +992,10 @@ def test_save_aligned_dataset_preserves_mobility(tmp_path):
     assert float(saved_mob.max()) <= expected_log_value + 0.01
 
     saved.close()
+
+
+def test_split_attr_list_accepts_netcdf_strings_and_zarr_lists():
+    assert _split_attr_list("cases, deaths") == ["cases", "deaths"]
+    assert _split_attr_list(["cases", " deaths"]) == ["cases", "deaths"]
+    assert _split_attr_list("S") == _split_attr_list(["S"]) == ["S"]
+    assert _split_attr_list(None) == []

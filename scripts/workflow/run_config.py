@@ -25,6 +25,17 @@ ALLOCATION_FIELDS = (
     "gres",
     "runtime",
 )
+# CPU-only preprocessing may run on one MN5 GPP node (112 cores) or on one
+# Nord4 main node (48 cores). Both clusters share the same GPFS.
+GPP_QOS = {"gp_bscls", "gp_debug"}
+GPP_MAX_CPUS_PER_TASK = 112
+GPP_GRES = "none"
+NORD4_QOS = {"bsc_ls", "debug"}
+NORD4_MAX_CPUS_PER_TASK = 48
+CPU_PREPROCESS_PARTITIONS = {
+    "gpp": ("GPP", "MN5 single-node GPP", GPP_QOS, GPP_MAX_CPUS_PER_TASK),
+    "main": ("Nord4", "Nord4 single-node main", NORD4_QOS, NORD4_MAX_CPUS_PER_TASK),
+}
 DISPATCH_REQUEST_SCHEMA_VERSION = 1
 RESEARCH_OUTPUT_FILES = (
     "research_fit_cases.parquet",
@@ -54,7 +65,8 @@ WORKFLOW_TARGETS = {
     "ablation": {"ablation"},
     "ablation_suite": {"ablation_suite"},
     "crossval": {"crossval"},
-    "preprocess": {"preprocess"},
+    # preprocess_qa stops after dataset QA and publishes nothing.
+    "preprocess": {"preprocess", "preprocess_qa"},
 }
 SCIENTIFIC_SOURCE_EXCLUDED_ROOTS = {
     ".agents",
@@ -345,13 +357,24 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         ):
             raise ValueError("preprocessing.base_config must be a source-relative path")
         preprocessing_dataset_name(workflow_config)
-        handoff_manifest = preprocessing.get("handoff_manifest")
-        if handoff_manifest is not None:
-            handoff_path = Path(str(handoff_manifest))
-            if handoff_path.is_absolute() or ".." in handoff_path.parts:
-                raise ValueError(
-                    "preprocessing.handoff_manifest must be a source-relative path"
-                )
+        if not isinstance(preprocessing.get("node_local_output", False), bool):
+            raise ValueError("preprocessing.node_local_output must be Boolean")
+        write_workers = preprocessing.get("write_workers", 1)
+        cpus = (
+            workflow_config.get("resources", {})
+            .get("allocation", {})
+            .get("cpus_per_task")
+        )
+        if (
+            not isinstance(write_workers, int)
+            or isinstance(write_workers, bool)
+            or write_workers < 1
+            or (isinstance(cpus, int) and write_workers > cpus)
+        ):
+            raise ValueError(
+                "preprocessing.write_workers must be an integer between 1 and "
+                "resources.allocation.cpus_per_task"
+            )
 
     evaluation = workflow_config.get("evaluation", {})
     research_outputs = evaluation.get("research_outputs", False)
@@ -505,8 +528,55 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     return kind
 
 
+def _validate_cpu_allocation(allocation: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Validate a one-task CPU allocation (MN5 GPP or Nord4) for preprocessing.
+
+    GPP grants memory per allocated CPU, so cpus_per_task sizes both the core
+    count and the memory of the step. A full 48-CPU Nord4 node is exclusive.
+    The dispatcher passes ``--gres=none``.
+    """
+    short, label, allowed_qos, max_cpus = CPU_PREPROCESS_PARTITIONS[
+        allocation["partition"]
+    ]
+    if kind != "preprocess":
+        raise ValueError(
+            f"{short} allocations are supported only for workflow.kind='preprocess'"
+        )
+    if "gres" in allocation or "gpu" in allocation or "gpus" in allocation:
+        raise ValueError(f"A {short} allocation must not request GPUs or gres")
+    expected = {"account": "bsc08", "nodes": 1, "tasks": 1}
+    mismatches = {
+        key: (allocation.get(key), value)
+        for key, value in expected.items()
+        if allocation.get(key) != value
+    }
+    qos = allocation.get("qos")
+    if qos not in allowed_qos:
+        mismatches["qos"] = (qos, " or ".join(sorted(allowed_qos)))
+    cpus = allocation.get("cpus_per_task")
+    if not isinstance(cpus, int) or isinstance(cpus, bool) or not 1 <= cpus <= max_cpus:
+        mismatches["cpus_per_task"] = (cpus, f"integer 1..{max_cpus}")
+    runtime = allocation.get("runtime")
+    if not isinstance(runtime, int) or isinstance(runtime, bool) or runtime <= 0:
+        mismatches["runtime"] = (runtime, "positive integer minutes")
+    if mismatches:
+        details = ", ".join(
+            f"{key}={actual!r} (expected {expected_value!r})"
+            for key, (actual, expected_value) in mismatches.items()
+        )
+        raise ValueError(f"Invalid {label} allocation: {details}")
+    return {
+        field: (GPP_GRES if field == "gres" else allocation[field])
+        for field in ALLOCATION_FIELDS
+    }
+
+
 def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
-    """Validate the one-node ACC allocation for the selected workflow kind."""
+    """Validate the one-node allocation for the selected workflow kind.
+
+    ACC is the default for every kind. Preprocessing may instead use one GPP
+    or Nord4 main task, because it runs no GPU step.
+    """
     resources = workflow_config.get("resources")
     if not isinstance(resources, dict):
         raise ValueError("Workflow config must define a resources mapping")
@@ -527,6 +597,8 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         )
 
     kind = validate_workflow_contract(workflow_config)
+    if allocation.get("partition") in CPU_PREPROCESS_PARTITIONS:
+        return _validate_cpu_allocation(allocation, kind)
     if kind == "hpo":
         workload = workflow_config.get("optuna")
         workload_name = "optuna"

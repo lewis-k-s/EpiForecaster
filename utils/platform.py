@@ -61,8 +61,9 @@ def stage_dataset_to_nvme(
 ) -> Path:
     """Stage dataset from NFS to node-local NVMe storage.
 
-    Copies dataset directory to NVMe for improved I/O performance.
-    Uses rsync if available, falls back to shutil.copytree.
+    Copies a dataset directory or single-file dataset to NVMe for improved
+    I/O performance. Directories use rsync if available, falling back to
+    shutil.copytree.
 
     Args:
         source_path: Path to dataset on NFS/shared storage.
@@ -97,8 +98,14 @@ def stage_dataset_to_nvme(
     start_time = time.time()
 
     try:
+        if source_path.is_file():
+            # Single-file datasets (*.zarr.zip, *.nc): copy, then rename, so
+            # an interrupted copy is never taken as a staged dataset.
+            partial = dest_path.with_name(dest_path.name + ".partial")
+            shutil.copyfile(source_path, partial)
+            partial.replace(dest_path)
         # Use rsync if available (preserves permissions, faster for large files)
-        if shutil.which("rsync"):
+        elif shutil.which("rsync"):
             import subprocess
 
             subprocess.run(

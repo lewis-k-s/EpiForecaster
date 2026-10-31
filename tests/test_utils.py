@@ -33,6 +33,20 @@ class TestPlatform:
             args = mock_run.call_args[0][0]
             assert "rsync" in args
 
+    def test_stage_dataset_to_nvme_copies_single_file_dataset(self, tmp_path):
+        source = tmp_path / "shared" / "tiny.zarr.zip"
+        source.parent.mkdir()
+        source.write_bytes(b"packed store")
+        nvme = tmp_path / "nvme"
+        nvme.mkdir()
+
+        with patch("utils.platform.get_nvme_path", return_value=nvme):
+            dest = stage_dataset_to_nvme(source, enable_staging=True)
+
+        assert dest == nvme / "tiny.zarr.zip"
+        assert dest.read_bytes() == b"packed store"
+        assert sorted(p.name for p in nvme.iterdir()) == ["tiny.zarr.zip"]
+
 
 # --- Test Temporal ---
 

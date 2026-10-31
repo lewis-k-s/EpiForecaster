@@ -6,7 +6,8 @@ and scheduler observation, load and follow the `mn5-cluster-usage` skill.
 
 Snakemake is the production entry point for MN5 preprocessing, training,
 evaluation, cross-validation, HPO, ablation, and artifact promotion. Each
-workflow uses one ACC-node allocation. Snakemake runs as an
+workflow uses one ACC-node allocation; preprocessing may use one GPP node
+instead. Snakemake runs as an
 allocation-internal lightweight coordinator and launches scientific work as
 one or more `srun` job steps.
 
@@ -39,6 +40,22 @@ Single training and evaluation use `N=1`. HPO and ablation use their configured
 worker count. Cross-validation uses up to `N` concurrent folds, with ten folds
 and four GPUs in the production template. `N` must be between one and four.
 The coordinator sets the Snakemake CPU, job, and GPU limits from the allocation.
+
+Preprocessing runs no GPU step, so a `workflow.kind: preprocess` config may
+request one GPP node instead:
+
+```text
+partition=gpp
+qos=gp_bscls or gp_debug
+nodes=1
+tasks=1
+cpus_per_task=1..112
+(no gres)
+```
+
+GPP grants about 1.87 GB of memory per CPU, so `cpus_per_task` sizes the
+memory of the step. The dispatcher passes `--gres=none` to override the GPU
+default in the coordinator batch header. `run-interactive` remains ACC-only.
 
 The batch shell owns the allocation and runs the lightweight Snakemake manager.
 A parallel worker rule launches:
@@ -164,12 +181,13 @@ preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
 Synthetic pretraining uses the same `train` entity through
-`workflow/config/mn5_synth_pretrain.yaml`. Its processed Zarr is materialized
-for training, while the raw synthetic Zarr is a provenance-only DVC target.
+`workflow/config/mn5_synth_pretrain_reactive_n100.yaml`. Its processed Zarr is
+materialized for training, while the raw synthetic Zarr is a provenance-only DVC
+target. The raw corpus DVC pointer is the corpus identity.
 
-The corrected 20-run corpus uses
-`workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml`. The immutable
-run owns the processed NetCDF, QA record, generated DVC pointer, and publication
+The a97c812 corpus uses
+`workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml`. The immutable
+run owns the processed dataset, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
@@ -319,8 +337,14 @@ Publication uses atomic hard links within the run filesystem, so large payloads
 do not require a second copy. Keep attempt directories for the lifetime of the
 run: they contain the training logs, dynamics, and recovery evidence. Incomplete
 training attempts restart from the configured initial state; completed folds
-are reused. Preprocessing declares `<dataset_name>.nc` as a DAG output, and
+are reused. Preprocessing declares `<dataset_name>.zarr.zip` as a DAG output, and
 publication depends on that file as well as its QA evidence.
+
+Processed datasets are sharded Zarr v3 stores packed into one uncompressed
+ZIP64 file (`data/preprocess/zarr_layout.py`, layout `synthetic-zarr-v1`).
+Each per-run variable has one shard per run, so `preprocessing.write_workers`
+processes write runs in parallel and verify each run by read-back. DVC tracks
+the packed file as one object. See `docs/SYNTHETIC_ZARR_LAYOUT.md`.
 
 ## Prepare and submit
 
@@ -364,9 +388,9 @@ bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
 bash scripts/workflow/mn5_workflow.sh prepare <crossval-run-id> \
   --config workflow/config/mn5_crossval.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
-  --config workflow/config/mn5_synth_pretrain.yaml
+  --config workflow/config/mn5_synth_pretrain_reactive_n100.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <preprocess-run-id> \
-  --config workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml
+  --config workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml
 ```
 
 For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set

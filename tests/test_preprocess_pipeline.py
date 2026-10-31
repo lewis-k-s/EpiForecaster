@@ -8,7 +8,9 @@ import xarray as xr
 import pandas as pd
 
 from data.preprocess.config import PreprocessingConfig, REGION_COORD
+from data.epi_dataset import open_processed_dataset
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
+from data.preprocess.zarr_layout import RunWriteResult
 
 
 @pytest.fixture
@@ -277,8 +279,8 @@ class TestPipelineMasksAndMetadata:
 
 
 class TestPipelineStorage:
-    def test_saved_netcdf_chunk_schema(self, mock_config, tmp_path):
-        """Test saved NetCDF chunk schema for run_id, date, and spatial dims."""
+    def test_saved_zarr_shard_schema(self, mock_config, tmp_path):
+        """Each per-run variable is stored as one shard per run."""
         pipeline = OfflinePreprocessingPipeline(mock_config)
 
         # Create a dummy aligned dataset
@@ -313,26 +315,17 @@ class TestPipelineStorage:
             "raw_corpus_full_tree_sha256": "deadbeef",
         }
 
-        # Mock _log_postwrite_summary to avoid opening the saved file again
-        pipeline._log_postwrite_summary = Mock()
-
         saved_path = pipeline._save_aligned_dataset(ds)
+        assert saved_path.name == "test_chunk_schema.zarr.zip"
+        saved_ds = open_processed_dataset(saved_path)
 
-        # Re-open and check on-disk chunksizes from encoding
-        saved_ds = xr.open_dataset(saved_path, engine="netcdf4")
-
-        # Check 'cases' chunksizes (on-disk HDF5 chunk layout)
-        cases_chunks = saved_ds.cases.encoding["chunksizes"]
-        assert cases_chunks[0] == 2  # run_id
-        assert cases_chunks[1] == 10  # date
-        assert cases_chunks[2] == 5  # region_id (<= mobility_chunk_size)
-        assert saved_ds.cases.dtype == np.float32  # upcast from float16 for NetCDF
-
-        mobility_chunks = saved_ds.mobility.encoding["chunksizes"]
-        assert mobility_chunks[0] == 2  # run_id
-        assert mobility_chunks[1] == 10  # date
-        assert mobility_chunks[2] == 5  # origin
-        assert mobility_chunks[3] == 5  # destination
+        # The in-memory Dask chunks do not set the stored layout.
+        assert saved_ds.cases.encoding["shards"] == (1, 20, 10)
+        assert saved_ds.cases.encoding["chunks"] == (1, 20, 10)
+        assert saved_ds.cases.dtype == np.float32  # float16 is upcast
+        assert saved_ds.mobility.encoding["shards"] == (1, 20, 10, 10)
+        assert saved_ds.mobility.encoding["chunks"] == (1, 20, 10, 10)
+        assert saved_ds.attrs["zarr_layout_version"] == "synthetic-zarr-v1"
 
         # Check smoothing metadata attrs are persisted in output dataset.
         assert saved_ds.attrs["log_transformed"] == 1
@@ -382,11 +375,10 @@ class TestPipelineStorage:
             },
         )
         pipeline = OfflinePreprocessingPipeline(mock_config)
-        pipeline._log_postwrite_summary = Mock()
 
         saved_path = pipeline._save_aligned_dataset(dataset)
 
-        saved = xr.open_dataset(saved_path, engine="netcdf4")
+        saved = open_processed_dataset(saved_path)
         try:
             assert saved.attrs["continuous_storage_dtype"] == "float32"
             assert saved["cases"].dtype == np.float32
@@ -395,6 +387,25 @@ class TestPipelineStorage:
             assert bool((saved["latent_I_true"] > 0).all())
         finally:
             saved.close()
+
+    def test_postwrite_summary_uses_writer_counts(self, capsys):
+        """The summary adds the per-run counts and does not reopen the store."""
+        results = [
+            RunWriteResult(0, "a", {"mobility": 36, "cases": 12}),
+            RunWriteResult(1, "b", {"mobility": 27, "cases": 12}),
+        ]
+
+        OfflinePreprocessingPipeline._log_postwrite_summary(results)
+
+        out = capsys.readouterr().out
+        assert "Verified mobility data: 63 non-null values" in out
+        assert "Verified cases data: 24 non-null values" in out
+
+    def test_postwrite_summary_rejects_all_nan_mobility(self):
+        with pytest.raises(ValueError, match="all NaN"):
+            OfflinePreprocessingPipeline._log_postwrite_summary(
+                [RunWriteResult(0, "a", {"mobility": 0})]
+            )
 
 
 class TestPreprocessingConfigValidation:

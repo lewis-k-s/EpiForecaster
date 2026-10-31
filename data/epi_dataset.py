@@ -33,24 +33,18 @@ from .mobility_preprocessor import (  # noqa: E402
     MobilityPreprocessorConfig,
 )
 from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
+from .preprocess.zarr_layout import is_zarr_zip, open_zarr_zip  # noqa: E402
 from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
 def open_processed_dataset(path: Path | str, **kwargs: Any) -> xr.Dataset:
-    """Open a processed dataset, detecting Zarr directory vs NetCDF file.
-
-    Legacy processed outputs are Zarr directories; new outputs are single
-    NetCDF4 files.  This helper dispatches to the correct xarray backend
-    so callers do not need to know the on-disk format.
-    """
+    """Open a processed dataset (packed ``*.zarr.zip`` or Zarr directory)."""
     p = Path(path)
-    if p.is_dir() or p.suffix == ".zarr":
-        return xr.open_zarr(str(p), **kwargs)
-    # The MN5 netCDF4 backend crashes when the research split reopens a file
-    # after threaded metadata reads. Use the h5py-backed NetCDF4 reader.
-    return xr.open_dataset(str(p), engine="h5netcdf", **kwargs)
+    if is_zarr_zip(p):
+        return open_zarr_zip(p, **kwargs)
+    return xr.open_zarr(str(p), **kwargs)
 
 
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")
@@ -294,6 +288,9 @@ class EpiDataset(Dataset):
             self.mobility_preprocessor = MobilityPreprocessor(mp_config)
         else:
             self.mobility_preprocessor = mobility_preprocessor
+
+        # Compact [T, N_ctx, N_ctx] graph weights; set by release_dense_mobility().
+        self.graph_mobility_weights: torch.Tensor | None = None
 
         if (preloaded_mobility is None) != (mobility_mask is None):
             raise ValueError(
@@ -779,6 +776,44 @@ class EpiDataset(Dataset):
         if self.shared_sparse_topology is not None:
             self.shared_sparse_topology = None
             logger.info("Released shared full sparse topology")
+
+    def release_dense_mobility(self) -> None:
+        """Keep only the mobility state that training reads after init.
+
+        Dense ``(T, N, N)`` mobility weights, the edge mask, the per-timestep
+        adjacency cache are only needed to build the
+        context tables. Training then reads the weights between graph nodes
+        (``inject_gpu_mobility``) and the prebuilt context tables. This keeps
+        the masked float16 weights restricted to graph nodes, laid out exactly
+        as ``inject_gpu_mobility`` slices them, and drops everything else.
+
+        Call it only on datasets whose dense tensors are not shared with other
+        datasets that are built later. Tensors that another dataset still holds
+        stay alive through that dataset.
+        """
+        self._adjacency_cache = {}
+        if self.config.model.graph_adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
+            # Static adjacency does not read dynamic weights after init.
+            return
+        if self.graph_mobility_weights is not None:
+            return
+        if self.preloaded_mobility is None or self.mobility_mask is None:
+            raise RuntimeError("Dense mobility was released without graph weights")
+        node_ids = torch.where(self._get_graph_node_mask())[0]
+        rows = node_ids.unsqueeze(-1)
+        weights = self.preloaded_mobility[:, rows, node_ids]
+        mask = self.mobility_mask[:, rows, node_ids]
+        self.graph_mobility_weights = weights.masked_fill(~mask, 0.0)
+        self.preloaded_mobility = None
+        self.mobility_mask = None
+        logger.info(
+            "Released dense mobility for run %s; kept graph weights %s (%.2f MB)",
+            self.run_id,
+            tuple(self.graph_mobility_weights.shape),
+            self.graph_mobility_weights.numel()
+            * self.graph_mobility_weights.element_size()
+            / 1e6,
+        )
 
     def __del__(self) -> None:
         """Cleanup zarr dataset on garbage collection.

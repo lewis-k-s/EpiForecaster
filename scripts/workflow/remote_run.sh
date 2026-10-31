@@ -140,7 +140,31 @@ validate_dispatch_request() {
     echo "Dispatch request contains an invalid SHA-256 identity" >&2
     return 1
   fi
-  if [ "$NODES" != "1" ] \
+  if [ "$PARTITION" = "gpp" ]; then
+    # CPU-only preprocessing: one task, memory scales with the CPU count.
+    if [ "$WORKFLOW_KIND" != "preprocess" ] \
+      || [ "$NODES" != "1" ] \
+      || [ "$TASKS" != "1" ] \
+      || [[ ! "$CPUS_PER_TASK" =~ ^[1-9][0-9]*$ ]] \
+      || [ "$CPUS_PER_TASK" -gt 112 ] \
+      || [ "$GRES" != "none" ] \
+      || [[ "$QOS" != gp_bscls && "$QOS" != gp_debug ]]; then
+      echo "Dispatch request violates the MN5 single-node GPP allocation contract" >&2
+      return 1
+    fi
+  elif [ "$PARTITION" = "main" ]; then
+    # CPU-only preprocessing on one Nord4 node (48 cores, shared GPFS).
+    if [ "$WORKFLOW_KIND" != "preprocess" ] \
+      || [ "$NODES" != "1" ] \
+      || [ "$TASKS" != "1" ] \
+      || [[ ! "$CPUS_PER_TASK" =~ ^[1-9][0-9]*$ ]] \
+      || [ "$CPUS_PER_TASK" -gt 48 ] \
+      || [ "$GRES" != "none" ] \
+      || [[ "$QOS" != bsc_ls && "$QOS" != debug ]]; then
+      echo "Dispatch request violates the Nord4 single-node allocation contract" >&2
+      return 1
+    fi
+  elif [ "$NODES" != "1" ] \
     || [[ ! "$TASKS" =~ ^[1-4]$ ]] \
     || [ "$CPUS_PER_TASK" != "20" ] \
     || [ "$GRES" != "gpu:$TASKS" ]; then
@@ -161,13 +185,25 @@ verify_config() {
 }
 
 load_singularity() {
+  local status=0
+
+  # Site profile scripts and the Nord4 module function read unset variables
+  # and return non-zero, so the module section runs without errexit/nounset.
+  set +eu
+  load_singularity_module
+  status=$?
+  set -eu
+  return "$status"
+}
+
+load_singularity_module() {
   local profile_script candidate loaded=0
 
   if ! command -v module >/dev/null 2>&1; then
-    set +u
     for profile_script in \
       /etc/profile.d/00-bsc.sh \
       /etc/profile.d/01-module.sh \
+      /etc/profile.d/01-modules.sh \
       /apps/modules/LMOD/8.7/lmod/8.7/init/profile; do
       if [ -r "$profile_script" ]; then
         # shellcheck disable=SC1090
@@ -177,7 +213,6 @@ load_singularity() {
         break
       fi
     done
-    set -u
   fi
 
   if command -v singularity >/dev/null 2>&1; then
@@ -188,7 +223,8 @@ load_singularity() {
   for candidate in \
     "${SINGULARITY_MODULE:-singularity/4.1.5}" \
     "Singularity/4.1.5" \
-    "SingularityCE/4.1.5"; do
+    "SingularityCE/4.1.5" \
+    "singularity/4.1.0"; do
     if module load "$candidate" >/dev/null 2>&1; then
       loaded=1
       break
@@ -196,7 +232,7 @@ load_singularity() {
   done
 
   if [ "$loaded" -ne 1 ]; then
-    echo "Unable to load Singularity 4.1.5 module" >&2
+    echo "Unable to load a Singularity 4.1 module (4.1.5 on MN5, 4.1.0 on Nord4)" >&2
     return 1
   fi
 }
