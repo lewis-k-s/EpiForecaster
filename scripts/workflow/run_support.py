@@ -1274,17 +1274,6 @@ def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> P
     return output_marker
 
 
-def _tree_digest(root: Path) -> str:
-    """Hash a regular-file tree without following links."""
-    digest = hashlib.sha256()
-    for relative, checksum in _tree_hashes(root).items():
-        digest.update(relative.encode())
-        digest.update(b"\0")
-        digest.update(checksum.encode())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
 def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     """Publish a QA-passed dataset as a run-owned DVC pointer."""
     config = load_yaml(config_path)

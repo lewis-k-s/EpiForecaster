@@ -27,7 +27,7 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
-from scripts.workflow import run_config, run_support, tooling_identity
+from scripts.workflow import run_config, run_support
 from workflow.common import container_command, slurm_step
 from training.training_dynamics import (
     TrainingDynamicsWriter,
@@ -381,22 +381,6 @@ def test_relocatable_bundle_rejects_tracked_dvc_payload(tmp_path: Path) -> None:
         )
 
 
-def test_workflow_tooling_key_tracks_lockfile_and_bootstrap(tmp_path: Path) -> None:
-    lock = tmp_path / "uv.lock"
-    bootstrap = tmp_path / "remote_tooling.sh"
-    lock.write_text("version = 1\n")
-    bootstrap.write_text("#!/bin/bash\n")
-
-    initial = tooling_identity.workflow_tooling_key(lock, bootstrap)
-
-    assert initial == tooling_identity.workflow_tooling_key(lock, bootstrap)
-    lock.write_text("version = 2\n")
-    changed_lock = tooling_identity.workflow_tooling_key(lock, bootstrap)
-    assert initial != changed_lock
-    bootstrap.write_text("#!/bin/bash\nset -e\n")
-    assert changed_lock != tooling_identity.workflow_tooling_key(lock, bootstrap)
-
-
 def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     run_root = tmp_path / "runs/test-run"
     source_root = run_root / "source"
@@ -740,7 +724,6 @@ def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> No
     assert Path("workflow/Snakefile") in paths
     assert Path("scripts/workflow/mn5_container_exec.sh") in paths
     assert Path("scripts/workflow/remote_run.sh") in paths
-    assert Path("scripts/workflow/remote_tooling.sh") in paths
     assert set(payloads) == {
         Path("data/files/mobility.zarr.dvc"),
         Path("data/processed/real_with_id.zarr.dvc"),
@@ -2869,12 +2852,10 @@ def test_workflow_dispatch_enforces_isolation_and_single_coordinator() -> None:
     assert "declare -f" not in dispatcher
     assert "remote_function" not in dispatcher
     assert "remote_run.sh" in dispatcher
-    assert "remote_tooling.sh" not in dispatcher
     assert 'staging_root="$REMOTE_WORKFLOW_RUN_ROOT/.staging-' in dispatcher
     assert "--dispatch-file" in dispatcher
     assert "uv sync" not in dispatcher
     assert "uv sync" not in remote_runner
-    assert "scripts.workflow.tooling_identity" not in dispatcher
     assert 'REMOTE_SNAKEMAKE_BIN="/usr/local/bin/snakemake"' in dispatcher
     assert 'TOOLING_KEY="sif-sha256:$observed_sha"' in dispatcher
     assert "executor_commit=" not in dispatcher

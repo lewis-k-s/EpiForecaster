@@ -718,17 +718,12 @@ def _budgeted_failures(
     failed = [
         trial
         for trial in attempts
-        if trial.state
-        in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
+        if trial.state in {optuna.trial.TrialState.FAIL, optuna.trial.TrialState.PRUNED}
     ]
     if not stale:
         return len(failed)
     infrastructure = sum(trial.number in stale for trial in failed)
-    return (
-        len(failed)
-        - infrastructure
-        + max(0, infrastructure - STALE_RECOVERY_BUDGET)
-    )
+    return len(failed) - infrastructure + max(0, infrastructure - STALE_RECOVERY_BUDGET)
 
 
 TRAINING_ONLY_EXCLUSIONS = (
@@ -781,14 +776,19 @@ def hydrated_training_config(
     ).to_dict()
 
 
+def _training_config_sha256(hydrated: Mapping[str, Any]) -> str:
+    """Hash the training-relevant hydrated config; evaluation controls excluded."""
+    identity = _without_evaluation_controls(hydrated)
+    return hashlib.sha256(_canonical_json(identity).encode()).hexdigest()
+
+
 def hydrated_training_config_sha256(
     campaign: AblationCampaign, *, condition: str, fold: int, seed: int
 ) -> str:
-    """Hash the training-relevant hydrated config; evaluation controls excluded."""
-    identity = _without_evaluation_controls(
+    """Hash one identity's hydrated training config."""
+    return _training_config_sha256(
         hydrated_training_config(campaign, condition=condition, fold=fold, seed=seed)
     )
-    return hashlib.sha256(_canonical_json(identity).encode()).hexdigest()
 
 
 def _bare_sha256(value: object) -> str | None:
@@ -852,10 +852,9 @@ def reuse_rejection_reasons(
         )
     except (KeyError, TypeError, ValueError) as exc:
         return [*reasons, f"identity_unresolvable:{type(exc).__name__}"]
-    expected_hash = hashlib.sha256(
-        _canonical_json(_without_evaluation_controls(hydrated)).encode()
-    ).hexdigest()
-    if record.get("hydrated_training_config_sha256") != expected_hash:
+    if record.get("hydrated_training_config_sha256") != _training_config_sha256(
+        hydrated
+    ):
         reasons.append("hydrated_training_config_mismatch")
     for field, config_key in (
         ("dataset_dvc_md5", "dataset_path"),

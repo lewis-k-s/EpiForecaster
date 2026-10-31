@@ -87,17 +87,9 @@ def _record_training_dynamics_attrs(
         identity["status"],
     )
     return identity
+
+
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
-
-# Global flag for signal handling
-_shutdown_requested = False
-
-
-def _handle_shutdown(signum: int, frame: Any) -> None:
-    """Handle SLURM termination signals gracefully."""
-    global _shutdown_requested
-    logger.warning(f"Received signal {signum}, requesting graceful shutdown...")
-    _shutdown_requested = True
 
 
 def _categorical_choices(choices: tuple[Any, ...] | list[Any]) -> tuple[Any, ...]:
