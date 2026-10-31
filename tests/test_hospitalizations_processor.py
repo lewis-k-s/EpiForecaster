@@ -418,6 +418,8 @@ class TestFullPipeline:
 
     def test_process_weekly_data(self, mock_config, mock_hospitalizations_file):
         """Test full processing pipeline with weekly data."""
+        # This test covers weekly-to-daily filling, not the reporting lag.
+        mock_config.hospitalizations_reporting_lag_days = 0
         proc = HospitalizationsProcessor(mock_config)
 
         result = proc.process(mock_hospitalizations_file)

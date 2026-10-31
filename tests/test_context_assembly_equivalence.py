@@ -33,6 +33,8 @@ def _make_config(dataset_path: str, gnn_depth: int = 2) -> EpiForecasterConfig:
             "gnn_depth": gnn_depth,
             "gnn_module": "gcn",
             "gnn_hidden_dim": 8,
+            # 3 series x 3 channels plus one imported-risk lag.
+            "cases_dim": 10,
         },
         data_options={
             "use_imported_risk": True,

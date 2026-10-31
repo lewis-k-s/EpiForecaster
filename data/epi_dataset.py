@@ -540,14 +540,14 @@ class EpiDataset(Dataset):
             expected_clinical_dim += lag_dim
         expected_bio_dim = self.biomarkers_output_dim
 
-        # Note: cases_dim is deprecated, clinical series use fixed 3-channel format
         if self.config.model.cases_dim != expected_clinical_dim:
-            logger.info(
-                "Updating cases_dim from %d to %d (3 clinical series x 3 channels)",
-                self.config.model.cases_dim,
-                expected_clinical_dim,
+            raise ValueError(
+                f"model.cases_dim={self.config.model.cases_dim} does not match "
+                f"the dataset clinical feature width {expected_clinical_dim} "
+                "(3 series x 3 channels, plus one column per mobility lag when "
+                "data.use_imported_risk is true). Set model.params.cases_dim "
+                f"to {expected_clinical_dim}."
             )
-            self.config.model.cases_dim = expected_clinical_dim
         if self.config.model.biomarkers_dim != expected_bio_dim:
             logger.info(
                 "Updating biomarkers_dim from %d to %d based on dataset",

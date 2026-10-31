@@ -595,6 +595,10 @@ class ObservationHeadConfig:
     # i.e. shape ~2.04 and scale ~6.09 d.
     kernel_gamma_shape_ww: float = 2.0
     kernel_gamma_scale_ww: float = 6.0
+    # Deaths prior: mean 7 d, sd 2 d. Chosen in commit 0b021f2 to match the
+    # synthetic generator's death delay (3-epoch single-seed synthetic smoke
+    # runs gamma-deaths-fixed-matched-01 / gamma-deaths-gamma2p-01). Not
+    # validated on real data. Ignored when kernel_mlp_deaths is true.
     # Gamma(shape, scale) prior for the deaths delay kernel. This initializes
     # its simplex weights by default and initializes the explicit two-parameter
     # Gamma family when selected.
@@ -922,7 +926,10 @@ class ModelConfig:
     # -- dimensionality --#
     # 3 variants × 4 channels (value/mask/censor/age) + 1 has_data = 13
     biomarkers_dim: int = 13
-    cases_dim: int = 3  # (value, mask, age) - age = days since last measurement
+    # Clinical input width: 3 series x (value, mask, age) = 9, plus one column
+    # per mobility lag when data.use_imported_risk is true. The dataset raises
+    # when this value does not match its actual width.
+    cases_dim: int = 9
     # GNN depth determines message passing depth AND feature masking radius
     # - gnn_depth=0: No masking (all nodes contribute)
     # - gnn_depth=1: 1-hop neighbors (direct neighbors only)

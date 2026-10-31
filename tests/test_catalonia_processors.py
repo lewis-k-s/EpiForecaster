@@ -174,6 +174,8 @@ def test_hospitalizations_processor_weekly_data(
     interpolated output with Kalman smoothing. Marked as integration test
     because it tests multiple components together (resample + smooth + mask).
     """
+    # This test covers weekly-to-daily filling, not the reporting lag.
+    config.hospitalizations_reporting_lag_days = 0
     proc = HospitalizationsProcessor(config)
     result = proc.process(temp_data_dir)
 

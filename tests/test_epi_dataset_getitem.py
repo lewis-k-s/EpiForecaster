@@ -394,6 +394,7 @@ def test_imported_risk_gating(tmp_path):
     config2 = deepcopy(config)
     config2.data.use_imported_risk = True
     config2.data.mobility_lags = [1, 7]
+    config2.model.cases_dim = 11
 
     dataset2 = EpiDataset(config=config2, target_nodes=[0, 1], context_nodes=[0, 1])
     assert dataset2.cases_output_dim == 11  # 9 + 2 lags

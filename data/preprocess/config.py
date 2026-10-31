@@ -187,7 +187,7 @@ class PreprocessingConfig:
     synthetic_path: str | None = None
     hospitalizations_file: str | None = None
     # Conservative availability shift for weekly totals stamped at week start.
-    hospitalizations_reporting_lag_days: int = 0
+    hospitalizations_reporting_lag_days: int = 7
     deaths_file: str | None = None  # Deaths data (comarca-level)
     catalonia_cases_file: str | None = None  # Alternative Catalonia cases data
     vaccination_file: str | None = None  # Municipality-level COVID vaccination data
@@ -223,7 +223,7 @@ class PreprocessingConfig:
 
     # Output configuration
     compression: str = "blosc"
-    continuous_storage_dtype: str = "float16"
+    continuous_storage_dtype: str = "float32"
     chunk_sizes: dict[str, list[int]] | None = None
 
     # Alignment and validation options
