@@ -1,4 +1,4 @@
-# Matched from-scratch real-data smoke for the reporting-v1 pretraining study.
+# Matched from-scratch real-data smoke for the reactive-n100 pretraining study.
 # This is a bounded pipeline diagnostic, not scientific comparison evidence.
 
 run: {}
@@ -17,7 +17,7 @@ dvc:
 
 training:
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  experiment_name: synthetic-pretraining-control-reporting-v1-smoke
+  experiment_name: synthetic-pretraining-control-reactive-n100-smoke
   model_id: model
   max_batches: 10
   overrides:

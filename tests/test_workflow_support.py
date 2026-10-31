@@ -1734,7 +1734,7 @@ def test_preprocessing_publication_launches_a_host_slurm_step(tmp_path: Path) ->
     run_root = tmp_path / "run"
     config = _workflow_mode_config("preprocess", run_root)
     template = run_config.load_template(
-        REPO_ROOT / "workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml"
+        REPO_ROOT / "workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml"
     )
     config["workflow"].update(template["workflow"])
     config["dvc"].update(template["dvc"])
@@ -1753,7 +1753,7 @@ def test_preprocessing_publication_launches_a_host_slurm_step(tmp_path: Path) ->
     ]
     assert len(publication_commands) == 1
     assert publication_commands[0].startswith("Shell command: srun ")
-    assert "--cpus-per-task=20" in publication_commands[0]
+    assert "--cpus-per-task=64" in publication_commands[0]
     assert "--gpus-per-task" not in publication_commands[0]
 
 

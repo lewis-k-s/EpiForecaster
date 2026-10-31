@@ -1,6 +1,6 @@
-# Matched real-data fine-tuning treatment for the reporting-v1 pretraining
+# Matched real-data fine-tuning treatment for the reactive-n100 pretraining
 # study. Copy this template and set training.init_checkpoint to the absolute
-# GPFS checkpoint from the accepted corrected-corpus pretraining run.
+# GPFS checkpoint from the accepted a97c812 pretraining run.
 #
 # This template deliberately matches mn5_synth_pretrain_control.yaml in real
 # data, seed, architecture, schedule, evaluation, and resources. Only the
@@ -22,7 +22,7 @@ dvc:
 
 training:
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  experiment_name: synthetic-pretraining-finetune-reporting-v1
+  experiment_name: synthetic-pretraining-finetune-reactive-n100
   model_id: model
   max_batches: null
   require_init_checkpoint: true

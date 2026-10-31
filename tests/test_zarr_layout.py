@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import subprocess
-import sys
 import zipfile
 
 import numpy as np
@@ -139,35 +137,6 @@ def test_open_processed_dataset_dispatches_packed_zarr(tmp_path):
     assert saved.mobility.encoding["shards"] == (1, 130, 6, 6)
 
 
-def test_convert_netcdf_keeps_values_and_records_source(tmp_path):
-    source = _dataset()
-    netcdf = tmp_path / "tiny.nc"
-    source.to_netcdf(netcdf, engine="netcdf4")
-    destination = tmp_path / "tiny.zarr.zip"
-
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "data.preprocess.convert_netcdf",
-            str(netcdf),
-            str(destination),
-            "--workers",
-            "2",
-            "--source-dvc-md5",
-            "abc123",
-        ],
-        check=True,
-        cwd=Path(__file__).resolve().parents[1],
-        capture_output=True,
-    )
-
-    saved = open_zarr_zip(destination)
-    _assert_same_values(saved, xr.open_dataset(netcdf, engine="h5netcdf"))
-    assert saved.attrs["converted_from"] == "tiny.nc"
-    assert saved.attrs["converted_from_dvc_md5"] == "abc123"
-
-
 def test_bitround_keeps_the_requested_mantissa_bits():
     rng = np.random.default_rng(3)
     values = np.concatenate(
@@ -245,33 +214,6 @@ def test_write_dataset_rejects_bitround_on_non_float32(tmp_path):
         )
 
 
-def test_convert_netcdf_rounds_and_subsets_runs(tmp_path):
-    from data.preprocess.convert_netcdf import convert, parse_bitround
-
-    source = _dataset()
-    netcdf = tmp_path / "tiny.nc"
-    source.to_netcdf(netcdf, engine="netcdf4")
-    destination = tmp_path / "tiny.zarr.zip"
-
-    convert(
-        netcdf,
-        destination,
-        workers=1,
-        source_dvc_md5=None,
-        bitround_keepbits=parse_bitround(["mobility=7"]),
-        runs=2,
-    )
-
-    saved = open_zarr_zip(destination)
-    assert saved.sizes["run_id"] == 2
-    assert np.array_equal(
-        saved.mobility.values, bitround(source.mobility.values[:2], 7), equal_nan=True
-    )
-    assert saved.attrs["converted_run_subset"] == "first 2 runs"
-    with pytest.raises(ValueError, match="NAME=BITS"):
-        parse_bitround(["mobility"])
-
-
 def _preprocess_workflow(write_workers: object) -> dict:
     return {
         "workflow": {"kind": "preprocess"},
@@ -315,12 +257,12 @@ def test_preprocessing_config_rejects_invalid_bitround_bits(tmp_path, bits):
         )
 
 
-def test_b354b27_preprocess_config_rounds_mobility_to_float16_precision():
+def test_a97c812_preprocess_config_rounds_mobility_to_float16_precision():
     from data.preprocess.config import PreprocessingConfig
 
     loaded = PreprocessingConfig._load_config_dict(
         Path(__file__).resolve().parents[1]
-        / "configs/production_only/preprocess_mn5_synth_sirhd_v1_b354b27_reactive_n100.yaml",
+        / "configs/production_only/preprocess_mn5_synth_sirhd_v1_a97c812_reactive_n100.yaml",
         seen_paths=set(),
     )
     assert loaded["bitround_keepbits"] == {"mobility": 10}

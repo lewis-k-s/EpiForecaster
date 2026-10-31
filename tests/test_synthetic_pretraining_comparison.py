@@ -671,7 +671,7 @@ def test_generate_comparison_rejects_wrong_dataset_role(tmp_path: Path) -> None:
         ValueError,
         match=(
             "did not stage data/processed/"
-            "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped.zarr.dvc"
+            "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip.dvc"
         ),
     ):
         generate_comparison(spec, tmp_path / "comparison")

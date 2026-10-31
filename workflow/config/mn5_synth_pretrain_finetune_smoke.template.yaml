@@ -1,6 +1,6 @@
-# Matched initialized real-data smoke for the reporting-v1 pretraining study.
+# Matched initialized real-data smoke for the reactive-n100 pretraining study.
 # Copy this template, replace training.init_checkpoint with the absolute GPFS
-# checkpoint produced by the corrected-corpus pretraining smoke, then prepare a
+# checkpoint produced by the a97c812 pretraining smoke, then prepare a
 # new immutable run. The fail-closed flag prevents a null checkpoint from
 # silently becoming another from-scratch control.
 
@@ -20,7 +20,7 @@ dvc:
 
 training:
   base_config: configs/production_only/train_epifor_mn5_full.yaml
-  experiment_name: synthetic-pretraining-finetune-reporting-v1-smoke
+  experiment_name: synthetic-pretraining-finetune-reactive-n100-smoke
   model_id: model
   max_batches: 10
   require_init_checkpoint: true

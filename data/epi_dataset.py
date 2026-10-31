@@ -40,20 +40,11 @@ logger = logging.getLogger(__name__)
 
 
 def open_processed_dataset(path: Path | str, **kwargs: Any) -> xr.Dataset:
-    """Open a processed dataset in any of its on-disk formats.
-
-    New outputs are packed sharded Zarr stores (``*.zarr.zip``). Earlier
-    outputs are NetCDF4 files or Zarr directories. This helper dispatches to
-    the correct reader so callers do not need to know the format.
-    """
+    """Open a processed dataset (packed ``*.zarr.zip`` or Zarr directory)."""
     p = Path(path)
     if is_zarr_zip(p):
         return open_zarr_zip(p, **kwargs)
-    if p.is_dir() or p.suffix == ".zarr":
-        return xr.open_zarr(str(p), **kwargs)
-    # The MN5 netCDF4 backend crashes when the research split reopens a file
-    # after threaded metadata reads. Use the h5py-backed NetCDF4 reader.
-    return xr.open_dataset(str(p), engine="h5netcdf", **kwargs)
+    return xr.open_zarr(str(p), **kwargs)
 
 
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")

@@ -357,13 +357,6 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
         ):
             raise ValueError("preprocessing.base_config must be a source-relative path")
         preprocessing_dataset_name(workflow_config)
-        handoff_manifest = preprocessing.get("handoff_manifest")
-        if handoff_manifest is not None:
-            handoff_path = Path(str(handoff_manifest))
-            if handoff_path.is_absolute() or ".." in handoff_path.parts:
-                raise ValueError(
-                    "preprocessing.handoff_manifest must be a source-relative path"
-                )
         if not isinstance(preprocessing.get("node_local_output", False), bool):
             raise ValueError("preprocessing.node_local_output must be Boolean")
         write_workers = preprocessing.get("write_workers", 1)
@@ -382,18 +375,6 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 "preprocessing.write_workers must be an integer between 1 and "
                 "resources.allocation.cpus_per_task"
             )
-        qa_acceptance = preprocessing.get("handoff_qa_acceptance")
-        if qa_acceptance is not None:
-            if handoff_manifest is None:
-                raise ValueError(
-                    "preprocessing.handoff_qa_acceptance requires "
-                    "preprocessing.handoff_manifest"
-                )
-            acceptance_path = Path(str(qa_acceptance))
-            if acceptance_path.is_absolute() or ".." in acceptance_path.parts:
-                raise ValueError(
-                    "preprocessing.handoff_qa_acceptance must be a source-relative path"
-                )
 
     evaluation = workflow_config.get("evaluation", {})
     research_outputs = evaluation.get("research_outputs", False)

@@ -1,4 +1,4 @@
-# Short, allocation-attached debug run for the 198-run b354b27 reactive corpus.
+# Short, allocation-attached debug run for the 200-run a97c812 reactive corpus.
 # It uses the production loader settings (batch size, workers, prefetch) so the
 # progress log measures data-loader throughput from the node-local input copy.
 # max_batches limits the run to one epoch.
@@ -15,14 +15,14 @@ workflow:
 
 dvc:
   targets:
-    - data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.zarr.zip.dvc
+    - data/processed/synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
   provenance_targets:
-    - data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc
+    - data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip.dvc
 
 training:
   base_config: configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml
-  experiment_name: synthetic-pretrain-sirhd-v1-b354b27-reactive-n100-interactive-debug
+  experiment_name: synthetic-pretrain-sirhd-v1-a97c812-reactive-n100-interactive-debug
   model_id: model
   max_batches: 300
   overrides:

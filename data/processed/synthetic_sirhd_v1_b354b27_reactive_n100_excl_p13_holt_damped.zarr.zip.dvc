@@ -1,5 +1,0 @@
-outs:
-- md5: 8308952213e3700693e349a9b2371399
-  size: 71369022411
-  hash: md5
-  path: synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.zarr.zip

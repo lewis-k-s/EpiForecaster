@@ -12,8 +12,7 @@ The real dataset (`real_with_id.zarr`) is not in this layout.
 
 ## 1. Why one packed file
 
-An earlier change moved the processed output from a Zarr directory to NetCDF4. A
-Zarr directory becomes a DVC `.dir` output, and the cost of that output grows
+A plain Zarr directory becomes a DVC `.dir` output, and the cost of that output grows
 with the number of files:
 
 - DVC hashes every file;
@@ -27,7 +26,7 @@ An unsharded layout with the current chunks (1, 30, 100, 100) would make about
 
 This layout uses Zarr v3 sharding, which gives about 8,000 files, and
 packs the store into one uncompressed ZIP64 file: `<dataset_name>.zarr.zip`. DVC
-then tracks one file with one MD5, as it does for NetCDF. Publication, staging,
+then tracks one file with one MD5, as it does for any single file. Publication, staging,
 receipts and the `.dvc` pointers keep their single-file form.
 
 A prototype with zarr 3.1.5 and xarray 2025.10.1 confirmed four things:
@@ -44,7 +43,7 @@ A prototype with zarr 3.1.5 and xarray 2025.10.1 confirmed four things:
 
 - **Format:** Zarr v3, with `zarr_format=3` and consolidated metadata.
 - **Dimensions, coordinates, variable names and attributes:** the same as the
-  current NetCDF output. Consumers keep the same xarray contract.
+  earlier processed output. Consumers keep the same xarray contract.
 - **Store attributes:** `layout_version = "synthetic-zarr-v1"`, the codec, and
   the BitRound mantissa bits of each variable.
 
@@ -79,7 +78,7 @@ Notes on the layout:
   overhead makes them larger than the raw data.
 - **BitRound:** apply it explicitly in the preprocessing code, before the
   write, and record the mantissa bits in the variable attributes. Any Zarr
-  reader can read the result. The default is no rounding; the b354b27 config
+  reader can read the result. The default is no rounding; the a97c812 config
   rounds mobility to 10 bits.
 - **Data type:** keep float32 for continuous values.
   - Do not store float16, because positive synthetic flows go down to 5.7e-20
@@ -132,10 +131,3 @@ model input and needs a model-fidelity check before use.
 
 Do not store float16 mobility in the processed file: positive synthetic flows
 go down to 5.7e-20 and float16 makes them zero.
-
-## 5. Conversion
-
-`python -m data.preprocess.convert_netcdf` converts an earlier NetCDF output
-to this layout without changing its values. Open the NetCDF source in each
-worker after the workers start (spawn). Forking workers after the parent has
-opened the file through HDF5 can stall every worker.

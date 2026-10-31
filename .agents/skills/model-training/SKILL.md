@@ -65,7 +65,8 @@ pointer and cache object. Distinguish:
   published.
 
 Synthetic pretraining is unavailable while
-`data/processed/synthetic_full_holt_damped.zarr.dvc` is absent. Report that gate;
+`data/processed/synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip.dvc`
+is absent. Report that gate;
 do not create or publish the pointer implicitly.
 
 Preprocessing is a potentially expensive mutation. In particular,

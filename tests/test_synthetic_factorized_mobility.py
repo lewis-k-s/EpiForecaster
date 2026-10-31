@@ -2,7 +2,7 @@
 
 The corpus stores one base edge series per mobility profile plus the per-run,
 per-region NPI reduction; the loader rebuilds the dense origin-major tensor by
-the ``max_endpoint_self_loop`` v1 rule. Fixtures are written as NetCDF.
+the ``max_endpoint_self_loop`` v1 rule. Fixtures are written as Zarr directories.
 """
 
 import json
@@ -84,7 +84,7 @@ def _write_factorized_corpus(
     rule=EPISIM_RULE,
     attrs=None,
 ):
-    """Write a NetCDF corpus with the factorized layout.
+    """Write a Zarr corpus with the factorized layout.
 
     Returns the reference dense mobility ``(run, corpus date, origin, dest)``.
     """
@@ -159,12 +159,12 @@ def _write_factorized_corpus(
             "model_facing_targets": "sirhd_S,sirhd_I,sirhd_H,sirhd_R,sirhd_D,"
             "sirhd_death_flow",
             "audit_only_variables": "latent_S_true,latent_I_true,latent_CH_true",
-            "simulation_source_commit": "b354b27",
+            "simulation_source_commit": "a97c812",
             "reporting_profile": "sirhd_pretraining_reporting_v2",
             **(attrs or {}),
         }
     )
-    ds.to_netcdf(path, engine="netcdf4")
+    ds.to_zarr(path, mode="w", zarr_format=2)
     return expected
 
 
@@ -176,7 +176,7 @@ def _processor(tmp_path, synthetic_path):
 
 @pytest.mark.epiforecaster
 def test_factorized_mobility_matches_dense_layout(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     expected = _write_factorized_corpus(path)
     processor = _processor(tmp_path, path)
 
@@ -198,13 +198,13 @@ def test_factorized_mobility_matches_dense_layout(tmp_path):
     assert qa["max_abs_error"] <= qa["parity_atol"]
     # The fixture is asymmetric, so the transposed comparison must fail.
     assert qa["swapped_max_abs_error"] > 1e-2
-    assert provenance["simulation_source_commit"] == "b354b27"
+    assert provenance["simulation_source_commit"] == "a97c812"
     assert provenance["reporting_profile"] == "sirhd_pretraining_reporting_v2"
 
 
 @pytest.mark.epiforecaster
 def test_factorized_mobility_preferred_without_dense_layout(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     expected = _write_factorized_corpus(path, include_dense=False)
 
     result = _processor(tmp_path, path).process(str(path))
@@ -253,7 +253,7 @@ def test_edge_list_requires_origin_self_loop():
     ],
 )
 def test_swapped_orientation_fails_qa(tmp_path, corpus_kwargs, message):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(path, **corpus_kwargs)
 
     with pytest.raises(ValueError, match=message):
@@ -271,7 +271,7 @@ def test_swapped_orientation_fails_qa(tmp_path, corpus_kwargs, message):
     ],
 )
 def test_rejects_unknown_reduction_rule(tmp_path, rule, message):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(path, rule=rule)
 
     with pytest.raises(ValueError, match=message):
@@ -289,7 +289,7 @@ def test_reduction_rule_ignores_documentation_fields():
 
 @pytest.mark.epiforecaster
 def test_rejects_run_without_profile(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(path, profile_ids=np.array([3, -1, 17]))
     processor = _processor(tmp_path, path)
 
@@ -306,7 +306,7 @@ def test_rejects_run_without_profile(tmp_path):
 
 @pytest.mark.epiforecaster
 def test_rejects_profile_missing_from_base(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(path, profile_ids=np.array([3, 3, 99]))
 
     with pytest.raises(ValueError, match=r"\[99\] are not on"):
@@ -315,7 +315,7 @@ def test_rejects_profile_missing_from_base(tmp_path):
 
 @pytest.mark.epiforecaster
 def test_unpadded_run_ids_round_trip(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     expected = _write_factorized_corpus(path)
 
     result = _processor(tmp_path, path).process(
@@ -341,20 +341,22 @@ def _seed_above_population(path, run_id):
     In region 0, S becomes negative on every date and I absorbs the difference,
     so the S + I + H + R + D partition still equals the population.
     """
-    with xr.open_dataset(path, engine="netcdf4") as source:
+    with xr.open_zarr(path, zarr_format=2) as source:
         ds = source.load()
+    for variable in (*ds.data_vars.values(), *ds.coords.values()):
+        variable.encoding.clear()
     run = int(np.nonzero(ds["run_id"].values == run_id)[0][0])
     s = ds["sirhd_S"].values
     i = ds["sirhd_I"].values
     excess = np.float32(0.1) * ds["population"].values[run, 0]
     i[run, :, 0] += s[run, :, 0] + excess
     s[run, :, 0] = -excess
-    ds.to_netcdf(path, engine="netcdf4")
+    ds.to_zarr(path, mode="w", zarr_format=2)
 
 
 @pytest.mark.epiforecaster
 def test_declared_run_exclusion_drops_invalid_run_and_records_reason(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(path)
     _seed_above_population(path, "baseline_3")
     reason = "S negative: initial seeding larger than the region population"
@@ -386,7 +388,7 @@ def test_declared_run_exclusion_drops_invalid_run_and_records_reason(tmp_path):
 
 @pytest.mark.epiforecaster
 def test_run_exclusion_must_name_a_corpus_run(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(path)
     processor = SyntheticProcessor(
         _make_config(
@@ -402,7 +404,7 @@ def test_run_exclusion_must_name_a_corpus_run(tmp_path):
 
 @pytest.mark.epiforecaster
 def test_rejects_audit_only_model_target(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(
         path, attrs={"audit_only_variables": "latent_S_true,sirhd_I"}
     )
@@ -413,7 +415,7 @@ def test_rejects_audit_only_model_target(tmp_path):
 
 @pytest.mark.epiforecaster
 def test_rejects_latent_target_missing_from_model_facing_targets(tmp_path):
-    path = tmp_path / "raw.nc"
+    path = tmp_path / "raw.zarr"
     _write_factorized_corpus(
         path, attrs={"model_facing_targets": "sirhd_S,sirhd_I,sirhd_H,sirhd_R"}
     )
@@ -424,8 +426,8 @@ def test_rejects_latent_target_missing_from_model_facing_targets(tmp_path):
 
 @pytest.mark.epiforecaster
 @pytest.mark.integration
-def test_pipeline_end_to_end_factorized_netcdf(tmp_path):
-    path = tmp_path / "raw.nc"
+def test_pipeline_end_to_end_factorized_zarr(tmp_path):
+    path = tmp_path / "raw.zarr"
     region_metadata_path = tmp_path / "edar_map.nc"
     expected = _write_factorized_corpus(path)
     _write_region_metadata(
@@ -455,4 +457,4 @@ def test_pipeline_end_to_end_factorized_netcdf(tmp_path):
         provenance = json.loads(ds.attrs["synthetic_corpus_provenance_json"])
     assert provenance["mobility_layout"] == "factorized_edges"
     assert provenance["mobility_qa"]["dense_parity_checked"] is True
-    assert provenance["simulation_source_commit"] == "b354b27"
+    assert provenance["simulation_source_commit"] == "a97c812"

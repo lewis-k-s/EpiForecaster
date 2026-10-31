@@ -232,7 +232,6 @@ def test_preprocessing_retry_and_restore_do_not_repeat_completed_work(
     monkeypatch.setattr(
         run_support, "_processed_dataset_qa", lambda *args: {"ok": True}
     )
-    monkeypatch.setattr(run_support, "_handoff_provenance_qa", lambda *args: None)
     with pytest.raises(RuntimeError, match="preempted"):
         run_support.run_preprocessing(config_path, source, run)
     marker = run_support.run_preprocessing(config_path, source, run)
@@ -293,7 +292,6 @@ def test_preprocessing_builds_node_local_and_copies_into_attempt(tmp_path, monke
     monkeypatch.setattr(
         run_support, "_processed_dataset_qa", lambda *args: {"ok": True}
     )
-    monkeypatch.setattr(run_support, "_handoff_provenance_qa", lambda *args: None)
 
     marker = run_support.run_preprocessing(config_path, source, run)
 

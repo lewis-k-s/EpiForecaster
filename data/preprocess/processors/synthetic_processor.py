@@ -315,7 +315,7 @@ class SyntheticProcessor:
         Load and extract synthetic data from bundled zarr.
 
         Args:
-            synthetic_path: Path to raw_synthetic_observations (.nc or .zarr)
+            synthetic_path: Path to raw_synthetic_observations (packed .zarr.zip or Zarr directory)
             run_filter: Optional list of run_ids to include. If None, includes all runs.
 
         Returns:
@@ -478,8 +478,8 @@ class SyntheticProcessor:
         if not path.exists():
             raise FileNotFoundError(f"Synthetic data path does not exist: {path}")
 
-        # Direct NetCDF file or packed Zarr store
-        if path.is_file() and (path.suffix == ".nc" or is_zarr_zip(path)):
+        # Packed Zarr store
+        if path.is_file() and is_zarr_zip(path):
             return str(path)
 
         # Direct Zarr directory
@@ -503,7 +503,7 @@ class SyntheticProcessor:
         return str(path)
 
     def _open_synthetic_data(self, resolved_path: str) -> xr.Dataset:
-        """Open synthetic data (NetCDF or Zarr), handling inconsistent run_id
+        """Open synthetic data (Zarr), handling inconsistent run_id
         dimensions.
 
         Some synthetic datasets have variables with conflicting run_id sizes
@@ -519,16 +519,12 @@ class SyntheticProcessor:
             self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
             return self._normalize_mobility_dims(ds)
-        is_netcdf = Path(resolved_path).is_file()
         try:
-            if is_netcdf:
-                ds = xr.open_dataset(resolved_path, engine="netcdf4", chunks=chunks)
-            else:
-                ds = xr.open_zarr(
-                    resolved_path,
-                    chunks=chunks,  # type: ignore[arg-type]
-                )
-                self._clear_source_zarr_encodings(ds)
+            ds = xr.open_zarr(
+                resolved_path,
+                chunks=chunks,  # type: ignore[arg-type]
+            )
+            self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
             ds = self._normalize_mobility_dims(ds)
             return ds
@@ -560,20 +556,12 @@ class SyntheticProcessor:
                 f"  Note: dropping {len(conflicting_vars)} variables with "
                 f"conflicting run_id size: {conflicting_vars}"
             )
-            if is_netcdf:
-                ds = xr.open_dataset(
-                    resolved_path,
-                    engine="netcdf4",
-                    chunks=chunks,
-                    drop_variables=conflicting_vars,
-                )
-            else:
-                ds = xr.open_zarr(
-                    resolved_path,
-                    drop_variables=conflicting_vars,
-                    chunks=chunks,  # type: ignore[arg-type]
-                )
-                self._clear_source_zarr_encodings(ds)
+            ds = xr.open_zarr(
+                resolved_path,
+                drop_variables=conflicting_vars,
+                chunks=chunks,  # type: ignore[arg-type]
+            )
+            self._clear_source_zarr_encodings(ds)
             ds = self._strip_run_id_padding(ds)
             ds = self._normalize_mobility_dims(ds)
 
@@ -612,10 +600,8 @@ class SyntheticProcessor:
         """Strip whitespace padding from ``run_id`` fixed-width string coordinates.
 
         Synthetic zarr stores ``run_id`` as ``<U50`` (right-padded to 50 chars).
-        NetCDF4 uses vlen strings that may also carry trailing spaces.
-        The generator handoff manifest stores clean stripped strings.  Stripping
-        at the earliest entry point lets clean values propagate through the
-        entire pipeline and pass provenance QA.
+        Stripping at the earliest entry point lets clean run IDs propagate
+        through the entire pipeline.
         """
         if "run_id" in dataset.coords:
             raw = dataset["run_id"].values.astype("U")
@@ -625,12 +611,11 @@ class SyntheticProcessor:
 
     @staticmethod
     def _normalize_mobility_dims(dataset: xr.Dataset) -> xr.Dataset:
-        """Rename NetCDF mobility dimension names to the canonical forms.
+        """Rename mobility dimension names to the canonical forms.
 
-        Upstream NetCDF output uses ``in_region_id``/``out_region_id`` for the
-        OD matrix spatial dims, while legacy zarr used ``origin``/``target``.
-        Rename to ``origin``/``target`` so downstream extraction works
-        identically regardless of source format.
+        The generator may name the OD matrix spatial dims
+        ``in_region_id``/``out_region_id``. Rename them to ``origin``/``target``
+        so downstream extraction uses one name.
         """
         rename_map: dict[str, str] = {}
         if "in_region_id" in dataset.dims and "origin" not in dataset.dims:

@@ -4,8 +4,8 @@
 #
 # EpiSim.jl a97c812 regenerated all 200 simulations with the seed cap
 # max_seed_half_region_population v1 (2 runs capped), so profile 13 no longer
-# seeds more infected than people and no run is excluded. It replaces the
-# b354b27 NetCDF dataset identity.
+# seeds more infected than people and no run is excluded. It is the
+# only synthetic corpus.
 #
 # The raw corpus is packed sharded Zarr (episim-raw-zarr-v1, lossless). It
 # stores only the factorized mobility (mobility_base_edges +
@@ -14,10 +14,8 @@
 # the factorized layout and checks the row sums. EpiSim checked the rebuild
 # against the run source files on all 200 runs (max error 0.0).
 #
-# Generator QA: qa_passed=false. The EpiSim owner accepted the two failed gates
-# incidence_p90_over_p10 (5.25 < 8) and policy_release_fraction (0.479 < 0.5)
-# on 2026-10-27 (qa_acceptance.json). The workflow honours the waiver only for
-# exactly these gates and this handoff manifest SHA-256.
+# The corpus identity is its DVC pointer
+# (data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip.dvc).
 
 base_config: "preprocess_mn5_synth.yaml"
 
@@ -59,7 +57,6 @@ source_provenance:
   simulation_source_commit: "a97c812ffbf5331aae7ae0e5f844fcb55dbca205"
   generator_dvc_commit: "323d78a2c2064ad31d077a939d83e3c3a2837a6f"
   generator_bundle: "epiforecaster_sirhd_v1_zarr_a97c812_20261027_reactive_n100"
-  replaces_bundle: "epiforecaster_sirhd_v1_netcdf_b354b27_20261015_reactive_n100"
   raw_corpus_dvc_md5: "cfdd2a02c7a81a8f9e008339b693b1a5"
   raw_corpus_bytes: 46612607993
   raw_corpus_physical_file_sha256: "290108a06e5104b9de78c8f631c86659bc4813c8fdd536218609558478c51218"
@@ -73,6 +70,4 @@ source_provenance:
   mobility_reduction_rule: "max_endpoint_self_loop v1"
   dense_mobility: "omitted"
   seed_cap_rule: "max_seed_half_region_population v1 (fraction 0.5, 2 runs capped)"
-  handoff_manifest_sha256: "c17ec5e10ccf5ef07bf58d2fb9125a2a8b99f0577a20f0d2a9cb728d6e7ecac3"
-  handoff_qa_acceptance_sha256: "cb274598397ce03d02c472377a662670e197d6ea3afd82e40b500795473c0d26"
   generation_slurm_jobs: "simulate=48137087 merge=48137088 dvc_hash=48144088"

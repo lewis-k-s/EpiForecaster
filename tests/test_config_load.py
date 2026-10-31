@@ -100,7 +100,7 @@ def test_load_config_without_overrides():
     "config_path",
     [
         "configs/production_only/train_epifor_mn5_full.yaml",
-        "configs/production_only/train_epifor_mn5_synth_pretrain.yaml",
+        "configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml",
     ],
 )
 def test_production_training_configs_default_to_normal_nll(config_path: str) -> None:

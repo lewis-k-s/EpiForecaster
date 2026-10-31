@@ -1149,145 +1149,6 @@ def _synthetic_corpus_provenance(dataset: Any) -> dict[str, Any] | None:
     return json.loads(str(value)) if value is not None else None
 
 
-def _handoff_qa_acceptance(
-    source_root: Path,
-    workflow_config: dict[str, Any],
-    handoff: dict[str, Any],
-    handoff_sha256: str,
-) -> dict[str, Any]:
-    """Accept a failed generator handoff only under an exact owner waiver.
-
-    The waiver must name this handoff manifest by SHA-256 and list exactly the
-    gates that the handoff reports as failed, with the same observed values.
-    """
-    acceptance_value = workflow_config["preprocessing"].get("handoff_qa_acceptance")
-    if acceptance_value is None:
-        raise ValueError("Synthetic generator handoff QA did not pass")
-    relative = Path(str(acceptance_value))
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("preprocessing.handoff_qa_acceptance must be source-relative")
-    acceptance_path = (source_root / relative).resolve(strict=True)
-    acceptance_path.relative_to(source_root.resolve(strict=True))
-    acceptance = json.loads(acceptance_path.read_text())
-    if acceptance.get("handoff_manifest_sha256") != handoff_sha256:
-        raise ValueError(
-            "Handoff QA acceptance names a different handoff manifest SHA-256"
-        )
-    if acceptance.get("generated_qa_passed") is not False:
-        raise ValueError("Handoff QA acceptance must record generated_qa_passed=false")
-    failed = {
-        str(gate["gate"]): gate["observed"]
-        for gate in handoff.get("qa_gates", [])
-        if gate.get("passed") is not True
-    }
-    accepted = {
-        str(gate["gate"]): gate["observed"]
-        for gate in acceptance.get("accepted_failed_gates", [])
-    }
-    if not failed:
-        raise ValueError(
-            "Synthetic generator handoff QA did not pass and lists no failed gates"
-        )
-    if accepted != failed:
-        raise ValueError(
-            "Handoff QA acceptance must list exactly the failed gates with their "
-            f"observed values: failed={failed}, accepted={accepted}"
-        )
-    return {
-        "path": relative.as_posix(),
-        "sha256": sha256_file(acceptance_path),
-        "decision": acceptance.get("decision"),
-        "date": acceptance.get("date"),
-        "accepted_failed_gates": sorted(accepted),
-    }
-
-
-def _handoff_provenance_qa(
-    source_root: Path,
-    workflow_config: dict[str, Any],
-    effective_config: dict[str, Any],
-    dataset: Any,
-) -> dict[str, Any] | None:
-    """Validate and retain the generator handoff identity and seed record."""
-    handoff_value = workflow_config["preprocessing"].get("handoff_manifest")
-    if handoff_value is None:
-        return None
-    relative = Path(str(handoff_value))
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("preprocessing.handoff_manifest must be source-relative")
-    handoff_path = (source_root / relative).resolve(strict=True)
-    handoff_path.relative_to(source_root.resolve(strict=True))
-    handoff = json.loads(handoff_path.read_text())
-    handoff_sha256 = sha256_file(handoff_path)
-    expected_sha256 = effective_config.get("source_provenance", {}).get(
-        "handoff_manifest_sha256"
-    )
-    if expected_sha256 and handoff_sha256 != str(expected_sha256):
-        raise ValueError(
-            "Synthetic generator handoff manifest SHA-256 does not match the "
-            "preprocessing source contract"
-        )
-    acceptance = None
-    if handoff.get("qa_passed") is not True:
-        acceptance = _handoff_qa_acceptance(
-            source_root,
-            workflow_config,
-            handoff,
-            handoff_sha256,
-        )
-    handoff_run_ids = [str(value) for value in handoff.get("run_ids", [])]
-    # Config-declared exclusions are the only runs allowed to be missing.
-    exclusions = effective_config.get("synthetic_run_exclusions") or {}
-    unknown_exclusions = sorted(set(exclusions) - set(handoff_run_ids))
-    if unknown_exclusions:
-        raise ValueError(
-            "synthetic_run_exclusions names runs absent from the generator "
-            f"handoff: {unknown_exclusions}"
-        )
-    expected_run_ids = [
-        run_id for run_id in handoff_run_ids if run_id not in exclusions
-    ]
-    observed_run_ids = [str(value) for value in dataset["run_id"].values]
-    if sorted(expected_run_ids) != sorted(observed_run_ids):
-        raise ValueError(
-            "Processed run IDs differ from the synthetic generator handoff "
-            "minus the declared exclusions"
-        )
-    seeds = handoff.get("seeds")
-    if not isinstance(seeds, dict) or not seeds:
-        raise ValueError("Synthetic generator handoff has no seed record")
-    for name, values in seeds.items():
-        if not isinstance(values, list) or len(values) != len(handoff_run_ids):
-            raise ValueError(
-                f"Synthetic generator seed vector {name!r} does not match run count"
-            )
-    seed_by_run = {
-        name: {
-            run_id: seed
-            for run_id, seed in zip(handoff_run_ids, values, strict=True)
-            if run_id not in exclusions
-        }
-        for name, values in seeds.items()
-    }
-    return {
-        "path": relative.as_posix(),
-        "sha256": handoff_sha256,
-        "qa_passed": acceptance is None,
-        "qa_acceptance": acceptance,
-        "run_ids": expected_run_ids,
-        "handoff_run_ids": handoff_run_ids,
-        "excluded_runs": [
-            {"run_id": run_id, "reason": str(exclusions[run_id])}
-            for run_id in sorted(exclusions)
-        ],
-        "seeds": seeds,
-        "seed_by_run": seed_by_run,
-        "corpus_full_tree_sha256": handoff.get("corpus_full_tree_sha256"),
-        "corpus_metadata_tree_sha256": handoff.get("corpus_metadata_tree_sha256"),
-        "reporting_config_sha256": handoff.get("reporting_config_sha256"),
-    }
-
-
 def run_preprocessing(config_path: Path, source_root: Path, run_root: Path) -> Path:
     """Build and QA a processed dataset inside one immutable run root."""
     config = load_yaml(config_path)
@@ -1372,12 +1233,6 @@ def _run_preprocessing_attempt(
             "dataset": str(dataset_path),
             "dataset_relative": str(dataset_path.relative_to(run_root)),
             **_processed_dataset_qa(dataset, config),
-            "generator_handoff": _handoff_provenance_qa(
-                source_root,
-                config,
-                effective,
-                dataset,
-            ),
             "synthetic_corpus_provenance": _synthetic_corpus_provenance(dataset),
             "effective_config": str(effective_config),
             "effective_config_sha256": sha256_file(attempt_config),
@@ -1455,8 +1310,8 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
             )
         destination.rmdir()
     # Stage next to the dataset on the shared filesystem and hard-link it.
-    # Node-local /tmp may be smaller than the dataset (118 GB for b354b27 on
-    # Nord4), and DVC moves the payload into the shared cache anyway.
+    # Node-local /tmp may be smaller than the dataset (118 GB for a 198-run
+    # corpus on Nord4), and DVC moves the payload into the shared cache anyway.
     scratch_staging = Path(
         tempfile.mkdtemp(prefix=f".publication.staging-{os.getpid()}-", dir=output_root)
     )

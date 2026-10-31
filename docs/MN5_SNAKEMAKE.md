@@ -181,11 +181,12 @@ preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
 Synthetic pretraining uses the same `train` entity through
-`workflow/config/mn5_synth_pretrain.yaml`. Its processed Zarr is materialized
-for training, while the raw synthetic Zarr is a provenance-only DVC target.
+`workflow/config/mn5_synth_pretrain_reactive_n100.yaml`. Its processed Zarr is
+materialized for training, while the raw synthetic Zarr is a provenance-only DVC
+target. The raw corpus DVC pointer is the corpus identity.
 
-The corrected 20-run corpus uses
-`workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml`. The immutable
+The a97c812 corpus uses
+`workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml`. The immutable
 run owns the processed dataset, QA record, generated DVC pointer, and publication
 receipt. Promote the pointer to the source repository only after these records
 pass review.
@@ -343,9 +344,7 @@ Processed datasets are sharded Zarr v3 stores packed into one uncompressed
 ZIP64 file (`data/preprocess/zarr_layout.py`, layout `synthetic-zarr-v1`).
 Each per-run variable has one shard per run, so `preprocessing.write_workers`
 processes write runs in parallel and verify each run by read-back. DVC tracks
-the packed file as one object. `python -m data.preprocess.convert_netcdf`
-converts an earlier NetCDF output without changing its values. See
-`docs/SYNTHETIC_ZARR_LAYOUT.md`.
+the packed file as one object. See `docs/SYNTHETIC_ZARR_LAYOUT.md`.
 
 ## Prepare and submit
 
@@ -389,9 +388,9 @@ bash scripts/workflow/mn5_workflow.sh prepare <ablation-run-id> \
 bash scripts/workflow/mn5_workflow.sh prepare <crossval-run-id> \
   --config workflow/config/mn5_crossval.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <pretrain-run-id> \
-  --config workflow/config/mn5_synth_pretrain.yaml
+  --config workflow/config/mn5_synth_pretrain_reactive_n100.yaml
 bash scripts/workflow/mn5_workflow.sh prepare <preprocess-run-id> \
-  --config workflow/config/mn5_preprocess_sirhd_reporting_v1_20run.yaml
+  --config workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml
 ```
 
 For evaluation without training, copy `workflow/config/mn5_evaluate.yaml`, set

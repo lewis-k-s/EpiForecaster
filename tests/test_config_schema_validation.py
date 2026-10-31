@@ -159,18 +159,21 @@ def test_preprocessing_configs_parse(config_path):
     datetime.fromisoformat(config_dict["end_date"])
 
 
-def test_corrected_sirhd_preprocessing_has_versioned_artifact_identity():
+def test_sirhd_preprocessing_has_versioned_artifact_identity():
     config = PreprocessingConfig._load_config_dict(
-        Path("configs/production_only/preprocess_mn5_synth_sirhd_reporting_v1.yaml"),
+        Path(
+            "configs/production_only/"
+            "preprocess_mn5_synth_sirhd_v1_a97c812_reactive_n100.yaml"
+        ),
         seen_paths=set(),
     )
 
     assert config["env"] == "mn5"
     assert config["synthetic_path"] == (
-        "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc"
+        "data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip"
     )
     assert config["dataset_name"] == (
-        "synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2"
+        "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped"
     )
     assert config["smoothing"]["clinical_method"] == "holt_damped"
     assert config["continuous_storage_dtype"] == "float32"

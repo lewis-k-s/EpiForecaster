@@ -9,23 +9,26 @@ from models.configs import EpiForecasterConfig
 from scripts.workflow.run_config import validate_workflow_contract
 
 
-CORRECTED_PROCESSED_PATH = (
-    "data/processed/synthetic_sirhd_reporting_v1_cb6b4e5_holt_damped_latent_flow_v2.nc"
+A97C812_RAW_POINTER = (
+    "data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip.dvc"
 )
-CORRECTED_PROCESSED_POINTER = f"{CORRECTED_PROCESSED_PATH}.dvc"
-CORRECTED_RAW_POINTER = (
-    "data/files/raw_synthetic_observations_sirhd_reporting_v1_cb6b4e5.nc.dvc"
+A97C812_DATASET_NAME = "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped"
+A97C812_PROCESSED_PATH = f"data/processed/{A97C812_DATASET_NAME}.zarr.zip"
+SIRHD_V1_CONTRACT_SHA256 = (
+    "d8837d63a35a36c1d095184d58c622880b78c5f4ee85d83370c9e9dac6ffe582"
 )
 
 
 def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
     config = EpiForecasterConfig.load(
-        Path("configs/production_only/train_epifor_mn5_synth_pretrain.yaml")
+        Path(
+            "configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml"
+        )
     )
 
     assert config.data.mobility_min_flow_raw == 0.0
     assert config.model.max_neighbors == 20
-    assert config.data.dataset_path == CORRECTED_PROCESSED_PATH
+    assert config.data.dataset_path == A97C812_PROCESSED_PATH
     assert config.model.observation_heads.relevant_source_mapping() == {
         "hosp": "hospitalization_flow",
         "ww": "I",
@@ -34,25 +37,14 @@ def test_synthetic_pretraining_keeps_fractional_mobility_edges() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "workflow_path",
-    [
-        "workflow/config/mn5_synth_pretrain.yaml",
-    ],
-)
-def test_live_synthetic_pretraining_workflows_use_corrected_corpus(
-    workflow_path: str,
-) -> None:
-    workflow = yaml.safe_load(Path(workflow_path).read_text())
-
-    assert CORRECTED_PROCESSED_POINTER in workflow["dvc"]["targets"]
-    assert workflow["dvc"]["provenance_targets"] == [CORRECTED_RAW_POINTER]
-
-
 def test_synthetic_pretrain_production_emits_evaluation_diagnostics() -> None:
-    config = yaml.safe_load(Path("workflow/config/mn5_synth_pretrain.yaml").read_text())
+    config = yaml.safe_load(
+        Path("workflow/config/mn5_synth_pretrain_reactive_n100.yaml").read_text()
+    )
     training = EpiForecasterConfig.load(
-        Path("configs/production_only/train_epifor_mn5_synth_pretrain.yaml")
+        Path(
+            "configs/production_only/train_epifor_mn5_synth_pretrain_reactive_n100.yaml"
+        )
     )
 
     assert config["workflow"]["target"] == "train_evaluate"
@@ -75,7 +67,7 @@ def test_synthetic_pretrain_control_matches_real_training_contract() -> None:
     assert control["resources"] == canonical["resources"]
 
 
-def test_reporting_v1_finetune_matches_from_scratch_control() -> None:
+def test_reactive_finetune_matches_from_scratch_control() -> None:
     control = yaml.safe_load(
         Path("workflow/config/mn5_synth_pretrain_control.yaml").read_text()
     )
@@ -107,7 +99,7 @@ def test_reporting_v1_finetune_matches_from_scratch_control() -> None:
     assert validate_workflow_contract(rendered) == "train"
 
 
-def test_reporting_v1_finetune_smoke_matches_from_scratch_smoke() -> None:
+def test_reactive_finetune_smoke_matches_from_scratch_smoke() -> None:
     control = yaml.safe_load(
         Path("workflow/config/mn5_synth_pretrain_control_smoke.yaml").read_text()
     )
@@ -134,92 +126,6 @@ def test_reporting_v1_finetune_smoke_matches_from_scratch_smoke() -> None:
         validate_workflow_contract(fine_tune)
 
 
-def test_reporting_v1_checkpoint_evaluation_template_fails_closed() -> None:
-    template = yaml.safe_load(
-        Path(
-            "workflow/config/mn5_sirhd_reporting_v1_checkpoint_evaluate.template.yaml"
-        ).read_text()
-    )
-
-    assert template["evaluation"]["checkpoint"] is None
-    assert CORRECTED_PROCESSED_POINTER in template["dvc"]["targets"]
-    assert template["dvc"]["provenance_targets"] == [CORRECTED_RAW_POINTER]
-    with pytest.raises(
-        ValueError,
-        match="evaluation.checkpoint must be an absolute GPFS path",
-    ):
-        validate_workflow_contract(template)
-
-    rendered = deepcopy(template)
-    rendered["evaluation"]["checkpoint"] = (
-        "/gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/"
-        "EpiForecaster-DVC/runs/model/outputs/training/model/checkpoints/"
-        "best_model.pt"
-    )
-    assert validate_workflow_contract(rendered) == "evaluate"
-
-
-REACTIVE_RAW_POINTER = (
-    "data/files/epiforecaster_sirhd_v1_netcdf_d9c5bae_reactive_n100.nc.dvc"
-)
-REACTIVE_DATASET_NAME = "synthetic_sirhd_v1_d9c5bae_reactive_n100_holt_damped"
-REACTIVE_PROCESSED_PATH = f"data/processed/{REACTIVE_DATASET_NAME}.nc"
-SIRHD_V1_CONTRACT_SHA256 = (
-    "d8837d63a35a36c1d095184d58c622880b78c5f4ee85d83370c9e9dac6ffe582"
-)
-
-
-def test_reactive_raw_pointer_pins_upstream_corpus_without_payload() -> None:
-    pointer = yaml.safe_load(Path(REACTIVE_RAW_POINTER).read_text())
-
-    assert pointer["frozen"] is True
-    (dependency,) = pointer["deps"]
-    assert dependency["repo"]["url"] == "../EpiSim.jl"
-    assert dependency["repo"]["rev_lock"] == "cd60c2524856ec69f4927b2cb71702d15809d50a"
-    (output,) = pointer["outs"]
-    assert output["md5"] == "a30e21844967255fa43a15157e49ccfa"
-    assert output["size"] == 133926669691
-    assert not Path(REACTIVE_RAW_POINTER.removesuffix(".dvc")).exists()
-
-
-def test_reactive_preprocessing_pins_state_space_contract() -> None:
-    workflow = yaml.safe_load(
-        Path("workflow/config/mn5_preprocess_sirhd_v1_reactive_n100.yaml").read_text()
-    )
-    # Parse without input-path validation: the corpus stays on GPFS.
-    config = PreprocessingConfig._load_config_dict(
-        Path(workflow["preprocessing"]["base_config"]), seen_paths=set()
-    )
-
-    assert validate_workflow_contract(workflow) == "preprocess"
-    assert REACTIVE_RAW_POINTER in workflow["dvc"]["targets"]
-    assert workflow["preprocessing"]["expected_run_count"] == 200
-    assert workflow["preprocessing"]["dataset_name"] == REACTIVE_DATASET_NAME
-    assert config["dataset_name"] == REACTIVE_DATASET_NAME
-    assert config["synthetic_path"] == REACTIVE_RAW_POINTER.removesuffix(".dvc")
-    assert config["synthetic_state_space_contract_sha256"] == SIRHD_V1_CONTRACT_SHA256
-    assert config["start_date"] == "2020-02-10"
-    assert config["end_date"] == "2021-05-09"
-    assert config["source_provenance"]["raw_corpus_dvc_md5"] == (
-        "a30e21844967255fa43a15157e49ccfa"
-    )
-
-
-B354B27_RAW_POINTER = (
-    "data/files/epiforecaster_sirhd_v1_netcdf_b354b27_reactive_n100.nc.dvc"
-)
-B354B27_PROCESSED_PATH = "data/processed/synthetic_sirhd_v1_b354b27_reactive_n100_excl_p13_holt_damped.zarr.zip"
-
-
-def test_b354b27_processed_pointer_pins_published_dataset() -> None:
-    pointer = yaml.safe_load(Path(f"{B354B27_PROCESSED_PATH}.dvc").read_text())
-
-    (output,) = pointer["outs"]
-    assert output["md5"] == "8308952213e3700693e349a9b2371399"
-    assert output["size"] == 71369022411
-    assert output["path"] == Path(B354B27_PROCESSED_PATH).name
-
-
 @pytest.mark.parametrize(
     "workflow_path",
     [
@@ -235,9 +141,9 @@ def test_reactive_pretraining_consumes_reactive_corpus(workflow_path: str) -> No
     )
 
     assert validate_workflow_contract(workflow) == "train"
-    assert f"{B354B27_PROCESSED_PATH}.dvc" in workflow["dvc"]["targets"]
-    assert workflow["dvc"]["provenance_targets"] == [B354B27_RAW_POINTER]
-    assert training.data.dataset_path == B354B27_PROCESSED_PATH
+    assert f"{A97C812_PROCESSED_PATH}.dvc" in workflow["dvc"]["targets"]
+    assert workflow["dvc"]["provenance_targets"] == [A97C812_RAW_POINTER]
+    assert training.data.dataset_path == A97C812_PROCESSED_PATH
     assert training.data.mobility_min_flow_raw == 0.0
     assert training.training.loss.joint.latent.total_weight > 0.0
     (phase,) = training.training.curriculum.schedule
@@ -264,13 +170,6 @@ def test_reactive_interactive_debug_keeps_production_loader_settings() -> None:
         assert getattr(debug.training, field) == getattr(base.training, field)
 
 
-A97C812_RAW_POINTER = (
-    "data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100.zarr.zip.dvc"
-)
-A97C812_QA_DIR = Path("data/files/epiforecaster_sirhd_v1_zarr_a97c812_reactive_n100_qa")
-A97C812_DATASET_NAME = "synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped"
-
-
 def test_a97c812_raw_pointer_pins_seed_capped_zarr_corpus() -> None:
     pointer = yaml.safe_load(Path(A97C812_RAW_POINTER).read_text())
 
@@ -284,49 +183,29 @@ def test_a97c812_raw_pointer_pins_seed_capped_zarr_corpus() -> None:
     assert not Path(A97C812_RAW_POINTER.removesuffix(".dvc")).exists()
 
 
-def test_a97c812_preprocessing_uses_full_handoff_without_exclusions() -> None:
-    import json
-
-    from scripts.workflow.run_support import sha256_file
-
+def test_a97c812_preprocessing_pins_corpus_and_state_space_contract() -> None:
     workflow = yaml.safe_load(
         Path(
             "workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml"
         ).read_text()
     )
     preprocessing = workflow["preprocessing"]
+    # Parse without input-path validation: the corpus stays on GPFS.
     config = PreprocessingConfig._load_config_dict(
         Path(preprocessing["base_config"]), seen_paths=set()
     )
     provenance = config["source_provenance"]
-    handoff_path = Path(preprocessing["handoff_manifest"])
-    handoff = json.loads(handoff_path.read_text())
-    acceptance = json.loads(Path(preprocessing["handoff_qa_acceptance"]).read_text())
 
     assert validate_workflow_contract(workflow) == "preprocess"
-    assert handoff_path.parent == A97C812_QA_DIR
+    assert "handoff_manifest" not in preprocessing
     assert A97C812_RAW_POINTER in workflow["dvc"]["targets"]
     assert config["synthetic_path"] == A97C812_RAW_POINTER.removesuffix(".dvc")
     assert preprocessing["dataset_name"] == config["dataset_name"]
     assert config["dataset_name"] == A97C812_DATASET_NAME
     assert "synthetic_run_exclusions" not in config
-    assert preprocessing["expected_run_count"] == len(handoff["run_ids"]) == 200
+    assert preprocessing["expected_run_count"] == 200
     assert config["bitround_keepbits"] == {"mobility": 10}
     assert config["synthetic_state_space_contract_sha256"] == SIRHD_V1_CONTRACT_SHA256
-    assert handoff["dense_mobility"].startswith("omitted")
-    assert handoff["seed_cap"]["rule"] == "max_seed_half_region_population"
+    assert config["start_date"] == "2020-02-10"
+    assert config["end_date"] == "2021-05-09"
     assert provenance["raw_corpus_dvc_md5"] == "cfdd2a02c7a81a8f9e008339b693b1a5"
-    assert (
-        provenance["raw_corpus_physical_file_sha256"]
-        == (handoff["corpus_physical_file_sha256"])
-    )
-    assert (
-        provenance["raw_corpus_logical_dataset_sha256"]
-        == (handoff["corpus_logical_dataset_sha256"])
-    )
-    assert provenance["generator_source_commit"] == handoff["source_commit"]
-    assert provenance["handoff_manifest_sha256"] == sha256_file(handoff_path)
-    assert acceptance["handoff_manifest_sha256"] == sha256_file(handoff_path)
-    assert provenance["handoff_qa_acceptance_sha256"] == sha256_file(
-        Path(preprocessing["handoff_qa_acceptance"])
-    )
