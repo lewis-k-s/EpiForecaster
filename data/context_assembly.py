@@ -26,6 +26,26 @@ def unpack_mask_bits(packed: torch.Tensor, size: int) -> torch.Tensor:
     return bits.reshape(*packed.shape[:-1], -1)[..., :size]
 
 
+def target_positions_in_context(
+    node_ids: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Return each target's position in the sorted context node list.
+
+    Runs once when the context tables are built, so the per-batch assembly path
+    needs no device-to-host check. Raises when a target is missing from the
+    context nodes or listed twice.
+    """
+    positions = torch.searchsorted(node_ids, targets)
+    in_range = positions < node_ids.numel()
+    found = in_range & (node_ids[positions.clamp(max=node_ids.numel() - 1)] == targets)
+    if not bool(found.all()) or torch.unique(targets).numel() != targets.numel():
+        raise ValueError(
+            "Batch target is not part of the dataset's target list; "
+            "context tables cannot be indexed for it."
+        )
+    return positions
+
+
 def assemble_context_features(
     dataset: object,
     window_starts: torch.Tensor,
@@ -61,11 +81,6 @@ def assemble_context_features(
     target_slots = tables["context_target_slot_by_position"].index_select(
         0, target_positions
     )
-    if int(target_slots.min()) < 0:
-        raise ValueError(
-            "Batch target is not part of the dataset's target list; "
-            "context tables cannot be indexed for it."
-        )
 
     # The neighbor and k-hop tables are bit-packed along the context axis.
     context_size = tables["context_target_slot_by_position"].numel()

@@ -73,9 +73,14 @@ def build_latent_diagnostic_protocols(
         R0=state_tensors["r"][:, 0],
         population=ones,
     )
+    # Index 0 of each state trajectory is the oracle initial condition (zero
+    # error by construction); score only the rolled-forward steps 1..H.
+    oracle_outputs = dict(oracle)
+    for output_key, _target_key in _STATE_TASKS.values():
+        oracle_outputs[output_key] = oracle[output_key][:, 1:]
     oracle_targets = {
-        target_key: targets[target_key]
-        for _output_key, target_key in _STATE_TASKS.values()
+        target_key: state_tensors[name][:, 1:]
+        for name, (_output_key, target_key) in _STATE_TASKS.items()
     }
     oracle_targets["death_flow_target"] = death_flow_target
 
@@ -115,6 +120,6 @@ def build_latent_diagnostic_protocols(
     teacher_targets["death_flow_target"] = death_flow_target
 
     return {
-        "oracle_x0": (oracle, oracle_targets),
+        "oracle_x0": (oracle_outputs, oracle_targets),
         "teacher_forced_one_step": (teacher_outputs, teacher_targets),
     }

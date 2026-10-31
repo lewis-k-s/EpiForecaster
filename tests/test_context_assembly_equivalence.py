@@ -197,3 +197,17 @@ def test_mask_bit_packing_round_trips(size: int) -> None:
     assert packed.shape == (3, 4, -(-size // 8))
     assert torch.equal(unpack_mask_bits(packed, size), mask)
     assert torch.equal(unpack_mask_bits(packed[1, 2], size), mask[1, 2])
+
+
+def test_target_positions_in_context_validates_once() -> None:
+    from data.context_assembly import target_positions_in_context
+
+    node_ids = torch.tensor([1, 3, 4, 7])
+    positions = target_positions_in_context(node_ids, torch.tensor([3, 7]))
+    assert positions.tolist() == [1, 3]
+    with pytest.raises(ValueError, match="not part of the dataset's target list"):
+        target_positions_in_context(node_ids, torch.tensor([3, 5]))
+    with pytest.raises(ValueError, match="not part of the dataset's target list"):
+        target_positions_in_context(node_ids, torch.tensor([3, 9]))
+    with pytest.raises(ValueError, match="not part of the dataset's target list"):
+        target_positions_in_context(node_ids, torch.tensor([3, 3]))

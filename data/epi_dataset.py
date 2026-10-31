@@ -16,7 +16,7 @@ from constants import (
     EDAR_BIOMARKER_VARIANTS,
 )
 from data import dtypes as dtype_utils
-from data.context_assembly import pack_mask_bits
+from data.context_assembly import pack_mask_bits, target_positions_in_context
 from data.epi_batch import _replace_non_finite
 from models.configs import EpiForecasterConfig
 from utils.logging import suppress_zarr_warnings
@@ -633,7 +633,8 @@ class EpiDataset(Dataset):
         """Prebuild context tables consumed by ``data.context_assembly``."""
         node_ids = self._graph_node_ids  # (N_ctx,) k-hop closure around targets
         targets = torch.tensor(self.target_nodes, dtype=torch.long)  # (n_targets,)
-        positions = torch.searchsorted(node_ids, targets)  # (n_targets,) ctx slots
+        # (n_targets,) ctx slots; validated once here, not per batch
+        positions = target_positions_in_context(node_ids, targets)
         self.target_local_positions = positions
         # Map a context-node position to its slot in the per-target tables so
         # assembly can translate batch-side local target positions.
