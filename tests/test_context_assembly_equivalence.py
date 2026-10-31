@@ -181,3 +181,19 @@ def test_batch_injection_matches_per_item_assembly(tmp_path) -> None:
         [context_features_for_item(dataset, item) for item in items], dim=0
     )
     assert torch.equal(x_dense, per_item)
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize("size", [1, 7, 8, 9, 661])
+def test_mask_bit_packing_round_trips(size: int) -> None:
+    from data.context_assembly import pack_mask_bits, unpack_mask_bits
+
+    generator = torch.Generator().manual_seed(size)
+    mask = torch.rand(3, 4, size, generator=generator) > 0.5
+
+    packed = pack_mask_bits(mask)
+
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (3, 4, -(-size // 8))
+    assert torch.equal(unpack_mask_bits(packed, size), mask)
+    assert torch.equal(unpack_mask_bits(packed[1, 2], size), mask[1, 2])

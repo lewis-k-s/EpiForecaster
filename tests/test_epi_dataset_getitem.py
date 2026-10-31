@@ -173,7 +173,8 @@ def test_dynamic_mask_is_shared_by_clinical_topology_and_gpu_adjacency(
         expected_weights,
         torch.eye(len(node_ids)),
     )
-    assert torch.allclose(batch.mob_batch.adj_dense[0].float(), expected_weights)
+    adjacency = batch.mob_batch.adj_table[batch.mob_batch.adj_time_ids]
+    assert torch.allclose(adjacency[0].float(), expected_weights)
 
 
 @pytest.mark.epiforecaster
@@ -250,9 +251,7 @@ def test_getitem_aligns_death_flow_and_rebases_cumulative_d(tmp_path):
     periods = 8
     dataset_source = make_tiny_epi_dataset(periods=periods)
     time_index = np.arange(periods, dtype=np.float32)
-    cumulative_d = np.stack(
-        (time_index * 0.1, time_index * 0.2), axis=-1
-    )[None, ...]
+    cumulative_d = np.stack((time_index * 0.1, time_index * 0.2), axis=-1)[None, ...]
     death_flow = np.stack(
         (
             np.concatenate(([0.0], np.full(periods - 1, 0.1, dtype=np.float32))),

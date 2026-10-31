@@ -687,11 +687,10 @@ class EpiForecaster(nn.Module):
                 "Mobility processing requested but MobilityGNN is not enabled."
             )
 
-        node_emb = self._get_mobility_node_embeddings(mob_batch, region_embeddings)
-        mobility_embeddings = self._gather_target_mobility_embeddings(
-            node_emb, mob_batch, B, T, target_nodes
+        target_embeddings = self._get_mobility_node_embeddings(
+            mob_batch, B, T, target_nodes, region_embeddings
         )
-        return mobility_embeddings
+        return rearrange(target_embeddings, "(b t) d -> b t d", b=B, t=T)
 
     def _get_temporal_node_dim(self) -> int:
         """Compute temporal node dimension based on enabled variants."""
@@ -746,20 +745,28 @@ class EpiForecaster(nn.Module):
         return prediction
 
     def _get_mobility_node_embeddings(
-        self, mob_batch: Batch, region_embeddings: torch.Tensor | None = None
+        self,
+        mob_batch: Batch,
+        B: int,
+        T: int,
+        target_nodes: torch.Tensor,
+        region_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run dense GNN encoder on mobility batch."""
-        if not hasattr(mob_batch, "x_dense") or not hasattr(mob_batch, "adj_dense"):
+        """Run dense GNN encoder on mobility batch; return [G, D] target rows."""
+        x_dense = getattr(mob_batch, "x_dense", None)
+        adj_table = getattr(mob_batch, "adj_table", None)
+        adj_time_ids = getattr(mob_batch, "adj_time_ids", None)
+        if x_dense is None or adj_table is None or adj_time_ids is None:
             raise ValueError(
-                "Mobility batch missing dense graph tensors x_dense/adj_dense."
+                "Mobility batch missing dense graph tensors "
+                "x_dense/adj_table/adj_time_ids."
             )
-
-        x_dense = mob_batch.x_dense  # type: ignore[attr-defined]
-        adj_dense = mob_batch.adj_dense  # type: ignore[attr-defined]
-        if x_dense is None or adj_dense is None:
-            raise ValueError(
-                "Mobility batch has null dense graph tensors x_dense/adj_dense."
-            )
+        # [T_total, N, N] table -> [G, N, N]; gathered here so a compiled
+        # forward can fuse it with the GCN normalization.
+        adj_dense = adj_table[adj_time_ids]
+        target_local = self._target_local_indices(
+            mob_batch, x_dense, B, T, target_nodes
+        )
 
         # Optional: Inject region embeddings into GNN node features
         if self.variant_type.regions and region_embeddings is not None:
@@ -811,23 +818,18 @@ class EpiForecaster(nn.Module):
                 f"{self.mobility_gnn.layers[0].in_channels}"
             )
 
-        return self.mobility_gnn(x_dense, adj_dense)
+        return self.mobility_gnn(x_dense, adj_dense, target_index=target_local)
 
-    def _gather_target_mobility_embeddings(
+    def _target_local_indices(
         self,
-        node_emb: torch.Tensor,
         mob_batch: Batch,
+        x_dense: torch.Tensor,
         B: int,
         T: int,
         target_nodes: torch.Tensor,
     ) -> torch.Tensor:
-        """Gather [G, N, D] targets; G=B*T in sample-major collate order."""
-        if node_emb.ndim != 3:
-            raise ValueError(
-                f"Expected dense node embeddings [G, N, D], got shape {tuple(node_emb.shape)}"
-            )
-
-        num_graphs = node_emb.size(0)
+        """Local target node per graph [G]; G=B*T in sample-major collate order."""
+        num_graphs, num_nodes = x_dense.shape[0], x_dense.shape[1]
         expected_graphs = B * T
         if num_graphs != expected_graphs:
             raise ValueError(
@@ -837,7 +839,7 @@ class EpiForecaster(nn.Module):
 
         if hasattr(mob_batch, "target_node") and mob_batch.target_node is not None:
             target_local = mob_batch.target_node.reshape(-1).to(
-                node_emb.device, dtype=torch.long
+                x_dense.device, dtype=torch.long
             )
         # Fallback: recover per-graph targets by matching real node ids.
         elif (
@@ -846,11 +848,11 @@ class EpiForecaster(nn.Module):
         ):
             real_nodes = torch.as_tensor(
                 mob_batch.mob_real_node_idx,
-                device=node_emb.device,
+                device=x_dense.device,
                 dtype=torch.long,
             ).reshape(-1)
             target_global = target_nodes.to(
-                node_emb.device, dtype=torch.long
+                x_dense.device, dtype=torch.long
             ).repeat_interleave(T)
             matches = real_nodes.unsqueeze(0) == target_global.unsqueeze(1)
             match_counts = matches.sum(dim=1)
@@ -868,17 +870,14 @@ class EpiForecaster(nn.Module):
             raise ValueError("Mobility batch missing target indices.")
 
         if self.strict:
-            max_local_idx = node_emb.shape[1] - 1
+            max_local_idx = num_nodes - 1
             if (target_local < 0).any() or (target_local > max_local_idx).any():
                 raise RuntimeError(
                     f"target_local indices out of bounds. "
                     f"Max allowed: {max_local_idx}, Min found: {target_local.min().item()}, "
                     f"Max found: {target_local.max().item()}"
                 )
-        graph_ids = torch.arange(num_graphs, device=node_emb.device)
-        # Paired indexing selects target_local[g] from graph g.
-        target_embeddings = node_emb[graph_ids, target_local]
-        return rearrange(target_embeddings, "(b t) d -> b t d", b=B, t=T)
+        return target_local
 
     def to(self, *args, **kwargs):
         """Override to update cached device/dtype when model is moved."""

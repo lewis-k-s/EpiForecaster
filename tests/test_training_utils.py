@@ -15,6 +15,11 @@ class _MobBatch:
         self.run_id = run_id
 
 
+def _adj(mob_batch) -> torch.Tensor:
+    """Per-graph adjacency, as the model gathers it."""
+    return mob_batch.adj_table[mob_batch.adj_time_ids]
+
+
 class _DummyMobilityDataset(Dataset):
     def __init__(
         self,
@@ -63,7 +68,7 @@ def test_inject_gpu_mobility_uses_correct_concat_subdataset_by_run_id() -> None:
     batch_data = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="synth_1"))
     inject_gpu_mobility(batch_data, dataset, torch.device("cpu"))
 
-    adj_dense = batch_data.mob_batch.adj_dense
+    adj_dense = _adj(batch_data.mob_batch)
     assert adj_dense.shape == (1, 2, 2)
     assert adj_dense.dtype == MODEL_PARAM_DTYPE
     assert float(adj_dense[0, 0, 1]) == pytest.approx(9.0, abs=1e-3)
@@ -84,11 +89,11 @@ def test_inject_gpu_mobility_reuses_cached_tensor_without_crashing() -> None:
 
     first_batch = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="real"))
     inject_gpu_mobility(first_batch, dataset, device)
-    first_adj = first_batch.mob_batch.adj_dense
+    first_adj = _adj(first_batch.mob_batch)
 
     second_batch = SimpleNamespace(mob_batch=_MobBatch(global_t=[1], run_id="real"))
     inject_gpu_mobility(second_batch, dataset, device)
-    second_adj = second_batch.mob_batch.adj_dense
+    second_adj = _adj(second_batch.mob_batch)
 
     assert float(first_adj[0, 0, 1]) == pytest.approx(1.0, abs=1e-3)
     assert float(second_adj[0, 0, 1]) == pytest.approx(3.0, abs=1e-3)
@@ -117,7 +122,7 @@ def test_inject_gpu_mobility_applies_mask_and_orients_edges_as_incoming() -> Non
 
     inject_gpu_mobility(batch_data, dataset, torch.device("cpu"))
 
-    adjacency = batch_data.mob_batch.adj_dense[0]
+    adjacency = _adj(batch_data.mob_batch)[0]
     assert float(adjacency[0, 1]) == pytest.approx(7.0)
     assert float(adjacency[1, 0]) == pytest.approx(0.0)
 
@@ -143,7 +148,7 @@ def test_inject_gpu_mobility_uses_spatial_knn_adjacency_by_time_index() -> None:
     batch_data = SimpleNamespace(mob_batch=_MobBatch(global_t=[0, 2], run_id="real"))
     inject_gpu_mobility(batch_data, dataset, torch.device("cpu"))
 
-    adj_dense = batch_data.mob_batch.adj_dense
+    adj_dense = _adj(batch_data.mob_batch)
     assert adj_dense.shape == (2, 3, 3)
     assert adj_dense.dtype == MODEL_PARAM_DTYPE
     assert float(adj_dense[0, 0, 1]) == pytest.approx(1.0)
@@ -176,7 +181,7 @@ def test_inject_gpu_mobility_uses_spatial_queen_adjacency_by_time_index() -> Non
     batch_data = SimpleNamespace(mob_batch=_MobBatch(global_t=[0, 2], run_id="real"))
     inject_gpu_mobility(batch_data, dataset, torch.device("cpu"))
 
-    adj_dense = batch_data.mob_batch.adj_dense
+    adj_dense = _adj(batch_data.mob_batch)
     assert adj_dense.shape == (2, 3, 3)
     assert adj_dense.dtype == MODEL_PARAM_DTYPE
     assert float(adj_dense[0, 0, 1]) == pytest.approx(1.0)
@@ -197,7 +202,7 @@ def test_inject_gpu_mobility_cache_key_includes_adjacency_source() -> None:
 
     mobility_batch = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="real"))
     inject_gpu_mobility(mobility_batch, dataset, device)
-    assert float(mobility_batch.mob_batch.adj_dense[0, 0, 1]) == pytest.approx(5.0)
+    assert float(_adj(mobility_batch.mob_batch)[0, 0, 1]) == pytest.approx(5.0)
 
     dataset.config.model.graph_adjacency_source = "spatial_knn"
     dataset.spatial_knn_adjacency = spatial
@@ -205,7 +210,7 @@ def test_inject_gpu_mobility_cache_key_includes_adjacency_source() -> None:
     spatial_batch = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="real"))
     inject_gpu_mobility(spatial_batch, dataset, device)
 
-    assert float(spatial_batch.mob_batch.adj_dense[0, 0, 1]) == pytest.approx(0.0)
+    assert float(_adj(spatial_batch.mob_batch)[0, 0, 1]) == pytest.approx(0.0)
     assert len(dataset._gpu_mobility_cache) == 2
 
 
@@ -230,7 +235,7 @@ def test_ensure_mobility_adj_dense_ready_noop_when_not_required() -> None:
 @pytest.mark.epiforecaster
 def test_ensure_mobility_adj_dense_ready_raises_when_missing_adj_dense() -> None:
     batch_data = SimpleNamespace(mob_batch=_MobBatch(global_t=[0], run_id="real"))
-    with pytest.raises(ValueError, match="mob_batch.adj_dense"):
+    with pytest.raises(ValueError, match="mob_batch.adj_table"):
         ensure_mobility_adj_dense_ready(
             batch_data,
             required=True,
@@ -241,7 +246,7 @@ def test_ensure_mobility_adj_dense_ready_raises_when_missing_adj_dense() -> None
 @pytest.mark.epiforecaster
 def test_ensure_mobility_adj_dense_ready_passes_when_present() -> None:
     mob_batch = _MobBatch(global_t=[0], run_id="real")
-    mob_batch.adj_dense = torch.ones(1, 2, 2, dtype=torch.float16)
+    mob_batch.adj_table = torch.ones(1, 2, 2, dtype=torch.float16)
     batch_data = SimpleNamespace(mob_batch=mob_batch)
     ensure_mobility_adj_dense_ready(
         batch_data,

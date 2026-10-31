@@ -16,6 +16,7 @@ from constants import (
     EDAR_BIOMARKER_VARIANTS,
 )
 from data import dtypes as dtype_utils
+from data.context_assembly import pack_mask_bits
 from data.epi_batch import _replace_non_finite
 from models.configs import EpiForecasterConfig
 from utils.logging import suppress_zarr_warnings
@@ -699,14 +700,15 @@ class EpiDataset(Dataset):
         target_index = torch.arange(target_count).unsqueeze(0)
         # Targets observe themselves regardless of adjacency source.
         neighbor_table[time_index, target_index, positions.unsqueeze(0)] = True
-        self.context_neigh_table = neighbor_table
+        # Bit-packed along ctx_pos: (time, target_slot, ceil(N_ctx / 8)) uint8.
+        self.context_neigh_table = pack_mask_bits(neighbor_table)
 
         if self._target_k_hop_reach is not None:
             # Restrict (T, T_n, N_all) target reachability columns to context
             # nodes -> (T, T_n, N_ctx), matching the neighbor table layout.
             k_hop = self._target_k_hop_reach.index_select(2, node_ids)
             k_hop[time_index, target_index, positions.unsqueeze(0)] = True
-            self.context_khop_table = k_hop.contiguous()
+            self.context_khop_table = pack_mask_bits(k_hop)
         else:
             self.context_khop_table = None
 
@@ -851,6 +853,10 @@ class EpiDataset(Dataset):
         with the configured stride and filtered by missingness permit.
         """
         return len(self._index_map)
+
+    def sample_window_starts(self) -> list[int]:
+        """Window start of each sample, in index order."""
+        return [start for _, start in self._index_map]
 
     def __getitem__(self, idx: int) -> EpiDatasetItem:
         """Return one ``(target_node, window_start)`` sample.

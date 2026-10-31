@@ -7,6 +7,24 @@ import torch
 from einops import repeat
 from utils.precision_policy import MODEL_PARAM_DTYPE
 
+_BIT_WEIGHTS = torch.tensor([1 << bit for bit in range(8)], dtype=torch.uint8)
+
+
+def pack_mask_bits(mask: torch.Tensor) -> torch.Tensor:
+    """Pack a bool mask along its last dim into uint8 bytes (8 entries each)."""
+    pad = -mask.shape[-1] % 8
+    if pad:
+        mask = torch.nn.functional.pad(mask, (0, pad))
+    groups = mask.reshape(*mask.shape[:-1], -1, 8).to(torch.uint8)
+    return (groups * _BIT_WEIGHTS.to(mask.device)).sum(dim=-1, dtype=torch.uint8)
+
+
+def unpack_mask_bits(packed: torch.Tensor, size: int) -> torch.Tensor:
+    """Invert ``pack_mask_bits``: uint8 [..., ceil(size/8)] -> bool [..., size]."""
+    weights = _BIT_WEIGHTS.to(packed.device)
+    bits = (packed.unsqueeze(-1) & weights) != 0
+    return bits.reshape(*packed.shape[:-1], -1)[..., :size]
+
 
 def assemble_context_features(
     dataset: object,
@@ -49,6 +67,8 @@ def assemble_context_features(
             "context tables cannot be indexed for it."
         )
 
+    # The neighbor and k-hop tables are bit-packed along the context axis.
+    context_size = tables["context_target_slot_by_position"].numel()
     history_length = int(getattr(dataset, "config").model.input_window_length)
     # (S, 1) + (1, L) -> (S, L) absolute table indices per graph step,
     # flattened to (S * L,) in the same sample-major order as the outputs.
@@ -66,7 +86,9 @@ def assemble_context_features(
         clinical_window = clinical[time_grid]
         # Pair each graph's timestep with its target slot in the
         # (time, target_slot, ctx_pos) table -> (S * L, N_ctx) mask.
-        neighbor_mask = tables["context_neigh_table"][time_grid, target_slots]
+        neighbor_mask = unpack_mask_bits(
+            tables["context_neigh_table"][time_grid, target_slots], context_size
+        )
         blocks.append(
             torch.where(
                 neighbor_mask.unsqueeze(-1),
@@ -100,7 +122,7 @@ def assemble_context_features(
     k_hop = tables.get("context_khop_table")
     if k_hop is not None:
         # Same (time, target_slot) lookup -> (S * L, N_ctx) keep-mask.
-        keep_mask = k_hop[time_grid, target_slots]
+        keep_mask = unpack_mask_bits(k_hop[time_grid, target_slots], context_size)
         features = torch.where(
             keep_mask.unsqueeze(-1),
             features,
