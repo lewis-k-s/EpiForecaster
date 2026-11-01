@@ -892,6 +892,8 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
         source_pointer = source_root / target
         workspace_pointer = workspace / target
         workspace_pointer.parent.mkdir(parents=True, exist_ok=True)
+        # A retried attempt finds the read-only pointer copied by the last one.
+        workspace_pointer.unlink(missing_ok=True)
         shutil.copy2(source_pointer, workspace_pointer)
         output = dvc_output(source_pointer)
         output_relative = target.parent / str(output["path"])
@@ -905,9 +907,11 @@ def stage_dvc(config_path: Path, source_root: Path, run_root: Path) -> list[Path
     cache = Path(str(config["dvc"]["cache"]))
     _run(["dvc", "remote", "add", "--force", "mn5-nfs", str(remote)], cwd=workspace)
     _run(["dvc", "config", "core.remote", "mn5-nfs"], cwd=workspace)
-    # Keep DVC's SQLite/index state off the quota-constrained cluster home.
-    # A relative path is resolved inside this run's isolated DVC workspace.
-    _run(["dvc", "config", "core.site_cache_dir", ".dvc/tmp"], cwd=workspace)
+    # Keep DVC's SQLite/index state off the cluster home and off GPFS: one
+    # SQLite update per file on GPFS made checkout take about 1 s per file.
+    # TMPDIR is the execution's node-local scratch inside the container.
+    site_cache = tempfile.mkdtemp(prefix="dvc-site-cache-")
+    _run(["dvc", "config", "--local", "core.site_cache_dir", site_cache], cwd=workspace)
     _run(["dvc", "config", "cache.dir", str(cache)], cwd=workspace)
     _run(["dvc", "config", "cache.shared", "group"], cwd=workspace)
     _run(["dvc", "config", "cache.type", "symlink"], cwd=workspace)
