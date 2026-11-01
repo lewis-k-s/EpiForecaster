@@ -103,7 +103,7 @@ def test_ablation_smoke_overlay_resolves_to_frozen_mapping() -> None:
         "workflow": {"kind": "ablation", "target": "ablation"},
         "dvc": {
             "targets": [
-                "data/files/mobility.zarr.dvc",
+                "data/files/mobility.zarr.zip.dvc",
                 "data/processed/real_with_id.zarr.dvc",
                 "outputs/region_embeddings/region_embeddings.pt.dvc",
             ]

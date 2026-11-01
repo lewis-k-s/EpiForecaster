@@ -1,7 +1,7 @@
 """Standalone analysis of mobility regime shifts.
 
 This script ingests the raw OD mobility cube stored in
-``data/files/mobility.zarr`` and computes two complementary feature views per
+``data/files/mobility.zarr.zip`` and computes two complementary feature views per
 snapshot: topology-oriented (scale-reduced) and intensity-oriented
 (scale-sensitive). It then builds regime signatures, estimates distances between
 adjacent time steps, and surfaces potential change points grouped into
@@ -10,7 +10,7 @@ topology, intensity, or mixed regimes.
 Example usage
 -------------
 python dataviz/mobility_regime_analysis.py \
-    --mobility-path data/files/mobility.zarr \
+    --mobility-path data/files/mobility.zarr.zip \
     --output-dir outputs/reports/mobility_regimes \
     --edge-threshold 5.0 --laplacian-components 5 \
     --combined-threshold 2.5 --topology-threshold 2.0 --intensity-threshold 2.0
@@ -613,7 +613,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mobility-path",
         type=Path,
-        default=Path("data/files/mobility.zarr"),
+        default=Path("data/files/mobility.zarr.zip"),
         help="Path to the mobility Zarr store",
     )
     parser.add_argument(

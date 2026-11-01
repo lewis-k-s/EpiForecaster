@@ -194,7 +194,7 @@ pass review.
 The real dataset `real_with_id` is rebuilt with
 `workflow/config/mn5_preprocess_real.yaml` on one `acc_debug` node (120 minutes).
 Raw inputs are the DVC pointers `data/files/catalonia_real_raw_inputs_v1.dvc` and
-`data/files/mobility.zarr.dvc`. The run publishes a packed
+`data/files/mobility.zarr.zip.dvc`. The run publishes a packed
 `real_with_id.zarr.zip.dvc` pointer, not the old `real_with_id.zarr.dvc`
 directory pointer. After review, copy it to `data/processed/` and repoint the
 consuming templates and `data.dataset_path` (see the template header).

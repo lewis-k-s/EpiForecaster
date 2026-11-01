@@ -89,7 +89,7 @@ def get_preprocess_paths(preprocess_config: Path) -> tuple[str, str, str]:
     defaults = (
         "data/files/hospitalizations_municipality.csv",
         "data/files/deaths_municipality.csv",
-        "data/files/mobility.zarr",
+        "data/files/mobility.zarr.zip",
     )
     if not preprocess_config.exists():
         return defaults
@@ -107,9 +107,9 @@ def get_preprocess_paths(preprocess_config: Path) -> tuple[str, str, str]:
 
 
 def has_edge_weight_source_data(
-    data_path: Path = Path("data/files/mobility.zarr"),
+    data_path: Path = Path("data/files/mobility.zarr.zip"),
 ) -> bool:
-    """Return True if mobility.zarr exists for edge-weight analysis."""
+    """Return True if mobility.zarr.zip exists for edge-weight analysis."""
     return data_path.exists()
 
 

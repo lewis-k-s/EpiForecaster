@@ -1,0 +1,5 @@
+outs:
+- md5: 33fbb511948f9b764d93037fcbb9d2e5
+  size: 714381020
+  hash: md5
+  path: mobility.zarr.zip

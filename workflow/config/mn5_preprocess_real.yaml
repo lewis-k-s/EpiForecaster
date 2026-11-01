@@ -3,7 +3,7 @@
 # hospitalizations_reporting_lag_days=7, float32 storage).
 #
 # Raw inputs are the DVC directory data/files/catalonia_real_raw_inputs_v1.dvc
-# (nine files, 233 MB) and data/files/mobility.zarr.dvc. Preprocessing runs no
+# (nine files, 233 MB) and data/files/mobility.zarr.zip.dvc. Preprocessing runs no
 # GPU step; the acc_debug allocation is the one approved QoS (2 h maximum).
 #
 # Run:
@@ -33,7 +33,7 @@ workflow:
 dvc:
   targets:
     - data/files/catalonia_real_raw_inputs_v1.dvc
-    - data/files/mobility.zarr.dvc
+    - data/files/mobility.zarr.zip.dvc
   provenance_targets: []
 
 preprocessing:

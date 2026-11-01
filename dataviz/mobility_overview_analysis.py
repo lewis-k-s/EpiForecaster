@@ -1,6 +1,6 @@
 """Overview diagnostics for raw OD mobility matrices.
 
-This script reads ``data/files/mobility.zarr`` with xarray and produces a compact
+This script reads ``data/files/mobility.zarr.zip`` with xarray and produces a compact
 set of mobility indicators useful before deeper regime or epidemiological
 coupling analyses.
 """
@@ -364,7 +364,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mobility-path",
         type=Path,
-        default=Path("data/files/mobility.zarr"),
+        default=Path("data/files/mobility.zarr.zip"),
         help="Path to the mobility Zarr store",
     )
     parser.add_argument(

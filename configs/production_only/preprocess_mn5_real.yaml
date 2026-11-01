@@ -3,7 +3,7 @@
 # configs/preprocess_full.yaml; only input paths point at the staged DVC
 # directory data/files/catalonia_real_raw_inputs_v1 (nine files: five clinical
 # and wastewater CSVs, population, holidays, edar_muni_edges.nc and
-# input_manifest.json) and mobility at data/files/mobility.zarr.
+# input_manifest.json) and mobility at data/files/mobility.zarr.zip.
 # parameter_fit_end_date stays unset, as in production.
 #
 # Cases-only preprocessing configuration for Catalan COVID-19 epidemiological data
@@ -30,7 +30,7 @@ vaccination_file: "data/files/catalonia_real_raw_inputs_v1/vaccination_municipal
 wastewater_file: "data/files/catalonia_real_raw_inputs_v1/wastewater_biomarkers_icra.csv"
 region_metadata_file: "data/files/catalonia_real_raw_inputs_v1/edar_muni_edges.nc"
 population_file: "data/files/catalonia_real_raw_inputs_v1/fl_population_por_municipis.csv"
-mobility_path: "data/files/mobility.zarr"
+mobility_path: "data/files/mobility.zarr.zip"
 
 # Temporal processing parameters - maximum coverage
 start_date: "2020-03-01" # Earliest case data available

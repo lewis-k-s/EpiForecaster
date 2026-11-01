@@ -36,7 +36,7 @@ class RegionGraphPreprocessConfig:
     output_path: Path = Path("outputs/region_graph/region_graph.zarr")
     contiguity: str = "queen"  # "queen" or "rook"
     metric_crs: str = "EPSG:3035"
-    mobility_zarr_path: Path | None = Path("data/files/mobility.zarr")
+    mobility_zarr_path: Path | None = Path("data/files/mobility.zarr.zip")
     start_date: str | None = None
     end_date: str | None = None
 

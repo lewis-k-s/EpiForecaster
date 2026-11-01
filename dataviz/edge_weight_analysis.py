@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 class EdgeWeightAnalyzer:
     """Analyzes edge weight distributions in OD mobility networks."""
 
-    def __init__(self, mobility_path: str = "data/files/mobility.zarr"):
+    def __init__(self, mobility_path: str = "data/files/mobility.zarr.zip"):
         self.mobility_path = Path(mobility_path)
         self.results = {}
         self.lockdown_periods = LOCKDOWNS

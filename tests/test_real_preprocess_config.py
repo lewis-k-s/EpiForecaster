@@ -73,6 +73,6 @@ def test_base_config_inputs_come_from_the_raw_pointer(staged_config: Path) -> No
         config.population_file,
     ):
         assert str(path).startswith(root)
-    assert str(config.mobility_path) == "data/files/mobility.zarr"
+    assert str(config.mobility_path) == "data/files/mobility.zarr.zip"
     assert "outs:" in RAW_POINTER.read_text()
     assert "path: catalonia_real_raw_inputs_v1" in RAW_POINTER.read_text()

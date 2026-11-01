@@ -139,7 +139,7 @@ check_input_pointers() {
   local pointer
 
   [ "$INPUTS_RUN" = "$TEMPLATE_RUN" ] && return 0
-  for pointer in data/files/mobility.zarr.dvc data/processed/real_with_id.zarr.dvc \
+  for pointer in data/files/mobility.zarr.zip.dvc data/processed/real_with_id.zarr.dvc \
     outputs/region_embeddings/region_embeddings.pt.dvc; do
     if ! cmp -s <(grep -m1 md5 "$TEMPLATE_RUN/source/$pointer") \
       <(grep -m1 md5 "$INPUTS_RUN/source/$pointer"); then
@@ -244,7 +244,7 @@ stage_inputs() {
     mkdir -p "$tmp/outputs/region_embeddings"
     cp "$cache_file" "$tmp/outputs/region_embeddings/region_embeddings.pt"
     test -d "$tmp/data/processed/real_with_id.zarr"
-    test -d "$tmp/data/files/mobility.zarr"
+    test -f "$tmp/data/files/mobility.zarr.zip"
     touch "$tmp/.ready"
     rm -rf "$tree"
     mv "$tmp" "$tree"

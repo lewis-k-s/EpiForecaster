@@ -726,7 +726,7 @@ def test_production_source_bundle_contains_pipeline_without_dvc_payloads() -> No
     assert Path("scripts/workflow/mn5_container_exec.sh") in paths
     assert Path("scripts/workflow/remote_run.sh") in paths
     assert set(payloads) == {
-        Path("data/files/mobility.zarr.dvc"),
+        Path("data/files/mobility.zarr.zip.dvc"),
         Path("data/processed/real_with_id.zarr.dvc"),
         Path("outputs/region_embeddings/region_embeddings.pt.dvc"),
     }

@@ -32,7 +32,7 @@
 
 ### `preprocess_mn5_real.yaml`
 - Rebuilds the production real dataset `real_with_id` from the staged DVC
-  directory `data/files/catalonia_real_raw_inputs_v1` and `data/files/mobility.zarr`
+  directory `data/files/catalonia_real_raw_inputs_v1` and `data/files/mobility.zarr.zip`
 - Scientific settings match `configs/preprocess_full.yaml` (hospitalization
   reporting lag 7, float32 storage, `parameter_fit_end_date` unset)
 - Invoked only through `workflow/config/mn5_preprocess_real.yaml`
