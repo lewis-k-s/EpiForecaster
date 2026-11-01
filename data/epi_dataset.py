@@ -33,7 +33,7 @@ from .mobility_preprocessor import (  # noqa: E402
     MobilityPreprocessorConfig,
 )
 from .preprocess.config import REGION_COORD, TEMPORAL_COORD  # noqa: E402
-from .preprocess.zarr_layout import is_zarr_zip, open_zarr_zip  # noqa: E402
+from .preprocess.zarr_layout import open_zarr_store  # noqa: E402
 from .region_embedding_store import RegionEmbeddingStore  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -41,10 +41,7 @@ logger = logging.getLogger(__name__)
 
 def open_processed_dataset(path: Path | str, **kwargs: Any) -> xr.Dataset:
     """Open a processed dataset (packed ``*.zarr.zip`` or Zarr directory)."""
-    p = Path(path)
-    if is_zarr_zip(p):
-        return open_zarr_zip(p, **kwargs)
-    return xr.open_zarr(str(p), **kwargs)
+    return open_zarr_store(path, **kwargs)
 
 
 _DEFAULT_REGION_NAME_SOURCE = Path("data/files/geo/fl_municipios_catalonia.geojson")

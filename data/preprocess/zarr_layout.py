@@ -49,6 +49,13 @@ def open_zarr_zip(path: Path | str, **kwargs: Any) -> xr.Dataset:
     return xr.open_zarr(store, consolidated=False, **kwargs)
 
 
+def open_zarr_store(path: Path | str, **kwargs: Any) -> xr.Dataset:
+    """Open a packed ``*.zarr.zip`` or a Zarr directory store read-only."""
+    if is_zarr_zip(path):
+        return open_zarr_zip(path, **kwargs)
+    return xr.open_zarr(str(path), **kwargs)
+
+
 def bitround(values: np.ndarray, keepbits: int) -> np.ndarray:
     """Round float32 values to ``keepbits`` mantissa bits (round half to even).
 

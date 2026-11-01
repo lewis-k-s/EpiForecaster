@@ -37,6 +37,8 @@ from scipy.sparse import csr_matrix, diags, eye
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import eigsh
 
+from data.preprocess.zarr_layout import open_zarr_store
+
 logger = logging.getLogger("mobility_regime_analysis")
 
 # Threshold defaults tuned from empirical distribution of smoothed distances.
@@ -99,7 +101,7 @@ class MobilityRegimeAnalyzer:
 
     def _open_dataset(self) -> xr.Dataset:
         logger.info("Opening mobility dataset from %s", self.config.mobility_path)
-        ds = xr.open_zarr(self.config.mobility_path, chunks={"date": 1})
+        ds = open_zarr_store(self.config.mobility_path, chunks={"date": 1})
         if "target" in ds.dims:
             ds = ds.rename({"target": "destination"})
         if "destination" not in ds.dims:
