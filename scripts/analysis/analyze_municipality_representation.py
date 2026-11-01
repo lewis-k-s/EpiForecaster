@@ -26,6 +26,7 @@ from scipy import stats as sp_stats
 
 from data.dataset_factory import split_nodes_by_ratio
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 from utils.plotting import Palette
 
@@ -271,7 +272,7 @@ def compute_diagnostics(
     list[int],
     dict[str, list[int]],
 ]:
-    dataset = xr.open_zarr(config.data.dataset_path)
+    dataset = open_zarr_store(config.data.dataset_path)
     if "run_id" in dataset.dims:
         dataset = dataset.sel(run_id=config.data.run_id)
 
@@ -780,7 +781,7 @@ def compute_sweep(
     config: EpiForecasterConfig,
     scales: list[float],
 ) -> tuple[list[SweepPoint], dict[str, list[int]], dict[str, np.ndarray]]:
-    dataset = xr.open_zarr(config.data.dataset_path)
+    dataset = open_zarr_store(config.data.dataset_path)
     if "run_id" in dataset.dims:
         dataset = dataset.sel(run_id=config.data.run_id)
 

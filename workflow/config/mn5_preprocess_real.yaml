@@ -16,11 +16,9 @@
 # After the receipt passes review, promote the pointer by hand:
 #   1. copy publication/real_with_id.zarr.zip.dvc to
 #      data/processed/real_with_id.zarr.zip.dvc in a Git branch;
-#   2. in the HPO, train and crossval templates, replace the dvc target
-#      data/processed/real_with_id.zarr.dvc with the new pointer and set
-#      data.dataset_path to data/processed/real_with_id.zarr.zip;
-#   3. retire the old directory pointer data/processed/real_with_id.zarr.dvc.
-# The old directory pointer is not overwritten, so earlier runs keep their data.
+#   2. in the consuming templates, use the new pointer as the dvc target and
+#      set data.dataset_path to data/processed/real_with_id.zarr.zip.
+# The old directory pointer was retired. Earlier runs keep their own data.
 
 run: {}
 source: {}

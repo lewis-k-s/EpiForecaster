@@ -9,10 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import xarray as xr
 
 from data.dataset_factory import split_nodes_by_ratio
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 
 RAW_THRESHOLDS = np.asarray(
@@ -253,7 +253,7 @@ def main() -> None:
     )
     train_indices = np.asarray(train_nodes, dtype=np.int64)
 
-    dataset = xr.open_zarr(dataset_path)
+    dataset = open_zarr_store(dataset_path)
     try:
         selected_dataset = (
             dataset.sel(run_id=run_id, drop=True)
