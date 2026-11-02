@@ -7,9 +7,8 @@ env: "mn5"
 # train_epifor_mn5_full.yaml with training.init_checkpoint_path set to the best
 # checkpoint from this run.
 #
-# Sizing: one epoch is about ten times a 20-run epoch
-# (~4.2M examples, ~131k batches, ~3.1 h at the measured compiled throughput).
-# Four epochs keep the cycle well inside one acc_bscls allocation.
+# Sizing: one epoch is ~4.2M examples (~131k batches). Compiled training ran at
+# about 104 batches/s on MN5 (sizing job 48421321), about 21 min per epoch.
 #
 # Memory: the 200 runs are never all resident. training.curriculum.run_block_size
 # keeps 8 runs at a time (each epoch draws blocks of 8 runs; chunks interleave
