@@ -24,7 +24,8 @@ Example:
 Notes:
 - Uses CMA-ES sampler by default for better convergence on high-dimensional spaces.
 - Implements early pruning to kill unpromising trials and save compute.
-- Default: 50 epochs per trial with pruning after epoch 10.
+- Default: 50 epochs per trial with pruning after epoch 10, once 2 trials have
+  completed.
 - We force `training.plot_forecasts=False` by default to avoid workers clobbering
   shared forecast images (trainer writes `{split}_forecasts.png` at the
   experiment root).
@@ -192,7 +193,7 @@ def _overrides_to_dotlist(overrides: dict[str, Any]) -> list[str]:
 
 
 SEARCH_SPACES = ("default", "lr_only", "core")
-CORE_HEAD_D_MODEL_CHOICES = (64, 128, 256)
+CORE_HEAD_D_MODEL_CHOICES = (128, 256, 384, 512)
 
 
 def _suggest_core_params(trial: Any, base_cfg: EpiForecasterConfig) -> dict[str, Any]:
@@ -206,7 +207,7 @@ def _suggest_core_params(trial: Any, base_cfg: EpiForecasterConfig) -> dict[str,
         )
     return {
         "training.learning_rate": trial.suggest_float(
-            "training.learning_rate", 1e-4, 3e-3, log=True
+            "training.learning_rate", 1e-4, 1e-2, log=True
         ),
         "training.weight_decay": trial.suggest_float(
             "training.weight_decay", 1e-7, 1e-3, log=True
@@ -630,6 +631,13 @@ def objective(
     help="Epoch to start checking for pruning (default: 10).",
 )
 @click.option(
+    "--pruning-startup-trials",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Completed trials required before any trial can be pruned.",
+)
+@click.option(
     "--override",
     "cli_overrides",
     type=str,
@@ -661,6 +669,7 @@ def main(
     seed: int,
     sampler: str,
     pruning_start_epoch: int,
+    pruning_startup_trials: int,
     cli_overrides: tuple[str, ...],
     sample_training_loss_objective: bool,
     search_space: str,
@@ -724,11 +733,11 @@ def main(
         logger.info("Using Random sampler (seed=%d)", worker_seed)
 
     storage = JournalStorage(JournalFileBackend(str(journal_file)))
-    # Use PercentilePruner to enable early pruning even with few workers
-    # Prunes trials in the bottom 25th percentile after just 2 trials complete
+    # Prune a trial that is outside the best quarter of completed trials at the
+    # same epoch, once pruning_startup_trials trials have completed.
     selected_pruner = optuna.pruners.PercentilePruner(
         percentile=25.0,
-        n_startup_trials=2,
+        n_startup_trials=pruning_startup_trials,
         n_warmup_steps=pruning_start_epoch,
     )
     study = optuna.create_study(
@@ -745,10 +754,11 @@ def main(
     logger.info("Journal file: %s", journal_file)
     logger.info("Run root: %s", run_root)
     logger.info(
-        "Settings: epochs=%d, pruning_start_epoch=%d, seed=%d, "
-        "pruner=PercentilePruner(25%%)",
+        "Settings: epochs=%d, pruning_start_epoch=%d, pruning_startup_trials=%d, "
+        "seed=%d, pruner=PercentilePruner(25%%)",
         epochs,
         pruning_start_epoch,
+        pruning_startup_trials,
         seed,
     )
     slurm = _slurm_identity()

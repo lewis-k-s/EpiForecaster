@@ -209,6 +209,8 @@ def hpo_worker_arguments(config: dict[str, Any]) -> list[object]:
         options["sampler"],
         "--pruning-start-epoch",
         int(options["pruning_start_epoch"]),
+        "--pruning-startup-trials",
+        int(options["pruning_startup_trials"]),
         "--search-space",
         options["search_space"],
     ]

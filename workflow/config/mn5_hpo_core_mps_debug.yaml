@@ -1,17 +1,27 @@
-# Real-data HPO debug run: 8 workers share 2 GPUs under CUDA MPS (4 clients per
-# GPU) in one 2 h acc_debug allocation. The "core" search space samples only
-# the learning rate, weight decay, and head capacity; the base config owns the
+# Real-data HPO: 8 workers share 2 GPUs under CUDA MPS (4 clients per GPU) in
+# one 2 h acc_debug allocation. The "core" search space samples only the
+# learning rate, weight decay, and head capacity; the base config owns the
 # rest. HPO has no close-out signal, so timeout_s stops new trials 15 minutes
 # before the allocation ends (7200 - 900 s). A running trial finishes first.
+#
+# A worker that reaches timeout_s with trials left fails the run, so
+# trials_per_worker must fit in timeout_s. In run hpo-core-mps-debug-20261101 a
+# trial cost about 210 s of setup, compilation and first validation, then about
+# 2 s per epoch. A 50-epoch trial therefore takes about 5.5 to 6 minutes, and
+# 16 trials fit with a margin for the larger head_d_model choices.
+#
+# Pruning waits for 8 completed trials, one per concurrent worker, so the first
+# wave is never pruned against only 2 peers near its final epoch.
 extends: mn5.yaml
 
 optuna:
-  study_name: epiforecaster_hpo_core_mps_debug_v1
+  study_name: epiforecaster_hpo_core_mps_debug_v2
   workers: 8
-  trials_per_worker: 3
+  trials_per_worker: 16
   timeout_s: 6300
-  epochs: 30
-  pruning_start_epoch: 10
+  epochs: 50
+  pruning_start_epoch: 15
+  pruning_startup_trials: 8
   search_space: core
   # Lists replace the parent's list. Eight workers share 40 CPUs, so each
   # trial gets 2 training and 1 validation loader workers.

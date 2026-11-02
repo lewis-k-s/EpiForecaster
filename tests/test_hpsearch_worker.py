@@ -227,10 +227,10 @@ class TestSuggestEpiforecasterParams:
         }
         assert {call[1] for call in trial.suggest_calls} == set(overrides)
         assert trial.suggest_calls == [
-            ("float", "training.learning_rate", (1e-4, 3e-3, True)),
+            ("float", "training.learning_rate", (1e-4, 1e-2, True)),
             ("float", "training.weight_decay", (1e-7, 1e-3, True)),
             ("float", "model.head_dropout", (0.0, 0.3, False)),
-            ("categorical", "model.head_d_model", (64, 128, 256)),
+            ("categorical", "model.head_d_model", (128, 256, 384, 512)),
             ("int", "model.head_num_layers", (2, 4)),
         ]
 
