@@ -6,7 +6,7 @@ import yaml
 
 from data.preprocess.config import PreprocessingConfig
 from models.configs import EpiForecasterConfig
-from scripts.workflow.run_config import validate_workflow_contract
+from scripts.workflow.run_config import load_template, validate_workflow_contract
 
 
 A97C812_RAW_POINTER = (
@@ -131,10 +131,11 @@ def test_reactive_finetune_smoke_matches_from_scratch_smoke() -> None:
     [
         "workflow/config/mn5_synth_pretrain_reactive_n100.yaml",
         "workflow/config/mn5_synth_pretrain_reactive_n100_interactive_debug.yaml",
+        "workflow/config/mn5_synth_pretrain_reactive_n100_sizing.yaml",
     ],
 )
 def test_reactive_pretraining_consumes_reactive_corpus(workflow_path: str) -> None:
-    workflow = yaml.safe_load(Path(workflow_path).read_text())
+    workflow = load_template(Path(workflow_path))
     training = EpiForecasterConfig.load(
         Path(workflow["training"]["base_config"]),
         overrides=workflow["training"]["overrides"],
