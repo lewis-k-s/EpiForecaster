@@ -6,6 +6,7 @@ import json
 import math
 
 import pytest
+import torch
 
 from models.configs import OutputConfig, TrainingParams
 from scripts.workflow.run_support import evaluate_best
@@ -63,6 +64,18 @@ def test_train_checkpoint_and_evaluate_synthetic_dataset(tmp_path, mobility_enab
     model_dir = tmp_path / "training/integration/model"
     checkpoint = model_dir / "checkpoints/best_model.pt"
     assert checkpoint.is_file()
+    epoch_checkpoint = torch.load(
+        model_dir / "checkpoints/checkpoint_epoch_0000.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    # The periodic checkpoint is written after best-score bookkeeping so an
+    # exact resume sees this epoch's selection state.
+    assert (
+        epoch_checkpoint["best_val_selection_score"]
+        == epoch_checkpoint["val_selection_score"]
+    )
+    assert len(epoch_checkpoint["training_history"]["val_loss"]) == 1
     evaluation_dir = tmp_path / "evaluation"
     manifest_path = evaluate_best(checkpoint, evaluation_dir, "test", [], False)
     manifest = json.loads(manifest_path.read_text())

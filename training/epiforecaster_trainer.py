@@ -1489,18 +1489,6 @@ class EpiForecasterTrainer:
             if self.scheduler and self.config.training.scheduler_type == "step":
                 self.scheduler.step()
 
-            # Checkpointing
-            if (
-                self.config.output.save_checkpoints
-                and (epoch + 1) % self.config.output.checkpoint_frequency == 0
-            ):
-                self._save_checkpoint(
-                    epoch,
-                    val_loss,
-                    val_selection_score=val_selection_score,
-                    val_selection_metric=val_selection_metric,
-                )
-
             # Early stopping (disabled if patience is None)
             should_stop = False
             early_stopping_enabled = self._is_early_stopping_enabled()
@@ -1575,6 +1563,20 @@ class EpiForecasterTrainer:
             # records this epoch's selection state.
             if self.config.training.retain_best_crps_checkpoint:
                 self._maybe_save_crps_checkpoint(epoch, val_loss, val_metrics)
+
+            # Periodic checkpoint is written last so it carries this epoch's
+            # best-score, patience, CRPS, and history state; an exact resume at
+            # epoch + 1 must not re-derive any of them.
+            if (
+                self.config.output.save_checkpoints
+                and (epoch + 1) % self.config.output.checkpoint_frequency == 0
+            ):
+                self._save_checkpoint(
+                    epoch,
+                    val_loss,
+                    val_selection_score=val_selection_score,
+                    val_selection_metric=val_selection_metric,
+                )
 
             _prev_val_loss = val_loss
 
