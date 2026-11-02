@@ -33,6 +33,7 @@ Notes:
 
 from __future__ import annotations
 
+import gc
 import importlib
 import json
 import logging
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import torch
 
 from models.configs import EpiForecasterConfig
 from scripts.hpo.trial_artifacts import (
@@ -88,6 +90,21 @@ def _record_training_dynamics_attrs(
         identity["status"],
     )
     return identity
+
+
+def _release_trial_resources() -> None:
+    """Free the finished trial's compiled graphs and memory.
+
+    Every trial builds a new trainer, so torch.compile recompiles the shared
+    training-step code. Dynamo keeps each entry, with its model references and
+    CUDA graph pools, and runs eager once recompile_limit (8) entries exist. In
+    run hpo-core-mps-20261102 later trials trained 10x slower and worker host
+    memory grew until the step ran out of memory.
+    """
+    torch._dynamo.reset()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
@@ -470,6 +487,7 @@ def objective(
         pruning_start_epoch=pruning_start_epoch,
         model_id=model_id,
     )
+    trainer_model_id = trainer.model_id
     if trainer.experiment_dir is None:
         raise RuntimeError("Trainer did not initialize its experiment directory")
     actual_trial_dir = trainer.experiment_dir.resolve()
@@ -521,6 +539,9 @@ def objective(
             raise
         # Re-raise other exceptions
         raise
+    finally:
+        del trainer
+        _release_trial_resources()
 
     duration_s = time.time() - start_time
     logger.info(
@@ -556,7 +577,7 @@ def objective(
                 "config_effective": {
                     "output.log_dir": cfg.output.log_dir,
                     "output.experiment_name": cfg.output.experiment_name,
-                    "trainer.model_id": trainer.model_id,
+                    "trainer.model_id": trainer_model_id,
                 },
             },
             indent=2,

@@ -15,7 +15,7 @@
 extends: mn5.yaml
 
 optuna:
-  study_name: epiforecaster_hpo_core_mps_debug_v2
+  study_name: epiforecaster_hpo_core_mps_debug_v3
   workers: 8
   trials_per_worker: 16
   timeout_s: 6300
