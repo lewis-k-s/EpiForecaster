@@ -15,6 +15,11 @@ from typing import Any
 DYNAMICS_SCHEMA_VERSION = 1
 DYNAMICS_ARTIFACT_NAME = "training_dynamics.jsonl"
 DYNAMICS_MANIFEST_NAME = "training_dynamics_manifest.json"
+# Per-block heavy-state build profiling of curriculum runs (one record per
+# line: startup light build, one per block, one per epoch). Not a step series,
+# so it lives beside the dynamics artifact instead of inside it.
+BLOCK_BUILD_ARTIFACT_NAME = "curriculum_block_builds.jsonl"
+BLOCK_BUILD_SCHEMA_VERSION = 1
 DYNAMICS_TERMINAL_STATUSES = {
     "complete",
     "pruned",
@@ -67,8 +72,7 @@ def load_training_dynamics_identity(model_root: Path) -> dict[str, Any]:
     artifact_sha256 = sha256_file(artifact_path)
     if manifest.get("artifact_sha256") != artifact_sha256:
         raise ValueError(
-            "Training dynamics artifact SHA-256 mismatch: "
-            f"{artifact_path}"
+            f"Training dynamics artifact SHA-256 mismatch: {artifact_path}"
         )
     return {
         "manifest": str(manifest_path),
@@ -78,6 +82,14 @@ def load_training_dynamics_identity(model_root: Path) -> dict[str, Any]:
         "status": status,
         "row_count": int(manifest.get("row_count", 0)),
     }
+
+
+def append_block_build_record(model_root: Path, record: dict[str, Any]) -> None:
+    """Append one block-pipeline profiling record to the sidecar JSONL."""
+    row = {"schema_version": BLOCK_BUILD_SCHEMA_VERSION, **record}
+    with (model_root / BLOCK_BUILD_ARTIFACT_NAME).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, allow_nan=False))
+        handle.write("\n")
 
 
 def _utc_now() -> str:
@@ -211,8 +223,7 @@ class TrainingDynamicsWriter:
         }
         if mismatches:
             raise ValueError(
-                "Training dynamics identity does not match on resume: "
-                f"{mismatches}"
+                f"Training dynamics identity does not match on resume: {mismatches}"
             )
         if manifest.get("status") in DYNAMICS_TERMINAL_STATUSES:
             raise ValueError(

@@ -17,6 +17,7 @@ import platform
 import random
 import re
 import time
+from contextlib import nullcontext
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
@@ -61,7 +62,10 @@ from training.pathway_gradients import (
     compute_pathway_gradient_metrics,
     should_probe_pathway_gradients,
 )
-from training.training_dynamics import TrainingDynamicsWriter
+from training.training_dynamics import (
+    TrainingDynamicsWriter,
+    append_block_build_record,
+)
 from utils.device import (
     iter_device_ready_batches,
     setup_device_streams,
@@ -227,6 +231,7 @@ class EpiForecasterTrainer:
         self.test_dataset = dataset_splits.test
         self.real_run_id = dataset_splits.real_run_id
         self.synth_run_ids = dataset_splits.synth_run_ids
+        self.block_pipeline = dataset_splits.block_pipeline
         self.latent_scale_state = self._fit_latent_scale_state()
 
         # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
@@ -297,6 +302,7 @@ class EpiForecasterTrainer:
             real_run_id=self.real_run_id or "real",
             device_hint=self._device_hint,
             seed=self.config.training.seed,
+            block_pipeline=self.block_pipeline,
         )
         self.train_loader = loader_bundle.train
         self.val_loader = loader_bundle.val
@@ -840,16 +846,35 @@ class EpiForecasterTrainer:
         )
 
     def _fit_latent_scale_state(self) -> LatentScaleState | None:
-        """Fit fixed latent scales from the training split when requested."""
+        """Fit fixed latent scales from the training split when requested.
+
+        The scales only enter the loss for ``scaling`` ``std`` and ``asinh``
+        (``evaluation.losses.JointInferenceLoss._transform_latent_pair``); with
+        ``none`` neither the loss nor evaluation reads them, so no fit (and no
+        scale state or receipt) is produced.
+        """
         latent_config = self.config.training.loss.joint.latent
         if latent_config.total_weight <= 0:
             return None
 
         if latent_config.require_complete_targets:
+            validate_started = time.perf_counter()
             for split in (self.train_dataset, self.val_dataset, self.test_dataset):
                 if split is not None:
                     validate_complete_latent_targets(split)
+            self._status(
+                "Validated complete latent targets in "
+                f"{time.perf_counter() - validate_started:.1f}s",
+                logging.INFO,
+            )
 
+        if latent_config.scaling == "none":
+            self._status(
+                "Latent scaling is 'none': skipping the latent scale fit", logging.INFO
+            )
+            return None
+
+        fit_started = time.perf_counter()
         dataset_identity = str(
             getattr(
                 self,
@@ -864,7 +889,8 @@ class EpiForecasterTrainer:
         )
         self._status(
             "Fitted latent supervision scales from the training split: "
-            f"mode={latent_config.scaling}, hash={state.state_hash}",
+            f"mode={latent_config.scaling}, hash={state.state_hash}, "
+            f"took {time.perf_counter() - fit_started:.1f}s",
             logging.INFO,
         )
         return state
@@ -905,10 +931,18 @@ class EpiForecasterTrainer:
         This allows forked workers to inherit preloaded mobility tensors without
         copying once CUDA is initialized in the parent process.
         """
-        for loader in loaders:
-            if loader is None or loader.num_workers == 0:
-                continue
-            _ = iter(loader)
+        # One guard around all forks: the first loader's epoch plan must not
+        # start background builds before the last loader has forked its workers.
+        guard = (
+            self.block_pipeline.quiesced()
+            if self.block_pipeline is not None
+            else nullcontext()
+        )
+        with guard:
+            for loader in loaders:
+                if loader is None or loader.num_workers == 0:
+                    continue
+                _ = iter(loader)
 
     def setup_logging(self):
         """Setup logging and experiment tracking."""
@@ -1289,6 +1323,16 @@ class EpiForecasterTrainer:
             grad_norm_log_frequency=self.config.training.grad_norm_log_frequency,
             mobility_enabled=bool(self.config.model.type.mobility),
             resume=resume_existing,
+        )
+        if self.block_pipeline is not None:
+            self.block_pipeline.set_record_sink(self._append_block_build_record)
+
+    def _append_block_build_record(self, record: dict[str, Any]) -> None:
+        """Append one block-pipeline profiling record to the sidecar JSONL."""
+        if self.experiment_dir is None:
+            raise RuntimeError("experiment_dir not set; call setup_logging() first")
+        append_block_build_record(
+            self.experiment_dir, {**record, "global_step": self.global_step}
         )
 
     def _append_nonfinite_dynamics_record(
@@ -2908,6 +2952,13 @@ class EpiForecasterTrainer:
                     self._status("==== PROFILING COMPLETE ====")
                     profiler_complete_announced = True
 
+        if self.block_pipeline is not None:
+            # Close the epoch's block accounting and persist the diagnostics of
+            # the runs whose heavy state was built during it.
+            self.block_pipeline.end_epoch()
+            if self.experiment_dir is not None:
+                self._persist_mobility_diagnostics(self.experiment_dir)
+
         effective_batches = max(1, counted_batches)
         result = total_loss / effective_batches
         return result.item() if isinstance(result, torch.Tensor) else float(result)
@@ -3569,6 +3620,8 @@ class EpiForecasterTrainer:
                     self._status(
                         f"Error cleaning up {name} loader: {e}", logging.WARNING
                     )
+        if getattr(self, "block_pipeline", None) is not None:
+            self.block_pipeline.shutdown()
 
     def get_training_results(self) -> dict[str, Any]:
         """Return training results summary dictionary."""

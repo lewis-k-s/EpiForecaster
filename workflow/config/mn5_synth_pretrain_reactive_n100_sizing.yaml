@@ -2,11 +2,14 @@
 # every production setting (compilation, loaders, profiler) and caps training
 # at max_batches, which also limits the run to one epoch. Validation is not
 # capped, so the log records:
-#   - dataset construction time and peak host RSS for all 200 runs;
+#   - startup light-build time and peak host RSS for all 200 runs;
 #   - steady-state compiled training throughput (SPS in the progress log);
+#   - per-block heavy builds and main-process stalls
+#     (curriculum_block_builds.jsonl); 21000 batches span about four 8-run
+#     blocks (~5,200 batches each);
 #   - one full validation pass.
-# Size the production runtime from these numbers. An epoch is about 131k
-# training batches.
+# Size the production runtime and tune prefetch_blocks / block_build_workers
+# from these numbers. An epoch is about 131k training batches.
 extends: mn5_synth_pretrain_reactive_n100.yaml
 
 workflow:
@@ -14,7 +17,7 @@ workflow:
 
 training:
   experiment_name: synthetic-pretrain-sirhd-v1-a97c812-reactive-n100-sizing
-  max_batches: 6000
+  max_batches: 21000
 
 resources:
   allocation:

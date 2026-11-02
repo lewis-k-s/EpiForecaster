@@ -312,12 +312,23 @@ class CurriculumConfig:
     chunk_size: int = 512
     # Synthetic runs resident at a time. Each epoch the active runs are split
     # into consecutive blocks of this many runs; chunks are interleaved only
-    # within a block and blocks are visited one after another. Per-run host
-    # state of the runs outside the current block is spilled to node-local
-    # disk and the device caches of those runs are evicted, so memory scales
-    # with this value instead of the run count. A value >= the number of
-    # active runs gives one block and no rotation.
+    # within a block and blocks are visited one after another. A run's heavy
+    # state (dense mobility reduction, k-hop closure, graph weights, context
+    # tables) is built when its block is reached and dropped, with its device
+    # caches, when the block ends, so memory scales with this value instead of
+    # the run count. A value >= the number of active runs gives one block, no
+    # rotation, and heavy state stays resident across epochs.
     run_block_size: int = 8
+    # Blocks built in the background ahead of the block being trained. 0 builds
+    # each block on demand when its first batch is needed (no overlap).
+    prefetch_blocks: int = 1
+    # Threads building the runs of a block (and of prefetched blocks)
+    # concurrently. Each thread holds one run's dense mobility (~1.2 GB for a
+    # 945-region, 455-day run) transiently.
+    block_build_workers: int = 2
+    # Threads building every synthetic run's light state (series, masks, index
+    # maps) at startup.
+    light_build_workers: int = 8
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
     # Build each batch from one window start of one run (replaces chunk_size
@@ -341,6 +352,18 @@ class CurriculumConfig:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
         if self.run_block_size < 1:
             raise ValueError(f"run_block_size must be >= 1, got {self.run_block_size}")
+        if self.prefetch_blocks < 0:
+            raise ValueError(
+                f"prefetch_blocks must be >= 0, got {self.prefetch_blocks}"
+            )
+        if self.block_build_workers < 1:
+            raise ValueError(
+                f"block_build_workers must be >= 1, got {self.block_build_workers}"
+            )
+        if self.light_build_workers < 1:
+            raise ValueError(
+                f"light_build_workers must be >= 1, got {self.light_build_workers}"
+            )
 
         # Validate schedule phases don't overlap
         for i, phase in enumerate(self.schedule):

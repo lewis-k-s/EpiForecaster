@@ -7,7 +7,9 @@
 # Measured in sizing run synth-sizing-a97c812-20261102b (job 48421321), with
 # training.curriculum.run_block_size=8:
 #   - peak host RSS 23.7 GB (the all-resident build was OOM-killed at 115.5 GB);
-#   - staging about 2.5 min and dataset construction about 21 min;
+#   - staging about 2.5 min and dataset construction about 21 min (eager build
+#     of every run; superseded by the startup light build plus per-block
+#     builds, see curriculum_block_builds.jsonl in the run directory);
 #   - compiled training at about 104 batches/s, so ~21 min per ~131k-batch epoch;
 #   - one validation pass about 2 min.
 # Four epochs therefore take about 2 h end to end. 240 minutes leaves about 2x

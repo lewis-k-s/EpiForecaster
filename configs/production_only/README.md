@@ -18,9 +18,12 @@
 - Invoked only through `workflow/config/mn5_synth_pretrain_reactive_n100.yaml`
 - Enables direct latent `S/I/H/R/death_flow` supervision for stage-1 pretraining
 - Memory: `training.curriculum.run_block_size: 8` keeps one block of 8 of the 200
-  runs resident; per-run graph weights and context tables (~0.46 GB/run, ~92 GB
-  total) are spilled to node-local `TMPDIR` during the build, so the node needs
-  that much free local disk
+  runs resident. Startup builds only each run's light series state (in parallel,
+  `light_build_workers`); a block's heavy state (graph weights and context
+  tables, ~0.46 GB/run) is built when the block is reached, with the next
+  `prefetch_blocks` blocks built in the background, and dropped when the block
+  ends. No node-local disk is used. Per-block build and wait times are written
+  to `curriculum_block_builds.jsonl` in the run directory
 
 ### `preprocess_mn5_synth.yaml`
 - Canonical MN5 synthetic preprocessing base

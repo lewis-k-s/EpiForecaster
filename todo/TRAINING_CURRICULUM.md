@@ -152,6 +152,9 @@ training:
     enabled: true
     chunk_size: 512         # contiguous windows per run
     run_block_size: 8       # synthetic runs resident at a time (see below)
+    prefetch_blocks: 1      # blocks built in the background ahead of training
+    block_build_workers: 2  # threads building the runs of a block
+    light_build_workers: 8  # threads building every run's light state at startup
     run_sampling: "round_robin"  # or "random"
     schedule:
       - start_epoch: 0
@@ -185,20 +188,81 @@ least the number of active runs gives one block, identical to interleaving all
 runs. When more than one block is needed, the runs are permuted with the epoch
 seed before splitting, so block membership and order differ per epoch.
 
-Runs outside the current block hold no heavy state:
+Runs outside the current block (and the prefetched blocks) hold no heavy state.
 
-*   **Host:** when there are more synthetic runs than `run_block_size`, each
-    run's graph weights and context tables are written once to a file under the
-    node-local `TMPDIR` as it is built (about 0.46 GB per 945-region, 455-day
-    run; the build aborts on the first run if the disk cannot hold them all).
-    The main process memory-maps them back when the run's block starts and
-    unmaps them when the run is evicted. DataLoader workers (forked before the
-    state is loaded) never read these tables, so nothing is duplicated in them.
+#### Light vs heavy run state
+
+`EpiDataset` splits a synthetic run's state in two:
+
+*   **Light** (everything the sampler and DataLoader workers read; built for all
+    runs at startup, in `light_build_workers` threads): clinical and wastewater
+    series and masks, latent targets, biomarkers, temporal covariates, the
+    `(target node, window start)` index maps and sample counts, region metadata,
+    dims. Index maps and eligibility depend only on the series masks, never on
+    mobility or the k-hop set, so the light build yields exactly the eager
+    build's index maps (`tests/test_lazy_heavy_state.py`). Imported-risk lag
+    features (`data.use_imported_risk`) are a per-sample worker input derived
+    from mobility, so they count as light state: for lazy runs they are
+    computed at startup from a transiently read dense mobility.
+*   **Heavy** (main process only; built per block): the dense mobility read and
+    its reduction to float16 graph weights `[T, N_ctx, N_ctx]`, the k-hop
+    closure (context node set and each target's local position in it), static
+    adjacency, diagnostics, and the bit-packed context tables. Workers never
+    receive it: `__getitem__` returns global node ids only, and
+    `utils.training_utils.inject_context_placement` attaches
+    `mob_batch.target_node` (local positions) and `mob_batch.mob_real_node_idx`
+    in the main process from the run's heavy state. `EpiDataset.__getstate__`
+    drops it from pickles.
+
+Validation and test datasets (and the real run) build their heavy state eagerly
+and are unaffected; in synth-only mode the scaler run builds eagerly so that
+validation and test can share its dense mobility, then turns lazy.
+
+#### Per-block pipeline (`data/block_pipeline.py`)
+
+The sampler publishes each epoch's block plan to `RunBlockPipeline`. Before each
+batch the main process calls `activate(run)`. The first batch of a new block
+releases the previous block's heavy state and device caches, submits the builds
+of blocks up to `prefetch_blocks` ahead, and waits only for the current block's
+unfinished builds. `block_build_workers` threads build runs (runs of later blocks
+queue behind the current block's). With `prefetch_blocks: 0` each block is built
+on demand with no overlap. A single-block epoch keeps its runs resident across
+epochs. Threads are used instead of processes because a run build is zarr/blosc
+decompression plus numpy/torch passes that release the GIL, and the result
+(~0.5 GB of tensors per run) must be read zero-copy by the main process.
+
+#### Fork safety
+
+DataLoader workers are forked (`fork` context; persistent by default, prestarted
+at trainer init). A fork while a builder thread runs can leave a lock held
+forever in the child, and the child would keep the parent's heavy tensors alive
+after the parent dropped them. All three loaders are `ForkGuardedDataLoader`s:
+creating a worker iterator (the fork) runs inside `RunBlockPipeline.quiesced()`,
+which waits for in-flight builds, joins the pool threads and releases all heavy
+state; an epoch plan published meanwhile only starts building when the guard
+exits. The trainer's prestart wraps all loader forks in one guard so the first
+loader's plan does not start builds before the last one has forked. With
+persistent workers (the default) the guard costs nothing after the prestart;
+with `persistent_workers: false` every `iter(loader)` forks again, so each
+epoch/evaluation start drops the heavy state and rebuilds the current block.
+
+#### Profiling
+
+Each block logs `block_index, n_runs, build_s` (wall time of the block's builds),
+per-run build mean/max, per-phase means (`run_phase_s_mean`) and `wait_s` (main
+process stall at block start); each epoch logs total stall, block count and mean
+build time; startup logs the light-build wall time. The same records are
+appended to `curriculum_block_builds.jsonl` (schema version 1, one JSON object
+per line with `kind` = `startup` | `block` | `epoch` and the global step) in the
+run directory, so tuning runs of `prefetch_blocks` / `block_build_workers` can
+be compared. `mobility_initialization_diagnostics.json` is rewritten after each
+epoch because lazy runs compute their diagnostics when their block is built.
+
 *   **Device:** `utils.training_utils` keeps at most
     `run_block_size + number of real datasets` datasets cached on the GPU
     (`EpidemicCurriculumSampler.resident_dataset_limit`); the least recently
-    used run is evicted when a new block's run arrives, so a run is uploaded
-    once per epoch.
+    used run is evicted when a new block's run arrives, and a block's device
+    caches are dropped with its heavy state, so a run is uploaded once per epoch.
 
 ---
 

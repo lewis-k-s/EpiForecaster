@@ -7,26 +7,26 @@ This module handles the assembly of curriculum training datasets, including:
 - Region ID mapping between runs
 - Preprocessor fitting (separate for real/synthetic to avoid leakage)
 - ConcatDataset assembly
+- Per-block lazy construction of heavy synthetic run state
+  (``data.block_pipeline``): only light state is built here, in parallel
 """
 
 import copy
 import logging
-import os
 import random
-import shutil
-import tempfile
-import weakref
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 from torch.utils.data import ConcatDataset
 
+from data.block_pipeline import RunBlockPipeline
 from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD
 from data.region_embedding_store import RegionEmbeddingStore
-from models.configs import EpiForecasterConfig
-from utils.platform import get_nvme_path
+from models.configs import CurriculumConfig, EpiForecasterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -55,66 +55,9 @@ class CurriculumBuildResult:
     real_run_id: str
     synth_run_ids: list[str]
     region_embedding_store: RegionEmbeddingStore | None
-
-
-class _RunStateSpiller:
-    """Moves each synthetic run's per-run tables to node-local disk.
-
-    The curriculum samples ``run_block_size`` runs at a time, so with more runs
-    than that the runs outside the current block need not hold their device
-    cache sources in host memory. A run is spilled right after it is built,
-    which keeps the build's peak at one dense run plus the compact state of
-    the resident series. With no more runs than one block nothing is spilled.
-    """
-
-    def __init__(self, run_block_size: int, total_runs: int) -> None:
-        self.enabled = total_runs > run_block_size
-        self.total_runs = total_runs
-        self.spilled = 0
-        self.directory: Path | None = None
-        if self.enabled:
-            self.directory = Path(
-                tempfile.mkdtemp(prefix="run_state_", dir=get_nvme_path())
-            )
-            logger.info(
-                "Spilling per-run state of %d synthetic runs to %s (run_block_size=%d)",
-                total_runs,
-                self.directory,
-                run_block_size,
-            )
-
-    def spill(self, dataset: EpiDataset) -> None:
-        if self.directory is None:
-            return
-        size = dataset.spill_run_state(self.directory / f"run_{self.spilled}.pt")
-        self.spilled += 1
-        if self.spilled == 1:
-            # Runs are near-identical in size; fail on the first one if the
-            # disk cannot hold the rest rather than after hours of building.
-            needed = size * (self.total_runs - 1)
-            free = shutil.disk_usage(self.directory).free
-            if free < needed * 1.05:
-                raise RuntimeError(
-                    f"Spilling {self.total_runs} runs needs ~{needed / 1e9:.0f} GB "
-                    f"in {self.directory} but only {free / 1e9:.0f} GB is free; "
-                    "point TMPDIR at larger node-local storage."
-                )
-
-    def attach(self, train_dataset: ConcatDataset) -> None:
-        """Delete the spill directory when the training dataset is collected.
-
-        Forked DataLoader workers inherit the finalizer, so only the process
-        that built the datasets may delete the files they all read.
-        """
-        if self.directory is not None:
-            weakref.finalize(
-                train_dataset, _remove_spill_dir, str(self.directory), os.getpid()
-            )
-
-
-def _remove_spill_dir(directory: str, owner_pid: int) -> None:
-    if os.getpid() == owner_pid:
-        shutil.rmtree(directory, ignore_errors=True)
+    # Builds and drops the heavy state of the synthetic runs per block; the
+    # sampler publishes each epoch's block plan to it.
+    block_pipeline: RunBlockPipeline | None = None
 
 
 def load_sparsity_mapping(dataset_path: Path) -> dict[str, float]:
@@ -429,6 +372,64 @@ def _validate_curriculum_dataset_dimensions(datasets: list[EpiDataset]) -> None:
     )
 
 
+def _build_light_synth_datasets(
+    config: EpiForecasterConfig,
+    synth_runs: list[str],
+    *,
+    scaler_run: str,
+    scaler_ds: EpiDataset,
+    train_region_ids: list[str],
+    overlap_label: str,
+    bio_preprocessor: object,
+    mobility_preprocessor: object,
+    region_embedding_store: RegionEmbeddingStore | None,
+    workers: int,
+) -> tuple[list[EpiDataset], float]:
+    """Build every synthetic run's light state in parallel, in ``synth_runs`` order.
+
+    Each run opens its own zarr handle and shares only the read-only fitted
+    preprocessors, so the builds are independent. Threads are enough: reading a
+    run is zarr/blosc decompression plus numpy/torch passes that release the
+    GIL. No DataLoader fork happens here (the pool is joined before return).
+    Returns the datasets and the wall time of the build.
+    """
+    dataset_path = Path(config.data.dataset_path)
+
+    def build(run_id: str) -> EpiDataset:
+        if run_id == scaler_run:
+            return scaler_ds
+        mapped_train_nodes = _map_region_ids_to_nodes(
+            train_region_ids,
+            dataset_path=dataset_path,
+            run_id=run_id,
+        )
+        if not mapped_train_nodes:
+            mapped_train_nodes = _fallback_all_nodes(dataset_path, run_id)
+            logger.warning(
+                "Synthetic run '%s' has no overlap with %s regions; "
+                "using all nodes for training targets.",
+                run_id,
+                overlap_label,
+            )
+        return EpiDataset(
+            config=config,
+            target_nodes=mapped_train_nodes,
+            context_nodes=mapped_train_nodes,
+            biomarker_preprocessor=bio_preprocessor,
+            mobility_preprocessor=mobility_preprocessor,
+            run_id=run_id,
+            region_embedding_store=region_embedding_store,
+            defer_heavy_state=True,
+        )
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="light-build"
+    ) as executor:
+        datasets = list(executor.map(build, synth_runs))
+    return datasets, time.perf_counter() - started
+
+
 def build_curriculum_datasets(
     config: EpiForecasterConfig,
     train_nodes: list[int],
@@ -436,10 +437,16 @@ def build_curriculum_datasets(
     test_nodes: list[int],
     real_run: str,
     synth_runs: list[str],
-    run_block_size: int,
+    curriculum: CurriculumConfig,
     region_embedding_store: RegionEmbeddingStore | None = None,
 ) -> CurriculumBuildResult:
     """Build curriculum training datasets with real + synthetic runs.
+
+    Synthetic runs get only their light state here (built in parallel,
+    ``curriculum.light_build_workers`` threads); their heavy state is built per
+    block by the returned ``block_pipeline`` (``curriculum.prefetch_blocks``,
+    ``curriculum.block_build_workers``). The real run and the validation/test
+    datasets are built eagerly.
 
     Args:
         config: EpiForecasterConfig
@@ -448,15 +455,16 @@ def build_curriculum_datasets(
         test_nodes: Node indices for test targets
         real_run: Real run ID (typically "real")
         synth_runs: List of synthetic run IDs
-        run_block_size: ``training.curriculum.run_block_size``; with more
-            synthetic runs than this, each run's per-run tables are spilled to
-            node-local disk and restored only while its block is sampled.
+        curriculum: ``training.curriculum`` block pipeline settings
 
     Returns:
         CurriculumBuildResult with train/val/test datasets
     """
     dataset_path = Path(config.data.dataset_path)
-    spiller = _RunStateSpiller(run_block_size, len(synth_runs))
+    pipeline = RunBlockPipeline(
+        prefetch_blocks=curriculum.prefetch_blocks,
+        block_build_workers=curriculum.block_build_workers,
+    )
 
     # --- Synth-only mode: no real dataset ---
     if not real_run:
@@ -478,6 +486,8 @@ def build_curriculum_datasets(
                 synth_scaler_run,
             )
 
+        # The scaler run is built eagerly: validation and test reuse its dense
+        # mobility tensors. It turns lazy once they are built.
         synth_scaler_ds = EpiDataset(
             config=config,
             target_nodes=synth_train_nodes,
@@ -491,42 +501,20 @@ def build_curriculum_datasets(
         synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
         synth_mobility_preprocessor = synth_scaler_ds.mobility_preprocessor
 
-        synth_datasets = []
-        for s_run in synth_runs:
-            if s_run == synth_scaler_run:
-                synth_datasets.append(synth_scaler_ds)
-                continue
-
-            mapped_train_nodes = _map_region_ids_to_nodes(
-                train_region_ids,
-                dataset_path=dataset_path,
-                run_id=s_run,
-            )
-            if not mapped_train_nodes:
-                mapped_train_nodes = _fallback_all_nodes(dataset_path, s_run)
-                logger.warning(
-                    "Synthetic run '%s' has no overlap with reference regions; "
-                    "using all nodes for training targets.",
-                    s_run,
-                )
-
-            s_ds = EpiDataset(
-                config=config,
-                target_nodes=mapped_train_nodes,
-                context_nodes=mapped_train_nodes,
-                biomarker_preprocessor=synth_bio_preprocessor,
-                mobility_preprocessor=synth_mobility_preprocessor,
-                run_id=s_run,
-                region_embedding_store=region_embedding_store,
-            )
-            # Release before the next run is built so peak memory holds one
-            # dense run plus the compact state of the runs built so far.
-            s_ds.release_dense_mobility()
-            spiller.spill(s_ds)
-            synth_datasets.append(s_ds)
+        synth_datasets, light_build_s = _build_light_synth_datasets(
+            config,
+            synth_runs,
+            scaler_run=synth_scaler_run,
+            scaler_ds=synth_scaler_ds,
+            train_region_ids=train_region_ids,
+            overlap_label="reference",
+            bio_preprocessor=synth_bio_preprocessor,
+            mobility_preprocessor=synth_mobility_preprocessor,
+            region_embedding_store=region_embedding_store,
+            workers=curriculum.light_build_workers,
+        )
 
         train_dataset = ConcatDataset(synth_datasets)
-        spiller.attach(train_dataset)
 
         val_dataset = EpiDataset(
             config=config,
@@ -554,9 +542,9 @@ def build_curriculum_datasets(
             region_embedding_store=region_embedding_store,
         )
 
-        # Val/test keep the scaler run's dense tensors alive by reference.
-        synth_scaler_ds.release_dense_mobility()
-        spiller.spill(synth_scaler_ds)
+        # Val/test keep the scaler run's dense tensors alive by reference; the
+        # scaler run itself rebuilds its heavy state per block like every run.
+        synth_scaler_ds.convert_to_lazy_heavy_state()
         synth_scaler_ds.release_shared_sparse_topology()
         val_dataset.release_shared_sparse_topology()
         test_dataset.release_shared_sparse_topology()
@@ -564,6 +552,12 @@ def build_curriculum_datasets(
             ds.release_shared_sparse_topology()
 
         _validate_curriculum_dataset_dimensions(synth_datasets)
+        pipeline.register(synth_datasets)
+        pipeline.record_startup(
+            light_build_s=light_build_s,
+            n_runs=len(synth_datasets),
+            workers=curriculum.light_build_workers,
+        )
 
         return CurriculumBuildResult(
             train_dataset=train_dataset,
@@ -572,6 +566,7 @@ def build_curriculum_datasets(
             real_run_id="",
             synth_run_ids=synth_runs,
             region_embedding_store=region_embedding_store,
+            block_pipeline=pipeline,
         )
 
     # --- Standard mode: real + synthetic ---
@@ -615,6 +610,8 @@ def build_curriculum_datasets(
             synth_scaler_run,
         )
 
+    # Synthetic runs share no dense tensors with the real val/test datasets, so
+    # the scaler run is lazy from the start.
     synth_scaler_ds = EpiDataset(
         config=config,
         target_nodes=synth_train_nodes,
@@ -623,49 +620,26 @@ def build_curriculum_datasets(
         mobility_preprocessor=None,
         run_id=synth_scaler_run,
         region_embedding_store=region_embedding_store,
+        defer_heavy_state=True,
     )
 
     synth_bio_preprocessor = synth_scaler_ds.biomarker_preprocessor
     synth_mobility_preprocessor = synth_scaler_ds.mobility_preprocessor
 
-    # Synthetic runs share no dense tensors with the real val/test datasets.
-    synth_scaler_ds.release_dense_mobility()
-    spiller.spill(synth_scaler_ds)
-
-    synth_datasets = []
-    for s_run in synth_runs:
-        if s_run == synth_scaler_run:
-            synth_datasets.append(synth_scaler_ds)
-            continue
-
-        mapped_train_nodes = _map_region_ids_to_nodes(
-            train_region_ids,
-            dataset_path=dataset_path,
-            run_id=s_run,
-        )
-        if not mapped_train_nodes:
-            mapped_train_nodes = _fallback_all_nodes(dataset_path, s_run)
-            logger.warning(
-                "Synthetic run '%s' has no overlap with real regions; "
-                "using all nodes for training targets.",
-                s_run,
-            )
-
-        s_ds = EpiDataset(
-            config=config,
-            target_nodes=mapped_train_nodes,
-            context_nodes=mapped_train_nodes,
-            biomarker_preprocessor=synth_bio_preprocessor,
-            mobility_preprocessor=synth_mobility_preprocessor,
-            run_id=s_run,
-            region_embedding_store=region_embedding_store,
-        )
-        s_ds.release_dense_mobility()
-        spiller.spill(s_ds)
-        synth_datasets.append(s_ds)
+    synth_datasets, light_build_s = _build_light_synth_datasets(
+        config,
+        synth_runs,
+        scaler_run=synth_scaler_run,
+        scaler_ds=synth_scaler_ds,
+        train_region_ids=train_region_ids,
+        overlap_label="real",
+        bio_preprocessor=synth_bio_preprocessor,
+        mobility_preprocessor=synth_mobility_preprocessor,
+        region_embedding_store=region_embedding_store,
+        workers=curriculum.light_build_workers,
+    )
 
     train_dataset = ConcatDataset([real_train_ds] + synth_datasets)
-    spiller.attach(train_dataset)
 
     val_dataset = EpiDataset(
         config=real_config,
@@ -700,6 +674,12 @@ def build_curriculum_datasets(
         ds.release_shared_sparse_topology()
 
     _validate_curriculum_dataset_dimensions([real_train_ds] + synth_datasets)
+    pipeline.register(synth_datasets)
+    pipeline.record_startup(
+        light_build_s=light_build_s,
+        n_runs=len(synth_datasets),
+        workers=curriculum.light_build_workers,
+    )
 
     return CurriculumBuildResult(
         train_dataset=train_dataset,
@@ -708,4 +688,5 @@ def build_curriculum_datasets(
         real_run_id=real_run,
         synth_run_ids=synth_runs,
         region_embedding_store=region_embedding_store,
+        block_pipeline=pipeline,
     )

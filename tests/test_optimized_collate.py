@@ -7,9 +7,6 @@ from data.epi_dataset import EpiDatasetItem
 from data.epi_batch import optimized_collate_graphs
 
 
-SHARED_NODES = torch.tensor([4, 5, 6], dtype=torch.long)
-
-
 def _make_item(
     window_start: int, target_pos: int = 0, run_id="real", L: int = 3
 ) -> EpiDatasetItem:
@@ -22,8 +19,6 @@ def _make_item(
         "hosp_hist": torch.zeros(L, 3),
         "deaths_hist": torch.zeros(L, 3),
         "cases_hist": torch.zeros(L, 3),
-        "mob_target_node_idx": torch.tensor(target_pos, dtype=torch.long),
-        "mob_real_node_idx": SHARED_NODES,
         "population": torch.tensor(1.0),
         "run_id": run_id,
         "target_region_index": None,
@@ -59,8 +54,10 @@ def test_placement_tensors_follow_batch_order() -> None:
     expected_global_t = torch.cat([torch.arange(10 * b, 10 * b + L) for b in range(B)])
     assert torch.equal(mob_batch.global_t, expected_global_t)
 
-    expected_targets = torch.arange(B).repeat_interleave(L)
-    assert torch.equal(mob_batch.target_node, expected_targets)
+    # The local target position and context nodes depend on the run's heavy
+    # state and are attached in the main process (inject_context_placement).
+    assert not hasattr(mob_batch, "target_node")
+    assert not hasattr(mob_batch, "mob_real_node_idx")
 
 
 @pytest.mark.epiforecaster
@@ -79,24 +76,13 @@ def test_heterogeneous_or_missing_run_id_stays_none() -> None:
         {
             "window_start": 0,
             "temporal_covariates": torch.zeros(2, 0),
-            "mob_target_node_idx": torch.tensor(0),
         },
         {
             "window_start": 1,
             "temporal_covariates": torch.zeros(2, 0),
-            "mob_target_node_idx": torch.tensor(0),
         },
     ]
     assert getattr(optimized_collate_graphs(missing), "run_id", None) is None
-
-
-@pytest.mark.epiforecaster
-def test_shared_context_nodes_must_be_identical_objects() -> None:
-    item_a = _make_item(0)
-    item_b = _make_item(1)
-    item_b["mob_real_node_idx"] = item_b["mob_real_node_idx"].clone()
-    with pytest.raises(ValueError, match="same cached tensor"):
-        optimized_collate_graphs([item_a, item_b])
 
 
 @pytest.mark.epiforecaster
@@ -106,4 +92,3 @@ def test_shared_window_start_emits_one_time_row() -> None:
     mob_batch = optimized_collate_graphs(items)
 
     assert torch.equal(mob_batch.global_t, torch.arange(7, 7 + L))
-    assert mob_batch.target_node.shape == (B * L,)

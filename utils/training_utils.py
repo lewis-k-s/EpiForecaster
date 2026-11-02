@@ -16,9 +16,10 @@ STATIC_GRAPH_ADJACENCY_SOURCES = {"spatial_knn", "spatial_queen"}
 # (~1 GB per 945-region, 455-day run). Keep at most this many datasets
 # resident; an evicted dataset rebuilds its cache on next use. Curriculum
 # training raises the limit to the run block size
-# (``EpidemicCurriculumSampler.resident_dataset_limit``) and additionally
-# evicts every run outside the block being sampled (``run_blocks``), so a
-# block's runs stay resident and nothing is rebuilt within a block.
+# (``EpidemicCurriculumSampler.resident_dataset_limit``); the block pipeline
+# (``data.block_pipeline``) additionally drops a block's host and device state
+# when the block ends, so a block's runs stay resident and nothing is rebuilt
+# within a block.
 MAX_DEVICE_CACHED_DATASETS = 4
 _device_cache_limit = MAX_DEVICE_CACHED_DATASETS
 _device_cached_datasets: OrderedDict[int, weakref.ReferenceType] = OrderedDict()
@@ -32,14 +33,19 @@ def set_device_cache_limit(limit: int) -> None:
     _device_cache_limit = limit
 
 
+def _has_device_caches(dataset: object) -> bool:
+    return bool(
+        getattr(dataset, "_gpu_mobility_cache", None)
+        or getattr(dataset, "_context_device_cache", None)
+    )
+
+
 def _evict_device_caches(evicted: object) -> None:
-    """Clear a dataset's device caches and unmap its spilled host state."""
+    """Clear a dataset's device caches."""
     for name in ("_gpu_mobility_cache", "_context_device_cache"):
         cache = getattr(evicted, name, None)
         if cache:
             cache.clear()
-    if isinstance(evicted, EpiDataset) and evicted.run_state_spilled:
-        evicted.unload_run_state()
 
 
 def _retain_device_caches(base_ds: object) -> None:
@@ -48,6 +54,12 @@ def _retain_device_caches(base_ds: object) -> None:
     existing = _device_cached_datasets.pop(key, None)
     if existing is not None and existing() is not base_ds:
         existing = None
+    # Datasets whose caches were dropped (released blocks) must not count
+    # against the limit and push out live ones.
+    for other_key, ref in list(_device_cached_datasets.items()):
+        other = ref()
+        if other is None or not _has_device_caches(other):
+            del _device_cached_datasets[other_key]
     _device_cached_datasets[key] = existing or weakref.ref(base_ds)
     while len(_device_cached_datasets) > _device_cache_limit:
         _, ref = _device_cached_datasets.popitem(last=False)
@@ -56,40 +68,16 @@ def _retain_device_caches(base_ds: object) -> None:
             _evict_device_caches(evicted)
 
 
-def _evict_outside_block(
-    block: frozenset[int], run_blocks: list[frozenset[int]]
-) -> None:
-    """Evict every block-managed dataset that is not in ``block``.
+def _activate_dataset(base_ds: object | None) -> None:
+    """Make ``base_ds`` the most recent resident run with its heavy state built.
 
-    Datasets outside all of ``run_blocks`` (real, validation, test) are not
-    managed by blocks and stay under the LRU limit only.
-    """
-    managed = frozenset().union(*run_blocks)
-    for key in list(_device_cached_datasets):
-        if key in managed and key not in block:
-            evicted = _device_cached_datasets.pop(key)()
-            if evicted is not None:
-                _evict_device_caches(evicted)
-
-
-def _activate_dataset(
-    base_ds: object | None, concat_dataset: torch.utils.data.Dataset | None
-) -> None:
-    """Make ``base_ds`` the most recent resident run, restoring spilled state.
-
-    ``concat_dataset.run_blocks`` (set by the curriculum sampler each epoch)
-    lists the ``id`` of each block's runs; reaching a run of a new block evicts
-    the runs of every other block first.
+    A lazy run belongs to a block pipeline; reaching a run of a new block
+    releases the previous block and waits for this block's build.
     """
     if base_ds is None:
         return
-    run_blocks = getattr(concat_dataset, "run_blocks", None)
-    if run_blocks:
-        block = next((b for b in run_blocks if id(base_ds) in b), None)
-        if block is not None:
-            _evict_outside_block(block, run_blocks)
-    if isinstance(base_ds, EpiDataset):
-        base_ds.load_run_state()
+    if isinstance(base_ds, EpiDataset) and base_ds.block_pipeline is not None:
+        base_ds.block_pipeline.activate(base_ds)
     _retain_device_caches(base_ds)
 
 
@@ -205,6 +193,34 @@ def _resolve_base_dataset(
     return base_ds
 
 
+def inject_context_placement(
+    batch_data: EpiBatch,
+    dataset: torch.utils.data.Dataset,
+) -> None:
+    """Attach the run's graph placement to ``batch_data.mob_batch``.
+
+    Workers only know global node ids. The local target position inside the
+    k-hop context node set and the context nodes' region indices depend on the
+    run's mobility, so they come from its heavy state here in the main process:
+    ``mob_batch.target_node`` is [B*L] (each sample's target position repeated
+    over its L history steps) and ``mob_batch.mob_real_node_idx`` is [N_ctx].
+    """
+    mob_batch = batch_data.mob_batch
+    if mob_batch is None or not hasattr(mob_batch, "global_t"):
+        return
+
+    base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
+    if not isinstance(base_ds, EpiDataset):
+        raise TypeError(
+            f"Cannot place a batch on {type(base_ds).__name__}; EpiDataset required."
+        )
+    # Builds the run's heavy state first: placement reads it.
+    _activate_dataset(base_ds)
+    local_targets = base_ds.local_target_positions(batch_data.target_node)
+    mob_batch.target_node = local_targets.repeat_interleave(batch_data.t)
+    mob_batch.mob_real_node_idx = base_ds.mob_real_node_idx
+
+
 def inject_gpu_mobility(
     batch_data: EpiBatch,
     dataset: torch.utils.data.Dataset,
@@ -226,8 +242,8 @@ def inject_gpu_mobility(
         return
 
     base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
-    # Restores spilled run state first: the checks below read it.
-    _activate_dataset(base_ds, dataset)
+    # Builds the run's heavy state first: the checks below read it.
+    _activate_dataset(base_ds)
 
     config = getattr(base_ds, "config", None)
     adjacency_source = (
@@ -263,7 +279,7 @@ def inject_gpu_mobility(
             sliced_mob = source_adjacency[node_ids.unsqueeze(-1), node_ids].to(
                 MODEL_PARAM_DTYPE
             )
-            total_t = base_ds.preloaded_mobility.shape[0]
+            total_t = len(base_ds._temporal_coords)
             sliced_mob = sliced_mob.unsqueeze(0).expand(total_t, -1, -1)
         elif source_adjacency is None:
             # Released dataset: weights are already masked and restricted to
@@ -339,8 +355,8 @@ def inject_context_features(
         return
 
     base_ds = _resolve_base_dataset(dataset, getattr(mob_batch, "run_id", None))
-    # Restores spilled run state first: the checks below read it.
-    _activate_dataset(base_ds, dataset)
+    # Builds the run's heavy state first: the checks below read it.
+    _activate_dataset(base_ds)
     if base_ds is None or (
         getattr(base_ds, "context_feature_ww", None) is None
         and getattr(base_ds, "context_feature_clinical", None) is None

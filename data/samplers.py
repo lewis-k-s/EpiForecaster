@@ -6,6 +6,7 @@ from typing import Iterator
 
 from torch.utils.data import BatchSampler, ConcatDataset
 
+from data.block_pipeline import RunBlockPipeline
 from models.configs import CurriculumConfig
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         drop_last: bool = False,
         real_run_id: str = "real",
         seed: int | None = None,
+        block_pipeline: RunBlockPipeline | None = None,
     ):
         """
         Args:
@@ -128,6 +130,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.drop_last = drop_last
         self.real_run_id = real_run_id.strip()
         self.seed = seed
+        self.block_pipeline = block_pipeline
 
         self.state = CurriculumState()
 
@@ -615,13 +618,17 @@ class EpidemicCurriculumSampler(BatchSampler):
 
     def __iter__(self) -> Iterator[list[int]]:
         blocks = self.plan_epoch_blocks()
-        if isinstance(self.dataset, ConcatDataset):
-            # Consumers evict the device caches of runs outside the block
-            # being sampled (utils.training_utils._activate_dataset).
-            self.dataset.run_blocks = [
-                frozenset(id(self.sub_datasets[i]) for i in block.synth_dataset_indices)
-                for block in blocks
-            ]
+        if self.block_pipeline is not None:
+            # The consumer (main process) builds a block's heavy run state on
+            # demand and drops it afterwards (data.block_pipeline). Batches are
+            # consumed in block order, so the plan also fixes the prefetch order.
+            self.block_pipeline.begin_epoch(
+                [
+                    [self.sub_datasets[i] for i in block.synth_dataset_indices]
+                    for block in blocks
+                ],
+                epoch=self.state.epoch,
+            )
         for block in blocks:
             yield from block.batches
 

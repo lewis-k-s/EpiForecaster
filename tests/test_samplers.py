@@ -294,14 +294,30 @@ def test_resident_dataset_limit_is_block_runs_plus_real() -> None:
     )
 
 
-def test_iteration_publishes_run_blocks_to_the_dataset() -> None:
+class _PlanRecorder:
+    def __init__(self) -> None:
+        self.plans: list[tuple[list[list[Dataset]], int]] = []
+
+    def begin_epoch(self, blocks: list[list[Dataset]], epoch: int) -> None:
+        self.plans.append((blocks, epoch))
+
+
+def test_iteration_publishes_the_block_plan_to_the_pipeline() -> None:
     dataset = _blocked_dataset(with_real=True)
     sampler = _blocked_sampler(dataset, run_block_size=3, synth_ratio=0.5)
+    recorder = _PlanRecorder()
+    sampler.block_pipeline = recorder
     sampler.set_curriculum(0)
     iterator = iter(sampler)
+    assert not recorder.plans  # published when the first batch is requested
     next(iterator)
     plan = sampler.plan_epoch_blocks(0)
-    assert dataset.run_blocks == [
-        frozenset(id(dataset.datasets[i]) for i in block.synth_dataset_indices)
-        for block in plan
+    assert recorder.plans == [
+        (
+            [
+                [dataset.datasets[i] for i in block.synth_dataset_indices]
+                for block in plan
+            ],
+            0,
+        )
     ]
