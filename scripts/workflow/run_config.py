@@ -468,6 +468,28 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             raise ValueError(
                 "training.init_checkpoint is required by this workflow template"
             )
+        resume_checkpoint = training.get("resume_checkpoint")
+        resume_best_checkpoint = training.get("resume_best_checkpoint")
+        if (resume_checkpoint is None) != (resume_best_checkpoint is None):
+            raise ValueError(
+                "training.resume_checkpoint and training.resume_best_checkpoint "
+                "must be provided together"
+            )
+        if resume_checkpoint is not None:
+            for field, value in (
+                ("resume_checkpoint", resume_checkpoint),
+                ("resume_best_checkpoint", resume_best_checkpoint),
+            ):
+                if not Path(str(value)).is_absolute():
+                    raise ValueError(
+                        f"training.{field} must be an absolute GPFS path when provided"
+                    )
+            if init_checkpoint is not None or require_init_checkpoint:
+                raise ValueError(
+                    "training.resume_checkpoint is mutually exclusive with "
+                    "training.init_checkpoint and "
+                    "training.require_init_checkpoint"
+                )
     elif kind == "evaluate":
         checkpoint = workflow_config["evaluation"].get("checkpoint")
         if checkpoint is None or not Path(str(checkpoint)).is_absolute():

@@ -434,6 +434,33 @@ declared artifacts without rewriting that default receipt. Existing run
 directories and promotion destinations are never overwritten. Do not run
 `dvc gc` while any run or promoted artifact may reference the shared cache.
 
+### Training continuation
+
+A `train` run that hits its Slurm time limit can be continued exactly by a new
+immutable run. The run keeps `checkpoint_epoch_NNNN.pt` after every epoch
+(`output.checkpoint_frequency=1` in the synthetic-pretraining template) under
+`outputs/training/<experiment_name>/<model_id>/checkpoints/` on GPFS. Work done
+after the last epoch checkpoint is lost; the continuation restarts at the
+following epoch.
+
+1. Copy the original template and keep every scientific setting identical,
+   including `training.epochs` in the base config, so the cosine schedule
+   continues rather than restarts.
+2. Set both absolute GPFS paths from the timed-out run:
+   `training.resume_checkpoint` to the last `checkpoint_epoch_NNNN.pt` and
+   `training.resume_best_checkpoint` to that run's `best_model.pt`. They must be
+   given together and exclude `training.init_checkpoint`.
+3. `prepare` a new run id with that config and `run` it as usual.
+
+Preparation pins both files under `inputs/` and records their SHA-256 in the
+manifest (`training_resume_input`). Before training, the best checkpoint must
+not be later than the resume checkpoint and must carry the resume checkpoint's
+best selection score and metric. It seeds the new run's `best_model.pt`, so the
+canonical checkpoint exists even if no later epoch improves. A retried attempt
+restarts from the same pinned pair and replaces any stale `best_model.pt`.
+Optimizer, scheduler, RNG, epoch, patience, and selection state resume from the
+epoch checkpoint.
+
 ## Research-role evaluation
 
 For a protected research training config, set `evaluation.research_outputs: true`,

@@ -37,6 +37,7 @@ training:
   overrides:
     - output.save_checkpoints=true
     - training.run_final_evaluation=false
+    - output.checkpoint_frequency=1
 
 evaluation:
   split: test
