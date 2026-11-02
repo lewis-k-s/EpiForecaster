@@ -39,4 +39,7 @@ resources:
     tasks: 1
     cpus_per_task: 20
     gres: gpu:1
-    runtime: 420
+    # A 50-epoch real-data trial in HPO run hpo-core-replicates-20261102 took
+    # about 5 minutes on a quarter of a GPU (compilation, training, per-epoch
+    # validation). Staging, test evaluation, and plots add a few minutes.
+    runtime: 60
