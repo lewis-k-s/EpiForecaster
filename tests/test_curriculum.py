@@ -384,14 +384,16 @@ class TestCurriculumConfigRunBlockSize:
     def test_block_pipeline_defaults(self):
         config = CurriculumConfig()
         assert config.prefetch_blocks == 1
-        assert config.block_build_workers == 2
+        assert config.block_builders == 4
+        assert config.builder_threads == 3
         assert config.light_build_workers == 8
 
     @pytest.mark.parametrize(
         ("field", "value", "message"),
         [
             ("prefetch_blocks", -1, "prefetch_blocks must be >= 0"),
-            ("block_build_workers", 0, "block_build_workers must be >= 1"),
+            ("block_builders", 0, "block_builders must be >= 1"),
+            ("builder_threads", 0, "builder_threads must be >= 1"),
             ("light_build_workers", 0, "light_build_workers must be >= 1"),
         ],
     )

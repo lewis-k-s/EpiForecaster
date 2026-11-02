@@ -153,7 +153,8 @@ training:
     chunk_size: 512         # contiguous windows per run
     run_block_size: 8       # synthetic runs resident at a time (see below)
     prefetch_blocks: 1      # blocks built in the background ahead of training
-    block_build_workers: 2  # threads building the runs of a block
+    block_builders: 4       # spawned processes building the runs of a block
+    builder_threads: 3      # native threads per builder process
     light_build_workers: 8  # threads building every run's light state at startup
     run_sampling: "round_robin"  # or "random"
     schedule:
@@ -224,26 +225,48 @@ The sampler publishes each epoch's block plan to `RunBlockPipeline`. Before each
 batch the main process calls `activate(run)`. The first batch of a new block
 releases the previous block's heavy state and device caches, submits the builds
 of blocks up to `prefetch_blocks` ahead, and waits only for the current block's
-unfinished builds. `block_build_workers` threads build runs (runs of later blocks
-queue behind the current block's). With `prefetch_blocks: 0` each block is built
-on demand with no overlap. A single-block epoch keeps its runs resident across
-epochs. Threads are used instead of processes because a run build is zarr/blosc
-decompression plus numpy/torch passes that release the GIL, and the result
-(~0.5 GB of tensors per run) must be read zero-copy by the main process.
+unfinished builds. With `prefetch_blocks: 0` each block is built on demand with
+no overlap. A single-block epoch keeps its runs resident across epochs.
+
+Runs are built by `block_builders` **spawned processes** (`ProcessPoolExecutor`,
+`spawn` context), each limited to `builder_threads` torch/dask/blosc threads;
+runs of later blocks queue behind the current block's. Builders were threads of
+the trainer at first; on MN5 (job 48425142, `OMP_NUM_THREADS=20`) that built a
+run 3-10x slower than the old serial build (diagnostics and k-hop are Python
+loops that contend with the training loop for the GIL; torch/dask/blosc fan out
+inside the trainer) and cost ~30% of the training throughput. A builder receives
+a small `HeavyBuildRequest` (config, run id, node sets, fitted mobility
+preprocessor), re-reads the run's mobility from the zarr store, runs the very
+same `EpiDataset._build_mobility_state` code as the eager build on a reduced
+view, and returns the float16 graph weights, the bit-packed neighbor and k-hop
+tables, the context node set and (first build only) the diagnostics. The
+tensors cross the process boundary through shared memory
+(`torch.multiprocessing`), not pickle bytes. The main process installs them
+(`EpiDataset.install_heavy_state`) and derives the series-side context tables
+from the light series it holds (an index_select, logged as `install_s`).
+Mobility diagnostics are computed once per run, on its first build, and kept
+when the heavy state is released. Defaults: 4 builders x 3 threads use 12 of 20
+CPUs next to 4 train and 2 validation loader workers and the trainer; each
+builder holds ~2-3 GB transiently. The entry point must be importable by
+`spawn` (the CLI is: `if __name__ == "__main__"`).
 
 #### Fork safety
 
 DataLoader workers are forked (`fork` context; persistent by default, prestarted
-at trainer init). A fork while a builder thread runs can leave a lock held
-forever in the child, and the child would keep the parent's heavy tensors alive
-after the parent dropped them. All three loaders are `ForkGuardedDataLoader`s:
+at trainer init). With thread builders a fork had to wait for builder threads
+holding allocator/OMP/zarr locks; spawned builders are separate interpreters, so
+that hazard is gone and builds can run during a fork. What remains is memory: a
+forked worker inherits the parent's mappings of installed heavy state and of
+finished-but-uninstalled builder results, and keeps them alive after the parent
+drops them, which for per-epoch (non-persistent) workers pins a block for the
+whole epoch. All three loaders are therefore still `ForkGuardedDataLoader`s:
 creating a worker iterator (the fork) runs inside `RunBlockPipeline.quiesced()`,
-which waits for in-flight builds, joins the pool threads and releases all heavy
-state; an epoch plan published meanwhile only starts building when the guard
-exits. The trainer's prestart wraps all loader forks in one guard so the first
-loader's plan does not start builds before the last one has forked. With
-persistent workers (the default) the guard costs nothing after the prestart;
-with `persistent_workers: false` every `iter(loader)` forks again, so each
+which waits out in-flight builds, discards their results and releases all heavy
+state (the builder pool stays up); an epoch plan published meanwhile only starts
+building when the guard exits. The trainer's prestart wraps all loader forks in
+one guard. With persistent workers (the default) the only guarded fork is that
+prestart, when nothing is built yet, so the guard costs nothing; with
+`persistent_workers: false` every `iter(loader)` forks again, so each
 epoch/evaluation start drops the heavy state and rebuilds the current block.
 
 #### Profiling
@@ -251,12 +274,14 @@ epoch/evaluation start drops the heavy state and rebuilds the current block.
 Each block logs `block_index, n_runs, build_s` (wall time of the block's builds),
 per-run build mean/max, per-phase means (`run_phase_s_mean`) and `wait_s` (main
 process stall at block start); each epoch logs total stall, block count and mean
-build time; startup logs the light-build wall time. The same records are
+build time; startup logs the light-build wall time and the builder pool's
+startup time; block records carry the builder pids and torch thread count and
+the install time in `run_phase_s_mean`. The same records are
 appended to `curriculum_block_builds.jsonl` (schema version 1, one JSON object
 per line with `kind` = `startup` | `block` | `epoch` and the global step) in the
-run directory, so tuning runs of `prefetch_blocks` / `block_build_workers` can
+run directory, so tuning runs of `prefetch_blocks` / `block_builders` / `builder_threads` can
 be compared. `mobility_initialization_diagnostics.json` is rewritten after each
-epoch because lazy runs compute their diagnostics when their block is built.
+epoch because lazy runs compute their diagnostics when their first block is built.
 
 *   **Device:** `utils.training_utils` keeps at most
     `run_block_size + number of real datasets` datasets cached on the GPU

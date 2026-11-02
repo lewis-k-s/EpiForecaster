@@ -322,10 +322,14 @@ class CurriculumConfig:
     # Blocks built in the background ahead of the block being trained. 0 builds
     # each block on demand when its first batch is needed (no overlap).
     prefetch_blocks: int = 1
-    # Threads building the runs of a block (and of prefetched blocks)
-    # concurrently. Each thread holds one run's dense mobility (~1.2 GB for a
-    # 945-region, 455-day run) transiently.
-    block_build_workers: int = 2
+    # Builder processes (spawn) building the runs of a block and of prefetched
+    # blocks concurrently. Each holds one run's dense mobility (~1.2 GB for a
+    # 945-region, 455-day run) plus ~1 GB of intermediates transiently.
+    block_builders: int = 4
+    # Torch/dask/blosc threads inside each builder process. builders x threads
+    # should leave room on the node for the trainer, DataLoader workers and
+    # their threads (4 x 3 = 12 of 20 CPUs next to 4 train + 2 val workers).
+    builder_threads: int = 3
     # Threads building every synthetic run's light state (series, masks, index
     # maps) at startup.
     light_build_workers: int = 8
@@ -356,9 +360,11 @@ class CurriculumConfig:
             raise ValueError(
                 f"prefetch_blocks must be >= 0, got {self.prefetch_blocks}"
             )
-        if self.block_build_workers < 1:
+        if self.block_builders < 1:
+            raise ValueError(f"block_builders must be >= 1, got {self.block_builders}")
+        if self.builder_threads < 1:
             raise ValueError(
-                f"block_build_workers must be >= 1, got {self.block_build_workers}"
+                f"builder_threads must be >= 1, got {self.builder_threads}"
             )
         if self.light_build_workers < 1:
             raise ValueError(

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from data.block_pipeline import RunBlockPipeline, live_builder_threads
+from data.block_pipeline import RunBlockPipeline
 from training.dataloader_factory import ForkGuardedDataLoader
 from training.training_dynamics import (
     BLOCK_BUILD_ARTIFACT_NAME,
@@ -20,12 +24,17 @@ from training.training_dynamics import (
 
 
 class _StubRun:
-    """Minimal lazy run; ``gate`` holds its build until set."""
+    """Minimal lazy run; ``gate`` holds its build until set.
+
+    ``heavy_build_request`` returns the run itself; the pipeline's worker
+    function (``_stub_worker``) "builds" it in a pool thread and the main thread
+    installs the result, like the real run and builder process.
+    """
 
     def __init__(self, name: str, *, fail: bool = False) -> None:
         self.run_id = name
         self.heavy_state_ready = False
-        self.heavy_build_timings = {"phase_s": 0.25}
+        self.heavy_build_timings: dict[str, float] = {}
         self.block_pipeline: RunBlockPipeline | None = None
         self.started = threading.Event()
         self.gate = threading.Event()
@@ -34,22 +43,43 @@ class _StubRun:
         self.builds = 0
         self.releases = 0
 
-    def build_heavy_state(self) -> float:
-        self.started.set()
-        assert self.gate.wait(10), "test gate never opened"
-        if self.fail:
-            raise ValueError(f"build of {self.run_id} failed")
+    def heavy_build_request(self) -> _StubRun:
+        return self
+
+    def install_heavy_state(self, result) -> None:
+        self.heavy_build_timings = {**result.phases, "install_s": 0.5}
         self.heavy_state_ready = True
         self.builds += 1
-        return 0.01
 
     def release_heavy_state(self) -> None:
         self.heavy_state_ready = False
         self.releases += 1
 
 
-def _pipeline(runs: list[_StubRun], *, prefetch: int, workers: int = 2):
-    pipeline = RunBlockPipeline(prefetch_blocks=prefetch, block_build_workers=workers)
+def _stub_worker(run: _StubRun):
+    run.started.set()
+    assert run.gate.wait(10), "test gate never opened"
+    if run.fail:
+        raise ValueError(f"build of {run.run_id} failed")
+    now = time.time()
+    return SimpleNamespace(
+        started=now - 0.01,
+        finished=now,
+        pid=os.getpid(),
+        torch_threads=3,
+        phases={"phase_s": 0.25},
+    )
+
+
+def _pipeline(runs: list[_StubRun], *, prefetch: int, builders: int = 2):
+    pipeline = RunBlockPipeline(
+        prefetch_blocks=prefetch,
+        block_builders=builders,
+        builder_threads=3,
+        executor_factory=lambda n, _threads: ThreadPoolExecutor(max_workers=n),
+        worker_fn=_stub_worker,
+        warmup_fn=os.getpid,
+    )
     pipeline.register(runs)
     return pipeline
 
@@ -105,18 +135,22 @@ def test_zero_prefetch_builds_each_block_on_demand(blocks):
     pipeline.shutdown()
 
 
-def test_prefetch_window_never_exceeds_the_configured_blocks(blocks):
+def test_prefetch_of_two_blocks_builds_every_block_ahead(blocks):
     pipeline = _pipeline(_all(blocks), prefetch=2)
     pipeline.begin_epoch(blocks, epoch=0)
     pipeline.activate(blocks[0][0])
-    # Wait until every run inside the window has finished building.
+    # Both following blocks build while block 0 is current; nothing installs
+    # until its block is entered.
     for run in blocks[1] + blocks[2]:
         assert run.started.wait(5)
-    pipeline.shutdown()
+        assert not run.heavy_state_ready
+    pipeline.activate(blocks[1][0])
+    pipeline.activate(blocks[2][0])
     assert [run.builds for run in _all(blocks)] == [1, 1, 1, 1, 1]
+    pipeline.shutdown()
 
 
-def test_fork_guard_leaves_no_builder_thread_and_no_heavy_state(blocks):
+def test_fork_guard_leaves_no_build_in_flight_and_no_heavy_state(blocks):
     runs = _all(blocks)
     pipeline = _pipeline(runs, prefetch=1)
     for run in blocks[1]:
@@ -124,32 +158,32 @@ def test_fork_guard_leaves_no_builder_thread_and_no_heavy_state(blocks):
     pipeline.begin_epoch(blocks, epoch=0)
     pipeline.activate(blocks[0][0])
     assert blocks[1][0].started.wait(5)
-    assert live_builder_threads(), "a prefetch build is in flight"
+    assert pipeline.in_flight_builds, "a prefetch build is in flight"
 
     # The guard waits for the in-flight build, then drops everything.
     opener = threading.Timer(0.2, lambda: [run.gate.set() for run in blocks[1]])
     opener.start()
     with pipeline.quiesced():
-        assert live_builder_threads() == []
+        assert pipeline.in_flight_builds == 0
         assert not any(run.heavy_state_ready for run in runs)
         with pytest.raises(RuntimeError, match="fork guard"):
             pipeline.activate(blocks[0][0])
         with pipeline.quiesced():  # re-entrant
-            assert live_builder_threads() == []
+            assert pipeline.in_flight_builds == 0
     opener.join()
 
     # After the guard the epoch resumes: the current block is rebuilt on use.
     pipeline.activate(blocks[0][0])
     assert all(run.heavy_state_ready for run in blocks[0])
     pipeline.shutdown()
-    assert live_builder_threads() == []
+    assert pipeline.in_flight_builds == 0
 
 
 def test_epoch_plan_published_inside_the_guard_starts_building_on_exit(blocks):
     pipeline = _pipeline(_all(blocks), prefetch=1)
     with pipeline.quiesced():
         pipeline.begin_epoch(blocks, epoch=0)
-        assert live_builder_threads() == []
+        assert pipeline.in_flight_builds == 0
         assert not any(run.started.is_set() for run in _all(blocks))
     assert blocks[0][0].started.wait(5)
     assert blocks[0][1].started.wait(5)
@@ -169,12 +203,14 @@ def test_dataloader_forks_only_inside_the_guard(blocks, monkeypatch, persistent)
     pipeline.activate(blocks[0][0])
     assert blocks[1][0].started.wait(5)
 
-    seen: list[tuple[list[str], list[bool]]] = []
+    seen: list[tuple[int, list[bool]]] = []
     original = DataLoader._get_iterator
 
     def spy(self):
         # The fork happens in here.
-        seen.append((live_builder_threads(), [run.heavy_state_ready for run in runs]))
+        seen.append(
+            (pipeline.in_flight_builds, [run.heavy_state_ready for run in runs])
+        )
         return original(self)
 
     monkeypatch.setattr(DataLoader, "_get_iterator", spy)
@@ -203,8 +239,8 @@ def test_dataloader_forks_only_inside_the_guard(blocks, monkeypatch, persistent)
 
     forks = 1 if persistent else 2
     assert len(seen) == forks
-    for threads, ready in seen:
-        assert threads == [], "no builder thread during the fork"
+    for in_flight, ready in seen:
+        assert in_flight == 0, "no build in flight during the fork"
         assert not any(ready), "no heavy state in the forked workers"
     pipeline.shutdown()
 
@@ -256,23 +292,13 @@ def test_registering_a_run_twice_is_rejected(blocks):
         pipeline.register(runs[:1])
 
 
-def _wait_until_ready(runs: list[_StubRun]) -> None:
-    for run in runs:
-        assert run.started.wait(5)
-    deadline = threading.Event()
-    for _ in range(100):
-        if all(run.heavy_state_ready for run in runs):
-            return
-        deadline.wait(0.05)
-    raise AssertionError("builds did not finish")
-
-
 def test_a_new_plan_reuses_resident_runs_and_drops_the_rest(blocks):
     runs = _all(blocks)
     pipeline = _pipeline(runs, prefetch=1)
     # A plan published but never consumed (e.g. the DataLoader prestart).
     pipeline.begin_epoch(blocks, epoch=0)
-    _wait_until_ready(blocks[0])
+    for run in blocks[0]:
+        assert run.started.wait(5)
 
     pipeline.begin_epoch([blocks[0], blocks[2]], epoch=1)
     pipeline.activate(blocks[0][1])
@@ -298,17 +324,25 @@ def test_epoch_records_account_for_waits_and_builds(blocks):
         pipeline.activate(block[0])
     summary = pipeline.end_epoch()
 
-    assert records[0] == {
-        "kind": "startup",
-        "light_build_s": 2.5,
-        "n_runs": 5,
-        "light_build_workers": 4,
-    }
+    assert records[0]["kind"] == "startup"
+    assert records[0]["light_build_s"] == 2.5
+    assert records[0]["n_runs"] == 5
+    assert records[0]["light_build_workers"] == 4
+    assert records[0]["block_builders"] == 2
+    assert records[0]["builder_threads"] == 3
+    assert records[0]["builder_pool_startup_s"] > 0
+    assert records[0]["builder_pids"] == [os.getpid()]
     block_records = [r for r in records if r["kind"] == "block"]
     assert [r["block_index"] for r in block_records] == [0, 1, 2]
     assert [r["n_runs"] for r in block_records] == [2, 2, 1]
     assert all(r["epoch"] == 3 and r["n_blocks"] == 3 for r in block_records)
-    assert all(r["run_phase_s_mean"] == {"phase_s": 0.25} for r in block_records)
+    assert all(
+        r["run_phase_s_mean"] == {"phase_s": 0.25, "install_s": 0.5}
+        for r in block_records
+    )
+    assert all(r["builder_pids"] == [os.getpid()] for r in block_records)
+    assert all(r["builder_torch_threads"] == 3 for r in block_records)
+    assert all(r["block_builders"] == 2 for r in block_records)
     assert summary["epoch"] == 3 and summary["blocks"] == 3
     assert summary["total_wait_s"] == pytest.approx(
         sum(r["wait_s"] for r in block_records)
@@ -324,9 +358,11 @@ def test_epoch_records_account_for_waits_and_builds(blocks):
 
 def test_prefetch_and_worker_counts_are_validated():
     with pytest.raises(ValueError, match="prefetch_blocks"):
-        RunBlockPipeline(prefetch_blocks=-1, block_build_workers=1)
-    with pytest.raises(ValueError, match="block_build_workers"):
-        RunBlockPipeline(prefetch_blocks=0, block_build_workers=0)
+        RunBlockPipeline(prefetch_blocks=-1, block_builders=1, builder_threads=1)
+    with pytest.raises(ValueError, match="block_builders"):
+        RunBlockPipeline(prefetch_blocks=0, block_builders=0, builder_threads=1)
+    with pytest.raises(ValueError, match="builder_threads"):
+        RunBlockPipeline(prefetch_blocks=0, block_builders=1, builder_threads=0)
 
 
 def test_block_build_records_append_as_jsonl(tmp_path: Path):

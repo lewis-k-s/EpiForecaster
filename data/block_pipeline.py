@@ -1,4 +1,4 @@
-"""Lazy per-block construction of heavy run state with background prefetch.
+"""Lazy per-block construction of heavy run state in builder processes.
 
 Curriculum training samples a block of ``run_block_size`` synthetic runs at a
 time. A run's *light* state (series, masks, index maps; see ``EpiDataset``) is
@@ -7,40 +7,42 @@ k-hop closure, graph weights, context tables) is needed only by the main
 process and is built here, per block, on demand:
 
 - ``RunBlockPipeline.begin_epoch`` receives the epoch's block plan from the
-  sampler and starts building the first block(s) in a small thread pool.
+  sampler and starts building the first block(s).
 - ``activate`` (main process, once per batch) detects the first batch of a new
   block, releases the previous block's heavy and device state, submits the
   builds of the next ``prefetch_blocks`` blocks and waits only for the builds
-  of the block it entered that are still unfinished.
-- ``quiesced`` is the fork guard: DataLoader workers are forked, and a fork
-  while a builder thread runs can leave a lock (allocator, zarr/blosc, GIL
-  hand-off state) held forever in the child, and would hand the child a copy of
-  heavy tensors that it keeps alive after the parent drops them. Inside the
-  guard no builder thread exists and no heavy state is resident; builds
-  requested meanwhile start when the guard exits.
+  of the block it entered that are still unfinished, installing each finished
+  run on its dataset.
+- ``quiesced`` is the DataLoader fork guard (see its docstring).
 
-Threads, not processes: a run's heavy build is dominated by zarr/blosc
-decompression, numpy elementwise passes and torch tensor ops, all of which
-release the GIL, and the result is ~0.5 GB of tensors per run that the main
-process must read zero-copy. A process pool would pickle that through pipes
-and fork (or spawn) alongside the DataLoader workers.
+Builds run in a pool of ``block_builders`` **spawned** processes, each limited
+to ``builder_threads`` native threads. A thread pool inside the trainer
+measured 3-10x slower per run than the old serial build (MN5 job 48425142) and
+stalled training: the builds' Python loops (diagnostics, k-hop) contend with the
+training loop for the GIL, and torch/dask/blosc fan out inside the trainer
+process. In a builder process neither applies. A builder receives only a small
+``HeavyBuildRequest`` (config, run id, node sets, fitted mobility preprocessor),
+re-reads the run's mobility from the zarr store, and returns the compact
+tensors (~0.46 GB/run) through shared memory, not pickle bytes. The main process
+installs them and derives the series-side context tables, which need the light
+series it already holds.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import threading
+import multiprocessing
 import time
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-logger = logging.getLogger(__name__)
+from data.epi_dataset import builder_warmup, init_builder_process, run_heavy_build
 
-BUILDER_THREAD_PREFIX = "run-block-build"
+logger = logging.getLogger(__name__)
 
 
 class LazyRun(Protocol):
@@ -51,7 +53,9 @@ class LazyRun(Protocol):
     heavy_build_timings: dict[str, float]
     block_pipeline: RunBlockPipeline | None
 
-    def build_heavy_state(self) -> float: ...
+    def heavy_build_request(self) -> Any: ...
+
+    def install_heavy_state(self, result: Any) -> None: ...
 
     def release_heavy_state(self) -> None: ...
 
@@ -61,59 +65,100 @@ class _RunTiming:
     build_s: float
     started: float
     finished: float
+    pid: int
+    threads: int
     phases: dict[str, float]
 
 
-def _timed_build(run: LazyRun) -> _RunTiming:
-    started = time.perf_counter()
-    run.build_heavy_state()
-    finished = time.perf_counter()
-    return _RunTiming(
-        build_s=finished - started,
-        started=started,
-        finished=finished,
-        phases=dict(run.heavy_build_timings),
+def spawn_builder_pool(block_builders: int, builder_threads: int) -> Executor:
+    """The production pool: ``block_builders`` spawned processes.
+
+    ``spawn`` (not fork): a builder starts from a clean interpreter and shares
+    nothing with the trainer's threads, locks, CUDA context or DataLoader state.
+    """
+    return ProcessPoolExecutor(
+        max_workers=block_builders,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=init_builder_process,
+        initargs=(builder_threads,),
     )
-
-
-def live_builder_threads() -> list[str]:
-    """Names of alive threads started by any ``RunBlockPipeline``."""
-    return [
-        thread.name
-        for thread in threading.enumerate()
-        if thread.name.startswith(BUILDER_THREAD_PREFIX)
-    ]
 
 
 class RunBlockPipeline:
     """Builds and drops the heavy state of curriculum runs block by block.
 
-    All methods are called from the main (consumer) thread; only the builds
-    themselves run in pool threads. Runs must be registered once.
+    All methods are called from the main (consumer) thread. Runs must be
+    registered once. ``executor_factory`` and ``worker_fn`` default to the
+    spawned builder pool and ``run_heavy_build``; tests substitute in-process
+    equivalents.
     """
 
-    def __init__(self, *, prefetch_blocks: int, block_build_workers: int) -> None:
+    def __init__(
+        self,
+        *,
+        prefetch_blocks: int,
+        block_builders: int,
+        builder_threads: int,
+        executor_factory: Callable[[int, int], Executor] | None = None,
+        worker_fn: Callable[[Any], Any] = run_heavy_build,
+        warmup_fn: Callable[[], Any] = builder_warmup,
+    ) -> None:
         if prefetch_blocks < 0:
             raise ValueError(f"prefetch_blocks must be >= 0, got {prefetch_blocks}")
-        if block_build_workers < 1:
-            raise ValueError(
-                f"block_build_workers must be >= 1, got {block_build_workers}"
-            )
+        if block_builders < 1:
+            raise ValueError(f"block_builders must be >= 1, got {block_builders}")
+        if builder_threads < 1:
+            raise ValueError(f"builder_threads must be >= 1, got {builder_threads}")
         self.prefetch_blocks = prefetch_blocks
-        self.block_build_workers = block_build_workers
-        self._executor: ThreadPoolExecutor | None = None
+        self.block_builders = block_builders
+        self.builder_threads = builder_threads
+        self._executor_factory = executor_factory or spawn_builder_pool
+        self._worker_fn = worker_fn
+        self._warmup_fn = warmup_fn
+        self._executor: Executor | None = None
+        self._pool_started_at = 0.0
+        self._warmups: list[Future[Any]] = []
+        self._warmup_done_at: list[float] = []
         self._runs: dict[int, LazyRun] = {}
         self._plan: list[list[LazyRun]] = []
         self._block_of: dict[int, int] = {}
         self._current = -1
         self._epoch = -1
         self._pause_depth = 0
-        self._builds: dict[int, Future[_RunTiming]] = {}
+        self._builds: dict[int, Future[Any]] = {}
         self._timings: dict[int, _RunTiming] = {}
         self._wait_s: dict[int, float] = {}
         self._block_records: list[dict[str, Any]] = []
         self._record_sink: Callable[[dict[str, Any]], None] | None = None
         self._pending_records: list[dict[str, Any]] = []
+
+    # -- builder pool ---------------------------------------------------------
+
+    @property
+    def in_flight_builds(self) -> int:
+        """Builds submitted and not yet consumed or discarded."""
+        return len(self._builds)
+
+    def start_builders(self) -> None:
+        """Start the builder processes and a warm-up task on each (idempotent).
+
+        Returns immediately; the processes import their modules while the
+        caller keeps working. ``record_startup`` reports when all are ready.
+        """
+        if self._executor is not None:
+            return
+        self._pool_started_at = time.perf_counter()
+        self._executor = self._executor_factory(
+            self.block_builders, self.builder_threads
+        )
+        # Dynamic spawning starts one process per submit while none is idle;
+        # a fresh process cannot be idle before it has imported its modules.
+        for _ in range(self.block_builders):
+            future = self._executor.submit(self._warmup_fn)
+            future.add_done_callback(
+                lambda _f: self._warmup_done_at.append(time.perf_counter())
+            )
+            self._warmups.append(future)
 
     # -- registration and records ------------------------------------------
 
@@ -143,12 +188,19 @@ class RunBlockPipeline:
     def record_startup(
         self, *, light_build_s: float, n_runs: int, workers: int
     ) -> None:
-        """Record the wall time of the startup light build of all runs."""
+        """Record the light-build wall time and the builder pool's startup time."""
+        self.start_builders()
+        pids = sorted({future.result() for future in self._warmups})
+        pool_startup_s = max(self._warmup_done_at) - self._pool_started_at
         logger.info(
-            "Light build of %d synthetic runs took %.1f s (%d threads)",
+            "Light build of %d synthetic runs took %.1f s (%d threads); "
+            "%d builder processes (%d threads each) ready after %.1f s",
             n_runs,
             light_build_s,
             workers,
+            len(pids),
+            self.builder_threads,
+            pool_startup_s,
         )
         self._emit(
             {
@@ -156,6 +208,10 @@ class RunBlockPipeline:
                 "light_build_s": light_build_s,
                 "n_runs": n_runs,
                 "light_build_workers": workers,
+                "builder_pool_startup_s": pool_startup_s,
+                "block_builders": self.block_builders,
+                "builder_threads": self.builder_threads,
+                "builder_pids": pids,
             }
         )
 
@@ -249,9 +305,22 @@ class RunBlockPipeline:
 
     @contextmanager
     def quiesced(self) -> Iterator[None]:
-        """No builder thread and no heavy state while the body (a fork) runs.
+        """No build in flight and no heavy state resident while the body runs.
 
-        Re-entrant. Builds requested inside (``begin_epoch``) start on exit.
+        Wrapped around every DataLoader worker fork. Builds no longer run in
+        trainer threads, so the original hazard (a fork while a builder thread
+        holds an allocator, OMP, zarr or blosc lock) is gone: the builders are
+        separate spawned processes. What a fork still must not see is
+        (1) heavy tensors: a forked worker inherits the parent's mappings
+        (installed state and finished-but-uninstalled builder results) and keeps
+        them alive after the parent drops them, which for per-epoch (non
+        persistent) workers pins a block's memory for the whole epoch; and
+        (2) a build that completes into a half-forked state. The guard therefore
+        waits out in-flight builds, discards their results and releases all
+        heavy state. The builder pool stays up. Re-entrant. Builds requested
+        inside (``begin_epoch``) start on exit. With the default persistent
+        workers the only guarded fork is the trainer-init prestart, when nothing
+        is built yet, so it costs nothing.
         """
         self._pause_depth += 1
         try:
@@ -264,9 +333,13 @@ class RunBlockPipeline:
                 self._submit_through(self._current + self.prefetch_blocks)
 
     def shutdown(self) -> None:
-        """Stop builder threads and drop every run's heavy state."""
+        """Stop the builder processes and drop every run's heavy state."""
         self._drain_and_release()
         self._drop_plan()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+            self._warmups.clear()
 
     # -- internals ------------------------------------------------------------
 
@@ -275,25 +348,19 @@ class RunBlockPipeline:
         self._block_of = {}
         self._current = -1
 
-    def _ensure_executor(self) -> ThreadPoolExecutor:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=self.block_build_workers,
-                thread_name_prefix=BUILDER_THREAD_PREFIX,
-            )
-        return self._executor
-
     def _submit_through(self, last_block: int) -> None:
         """Start builds for every unbuilt run of blocks ``current..last_block``."""
         if self._pause_depth or not self._plan:
             return
         last_block = min(last_block, len(self._plan) - 1)
+        self.start_builders()
+        assert self._executor is not None
         for index in range(max(self._current, 0), last_block + 1):
             for run in self._plan[index]:
                 if run.heavy_state_ready or id(run) in self._builds:
                     continue
-                self._builds[id(run)] = self._ensure_executor().submit(
-                    _timed_build, run
+                self._builds[id(run)] = self._executor.submit(
+                    self._worker_fn, run.heavy_build_request()
                 )
 
     def _enter_block(self, block: int) -> None:
@@ -309,8 +376,18 @@ class RunBlockPipeline:
         self._submit_through(block + self.prefetch_blocks)
         for run in self._plan[block]:
             future = self._builds.pop(id(run), None)
-            if future is not None:
-                self._timings[id(run)] = future.result()
+            if future is None:
+                continue
+            result = future.result()
+            run.install_heavy_state(result)
+            self._timings[id(run)] = _RunTiming(
+                build_s=result.finished - result.started,
+                started=result.started,
+                finished=result.finished,
+                pid=result.pid,
+                threads=result.torch_threads,
+                phases=dict(run.heavy_build_timings),
+            )
         self._wait_s[block] = self._wait_s.get(block, 0.0) + (
             time.perf_counter() - wait_started
         )
@@ -339,7 +416,10 @@ class RunBlockPipeline:
             "run_build_s_max": max(run_times, default=0.0),
             "wait_s": self._wait_s.pop(block, 0.0),
             "prefetch_blocks": self.prefetch_blocks,
-            "block_build_workers": self.block_build_workers,
+            "block_builders": self.block_builders,
+            "builder_threads": self.builder_threads,
+            "builder_pids": sorted({t.pid for t in timings}),
+            "builder_torch_threads": max((t.threads for t in timings), default=0),
             "run_phase_s_mean": {
                 name: sum(t.phases.get(name, 0.0) for t in timings) / len(timings)
                 for name in phase_names
@@ -347,7 +427,7 @@ class RunBlockPipeline:
         }
         logger.info(
             "Epoch %d block %d/%d: runs=%d built=%d build_s=%.1f "
-            "(per run mean %.1f max %.1f) wait_s=%.1f",
+            "(per run mean %.1f max %.1f) wait_s=%.1f builders=%d",
             record["epoch"],
             block + 1,
             record["n_blocks"],
@@ -357,6 +437,7 @@ class RunBlockPipeline:
             record["run_build_s_mean"],
             record["run_build_s_max"],
             record["wait_s"],
+            len(record["builder_pids"]),
         )
         self._block_records.append(record)
         self._emit(record)
@@ -378,9 +459,6 @@ class RunBlockPipeline:
             if not future.cancel():
                 future.exception()
         self._builds.clear()
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
         for run in self._runs.values():
             if run.heavy_state_ready:
                 run.release_heavy_state()

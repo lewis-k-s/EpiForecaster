@@ -101,7 +101,7 @@ def _config(
 
 
 def _curriculum(
-    *, run_block_size: int = 8, prefetch_blocks: int = 1, block_build_workers: int = 2
+    *, run_block_size: int = 8, prefetch_blocks: int = 1, block_builders: int = 2
 ) -> CurriculumConfig:
     return CurriculumConfig(
         enabled=True,
@@ -110,7 +110,8 @@ def _curriculum(
         run_sampling="round_robin",
         run_block_size=run_block_size,
         prefetch_blocks=prefetch_blocks,
-        block_build_workers=block_build_workers,
+        block_builders=block_builders,
+        builder_threads=1,
         light_build_workers=3,
         schedule=[CurriculumPhaseConfig(start_epoch=0, end_epoch=2, synth_ratio=1.0)],
     )
@@ -293,6 +294,26 @@ def test_lazy_heavy_state_matches_the_eager_build(
 
 
 @pytest.mark.epiforecaster
+def test_diagnostics_are_computed_once_per_run(tmp_path: Path) -> None:
+    """Block builds after the first reuse the run's diagnostics."""
+    path = tmp_path / "runs.zarr"
+    _write_runs(path)
+    run = _build(_config(path), _curriculum()).train_dataset.datasets[0]
+
+    assert run.heavy_build_request().compute_diagnostics
+    run.build_heavy_state()
+    diagnostics = run.mobility_diagnostics
+    assert diagnostics is not None
+    assert "diagnostics_s" in run.heavy_build_timings
+
+    run.release_heavy_state()
+    assert not run.heavy_build_request().compute_diagnostics
+    run.build_heavy_state()
+    assert run.mobility_diagnostics is diagnostics
+    assert "diagnostics_s" not in run.heavy_build_timings
+
+
+@pytest.mark.epiforecaster
 def test_eager_datasets_build_heavy_state_in_init(tmp_path: Path) -> None:
     path = tmp_path / "runs.zarr"
     _write_runs(path)
@@ -338,7 +359,7 @@ def test_blocked_epochs_match_the_eager_reference(
     curriculum = _curriculum(
         run_block_size=run_block_size,
         prefetch_blocks=prefetch_blocks,
-        block_build_workers=workers,
+        block_builders=workers,
     )
     lazy = _build(config, curriculum)
     pipeline = lazy.block_pipeline
@@ -476,7 +497,8 @@ def test_profiling_records_cover_startup_blocks_and_epochs(tmp_path: Path) -> No
         assert 0 < record["run_build_s_mean"] <= record["run_build_s_max"]
         assert record["wait_s"] >= 0
         assert record["prefetch_blocks"] == 1
-        assert record["block_build_workers"] == 2
+        assert record["block_builders"] == 2
+        assert record["builder_threads"] == 1
         assert "k_hop_s" in record["run_phase_s_mean"]
         assert record["epoch"] == 0
     assert records[-1] == summary
@@ -536,3 +558,73 @@ def test_released_datasets_do_not_count_against_the_device_cache_limit(
     del first._gpu_mobility_cache, first._context_device_cache
     training_utils._retain_device_caches(third)
     assert second._gpu_mobility_cache and third._gpu_mobility_cache
+
+
+@pytest.mark.epiforecaster
+def test_spawned_builder_processes_match_the_eager_reference(
+    tmp_path: Path, spawn_builders
+) -> None:
+    """The real path: spawned processes, shared-memory tensors, bitwise equal."""
+    import os
+
+    path = tmp_path / "runs.zarr"
+    _write_runs(path)
+    config = _config(path)
+    curriculum = _curriculum(run_block_size=2, prefetch_blocks=1, block_builders=2)
+    lazy = _build(config, curriculum)
+    pipeline = lazy.block_pipeline
+    records: list[dict] = []
+    pipeline.set_record_sink(records.append)
+    try:
+        runs = lazy.train_dataset.datasets
+        eager_runs = _eager_runs(config, runs)
+        for run in eager_runs:
+            run.release_dense_mobility()
+        eager_train = ConcatDataset(eager_runs)
+        by_id = dict(zip((run.run_id for run in runs), zip(runs, eager_runs)))
+
+        lazy_sampler = _sampler(lazy.train_dataset, curriculum, block_pipeline=pipeline)
+        eager_sampler = _sampler(eager_train, curriculum)
+        eager_order = [
+            batch
+            for block in eager_sampler.plan_epoch_blocks(0)
+            for batch in block.batches
+        ]
+        lazy_sampler.set_curriculum(0)
+        compared: set[str] = set()
+        for indices, want in zip(lazy_sampler, eager_order, strict=True):
+            assert indices == want
+            batch = _prepared(lazy.train_dataset, indices)
+            _assert_batches_equal(batch, _prepared(eager_train, indices))
+            run, eager = by_id[batch.mob_batch.run_id]
+            if run.run_id in compared:
+                continue
+            compared.add(run.run_id)
+            for name in HEAVY_STATE_ATTRS:
+                want_value, got = getattr(eager, name), getattr(run, name)
+                if want_value is None:
+                    assert got is None, name
+                else:
+                    _assert_same_value(got, want_value, name)
+            # Built in another process and mapped from shared memory.
+            assert run.graph_mobility_weights.is_shared()
+            assert run.context_neigh_table.is_shared()
+        assert compared == set(RUN_IDS)
+        pipeline.end_epoch()
+    finally:
+        pipeline.shutdown()
+
+    startup = records[0]
+    assert startup["kind"] == "startup"
+    assert startup["builder_pool_startup_s"] > 0
+    assert startup["block_builders"] == 2 and startup["builder_threads"] == 1
+    assert len(startup["builder_pids"]) == 2
+    assert os.getpid() not in startup["builder_pids"]
+    blocks = [r for r in records if r["kind"] == "block"]
+    assert len(blocks) == 2
+    for record in blocks:
+        assert record["builder_pids"], "built by builder processes"
+        assert set(record["builder_pids"]) <= set(startup["builder_pids"])
+        assert os.getpid() not in record["builder_pids"]
+        assert record["builder_torch_threads"] == 1
+        assert "install_s" in record["run_phase_s_mean"]

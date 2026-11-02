@@ -445,7 +445,7 @@ def build_curriculum_datasets(
     Synthetic runs get only their light state here (built in parallel,
     ``curriculum.light_build_workers`` threads); their heavy state is built per
     block by the returned ``block_pipeline`` (``curriculum.prefetch_blocks``,
-    ``curriculum.block_build_workers``). The real run and the validation/test
+    ``curriculum.block_builders`` processes). The real run and the validation/test
     datasets are built eagerly.
 
     Args:
@@ -463,8 +463,11 @@ def build_curriculum_datasets(
     dataset_path = Path(config.data.dataset_path)
     pipeline = RunBlockPipeline(
         prefetch_blocks=curriculum.prefetch_blocks,
-        block_build_workers=curriculum.block_build_workers,
+        block_builders=curriculum.block_builders,
+        builder_threads=curriculum.builder_threads,
     )
+    # Builder processes import their modules while the datasets build below.
+    pipeline.start_builders()
 
     # --- Synth-only mode: no real dataset ---
     if not real_run:

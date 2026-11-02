@@ -8,7 +8,8 @@
 #     (curriculum_block_builds.jsonl); 21000 batches span about four 8-run
 #     blocks (~5,200 batches each);
 #   - one full validation pass.
-# Size the production runtime and tune prefetch_blocks / block_build_workers
+# Size the production runtime and tune prefetch_blocks / block_builders /
+# builder_threads
 # from these numbers. An epoch is about 131k training batches.
 extends: mn5_synth_pretrain_reactive_n100.yaml
 

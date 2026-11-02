@@ -1,5 +1,6 @@
 import logging
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -623,17 +624,21 @@ class EpiDataset(Dataset):
         )
         return _replace_non_finite(lagged_risk)
 
-    def _build_heavy_state(
+    def _build_mobility_state(
         self,
         ds: xr.Dataset,
         shared_mobility: torch.Tensor | None,
         shared_mask: torch.Tensor | None,
-    ) -> None:
-        """Build dense mobility, k-hop closure, diagnostics and context tables.
+        *,
+        compute_diagnostics: bool,
+    ) -> dict[str, float]:
+        """Everything that needs the dense mobility: weights, k-hop, mask tables.
 
-        ``ds`` is the run's open canonical dataset. Writes only heavy attributes
-        (plus ``lagged_risk`` for eager datasets), so a lazy dataset can be built
-        by a background thread while the main process reads other datasets.
+        ``ds`` is the run's open canonical dataset. Reads only config, node
+        sets, region ids and the mobility preprocessor, so it also runs on the
+        reduced view a builder process uses (``_HeavyBuildView``). Returns the
+        wall time of each phase. A lazy dataset ends with only the compact graph
+        weights, the context node set and the bit-packed tables.
         """
         timings: dict[str, float] = {}
         tick = time.perf_counter()
@@ -682,8 +687,9 @@ class EpiDataset(Dataset):
             if adjacency_source == "spatial_knn":
                 self.spatial_knn_adjacency = self.static_graph_adjacency
             lap("static_adjacency_s")
-        self.mobility_diagnostics = self._build_mobility_diagnostics()
-        lap("diagnostics_s")
+        if compute_diagnostics:
+            self.mobility_diagnostics = self._build_mobility_diagnostics()
+            lap("diagnostics_s")
 
         # Precompute k-hop masks for all timesteps to avoid CPU bottleneck in
         # sampling: moves expensive matrix operations from per-sample to build time.
@@ -695,6 +701,20 @@ class EpiDataset(Dataset):
             f"(depth={self.config.model.gnn_depth}, targets={len(self.target_nodes)})"
         )
         self._graph_node_ids = torch.where(self._target_khop_mask)[0]
+
+        self._build_context_positions()
+        self._build_context_mobility_tables()
+        lap("mobility_tables_s")
+
+        if self.lazy_heavy_state:
+            # Keep only the compact graph weights; the dense tensors and the
+            # k-hop reachability are not needed once the tables exist.
+            self.release_dense_mobility()
+            lap("compaction_s")
+        return timings
+
+    def _finish_context_state(self) -> None:
+        """Region indices and series-side context tables for ``_graph_node_ids``."""
         if self._region_embedding_index_by_id is not None:
             self._graph_region_indices = torch.tensor(
                 [
@@ -703,15 +723,21 @@ class EpiDataset(Dataset):
                 ],
                 dtype=torch.long,
             )
+        self._build_context_feature_tables()
 
-        self._build_context_tables()
-        lap("context_tables_s")
-
-        if self.lazy_heavy_state:
-            # Keep only the compact graph weights; the dense tensors and the
-            # k-hop reachability are not needed once the tables exist.
-            self.release_dense_mobility()
-            lap("compaction_s")
+    def _build_heavy_state(
+        self,
+        ds: xr.Dataset,
+        shared_mobility: torch.Tensor | None,
+        shared_mask: torch.Tensor | None,
+    ) -> None:
+        """Eager build of the dense mobility state and the context tables."""
+        timings = self._build_mobility_state(
+            ds, shared_mobility, shared_mask, compute_diagnostics=True
+        )
+        tick = time.perf_counter()
+        self._finish_context_state()
+        timings["feature_tables_s"] = time.perf_counter() - tick
         self.heavy_build_timings = timings
         self._heavy_ready = True
 
@@ -720,12 +746,62 @@ class EpiDataset(Dataset):
         """True while the main-process state (see HEAVY_STATE_ATTRS) is resident."""
         return self._heavy_ready
 
-    def build_heavy_state(self) -> float:
-        """Build this lazy run's heavy state from its zarr slice; return seconds.
+    def heavy_build_request(self) -> "HeavyBuildRequest":
+        """Inputs a builder process needs to build this lazy run's heavy state.
 
-        Thread-safe with respect to other datasets: it opens its own dataset
-        handle and writes only this dataset's heavy attributes. A no-op when the
-        state is already resident.
+        Small and picklable: the config, the run's identity and node sets, and
+        the fitted mobility preprocessor. The series stay in this process; the
+        builder re-reads the run's mobility from the zarr store.
+        """
+        if not self.lazy_heavy_state:
+            raise RuntimeError(
+                f"Run {self.run_id} builds its heavy state eagerly in __init__"
+            )
+        return HeavyBuildRequest(
+            config=self.config,
+            aligned_data_path=str(self.aligned_data_path),
+            run_id=self.run_id,
+            target_nodes=list(self.target_nodes),
+            context_mask=self.context_mask.numpy(),
+            region_ids=self._region_ids,
+            num_time_steps=len(self._temporal_coords),
+            mobility_preprocessor=self.mobility_preprocessor,
+            # Diagnostics are a property of the run, not of a block: computed on
+            # its first build and kept when the heavy state is released.
+            compute_diagnostics=self.mobility_diagnostics is None,
+        )
+
+    def install_heavy_state(self, result: "HeavyBuildResult") -> None:
+        """Install a builder's tensors and derive the series-side context tables.
+
+        Runs in the main process. The builder returned everything that needs
+        the dense mobility; the context node set it found is applied to the
+        light series here (index_select over a few hundred MB at most).
+        """
+        if not self.lazy_heavy_state:
+            raise RuntimeError(f"Run {self.run_id} builds its heavy state eagerly")
+        started = time.perf_counter()
+        for name, tensor in result.tensors.items():
+            setattr(self, name, tensor)
+        if (
+            self.config.model.graph_adjacency_source == "spatial_knn"
+            and self.static_graph_adjacency is not None
+        ):
+            self.spatial_knn_adjacency = self.static_graph_adjacency
+        if result.diagnostics is not None:
+            self.mobility_diagnostics = result.diagnostics
+        self._build_context_positions()
+        self._finish_context_state()
+        timings = dict(result.phases)
+        timings["install_s"] = time.perf_counter() - started
+        self.heavy_build_timings = timings
+        self._heavy_ready = True
+
+    def build_heavy_state(self) -> float:
+        """Build this lazy run's heavy state in this process; return seconds.
+
+        The same code the builder processes run (``run_heavy_build``), without
+        the process boundary. A no-op when the state is already resident.
         """
         if not self.lazy_heavy_state:
             raise RuntimeError(
@@ -734,15 +810,7 @@ class EpiDataset(Dataset):
         if self._heavy_ready:
             return 0.0
         started = time.perf_counter()
-        ds = self.load_canonical_dataset(
-            self.aligned_data_path,
-            run_id=self.run_id,
-            run_id_chunk_size=self.config.data.run_id_chunk_size,
-        )
-        try:
-            self._build_heavy_state(ds, None, None)
-        finally:
-            ds.close()
+        self.install_heavy_state(run_heavy_build(self.heavy_build_request()))
         return time.perf_counter() - started
 
     def release_heavy_state(self) -> None:
@@ -786,6 +854,12 @@ class EpiDataset(Dataset):
 
     def _build_context_tables(self) -> None:
         """Prebuild context tables consumed by ``data.context_assembly``."""
+        self._build_context_positions()
+        self._build_context_feature_tables()
+        self._build_context_mobility_tables()
+
+    def _build_context_positions(self) -> None:
+        """Target positions inside the k-hop context node set (``_graph_node_ids``)."""
         node_ids = self._graph_node_ids  # (N_ctx,) k-hop closure around targets
         targets = torch.tensor(self.target_nodes, dtype=torch.long)  # (n_targets,)
         # (n_targets,) ctx slots; validated once here, not per batch
@@ -799,9 +873,10 @@ class EpiDataset(Dataset):
         self.context_target_slot_by_position[positions] = torch.arange(
             targets.numel(), dtype=torch.long
         )
-        target_count = targets.numel()
-        total_time = len(self._temporal_coords)
 
+    def _build_context_feature_tables(self) -> None:
+        """Slice the light series to the context nodes (no mobility involved)."""
+        node_ids = self._graph_node_ids
         if self.config.model.type.cases:
             clinical = torch.cat(
                 [
@@ -832,6 +907,14 @@ class EpiDataset(Dataset):
             self.context_feature_bio = None
             self.context_feature_ww = None
             self.context_bio_start = None
+
+    def _build_context_mobility_tables(self) -> None:
+        """Bit-packed neighbor and k-hop tables (need mobility or static adjacency)."""
+        node_ids = self._graph_node_ids
+        positions = self.target_local_positions
+        targets = torch.tensor(self.target_nodes, dtype=torch.long)  # (n_targets,)
+        target_count = targets.numel()
+        total_time = len(self._temporal_coords)
 
         adjacency_source = self.config.model.graph_adjacency_source
         if adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
@@ -2187,3 +2270,122 @@ class EpiDataset(Dataset):
                 dataset = dataset.load()
 
         return dataset
+
+
+# Tensors a builder process hands back (see ``run_heavy_build``). Everything
+# else of the heavy state is derived from these and the light series in the main
+# process (``EpiDataset.install_heavy_state``).
+_BUILDER_RESULT_ATTRS = (
+    "graph_mobility_weights",
+    "context_neigh_table",
+    "context_khop_table",
+    "_graph_node_ids",
+    "_target_khop_mask",
+    "static_graph_adjacency",
+)
+
+
+@dataclass(frozen=True)
+class HeavyBuildRequest:
+    """What a builder process needs to build one run's mobility-dependent state."""
+
+    config: EpiForecasterConfig
+    aligned_data_path: str
+    run_id: str
+    target_nodes: list[int]
+    context_mask: np.ndarray
+    region_ids: list[str]
+    num_time_steps: int
+    mobility_preprocessor: MobilityPreprocessor
+    compute_diagnostics: bool
+
+
+@dataclass
+class HeavyBuildResult:
+    """A builder's output: compact tensors, optional diagnostics, timings.
+
+    Tensors travel through shared memory (``torch.multiprocessing``), not pickle
+    bytes. ``started``/``finished`` are wall-clock seconds so they compare
+    across processes.
+    """
+
+    tensors: dict[str, torch.Tensor | None]
+    diagnostics: dict[str, Any] | None
+    phases: dict[str, float]
+    pid: int
+    torch_threads: int
+    started: float
+    finished: float
+
+
+class _HeavyBuildView(EpiDataset):
+    """The slice of an ``EpiDataset`` the mobility-dependent build reads.
+
+    A builder process has no series and no dataset handle; it constructs this
+    from a ``HeavyBuildRequest`` and runs the very same ``_build_mobility_state``
+    methods the eager build runs, so both paths produce identical tensors.
+    ``EpiDataset.__init__`` is deliberately not called.
+    """
+
+    def __init__(self, request: HeavyBuildRequest) -> None:
+        self._dataset = None
+        self.config = request.config
+        self.run_id = request.run_id
+        self.aligned_data_path = Path(request.aligned_data_path)
+        self.target_nodes = request.target_nodes
+        self.context_mask = torch.from_numpy(request.context_mask)
+        self.num_nodes = int(self.context_mask.numel())
+        self._region_ids = request.region_ids
+        self._temporal_coords = list(range(request.num_time_steps))
+        self.mobility_preprocessor = request.mobility_preprocessor
+        self.lazy_heavy_state = True
+        self.mobility_diagnostics = None
+        for name in HEAVY_STATE_ATTRS:
+            setattr(self, name, None)
+        self._adjacency_cache = {}
+
+
+def run_heavy_build(request: HeavyBuildRequest) -> HeavyBuildResult:
+    """Build one run's mobility-dependent heavy state; runs in a builder process."""
+    started = time.time()
+    view = _HeavyBuildView(request)
+    ds = EpiDataset.load_canonical_dataset(
+        view.aligned_data_path,
+        run_id=request.run_id,
+        run_id_chunk_size=request.config.data.run_id_chunk_size,
+    )
+    try:
+        phases = view._build_mobility_state(
+            ds, None, None, compute_diagnostics=request.compute_diagnostics
+        )
+    finally:
+        ds.close()
+    return HeavyBuildResult(
+        tensors={name: getattr(view, name) for name in _BUILDER_RESULT_ATTRS},
+        diagnostics=view.mobility_diagnostics,
+        phases=phases,
+        pid=os.getpid(),
+        torch_threads=torch.get_num_threads(),
+        started=started,
+        finished=time.time(),
+    )
+
+
+def init_builder_process(torch_threads: int) -> None:
+    """Pin a builder process's native thread pools to ``torch_threads``.
+
+    The environment may say ``OMP_NUM_THREADS=<all cpus>`` for the trainer; N
+    builders must not each fan out over every CPU (torch intra-op, dask chunk
+    reads, blosc decompression).
+    """
+    import dask
+    from numcodecs import blosc
+
+    torch.set_num_threads(torch_threads)
+    dask.config.set(num_workers=torch_threads)
+    blosc.set_nthreads(torch_threads)
+
+
+def builder_warmup() -> int:
+    """No-op task that makes a builder process start and import this module."""
+    return os.getpid()

@@ -21,8 +21,9 @@
   runs resident. Startup builds only each run's light series state (in parallel,
   `light_build_workers`); a block's heavy state (graph weights and context
   tables, ~0.46 GB/run) is built when the block is reached, with the next
-  `prefetch_blocks` blocks built in the background, and dropped when the block
-  ends. No node-local disk is used. Per-block build and wait times are written
+  `prefetch_blocks` blocks built in the background by `block_builders` spawned
+  processes (`builder_threads` threads each; 4 x 3 of the node's 20 CPUs), and
+  dropped when the block ends. No node-local disk is used. Per-block build and wait times are written
   to `curriculum_block_builds.jsonl` in the run directory
 
 ### `preprocess_mn5_synth.yaml`
