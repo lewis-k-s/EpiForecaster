@@ -43,6 +43,11 @@ model:
     forecast_horizon: 28
     max_neighbors: 20
     gnn_depth: 2
+    # Head architecture and optimizer match train_epifor_mn5_full.yaml so the
+    # pretrained checkpoint initializes the real-data fine-tune.
+    head_d_model: 128
+    head_num_layers: 4
+    head_dropout: 0.162
     sir_physics:
       dt: 1.0
       enforce_nonnegativity: true
@@ -85,8 +90,8 @@ training:
   early_stopping_patience: 5
   nan_loss_patience: 5
   epochs: 4
-  learning_rate: 0.001
-  weight_decay: 1.0e-05
+  learning_rate: 5.52e-04
+  weight_decay: 5.94e-04
   warmup_steps: 100
   num_workers: 4
   val_workers: 2
