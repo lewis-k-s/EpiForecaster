@@ -13,9 +13,11 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import shutil
 from typing import Any
+import weakref
 import zipfile
 
 import dask
@@ -41,9 +43,31 @@ def is_zarr_zip(path: Path | str) -> bool:
     return str(path).endswith(ZARR_ZIP_SUFFIX)
 
 
+# Every open packed store, so that a forked child can reopen each one. Keyed by
+# id() because ZipStore defines __eq__ and is therefore unhashable.
+_OPEN_ZIP_STORES: weakref.WeakValueDictionary[int, zarr.storage.ZipStore] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _reopen_zip_stores_in_child() -> None:
+    # A forked child inherits the parent's open archive. All processes then
+    # share one file offset, and ZipFile's seek-then-read races across them
+    # (its lock is per process), so concurrent reads return wrong bytes. Give
+    # the child its own file handle and lock.
+    for store in list(_OPEN_ZIP_STORES.values()):
+        if store._is_open:
+            store._is_open = False
+            store._sync_open()
+
+
+os.register_at_fork(after_in_child=_reopen_zip_stores_in_child)
+
+
 def open_zarr_zip(path: Path | str, **kwargs: Any) -> xr.Dataset:
-    """Open a packed store read-only."""
+    """Open a packed store read-only; forked children reopen it."""
     store = zarr.storage.ZipStore(Path(path), mode="r")
+    _OPEN_ZIP_STORES[id(store)] = store
     # Consolidated metadata is not part of the Zarr v3 specification; the
     # per-array metadata in a local ZIP file is cheap to read.
     return xr.open_zarr(store, consolidated=False, **kwargs)
