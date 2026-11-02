@@ -11,8 +11,10 @@
 # The output is packed sharded Zarr (docs/SYNTHETIC_ZARR_LAYOUT.md):
 # write_workers processes rebuild and write one run each, and mobility is
 # rounded to 10 mantissa bits (bitround_keepbits in the base config). The
-# earlier 198-run rebuild took 28.5 minutes with 12 workers (peak 62.7 GiB),
-# so 240 minutes leave a wide margin.
+# earlier 198-run rebuild (b354b27, job 48128720) took 28.5 minutes in its
+# preprocess step with 12 workers (peak 62.7 GiB) and 34.8 minutes in total;
+# that input was a 173 GB NetCDF, against 46.6 GB here. gp_debug starts in
+# seconds and allows 2 h, so 90 minutes leave about 3x the expected time.
 
 run: {}
 source: {}
@@ -71,8 +73,8 @@ resources:
   allocation:
     account: bsc08
     partition: gpp
-    qos: gp_bscls
+    qos: gp_debug
     nodes: 1
     tasks: 1
     cpus_per_task: 64
-    runtime: 240
+    runtime: 90
