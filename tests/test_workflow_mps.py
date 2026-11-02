@@ -449,6 +449,41 @@ def test_core_mps_debug_template_is_valid() -> None:
     assert template["optuna"]["timeout_s"] == allocation["runtime"] * 60 - 900
 
 
+def _replicate_template() -> dict:
+    return run_config.load_template(
+        REPO_ROOT / "workflow/config/mn5_hpo_core_replicates.yaml"
+    )
+
+
+def test_replicate_template_queues_every_trial_it_runs() -> None:
+    template = _replicate_template()
+
+    allocation = run_config.validate_mn5_allocation(template)
+
+    optuna = template["optuna"]
+    queue = optuna["enqueue_trials"]
+    assert allocation["mps_clients_per_gpu"] == 4
+    assert optuna["workers"] * optuna["trials_per_worker"] == len(
+        queue["params"]
+    ) * len(queue["seeds"])
+    assert optuna["timeout_s"] <= allocation["runtime"] * 60 - 900
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("trials_per_worker", 5, "must equal the 32 enqueued trials"),
+        ("pruning_start_epoch", 15, "pruning_start_epoch >= epochs"),
+    ],
+)
+def test_replicate_queue_rejects_sampling_or_pruning(field, value, message) -> None:
+    template = _replicate_template()
+    template["optuna"][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        run_config.validate_workflow_contract(template)
+
+
 def _mps_allocation(config: dict) -> None:
     config["optuna"]["workers"] = 8
     config["resources"]["allocation"] |= {

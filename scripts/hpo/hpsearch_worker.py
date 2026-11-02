@@ -34,6 +34,7 @@ Notes:
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib
 import json
 import logging
@@ -46,6 +47,7 @@ import click
 import torch
 
 from models.configs import EpiForecasterConfig
+from scripts.hpo.file_lock import file_lock
 from scripts.hpo.trial_artifacts import (
     BEST_MODEL_PATH_ATTR,
     BEST_MODEL_SHA256_ATTR,
@@ -108,6 +110,31 @@ def _release_trial_resources() -> None:
 
 
 LOGICAL_WORKER_ID_ATTR = "epiforecaster_worker_id"
+# A replicate trial reruns fixed parameters under its own training.seed.
+REPLICATE_SEED_ATTR = "replicate_seed"
+ENQUEUED_TRIALS_ATTR = "enqueued_trials_sha256"
+
+
+def enqueue_replicate_trials(study: Any, spec: dict[str, Any], lock_path: Path) -> None:
+    """Queue every parameter set once per seed, once per study.
+
+    All workers call this at startup; the lock and the recorded digest let only
+    the first one enqueue. Trials are queued seed by seed, so every parameter
+    set gets its first replicates before any set gets more.
+    """
+    digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+    with file_lock(lock_path):
+        recorded = study.user_attrs.get(ENQUEUED_TRIALS_ATTR)
+        if recorded == digest:
+            return
+        if recorded is not None:
+            raise ValueError(
+                f"Study {study.study_name!r} already queued a different replicate set"
+            )
+        for seed in spec["seeds"]:
+            for params in spec["params"]:
+                study.enqueue_trial(params, user_attrs={REPLICATE_SEED_ATTR: int(seed)})
+        study.set_user_attr(ENQUEUED_TRIALS_ATTR, digest)
 
 
 def _categorical_choices(choices: tuple[Any, ...] | list[Any]) -> tuple[Any, ...]:
@@ -224,7 +251,7 @@ def _suggest_core_params(trial: Any, base_cfg: EpiForecasterConfig) -> dict[str,
         )
     return {
         "training.learning_rate": trial.suggest_float(
-            "training.learning_rate", 1e-4, 1e-2, log=True
+            "training.learning_rate", 1e-5, 1e-3, log=True
         ),
         "training.weight_decay": trial.suggest_float(
             "training.weight_decay", 1e-7, 1e-3, log=True
@@ -446,6 +473,9 @@ def objective(
     # Add CLI-provided overrides (dotted keys, same as train CLI)
     for override in cli_overrides:
         override_list.append(override)
+    replicate_seed = trial.user_attrs.get(REPLICATE_SEED_ATTR)
+    if replicate_seed is not None:
+        override_list.append(f"training.seed={int(replicate_seed)}")
 
     # Reload config with all overrides via OmegaConf
     cfg = EpiForecasterConfig.load(
@@ -677,6 +707,16 @@ def objective(
     show_default=True,
     help="Named HPO search space to use.",
 )
+@click.option(
+    "--enqueue-trials",
+    "enqueue_trials_json",
+    type=str,
+    default=None,
+    help=(
+        'JSON {"params": [...], "seeds": [...]}: run every parameter set once '
+        "per training seed before any sampled trial."
+    ),
+)
 def main(
     *,
     config_path: Path,
@@ -694,6 +734,7 @@ def main(
     cli_overrides: tuple[str, ...],
     sample_training_loss_objective: bool,
     search_space: str,
+    enqueue_trials_json: str | None,
 ) -> None:
     """Run one HPO worker process."""
     setup_logging()
@@ -769,6 +810,12 @@ def main(
         sampler=selected_sampler,
         pruner=selected_pruner,
     )
+    if enqueue_trials_json is not None:
+        enqueue_replicate_trials(
+            study,
+            json.loads(enqueue_trials_json),
+            journal_file.with_name(f"{journal_file.name}.enqueue.lock"),
+        )
 
     logger.info("Starting HPO worker for study '%s'", study_name)
     logger.info("Config: %s", config_path)

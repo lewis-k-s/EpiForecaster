@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -221,6 +222,10 @@ def hpo_worker_arguments(config: dict[str, Any]) -> list[object]:
     arguments.extend(["--override", "training.run_final_evaluation=false"])
     if options.get("sample_training_loss_objective", False):
         arguments.append("--sample-training-loss-objective")
+    if options.get("enqueue_trials") is not None:
+        arguments.extend(
+            ["--enqueue-trials", json.dumps(options["enqueue_trials"], sort_keys=True)]
+        )
     return arguments
 
 

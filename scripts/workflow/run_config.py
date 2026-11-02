@@ -333,6 +333,43 @@ def _validate_container_pin(workflow_config: dict[str, Any]) -> None:
         raise ValueError("container.expected_sha256 must be 64 lowercase hex digits")
 
 
+def _validate_enqueued_trials(optuna: dict[str, Any]) -> None:
+    """A replicate study must consume exactly its queue and never prune it."""
+    spec = optuna.get("enqueue_trials")
+    if spec is None:
+        return
+    params = spec.get("params") if isinstance(spec, dict) else None
+    seeds = spec.get("seeds") if isinstance(spec, dict) else None
+    if not (
+        isinstance(params, list)
+        and params
+        and all(isinstance(entry, dict) and entry for entry in params)
+    ):
+        raise ValueError(
+            "optuna.enqueue_trials.params must be a non-empty list of mappings"
+        )
+    if not (
+        isinstance(seeds, list)
+        and seeds
+        and all(isinstance(s, int) and not isinstance(s, bool) for s in seeds)
+        and len(set(seeds)) == len(seeds)
+    ):
+        raise ValueError(
+            "optuna.enqueue_trials.seeds must be a non-empty list of distinct integers"
+        )
+    queued = len(params) * len(seeds)
+    if optuna.get("workers", 0) * optuna.get("trials_per_worker", 0) != queued:
+        raise ValueError(
+            "optuna.workers * optuna.trials_per_worker must equal the "
+            f"{queued} enqueued trials, so no trial is sampled"
+        )
+    if optuna.get("pruning_start_epoch", 0) < optuna.get("epochs", 0):
+        raise ValueError(
+            "optuna.enqueue_trials requires pruning_start_epoch >= epochs, "
+            "so every replicate trains to the end"
+        )
+
+
 def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     """Validate mode-specific configuration before snapshot transfer."""
     kind = workflow_kind(workflow_config)
@@ -379,6 +416,9 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 "preprocessing.write_workers must be an integer between 1 and "
                 "resources.allocation.cpus_per_task"
             )
+
+    if kind == "hpo":
+        _validate_enqueued_trials(workflow_config["optuna"])
 
     evaluation = workflow_config.get("evaluation", {})
     research_outputs = evaluation.get("research_outputs", False)

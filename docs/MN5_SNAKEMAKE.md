@@ -465,6 +465,18 @@ calibration evidence. It is not a negative alert. Summary JSON contains metric
 counts, support reasons, and horizon-band results. Hospitalization event scores
 remain unsupported until source-level aggregation is defined.
 
+## HPO seed replicates
+
+An HPO config may set `optuna.enqueue_trials` with `params` (a list of complete
+parameter mappings) and `seeds` (distinct `training.seed` values). The first
+worker queues every parameter set once per seed, seed by seed, and each queued
+trial overrides `training.seed`. Preparation rejects a config unless
+`workers * trials_per_worker` equals the queue length, so no trial is sampled,
+and unless `pruning_start_epoch >= epochs`, so every replicate trains to the
+end. `workflow/config/mn5_hpo_core_replicates.yaml` replicates the best core
+configurations. The selection stage still promotes the single best trial; compare
+configurations by their WIS across seeds in the journal.
+
 ## CUDA MPS worker packing
 
 Set `resources.allocation.mps_clients_per_gpu` to K to run K HPO or ablation

@@ -12,10 +12,13 @@
 #
 # Pruning waits for 8 completed trials, one per concurrent worker, so the first
 # wave is never pruned against only 2 peers near its final epoch.
+#
+# Study v4 searches learning rates from 1e-5 to 1e-3. In v3 (1e-4 to 1e-2) the
+# best trial sat at 1.1e-4, and every trial above 1e-3 was worse at 50 epochs.
 extends: mn5.yaml
 
 optuna:
-  study_name: epiforecaster_hpo_core_mps_debug_v3
+  study_name: epiforecaster_hpo_core_mps_debug_v4
   workers: 8
   trials_per_worker: 16
   timeout_s: 6300

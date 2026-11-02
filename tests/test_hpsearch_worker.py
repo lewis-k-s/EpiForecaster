@@ -8,11 +8,13 @@ from typing import Any
 import pytest
 
 from scripts.hpo.hpsearch_worker import (
+    REPLICATE_SEED_ATTR,
     _categorical_choices,
     _decode_categorical_value,
     _overrides_to_dotlist,
     _remaining_worker_trials,
     _worker_outcome_error,
+    enqueue_replicate_trials,
     objective,
     suggest_epiforecaster_params,
 )
@@ -227,7 +229,7 @@ class TestSuggestEpiforecasterParams:
         }
         assert {call[1] for call in trial.suggest_calls} == set(overrides)
         assert trial.suggest_calls == [
-            ("float", "training.learning_rate", (1e-4, 1e-2, True)),
+            ("float", "training.learning_rate", (1e-5, 1e-3, True)),
             ("float", "training.weight_decay", (1e-7, 1e-3, True)),
             ("float", "model.head_dropout", (0.0, 0.3, False)),
             ("categorical", "model.head_d_model", (128, 256, 384, 512)),
@@ -497,6 +499,7 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     )
 
     trial = _StubTrial()
+    trial.user_attrs[REPLICATE_SEED_ATTR] = 47
     value = objective(
         trial,
         base_config_path=tmp_path / "config.yaml",
@@ -505,7 +508,7 @@ def test_objective_returns_selection_score_and_records_joint_loss(
         fixed_epochs=1,
         fixed_max_batches=None,
         seed=None,
-        cli_overrides=["training.loss.joint.observation_loss=mae"],
+        cli_overrides=["training.loss.joint.observation_loss=mae", "training.seed=1"],
         pruning_start_epoch=3,
         sample_training_loss_objective=False,
         search_space="default",
@@ -521,6 +524,8 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     assert captured["pruning_start_epoch"] == 3
     assert captured["constructor_model_id"] == "trial-000000"
     assert captured["trainer_model_id"] == "trial-000000"
+    # A replicate's seed overrides every earlier seed, including the CLI's.
+    assert captured["overrides"][-1] == "training.seed=47"
 
     trial_dir = tmp_path / "study" / "trial-000000"
     checkpoint = trial_dir / "checkpoints/best_model.pt"
@@ -538,3 +543,62 @@ def test_objective_returns_selection_score_and_records_joint_loss(
     assert summary["training_loss_objective"] == "mae"
     assert summary["best_model_path"] == str(checkpoint)
     assert summary["best_model_sha256"] == checkpoint_sha256
+
+
+def _replicate_spec() -> dict[str, Any]:
+    return {
+        "params": [
+            {"training.learning_rate": 1e-4, "model.head_d_model": 512},
+            {"training.learning_rate": 3e-4, "model.head_d_model": 128},
+        ],
+        "seeds": [42, 43, 44],
+    }
+
+
+def test_replicate_queue_runs_each_config_once_per_seed(tmp_path) -> None:
+    import optuna
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        sampler=optuna.samplers.RandomSampler(seed=0), direction="minimize"
+    )
+    lock = tmp_path / "journal.enqueue.lock"
+    spec = _replicate_spec()
+    # Every worker enqueues at startup; only the first call may add trials.
+    enqueue_replicate_trials(study, spec, lock)
+    enqueue_replicate_trials(study, spec, lock)
+
+    seen: list[tuple[float, int, int]] = []
+
+    def record(trial) -> float:
+        lr = trial.suggest_float("training.learning_rate", 1e-5, 1e-3, log=True)
+        d_model = trial.suggest_categorical("model.head_d_model", (128, 512))
+        seen.append((lr, d_model, trial.user_attrs[REPLICATE_SEED_ATTR]))
+        return 0.0
+
+    study.optimize(record, n_trials=6)
+
+    assert seen == [
+        (1e-4, 512, 42),
+        (3e-4, 128, 42),
+        (1e-4, 512, 43),
+        (3e-4, 128, 43),
+        (1e-4, 512, 44),
+        (3e-4, 128, 44),
+    ]
+
+
+def test_replicate_queue_rejects_a_different_set_for_the_same_study(
+    tmp_path,
+) -> None:
+    import optuna
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction="minimize")
+    lock = tmp_path / "journal.enqueue.lock"
+    enqueue_replicate_trials(study, _replicate_spec(), lock)
+    changed = _replicate_spec() | {"seeds": [42, 43]}
+
+    with pytest.raises(ValueError, match="different replicate set"):
+        enqueue_replicate_trials(study, changed, lock)
+    assert len(study.trials) == 6
