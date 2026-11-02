@@ -1137,6 +1137,7 @@ def build_datasets(config: EpiForecasterConfig) -> DatasetSplits:
             test_nodes=list(test_nodes),
             real_run=real_run,
             synth_runs=synth_runs,
+            run_block_size=config.training.curriculum.run_block_size,
             region_embedding_store=region_embedding_store,
         )
 

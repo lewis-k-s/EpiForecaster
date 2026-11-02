@@ -9,6 +9,8 @@ the release, for production-like and thresholded edge selection.
 from __future__ import annotations
 
 import dataclasses
+import pickle
+from collections import OrderedDict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +22,7 @@ import xarray as xr
 from data.context_assembly import pack_mask_bits, unpack_mask_bits
 from data.curriculum_builder import build_curriculum_datasets
 from data.epi_batch import collate_epiforecaster_batch
-from data.epi_dataset import EpiDataset
+from data.epi_dataset import RUN_STATE_ATTRS, EpiDataset
 from data.samplers import EpidemicCurriculumSampler
 from models.configs import CurriculumConfig, CurriculumPhaseConfig, ModelVariant
 from tests.dataset_test_helpers import make_epi_config, make_tiny_epi_dataset
@@ -95,7 +97,13 @@ CURRICULUM = CurriculumConfig(
 )
 
 
-def _build(path: Path, config, *, release: bool):
+def _build(
+    path: Path,
+    config,
+    *,
+    release: bool,
+    run_block_size: int = CURRICULUM.run_block_size,
+):
     nodes = list(range(NUM_NODES))
     kwargs = dict(
         config=config,
@@ -104,6 +112,7 @@ def _build(path: Path, config, *, release: bool):
         test_nodes=nodes[10:],
         real_run="",
         synth_runs=RUN_IDS,
+        run_block_size=run_block_size,
     )
     if release:
         return build_curriculum_datasets(**kwargs)
@@ -111,11 +120,13 @@ def _build(path: Path, config, *, release: bool):
         return build_curriculum_datasets(**kwargs)
 
 
-def _epoch_batches(result, epoch: int) -> list[list[int]]:
+def _epoch_batches(
+    result, epoch: int, curriculum: CurriculumConfig = CURRICULUM
+) -> list[list[int]]:
     sampler = EpidemicCurriculumSampler(
         result.train_dataset,
         batch_size=3,
-        config=CURRICULUM,
+        config=curriculum,
         real_run_id="",
         seed=42,
     )
@@ -257,6 +268,7 @@ def test_device_caches_keep_only_recent_datasets(monkeypatch) -> None:
         type(training_utils._device_cached_datasets)(),
     )
     limit = training_utils.MAX_DEVICE_CACHED_DATASETS
+    monkeypatch.setattr(training_utils, "_device_cache_limit", limit)
     datasets = [_CachedDataset() for _ in range(limit + 2)]
     for dataset in datasets:
         training_utils._retain_device_caches(dataset)
@@ -269,3 +281,142 @@ def test_device_caches_keep_only_recent_datasets(monkeypatch) -> None:
         resident = index not in evicted
         assert bool(dataset._gpu_mobility_cache) is resident, index
         assert bool(dataset._context_device_cache) is resident, index
+
+
+def _fresh_device_registry(monkeypatch, limit: int) -> None:
+    monkeypatch.setattr(training_utils, "_device_cached_datasets", OrderedDict())
+    monkeypatch.setattr(training_utils, "_device_cache_limit", limit)
+
+
+@pytest.mark.epiforecaster
+def test_release_drops_k_hop_reachability_and_keeps_context_tables(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runs.zarr"
+    _write_runs(path)
+    released = _build(path, _config(path, min_flow_raw=0.0, clip_max=8.0), release=True)
+    dense = _build(path, _config(path, min_flow_raw=0.0, clip_max=8.0), release=False)
+
+    for dataset in released.train_dataset.datasets:
+        assert dataset._target_k_hop_reach is None
+        assert dataset.context_khop_table is not None
+    for dataset in dense.train_dataset.datasets:
+        assert dataset._target_k_hop_reach is not None
+
+
+@pytest.mark.epiforecaster
+def test_spilled_run_state_is_restored_bitwise_on_every_visit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "scratch"))
+    path = tmp_path / "runs.zarr"
+    _write_runs(path)
+    config_args = dict(min_flow_raw=0.0, clip_max=8.0)
+    resident = _build(path, _config(path, **config_args), release=True)
+    spilled = _build(path, _config(path, **config_args), release=True, run_block_size=1)
+
+    for expected, actual in zip(
+        resident.train_dataset.datasets, spilled.train_dataset.datasets
+    ):
+        assert not expected.run_state_spilled
+        assert actual.run_state_spilled
+        assert all(getattr(actual, name) is None for name in RUN_STATE_ATTRS)
+        for _ in range(2):
+            actual.load_run_state()
+            for name in RUN_STATE_ATTRS:
+                want, got = getattr(expected, name), getattr(actual, name)
+                if want is None:
+                    assert got is None, name
+                    continue
+                assert got.dtype == want.dtype, name
+                assert torch.equal(got, want), name
+            actual.unload_run_state()
+            assert all(getattr(actual, name) is None for name in RUN_STATE_ATTRS)
+
+    # DataLoader workers receive datasets without the spilled tables.
+    restored = pickle.loads(pickle.dumps(spilled.train_dataset.datasets[0]))
+    assert restored.run_state_spilled
+    assert all(getattr(restored, name) is None for name in RUN_STATE_ATTRS)
+
+
+@pytest.mark.epiforecaster
+def test_spill_directory_is_removed_with_the_training_dataset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    path = tmp_path / "runs.zarr"
+    _write_runs(path)
+    spilled = _build(
+        path,
+        _config(path, min_flow_raw=0.0, clip_max=8.0),
+        release=True,
+        run_block_size=1,
+    )
+    state_dirs = list(scratch.glob("epiforecaster_*/run_state_*"))
+    assert len(state_dirs) == 1
+    assert len(list(state_dirs[0].glob("run_*.pt"))) == len(RUN_IDS)
+
+    del spilled
+    import gc
+
+    gc.collect()
+    assert not state_dirs[0].exists()
+
+
+@pytest.mark.epiforecaster
+@pytest.mark.parametrize("run_block_size", [1, 2])
+def test_blocked_rotation_keeps_only_block_runs_resident(
+    tmp_path: Path, monkeypatch, run_block_size: int
+) -> None:
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "scratch"))
+    path = tmp_path / "runs.zarr"
+    _write_runs(path)
+    config_args = dict(min_flow_raw=0.0, clip_max=8.0)
+    resident = _build(path, _config(path, **config_args), release=True)
+    spilled = _build(
+        path,
+        _config(path, **config_args),
+        release=True,
+        run_block_size=run_block_size,
+    )
+    curriculum = dataclasses.replace(CURRICULUM, run_block_size=run_block_size)
+    sampler = EpidemicCurriculumSampler(
+        spilled.train_dataset,
+        batch_size=3,
+        config=curriculum,
+        real_run_id="",
+        seed=42,
+    )
+    blocks = sampler.plan_epoch_blocks(0)
+    assert len(blocks) == -(-len(RUN_IDS) // run_block_size)
+    assert sampler.resident_dataset_limit == run_block_size
+
+    _fresh_device_registry(monkeypatch, limit=100)
+    expected = [
+        _collated(resident.train_dataset, indices)
+        for block in blocks
+        for indices in block.batches
+    ]
+
+    _fresh_device_registry(monkeypatch, limit=sampler.resident_dataset_limit)
+    datasets = spilled.train_dataset.datasets
+    block_of_batch = [
+        block for block in blocks for _ in block.batches
+    ]  # the block each consecutive batch belongs to
+    sampler.set_curriculum(0)
+    consumed = 0
+    for indices, block, want in zip(sampler, block_of_batch, expected):
+        _assert_batches_equal(_collated(spilled.train_dataset, indices), want)
+        device_cached = {
+            i
+            for i, ds in enumerate(datasets)
+            if getattr(ds, "_gpu_mobility_cache", None)
+        }
+        host_loaded = {
+            i for i, ds in enumerate(datasets) if ds.context_neigh_table is not None
+        }
+        assert device_cached <= set(block.synth_dataset_indices)
+        assert host_loaded <= set(block.synth_dataset_indices)
+        consumed += 1
+    assert consumed == len(expected) == len(block_of_batch)

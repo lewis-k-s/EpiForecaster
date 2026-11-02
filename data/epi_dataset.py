@@ -76,6 +76,19 @@ SHARED_SERIES_ATTRS = (
     "temporal_covariates",
 )
 
+# Per-run tensors the main process reads only to fill its device caches
+# (``inject_gpu_mobility`` / ``data.context_assembly``). DataLoader workers
+# never touch them, so a run outside the current curriculum block keeps them
+# in a node-local file (``spill_run_state``) instead of host memory.
+RUN_STATE_ATTRS = (
+    "graph_mobility_weights",
+    "context_feature_clinical",
+    "context_feature_bio",
+    "context_feature_ww",
+    "context_neigh_table",
+    "context_khop_table",
+)
+
 
 @dataclass
 class SharedSparseTopology:
@@ -288,6 +301,8 @@ class EpiDataset(Dataset):
 
         # Compact [T, N_ctx, N_ctx] graph weights; set by release_dense_mobility().
         self.graph_mobility_weights: torch.Tensor | None = None
+        # Node-local file holding RUN_STATE_ATTRS once spilled; None otherwise.
+        self._run_state_path: Path | None = None
 
         if (preloaded_mobility is None) != (mobility_mask is None):
             raise ValueError(
@@ -747,6 +762,10 @@ class EpiDataset(Dataset):
         state["_dataset"] = None
         # Full shared topology is only needed during init-time pruning.
         state["shared_sparse_topology"] = None
+        if self._run_state_path is not None:
+            # Spilled run state is reloaded from its file in the main process.
+            for name in RUN_STATE_ATTRS:
+                state[name] = None
         return state
 
     def close(self) -> None:
@@ -778,17 +797,19 @@ class EpiDataset(Dataset):
         """Keep only the mobility state that training reads after init.
 
         Dense ``(T, N, N)`` mobility weights, the edge mask, the per-timestep
-        adjacency cache are only needed to build the
-        context tables. Training then reads the weights between graph nodes
-        (``inject_gpu_mobility``) and the prebuilt context tables. This keeps
-        the masked float16 weights restricted to graph nodes, laid out exactly
-        as ``inject_gpu_mobility`` slices them, and drops everything else.
+        adjacency cache and the ``(T, n_targets, N)`` k-hop reachability are
+        only needed to build the context tables. Training then reads the
+        weights between graph nodes (``inject_gpu_mobility``) and the prebuilt
+        context tables. This keeps the masked float16 weights restricted to
+        graph nodes, laid out exactly as ``inject_gpu_mobility`` slices them,
+        and drops everything else.
 
         Call it only on datasets whose dense tensors are not shared with other
         datasets that are built later. Tensors that another dataset still holds
         stay alive through that dataset.
         """
         self._adjacency_cache = {}
+        self._target_k_hop_reach = None
         if self.config.model.graph_adjacency_source in _STATIC_GRAPH_ADJACENCY_SOURCES:
             # Static adjacency does not read dynamic weights after init.
             return
@@ -811,6 +832,46 @@ class EpiDataset(Dataset):
             * self.graph_mobility_weights.element_size()
             / 1e6,
         )
+
+    @property
+    def run_state_spilled(self) -> bool:
+        """True when ``RUN_STATE_ATTRS`` live in a file, not necessarily in memory."""
+        return self._run_state_path is not None
+
+    def spill_run_state(self, path: Path) -> int:
+        """Write ``RUN_STATE_ATTRS`` to ``path`` and drop them from host memory.
+
+        Returns the number of tensor bytes written. ``load_run_state`` restores
+        the tensors bit for bit.
+        """
+        if self._run_state_path is not None:
+            raise RuntimeError(f"Run {self.run_id} state is already spilled")
+        state = {
+            name: tensor
+            for name in RUN_STATE_ATTRS
+            if (tensor := getattr(self, name)) is not None
+        }
+        torch.save(state, path)
+        self._run_state_path = path
+        self.unload_run_state()
+        return sum(tensor.numel() * tensor.element_size() for tensor in state.values())
+
+    def load_run_state(self) -> None:
+        """Map the spilled run state back in; no-op when it is already resident."""
+        if self._run_state_path is None or self.context_neigh_table is not None:
+            return
+        # mmap keeps the tensors file-backed: the pages are reclaimable page
+        # cache, not process-private memory, and unload only unmaps them.
+        state = torch.load(self._run_state_path, mmap=True, weights_only=True)
+        for name, tensor in state.items():
+            setattr(self, name, tensor)
+
+    def unload_run_state(self) -> None:
+        """Drop the host copy of a spilled run's state (it stays in its file)."""
+        if self._run_state_path is None:
+            raise RuntimeError(f"Run {self.run_id} state was never spilled")
+        for name in RUN_STATE_ATTRS:
+            setattr(self, name, None)
 
     def __del__(self) -> None:
         """Cleanup zarr dataset on garbage collection.

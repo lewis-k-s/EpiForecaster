@@ -11,7 +11,11 @@ This module handles the assembly of curriculum training datasets, including:
 
 import copy
 import logging
+import os
 import random
+import shutil
+import tempfile
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +26,7 @@ from data.epi_dataset import EpiDataset
 from data.preprocess.config import REGION_COORD
 from data.region_embedding_store import RegionEmbeddingStore
 from models.configs import EpiForecasterConfig
+from utils.platform import get_nvme_path
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +55,66 @@ class CurriculumBuildResult:
     real_run_id: str
     synth_run_ids: list[str]
     region_embedding_store: RegionEmbeddingStore | None
+
+
+class _RunStateSpiller:
+    """Moves each synthetic run's per-run tables to node-local disk.
+
+    The curriculum samples ``run_block_size`` runs at a time, so with more runs
+    than that the runs outside the current block need not hold their device
+    cache sources in host memory. A run is spilled right after it is built,
+    which keeps the build's peak at one dense run plus the compact state of
+    the resident series. With no more runs than one block nothing is spilled.
+    """
+
+    def __init__(self, run_block_size: int, total_runs: int) -> None:
+        self.enabled = total_runs > run_block_size
+        self.total_runs = total_runs
+        self.spilled = 0
+        self.directory: Path | None = None
+        if self.enabled:
+            self.directory = Path(
+                tempfile.mkdtemp(prefix="run_state_", dir=get_nvme_path())
+            )
+            logger.info(
+                "Spilling per-run state of %d synthetic runs to %s (run_block_size=%d)",
+                total_runs,
+                self.directory,
+                run_block_size,
+            )
+
+    def spill(self, dataset: EpiDataset) -> None:
+        if self.directory is None:
+            return
+        size = dataset.spill_run_state(self.directory / f"run_{self.spilled}.pt")
+        self.spilled += 1
+        if self.spilled == 1:
+            # Runs are near-identical in size; fail on the first one if the
+            # disk cannot hold the rest rather than after hours of building.
+            needed = size * (self.total_runs - 1)
+            free = shutil.disk_usage(self.directory).free
+            if free < needed * 1.05:
+                raise RuntimeError(
+                    f"Spilling {self.total_runs} runs needs ~{needed / 1e9:.0f} GB "
+                    f"in {self.directory} but only {free / 1e9:.0f} GB is free; "
+                    "point TMPDIR at larger node-local storage."
+                )
+
+    def attach(self, train_dataset: ConcatDataset) -> None:
+        """Delete the spill directory when the training dataset is collected.
+
+        Forked DataLoader workers inherit the finalizer, so only the process
+        that built the datasets may delete the files they all read.
+        """
+        if self.directory is not None:
+            weakref.finalize(
+                train_dataset, _remove_spill_dir, str(self.directory), os.getpid()
+            )
+
+
+def _remove_spill_dir(directory: str, owner_pid: int) -> None:
+    if os.getpid() == owner_pid:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def load_sparsity_mapping(dataset_path: Path) -> dict[str, float]:
@@ -371,6 +436,7 @@ def build_curriculum_datasets(
     test_nodes: list[int],
     real_run: str,
     synth_runs: list[str],
+    run_block_size: int,
     region_embedding_store: RegionEmbeddingStore | None = None,
 ) -> CurriculumBuildResult:
     """Build curriculum training datasets with real + synthetic runs.
@@ -382,11 +448,15 @@ def build_curriculum_datasets(
         test_nodes: Node indices for test targets
         real_run: Real run ID (typically "real")
         synth_runs: List of synthetic run IDs
+        run_block_size: ``training.curriculum.run_block_size``; with more
+            synthetic runs than this, each run's per-run tables are spilled to
+            node-local disk and restored only while its block is sampled.
 
     Returns:
         CurriculumBuildResult with train/val/test datasets
     """
     dataset_path = Path(config.data.dataset_path)
+    spiller = _RunStateSpiller(run_block_size, len(synth_runs))
 
     # --- Synth-only mode: no real dataset ---
     if not real_run:
@@ -452,9 +522,11 @@ def build_curriculum_datasets(
             # Release before the next run is built so peak memory holds one
             # dense run plus the compact state of the runs built so far.
             s_ds.release_dense_mobility()
+            spiller.spill(s_ds)
             synth_datasets.append(s_ds)
 
         train_dataset = ConcatDataset(synth_datasets)
+        spiller.attach(train_dataset)
 
         val_dataset = EpiDataset(
             config=config,
@@ -484,6 +556,7 @@ def build_curriculum_datasets(
 
         # Val/test keep the scaler run's dense tensors alive by reference.
         synth_scaler_ds.release_dense_mobility()
+        spiller.spill(synth_scaler_ds)
         synth_scaler_ds.release_shared_sparse_topology()
         val_dataset.release_shared_sparse_topology()
         test_dataset.release_shared_sparse_topology()
@@ -557,6 +630,7 @@ def build_curriculum_datasets(
 
     # Synthetic runs share no dense tensors with the real val/test datasets.
     synth_scaler_ds.release_dense_mobility()
+    spiller.spill(synth_scaler_ds)
 
     synth_datasets = []
     for s_run in synth_runs:
@@ -587,9 +661,11 @@ def build_curriculum_datasets(
             region_embedding_store=region_embedding_store,
         )
         s_ds.release_dense_mobility()
+        spiller.spill(s_ds)
         synth_datasets.append(s_ds)
 
     train_dataset = ConcatDataset([real_train_ds] + synth_datasets)
+    spiller.attach(train_dataset)
 
     val_dataset = EpiDataset(
         config=real_config,

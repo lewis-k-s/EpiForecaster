@@ -310,6 +310,14 @@ class CurriculumConfig:
     active_runs: int = 1
     # Contiguous windows per run before rotating to next run
     chunk_size: int = 512
+    # Synthetic runs resident at a time. Each epoch the active runs are split
+    # into consecutive blocks of this many runs; chunks are interleaved only
+    # within a block and blocks are visited one after another. Per-run host
+    # state of the runs outside the current block is spilled to node-local
+    # disk and the device caches of those runs are evicted, so memory scales
+    # with this value instead of the run count. A value >= the number of
+    # active runs gives one block and no rotation.
+    run_block_size: int = 8
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
     # Build each batch from one window start of one run (replaces chunk_size
@@ -331,6 +339,8 @@ class CurriculumConfig:
             )
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
+        if self.run_block_size < 1:
+            raise ValueError(f"run_block_size must be >= 1, got {self.run_block_size}")
 
         # Validate schedule phases don't overlap
         for i, phase in enumerate(self.schedule):

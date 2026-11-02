@@ -103,7 +103,11 @@ from training.grad_utils import (
     compute_gradient_norms_and_clip,
     should_log_gradnorm_components,
 )
-from utils.training_utils import should_log_step
+from utils.training_utils import (
+    MAX_DEVICE_CACHED_DATASETS,
+    set_device_cache_limit,
+    should_log_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +302,12 @@ class EpiForecasterTrainer:
         self.val_loader = loader_bundle.val
         self.test_loader = loader_bundle.test
         self.curriculum_sampler = loader_bundle.curriculum_sampler
+        # A curriculum block's runs stay device-resident while it is sampled.
+        set_device_cache_limit(
+            self.curriculum_sampler.resident_dataset_limit
+            if self.curriculum_sampler is not None
+            else MAX_DEVICE_CACHED_DATASETS
+        )
         self._multiprocessing_context = loader_bundle.multiprocessing_context
 
         if should_prestart_dataloader_workers(

@@ -1,5 +1,6 @@
 """Curriculum sampling contracts that affect run balance and batch ordering."""
 
+from collections import Counter
 from dataclasses import dataclass
 
 import pytest
@@ -175,3 +176,132 @@ def test_window_start_batches_are_full_single_start_and_cover_every_sample() -> 
     assert seen == set(range(len(dataset)))
     # 3 starts of 5 samples -> 2 batches each; 4 starts of 2 samples -> 1 each.
     assert len(batches) == sampler.num_batches_for_epoch(0) == 10
+
+
+def _blocked_dataset(*, with_real: bool) -> ConcatDataset:
+    runs = [_Run(f"synth_{i}", _samples([f"s{i}"], range(7 + 3 * i))) for i in range(7)]
+    if with_real:
+        runs.insert(0, _Run("real", _samples(["r0"], range(40))))
+    return ConcatDataset(runs)
+
+
+def _blocked_sampler(
+    dataset: ConcatDataset, *, run_block_size: int, synth_ratio: float, seed: int = 5
+) -> EpidemicCurriculumSampler:
+    config = CurriculumConfig(
+        enabled=True,
+        active_runs=-1,
+        chunk_size=5,
+        run_block_size=run_block_size,
+        schedule=[
+            CurriculumPhaseConfig(start_epoch=0, end_epoch=10, synth_ratio=synth_ratio)
+        ],
+    )
+    return EpidemicCurriculumSampler(
+        dataset=dataset,
+        batch_size=2,
+        config=config,
+        real_run_id="real",
+        seed=seed,
+    )
+
+
+def test_blocked_epoch_covers_every_sample_once_and_confines_runs_to_blocks() -> None:
+    dataset = _blocked_dataset(with_real=False)
+    unblocked = _blocked_sampler(dataset, run_block_size=100, synth_ratio=1.0)
+    blocked = _blocked_sampler(dataset, run_block_size=3, synth_ratio=1.0)
+
+    plan = blocked.plan_epoch_blocks(0)
+    assert [len(block.synth_dataset_indices) for block in plan] == [3, 3, 1]
+    assert sorted(i for block in plan for i in block.synth_dataset_indices) == list(
+        range(7)
+    )
+    for block in plan:
+        runs = {_run_index(dataset, i) for batch in block.batches for i in batch}
+        assert runs == set(block.synth_dataset_indices)
+
+    batches = list(blocked)
+    assert batches == [batch for block in plan for batch in block.batches]
+    assert Counter(i for b in batches for i in b) == Counter(
+        i for b in unblocked.plan_epoch_blocks(0)[0].batches for i in b
+    )
+    assert blocked.num_batches_for_epoch(0) == unblocked.num_batches_for_epoch(0)
+
+
+def test_blocked_epoch_is_deterministic_and_changes_blocks_per_epoch() -> None:
+    dataset = _blocked_dataset(with_real=False)
+    sampler = _blocked_sampler(dataset, run_block_size=3, synth_ratio=1.0)
+    peer = _blocked_sampler(dataset, run_block_size=3, synth_ratio=1.0)
+
+    first = sampler.plan_epoch_blocks(0)
+    assert [b.batches for b in first] == [b.batches for b in peer.plan_epoch_blocks(0)]
+    second = sampler.plan_epoch_blocks(1)
+    assert [b.synth_dataset_indices for b in first] != [
+        b.synth_dataset_indices for b in second
+    ]
+
+
+def test_blocked_epoch_spreads_real_budget_over_blocks() -> None:
+    dataset = _blocked_dataset(with_real=True)
+    unblocked = _blocked_sampler(dataset, run_block_size=100, synth_ratio=0.5)
+    blocked = _blocked_sampler(dataset, run_block_size=3, synth_ratio=0.5)
+
+    plan = blocked.plan_epoch_blocks(0)
+    assert len(plan) == 3
+    real_total = 0
+    for block in plan:
+        runs = [_run_index(dataset, i) for batch in block.batches for i in batch]
+        real_runs = [run for run in runs if run == 0]
+        assert real_runs, "every block carries real data"
+        assert set(runs) - {0} <= set(block.synth_dataset_indices)
+        real_total += len(real_runs)
+    unblocked_runs = [
+        _run_index(dataset, i)
+        for batch in unblocked.plan_epoch_blocks(0)[0].batches
+        for i in batch
+    ]
+    assert real_total == unblocked_runs.count(0)
+    assert blocked.num_batches_for_epoch(0) == unblocked.num_batches_for_epoch(0)
+
+
+def test_one_block_keeps_the_resolved_run_order() -> None:
+    dataset = _blocked_dataset(with_real=True)
+    sampler = _blocked_sampler(dataset, run_block_size=7, synth_ratio=0.5)
+    plan = sampler.plan_epoch_blocks(3)
+    assert len(plan) == 1
+    assert plan[0].synth_dataset_indices == sampler._resolve_active_synth_indices()
+
+
+def test_resident_dataset_limit_is_block_runs_plus_real() -> None:
+    dataset = _blocked_dataset(with_real=True)
+    assert (
+        _blocked_sampler(
+            dataset, run_block_size=3, synth_ratio=0.5
+        ).resident_dataset_limit
+        == 4
+    )
+    assert (
+        _blocked_sampler(
+            dataset, run_block_size=50, synth_ratio=0.5
+        ).resident_dataset_limit
+        == 8
+    )
+    assert (
+        _blocked_sampler(
+            _blocked_dataset(with_real=False), run_block_size=2, synth_ratio=1.0
+        ).resident_dataset_limit
+        == 2
+    )
+
+
+def test_iteration_publishes_run_blocks_to_the_dataset() -> None:
+    dataset = _blocked_dataset(with_real=True)
+    sampler = _blocked_sampler(dataset, run_block_size=3, synth_ratio=0.5)
+    sampler.set_curriculum(0)
+    iterator = iter(sampler)
+    next(iterator)
+    plan = sampler.plan_epoch_blocks(0)
+    assert dataset.run_blocks == [
+        frozenset(id(dataset.datasets[i]) for i in block.synth_dataset_indices)
+        for block in plan
+    ]

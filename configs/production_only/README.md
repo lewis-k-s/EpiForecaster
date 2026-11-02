@@ -17,6 +17,10 @@
 - Production synthetic pretraining on the processed a97c812 reactive corpus
 - Invoked only through `workflow/config/mn5_synth_pretrain_reactive_n100.yaml`
 - Enables direct latent `S/I/H/R/death_flow` supervision for stage-1 pretraining
+- Memory: `training.curriculum.run_block_size: 8` keeps one block of 8 of the 200
+  runs resident; per-run graph weights and context tables (~0.46 GB/run, ~92 GB
+  total) are spilled to node-local `TMPDIR` during the build, so the node needs
+  that much free local disk
 
 ### `preprocess_mn5_synth.yaml`
 - Canonical MN5 synthetic preprocessing base

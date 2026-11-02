@@ -10,6 +10,22 @@ env: "mn5"
 # Sizing: one epoch is about ten times a 20-run epoch
 # (~4.2M examples, ~131k batches, ~3.1 h at the measured compiled throughput).
 # Four epochs keep the cycle well inside one acc_bscls allocation.
+#
+# Memory: the 200 runs are never all resident. training.curriculum.run_block_size
+# keeps 8 runs at a time (each epoch draws blocks of 8 runs; chunks interleave
+# only inside a block). A run's per-run tables (compact float16 graph weights
+# [455, 660, 660] ~0.40 GB plus bit-packed context tables ~0.06 GB, ~0.46 GB
+# per run) are spilled to node-local TMPDIR once at build time (~92 GB of disk
+# for 200 runs; the build fails early if the disk is too small) and are
+# memory-mapped back only while the run's block is sampled. Host RAM then holds
+# only the per-run series the DataLoader workers read (~0.05 GB/run, ~10 GB for
+# 200 runs) plus ~7 GB fixed overhead, instead of the ~0.7 GB/run measured in
+# the MN5 sizing run (job 48420141: OOM at 115.5 GB after 152 runs; graph
+# weights plus a never-freed (T, n_targets, N) k-hop table). On the device a
+# block holds ~0.86 GB/run (float32 adjacency ~0.79 GB plus context tables),
+# ~7 GB for 8 runs against the 64 GB H100. A run is loaded onto the device once
+# per epoch (200 loads instead of ~8k chunk-switch rebuilds), and 8 runs per
+# block keep every stretch of batches mixed over several scenarios.
 
 data:
   dataset_path: data/processed/synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip
@@ -135,6 +151,7 @@ training:
     enabled: true
     active_runs: -1          # Use all available synthetic runs each epoch
     chunk_size: 512
+    run_block_size: 8        # 25 blocks of 8 runs per epoch; one block resident
     run_sampling: "round_robin"
     schedule:
       - start_epoch: 0

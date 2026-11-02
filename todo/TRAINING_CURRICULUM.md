@@ -151,6 +151,7 @@ training:
   curriculum:
     enabled: true
     chunk_size: 512         # contiguous windows per run
+    run_block_size: 8       # synthetic runs resident at a time (see below)
     run_sampling: "round_robin"  # or "random"
     schedule:
       - start_epoch: 0
@@ -170,6 +171,34 @@ training:
         synth_ratio: 0.05
         mode: "time_major"
 ```
+
+### Blocked Run Rotation (`run_block_size`)
+
+With many synthetic runs (`active_runs: -1`) the sampler would otherwise
+interleave chunks from every run in every epoch, keeping all runs in host and
+device memory and rebuilding the device caches on nearly every chunk switch.
+Each epoch the active runs are therefore split into consecutive blocks of
+`run_block_size` runs. Chunks (and the real-data budget, proportionally) are
+interleaved only within a block, and blocks are visited one after another.
+The per-epoch batch total does not depend on the block size; a block size of at
+least the number of active runs gives one block, identical to interleaving all
+runs. When more than one block is needed, the runs are permuted with the epoch
+seed before splitting, so block membership and order differ per epoch.
+
+Runs outside the current block hold no heavy state:
+
+*   **Host:** when there are more synthetic runs than `run_block_size`, each
+    run's graph weights and context tables are written once to a file under the
+    node-local `TMPDIR` as it is built (about 0.46 GB per 945-region, 455-day
+    run; the build aborts on the first run if the disk cannot hold them all).
+    The main process memory-maps them back when the run's block starts and
+    unmaps them when the run is evicted. DataLoader workers (forked before the
+    state is loaded) never read these tables, so nothing is duplicated in them.
+*   **Device:** `utils.training_utils` keeps at most
+    `run_block_size + number of real datasets` datasets cached on the GPU
+    (`EpidemicCurriculumSampler.resident_dataset_limit`); the least recently
+    used run is evicted when a new block's run arrives, so a run is uploaded
+    once per epoch.
 
 ---
 

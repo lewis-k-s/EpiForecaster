@@ -332,6 +332,7 @@ class TestDiscoverRunsSynthOnly:
                 test_nodes=[3],
                 real_run="",
                 synth_runs=synth_runs,
+                run_block_size=8,
             )
 
         load_region_ids.assert_called_once_with(
@@ -371,3 +372,15 @@ class TestCurriculumConfigActiveRuns:
         """Positive active_runs values should still be valid."""
         config = CurriculumConfig(active_runs=3)
         assert config.active_runs == 3
+
+
+class TestCurriculumConfigRunBlockSize:
+    """Tests for CurriculumConfig.run_block_size validation."""
+
+    def test_default_block_size_is_positive(self):
+        assert CurriculumConfig().run_block_size == 8
+
+    @pytest.mark.parametrize("size", [0, -1])
+    def test_non_positive_block_size_is_invalid(self, size):
+        with pytest.raises(ValueError, match="run_block_size must be >= 1"):
+            CurriculumConfig(run_block_size=size)
