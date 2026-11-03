@@ -44,8 +44,15 @@ env: "mn5"
 # per epoch (200 loads instead of ~8k chunk-switch rebuilds), and 8 runs per
 # block keep every stretch of batches mixed over several scenarios.
 #
-# Latent supervision uses scaling "none", so no latent scale fit runs; the
-# completeness check (require_complete_targets) still validates every split.
+# Latent supervision is fit in a fixed training-split scale: S and R are divided
+# by their standard deviation, I, H and death flow are compared after
+# asinh(x / std). With raw fraction-space MSE ("none", total_weight 0.01) the
+# first a97c812 pretrain logged a weighted latent loss of ~2e-4 against an
+# observation loss of order 1, and its synthetic-test I predictions kept
+# 0.00085 of the target standard deviation. I carries the largest component
+# weight because the inferred prevalence anchors the real-data latents.
+# total_weight is sized from the sizing run's shared-parameter gradient share
+# (latentgrad_combined_squared_gradient_share in training_dynamics).
 
 data:
   dataset_path: data/processed/synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip
@@ -163,8 +170,14 @@ training:
     joint:
       observation_loss: nll
       latent:
-        total_weight: 0.01
-        scaling: "none"
+        total_weight: 1.0
+        scaling: "asinh"
+        component_weights:
+          s: 0.15
+          i: 0.4
+          h: 0.15
+          r: 0.15
+          death_flow: 0.15
         require_complete_targets: true
 
   curriculum:
