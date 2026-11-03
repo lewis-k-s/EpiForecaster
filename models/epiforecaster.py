@@ -432,6 +432,7 @@ class EpiForecaster(nn.Module):
         R_traj = sir_outputs["R_trajectory"]  # [B, H+1]
         D_traj = sir_outputs["D_trajectory"]  # [B, H+1]
         hospitalization_flow = sir_outputs["hospitalization_flow"]  # [B, H]
+        infection_flow = sir_outputs["infection_flow"]  # [B, H]
         death_flow = sir_outputs["death_flow"]  # [B, H]
         physics_residual = sir_outputs["physics_residual"]  # [B, H]
 
@@ -530,6 +531,7 @@ class EpiForecaster(nn.Module):
             "R_trajectory": R_traj,
             "D_trajectory": D_traj,
             "hospitalization_flow": hospitalization_flow,
+            "infection_flow": infection_flow,
             "death_flow": death_flow,
             "physics_residual": physics_residual,
             "pred_ww": pred_ww,

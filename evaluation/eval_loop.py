@@ -37,6 +37,7 @@ from evaluation.pathway_metrics import (
     ObservationLatentMetricResult,
     PathwayMetricResult,
     TorchLatentCoherenceAccumulator,
+    TorchLatentPlausibilityAccumulator,
     TorchLatentProtocolAccumulator,
     TorchObservationLatentCoherenceAccumulator,
     TorchPathwayMetricAccumulator,
@@ -91,6 +92,13 @@ _ALLOWED_RELEVANT_SOURCES = {
     "ww": {"I"},
     "cases": {"I"},
     "deaths": {"death_flow", "D"},
+}
+
+# Latent flow compared with each observed count series for implied ascertainment.
+_ASCERTAINMENT_LATENT_FLOWS = {
+    "cases": "infection_flow",
+    "hosp": "hospitalization_flow",
+    "deaths": "death_flow",
 }
 
 
@@ -508,6 +516,9 @@ def evaluate_loader(
     latent_metrics = TorchLatentCoherenceAccumulator(
         device=device, compile_step=compile_metrics
     )
+    latent_plausibility_metrics = TorchLatentPlausibilityAccumulator(
+        device=device, compile_step=compile_metrics
+    )
     latent_diagnostic_metrics = {
         protocol: TorchLatentProtocolAccumulator(
             protocol=protocol, device=device, compile_step=compile_metrics
@@ -670,6 +681,26 @@ def evaluate_loader(
                     model_outputs=model_outputs,
                     targets=targets_dict,
                 )
+                # Plausibility indicators use every window, with or without latent
+                # targets, so they are valid on real data.
+                ascertainment_inputs = {}
+                for head_name, flow_key in _ASCERTAINMENT_LATENT_FLOWS.items():
+                    head_target = metric_supervision[head_name]["target"]
+                    head_weights = metric_supervision[head_name]["weights"]
+                    if head_target is None or head_weights is None:
+                        continue
+                    ascertainment_inputs[head_name] = (
+                        drop_nowcast(
+                            model_outputs[flow_key], int(head_target.shape[1])
+                        ),
+                        head_target,
+                        head_weights,
+                    )
+                latent_plausibility_metrics.update(
+                    model_outputs=model_outputs,
+                    ascertainment=ascertainment_inputs,
+                )
+                del ascertainment_inputs
                 for protocol, (
                     diagnostic_predictions,
                     diagnostic_targets,
@@ -1192,6 +1223,7 @@ def evaluate_loader(
         for head_name, accumulator in observation_latent_metrics.items()
     }
     latent_summary = latent_metrics.finalize()
+    latent_plausibility_summary = latent_plausibility_metrics.finalize()
     latent_diagnostic_summary = {
         key: value
         for accumulator in latent_diagnostic_metrics.values()
@@ -1408,6 +1440,7 @@ def evaluate_loader(
             summary=observation_latent_summaries[head_name],
         )
     metrics.update(latent_summary)
+    metrics.update(latent_plausibility_summary)
     metrics.update(latent_diagnostic_summary)
     _add_delay_kernel_metrics(metrics=metrics, model=model)
 

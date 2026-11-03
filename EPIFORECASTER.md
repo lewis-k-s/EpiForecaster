@@ -40,7 +40,7 @@ The model operates as a three-stage differentiable pipeline:
     $$ \frac{dR}{dt} = \gamma_t I + \rho_t H $$
     $$ \frac{dD}{dt} = \mu^I_t I + \mu^H_t H $$
 *   **Latent Contract**: All states are modeled as **fractions** of the population ($S+I+H+R+D=1.0$). The physics core uses a normalized population $N=1.0$ internally to ensure scale invariance.
-*   **Outputs**: Trajectories for $S, I, H, R, D$, `hospitalization_flow` (flux into $H$), and `death_flow` (flux into $D$).
+*   **Outputs**: Trajectories for $S, I, H, R, D$, `infection_flow` (flux out of $S$, $\beta_t S_t I_t / N$ of each Euler step, reported before the non-negativity clamp and mass rescale), `hospitalization_flow` (flux into $H$), and `death_flow` (flux into $D$).
 
 ### Stage 3: Observation Heads
 Differentiable layers mapping latent states to observable metrics.
@@ -160,6 +160,52 @@ mode can use raw fraction-space MSE, fixed training-split standard-deviation
 scaling, or fixed `asinh` scaling for I, H, and death flow. Synthetic
 pretraining can require all five finite, nonnegative targets; other runs use a
 zero latent weight.
+
+### Latent plausibility indicators (evaluation)
+
+Real data has no latent targets, so evaluation emits ground-truth-free
+indicators of whether the inferred SIRHD latents are epidemiologically
+plausible. They use every forecast window, are computed by
+`TorchLatentPlausibilityAccumulator` in the evaluation loop, and are written to
+`test_summary.json` `metrics` with prefix `latent_plausibility_` next to the
+`latent_*` and `observation_latent_*` metrics. Quantile suffixes are `q05`,
+`q25`, `median`, `q75`, `q95` (exact `torch.quantile` across windows; NaN and
+non-finite windows excluded). All quantities are population fractions ($N=1$).
+
+| Key | Definition |
+| --- | --- |
+| `window_count` | Forecast windows evaluated |
+| `i_origin_<q>` | $I$ at the forecast origin (`I_trajectory[:, 0]`) |
+| `i_peak_<q>` | $\max_h I$ over the trajectory |
+| `i_collapse_fraction` | Fraction of windows with $I$ peak $< 10^{-6}$ (0.1 per 100k) |
+| `s_depletion_origin_<q>` | $1 - S_0$ |
+| `forecast_attack_<q>` | $S_0 - S_H$, fraction infected over the forecast |
+| `rt_origin_<q>` | $\beta_0 S_0 / (\gamma_0 + \alpha_0 + \mu^I_0)$ |
+| `rt_horizon_mean_<q>` | Per-window mean over $h=0..H-1$ of $\beta_h S_h / (\gamma_h + \alpha_h + \mu^I_h)$ |
+| `ascertainment_<head>_<q>` | Per-window implied ascertainment, `head` in `cases`, `hosp`, `deaths` |
+| `ascertainment_<head>_pooled` | Total observed per-100k over total latent per-100k |
+| `ascertainment_<head>_window_count` | Windows entering the ascertainment quantiles |
+| `ascertainment_<head>_zero_latent_window_fraction` | Share of observed windows whose latent flow sums to zero |
+
+$\alpha$ is the $I \to H$ rate (`hospitalization_rate_t`) and $\mu^I$ is the
+direct $I \to D$ mortality (`mortality_t`); hospital mortality is not part of
+the removal rate from $I$. Steps with a non-positive denominator or non-finite
+value are skipped, and a window is excluded only when no step is valid.
+
+Implied ascertainment compares observed counts with the latent flow feeding the
+head: `infection_flow` for cases, `hospitalization_flow` for hospitalizations,
+and `death_flow` for deaths. Supervised targets are absolute
+`log1p(per-100k)` (`delta_forecasting` only anchors predictions), so the
+observed count per 100k is `expm1(target)` and the latent count per 100k is the
+flow times $10^5$, aligned to the forecast targets. Per window the ratio is
+$\sum_t w_t\, y_t / \sum_t w_t\, \ell_t$ over supervised days ($w_t>0$); windows
+need $\sum_t w_t > 0$ and a positive latent sum to enter the quantiles. The
+pooled ratio sums over all windows with supervision and finite sums, including
+zero-latent windows. Cases and deaths are daily counts. Hospitalizations are
+weekly totals placed on the week-start date
+(`data/preprocess/processors/hospitalizations_processor.py`), so the `hosp`
+ratio divides a weekly total by one day's latent flow and is about seven times
+an admission ascertainment.
 
 ## 4. Model Variants
 
@@ -287,7 +333,7 @@ def forward(
 
 **Returns**:
 
-*   `beta_t`, `S_trajectory`, `I_trajectory`, `R_trajectory`: Latent dynamics.
+*   `beta_t`, `S_trajectory`, `I_trajectory`, `R_trajectory`: Latent dynamics; `infection_flow`, `hospitalization_flow`, `death_flow`: per-step latent flows.
 *   `pred_ww`, `pred_hosp`, `pred_cases`, `pred_deaths`: Observation predictions.
 *   `physics_residual`: Deviation from pure SIR dynamics (for $L_{SIR}$).
 
