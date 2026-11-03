@@ -1217,11 +1217,13 @@ class TorchLatentPlausibilityAccumulator:
       ``_zero_latent_window_fraction`` (windows with ``sum(w) > 0`` and latent
       sum <= 0, over windows with ``sum(w) > 0`` and finite sums).
 
-    Cases and deaths are daily counts, so their ratios are daily ascertainment
-    (cases use the S->I infection flow, not reported-onset prevalence).
-    Hospitalization observations are weekly totals placed on the week-start
-    date (``hospitalizations_processor``), so the hosp ratio divides a weekly
-    total by one day's latent flow and is about 7x an admission ascertainment.
+    In the real dataset, cases and deaths are daily counts, so their ratios are
+    daily ascertainment (cases use the S->I infection flow, not reported-onset
+    prevalence). Real hospitalization observations are weekly totals placed on
+    the week-start date (``hospitalizations_processor``), so the hosp ratio
+    divides a weekly total by one day's latent flow and is about 7x an
+    admission ascertainment. Synthetic corpora follow their generator's
+    reporting convention.
     """
 
     def __init__(self, *, device: torch.device, compile_step: bool = False) -> None:

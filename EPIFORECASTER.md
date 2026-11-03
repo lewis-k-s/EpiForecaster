@@ -205,11 +205,13 @@ flow times $10^5$, aligned to the forecast targets. Per window the ratio is
 $\sum_t w_t\, y_t / \sum_t w_t\, \ell_t$ over supervised days ($w_t>0$); windows
 need $\sum_t w_t > 0$ and a positive latent sum to enter the quantiles. The
 pooled ratio sums over all windows with supervision and finite sums, including
-zero-latent windows. Cases and deaths are daily counts. Hospitalizations are
-weekly totals placed on the week-start date
+zero-latent windows. In the real dataset, cases and deaths are daily counts and
+hospitalizations are weekly totals placed on the week-start date
 (`data/preprocess/processors/hospitalizations_processor.py`), so the `hosp`
 ratio divides a weekly total by one day's latent flow and is about seven times
-an admission ascertainment.
+an admission ascertainment. Synthetic corpora follow their generator's
+reporting convention: on the a97c812 test split the `hosp` and `deaths` ratios
+are both about 7, consistent with weekly totals.
 
 ## 4. Model Variants
 
