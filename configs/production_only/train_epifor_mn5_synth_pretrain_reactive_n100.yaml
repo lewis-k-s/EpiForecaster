@@ -7,8 +7,9 @@ env: "mn5"
 # train_epifor_mn5_full.yaml with training.init_checkpoint_path set to the best
 # checkpoint from this run.
 #
-# Sizing: one epoch is ~4.2M examples (~131k batches). Compiled training ran at
-# about 104 batches/s on MN5 (sizing job 48421321), about 21 min per epoch.
+# Sizing: one epoch is ~4.2M examples (~131k batches). Compiled training with the
+# block pipeline below ran at about 97 batches/s on MN5 (sizing job 48428830),
+# about 23 min per epoch.
 #
 # Memory: the 200 runs are never all resident. training.curriculum.run_block_size
 # keeps 8 runs at a time (each epoch draws blocks of 8 runs; chunks interleave
@@ -26,8 +27,9 @@ env: "mn5"
 # run's mobility, holds ~1.2 GB dense plus ~1 GB intermediates transiently and
 # hands the ~0.46 GB result to the trainer through shared memory. 4 builders x
 # 3 threads use 12 of the 20 CPUs next to the 4 train and 2 validation loader
-# workers and the trainer; the earlier eager build took ~4.6 s per run, so a
-# block of 8 should build in two rounds well inside the 50-75 s a block trains.
+# workers and the trainer. In sizing job 48428830 a run built in ~11.7 s and a
+# block of 8 in ~25 s, so each epoch's first block waits ~25 s; later blocks
+# waited under 1 s. Peak host RSS was 36.2 GB.
 # Mobility diagnostics are computed once per run, on its first build. Nothing is
 # written to disk. Host RAM holds the light
 # state plus one block plus the prefetched block(s) plus ~7 GB fixed overhead,
