@@ -1,0 +1,61 @@
+# Immutable rebuild of the production real dataset real_with_id with the
+# current preprocessing defaults (leading-NaN clinical smoothing,
+# hospitalizations_reporting_lag_days=7, float32 storage).
+#
+# Raw inputs are the DVC directory data/files/catalonia_real_raw_inputs_v1.dvc
+# (nine files, 233 MB) and data/files/mobility.zarr.zip.dvc. Preprocessing runs no
+# GPU step; the acc_debug allocation is the one approved QoS (2 h maximum).
+#
+# Run:
+#   bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
+#     --config workflow/config/mn5_preprocess_real.yaml
+#   (then submit the prepared run as docs/MN5_SNAKEMAKE.md describes)
+#
+# The run owns outputs/preprocessing/real_with_id.zarr.zip, qa.json and
+# outputs/preprocessing/publication/{real_with_id.zarr.zip.dvc,receipt.json}.
+# After the receipt passes review, promote the pointer by hand:
+#   1. copy publication/real_with_id.zarr.zip.dvc to
+#      data/processed/real_with_id.zarr.zip.dvc in a Git branch;
+#   2. in the consuming templates, use the new pointer as the dvc target and
+#      set data.dataset_path to data/processed/real_with_id.zarr.zip.
+# The old directory pointer was retired. Earlier runs keep their own data.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: preprocess
+  target: preprocess
+
+dvc:
+  targets:
+    - data/files/catalonia_real_raw_inputs_v1.dvc
+    - data/files/mobility.zarr.zip.dvc
+  provenance_targets: []
+
+preprocessing:
+  base_config: configs/production_only/preprocess_mn5_real.yaml
+  dataset_name: real_with_id
+  expected_run_count: 1
+  required_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - edar_biomarker_N1
+  float32_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - edar_biomarker_N1
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 120

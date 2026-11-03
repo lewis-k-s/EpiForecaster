@@ -17,6 +17,7 @@ import platform
 import random
 import re
 import time
+from contextlib import nullcontext
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
@@ -61,7 +62,10 @@ from training.pathway_gradients import (
     compute_pathway_gradient_metrics,
     should_probe_pathway_gradients,
 )
-from training.training_dynamics import TrainingDynamicsWriter
+from training.training_dynamics import (
+    TrainingDynamicsWriter,
+    append_block_build_record,
+)
 from utils.device import (
     iter_device_ready_batches,
     setup_device_streams,
@@ -103,7 +107,11 @@ from training.grad_utils import (
     compute_gradient_norms_and_clip,
     should_log_gradnorm_components,
 )
-from utils.training_utils import should_log_step
+from utils.training_utils import (
+    MAX_DEVICE_CACHED_DATASETS,
+    set_device_cache_limit,
+    should_log_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +231,7 @@ class EpiForecasterTrainer:
         self.test_dataset = dataset_splits.test
         self.real_run_id = dataset_splits.real_run_id
         self.synth_run_ids = dataset_splits.synth_run_ids
+        self.block_pipeline = dataset_splits.block_pipeline
         self.latent_scale_state = self._fit_latent_scale_state()
 
         # Access cases_dim/biomarkers_dim safely (handle ConcatDataset)
@@ -293,11 +302,18 @@ class EpiForecasterTrainer:
             real_run_id=self.real_run_id or "real",
             device_hint=self._device_hint,
             seed=self.config.training.seed,
+            block_pipeline=self.block_pipeline,
         )
         self.train_loader = loader_bundle.train
         self.val_loader = loader_bundle.val
         self.test_loader = loader_bundle.test
         self.curriculum_sampler = loader_bundle.curriculum_sampler
+        # A curriculum block's runs stay device-resident while it is sampled.
+        set_device_cache_limit(
+            self.curriculum_sampler.resident_dataset_limit
+            if self.curriculum_sampler is not None
+            else MAX_DEVICE_CACHED_DATASETS
+        )
         self._multiprocessing_context = loader_bundle.multiprocessing_context
 
         if should_prestart_dataloader_workers(
@@ -830,16 +846,35 @@ class EpiForecasterTrainer:
         )
 
     def _fit_latent_scale_state(self) -> LatentScaleState | None:
-        """Fit fixed latent scales from the training split when requested."""
+        """Fit fixed latent scales from the training split when requested.
+
+        The scales only enter the loss for ``scaling`` ``std`` and ``asinh``
+        (``evaluation.losses.JointInferenceLoss._transform_latent_pair``); with
+        ``none`` neither the loss nor evaluation reads them, so no fit (and no
+        scale state or receipt) is produced.
+        """
         latent_config = self.config.training.loss.joint.latent
         if latent_config.total_weight <= 0:
             return None
 
         if latent_config.require_complete_targets:
+            validate_started = time.perf_counter()
             for split in (self.train_dataset, self.val_dataset, self.test_dataset):
                 if split is not None:
                     validate_complete_latent_targets(split)
+            self._status(
+                "Validated complete latent targets in "
+                f"{time.perf_counter() - validate_started:.1f}s",
+                logging.INFO,
+            )
 
+        if latent_config.scaling == "none":
+            self._status(
+                "Latent scaling is 'none': skipping the latent scale fit", logging.INFO
+            )
+            return None
+
+        fit_started = time.perf_counter()
         dataset_identity = str(
             getattr(
                 self,
@@ -854,7 +889,8 @@ class EpiForecasterTrainer:
         )
         self._status(
             "Fitted latent supervision scales from the training split: "
-            f"mode={latent_config.scaling}, hash={state.state_hash}",
+            f"mode={latent_config.scaling}, hash={state.state_hash}, "
+            f"took {time.perf_counter() - fit_started:.1f}s",
             logging.INFO,
         )
         return state
@@ -895,10 +931,18 @@ class EpiForecasterTrainer:
         This allows forked workers to inherit preloaded mobility tensors without
         copying once CUDA is initialized in the parent process.
         """
-        for loader in loaders:
-            if loader is None or loader.num_workers == 0:
-                continue
-            _ = iter(loader)
+        # One guard around all forks: the first loader's epoch plan must not
+        # start background builds before the last loader has forked its workers.
+        guard = (
+            self.block_pipeline.quiesced()
+            if self.block_pipeline is not None
+            else nullcontext()
+        )
+        with guard:
+            for loader in loaders:
+                if loader is None or loader.num_workers == 0:
+                    continue
+                _ = iter(loader)
 
     def setup_logging(self):
         """Setup logging and experiment tracking."""
@@ -1280,6 +1324,16 @@ class EpiForecasterTrainer:
             mobility_enabled=bool(self.config.model.type.mobility),
             resume=resume_existing,
         )
+        if self.block_pipeline is not None:
+            self.block_pipeline.set_record_sink(self._append_block_build_record)
+
+    def _append_block_build_record(self, record: dict[str, Any]) -> None:
+        """Append one block-pipeline profiling record to the sidecar JSONL."""
+        if self.experiment_dir is None:
+            raise RuntimeError("experiment_dir not set; call setup_logging() first")
+        append_block_build_record(
+            self.experiment_dir, {**record, "global_step": self.global_step}
+        )
 
     def _append_nonfinite_dynamics_record(
         self,
@@ -1347,6 +1401,9 @@ class EpiForecasterTrainer:
         try:
             result = self._run_training()
         except Exception as exc:
+            # A pruned or failed trial skips the cleanup at the end of
+            # _run_training; release its persistent loader workers here.
+            self.cleanup_dataloaders()
             status = "pruned" if exc.__class__.__name__ == "TrialPruned" else "failed"
             writer = getattr(self, "training_dynamics_writer", None)
             if writer is not None:
@@ -1486,18 +1543,6 @@ class EpiForecasterTrainer:
             if self.scheduler and self.config.training.scheduler_type == "step":
                 self.scheduler.step()
 
-            # Checkpointing
-            if (
-                self.config.output.save_checkpoints
-                and (epoch + 1) % self.config.output.checkpoint_frequency == 0
-            ):
-                self._save_checkpoint(
-                    epoch,
-                    val_loss,
-                    val_selection_score=val_selection_score,
-                    val_selection_metric=val_selection_metric,
-                )
-
             # Early stopping (disabled if patience is None)
             should_stop = False
             early_stopping_enabled = self._is_early_stopping_enabled()
@@ -1572,6 +1617,20 @@ class EpiForecasterTrainer:
             # records this epoch's selection state.
             if self.config.training.retain_best_crps_checkpoint:
                 self._maybe_save_crps_checkpoint(epoch, val_loss, val_metrics)
+
+            # Periodic checkpoint is written last so it carries this epoch's
+            # best-score, patience, CRPS, and history state; an exact resume at
+            # epoch + 1 must not re-derive any of them.
+            if (
+                self.config.output.save_checkpoints
+                and (epoch + 1) % self.config.output.checkpoint_frequency == 0
+            ):
+                self._save_checkpoint(
+                    epoch,
+                    val_loss,
+                    val_selection_score=val_selection_score,
+                    val_selection_metric=val_selection_metric,
+                )
 
             _prev_val_loss = val_loss
 
@@ -2893,6 +2952,13 @@ class EpiForecasterTrainer:
                     self._status("==== PROFILING COMPLETE ====")
                     profiler_complete_announced = True
 
+        if self.block_pipeline is not None:
+            # Close the epoch's block accounting and persist the diagnostics of
+            # the runs whose heavy state was built during it.
+            self.block_pipeline.end_epoch()
+            if self.experiment_dir is not None:
+                self._persist_mobility_diagnostics(self.experiment_dir)
+
         effective_batches = max(1, counted_batches)
         result = total_loss / effective_batches
         return result.item() if isinstance(result, torch.Tensor) else float(result)
@@ -3554,6 +3620,8 @@ class EpiForecasterTrainer:
                     self._status(
                         f"Error cleaning up {name} loader: {e}", logging.WARNING
                     )
+        if getattr(self, "block_pipeline", None) is not None:
+            self.block_pipeline.shutdown()
 
     def get_training_results(self) -> dict[str, Any]:
         """Return training results summary dictionary."""

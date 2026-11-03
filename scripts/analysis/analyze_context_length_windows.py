@@ -20,6 +20,7 @@ import xarray as xr
 
 from data.dataset_factory import split_nodes_by_ratio
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 from models.configs import EpiForecasterConfig
 from utils.plotting import Palette
 
@@ -164,7 +165,7 @@ def compute_counts(
     config: EpiForecasterConfig,
     context_lengths: list[int],
 ) -> list[SplitCounts]:
-    dataset = _select_run_id(xr.open_zarr(config.data.dataset_path), config.data.run_id)
+    dataset = _select_run_id(open_zarr_store(config.data.dataset_path), config.data.run_id)
     valid_targets = _valid_targets(dataset, config)
 
     if config.training.split_strategy == "node":

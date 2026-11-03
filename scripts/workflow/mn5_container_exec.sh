@@ -16,6 +16,7 @@ PROMOTION_ROOT=""
 STAGE_DATA=0
 USE_NV=0
 REQUESTED_CPUS=""
+MPS_PIPE_DIR=""
 INPUT_PATHS=()
 SCIENTIFIC_COMMAND=()
 BINDS=()
@@ -28,7 +29,7 @@ usage() {
 Usage: $(basename "$0") --run-root PATH --source-root PATH --sif PATH \\
   [--dvc-mode pull|push --dvc-remote PATH --dvc-cache PATH] \\
   [--promotion-root PATH] [--input-path PATH]... \
-  [--stage-data] [--nv] [--cpus N] -- COMMAND [ARG...]
+  [--stage-data] [--nv] [--cpus N] [--mps-pipe-dir PATH] -- COMMAND [ARG...]
 EOF
 }
 
@@ -80,6 +81,10 @@ parse_arguments() {
         REQUESTED_CPUS="$2"
         shift 2
         ;;
+      --mps-pipe-dir)
+        MPS_PIPE_DIR="$2"
+        shift 2
+        ;;
       --)
         shift
         SCIENTIFIC_COMMAND=("$@")
@@ -127,6 +132,11 @@ validate_arguments() {
   if [ -n "$REQUESTED_CPUS" ] \
     && [[ ! "$REQUESTED_CPUS" =~ ^[1-9][0-9]*$ ]]; then
     echo "--cpus must be a positive integer: $REQUESTED_CPUS" >&2
+    return 2
+  fi
+
+  if [ -n "$MPS_PIPE_DIR" ] && { [ "$USE_NV" -ne 1 ] || [ ! -d "$MPS_PIPE_DIR" ]; }; then
+    echo "--mps-pipe-dir requires --nv and an existing directory: $MPS_PIPE_DIR" >&2
     return 2
   fi
 
@@ -287,7 +297,14 @@ configure_singularity_arguments() {
   local bind
   local container_path allocated_cpus
 
-  SINGULARITY_ARGS=(exec --cleanenv --containall)
+  # CUDA MPS rejects clients in a separate PID or IPC namespace, which
+  # --containall creates. An MPS client therefore uses --contain, which still
+  # isolates the filesystem, and binds the node-local MPS pipe directory.
+  if [ -n "$MPS_PIPE_DIR" ]; then
+    SINGULARITY_ARGS=(exec --cleanenv --contain)
+  else
+    SINGULARITY_ARGS=(exec --cleanenv --containall)
+  fi
   if [ "$USE_NV" -eq 1 ]; then
     SINGULARITY_ARGS+=(--nv)
   fi
@@ -313,6 +330,12 @@ configure_singularity_arguments() {
   )
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     SINGULARITY_ARGS+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+  fi
+  if [ -n "$MPS_PIPE_DIR" ]; then
+    SINGULARITY_ARGS+=(
+      --bind "$MPS_PIPE_DIR:$MPS_PIPE_DIR:rw"
+      --env "CUDA_MPS_PIPE_DIRECTORY=$MPS_PIPE_DIR"
+    )
   fi
   # Execute the verified immutable SIF directly from shared GPFS. Node-local
   # image staging is deferred until its end-to-end cost is benchmarked.

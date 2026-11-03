@@ -14,6 +14,7 @@ import pandas as pd
 import xarray as xr
 
 from data.preprocess.config import REGION_COORD, TEMPORAL_COORD
+from data.preprocess.zarr_layout import open_zarr_store
 
 
 CLINICAL_SERIES = ("cases", "hospitalizations", "deaths")
@@ -579,7 +580,7 @@ def main() -> None:
     if membership.empty:
         raise ValueError(f"Strategy not found in membership table: {args.strategy}")
 
-    dataset = xr.open_zarr(args.dataset, consolidated=True)
+    dataset = open_zarr_store(args.dataset)
     try:
         selected = _select_run(dataset, args.run_id)
         targets = load_target_series(selected)

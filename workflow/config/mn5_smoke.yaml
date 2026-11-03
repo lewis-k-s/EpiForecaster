@@ -11,8 +11,8 @@ workflow:
 
 dvc:
   targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 optuna:
@@ -26,6 +26,7 @@ optuna:
   seed: 42
   sampler: tpe
   pruning_start_epoch: 10
+  pruning_startup_trials: 2
   search_space: default
   sample_training_loss_objective: false
   overrides:

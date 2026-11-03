@@ -151,6 +151,11 @@ training:
   curriculum:
     enabled: true
     chunk_size: 512         # contiguous windows per run
+    run_block_size: 8       # synthetic runs resident at a time (see below)
+    prefetch_blocks: 1      # blocks built in the background ahead of training
+    block_builders: 4       # spawned processes building the runs of a block
+    builder_threads: 3      # native threads per builder process
+    light_build_workers: 8  # threads building every run's light state at startup
     run_sampling: "round_robin"  # or "random"
     schedule:
       - start_epoch: 0
@@ -170,6 +175,119 @@ training:
         synth_ratio: 0.05
         mode: "time_major"
 ```
+
+### Blocked Run Rotation (`run_block_size`)
+
+With many synthetic runs (`active_runs: -1`) the sampler would otherwise
+interleave chunks from every run in every epoch, keeping all runs in host and
+device memory and rebuilding the device caches on nearly every chunk switch.
+Each epoch the active runs are therefore split into consecutive blocks of
+`run_block_size` runs. Chunks (and the real-data budget, proportionally) are
+interleaved only within a block, and blocks are visited one after another.
+The per-epoch batch total does not depend on the block size; a block size of at
+least the number of active runs gives one block, identical to interleaving all
+runs. When more than one block is needed, the runs are permuted with the epoch
+seed before splitting, so block membership and order differ per epoch.
+
+Runs outside the current block (and the prefetched blocks) hold no heavy state.
+
+#### Light vs heavy run state
+
+`EpiDataset` splits a synthetic run's state in two:
+
+*   **Light** (everything the sampler and DataLoader workers read; built for all
+    runs at startup, in `light_build_workers` threads): clinical and wastewater
+    series and masks, latent targets, biomarkers, temporal covariates, the
+    `(target node, window start)` index maps and sample counts, region metadata,
+    dims. Index maps and eligibility depend only on the series masks, never on
+    mobility or the k-hop set, so the light build yields exactly the eager
+    build's index maps (`tests/test_lazy_heavy_state.py`). Imported-risk lag
+    features (`data.use_imported_risk`) are a per-sample worker input derived
+    from mobility, so they count as light state: for lazy runs they are
+    computed at startup from a transiently read dense mobility.
+*   **Heavy** (main process only; built per block): the dense mobility read and
+    its reduction to float16 graph weights `[T, N_ctx, N_ctx]`, the k-hop
+    closure (context node set and each target's local position in it), static
+    adjacency, diagnostics, and the bit-packed context tables. Workers never
+    receive it: `__getitem__` returns global node ids only, and
+    `utils.training_utils.inject_context_placement` attaches
+    `mob_batch.target_node` (local positions) and `mob_batch.mob_real_node_idx`
+    in the main process from the run's heavy state. `EpiDataset.__getstate__`
+    drops it from pickles.
+
+Validation and test datasets (and the real run) build their heavy state eagerly
+and are unaffected; in synth-only mode the scaler run builds eagerly so that
+validation and test can share its dense mobility, then turns lazy.
+
+#### Per-block pipeline (`data/block_pipeline.py`)
+
+The sampler publishes each epoch's block plan to `RunBlockPipeline`. Before each
+batch the main process calls `activate(run)`. The first batch of a new block
+releases the previous block's heavy state and device caches, submits the builds
+of blocks up to `prefetch_blocks` ahead, and waits only for the current block's
+unfinished builds. With `prefetch_blocks: 0` each block is built on demand with
+no overlap. A single-block epoch keeps its runs resident across epochs.
+
+Runs are built by `block_builders` **spawned processes** (`ProcessPoolExecutor`,
+`spawn` context), each limited to `builder_threads` torch/dask/blosc threads;
+runs of later blocks queue behind the current block's. Builders were threads of
+the trainer at first; on MN5 (job 48425142, `OMP_NUM_THREADS=20`) that built a
+run 3-10x slower than the old serial build (diagnostics and k-hop are Python
+loops that contend with the training loop for the GIL; torch/dask/blosc fan out
+inside the trainer) and cost ~30% of the training throughput. A builder receives
+a small `HeavyBuildRequest` (config, run id, node sets, fitted mobility
+preprocessor), re-reads the run's mobility from the zarr store, runs the very
+same `EpiDataset._build_mobility_state` code as the eager build on a reduced
+view, and returns the float16 graph weights, the bit-packed neighbor and k-hop
+tables, the context node set and (first build only) the diagnostics. The
+tensors cross the process boundary through shared memory
+(`torch.multiprocessing`), not pickle bytes. The main process installs them
+(`EpiDataset.install_heavy_state`) and derives the series-side context tables
+from the light series it holds (an index_select, logged as `install_s`).
+Mobility diagnostics are computed once per run, on its first build, and kept
+when the heavy state is released. Defaults: 4 builders x 3 threads use 12 of 20
+CPUs next to 4 train and 2 validation loader workers and the trainer; each
+builder holds ~2-3 GB transiently. The entry point must be importable by
+`spawn` (the CLI is: `if __name__ == "__main__"`).
+
+#### Fork safety
+
+DataLoader workers are forked (`fork` context; persistent by default, prestarted
+at trainer init). With thread builders a fork had to wait for builder threads
+holding allocator/OMP/zarr locks; spawned builders are separate interpreters, so
+that hazard is gone and builds can run during a fork. What remains is memory: a
+forked worker inherits the parent's mappings of installed heavy state and of
+finished-but-uninstalled builder results, and keeps them alive after the parent
+drops them, which for per-epoch (non-persistent) workers pins a block for the
+whole epoch. All three loaders are therefore still `ForkGuardedDataLoader`s:
+creating a worker iterator (the fork) runs inside `RunBlockPipeline.quiesced()`,
+which waits out in-flight builds, discards their results and releases all heavy
+state (the builder pool stays up); an epoch plan published meanwhile only starts
+building when the guard exits. The trainer's prestart wraps all loader forks in
+one guard. With persistent workers (the default) the only guarded fork is that
+prestart, when nothing is built yet, so the guard costs nothing; with
+`persistent_workers: false` every `iter(loader)` forks again, so each
+epoch/evaluation start drops the heavy state and rebuilds the current block.
+
+#### Profiling
+
+Each block logs `block_index, n_runs, build_s` (wall time of the block's builds),
+per-run build mean/max, per-phase means (`run_phase_s_mean`) and `wait_s` (main
+process stall at block start); each epoch logs total stall, block count and mean
+build time; startup logs the light-build wall time and the builder pool's
+startup time; block records carry the builder pids and torch thread count and
+the install time in `run_phase_s_mean`. The same records are
+appended to `curriculum_block_builds.jsonl` (schema version 1, one JSON object
+per line with `kind` = `startup` | `block` | `epoch` and the global step) in the
+run directory, so tuning runs of `prefetch_blocks` / `block_builders` / `builder_threads` can
+be compared. `mobility_initialization_diagnostics.json` is rewritten after each
+epoch because lazy runs compute their diagnostics when their first block is built.
+
+*   **Device:** `utils.training_utils` keeps at most
+    `run_block_size + number of real datasets` datasets cached on the GPU
+    (`EpidemicCurriculumSampler.resident_dataset_limit`); the least recently
+    used run is evicted when a new block's run arrives, and a block's device
+    caches are dropped with its heavy state, so a run is uploaded once per epoch.
 
 ---
 

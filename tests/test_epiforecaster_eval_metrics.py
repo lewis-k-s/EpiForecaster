@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 from types import SimpleNamespace
@@ -70,6 +72,15 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
             "pred_cases": torch.tensor([[3.0, 4.0], [5.0, 6.0]], dtype=torch.float32),
             "pred_deaths": torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
             "physics_residual": torch.zeros((2, 2), dtype=torch.float32),
+            "S_trajectory": torch.tensor([[0.9, 0.85, 0.8], [0.95, 0.9, 0.85]]),
+            "I_trajectory": torch.tensor([[0.01, 0.02, 0.03], [0.01, 0.01, 0.01]]),
+            "beta_t": torch.full((2, 2), 0.3),
+            "gamma_t": torch.full((2, 2), 0.1),
+            "mortality_t": torch.full((2, 2), 0.01),
+            "hospitalization_rate_t": torch.full((2, 2), 0.05),
+            "infection_flow": torch.tensor([[1.0e-4, 2.0e-4], [3.0e-4, 4.0e-4]]),
+            "hospitalization_flow": torch.tensor([[1.0e-5, 1.0e-5], [2.0e-5, 2.0e-5]]),
+            "death_flow": torch.full((2, 2), 1.0e-6),
         },
         targets_dict={
             "hosp": torch.tensor([[1.0, 2.0], [2.0, 3.0]], dtype=torch.float32),
@@ -123,3 +134,31 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
     assert metrics["observed_count_deaths"] == 2
     assert metrics["mae_cases_log1p_per_100k"] > 0.0
     assert _node_mae["hospitalizations"] == {0: 0.0, 1: 0.0}
+
+    # Latent plausibility: every window counts and each head divides the
+    # observed per-100k counts (expm1 of the log1p targets) on weighted days by
+    # the aligned latent flow per 100k.
+    prefix = "latent_plausibility_"
+    assert metrics[f"{prefix}window_count"] == 2
+    assert metrics[f"{prefix}i_origin_median"] == pytest.approx(0.01)
+    assert metrics[f"{prefix}i_peak_q95"] == pytest.approx(0.01 + 0.95 * 0.02)
+    assert metrics[f"{prefix}forecast_attack_median"] == pytest.approx(0.1)
+    assert metrics[f"{prefix}rt_origin_q05"] == pytest.approx(
+        (0.3 * 0.9 + 0.05 * 0.3 * (0.95 - 0.9)) / 0.16, rel=1e-4
+    )
+    expm1 = math.expm1
+    cases_ratios = [expm1(2.0) / 10.0, (expm1(8.0) + expm1(6.0)) / 70.0]
+    assert metrics[f"{prefix}ascertainment_cases_window_count"] == 2
+    assert metrics[f"{prefix}ascertainment_cases_median"] == pytest.approx(
+        sum(cases_ratios) / 2.0, rel=1e-4
+    )
+    assert metrics[f"{prefix}ascertainment_cases_pooled"] == pytest.approx(
+        (expm1(2.0) + expm1(8.0) + expm1(6.0)) / 80.0, rel=1e-4
+    )
+    assert metrics[f"{prefix}ascertainment_hosp_pooled"] == pytest.approx(
+        (expm1(1.0) + 2 * expm1(2.0) + expm1(3.0)) / 6.0, rel=1e-4
+    )
+    assert metrics[f"{prefix}ascertainment_deaths_pooled"] == pytest.approx(
+        expm1(1.0) / 0.1, rel=1e-4
+    )
+    assert metrics[f"{prefix}ascertainment_deaths_zero_latent_window_fraction"] == 0.0

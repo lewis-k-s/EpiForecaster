@@ -161,7 +161,7 @@ def test_assembly_matches_legacy_loop_bitwise(tmp_path, gnn_depth: int) -> None:
 @pytest.mark.epiforecaster
 def test_batch_injection_matches_per_item_assembly(tmp_path) -> None:
     from data.epi_batch import collate_epiforecaster_batch
-    from utils.training_utils import inject_context_features
+    from utils.training_utils import inject_context_features, inject_context_placement
 
     zarr_path = str(tmp_path / "batch_equivalence.zarr")
     _write_dataset(zarr_path)
@@ -174,6 +174,7 @@ def test_batch_injection_matches_per_item_assembly(tmp_path) -> None:
     batch = collate_epiforecaster_batch(items, require_region_index=False)
     assert not hasattr(batch.mob_batch, "x_dense")
 
+    inject_context_placement(batch, dataset)
     inject_context_features(batch, dataset, torch.device("cpu"))
     x_dense = batch.mob_batch.x_dense
     L = config.model.input_window_length

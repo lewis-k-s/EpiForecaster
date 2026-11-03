@@ -85,6 +85,19 @@ def test_write_dataset_round_trips_values_with_any_worker_count(tmp_path, worker
     assert sorted(p.name for p in tmp_path.iterdir()) == ["tiny.zarr.zip"]
 
 
+def test_parallel_write_reads_a_packed_source_correctly(tmp_path):
+    # The synthetic preprocess opens the packed raw corpus before its workers
+    # fork, so every worker must read through its own archive handle.
+    source = _dataset(runs=8, dates=130, regions=60)
+    packed = tmp_path / "source.zarr.zip"
+    write_dataset(source, packed, workers=1)
+    destination = tmp_path / "copy.zarr.zip"
+
+    write_dataset(open_zarr_zip(packed, chunks={"run_id": 1}), destination, workers=4)
+
+    _assert_same_values(open_zarr_zip(destination), source)
+
+
 def test_parallel_and_serial_outputs_hold_the_same_members(tmp_path):
     source = _dataset().chunk({"run_id": 1})
     serial, parallel = tmp_path / "s.zarr.zip", tmp_path / "p.zarr.zip"

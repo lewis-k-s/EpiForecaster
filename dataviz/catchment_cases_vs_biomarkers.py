@@ -22,6 +22,7 @@ from data.preprocess.config import (  # noqa: E402
     PreprocessingConfig,
 )
 from data.preprocess.processors.edar_processor import EDARProcessor  # noqa: E402
+from data.preprocess.zarr_layout import open_zarr_store  # noqa: E402
 from utils.plotting import Style, format_date_axis, save_figure  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -247,7 +248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-path",
         type=Path,
-        default=Path("data/processed/real_with_id.zarr"),
+        default=Path("data/processed/real_with_id.zarr.zip"),
     )
     parser.add_argument(
         "--config",
@@ -275,7 +276,7 @@ def main() -> None:
     args = parse_args()
 
     config = PreprocessingConfig.from_file(args.config)
-    dataset = xr.open_zarr(args.dataset_path)
+    dataset = open_zarr_store(args.dataset_path)
     dates = pd.DatetimeIndex(pd.to_datetime(dataset[TEMPORAL_COORD].values))
 
     mapping = load_mapping(args.region_metadata)

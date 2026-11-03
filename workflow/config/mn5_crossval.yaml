@@ -8,8 +8,8 @@ workflow:
 
 dvc:
   targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 crossval:
@@ -34,9 +34,12 @@ resources:
   allocation:
     account: bsc08
     partition: acc
-    qos: acc_bscls
+    qos: acc_debug
     nodes: 1
     tasks: 4
     cpus_per_task: 20
     gres: gpu:4
-    runtime: 420
+    # One fold took about 7 minutes end to end in real-control-20261102c
+    # (5.5 min training, 1 min test evaluation). Ten folds on four GPUs run in
+    # three waves of about 7 minutes each.
+    runtime: 90

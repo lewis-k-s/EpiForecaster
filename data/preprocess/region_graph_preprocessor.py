@@ -19,6 +19,8 @@ from libpysal import weights  # type: ignore[import-not-found]
 
 from utils.logging import suppress_zarr_warnings
 
+from .zarr_layout import open_zarr_store
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASELINE_MOBILITY_WINDOW_DAYS = 7
@@ -34,7 +36,7 @@ class RegionGraphPreprocessConfig:
     output_path: Path = Path("outputs/region_graph/region_graph.zarr")
     contiguity: str = "queen"  # "queen" or "rook"
     metric_crs: str = "EPSG:3035"
-    mobility_zarr_path: Path | None = Path("data/files/mobility.zarr")
+    mobility_zarr_path: Path | None = Path("data/files/mobility.zarr.zip")
     start_date: str | None = None
     end_date: str | None = None
 
@@ -203,7 +205,7 @@ class RegionGraphPreprocessor:
         try:
             path = Path(mobility_path)
             engine = "netcdf4" if path.suffix == ".nc" else None
-            open_fn = xr.open_dataset if path.suffix == ".nc" else xr.open_zarr
+            open_fn = xr.open_dataset if path.suffix == ".nc" else open_zarr_store
             with open_fn(
                 str(path), decode_coords="all", **({"engine": engine} if engine else {})
             ) as ds:

@@ -24,7 +24,11 @@ ALLOCATION_FIELDS = (
     "cpus_per_task",
     "gres",
     "runtime",
+    "mps_clients_per_gpu",
 )
+# One MN5 ACC node grants 20 CPUs per GPU and has at most four GPUs.
+ACC_CPUS_PER_GPU = 20
+ACC_MAX_GPUS = 4
 # CPU-only preprocessing may run on one MN5 GPP node (112 cores) or on one
 # Nord4 main node (48 cores). Both clusters share the same GPFS.
 GPP_QOS = {"gp_bscls", "gp_debug"}
@@ -329,6 +333,43 @@ def _validate_container_pin(workflow_config: dict[str, Any]) -> None:
         raise ValueError("container.expected_sha256 must be 64 lowercase hex digits")
 
 
+def _validate_enqueued_trials(optuna: dict[str, Any]) -> None:
+    """A replicate study must consume exactly its queue and never prune it."""
+    spec = optuna.get("enqueue_trials")
+    if spec is None:
+        return
+    params = spec.get("params") if isinstance(spec, dict) else None
+    seeds = spec.get("seeds") if isinstance(spec, dict) else None
+    if not (
+        isinstance(params, list)
+        and params
+        and all(isinstance(entry, dict) and entry for entry in params)
+    ):
+        raise ValueError(
+            "optuna.enqueue_trials.params must be a non-empty list of mappings"
+        )
+    if not (
+        isinstance(seeds, list)
+        and seeds
+        and all(isinstance(s, int) and not isinstance(s, bool) for s in seeds)
+        and len(set(seeds)) == len(seeds)
+    ):
+        raise ValueError(
+            "optuna.enqueue_trials.seeds must be a non-empty list of distinct integers"
+        )
+    queued = len(params) * len(seeds)
+    if optuna.get("workers", 0) * optuna.get("trials_per_worker", 0) != queued:
+        raise ValueError(
+            "optuna.workers * optuna.trials_per_worker must equal the "
+            f"{queued} enqueued trials, so no trial is sampled"
+        )
+    if optuna.get("pruning_start_epoch", 0) < optuna.get("epochs", 0):
+        raise ValueError(
+            "optuna.enqueue_trials requires pruning_start_epoch >= epochs, "
+            "so every replicate trains to the end"
+        )
+
+
 def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
     """Validate mode-specific configuration before snapshot transfer."""
     kind = workflow_kind(workflow_config)
@@ -375,6 +416,9 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
                 "preprocessing.write_workers must be an integer between 1 and "
                 "resources.allocation.cpus_per_task"
             )
+
+    if kind == "hpo":
+        _validate_enqueued_trials(workflow_config["optuna"])
 
     evaluation = workflow_config.get("evaluation", {})
     research_outputs = evaluation.get("research_outputs", False)
@@ -424,6 +468,28 @@ def validate_workflow_contract(workflow_config: dict[str, Any]) -> str:
             raise ValueError(
                 "training.init_checkpoint is required by this workflow template"
             )
+        resume_checkpoint = training.get("resume_checkpoint")
+        resume_best_checkpoint = training.get("resume_best_checkpoint")
+        if (resume_checkpoint is None) != (resume_best_checkpoint is None):
+            raise ValueError(
+                "training.resume_checkpoint and training.resume_best_checkpoint "
+                "must be provided together"
+            )
+        if resume_checkpoint is not None:
+            for field, value in (
+                ("resume_checkpoint", resume_checkpoint),
+                ("resume_best_checkpoint", resume_best_checkpoint),
+            ):
+                if not Path(str(value)).is_absolute():
+                    raise ValueError(
+                        f"training.{field} must be an absolute GPFS path when provided"
+                    )
+            if init_checkpoint is not None or require_init_checkpoint:
+                raise ValueError(
+                    "training.resume_checkpoint is mutually exclusive with "
+                    "training.init_checkpoint and "
+                    "training.require_init_checkpoint"
+                )
     elif kind == "evaluate":
         checkpoint = workflow_config["evaluation"].get("checkpoint")
         if checkpoint is None or not Path(str(checkpoint)).is_absolute():
@@ -565,8 +631,16 @@ def _validate_cpu_allocation(allocation: dict[str, Any], kind: str) -> dict[str,
             for key, (actual, expected_value) in mismatches.items()
         )
         raise ValueError(f"Invalid {label} allocation: {details}")
+    if allocation.get("mps_clients_per_gpu", 1) != 1:
+        raise ValueError(f"A {short} allocation has no GPUs; MPS clients must be 1")
     return {
-        field: (GPP_GRES if field == "gres" else allocation[field])
+        field: (
+            GPP_GRES
+            if field == "gres"
+            else 1
+            if field == "mps_clients_per_gpu"
+            else allocation[field]
+        )
         for field in ALLOCATION_FIELDS
     }
 
@@ -619,20 +693,52 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     if workload is None and kind in {"hpo", "ablation"}:
         raise ValueError(f"Workflow config must define a {workload_name} mapping")
     expected_tasks = 1 if workload is None else workload.get("workers")
+    mps_clients = allocation.get("mps_clients_per_gpu", 1)
+    if (
+        not isinstance(mps_clients, int)
+        or isinstance(mps_clients, bool)
+        or mps_clients < 1
+    ):
+        raise ValueError(
+            "resources.allocation.mps_clients_per_gpu must be an integer of at least 1"
+        )
+    if mps_clients > 1 and kind not in {"hpo", "ablation"}:
+        raise ValueError(
+            "resources.allocation.mps_clients_per_gpu > 1 is supported only for "
+            "workflow.kind 'hpo' and 'ablation'"
+        )
     if (
         not isinstance(expected_tasks, int)
         or isinstance(expected_tasks, bool)
-        or not 1 <= expected_tasks <= 4
+        or expected_tasks < 1
     ):
-        raise ValueError(f"{workload_name}.workers must be an integer between 1 and 4")
+        raise ValueError(f"{workload_name}.workers must be a positive integer")
+    # Without MPS, one worker owns one GPU. With K MPS clients per GPU, G GPUs
+    # host G * K workers that share the node's 20 CPUs per GPU.
+    if expected_tasks % mps_clients != 0:
+        raise ValueError(
+            f"{workload_name}.workers={expected_tasks} must be a multiple of "
+            f"resources.allocation.mps_clients_per_gpu={mps_clients}"
+        )
+    gpus = expected_tasks // mps_clients
+    if not 1 <= gpus <= ACC_MAX_GPUS:
+        raise ValueError(
+            f"{workload_name}.workers must be an integer between 1 and "
+            f"{ACC_MAX_GPUS * mps_clients} (workers / mps_clients_per_gpu GPUs)"
+        )
+    node_cpus = ACC_CPUS_PER_GPU * gpus
+    if node_cpus % expected_tasks != 0:
+        raise ValueError(
+            f"{node_cpus} CPUs cannot be split evenly across {expected_tasks} workers"
+        )
 
     expected = {
         "account": "bsc08",
         "partition": "acc",
         "nodes": 1,
         "tasks": expected_tasks,
-        "cpus_per_task": 20,
-        "gres": f"gpu:{expected_tasks}",
+        "cpus_per_task": node_cpus // expected_tasks,
+        "gres": f"gpu:{gpus}",
     }
     mismatches = {
         key: (allocation.get(key), value)
@@ -643,10 +749,10 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
     qos = allocation.get("qos")
     if qos not in {"acc_bscls", "acc_debug", "acc_interactive"}:
         mismatches["qos"] = (qos, "acc_bscls, acc_debug, or acc_interactive")
-    if qos == "acc_interactive" and expected_tasks > 2:
-        mismatches["tasks"] = (
-            expected_tasks,
-            "at most 2 for acc_interactive's 40-CPU ceiling",
+    if qos == "acc_interactive" and gpus > 2:
+        mismatches["gres"] = (
+            allocation.get("gres"),
+            "at most 2 GPUs for acc_interactive's 40-CPU ceiling",
         )
     if qos == "acc_interactive" and isinstance(runtime, int) and runtime > 120:
         mismatches["runtime"] = (
@@ -679,7 +785,11 @@ def validate_mn5_allocation(workflow_config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             "resources.allocation must use gres='gpu:<tasks>', not gpu/gpus"
         )
-    return {field: allocation[field] for field in ALLOCATION_FIELDS}
+    return {
+        field: allocation[field]
+        for field in ALLOCATION_FIELDS
+        if field != "mps_clients_per_gpu"
+    } | {"mps_clients_per_gpu": mps_clients}
 
 
 def source_snapshot_sha256(source_root: Path, paths: list[Path]) -> str:
@@ -871,6 +981,30 @@ def _dispatch_field(value: object, *, field: str) -> str:
     return rendered
 
 
+def checkpoint_input_dirs(workflow_config: dict[str, Any]) -> list[Path]:
+    """Return the directories of the out-of-run checkpoints a run pins.
+
+    ``prepare_run`` copies these checkpoints into the run inside the contained
+    coordinator, which sees only the run root unless each directory is bound.
+    """
+    kind = workflow_kind(workflow_config)
+    if kind == "train":
+        training = workflow_config["training"]
+        configured = [
+            training.get(field)
+            for field in (
+                "init_checkpoint",
+                "resume_checkpoint",
+                "resume_best_checkpoint",
+            )
+        ]
+    elif kind == "evaluate":
+        configured = [workflow_config["evaluation"].get("checkpoint")]
+    else:
+        return []
+    return sorted({Path(str(path)).parent for path in configured if path is not None})
+
+
 def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, str]:
     """Write the immutable, shell-safe bindings needed before Snakemake starts.
 
@@ -927,9 +1061,15 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
     ]
     request = {field: _dispatch_field(value, field=field) for field, value in fields}
 
+    checkpoint_lines = [
+        "checkpoint_input_dir\t"
+        f"{_dispatch_field(directory, field='checkpoint_input_dir')}\n"
+        for directory in checkpoint_input_dirs(document)
+    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         "".join(f"{field}\t{value}\n" for field, value in request.items())
+        + "".join(checkpoint_lines)
     )
     digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
     output_path.with_suffix(output_path.suffix + ".sha256").write_text(

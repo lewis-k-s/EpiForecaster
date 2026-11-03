@@ -10,12 +10,15 @@ This module handles:
 
 import logging
 import os
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
 from torch.utils.data import ConcatDataset, DataLoader
 
+from data.block_pipeline import RunBlockPipeline
 from data.epi_batch import collate_epiforecaster_batch
 from data.epi_dataset import EpiDataset
 from data.samplers import EpidemicCurriculumSampler, ShuffledBatchSampler
@@ -24,6 +27,31 @@ from utils.device import prefetch_enabled
 from utils.platform import select_multiprocessing_context
 
 logger = logging.getLogger(__name__)
+
+
+class ForkGuardedDataLoader(DataLoader):
+    """DataLoader that forks its workers only inside ``fork_guard()``.
+
+    Creating the worker iterator is what forks (once for persistent workers,
+    on every ``iter`` otherwise). Block builder threads must not run, and
+    heavy run state must not be resident, while that happens: see
+    ``RunBlockPipeline.quiesced``.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        fork_guard: Callable[[], AbstractContextManager[None]],
+        **kwargs: Any,
+    ) -> None:
+        self._fork_guard = fork_guard
+        super().__init__(*args, **kwargs)
+
+    def _get_iterator(self):
+        if self.num_workers == 0:
+            return super()._get_iterator()
+        with self._fork_guard():
+            return super()._get_iterator()
 
 
 @dataclass
@@ -62,6 +90,7 @@ def build_dataloaders(
     real_run_id: str = "real",
     device_hint: str = "cpu",
     seed: int | None = None,
+    block_pipeline: RunBlockPipeline | None = None,
 ) -> DataLoaderBundle:
     """Create DataLoaders with hardware-aware worker configuration.
 
@@ -75,6 +104,9 @@ def build_dataloaders(
         real_run_id: Real run ID for curriculum sampler
         device_hint: Device hint for pin memory and multiprocessing decisions
         seed: Random seed for shuffling
+        block_pipeline: Per-block heavy-state builder of the curriculum runs; its
+            fork guard wraps every worker fork and the sampler publishes its
+            epoch plans to it
 
     Returns:
         DataLoaderBundle with train/val/test loaders and optional curriculum sampler
@@ -103,9 +135,11 @@ def build_dataloaders(
     )
 
     curriculum_sampler: EpidemicCurriculumSampler | None = None
+    fork_guard = block_pipeline.quiesced if block_pipeline is not None else nullcontext
 
     train_loader_kwargs: dict[str, Any] = {
         "dataset": train_dataset,
+        "fork_guard": fork_guard,
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
@@ -126,6 +160,7 @@ def build_dataloaders(
             drop_last=True,
             real_run_id=real_run_id,
             seed=seed,
+            block_pipeline=block_pipeline,
         )
         train_loader_kwargs["batch_sampler"] = curriculum_sampler
         train_loader_kwargs["collate_fn"] = shared_collate
@@ -148,11 +183,12 @@ def build_dataloaders(
     if prefetch_enabled(training_config.prefetch_factor) and num_workers > 0:
         train_loader_kwargs["prefetch_factor"] = training_config.prefetch_factor
 
-    train_loader = DataLoader(**train_loader_kwargs)
+    train_loader = ForkGuardedDataLoader(**train_loader_kwargs)
 
     val_persistent_workers = training_config.persistent_workers and val_num_workers > 0
     val_loader_kwargs: dict[str, Any] = {
         "dataset": val_dataset,
+        "fork_guard": fork_guard,
         "batch_size": training_config.eval_batch_size,
         "shuffle": False,
         "num_workers": val_num_workers,
@@ -165,13 +201,14 @@ def build_dataloaders(
         val_loader_kwargs["persistent_workers"] = True
     if prefetch_enabled(training_config.prefetch_factor) and val_num_workers > 0:
         val_loader_kwargs["prefetch_factor"] = training_config.prefetch_factor
-    val_loader = DataLoader(**val_loader_kwargs)
+    val_loader = ForkGuardedDataLoader(**val_loader_kwargs)
 
     test_persistent_workers = (
         training_config.persistent_workers and test_num_workers > 0
     )
     test_loader_kwargs: dict[str, Any] = {
         "dataset": test_dataset,
+        "fork_guard": fork_guard,
         "batch_size": training_config.eval_batch_size,
         "shuffle": False,
         "num_workers": test_num_workers,
@@ -184,7 +221,7 @@ def build_dataloaders(
         test_loader_kwargs["persistent_workers"] = True
     if prefetch_enabled(training_config.prefetch_factor) and test_num_workers > 0:
         test_loader_kwargs["prefetch_factor"] = training_config.prefetch_factor
-    test_loader = DataLoader(**test_loader_kwargs)
+    test_loader = ForkGuardedDataLoader(**test_loader_kwargs)
 
     return DataLoaderBundle(
         train=train_loader,

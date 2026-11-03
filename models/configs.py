@@ -61,6 +61,12 @@ class LatentSupervisionConfig:
     scale_floors: dict[str, float] = field(
         default_factory=lambda: {name: 1.0e-8 for name in _LATENT_TASKS}
     )
+    # In asinh mode, I/H/death-flow targets are compared as asinh(x / c) with
+    # c = asinh_scale_fraction * (fitted training-split std). Above c the
+    # comparison is logarithmic, so a collapsed small latent keeps an O(1)
+    # gradient through the multiplicative roll-forward and the X0 softmax; with
+    # c = std it is linear there and the gradient vanishes with the latent.
+    asinh_scale_fraction: float = 1.0
     require_complete_targets: bool = True
 
     def __post_init__(self) -> None:
@@ -75,6 +81,14 @@ class LatentSupervisionConfig:
             raise ValueError(
                 "latent.total_weight must be finite and non-negative, "
                 f"got {self.total_weight}"
+            )
+        if (
+            not math.isfinite(self.asinh_scale_fraction)
+            or self.asinh_scale_fraction <= 0
+        ):
+            raise ValueError(
+                "latent.asinh_scale_fraction must be finite and positive, "
+                f"got {self.asinh_scale_fraction}"
             )
 
         expected_tasks = set(_LATENT_TASKS)
@@ -310,6 +324,29 @@ class CurriculumConfig:
     active_runs: int = 1
     # Contiguous windows per run before rotating to next run
     chunk_size: int = 512
+    # Synthetic runs resident at a time. Each epoch the active runs are split
+    # into consecutive blocks of this many runs; chunks are interleaved only
+    # within a block and blocks are visited one after another. A run's heavy
+    # state (dense mobility reduction, k-hop closure, graph weights, context
+    # tables) is built when its block is reached and dropped, with its device
+    # caches, when the block ends, so memory scales with this value instead of
+    # the run count. A value >= the number of active runs gives one block, no
+    # rotation, and heavy state stays resident across epochs.
+    run_block_size: int = 8
+    # Blocks built in the background ahead of the block being trained. 0 builds
+    # each block on demand when its first batch is needed (no overlap).
+    prefetch_blocks: int = 1
+    # Builder processes (spawn) building the runs of a block and of prefetched
+    # blocks concurrently. Each holds one run's dense mobility (~1.2 GB for a
+    # 945-region, 455-day run) plus ~1 GB of intermediates transiently.
+    block_builders: int = 4
+    # Torch/dask/blosc threads inside each builder process. builders x threads
+    # should leave room on the node for the trainer, DataLoader workers and
+    # their threads (4 x 3 = 12 of 20 CPUs next to 4 train + 2 val workers).
+    builder_threads: int = 3
+    # Threads building every synthetic run's light state (series, masks, index
+    # maps) at startup.
+    light_build_workers: int = 8
     # How to select runs: "round_robin" or "random"
     run_sampling: str = "round_robin"
     # Build each batch from one window start of one run (replaces chunk_size
@@ -331,6 +368,22 @@ class CurriculumConfig:
             )
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
+        if self.run_block_size < 1:
+            raise ValueError(f"run_block_size must be >= 1, got {self.run_block_size}")
+        if self.prefetch_blocks < 0:
+            raise ValueError(
+                f"prefetch_blocks must be >= 0, got {self.prefetch_blocks}"
+            )
+        if self.block_builders < 1:
+            raise ValueError(f"block_builders must be >= 1, got {self.block_builders}")
+        if self.builder_threads < 1:
+            raise ValueError(
+                f"builder_threads must be >= 1, got {self.builder_threads}"
+            )
+        if self.light_build_workers < 1:
+            raise ValueError(
+                f"light_build_workers must be >= 1, got {self.light_build_workers}"
+            )
 
         # Validate schedule phases don't overlap
         for i, phase in enumerate(self.schedule):

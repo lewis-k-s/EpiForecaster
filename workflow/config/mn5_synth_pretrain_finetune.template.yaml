@@ -16,8 +16,8 @@ workflow:
 
 dvc:
   targets:
-    - data/files/mobility.zarr.dvc
-    - data/processed/real_with_id.zarr.dvc
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id.zarr.zip.dvc
     - outputs/region_embeddings/region_embeddings.pt.dvc
 
 training:
@@ -41,9 +41,9 @@ resources:
   allocation:
     account: bsc08
     partition: acc
-    qos: acc_bscls
+    qos: acc_debug
     nodes: 1
     tasks: 1
     cpus_per_task: 20
     gres: gpu:1
-    runtime: 420
+    runtime: 60

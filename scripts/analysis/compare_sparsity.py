@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import xarray as xr
+from data.preprocess.zarr_layout import open_zarr_store
 
 # Wastewater biomarker variants
 WW_BIOMARKERS = ["edar_biomarker_N1", "edar_biomarker_N2", "edar_biomarker_IP4"]
@@ -36,7 +37,7 @@ def compute_sparsity(obs_mask):
     return (1.0 - np.mean(obs_mask)) * 100
 
 def analyze_dataset(path):
-    ds = xr.open_zarr(path)
+    ds = open_zarr_store(path)
     variables = ["cases", "hospitalizations", "deaths", "wastewater"]
     
     results = {}
@@ -74,7 +75,7 @@ def analyze_dataset(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--synth", type=str, default="data/processed/synthetic_full.zarr")
-    parser.add_argument("--real", type=str, default="data/processed/real_with_id.zarr")
+    parser.add_argument("--real", type=str, default="data/processed/real_with_id.zarr.zip")
     args = parser.parse_args()
     
     print(f"Analyzing Synthetic: {args.synth}")

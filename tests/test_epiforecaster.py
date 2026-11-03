@@ -157,6 +157,12 @@ class TestEpiForecaster:
         assert out["D_trajectory"].shape == (batch_size, horizon + 1)
         assert out["hospitalization_flow"].shape == (batch_size, horizon)
         assert out["death_flow"].shape == (batch_size, horizon)
+        assert out["infection_flow"].shape == (batch_size, horizon)
+        # N = 1: the S -> I flow is beta * S_t * I_t of each Euler step.
+        assert torch.allclose(
+            out["infection_flow"],
+            out["beta_t"] * out["S_trajectory"][:, :-1] * out["I_trajectory"][:, :-1],
+        )
         assert out["observation_source_ww"].shape == (batch_size, horizon + 1)
         assert out["observation_source_cases"].shape == (batch_size, horizon + 1)
         assert out["observation_source_hosp"].shape == (batch_size, horizon + 1)

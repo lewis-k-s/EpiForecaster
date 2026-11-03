@@ -4,15 +4,19 @@
 # mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml and must be promoted into
 # data/processed/ before this workflow is prepared.
 #
-# Memory: each synthetic run releases its dense mobility after construction
-# and keeps only graph-node weights and bit-packed context tables (~479 MB per
-# run, batches unchanged). The projected peak for 200 runs is ~96 GiB, against
-# ~120 GiB in the single-task ACC contract (20 CPUs, one GPU). Measure the peak
-# RSS in a bounded run on MN5 before the first full submission.
-#
-# Sizing: four epochs at ~3.1 h each plus dataset construction and test
-# evaluation; 1440 minutes leaves about 2x margin because an incomplete
-# training attempt restarts from its initial state.
+# Measured in sizing run synth-sizing-a97c812-20261103 (job 48428830), with the
+# block pipeline of the base config (blocks of 8 runs, 4 builder processes):
+#   - peak host RSS 36.2 GB, peak GPU memory 16.8 GB;
+#   - staging and setup about 5 min, light build of all runs about 95 s, the
+#     first block about 25 s;
+#   - training at about 97 batches/s including block switches (about 90
+#     batches/s sustained over a full epoch in job 48429417);
+#   - one validation pass about 1.5 min.
+# An epoch is 165,825 batches, about 31 min. Four epochs plus the test
+# evaluation take about 2 h 20 min, longer than the 2 h acc_debug limit: the
+# first run completes three epochs and a continuation run from its last epoch
+# checkpoint trains the fourth and evaluates (docs/MN5_SNAKEMAKE.md, "Training
+# continuation").
 
 run: {}
 source: {}
@@ -37,6 +41,7 @@ training:
   overrides:
     - output.save_checkpoints=true
     - training.run_final_evaluation=false
+    - output.checkpoint_frequency=1
 
 evaluation:
   split: test
@@ -48,9 +53,9 @@ resources:
   allocation:
     account: bsc08
     partition: acc
-    qos: acc_bscls
+    qos: acc_debug
     nodes: 1
     tasks: 1
     cpus_per_task: 20
     gres: gpu:1
-    runtime: 1440
+    runtime: 120

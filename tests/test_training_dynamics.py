@@ -267,6 +267,7 @@ def test_trainer_run_finalizes_pruned_and_failed_dynamics() -> None:
         (RuntimeError("failed"), "failed"),
     ]:
         finalized: list[tuple[str, dict[str, object]]] = []
+        cleaned: list[bool] = []
 
         def fail() -> None:
             raise error
@@ -276,12 +277,15 @@ def test_trainer_run_finalizes_pruned_and_failed_dynamics() -> None:
                 finalize=lambda status, **kwargs: finalized.append((status, kwargs))
             ),
             _run_training=fail,
+            cleanup_dataloaders=lambda: cleaned.append(True),
         )
         with pytest.raises(type(error)):
             EpiForecasterTrainer.run(trainer)
         assert finalized[0][0] == expected
         assert finalized[0][1]["error_type"] == type(error).__name__
         assert finalized[0][1]["summary"]["training_history"] == {}
+        # Persistent loader workers must not outlive a pruned or failed trial.
+        assert cleaned == [True]
 
 
 def test_provenance_query_reconciles_dvc_and_survives_portable_copy(

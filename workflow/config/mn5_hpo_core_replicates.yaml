@@ -1,0 +1,48 @@
+# Seed replicates of the best core-HPO configurations from study
+# epiforecaster_hpo_core_mps_debug_v3 (run hpo-core-mps-20261102b), one per
+# head_d_model. Their validation WIS spread was 0.2545 to 0.2555, so one seed
+# each could not rank them. Every configuration trains once per seed below:
+# 4 configurations x 8 seeds = 32 trials = 8 workers x 4 trials. Seed 42 is the
+# base config's training.seed and so repeats the original trial.
+#
+# No trial is sampled and none is pruned (pruning_start_epoch = epochs): the
+# result is a per-configuration WIS distribution, read from the journal. A
+# 50-epoch trial takes about 6 minutes, so 4 trials per worker fit in timeout_s.
+extends: mn5_hpo_core_mps_debug.yaml
+
+optuna:
+  study_name: epiforecaster_hpo_core_replicates_v1
+  trials_per_worker: 4
+  timeout_s: 2700
+  pruning_start_epoch: 50
+  enqueue_trials:
+    seeds: [42, 43, 44, 45, 46, 47, 48, 49]
+    params:
+      # v3 trial 3, WIS 0.25452
+      - training.learning_rate: 0.00010838783508283825
+        training.weight_decay: 0.00036837747667933297
+        model.head_dropout: 0.08545835024217549
+        model.head_d_model: 512
+        model.head_num_layers: 3
+      # v3 trial 31, WIS 0.25491
+      - training.learning_rate: 0.0002036395984879341
+        training.weight_decay: 8.614925777860467e-06
+        model.head_dropout: 0.00032022810763232545
+        model.head_d_model: 384
+        model.head_num_layers: 3
+      # v3 trial 127, WIS 0.25504
+      - training.learning_rate: 0.00031791595968638634
+        training.weight_decay: 3.204658866179539e-05
+        model.head_dropout: 0.01174149798692577
+        model.head_d_model: 256
+        model.head_num_layers: 3
+      # v3 trial 24, WIS 0.25553
+      - training.learning_rate: 0.0005519457357970924
+        training.weight_decay: 0.0005937287843804378
+        model.head_dropout: 0.16222822242392812
+        model.head_d_model: 128
+        model.head_num_layers: 4
+
+resources:
+  allocation:
+    runtime: 60

@@ -191,6 +191,14 @@ run owns the processed dataset, QA record, generated DVC pointer, and publicatio
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
+The real dataset `real_with_id` is rebuilt with
+`workflow/config/mn5_preprocess_real.yaml` on one `acc_debug` node (120 minutes).
+Raw inputs are the DVC pointers `data/files/catalonia_real_raw_inputs_v1.dvc` and
+`data/files/mobility.zarr.zip.dvc`. The run publishes a packed
+`real_with_id.zarr.zip.dvc` pointer, which replaced the old `real_with_id.zarr.dvc`
+directory pointer. After review, copy it to `data/processed/` and repoint the
+consuming templates and `data.dataset_path` (see the template header).
+
 `mn5_train.yaml` pins `workflow.target: train`, so its default terminal artifact
 is the training manifest and checkpoint. `train_evaluate` is the explicit
 composition when both stages are wanted. Training and HPO trials force
@@ -426,6 +434,37 @@ declared artifacts without rewriting that default receipt. Existing run
 directories and promotion destinations are never overwritten. Do not run
 `dvc gc` while any run or promoted artifact may reference the shared cache.
 
+### Training continuation
+
+A `train` run that hits its Slurm time limit can be continued exactly by a new
+immutable run. The run keeps `checkpoint_epoch_NNNN.pt` after every epoch
+(`output.checkpoint_frequency=1` in the synthetic-pretraining template) under
+`outputs/training/<experiment_name>/<model_id>/checkpoints/` on GPFS. Work done
+after the last epoch checkpoint is lost; the continuation restarts at the
+following epoch.
+
+1. Copy the original template and keep every scientific setting identical,
+   including `training.epochs` in the base config, so the cosine schedule
+   continues rather than restarts.
+2. Set both absolute GPFS paths from the timed-out run:
+   `training.resume_checkpoint` to the last `checkpoint_epoch_NNNN.pt` and
+   `training.resume_best_checkpoint` to that run's `best_model.pt`. They must be
+   given together and exclude `training.init_checkpoint`.
+3. `prepare` a new run id with that config and `run` it as usual.
+
+Preparation pins both files under `inputs/` and records their SHA-256 in the
+manifest (`training_resume_input`). The sealed dispatch request lists the
+directory of every out-of-run checkpoint (`training.init_checkpoint`, the resume
+pair, `evaluation.checkpoint`), and the coordinator binds each read-only into its
+contained runtime so `prepare_run` can copy them. Before training, the best
+checkpoint must
+not be later than the resume checkpoint and must carry the resume checkpoint's
+best selection score and metric. It seeds the new run's `best_model.pt`, so the
+canonical checkpoint exists even if no later epoch improves. A retried attempt
+restarts from the same pinned pair and replaces any stale `best_model.pt`.
+Optimizer, scheduler, RNG, epoch, patience, and selection state resume from the
+epoch checkpoint.
+
 ## Research-role evaluation
 
 For a protected research training config, set `evaluation.research_outputs: true`,
@@ -456,3 +495,30 @@ value and alert thresholds, `event_decision_fixed_0_5`, and nullable
 calibration evidence. It is not a negative alert. Summary JSON contains metric
 counts, support reasons, and horizon-band results. Hospitalization event scores
 remain unsupported until source-level aggregation is defined.
+
+## HPO seed replicates
+
+An HPO config may set `optuna.enqueue_trials` with `params` (a list of complete
+parameter mappings) and `seeds` (distinct `training.seed` values). The first
+worker queues every parameter set once per seed, seed by seed, and each queued
+trial overrides `training.seed`. Preparation rejects a config unless
+`workers * trials_per_worker` equals the queue length, so no trial is sampled,
+and unless `pruning_start_epoch >= epochs`, so every replicate trains to the
+end. `workflow/config/mn5_hpo_core_replicates.yaml` replicates the best core
+configurations. The selection stage still promotes the single best trial; compare
+configurations by their WIS across seeds in the journal.
+
+## CUDA MPS worker packing
+
+Set `resources.allocation.mps_clients_per_gpu` to K to run K HPO or ablation
+workers on each GPU. The default is 1 and keeps one worker per GPU. For K above
+1, `gres` is `gpu:G`, the worker count is `G * K`, `tasks` equals the worker
+count, and `cpus_per_task` is `20 * G / tasks`. Only `hpo` and `ablation` kinds
+accept K above 1.
+
+All workers run in one Slurm step that sees all G GPUs. Rank r uses GPU `r // K`,
+selected by UUID. The first rank on each GPU starts one MPS daemon for that GPU
+under the job `TMPDIR`, and stops it after all K ranks on that GPU exit. Each
+worker runs with `singularity exec --contain`, because `--containall` makes
+MPS reject the client. K of 1 keeps `--containall`. Daemon logs are copied to
+`logs/mps/` in the run root.

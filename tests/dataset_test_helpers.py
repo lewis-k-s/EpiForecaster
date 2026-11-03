@@ -235,7 +235,9 @@ def context_features_for_item(
     from data.context_assembly import assemble_context_features
 
     window_starts = torch.tensor([item["window_start"]], dtype=torch.long)
-    positions = torch.tensor([int(item["mob_target_node_idx"])], dtype=torch.long)
+    positions = dataset.local_target_positions(
+        torch.tensor([item["target_node"]], dtype=torch.long)
+    )
     features = assemble_context_features(
         dataset,
         window_starts,

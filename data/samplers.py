@@ -6,6 +6,7 @@ from typing import Iterator
 
 from torch.utils.data import BatchSampler, ConcatDataset
 
+from data.block_pipeline import RunBlockPipeline
 from models.configs import CurriculumConfig
 
 logger = logging.getLogger(__name__)
@@ -14,6 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CurriculumState:
     """State of the curriculum for the current epoch."""
+
     epoch: int = 0
     synth_ratio: float = 0.0
     mode: str = "time_major"  # 'time_major' vs 'node_major'
@@ -21,6 +23,19 @@ class CurriculumState:
     # Sparsity bounds for filtering synthetic runs
     min_sparsity: float | None = None
     max_sparsity: float | None = None
+
+
+@dataclass
+class EpochBlock:
+    """Synthetic runs sampled together for one stretch of an epoch.
+
+    ``synth_dataset_indices`` are the ConcatDataset indices of the block's
+    runs; every batch in ``batches`` draws only from them and from the real
+    datasets.
+    """
+
+    synth_dataset_indices: list[int]
+    batches: list[list[int]]
 
 
 class ShuffledBatchSampler(BatchSampler):
@@ -79,10 +94,10 @@ class ShuffledBatchSampler(BatchSampler):
 class EpidemicCurriculumSampler(BatchSampler):
     """
     Curriculum sampler that mixes synthetic and real data.
-    
+
     It manages a mixture of "Real" and "Synthetic" data streams, adjusting the
     ratio and sampling mode (Time-Major vs Node-Major) according to a schedule.
-    
+
     To preserve data locality (especially for Zarr/Mobility access), it samples
     indices in contiguous "chunks" from each run before switching.
     """
@@ -95,6 +110,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         drop_last: bool = False,
         real_run_id: str = "real",
         seed: int | None = None,
+        block_pipeline: RunBlockPipeline | None = None,
     ):
         """
         Args:
@@ -114,6 +130,7 @@ class EpidemicCurriculumSampler(BatchSampler):
         self.drop_last = drop_last
         self.real_run_id = real_run_id.strip()
         self.seed = seed
+        self.block_pipeline = block_pipeline
 
         self.state = CurriculumState()
 
@@ -151,7 +168,7 @@ class EpidemicCurriculumSampler(BatchSampler):
             run_id_str = str(run_id).strip()
 
             # Extract sparsity from dataset's precomputed sparsity_level attribute
-            if hasattr(ds, 'sparsity_level') and ds.sparsity_level is not None:
+            if hasattr(ds, "sparsity_level") and ds.sparsity_level is not None:
                 self._dataset_sparsity[i] = ds.sparsity_level
 
             logger.info(
@@ -205,8 +222,9 @@ class EpidemicCurriculumSampler(BatchSampler):
                 # Unknown sparsity - exclude when filtering is requested
                 # (only include runs with known sparsity in range)
                 continue
-            if (min_sparsity is None or sparsity >= min_sparsity) and \
-               (max_sparsity is None or sparsity <= max_sparsity):
+            if (min_sparsity is None or sparsity >= min_sparsity) and (
+                max_sparsity is None or sparsity <= max_sparsity
+            ):
                 filtered.append(idx)
         return filtered
 
@@ -473,7 +491,83 @@ class EpidemicCurriculumSampler(BatchSampler):
         rng = self._rng_for_epoch()
         return rng.sample(available_synth, n_active)
 
-    def _build_epoch_batches(self, epoch: int | None = None) -> list[list[int]]:
+    @property
+    def resident_dataset_limit(self) -> int:
+        """Datasets that must stay device-resident to sample one block."""
+        block_runs = min(
+            self.config.run_block_size, max(1, len(self.synth_dataset_indices))
+        )
+        return block_runs + len(self.real_dataset_indices)
+
+    def _partition_into_blocks(
+        self, active_synth_indices: list[int], rng: random.Random
+    ) -> list[list[int]]:
+        """Split the active runs into consecutive blocks of ``run_block_size``.
+
+        When more than one block is needed the runs are first permuted with the
+        epoch RNG, so block membership and order change every epoch instead of
+        always pairing the same neighbouring runs (and ending on the same
+        ones). One block keeps the resolved run order.
+        """
+        size = self.config.run_block_size
+        if len(active_synth_indices) <= size:
+            return [active_synth_indices]
+        runs = list(active_synth_indices)
+        rng.shuffle(runs)
+        return [runs[i : i + size] for i in range(0, len(runs), size)]
+
+    @staticmethod
+    def _allocate_budget(total: int, weights: list[int]) -> list[int]:
+        """Split ``total`` over blocks proportionally to ``weights``.
+
+        Cumulative rounding keeps the parts summing to ``total`` exactly.
+        """
+        weight_sum = sum(weights)
+        if weight_sum <= 0:
+            return [total] + [0] * (len(weights) - 1)
+        parts: list[int] = []
+        cumulative_weight = 0
+        previous = 0
+        for weight in weights:
+            cumulative_weight += weight
+            cumulative = (total * cumulative_weight + weight_sum // 2) // weight_sum
+            parts.append(cumulative - previous)
+            previous = cumulative
+        return parts
+
+    @staticmethod
+    def _split_streams(
+        streams: list[list[list[int]]], budgets: list[int]
+    ) -> list[list[list[list[int]]]]:
+        """Hand consecutive chunk streams to blocks, ``budgets[i]`` batches each.
+
+        A chunk that straddles two blocks is cut at the boundary. Batches
+        beyond the summed budgets are dropped, like the truncated tail of an
+        unblocked epoch.
+        """
+        pending = list(reversed(streams))
+        per_block: list[list[list[list[int]]]] = []
+        for budget in budgets:
+            taken: list[list[list[int]]] = []
+            need = budget
+            while need > 0 and pending:
+                chunk_batches = pending.pop()
+                if len(chunk_batches) > need:
+                    pending.append(chunk_batches[need:])
+                    chunk_batches = chunk_batches[:need]
+                taken.append(chunk_batches)
+                need -= len(chunk_batches)
+            per_block.append(taken)
+        return per_block
+
+    def plan_epoch_blocks(self, epoch: int | None = None) -> list[EpochBlock]:
+        """Plan an epoch as consecutive blocks of synthetic runs.
+
+        Chunks are interleaved, and the real-data budget spread, only within a
+        block; blocks are visited one after another. With a single block this
+        is exactly the all-runs interleave. The planned batch total does not
+        depend on ``run_block_size``.
+        """
         if epoch is not None:
             self.set_curriculum(epoch)
 
@@ -484,32 +578,59 @@ class EpidemicCurriculumSampler(BatchSampler):
             for idx in self.real_dataset_indices:
                 all_indices.extend(self._get_indices_for_dataset(idx))
             rng.shuffle(all_indices)
-            return self._chunk_to_batches(all_indices)
+            return [EpochBlock([], self._chunk_to_batches(all_indices))]
 
         active_synth_indices = self._resolve_active_synth_indices()
         real_streams = self._build_chunk_streams(self.real_dataset_indices, rng)
-        synth_streams = self._build_chunk_streams(active_synth_indices, rng)
+        blocks = self._partition_into_blocks(active_synth_indices, rng)
+        synth_streams = [self._build_chunk_streams(block, rng) for block in blocks]
 
-        real_available = self._stream_batch_count(real_streams)
-        synth_available = self._stream_batch_count(synth_streams)
+        synth_available = [self._stream_batch_count(s) for s in synth_streams]
         real_budget, synth_budget = self._resolve_batch_budget(
-            real_available, synth_available
+            self._stream_batch_count(real_streams), sum(synth_available)
         )
+        synth_budgets = self._allocate_budget(synth_budget, synth_available)
+        real_budgets = self._allocate_budget(real_budget, synth_budgets)
+        real_per_block = self._split_streams(real_streams, real_budgets)
 
-        return self._interleave_chunk_streams(
-            real_streams=real_streams,
-            synth_streams=synth_streams,
-            real_budget=real_budget,
-            synth_budget=synth_budget,
-        )
+        planned = []
+        for block, block_synth, block_real, synth_n, real_n in zip(
+            blocks, synth_streams, real_per_block, synth_budgets, real_budgets
+        ):
+            batches = self._interleave_chunk_streams(
+                real_streams=block_real,
+                synth_streams=block_synth,
+                real_budget=real_n,
+                synth_budget=synth_n,
+            )
+            if batches:
+                planned.append(EpochBlock(block, batches))
+        return planned
+
+    def _build_epoch_batches(self, epoch: int | None = None) -> list[list[int]]:
+        return [
+            batch for block in self.plan_epoch_blocks(epoch) for batch in block.batches
+        ]
 
     def num_batches_for_epoch(self, epoch: int | None = None) -> int:
         """Compute the exact number of batches yielded for a curriculum epoch."""
         return len(self._build_epoch_batches(epoch))
 
     def __iter__(self) -> Iterator[list[int]]:
-        for batch in self._build_epoch_batches():
-            yield batch
+        blocks = self.plan_epoch_blocks()
+        if self.block_pipeline is not None:
+            # The consumer (main process) builds a block's heavy run state on
+            # demand and drops it afterwards (data.block_pipeline). Batches are
+            # consumed in block order, so the plan also fixes the prefetch order.
+            self.block_pipeline.begin_epoch(
+                [
+                    [self.sub_datasets[i] for i in block.synth_dataset_indices]
+                    for block in blocks
+                ],
+                epoch=self.state.epoch,
+            )
+        for block in blocks:
+            yield from block.batches
 
     def __len__(self) -> int:
         return self.num_batches_for_epoch()

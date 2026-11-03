@@ -615,3 +615,77 @@ def test_explicit_selection_resume_rejects_policy_or_distribution_changes():
     changed["config"]["training"]["loss"]["joint"]["distribution_family"] = "student_t"
     with pytest.raises(ValueError, match="observation contract"):
         trainer._validate_checkpoint_selection_contract(changed)
+
+
+def _latent_fit_trainer(
+    scaling: str, *, require_complete_targets: bool = True
+) -> EpiForecasterTrainer:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    latent = SimpleNamespace(
+        total_weight=0.01,
+        scaling=scaling,
+        require_complete_targets=require_complete_targets,
+        scale_floors={name: 1.0e-6 for name in LATENT_SCALE_TASKS},
+    )
+    trainer.config = SimpleNamespace(
+        training=SimpleNamespace(
+            loss=SimpleNamespace(joint=SimpleNamespace(latent=latent))
+        ),
+        data=SimpleNamespace(dataset_path="data.zarr"),
+    )
+    trainer.train_dataset = object()
+    trainer.val_dataset = object()
+    trainer.test_dataset = None
+    return trainer
+
+
+def test_latent_scale_fit_is_skipped_when_scaling_is_none() -> None:
+    trainer = _latent_fit_trainer("none")
+    with (
+        patch(
+            "training.epiforecaster_trainer.validate_complete_latent_targets"
+        ) as validate,
+        patch("training.epiforecaster_trainer.fit_latent_scale_state") as fit,
+    ):
+        assert trainer._fit_latent_scale_state() is None
+
+    # Completeness is still enforced on every present split; the fit is not run.
+    assert [call.args[0] for call in validate.call_args_list] == [
+        trainer.train_dataset,
+        trainer.val_dataset,
+    ]
+    fit.assert_not_called()
+
+
+@pytest.mark.parametrize("scaling", ["std", "asinh"])
+def test_latent_scale_fit_runs_for_scaled_losses(scaling: str) -> None:
+    trainer = _latent_fit_trainer(scaling, require_complete_targets=False)
+    state = _latent_scale_state()
+    with (
+        patch(
+            "training.epiforecaster_trainer.validate_complete_latent_targets"
+        ) as validate,
+        patch(
+            "training.epiforecaster_trainer.fit_latent_scale_state", return_value=state
+        ) as fit,
+    ):
+        assert trainer._fit_latent_scale_state() is state
+
+    validate.assert_not_called()
+    assert fit.call_args.args[0] is trainer.train_dataset
+
+
+def test_block_build_records_carry_the_global_step(tmp_path) -> None:
+    trainer = EpiForecasterTrainer.__new__(EpiForecasterTrainer)
+    trainer.experiment_dir = tmp_path
+    trainer.global_step = 17
+
+    trainer._append_block_build_record({"kind": "block", "block_index": 2})
+
+    line = (tmp_path / "curriculum_block_builds.jsonl").read_text().strip()
+    assert json.loads(line) == {
+        "schema_version": 1,
+        "kind": "block",
+        "block_index": 2,
+        "global_step": 17,
+    }
