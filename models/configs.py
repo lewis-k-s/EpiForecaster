@@ -61,6 +61,12 @@ class LatentSupervisionConfig:
     scale_floors: dict[str, float] = field(
         default_factory=lambda: {name: 1.0e-8 for name in _LATENT_TASKS}
     )
+    # In asinh mode, I/H/death-flow targets are compared as asinh(x / c) with
+    # c = asinh_scale_fraction * (fitted training-split std). Above c the
+    # comparison is logarithmic, so a collapsed small latent keeps an O(1)
+    # gradient through the multiplicative roll-forward and the X0 softmax; with
+    # c = std it is linear there and the gradient vanishes with the latent.
+    asinh_scale_fraction: float = 1.0
     require_complete_targets: bool = True
 
     def __post_init__(self) -> None:
@@ -75,6 +81,14 @@ class LatentSupervisionConfig:
             raise ValueError(
                 "latent.total_weight must be finite and non-negative, "
                 f"got {self.total_weight}"
+            )
+        if (
+            not math.isfinite(self.asinh_scale_fraction)
+            or self.asinh_scale_fraction <= 0
+        ):
+            raise ValueError(
+                "latent.asinh_scale_fraction must be finite and positive, "
+                f"got {self.asinh_scale_fraction}"
             )
 
         expected_tasks = set(_LATENT_TASKS)

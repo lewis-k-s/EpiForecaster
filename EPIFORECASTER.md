@@ -157,9 +157,13 @@ Synthetic runs may additionally provide dense SIRHD compartment targets.
 `training.loss.joint.latent.total_weight` controls this regularizer. The five
 tasks are S, I, H, R, and destination-dated death flow. The configured latent
 mode can use raw fraction-space MSE, fixed training-split standard-deviation
-scaling, or fixed `asinh` scaling for I, H, and death flow. Synthetic
-pretraining can require all five finite, nonnegative targets; other runs use a
-zero latent weight.
+scaling, or fixed `asinh` scaling for I, H, and death flow. In `asinh` mode
+these three are compared as $\operatorname{asinh}(x/c)$ with
+$c = \texttt{asinh\_scale\_fraction} \times \sigma_{\mathrm{train}}$; a fraction
+well below 1 makes the comparison logarithmic over realistic magnitudes, so a
+collapsed small latent keeps a usable gradient through the initial-state
+softmax and the multiplicative roll-forward. Synthetic pretraining can require
+all five finite, nonnegative targets; other runs use a zero latent weight.
 
 ### Latent plausibility indicators (evaluation)
 

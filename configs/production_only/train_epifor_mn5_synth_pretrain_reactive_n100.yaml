@@ -45,13 +45,21 @@ env: "mn5"
 # block keep every stretch of batches mixed over several scenarios.
 #
 # Latent supervision is fit in a fixed training-split scale: S and R are divided
-# by their standard deviation, I, H and death flow are compared after
-# asinh(x / std). With raw fraction-space MSE ("none", total_weight 0.01) the
-# first a97c812 pretrain logged a weighted latent loss of ~2e-4 against an
-# observation loss of order 1, and its synthetic-test I predictions kept
-# 0.00085 of the target standard deviation. I carries the largest component
-# weight because the inferred prevalence anchors the real-data latents.
-# total_weight is sized from the sizing run's shared-parameter gradient share
+# by their standard deviation, I, H and death flow are compared as asinh(x / c)
+# with c = asinh_scale_fraction * std. With raw fraction-space MSE ("none",
+# total_weight 0.01) the first a97c812 pretrain logged a weighted latent loss of
+# ~2e-4 against an observation loss of order 1, and its synthetic-test I
+# predictions kept 0.00085 of the target standard deviation. With c = std
+# (sizing run synth-sizing-asinh-a97c812-20261103, total_weight 1.0) the latent
+# objective held ~95% of the shared X0/rate gradient, yet I still collapsed to
+# ~1e-7 within 500 steps and its own gradient fell to ~1e-6 of the S/R
+# gradients: below c the asinh comparison is linear, so its gradient shrinks
+# with I through the X0 softmax and the multiplicative roll-forward. The fitted
+# stds are I 0.0275, H 7.1e-4, death flow 8.7e-6 per day; a fraction of 1e-3
+# puts c at 2.75 per 100k for I, so the comparison is logarithmic across
+# epidemiologically relevant prevalence. I carries the largest component weight
+# because the inferred prevalence anchors the real-data latents. total_weight is
+# sized from the sizing run's shared-parameter gradient share
 # (latentgrad_combined_squared_gradient_share in training_dynamics).
 
 data:
@@ -178,6 +186,7 @@ training:
           h: 0.15
           r: 0.15
           death_flow: 0.15
+        asinh_scale_fraction: 1.0e-3
         require_complete_targets: true
 
   curriculum:
