@@ -981,6 +981,30 @@ def _dispatch_field(value: object, *, field: str) -> str:
     return rendered
 
 
+def checkpoint_input_dirs(workflow_config: dict[str, Any]) -> list[Path]:
+    """Return the directories of the out-of-run checkpoints a run pins.
+
+    ``prepare_run`` copies these checkpoints into the run inside the contained
+    coordinator, which sees only the run root unless each directory is bound.
+    """
+    kind = workflow_kind(workflow_config)
+    if kind == "train":
+        training = workflow_config["training"]
+        configured = [
+            training.get(field)
+            for field in (
+                "init_checkpoint",
+                "resume_checkpoint",
+                "resume_best_checkpoint",
+            )
+        ]
+    elif kind == "evaluate":
+        configured = [workflow_config["evaluation"].get("checkpoint")]
+    else:
+        return []
+    return sorted({Path(str(path)).parent for path in configured if path is not None})
+
+
 def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, str]:
     """Write the immutable, shell-safe bindings needed before Snakemake starts.
 
@@ -1037,9 +1061,15 @@ def write_dispatch_request(config_path: Path, output_path: Path) -> dict[str, st
     ]
     request = {field: _dispatch_field(value, field=field) for field, value in fields}
 
+    checkpoint_lines = [
+        "checkpoint_input_dir\t"
+        f"{_dispatch_field(directory, field='checkpoint_input_dir')}\n"
+        for directory in checkpoint_input_dirs(document)
+    ]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         "".join(f"{field}\t{value}\n" for field, value in request.items())
+        + "".join(checkpoint_lines)
     )
     digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
     output_path.with_suffix(output_path.suffix + ".sha256").write_text(

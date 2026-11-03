@@ -437,6 +437,40 @@ def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> No
     assert request["closeout_signal_seconds"] == "600"
 
 
+def test_dispatch_request_lists_checkpoint_input_directories(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/test-run"
+    config = _workflow_config(run_root, run_root / "source")
+    config["workflow"]["kind"] = "train"
+    config["training"] = {
+        "base_config": "configs/train.yaml",
+        "experiment_name": "pretrain",
+        "model_id": "model",
+        "resume_checkpoint": "/gpfs/prev/checkpoints/checkpoint_epoch_0002.pt",
+        "resume_best_checkpoint": "/gpfs/prev/checkpoints/best_model.pt",
+    }
+    config["resources"]["allocation"].update({"tasks": 1, "gres": "gpu:1"})
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    config_path = tmp_path / "config.yaml"
+    dispatch_path = tmp_path / "dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    run_config.write_dispatch_request(config_path, dispatch_path)
+
+    lines = dispatch_path.read_text().splitlines()
+    assert [line for line in lines if line.startswith("checkpoint_input_dir")] == [
+        "checkpoint_input_dir\t/gpfs/prev/checkpoints"
+    ]
+
+    config["workflow"]["kind"] = "evaluate"
+    config["evaluation"] = {"checkpoint": "/gpfs/eval/model/best_model.pt"}
+    assert run_config.checkpoint_input_dirs(config) == [Path("/gpfs/eval/model")]
+    config["workflow"]["kind"] = "hpo"
+    assert run_config.checkpoint_input_dirs(config) == []
+
+
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -3066,6 +3100,11 @@ def test_container_coordinator_preserves_capacity_and_completion(
     attempt_root.mkdir(parents=True)
     source_root.mkdir()
     (run_root / "config.yaml").write_text("{}\n")
+    checkpoint_dir = tmp_path / "previous-run/checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    (run_root / ".state/dispatch.tsv").write_text(
+        f"run_id\trun\ncheckpoint_input_dir\t{checkpoint_dir}\n"
+    )
     capture = tmp_path / "capacity.txt"
     sif = tmp_path / "runtime.sif"
     sif.touch()
@@ -3119,6 +3158,7 @@ def test_container_coordinator_preserves_capacity_and_completion(
     assert Path(f"{capture}.mode").read_text().strip() == mode
     container_arguments = Path(f"{capture}.container").read_text().splitlines()
     assert f"{sif.parent}:{sif.parent}:ro" in container_arguments
+    assert f"{checkpoint_dir}:{checkpoint_dir}:ro" in container_arguments
     arguments = Path(f"{capture}.args").read_text().splitlines()
     assert arguments[arguments.index("--cores") + 1] == "40"
     assert arguments[arguments.index("--jobs") + 1] == "2"

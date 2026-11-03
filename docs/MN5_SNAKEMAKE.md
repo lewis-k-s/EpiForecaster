@@ -453,7 +453,11 @@ following epoch.
 3. `prepare` a new run id with that config and `run` it as usual.
 
 Preparation pins both files under `inputs/` and records their SHA-256 in the
-manifest (`training_resume_input`). Before training, the best checkpoint must
+manifest (`training_resume_input`). The sealed dispatch request lists the
+directory of every out-of-run checkpoint (`training.init_checkpoint`, the resume
+pair, `evaluation.checkpoint`), and the coordinator binds each read-only into its
+contained runtime so `prepare_run` can copy them. Before training, the best
+checkpoint must
 not be later than the resume checkpoint and must carry the resume checkpoint's
 best selection score and metric. It seeds the new run's `best_model.pt`, so the
 canonical checkpoint exists even if no later epoch improves. A retried attempt

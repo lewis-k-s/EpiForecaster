@@ -39,6 +39,8 @@ MPS_CLIENTS_PER_GPU=""
 GRES=""
 RUNTIME=""
 CLOSEOUT_SIGNAL_SECONDS=""
+# The coordinator binds these read-only; the runner only validates them.
+CHECKPOINT_INPUT_DIRS=()
 
 usage() {
   cat <<EOF
@@ -100,6 +102,7 @@ load_dispatch_request() {
       runtime) RUNTIME="$value" ;;
       mps_clients_per_gpu) MPS_CLIENTS_PER_GPU="$value" ;;
       closeout_signal_seconds) CLOSEOUT_SIGNAL_SECONDS="$value" ;;
+      checkpoint_input_dir) CHECKPOINT_INPUT_DIRS+=("$value") ;;
       *)
         echo "Unknown dispatch request field: $field" >&2
         return 1
@@ -181,6 +184,13 @@ validate_dispatch_request() {
     echo "Dispatch request contains an invalid close-out signal duration" >&2
     return 1
   fi
+  local directory
+  for directory in ${CHECKPOINT_INPUT_DIRS[@]+"${CHECKPOINT_INPUT_DIRS[@]}"}; do
+    if [[ "$directory" != /* ]] || [[ "$directory" == *:* ]]; then
+      echo "Dispatch request contains an invalid checkpoint input directory: $directory" >&2
+      return 1
+    fi
+  done
 }
 
 verify_config() {
