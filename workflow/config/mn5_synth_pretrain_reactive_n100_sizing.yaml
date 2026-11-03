@@ -10,7 +10,7 @@
 #   - one full validation pass.
 # Size the production runtime and tune prefetch_blocks / block_builders /
 # builder_threads
-# from these numbers. An epoch is about 131k training batches.
+# from these numbers. An epoch is 165,825 training batches.
 extends: mn5_synth_pretrain_reactive_n100.yaml
 
 workflow:

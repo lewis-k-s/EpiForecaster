@@ -9,12 +9,14 @@
 #   - peak host RSS 36.2 GB, peak GPU memory 16.8 GB;
 #   - staging and setup about 5 min, light build of all runs about 95 s, the
 #     first block about 25 s;
-#   - training at about 97 batches/s including block switches, so ~23 min per
-#     ~131k-batch epoch;
+#   - training at about 97 batches/s including block switches (about 90
+#     batches/s sustained over a full epoch in job 48429417);
 #   - one validation pass about 1.5 min.
-# Four epochs plus the test evaluation take about 110 min, inside the 2 h
-# acc_debug limit with little margin. A run that hits the limit continues from
-# its last epoch checkpoint (docs/MN5_SNAKEMAKE.md, "Training continuation").
+# An epoch is 165,825 batches, about 31 min. Four epochs plus the test
+# evaluation take about 2 h 20 min, longer than the 2 h acc_debug limit: the
+# first run completes three epochs and a continuation run from its last epoch
+# checkpoint trains the fourth and evaluates (docs/MN5_SNAKEMAKE.md, "Training
+# continuation").
 
 run: {}
 source: {}
