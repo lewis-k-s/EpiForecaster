@@ -115,6 +115,19 @@ def test_streaming_updates_match_a_single_combined_update() -> None:
     assert streamed.finalize() == combined.finalize()
 
 
+def test_reused_output_buffers_do_not_change_accumulated_windows() -> None:
+    # A CUDA-graph forward overwrites its output buffers on the next batch.
+    reused = _state_windows([0.02, 0.04])
+    reference = _accumulator()
+    reference.update(model_outputs=_state_windows([0.02, 0.04]), ascertainment={})
+    accumulator = _accumulator()
+    accumulator.update(model_outputs=reused, ascertainment={})
+    for tensor in reused.values():
+        tensor.fill_(0.5)
+
+    assert accumulator.finalize() == reference.finalize()
+
+
 def test_state_indicators_use_origin_peak_depletion_and_attack_definitions() -> None:
     accumulator = _accumulator()
     accumulator.update(

@@ -57,10 +57,15 @@ env: "mn5"
 # with I through the X0 softmax and the multiplicative roll-forward. The fitted
 # stds are I 0.0275, H 7.1e-4, death flow 8.7e-6 per day; a fraction of 1e-3
 # puts c at 2.75 per 100k for I, so the comparison is logarithmic across
-# epidemiologically relevant prevalence. I carries the largest component weight
-# because the inferred prevalence anchors the real-data latents. total_weight is
-# sized from the sizing run's shared-parameter gradient share
-# (latentgrad_combined_squared_gradient_share in training_dynamics).
+# epidemiologically relevant prevalence. In sizing run
+# synth-sizing-asinh-f1e-3-a97c812-20261103b (total_weight 1.0, 21,000
+# batches) I no longer collapsed: its batch prediction spread tracked the
+# target spread (e.g. 0.018 vs 0.026) and I had the largest latent gradient.
+# After step 5,000 the latent/observation shared-gradient norm ratio had median
+# 0.29 (latentgrad_combined_to_obs_grad_norm_ratio). total_weight 1.5 targets a
+# ratio of ~0.44, a squared gradient share of ~16%. I carries the largest
+# component weight because the inferred prevalence anchors the real-data
+# latents.
 
 data:
   dataset_path: data/processed/synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped.zarr.zip
@@ -178,7 +183,7 @@ training:
     joint:
       observation_loss: nll
       latent:
-        total_weight: 1.0
+        total_weight: 1.5
         scaling: "asinh"
         component_weights:
           s: 0.15

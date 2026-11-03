@@ -1268,8 +1268,10 @@ class TorchLatentPlausibilityAccumulator:
             ),
             tuple(ascertainment.get(head) for head in _ASCERTAINMENT_HEADS),
         )
+        # Per-window values can alias model outputs (e.g. I_trajectory[:, 0]);
+        # a CUDA-graph forward reuses those buffers on the next batch.
         for name, value in batch.items():
-            self.windows.setdefault(name, []).append(value)
+            self.windows.setdefault(name, []).append(value.clone())
 
     def _column(self, name: str) -> torch.Tensor:
         """All windows of one scalar as a flat float64 CPU tensor."""
