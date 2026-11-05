@@ -210,8 +210,10 @@ hospitalizations are weekly totals placed on the week-start date
 (`data/preprocess/processors/hospitalizations_processor.py`), so the `hosp`
 ratio divides a weekly total by one day's latent flow and is about seven times
 an admission ascertainment. Synthetic corpora follow their generator's
-reporting convention: on the a97c812 test split the `hosp` and `deaths` ratios
-are both about 7, consistent with weekly totals.
+reporting layer. The a97c812 corpus (reporting v2) passes counts through a
+magnitude calibration in `log1p(per 100k)` space that puts observed deaths about
+8-10 times above the latent death flow, so its synthetic `deaths` ratio is not
+an ascertainment.
 
 ## 4. Model Variants
 
