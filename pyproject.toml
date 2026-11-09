@@ -31,7 +31,7 @@ dependencies = [
   # For reproducibility
   "python-dateutil>=2.8.0",
   "pytz>=2023.3",
-  "xarray>=2024.7.0",
+  "xarray>=2026.9.0",
   "netcdf4>=1.7.2",
   "dask>=2024.8.0",
   "h5netcdf>=1.6.4",

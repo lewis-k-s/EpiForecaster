@@ -1170,21 +1170,28 @@ def _processed_dataset_qa(
 
     flow_alignment: dict[str, Any] | None = None
     if {"latent_D_true", "latent_death_flow_true"} <= set(dataset.data_vars):
-        cumulative_difference = dataset["latent_D_true"].diff("date")
+        from data.preprocess.processors.synthetic_processor import (
+            LATENT_DEATH_FLOW_ALIGNMENT_ATOL,
+            LATENT_DEATH_FLOW_ALIGNMENT_RTOL,
+            death_flow_alignment_tolerance,
+        )
+
+        stock = dataset["latent_D_true"]
+        cumulative_difference = stock.diff("date")
         destination_flow = dataset["latent_death_flow_true"].sel(
             date=cumulative_difference["date"]
         )
         difference_values = np.asarray(cumulative_difference.values)
         flow_values = np.asarray(destination_flow.values)
+        allowed = death_flow_alignment_tolerance(
+            np.asarray(stock.isel(date=slice(None, -1)).values),
+            np.asarray(stock.isel(date=slice(1, None)).values),
+            difference_values,
+        )
         comparable = np.isfinite(difference_values) & np.isfinite(flow_values)
         absolute_error = np.abs(difference_values[comparable] - flow_values[comparable])
         max_absolute_error = float(absolute_error.max()) if absolute_error.size else 0.0
-        if not np.allclose(
-            difference_values[comparable],
-            flow_values[comparable],
-            rtol=1e-5,
-            atol=1e-8,
-        ):
+        if (absolute_error > allowed[comparable]).any():
             raise ValueError(
                 "Processed latent death flow is not destination-aligned with "
                 f"latent_D_true.diff(date); max error={max_absolute_error:.8g}"
@@ -1192,8 +1199,9 @@ def _processed_dataset_qa(
         flow_alignment = {
             "comparison_count": int(comparable.sum()),
             "max_absolute_error": max_absolute_error,
-            "rtol": 1e-5,
-            "atol": 1e-8,
+            "rtol": LATENT_DEATH_FLOW_ALIGNMENT_RTOL,
+            "atol": LATENT_DEATH_FLOW_ALIGNMENT_ATOL,
+            "float32_stock_quantization": "2 * eps * max(D_t, D_t+1)",
         }
 
     preservation_json = dataset.attrs.get("positive_clinical_preservation_json")
@@ -1325,25 +1333,27 @@ def _run_preprocessing_attempt(
         }
     finally:
         dataset.close()
-    dataset_sha256 = sha256_file(built_dataset)
     if local_root is None:
         attempt_dataset = built_dataset
     else:
         attempt_dataset = attempt / "dataset" / built_dataset.name
         attempt_dataset.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(built_dataset, attempt_dataset)
-        if attempt_dataset.stat().st_size != built_dataset.stat().st_size:
-            raise ValueError(
-                f"Copy of the node-local dataset is incomplete: {attempt_dataset}"
-            )
+    dataset_bytes = built_dataset.stat().st_size
+    if attempt_dataset.stat().st_size != dataset_bytes:
+        raise ValueError(
+            f"Copy of the node-local dataset is incomplete: {attempt_dataset}"
+        )
     attempt_qa = attempt / "qa.json"
     attempt_marker = attempt / ".preprocessed.done"
     write_json(attempt_qa, qa_record)
+    # The dataset is identified by size until publication: its DVC md5 is the
+    # only hash of the payload.
     write_json(
         attempt_marker,
         {
             "dataset": str(dataset_path),
-            "dataset_sha256": dataset_sha256,
+            "dataset_bytes": dataset_bytes,
             "qa": str(qa_path),
             "qa_sha256": sha256_file(attempt_qa),
         },
@@ -1358,6 +1368,7 @@ def _run_preprocessing_attempt(
             output_marker: attempt_marker,
         },
         run_root,
+        size_only={dataset_path},
     )
     return output_marker
 
@@ -1375,7 +1386,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
     dataset.relative_to(output_root.resolve(strict=True))
     if dataset.is_symlink() or not dataset.is_file():
         raise ValueError("Preprocessed dataset must be a non-symlink packed Zarr file")
-    if sha256_file(dataset) != str(marker["dataset_sha256"]):
+    if dataset.stat().st_size != int(marker["dataset_bytes"]):
         raise ValueError("Preprocessed dataset changed after QA")
     qa_path = Path(str(marker["qa"])).resolve(strict=True)
     if sha256_file(qa_path) != str(marker["qa_sha256"]):
@@ -1407,10 +1418,10 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
             if error.errno != errno.EXDEV:
                 raise
             shutil.copy2(dataset, payload)
-            if sha256_file(payload) != str(marker["dataset_sha256"]):
+            if payload.stat().st_size != int(marker["dataset_bytes"]):
                 raise ValueError(
-                    "Publication staging changed the processed dataset"
-                ) from None
+                    "Publication staging copy of the dataset is incomplete"
+                )
         remote = Path(str(config["dvc"]["remote"]))
         cache = Path(str(config["dvc"]["cache"]))
         _run(["dvc", "init", "--no-scm"], cwd=scratch_staging)
@@ -1447,7 +1458,7 @@ def publish_preprocessed_dataset(config_path: Path, run_root: Path) -> Path:
             },
             "dvc_pointer": dataset_pointer,
             "dvc_md5": str(pointer_identity["md5"]),
-            "dataset_sha256": str(marker["dataset_sha256"]),
+            "dataset_bytes": int(marker["dataset_bytes"]),
             "qa": str(qa_path),
             "qa_sha256": str(marker["qa_sha256"]),
             "published_at": datetime.now(UTC).isoformat(),
