@@ -19,13 +19,18 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "workflow/config/mn5_preprocess_real.yaml"
 BASE = ROOT / "configs/production_only/preprocess_mn5_real.yaml"
 RAW_POINTER = ROOT / "data/files/catalonia_real_raw_inputs_v1.dvc"
+MOBILITY_POINTER = ROOT / "data/files/dasymetric_mob_full-20261104b.dvc"
+MOBILITY_PATH = (
+    "data/files/dasymetric_mob_full-20261104b/mobility/mobility_catalonia.zarr"
+)
 
 
 def test_template_is_a_valid_preprocess_workflow() -> None:
     template = load_template(TEMPLATE)
     assert validate_workflow_contract(template) == "preprocess"
     allocation = validate_mn5_allocation(template)
-    assert allocation["qos"] == "acc_debug"
+    assert allocation["partition"] == "gpp"
+    assert allocation["qos"] == "gp_debug"
     assert allocation["runtime"] <= 120
     assert preprocessing_dataset_name(template) == "real_with_id"
     assert template["preprocessing"]["expected_run_count"] == 1
@@ -73,6 +78,9 @@ def test_base_config_inputs_come_from_the_raw_pointer(staged_config: Path) -> No
         config.population_file,
     ):
         assert str(path).startswith(root)
-    assert str(config.mobility_path) == "data/files/mobility.zarr.zip"
+    assert str(config.mobility_path) == MOBILITY_PATH
+    pointer = MOBILITY_POINTER.read_text()
+    assert "path: dasymetric_mob_full-20261104b" in pointer
+    assert "md5: 0ff9ace36dce9637ab739a56c94ad910.dir" in pointer
     assert "outs:" in RAW_POINTER.read_text()
     assert "path: catalonia_real_raw_inputs_v1" in RAW_POINTER.read_text()

@@ -3,8 +3,10 @@
 # hospitalizations_reporting_lag_days=7, float32 storage).
 #
 # Raw inputs are the DVC directory data/files/catalonia_real_raw_inputs_v1.dvc
-# (nine files, 233 MB) and data/files/mobility.zarr.zip.dvc. Preprocessing runs no
-# GPU step; the acc_debug allocation is the one approved QoS (2 h maximum).
+# (nine files, 233 MB) and the dasymetric_mob promotion
+# data/files/dasymetric_mob_full-20261104b.dvc (2070 files, 4.0 GB; mobility is
+# mobility/mobility_catalonia.zarr, Zarr v3). Preprocessing runs no GPU step, so
+# it uses one GPP node under gp_debug (2 h maximum).
 #
 # Run:
 #   bash scripts/workflow/mn5_workflow.sh prepare <run-id> \
@@ -31,7 +33,7 @@ workflow:
 dvc:
   targets:
     - data/files/catalonia_real_raw_inputs_v1.dvc
-    - data/files/mobility.zarr.zip.dvc
+    - data/files/dasymetric_mob_full-20261104b.dvc
   provenance_targets: []
 
 preprocessing:
@@ -52,10 +54,10 @@ preprocessing:
 resources:
   allocation:
     account: bsc08
-    partition: acc
-    qos: acc_debug
+    partition: gpp
+    qos: gp_debug
     nodes: 1
     tasks: 1
-    cpus_per_task: 20
-    gres: gpu:1
-    runtime: 120
+    # GPP grants about 1.87 GB per CPU: 48 CPUs give about 90 GB.
+    cpus_per_task: 48
+    runtime: 90

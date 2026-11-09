@@ -22,11 +22,11 @@ vaccination_file: "data/files/vaccination_municipality.csv"
 wastewater_file: "data/files/wastewater_biomarkers_icra.csv"
 region_metadata_file: "data/files/edar_muni_edges.nc"
 population_file: "data/files/fl_population_por_municipis.csv"
-mobility_path: "data/files/mobility.zarr.zip"
+mobility_path: "data/files/dasymetric_mob_full-20261104b/mobility/mobility_catalonia.zarr"
 
 # Temporal processing parameters - maximum coverage
 start_date: "2020-03-01" # Earliest case data available
-end_date: "2021-05-09" # Latest mobility data available
+end_date: "2021-05-09" # Canonical window end; mobility extends to 2023-06-30
 
 # Feature processing options
 min_flow_threshold: 10
