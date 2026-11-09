@@ -8,11 +8,8 @@ DVC tracks as one object. See docs/SYNTHETIC_ZARR_LAYOUT.md.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
-import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -21,9 +18,9 @@ import weakref
 import zipfile
 
 import dask
+import dask.array as da
 import numpy as np
 import xarray as xr
-from xarray.backends.file_manager import FILE_CACHE
 import zarr
 from zarr.codecs import BloscCodec, BloscShuffle
 
@@ -64,20 +61,47 @@ def _reopen_zip_stores_in_child() -> None:
 os.register_at_fork(after_in_child=_reopen_zip_stores_in_child)
 
 
+def restore_object_strings(dataset: xr.Dataset) -> xr.Dataset:
+    """Return variable-length string variables as object arrays.
+
+    xarray 2026 decodes Zarr variable-length strings as NumPy ``StringDType``,
+    which has no unsized ``astype(str)`` or ``np.str_`` elements. Every consumer
+    of these datasets was written for object arrays, so restore them at the
+    single open boundary. Data variables stay lazy.
+    """
+    coords = {
+        name: dataset[name].astype(object)
+        for name in dataset.coords
+        if dataset[name].dtype.kind == "T"
+    }
+    data_vars = {
+        name: dataset[name].astype(object)
+        for name in dataset.data_vars
+        if dataset[name].dtype.kind == "T"
+    }
+    # Coordinates go last: assigning data variables afterwards re-aligns them
+    # on the original index and reverts it to StringDType.
+    if data_vars:
+        dataset = dataset.assign(data_vars)
+    if coords:
+        dataset = dataset.assign_coords(coords)
+    return dataset
+
+
 def open_zarr_zip(path: Path | str, **kwargs: Any) -> xr.Dataset:
     """Open a packed store read-only; forked children reopen it."""
     store = zarr.storage.ZipStore(Path(path), mode="r")
     _OPEN_ZIP_STORES[id(store)] = store
     # Consolidated metadata is not part of the Zarr v3 specification; the
     # per-array metadata in a local ZIP file is cheap to read.
-    return xr.open_zarr(store, consolidated=False, **kwargs)
+    return restore_object_strings(xr.open_zarr(store, consolidated=False, **kwargs))
 
 
 def open_zarr_store(path: Path | str, **kwargs: Any) -> xr.Dataset:
     """Open a packed ``*.zarr.zip`` or a Zarr directory store read-only."""
     if is_zarr_zip(path):
         return open_zarr_zip(path, **kwargs)
-    return xr.open_zarr(str(path), **kwargs)
+    return restore_object_strings(xr.open_zarr(str(path), **kwargs))
 
 
 def bitround(values: np.ndarray, keepbits: int) -> np.ndarray:
@@ -178,24 +202,27 @@ def build_encoding(dataset: xr.Dataset) -> dict[str, dict[str, Any]]:
 
 @dataclass(frozen=True)
 class RunWriteResult:
+    """What one ``write_run`` call wrote and verified.
+
+    ``run_level`` holds the run's values of the variables that keep all runs in
+    one chunk (``run_id`` but no ``date``); only one process may write those, so
+    the caller collects them and passes them to ``finish_store``. ``static``
+    holds the variables without ``run_id``.
+    """
+
     run_index: int
     run_id: str
     non_null: dict[str, int]
+    run_level: dict[str, np.ndarray] = field(default_factory=dict)
+    static: dict[str, np.ndarray] = field(default_factory=dict)
 
 
-_WORKER_DATASET: xr.Dataset | None = None
-_WORKER_STORE: Path | None = None
-_WORKER_VARIABLES: tuple[str, ...] = ()
-_WORKER_COUNT_VARIABLES: tuple[str, ...] = ()
-
-
-def _close_cached_files() -> None:
-    # Forked workers must not share open HDF5 handles with the parent.
-    # xarray reopens a closed file on the next access.
-    for key in list(FILE_CACHE.keys()):
-        handle = FILE_CACHE.pop(key, None)
-        if handle is not None:
-            handle.close()
+# Per-run variables larger than this are computed into one preallocated array
+# and verified in date slabs, so a worker holds a single copy of the run.
+LARGE_RUN_VARIABLE_BYTES = 256 << 20
+# Packing reads and writes in 16 MiB blocks; zipfile's 8 KiB default packs a
+# large shard about half as fast.
+PACK_COPY_BYTES = 16 << 20
 
 
 def _values_equal(expected: np.ndarray, actual: np.ndarray) -> bool:
@@ -206,27 +233,184 @@ def _values_equal(expected: np.ndarray, actual: np.ndarray) -> bool:
     return bool(np.array_equal(expected, actual))
 
 
-def _write_run(run_index: int) -> RunWriteResult:
-    dataset, store = _WORKER_DATASET, _WORKER_STORE
-    if dataset is None or store is None:
-        raise RuntimeError("Zarr run writer is not initialised")
-    region = {RUN_DIM: slice(run_index, run_index + 1)}
-    written = xr.open_zarr(store, consolidated=False)
-    non_null: dict[str, int] = {}
+def _non_null(values: np.ndarray) -> int:
+    if np.issubdtype(values.dtype, np.floating):
+        return int(np.count_nonzero(~np.isnan(values)))
+    return int(values.size)
+
+
+def prepare_for_store(
+    dataset: xr.Dataset, bitround_keepbits: dict[str, int] | None = None
+) -> xr.Dataset:
+    """Apply BitRound, variable-length strings and the layout attributes."""
+    keepbits = dict(sorted((bitround_keepbits or {}).items()))
+    dataset = apply_bitround(dataset, keepbits)
+    return with_variable_length_strings(dataset).assign_attrs(
+        zarr_layout_version=LAYOUT_VERSION,
+        zarr_compressor=f"blosc-{COMPRESSOR['cname']}-{COMPRESSOR['clevel']}-"
+        f"{COMPRESSOR['shuffle']}",
+        zarr_bitround_keepbits_json=json.dumps(keepbits),
+    )
+
+
+def staging_path(destination: Path) -> Path:
+    return destination.with_name(destination.name.removesuffix(".zip") + ".staging")
+
+
+def create_store(template: xr.Dataset, destination: Path) -> Path:
+    """Create the directory store for ``destination`` (``*.zarr.zip``).
+
+    ``template`` must come from ``prepare_for_store``. Variables held in memory
+    are written now. Dask-backed variables only define their arrays: the
+    template replaces them with empty arrays of the same shape, so creating the
+    store does not build the task graph of the data.
+    """
+    destination = Path(destination)
+    if not is_zarr_zip(destination):
+        raise ValueError(f"Packed Zarr output must end in {ZARR_ZIP_SUFFIX}")
+    store = staging_path(destination)
+    if store.exists():
+        shutil.rmtree(store)
+    destination.unlink(missing_ok=True)
+    skeleton = template.assign(
+        {
+            name: var.copy(data=da.empty(var.shape, dtype=var.dtype, chunks=-1))
+            for name, var in template.data_vars.items()
+            if var.chunks
+        }
+    )
+    skeleton.to_zarr(
+        store,
+        mode="w",
+        compute=False,
+        encoding=build_encoding(template),
+        zarr_format=3,
+        consolidated=False,
+        safe_chunks=False,
+    )
+    return store
+
+
+def _compute_into(var: xr.DataArray) -> np.ndarray:
+    if not isinstance(var.data, da.Array):
+        return np.asarray(var.data)
+    values = np.empty(var.shape, dtype=var.dtype)
+    da.store(var.data, values, lock=False, scheduler="synchronous")
+    return values
+
+
+def write_run(
+    store: Path,
+    run_index: int,
+    dataset: xr.Dataset,
+    *,
+    count_variables: tuple[str, ...] = ("mobility", "cases"),
+) -> RunWriteResult:
+    """Compute, write and verify run ``run_index`` of a store from ``create_store``.
+
+    ``dataset`` holds this one run (``run_id`` of size 1) and must come from
+    ``prepare_for_store``. Each per-run variable fills one shard, so concurrent
+    calls for different runs never write the same file. Every written region
+    is read back and compared before the call returns.
+    """
+    if dataset.sizes.get(RUN_DIM) != 1:
+        raise ValueError("write_run needs a dataset that holds exactly one run")
+    per_run, run_level, static, large = [], [], [], []
+    for name, var in dataset.data_vars.items():
+        if is_per_run(var):
+            (large if var.nbytes > LARGE_RUN_VARIABLE_BYTES else per_run).append(name)
+        elif RUN_DIM in var.dims:
+            run_level.append(name)
+        else:
+            static.append(name)
+    small = [*per_run, *run_level, *static]
     with dask.config.set(scheduler="synchronous"):
-        for name in _WORKER_VARIABLES:
-            values = dataset[name].isel(region).compute()
-            part = xr.Dataset({name: values}).drop_vars(list(values.coords))
-            part.to_zarr(store, region=region, mode="r+", consolidated=False)
-            readback = written[name].isel(region).values
-            if not _values_equal(values.values, readback):
+        computed = dict(
+            zip(small, dask.compute(*(dataset[name].data for name in small)))
+        )
+    computed = {name: np.asarray(values) for name, values in computed.items()}
+
+    region = {RUN_DIM: slice(run_index, run_index + 1)}
+    group = zarr.open_group(store, mode="r", zarr_format=3)
+    non_null: dict[str, int] = {}
+
+    def write(names: list[str], values: dict[str, np.ndarray]) -> None:
+        part = xr.Dataset({name: (dataset[name].dims, values[name]) for name in names})
+        part.to_zarr(store, region=region, mode="r+", consolidated=False)
+
+    if per_run:
+        write(per_run, computed)
+        for name in per_run:
+            if not _values_equal(
+                computed[name], group[name][run_index : run_index + 1]
+            ):
                 raise ValueError(
                     f"Zarr read-back of {name!r} differs for run index {run_index}"
                 )
-            if name in _WORKER_COUNT_VARIABLES:
-                non_null[name] = int(np.count_nonzero(~np.isnan(values.values)))
-    run_id = str(dataset[RUN_DIM].values[run_index])
-    return RunWriteResult(run_index=run_index, run_id=run_id, non_null=non_null)
+            if name in count_variables:
+                non_null[name] = _non_null(computed[name])
+    for name in large:
+        values = _compute_into(dataset[name])
+        write([name], {name: values})
+        array = group[name]
+        date_axis = dataset[name].dims.index(DATE_DIM)
+        count = 0
+        for start in range(0, values.shape[date_axis], MOBILITY_DATE_CHUNK):
+            window = slice(start, start + MOBILITY_DATE_CHUNK)
+            index = [slice(None)] * values.ndim
+            index[date_axis] = window
+            expected = values[tuple(index)]
+            index[0] = slice(run_index, run_index + 1)
+            if not _values_equal(expected, array[tuple(index)]):
+                raise ValueError(
+                    f"Zarr read-back of {name!r} differs for run index {run_index}"
+                )
+            count += _non_null(expected)
+        if name in count_variables:
+            non_null[name] = count
+        del values
+    return RunWriteResult(
+        run_index=run_index,
+        run_id=str(dataset[RUN_DIM].values[0]),
+        non_null=non_null,
+        run_level={name: computed[name] for name in run_level},
+        static={name: computed[name] for name in static},
+    )
+
+
+def finish_store(
+    store: Path,
+    destination: Path,
+    *,
+    run_level: xr.Dataset | None = None,
+    attrs: dict[str, Any] | None = None,
+) -> None:
+    """Write the run-level variables and attributes, then pack the store."""
+    if run_level is not None and run_level.data_vars:
+        run_level = run_level.drop_vars(list(run_level.coords))
+        region = {str(dim): slice(None) for dim in run_level.dims}
+        run_level.to_zarr(store, region=region, mode="r+", consolidated=False)
+    if attrs:
+        zarr.open_group(store, mode="r+", zarr_format=3).attrs.update(attrs)
+    pack_store(store, Path(destination))
+    shutil.rmtree(store)
+
+
+def collect_run_level(
+    template: xr.Dataset, results: list[RunWriteResult]
+) -> xr.Dataset:
+    """Stack the run-level values that ``write_run`` returned, in run order."""
+    ordered = sorted(results, key=lambda result: result.run_index)
+    names = sorted(ordered[0].run_level) if ordered else []
+    return xr.Dataset(
+        {
+            name: (
+                template[name].dims,
+                np.concatenate([result.run_level[name] for result in ordered]),
+            )
+            for name in names
+        }
+    )
 
 
 def _write_whole_variable(store: Path, dataset: xr.Dataset, name: str) -> None:
@@ -247,88 +431,42 @@ def pack_store(store: Path, destination: Path) -> None:
         destination, "w", compression=zipfile.ZIP_STORED, allowZip64=True
     ) as archive:
         for path in files:
-            archive.write(path, path.relative_to(store).as_posix())
+            info = zipfile.ZipInfo.from_file(path, path.relative_to(store).as_posix())
+            info.compress_type = zipfile.ZIP_STORED
+            with path.open("rb") as source, archive.open(info, "w") as target:
+                shutil.copyfileobj(source, target, PACK_COPY_BYTES)
 
 
 def write_dataset(
     dataset: xr.Dataset,
     destination: Path,
     *,
-    workers: int,
     bitround_keepbits: dict[str, int] | None = None,
     count_variables: tuple[str, ...] = ("mobility", "cases"),
-    log: Callable[[str], None] = print,
 ) -> list[RunWriteResult]:
-    """Write ``dataset`` to ``destination`` (``*.zarr.zip``) in parallel.
+    """Write an in-process ``dataset`` to ``destination`` (``*.zarr.zip``).
 
-    Workers compute and write one run at a time and verify each written region
-    by read-back before the store is packed. ``bitround_keepbits`` maps float32
-    variables to the mantissa bits to keep; the read-back compares against the
-    rounded values. Returns the per-run results in run order.
+    Runs are written one after another with ``write_run``, so every region is
+    verified by read-back before the store is packed. ``bitround_keepbits``
+    maps float32 variables to the mantissa bits to keep. Returns the per-run
+    results in run order.
     """
-    global _WORKER_DATASET, _WORKER_STORE, _WORKER_VARIABLES, _WORKER_COUNT_VARIABLES
     destination = Path(destination)
-    if not is_zarr_zip(destination):
-        raise ValueError(f"Packed Zarr output must end in {ZARR_ZIP_SUFFIX}")
-    if workers < 1:
-        raise ValueError("workers must be at least 1")
-    store = destination.with_name(destination.name.removesuffix(".zip") + ".staging")
-    if store.exists():
-        shutil.rmtree(store)
-    destination.unlink(missing_ok=True)
-
-    keepbits = dict(sorted((bitround_keepbits or {}).items()))
-    dataset = apply_bitround(dataset, keepbits)
-    dataset = with_variable_length_strings(dataset).assign_attrs(
-        zarr_layout_version=LAYOUT_VERSION,
-        zarr_compressor=f"blosc-{COMPRESSOR['cname']}-{COMPRESSOR['clevel']}-"
-        f"{COMPRESSOR['shuffle']}",
-        zarr_bitround_keepbits_json=json.dumps(keepbits),
-    )
-    # Data held in memory is written with the template; dask-backed data is
-    # written below, per run or as a whole variable. Those writes use computed
-    # NumPy regions that cover whole shards, so the Dask chunk layout does not
-    # need to match the shards.
-    dataset.to_zarr(
-        store,
-        mode="w",
-        compute=False,
-        encoding=build_encoding(dataset),
-        zarr_format=3,
-        consolidated=False,
-        safe_chunks=False,
-    )
-    lazy = [str(name) for name, var in dataset.data_vars.items() if var.chunks]
-    per_run = tuple(name for name in lazy if is_per_run(dataset[name]))
-    for name in lazy:
-        if name not in per_run:
-            _write_whole_variable(store, dataset, name)
-
-    run_count = dataset.sizes.get(RUN_DIM, 0)
-    _WORKER_DATASET, _WORKER_STORE = dataset, store
-    _WORKER_VARIABLES = per_run
-    _WORKER_COUNT_VARIABLES = tuple(n for n in count_variables if n in per_run)
-    try:
-        log(
-            f"  Writing {len(per_run)} per-run variables for {run_count} runs "
-            f"with {workers} worker(s)"
+    prepared = prepare_for_store(dataset, bitround_keepbits)
+    store = create_store(prepared, destination)
+    for name, var in prepared.data_vars.items():
+        if var.chunks and RUN_DIM not in var.dims:
+            _write_whole_variable(store, prepared, str(name))
+    run_vars = [name for name, var in prepared.data_vars.items() if RUN_DIM in var.dims]
+    runs = prepared[run_vars]
+    results = [
+        write_run(
+            store,
+            index,
+            runs.isel({RUN_DIM: slice(index, index + 1)}),
+            count_variables=count_variables,
         )
-        if workers == 1 or run_count <= 1:
-            results = [_write_run(index) for index in range(run_count)]
-        else:
-            _close_cached_files()
-            context = multiprocessing.get_context("fork")
-            with ProcessPoolExecutor(
-                max_workers=min(workers, run_count), mp_context=context
-            ) as pool:
-                results = []
-                for result in pool.map(_write_run, range(run_count)):
-                    results.append(result)
-                    log(f"    wrote run {result.run_index + 1}/{run_count}")
-    finally:
-        _WORKER_DATASET, _WORKER_STORE = None, None
-        _WORKER_VARIABLES, _WORKER_COUNT_VARIABLES = (), ()
-
-    pack_store(store, destination)
-    shutil.rmtree(store)
+        for index in range(prepared.sizes.get(RUN_DIM, 0))
+    ]
+    finish_store(store, destination, run_level=collect_run_level(prepared, results))
     return results

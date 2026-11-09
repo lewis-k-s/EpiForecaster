@@ -8,9 +8,10 @@
 #
 # The raw corpus has no dense mobility_time_varying; mobility is rebuilt lazily
 # from the factorized layout. Preprocessing runs no GPU step, so it uses GPP.
-# The output is packed sharded Zarr (docs/SYNTHETIC_ZARR_LAYOUT.md):
-# write_workers processes rebuild and write one run each, and mobility is
-# rounded to 10 mantissa bits (bitround_keepbits in the base config). The
+# The output is packed sharded Zarr (docs/SYNTHETIC_ZARR_LAYOUT.md). Each of
+# write_workers spawned processes builds one run at a time from the raw corpus
+# (data/preprocess/synthetic_runs.py), and mobility is rounded to 10 mantissa
+# bits (bitround_keepbits in the base config). The
 # earlier 198-run rebuild (b354b27, job 48128720) took 28.5 minutes in its
 # preprocess step with 12 workers (peak 62.7 GiB) and 34.8 minutes in total;
 # that input was a 173 GB NetCDF, against 46.6 GB here. gp_debug starts in
@@ -35,12 +36,12 @@ preprocessing:
   dataset_name: synthetic_sirhd_v1_a97c812_reactive_n100_holt_damped
   expected_run_count: 200
   # GPP NVMe (~960 GB) holds the staged 47 GB input, the Zarr staging
-  # directory and the packed output (~72 GB each), so write, QA and hash the
+  # directory and the packed output (~72 GB each), so write and QA the
   # dataset node-locally.
   node_local_output: true
-  # One run per worker at ~6 GB each; 12 workers fit the 64-CPU share of
-  # GPP memory (2 GB per CPU).
-  write_workers: 12
+  # A worker holds one run (about 3 GB with its 1.6 GB of mobility); 32
+  # workers fit the 125 GiB that 64 CPUs grant.
+  write_workers: 32
   required_variables:
     - cases
     - hospitalizations

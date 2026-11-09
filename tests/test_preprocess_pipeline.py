@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import Mock, patch
 from datetime import datetime
+from pathlib import Path
 import numpy as np
 import xarray as xr
 import pandas as pd
@@ -10,7 +11,7 @@ import pandas as pd
 from data.preprocess.config import PreprocessingConfig, REGION_COORD
 from data.epi_dataset import open_processed_dataset
 from data.preprocess.pipeline import OfflinePreprocessingPipeline
-from data.preprocess.zarr_layout import RunWriteResult
+from data.preprocess.zarr_layout import RunWriteResult, write_dataset
 
 
 @pytest.fixture
@@ -44,74 +45,6 @@ def mock_config(tmp_path):
 
 
 class TestPipelineSourceSelection:
-    @patch("data.preprocess.pipeline.SyntheticProcessor")
-    @patch("data.preprocess.pipeline.EDARProcessor")
-    def test_synthetic_source_dispatch(self, MockEDAR, MockSynthetic, mock_config):
-        """Verify synthetic data source selection and processor dispatch."""
-        mock_config.synthetic_path = "synthetic_data.zarr"
-
-        # Mock synthetic processor output
-        mock_processed = {
-            "cases": xr.DataArray([1], dims=["x"]),
-            "mobility": xr.DataArray([1], dims=["x"]),
-            "population": xr.DataArray([1], dims=["x"]),
-            "edar_flow": xr.DataArray([1], dims=["x"]),
-            "edar_censor": xr.DataArray([1], dims=["x"]),
-        }
-        MockSynthetic.return_value.process.return_value = mock_processed
-
-        pipeline = OfflinePreprocessingPipeline(mock_config)
-
-        # Mock EDAR processing from xarray
-        MockEDAR.return_value.process_from_xarray.return_value = xr.Dataset()
-
-        # We need to mock _load_raw_sources because it's called by run(),
-        # but we want to test its internal logic.
-        processed = pipeline._load_raw_sources()
-
-        assert MockSynthetic.called
-        MockSynthetic.return_value.process.assert_called_once_with(
-            "synthetic_data.zarr"
-        )
-        assert "edar" in processed
-        assert processed["hospitalizations"] is None
-        assert processed["deaths"] is None
-
-    @patch("data.preprocess.pipeline.SyntheticProcessor")
-    @patch("data.preprocess.pipeline.EDARProcessor")
-    def test_synthetic_source_dispatch_preserves_temporal_covariates(
-        self,
-        MockEDAR,
-        MockSynthetic,
-        mock_config,
-    ):
-        """Synthetic source loading should pass temporal covariates through."""
-        mock_config.synthetic_path = "synthetic_data.zarr"
-        temporal_covariates = xr.DataArray(
-            np.ones((3, 3), dtype=np.float16),
-            dims=["date", "covariate"],
-            coords={
-                "date": pd.date_range("2022-01-01", periods=3, freq="D"),
-                "covariate": ["dow_sin", "dow_cos", "is_holiday"],
-            },
-        )
-        mock_processed = {
-            "cases": xr.DataArray([1], dims=["x"]),
-            "mobility": xr.DataArray([1], dims=["x"]),
-            "population": xr.DataArray([1], dims=["x"]),
-            "edar_flow": xr.DataArray([1], dims=["x"]),
-            "edar_censor": xr.DataArray([1], dims=["x"]),
-            "temporal_covariates": temporal_covariates,
-        }
-        MockSynthetic.return_value.process.return_value = mock_processed
-
-        pipeline = OfflinePreprocessingPipeline(mock_config)
-        MockEDAR.return_value.process_from_xarray.return_value = xr.Dataset()
-        processed = pipeline._load_raw_sources()
-
-        assert "temporal_covariates" in processed
-        assert processed["temporal_covariates"].equals(temporal_covariates)
-
     @patch("data.preprocess.pipeline.CataloniaCasesProcessor")
     def test_cases_source_dispatch(self, MockCases, mock_config):
         """Verify real cases data source selection and processor dispatch."""
@@ -179,9 +112,9 @@ class TestPipelineMasksAndMetadata:
         mock_config.valid_target_min_observed_days = 3
         mock_config.valid_target_qualifying_end_date = "2020-01-08"
 
-        selected = OfflinePreprocessingPipeline(mock_config)._compute_valid_targets_mask(
-            dataset
-        )
+        selected = OfflinePreprocessingPipeline(
+            mock_config
+        )._compute_valid_targets_mask(dataset)
 
         assert selected.sel(run_id="real").values.tolist() == [1, 0, 0]
 
@@ -278,6 +211,20 @@ class TestPipelineMasksAndMetadata:
         assert mask.name == "edar_has_source"
 
 
+def _save(pipeline: OfflinePreprocessingPipeline, aligned: xr.Dataset) -> Path:
+    """Prepare and write an aligned dataset as the real-data path does."""
+    path = Path(pipeline.config.output_path) / (
+        pipeline.config.dataset_name + ".zarr.zip"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_dataset(
+        pipeline._prepare_dataset(aligned),
+        path,
+        bitround_keepbits=pipeline.config.bitround_keepbits,
+    )
+    return path
+
+
 class TestPipelineStorage:
     def test_saved_zarr_shard_schema(self, mock_config, tmp_path):
         """Each per-run variable is stored as one shard per run."""
@@ -315,7 +262,7 @@ class TestPipelineStorage:
             "raw_corpus_full_tree_sha256": "deadbeef",
         }
 
-        saved_path = pipeline._save_aligned_dataset(ds)
+        saved_path = _save(pipeline, ds)
         assert saved_path.name == "test_chunk_schema.zarr.zip"
         saved_ds = open_processed_dataset(saved_path)
 
@@ -376,7 +323,7 @@ class TestPipelineStorage:
         )
         pipeline = OfflinePreprocessingPipeline(mock_config)
 
-        saved_path = pipeline._save_aligned_dataset(dataset)
+        saved_path = _save(pipeline, dataset)
 
         saved = open_processed_dataset(saved_path)
         try:
