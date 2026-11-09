@@ -1,0 +1,47 @@
+run: {}
+source: {}
+container: {}
+workflow:
+  kind: train
+  target: train_evaluate
+dvc:
+  targets:
+  - data/files/mobility.zarr.zip.dvc
+  - data/processed/real_with_id.zarr.zip.dvc
+  - outputs/region_embeddings/region_embeddings.pt.dvc
+training:
+  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  experiment_name: transfer-dev-smoke
+  model_id: model
+  max_batches: 10
+  overrides:
+  - output.save_checkpoints=true
+  - training.run_final_evaluation=false
+  - training.seed=42
+  - model.observation_heads.ww_source=infection_flow
+  - model.observation_heads.relevant_source_ww=infection_flow
+  - training.residual_schedule.enabled=true
+  - 'training.residual_schedule.schedule=[{start_epoch: 0, end_epoch: 1, max_log_location_fraction: 0.0}, {start_epoch: 1, end_epoch: 3, max_log_location_fraction: 0.1}]'
+  - training.compile=false
+  - training.profiler.enabled=false
+  - training.num_workers=1
+  - training.val_workers=1
+  - training.test_workers=1
+  - training.epochs=3
+evaluation:
+  split: test
+  granular: true
+  overrides:
+  - training.val_workers=1
+  - training.test_workers=1
+  - training.num_forecast_samples=1
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 30

@@ -1,0 +1,36 @@
+run: {}
+source: {}
+container: {}
+workflow:
+  kind: train
+  target: train_evaluate
+dvc:
+  targets:
+  - data/files/mobility.zarr.zip.dvc
+  - data/processed/real_with_id.zarr.zip.dvc
+  - outputs/region_embeddings/region_embeddings.pt.dvc
+training:
+  base_config: configs/production_only/train_epifor_mn5_full.yaml
+  experiment_name: transfer-dev-real-blackbox
+  model_id: model
+  max_batches: null
+  overrides:
+  - output.save_checkpoints=true
+  - training.run_final_evaluation=false
+  - training.seed=43
+  - model.observation_heads.mechanistic_disabled_heads=[ww,hosp,cases,deaths]
+evaluation:
+  split: test
+  granular: true
+  overrides:
+  - training.val_workers=2
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 20
+    gres: gpu:1
+    runtime: 30
