@@ -1,0 +1,39 @@
+# Transfer campaign (configs/campaigns/transfer_v1.yaml): 5 conditions x 10 folds x
+# 3 paired seeds = 150 identities on one four-GPU allocation.
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: ablation
+  target: ablation
+
+dvc:
+  targets:
+    - data/files/mobility.zarr.zip.dvc
+    - data/processed/real_with_id.zarr.zip.dvc
+    - outputs/region_embeddings/region_embeddings.pt.dvc
+
+ablation:
+  study_name: epiforecaster_transfer_v1
+  campaign: configs/campaigns/transfer_v1.yaml
+  workers: 4
+  # One-hour Slurm close-out is reserved for active trials and finalization.
+  closeout_signal_seconds: 3600
+  timeout_s: 21600
+  sampler_seed: 42
+  smoketest: false
+  recover_stale_running: true
+  requeue_running: false
+
+resources:
+  allocation:
+    account: bsc08
+    partition: acc
+    qos: acc_bscls
+    nodes: 1
+    tasks: 4
+    cpus_per_task: 20
+    gres: gpu:4
+    runtime: 420

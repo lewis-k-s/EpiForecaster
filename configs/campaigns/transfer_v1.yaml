@@ -1,0 +1,70 @@
+schema_version: 1
+campaign_id: epiforecaster_transfer_v1
+stage: ablation
+hypothesis: Synthetic SIRHD pretraining, the mechanistic observation path, wastewater incidence sourcing, and a bounded residual change held-out forecast skill over every valid target region.
+base_config: configs/production_only/train_epifor_mn5_full.yaml
+baseline_condition: real-base
+fixed_overrides: {}
+smoke_overrides:
+  training:
+    compile: false
+    num_workers: 1
+    val_workers: 1
+    test_workers: 1
+init_checkpoints:
+  # Reactive n400 SIRHD pretrain, epoch-10 best checkpoint (commit 5a2262d corpus).
+  synth-n400-e10: /gpfs/projects/bsc08/shared_projects/MePreCiSa/EpiForecaster/EpiForecaster-DVC/runs/synth-pretrain-5a2262d-n400-e10-20261106/outputs/training/synthetic-pretrain-sirhd-v1-reactive-n400/model/checkpoints/best_model.pt
+conditions:
+  - name: real-base
+    hypothesis: The production configuration trained from scratch on real data is the paired reference.
+    overrides: {}
+    allowed_difference_paths: []
+  - name: real-blackbox
+    hypothesis: The mechanistic observation path improves forecasts over a residual-only network with the same encoder.
+    overrides: {model: {observation_heads: {mechanistic_disabled_heads: [ww, hosp, cases, deaths]}}}
+    allowed_difference_paths: [model.observation_heads.mechanistic_disabled_heads]
+  - name: ft-base
+    hypothesis: Initializing from the synthetic SIRHD pretrain improves forecasts over training from scratch.
+    init_checkpoint: synth-n400-e10
+    overrides: {}
+    allowed_difference_paths: [training.init_checkpoint_path]
+  - name: ft-wwflow
+    hypothesis: Convolving latent incidence rather than prevalence in the wastewater head improves the fine-tuned model.
+    init_checkpoint: synth-n400-e10
+    overrides: {model: {observation_heads: {ww_source: infection_flow, relevant_source_ww: infection_flow}}}
+    allowed_difference_paths: [training.init_checkpoint_path, model.observation_heads.ww_source, model.observation_heads.relevant_source_ww]
+  - name: ft-budget025
+    hypothesis: Locking the residual for 10 epochs and then bounding it to 0.25 of the mechanistic log-location trades forecast skill for latent reliance.
+    init_checkpoint: synth-n400-e10
+    overrides:
+      training:
+        residual_schedule:
+          enabled: true
+          schedule:
+            - {start_epoch: 0, end_epoch: 10, max_log_location_fraction: 0.0}
+            - {start_epoch: 10, end_epoch: 50, max_log_location_fraction: 0.25}
+    allowed_difference_paths: [training.init_checkpoint_path, training.residual_schedule.enabled, training.residual_schedule.schedule]
+# Paired stochastic-training replicates: shared across all conditions within a fold.
+paired_model_seeds: [42, 43, 44]
+cross_validation:
+  split_manifest: configs/crossval/representative_10fold_mobility_refined.json
+  # Every manifest fold: all 161 valid target regions are held out exactly once
+  # per condition and model seed.
+  fold_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  # Routing check only; scientifically ineligible.
+  smoke_fold_indices: [1, 4]
+metrics:
+  primary: {name: mean_target_wis, direction: minimize}
+  secondary: [mae_median, rmse_median]
+  safety: [coverage_ratio]
+  diagnostic: [best_val_selection_value]
+equal_budget_policy:
+  paths: [training.epochs, training.max_batches]
+completeness_requirements:
+  require_exact_identity_matrix: true
+  require_terminal_trials: true
+  require_finite_primary_metric: true
+  require_full_manifest_folds: true
+provenance_requirements:
+  require_campaign_sha256: true
+  require_output_identity: true
