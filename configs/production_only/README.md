@@ -31,16 +31,27 @@
 - Reads the DVC-tracked raw synthetic Zarr on project GPFS
 
 ### `preprocess_mn5_synth_sirhd_v1_a97c812_reactive_n100.yaml`
-- Produces the processed a97c812 reactive corpus (the only synthetic corpus)
+- Produces the processed a97c812 reactive corpus (the corpus that production
+  pretraining uses)
 - Keeps clinical observations as continuous expected reported counts and stores
   float32 processed supervision so small positive clinical expectations and
   latent fractions cannot underflow back to zero
 - Represents missingness only through masks and NaNs and stores wastewater as
   raw concentration for exactly one downstream `log1p`
 
+### `preprocess_mn5_synth_sirhd_v1_5a2262d_reactive_n400.yaml`
+- Produces the processed 5a2262d reactive corpus: 440 runs (400 Reactive runs
+  with a policy and 40 Baseline twins), widened parameter ranges, state space
+  `epiforecaster_sirhd_v2` and reporting profile `sirhd_pretraining_reporting_v4`
+- Same processed-variable contract as the a97c812 config; the v2
+  `sirhd_infection_flow` and `sirhd_hospitalization_flow` are not read
+- Invoked through `workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml`
+
 ### `preprocess_mn5_real.yaml`
 - Rebuilds the production real dataset `real_with_id` from the staged DVC
-  directory `data/files/catalonia_real_raw_inputs_v1` and `data/files/mobility.zarr.zip`
+  directory `data/files/catalonia_real_raw_inputs_v1` and the dasymetric_mob
+  promotion `data/files/dasymetric_mob_full-20261104b`
+  (`mobility/mobility_catalonia.zarr`)
 - Scientific settings match `configs/preprocess_full.yaml` (hospitalization
   reporting lag 7, float32 storage, `parameter_fit_end_date` unset)
 - Invoked only through `workflow/config/mn5_preprocess_real.yaml`

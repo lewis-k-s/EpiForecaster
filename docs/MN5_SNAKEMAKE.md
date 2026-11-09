@@ -181,9 +181,10 @@ preprocess:      stage_data -> preprocess_dataset -> publish_preprocessed
 ```
 
 Synthetic pretraining uses the same `train` entity through
-`workflow/config/mn5_synth_pretrain_reactive_n100.yaml`. Its processed Zarr is
-materialized for training, while the raw synthetic Zarr is a provenance-only DVC
-target. The raw corpus DVC pointer is the corpus identity.
+`workflow/config/mn5_synth_pretrain_reactive_n100.yaml` and, for the n400
+corpus, `workflow/config/mn5_synth_pretrain_reactive_n400.yaml`. Its processed
+Zarr is materialized for training, while the raw synthetic Zarr is a
+provenance-only DVC target. The raw corpus DVC pointer is the corpus identity.
 
 The a97c812 corpus uses
 `workflow/config/mn5_preprocess_sirhd_v1_a97c812_reactive_n100.yaml`. The immutable
@@ -191,10 +192,20 @@ run owns the processed dataset, QA record, generated DVC pointer, and publicatio
 receipt. Promote the pointer to the source repository only after these records
 pass review.
 
+The 5a2262d n400 corpus uses
+`workflow/config/mn5_preprocess_sirhd_v1_5a2262d_reactive_n400.yaml` on one
+`gp_debug` GPP node (120 minutes, 64 CPUs). Its raw object is 239 GB, so hard-link
+it from the EpiSim.jl DVC store on GPFS into both the `storage` and `cache`
+directories of the EpiForecaster DVC root, as for the a97c812 corpus.
+
 The real dataset `real_with_id` is rebuilt with
-`workflow/config/mn5_preprocess_real.yaml` on one `acc_debug` node (120 minutes).
-Raw inputs are the DVC pointers `data/files/catalonia_real_raw_inputs_v1.dvc` and
-`data/files/mobility.zarr.zip.dvc`. The run publishes a packed
+`workflow/config/mn5_preprocess_real.yaml` on one `gp_debug` GPP node (90 minutes,
+48 CPUs). Raw inputs are the DVC pointers
+`data/files/catalonia_real_raw_inputs_v1.dvc` and
+`data/files/dasymetric_mob_full-20261104b.dvc`. The latter is the dasymetric_mob
+promotion `full-20261104b`; its objects were hard-linked from that project's DVC
+store into `EpiForecaster-DVC/storage`, and preprocessing reads
+`mobility/mobility_catalonia.zarr` (Zarr v3) from it. The run publishes a packed
 `real_with_id.zarr.zip.dvc` pointer, which replaced the old `real_with_id.zarr.dvc`
 directory pointer. After review, copy it to `data/processed/` and repoint the
 consuming templates and `data.dataset_path` (see the template header).
@@ -324,9 +335,16 @@ coverage, run-context, aggregate table, and artifact manifest. Completion
 markers remain receipts rather than the sole scientific output contract.
 
 `stage_data` materializes the pinned DVC payloads once in the run workspace.
-The first scientific step copies them to an allocation-local cache on the node.
-The key includes the run config and data manifest. A lock protects construction;
-only a complete copy is published. All ranks and later stages mount this copy
+The first scientific step copies them to an allocation-local cache on the node:
+rsync copies files below 1 GiB and `scripts/workflow/parallel_copy.py` copies
+larger files with 16 concurrent 64 MiB block readers, because one stream reads
+about 0.4 GB/s from GPFS. Other jobs share the disk of an ACC node and can
+leave it nearly full (job 48640552 found 165 of 436 GB free for a 204 GB
+dataset and failed after four minutes of copying), so the copy checks the free
+space first and fails at once unless the large files fit with 16 GiB to spare.
+Resubmit to get another node. The key includes the run config and data manifest. A
+lock protects construction; only a complete copy is published. All ranks and
+later stages mount this copy
 read-only. Each process keeps a private temporary directory. Shared leases keep
 the cache alive during execution, and the coordinator removes it on exit when
 no step still uses it. An abrupt allocation loss can leave node-local files;
@@ -339,8 +357,10 @@ progress. The initialization rule creates the journal before workers start.
 
 Preprocessing and cross-validation keep each attempt under `.state/attempts/`.
 Partial attempts remain available for inspection. A completed attempt has a
-receipt with the config identity and file hashes. On retry, the runtime checks
-those hashes and restores missing public outputs without repeating the work.
+receipt with the config identity and file hashes; the processed dataset is
+recorded by byte size, because its DVC MD5 at publication is its only hash. On
+retry, the runtime checks the recorded identities and restores missing public
+outputs without repeating the work.
 Publication uses atomic hard links within the run filesystem, so large payloads
 do not require a second copy. Keep attempt directories for the lifetime of the
 run: they contain the training logs, dynamics, and recovery evidence. Incomplete
@@ -350,8 +370,9 @@ publication depends on that file as well as its QA evidence.
 
 Processed datasets are sharded Zarr v3 stores packed into one uncompressed
 ZIP64 file (`data/preprocess/zarr_layout.py`, layout `synthetic-zarr-v1`).
-Each per-run variable has one shard per run, so `preprocessing.write_workers`
-processes write runs in parallel and verify each run by read-back. DVC tracks
+Each per-run variable has one shard per run. `preprocessing.write_workers`
+processes each build one synthetic run from the raw corpus, write it and verify
+it by read-back (`data/preprocess/synthetic_runs.py`). DVC tracks
 the packed file as one object. See `docs/SYNTHETIC_ZARR_LAYOUT.md`.
 
 ## Prepare and submit

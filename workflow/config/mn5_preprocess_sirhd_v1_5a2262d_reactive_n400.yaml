@@ -1,0 +1,84 @@
+# Immutable full-corpus preprocessing for the 440-run closed-loop reactive
+# corpus epiforecaster_sirhd_v1_zarr_5a2262d_20261105_reactive_n400 (400
+# Reactive runs with a policy and 40 no-policy Baseline twins).
+# The run publishes a new DVC object and leaves the generated pointer in its
+# immutable publication directory for reviewed promotion to this repository.
+#
+# The raw object afda29837a0e7c77b48e86a5429f6812 (239 GB) must be hard-linked
+# from the EpiSim.jl DVC store into EpiForecaster-DVC/storage on GPFS (no copy).
+#
+# The raw corpus has no dense mobility_time_varying; mobility is rebuilt lazily
+# from the factorized layout. Preprocessing runs no GPU step, so it uses GPP.
+# The output is packed sharded Zarr (docs/SYNTHETIC_ZARR_LAYOUT.md). Each of
+# write_workers spawned processes builds one run at a time from the raw corpus,
+# writes its shards and reads them back (data/preprocess/synthetic_runs.py);
+# mobility is rounded to 10 mantissa bits (bitround_keepbits in the base
+# config). Run d of the earlier whole-corpus pipeline (job 48632495) took 79.5
+# minutes: 9 to stage the input, 19 in one process before the writers, 20 with
+# 12 writers, 6.5 to pack and 14 to publish. Run e of this per-run pipeline
+# (job 48637267) took 32 minutes: 3.6 to stage, 10.5 with 32 workers at about
+# 40 busy cores and at most 103 GB of process memory, 4 to pack, 3 for QA and
+# the copy to GPFS, and 10 to publish (the DVC md5 of the 204 GB file).
+# Node-local NVMe holds the staged input (223 GB), the Zarr staging directory
+# and the packed output (204 GB each).
+
+run: {}
+source: {}
+container: {}
+
+workflow:
+  kind: preprocess
+  target: preprocess
+
+dvc:
+  targets:
+    - data/files/epiforecaster_sirhd_v1_zarr_5a2262d_reactive_n400.zarr.zip.dvc
+    - data/files/catalonia_preprocessing_inputs_v1.dvc
+  provenance_targets: []
+
+preprocessing:
+  base_config: configs/production_only/preprocess_mn5_synth_sirhd_v1_5a2262d_reactive_n400.yaml
+  dataset_name: synthetic_sirhd_v1_5a2262d_reactive_n400_holt_damped
+  expected_run_count: 440
+  node_local_output: true
+  # A worker holds one run (about 3 GB with its 1.6 GB of mobility). 32
+  # workers keep the peak near 100 GB of the 125 GiB that 64 CPUs grant, and
+  # the 128 hardware threads give each worker 4 Zarr codec threads.
+  write_workers: 32
+  required_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  float32_variables:
+    - cases
+    - hospitalizations
+    - deaths
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+  nonnegative_variables:
+    - latent_S_true
+    - latent_I_true
+    - latent_H_true
+    - latent_R_true
+    - latent_D_true
+    - latent_death_flow_true
+
+resources:
+  allocation:
+    account: bsc08
+    partition: gpp
+    qos: gp_debug
+    nodes: 1
+    tasks: 1
+    cpus_per_task: 64
+    runtime: 120
