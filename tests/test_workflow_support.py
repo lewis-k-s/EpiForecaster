@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -396,7 +397,7 @@ def test_dispatch_request_pins_submission_contract(tmp_path: Path) -> None:
     dispatch_path = tmp_path / "dispatch.tsv"
     config_path.write_text(yaml.safe_dump(config))
 
-    request = run_config.write_dispatch_request(config_path, dispatch_path)
+    request = run_config.write_dispatch_request(config_path, dispatch_path, tmp_path)
 
     assert request["run_id"] == "test-run"
     assert request["run_root"] == str(run_root)
@@ -432,7 +433,7 @@ def test_dispatch_request_carries_ablation_closeout_signal(tmp_path: Path) -> No
     dispatch_path = tmp_path / "ablation-dispatch.tsv"
     config_path.write_text(yaml.safe_dump(config))
 
-    request = run_config.write_dispatch_request(config_path, dispatch_path)
+    request = run_config.write_dispatch_request(config_path, dispatch_path, REPO_ROOT)
 
     assert request["closeout_signal_seconds"] == "600"
 
@@ -457,7 +458,7 @@ def test_dispatch_request_lists_checkpoint_input_directories(tmp_path: Path) -> 
     dispatch_path = tmp_path / "dispatch.tsv"
     config_path.write_text(yaml.safe_dump(config))
 
-    run_config.write_dispatch_request(config_path, dispatch_path)
+    run_config.write_dispatch_request(config_path, dispatch_path, tmp_path)
 
     lines = dispatch_path.read_text().splitlines()
     assert [line for line in lines if line.startswith("checkpoint_input_dir")] == [
@@ -466,9 +467,11 @@ def test_dispatch_request_lists_checkpoint_input_directories(tmp_path: Path) -> 
 
     config["workflow"]["kind"] = "evaluate"
     config["evaluation"] = {"checkpoint": "/gpfs/eval/model/best_model.pt"}
-    assert run_config.checkpoint_input_dirs(config) == [Path("/gpfs/eval/model")]
+    assert run_config.checkpoint_input_dirs(config, tmp_path) == [
+        Path("/gpfs/eval/model")
+    ]
     config["workflow"]["kind"] = "hpo"
-    assert run_config.checkpoint_input_dirs(config) == []
+    assert run_config.checkpoint_input_dirs(config, tmp_path) == []
 
 
 def test_copied_source_snapshot_verifies_after_worktree_changes(tmp_path: Path) -> None:
@@ -2710,6 +2713,8 @@ def _make_remote_run_staging(
 
     for relative in (
         "scripts/__init__.py",
+        "scripts/hpo/__init__.py",
+        "scripts/hpo/campaign_init.py",
         "scripts/workflow/__init__.py",
         "scripts/workflow/run_config.py",
         "scripts/workflow/remote_run.sh",
@@ -2756,7 +2761,7 @@ def _make_remote_run_staging(
         configure(config)
     config_path = staging / "config.yaml"
     config_path.write_text(yaml.safe_dump(config))
-    run_config.write_dispatch_request(config_path, state / "dispatch.tsv")
+    run_config.write_dispatch_request(config_path, state / "dispatch.tsv", source_root)
 
     request = (state / "dispatch.tsv").read_text()
     expected = f"tooling_python\t{tooling_python}\n"
@@ -3569,3 +3574,144 @@ def test_snapshot_rejects_dvc_mount_parent_missing_from_inventory(
     assert run_config.validate_code_data_separation(
         tmp_path, [relative], {"dvc": {"targets": [str(relative)]}}
     ) == {relative: Path("inputs/raw/data")}
+
+
+def _write_init_campaign(
+    source_root: Path, checkpoints: dict[str, Path], *, use: dict[str, str | None]
+) -> str:
+    """Write a campaign declaration subset that carries init checkpoints."""
+    relative = "configs/campaigns/transfer.yaml"
+    path = source_root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "campaign_id": "transfer",
+                "init_checkpoints": {name: str(p) for name, p in checkpoints.items()},
+                "conditions": [
+                    {"name": name, "init_checkpoint": checkpoint}
+                    for name, checkpoint in use.items()
+                ],
+            }
+        )
+    )
+    return relative
+
+
+def _ablation_init_config(run_root: Path, source_root: Path, campaign: str) -> dict:
+    config = _workflow_config(run_root, source_root)
+    config["workflow"].update({"kind": "ablation", "target": "ablation"})
+    config["ablation"] = {
+        "study_name": "transfer",
+        "campaign": campaign,
+        "workers": 4,
+        "timeout_s": 3000,
+        "closeout_signal_seconds": 600,
+        "recover_stale_running": True,
+    }
+    config.pop("optuna")
+    config.pop("promotion")
+    return config
+
+
+def test_dispatch_request_lists_campaign_init_checkpoint_directories(
+    tmp_path: Path,
+) -> None:
+    run_root = tmp_path / "runs/test-run"
+    source_root = tmp_path / "snapshot"
+    campaign = _write_init_campaign(
+        source_root,
+        {"a": Path("/gpfs/synth/a/best.pt"), "b": Path("/gpfs/synth/b/best.pt")},
+        use={"real-only": None, "ft-a": "a", "ft-b": "b"},
+    )
+    config = _ablation_init_config(run_root, run_root / "source", campaign)
+    config["container"] = {
+        "sif": "/containers/runtime.sif",
+        "digest_file": "/containers/runtime.sif.sha256",
+    }
+    config_path = tmp_path / "config.yaml"
+    dispatch_path = tmp_path / "dispatch.tsv"
+    config_path.write_text(yaml.safe_dump(config))
+
+    run_config.write_dispatch_request(config_path, dispatch_path, source_root)
+
+    lines = dispatch_path.read_text().splitlines()
+    assert [line for line in lines if line.startswith("checkpoint_input_dir")] == [
+        "checkpoint_input_dir\t/gpfs/synth/a",
+        "checkpoint_input_dir\t/gpfs/synth/b",
+    ]
+    assert run_config.workflow_campaign_init_checkpoints(config, source_root) == {
+        "transfer": {
+            "a": Path("/gpfs/synth/a/best.pt"),
+            "b": Path("/gpfs/synth/b/best.pt"),
+        }
+    }
+
+
+def test_campaign_init_checkpoint_declarations_fail_before_transfer(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "snapshot"
+    run_root = tmp_path / "runs/test-run"
+    campaign = _write_init_campaign(
+        source_root, {"a": Path("/gpfs/a.pt")}, use={"real-only": None, "ft": "typo"}
+    )
+    config = _ablation_init_config(run_root, run_root / "source", campaign)
+
+    with pytest.raises(ValueError, match="undeclared init_checkpoint"):
+        run_config.workflow_campaign_init_checkpoints(config, source_root)
+
+
+def test_prepare_run_pins_campaign_init_checkpoints(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs/transfer"
+    source_root = run_root / "source"
+    _write_pointer(
+        source_root,
+        "data/files/raw.zarr.dvc",
+        md5="raw.dir",
+        output_name="raw.zarr",
+    )
+    _write_pointer(
+        source_root,
+        "data/processed/processed.zarr.dvc",
+        md5="processed.dir",
+        output_name="processed.zarr",
+    )
+    external = tmp_path / "pretrain"
+    external.mkdir()
+    (external / "a.pt").write_bytes(b"synthetic a")
+    (external / "b.pt").write_bytes(b"synthetic b")
+    campaign = _write_init_campaign(
+        source_root,
+        {"a": external / "a.pt", "b": external / "b.pt"},
+        use={"real-only": None, "ft-a": "a", "ft-b": "b"},
+    )
+    config = _ablation_init_config(run_root, source_root, campaign)
+    config_path = run_root / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.safe_dump(config))
+    _write_published_run_contract(run_root, config_path, config)
+    config_path.chmod(0o444)
+    source_root.chmod(0o555)
+
+    try:
+        manifest_path = run_support.prepare_run(config_path, source_root, run_root)
+    finally:
+        source_root.chmod(0o755)
+
+    manifest = yaml.safe_load(manifest_path.read_text())
+    for name, payload in (("a", b"synthetic a"), ("b", b"synthetic b")):
+        pinned = run_root / f"inputs/campaign_init/transfer/{name}.pt"
+        record = manifest["campaign_init_inputs"]["transfer"][name]
+        assert pinned.read_bytes() == payload
+        assert not pinned.stat().st_mode & 0o222
+        assert record["pinned_checkpoint"] == str(pinned)
+        assert record["pinned_checkpoint_relative"] == (
+            f"inputs/campaign_init/transfer/{name}.pt"
+        )
+        assert record["configured_checkpoint"] == str(external / f"{name}.pt")
+        assert record["checkpoint_sha256"] == hashlib.sha256(payload).hexdigest()
+        assert (
+            manifest["identity"]["campaign_init_checkpoint_sha256"]["transfer"][name]
+            == hashlib.sha256(payload).hexdigest()
+        )

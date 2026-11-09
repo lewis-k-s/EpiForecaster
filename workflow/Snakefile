@@ -7,10 +7,12 @@ import yaml
 
 sys.path.insert(0, str(Path(config["run"]["source_root"])))
 
+from scripts.hpo.campaign_init import pinned_init_checkpoint_relative
 from scripts.workflow.run_config import (
     RESEARCH_OUTPUT_FILES,
     preprocessing_dataset_name,
     validate_mn5_allocation,
+    workflow_campaign_init_checkpoints,
     workflow_kind,
     workflow_target,
 )
@@ -76,6 +78,13 @@ if (
             str(PINNED_TRAINING_RESUME_CHECKPOINT),
             str(PINNED_TRAINING_RESUME_BEST_CHECKPOINT),
         ]
+    )
+for _campaign_id, _declared in workflow_campaign_init_checkpoints(
+    config, SOURCE_ROOT
+).items():
+    PREPARE_OUTPUTS.extend(
+        str(RUN_ROOT / pinned_init_checkpoint_relative(_campaign_id, _name))
+        for _name in _declared
     )
 DATA_STAGED = RUN_ROOT / ".state/data_staged.done"
 DATA_MANIFEST = RUN_ROOT / ".state/data_manifest.json"

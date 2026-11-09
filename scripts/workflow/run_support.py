@@ -36,9 +36,11 @@ from scripts.hpo.trial_artifacts import (
     best_model_path,
     trial_directory,
 )
+from scripts.hpo.campaign_init import pinned_init_checkpoint_relative
 from scripts.workflow.run_config import (
     preprocessing_dataset_name,
     validate_workflow_contract,
+    workflow_campaign_init_checkpoints,
 )
 from training.training_dynamics import (
     DYNAMICS_ARTIFACT_NAME,
@@ -400,6 +402,26 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         )
         identity["input_checkpoint_sha256"] = evaluation_input["checkpoint_sha256"]
 
+    campaign_init_inputs: dict[str, dict[str, dict[str, str]]] = {}
+    for campaign_id, declared in workflow_campaign_init_checkpoints(
+        config, source_root
+    ).items():
+        campaign_init_inputs[campaign_id] = {
+            name: pin_checkpoint(
+                path,
+                run_root / pinned_init_checkpoint_relative(campaign_id, name),
+                label=f"Campaign {campaign_id} init checkpoint {name}",
+            )
+            for name, path in declared.items()
+        }
+    if campaign_init_inputs:
+        identity["campaign_init_checkpoint_sha256"] = {
+            campaign_id: {
+                name: pinned["checkpoint_sha256"] for name, pinned in inputs.items()
+            }
+            for campaign_id, inputs in campaign_init_inputs.items()
+        }
+
     manifest = {
         "schema_version": 1,
         "run_id": config["run"]["id"],
@@ -456,6 +478,8 @@ def prepare_run(config_path: Path, source_root: Path, run_root: Path) -> Path:
         manifest["training_input"] = training_input
     if training_resume_input is not None:
         manifest["training_resume_input"] = training_resume_input
+    if campaign_init_inputs:
+        manifest["campaign_init_inputs"] = campaign_init_inputs
     manifest_path = run_root / "manifest.yaml"
     write_yaml(manifest_path, manifest)
     prepared_path = run_root / ".state/prepared.done"
@@ -1866,7 +1890,11 @@ def finalize_ablation(
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend
 
-    from scripts.hpo.ablation_worker import is_study_complete, load_campaign
+    from scripts.hpo.ablation_worker import (
+        bind_pinned_init_checkpoints,
+        is_study_complete,
+        load_campaign,
+    )
     from evaluation.ablation_probabilistic_analysis import campaign_analysis_spec
 
     config = load_yaml(config_path)
@@ -1890,7 +1918,9 @@ def finalize_ablation(
         study_name=str(ablation["study_name"]),
         storage=JournalStorage(JournalFileBackend(str(journal_path))),
     )
-    campaign = load_campaign(Path(str(ablation["campaign"])))
+    campaign = bind_pinned_init_checkpoints(
+        load_campaign(Path(str(ablation["campaign"]))), run_root / "manifest.yaml"
+    )
     if not is_study_complete(study, campaign, smoketest=smoketest):
         state_counts = Counter(trial.state.name for trial in study.trials)
         # The worker rule's completion marker is meaningless while the identity
@@ -1961,6 +1991,10 @@ def finalize_ablation(
             "study_name": study.study_name,
             "campaign_id": campaign_id,
             "campaign_sha256": campaign.sha256,
+            "init_checkpoint_sha256": {
+                name: pin.sha256
+                for name, pin in sorted(campaign.pinned_init_checkpoints.items())
+            },
             "journal": str(journal_path),
             "trial_count": len(study.trials),
             "artifacts": [

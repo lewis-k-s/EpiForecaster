@@ -428,7 +428,9 @@ def test_dispatch_request_carries_mps_clients(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))
 
-    request = run_config.write_dispatch_request(path, tmp_path / "dispatch.tsv")
+    request = run_config.write_dispatch_request(
+        path, tmp_path / "dispatch.tsv", tmp_path
+    )
 
     assert request["mps_clients_per_gpu"] == "4"
     assert request["tasks"] == "8"

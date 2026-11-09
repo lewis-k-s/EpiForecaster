@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -676,3 +677,397 @@ def test_ablation_stage_requires_two_conditions_and_two_seeds(tmp_path: Path) ->
     document["stage"] = "ablation_smoke"
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     assert worker.load_campaign(path).stage == "ablation_smoke"
+
+
+# --- campaign-declared init checkpoints -------------------------------------
+
+
+def _init_campaign_extra(
+    tmp_path: Path,
+    *,
+    checkpoints: dict[str, str] | None = None,
+    finetune_overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "init_checkpoints": (
+            {"synth-a": str(tmp_path / "a.pt"), "synth-b": str(tmp_path / "b.pt")}
+            if checkpoints is None
+            else checkpoints
+        ),
+        "conditions": [
+            {
+                "name": "real-only",
+                "hypothesis": "reference",
+                "overrides": {},
+                "allowed_difference_paths": [],
+            },
+            {
+                "name": "ft-a",
+                "hypothesis": "fine-tune from a",
+                "overrides": finetune_overrides or {},
+                "init_checkpoint": "synth-a",
+                "allowed_difference_paths": ["training.init_checkpoint_path"],
+            },
+            {
+                "name": "ft-b",
+                "hypothesis": "fine-tune from b",
+                "overrides": finetune_overrides or {},
+                "init_checkpoint": "synth-b",
+                "allowed_difference_paths": ["training.init_checkpoint_path"],
+            },
+        ],
+        "baseline_condition": "real-only",
+    }
+
+
+def _init_campaign(tmp_path: Path, **kwargs: object) -> worker.AblationCampaign:
+    return worker.load_campaign(
+        _write_campaign(tmp_path, extra=_init_campaign_extra(tmp_path, **kwargs))
+    )
+
+
+def _write_run_manifest(
+    run_root: Path, campaign: worker.AblationCampaign, payloads: dict[str, bytes]
+) -> Path:
+    """Write pinned checkpoints and the manifest section prepare would record."""
+    recorded: dict[str, object] = {}
+    for name, payload in payloads.items():
+        relative = Path("inputs/campaign_init") / campaign.campaign_id / f"{name}.pt"
+        pinned = run_root / relative
+        pinned.parent.mkdir(parents=True, exist_ok=True)
+        pinned.write_bytes(payload)
+        recorded[name] = {
+            "configured_checkpoint": str(campaign.init_checkpoints[name]),
+            "pinned_checkpoint_relative": str(relative),
+            "checkpoint_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    manifest = run_root / "manifest.yaml"
+    manifest.write_text(
+        yaml.safe_dump({"campaign_init_inputs": {campaign.campaign_id: recorded}}),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_init_campaign_loads_and_requires_the_path_in_declared_drift(
+    tmp_path: Path,
+) -> None:
+    campaign = _init_campaign(tmp_path)
+
+    assert set(campaign.init_checkpoints) == {"synth-a", "synth-b"}
+    assert campaign.conditions_by_name["ft-a"].init_checkpoint == "synth-a"
+    assert campaign.conditions_by_name["real-only"].init_checkpoint is None
+
+    extra = _init_campaign_extra(tmp_path)
+    extra["conditions"][1]["allowed_difference_paths"] = []  # type: ignore[index]
+    with pytest.raises(ValueError, match="undeclared config drift"):
+        worker.load_campaign(_write_campaign(tmp_path, extra=extra))
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda extra: extra["conditions"][1].update(init_checkpoint="missing"),
+            "undeclared init_checkpoint",
+        ),
+        (
+            lambda extra: extra["init_checkpoints"].update({"unused": "/gpfs/u.pt"}),
+            "used by no condition",
+        ),
+        (
+            lambda extra: extra["init_checkpoints"].update({"synth-a": "rel/a.pt"}),
+            "absolute path",
+        ),
+        (
+            lambda extra: extra["init_checkpoints"].update({"bad name": "/gpfs/u.pt"}),
+            "must match",
+        ),
+        (
+            lambda extra: extra.update(init_checkpoints=["/gpfs/a.pt"]),
+            "must be a mapping",
+        ),
+        (
+            lambda extra: extra["conditions"][1]["overrides"].update(
+                {"training": {"init_checkpoint_path": "/gpfs/raw.pt"}}
+            ),
+            "must not set training.init_checkpoint_path",
+        ),
+    ],
+)
+def test_init_campaign_rejects_invalid_declarations(
+    tmp_path: Path,
+    mutate,
+    message: str,  # noqa: ANN001
+) -> None:
+    extra = _init_campaign_extra(tmp_path)
+    mutate(extra)
+
+    with pytest.raises(ValueError, match=message):
+        worker.load_campaign(_write_campaign(tmp_path, extra=extra))
+
+
+def test_init_checkpoint_path_in_fixed_overrides_is_rejected(tmp_path: Path) -> None:
+    extra = _init_campaign_extra(tmp_path)
+    extra["fixed_overrides"] = {
+        "training": {"epochs": 1, "init_checkpoint_path": "/gpfs/raw.pt"}
+    }
+
+    with pytest.raises(ValueError, match="fixed_overrides must not set"):
+        worker.load_campaign(_write_campaign(tmp_path, extra=extra))
+
+
+def test_campaign_hash_ignores_checkpoint_location(tmp_path: Path) -> None:
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    first = _init_campaign(tmp_path / "one")
+    second = _init_campaign(
+        tmp_path / "two",
+        checkpoints={"synth-a": "/elsewhere/a.pt", "synth-b": "/elsewhere/b.pt"},
+    )
+
+    assert first.sha256 == second.sha256
+
+
+def test_pinned_checkpoints_are_verified_against_the_manifest(tmp_path: Path) -> None:
+    campaign = _init_campaign(tmp_path)
+    run_root = tmp_path / "run"
+    manifest = _write_run_manifest(
+        run_root, campaign, {"synth-a": b"checkpoint a", "synth-b": b"checkpoint b"}
+    )
+
+    pins = worker.load_pinned_init_checkpoints(manifest, campaign)
+
+    assert pins["synth-a"].path == (
+        run_root / "inputs/campaign_init" / campaign.campaign_id / "synth-a.pt"
+    )
+    assert pins["synth-a"].sha256 == hashlib.sha256(b"checkpoint a").hexdigest()
+
+    pins["synth-b"].path.chmod(0o644)
+    pins["synth-b"].path.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="failed validation"):
+        worker.load_pinned_init_checkpoints(manifest, campaign)
+
+
+def test_pinned_checkpoints_must_match_declared_names(tmp_path: Path) -> None:
+    campaign = _init_campaign(tmp_path)
+    manifest = _write_run_manifest(
+        tmp_path / "run", campaign, {"synth-a": b"checkpoint a"}
+    )
+
+    with pytest.raises(ValueError, match="run manifest pins init checkpoints"):
+        worker.load_pinned_init_checkpoints(manifest, campaign)
+
+
+def _capture_objective(
+    monkeypatch: pytest.MonkeyPatch,
+    campaign: worker.AblationCampaign,
+    tmp_path: Path,
+    condition: str,
+) -> tuple[list[str], dict[str, object], list[Path]]:
+    captured: list[str] = []
+    attrs: dict[str, object] = {}
+    experiment_dirs: list[Path] = []
+
+    class Trial:
+        number = 0
+
+        def suggest_categorical(self, name, choices):  # noqa: ANN001
+            return {"condition": condition, "seed": 42}[name]
+
+        def set_user_attr(self, key, value):  # noqa: ANN001
+            attrs[key] = value
+
+    class Trainer:
+        experiment_dir = tmp_path / "experiment"
+
+        def __init__(self, config, model_id):  # noqa: ANN001
+            self.experiment_dir.mkdir(exist_ok=True)
+            experiment_dirs.append(self.experiment_dir)
+
+        def run(self):
+            return {
+                "best_val_selection_score": 1.0,
+                "best_val_selection_metric": "mae_median",
+            }
+
+    def load_config(path, overrides):  # noqa: ANN001
+        captured.extend(overrides)
+        return SimpleNamespace(output=SimpleNamespace(log_dir=""))
+
+    monkeypatch.setattr(worker.EpiForecasterConfig, "load", staticmethod(load_config))
+    monkeypatch.setattr(worker, "EpiForecasterTrainer", Trainer)
+    worker.objective(Trial(), campaign=campaign, run_root=tmp_path)
+    return captured, attrs, experiment_dirs
+
+
+def test_objective_passes_the_pinned_path_and_records_the_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _init_campaign(tmp_path)
+    run_root = tmp_path / "run"
+    manifest = _write_run_manifest(
+        run_root, campaign, {"synth-a": b"checkpoint a", "synth-b": b"checkpoint b"}
+    )
+    bound = worker.bind_pinned_init_checkpoints(campaign, manifest)
+    pinned = run_root / "inputs/campaign_init" / campaign.campaign_id / "synth-a.pt"
+
+    overrides, attrs, experiment_dirs = _capture_objective(
+        monkeypatch, bound, tmp_path, "ft-a"
+    )
+
+    assert f"training.init_checkpoint_path={json.dumps(str(pinned))}" in overrides
+    assert str(tmp_path / "a.pt") not in " ".join(overrides)
+    digest = hashlib.sha256(b"checkpoint a").hexdigest()
+    assert attrs["campaign_init_checkpoint_sha256"] == digest
+    identity = json.loads(
+        (experiment_dirs[0] / "campaign_identity.json").read_text(encoding="utf-8")
+    )
+    assert identity["init_checkpoint"] == "synth-a"
+    assert identity["init_checkpoint_sha256"] == digest
+
+    baseline_overrides, _, _ = _capture_objective(
+        monkeypatch, bound, tmp_path, "real-only"
+    )
+    assert not any(
+        o.startswith("training.init_checkpoint_path") for o in baseline_overrides
+    )
+
+
+def test_objective_rejects_a_tampered_pinned_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = _init_campaign(tmp_path)
+    manifest = _write_run_manifest(
+        tmp_path / "run",
+        campaign,
+        {"synth-a": b"checkpoint a", "synth-b": b"checkpoint b"},
+    )
+    bound = worker.bind_pinned_init_checkpoints(campaign, manifest)
+    bound.pinned_init_checkpoints["synth-a"].path.write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="failed validation"):
+        _capture_objective(monkeypatch, bound, tmp_path, "ft-a")
+
+
+def test_objective_requires_a_bound_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(ValueError, match="not bound to run-pinned copies"):
+        _capture_objective(monkeypatch, _init_campaign(tmp_path), tmp_path, "ft-a")
+
+
+def test_hydrated_identity_follows_checkpoint_hash_not_path(tmp_path: Path) -> None:
+    campaign = _init_campaign(tmp_path)
+    manifest_one = _write_run_manifest(
+        tmp_path / "run1", campaign, {"synth-a": b"one", "synth-b": b"b"}
+    )
+    manifest_same = _write_run_manifest(
+        tmp_path / "run2", campaign, {"synth-a": b"one", "synth-b": b"b"}
+    )
+    manifest_other = _write_run_manifest(
+        tmp_path / "run3", campaign, {"synth-a": b"two", "synth-b": b"b"}
+    )
+
+    def digest(manifest: Path, condition: str) -> str:
+        return worker.hydrated_training_config_sha256(
+            worker.bind_pinned_init_checkpoints(campaign, manifest),
+            condition=condition,
+            fold=0,
+            seed=42,
+        )
+
+    # Different run roots give different pinned paths but the same identity.
+    assert digest(manifest_one, "ft-a") == digest(manifest_same, "ft-a")
+    assert digest(manifest_one, "ft-a") != digest(manifest_other, "ft-a")
+    assert digest(manifest_one, "ft-a") != digest(manifest_one, "ft-b")
+    assert digest(manifest_one, "real-only") == digest(manifest_other, "real-only")
+
+
+def test_reuse_acceptance_distinguishes_checkpoint_hashes(tmp_path: Path) -> None:
+    campaign = _init_campaign(tmp_path)
+    manifest = _write_run_manifest(
+        tmp_path / "run", campaign, {"synth-a": b"one", "synth-b": b"b"}
+    )
+    bound = worker.bind_pinned_init_checkpoints(campaign, manifest)
+    hydrated = worker.hydrated_training_config(bound, condition="ft-a", fold=0, seed=42)
+    execution = worker.ExecutionIdentity(
+        source_bundle_sha256="a" * 64,
+        container_digest="c" * 64,
+        dvc_md5_by_output={
+            Path(str(hydrated["data"]["dataset_path"])).as_posix(): "d" * 32,
+            Path(str(hydrated["data"]["region2vec_path"])).as_posix(): "e" * 32,
+        },
+    )
+    sha = hashlib.sha256(b"one").hexdigest()
+    record = {
+        "condition": "ft-a",
+        "seed": 42,
+        "fold": 0,
+        "status": "reusable",
+        "source_bundle_sha256": "a" * 64,
+        "container_digest": f"sha256:{'c' * 64}",
+        "dataset_dvc_md5": "d" * 32,
+        "region2vec_dvc_md5": "e" * 32,
+        "hydrated_training_config_sha256": worker.hydrated_training_config_sha256(
+            bound, condition="ft-a", fold=0, seed=42
+        ),
+        "init_checkpoint_sha256": sha,
+    }
+
+    assert (
+        worker.reuse_rejection_reasons(record, campaign=bound, execution=execution)
+        == []
+    )
+    stale = {**record, "init_checkpoint_sha256": hashlib.sha256(b"two").hexdigest()}
+    assert worker.reuse_rejection_reasons(
+        stale, campaign=bound, execution=execution
+    ) == ["init_checkpoint_sha256_mismatch"]
+    missing = {
+        key: value for key, value in record.items() if key != "init_checkpoint_sha256"
+    }
+    assert "init_checkpoint_sha256_mismatch" in worker.reuse_rejection_reasons(
+        missing, campaign=bound, execution=execution
+    )
+
+    other_manifest = _write_run_manifest(
+        tmp_path / "run-other", campaign, {"synth-a": b"two", "synth-b": b"b"}
+    )
+    rebound = worker.bind_pinned_init_checkpoints(campaign, other_manifest)
+    reasons = worker.reuse_rejection_reasons(
+        record, campaign=rebound, execution=execution
+    )
+    assert "hydrated_training_config_mismatch" in reasons
+    assert "init_checkpoint_sha256_mismatch" in reasons
+
+
+def test_study_queue_records_and_checks_init_hashes(tmp_path: Path) -> None:
+    campaign = _init_campaign(tmp_path)
+    manifest = _write_run_manifest(
+        tmp_path / "run", campaign, {"synth-a": b"one", "synth-b": b"b"}
+    )
+    bound = worker.bind_pinned_init_checkpoints(campaign, manifest)
+    study = _FakeStudy()
+    lock = tmp_path / "queue.lock"
+
+    worker.initialize_study_queue(study=study, campaign=bound, lock_path=lock)  # type: ignore[arg-type]
+
+    assert study.user_attrs[worker.INIT_CHECKPOINT_SHA256_ATTR] == {
+        "synth-a": hashlib.sha256(b"one").hexdigest(),
+        "synth-b": hashlib.sha256(b"b").hexdigest(),
+    }
+    changed = _write_run_manifest(
+        tmp_path / "run-changed", campaign, {"synth-a": b"two", "synth-b": b"b"}
+    )
+    with pytest.raises(ValueError, match="init checkpoint SHA-256 identities"):
+        worker.initialize_study_queue(
+            study=study,  # type: ignore[arg-type]
+            campaign=worker.bind_pinned_init_checkpoints(campaign, changed),
+            lock_path=lock,
+        )
+    with pytest.raises(ValueError, match="not bound to run-pinned copies"):
+        worker.initialize_study_queue(
+            study=_FakeStudy(),  # type: ignore[arg-type]
+            campaign=campaign,
+            lock_path=lock,
+        )

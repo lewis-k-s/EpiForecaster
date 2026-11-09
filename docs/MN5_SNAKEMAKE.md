@@ -265,6 +265,44 @@ in memory; the workflow never generates per-run YAML files. A campaign with fold
 indices must declare an existing persisted split manifest, and undeclared
 resolved-config drift fails before a worker starts training.
 
+Fine-tuning conditions declare their pretrained sources once, in a top-level
+`init_checkpoints` mapping of name to absolute GPFS path, and reference one by
+name with the condition's `init_checkpoint`:
+
+```yaml
+init_checkpoints:
+  synth-n400: /gpfs/projects/bsc08/.../synth_n400/checkpoints/best_model.pt
+conditions:
+  - name: real-only
+    overrides: {}
+    allowed_difference_paths: []
+  - name: ft-synth-n400
+    init_checkpoint: synth-n400
+    overrides: {}
+    allowed_difference_paths: [training.init_checkpoint_path]
+```
+
+A campaign fails at load if a condition names an undeclared checkpoint, a
+declared checkpoint is used by no condition, a path is relative, or any override
+or the base config sets `training.init_checkpoint_path` directly. The path change
+is not implicit: it is part of the condition's hydrated difference from the
+baseline, so `training.init_checkpoint_path` must be in that condition's
+`allowed_difference_paths`. Fine-tuning and from-scratch conditions must still
+share `equal_budget_policy.paths`.
+
+`mn5_workflow.sh prepare` pins every declared checkpoint into
+`inputs/campaign_init/<campaign_id>/<name>.pt`, records its SHA-256 in
+`manifest.yaml` (`campaign_init_inputs`, `identity.campaign_init_checkpoint_sha256`),
+and lists the source directories as `checkpoint_input_dir` bindings of the sealed
+dispatch request. Workers pass the pinned in-run path, never the GPFS path, and
+re-verify the SHA-256 at worker start and before every trial; a tampered file
+fails the worker. Scientific identity follows checkpoint content: the hydrated
+training-config hash used for `reuse_receipt` acceptance substitutes
+`sha256:<hash>` for `training.init_checkpoint_path`, reuse records must carry a
+matching `init_checkpoint_sha256`, and the campaign hash covers checkpoint names
+but not paths. The hashes are also recorded in the study journal, each trial's
+`campaign_identity.json`, and `ablation_manifest.json`.
+
 An `ablation_suite` config groups distinct campaigns in one immutable run and
 one four-GPU Slurm allocation. The suite runs each campaign in listed order,
 with four workers per campaign. Each study keeps a separate journal, worker
