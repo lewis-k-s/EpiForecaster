@@ -687,6 +687,12 @@ class ObservationHeadConfig:
     # Heads in this set have no direct observation-context residual path. The
     # mechanistic signal and its learnable delay/scale remain active.
     residual_disabled_heads: list[str] = field(default_factory=list)
+    # Heads in this set predict from the observation-context residual alone:
+    # their mechanistic log location is an exact zero (black-box control).
+    mechanistic_disabled_heads: list[str] = field(default_factory=list)
+    # Latent consumed by the wastewater shedding convolution: "I" (prevalence)
+    # or "infection_flow" (incidence, as in renewal-based wastewater models).
+    ww_source: str = "I"
 
     # Observation context dimension
     obs_context_dim: int = 96
@@ -771,13 +777,33 @@ class ObservationHeadConfig:
             raise ValueError(
                 f"residual_scale must be non-negative, got {self.residual_scale}"
             )
-        invalid_residual_heads = set(self.residual_disabled_heads).difference(
-            {"ww", "hosp", "cases", "deaths"}
+        for field_name, heads in (
+            ("residual_disabled_heads", self.residual_disabled_heads),
+            ("mechanistic_disabled_heads", self.mechanistic_disabled_heads),
+        ):
+            invalid_heads = set(heads).difference({"ww", "hosp", "cases", "deaths"})
+            if invalid_heads:
+                raise ValueError(
+                    f"{field_name} must contain only 'ww', 'hosp', 'cases', "
+                    f"or 'deaths', got {sorted(invalid_heads)!r}"
+                )
+        silent_heads = set(self.residual_disabled_heads).intersection(
+            self.mechanistic_disabled_heads
         )
-        if invalid_residual_heads:
+        if silent_heads:
             raise ValueError(
-                "residual_disabled_heads must contain only 'ww', 'hosp', 'cases', "
-                f"or 'deaths', got {sorted(invalid_residual_heads)!r}"
+                "A head cannot disable both its residual and mechanistic paths, "
+                f"got {sorted(silent_heads)!r}"
+            )
+        if self.ww_source not in {"I", "infection_flow"}:
+            raise ValueError(
+                f"ww_source must be 'I' or 'infection_flow', got {self.ww_source!r}"
+            )
+        if self.relevant_source_ww != self.ww_source:
+            raise ValueError(
+                "relevant_source_ww must equal ww_source so latent indicators "
+                f"use the latent the head consumes, got {self.relevant_source_ww!r} "
+                f"and {self.ww_source!r}"
             )
 
         if self.residual_hidden_dim <= 0:
@@ -814,7 +840,7 @@ class ObservationHeadConfig:
 
         valid_relevant_sources = {
             "hosp": {"hospitalization_flow", "H"},
-            "ww": {"I"},
+            "ww": {"I", "infection_flow"},
             "cases": {"I"},
             "deaths": {"death_flow", "D"},
         }

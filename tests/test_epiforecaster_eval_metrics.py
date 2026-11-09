@@ -61,9 +61,7 @@ def test_distribution_metric_accumulator_preserves_negative_nll() -> None:
     assert summary.nll == pytest.approx(expected)
 
 
-def test_evaluate_loader_emits_cases_and_deaths_metrics():
-    model = _DummyModel()
-
+def _make_batch(*, with_residuals: bool = False) -> SimpleNamespace:
     batch = SimpleNamespace(
         target_node=torch.tensor([0, 1], dtype=torch.long),
         model_outputs={
@@ -94,20 +92,42 @@ def test_evaluate_loader_emits_cases_and_deaths_metrics():
         },
         mob_batch=None,
     )
+    if with_residuals:
+        for head in ("hosp", "ww", "cases", "deaths"):
+            batch.model_outputs[f"residual_{head}"] = torch.zeros((2, 2))
     batch.to = lambda device, **_: batch
+    return batch
 
-    loader = _DummyLoader([batch])
-    criterion = JointInferenceLoss(
-        obs_weight_sum=4.0,
-        latent_total_weight=0.0,
-    )
-    _loss, metrics, _node_mae = evaluate_loader(
-        model=model,
-        loader=loader,
-        criterion=criterion,
+
+def _evaluate(batch: SimpleNamespace, **kwargs):  # noqa: ANN202
+    return evaluate_loader(
+        model=_DummyModel(),
+        loader=_DummyLoader([batch]),
+        criterion=JointInferenceLoss(obs_weight_sum=4.0, latent_total_weight=0.0),
         horizon=2,
         device=torch.device("cpu"),
+        **kwargs,
     )
+
+
+def test_latent_information_indicators_follow_their_flag():
+    _loss, disabled, _ = _evaluate(_make_batch(with_residuals=True))
+    _loss, enabled, _ = _evaluate(
+        _make_batch(with_residuals=True), latent_information=True
+    )
+
+    assert not any(key.startswith("latent_info_") for key in disabled)
+    # Every head has two windows; cases and deaths each keep only the window
+    # with two supervised days.
+    assert enabled["latent_info_hosp_window_count"] == 2
+    assert enabled["latent_info_ww_window_count"] == 2
+    assert enabled["latent_info_cases_window_count"] == 1
+    assert enabled["latent_info_deaths_window_count"] == 0
+    assert enabled["latent_info_hosp_observation_count"] == 4
+
+
+def test_evaluate_loader_emits_cases_and_deaths_metrics():
+    _loss, metrics, _node_mae = _evaluate(_make_batch())
 
     expected_joint_obs_loss = (
         metrics["loss_ww_weighted"]

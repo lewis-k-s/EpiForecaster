@@ -107,6 +107,82 @@ class TestEpiForecaster:
         with pytest.raises(ValueError, match="residual_disabled_heads"):
             ObservationHeadConfig(residual_disabled_heads=["invalid"])
 
+    def _forward(self, model, batch):  # noqa: ANN001, ANN202
+        return model(
+            hosp_hist=batch["hosp_hist"],
+            deaths_hist=batch["deaths_hist"],
+            cases_hist=batch["cases_hist"],
+            biomarkers_hist=batch["biomarkers_hist"],
+            mob_graphs=None,
+            target_nodes=batch["target_nodes"],
+            population=batch["population"],
+        )
+
+    def test_mechanistic_disabled_heads_predict_from_residual_alone(
+        self, basic_config, dummy_batch
+    ):
+        heads = ["ww", "hosp", "cases", "deaths"]
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            mechanistic_disabled_heads=heads
+        )
+        model = EpiForecaster(**basic_config)
+        out = self._forward(model, dummy_batch)
+
+        for head in heads:
+            assert torch.equal(
+                out[f"mechanistic_{head}"], torch.zeros_like(out[f"pred_{head}"])
+            )
+            assert torch.equal(out[f"pred_{head}"], out[f"residual_{head}"])
+        loss = sum(out[f"pred_{head}"].square().mean() for head in heads)
+        loss.backward()
+        # No prediction depends on the physics path or its observation kernels.
+        for parameter in (model.cases_head.scale, model.ww_head.scale):
+            assert parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
+        assert model.cases_head.residual_proj.weight.grad is not None
+
+    def test_residual_budget_requires_mechanistic_path(self, basic_config):
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            mechanistic_disabled_heads=["cases"]
+        )
+        model = EpiForecaster(**basic_config)
+
+        model.set_observation_residual_max_log_location_fraction(None)
+        with pytest.raises(ValueError, match="requires the mechanistic path"):
+            model.set_observation_residual_max_log_location_fraction(0.5)
+
+    def test_config_rejects_head_without_any_prediction_path(self):
+        with pytest.raises(ValueError, match="both its residual and mechanistic"):
+            ObservationHeadConfig(
+                residual_disabled_heads=["hosp"], mechanistic_disabled_heads=["hosp"]
+            )
+        with pytest.raises(ValueError, match="mechanistic_disabled_heads"):
+            ObservationHeadConfig(mechanistic_disabled_heads=["icu"])
+
+    def test_ww_source_infection_flow_feeds_incidence(self, basic_config, dummy_batch):
+        basic_config["observation_heads"] = ObservationHeadConfig(
+            ww_source="infection_flow", relevant_source_ww="infection_flow"
+        )
+        model = EpiForecaster(**basic_config)
+        out = self._forward(model, dummy_batch)
+
+        flow = out["infection_flow"]
+        expected = torch.cat([flow[:, :1], flow], dim=1)
+        assert torch.equal(out["observation_source_ww"], expected)
+        reference = model.ww_head.forward_distribution(
+            I_trajectory=expected,
+            population=torch.ones(flow.shape[0]),
+            obs_context=torch.cat(
+                [out["obs_context"][:, :1], out["obs_context"]], dim=1
+            ),
+        )
+        assert torch.allclose(out["mechanistic_ww"], reference["mechanistic_loc"])
+
+    def test_ww_source_must_match_its_relevant_source(self):
+        with pytest.raises(ValueError, match="relevant_source_ww must equal ww_source"):
+            ObservationHeadConfig(ww_source="infection_flow")
+        with pytest.raises(ValueError, match="ww_source must be"):
+            ObservationHeadConfig(ww_source="H", relevant_source_ww="H")
+
     def test_forward_basic(self, basic_config, dummy_batch):
         """Test forward pass with minimal features (cases only)."""
         model = EpiForecaster(**basic_config)

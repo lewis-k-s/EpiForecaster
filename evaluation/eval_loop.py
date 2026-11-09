@@ -27,6 +27,7 @@ from evaluation.granular_export import (
 )
 from evaluation.loaders import build_loader_from_config, load_model_from_checkpoint
 from evaluation.latent_diagnostics import build_latent_diagnostic_protocols
+from evaluation.latent_information import TorchLatentInformationAccumulator
 from evaluation.losses import JointInferenceLoss, get_loss_from_config
 from evaluation.metrics import (
     ProbabilisticMetricResult,
@@ -85,11 +86,12 @@ _RELEVANT_SOURCE_OUTPUT_KEYS = {
     "H": "H_trajectory",
     "I": "I_trajectory",
     "death_flow": "death_flow",
+    "infection_flow": "infection_flow",
     "D": "D_trajectory",
 }
 _ALLOWED_RELEVANT_SOURCES = {
     "hosp": {"hospitalization_flow", "H"},
-    "ww": {"I"},
+    "ww": {"I", "infection_flow"},
     "cases": {"I"},
     "deaths": {"death_flow", "D"},
 }
@@ -125,6 +127,30 @@ def _resolve_relevant_source_mapping(
                 f"{sorted(allowed_sources)}, got {source_name!r}"
             )
     return resolved
+
+
+def _update_latent_information(
+    accumulator: TorchLatentInformationAccumulator | None,
+    *,
+    head: str,
+    latent: torch.Tensor | None,
+    observed: torch.Tensor,
+    prediction: torch.Tensor,
+    residual: torch.Tensor | None,
+    weights: torch.Tensor,
+    nodes: torch.Tensor,
+) -> None:
+    if accumulator is None or latent is None or residual is None:
+        return
+    accumulator.update(
+        head=head,
+        latent=latent,
+        observed=observed,
+        prediction=prediction,
+        residual=residual,
+        weights=weights,
+        nodes=nodes,
+    )
 
 
 def _forecast_aligned_output(
@@ -416,6 +442,7 @@ def evaluate_loader(
     output_csv_path: Path | None = None,
     node_metrics_target: str = "hospitalizations",
     log_every: int = 10,
+    latent_information: bool = False,
 ) -> tuple[float, dict[str, Any], dict[str, dict[int, float]]]:
     """Evaluate a loader and compute loss/metrics matching trainer behavior.
 
@@ -442,6 +469,9 @@ def evaluate_loader(
         output_csv_path: Deprecated alias for node_metrics_csv_path
         node_metrics_target: Canonical target name for the legacy node metrics CSV
         log_every: Progress logging cadence in batches
+        latent_information: Compute the within-window latent-information
+            indicators (``latent_info_*``). They move every batch to CPU, so
+            enable them for final evaluations, not per-epoch validation.
 
     Returns:
         Tuple of (mean_loss, metrics_dict, node_mae_dict) where:
@@ -525,6 +555,9 @@ def evaluate_loader(
         )
         for protocol in ("oracle_x0", "teacher_forced_one_step")
     }
+    latent_information_metrics = (
+        TorchLatentInformationAccumulator() if latent_information else None
+    )
     loss_ww_sum = torch.tensor(0.0, device=device)
     loss_hosp_sum = torch.tensor(0.0, device=device)
     loss_cases_sum = torch.tensor(0.0, device=device)
@@ -792,6 +825,16 @@ def evaluate_loader(
                         weights=hosp_weights,
                         mechanistic_projection=hosp_mechanistic,
                     )
+                    _update_latent_information(
+                        latent_information_metrics,
+                        head="hosp",
+                        latent=hosp_relevant_source,
+                        observed=hosp_targets,
+                        prediction=pred_hosp,
+                        residual=hosp_residual,
+                        weights=hosp_weights,
+                        nodes=batch_data.target_node,
+                    )
                     if hosp_mechanistic is not None and hosp_residual is not None:
                         pathway_metrics["hosp"].update(
                             full=hosp_loc,
@@ -901,6 +944,16 @@ def evaluate_loader(
                         relevant_latent=ww_relevant_source,
                         weights=ww_weights,
                         mechanistic_projection=ww_mechanistic,
+                    )
+                    _update_latent_information(
+                        latent_information_metrics,
+                        head="ww",
+                        latent=ww_relevant_source,
+                        observed=ww_targets,
+                        prediction=pred_ww,
+                        residual=ww_residual,
+                        weights=ww_weights,
+                        nodes=batch_data.target_node,
                     )
                     if ww_mechanistic is not None and ww_residual is not None:
                         pathway_metrics["ww"].update(
@@ -1012,6 +1065,16 @@ def evaluate_loader(
                         weights=cases_weights,
                         mechanistic_projection=cases_mechanistic,
                     )
+                    _update_latent_information(
+                        latent_information_metrics,
+                        head="cases",
+                        latent=cases_relevant_source,
+                        observed=cases_targets,
+                        prediction=pred_cases,
+                        residual=cases_residual,
+                        weights=cases_weights,
+                        nodes=batch_data.target_node,
+                    )
                     if cases_mechanistic is not None and cases_residual is not None:
                         pathway_metrics["cases"].update(
                             full=cases_loc,
@@ -1121,6 +1184,16 @@ def evaluate_loader(
                         relevant_latent=deaths_relevant_source,
                         weights=deaths_weights,
                         mechanistic_projection=deaths_mechanistic,
+                    )
+                    _update_latent_information(
+                        latent_information_metrics,
+                        head="deaths",
+                        latent=deaths_relevant_source,
+                        observed=deaths_targets,
+                        prediction=pred_deaths,
+                        residual=deaths_residual,
+                        weights=deaths_weights,
+                        nodes=batch_data.target_node,
                     )
                     if deaths_mechanistic is not None and deaths_residual is not None:
                         pathway_metrics["deaths"].update(
@@ -1441,6 +1514,8 @@ def evaluate_loader(
         )
     metrics.update(latent_summary)
     metrics.update(latent_plausibility_summary)
+    if latent_information_metrics is not None:
+        metrics.update(latent_information_metrics.finalize())
     metrics.update(latent_diagnostic_summary)
     _add_delay_kernel_metrics(metrics=metrics, model=model)
 
@@ -1620,6 +1695,7 @@ def eval_checkpoint(
             granular_eval_format=resolved_granular_format,
             node_metrics_target=node_metrics_target,
             log_every=log_every,
+            latent_information=True,
             granular_metadata={
                 "batch_size": batch_size
                 if batch_size is not None

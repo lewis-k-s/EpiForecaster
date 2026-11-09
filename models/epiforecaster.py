@@ -180,6 +180,8 @@ class EpiForecaster(nn.Module):
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
             residual_enabled="ww" not in observation_heads.residual_disabled_heads,
+            mechanistic_enabled="ww"
+            not in observation_heads.mechanistic_disabled_heads,
             strict=self.strict,
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
@@ -200,6 +202,8 @@ class EpiForecaster(nn.Module):
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
             residual_enabled="hosp" not in observation_heads.residual_disabled_heads,
+            mechanistic_enabled="hosp"
+            not in observation_heads.mechanistic_disabled_heads,
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_hosp,
@@ -219,6 +223,8 @@ class EpiForecaster(nn.Module):
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
             residual_enabled="cases" not in observation_heads.residual_disabled_heads,
+            mechanistic_enabled="cases"
+            not in observation_heads.mechanistic_disabled_heads,
             delta_forecasting=observation_heads.delta_forecasting,
             anchor_mode=observation_heads.anchor_mode,
             kernel_mlp=observation_heads.kernel_mlp_cases,
@@ -239,6 +245,8 @@ class EpiForecaster(nn.Module):
             residual_dim=observation_heads.obs_context_dim,
             alpha_init=observation_heads.residual_scale,
             residual_enabled="deaths" not in observation_heads.residual_disabled_heads,
+            mechanistic_enabled="deaths"
+            not in observation_heads.mechanistic_disabled_heads,
             delta_forecasting=False,  # Do not anchor deaths since death_flow lacks t=0 nowcast
             anchor_mode="disabled",
             kernel_mlp=observation_heads.kernel_mlp_deaths,
@@ -469,9 +477,16 @@ class EpiForecaster(nn.Module):
                 ww_last, ww_last_mask = resolve_last_valid_anchor(ww_hist, ww_hist_mask)
 
         # Wastewater prediction
-        # SIR is modeled in fraction space (S+I+R=1), so population N=1.0
+        # SIR is modeled in fraction space (S+I+R=1), so population N=1.0.
+        # With ww_source="infection_flow" the shedding kernel convolves
+        # incidence; the origin incidence (index 0) is the first step's flux,
+        # beta_0 S_0 I_0, because the roll-forward has no pre-origin flow.
+        if self.observation_heads_config.ww_source == "infection_flow":
+            ww_source = torch.cat([infection_flow[:, :1], infection_flow], dim=1)
+        else:
+            ww_source = I_traj
         dist_ww = self.ww_head.forward_distribution(
-            I_trajectory=I_traj,
+            I_trajectory=ww_source,
             population=torch.ones(B, device=beta_t.device, dtype=beta_t.dtype),
             obs_context=obs_context_with_init,
             last_observed=ww_last,
@@ -558,7 +573,7 @@ class EpiForecaster(nn.Module):
             "mechanistic_deaths": dist_deaths["mechanistic_loc"],
             "residual_deaths": dist_deaths["residual_loc"],
             "residual_input_deaths": dist_deaths["residual_input"],
-            "observation_source_ww": I_traj,
+            "observation_source_ww": ww_source,
             "observation_source_hosp": hospitalization_source,
             "observation_source_cases": I_traj,
             "observation_source_deaths": death_flow,

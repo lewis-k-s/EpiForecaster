@@ -46,8 +46,12 @@ The model operates as a three-stage differentiable pipeline:
 Differentiable layers mapping latent states to observable metrics.
 
 1.  **Wastewater Head (`pred_ww`)**:
-    *   **Mechanism**: Convolves latent $I$ trajectory with a shedding kernel.
-    *   **Function**: $I_{t-k:t} \to \text{Viral Load}_t$
+    *   **Mechanism**: Convolves a latent source with a shedding kernel. The source is
+        $I$ (prevalence, default) or, with `model.observation_heads.ww_source:
+        infection_flow`, the S→I incidence, as in renewal-based wastewater models;
+        the origin incidence is the first Euler step's flux. Set
+        `relevant_source_ww` to the same value.
+    *   **Function**: $\text{source}_{t-k:t} \to \text{Viral Load}_t$
 2.  **Hospitalization Head (`pred_hosp`)**:
     *   **Mechanism**: Applies delay kernel and scaling to the latent hospitalization/admission flow.
     *   **Function**: $\text{hospitalization\_flow}_{t-k:t} \to \text{Hospital Admissions}_t$
@@ -215,6 +219,36 @@ magnitude calibration in `log1p(per 100k)` space that puts observed deaths about
 8-10 times above the latent death flow, so its synthetic `deaths` ratio is not
 an ascertainment.
 
+### Latent information indicators (evaluation)
+
+Plausibility indicators check latent levels; the information indicators check
+whether the latent feeding each head tracks the observed series and drives the
+forecast. `TorchLatentInformationAccumulator`
+(`evaluation/latent_information.py`) runs in final test evaluations (trainer
+test split and `eval_checkpoint`, not per-epoch validation) and writes
+`latent_info_<head>_*` keys, `head` in `hosp`, `ww`, `cases`, `deaths`, to
+`test_summary.json` `metrics`.
+
+Each series is centred within its forecast window over supervised days, so a
+region's level and the delta-forecasting anchor carry no information. The latent
+is the head's `relevant_source` compared as $\log(1 + 10^5 x)$.
+
+|Key|Definition|
+|---|---|
+|`r2_lat_obs`, `r2_lat_pred`|Squared same-day correlation of latent with observation / forecast location|
+|`mi_lat_obs`, `mi_lat_pred`, `mi_pred_obs`|Gaussian-copula mutual information, bits|
+|`te_lat_obs`, `te_pred_obs`|Linear-Gaussian transfer entropy to the observation one reporting step ahead (1 day cases/deaths, 7 days hosp/ww), bits|
+|`sign_lat_obs`, `sign_lat_pred`|Fraction of step changes with the same sign|
+|`resid_share`|Within-window variance of the residual contribution over that of the forecast|
+|`r2_lat_obs_weekly`, `resid_share_weekly`|Cases and deaths: the same on 7-day block means, which removes the day-of-week reporting cycle|
+|`lag_r2_lat_obs_<m\|p><d>`, `best_lag_lat_obs`, `best_lag_r2_lat_obs`|Lag scan; `p` means the latent leads (±14 d daily heads, ±21 d in 7-day steps weekly heads)|
+|`<metric>_null95`|95th percentile over 200 permutations pairing each window's observations with another window's latent (latent-observation metrics)|
+|`<metric>_q05`, `<metric>_q95`|Region-bootstrap interval, 200 resamples; region sampling only|
+
+Permutations and bootstraps use at most 20,000 seeded windows
+(`resample_window_count`). Overlapping windows make the effective sample smaller
+than `observation_count`.
+
 ## 4. Model Variants
 
 The architecture supports ablation studies via `ModelVariant` flags:
@@ -223,6 +257,12 @@ The architecture supports ablation studies via `ModelVariant` flags:
 *   **Mobility**: Enables `MobilityDenseEncoder` to process dynamic mobility graphs.
 *   **Biomarkers**: Enables wastewater inputs.
 *   **Cases**: Enables clinical history inputs.
+
+`model.observation_heads.mechanistic_disabled_heads` sets a head's mechanistic
+log location to an exact zero, so it predicts from the observation-context
+residual alone. Disabling every head gives a black-box control with the same
+encoder; a relative residual budget (`training.residual_schedule`) is rejected
+on such heads, and a head cannot disable both paths.
 
 ## 5. Configuration Parameters
 
